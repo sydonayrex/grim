@@ -2,12 +2,12 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::{f32_to_mxfp4_e2m1, mxfp4_e2m1_to_f32};
+use grim_tensor::{CoreTensorOps, MemoryOps};
 use grim_tensor::{
     Shape,
     dtype::{ArithType, DType, FloatPackScheme, Storage},
 };
 use std::panic;
-use grim_tensor::{CoreTensorOps, MemoryOps};
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -486,8 +486,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_parity() -> TestResult {
             storage: Storage::Native,
         },
     )?;
-    let pos_dev =
-        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+    let pos_dev = MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_cache_shape, DType::F32)?;
@@ -715,8 +714,7 @@ fn test_fused_rmsnorm_mxfp4_gemm_rope_kv_yarn_parity() -> TestResult {
         },
     )?;
     let inv_freq_dev = CoreTensorOps::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
-    let pos_dev =
-        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+    let pos_dev = MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_cache_shape, DType::F32)?;
@@ -923,8 +921,7 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_parity() -> TestResult {
             storage: Storage::Native,
         },
     )?;
-    let pos_dev =
-        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+    let pos_dev = MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_shape, DType::F32)?;
@@ -1148,8 +1145,7 @@ fn test_fused_mxfp4_gemm_qk_norm_rope_kv_yarn_parity() -> TestResult {
         },
     )?;
     let inv_freq_dev = CoreTensorOps::from_cpu(&dev, &inv_freq, &inv_freq_shape, DType::F32)?;
-    let pos_dev =
-        MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
+    let pos_dev = MemoryOps::from_cpu_bytes(&dev, as_u8_slice(&positions), &pos_shape, DType::U32)?;
 
     let q_out_dev = CoreTensorOps::zeros(&dev, &q_shape, DType::F32)?;
     let k_cache_dev = CoreTensorOps::zeros(&dev, &kv_shape, DType::F32)?;

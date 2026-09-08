@@ -1,9 +1,5 @@
 //! LoRA injection point configuration (WI-T1 item 1).
-//!
-//! Forward-side prerequisite: extend LoRA application from logits-only to
-//! standard QLoRA injection points (attention Q/K/V/O + MLP Gate/Up/Down).
-//! The backward graph needs to match wherever forward adapters get applied,
-//! so the injection-point enumeration lives here.
+//! Forward-side prerequisite: extend LoRA application from logits-only to standard QLoRA injection points (attention Q/K/V/O +.
 
 use crate::ParamId;
 use grim_tensor::error::{Error, Result};
@@ -14,12 +10,7 @@ fn default_device() -> grim_tensor::Device {
 }
 
 /// Standard LoRA injection points for QLoRA parity with Unsloth.
-///
-/// Unsloth applies LoRA to all attention projections (Q/K/V/O) and MLP
-/// projections (Gate/Up/Down) — 7 injection points per layer. The legacy
-/// `Logits` injection point (the only one wired in `lora.rs` today) is kept
-/// for backwards compatibility but is **not sufficient for real QLoRA parity**
-/// per the plan's WI-T1 note.
+/// Unsloth applies LoRA to all attention projections (Q/K/V/O) and MLP projections (Gate/Up/Down) - 7 injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LoRAInjectionPoint {
     /// Query projection in attention (W_q).
@@ -42,9 +33,8 @@ pub enum LoRAInjectionPoint {
 }
 
 impl LoRAInjectionPoint {
-    /// F2b: stable short suffix for sidecar blob slot names so distinct
-    /// points never collide (base weights previously all mapped to
-    /// `param_L_0_a`, silently dropping all but one per layer).
+    /// F2b: stable short suffix for sidecar blob slot names so distinct points never collide
+    /// (base weights previously all mapped to `param_L_0_a`, silently dropping all but one per layer).
     pub fn suffix(&self) -> &'static str {
         match self {
             Self::QProj => "qproj",
@@ -191,9 +181,8 @@ pub struct LoRAInjectionConfig {
     pub codebook_dim: usize,
     /// VeRA: number of scalar codebooks used for quantization.
     pub num_codebooks: usize,
-    /// SPECTRAL-QLORA: initialize A/B so that AB is semi-orthogonal in the
-    /// dominant subspace, reusing `grim-quant::soul_eater::subspace_newton_schulz_step`
-    /// at adapter creation. Replaces standard Kaiming/Zeors init.
+    /// SPECTRAL-QLORA: initialize A/B so that AB is semi-orthogonal in the dominant subspace, reusing `grim-quant::soul_eater::subspace_newton_schulz_step` at adapter creation.
+    /// Replaces standard Kaiming/Zeors init.
     pub use_spectral_qlora: bool,
     /// LoRA+: effective lr multiplier for the B matrix (1.0 = standard LoRA).
     pub lora_plus_ratio: f32,
@@ -240,9 +229,7 @@ impl LoRAInjectionConfig {
         }
     }
 
-    /// Scaling factor gamma.
-    /// Standard LoRA: alpha / r.
-    /// RSLoRA: alpha / sqrt(r).
+    /// Scaling factor gamma. Standard LoRA: alpha / r.
     pub fn scale(&self) -> f32 {
         if self.use_rs_lora {
             self.alpha / (self.rank as f32).sqrt()
@@ -383,21 +370,7 @@ impl LoRAInjectionRegistry {
 }
 
 /// LoftQ (Low-Rank Transfer Quantization) initialization.
-///
 /// Minimizes initialization error ||W0 - (Q(W0 - BA) + BA)||_F via alternating SVD quantization.
-///
-/// Algorithm:
-/// 1. Initialize B(0) = 0, A(0) = 0
-/// 2. For t = 1..N:
-///    - Compute residual R(t) = W0 - B(t-1) @ A(t-1)
-///    - Quantize residual: Q(t) = quantize(R(t))
-///    - Compute remainder S(t) = W0 - Q(t)
-///    - Compute truncated SVD: S(t) ≈ U_r @ Σ_r @ V_r^T
-///    - Set B(t) = U_r @ sqrt(Σ_r), A(t) = sqrt(Σ_r) @ V_r^T
-/// 3. Return quantized base Q and adapter matrices A, B
-///
-/// Returns (quantized_weights, A_matrix, B_matrix) as byte vectors and f32 vectors.
-/// The quantized weights use u8 storage (Q8_0 format simulation).
 pub fn loftq_initialize(
     w_base: &[f32],
     rows: usize,
@@ -471,10 +444,8 @@ pub fn loftq_initialize(
             .map(|(&w, &qd)| w - qd)
             .collect();
 
-        // Compute truncated SVD using randomized SVD approximation
-        // Using the algorithm from the plan:
-        // S ≈ U_r @ Σ_r @ V_r^T
-        // B = U_r @ sqrt(Σ_r), A = sqrt(Σ_r) @ V_r^T
+        // Compute truncated SVD using randomized SVD approximation Using the algorithm from the plan: S ≈
+        // U_r @ Σ_r @ V_r^T B = U_r @ sqrt(Σ_r), A = sqrt(Σ_r) @ V_r^T
 
         // Simple power iteration-based SVD approximation
         let s_vec = compute_truncated_svd(&remainder, rows, cols, rank)?;
@@ -485,20 +456,16 @@ pub fn loftq_initialize(
         // Compute sqrt(Σ_r)
         let sqrt_sigma: Vec<f32> = sigma_r.iter().map(|s| s.sqrt().max(0.0)).collect();
 
-        // Compute B = U_r @ diag(sqrt(Σ_r))
-        // U_r has shape (rows, rank), sqrt_sigma has shape (rank,)
-        // B has shape (rows, rank)
-        // B[r,k] = U_r[r,k] * sqrt_sigma[k]
+        // Compute B = U_r @ diag(sqrt(Σ_r)) U_r has shape (rows, rank), sqrt_sigma
+        // has shape (rank,) B has shape (rows, rank) B[r,k] = U_r[r,k] * sqrt_sigma[k]
         for r in 0..rows {
             for k in 0..rank {
                 b_vec[r * rank + k] = u_r[r * rank + k] * sqrt_sigma[k];
             }
         }
 
-        // Compute A = diag(sqrt(Σ_r)) @ V_r^T
-        // V_r^T has shape (rank, cols), sqrt_sigma has shape (rank,)
-        // A has shape (rank, cols)
-        // A[k,c] = sqrt_sigma[k] * V_r^T[k,c]
+        // Compute A = diag(sqrt(Σ_r)) @ V_r^T V_r^T has shape (rank, cols), sqrt_sigma
+        // has shape (rank,) A has shape (rank, cols) A[k,c] = sqrt_sigma[k] * V_r^T[k,c]
         for k in 0..rank {
             for c in 0..cols {
                 a_vec[k * cols + c] = sqrt_sigma[k] * v_t_r[k * cols + c];
@@ -535,19 +502,7 @@ pub fn loftq_initialize(
 }
 
 /// PiSSA (Principal Singular values and Singular vectors Adaptation) initialization.
-///
-/// Initializes LoRA adapters `A`, `B` from the top-`rank` singular components of
-/// the base weight `W0`, and sets the quantized base to the residual `W0 - B·A`.
-/// This converges faster than random Kaiming init because the adapters already
-/// capture the dominant directions of the weight update target.
-///
-/// Steps:
-/// 1. Truncated SVD: `W0 ≈ U_r Σ_r V_r^T`.
-/// 2. `B = U_r·sqrt(Σ_r)`, shape `[rows, rank]`.
-/// 3. `A = sqrt(Σ_r)·V_r^T`, shape `[rank, cols]`.
-/// 4. Quantize residual base `Q = quantize_q80(W0 - B·A)`.
-///
-/// Returns `(a, b, quantized_base_bytes)` as f32 vectors and Q8_0 u8 bytes.
+/// Initializes LoRA adapters `A`, `B` from the top-`rank` singular components of the base weight `W0`,.
 pub fn pissa_initialize(
     w_base: &[f32],
     rows: usize,
@@ -719,9 +674,8 @@ fn compute_truncated_svd(
         }
         v_vectors.clone_from_slice(&temp);
 
-        // Orthogonalize U and V via modified Gram-Schmidt so the subspace
-        // iterates stay well-conditioned (columns of U converge to the leading
-        // left singular vectors; V is re-derived from U after normalization).
+        // Orthogonalize U and V via modified Gram-Schmidt so the subspace iterates stay well-conditioned (columns of
+        // U converge to the leading left singular vectors; V is re-derived from U after normalization).
         orthogonalize_columns(&mut u_vectors, rows, rank);
         // Re-derive V = A^T @ U using the orthonormalized U so V tracks it.
         let mut temp = vec![0.0f32; cols * rank];
@@ -764,9 +718,8 @@ fn compute_truncated_svd(
         }
     }
 
-    // V^T is returned as (rank, cols). Internally v_vectors is (cols, rank)
-    // with element (c,k) at index c*rank+k, so transpose it explicitly —
-    // otherwise consumers reading v_t[k*cols+c] get a scrambled matrix.
+    // V^T is returned as (rank, cols). Internally v_vectors is (cols, rank) with element (c,k) at
+    // index c*rank+k, so transpose it explicitly - otherwise consumers reading v_t[k*cols+c] get a scrambled matrix.
     let mut v_t = vec![0.0f32; rank * cols];
     for k in 0..rank {
         for c in 0..cols {
@@ -897,25 +850,16 @@ mod tests {
     fn num_trainable_params_matches_reference() {
         let r = LoRAInjectionRegistry::standard_qlora(1, 16, 32.0, 1);
         let c = cfg();
-        // Per layer with 7 injection points, rank 16, hidden=4096, head_dim=128,
-        //   num_heads=32, num_kv_heads=8, intermediate=11008:
-        //   Q: (16*4096) + (4096*16)    = 131072
-        //   K: (16*4096) + (1024*16)    = 81920
-        //   V: same as K                = 81920
-        //   O: (16*4096) + (4096*16)    = 131072
-        //   Gate: (16*4096) + (11008*16)= 241664
-        //   Up:   same as Gate           = 241664
-        //   Down: (16*11008)+ (4096*16) = 241664
-        //   total = 131072+81920*2+131072+241664*3 = 1,150,976
+        // Per layer with 7 injection points, rank 16, hidden=4096, head_dim=128, num_heads=32, num_kv_heads=8, intermediate=11008: Q: (16*4096) + (4096*16) = 131072 K: (16*4096) + (1024*16) = 81920 V: same as K
+        // = 81920 O: (16*4096) + (4096*16) = 131072 Gate: (16*4096) + (11008*16)= 241664 Up: same as Gate = 241664 Down: (16*11008)+ (4096*16) = 241664 total = 131072+81920*2+131072+241664*3 = 1,150,976
         let n = r.num_trainable_params(&c);
         assert_eq!(n, 1_150_976);
     }
 
     #[test]
     fn pissa_initialize_reconstructs_top_rank_singular_components() {
-        // W0 = diag(4, 3, 1) padded to 3x3. Rank 2 SVD should capture the
-        // top two singular values (4, 3) and the adapters must satisfy
-        // W0 ≈ B@A in the top-2 directions, with the residual base quantized.
+        // W0 = diag(4, 3, 1) padded to 3x3. Rank 2 SVD should capture the top two singular values
+        // (4, 3) and the adapters must satisfy W0 ≈ B@A in the top-2 directions, with the residual base quantized.
         let w = vec![4.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.0];
         let (a, b, q_base) = pissa_initialize(&w, 3, 3, 2).unwrap();
 
@@ -936,8 +880,7 @@ mod tests {
             }
         }
         // diag entries 4 and 3 captured; residual diagonal entry for σ=1 left over.
-        // Tolerances are loose: compute_truncated_svd is a power-iteration
-        // approximation, so reconstruction is approximate, not exact.
+        // Tolerances are loose: compute_truncated_svd is a power-iteration approximation, so reconstruction is approximate, not exact.
         assert!((ba[0] - 4.0).abs() < 0.1, "BA[0,0]={} != 4", ba[0]);
         assert!((ba[4] - 3.0).abs() < 0.1, "BA[1,1]={} != 3", ba[4]);
         // The σ=1 direction should be roughly absent from the rank-2 adapters.

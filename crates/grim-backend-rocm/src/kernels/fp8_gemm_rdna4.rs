@@ -2,9 +2,7 @@
 
 /// HIPRTC source for the RDNA4 FP8 GEMM kernel. [see: `__gfx1200__`, `__gfx1100__`]
 pub const KERNEL_SOURCE: &str = r#"
-// ---------------------------------------------------------------------------
-// gfx1200+ tiled GEMM — 16×16 tiles, unrolled K in steps of 16.
-// ---------------------------------------------------------------------------
+// gfx1200+ tiled GEMM - 16×16 tiles, unrolled K in steps of 16.
 #if defined(__gfx1200__) || defined(__gfx1201__)
 
 extern "C" __global__ void grim_fp8_gemm_rdna4(
@@ -31,9 +29,7 @@ extern "C" __global__ void grim_fp8_gemm_rdna4(
 }
 
 #else
-// ---------------------------------------------------------------------------
-// RDNA3 (gfx1100) tiled GEMM — same 16×16 tiling, F32 accumulate.
-// ---------------------------------------------------------------------------
+// RDNA3 (gfx1100) tiled GEMM - same 16×16 tiling, F32 accumulate.
 #if defined(__gfx1100__) || defined(__gfx1103__)
 
 extern "C" __global__ void grim_fp8_gemm_rdna4(
@@ -60,9 +56,7 @@ extern "C" __global__ void grim_fp8_gemm_rdna4(
 }
 
 #else
-// ---------------------------------------------------------------------------
 // Scalar fallback for RDNA2 and older architectures
-// ---------------------------------------------------------------------------
 extern "C" __global__ void grim_fp8_gemm_rdna4(
     const float* __restrict__ A,
     const float* __restrict__ B,

@@ -1,14 +1,5 @@
-//! MCP server registry: config from `$XDG_CONFIG_HOME/grim/mcp.toml`,
-//! one `McpClient` per enabled server, tools exposed to the model with
-//! `mcp_<server>_<tool>` names. All MCP output is untrusted: truncated hard.
-//!
-//! Config format:
-//! ```toml
-//! [servers.filesystem]
-//! command = "mcp-server-filesystem"
-//! args = ["/home/me/project"]
-//! enabled = true
-//! ```
+//! MCP server registry: config from `$XDG_CONFIG_HOME/grim/mcp.toml`, one `McpClient` per enabled server, tools exposed to the model with `mcp_<server>_<tool>` names.
+//! All MCP output is untrusted: truncated hard.
 
 use crate::tui::mcp::client::McpClient;
 use crate::tui::mcp::types::McpTool;
@@ -160,7 +151,10 @@ mod tests {
 
     #[test]
     fn sanitize_is_prefixed_and_clean() {
-        assert_eq!(sanitize("File System", "read_file"), "mcp_file_system_read_file");
+        assert_eq!(
+            sanitize("File System", "read_file"),
+            "mcp_file_system_read_file"
+        );
         assert_eq!(sanitize("git", "commit!"), "mcp_git_commit_");
     }
 

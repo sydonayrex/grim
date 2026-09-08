@@ -1,18 +1,11 @@
-//! Storage codec enum for model weights.
-//!
-//! `WeightFormat` names the codec used to store base model weights during
-//! training. The names are grim's internal bird-themed aliases. It lives in
-//! `grim-format` (not `grim-garage`) because `ModelFootprint` — a
-//! header-only model descriptor — needs it, and `grim-format` must not
-//! depend on `grim-garage`. `grim-garage` re-exports it.
+//! Storage codec enum for model weights. `WeightFormat` names the
+//! codec used to store base model weights during training.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 /// Codec used to store base model weights during training.
-///
-/// On arches that don't support a format natively, grim falls back via
-/// `resolve_quant_mode`: Raven -> Bf16 on RDNA2/3; all others pass through.
+/// On arches that don't support a format natively, grim falls back via `resolve_quant_mode`: Raven ->.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WeightFormat {
@@ -36,10 +29,7 @@ pub enum WeightFormat {
 }
 
 impl WeightFormat {
-    /// Bits-per-weight for this codec. Used by the VRAM estimate in
-    /// `ModelFootprint::estimate_vram_bytes`. Conservative upper bounds —
-    /// the on-disk size may be smaller, but predicting *under* rather than
-    /// *over* is the failure mode that causes OOM.
+    /// Bits-per-weight for this codec. Used by the VRAM estimate in `ModelFootprint::estimate_vram_bytes`.
     pub fn bpw(self) -> f32 {
         match self {
             WeightFormat::Bf16 => 16.0,
@@ -53,17 +43,7 @@ impl WeightFormat {
     }
 
     /// Map this codec to a backend-agnostic `QuantModeHint`.
-    ///
-    /// This is the single bridge between the *storage* codec
-    /// (`WeightFormat`, a training/conversion concept) and the *dispatch*
-    /// mode a backend selects. It returns a `QuantModeHint` (defined here,
-    /// in `grim-format`) rather than a concrete `QuantMode` (which lives in
-    /// each backend crate) so `grim-format` stays backend-free. WI-2
-    /// pre-flight uses the hint to classify native vs. fallback support.
-    ///
-    /// `Crow`/`Jay`/`Magpie` have no runtime dispatch equivalent — they are
-    /// storage-only aliases resolved at conversion time. `None` here means
-    /// "no runtime dispatch gate applies", not "unsupported".
+    /// This is the single bridge between the *storage* codec (`WeightFormat`, a training/conversion concept) and the.
     pub fn as_quant_mode_hint(self) -> Option<QuantModeHint> {
         Some(match self {
             WeightFormat::Bf16 => QuantModeHint::Bf16,
@@ -78,10 +58,8 @@ impl WeightFormat {
     }
 }
 
-/// Backend-agnostic quantization dispatch hint. Mirrors
-/// `grim_backend_rocm::QuantMode`'s variants without depending on any
-/// backend crate. `grim-garage` maps this to a concrete `QuantMode` before
-/// running the arch gate.
+/// Backend-agnostic quantization dispatch hint.
+/// Mirrors `grim_backend_rocm::QuantMode`'s variants without depending on any backend crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantModeHint {
     Fp32,
@@ -100,11 +78,8 @@ impl std::fmt::Display for WeightFormat {
     }
 }
 
-/// Parse a codec name from a `.grim` header's `target_weight_format`
-/// string. Accepts both the serde `snake_case` spelling ("bf16", "crow")
-/// and the canonical variant names ("Bf16", "Crow"). Unknown strings
-/// return `Err` so the caller falls back to the raw byte sum rather than
-/// guessing a smaller bpw.
+/// Parse a codec name from a `.grim` header's `target_weight_format` string.
+/// Accepts both the serde `snake_case` spelling ("bf16", "crow") and the canonical variant names ("Bf16", "Crow").
 impl FromStr for WeightFormat {
     type Err = ParseWeightFormatError;
 
@@ -262,7 +237,6 @@ impl ModelFootprint {
 }
 
 /// Conservative estimation of VRAM bytes needed for loading and running a model.
-///
 /// Formula: weight bytes + KV cache estimate + 10% overhead heuristic.
 pub fn estimate_vram_bytes(
     footprint: &ModelFootprint,

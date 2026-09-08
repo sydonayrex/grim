@@ -1,15 +1,5 @@
 //! KV-OMNI: universal multimodal KV-cache compression.
-//!
-//! Implements Method 6 from `new_methods.md`:
-//!  - **Per-modality compression policy:** text → KVTuner-style mixed precision
-//!    (K8V4 or K4V2 depending on layer depth); audio → RotateKV rotation +
-//!    2-bit uniform quant; visual → JoLT low-rank Tucker + Dual-Signal eviction.
-//!  - **Shared asymmetric pool:** keys INT8 across all modalities, values
-//!    compressed per modality (text=INT4, audio=2-bit uniform, visual=Tucker-16).
-//!  - **Eviction with cross-modal importance:** tokens scored by a weighted sum
-//!    of attention salience, audio energy, and visual motion magnitude.
-//!  - **Resumable on-disk contract:** persistent KV layout descriptor via
-//!    [`crate::KvBlockOnDisk`].
+//! Implements Method 6 from `new_methods.md`: - **Per-modality compression policy:** text → KVTuner-style mixed precision (K8V4.
 
 use std::collections::HashMap;
 
@@ -42,9 +32,7 @@ pub struct ModalityPolicy {
 
 impl KvModality {
     /// Resolve the compression policy for this modality.
-    ///
-    /// `layer_depth_ratio` ∈ [0, 1] controls KVTuner-style depth-dependent
-    /// precision for text (deeper → lower precision).
+    /// `layer_depth_ratio` ∈ [0, 1] controls KVTuner-style depth-dependent precision for text (deeper → lower precision).
     pub fn policy(&self, layer_depth_ratio: f32) -> ModalityPolicy {
         match self {
             KvModality::Text => {
@@ -109,15 +97,8 @@ impl KvModality {
 
 // ────────────────────────── OmniKvCompressor ──────────────────────────
 
-/// Universal multimodal KV-cache compressor (KV-OMNI §1–4).
-///
-/// Dispatches per-modality compression policy:
-/// - **Text** → `LloydMaxCompressor` with K8V4 (shallow) or K4V2 (deep).
-/// - **Audio** → `LloydMaxCompressor` with RotateKV rotation + 2-bit quant.
-/// - **Visual** → JoLT low-rank Tucker projection + 8-bit keys / Tucker-16 values.
-///
-/// The `KvCompressor` trait impl uses `self.default_modality`; callers that need
-/// modality-specific compression should use [`OmniKvCompressor::compress_with_modality`].
+/// Universal multimodal KV-cache compressor (KV-OMNI §1-4).
+/// Dispatches per-modality compression policy: - **Text** → `LloydMaxCompressor` with K8V4 (shallow) or K4V2 (deep).
 #[derive(Clone)]
 pub struct OmniKvCompressor {
     /// Default modality for the trait-level `compress`/`dequantize`/`fused_attention`.
@@ -193,8 +174,7 @@ impl OmniKvCompressor {
     }
 
     /// Audio path: RotateKV-style rotation + 2-bit uniform quant.
-    /// Keys get pre-rotated with a random orthogonal matrix, then quantized
-    /// at 2-bit. Values use the same 2-bit quant without rotation.
+    /// Keys get pre-rotated with a random orthogonal matrix, then quantized at 2-bit.
     fn compress_audio_rotatekv(&self, keys: &Tensor, values: &Tensor) -> Result<CompressedKvBlock> {
         let policy = KvModality::Audio.policy(self.layer_depth_ratio);
         let config = KvQuantConfig {
@@ -212,13 +192,7 @@ impl OmniKvCompressor {
     }
 
     /// Visual path: JoLT low-rank Tucker projection + PolyKV INT8 keys / Tucker-16 values.
-    ///
-    /// 1. Generate a random projection matrix R [head_dim, rank] from the policy seed.
-    /// 2. Project keys: K_proj = K @ R  → [seq, heads, rank]  (compressed).
-    /// 3. Project values: V_proj = V @ R → [seq, heads, rank] (compressed).
-    /// 4. Quantize projected keys at 8-bit (PolyKV shared INT8 pool).
-    /// 5. Store projected values as f32 bytes (Tucker-16 core, f32 for CPU path).
-    /// 6. Embed R in `key_meta` for reconstruction: [num_meta_scales, R_flat…, R_flat…].
+    /// 1.
     fn compress_visual_tucker(&self, keys: &Tensor, values: &Tensor) -> Result<CompressedKvBlock> {
         let k_dims = keys.shape().dims();
         let num_tokens = k_dims[0];
@@ -295,12 +269,7 @@ impl OmniKvCompressor {
         // 5. Store projected values as raw f32 bytes (Tucker core).
         let value_bits: Vec<u8> = v_proj.iter().flat_map(|v| v.to_le_bytes()).collect();
         // Embed the projection matrix R in value_meta for reconstruction.
-        // Layout (self-describing):
-        //   [ reserved: 0.0 ][ rank: f32 ][ R_flat: rank × head_dim f32 ]
-        // The rank is stored IN the block so dequantization never has to
-        // re-derive it from a policy that depends on the (possibly
-        // different) reader-side layer_depth_ratio — the old layout
-        // hard-coded r_start = 1 with an assumed rank.
+        // Layout (self-describing): [ reserved: 0.0 ][ rank: f32 ][ R_flat: rank × head_dim f32 ].
         let mut value_meta: Vec<f32> = Vec::with_capacity(2 + r_matrix.len());
         value_meta.push(0.0); // reserved
         value_meta.push(rank as f32);
@@ -356,11 +325,7 @@ impl OmniKvCompressor {
         let total_elems = num_tokens * num_kv_heads * head_dim;
         let policy = KvModality::Visual.policy(self.layer_depth_ratio);
 
-        // 1. Reconstruct R from value_meta. Self-describing layout:
-        //      [ reserved: 0.0 ][ rank: f32 ][ R_flat: rank × head_dim ]
-        //    Legacy blocks (pre-rank-embedding) carried
-        //      [ reserved: 0.0 ][ R_flat: policy_rank × head_dim ]
-        //    and are detected by the absence of the rank field.
+        // 1. Reconstruct R from value_meta.
         let policy_rank = policy.tucker_rank.unwrap_or(16).min(head_dim);
         let (rank, r_start) = {
             let legacy_len = 1 + policy_rank * head_dim;
@@ -635,13 +600,7 @@ impl Default for KvOmniConfig {
 // ────────────────────── KvOmniEvictor ──────────────────────
 
 /// Cross-modal KV-cache eviction scorer (KV-OMNI §3).
-///
-/// Scores tokens by a weighted sum of:
-/// - text-attention salience × text weight
-/// - audio-energy envelope × audio weight
-/// - visual-motion magnitude × visual weight
-///
-/// Then evicts the lowest-scoring tokens to respect the budget.
+/// Scores tokens by a weighted sum of: - text-attention salience × text weight - audio-energy.
 #[derive(Debug, Clone)]
 pub struct KvOmniEvictor {
     pub config: KvOmniConfig,
@@ -676,16 +635,8 @@ impl KvOmniEvictor {
         weights
     }
 
-    /// Compute per-token cross-modal salience as a weighted sum of all three
-    /// signals (KV-OMNI §3):
-    ///
-    /// `salience[i] = attention[i] * w_text + audio[i] * w_audio + motion[i] * w_visual`
-    ///
-    /// Every token is scored by the joint weighted sum of text-attention salience,
-    /// audio-energy envelope, and visual-motion magnitude. The weights represent
-    /// the relative importance of each modality's signal in the eviction decision,
-    /// preventing any single modality from evicting tokens that are important to
-    /// another. Tokens shorter than any signal default that signal to 0.0.
+    /// Compute per-token cross-modal salience as a weighted sum of all three signals (KV-OMNI §3): `salience[i] = attention[i] * w_text + audio[i] * w_audio + motion[i] * w_visual` Every token is scored by the joint weighted sum of text-attention salience, audio-energy envelope, and visual-motion magnitude.
+    /// The weights represent the relative importance of each modality's signal in the eviction decision, preventing.
     pub fn compute_cross_modal_salience(
         &self,
         attention_scores: &[f32],
@@ -714,11 +665,7 @@ impl KvOmniEvictor {
     }
 
     /// Evict KV-cache blocks to respect `total_budget`.
-    ///
-    /// 1. Compute cross-modal salience for each token.
-    /// 2. Sort tokens by salience descending.
-    /// 3. Keep top `total_budget` tokens.
-    /// 4. Mark evicted blocks as stale.
+    /// 1.
     pub fn evict(
         &mut self,
         blocks: &mut [CompressedKvBlock],
@@ -761,28 +708,7 @@ impl KvOmniEvictor {
     }
 
     /// Merge KV blocks from different modalities into a joint cache.
-    ///
-    /// Each sub-block is serialized independently (with its modality tag embedded
-    /// in `to_bytes`), and the merged blob carries per-sub-block boundary
-    /// offsets in `value_meta` so [`KvOmniEvictor::split_merged_block`] can
-    /// reconstruct the three sub-blocks exactly.
-    ///
-    /// Layout of merged `key_bits`:
-    ///   [ text_key_bits | audio_key_bits | visual_key_bits ] (concatenated)
-    /// Layout of merged `value_bits`:
-    ///   [ text_value_bits | audio_value_bits | visual_value_bits ] (concatenated)
-    /// Layout of merged `key_meta`:
-    ///   [ text_key_meta | audio_key_meta | visual_key_meta ] (concatenated)
-    /// Layout of merged `value_meta` (16-f32 header + concatenated metas):
-    /// ```text
-    /// [ 3.0 ]                        // sub-block count tag
-    /// [ text_nt,   audio_nt,   visual_nt ]     // num_tokens per sub-block
-    /// [ text_km,   audio_km,   visual_km ]     // key_meta lens
-    /// [ text_kb,   audio_kb,   visual_kb ]     // key_bits byte lens
-    /// [ text_vb,   audio_vb,   visual_vb ]     // value_bits byte lens
-    /// [ text_vm,   audio_vm,   visual_vm ]     // value_meta lens
-    /// [ text_value_meta | audio_value_meta | visual_value_meta ]
-    /// ```
+    /// Each sub-block is serialized independently (with its modality tag embedded in `to_bytes`), and the merged.
     pub fn merge_across_modalities(
         text_kv: CompressedKvBlock,
         audio_kv: CompressedKvBlock,
@@ -797,7 +723,11 @@ impl KvOmniEvictor {
             audio_kv.value_meta.len(),
             visual_kv.value_meta.len(),
         ];
-        let sub_nt: [usize; 3] = [text_kv.num_tokens, audio_kv.num_tokens, visual_kv.num_tokens];
+        let sub_nt: [usize; 3] = [
+            text_kv.num_tokens,
+            audio_kv.num_tokens,
+            visual_kv.num_tokens,
+        ];
         let sub_km: [usize; 3] = [
             text_kv.key_meta.len(),
             audio_kv.key_meta.len(),
@@ -859,9 +789,7 @@ impl KvOmniEvictor {
         }
     }
 
-    /// Inverse of [`KvOmniEvictor::merge_across_modalities`]: reconstruct the
-    /// three per-modality sub-blocks (text, audio, visual — the fixed merge
-    /// order) from the boundary header in the merged block's `value_meta`.
+    /// Inverse of [`KvOmniEvictor::merge_across_modalities`]: reconstruct the three per-modality sub-blocks (text, audio, visual - the fixed merge order) from the boundary header in the merged block's `value_meta`.
     /// Errors if the block is not a merged block or the header is malformed.
     pub fn split_merged_block(
         merged: &CompressedKvBlock,
@@ -1099,7 +1027,6 @@ mod tests {
         assert_eq!(block.head_dim, 16);
         // Visual uses 8-bit keys → one byte per projected element.
         // rank = 16, total_proj = 2*4*16 = 128 elements → 128 bytes.
-        // But values are stored as raw f32, so value_bits = 128 * 4 = 512 bytes.
         assert_eq!(block.key_bits.len(), 128);
         assert_eq!(block.value_bits.len(), 128 * 4);
         // value_meta: [reserved, rank] + R [16*16 = 256] = 258 entries,
@@ -1127,8 +1054,7 @@ mod tests {
         // but values are stored as raw f32 so should be exact).
         let v_orig = values.to_vec_f32().unwrap();
         let v_deq = deq_values.to_vec_f32().unwrap();
-        // V reconstruction from projected V_proj @ R^T should recover V since R
-        // is a projection onto 16 dim of 16-dim space — identity.
+        // V reconstruction from projected V_proj @ R^T should recover V since R is a projection onto 16 dim of 16-dim space - identity.
         // But K is quantized to 8-bit, so K reconstruction has quantization error.
         for i in 0..v_orig.len() {
             assert!(
@@ -1278,9 +1204,8 @@ mod tests {
         );
 
         assert_eq!(preserved.len(), 3);
-        // Cross-modal salience: attn*1.0 + audio*0.8 + motion*0.6
-        // Token 0: 5.0, Token 1: 4.0, Token 2: 3.0, Token 3: 2.0, Token 4: 1.0
-        // Top 3 by salience: tokens 0, 1, 2
+        // Cross-modal salience: attn*1.0 + audio*0.8 + motion*0.6 Token 0: 5.0, Token 1: 4.0, Token 2:
+        // 3.0, Token 3: 2.0, Token 4: 1.0 Top 3 by salience: tokens 0, 1, 2
         assert!(preserved.contains(&0));
         assert!(preserved.contains(&1));
         assert!(preserved.contains(&2));
@@ -1338,9 +1263,8 @@ mod tests {
 
     #[test]
     fn test_kv_omni_split_real_compressed_blocks_round_trip() {
-        // End-to-end: real per-modality compressor outputs merged then
-        // split; each reconstructed sub-block must be byte-identical and
-        // still dequantizable through its own modality path.
+        // End-to-end: real per-modality compressor outputs merged then split; each reconstructed sub-block
+        // must be byte-identical and still dequantizable through its own modality path.
         let device = grim_backend_cpu::CpuDevice::new();
         let (keys, values) = make_tensors(&device, &[2, 2, 8]);
         let text = OmniKvCompressor::new(KvModality::Text, 0.0)
@@ -1352,11 +1276,7 @@ mod tests {
         let visual = OmniKvCompressor::new(KvModality::Visual, 0.0)
             .compress_with_modality(&keys, &values, KvModality::Visual)
             .unwrap();
-        let (t0, a0, v0) = (
-            text.clone(),
-            audio.clone(),
-            visual.clone(),
-        );
+        let (t0, a0, v0) = (text.clone(), audio.clone(), visual.clone());
         let merged = KvOmniEvictor::merge_across_modalities(text, audio, visual);
         let (t, a, v) = KvOmniEvictor::split_merged_block(&merged).unwrap();
         assert_eq!(t.key_bits, t0.key_bits);
@@ -1463,9 +1383,7 @@ mod tests {
         let ondisk = block.to_ondisk(true);
         assert_eq!(ondisk.modality, KvModality::Visual);
         // Visual with Tucker rank 16 should carry the rank info.
-        // The to_ondisk on CompressedKvBlock defaults tucker_rank to None;
-        // the OmniKvCompressor should set it explicitly.
-        // This test verifies the modality round-trips.
+        // The to_ondisk on CompressedKvBlock defaults tucker_rank to None; the OmniKvCompressor should set it explicitly.
         assert_eq!(ondisk.modality, KvModality::Visual);
     }
 }

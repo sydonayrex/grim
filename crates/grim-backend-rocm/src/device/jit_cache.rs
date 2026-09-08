@@ -1,12 +1,5 @@
 //! Persistent disk cache for compiled ROCm HSA Code Objects (HSACO).
-//!
-//! Avoids expensive hipRTC multi-second recompilation stalls during cold starts
-//! on consumer GPUs and APUs by caching binary bytecode indexed by SeaHash key.
-//!
-//! WI-X9: concurrent test processes (or two grim processes) can JIT-compile the
-//! same kernel simultaneously. Writes are therefore (a) cross-process serialized
-//! behind an advisory `flock` on a per-cache-dir lock file and (b) atomic via
-//! tmp-file + rename, so a reader never observes a partial code object.
+//! Avoids expensive hipRTC multi-second recompilation stalls during cold starts on consumer GPUs and APUs by.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -27,10 +20,7 @@ pub fn jit_cache_dir() -> PathBuf {
 }
 
 /// Identify the HIP runtime and HIPRTC compiler that produced a code object.
-///
-/// Code objects are not a stable interchange format across ROCm upgrades, so
-/// this value must be part of every persistent-cache key.  Failed queries are
-/// retained in the fingerprint rather than silently aliasing a known version.
+/// Code objects are not a stable interchange format across ROCm upgrades, so this value must.
 pub(crate) fn toolchain_fingerprint() -> String {
     let mut runtime = -1;
     let mut hiprtc_major = -1;
@@ -47,9 +37,8 @@ fn jit_cache_lock_file() -> PathBuf {
     jit_cache_dir().join(".write.lock")
 }
 
-/// RAII guard holding an exclusive advisory flock on the cache dir for the
-/// duration of a write. Falls back to no-op locking on platforms where flock
-/// is unavailable — the atomic tmp+rename still guarantees read safety.
+/// RAII guard holding an exclusive advisory flock on the cache dir for the duration of a write.
+/// Falls back to no-op locking on platforms where flock is unavailable - the atomic tmp+rename.
 pub struct JitCacheWriteLock {
     #[allow(dead_code)]
     file: File,
@@ -144,10 +133,8 @@ pub fn load_cached_code_object(cache_key: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Store a freshly compiled HSA code object binary to disk atomically and
-/// under an advisory cross-process lock (WI-X9): tmp write → fsync → rename,
-/// with all writers serialized by `.write.lock` in the cache dir. Readers need
-/// no lock — rename is atomic, so they see either the old object or the new.
+/// Store a freshly compiled HSA code object binary to disk atomically and under an advisory cross-process lock (WI-X9): tmp write → fsync → rename, with all writers serialized by `.write.lock` in the cache dir.
+/// Readers need no lock - rename is atomic, so they see either the old object.
 pub fn store_cached_code_object(cache_key: &str, bytes: &[u8]) -> std::io::Result<()> {
     let dir = jit_cache_dir();
     fs::create_dir_all(&dir)?;

@@ -1,35 +1,5 @@
-//! A unified compressed tensor container format compatible with all
-//! production-ready compressed tensor types in grim.
-//!
-//! This module defines a single container (.gcct — Grim Compact Tensor)
-//! that can hold `W8A8Mxfp8`, `WNA16`, and `EmbeddingWNA16Int` tensors
-//! in one file, with type-tagged per-tensor metadata and data sections.
-//!
-//! The container is a binary format with:
-//! - A 4-byte magic + u32 version + u32 tensor_count header
-//! - Per-tensor: name (u32-prefixed), type tag (u32), metadata (u32-prefixed
-//!   length + opaque bytes), data (u64-prefixed length + raw bytes)
-//!
-//! [`read_gcct`] deserializes into [`CompressedTensor`] values that expose
-//! the type tag, metadata bytes, and raw data bytes. [`dequantize_w8a8`]
-//! dispatches the two W8A8 variants whose payload layouts this crate
-//! DEFINES (see below); the remaining variants are container pass-through
-//! because their payload layouts are owned by their producers (grim-quant /
-//! the model loaders) — requesting their dequantization here is an explicit
-//! [`GcctError::UnsupportedLayout`], never a silent guess.
-//!
-//! # Defined payload layouts
-//!
-//! - **`CompressedTensorsW8A8Int8`** — metadata: little-endian
-//!   `(num_channels: u32, hidden: u32)`; data: `num_channels * hidden`
-//!   int8 codes followed by `num_channels` f32 per-channel scales.
-//!   Dequantized: `code * scale[channel]`.
-//! - **`CompressedTensorsW8A8Fp8`** — metadata: little-endian
-//!   `(num_channels: u32, hidden: u32)`; data: OCP E4M3 fp8 codes
-//!   (`num_channels * hidden`) followed by `num_channels` f32 scales.
-//!   Dequantized: `fp8_to_f32(code) * scale[channel]`.
-//! - **`W8A8Mxfp8` / `WNA16` / `EmbeddingWNA16Int`** — container-only here:
-//!   layout is producer-defined; [`dequantize_w8a8`] rejects them loudly.
+//! Unified container (.gcct) for compressed tensors in grim.
+//! Stores type-tagged metadata and data sections for multi-scheme tensors.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -39,9 +9,7 @@ pub const GCCT_MAGIC: &[u8; 4] = b"GCT\x01";
 /// Current container format version.
 pub const GCCT_VERSION: u32 = 1;
 
-/// Container parse / IO error. (Audit fix: `from_tag` previously returned
-/// `fmt::Error` — the error type of std::fmt formatting traits — for a
-/// data-format parse failure. All format errors now flow through this type.)
+/// Container parse or IO error.
 #[derive(Debug)]
 pub enum GcctError {
     /// Underlying I/O failure.
@@ -70,14 +38,20 @@ impl fmt::Display for GcctError {
             GcctError::Io(e) => write!(f, "gcct i/o error: {e}"),
             GcctError::BadMagic => write!(f, "gcct: bad magic bytes (expected GCT\\x01)"),
             GcctError::UnsupportedVersion(v) => {
-                write!(f, "gcct: unsupported container version {v} (this crate reads {GCCT_VERSION})")
+                write!(
+                    f,
+                    "gcct: unsupported container version {v} (this crate reads {GCCT_VERSION})"
+                )
             }
             GcctError::BadTag(t) => write!(f, "gcct: unknown compressed tensor type tag {t}"),
             GcctError::Truncated(what) => write!(f, "gcct: truncated stream while reading {what}"),
             GcctError::InvalidName => write!(f, "gcct: tensor name is not valid UTF-8"),
             GcctError::InvalidLength(n) => write!(f, "gcct: implausible section length {n}"),
             GcctError::UnsupportedLayout(what) => {
-                write!(f, "gcct: dequantization layout not defined in this crate: {what}")
+                write!(
+                    f,
+                    "gcct: dequantization layout not defined in this crate: {what}"
+                )
             }
         }
     }
@@ -138,9 +112,7 @@ impl CompressedTensorType {
 pub struct CompressedTensor {
     pub name: String,
     pub tensor_type: CompressedTensorType,
-    /// Opaque per-writer metadata bytes (dims, group size, …). The W8A8
-    /// layouts consumed by [`dequantize_w8a8`] are defined in this crate's
-    /// module docs; every other writer defines its own.
+    /// Opaque per-writer metadata bytes such as dimensions or group size.
     pub metadata: Vec<u8>,
     pub data: Vec<u8>,
 }
@@ -253,28 +225,32 @@ pub fn fp8_e4m3_to_f32(b: u8) -> f32 {
     sign * (1.0 + mant as f32 / 8.0) * 2.0f32.powi(exp - 7)
 }
 
-/// Dispatch dequantization for the W8A8 variants whose payload layouts this
-/// crate defines (see the module docs). Returns
-/// [`GcctError::UnsupportedLayout`] for the producer-owned variants —
-/// loudly, never as a guessed decode.
+/// Dequantizes supported W8A8 variants defined in this crate.
+/// Returns [`GcctError::UnsupportedLayout`] for producer-owned variants.
 pub fn dequantize_w8a8(t: &CompressedTensor) -> Result<Vec<f32>, GcctError> {
     match t.tensor_type {
         CompressedTensorType::CompressedTensorsW8A8Int8
         | CompressedTensorType::CompressedTensorsW8A8Fp8 => {}
         CompressedTensorType::W8A8Mxfp8 => {
-            return Err(GcctError::UnsupportedLayout("W8A8Mxfp8 (layout owned by its producer)"))
+            return Err(GcctError::UnsupportedLayout(
+                "W8A8Mxfp8 (layout owned by its producer)",
+            ));
         }
         CompressedTensorType::WNA16 => {
-            return Err(GcctError::UnsupportedLayout("WNA16 (layout owned by its producer)"))
+            return Err(GcctError::UnsupportedLayout(
+                "WNA16 (layout owned by its producer)",
+            ));
         }
         CompressedTensorType::EmbeddingWNA16Int => {
             return Err(GcctError::UnsupportedLayout(
                 "EmbeddingWNA16Int (layout owned by its producer)",
-            ))
+            ));
         }
     }
     if t.metadata.len() < 8 {
-        return Err(GcctError::Truncated("metadata shorter than (channels, hidden)".into()));
+        return Err(GcctError::Truncated(
+            "metadata shorter than (channels, hidden)".into(),
+        ));
     }
     let num_channels = u32::from_le_bytes(t.metadata[0..4].try_into().unwrap()) as usize;
     let hidden = u32::from_le_bytes(t.metadata[4..8].try_into().unwrap()) as usize;
@@ -292,9 +268,8 @@ pub fn dequantize_w8a8(t: &CompressedTensor) -> Result<Vec<f32>, GcctError> {
     match t.tensor_type {
         CompressedTensorType::CompressedTensorsW8A8Int8 => {
             for ch in 0..num_channels {
-                let scale = f32::from_le_bytes(
-                    t.data[n + ch * 4..n + ch * 4 + 4].try_into().unwrap(),
-                );
+                let scale =
+                    f32::from_le_bytes(t.data[n + ch * 4..n + ch * 4 + 4].try_into().unwrap());
                 for &code in &t.data[ch * hidden..(ch + 1) * hidden] {
                     out.push((code as i8) as f32 * scale);
                 }
@@ -302,9 +277,8 @@ pub fn dequantize_w8a8(t: &CompressedTensor) -> Result<Vec<f32>, GcctError> {
         }
         CompressedTensorType::CompressedTensorsW8A8Fp8 => {
             for ch in 0..num_channels {
-                let scale = f32::from_le_bytes(
-                    t.data[n + ch * 4..n + ch * 4 + 4].try_into().unwrap(),
-                );
+                let scale =
+                    f32::from_le_bytes(t.data[n + ch * 4..n + ch * 4 + 4].try_into().unwrap());
                 for &code in &t.data[ch * hidden..(ch + 1) * hidden] {
                     out.push(fp8_e4m3_to_f32(code) * scale);
                 }
@@ -359,7 +333,10 @@ mod tests {
                 tensor_type: CompressedTensorType::CompressedTensorsW8A8Int8,
                 metadata: w8a8_metadata(2, 4),
                 data: {
-                    let mut d = vec![1i8 as u8, 2, 3, 4, 200u8 as u8 /* wraps to -56 */, 0, 127, 128u8 as u8];
+                    let mut d = vec![
+                        1i8 as u8, 2, 3, 4, 200_u8, /* wraps to -56 */
+                        0, 127, 128_u8,
+                    ];
                     d.extend_from_slice(&le_f32s(&[0.5, 2.0]));
                     d
                 },

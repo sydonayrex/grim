@@ -1,5 +1,4 @@
 //! Autograd registry holding trainable parameters and layer injection points (WI-T1).
-//!
 //! Integrates model geometry configs, LoRA injection point registries, and active parameter sets.
 
 use crate::AutogradScope;
@@ -8,9 +7,8 @@ use crate::param::{ParamId, TrainableParam, TrainableParams};
 use grim_backend_cpu::cpu_tensor;
 use grim_tensor::{CoreTensorOps, Shape, error::Result};
 
-/// Base weights keyed by `(layer_idx, injection_point)`, in
-/// `[out_features * in_features]` row-major order. Supplied by the
-/// training worker once real weights exist; PiSSA reads from this map.
+/// Base weights keyed by `(layer_idx, injection_point)`, in `[out_features * in_features]` row-major order.
+/// Supplied by the training worker once real weights exist; PiSSA reads from this map.
 pub type BaseWeightMap = std::collections::HashMap<(usize, LoRAInjectionPoint), Vec<f32>>;
 
 /// Master registry managing autograd trainable parameters across all layers.
@@ -35,9 +33,7 @@ impl AutogradRegistry {
     }
 
     /// Create a new `AutogradRegistry` with an explicit autograd scope.
-    ///
-    /// Defaults to `LoRAOnly` for QLoRA modes; `FullParameter` is used for
-    /// BF16Full fine-tuning so gradients reach every base weight.
+    /// Defaults to `LoRAOnly` for QLoRA modes; `FullParameter` is used for BF16Full fine-tuning so gradients reach.
     pub fn with_scope(
         model_config: InjectionConfig,
         injection_registry: LoRAInjectionRegistry,
@@ -82,14 +78,8 @@ impl AutogradRegistry {
         )
     }
 
-    /// Create a new `AutogradRegistry` with an explicit scope and optional
-    /// base weights.
-    ///
-    /// When `base_weights` supplies the weight for an adapter whose config
-    /// has `use_pissa`, the A/B matrices are initialized from the principal
-    /// singular components of that weight via `pissa_initialize` instead of
-    /// the default Kaiming A / zero B. Adapters without a base-weight entry
-    /// (or without `use_pissa`) fall back to the default initialization.
+    /// Create a new `AutogradRegistry` with an explicit scope and optional base weights.
+    /// When `base_weights` supplies the weight for an adapter whose config has `use_pissa`, the A/B matrices.
     pub fn with_scope_and_base_weights(
         model_config: InjectionConfig,
         injection_registry: LoRAInjectionRegistry,
@@ -126,10 +116,8 @@ impl AutogradRegistry {
                     .lora_b_shape(&model_config, config.rank);
 
                 let stddev = (1.0 / a_cols as f32).sqrt();
-                // When a user seed is set (salamander.md P0.2), mix it into the
-                // Kaiming pseudo-random value per flat index so init is
-                // reproducible and differs across seeds. Seed 0 preserves the
-                // legacy flat-index behavior (`i % 17`) bit-for-bit.
+                // When a user seed is set (salamander.md P0.2), mix it into the Kaiming pseudo-random value per flat index so init is reproducible and differs across seeds.
+                // Seed 0 preserves the legacy flat-index behavior (`i % 17`) bit-for-bit.
                 let mut seed_state = seed
                     .wrapping_mul(0x9E3779B97F4A7C15)
                     .wrapping_add((config.layer_idx as u64).wrapping_mul(0x100000001B3))
@@ -149,12 +137,8 @@ impl AutogradRegistry {
                     .collect();
                 let zero_b: Vec<f32> = vec![0.0f32; b_rows * b_cols];
 
-                // SPECTRAL-QLORA override: use the well-conditioned 2D-dependent
-                // seed formula from SoulEaterAdapter instead of the flat-index
-                // default_a / zero_b, so that Newton-Schulz and Gram-Schmidt have
-                // a full-rank matrix to orthogonalize. The standard LoRA defaults
-                // are kept for non-SpectralQLoRA paths (A is Kaiming random,
-                // B is zero so the adapter starts as identity).
+                // SPECTRAL-QLORA override: use the well-conditioned 2D-dependent seed formula from SoulEaterAdapter instead of the flat-index default_a / zero_b, so that Newton-Schulz and Gram-Schmidt have a full-rank matrix to orthogonalize.
+                // The standard LoRA defaults are kept for non-SpectralQLoRA paths (A is Kaiming random, B is.
                 let (spectral_a, spectral_b) = if config.use_spectral_qlora {
                     let s_a: Vec<f32> = (0..(a_rows * a_cols))
                         .map(|idx| {
@@ -175,10 +159,8 @@ impl AutogradRegistry {
                     (default_a.clone(), zero_b.clone())
                 };
 
-                // PiSSA: initialize A/B from the base weight's principal
-                // singular components. The base weight is [out, in] =
-                // [b_rows, a_cols]; pissa returns a = [rank, in],
-                // b = [out, rank], matching the A/B layout above.
+                // PiSSA: initialize A/B from the base weight's principal singular components.
+                // The base weight is [out, in] = [b_rows, a_cols]; pissa returns a = [rank, in],.
                 let (a_data, b_data) = if config.use_pissa {
                     match base_weights
                         .and_then(|m| m.get(&(config.layer_idx, config.injection_point)))
@@ -188,9 +170,8 @@ impl AutogradRegistry {
                                 crate::injection::pissa_initialize(w, b_rows, a_cols, config.rank)?;
                             (a, b)
                         }
-                        // No base weight yet (pre-WI-T8 worker): fall back to
-                        // the well-conditioned spectral seed (if SpectralQLoRA) or
-                        // the default Kaiming A / zero B otherwise.
+                        // No base weight yet (pre-WI-T8 worker): fall back to the well-conditioned spectral
+                        // seed (if SpectralQLoRA) or the default Kaiming A / zero B otherwise.
                         None => {
                             if config.use_spectral_qlora {
                                 (spectral_a, spectral_b)
@@ -208,14 +189,7 @@ impl AutogradRegistry {
                 };
 
                 // SPECTRAL-QLORA: orthogonal adapter initialization.
-                // Apply subspace Newton-Schulz orthogonalization once at adapter
-                // creation so that AB is semi-orthogonal in the dominant subspace.
-                // This reuses `grim-quant::soul_eater::subspace_newton_schulz_step`
-                // for the Gram-matrix-based orthogonality check, matching
-                // SoulEaterAdapter's init pattern. When Newton-Schulz cannot
-                // converge (ill-conditioned seed or iteration cap reached), fall
-                // back to modified Gram-Schmidt which always yields orthonormal
-                // columns.
+                // Apply subspace Newton-Schulz orthogonalization once at adapter creation so that AB is semi-orthogonal in the.
                 let (a_data, b_data) = if config.use_spectral_qlora {
                     let mut a_data = a_data;
                     let mut b_data = b_data;
@@ -232,9 +206,8 @@ impl AutogradRegistry {
                         crate::injection::orthogonalize_columns(&mut b_data, b_rows, b_cols);
                     }
 
-                    // A [a_rows, a_cols] = [rank, in] is wide/thin. Transpose to
-                    // [in, rank] (tall/thin), orthogonalize, then transpose back so
-                    // rows of A become orthonormal: A * A^T ≈ I.
+                    // A [a_rows, a_cols] = [rank, in] is wide/thin.
+                    // Transpose to [in, rank] (tall/thin), orthogonalize, then transpose back so rows of A become orthonormal:.
                     let mut a_t = vec![0.0f32; a_cols * a_rows];
                     for row in 0..a_cols {
                         for col in 0..a_rows {
@@ -335,8 +308,7 @@ impl AutogradRegistry {
     }
 
     /// Clone the initialized adapter registry for another data-parallel rank.
-    /// Parameter tensors are cloned by value, so a rank can update its copy
-    /// independently while starting from identical weights.
+    /// Parameter tensors are cloned by value, so a rank can update its copy independently while.
     pub fn fork_for_rank(&self) -> Self {
         self.clone()
     }
@@ -496,9 +468,8 @@ mod tests {
 
     #[test]
     fn seeded_init_is_reproducible_across_runs() {
-        // Same seed -> identical A/B init; different seed -> different init
-        // (salamander.md P0.2). This is the property that makes `--seed`
-        // a reproducibility lever.
+        // Same seed -> identical A/B init; different seed -> different init (salamander.md P0.2).
+        // This is the property that makes `--seed` a reproducibility lever.
         let cfg = cfg();
         let make = |seed: u64| {
             let mut inj = LoRAInjectionRegistry::new();

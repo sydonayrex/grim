@@ -1,10 +1,5 @@
 //! GPU-native fused log-softmax vector-Jacobian product (VJP) kernel.
-//!
-//! Evaluates the analytical gradient for cross-entropy and preference alignment loss
-//! (DPO, KTO, SimPO, ORPO, GRPO) directly in GPU VRAM without host transfers:
-//! \[
-//! \frac{\partial \mathcal{L}}{\partial z_{t, v}} = \frac{\partial \mathcal{L}}{\partial \log \pi} \cdot (\mathbb{I}(v = y_t) - P(v))
-//! \]
+//! Evaluates the analytical gradient for cross-entropy and preference alignment loss (DPO, KTO, SimPO, ORPO, GRPO).
 
 /// HIP C++ kernel source for fused log-softmax VJP evaluation with warp-level reductions.
 pub const LOG_SOFTMAX_VJP_KERNEL_SOURCE: &str = r#"

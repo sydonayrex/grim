@@ -1,16 +1,9 @@
 //! ZeRO-3 / FSDP parameter sharding for Vulkan backends.
-//!
-//! `VkFsdpGroup` mirrors the structure of `grim-backend-rocm/src/fsdp.rs`:
-//! it plans parameter sharding across `world_size` ranks and delegates
-//! all-gather / reduce-scatter to a `VkCommunicator`.
-//!
-//! Current state: shard planning + single-GPU all-gather/reduce-scatter via
-//! `VkCommunicator`. Multi-GPU requires `VkCommunicator::world_size > 1`
-//! (Phase P3 transport). Honesty: not verified on multi-GPU hardware.
+//! `VkFsdpGroup` mirrors the structure of `grim-backend-rocm/src/fsdp.rs`: it plans parameter sharding across `world_size` ranks and delegates.
 
+use crate::collective::VkCommunicator;
 use grim_tensor::Shape;
 use grim_tensor::error::{Error, Result};
-use crate::collective::VkCommunicator;
 
 /// Configuration for Vulkan FSDP sharding.
 #[derive(Debug, Clone)]

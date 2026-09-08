@@ -1,10 +1,5 @@
-//! 2D UNet for diffusion: contract/expand with skip connections, time-step
-//! conditioning via a sinusoidal embedding, cross-attention-free (text-free)
-//! variant for unconditional denoising. Implements
-//! `grim_core::model::DiffusionModel`.
-//!
-//! The v1 model is structurally complete but uses small fixed sizes for
-//! testability. ROCm kernels arrive with phase 4.
+//! 2D UNet for diffusion: contract/expand with skip connections, time-step conditioning via a sinusoidal embedding, cross-attention-free (text-free) variant for unconditional denoising.
+//! Implements `grim_core::model::DiffusionModel`.
 
 use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_core::error::{Error, Result};
@@ -121,8 +116,7 @@ impl UpBlock {
                     acc += self.conv_w[ch_out * (hidden * 2) + ch_in] * prev[ch_in * hw + elem];
                 }
                 if !skip.is_empty() {
-                    // Skip connection: conv_w has [hidden * 2] entries per output channel,
-                    // where the second half [hidden..hidden*2] are the skip projection weights.
+                    // Skip connection: conv_w has [hidden * 2] entries per output channel, where the second half [hidden..hidden*2] are the skip projection weights.
                     // Index by ch_out (output channel) for the skip weights.
                     acc += self.conv_w[ch_out * (hidden * 2) + hidden + ch_out]
                         * skip[ch_out * hw + elem];

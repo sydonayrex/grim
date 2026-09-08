@@ -1,8 +1,5 @@
 //! DeepSeek V3 / V3.2 architecture featuring 256-expert MoE routing, Q-LoRA + KV-LoRA MLA attention.
-//!
-//! # Architecture Details
-//! - **DeepSeek V3 MLA**: Compresses queries via `q_a_proj -> q_a_layernorm -> q_b_proj` and KV via `kv_a_proj_with_mqa -> kv_a_layernorm -> kv_b_proj`.
-//! - **Fine-Grained 256-Expert MoE**: Routes 8 experts per token across 256 sparse experts with isolated shared experts.
+//! # Architecture Details - **DeepSeek V3 MLA**: Compresses queries via `q_a_proj -> q_a_layernorm -> q_b_proj`.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
@@ -12,9 +9,7 @@ use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, DType, Device, QuantProvenance, Shape, Tensor};
 use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for DeepSeek V3 / V3.2 model architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,9 +77,7 @@ impl ModelConfig for DeepSeek32Config {
     }
 }
 
-// ---------------------------------------------------------------------------
 // GPU fallback guard
-// ---------------------------------------------------------------------------
 
 /// `Ok(None)` marks "backend lacks the kernel — use the host fallback";
 /// other errors are real failures and propagate.
@@ -96,9 +89,7 @@ fn or_host_fallback<T>(r: std::result::Result<T, grim_tensor::Error>) -> Result<
     }
 }
 
-// ---------------------------------------------------------------------------
 // MLA Attention Block
-// ---------------------------------------------------------------------------
 
 pub struct DeepSeek32Mla {
     pub q_a_proj: Option<Linear>,
@@ -180,9 +171,8 @@ impl DeepSeek32Mla {
 
         let rope = Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
 
-        // Extract the per-head key/value up-projections from kv_b_proj's
-        // weight ([num_heads * (nope + v), rank], GGUF row-major) so queries
-        // can absorb w_kc and attention can run in latent space.
+        // Extract the per-head key/value up-projections from kv_b_proj's weight ([num_heads * (nope + v), rank],
+        // GGUF row-major) so queries can absorb w_kc and attention can run in latent space.
         let kv_b_w = kv_b_proj.weight.to_vec_f32()?;
         let kv_b_head = cfg.qk_nope_head_dim + cfg.v_head_dim;
         let rank = cfg.kv_lora_rank;
@@ -281,10 +271,8 @@ impl DeepSeek32Mla {
 
         crate::qwen35::apply_rope_neox(&mut k_rope_v, positions, 1, self.qk_rope_head_dim, 10000.0);
 
-        // 3. Absorb the per-head key up-projection (w_kc) into the query so
-        //    attention runs entirely in latent space:
-        //    q_absorbed[s,h] = q_nope[s,h] @ w_kc[h]^T
-        //    (q_nope · (w_kc c) == (q_nope w_kc) · c.)
+        // 3. Absorb the per-head key up-projection (w_kc) into the query so attention runs entirely in
+        // latent space: q_absorbed[s,h] = q_nope[s,h] @ w_kc[h]^T (q_nope · (w_kc c) == (q_nope w_kc) · c.)
         let kv_a_normed_v = kv_a_normed.to_vec_f32()?;
         let rank = kv_rank;
         let nope = self.qk_nope_head_dim;
@@ -315,11 +303,7 @@ impl DeepSeek32Mla {
                 .copy_from_slice(&k_rope_v[s * rope_d..(s + 1) * rope_d]);
         }
 
-        // 5. Append to the device-resident latent KV cache. Format: `.0` holds
-        //    the compressed latent `[total_kv, rank + rope_d]`; `.1` is unused
-        //    (kept only for the `(Tensor, Tensor)` cache shape the surrounding
-        //    plumbing uses). The history stays on its device — only the new
-        //    rows cross H2D, and the append is a D2D concat.
+        // 5. Append to the device-resident latent KV cache.
         let row = rank + rope_d;
         let cache_dev = grim_nn::modules::pick_device_for_storage_device(x.device());
         let new_latent_st =
@@ -347,18 +331,21 @@ impl DeepSeek32Mla {
 
         // 6a. GPU decode fast path (decode-only kernel: one launch per head).
         if seq_len == 1 && x.device() != &Device::Cpu {
-            if let Some(attn_t) =
-                self.gpu_absorbed_decode(&q_absorbed, &q_rope_v, &latent_all, rank, total_kv_len, scale, x.device())?
-            {
+            if let Some(attn_t) = self.gpu_absorbed_decode(
+                &q_absorbed,
+                &q_rope_v,
+                &latent_all,
+                rank,
+                total_kv_len,
+                scale,
+                x.device(),
+            )? {
                 return Ok(self.o_proj.forward(&attn_t)?);
             }
         }
 
-        // 6b. Scalar latent-space reference path with causal masking — the
-        // documented FALLBACK, reached only when the backend lacks the MLA
-        // decode kernel (`is_kernel_unimplemented`) or on the CPU device.
-        // Query at absolute position cache_offset + s attends only to
-        // t <= cache_offset + s.
+        // 6b. Scalar latent-space reference path with causal masking - the documented FALLBACK, reached only
+        // when the backend lacks the MLA decode kernel (`is_kernel_unimplemented`) or on the CPU device.
         let latent_all_v = latent_all.to_vec_f32()?;
         let cache_offset = total_kv_len - seq_len;
         let row = rank + rope_d;
@@ -422,23 +409,8 @@ impl DeepSeek32Mla {
         Ok(self.o_proj.forward(&attn_tensor)?)
     }
 
-    /// GPU decode path via `BackendDevice::mla_absorbed_decode` (decode-only,
-    /// `seq_len == 1`). Runs entirely on-device: the latent cache is the
-    /// device-resident tensor (no H2D re-upload), the per-head `w_vc`
-    /// projection happens inside the kernel, and the decoded output stays a
-    /// device tensor — no `synchronize`, no result D2H, no host matmul.
-    ///
-    /// The kernel indexes `w_uv` WITHOUT a per-head offset
-    /// (`w_uv[v * kv_lora_rank + c]` for every head), so a single multi-head
-    /// launch would repeat head 0's rows for all heads. The kernel is instead
-    /// launched once per head with `num_heads = 1`, passing exactly that
-    /// head's `[v_head_dim, kv_lora_rank]` block extracted D2D from the
-    /// device-resident `kv_b_proj.weight` (contiguous rows
-    /// `[h*(nope+v) + nope, +v)` — identical values to `self.w_vc[h]`).
-    ///
-    /// Returns `Ok(None)` when the backend lacks a needed kernel
-    /// (`is_kernel_unimplemented`); the caller then runs the scalar latent
-    /// loop. Real kernel failures propagate.
+    /// GPU decode path via `BackendDevice::mla_absorbed_decode` (decode-only, `seq_len == 1`).
+    /// Runs entirely on-device: the latent cache is the device-resident tensor (no H2D re-upload), the per-head.
     #[allow(clippy::too_many_arguments)]
     fn gpu_absorbed_decode(
         &self,
@@ -477,15 +449,16 @@ impl DeepSeek32Mla {
 
         // H2D only the small per-step query planes; the latent cache and the
         // w_vc source stay on their device.
-        let Some(qa_all) = or_host_fallback(
-            dev.from_cpu(&q_abs_scaled, &Shape::new(vec![nh, rank]), DType::F32),
-        )?
+        let Some(qa_all) =
+            or_host_fallback(dev.from_cpu(&q_abs_scaled, &Shape::new(vec![nh, rank]), DType::F32))?
         else {
             return Ok(None);
         };
-        let Some(qr_all) = or_host_fallback(
-            dev.from_cpu(&q_rope_scaled, &Shape::new(vec![nh, rope_d]), DType::F32),
-        )?
+        let Some(qr_all) = or_host_fallback(dev.from_cpu(
+            &q_rope_scaled,
+            &Shape::new(vec![nh, rope_d]),
+            DType::F32,
+        ))?
         else {
             return Ok(None);
         };
@@ -573,13 +546,8 @@ impl DeepSeek32Mla {
             {
                 return Ok(None);
             }
-            if or_host_fallback(dev.copy_slice_into(
-                out_all.as_ref(),
-                out_h.as_ref(),
-                h * vd,
-                vd,
-            ))?
-            .is_none()
+            if or_host_fallback(dev.copy_slice_into(out_all.as_ref(), out_h.as_ref(), h * vd, vd))?
+                .is_none()
             {
                 return Ok(None);
             }
@@ -595,9 +563,7 @@ impl DeepSeek32Mla {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Feed-Forward Layer
-// ---------------------------------------------------------------------------
 
 pub struct DeepSeek32Expert {
     pub w1: Linear,
@@ -669,11 +635,8 @@ impl DeepSeek32Moe {
         })
     }
 
-    /// GPU-first MoE forward: routing stays on host (small gate-logits pull),
-    /// but on non-CPU devices the experts run on-device and the routing
-    /// weighted sum accumulates with scalar-mul/add kernels so per-expert
-    /// outputs never cross to host. Falls back to [`Self::forward_moe_host`]
-    /// on CPU devices or when the backend lacks a needed primitive.
+    /// GPU-first MoE forward: routing stays on host (small gate-logits pull), but on non-CPU devices the experts run on-device and the routing weighted sum accumulates with scalar-mul/add kernels so per-expert outputs never cross to host.
+    /// Falls back to [`Self::forward_moe_host`] on CPU devices or when the backend lacks a needed primitive.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.gate.forward(x)?;
         let logits_v = logits.to_vec_f32()?;
@@ -686,10 +649,8 @@ impl DeepSeek32Moe {
         self.forward_moe_host(x, &logits_v)
     }
 
-    /// Device-resident MoE: token rows are extracted D2D, experts run
-    /// on-device (Linear + `silu_mul_on_device`), and the weighted sum
-    /// accumulates on-device. `Ok(None)` = backend lacks a needed kernel
-    /// (`is_kernel_unimplemented`); caller uses the host path.
+    /// Device-resident MoE: token rows are extracted D2D, experts run on-device (Linear + `silu_mul_on_device`), and the weighted sum accumulates on-device.
+    /// `Ok(None)` = backend lacks a needed kernel (`is_kernel_unimplemented`); caller uses the host path.
     fn forward_moe_device(&self, x: &Tensor, logits_v: &[f32]) -> Result<Option<Tensor>> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -796,10 +757,8 @@ impl DeepSeek32Moe {
         Ok(Some(out_t))
     }
 
-    /// Host routing reference path — the documented FALLBACK (CPU device, or
-    /// GPU backends missing the copy/mul primitives). Identical math to the
-    /// device path: per-token top-k routing on the gate logits, expert
-    /// forward, routed-scaling weighted sum.
+    /// Host routing reference path - the documented FALLBACK (CPU device, or GPU backends missing the copy/mul primitives).
+    /// Identical math to the device path: per-token top-k routing on the gate logits, expert forward,.
     fn forward_moe_host(&self, x: &Tensor, logits_v: &[f32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
@@ -850,9 +809,7 @@ impl DeepSeek32Moe {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct DeepSeek32Block {
     pub attn_norm: RmsNorm,
@@ -917,9 +874,7 @@ impl DeepSeek32Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct DeepSeek32 {
     pub cfg: DeepSeek32Config,

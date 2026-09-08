@@ -1,11 +1,5 @@
 //! Vocos Neural Audio Vocoder Architecture.
-//!
-//! Matches the real Vocos checkpoint layout (e.g. `MeanVC2/vocos.pt`):
-//! a Conv1d stem (`backbone.embed`), LayerNorm + ConvNeXt backbone
-//! (`backbone.convnext.{i}` with depthwise conv, LayerNorm, pointwise MLP
-//! and layer-scale gamma), a final LayerNorm, and an iSTFT head whose linear
-//! emits log-magnitude + phase halves (`head.out`) with a learned synthesis
-//! window (`head.istft.window`).
+//! Matches the real Vocos checkpoint layout (e.g.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;

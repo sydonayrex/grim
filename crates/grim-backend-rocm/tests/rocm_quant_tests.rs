@@ -5,9 +5,9 @@
 //! the CPU `grim_quant` reference.
 
 use grim_backend_rocm::RocmDevice;
+use grim_tensor::CoreTensorOps;
+use grim_tensor::Shape;
 use grim_tensor::dtype::{DType, FloatPackScheme, KQuantScheme, QuantFormat, Storage};
-use grim_tensor::{Shape};
-use grim_tensor::{CoreTensorOps};
 
 #[test]
 fn test_rocm_quantize_q8_0_and_fp8() {

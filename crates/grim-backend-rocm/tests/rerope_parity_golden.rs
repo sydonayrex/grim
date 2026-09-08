@@ -30,8 +30,8 @@ fn test_rerope_rocm_gpu_parity_vs_fresh_rope() {
     let d = 8usize;
     let shape = Shape::new(vec![b, s, d]);
     let mut data = vec![0.0f32; b * s * d];
-    for i in 0..data.len() {
-        data[i] = ((i as f32 + 1.0) * 0.1).sin();
+    for (i, val) in data.iter_mut().enumerate() {
+        *val = ((i as f32 + 1.0) * 0.1).sin();
     }
 
     let k_orig_storage = CoreTensorOps::from_cpu(&dev, &data, &shape, DType::F32).unwrap();

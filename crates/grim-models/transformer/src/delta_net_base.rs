@@ -1,9 +1,5 @@
 //! DeltaNet linear attention transformer architecture with delta rule state recurrence.
-//!
-//! # Architecture Details
-//! - **Delta Rule Recurrence**: Recurrent state matrix $S_t = S_{t-1}(I - \beta_t k_t k_t^T) + \beta_t v_t k_t^T$ computed per head.
-//! - **Linear Attention**: Query readout $o_t = q_t S_t$ with linear $O(1)$ memory complexity per step.
-//! - **SwiGLU FFN**: Feed-forward projection with RMSNorm normalization.
+//! # Architecture Details - **Delta Rule Recurrence**: Recurrent state matrix $S_t = S_{t-1}(I - \beta_t.
 
 use std::sync::Arc;
 
@@ -12,11 +8,9 @@ use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for DeltaNet linear attention architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -60,9 +54,7 @@ impl ModelConfig for DeltaNetBaseConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Delta Attention Layer
-// ---------------------------------------------------------------------------
 
 /// DeltaNet recurrent linear attention layer.
 pub struct DeltaNetAttention {
@@ -98,7 +90,6 @@ impl DeltaNetAttention {
 
     /// Forward pass updating per-head state matrix $S \in \mathbb{R}^{H \times D \times D}$.
     /// GPU-first: delta-rule recurrence runs on device via `delta_rule_decode`.
-    /// State is uploaded/downloaded around the device call.
     pub fn forward(&self, x: &Tensor, state: &mut Option<Vec<f32>>) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let q = self.q_proj.forward(x)?;
@@ -119,7 +110,8 @@ impl DeltaNetAttention {
         let b_v = beta.to_vec_f32()?;
 
         // Upload state to device once; it gets updated in-place per token
-        let state_storage = dev.from_cpu(&s_mat, &Shape::new(vec![self.num_heads, d, d]), DType::F32)?;
+        let state_storage =
+            dev.from_cpu(&s_mat, &Shape::new(vec![self.num_heads, d, d]), DType::F32)?;
         let state_tensor = Tensor::new(
             Arc::from(state_storage),
             Shape::new(vec![self.num_heads, d, d]),
@@ -136,18 +128,40 @@ impl DeltaNetAttention {
             let v_tok = &v.to_vec_f32()?[tok_offset..tok_offset + q_dim];
 
             // Compute beta scalar for this token (average across heads)
-            let beta_val: f32 = (0..self.num_heads).map(|h| {
-                1.0 / (1.0 + (-b_v[t * self.num_heads + h]).exp())
-            }).sum::<f32>() / self.num_heads as f32;
+            let beta_val: f32 = (0..self.num_heads)
+                .map(|h| 1.0 / (1.0 + (-b_v[t * self.num_heads + h]).exp()))
+                .sum::<f32>()
+                / self.num_heads as f32;
 
             // Upload per-token tensors to device
-            let q_storage = dev.from_cpu(q_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
-            let k_storage = dev.from_cpu(k_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
-            let v_storage = dev.from_cpu(v_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
+            let q_storage =
+                dev.from_cpu(q_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
+            let k_storage =
+                dev.from_cpu(k_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
+            let v_storage =
+                dev.from_cpu(v_tok, &Shape::new(vec![self.num_heads, d]), DType::F32)?;
 
-            let q_t = Tensor::new(Arc::from(q_storage), Shape::new(vec![self.num_heads, d]), DType::F32, q.provenance().clone(), x.device().clone());
-            let k_t = Tensor::new(Arc::from(k_storage), Shape::new(vec![self.num_heads, d]), DType::F32, k.provenance().clone(), x.device().clone());
-            let v_t = Tensor::new(Arc::from(v_storage), Shape::new(vec![self.num_heads, d]), DType::F32, v.provenance().clone(), x.device().clone());
+            let q_t = Tensor::new(
+                Arc::from(q_storage),
+                Shape::new(vec![self.num_heads, d]),
+                DType::F32,
+                q.provenance().clone(),
+                x.device().clone(),
+            );
+            let k_t = Tensor::new(
+                Arc::from(k_storage),
+                Shape::new(vec![self.num_heads, d]),
+                DType::F32,
+                k.provenance().clone(),
+                x.device().clone(),
+            );
+            let v_t = Tensor::new(
+                Arc::from(v_storage),
+                Shape::new(vec![self.num_heads, d]),
+                DType::F32,
+                v.provenance().clone(),
+                x.device().clone(),
+            );
 
             // Device delta-rule recurrence (updates state in-place)
             let out_shape = Shape::new(vec![self.num_heads, d]);
@@ -164,7 +178,13 @@ impl DeltaNetAttention {
             )?;
 
             // Download output for this token
-            let out_t = Tensor::new(Arc::from(out_storage), out_shape, DType::F32, q.provenance().clone(), x.device().clone());
+            let out_t = Tensor::new(
+                Arc::from(out_storage),
+                out_shape,
+                DType::F32,
+                q.provenance().clone(),
+                x.device().clone(),
+            );
             let out_vec = out_t.to_vec_f32()?;
             out[tok_offset..tok_offset + q_dim].copy_from_slice(&out_vec);
         }
@@ -178,9 +198,7 @@ impl DeltaNetAttention {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct DeltaNetBlock {
     pub attn_norm: RmsNorm,
@@ -243,14 +261,11 @@ impl DeltaNetBlock {
         let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         let mlp_out = self.w_down.forward(&act)?;
 
-        grim_nn::modules::add_on_device(&res1_t, &mlp_out)
-            .map_err(grim_core::error::Error::from)
+        grim_nn::modules::add_on_device(&res1_t, &mlp_out).map_err(grim_core::error::Error::from)
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct DeltaNetBase {
     pub cfg: DeltaNetBaseConfig,
@@ -335,9 +350,8 @@ impl CausalLm for DeltaNetBase {
         let ids = input_ids.to_vec_f32()?;
         let seq_len = ids.len();
 
-        // An out-of-vocab token id is a tokenizer contract violation:
-        // silently embedding a zero row would feed garbage through every
-        // downstream layer with no signal — error instead.
+        // An out-of-vocab token id is a tokenizer contract violation: silently embedding a zero
+        // row would feed garbage through every downstream layer with no signal - error instead.
         let ids_u32: Vec<u32> = ids
             .iter()
             .enumerate()
@@ -362,11 +376,8 @@ impl CausalLm for DeltaNetBase {
             self.cfg.hidden_size,
         )?;
 
-        // Audit fix (grim-models): the per-layer delta-rule states used to be
-        // a LOCAL vec — every forward started from zeroed delta-state, so
-        // decode was context-free after the first token (the same bug class
-        // the Mamba session-state fix addressed). The states now live on the
-        // session and advance across calls, mirroring the KV-cache contract.
+        // Audit fix (grim-models): the per-layer delta-rule states used to be a LOCAL vec - every forward started from zeroed delta-state, so decode was context-free after the first token (the same bug class the Mamba session-state fix addressed).
+        // The states now live on the session and advance across calls, mirroring the KV-cache contract.
         if session.model_state().is_none() {
             session.set_model_state(Box::new(Vec::<Option<Vec<f32>>>::new()));
         }
@@ -405,9 +416,7 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Numeric reference + session-state gates (audit follow-up).
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod delta_numeric_reference_tests {
@@ -416,10 +425,7 @@ mod delta_numeric_reference_tests {
     use grim_nn::Linear;
 
     fn lin(weight: Vec<f32>, out_dim: usize, in_dim: usize) -> Linear {
-        Linear::from_tensor(
-            cpu_tensor(weight, Shape::new(vec![out_dim, in_dim])),
-            None,
-        )
+        Linear::from_tensor(cpu_tensor(weight, Shape::new(vec![out_dim, in_dim])), None)
     }
 
     /// Deterministic pseudo-random weights (LCG) so the reference test
@@ -428,7 +434,9 @@ mod delta_numeric_reference_tests {
         let mut st = seed;
         (0..n)
             .map(|_| {
-                st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (((st >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.3
             })
             .collect()
@@ -447,11 +455,8 @@ mod delta_numeric_reference_tests {
         }
     }
 
-    /// Delta rule vs an independent f64 recomputation:
-    ///   S' = S + β(v − S·k)kᵀ   (β = sigmoid(β_proj·x))
-    ///   o  = q·S'ᵀ
-    /// run over a 2-token sequence WITH carried state (the second token's
-    /// output must see the state the first token wrote).
+    /// Delta rule vs an independent f64 recomputation: S' = S + β(v − S·k)kᵀ (β = sigmoid(β_proj·x)) o = q·S'ᵀ
+    /// run over a 2-token sequence WITH carried state (the second token's output must see the state the first token wrote).
     #[test]
     fn delta_rule_matches_f64_reference() {
         let attn = test_attention();
@@ -470,7 +475,10 @@ mod delta_numeric_reference_tests {
         // f64 per-token projections (weight [out,in] row-major).
         let mut s = vec![0.0f64; d * d];
         for t in 0..2 {
-            let xt: Vec<f64> = x_data[t * d..(t + 1) * d].iter().map(|&v| v as f64).collect();
+            let xt: Vec<f64> = x_data[t * d..(t + 1) * d]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
             let q = proj(&attn.q_proj.weight.to_vec_f32().unwrap(), &xt);
             let k = proj(&attn.k_proj.weight.to_vec_f32().unwrap(), &xt);
             let v = proj(&attn.v_proj.weight.to_vec_f32().unwrap(), &xt);
@@ -491,7 +499,10 @@ mod delta_numeric_reference_tests {
             }
             let out = proj(&attn.o_proj.weight.to_vec_f32().unwrap(), &o);
             for (r, g) in out.iter().zip(&got[t * d..(t + 1) * d]) {
-                assert!((r - *g as f64).abs() < 1e-4, "token {t}: reference {r} vs impl {g}");
+                assert!(
+                    (r - *g as f64).abs() < 1e-4,
+                    "token {t}: reference {r} vs impl {g}"
+                );
             }
         }
     }
@@ -542,11 +553,8 @@ mod delta_numeric_reference_tests {
         cpu_tensor(vec![v], Shape::new(vec![1]))
     }
 
-    /// Audit fix gate (bug #1): the delta-rule states used to be a LOCAL vec,
-    /// making every forward context-free. Through ONE session, sequential
-    /// single-token forwards must produce the same second-token logits as a
-    /// single batched 2-token forward (per-token independence of norm/FFN
-    /// means the only cross-token coupling is the delta state).
+    /// Audit fix gate (bug #1): the delta-rule states used to be a LOCAL vec, making every forward context-free.
+    /// Through ONE session, sequential single-token forwards must produce the same second-token logits as a single.
     #[test]
     fn deltanet_session_state_makes_decode_context_aware() {
         let model = test_model();

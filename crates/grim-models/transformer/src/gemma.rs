@@ -122,13 +122,8 @@ impl GemmaBlock {
         self.forward_cached(x, positions, &mut cache)
     }
 
-    /// Cache-aware forward. Appends this call's post-RoPE K and raw V to
-    /// `cache` before attending, so a single-token decode step sees the full
-    /// prior context rather than only itself. [Group B fix: decode was
-    /// stateless.]
-    ///
-    /// Legacy host-cache path kept for callers holding a `RefKvCache`;
-    /// the model-level decode path uses the device-first [`GemmaBlock::forward_kv`].
+    /// Cache-aware forward. Appends this call's post-RoPE K and raw V to `cache` before attending,
+    /// so a single-token decode step sees the full prior context rather than only itself.
     pub fn forward_cached(
         &self,
         x: &Tensor,
@@ -140,9 +135,8 @@ impl GemmaBlock {
         let k = self.wk.forward(&norm_x)?;
         let v = self.wv.forward(&norm_x)?;
 
-        // Apply RoPE per head. The projections are (S, H*D); RoPE operates on
-        // (B, S, D=head_dim) per head, so reshape to (1, S, H, D) and rotate
-        // each head independently.
+        // Apply RoPE per head. The projections are (S, H*D); RoPE operates on (B, S,
+        // D=head_dim) per head, so reshape to (1, S, H, D) and rotate each head independently.
         let new_tokens = q.shape().dims()[0];
         let q_row = self.num_heads * self.head_dim;
         let kv_row = self.num_kv_heads * self.head_dim;
@@ -186,7 +180,7 @@ impl GemmaBlock {
             q_row,
             kv_row,
             &kv_head,
-                    None,
+            None,
         );
 
         let attn_out_t = cpu_tensor(attn_out, grim_tensor::Shape::new(vec![new_tokens, q_row]));
@@ -201,11 +195,8 @@ impl GemmaBlock {
         add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 
-    /// Device-first cache-aware forward: ONE `rope_2d_on_device` call per
-    /// tensor (no per-head host loop), device-resident KV history via
-    /// `concat_rows_on_device`, and fused `fused_attention_tensors` — no
-    /// host roundtrip on GPU backends. The GeGLU activation stays host-side
-    /// (gelu-tanh has no device kernel) and is re-uploaded once.
+    /// Device-first cache-aware forward: ONE `rope_2d_on_device` call per tensor (no per-head host loop), device-resident KV history via `concat_rows_on_device`, and fused `fused_attention_tensors` - no host roundtrip on GPU backends.
+    /// The GeGLU activation stays host-side (gelu-tanh has no device kernel) and is re-uploaded once.
     pub fn forward_kv(
         &self,
         x: &Tensor,
@@ -218,12 +209,8 @@ impl GemmaBlock {
         let v = self.wv.forward(&norm_x)?;
 
         let new_tokens = q.shape().dims()[0];
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -297,20 +284,8 @@ impl Gemma {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for Gemma.
-    ///
-    /// Gemma's attention layout (separate `wq`/`wk`/`wv`/`wo` + GQA
-    /// `num_kv_heads`) is identical to Llama's, so the *sharding math* would
-    /// reuse `plan_kv_head_sharding` cleanly. However, this module's `forward`
-    /// and `GemmaBlock::forward` call plain `Linear::forward` directly — they
-    /// do not go through `ColumnParallelLinear`/`RowParallelLinear`, so there
-    /// is no all-reduce hook to sum the row-parallel `wo`/`ffn_down` partials
-    /// across ranks. Shipping a load-side `load_tp` without reworking
-    /// `forward` would load a sharded weight whose partial output is never
-    /// reduced — silently wrong logits.
-    ///
-    /// Refuse `world_size > 1` with a typed `Unsupported` error until the
-    /// `forward` rework lands. `world_size == 1` delegates to the plain path.
+    /// Tensor-parallel load entry for Gemma. Gemma's attention layout (separate `wq`/`wk`/`wv`/`wo` + GQA
+    /// `num_kv_heads`) is identical to Llama's, so the *sharding math* would reuse `plan_kv_head_sharding` cleanly.
     pub fn load_tp(
         device: Device,
         ws: &grim_nn::WeightSource<'_>,
@@ -394,14 +369,10 @@ impl CausalLm for Gemma {
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
 
-        // Per-layer device-resident KV caches live on the session so decode
-        // steps see the full prior context (Group B fix); only the new K/V
-        // rows are appended each step.
+        // Per-layer device-resident KV caches live on the session so decode steps see the full
+        // prior context (Group B fix); only the new K/V rows are appended each step.
         if session.model_state().is_none() {
-            session.set_model_state(Box::new(vec![
-                None::<(Tensor, Tensor)>;
-                self.layers.len()
-            ]));
+            session.set_model_state(Box::new(vec![None::<(Tensor, Tensor)>; self.layers.len()]));
         }
         let caches = session
             .model_state_mut()
@@ -441,11 +412,7 @@ fn reshape_heads(x: &Tensor, s: usize, h: usize, d: usize) -> Result<Tensor> {
 }
 
 /// Apply `rope` to each head of a `(S, H, D)` tensor, returning `(S, H*D)`.
-///
-/// The shared `rope_2d_on_device` helper relabels to one `head_dim`-wide row
-/// per head with positions repeated per head — mathematically identical to
-/// rotating each head independently — and dispatches the device rope kernel
-/// when available.
+/// The shared `rope_2d_on_device` helper relabels to one `head_dim`-wide row per head with positions repeated per.
 fn apply_rope_per_head(
     x: &Tensor,
     positions: &[u32],

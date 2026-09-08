@@ -59,8 +59,7 @@ fn raw_block_mn(shape_class: ShapeClass) -> (u32, u32) {
 
 impl TileConfig {
     /// Re-derive block_m/block_n from spec + shape_class, rounding up to the wavefront size.
-    /// Used when reconstructing a `TileConfig` from the leaner `AutotuneConfig` cache entry,
-    /// which stores threads/block_k/grid_stride but not block_m/block_n.
+    /// Used when reconstructing a `TileConfig` from the leaner `AutotuneConfig` cache entry, which stores threads/block_k/grid_stride but.
     pub fn with_block_geometry(mut self, spec: &HardwareSpec, shape_class: ShapeClass) -> Self {
         let wave = spec.wavefront_size;
         let (bm, bn) = raw_block_mn(shape_class);
@@ -134,10 +133,7 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass, dims: ShapeDims)
 }
 
 /// Static roofline execution latency estimate in seconds for pre-filtering candidate configurations.
-///
-/// Compute time uses peak FP16 FLOPS/s (not bandwidth) — dividing FLOPs by a
-/// bandwidth term produced a dimensionally wrong estimate that systematically
-/// over-penalized compute-bound tiles.
+/// Compute time uses peak FP16 FLOPS/s (not bandwidth) - dividing FLOPs by a bandwidth term.
 pub fn roofline_cost(spec: &HardwareSpec, dims: ShapeDims, _tiles: &TileConfig) -> f64 {
     let muflops = 2.0 * (dims.m as f64) * (dims.n as f64) * (dims.k as f64);
     let compute_time_s = muflops / spec.peak_flops_fp16;
@@ -215,10 +211,8 @@ pub fn fcp_fallback_tile_search(
         }
     }
 
-    candidates.sort_by(|a, b| {
-        roofline_cost(spec, dims, a)
-            .total_cmp(&roofline_cost(spec, dims, b))
-    });
+    candidates
+        .sort_by(|a, b| roofline_cost(spec, dims, a).total_cmp(&roofline_cost(spec, dims, b)));
     candidates.truncate(candidates.len().min(16));
     candidates.dedup();
 
@@ -249,10 +243,7 @@ pub fn fcp_fallback_tile_search(
 }
 
 /// Eagerly tune and JIT-compile canonical GEMM workload shapes on host GPU during installation.
-///
-/// Sweeps standard inference shapes (decode token GEMMs, prefill prompt GEMMs, and lm_head logit projections)
-/// to populate the in-memory cache and write out both the tuned `{gpu_arch}.json` autotune map and
-/// compiled `.hsaco` binaries into `output_dir`.
+/// Sweeps standard inference shapes (decode token GEMMs, prefill prompt GEMMs, and lm_head logit projections) to.
 pub fn run_install_tune(
     device: &RocmDevice,
     output_dir: &std::path::Path,
@@ -426,8 +417,7 @@ mod tests {
         assert!(!candidate_valid(&spec, &invalid_cand));
     }
 
-    /// Reconstruction helper used by `get_or_tune_tiles` when mapping a cached
-    /// `AutotuneConfig` (which lacks block_m/block_n) back to a full `TileConfig`.
+    /// Reconstruction helper used by `get_or_tune_tiles` when mapping a cached `AutotuneConfig` (which lacks block_m/block_n) back to a full `TileConfig`.
     /// Re-derives geometry from spec + shape_class, rounding up to the wavefront size.
     #[test]
     fn with_block_geometry_reconstructs_from_shape_class() {
@@ -460,9 +450,7 @@ mod tests {
     }
 
     /// Gap 2: end-to-end tile selection for lm_head via lookup_gemm_config_for_shape.
-    /// The TLOLog arm must produce the distinct wide-N tile (block_n == 64), different from
-    /// the Decode/Prefill arms — proving the op-identity tag propagates through dispatch.
-    /// PASSED gfx1036 (RDNA2) 2026-08-21 — lm_head lookup_gemm_config_for_shape selects wide-N (block_n=64).
+    /// The TLOLog arm must produce the distinct wide-N tile (block_n == 64), different from the.
     #[test]
     fn tlolog_tile_via_lookup_gemm_config_for_shape() {
         use crate::WavefrontSize;

@@ -1,8 +1,5 @@
 //! Standalone chunk-aligned hidden-state cache on pinned host memory pool.
-//!
-//! Caches intermediate layer hidden states tied to KV cache chunk hashes,
-//! allowing instant priming of speculative draft models (e.g. Eagle-3, MTP)
-//! without recomputing bottom transformer layers.
+//! Caches intermediate layer hidden states tied to KV cache chunk hashes, allowing instant priming of.
 
 use grim_core::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};

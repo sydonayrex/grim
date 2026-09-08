@@ -67,9 +67,8 @@ pub struct CudaAutotuner {
     cache: Mutex<HashMap<(u64, usize, usize, usize, ShapeClass), Option<CudaTileConfig>>>,
 }
 
-/// Flat, JSON-friendly snapshot of one tune entry. The in-memory cache key is a tuple; serde
-/// JSON object keys must be strings, so each entry is serialized as a record instead. `None`
-/// cache values are preserved via `None`-able tile fields.
+/// Flat, JSON-friendly snapshot of one tune entry.
+/// The in-memory cache key is a tuple; serde JSON object keys must be strings, so.
 #[derive(Debug, Serialize, Deserialize)]
 struct TuneEntryOwned {
     caps_hash: u64,
@@ -102,9 +101,7 @@ impl CudaAutotuner {
     }
 
     /// Load autotune cache from disk for a specific hardware fingerprint.
-    /// Restores previously measured winners so a repeat shape on the same GPU hits the
-    /// cache instead of re-searching. JSON object keys must be strings, so the in-memory
-    /// tuple key is flattened to a Vec of records on disk.
+    /// Restores previously measured winners so a repeat shape on the same GPU hits the cache.
     pub fn load_cache(&self, caps: &CudaCaps) {
         let hash = caps.cache_key_hash();
         let path = Self::cache_path(hash);

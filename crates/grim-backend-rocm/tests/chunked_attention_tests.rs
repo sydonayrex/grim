@@ -5,9 +5,7 @@ use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::batch_orchestrator::{
     BatchReorderer, RequestCategory, SequenceMeta,
 };
-use grim_tensor::{Shape, dtype::DType,
-    CoreTensorOps, MemoryOps,
-};
+use grim_tensor::{CoreTensorOps, MemoryOps, Shape, dtype::DType};
 use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;

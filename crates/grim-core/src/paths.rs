@@ -1,22 +1,10 @@
-//! `grim_paths` — canonical path resolution for grim's data directories.
-//!
-//! All grim crates (`grim-cli`, `grim-server`, installer) must agree on
-//! where models live. This module is the single source of truth.
-//!
-//! Resolution order (first existing path wins):
-//! 1. `$GRIM_MODELS_DIR` env var override.
-//! 2. `/var/lib/grim/models` — system install (matching `dist/install.sh`).
-//! 3. `$HOME/.grim/models` — user install / development.
-//!
-//! For the config and log directories, `grim_config_dir` and `grim_log_dir`
-//! follow the same priority scheme.
+//! `grim_paths` - canonical path resolution for grim's data directories.
+//! All grim crates (`grim-cli`, `grim-server`, installer) must agree on where models live.
 
 use std::path::PathBuf;
 
-/// Returns the canonical models directory.
-///
-/// This is the same directory that `dist/install.sh` creates and that
-/// `GET /v1/models` and `grim pull` write to and read from.
+/// Returns the canonical models directory. This is the same directory that `dist/install.sh`
+/// creates and that `GET /v1/models` and `grim pull` write to and read from.
 pub fn grim_models_dir() -> PathBuf {
     // 1. Explicit override — useful for tests and custom layouts.
     if let Ok(dir) = std::env::var("GRIM_MODELS_DIR") {

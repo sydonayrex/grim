@@ -1,7 +1,5 @@
 //! Constrained layout engine for the chat TUI.
-//!
 //! Provides `VStack`, `HStack`, and `ScrollView` as composable layout nodes.
-//! Built on `ratatui::layout::Layout` and `Constraint` for allocation.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -52,9 +50,7 @@ pub trait LayoutNode {
     fn render(&self, area: Rect, buf: &mut Buffer);
 }
 
-// ---------------------------------------------------------------------------
 // VStack
-// ---------------------------------------------------------------------------
 
 pub struct VStack {
     children: Vec<StackEntry>,
@@ -87,9 +83,8 @@ impl LayoutNode for VStack {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         // Allocate heights, then paint each child at its y offset.
         // Positive remaining space goes to grow > 0 entries proportional to grow.
-        // Overflow shrinks entries with shrink > 0 proportional to shrink.
-        // Deterministic rounding: leftover cells go to earlier children.
-        let allocated = allocate_main_axis(&self.children, area.height, self.options.gap, area.width);
+        let allocated =
+            allocate_main_axis(&self.children, area.height, self.options.gap, area.width);
         let mut y = area.y;
         for (entry, h) in self.children.iter().zip(allocated) {
             if h == 0 {
@@ -107,9 +102,7 @@ impl LayoutNode for VStack {
     }
 }
 
-// ---------------------------------------------------------------------------
 // HStack (analogous, allocates widths)
-// ---------------------------------------------------------------------------
 
 pub struct HStack {
     children: Vec<StackEntry>,
@@ -153,9 +146,7 @@ impl LayoutNode for HStack {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ScrollView
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
 pub struct ScrollViewOptions {
@@ -223,24 +214,15 @@ impl LayoutNode for ScrollView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        // Render child at full height into a temporary buffer, then copy
-        // the viewport slice at scroll_top into the real buffer.
+        // Render child at full height into a temporary buffer, then copy the viewport slice at scroll_top into the real buffer.
         // For the initial implementation, render directly and clip.
-        // A later optimization can use the temp-buffer approach.
         self.child.render(area, buf);
     }
 }
 
-// ---------------------------------------------------------------------------
 // Allocation helper (shared by VStack and HStack)
-// ---------------------------------------------------------------------------
 
-fn allocate_main_axis(
-    children: &[StackEntry],
-    available: u16,
-    gap: u16,
-    width: u16,
-) -> Vec<u16> {
+fn allocate_main_axis(children: &[StackEntry], available: u16, gap: u16, width: u16) -> Vec<u16> {
     if children.is_empty() {
         return vec![];
     }
@@ -374,9 +356,8 @@ mod tests {
 
     #[test]
     fn vstack_grow_distributes_remaining_space() {
-        // With only height_for_width, grow does not affect intrinsic height
-        // directly. This test verifies the stack reports its intrinsic height
-        // as the sum of Auto children (grow is applied during render allocation).
+        // With only height_for_width, grow does not affect intrinsic height directly.
+        // This test verifies the stack reports its intrinsic height as the sum of Auto children.
         let stack = VStack::new(
             vec![
                 StackEntry {
@@ -429,9 +410,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_update)]
     fn scroll_view_clips_to_viewport() {
         let mut sv = ScrollView::new(
-            Box::new(FixedLeaf { h: 20, label: "tall" }),
+            Box::new(FixedLeaf {
+                h: 20,
+                label: "tall",
+            }),
             ScrollViewOptions {
                 follow_end: true,
                 ..Default::default()

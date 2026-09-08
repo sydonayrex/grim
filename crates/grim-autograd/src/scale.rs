@@ -1,8 +1,5 @@
 //! SCALE: Stateless Column-wise RMS Gradient Normalization.
-//!
 //! Repurposed from SCALE (arXiv:2506.16659).
-//! Replaces tracking per-element second moment EMA states (such as Adam's v or Fisher Information)
-//! with instantaneous column-wise root-mean-square normalization across the weight matrix dimension.
 
 /// Column-wise RMS normalization of a flat [d, r] gradient (row-major).
 /// Returns g_col_norm[k] = sqrt(mean_j g[j*r+k]^2) + eps, length r.
@@ -35,9 +32,8 @@ mod tests {
 
     #[test]
     fn test_column_rms_2d_matrix() {
-        // g = [[1, 2], [3, 4]], d = 2, r = 2
-        // col0: (1^2 + 3^2) / 2 = 5 -> sqrt(5) ≈ 2.2360679
-        // col1: (2^2 + 4^2) / 2 = 10 -> sqrt(10) ≈ 3.1622777
+        // g = [[1, 2], [3, 4]], d = 2, r = 2 col0: (1^2 + 3^2) / 2
+        // = 5 -> sqrt(5) ≈ 2.2360679 col1: (2^2 + 4^2) / 2 = 10 -> sqrt(10) ≈ 3.1622777
         let g = vec![1.0f32, 2.0, 3.0, 4.0];
         let norms = column_rms(&g, 2, 2, 0.0);
 

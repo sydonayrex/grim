@@ -51,9 +51,8 @@ pub fn apply_rope_on_latent(v: &mut [f32], positions: &[u32], num_heads: usize, 
     crate::qwen35::apply_rope_neox(v, positions, num_heads, head_dim, 10000.0);
 }
 
-/// Extract per-head key/value up-projections from the kv_b_proj weight
-/// `[num_heads * (nope + v), rank]` (GGUF row-major) into
-/// `(w_kc [nh, nope, rank], w_vc [nh, v, rank])`.
+/// Extract per-head key/value up-projections from the kv_b_proj weight `[num_heads * (nope +
+/// v), rank]` (GGUF row-major) into `(w_kc [nh, nope, rank], w_vc [nh, v, rank])`.
 pub fn extract_kv_b_up_projs(
     kv_b_w: &[f32],
     num_heads: usize,
@@ -80,9 +79,8 @@ pub fn extract_kv_b_up_projs(
     (w_kc, w_vc)
 }
 
-/// Absorb the per-head key up-projection into the query:
-/// `q_absorbed[s,h] = q_nope[s,h] @ w_kc[h]^T`,
-/// since `q_nope · (w_kc c) == (q_nope w_kc) · c`.
+/// Absorb the per-head key up-projection into the query: `q_absorbed[s,h] = q_nope[s,h]
+/// @ w_kc[h]^T`, since `q_nope · (w_kc c) == (q_nope w_kc) · c`.
 pub fn absorb_query_wkc(
     q_nope: &[f32],
     w_kc: &[f32],

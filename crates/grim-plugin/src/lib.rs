@@ -1,16 +1,5 @@
-//! `grim-plugin` — third-party extension system for Grim.
-//!
-//! §6 of the Grim architecture. Two loading strategies, chosen per plugin:
-//!
-//! - **Dylib** (`libloading`, §6.1) — for performance-critical extensions:
-//!   new kernels, new model architectures. Process-shared memory; runs at
-//!   near-native speed but a crash takes the engine down. First-party and
-//!   reviewed plugins only.
-//!
-//! - **WASM** (`wasmtime`, §6.1) — for control-path extensions: samplers,
-//!   grammars/constrained decoding, pre/post-processors, tokenizers.
-//!   Sandboxed; fuel + memory-limited; cannot touch host memory or make
-//!   syscalls outside a granted capability set.
+//! `grim-plugin` - third-party extension system for Grim.
+//! §6 of the Grim architecture.
 
 pub mod arch_compat;
 pub mod dylib_loader;
@@ -77,14 +66,7 @@ impl From<PluginCapabilities> for u32 {
 }
 
 /// Stable, `#[repr(C)]`-compatible vtable surface for dylib plugins.
-/// (Rust trait objects aren't ABI-stable across compiler versions, so the
-/// FFI boundary uses a C-compatible vtable — same pattern as `abi_stable`
-/// / `stabby`.)
-///
-/// `sampler_sample` mirrors the WASM `sample` export signature
-/// `(logits_ptr, logits_len, history_ptr, history_len) -> token_id`, keeping
-/// the dylib and WASM sampler paths symmetric. `Option<...>` so a plugin that
-/// doesn't declare the `SAMPLER` capability may leave it `None`.
+/// (Rust trait objects aren't ABI-stable across compiler versions, so the FFI boundary uses a C-compatible.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct GrimPluginVTable {
@@ -95,10 +77,8 @@ pub struct GrimPluginVTable {
     pub model_factory:
         Option<extern "C" fn(cfg: *const std::os::raw::c_char) -> *mut std::os::raw::c_void>,
     pub sampler_factory: Option<extern "C" fn() -> *mut std::os::raw::c_void>,
-    /// Invoke sampling on a handle returned by `sampler_factory`. The handle
-    /// is opaque host-owned state; the plugin reads `logits` (f32 slice of
-    /// length `logits_len`) and `history` (u32 slice of length `history_len`)
-    /// and returns a chosen token id.
+    /// Invoke sampling on a handle returned by `sampler_factory`.
+    /// The handle is opaque host-owned state; the plugin reads `logits` (f32 slice of length `logits_len`).
     pub sampler_sample: Option<
         extern "C" fn(
             handle: *mut std::os::raw::c_void,
@@ -119,14 +99,7 @@ pub enum PluginKind {
 }
 
 /// Capability grants for a plugin (§6.4, deny-by-default: all fields off).
-///
-/// Two manifest forms feed this struct:
-/// - legacy inline: `[plugin.grants] network = true, filesystem = ["models/"]`
-/// - scoped: `[grants] filesystem = true` + `[scopes] allowed_dirs = ["models/"]`
-///
-/// `filesystem` holds the effective scope — the exact directories that would
-/// be WASI-preopened for the plugin. It is only non-empty when a grant
-/// explicitly names its scopes.
+/// Two manifest forms feed this struct: - legacy inline: `[plugin.grants] network = true, filesystem =.
 #[derive(Debug, Clone, Default)]
 pub struct PluginGrants {
     pub network: bool,
@@ -157,34 +130,7 @@ pub struct PluginManifest {
 }
 
 /// Execution and memory limits for WASM plugin sandboxing.
-///
-/// These limits are enforced by the WASM loader (`WasmPluginLoader`) when
-/// present. Both fields default to `Some` with conservative values when using
-/// `PluginLimits::default()`:
-/// - `fuel_per_invocation`: defaults to `50_000` fuel units per invocation.
-///   Controls how much "work" a plugin can do before being paused. Higher values
-///   allow more complex sampling logic but increase the risk of a runaway plugin.
-/// - `max_memory_mb`: defaults to `64` MB. Caps the total linear memory a plugin
-///   can allocate. Prevents a malicious or buggy plugin from exhausting host RAM.
-///
-/// # Opt-out behavior
-///
-/// Both fields are `Option` types. Setting either field to `None` in a manifest
-/// **disables that limit entirely**. This is an explicit opt-out — a manifest
-/// that omits `limits` or sets `fuel_per_invocation = null` / `max_memory_mb = null`
-/// will run without that restriction. Operators should ensure untrusted/third-party
-/// plugins always carry explicit limits or be loaded in a context where the
-/// `require_pinned_hash` / capability-grant enforcement provides sufficient
-/// bounding.
-///
-/// # Trust model
-///
-/// For first-party and reviewed plugins, the defaults are typically sufficient.
-/// For third-party or untrusted plugins, consider:
-/// - Setting explicit lower limits in the manifest.
-/// - Using the WASM sandbox exclusively (not dylib loading).
-/// - Restricting capability grants (`network`, `filesystem`, `request_metadata`)
-///   to the minimum required.
+/// These limits are enforced by the WASM loader (`WasmPluginLoader`) when present.
 #[derive(Debug, Clone)]
 pub struct PluginLimits {
     pub fuel_per_invocation: Option<u64>,
@@ -321,10 +267,8 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
         }
     }
 
-    // Top-level [grants] / [scopes] form (§6.4). Grants are additive with the
-    // legacy [plugin.grants] table above. A `filesystem = true` grant must
-    // name its scopes: an unrestricted filesystem grant is rejected here, at
-    // plugin-load time, rather than silently degrading to a trap later.
+    // Top-level [grants] / [scopes] form (§6.4).
+    // Grants are additive with the legacy [plugin.grants] table above.
     if let Some(grants_tbl) = tbl.get("grants").and_then(|v| v.as_table()) {
         if grants_tbl
             .get("network")
@@ -479,20 +423,16 @@ impl PluginRegistry {
 
     /// Register a manifest for a loaded plugin.
     pub fn register_manifest(&mut self, manifest: PluginManifest) -> Result<()> {
-        // §6.3 Processing pipeline composition checks:
-        // Reject duplicate plugin identity at load time, independent of whether
-        // the optional stage/priority fields are present.
+        // §6.3 Processing pipeline composition checks: Reject duplicate plugin identity at
+        // load time, independent of whether the optional stage/priority fields are present.
         if self.manifests.contains_key(&manifest.name) {
             return Err(grim_tensor::Error::Backend(format!(
                 "Duplicate plugin registered: '{}'",
                 manifest.name
             )));
         }
-        // §6.3 Processing pipeline composition checks:
-        // Reject duplicate (stage, priority) pairs at load time. A processor
-        // declaring only ONE of stage/priority is still chainable — the
-        // missing field defaults (stage "default", priority 0) instead of the
-        // plugin silently disappearing from chain traversal.
+        // §6.3 Processing pipeline composition checks: Reject duplicate (stage, priority) pairs at load time.
+        // A processor declaring only ONE of stage/priority is still chainable - the missing field defaults.
         let mut effective = manifest.clone();
         if effective.stage.is_some() || effective.priority.is_some() {
             if effective.stage.is_none() {
@@ -573,10 +513,8 @@ impl Default for PluginRegistry {
 mod tests {
     use super::*;
 
-    /// Audit fix gate: a processor manifest with only `stage` (no priority)
-    /// — or only `priority` (no stage) — must still enter processor_chain
-    /// with the missing field defaulted, not silently vanish from
-    /// chain traversal.
+    /// Audit fix gate: a processor manifest with only `stage` (no priority) - or only `priority` (no
+    /// stage) - must still enter processor_chain with the missing field defaulted, not silently vanish from chain traversal.
     #[test]
     fn partial_processor_manifests_still_enter_chain() {
         let mut registry = PluginRegistry::new();
@@ -612,8 +550,7 @@ mod tests {
         registry.register_manifest(priority_only).unwrap();
 
         // Both must be visible to chain traversal (2 entries), with the
-        // missing fields defaulted: stage-only → priority 0, priority-only
-        // → stage "default".
+        // missing fields defaulted: stage-only → priority 0, priority-only → stage "default".
         assert_eq!(registry.processor_chain.len(), 2);
         let by_name = |n: &str| {
             registry
@@ -630,10 +567,8 @@ mod tests {
         assert_eq!(po.stage.as_deref(), Some("default"));
         assert_eq!(po.priority, Some(5));
 
-        // Duplicate (stage, priority) after defaulting must still be
-        // rejected: another stage-less processor also defaults to
-        // ("default", 0) — but that collides with nothing here. A second
-        // stage-only processor DOES collide with stage-only's ("post", 0).
+        // Duplicate (stage, priority) after defaulting must still be rejected: another stage-less processor also defaults to ("default", 0) - but that collides with nothing here.
+        // A second stage-only processor DOES collide with stage-only's ("post", 0).
         let dup = PluginManifest {
             name: "dup-post".into(),
             abi_version: 1,
@@ -722,26 +657,53 @@ max_memory_mb = 64
         // Test custom tokenizer registration
         struct TestTokenizer;
         impl TokenizerPlugin for TestTokenizer {
-            fn name(&self) -> &str { "test-tokenizer" }
-            fn encode(&self, _text: &str) -> Result<Vec<u32>> { Ok(vec![1, 2, 3]) }
-            fn decode(&self, _tokens: &[u32]) -> Result<String> { Ok("decoded".into()) }
-            fn vocab_size(&self) -> u32 { 32000 }
+            fn name(&self) -> &str {
+                "test-tokenizer"
+            }
+            fn encode(&self, _text: &str) -> Result<Vec<u32>> {
+                Ok(vec![1, 2, 3])
+            }
+            fn decode(&self, _tokens: &[u32]) -> Result<String> {
+                Ok("decoded".into())
+            }
+            fn vocab_size(&self) -> u32 {
+                32000
+            }
         }
         assert!(registry.get_tokenizer("test-tokenizer").is_none());
         registry.register_tokenizer("test-tokenizer".to_string(), Arc::new(TestTokenizer));
         assert!(registry.has_tokenizer("test-tokenizer"));
-        assert_eq!(registry.get_tokenizer("test-tokenizer").unwrap().vocab_size(), 32000);
+        assert_eq!(
+            registry
+                .get_tokenizer("test-tokenizer")
+                .unwrap()
+                .vocab_size(),
+            32000
+        );
 
         // Test custom processor registration
         struct TestProcessor;
         impl ProcessorPlugin for TestProcessor {
-            fn name(&self) -> &str { "test-processor" }
-            fn preprocess(&self, input: &str, _ctx: &str) -> Result<String> { Ok(format!("pre:{input}")) }
-            fn postprocess(&self, output: &str, _ctx: &str) -> Result<String> { Ok(format!("post:{output}")) }
+            fn name(&self) -> &str {
+                "test-processor"
+            }
+            fn preprocess(&self, input: &str, _ctx: &str) -> Result<String> {
+                Ok(format!("pre:{input}"))
+            }
+            fn postprocess(&self, output: &str, _ctx: &str) -> Result<String> {
+                Ok(format!("post:{output}"))
+            }
         }
         assert!(registry.get_processor("test-processor").is_none());
         registry.register_processor("test-processor".to_string(), Arc::new(TestProcessor));
         assert!(registry.has_processor("test-processor"));
-        assert_eq!(registry.get_processor("test-processor").unwrap().preprocess("foo", "{}").unwrap(), "pre:foo");
+        assert_eq!(
+            registry
+                .get_processor("test-processor")
+                .unwrap()
+                .preprocess("foo", "{}")
+                .unwrap(),
+            "pre:foo"
+        );
     }
 }

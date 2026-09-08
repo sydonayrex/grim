@@ -1,9 +1,9 @@
 //! Dynamic NCCL collective communication bindings and wrappers for CUDA.
 
-use std::ffi::{c_char, c_void};
-use std::sync::{Arc, Mutex};
 use grim_tensor::DType;
 use grim_tensor::error::{Error, Result};
+use std::ffi::{c_char, c_void};
+use std::sync::{Arc, Mutex};
 
 /// Opaque NCCL communicator handle.
 #[repr(transparent)]
@@ -69,6 +69,7 @@ pub struct CudaComm {
     comm: NcclComm,
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 impl CudaComm {
     pub fn new(nranks: i32, id: UniqueId, rank: i32) -> Result<Self> {
         let bindings = NcclBindings::get()?;
@@ -111,7 +112,9 @@ impl CudaComm {
             }
         };
         unsafe {
-            let res = (bindings.ncclAllReduce)(send, recv, count, nccl_dtype, NCCL_SUM, self.comm, stream);
+            let res = (bindings.ncclAllReduce)(
+                send, recv, count, nccl_dtype, NCCL_SUM, self.comm, stream,
+            );
             if res == NCCL_SUCCESS {
                 Ok(())
             } else {
@@ -179,9 +182,8 @@ impl CudaComm {
             }
         };
         unsafe {
-            let res = (bindings.ncclAllGather)(
-                send, recv, send_count, nccl_dtype, self.comm, stream,
-            );
+            let res =
+                (bindings.ncclAllGather)(send, recv, send_count, nccl_dtype, self.comm, stream);
             if res == NCCL_SUCCESS {
                 Ok(())
             } else {
@@ -360,29 +362,42 @@ impl NcclBindings {
             }
 
             let lib = loaded_lib.ok_or_else(|| {
-                Error::Backend("NCCL library (libnccl.so.2 / libnccl.so) not found in library search paths".into())
+                Error::Backend(
+                    "NCCL library (libnccl.so.2 / libnccl.so) not found in library search paths"
+                        .into(),
+                )
             })?;
 
             unsafe {
-                let ncclGetUniqueId = *lib.get(b"ncclGetUniqueId\0")
+                let ncclGetUniqueId = *lib
+                    .get(b"ncclGetUniqueId\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclGetUniqueId: {e}")))?;
-                let ncclCommInitRank = *lib.get(b"ncclCommInitRank\0")
+                let ncclCommInitRank = *lib
+                    .get(b"ncclCommInitRank\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclCommInitRank: {e}")))?;
-                let ncclCommDestroy = *lib.get(b"ncclCommDestroy\0")
+                let ncclCommDestroy = *lib
+                    .get(b"ncclCommDestroy\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclCommDestroy: {e}")))?;
-                let ncclAllReduce = *lib.get(b"ncclAllReduce\0")
+                let ncclAllReduce = *lib
+                    .get(b"ncclAllReduce\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclAllReduce: {e}")))?;
-                let ncclReduceScatter = *lib.get(b"ncclReduceScatter\0")
-                    .map_err(|e| Error::Backend(format!("Failed to load ncclReduceScatter: {e}")))?;
-                let ncclAllGather = *lib.get(b"ncclAllGather\0")
+                let ncclReduceScatter = *lib.get(b"ncclReduceScatter\0").map_err(|e| {
+                    Error::Backend(format!("Failed to load ncclReduceScatter: {e}"))
+                })?;
+                let ncclAllGather = *lib
+                    .get(b"ncclAllGather\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclAllGather: {e}")))?;
-                let ncclGroupStart = *lib.get(b"ncclGroupStart\0")
+                let ncclGroupStart = *lib
+                    .get(b"ncclGroupStart\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclGroupStart: {e}")))?;
-                let ncclGroupEnd = *lib.get(b"ncclGroupEnd\0")
+                let ncclGroupEnd = *lib
+                    .get(b"ncclGroupEnd\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclGroupEnd: {e}")))?;
-                let ncclSend = *lib.get(b"ncclSend\0")
+                let ncclSend = *lib
+                    .get(b"ncclSend\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclSend: {e}")))?;
-                let ncclRecv = *lib.get(b"ncclRecv\0")
+                let ncclRecv = *lib
+                    .get(b"ncclRecv\0")
                     .map_err(|e| Error::Backend(format!("Failed to load ncclRecv: {e}")))?;
 
                 let bindings = Arc::new(NcclBindings {
@@ -405,7 +420,9 @@ impl NcclBindings {
 
         #[cfg(not(feature = "nccl"))]
         {
-            Err(Error::Backend("NCCL feature not enabled in Cargo.toml (enable feature \"nccl\")".into()))
+            Err(Error::Backend(
+                "NCCL feature not enabled in Cargo.toml (enable feature \"nccl\")".into(),
+            ))
         }
     }
 }

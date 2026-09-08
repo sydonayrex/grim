@@ -1,6 +1,5 @@
-//! Mamba selective scan HIP kernel — Block size 256 threads, LDS tiling, persistent for decode-step.
+//! Mamba selective scan HIP kernel - Block size 256 threads, LDS tiling, persistent for decode-step.
 //! On RDNA2 (gfx1036/gfx1030, Wave32): 256 threads = 8 Wave32 wavefronts.
-//! On CDNA (gfx9xx, Wave64): 256 threads = 4 Wave64 wavefronts.
 
 /// HIP source for `grim_selective_scan` and `grim_selective_scan_backward`.
 pub const KERNEL_SOURCE: &str = r#"
@@ -21,10 +20,8 @@ extern "C" {
         return sign ? -res : res;
     }
 
-    /// Single-step Mamba selective scan (decode-step). One thread per n dimension.
-    /// h_t[n,s] = a[n,s] * h_{t-1}[n,s] + dt[n] * x_t[n] * b[n,s]
-    /// y[n] = sum_s(c[n] * h_t[n,s]) + D[n] * x_t[n]
-    ///   c[n] broadcast across state dim (per-channel C, matching d_param shape [d_inner]).
+    /// Single-step Mamba selective scan (decode-step).
+    /// One thread per n dimension.
     __global__ void grim_selective_scan(
         const float* __restrict__ a_log,       // [d_inner * d_state]  A = exp(a_log+1), pre-computed on host
         const float* __restrict__ b_tensor,    // [d_inner * d_state]  B parameter
@@ -118,12 +115,8 @@ extern "C" {
         d_x[batch_index * d_inner + n] = d_x_val;
     }
 
-    /// Falcon-H1 / llama.cpp `build_mamba2_layer` recurrence (headed variant):
-    ///   h[n,s] = exp(dt[h]·a[h])·h_prev[n,s] + b[s]·x[n]·dt[h]
-    ///   y[n]   = Σ_s c[s]·h[n,s] + d[h]·x[n]·dt[h]
-    /// with h(n) = n / head_dim_ssm and dt post-softplus. Unlike
-    /// grim_selective_scan, decay is dt-dependent and B/C are shared
-    /// across heads (indexed by state only).
+    /// Falcon-H1 / llama.cpp `build_mamba2_layer` recurrence (headed variant): h[n,s] = exp(dt[h]·a[h])·h_prev[n,s] + b[s]·x[n]·dt[h] y[n]  = Σ_s c[s]·h[n,s] + d[h]·x[n]·dt[h] with h(n) = n / head_dim_ssm and dt post-softplus.
+    /// Unlike grim_selective_scan, decay is dt-dependent and B/C are shared across heads (indexed by state only).
     __global__ void grim_selective_scan_headed(
         const float* __restrict__ x_tensor,    // [d_inner]
         const float* __restrict__ dt_tensor,   // [n_heads]  post-softplus
@@ -139,10 +132,8 @@ extern "C" {
     {
         int n = blockIdx.x * blockDim.x + threadIdx.x;
         int d_inner = n_heads * head_dim_ssm;
-        // No early return: threads past d_inner must still hit the
-        // __syncthreads barriers below, or the partial-block barrier is UB
-        // and the LDS tile ends up scrambled (observed as wrong y on
-        // d_inner < blockDim.x launches).
+        // No early return: threads past d_inner must still hit the __syncthreads barriers below, or the partial-block barrier
+        // is UB and the LDS tile ends up scrambled (observed as wrong y on d_inner < blockDim.x launches).
         bool active = n < d_inner;
         int h = active ? n / head_dim_ssm : 0;
         float dt_h = dt_tensor[h];
@@ -151,9 +142,8 @@ extern "C" {
         extern __shared__ float lds_hh[];
         float* my_h = lds_hh + threadIdx.x * d_state;
         if (active) {
-            // Each thread owns its whole LDS row (h_in_out row n) — the
-            // scan loop below reads every s, so strided loads would leave
-            // the row uninitialized.
+            // Each thread owns its whole LDS row (h_in_out row n) - the scan
+            // loop below reads every s, so strided loads would leave the row uninitialized.
             const float* h_row = h_in_out + n * d_state;
             for (int s = 0; s < d_state; ++s) {
                 my_h[s] = h_row[s];

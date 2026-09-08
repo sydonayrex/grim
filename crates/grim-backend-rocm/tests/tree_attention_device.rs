@@ -104,7 +104,7 @@ fn tree_attention_output_shape_spec_is_rank_4() {
 /// compile-time-ish check rather than FFI-instrument the call chain.
 #[test]
 fn tree_attention_delegates_to_launcher() {
-    static SRC: &str = include_str!("../src/device/roc_device.rs");
+    static SRC: &str = include_str!("../src/device/device_attention.rs");
     // Must call into the spec-laundered launcher (not a CPU fallback).
     assert!(
         SRC.contains("crate::launch_tree_attention") || SRC.contains("launch_tree_attention("),

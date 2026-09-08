@@ -12,9 +12,7 @@ use crate::block::{LlamaBlock, LlamaConfigRefs, LlamaLayerCache};
 use crate::model::Llama;
 use crate::model::LlamaConfig;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Qwen2Config {
@@ -42,9 +40,7 @@ impl ModelConfig for Qwen2Config {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama
-// ---------------------------------------------------------------------------
+// Model - thin wrapper around Llama
 
 pub struct Qwen2 {
     pub cfg: Qwen2Config,

@@ -2,12 +2,12 @@
 //!
 
 pub mod bloom;
-pub mod lookup;
 pub mod coherence;
+pub mod lookup;
 
 pub use bloom::BloomFilter;
-pub use lookup::LookupClient;
 pub use coherence::{CacheCoherenceManager, InvalidationMsg};
+pub use lookup::LookupClient;
 
 /// ReMP 2D KV-cache migration (WI-8): coalesced 128-byte block-major transfer within same VRAM pool.
 use std::sync::Arc;
@@ -18,12 +18,7 @@ use grim_kvtransport::{NetworkKvClient, PromptChannel};
 use grim_memory::KvBlockPool;
 
 /// Bounded exponential-backoff retry policy for cross-node KV transfers.
-///
-/// Transfers are one-shot TCP; a node that is briefly busy (receiver thread
-/// saturated, restart in progress) previously failed the whole handoff on the
-/// first refused connection. Transient connection-level failures are retried
-/// with exponential backoff; protocol-level failures (checksum, "not
-/// available", bad address) fail fast — retrying those can never succeed.
+/// Transfers are one-shot TCP; a node that is briefly busy (receiver thread saturated, restart in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Total attempts including the first (default 3).
@@ -44,19 +39,12 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Whether a transfer error is worth retrying: connection-level failures
-/// only. Server-authored answers ("not available", ACK rejections),
-/// protocol mismatches, checksum errors, and caller bugs (empty payload,
-/// bad address) are final.
+/// Whether a transfer error is worth retrying: connection-level failures only.
+/// Server-authored answers ("not available", ACK rejections), protocol mismatches, checksum errors, and caller bugs (empty payload,.
 fn is_transient_transfer_error(e: &Error) -> bool {
     let msg = e.to_string();
-    // io::Error display strings for connect/read/write failures:
-    // "Connection refused (os error 111)", "Connection reset by peer",
-    // "Broken pipe (os error 32)", "timed out", plus the crate's own
-    // "connection failed"/"read error"/"write error" wrappers around them.
-    // (grim-core carries no typed error kinds, so classification is by
-    // display string — keep this in sync with every failure string the
-    // transport can emit for a connection-level fault.)
+    // io::Error display strings for connect/read/write failures: "Connection refused (os error 111)", "Connection reset by peer", "Broken pipe (os error 32)", "timed out", plus the crate's own "connection failed"/"read error"/"write error" wrappers around them.
+    // (grim-core carries no typed error kinds, so classification is by display string - keep this.
     msg.contains("connection failed")
         || msg.contains("Connection refused")
         || msg.contains("reset by peer")
@@ -89,10 +77,8 @@ pub struct ReMPMigrationBatch {
 }
 
 impl ReMPMigrationBatch {
-    /// Validate batch shape: non-empty, 2D dims match block count, and all
-    /// blocks carry the same non-zero element count (consumers slice the
-    /// drained buffer with a uniform stride, so mixed lengths would
-    /// silently misalign it).
+    /// Validate batch shape: non-empty, 2D dims match block count, and all blocks carry the same non-zero element
+    /// count (consumers slice the drained buffer with a uniform stride, so mixed lengths would silently misalign it).
     pub fn validate(&self) -> Result<()> {
         if self.blocks.is_empty() {
             return Err(Error::KvCache("ReMPMigrationBatch: no blocks".into()));
@@ -132,9 +118,7 @@ impl ReMPMigrationBatch {
     pub fn migrate(&self) -> Result<Vec<f32>> {
         self.validate()?;
         // Index blocks once: (layer, chunk) → slot in the flat output.
-        // The naive per-slot `blocks.iter().find(...)` scans the whole batch
-        // L·C times — quadratic in blocks, which is 4×10⁸ comparisons for an
-        // 80-layer × 256-chunk model.
+        // The naive per-slot `blocks.iter().find(...)` scans the whole batch L·C times - quadratic in blocks, which.
         let mut slots: Vec<Option<&KvBlock>> =
             vec![None; self.num_layers as usize * self.num_seq_chunks as usize];
         for block in &self.blocks {
@@ -189,8 +173,7 @@ pub struct PoolAssignment {
 }
 
 /// Disaggregation configuration carried by `EngineConfig` and the serving CLI.
-/// Defined here (in grim-disagg) so both `grim-engine` and `grim-server` can
-/// depend on it without creating a circular dependency.
+/// Defined here (in grim-disagg) so both `grim-engine` and `grim-server` can depend on it without creating.
 #[derive(Debug, Clone)]
 pub struct DisaggConfig {
     pub role: PoolRole,
@@ -208,10 +191,8 @@ impl Default for DisaggConfig {
     }
 }
 
-/// Run `f` under `retry`: transient connection-level failures are retried
-/// with exponential backoff (capped at `max_backoff_ms`); everything else
-/// fails on the first attempt. Shared by [`DisaggRouter`] and
-/// [`LayerPipelinedKvStreamer`] so retry semantics cannot drift apart.
+/// Run `f` under `retry`: transient connection-level failures are retried with exponential backoff (capped at `max_backoff_ms`); everything else fails on the first attempt.
+/// Shared by [`DisaggRouter`] and [`LayerPipelinedKvStreamer`] so retry semantics cannot drift apart.
 fn retry_with_policy<T>(
     retry: &RetryPolicy,
     op: &str,
@@ -239,12 +220,8 @@ fn retry_with_policy<T>(
     }
 }
 
-/// Layer-pipelined KV transfer manager.
-///
-/// Overlaps compute with communication by transmitting KV blocks layer-by-layer
-/// as soon as each transformer layer completes prompt prefill. Calls are
-/// synchronous — each blocks the caller until the receiver ACKs the block —
-/// so pipeline by invoking from a dedicated sender thread's layer loop.
+/// Layer-pipelined KV transfer manager. Overlaps compute with communication by transmitting KV
+/// blocks layer-by-layer as soon as each transformer layer completes prompt prefill.
 pub struct LayerPipelinedKvStreamer {
     decode_node_addr: String,
     kv_client: NetworkKvClient,
@@ -266,10 +243,8 @@ impl LayerPipelinedKvStreamer {
         self
     }
 
-    /// Stream a single layer's KV block slice across the wire. Transient
-    /// connection failures retry per the default [`RetryPolicy`];
-    /// `num_tokens` is the block's valid token count (carried end-to-end so
-    /// the receiver does not derive it from the zero-padded payload).
+    /// Stream a single layer's KV block slice across the wire.
+    /// Transient connection failures retry per the default [`RetryPolicy`]; `num_tokens` is the block's valid token count.
     pub fn stream_layer_block(
         &self,
         block_id: usize,
@@ -300,14 +275,11 @@ pub struct DisaggOrchestrator {
     decode_healthy: bool,
     last_prefill_heartbeat_ms: u64,
     last_decode_heartbeat_ms: u64,
-    /// The role failover actually resolved to; may differ from
-    /// `config.role` after a failover. `handles_prefill`/`handles_decode`
-    /// consult this so they stay truthful post-failover.
+    /// The role failover actually resolved to; may differ from `config.role` after a failover.
+    /// `handles_prefill`/`handles_decode` consult this so they stay truthful post-failover.
     effective_role: PoolRole,
-    /// Clock baseline for peers that have never heartbeated: the first
-    /// `evaluate_failover` call. Without it, a node whose peer never sent
-    /// a single heartbeat would trust that peer forever (the old
-    /// `last_heartbeat_ms > 0` guard made the timeout unreachable).
+    /// Clock baseline for peers that have never heartbeated: the first `evaluate_failover` call.
+    /// Without it, a node whose peer never sent a single heartbeat would trust that peer.
     first_eval_ms: Option<u64>,
 }
 
@@ -325,9 +297,8 @@ impl DisaggOrchestrator {
         }
     }
 
-    /// Record a heartbeat timestamp for a node role. A Colocated heartbeat
-    /// means this node is alive in BOTH roles, so both freshness
-    /// timestamps advance.
+    /// Record a heartbeat timestamp for a node role.
+    /// A Colocated heartbeat means this node is alive in BOTH roles, so both freshness timestamps.
     pub fn record_heartbeat(&mut self, role: PoolRole, now_ms: u64) {
         match role {
             PoolRole::Prefill => {
@@ -347,17 +318,12 @@ impl DisaggOrchestrator {
         }
     }
 
-    /// Check peer freshness against a timeout window; fail over to
-    /// colocated execution when the remote peer is presumed dead. The
-    /// resolved role is retained — [`Self::effective_role`],
-    /// [`Self::handles_prefill`], and [`Self::handles_decode`] all report
-    /// it until the next evaluation. A peer that was failed over recovers
-    /// automatically once its heartbeats resume.
+    /// Check peer freshness against a timeout window; fail over to colocated execution when the remote peer is presumed dead.
+    /// The resolved role is retained - [`Self::effective_role`], [`Self::handles_prefill`], and [`Self::handles_decode`] all report it until the.
     pub fn evaluate_failover(&mut self, now_ms: u64, timeout_ms: u64) -> PoolRole {
         let first_eval = *self.first_eval_ms.get_or_insert(now_ms);
-        // Freshness baseline: the peer's last heartbeat, or — for a peer
-        // that has NEVER sent one — the first evaluation (startup grace =
-        // one timeout window from when failover checking began).
+        // Freshness baseline: the peer's last heartbeat, or - for a peer that has NEVER sent
+        // one - the first evaluation (startup grace = one timeout window from when failover checking began).
         let prefill_baseline = if self.last_prefill_heartbeat_ms > 0 {
             self.last_prefill_heartbeat_ms
         } else {
@@ -405,10 +371,7 @@ impl DisaggOrchestrator {
 }
 
 /// Router for cross-pool dispatch and network KV transfers.
-///
-/// When `pool` is set, the router extracts **real** KV block data from the
-/// engine's `KvBlockPool` via `read_keys()` / `read_values()` rather than
-/// synthesising fake payloads.
+/// When `pool` is set, the router extracts **real** KV block data from the engine's `KvBlockPool`.
 pub trait DisaggRouterT: Send + Sync {
     /// Dispatch a prefill task — sends the request's real KV blocks (its
     /// logical→physical block table) from the local pool to the prefill node.
@@ -437,10 +400,8 @@ pub struct DisaggRouter {
     pub pool: Option<Arc<Mutex<KvBlockPool>>>,
 }
 
-/// One (block, layer) KV payload snapshotted from a local pool, ready to
-/// send. `num_tokens` is the source block's valid token count — carried
-/// end-to-end so the receiver stores the real fill state instead of
-/// deriving a full-block count from the zero-padded payload length.
+/// One (block, layer) KV payload snapshotted from a local pool, ready to send.
+/// `num_tokens` is the source block's valid token count - carried end-to-end so the receiver stores.
 struct BlockLayerPayload {
     block_id: usize,
     layer_idx: u32,
@@ -461,9 +422,8 @@ impl DisaggRouter {
         }
     }
 
-    /// Attach the engine's shared KvBlockPool so that `transfer_kv_cache`,
-    /// `dispatch_prefill`, and `dispatch_decode` extract **real** KV data
-    /// instead of synthetic payloads.
+    /// Attach the engine's shared KvBlockPool so that `transfer_kv_cache`, `dispatch_prefill`,
+    /// and `dispatch_decode` extract **real** KV data instead of synthetic payloads.
     pub fn with_pool(mut self, pool: Arc<Mutex<KvBlockPool>>) -> Self {
         self.pool = Some(pool);
         self
@@ -482,21 +442,14 @@ impl DisaggRouter {
         self
     }
 
-    /// Run `f` with the router's bounded exponential-backoff retry. Only
-    /// transient connection-level failures retry; everything else fails on
-    /// the first attempt.
+    /// Run `f` with the router's bounded exponential-backoff retry.
+    /// Only transient connection-level failures retry; everything else fails on the first attempt.
     fn retrying<T>(&self, op: &str, f: impl FnMut() -> Result<T>) -> Result<T> {
         retry_with_policy(&self.retry, op, f)
     }
 
-    /// Copy one request's KV blocks (all layers, with their valid token
-    /// counts) out of `pool`. Bounds-checked and fill-checked: an
-    /// out-of-range or never-populated block id is an error, not a panic
-    /// or a silent zero-block handoff.
-    ///
-    /// Callers must release the pool lock before sending the returned
-    /// payloads over the network — the pool must never be held across
-    /// connect timeouts, retry backoff sleeps, or stalled sockets.
+    /// Copy one request's KV blocks (all layers, with their valid token counts) out of `pool`.
+    /// Bounds-checked and fill-checked: an out-of-range or never-populated block id is an error, not a panic.
     fn snapshot_block_layers(
         pool: &grim_memory::KvBlockPool,
         block_ids: &[usize],
@@ -536,9 +489,8 @@ impl DisaggRouter {
         Ok(payloads)
     }
 
-    /// Send snapshot payloads to `target` over the wire: pipelined through
-    /// one connection per chunk of messages, each message ACKed by the
-    /// receiver, each chunk retried on transient connection failures.
+    /// Send snapshot payloads to `target` over the wire: pipelined through one connection per chunk
+    /// of messages, each message ACKed by the receiver, each chunk retried on transient connection failures.
     fn send_block_layers(
         &self,
         payloads: Vec<BlockLayerPayload>,
@@ -564,18 +516,8 @@ impl DisaggRouter {
         Ok(())
     }
 
-    /// Transfer real KV blocks extracted from a physical KvBlockPool to the
-    /// remote decode engine.
-    ///
-    /// Each block's per-layer key/value data (and its valid token count) is
-    /// snapshotted from the pool, then sent over TCP using the V3 wire
-    /// protocol (magic + checksum + num_tokens in the header, per-message
-    /// ACK from the receiver).
-    ///
-    /// Note: `pool` is only read here. Entry points that hold the pool
-    /// mutex themselves (`transfer_kv_cache`, `dispatch_prefill`,
-    /// `dispatch_decode`) snapshot first and release the lock before any
-    /// network I/O happens.
+    /// Transfer real KV blocks extracted from a physical KvBlockPool to the remote decode engine.
+    /// Each block's per-layer key/value data (and its valid token count) is snapshotted from the pool,.
     pub fn transfer_kv_cache_real(
         &self,
         _request_id: u64,
@@ -591,10 +533,8 @@ impl DisaggRouter {
         self.send_block_layers(payloads, &self.decode_node_addr, "transfer_kv_cache_real")
     }
 
-    /// Copy KV blocks between two LOCAL pools (same node), all layers,
-    /// preserving each block's valid token count. This is a host-memory
-    /// memcpy path — no network, no serialization, and also not VRAM-to-VRAM
-    /// DMA despite the historical "zero-copy" name.
+    /// Copy KV blocks between two LOCAL pools (same node), all layers, preserving each block's valid token count.
+    /// This is a host-memory memcpy path - no network, no serialization, and also not VRAM-to-VRAM.
     pub fn transfer_kv_p2p_direct(
         &self,
         block_ids: &[usize],
@@ -618,9 +558,8 @@ impl DisaggRouter {
                     "transfer_kv_p2p_direct: source block {b_id} has no KV data"
                 )));
             }
-            // The source block's true valid token count. Passing the
-            // ELEMENT count here instead would mark every destination block
-            // as fully valid (element counts always exceed BLOCK_SIZE).
+            // The source block's true valid token count.
+            // Passing the ELEMENT count here instead would mark every destination block as fully valid (element.
             let num_tokens = src_pool.block_num_tokens(b_id).unwrap_or(0);
             let layers: Vec<(usize, Vec<f32>, Vec<f32>)> = (0..src_pool.num_layers(b_id))
                 .filter_map(|layer| {
@@ -676,16 +615,15 @@ impl DisaggRouter {
                 }
             }
         }
-        self.send_block_layers(payloads, &self.decode_node_addr, "transfer_paged_cache_real")
+        self.send_block_layers(
+            payloads,
+            &self.decode_node_addr,
+            "transfer_paged_cache_real",
+        )
     }
 
-    /// Extract real KV blocks for `block_ids` from the stored pool and send
-    /// them to the prefill node address.
-    ///
-    /// Only the request's own blocks are transferred — the pool is shared
-    /// across concurrent requests, so a full-pool scan would leak other
-    /// requests' KV cache over the wire. The pool lock is held only for the
-    /// snapshot; all network I/O happens after it is released.
+    /// Extract real KV blocks for `block_ids` from the stored pool and send them to the prefill node address.
+    /// Only the request's own blocks are transferred - the pool is shared across concurrent requests,.
     fn extract_and_send_prefill(
         &self,
         request_id: u64,
@@ -706,21 +644,16 @@ impl DisaggRouter {
             Self::snapshot_block_layers(&guard, block_ids, "dispatch_prefill")?
         };
         self.send_block_layers(payloads, &self.prefill_node_addr, "dispatch_prefill")?;
-        // Forward the prompt token IDs over the real control channel
-        // (PROMPT_FLAG protocol message stored in the receiver's
-        // PromptChannel). The previous mechanism smuggled them through as a
-        // fake KV "meta-block" at id = pool.num_blocks() that no receiver
-        // ever decoded.
+        // Forward the prompt token IDs over the real control channel (PROMPT_FLAG protocol message stored in the receiver's PromptChannel).
+        // The previous mechanism smuggled them through as a fake KV "meta-block" at id = pool.num_blocks().
         self.retrying("dispatch_prefill(prompt)", || {
             self.kv_client
                 .send_prompt_tokens(request_id, tokens, &self.prefill_node_addr)
         })
     }
 
-    /// Extract real KV blocks for `block_ids` from the stored pool and send
-    /// them to the decode node address as a decode step context. Snapshot
-    /// under the lock, send after releasing it (all layers, like every
-    /// other handoff path).
+    /// Extract real KV blocks for `block_ids` from the stored pool and send them to the decode node address as a decode step context.
+    /// Snapshot under the lock, send after releasing it (all layers, like every other handoff path).
     fn extract_and_send_decode(
         &self,
         _request_id: u64,
@@ -740,10 +673,7 @@ impl DisaggRouter {
     }
 
     /// Fetch a single KV block from the prefill node (decode → prefill pull).
-    /// Returns the key/value float data plus the block's stored valid token
-    /// count. Transient connection failures retry per the router's
-    /// [`RetryPolicy`]; a server "not available" answer is final. Errors
-    /// otherwise — never fabricates data.
+    /// Returns the key/value float data plus the block's stored valid token count.
     pub fn fetch_kv_block(
         &self,
         block_id: usize,
@@ -810,9 +740,8 @@ impl DisaggRouterT for DisaggRouter {
                 "transfer_kv_cache: no KvBlockPool attached for real KV extraction".into(),
             )
         })?;
-        // Snapshot under the lock, then release it before any network I/O:
-        // the engine's shared pool must never be held across connect
-        // timeouts, retry backoff sleeps, or stalled sockets.
+        // Snapshot under the lock, then release it before any network I/O: the engine's shared
+        // pool must never be held across connect timeouts, retry backoff sleeps, or stalled sockets.
         let payloads = {
             let guard = pool.lock().map_err(|e| {
                 Error::KvCache(format!("transfer_kv_cache: pool mutex poisoned: {e}"))
@@ -866,15 +795,7 @@ impl DisaggRouter {
 }
 
 /// Background TCP receiver server for cross-node KV cache block ingestion.
-///
-/// Wraps `grim_kvtransport::start_kv_receiver_server` with a reference to the
-/// engine's `KvBlockPool`.  The receiver listens on `listen_addr`, accepts
-/// incoming V3 protocol block transfers (magic / checksum / num_tokens
-/// verification, per-message ACK), and writes the received key/value data
-/// into the pool via the `KvBlockStore` trait.
-///
-/// Dropping the server sets the receiver's stop flag; the accept loop exits
-/// within its poll interval (the listener thread is not joined on drop).
+/// Wraps `grim_kvtransport::start_kv_receiver_server` with a reference to the engine's `KvBlockPool`.
 pub struct KvReceiverServer {
     listen_addr: String,
     pool: Arc<Mutex<KvBlockPool>>,
@@ -889,12 +810,7 @@ pub struct KvReceiverServer {
 
 impl KvReceiverServer {
     /// Start a KV receiver server on `listen_addr` that writes into `pool`.
-    /// Prompt-token control messages are collected in an internal
-    /// [`PromptChannel`] — read them via [`KvReceiverServer::take_prompt_tokens`].
-    ///
-    /// Also starts the same-host shared-memory inbox poller when the listen
-    /// address carries an explicit port, so `SharedMemP2p` senders can hand
-    /// off without touching a socket; TCP senders are unaffected.
+    /// Prompt-token control messages are collected in an internal [`PromptChannel`] - read them via [`KvReceiverServer::take_prompt_tokens`].
     pub fn new(listen_addr: &str, pool: Arc<Mutex<KvBlockPool>>) -> Result<Self> {
         use std::sync::atomic::AtomicBool;
         let prompts = PromptChannel::new();
@@ -906,26 +822,27 @@ impl KvReceiverServer {
             prompts.clone(),
         )?;
 
-        let shm_stop =
-            match listen_addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                Some(port) if port != 0 => {
-                    let flag = Arc::new(AtomicBool::new(false));
-                    match grim_kvtransport::start_shm_inbox_poller(
-                        listen_addr,
-                        pool.clone(),
-                        flag.clone(),
-                    ) {
-                        Ok(_handle) => Some(flag),
-                        Err(e) => {
-                            eprintln!(
-                                "[grim-disagg] shm inbox poller disabled for {listen_addr}: {e}"
-                            );
-                            None
-                        }
+        let shm_stop = match listen_addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            Some(port) if port != 0 => {
+                let flag = Arc::new(AtomicBool::new(false));
+                match grim_kvtransport::start_shm_inbox_poller(
+                    listen_addr,
+                    pool.clone(),
+                    flag.clone(),
+                ) {
+                    Ok(_handle) => Some(flag),
+                    Err(e) => {
+                        eprintln!("[grim-disagg] shm inbox poller disabled for {listen_addr}: {e}");
+                        None
                     }
                 }
-                _ => None,
-            };
+            }
+            _ => None,
+        };
 
         Ok(Self {
             listen_addr: listen_addr.to_string(),
@@ -1024,10 +941,8 @@ mod tests {
         );
     }
 
-    /// Retry policy: transient connection failures retry with backoff and
-    /// eventually succeed once the receiver comes up. A listener binds only
-    /// after a delay, so the first attempts are refused; with enough attempts
-    /// the transfer lands and the data round-trips.
+    /// Retry policy: transient connection failures retry with backoff and eventually succeed once the receiver comes up.
+    /// A listener binds only after a delay, so the first attempts are refused; with enough.
     #[test]
     fn test_retry_recovers_from_refused_connection() {
         let port = find_free_port();
@@ -1235,9 +1150,8 @@ mod tests {
         assert!(result.is_err(), "should fail with missing block");
     }
 
-    /// Real KV transfer loopback: start a receiver, attach a pool, create a
-    /// DisaggRouter with the pool, transfer KV blocks over TCP, and verify
-    /// the data arrives intact on the receiving end.
+    /// Real KV transfer loopback: start a receiver, attach a pool, create a DisaggRouter with the
+    /// pool, transfer KV blocks over TCP, and verify the data arrives intact on the receiving end.
     #[test]
     fn test_real_kv_transfer_loopback() {
         // Set up a real KvBlockPool with one block of known data.
@@ -1275,8 +1189,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         // Verify the data arrived at the destination.
-        // transfer_kv_cache_real now sends the physical block_id (0),
-        // not request_id + i (1) as the old buggy version did.
+        // transfer_kv_cache_real now sends the physical block_id (0), not request_id + i (1) as the old.
         let dest_guard = dest_pool.lock().unwrap();
         let recv_k = dest_guard.read_keys(0);
         let recv_v = dest_guard.read_values(0);
@@ -1294,19 +1207,12 @@ mod tests {
         drop(receiver);
     }
 
-    /// F8/F10 integration gate: the decode→prefill PULL path
-    /// (`DisaggRouter::fetch_kv_block`) against a live receiver backed by a
-    /// real `KvBlockPool`. Before the fix, the server never answered fetch
-    /// requests at all — both sides deadlocked on the first pull. Populates
-    /// BOTH layers via the existing network PUSH path, then pulls them back
-    /// and requires exact round-trip equality (data AND token counts).
+    /// F8/F10 integration gate: the decode→prefill PULL path (`DisaggRouter::fetch_kv_block`) against a live receiver backed by a real `KvBlockPool`.
+    /// Before the fix, the server never answered fetch requests at all - both sides deadlocked.
     #[test]
     fn test_fetch_kv_block_pull_roundtrip_real_pool() {
-        // Pool geometry: 4 blocks, 2 heads, head_dim 4 → elem_per_token 8,
-        // block_elems 16*8 = 128. Both layers arrive over the wire: layer 0
-        // through `write_layer_keys(0, …)` (which mirrors into `key_data`),
-        // layer 1 through the per-layer store — this is the shape a real
-        // multi-layer handoff produces.
+        // Pool geometry: 4 blocks, 2 heads, head_dim 4 → elem_per_token 8, block_elems 16*8 = 128.
+        // Both layers arrive over the wire: layer 0 through `write_layer_keys(0, …)` (which mirrors into `key_data`),.
         let pool = KvBlockPool::new(4, 2, 4);
         let block_id = 1usize;
         let k0: Vec<f32> = (0..128).map(|i| i as f32 * 0.5).collect();
@@ -1353,9 +1259,8 @@ mod tests {
         );
     }
 
-    /// G4 gate: float payloads survive the wire bit-exactly — including
-    /// NaN payloads, which f32 equality cannot check (NaN != NaN), so the
-    /// assertion compares bit patterns.
+    /// G4 gate: float payloads survive the wire bit-exactly - including NaN payloads, which
+    /// f32 equality cannot check (NaN != NaN), so the assertion compares bit patterns.
     #[test]
     fn test_nan_float_bit_exact_roundtrip() {
         let nan_a = f32::from_bits(0x7fc0_0001);
@@ -1379,23 +1284,29 @@ mod tests {
         let _receiver = crate::KvReceiverServer::new(&addr, src_shared.clone()).unwrap();
 
         let router = DisaggRouter::new(&addr, &addr, PoolRole::Prefill).with_pool(src_shared);
-        router.send_layer_block_remote(0, 0, &k_full, &v_full, 16).unwrap();
+        router
+            .send_layer_block_remote(0, 0, &k_full, &v_full, 16)
+            .unwrap();
 
         let (got_k, got_v, _) = router.fetch_kv_block(0, 0, block_elems).unwrap();
         let k_bits: Vec<u32> = k_full.iter().map(|f| f.to_bits()).collect();
         let v_bits: Vec<u32> = v_full.iter().map(|f| f.to_bits()).collect();
         let got_k_bits: Vec<u32> = got_k.iter().map(|f| f.to_bits()).collect();
         let got_v_bits: Vec<u32> = got_v.iter().map(|f| f.to_bits()).collect();
-        assert_eq!(k_bits, got_k_bits, "K bits (incl. NaN payloads) must round-trip");
-        assert_eq!(v_bits, got_v_bits, "V bits (incl. NaN payloads) must round-trip");
+        assert_eq!(
+            k_bits, got_k_bits,
+            "K bits (incl. NaN payloads) must round-trip"
+        );
+        assert_eq!(
+            v_bits, got_v_bits,
+            "V bits (incl. NaN payloads) must round-trip"
+        );
         // And the edge values specifically: negative zero must not become positive zero.
         assert!((got_k[1].to_bits() >> 31) & 1 == 1, "-0.0 must stay -0.0");
     }
 
-    /// L1 regression (wire push): a partially-filled block must arrive with
-    /// its REAL valid token count, not inflated to BLOCK_SIZE. Before the
-    /// num_tokens wire field, the receiver derived the count from the
-    /// zero-padded payload length and marked every block full.
+    /// L1 regression (wire push): a partially-filled block must arrive with its REAL valid token count, not inflated to BLOCK_SIZE.
+    /// Before the num_tokens wire field, the receiver derived the count from the zero-padded payload length.
     #[test]
     fn test_wire_push_preserves_num_tokens() {
         // Geometry: 4 blocks, 2 heads, head_dim 4 → elem_per_token 8,
@@ -1428,9 +1339,8 @@ mod tests {
         assert_eq!(&dest_guard.read_keys(0)[..40], &k[..]);
     }
 
-    /// L1 regression (P2P): the direct pool-to-pool path must copy the
-    /// source block's valid token count — not `k_data.len()`, which is an
-    /// ELEMENT count and always inflates to BLOCK_SIZE after capping.
+    /// L1 regression (P2P): the direct pool-to-pool path must copy the source block's valid token count
+    /// - not `k_data.len()`, which is an ELEMENT count and always inflates to BLOCK_SIZE after capping.
     #[test]
     fn test_p2p_preserves_num_tokens() {
         let mut src = KvBlockPool::new(4, 2, 4);
@@ -1453,9 +1363,8 @@ mod tests {
         assert_eq!(&dst.read_layer_keys(0, 0).unwrap()[..56], &k[..]);
     }
 
-    /// B2 regression: a receiver that cannot store a block (id out of
-    /// range on the destination pool) must surface a FINAL error on the
-    /// sender, not report Ok while the data silently vanished.
+    /// B2 regression: a receiver that cannot store a block (id out of range on the destination
+    /// pool) must surface a FINAL error on the sender, not report Ok while the data silently vanished.
     #[test]
     fn test_receiver_rejection_surfaces_as_error() {
         // Source pool has 8 blocks; destination receiver only 1 — block 1
@@ -1482,9 +1391,8 @@ mod tests {
         );
     }
 
-    /// L2 regression: dispatch_prefill must transfer ALL layers of each
-    /// block, not just the layer-0 mirror. Verified by pulling each layer
-    /// back from the prefill node and comparing exactly.
+    /// L2 regression: dispatch_prefill must transfer ALL layers of each block, not just the layer-0 mirror.
+    /// Verified by pulling each layer back from the prefill node and comparing exactly.
     #[test]
     fn test_dispatch_prefill_transfers_all_layers() {
         let mut src = KvBlockPool::new(4, 2, 4);
@@ -1522,9 +1430,8 @@ mod tests {
         assert_eq!(got_v1, v1);
     }
 
-    /// B5 regression: a peer that has NEVER heartbeated must still be
-    /// failed over after one timeout window from the first evaluation —
-    /// the old `last_heartbeat > 0` guard trusted a silent peer forever.
+    /// B5 regression: a peer that has NEVER heartbeated must still be failed over after one timeout
+    /// window from the first evaluation - the old `last_heartbeat > 0` guard trusted a silent peer forever.
     #[test]
     fn test_failover_without_any_heartbeat() {
         let cfg = DisaggConfig {
@@ -1560,7 +1467,10 @@ mod tests {
         assert_eq!(orch.evaluate_failover(2_200, 500), PoolRole::Decode);
         assert_eq!(orch.effective_role(), PoolRole::Decode);
         assert!(orch.handles_decode());
-        assert!(!orch.handles_prefill(), "recovered peer restores pure decode role");
+        assert!(
+            !orch.handles_prefill(),
+            "recovered peer restores pure decode role"
+        );
     }
 
     /// B6 regression: a Colocated heartbeat must advance BOTH freshness

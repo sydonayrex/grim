@@ -65,12 +65,7 @@ impl GgufTokenizer {
     }
 
     /// Load a tokenizer from a HuggingFace `tokenizer.json` file.
-    ///
-    /// Supports BPE and WordLevel model types. Reads the vocab from
-    /// `model.vocab` (a JSON object mapping token strings to IDs) and
-    /// constructs the same `tokens`/`token_to_id` structures that the
-    /// GGUF metadata path produces, so downstream encode/decode works
-    /// identically regardless of source format.
+    /// Supports BPE and WordLevel model types.
     pub fn from_hf_json(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Backend(format!("failed to read tokenizer.json: {e}")))?;
@@ -265,8 +260,7 @@ impl GgufTokenizer {
             .map(|s| s.to_string());
 
         // Load BPE merges from GGUF metadata if the model type is BPE.
-        // HF tokenizer.json-style merges may be stored as
-        // tokenizer.ggml.merges (array of ["tokenA", "tokenB"] or "tokenA tokenB").
+        // HF tokenizer.json-style merges may be stored as tokenizer.ggml.merges (array of ["tokenA", "tokenB"] or "tokenA tokenB").
         let bpe_merges = if model_type == "bpe" || model_type == "gpt2" {
             metadata
                 .get("tokenizer.ggml.merges")
@@ -323,9 +317,7 @@ impl GgufTokenizer {
             return Vec::new();
         }
         // WI-E3: large inputs go through the rayon parallel chunked path.
-        // Chunks split at '\n' — a hard pre-token boundary in both the GPT-2
-        // and SentencePiece conventions, so no merge can span a split and the
-        // concatenated result is identical to single-threaded encode.
+        // Chunks split at '\n' - a hard pre-token boundary in both the GPT-2 and SentencePiece.
         if text.len() >= 8192 {
             use rayon::prelude::*;
             let bounds = chunk_bounds(text, 4096);
@@ -355,9 +347,8 @@ impl GgufTokenizer {
             "</s>",
         ];
 
-        // For byte-level BPE tokenizers (model_type == "bpe"), use the GPT-2
-        // byte encoder to map text → byte-level unicode chars, then apply BPE
-        // merges rank-by-rank.
+        // For byte-level BPE tokenizers (model_type == "bpe"), use the GPT-2 byte encoder
+        // to map text → byte-level unicode chars, then apply BPE merges rank-by-rank.
         if self.model_type == "bpe" {
             return self.encode_bpe(text, &special_tokens);
         }
@@ -384,10 +375,8 @@ impl GgufTokenizer {
 
         let mut ids: Vec<u32> = Vec::new();
         let chars: Vec<char> = processed.chars().collect();
-        // WI-E3: `rest` was rebuilt as a fresh String at EVERY char position —
-        // O(n^2) allocations dominating encode. Special tokens all start with
-        // '<'; only run the starts_with checks when the current char can
-        // actually begin one.
+        // WI-E3: `rest` was rebuilt as a fresh String at EVERY char position - O(n^2) allocations dominating encode.
+        // Special tokens all start with '<'; only run the starts_with checks when the current char.
         let mut i = 0;
         while i < chars.len() {
             let mut matched_special = false;
@@ -425,12 +414,8 @@ impl GgufTokenizer {
             }
         }
 
-        // WI-E3: this merge loop was the encode bottleneck. Per pass it built
-        // a `format!("{}{}")` String for EVERY adjacent pair (O(n * tok_len))
-        // and merged only ONE pair, so a 33 KB corpus took ~10 s (quadratic+
-        // in text length). Fixes: (1) cache merged-string lookups in a
-        // pair→id HashMap so repeated pairs cost one hash, (2) merge ALL
-        // non-overlapping occurrences of the best pair per pass.
+        // WI-E3: this merge loop was the encode bottleneck.
+        // Per pass it built a `format!("{}{}")` String for EVERY adjacent pair (O(n * tok_len)) and.
         let mut pair_cache: std::collections::HashMap<(u32, u32), Option<u32>> =
             std::collections::HashMap::new();
         loop {
@@ -558,17 +543,12 @@ impl GgufTokenizer {
             }
         };
 
-        // Split into words, encode each via BPE.
-        // GPT-2 pretokenizer splits on whitespace but keeps the space prefix
-        // attached to the following word. For simplicity here we split on
-        // word boundaries using a regex-like approach.
+        // Split into words, encode each via BPE. GPT-2 pretokenizer splits on
+        // whitespace but keeps the space prefix attached to the following word.
         let mut ids: Vec<u32> = Vec::new();
 
-        // Pretokenize the ORIGINAL text per the GPT-2 regex (words, digits,
-        // punctuation runs, whitespace — newlines split correctly), then
-        // byte-encode each piece. Byte-encoding the entire text first and
-        // splitting on Ġ glued newline-adjacent words together and produced
-        // wrong tokens for any prompt containing newlines.
+        // Pretokenize the ORIGINAL text per the GPT-2 regex (words, digits, punctuation runs, whitespace - newlines split correctly), then byte-encode each piece.
+        // Byte-encoding the entire text first and splitting on Ġ glued newline-adjacent words together and produced.
         let pieces = split_on_gpt2_pretokenize(text);
 
         for piece in pieces {
@@ -653,10 +633,8 @@ impl GgufTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
-        // For byte-level BPE tokenizers, we need to:
-        // 1. Concatenate token strings (which contain byte-level unicode chars)
-        // 2. Map each unicode char back to its original byte via byte_decoder
-        // 3. Decode the resulting byte sequence as UTF-8
+        // For byte-level BPE tokenizers, we need to: 1.
+        // Concatenate token strings (which contain byte-level unicode chars) 2.
         if let Some(ref decoder) = self.byte_decoder {
             let mut text = String::new();
             for &id in ids {
@@ -734,12 +712,7 @@ where
 }
 
 /// A single chat message in an OpenAI-style `messages` array.
-///
-/// `tool_calls` carries one or more tool invocations an assistant message
-/// produced (assistant-role only). `tool_call_id` / `name` carry a tool result
-/// back to the model (tool-role only). Both are `Option`al so the common
-/// user/assistant text-only messages stay the simple two-field construction
-/// callers already use — the new fields default to `None`.
+/// `tool_calls` carries one or more tool invocations an assistant message produced (assistant-role only).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
@@ -753,10 +726,8 @@ pub struct ChatMessage {
     pub name: Option<String>,
 }
 
-/// One tool call embedded in an assistant `ChatMessage`. `arguments` is a
-/// JSON-encoded *string* matching OpenAI's wire format (the arguments are a
-/// string containing JSON, not a nested object), so it can be re-parsed by the
-/// caller without ambiguity.
+/// One tool call embedded in an assistant `ChatMessage`.
+/// `arguments` is a JSON-encoded *string* matching OpenAI's wire format (the arguments are a string containing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ToolCallMsg {
     pub id: String,
@@ -766,9 +737,7 @@ pub struct ToolCallMsg {
 }
 
 /// A tool definition accepted in a `/v1/chat/completions` request body.
-/// Serializes to the OpenAI tool-definition wire shape (`{"type":"function",
-/// "function": {...}}`) that tool-capable embedded chat templates (Hermes,
-/// Llama 3.1, Qwen2.5, …) consume directly via the `tools` Jinja variable.
+/// Serializes to the OpenAI tool-definition wire shape (`{"type":"function", "function": {...}}`) that tool-capable embedded chat templates.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ToolDef {
     /// Always `"function"` today; OpenAI's schema carries the discriminator.
@@ -782,28 +751,22 @@ pub struct FunctionDef {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// A JSON Schema object describing the tool's parameters. Kept as an
-    /// opaque `serde_json::Value` so we never have to model the full JSON-Schema
-    /// surface — we round-trip the schema the client gave us.
+    /// A JSON Schema object describing the tool's parameters.
+    /// Kept as an opaque `serde_json::Value` so we never have to model the full JSON-Schema surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
 }
 
-/// `tool_choice` controls whether tool calling happens at all for a request,
-/// matching OpenAI's semantics exactly. The custom `Serialize` impl emits the
-/// OpenAI wire forms — `"auto"` / `"none"` / `"required"` / a specific-tool
-/// object — so the enum can be injected directly into the Jinja `tool_choice`
-/// context variable and compared against the string literals real model
-/// templates test for.
+/// `tool_choice` controls whether tool calling happens at all for a request, matching OpenAI's semantics exactly.
+/// The custom `Serialize` impl emits the OpenAI wire forms - `"auto"` / `"none"` / `"required"`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolChoice {
     /// `"auto"` (the default): the model decides whether to call a tool.
     Auto,
     /// `"none"`: suppress tool-calling behavior entirely for this request.
     None,
-    /// `"required"`: the model must call a tool. (Per the spec, grammar
-    /// enforcement of this is WI-TOOLS-6; in the MVP we surface it to the
-    /// template and rely on the model's own convention.)
+    /// `"required"`: the model must call a tool.
+    /// (Per the spec, grammar enforcement of this is WI-TOOLS-6; in the MVP we surface it.
     Required,
     /// A specific named tool is forced.
     Specific {
@@ -879,18 +842,10 @@ pub struct FunctionName {
 }
 
 /// Strip unsupported Jinja block directives from a chat template string.
-///
-/// minijinja supports the standard block tags (`if`, `for`, `set`, `block`,
-/// `extends`, `macro`) but not arbitrary custom tags that some model finetuners
-/// embed in GGUF metadata (e.g. `{% generation %}…{% endgeneration %}`). These
-/// cause `template_from_str` to return a parse error, which triggers a silent
-/// fallback to the last message's content. This function removes the unsupported
-/// outer tags while preserving their inner content so the remaining template is
-/// valid minijinja.
+/// minijinja supports the standard block tags (`if`, `for`, `set`, `block`, `extends`, `macro`) but not arbitrary.
 pub fn sanitize_jinja_template(template: &str) -> String {
-    // Match `{% tag … %}` and `{% endtag %}`. We strip tags whose outer name
-    // minijinja doesn't recognise, keeping the text between opening and closing.
-    // The recognised set is deliberately conservative — minijinja's built-in tags.
+    // Match `{% tag … %}` and `{% endtag %}`. We strip tags
+    // whose outer name minijinja doesn't recognise, keeping the text between opening and closing.
     let recognised: &[&str] = &[
         "if",
         "elif",
@@ -945,11 +900,8 @@ pub fn sanitize_jinja_template(template: &str) -> String {
                     }
                 }
             }
-            // Extract the directive name (first whitespace-delimited token
-            // after stripping whitespace and Jinja whitespace-control markers
-            // (`-`). Without this, `{%- set ... -%}` would extract `-` as the
-            // tag name, which is not in the recognised list, causing all
-            // whitespace-controlled tags to be silently stripped.
+            // Extract the directive name (first whitespace-delimited token after stripping whitespace and Jinja whitespace-control markers (`-`).
+            // Without this, `{%- set ...
             let name = inner
                 .trim()
                 .trim_start_matches('-')
@@ -966,21 +918,8 @@ pub fn sanitize_jinja_template(template: &str) -> String {
         result.push(ch);
     }
 
-    // ---- minijinja compatibility transforms ----
-    //
-    // Many HuggingFace Jinja templates use Python-dict methods that minijinja
-    // does not implement. These cause runtime render errors (`unknown method:
-    // map has no method named get/items`), which trigger a silent fallback to
-    // the last message. We patch the two most common patterns:
-    //
-    // 1. `.get('key')` / `.get("key")` → `["key"]`
-    //    minijinja returns Undefined for missing bracket keys (which is
-    //    falsy in `{% if %}`), matching the Python `.get()` semantics for
-    //    absent keys (which returns None, also falsy).
-    //
-    // 2. `.items()` → `| items`
-    //    minijinja provides an `items` filter (pipe form) but not the `.items()`
-    //    method. This is used by tool-call templates: `{% for k, v in d.items() %}`.
+    // ---- minijinja compatibility transforms ---- Many HuggingFace Jinja templates use Python-dict methods that minijinja does not implement.
+    // These cause runtime render errors (`unknown method: map has no method named get/items`), which trigger.
 
     // Transform `.get('key')` and `.get("key")` → `["key"]`.
     while let Some(pos) = result.find(".get('") {
@@ -1044,9 +983,8 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     // Transform `.items()` → `| items`.
     let mut result = result.replace(".items()", " | items");
 
-    // NOTE: We do NOT replace ` + ` with ` ~ ` because `+` is arithmetic
-    // in Jinja and `~` is string concatenation. Replacing arithmetic `+`
-    // breaks expressions like `loop.index0 + 1`.
+    // NOTE: We do NOT replace ` + ` with ` ~ ` because `+` is arithmetic in Jinja and `~` is string concatenation.
+    // Replacing arithmetic `+` breaks expressions like `loop.index0 + 1`.
 
     // Transform `is string` → a permissive test for string values.
     result = result.replace("is string", "is matching(\".*\")");
@@ -1064,9 +1002,7 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     result = result.replace(".split(", " | split(");
     result = result.replace(".rstrip(", " | trim_end_matches(");
     result = result.replace(".lstrip(", " | trim_start_matches(");
-    // `.strip('x')` with an argument -> trim both ends; minijinja `trim` takes no arg,
-    // but for the newline-only uses in MiniCPM5 `strip('\n')` the arg-free `trim`
-    // is equivalent for whitespace and avoids a parse error from an unknown filter.
+    // `.strip('x')` with an argument -> trim both ends; minijinja `trim` takes no arg, but for the newline-only uses in MiniCPM5 `strip('\n')` the arg-free `trim` is equivalent for whitespace and avoids a parse error from an unknown filter.
     // Handle both single and double quoted forms.
     while let Some(pos) = result.find(".strip('") {
         if let Some(end) = result[pos..].find("')") {
@@ -1085,11 +1021,7 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     // Bare `.strip()` -> trim
     result = result.replace(".strip()", " | trim");
 
-    // ---- MiniCPM5 / advanced template compat ----
-    // MiniCPM5 uses Python slice/split idioms that minijinja 2.x does not parse:
-    //   messages[::-1]              -> messages | reverse
-    //   x.split(d)[-1] / x.split(d)[0] -> x | split(d) | last / first
-    // Direct textual replaces for the concrete patterns seen in MiniCPM5.
+    // ---- MiniCPM5 / advanced template compat ---- MiniCPM5 uses Python slice/split idioms that minijinja 2.x does not parse: messages[::-1]       -> messages | reverse x.split(d)[-1] / x.split(d)[0] -> x | split(d) | last / first Direct textual replaces for the concrete patterns seen in MiniCPM5.
     // These must run after the `.split(` -> `| split(` transform above.
     result = result.replace("[::-1]", " | reverse");
     result = result.replace(" | split('</think>')[-1]", " | split('</think>') | last");
@@ -1111,9 +1043,8 @@ pub fn sanitize_jinja_template(template: &str) -> String {
         }
         break;
     }
-    // The two slice-equality checks on message.content are not reliably handled by
-    // the generic endswith/startswith loop below due to nested `not(... and ...)` parens.
-    // Patch them directly to the custom tests we register in render_chat_template.
+    // The two slice-equality checks on message.content are not reliably handled by the generic endswith/startswith loop below due to nested `not(...
+    // and ...)` parens.
     result = result.replace(
         "message.content[0:15] == '<tool_response>'",
         "message.content is startingwith('<tool_response>')",
@@ -1130,9 +1061,8 @@ pub fn sanitize_jinja_template(template: &str) -> String {
         "message.content[-16:] == \"</tool_response>\"",
         "message.content is endingwith('</tool_response>')",
     );
-    // Tool arguments in grim are stored as a JSON-encoded string, but MiniCPM5
-    // iterates `args_dict.items()` expecting a dict. Insert a `fromjson` parse
-    // so the subsequent `| items` sees an object, not a string.
+    // Tool arguments in grim are stored as a JSON-encoded string, but MiniCPM5 iterates `args_dict.items()` expecting a dict.
+    // Insert a `fromjson` parse so the subsequent `| items` sees an object, not a string.
     result = result.replace(
         "{%- set args_dict = tool_call.arguments %}",
         "{%- set args_dict = tool_call.arguments | fromjson %}",
@@ -1145,22 +1075,8 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     result
 }
 
-/// Renders an OpenAI-style `messages` array through a model's Jinja chat
-/// template, producing the final prompt string ready for tokenization.
-///
-/// Covers the common HF/GGUF template variable subset (`messages`,
-/// `add_generation_prompt`, plus `bos_token`/`eos_token` when supplied). If a
-/// specific model's template references an unsupplied variable, minijinja
-/// surfaces the exact name — widen `ctx` as needed. Falls back to the raw
-/// last-message content if the template fails to render.
-///
-/// `tools` (when `Some`) exposes the OpenAI tool-definition array to the
-/// template's own Jinja logic under the standard `tools` variable name. The
-/// caller passes the *already-shaped* `&[ToolDef]`; we do not attempt a
-/// unified per-family templating shim — each tool-capable model's embedded
-/// template was written by its finetuner to match its own tool-call output
-/// convention, so per-family quirks are a parsing (WI-TOOLS-4) concern, not a
-/// rendering concern.
+/// Renders an OpenAI-style `messages` array through a model's Jinja chat template, producing the final prompt string ready for tokenization.
+/// Covers the common HF/GGUF template variable subset (`messages`, `add_generation_prompt`, plus `bos_token`/`eos_token` when supplied).
 pub fn render_chat_template(
     template: &str,
     messages: &[ChatMessage],
@@ -1174,9 +1090,8 @@ pub fn render_chat_template(
     // Most GGUF chat templates are self-contained; disable autoescaping and treat undefined variables gracefully.
     env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
-    // HuggingFace templates call `raise_exception("msg")` (and sometimes with
-    // extra args). Accept any number of arguments and return empty string so
-    // tool-aware templates that validate input don't abort the render.
+    // HuggingFace templates call `raise_exception("msg")` (and sometimes with extra args).
+    // Accept any number of arguments and return empty string so tool-aware templates that validate input.
     env.add_function(
         "raise_exception",
         |args: &[minijinja::Value]| -> std::result::Result<String, minijinja::Error> {
@@ -1185,24 +1100,20 @@ pub fn render_chat_template(
         },
     );
     // Add `matching` test for templates that use `is string` or regex matches.
-    // Our sanitize rewrites `is string` -> `is matching(".*")`, so the test receives
-    // the value under test plus the regex pattern string. Only true for actual
-    // strings (so `1 is string` is false and we don't attempt `'<' in 1`).
-    let _ = env.add_test("matching", |v: minijinja::Value, _pat: String| {
+    // Our sanitize rewrites `is string` -> `is matching(".*")`, so the test receives the value under.
+    env.add_test("matching", |v: minijinja::Value, _pat: String| {
         v.as_str().is_some()
     });
     // MiniCPM5 uses `is startingwith('x')` / `is endingwith('x')` via our sanitize.
-    let _ = env.add_test(
-        "startingwith",
-        |v: String, prefix: String| v.starts_with(&prefix),
-    );
-    let _ = env.add_test(
-        "endingwith",
-        |v: String, suffix: String| v.ends_with(&suffix),
-    );
+    env.add_test("startingwith", |v: String, prefix: String| {
+        v.starts_with(&prefix)
+    });
+    env.add_test("endingwith", |v: String, suffix: String| {
+        v.ends_with(&suffix)
+    });
     // MiniCPM5 uses `messages | reverse` for the `messages[::-1]` reverse iteration.
     // minijinja 2.23 does not ship a `reverse` filter by default, so we provide one.
-    let _ = env.add_filter("reverse", |v: Vec<minijinja::Value>| {
+    env.add_filter("reverse", |v: Vec<minijinja::Value>| {
         let mut out = v;
         out.reverse();
         out
@@ -1210,7 +1121,8 @@ pub fn render_chat_template(
     // Some templates pass extra args to `tojson` filter; accept and ignore them.
     env.add_filter(
         "tojson",
-        |v: minijinja::Value, _args: &[minijinja::Value]|
+        |v: minijinja::Value,
+         _args: &[minijinja::Value]|
          -> std::result::Result<String, minijinja::Error> {
             serde_json::to_string(&v).map_err(|e| {
                 minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
@@ -1218,27 +1130,28 @@ pub fn render_chat_template(
         },
     );
     // Add `split` filter for Python `.split()` method compatibility.
-    let _ = env.add_filter("split", |s: &str, sep: &str| -> Vec<String> {
+    env.add_filter("split", |s: &str, sep: &str| -> Vec<String> {
         s.split(sep).map(String::from).collect()
     });
     // Add `trim_end_matches` / `trim_start_matches` filters for `.rstrip()` / `.lstrip()`.
-    let _ = env.add_filter("trim_end_matches", |s: &str, pat: Option<&str>| -> String {
+    env.add_filter("trim_end_matches", |s: &str, pat: Option<&str>| -> String {
         match pat {
             Some(p) => s.trim_end_matches(p).to_string(),
             None => s.trim_end().to_string(),
         }
     });
-    let _ = env.add_filter("trim_start_matches", |s: &str, pat: Option<&str>| -> String {
-        match pat {
-            Some(p) => s.trim_start_matches(p).to_string(),
-            None => s.trim_start().to_string(),
-        }
-    });
-    // MiniCPM5 tool calls store `arguments` as a JSON-encoded string (e.g. '{"x":1}').
-    // The template does `{% set args_dict = tool_call.arguments | fromjson %}` then
-    // `{% for k,v in args_dict | items %}`. Provide a `fromjson` filter that parses
-    // a JSON string into an object, passing through objects unchanged.
-    let _ = env.add_filter("fromjson", |v: minijinja::Value| -> minijinja::Value {
+    env.add_filter(
+        "trim_start_matches",
+        |s: &str, pat: Option<&str>| -> String {
+            match pat {
+                Some(p) => s.trim_start_matches(p).to_string(),
+                None => s.trim_start().to_string(),
+            }
+        },
+    );
+    // MiniCPM5 tool calls store `arguments` as a JSON-encoded string (e.g.
+    // '{"x":1}').
+    env.add_filter("fromjson", |v: minijinja::Value| -> minijinja::Value {
         if let Some(s) = v.as_str() {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
                 return minijinja::Value::from_serialize(&parsed);
@@ -1248,7 +1161,7 @@ pub fn render_chat_template(
     });
     // Add `items` filter for iterating over object key-value pairs (Python dict style).
     // MiniCPM5 uses `{% for k,v in dict | items %}`.
-    let _ = env.add_filter("items", |v: minijinja::Value| -> minijinja::Value {
+    env.add_filter("items", |v: minijinja::Value| -> minijinja::Value {
         // Serialize to JSON, extract key-value pairs, return as list of [k, v].
         match serde_json::to_value(&v) {
             Ok(serde_json::Value::Object(map)) => {
@@ -1267,7 +1180,7 @@ pub fn render_chat_template(
         }
     });
     // Add `first` / `last` filters for Python-style list indexing (`list[0]` / `list[-1]`).
-    let _ = env.add_filter("first", |v: minijinja::Value| -> minijinja::Value {
+    env.add_filter("first", |v: minijinja::Value| -> minijinja::Value {
         // Serialize to JSON array, get first element.
         if let Ok(json) = serde_json::to_value(&v) {
             if let Some(arr) = json.as_array() {
@@ -1278,7 +1191,7 @@ pub fn render_chat_template(
         }
         minijinja::Value::UNDEFINED
     });
-    let _ = env.add_filter("last", |v: minijinja::Value| -> minijinja::Value {
+    env.add_filter("last", |v: minijinja::Value| -> minijinja::Value {
         if let Ok(json) = serde_json::to_value(&v) {
             if let Some(arr) = json.as_array() {
                 if let Some(last) = arr.last() {
@@ -1288,20 +1201,14 @@ pub fn render_chat_template(
         }
         minijinja::Value::UNDEFINED
     });
-    // P1-3.3: Some GGUF-embedded Jinja templates use block directives that
-    // minijinja does not support (e.g. `{% generation %}…{% endgeneration %}`).
-    // Strip those unsupported tags (keeping their inner content) so the
-    // remaining template parses and renders correctly instead of failing
-    // silently and falling back to the last message.
+    // P1-3.3: Some GGUF-embedded Jinja templates use block directives that minijinja does not support (e.g.
+    // `{% generation %}…{% endgeneration %}`).
     let sanitized = sanitize_jinja_template(template);
     let tmpl = env
         .template_from_str(&sanitized)
         .map_err(|e| Error::Backend(format!("chat template parse error: {e}")))?;
-    // minijinja's `context!` macro requires every referenced variable to be
-    // named, so we build the context conditionally: `tools`/`tool_choice` are
-    // only emitted when provided. A template that never references `tools`
-    // simply ignores them; a template that does reference them expects the
-    // caller to have supplied real definitions.
+    // minijinja's `context!` macro requires every referenced variable to be named, so we build the context conditionally: `tools`/`tool_choice` are only emitted when provided.
+    // A template that never references `tools` simply ignores them; a template that does reference them.
     let empty_str = "";
     let ctx = minijinja::context! {
         messages => messages,
@@ -1322,15 +1229,12 @@ pub fn render_chat_template(
             "chat template render error: {e}\n--- sanitized template ---\n{sanitized}"
         ))
     })?;
-    // If the caller supplied tools but the rendered output made no use of
-    // them (i.e. the model's template isn't tool-capable), surface a loud
-    // diagnostic so operators understand why no tool calls will be produced,
-    // rather than silently returning an ordinary completion.
+    // If the caller supplied tools but the rendered output made no use of them (i.e.
+    // the model's template isn't tool-capable), surface a loud diagnostic so operators understand why no tool.
     if let Some(ts) = tools {
         if !ts.is_empty() {
-            // minijinja silently ignores unreferenced context variables, so we
-            // detect "tool-capable template" structurally: a tool-aware template
-            // references `tools` somewhere in its source text.
+            // minijinja silently ignores unreferenced context variables, so we detect "tool-capable template"
+            // structurally: a tool-aware template references `tools` somewhere in its source text.
             if !template.contains("tools") {
                 eprintln!(
                     "[grim-format] WARNING: {n} tool(s) supplied but the model's chat \
@@ -1344,17 +1248,14 @@ pub fn render_chat_template(
     Ok(rendered)
 }
 
-/// Convenience: render `messages` through a tokenizer's embedded template when
-/// present, otherwise return the last message's content (raw fallback). No
-/// tools are exposed to the template.
+/// Convenience: render `messages` through a tokenizer's embedded template when present, otherwise return the last message's content (raw fallback).
+/// No tools are exposed to the template.
 pub fn render_messages_or_last(tokenizer: &GgufTokenizer, messages: &[ChatMessage]) -> String {
     render_messages_or_last_with_tools(tokenizer, messages, None, None)
 }
 
-/// Convenience: as [`render_messages_or_last`] but additionally exposes the
-/// provided `tools` / `tool_choice` to the template's own Jinja logic. Use this
-/// path for tool-calling requests; the tool-less overload keeps existing call
-/// sites unchanged.
+/// Convenience: as [`render_messages_or_last`] but additionally exposes the provided `tools` / `tool_choice` to the template's own Jinja logic.
+/// Use this path for tool-calling requests; the tool-less overload keeps existing call sites unchanged.
 pub fn render_messages_or_last_with_tools(
     tokenizer: &GgufTokenizer,
     messages: &[ChatMessage],
@@ -1383,11 +1284,8 @@ pub fn render_messages_or_last_with_tools(
             eprintln!(
                 "[grim-format] chat template render failed, falling back to structured ChatML: {e}"
             );
-            // Structured fallback: preserve role framing and BOS instead of returning
-            // raw last-message content. This avoids the TUI feeding an unformatted
-            // prompt that confuses instruction-tuned models, and it avoids leaking
-            // raw Jinja source ("a lot of garbage chat template text") when
-            // sanitize missed an unrecognized block.
+            // Structured fallback: preserve role framing and BOS instead of returning raw last-message content.
+            // This avoids the TUI feeding an unformatted prompt that confuses instruction-tuned models, and it avoids.
             let bos = tokenizer
                 .bos_token_id
                 .and_then(|id| tokenizer.tokens.get(id as usize))
@@ -1396,9 +1294,8 @@ pub fn render_messages_or_last_with_tools(
             let mut out = String::new();
             out.push_str(bos);
             for m in messages {
-                // MiniCPM5 / ChatML style: <|im_start|>role\ncontent<|im_end|>\n
-                // Keep it model-agnostic: this framing is understood by most
-                // instruction models and matches MiniCPM5's non-tool branch.
+                // MiniCPM5 / ChatML style: <|im_start|>role\ncontent<|im_end|>\n Keep it model-agnostic: this framing
+                // is understood by most instruction models and matches MiniCPM5's non-tool branch.
                 let role = if m.role == "tool" { "user" } else { &m.role };
                 out.push_str("<|im_start|>");
                 out.push_str(role);
@@ -1426,12 +1323,7 @@ pub fn render_messages_or_last_with_tools(
     }
 }
 
-/// GPT-2 byte-to-unicode mapping. Maps each of 256 byte values to a
-/// specific unicode character. This is the standard `bytes_to_unicode()`
-/// function from the GPT-2 implementation.
-///
-/// Printable ASCII + Latin-1 (33-126, 161-172, 174-255) map to themselves.
-/// Everything else maps to U+0100 + offset.
+/// GPT-2 byte-to-unicode mapping. Maps each of 256 byte values to a specific unicode character.
 fn gpt2_byte_encoder() -> HashMap<u8, char> {
     // WI-E3: built once, shared across calls (was rebuilt on every encode).
     use std::sync::OnceLock;
@@ -1471,13 +1363,8 @@ fn gpt2_byte_decoder() -> HashMap<char, u8> {
         .collect()
 }
 
-/// GPT-2-style pre-tokenization. Splits the byte-level encoded string into
-/// word units where a space (Ġ) starts a new word. This is a simplified
-/// version of the GPT-2 regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
-/// that handles the common cases.
-/// WI-E3: compute byte ranges of `text` split at '\n' boundaries into chunks
-/// of at most `target` bytes. Each range is a valid char boundary. Returns a
-/// list of (start, end) pairs covering the whole text.
+/// GPT-2-style pre-tokenization. Splits the byte-level encoded string into word
+/// units where a space (Ġ) starts a new word.
 fn chunk_bounds(text: &str, target: usize) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut bounds = Vec::new();
@@ -1511,13 +1398,8 @@ fn chunk_bounds(text: &str, target: usize) -> Vec<(usize, usize)> {
 }
 
 fn split_on_gpt2_pretokenize(s: &str) -> Vec<String> {
-    // GPT-2 pretokenizer regex, implemented as a scanner (grim has no regex
-    // dep). Pattern:
-    //   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
-    // The old version split ONLY on Ġ, so newline-adjacent words glued into a
-    // single "word" ("systemĊYou") and BPE merged across line boundaries —
-    // chat-template prompts encoded to garbage tokens (MiniCPM5 gibberish).
-    // Returns ORIGINAL-text pieces; caller byte-encodes each piece separately.
+    // GPT-2 pretokenizer regex, implemented as a scanner (grim has no regex dep).
+    // Pattern: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+ The old version split ONLY on Ġ, so newline-adjacent words.
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let is_letter = |c: char| c.is_alphabetic();
@@ -1553,15 +1435,21 @@ fn split_on_gpt2_pretokenize(s: &str) -> Vec<String> {
             let j0 = i + 1;
             let j = if is_letter(chars[j0]) {
                 let mut j = j0;
-                while j < n && is_letter(chars[j]) { j += 1; }
+                while j < n && is_letter(chars[j]) {
+                    j += 1;
+                }
                 j
             } else if is_num(chars[j0]) {
                 let mut j = j0;
-                while j < n && is_num(chars[j]) { j += 1; }
+                while j < n && is_num(chars[j]) {
+                    j += 1;
+                }
                 j
             } else {
                 let mut j = j0;
-                while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_num(chars[j]) { j += 1; }
+                while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_num(chars[j]) {
+                    j += 1;
+                }
                 j
             };
             words.push(chars[i..j].iter().collect());
@@ -1571,21 +1459,27 @@ fn split_on_gpt2_pretokenize(s: &str) -> Vec<String> {
 
         if is_letter(c) {
             let mut j = i;
-            while j < n && is_letter(chars[j]) { j += 1; }
+            while j < n && is_letter(chars[j]) {
+                j += 1;
+            }
             words.push(chars[i..j].iter().collect());
             i = j;
             continue;
         }
         if is_num(c) {
             let mut j = i;
-            while j < n && is_num(chars[j]) { j += 1; }
+            while j < n && is_num(chars[j]) {
+                j += 1;
+            }
             words.push(chars[i..j].iter().collect());
             i = j;
             continue;
         }
         if !is_ws(c) {
             let mut j = i;
-            while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_num(chars[j]) { j += 1; }
+            while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_num(chars[j]) {
+                j += 1;
+            }
             words.push(chars[i..j].iter().collect());
             i = j;
             continue;
@@ -1593,7 +1487,9 @@ fn split_on_gpt2_pretokenize(s: &str) -> Vec<String> {
 
         // Whitespace run.
         let mut j = i;
-        while j < n && is_ws(chars[j]) { j += 1; }
+        while j < n && is_ws(chars[j]) {
+            j += 1;
+        }
         if j == n {
             words.push(chars[i..j].iter().collect());
             i = j;
@@ -1681,10 +1577,8 @@ mod chat_template_tests {
     /// array and render the function definitions into the prompt.
     #[test]
     fn renders_tools_for_hermes_style_template() {
-        // Simplified Hermes-2-Pro tool section: emits an XML-ish block listing
-        // each tool's function name and reads the city property from the
-        // parameters schema (minijinja has no `tojson` filter, so we drill
-        // into the nested value directly instead).
+        // Simplified Hermes-2-Pro tool section: emits an XML-ish block listing each tool's function name and reads the city property
+        // from the parameters schema (minijinja has no `tojson` filter, so we drill into the nested value directly instead).
         let tpl = "{% if tools %}<tools>{% for t in tools %}<tool>{{ t['function']['name'] }} {{ t['function']['parameters']['properties']['city']['type'] }}</tool>{% endfor %}</tools>{% endif %}{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}".to_string();
         let msgs = vec![ChatMessage {
             role: "user".into(),
@@ -1800,11 +1694,8 @@ mod chat_template_tests {
         assert!(rendered.contains("tool: 72°F"), "tool message not rendered");
     }
 
-    /// LFM2 / HuggingFace templates use Python-dict methods (`.get()`,
-    /// `.items()`), whitespace-controlled tags (`{%- ... -%}`), and the `+`
-    /// operator for string concatenation — all of which need sanitizer
-    /// transforms to work under minijinja. This test exercises a template that
-    /// combines all three patterns (mirrors the real LFM2 chat template).
+    /// LFM2 / HuggingFace templates use Python-dict methods (`.get()`, `.items()`), whitespace-controlled tags (`{%- ...
+    /// -%}`), and the `+` operator for string concatenation - all of which need sanitizer transforms.
     #[test]
     fn renders_lfm2_style_template_with_compat_transforms() {
         let tpl = r#"{{- bos_token -}}
@@ -1852,10 +1743,8 @@ mod chat_template_tests {
         );
     }
 
-    /// HuggingFace templates call `raise_exception` with varying arity
-    /// (sometimes 1 arg, sometimes 2+). The function must accept any number
-    /// of arguments without failing the render. This reproduces the
-    /// "too many arguments (in <string>:6)" error seen with MiniCPM5.
+    /// HuggingFace templates call `raise_exception` with varying arity (sometimes 1 arg, sometimes 2+).
+    /// The function must accept any number of arguments without failing the render.
     #[test]
     fn renders_template_with_raise_exception_multi_arg() {
         let tpl = r#"{%- if messages | length > 100 -%}
@@ -1878,8 +1767,7 @@ mod chat_template_tests {
     }
 
     /// HuggingFace templates (e.g. MiniCPM5, Ternary-Bonsai) use Python string
-    /// methods `.startswith()` and `.endswith()` which minijinja does not
-    /// implement. The sanitizer must transform them into slice comparisons.
+    /// methods `.startswith()` and `.endswith()` which minijinja does not implement.
     #[test]
     fn renders_template_with_startswith_endswith() {
         let tpl = r#"{%- set s = "hello world" -%}
@@ -1932,9 +1820,8 @@ mod chat_template_tests {
 mod wi_e3_tests {
     use super::*;
 
-    /// WI-E3: parallel chunked encode must produce byte-identical output to
-    /// the serial path. The threshold is 8192 bytes, so build a >8 KiB sample
-    /// and compare against forced-serial encoding (encode each chunk small).
+    /// WI-E3: parallel chunked encode must produce byte-identical output to the serial path.
+    /// The threshold is 8192 bytes, so build a >8 KiB sample and compare against forced-serial.
     #[test]
     fn parallel_encode_matches_serial_on_mixed_text() {
         let tok = GgufTokenizer::default();

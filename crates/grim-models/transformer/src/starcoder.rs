@@ -8,9 +8,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::model::{Llama, LlamaConfig};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct StarcoderConfig {
@@ -38,9 +36,7 @@ impl ModelConfig for StarcoderConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama
-// ---------------------------------------------------------------------------
+// Model - thin wrapper around Llama
 
 pub struct Starcoder {
     pub cfg: StarcoderConfig,

@@ -1,15 +1,5 @@
-//! `grim arch-plugin generate` — generate and install an architecture compatibility
-//! plugin (.grimplugin) from a HuggingFace model repo.
-//!
+//! `grim arch-plugin generate` - generate and install an architecture compatibility plugin (.grimplugin) from a HuggingFace model repo.
 //! This is the CLI entry point for the `ArchCompatSpec` → `.grimplugin` workflow.
-//! It fetches config.json via the HF Hub API (through `ArchCompatSpec::from_hf_model_id`),
-//! validates required fields, and installs the plugin into `grim_plugins_dir()` where
-//! `model_loader.rs`'s `resolve_arch_compat_spec` can discover it at model-load time.
-//!
-//! This is deliberately a top-level `Commands::ArchPlugin` variant, NOT folded into
-//! `PluginCommands`, because the generated `.grimplugin` is model-loading metadata
-//! consumed by `model_loader.rs`, not a WASM/dylib plugin consumed by
-//! `PluginRegistry::scan_plugin_directory`.
 
 use grim_core::error::{Error, Result};
 use grim_plugin::ArchCompatSpec;
@@ -17,13 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Generate and install a .grimplugin from a HuggingFace model repo.
-///
-/// `model_id` is an `hf:org/repo` reference (e.g. `hf:Qwen/Qwen3.8-27B`).
-/// Resolve the install path for a given output filename and plugins directory.
-///
-/// Returns `Err` if the path is absolute or escaping and does not resolve
-/// inside `plugins_dir`, because such a path would not be auto-discoverable
-/// by `resolve_arch_compat_spec` and we should not tell the user it is.
+/// `model_id` is an `hf:org/repo` reference (e.g.
 fn resolve_install_path(
     out_path: &Path,
     plugins_dir: &Path,
@@ -33,9 +17,8 @@ fn resolve_install_path(
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        // Absolute or escaping path — only allow if it's inside plugins_dir.
-        // Use a string-prefix check on the display strings since canonicalization
-        // may fail for paths that don't exist yet.
+        // Absolute or escaping path - only allow if it's inside plugins_dir.
+        // Use a string-prefix check on the display strings since canonicalization may fail for paths that.
         let out_display = out_path.display().to_string();
         let plugins_display = plugins_dir.display().to_string();
         if out_display.starts_with(&plugins_display) || out_display == plugins_display {
@@ -114,10 +97,7 @@ pub async fn cmd_arch_plugin_generate(model_id: &str, output: Option<String>) ->
 }
 
 /// Validate that a spec has the required fields for installation.
-///
-/// `from_hf_model_id` does this internally, but we re-check here as a
-/// defense-in-depth gate. This mirrors the validation that `compat.rs` had
-/// before it was deleted.
+/// `from_hf_model_id` does this internally, but we re-check here as a defense-in-depth gate.
 fn validate_spec(spec: &ArchCompatSpec) -> Result<()> {
     if spec.model_type.is_empty() || spec.model_type == "custom" {
         return Err(Error::Config(
@@ -282,9 +262,7 @@ mod tests {
         assert!(validate_spec(&spec).is_ok());
     }
 
-    // ---------------------------------------------------------------------------
     // Tests for resolve_install_path
-    // ---------------------------------------------------------------------------
 
     #[test]
     fn resolve_install_path_rejects_absolute_path_outside_plugins_dir() {

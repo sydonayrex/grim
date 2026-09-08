@@ -1,9 +1,5 @@
 //! AdamW optimizer implementation for LoRA trainable parameters (WI-T4).
-//!
-//! Provides step update arithmetic for 1st moment (m) and 2nd moment (v) tracking,
-//! alongside serialization to and from `.grim.train` sidecars (`TrainState`).
-//!
-//! Also includes learning rate schedules and additional optimizer variants.
+//! Provides step update arithmetic for 1st moment (m) and 2nd moment (v) tracking, alongside serialization.
 
 use crate::param::{ParamId, TrainableParams};
 use grim_format::train::{TrainBlob, TrainFpFormat, TrainState};
@@ -139,11 +135,7 @@ impl std::fmt::Display for LRScheduler {
 }
 
 /// Selection of available optimizer variants.
-///
-/// Only the first six variants have a concrete `Optimizer` implementation in
-/// this crate. The remaining variants (AdamWBnb and up) are declared to keep
-/// the CLI surface stable and are rejected with `Error::Unimplemented` by
-/// `Optimizer::new` until their implementations land.
+/// Only the first six variants have a concrete `Optimizer` implementation in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OptimizerKind {
     /// Standard AdamW with FP32 moment buffers.
@@ -495,9 +487,8 @@ impl Optimizer {
         }
     }
 
-    /// Recreate this optimizer for another rank and copy its serialized
-    /// moments/state into the target parameter registry. This is the
-    /// rank-replica primitive: a new rank must not restart Adam moments.
+    /// Recreate this optimizer for another rank and copy its serialized moments/state into the target parameter registry.
+    /// This is the rank-replica primitive: a new rank must not restart Adam moments.
     pub fn fork_for_rank(
         &self,
         source_params: &TrainableParams,
@@ -672,13 +663,8 @@ pub struct AdamW {
     pub m: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
     /// 2nd moment vector (v) per trainable parameter ID (device-resident).
     pub v: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
-    /// Audit fix (grim-models-adjacent pass): PER-PARAMETER time steps for
-    /// `step_param` (the fused LOMO/backward_step path). The old code derived
-    /// bias corrections from `step_count`, which only `step()` increments —
-    /// a fused streaming run never advanced it, so bias correction stayed at
-    /// t=1 forever and updates were permanently mis-scaled (~1/beta1). Each
-    /// parameter now counts its own update; `step()` remains the batch entry
-    /// and behaves identically because it steps every param once.
+    /// Audit fix (grim-models-adjacent pass): PER-PARAMETER time steps for `step_param` (the fused LOMO/backward_step path).
+    /// The old code derived bias corrections from `step_count`, which only `step()` increments - a fused.
     pub param_steps: HashMap<ParamId, usize>,
 }
 
@@ -738,12 +724,8 @@ impl AdamW {
         };
         let weight_decay = self.config.weight_decay;
 
-        // Audit fix: bias corrections now come from THIS parameter's own
-        // update count (incremented below), not from `step_count` — which
-        // only the batch `step()` entry increments. The fused streaming path
-        // (`backward_step`) calls `step_param` directly, so its bias
-        // correction used to stay frozen at t=1 forever (~1/beta1 update
-        // mis-scale).
+        // Audit fix: bias corrections now come from THIS parameter's own update count (incremented below), not from `step_count` - which only the batch `step()` entry increments.
+        // The fused streaming path (`backward_step`) calls `step_param` directly, so its bias correction used to stay.
         let sc = {
             let t = self.param_steps.entry(id).or_insert(0);
             *t += 1;
@@ -948,10 +930,7 @@ fn decode_blob_f32s(bytes: &[u8], fmt: TrainFpFormat) -> Result<Vec<f32>> {
 }
 
 /// Persist only the parameter data + step count (no optimizer moments).
-///
-/// Used by optimizer variants whose moment buffers are not yet serialized to
-/// `.grim.train` (Lion, Lion8Bit, Adafactor, PagedAdamW moments are pending;
-/// AdamW persists m/v via its own richer implementation).
+/// Used by optimizer variants whose moment buffers are not yet serialized to `.grim.train` (Lion, Lion8Bit,.
 pub(crate) fn save_param_data_only(params: &TrainableParams, step_count: usize) -> TrainState {
     let mut state = TrainState {
         step: step_count as u64,
@@ -996,13 +975,10 @@ pub(crate) fn load_param_data_only(params: &mut TrainableParams, state: &TrainSt
     Ok(())
 }
 
-// ============================================================================
 // Lion Optimizer (Google's signed sparse action)
-// ============================================================================
 
-/// Hyperparameters for Lion optimizer.
-/// Lion = sign-based momentum: τ_t = β1 * τ_{t-1} + (1-β1) * g_t
-///        θ_t = θ_{t-1} - α * τ_t
+/// Hyperparameters for Lion optimizer. Lion = sign-based momentum: τ_t = β1 *
+/// τ_{t-1} + (1-β1) * g_t θ_t = θ_{t-1} - α * τ_t
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LionConfig {
     /// Learning rate (default: 1e-4)
@@ -1095,13 +1071,8 @@ impl Lion {
             return Ok(());
         }
 
-        // CPU fallback — REFERENCE Lion (Chen et al. 2023, NeurIPS):
-        //   τ_t = β1·m_{t-1} + (1-β1)·g         (fast/slow interpolation)
-        //   w_t = w_{t-1} − lr·(sign(τ_t) + wd·w_{t-1})   (sign step, decoupled decay)
-        //   m_t = β2·m_{t-1} + (1-β2)·g         (slow momentum, updated AFTER τ is taken)
-        // The previous fallback stored τ as m (no sign, β2 unused) — a
-        // sign-free SGDM, not Lion — and diverged from what the fused
-        // `fused_lion_step` kernel (beta1/beta2/sign) actually computes.
+        // CPU fallback - REFERENCE Lion (Chen et al.
+        // 2023, NeurIPS): τ_t = β1·m_{t-1} + (1-β1)·g (fast/slow interpolation) w_t = w_{t-1} − lr·(sign(τ_t) +.
         let m_old: Vec<f32> = m_st.to_cpu_vec_f32()?;
         let grad_vec: Vec<f32> = param.grad().to_vec_f32()?;
         let data_vec: Vec<f32> = param.data.to_vec_f32()?;
@@ -1160,10 +1131,7 @@ impl Lion {
     }
 }
 
-// ============================================================================
-// ============================================================================
 // 8-bit AdamW Optimizer
-// ============================================================================
 
 /// 8-bit AdamW optimizer with memory-efficient Q8_0 moment storage.
 /// Quantizes 1st (m) and 2nd (v) moments to Q8_0 blocks, saving ~75% moment memory vs FP32.
@@ -1366,13 +1334,10 @@ impl AdamW8Bit {
     }
 }
 
-// ============================================================================
 // Paged AdamW - Offloaded Moment Pages with Dirty-Set Tracking
-// ============================================================================
 
 /// Configuration for Paged AdamW optimizer.
-/// Paged AdamW offloads cold moment pages to host RAM with a dirty-set tracking
-/// mechanism and page-in on touch.
+/// Paged AdamW offloads cold moment pages to host RAM with a dirty-set tracking mechanism and.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PagedAdamWConfig {
     /// Learning rate
@@ -1630,9 +1595,7 @@ impl PagedAdamW {
     }
 }
 
-// ============================================================================
 // Lion8Bit Optimizer
-// ============================================================================
 
 /// Configuration for Lion8Bit optimizer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1736,9 +1699,7 @@ impl Lion8Bit {
     }
 }
 
-// ============================================================================
 // Adafactor Optimizer
-// ============================================================================
 
 /// Configuration for Adafactor optimizer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2344,19 +2305,9 @@ impl QGaLoreAdamW8Bit {
     }
 }
 
-// ============================================================================
 // Muon Optimizer (SPECTRAL-QLORA)
-// ============================================================================
 
-/// Hyperparameters for Muon optimizer.
-///
-/// Muon replaces AdamW for adapter-only training. It uses:
-/// - Newton-Schulz orthogonalization for the direction matrix (B, tall/thin)
-///   to keep it well-conditioned on the Stiefel manifold without second-moment storage.
-/// - 1-bit Sign-SGD for the magnitude matrix (A, wide/thin), with zero moment memory.
-///
-/// Split weight decay follows LoRA-Muon (2606.12921): different coefficient
-/// applied to A (is_a == true) vs B (is_a == false).
+/// Hyperparameters for Muon optimizer. Muon replaces AdamW for adapter-only training.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuonConfig {
     /// Learning rate for both matrices.
@@ -2386,17 +2337,7 @@ impl Default for MuonConfig {
 }
 
 /// Muon optimizer: Newton-Schulz + Sign-SGD with split weight decay.
-///
-/// - **B matrices** (`is_a == false`, shape `[out, rank]`, tall/thin): the
-///   gradient is orthogonalized via `subspace_newton_schulz_step` (reusing
-///   `grim-quant::soul_eater`), then accumulated into a momentum buffer and
-///   applied as `w -= lr * (m + wd_b * w)`.
-/// - **A matrices** (`is_a == true`, shape `[rank, in]`, wide/thin): 1-bit
-///   Sign-SGD update `w -= lr * (sign(g) + wd_a * w)`. No momentum buffer needed.
-///
-/// Only B matrices carry moment state. Checkpoints serialize B's momentum
-/// buffers using the `opt_m_{layer}_{adapter}_{b}` blob convention; A matrices
-/// are data-only (like Lion).
+/// - **B matrices** (`is_a == false`, shape `[out, rank]`, tall/thin): the gradient is orthogonalized via.
 pub struct Muon {
     pub config: MuonConfig,
     pub step_count: usize,
@@ -2426,10 +2367,7 @@ impl Muon {
     }
 
     /// Perform one optimization step over all parameters in `params`.
-    ///
-    /// B matrices (is_a == false): Newton-Schulz orthogonalization on the
-    /// gradient, then momentum update. A matrices (is_a == true): 1-bit
-    /// Sign-SGD with no momentum.
+    /// B matrices (is_a == false): Newton-Schulz orthogonalization on the gradient, then momentum update.
     pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
         self.step_count += 1;
 
@@ -2527,9 +2465,7 @@ impl Muon {
     }
 
     /// Save parameter data + B-matrix momentum buffers to a `TrainState`.
-    ///
     /// A matrices (sign-SGD) have no moment state and are data-only.
-    /// B matrices serialize their momentum as `opt_m_{layer}_{adapter}_b`.
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
         let mut state = TrainState {
             step: self.step_count as u64,
@@ -2613,10 +2549,7 @@ impl Muon {
 // ── M-Adam (Additive-Multiplicative Optimization) ───────────────────────────
 
 /// Configuration for M-Adam optimizer (arXiv:2607.10611).
-///
-/// Combines additive momentum tracking with a multiplicative learning-rate
-/// scaling factor derived from local gradient variance, stabilizing ultra-low
-/// precision (FP4/FP8) fine-tuning without step-size explosion.
+/// Combines additive momentum tracking with a multiplicative learning-rate scaling factor derived from local gradient variance,.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MAdamConfig {
     pub lr: f32,
@@ -3641,19 +3574,8 @@ mod tests {
 mod audit_tests {
     use super::*;
 
-    /// Audit gate: fused streaming steps (`step_param` called directly, as
-    /// `backward_step` does) must evolve the bias correction per update.
-    /// Pre-fix, `step_count` was never advanced on this path so corrections
-    /// stayed frozen at t=1 forever.
-    ///
-    /// Sequence g = [1, 0]: after t=1 AdamW lands at exactly -lr; at t=2 the
-    /// zero gradient leaves pure momentum, and the CORRECT t=2 correction
-    /// gives p2 = -lr - lr·m̂₂/(√v̂₂+ε):
-    ///   m₂ = β₁·0.1        = 0.09
-    ///   v₂ = β₂·0.001      = 0.000999
-    ///   ĉ₁ = 1-β₁²         = 0.19 ; ĉ₂ = 1-β₂² = 0.001999
-    ///   p₂ = -0.1 - 0.1·(0.09/0.19)/√(0.000999/0.001999) ≈ -0.166946
-    /// A frozen t=1 instead yields ≈ -0.189959 — the gate separates them.
+    /// Audit gate: fused streaming steps (`step_param` called directly, as `backward_step` does) must evolve the bias correction per update.
+    /// Pre-fix, `step_count` was never advanced on this path so corrections stayed frozen at t=1 forever.
     #[test]
     fn step_param_advances_per_param_bias_correction() {
         use grim_backend_cpu::cpu_tensor;

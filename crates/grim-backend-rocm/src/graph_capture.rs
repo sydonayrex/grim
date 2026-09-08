@@ -1,19 +1,5 @@
-//! Phase-3 §3.2 — HIP graph capture/replay for the fused decode step.
-//!
-//! `GraphCaptureManager` captures a closure's recorded stream into a
-//! `DecodeGraph`, caches it per-shape key, and replays by `DecodegKey`.
-//! Reuse hits the cache; the graph is created once per key and reused
-//! on every replay, which is the source of the 15-30 µs/token gain the
-//! spec calls out.
-//!
-//! Skill attribution:
-//! - `rust-gpu-parallelism` — HIP graph capture API (`hipStreamBeginCapture`,
-//!   `EndCapture`, `hipGraphInstantiate`, `hipGraphLaunch`).
-//! - `rust-ai-ml-inference-guide` Action 9 — graph capture for the
-//!   repeated decode step; invalidate via `hipGraphExecUpdate` on
-//!   weight/shape change.
-//! - `rocm-profiling-perf` — JIT warm-up guard: capture only after the
-//!   underlying kernels are loaded (Item 2 of the original implementation).
+//! Phase-3 §3.2 - HIP graph capture/replay for the fused decode step.
+//! `GraphCaptureManager` captures a closure's recorded stream into a `DecodeGraph`, caches it per-shape key, and replays.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -27,10 +13,8 @@ use crate::{
     hipStreamEndCapture, hipStreamSynchronize, hipSuccess,
 };
 
-/// Key for the cached graph: every captured kernel sequence is keyed by
-/// the runtime shape of the decoder. See `rocm-quantization-inference` /
-/// `rust-ai-ml-inference-guide` for how to materialize per-arch variants
-/// off the side-of-the-spec metadata (`target_gfx`).
+/// Key for the cached graph: every captured kernel sequence is keyed by the runtime shape of the decoder.
+/// See `rocm-quantization-inference` / `rust-ai-ml-inference-guide` for how to materialize per-arch variants off the side-of-the-spec metadata (`target_gfx`).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct DecodeGraphKey {
     pub batch: u32,
@@ -42,9 +26,8 @@ pub struct DecodeGraphKey {
     pub fused_dequant: bool,
 }
 
-/// A captured HIP graph plus its instantiated executable. Both handles
-/// are reclaimed on `Drop` so the device teardown never leaks graph
-/// resources even if a key is overwritten.
+/// A captured HIP graph plus its instantiated executable.
+/// Both handles are reclaimed on `Drop` so the device teardown never leaks graph resources even.
 #[derive(Debug)]
 pub struct DecodeGraph {
     graph: *mut c_void,
@@ -113,9 +96,8 @@ impl GraphCaptureManager {
         }
     }
 
-    /// Lazily create the capture stream. If creation fails, returns the
-    /// error and keeps the cache empty; callers will get `Err` again on
-    /// the next call (no silent CPU fallback per `rust-gpu-discipline` §3).
+    /// Lazily create the capture stream. If creation fails, returns the error and keeps the cache empty;
+    /// callers will get `Err` again on the next call (no silent CPU fallback per `rust-gpu-discipline` §3).
     fn ensure_capture_stream(&self) -> Result<*mut c_void> {
         if let Some(s) = *self
             .capture_stream
@@ -139,10 +121,8 @@ impl GraphCaptureManager {
         Ok(stream)
     }
 
-    /// Capture-once, replay-many read-through cache. The closure runs
-    /// **at most once per key**; subsequent calls hand back the same
-    /// `Arc<DecodeGraph>`. After `max_entries` unique keys are captured
-    /// without reuse, older entries are evicted (LRU).
+    /// Capture-once, replay-many read-through cache.
+    /// The closure runs **at most once per key**; subsequent calls hand back the same `Arc<DecodeGraph>`.
     pub fn get_or_capture<F>(&self, key: DecodeGraphKey, capture: F) -> Result<Arc<DecodeGraph>>
     where
         F: FnOnce(*mut c_void) -> Result<()> + Send,
@@ -383,20 +363,16 @@ impl Drop for GraphCaptureManager {
     }
 }
 
-// =============================================================================
-// Legacy HIP graph wrapper (Item 5 first iteration — `hip_graph_launch` +
-// `CapturedGraph` + `HipGraphExecutor`). Kept here so lib.rs stays small;
-// the modern `GraphCaptureManager` above is the Phase-3 §3.2 implementation.
-// =============================================================================
+// Legacy HIP graph wrapper (Item 5 first iteration - `hip_graph_launch` + `CapturedGraph` + `HipGraphExecutor`).
+// Kept here so lib.rs stays small; the modern `GraphCaptureManager` above is the Phase-3 §3.2 implementation.
 
 /// Thin `hipGraphLaunch` wrapper.
 pub fn hip_graph_launch(graph_exec: *mut c_void, stream: *mut c_void) -> HipErrorT {
     unsafe { hipGraphLaunch(graph_exec, stream) }
 }
 
-/// A captured HIP graph plus its instantiated executable, owned under a key in
-/// `RocmDevice::captured_graphs`. Frees both handles when dropped so a device
-/// teardown never leaks graph resources even if a key is overwritten.
+/// A captured HIP graph plus its instantiated executable, owned under a key in `RocmDevice::captured_graphs`.
+/// Frees both handles when dropped so a device teardown never leaks graph resources even if.
 #[derive(Debug)]
 pub struct CapturedGraph {
     pub(crate) graph: *mut c_void,
@@ -452,8 +428,7 @@ impl HipGraphExecutor {
             }
 
             // Instantiate graph before taking ownership of the stream.
-            // If instantiation fails, we destroy the stream here and return —
-            // self.stream is never set, so Drop won't double-destroy.
+            // If instantiation fails, we destroy the stream here and return - self.stream is never set,.
             let res = hipGraphInstantiate(
                 &mut exec,
                 self.graph,
@@ -484,10 +459,8 @@ impl HipGraphExecutor {
             _ => return Err(Error::Backend("Graph not instantiated".into())),
         };
 
-        // Pin the device (P1-7 discipline): the graph and its stream were
-        // created against `device_ordinal`'s context. If the calling thread's
-        // current device differs, hipStreamSynchronize would target the wrong
-        // context and either deadlock or sync the wrong stream.
+        // Pin the device (P1-7 discipline): the graph and its stream were created against `device_ordinal`'s context.
+        // If the calling thread's current device differs, hipStreamSynchronize would target the wrong context and either.
         let _guard = crate::device::util::DeviceGuard::set(self.device_ordinal as i32);
         unsafe {
             let res = hipGraphLaunch(exec, stream);

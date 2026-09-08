@@ -8,9 +8,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::model::{Llama, LlamaConfig};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct ExaoneConfig {
@@ -38,9 +36,7 @@ impl ModelConfig for ExaoneConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama
-// ---------------------------------------------------------------------------
+// Model - thin wrapper around Llama
 
 pub struct Exaone {
     pub cfg: ExaoneConfig,

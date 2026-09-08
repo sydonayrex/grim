@@ -8,28 +8,15 @@ use serde::{Deserialize, Serialize};
 /// roughly doubles VRAM overhead for a quantized base + LoRA adapter.
 pub const VALID_LORA_RANKS: &[u32] = &[8, 16, 32, 64];
 
-/// Strongly typed LoRA rank. Constructing one with `rank == 0` is a
-/// logic bug downstream — `apply_and_record_lora` divides by the rank
-/// — so the type refuses to admit zero values at the boundary.
-///
-/// M7: replaces the flow where `lora_rank: u32` slipped through the
-/// validation chain and reached the autograd function. The newtype
-/// constructor is the single place a rank value is allowed to cross
-/// into the rest of grim-garage.
-///
-/// Serde representation: serialized as the inner `u32` (transparent)
-/// — round-trip via `serde_qs_encode/from` works through `HyperparamFormV1`,
-/// not directly here. `LoraRank::new(...)` is the boundary that
-/// refuses zero; downstream deserializers are expected to call
-/// `LoraRank::try_from(u32)`.
+/// Strongly typed LoRA rank. Constructing one with `rank == 0` is a logic bug downstream -
+/// `apply_and_record_lora` divides by the rank - so the type refuses to admit zero values at the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LoraRank(u32);
 
 impl LoraRank {
-    /// Construct a `LoraRank` if and only if `rank > 0`. Snap to the
-    /// nearest valid tier via `pick_closest`. Returns Err on
-    /// `rank == 0`.
+    /// Construct a `LoraRank` if and only if `rank > 0`.
+    /// Snap to the nearest valid tier via `pick_closest`.
     pub fn new(rank: u32) -> Result<Self, LoraRankError> {
         if rank == 0 {
             return Err(LoraRankError::Zero);
@@ -50,14 +37,12 @@ impl LoraRank {
         Ok(Self(rank))
     }
 
-    /// Maximum rank allowed under QLoRA at 4-bit quantization, given
-    /// an 8 GB reference GPU budget. Empirical ceiling — settings
-    /// higher than this routinely OOM the named GPUs.
+    /// Maximum rank allowed under QLoRA at 4-bit quantization, given an 8 GB reference GPU budget.
+    /// Empirical ceiling - settings higher than this routinely OOM the named GPUs.
     pub const QLORA_MAX_RANK: u32 = 32;
 
-    /// Validate the pair (mode, rank) before spawning the worker. Returns
-    /// Err if rank > QLORA_MAX_RANK under QLoRA (the bug-fix for the
-    /// missing QLoRA×rank bound). Pre-fix the value could ship through.
+    /// Validate the pair (mode, rank) before spawning the worker.
+    /// Returns Err if rank > QLORA_MAX_RANK under QLoRA (the bug-fix for the missing QLoRA×rank bound).
     pub fn validate_for_mode(&self, mode: crate::jobs::TrainingMode) -> Result<(), LoraRankError> {
         if mode == crate::jobs::TrainingMode::QLoRA && self.0 > Self::QLORA_MAX_RANK {
             return Err(LoraRankError::QloraTooLarge {
@@ -193,8 +178,7 @@ impl HyperparamFormV1 {
     /// user types a custom value or moves between modes.
     pub fn normalized(mut self) -> Self {
         // M7: refuse to land on zero. Constructing a LoraRank(0) is
-        // the bug-fix; normalized() that produced 0 silently
-        // reached the autograd layer. Snap + lift.
+        // the bug-fix; normalized() that produced 0 silently reached the autograd layer.
         let rank = LoraRank::new(self.lora_rank).unwrap_or_default();
         self.lora_rank = rank.value();
         self
@@ -252,33 +236,20 @@ mod tests {
         assert_eq!(f.lora_rank, 32);
     }
 
-    // -----------------------------------------------------------------
     // M7 golden-style tests for `LoraRank` (mutation-resistant).
-    //
-    // Each test below pins a single hand-derived numeric value or
-    // pinpoints a specific rejected path so a wrong shift, swapped
-    // predicate, or removed floor mutation breaks at least one
-    // assertion here. We model the test style on
-    // `crates/grim-quant/tests/golden_*.rs` — exact-value assertions
-    // over hand-constructed inputs, plus invariant assertions for
-    // larger suites.
-    // -----------------------------------------------------------------
+    // Each test below pins a single hand-derived numeric value or pinpoints a specific rejected path.
 
     #[test]
     fn lora_rank_rejects_zero_in_new() {
-        // The constructor (`LoraRank::new`) is the canonical
-        // boundary; lora_rank = 0 is a logic-bug. Pre-fix the value
-        // slipped through to the autograd layer. Post-fix `new(0)`
-        // must return Err, not silently default.
+        // The constructor (`LoraRank::new`) is the canonical boundary; lora_rank = 0 is a logic-bug.
+        // Pre-fix the value slipped through to the autograd layer.
         assert_eq!(LoraRank::new(0), Err(LoraRankError::Zero));
     }
 
     #[test]
     fn lora_rank_snaps_then_stores_value() {
-        // Hand-derived: pick_closest snap points to the nearest
-        // valid tier; pin specifically so a wrong distance metric
-        // (e.g. subtraction in the wrong direction) is caught.
-        // `pick_closest(10, [8, 16, 32, 64]) == 8` because |10-8|=2.
+        // Hand-derived: pick_closest snap points to the nearest valid tier; pin specifically so a wrong distance metric (e.g.
+        // subtraction in the wrong direction) is caught.
         let r = LoraRank::new(10).unwrap();
         assert_eq!(r.value(), 8);
         // `pick_closest(20, …) == 16` because |20-16|=4 < |20-32|=12.
@@ -297,9 +268,8 @@ mod tests {
 
     #[test]
     fn lora_rank_from_valid_rejects_unknown_tier() {
-        // `from_valid` is the strict entry point used by trusted
-        // config-file readers — it must reject anything not in the
-        // canonical set rather than snapping.
+        // `from_valid` is the strict entry point used by trusted config-file readers -
+        // it must reject anything not in the canonical set rather than snapping.
         assert_eq!(
             LoraRank::from_valid(7),
             Err(LoraRankError::NotInTiers(7)),
@@ -314,10 +284,8 @@ mod tests {
 
     #[test]
     fn lora_rank_qlora_validation_caps_at_32() {
-        // M7 QLoRA×rank bound: rank > QLORA_MAX_RANK on QLoRA must
-        // surface as QloraTooLarge. Pre-fix no such check existed;
-        // a 64-rank QLoRA job would have been accepted and likely
-        // OOM'd on a mid-tier GPU.
+        // M7 QLoRA×rank bound: rank > QLORA_MAX_RANK on QLoRA must surface as QloraTooLarge.
+        // Pre-fix no such check existed; a 64-rank QLoRA job would have been accepted and likely.
         let rank_64 = LoraRank::new(64).unwrap();
         assert_eq!(
             rank_64.validate_for_mode(crate::jobs::TrainingMode::QLoRA),
@@ -353,26 +321,22 @@ mod tests {
 
     #[test]
     fn lora_rank_default_returns_a_known_valid_tier() {
-        // `Default::default()` is the contract for new-job promotion;
-        // it must always produce a tier-membership rank so the field
-        // doesn't trip the new LoraRank checks.
+        // `Default::default()` is the contract for new-job promotion; it must always produce
+        // a tier-membership rank so the field doesn't trip the new LoraRank checks.
         assert_eq!(LoraRank::default().value(), 16);
     }
 
     #[test]
     fn lora_rank_serde_round_trips_through_u32() {
-        // The newtype round-trips via `serde(transparent)` to a bare
-        // integer on the wire. Pin the round-trip so a
-        // serialization-shape regression is caught.
+        // The newtype round-trips via `serde(transparent)` to a bare integer on the wire.
+        // Pin the round-trip so a serialization-shape regression is caught.
         let r = LoraRank::new(16).unwrap();
         let s = serde_json::to_string(&r).unwrap();
         // The wire form is the integer value, not a JSON object —
         // because of `#[serde(transparent)]`.
         assert_eq!(s, "16");
-        // Transparent newtype deserializes from a bare integer; we
-        // don't reject zero at the JSON parse step (the
-        // TryFrom<u32> adapter is what enforces the rejection at
-        // construction time). Confirm the bare-int form is stable.
+        // Transparent newtype deserializes from a bare integer; we don't reject zero at the JSON parse step (the TryFrom<u32> adapter is what enforces the rejection at construction time).
+        // Confirm the bare-int form is stable.
         let back: LoraRank = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
     }
@@ -387,27 +351,8 @@ mod tests {
         assert_eq!(LoraRank::new(0), Err(LoraRankError::Zero));
     }
 
-    // -----------------------------------------------------------------
     // Mutation-resistant golden tests for `pick_closest` (lora snap).
     // Written through `LoraRank::new` to avoid exposing the helper.
-    // Each hand-picked value pins the expected nearest-tier output;
-    // a mutant that flips the comparator direction, swaps the abs()
-    // call to a sign, or rewrites the distance metric breaks at
-    // least one assertion.
-    //
-    // Tiers:      [8, 16, 32, 64]
-    // Hand-derived distances for boundary points:
-    //   value  | nearest tier | reason
-    //     4    |  8           | |8-4|=4 < |16-4|=12
-    //     9    |  8           | |9-8|=1  < |16-9|=7
-    //    11    |  8           | |11-8|=3 < |16-11|=5 — 8 is closer
-    //    12    | 16           | |16-12|=4 < |8-12|=4 — equal; precondition decides 16 (the larger-index equals case)
-    //    13    | 16           | |16-13|=3 < |8-13|=5
-    //    24    | 16           | |24-16|=8 < |32-24|=8 — equal-distant: same tie-break policy as above
-    //    25    | 32           | |32-25|=7 < |16-25|=9 (no tie)
-    //    36    | 32           | |36-32|=4 < |64-36|=28
-    //    56    | 64           | |64-56|=8 < |32-56|=24
-    // -----------------------------------------------------------------
     #[test]
     fn pick_closest_hand_picked_boundary_snap_table() {
         // Pin each value to its expected nearest tier. A reflective

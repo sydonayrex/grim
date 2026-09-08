@@ -1,59 +1,5 @@
 //! Segment-wise activation replay for real gradient checkpointing (WI-X13).
-//!
-//! [`crate::tape::Tape::free_intermediate_activations`] drops intra-segment
-//! intermediates after the forward pass. During backward, a freed segment is
-//! reconstructed by [`replay_segment`]: entries with `segment_idx == seg`
-//! are re-executed in forward order against the retained inputs (segment
-//! boundaries, parameter tensors, cross-segment inputs), and the recomputed
-//! activations are placed into an overlay map owned by the backward pass.
-//!
-//! # Semantics source (per op)
-//!
-//! Every replayed forward mirrors the EXACT semantics of its production
-//! twin / backward counterpart:
-//!
-//! - `MatMul`: `output = eff(A) @ eff(B)` honoring `transpose_a/transpose_b`.
-//!   Linear layers record `transpose_b = true` (`y = x @ W^T`; see
-//!   `grim-engine/src/streaming_forward.rs` and `matmul_backward` in ops.rs).
-//! - `Add` / `Scale`: trivial routes matching `add_backward` /
-//!   `scale_backward` in ops.rs. Add supports elementwise and row-broadcast
-//!   (the shapes production call sites use).
-//! - `LoRAApply`: `base + scale * (x @ A^T) @ B^T` with
-//!   `scale = alpha / rank`, byte-for-byte the math of
-//!   `BackendDevice::lora_accumulate` (grim-tensor) as invoked by
-//!   `apply_and_record_lora` (ops.rs). A is `[rank, in]`, B is `[out, rank]`.
-//!   Note: RSLoRA's `alpha/sqrt(rank)` scaling is not representable in
-//!   `TapeMetadata::LoRAApply`, so — exactly like `lora_backward` — replay
-//!   assumes the standard `alpha/rank`.
-//! - `SiluMul`: `silu(gate) * up` with `silu(v) = v / (1 + exp(-v))`
-//!   (`CpuDevice::silu_mul`; matches the CPU path of `silu_mul_backward`).
-//! - `RmsNorm`: row-wise over the last dim,
-//!   `(x / sqrt(mean(x^2) + eps)) * weight` (`CpuDevice::rms_norm`; same rms
-//!   definition as `rmsnorm_backward`).
-//! - `Rope`: half-split pair rotation `(x_i, x_{i+h})` by `(cos_i, sin_i)`:
-//!   `y_i = x_i c - x_{i+h} s`, `y_{i+h} = x_i s + x_{i+h} c`. This is the
-//!   exact inverse of `rope_backward` (ops.rs), which reads the recorded
-//!   cos/sin tensors — replayed activations therefore match what backward
-//!   expects. (The production `CpuDevice::rope` kernel uses interleaved
-//!   adjacent pairs and derives its tables internally; no call site records
-//!   Rope entries today, so backward consistency wins here.)
-//! - `Softmax`: numerically stable max-subtracted softmax along the last
-//!   dim (matches what `softmax_backward` expects: sum-to-one rows).
-//! - `Embedding`: `output[i] = weight[token_ids[i]]` row gather
-//!   (`CpuDevice::embedding`; matches `embedding_backward`'s scatter-add).
-//!
-//! Output shapes come from metadata plus resolved input shapes (`MatMul`
-//! from `m,k,n`, `Embedding` from `[token_ids.len(), hidden_dim]`,
-//! everything else from its primary input's shape) because freed outputs no
-//! longer have a live tensor to copy the shape from.
-//!
-//! # Device migration
-//!
-//! Replay executes on f32 CPU storages regardless of where the original
-//! forward ran. Values are what matter for gradient parity; a GPU-trained
-//! activation being replayed on CPU is acceptable by design. Reconstructed
-//! tensors are plain F32 CPU tensors with default provenance (same
-//! construction pattern as the crate's test helpers).
+//! [`crate::tape::Tape::free_intermediate_activations`] drops intra-segment intermediates after the forward pass.
 
 use crate::tape::{Tape, TapeEntry, TapeKind, TapeMetadata, TensorId};
 use grim_tensor::error::{Error, Result};
@@ -74,15 +20,8 @@ pub fn reset_replay_count() {
     REPLAY_COUNT.store(0, Ordering::Relaxed);
 }
 
-/// Reconstruct every dropped intermediate produced by checkpoint segment
-/// `seg`.
-///
-/// Entries with `segment_idx == seg` are replayed in forward order. Each
-/// input is resolved from `overlay` first, then from `tape` (retained
-/// boundary/cross-segment/parameter tensors); an input present in neither is
-/// a hard error. Outputs are inserted into `overlay`. Entries whose output is
-/// still materialized (live in the tape or already overlaid) are skipped, so
-/// repeated calls for an already-replayed segment are cheap no-ops.
+/// Reconstruct every dropped intermediate produced by checkpoint segment `seg`.
+/// Entries with `segment_idx == seg` are replayed in forward order.
 pub fn replay_segment(
     tape: &Tape,
     seg: usize,

@@ -3,9 +3,8 @@
 /// HIP source for `grim_fused_dequant_gemm_f16`.
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
-    // FUSED-QUANT-BWD §4.1: master-weight dtype tags. The production path is
-    // the fp32 master; the legacy fp16 truncation is retained only so
-    // backwards-compat tests can still audit the exact old truncation value.
+    // FUSED-QUANT-BWD §4.1: master-weight dtype tags.
+    // The production path is the fp32 master; the legacy fp16 truncation is retained only so.
     __device__ __constant__ int master_weight_dtype_tag = 32;
     __device__ __constant__ int legacy_weight_dtype_tag = 16;
 
@@ -117,23 +116,8 @@ extern "C" {
     }
 
 
-    // ────────────────────────────────────────────────────────────────────
-    // Backward kernel with Straight-Through Estimator (STE).
-    //
-    // FUSED-QUANT-BWD §3: gradients are computed against the dequantized
-    // weight (B_dequant) directly — the quantize→dequantize step is treated
-    // as the identity for gradient flow (STE). This means:
-    //
-    //   dX[m, k] = sum_n dY[m, n] * dequant(B_codes, B_scales)[col=n, k]
-    //
-    // The quantization itself receives zero gradient (the STE identity maps
-    // the upstream gradient straight through to the dequantized values).
-    // This avoids differentiating the rounding/discretization step, which
-    // would introduce biased gradient estimates. The scale-update path
-    // (M+Adam fusion, §4) is handled by a SEPARATE kernel invocation
-    // (`grim_madam_update_f32`) that runs AFTER all tile gradients are
-    // accumulated, avoiding the stale-scale one-step update issue.
-    // ────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────── Backward kernel with Straight-Through Estimator (STE).
+    // FUSED-QUANT-BWD §3: gradients are computed against the dequantized weight (B_dequant) directly - the quantize→dequantize step.
     __global__ void grim_fused_dequant_backward_gemm_f16(
         const _Float16* __restrict__ dY,
         const unsigned char* __restrict__ B_codes,
@@ -196,16 +180,13 @@ extern "C" {
                 }
             }
 
-            // STE: scale the gradient contribution. grad_scale = 1.0 for pure
-            // identity (straight-through); may be < 1.0 for gradient scaling
-            // on unstable tiles.
+            // STE: scale the gradient contribution. grad_scale = 1.0 for pure identity
+            // (straight-through); may be < 1.0 for gradient scaling on unstable tiles.
             acc += dy_val * w_val * grad_scale;
         }
 
-        // dX dtype is the backward GEMM's output dtype. The old code stored
-        // dX in fp16 in-place; the first step is to make that a typed constant
-        // too, so the training path can re-verify the dtype it receives from
-        // the backward kernel against one source of truth.
+        // dX dtype is the backward GEMM's output dtype.
+        // The old code stored dX in fp16 in-place; the first step is to make that.
         if (master_weight_dtype_tag == 16) {
             dX[row * stride_dx + k] = (_Float16)acc;
         } else {
@@ -231,14 +212,12 @@ extern "C" {
         const int row = (int)(idx / K);  // M-dimension of dX
         const int col = (int)(idx % K);  // K-dimension of dX
 
-        // The weight is [K, N] — we update all N columns for this (row, col) pair.
-        // In the M+Adam fusion, each thread handles one (m, k) element of dX
-        // and updates the corresponding K row of weight (N columns).
+        // The weight is [K, N] - we update all N columns for this (row, col) pair.
+        // In the M+Adam fusion, each thread handles one (m, k) element of dX and updates.
         const int w_row = col;  // weight row = dX's K dimension
 
-        // Hoist the per-thread gradient value out of the N-loop. The old
-        // impl re-read the same (row, col) from dX on every N iteration,
-        // which is O(M*N) redundant loads of one scalar (P4.1).
+        // Hoist the per-thread gradient value out of the N-loop.
+        // The old impl re-read the same (row, col) from dX on every N iteration, which.
         float dw = (float)dX[row * stride_dx + col];
 
         float* m_ptr = &m_buffer[w_row * N];     // per-column momentum row
@@ -261,11 +240,8 @@ extern "C" {
             float v_hat = *v_ptr / bias_corr_v;
             float update = m_hat / (sqrtf(v_hat) + eps);
 
-            // In-place weight update (scale-aware). The dtype written here is
-            // selected by `master_weight_dtype_tag` (§4.1): the production
-            // master is fp32 until the downstream consumers are re-verified
-            // against that layout; the old fp16 truncation is available only
-            // through the tagged legacy path for backwards-compat tests.
+            // In-place weight update (scale-aware). The dtype written here is selected by `master_weight_dtype_tag` (§4.1): the production master is fp32 until the downstream
+            // consumers are re-verified against that layout; the old fp16 truncation is available only through the tagged legacy path for backwards-compat tests.
             float new_w = w_val - lr * update * scale_val;
             if (master_weight_dtype_tag == 16) {
                 weight[w_row * stride_w + n] = (_Float16)new_w;
@@ -275,10 +251,7 @@ extern "C" {
             }
 
             // Scale-bump propagation: update only the owning column's scale.
-            // The old impl updated `scale[w_row]` on every N iteration of every
-            // thread — multiple redundant writes to the same column. The staged
-            // design (separate backward GEMM first) means the read-modify-write
-            // on scale is still safe, but we keep it column-scoped here too.
+            // The old impl updated `scale[w_row]` on every N iteration of every thread - multiple redundant.
             if (scale != nullptr) {
                 float new_peak = fabsf(new_w);
                 float new_scale = new_peak / 255.0f;
@@ -295,17 +268,12 @@ extern "C" {
 mod self_tests {
     use super::*;
 
-    // ████ RED-TO-GREEN GATE: P1 golden test currently ASSERTS the tagged-path
-    // semantics and FAILS because the kernel body still stores `(float)new_w`
-    // under the fp32 master branch while also still emitting the redundant N-loop
-    // re-read of `dw`. Update this assertion list after the kernel body is
-    // brought to green against it. Do not touch this test module after the kernel
-    // changes; treat it as the contract.
+    // ████ RED-TO-GREEN GATE: P1 golden test currently ASSERTS the tagged-path semantics and FAILS because the kernel body still stores `(float)new_w` under the fp32 master branch while also still emitting the redundant N-loop re-read of `dw`.
+    // Update this assertion list after the kernel body is brought to green against it.
     #[test]
     fn p1_golden_madam_fp16_legacy_and_fp32_master_semantics() {
-        // Both tagged constants must exist so a test can drive each path. This
-        // is the gate the kernel must satisfy; it failed when legacy_weight_dtype_tag
-        // was only in the test and not the kernel.
+        // Both tagged constants must exist so a test can drive each path.
+        // This is the gate the kernel must satisfy; it failed when legacy_weight_dtype_tag was only in.
         assert!(
             KERNEL_SOURCE.contains("master_weight_dtype_tag"),
             "P1: master_weight_dtype_tag must be declared in the kernel source"
@@ -315,9 +283,8 @@ mod self_tests {
             "P1: legacy_weight_dtype_tag must be declared in the kernel source"
         );
 
-        // P1 semantic coverage: the kernel must keep both write paths for the
-        // optimizer step so a future downstream consumer can choose the layout
-        // it expects (fp16 legacy master vs fp32 master in-place).
+        // P1 semantic coverage: the kernel must keep both write paths for the optimizer step so a
+        // future downstream consumer can choose the layout it expects (fp16 legacy master vs fp32 master in-place).
         assert!(
             KERNEL_SOURCE.contains("master_weight_dtype_tag == 16"),
             "P1: legacy truncation path must be gated by the tag"

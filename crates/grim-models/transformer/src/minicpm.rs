@@ -78,10 +78,8 @@ impl MiniCpmBlock {
         let (local_num_heads, local_num_kv_heads, kv_head_replica_factor) =
             crate::block::plan_kv_head_sharding(cfg.num_heads, cfg.num_kv_heads, tp.world_size)?;
 
-        // Apply `scale_depth` rescaling only when the model metadata specifies
-        // it. MiniCPM2/3 use this per-layer scaling; MiniCPM5 does NOT. Default
-        // to 1.0 (no-op) so the `(factor - 1.0).abs() > 1e-5` guards in the
-        // forward pass skip the scaling entirely.
+        // Apply `scale_depth` rescaling only when the model metadata specifies it.
+        // MiniCPM2/3 use this per-layer scaling; MiniCPM5 does NOT.
         let scale_depth_factor = cfg.scale_depth.unwrap_or(1.0f32);
 
         let refs = MiniCpmConfigRefs {
@@ -197,10 +195,8 @@ impl MiniCpmBlock {
         layer: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let orig_dims = x.shape().dims().to_vec();
-        // Audit fix: these rank conversions must PHYSICALLY reshape the
-        // storage — a hand-rolled Tensor::new relabel leaves the storage
-        // 3-D and CPU matmul validates storage rank ("matmul expects 2-D
-        // inputs" on every multi-token forward).
+        // Audit fix: these rank conversions must PHYSICALLY reshape the storage - a hand-rolled Tensor::new relabel leaves
+        // the storage 3-D and CPU matmul validates storage rank ("matmul expects 2-D inputs" on every multi-token forward).
         let (x_2d, is_3d) = if orig_dims.len() == 3 {
             (
                 crate::block::reshaped_view(
@@ -223,14 +219,8 @@ impl MiniCpmBlock {
 
         let paged_attn_out = if let Some(sess) = session {
             if sess.has_paged_kv() {
-                // The pages must hold POST-RoPE keys (the classic
-                // LlamaLayerCache path caches k_rot and the dense attention
-                // reads it directly — the pre-fix code appended the RAW k,
-                // so every paged attention scored rotated queries against
-                // un-rotated keys).
-                // A FAILED append must skip the paged read: attending over
-                // pages missing this call's K/V silently corrupts output;
-                // falling back to the classic cache path is always correct.
+                // The pages must hold POST-RoPE keys (the classic LlamaLayerCache path caches k_rot and the dense attention reads it directly - the pre-fix code appended the RAW k, so every paged attention scored rotated queries against un-rotated keys).
+                // A FAILED append must skip the paged read: attending over pages missing this call's K/V.
                 if sess.append_kv_layer(layer, &k_rot, &v).is_ok() {
                     if let (Some(bt), Some((k_pages, v_pages, page_size))) =
                         (sess.block_table(), sess.paged_kv_handles(layer))
@@ -336,11 +326,8 @@ impl MiniCpmBlock {
         let head_dim = self.cfg.head_dim;
         debug_assert_eq!(d, num_heads * head_dim);
 
-        // Perf (WI-rope): the old path round-tripped through host memory —
-        // to_vec_f32 → CPU repack → from_cpu → rope → to_vec_f32 → CPU repack
-        // → from_cpu (six crossings per layer per step). [b, s, H·D] and
-        // [b, s·H, D] are the SAME contiguous layout, so the repack is a
-        // zero-copy relabel; rope runs device-side on the relabeled view.
+        // Perf (WI-rope): the old path round-tripped through host memory - to_vec_f32 → CPU repack → from_cpu → rope → to_vec_f32 → CPU repack → from_cpu (six crossings per layer per step).
+        // [b, s, H·D] and [b, s·H, D] are the SAME contiguous layout, so the repack.
         let rope_shape = Shape::new(vec![b, s * num_heads, head_dim]);
         let relabeled = Tensor::new(
             x.storage().clone(),
@@ -362,9 +349,8 @@ impl MiniCpmBlock {
             }
         }
 
-        // Device rope first (no host roundtrip); fall back to the generic
-        // Rope module (also [b, s·H, D]-shaped) for backends without a rope
-        // launcher. Output storage already carries rope_shape.
+        // Device rope first (no host roundtrip); fall back to the generic Rope module (also [b, s·H, D]-shaped) for backends without a rope launcher.
+        // Output storage already carries rope_shape.
         let dev = pick_device_for_storage_device(&self.dev);
         let rope_out = match dev.rope(
             relabeled.storage().as_ref(),
@@ -401,10 +387,8 @@ impl MiniCpmBlock {
         _positions: &[u32],
     ) -> Result<Tensor> {
         let q_dims = q.shape().dims().to_vec();
-        // Accept both 3-D (B, S, H*D) and 2-D (S, H*D) producers: the block
-        // converts its input to 2-D before the projections, so the classic
-        // path hands this function a 2-D q. (Audit fix: the pre-fix code
-        // indexed q_dims[1] as S unconditionally — garbage shapes for 2-D.)
+        // Accept both 3-D (B, S, H*D) and 2-D (S, H*D) producers: the block converts its input to 2-D before the projections, so the classic path hands this function a 2-D q.
+        // (Audit fix: the pre-fix code indexed q_dims[1] as S unconditionally - garbage shapes for 2-D.)
         let (b, s) = match q_dims.len() {
             3 => (q_dims[0], q_dims[1]),
             2 => (1, q_dims[0]),
@@ -486,13 +470,8 @@ impl MiniCpmBlock {
         ))
     }
 
-    /// Paged attention over the session KV pages. Audit fix (grim-models):
-    /// this was a STUB that ignored the block table and pages entirely and
-    /// computed `prefilled_self_attention(q, q, q)` — every engine-served
-    /// MiniCPM token attended to garbage (its own query as keys AND values)
-    /// instead of its history. Real implementation: gather the
-    /// block-table-addressed history (post-RoPE K + raw V, appended by the
-    /// caller BEFORE this call) and run offset-aware causal attention.
+    /// Paged attention over the session KV pages.
+    /// Audit fix (grim-models): this was a STUB that ignored the block table and pages entirely.
     #[allow(clippy::too_many_arguments)]
     fn paged_self_attention(
         &self,
@@ -522,10 +501,8 @@ impl MiniCpmBlock {
         let kv_seq_len = cache_offset + s;
         let row_elems = num_heads * head_dim;
 
-        // Single-token decode: run the paged kernel directly over the
-        // device-resident page arenas — the pages never cross to host.
-        // Multi-token prefill keeps the host gather path below (the paged
-        // kernel contract is one query token).
+        // Single-token decode: run the paged kernel directly over the device-resident page arenas - the pages never cross to host.
+        // Multi-token prefill keeps the host gather path below (the paged kernel contract is one query.
         if b == 1 && s == 1 && q.shape().elem_count() == row_elems {
             let dev = pick_device_for_storage_device(&self.dev);
             let bt_f32: Vec<f32> = block_table.iter().map(|&v| v as f32).collect();
@@ -550,10 +527,7 @@ impl MiniCpmBlock {
                 None,
                 &self.dev,
             )?;
-            return Ok(crate::block::reshaped_view(
-                &attn,
-                &Shape::new(vec![b, s, row_elems]),
-            )?);
+            return crate::block::reshaped_view(&attn, &Shape::new(vec![b, s, row_elems]));
         }
 
         let bt: Vec<usize> = block_table.iter().map(|&v| v as usize).collect();
@@ -567,7 +541,7 @@ impl MiniCpmBlock {
         )?;
 
         let q_data = q.to_vec_f32()?;
-        
+
         let kv_head: Vec<usize> = (0..num_heads)
             .map(|h| h * num_kv_heads / num_heads)
             .collect();
@@ -586,8 +560,8 @@ impl MiniCpmBlock {
                 row_elems,
                 kv_stride,
                 &kv_head,
-                        None,
-        );
+                None,
+            );
             out_total.extend_from_slice(&out);
         }
 
@@ -687,10 +661,8 @@ impl MiniCpmModel {
             logits_2d
         };
 
-        // Apply the MiniCPM logit scale (`dim_model_base / hidden_size`) only
-        // when the model metadata specifies `dim_model_base`. MiniCPM5 does NOT
-        // use this scaling — it is a standard Llama-style model. Default to 1.0
-        // (no-op) when absent.
+        // Apply the MiniCPM logit scale (`dim_model_base / hidden_size`) only when the model metadata specifies `dim_model_base`.
+        // MiniCPM5 does NOT use this scaling - it is a standard Llama-style model.
         let logit_scale = self
             .cfg
             .dim_model_base
@@ -741,7 +713,11 @@ impl CausalLm for MiniCpmModel {
         positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        eprintln!("[minicpm] forward: self.device={:?} session.has_paged_kv={}", self.device, session.has_paged_kv());
+        eprintln!(
+            "[minicpm] forward: self.device={:?} session.has_paged_kv={}",
+            self.device,
+            session.has_paged_kv()
+        );
         let ids: Vec<u32> = match input_ids.dtype() {
             d if d == DType::F32 => {
                 let v = input_ids.to_vec_f32()?;
@@ -761,9 +737,8 @@ impl CausalLm for MiniCpmModel {
         let emb = self.tok_embeddings.weight.to_vec_f32()?;
 
         for (idx, &id) in ids.iter().enumerate() {
-            // Audit fix (grim-models M13): out-of-vocabulary ids used to be
-            // SILENTLY zeroed (an invisible no-op token); they now fail with
-            // the offending id.
+            // Audit fix (grim-models M13): out-of-vocabulary ids used to be SILENTLY zeroed
+            // (an invisible no-op token); they now fail with the offending id.
             if (id as usize) >= self.cfg.vocab_size {
                 return Err(grim_core::error::Error::Config(format!(
                     "MiniCPM: token id {} out of range for vocab_size {}",
@@ -781,10 +756,8 @@ impl CausalLm for MiniCpmModel {
                 .copy_from_slice(&emb[start..end]);
         }
 
-        // Apply `scale_emb` only when the model metadata specifies it. MiniCPM2/3
-        // use this rescaling (typically 12.0); MiniCPM5 does NOT — it is
-        // architecturally a standard Llama-style model. Applying the default
-        // 12.0 to a MiniCPM5 model corrupts the embeddings and produces gibberish.
+        // Apply `scale_emb` only when the model metadata specifies it.
+        // MiniCPM2/3 use this rescaling (typically 12.0); MiniCPM5 does NOT - it is architecturally a standard.
         if let Some(scale_emb) = self.cfg.scale_emb {
             for val in hidden.iter_mut() {
                 *val *= scale_emb;
@@ -825,9 +798,8 @@ impl CausalLm for MiniCpmModel {
             session.append_kv(k, v)?;
         }
         session.set_last_hidden_state(hidden_state);
-        // Audit fix (grim-models): MiniCPM never advanced the session
-        // position, so the engine's decode start_pos was stuck at 0 and
-        // EVERY decode token ran at RoPE position 0 while the KV cache grew.
+        // Audit fix (grim-models): MiniCPM never advanced the session position, so the engine's decode start_pos was stuck
+        // at 0 and EVERY decode token ran at RoPE position 0 while the KV cache grew.
         session.advance_pos(seq_len);
 
         Ok(logits)
@@ -1025,10 +997,8 @@ mod audit_tests {
         );
     }
 
-    /// Audit gate: the paged KV path must store POST-RoPE keys — paged and
-    /// classic attention over identical input must agree. Pre-fix the paged
-    /// append stored RAW keys while the query ran rotated, so the two paths
-    /// diverged on any input with nonzero positions.
+    /// Audit gate: the paged KV path must store POST-RoPE keys - paged and classic attention over identical input must agree.
+    /// Pre-fix the paged append stored RAW keys while the query ran rotated, so the two.
     #[test]
     fn minicpm_paged_matches_classic_attention() {
         let model = tiny_model();

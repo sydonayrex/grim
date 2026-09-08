@@ -1,10 +1,5 @@
 //! TOPS-style visual token pruning for training-time KV compression.
-//!
-//! Token dropping based on attention entropy: low-entropy (focused-attention)
-//! tokens are deemed important and preserved; high-entropy tokens are pruned.
-//!
-//! Reference: TOPS (Token Pruning via Attention Entropy) — keep top
-//! `preservation_ratio` tokens by importance = 1 / (entropy + eps).
+//! Token dropping based on attention entropy: low-entropy (focused-attention) tokens are deemed important and preserved; high-entropy.
 
 use grim_tensor::{Shape, Tensor};
 
@@ -48,19 +43,7 @@ impl TopsPruner {
     }
 
     /// Prune input tokens by per-token attention entropy.
-    ///
-    /// # Arguments
-    /// - `input_tensor`: 2D tensor of shape `[seq_len, hidden]` (CPU data).
-    /// - `attention_entropy`: per-token scalar entropy values, length `seq_len`.
-    ///
-    /// # Returns
-    /// `(pruned_tensor, preserved_indices)` where:
-    /// - `pruned_tensor` has shape `[k, hidden]` containing the selected tokens.
-    /// - `preserved_indices` gives the original token positions kept, length `k`.
-    ///
-    /// # Panics
-    /// Panics if `input_tensor` is not 2D, or if `attention_entropy` length
-    /// does not match `input_tensor`'s first dimension.
+    /// # Arguments - `input_tensor`: 2D tensor of shape `[seq_len, hidden]` (CPU data).
     pub fn prune(&self, input_tensor: &Tensor, attention_entropy: &[f32]) -> (Tensor, Vec<usize>) {
         let dims = input_tensor.shape().dims();
         assert!(
@@ -113,18 +96,7 @@ impl TopsPruner {
 }
 
 /// Compute average attention entropy per token from raw attention weights.
-///
-/// # Arguments
-/// - `attention_weights`: flattened attention weight matrix with length
-///   `num_heads * seq_len * seq_len` in row-major order.
-/// - `seq_len`: sequence length.
-/// - `num_heads`: number of attention heads.
-///
-/// # Returns
-/// Per-token entropy values of length `seq_len`, averaged across heads.
-///
-/// # Panics
-/// Panics if `attention_weights.len() != num_heads * seq_len * seq_len`.
+/// # Arguments - `attention_weights`: flattened attention weight matrix with length `num_heads * seq_len * seq_len`.
 pub fn compute_entropy(attention_weights: &[f32], seq_len: usize, num_heads: usize) -> Vec<f32> {
     assert_eq!(
         attention_weights.len(),

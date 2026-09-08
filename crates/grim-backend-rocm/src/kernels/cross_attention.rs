@@ -4,27 +4,8 @@
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-    /// Whisper cross-attention: softmax(Q @ K^T / sqrt(head_dim)) @ V.
-    ///
-    /// Q:  [seq_len_q, num_heads, head_dim]       (row-major, stride = num_heads * head_dim)
-    /// K:  [seq_len_k, num_heads_k, head_dim]     (row-major, stride = num_heads_k * head_dim)
-    /// V:  [seq_len_k, num_heads_k, head_dim]     (row-major, stride = num_heads_k * head_dim)
-    /// out: [seq_len_q, num_heads, head_dim]      (row-major, stride = num_heads * head_dim)
-    ///
-    /// GQA: num_heads_k divides num_heads evenly. Query head `h` uses KV head
-    /// `h / (num_heads / num_heads_k)` (contiguous grouping), matching
-    /// `grim_qkv_attention` and every other grim GQA kernel. This is the
-    /// standard GGUF/GQA convention, so upstream K/V projection weights are
-    /// laid out for contiguous grouping. [P1-13: was interleaved
-    /// `h % num_heads_k`; corrected to contiguous to match the codebase.]
-    ///
-    /// Full (non-causal) cross-attention: every query attends to every
-    /// encoder position. The output projection W_o is applied on the host.
-    ///
-    /// Launch geometry: one block per (q_pos, head) row. blockIdx.x indexes
-    /// the flat (seq_len_q * num_heads) grid; blockDim.x may be any power of
-    /// two >= head_dim. Shared memory holds the raw scores [seq_len_k] plus
-    /// two per-block partial-reduction arrays of size blockDim.x.
+    /// Whisper cross-attention: softmax(Q @ K_encoder^T / sqrt(head_dim)) @ V_encoder.
+    /// Q: [seq_len_q, num_heads, head_dim], K/V encoder: [seq_len_k, num_heads_k, head_dim].
     __global__ void grim_cross_attention(
         const float* __restrict__ Q,      // [seq_len_q, num_heads, head_dim]
         const float* __restrict__ K,      // [seq_len_k, num_heads_k, head_dim]
@@ -128,9 +109,8 @@ mod tests {
 
     #[test]
     fn cross_attention_uses_contiguous_gqa_grouping() {
-        // P1-13: the kernel must map query head h -> kv_head h / q_per_kv
-        // (contiguous), matching grim_qkv_attention. Interleaved grouping
-        // (`h % num_heads_k`) would silently attend with the wrong KV head.
+        // P1-13: the kernel must map query head h -> kv_head h / q_per_kv (contiguous), matching grim_qkv_attention.
+        // Interleaved grouping (`h % num_heads_k`) would silently attend with the wrong KV head.
         assert!(
             KERNEL_SOURCE.contains("const int q_per_kv = num_heads / num_heads_k;"),
             "missing contiguous q_per_kv derivation"

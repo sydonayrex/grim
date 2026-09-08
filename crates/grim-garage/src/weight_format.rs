@@ -1,10 +1,5 @@
-//! WI-2: arch-compat bridge between `WeightFormat` (storage codec) and
-//! `grim_backend_rocm`'s `QuantMode`/`GcnArch` arch gate.
-//!
-//! `WeightFormat` itself lives in `grim-format` (canonical home, needed by
-//! `ModelFootprint`); this module re-exports it and adds the WI-2
-//! `CompatResult` type + `check_support` helper, which live here because
-//! they depend on `grim-backend-rocm`, which `grim-format` must not.
+//! WI-2: arch-compat bridge between `WeightFormat` (storage codec) and `grim_backend_rocm`'s `QuantMode`/`GcnArch` arch gate.
+//! `WeightFormat` itself lives in `grim-format` (canonical home, needed by `ModelFootprint`); this module re-exports it and.
 
 pub use grim_format::WeightFormat;
 
@@ -16,30 +11,20 @@ use grim_backend_rocm::{GcnArch, QuantMode, resolve_quant_mode};
 pub enum CompatResult {
     /// The backend dispatches to this mode natively — no quality loss.
     NativeSupport,
-    /// The requested mode is not native, but `resolve_quant_mode` falls
-    /// back to `to` without changing the output's numerical class (e.g.
-    /// FP8 -> BF16). The model still runs correctly, just denser.
+    /// The requested mode is not native, but `resolve_quant_mode` falls back to `to` without changing the output's numerical class (e.g.
+    /// FP8 -> BF16).
     FallbackSupport {
         /// The mode the backend will actually dispatch to.
         to: QuantMode,
         /// Human-readable reason for the fallback.
         reason: String,
     },
-    /// No supported dispatch path exists. The model cannot run on this
-    /// hardware as-is (e.g. an int8-only kernel path on an arch with no
-    /// int8 MFMA). This is a hard stop, not a soft warning.
+    /// No supported dispatch path exists. The model cannot run on this hardware as-is (e.g.
     Unsupported { reason: String },
 }
 
-/// Map a storage codec to the runtime `QuantMode` the ROCm backend would
-/// dispatch to. This is the single bridge between the *storage* codec
-/// (`WeightFormat`, a training/conversion concept) and the *dispatch*
-/// mode (`QuantMode`, a kernel-selection concept). WI-2 pre-flight
-/// uses it to classify native vs. fallback support.
-///
-/// `Crow`/`Jay`/`Magpie` have no `QuantMode` equivalent — they are
-/// storage-only aliases resolved at conversion time. `None` here means
-/// "no runtime dispatch gate applies", not "unsupported".
+/// Map a storage codec to the runtime `QuantMode` the ROCm backend would dispatch to.
+/// This is the single bridge between the *storage* codec (`WeightFormat`, a training/conversion concept) and the.
 pub fn codec_quant_mode(format: WeightFormat) -> Option<QuantMode> {
     Some(match format {
         WeightFormat::Bf16 => QuantMode::Bf16,
@@ -53,15 +38,13 @@ pub fn codec_quant_mode(format: WeightFormat) -> Option<QuantMode> {
     })
 }
 
-/// WI-2: classify a storage codec against `arch` using the existing
-/// `resolve_quant_mode` gate. Reuses, does not reimplement, the backend's
-/// compat logic.
+/// WI-2: classify a storage codec against `arch` using the existing `resolve_quant_mode` gate.
+/// Reuses, does not reimplement, the backend's compat logic.
 pub fn check_support(format: WeightFormat, arch: GcnArch) -> CompatResult {
     let mode = match codec_quant_mode(format) {
         Some(m) => m,
-        // Storage-only aliases (Crow/Jay/Magpie) have no dispatch gate:
-        // they're resolved at conversion time into a concrete mode, so
-        // there's nothing to gate here. Treat as native.
+        // Storage-only aliases (Crow/Jay/Magpie) have no dispatch gate: they're resolved at conversion time into a concrete mode, so there's nothing to gate here.
+        // Treat as native.
         None => return CompatResult::NativeSupport,
     };
     let resolved = resolve_quant_mode(arch, mode);

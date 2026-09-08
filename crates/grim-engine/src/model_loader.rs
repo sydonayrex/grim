@@ -17,19 +17,19 @@ use grim_models_mamba::{
 use grim_models_transformer::{
     Bloom, BloomConfig, Chameleon, ChameleonConfig, CogVlm, CogVlmConfig, CogVlmVisionConfig,
     CommandR, CommandRConfig, Dbrx, DbrxConfig, DeepSeek, DeepSeek2, DeepSeek2Config, DeepSeek4,
-    DeepSeek4Config, DeepSeek32, DeepSeek32Config, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig,
-    DiffusionGemma, DiffusionGemmaConfig, Dots3Note, Dots3NoteConfig, Exaone45, Exaone45Config,
-    Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, Gemma2, Gemma2Config, Gemma3n,
-    Gemma3nConfig, GemmaConfig, Glm4MoeLite, Glm4MoeLiteConfig, Glm52, Glm52Config, Gpt2,
-    Gpt2Config, GptJ, GptJConfig, GptOss, GptOssConfig, GraniteMoeHybrid, GraniteMoeHybridConfig,
-    HunyuanVl, HunyuanVlConfig, HunyuanVlVisionConfig, HyV3, HyV3Config, HyV4, HyV4Config,
-    InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig, KimiK3, KimiK3Config,
-    Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, LongCatFlash, LongCatFlashConfig,
-    Mellum, MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig,
-    Qwen, Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl,
-    Qwen3VlConfig, Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig,
-    Qwen38FlashNext, Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2,
-    SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
+    DeepSeek4Config, DeepSeek32, DeepSeek32Config, DeepSeekConfig, DeltaNetBase,
+    DeltaNetBaseConfig, DiffusionGemma, DiffusionGemmaConfig, Dots3Note, Dots3NoteConfig, Exaone45,
+    Exaone45Config, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, Gemma2,
+    Gemma2Config, Gemma3n, Gemma3nConfig, GemmaConfig, Glm4MoeLite, Glm4MoeLiteConfig, Glm52,
+    Glm52Config, Gpt2, Gpt2Config, GptJ, GptJConfig, GptOss, GptOssConfig, GraniteMoeHybrid,
+    GraniteMoeHybridConfig, HunyuanVl, HunyuanVlConfig, HunyuanVlVisionConfig, HyV3, HyV3Config,
+    HyV4, HyV4Config, InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig,
+    KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, LongCatFlash,
+    LongCatFlashConfig, Mellum, MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3,
+    MiniMaxM3Config, Phi2, PhiConfig, Qwen, Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe,
+    Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe,
+    Qwen35MoeConfig, Qwen38FlashNext, Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config,
+    SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -38,22 +38,8 @@ use grim_tensor::{Device, TensorProvider, YaRNParams};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Resolve this process's tensor-parallel config from `GRIM_TP_*` and validate
-/// the `(rank, world_size)` contract.
-///
-/// Returns the default `{rank:0, world_size:1}` when `GRIM_TP_SIZE` is unset
-/// or `1` (single-device). Returns `Err(Config)` on a malformed contract
-/// (e.g. `rank >= world_size`, `world_size == 0`) so the loader fails loudly
-/// rather than silently loading the wrong shard — the central correctness fix
-/// from the TP sanity check.
-///
-/// This is the **single source of truth** for `(rank, world_size)` inside the
-/// loader. The derived `tp` is attached to every `WeightSource` via
-/// `with_tp_config(tp)`, so `get_sharded` slices by `tp.rank`; and it is passed
-/// by value to each `Foo::load_tp(...)` so the column/row-parallel linears
-/// shard consistently. `Llama::load` / `LlamaBlock::load` no longer re-read the
-/// env (they take `ws.tp_config()` instead), closing the split-brain where the
-/// loader's slice rank could disagree with the model's shard rank.
+/// Resolve this process's tensor-parallel config from `GRIM_TP_*` and validate the `(rank, world_size)` contract.
+/// Returns the default `{rank:0, world_size:1}` when `GRIM_TP_SIZE` is unset or `1` (single-device).
 fn resolve_tp_config() -> Result<TensorParallelConfig> {
     let tp = TensorParallelConfig::from_env().unwrap_or_default();
     if let Err(msg) = tp.validate() {
@@ -72,21 +58,8 @@ fn resolve_tp_config() -> Result<TensorParallelConfig> {
     Ok(tp)
 }
 
-/// Resolve which GPU ordinal this process should load on under the
-/// multi-process TP contract.
-///
-/// - When `GRIM_TP_SIZE > 1`: the ordinal is `GRIM_GPUS[GRIM_TP_RANK]` if the
-///   env gave one ordinal per rank; otherwise it falls back to
-///   `GRIM_TP_RANK` itself as the ordinal. The full ordinal list
-///   (`all_ordinals`) is also returned so the engine can build a single
-///   `RcclAllReduce` over the whole group (`ncclCommInitAll` needs every
-///   participating ordinal, not just this rank's).
-/// - When `GRIM_TP_SIZE <= 1` (single-device): returns `(None, None)` so the
-///   caller uses its existing "pick `probe().first()`" heuristic.
-///
-/// This must agree with `resolve_tp_config()`'s validation — it reads the same
-/// `GRIM_TP_*` env vars. Kept here (and mirrored in `Engine::new`) so the
-/// loader and engine pick the same ordinal without a shared crate dependency.
+/// Resolve which GPU ordinal this process should load on under the multi-process TP contract.
+/// - When `GRIM_TP_SIZE > 1`: the ordinal is `GRIM_GPUS[GRIM_TP_RANK]` if the env gave one ordinal.
 fn resolve_tp_ordinal() -> Result<(Option<usize>, Option<Vec<usize>>)> {
     let tp = TensorParallelConfig::from_env();
     let Some(tp) = tp else {
@@ -107,9 +80,8 @@ fn resolve_tp_ordinal() -> Result<(Option<usize>, Option<Vec<usize>>)> {
         .unwrap_or_default();
     // All participating ordinals for the RCCL group.
     let all_ordinals: Vec<usize> = if !gpus.is_empty() {
-        // Honour the explicit selection; pad up to world_size with rank-as-ordinal
-        // only if the user gave a short list (defensive — the documented contract
-        // is one ordinal per rank).
+        // Honour the explicit selection; pad up to world_size with rank-as-ordinal only if the user
+        // gave a short list (defensive - the documented contract is one ordinal per rank).
         if gpus.len() >= tp.world_size {
             gpus.iter().take(tp.world_size).copied().collect()
         } else {
@@ -159,10 +131,7 @@ macro_rules! dbg_eprintln {
     };
 }
 /// Probe the host GPU's actual wavefront size for a ROCm `Device`.
-///
-/// Returns `None` when the device is not a ROCm GPU (CPU, CUDA, Metal, Vulkan)
-/// or when the HIP probe itself fails. This is used by
-/// [`load_model_from_grim`] to gate `.grim` loading on wavefront compatibility.
+/// Returns `None` when the device is not a ROCm GPU (CPU, CUDA, Metal, Vulkan) or.
 fn probe_host_wavefront_size(device: &Device) -> Option<u32> {
     match device {
         Device::Rocm(ordinal) => grim_backend_rocm::probe_host_gpu(*ordinal)
@@ -172,18 +141,8 @@ fn probe_host_wavefront_size(device: &Device) -> Option<u32> {
     }
 }
 
-/// Attempt to resolve an `ArchCompatSpec` for an unknown architecture string,
-/// Read a sibling `config.json` from alongside a GGUF file, returning the contents
-/// as an `Option<&str>`. A missing sibling is optional — returns `None` so the
-/// caller falls back to the plugins-dir scan. This is the helper extracted from
-/// the GGUF load path so the config-reading fix has a regression test.
-///
-/// # Bug history
-///
-/// Prior to the extraction, the GGUF load path built a *path string* instead of
-/// reading file contents:
-///   `dir.join("config.json").to_str().map(|s| s.to_string())`
-/// which passed a path (e.g. "/path/config.json") as `config_raw`. `from_hf_config_json`
+/// Attempt to resolve an `ArchCompatSpec` for an unknown architecture string, Read a sibling `config.json` from alongside a GGUF file, returning the contents as an `Option<&str>`.
+/// A missing sibling is optional - returns `None` so the caller falls back to the.
 fn read_sibling_config_json(path: &str) -> Option<String> {
     let config_path = std::path::Path::new(path)
         .parent()
@@ -250,10 +209,8 @@ fn get_meta_array<'a>(provider: &'a GgufProvider, key: &str) -> Option<&'a [Gguf
     if let Some(v) = v { v.as_array() } else { None }
 }
 
-/// Returns true if `provider` can resolve a tensor by the given (GGUF) name,
-/// without materialising it. Used for architecture detection by tensor
-/// signature (e.g. distinguishing SmolLM2 from Llama under the same
-/// `general.architecture` tag).
+/// Returns true if `provider` can resolve a tensor by the given (GGUF) name, without materialising it.
+/// Used for architecture detection by tensor signature (e.g.
 fn weight_provider_has_tensor(provider: &dyn TensorProvider, name: &str) -> bool {
     provider.meta(name).is_ok()
 }
@@ -319,13 +276,7 @@ pub fn load_model_from_grim(path: &str, device: Device) -> Result<Box<dyn Causal
     let grim_provider = grim_format::tprov::GrimProvider::open(path)?;
 
     // P0-3.1: Wave64/Wave32 compatibility guard.
-    //
-    // `.grim` files may be compiled with `wavefront_size = 64` (Wave64, CDNA)
-    // but an RDNA2 host (`gfx1036` or similar) only supports Wave32. Loading
-    // a Wave64 `.grim` on a Wave32 GPU triggers GPU memory faults. If the
-    // artifact's declared wavefront size is both non-zero and incompatible with
-    // the probed host GPU, transparently fall back to the sibling GGUF which
-    // contains the same weights in a format that is always Wave32-safe.
+    // `.grim` files may be compiled with `wavefront_size = 64` (Wave64, CDNA) but an RDNA2 host.
     let grim_wf = grim_provider.wavefront_size();
     if let Some(host_wf) = probe_host_wavefront_size(&device) {
         if grim_wf != 0 && host_wf != 0 && grim_wf != host_wf {
@@ -428,25 +379,18 @@ struct SafetensorsConfig {
     num_attention_heads_per_layer: Option<Vec<usize>>,
     #[serde(rename = "partial_rotary_factor")]
     partial_rotary_factor: Option<f32>,
-    /// Laguna-S-2.1 nested `{full_attention: {rope_type, rope_theta, factor,
-    /// original_max_position_embeddings, beta_fast, beta_slow,
-    /// attention_factor, partial_rotary_factor}, sliding_attention: {...}}`.
+    /// Laguna-S-2.1 nested `{full_attention: {rope_type, rope_theta, factor, original_max_position_embeddings, beta_fast, beta_slow, attention_factor, partial_rotary_factor}, sliding_attention: {...}}`.
     /// Parsed lazily; absence = plain RoPE.
     #[serde(rename = "rope_parameters")]
     rope_parameters: Option<serde_json::Value>,
-    /// HuggingFace-standard rope-scaling block used by Qwen3.5-MoE and other
-    /// HF-exported checkpoints: `{rope_type: "yarn", factor, original_max_position_embeddings,
-    /// beta_fast, beta_slow, attention_factor}`. Parsed lazily by
-    /// `parse_yarn_scaling`; absence = plain RoPE.
+    /// HuggingFace-standard rope-scaling block used by Qwen3.5-MoE and other HF-exported checkpoints: `{rope_type: "yarn", factor, original_max_position_embeddings, beta_fast, beta_slow, attention_factor}`.
+    /// Parsed lazily by `parse_yarn_scaling`; absence = plain RoPE.
     #[serde(rename = "rope_scaling")]
     rope_scaling: Option<serde_json::Value>,
 }
 
 /// Extract full-attention YaRN params from Laguna-S-2.1 `rope_parameters`.
-///
-/// Layout: `{full_attention: {rope_type: "yarn", factor, original_max_position_embeddings,
-/// beta_fast, beta_slow, attention_factor, ...}}`. Returns `None` when the
-/// block is absent or `rope_type != "yarn"` (plain RoPE).
+/// Layout: `{full_attention: {rope_type: "yarn", factor, original_max_position_embeddings, beta_fast, beta_slow, attention_factor, ...}}`.
 fn parse_full_yarn(rope_parameters: &Option<serde_json::Value>) -> Option<YaRNParams> {
     let full = rope_parameters.as_ref()?.get("full_attention")?;
     if full.get("rope_type").and_then(|v| v.as_str()) != Some("yarn") {
@@ -473,13 +417,8 @@ fn parse_full_yarn(rope_parameters: &Option<serde_json::Value>) -> Option<YaRNPa
     })
 }
 
-/// Effective RoPE theta for a checkpoint whose HF `rope_scaling` block uses a
-/// non-YaRN method (`linear`, `llama3`, `longrope`, `dynamic`). These methods
-/// previously fell through `parse_yarn_scaling` as "plain RoPE" — silently
-/// loading a scaled checkpoint with its unscaled native theta and corrupting
-/// long-context positions. YaRN keeps the native theta here (full
-/// NTK-by-parts + magnitude correction ride on `YaRNParams`); absence keeps
-/// the native theta.
+/// Effective RoPE theta for a checkpoint whose HF `rope_scaling` block uses a non-YaRN method (`linear`, `llama3`, `longrope`, `dynamic`).
+/// These methods previously fell through `parse_yarn_scaling` as "plain RoPE" - silently loading a scaled checkpoint.
 pub fn effective_rope_theta(
     rope_scaling: &Option<serde_json::Value>,
     theta: f32,
@@ -514,9 +453,8 @@ pub fn effective_rope_theta(
     scaling_base(&method, theta, head_dim)
 }
 
-/// GGUF variant of [`effective_rope_theta`]: reads the dotted metadata keys
-/// (`rope_scaling.rope_type`, `rope_scaling.factor`) that llama.cpp-style
-/// converters write, mirroring `parse_yarn_scaling_gguf`.
+/// GGUF variant of [`effective_rope_theta`]: reads the dotted metadata
+/// keys (`rope_scaling.rope_type`, `rope_scaling.factor`) that llama.cpp-style converters write, mirroring `parse_yarn_scaling_gguf`.
 pub fn effective_rope_theta_gguf(lookup: &dyn MetadataLookup, theta: f32, head_dim: usize) -> f32 {
     for key in ["rope_scaling", "rope.scaling"] {
         if let Some(json_str) = lookup.get_str(key) {
@@ -535,11 +473,8 @@ pub fn effective_rope_theta_gguf(lookup: &dyn MetadataLookup, theta: f32, head_d
     effective_rope_theta(&Some(block), theta, head_dim)
 }
 
-/// Parse YaRN params from a HuggingFace-standard `rope_scaling` block
-/// `{rope_type: "yarn", factor, original_max_position_embeddings, beta_fast,
-/// beta_slow, attention_factor}`. Used by Qwen3.5-MoE and other HF-exported
-/// checkpoints. Returns `None` for non-YaRN rope types (`linear`, `dynamic`...)
-/// or absence, falling back to plain RoPE.
+/// Parse YaRN params from a HuggingFace-standard `rope_scaling` block `{rope_type: "yarn", factor, original_max_position_embeddings, beta_fast, beta_slow, attention_factor}`.
+/// Used by Qwen3.5-MoE and other HF-exported checkpoints.
 pub fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<YaRNParams> {
     let rs = rope_scaling.as_ref()?;
     // Only YaRN scaling yields a `YaRNParams`. Other rope types (`linear`,
@@ -564,10 +499,7 @@ pub fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<Ya
 }
 
 /// Parse full-attention YaRN params from a GGUF metadata string.
-///
-/// Some GGUF exports (e.g. llama.cpp-converted Laguna checkpoints) store the
-/// `rope_parameters` JSON block under a key like `laguna.rope_parameters`. When
-/// present, parse and return the YaRN params; otherwise `None` (plain RoPE).
+/// Some GGUF exports (e.g.
 pub fn parse_full_yarn_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams> {
     let json_str = lookup
         .get_str("rope_parameters")
@@ -576,11 +508,8 @@ pub fn parse_full_yarn_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams> {
     parse_full_yarn(&Some(value))
 }
 
-/// Parse a HuggingFace `rope_scaling` YaRN block from GGUF metadata. Checks the
-/// common GGUF keys carrying a JSON `rope_scaling` blob (`rope_scaling`,
-/// `<arch>.rope_scaling`, `rope.scaling`) and falls back to individual dotted
-/// keys (`rope_scaling.rope_type`, `rope_scaling.factor`, ...) — matching
-/// llama.cpp converter conventions.
+/// Parse a HuggingFace `rope_scaling` YaRN block from GGUF metadata.
+/// Checks the common GGUF keys carrying a JSON `rope_scaling` blob (`rope_scaling`, `<arch>.rope_scaling`, `rope.scaling`) and falls.
 pub fn parse_yarn_scaling_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams> {
     // First try the JSON-string form (some converters store the full block).
     for key in ["rope_scaling", "qwen35moe.rope_scaling", "rope.scaling"] {
@@ -621,15 +550,7 @@ pub fn parse_yarn_scaling_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams
 }
 
 /// Extract Laguna-S-2.1 hybrid-attention + RoPE fields from GGUF metadata.
-///
-/// GGUF checkpoints carry only a single `rope_theta` + `max_seq_len` in
-/// `ArchHyperparameters`/`hparams`; the dual thetas, partial-rotary factors,
-/// sliding window, layer types, and gating are **not** stored in GGUF metadata
-/// (they live in `config.json` for the Safetensors path). This helper reads what
-/// **is** available — the `rope_parameters` JSON string if the checkpoint was
-/// converted with it — and falls back to the published S-2.1 hardcoded values
-/// otherwise. This keeps the GGUF path correct for checkpoints that carry it and
-/// safety-correct (plain RoPE + published defaults) for those that don't.
+/// GGUF checkpoints carry only a single `rope_theta` + `max_seq_len` in `ArchHyperparameters`/`hparams`; the dual thetas, partial-rotary.
 pub fn extract_laguna_gguf_hybrid(
     lookup: &dyn MetadataLookup,
 ) -> (
@@ -722,11 +643,8 @@ fn load_model_from_config(
         .map(|s| s.max_seq_len)
         .unwrap_or(max_seq_len);
 
-    // `GRIM_CONTEXT` lets operators cap the effective context window without
-    // re-exporting the GGUF. The model's advertised hard limit is treated as a
-    // ceiling: an override requesting more than the model supports is clamped
-    // back to the GGUF value. Only `grim-engine`'s `EngineConfig` (not the
-    // model's RoPE) reads this, so it is purely an operator hint.
+    // `GRIM_CONTEXT` lets operators cap the effective context window without re-exporting the GGUF.
+    // The model's advertised hard limit is treated as a ceiling: an override requesting more than.
     let max_seq_len = grim_core::env_config::RuntimeEnv::from_env()
         .context
         .map_or(max_seq_len, |ctx| ctx.min(max_seq_len));
@@ -741,10 +659,8 @@ fn load_model_from_config(
         .and_then(|s| s.expert_used_count)
         .or(config.num_experts_per_tok)
         .unwrap_or(2);
-    // Routed-expert output scaling. Defaults to 1.0 (no-op) when neither
-    // the compat spec nor config.json specifies it. For real MoE checkpoints
-    // (e.g. Laguna-2, Qwen3-MoE, DeepSeek-V2) this must match the checkpoint
-    // or routed-expert contribute at the wrong magnitude.
+    // Routed-expert output scaling. Defaults to 1.0 (no-op) when
+    // neither the compat spec nor config.json specifies it.
     let routed_scaling_factor = compat_spec
         .as_ref()
         .and_then(|s| s.routed_scaling_factor)
@@ -801,10 +717,8 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         ModelArchitecture::Laguna => {
-            // Laguna-S-2.1 hybrid attention: per-layer layer_types, sliding
-            // window, per-layer head counts, dual RoPE, and the attention
-            // output gate. Parsed from config.json; defaults match the
-            // published S-2.1 checkpoint when keys are absent.
+            // Laguna-S-2.1 hybrid attention: per-layer layer_types, sliding window, per-layer head counts, dual RoPE, and the attention output gate.
+            // Parsed from config.json; defaults match the published S-2.1 checkpoint when keys are absent.
             let full_rope_theta = config
                 .rope_parameters
                 .as_ref()
@@ -1421,9 +1335,7 @@ fn load_model_from_config(
             let m = Gpt2::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Gemma
-        | ModelArchitecture::Gemma3
-        | ModelArchitecture::Gemma4 => {
+        ModelArchitecture::Gemma | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
             let cfg = GemmaConfig {
                 vocab_size,
                 hidden_size,
@@ -2222,10 +2134,8 @@ fn load_model_from_config(
                 max_seq_len,
 
                 partial_rotary_factor: 1.0,
-                // This arm is the safetensors/config.json path — yarn comes
-                // from the HF `rope_scaling` block (mirrors qwen35moe arms
-                // above). The GGUF path reads the dotted metadata keys via
-                // `parse_yarn_scaling_gguf` instead.
+                // This arm is the safetensors/config.json path - yarn comes from the HF `rope_scaling` block (mirrors qwen35moe arms above).
+                // The GGUF path reads the dotted metadata keys via `parse_yarn_scaling_gguf` instead.
                 yarn: parse_yarn_scaling(&config.rope_scaling),
             };
             log::info!(
@@ -2372,9 +2282,7 @@ fn load_model_with_providers(
             .to_lowercase();
         let path_lower = path.to_lowercase();
         // Only promote to MiniCPM when the GGUF carries MiniCPM2/3 metadata keys.
-        // MiniCPM5 reports `general.architecture = llama` and has NO `minicpm.*`
-        // metadata keys — it is architecturally standard Llama. Promoting it to
-        // MiniCPM would apply wrong rescaling and produce gibberish output.
+        // MiniCPM5 reports `general.architecture = llama` and has NO `minicpm.*` metadata keys - it is architecturally.
         let has_minicpm_metadata = lookup.get_f32("minicpm.scale_emb").is_some()
             || lookup.get_f32("minicpm.scale_depth").is_some()
             || lookup.get_f32("minicpm.dim_model_base").is_some();
@@ -2386,11 +2294,8 @@ fn load_model_with_providers(
             );
             model_arch = ModelArchitecture::MiniCpm;
         }
-        // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"`
-        // but is architecturally distinct: it ties the LM head to the token
-        // embedding (no `output.weight`) and uses `output_norm` / `token_embd`
-        // naming. Promote to SmolLm2 only on that exact tensor signature so
-        // genuine Llama files stay on the unmodified Llama loader.
+        // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"` but is architecturally distinct: it ties the LM head to the token embedding (no `output.weight`) and uses `output_norm` / `token_embd` naming.
+        // Promote to SmolLm2 only on that exact tensor signature so genuine Llama files stay on.
         let has_output_norm = lookup.get_str("general.architecture").is_some()
             && weight_provider_has_tensor(weight_provider, "output_norm.weight")
             && !weight_provider_has_tensor(weight_provider, "output.weight");
@@ -2469,11 +2374,8 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Laguna => {
-            // GGUF checkpoints carry only a single rope_theta + max_seq_len;
-            // the dual thetas, partial-rotary factors, sliding window, and YaRN
-            // block are read from GGUF metadata when present (llama.cpp-converted
-            // checkpoints may store `rope_parameters` as a JSON string), with the
-            // published S-2.1 values as defaults otherwise.
+            // GGUF checkpoints carry only a single rope_theta + max_seq_len; the dual thetas, partial-rotary factors, sliding window, and YaRN block are read
+            // from GGUF metadata when present (llama.cpp-converted checkpoints may store `rope_parameters` as a JSON string), with the published S-2.1 values as defaults otherwise.
             let (
                 full_rope_theta,
                 sliding_rope_theta,
@@ -2664,10 +2566,8 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
-            // GGUF YaRN: read the `rope_scaling` block if the converter stored
-            // it, falling back to plain RoPE (no YaRN). Partial-rotary factor
-            // is read from `<arch>.partial_rotary_factor` if present, else the
-            // published Qwen3.5-MoE default of 0.25.
+            // GGUF YaRN: read the `rope_scaling` block if the converter stored it, falling back to plain RoPE (no YaRN).
+            // Partial-rotary factor is read from `<arch>.partial_rotary_factor` if present, else the published Qwen3.5-MoE default of 0.25.
             let prf = lookup
                 .get_f32("qwen35moe.partial_rotary_factor")
                 .or_else(|| lookup.get_f32("partial_rotary_factor"))
@@ -3192,9 +3092,7 @@ fn load_model_with_providers(
             let m = Gpt2::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Gemma
-        | ModelArchitecture::Gemma3
-        | ModelArchitecture::Gemma4 => {
+        ModelArchitecture::Gemma | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
             let cfg = GemmaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -3580,12 +3478,8 @@ fn load_model_with_providers(
         }
 
         ModelArchitecture::BailingMoe3 => {
-            // Audit fix (grim-models): this branch loaded BailingMoeV3
-            // checkpoints as Qwen3Moe — architecturally wrong (BailingMoeV3
-            // is an MLA/KDA-hybrid MoE; its GGUF tensor names do not match
-            // Qwen3-MoE). The in-crate Ling3Tiny implementation exists but
-            // has no GGUF hparams/tensor mapping yet, so refuse loudly
-            // instead of silently building a mismatched model.
+            // Audit fix (grim-models): this branch loaded BailingMoeV3 checkpoints as Qwen3Moe - architecturally wrong (BailingMoeV3 is an MLA/KDA-hybrid MoE; its GGUF tensor names do not match Qwen3-MoE).
+            // The in-crate Ling3Tiny implementation exists but has no GGUF hparams/tensor mapping yet, so refuse loudly.
             Err(grim_core::error::Error::Config(
                 "BailingMoeV3 (bailingmoe3 / bailing_hybrid) is not loadable from GGUF: \
                  its MLA+KDA hybrid architecture has no GGUF tensor mapping in this \
@@ -4004,7 +3898,6 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
 
-
         ModelArchitecture::Arcee
         | ModelArchitecture::Apertus
         | ModelArchitecture::Arctic
@@ -4104,12 +3997,8 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         _ => {
-            // Check for a sibling config.json alongside the GGUF file to
-            // enrich ArchCompatSpec resolution for known HF architectures.
-            // Read the file *contents* (not just the path) so that
-            // resolve_arch_compat_spec's inline-config branch can parse it.
-            // A missing sibling config.json is optional — fall back to the
-            // plugins-dir scan, don't error.
+            // Check for a sibling config.json alongside the GGUF file to enrich ArchCompatSpec resolution for known HF architectures.
+            // Read the file *contents* (not just the path) so that resolve_arch_compat_spec's inline-config branch can parse.
             let config_raw = read_sibling_config_json(path);
 
             if let Some(spec) = resolve_arch_compat_spec(arch_str, config_raw.as_deref()) {
@@ -4193,18 +4082,13 @@ fn load_model_with_providers(
 }
 
 /// Convenience wrapper: detect the best available device and load a GGUF or GRIM model.
-///
-/// Device priority: ROCm → CUDA → Metal → CPU.  This is the entry point called by
-/// `grim-server`'s on-demand model loader so callers don't need to manage
-/// device selection themselves.
+/// Device priority: ROCm → CUDA → Metal → CPU.
 pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     let is_grim = path.ends_with(".grim");
     let is_safetensors = path.ends_with(".safetensors");
 
     // Check for forced device first. `GRIM_BACKEND` is canonical (set by the
-    // install script and by `serve --backend`); `GRIM_FORCE_DEVICE` is a
-    // legacy alias. An explicitly requested backend must actually be
-    // available — never silently degrade to a different device (WS-E1).
+    // install script and by `serve --backend`); `GRIM_FORCE_DEVICE` is a legacy alias.
     let forced = std::env::var("GRIM_BACKEND")
         .or_else(|_| std::env::var("GRIM_FORCE_DEVICE"))
         .ok()
@@ -4254,9 +4138,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                     ))
                 })?;
                 let first = cuda_devices.first().ok_or_else(|| {
-                    Error::Config(
-                        "CUDA backend forced via GRIM_BACKEND but no device found".into(),
-                    )
+                    Error::Config("CUDA backend forced via GRIM_BACKEND but no device found".into())
                 })?;
                 log::info!(
                     "[model_loader] Using CUDA device {} (forced)",
@@ -4282,11 +4164,8 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                         "ROCm backend forced via GRIM_BACKEND but no device found".into(),
                     ));
                 }
-                // Under multi-process TP, pin this process to its own rank
-                // ordinal (from GRIM_TP_RANK / GRIM_GPUS) rather than
-                // always using the first visible device — otherwise every
-                // rank would load onto the same GPU and the collective
-                // would deadlock waiting for peers that never started.
+                // Under multi-process TP, pin this process to its own rank ordinal (from GRIM_TP_RANK / GRIM_GPUS) rather than always using the first visible
+                // device - otherwise every rank would load onto the same GPU and the collective would deadlock waiting for peers that never started.
                 let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
                 let rank = TensorParallelConfig::from_env()
                     .map(|t| t.rank)
@@ -4337,10 +4216,8 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                     load_model_from_gguf(path, dev)
                 };
             }
-            // Availability already verified above; this is unreachable for
-            // valid backends. If we reach it, the backend was somehow marked
-            // available but has no match arm — fail loudly rather than silently
-            // falling through to auto-detection.
+            // Availability already verified above; this is unreachable for valid backends.
+            // If we reach it, the backend was somehow marked available but has no match arm.
             other => {
                 return Err(Error::Config(format!(
                     "backend '{other}' availability check passed but no match arm found — \
@@ -4352,9 +4229,8 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
 
     // Attempt ROCm first (AMD GPU — primary grim target).
     if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
-        // Same rank-ordinal pinning as the forced branch above: when multi-
-        // process TP is active, load onto THIS rank's ordinal so each peer
-        // process owns a distinct GPU and the RCCL collective can rendezvous.
+        // Same rank-ordinal pinning as the forced branch above: when multi- process TP is active, load onto
+        // THIS rank's ordinal so each peer process owns a distinct GPU and the RCCL collective can rendezvous.
         let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
         let rank = TensorParallelConfig::from_env()
             .map(|t| t.rank)
@@ -4433,11 +4309,8 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     }
 }
 
-/// Load a model onto an explicitly chosen device — the SCYTHE-2 farm-replica
-/// entry point. Unlike [`load_from_path`], no env-driven backend selection
-/// runs: the caller (the engine's farm loader) owns the per-replica device
-/// decision, and an unavailable device surfaces as that backend's own load
-/// error rather than a silent fallback.
+/// Load a model onto an explicitly chosen device - the SCYTHE-2 farm-replica entry point.
+/// Unlike [`load_from_path`], no env-driven backend selection runs: the caller (the engine's farm loader) owns the.
 pub fn load_from_path_on_device(path: &str, dev: Device) -> Result<Box<dyn CausalLm>> {
     if path.ends_with(".grim") {
         load_model_from_grim(path, dev)
@@ -4448,14 +4321,8 @@ pub fn load_from_path_on_device(path: &str, dev: Device) -> Result<Box<dyn Causa
     }
 }
 
-/// ROCm devices visible to this process, in ordinal order. The SCYTHE-2 farm
-/// loader loads one weight replica per entry; an empty list means this process
-/// sees no AMD GPUs (CPU-only box) and farm mode cannot arm.
-/// Resolve ROCm GPUs visible to the farm registrar. Mirrors
-/// [`resolve_discrete_rocm_devices`]'s policy of taking only dedicated GPUs —
-/// integrated APU devices must never become SCYTHE-2 farm ranks (they share
-/// system memory and would skew placement) — so at most the first two probes
-/// are eligible, matching syd-beasty's discrete pair.
+/// ROCm devices visible to this process, in ordinal order.
+/// The SCYTHE-2 farm loader loads one weight replica per entry; an empty list means this.
 pub fn visible_rocm_devices() -> Vec<Device> {
     grim_backend_rocm::RocmDevice::probe()
         .map(|devices| {
@@ -4577,11 +4444,7 @@ pub fn load_audio_model_from_path(
 }
 
 /// Infer a `VocosConfig` from checkpoint tensor shapes.
-///
-/// Reads `backbone.embed.weight` (`[dim, input_dim, 7]`), counts
-/// `backbone.convnext.N` blocks, derives `intermediate_dim` from block 0's
-/// `pwconv1.weight`, and derives `n_fft` from `head.istft.window` (hop is
-/// `n_fft / 2`, the standard Vocos setting).
+/// Reads `backbone.embed.weight` (`[dim, input_dim, 7]`), counts `backbone.convnext.N` blocks, derives `intermediate_dim` from block 0's `pwconv1.weight`, and.
 fn infer_vocos_config(provider: &PthProvider) -> Result<grim_models_audio::VocosConfig> {
     use grim_tensor::provider::TensorProvider;
 
@@ -4704,9 +4567,8 @@ mod tests {
         assert_eq!(spec.remap_tensor_name(gguf_name), hf_name);
     }
 
-    /// `parse_yarn_scaling` must accept a standard HF `rope_scaling` block with
-    /// `rope_type: "yarn"` and populate all five YaRNParams fields (with sensible
-    /// defaults for any missing sub-field).
+    /// `parse_yarn_scaling` must accept a standard HF `rope_scaling` block with `rope_type: "yarn"` and
+    /// populate all five YaRNParams fields (with sensible defaults for any missing sub-field).
     #[test]
     fn parse_yarn_scaling_reads_standard_hf_yarn_block() {
         let v: serde_json::Value = serde_json::from_str(
@@ -4740,10 +4602,8 @@ mod tests {
         assert!(parse_yarn_scaling(&None).is_none());
     }
 
-    /// T2.5: non-YaRN scaling methods fold into an EFFECTIVE theta at load —
-    /// previously `linear`/`llama3`/`longrope` blocks fell through
-    /// `parse_yarn_scaling` as "plain RoPE" and a scaled checkpoint loaded
-    /// with its unscaled native theta, corrupting long-context positions.
+    /// T2.5: non-YaRN scaling methods fold into an EFFECTIVE theta at load - previously `linear`/`llama3`/`longrope` blocks fell through
+    /// `parse_yarn_scaling` as "plain RoPE" and a scaled checkpoint loaded with its unscaled native theta, corrupting long-context positions.
     #[test]
     fn effective_rope_theta_scales_non_yarn_methods() {
         let block = |rt: &str, factor: f64| -> serde_json::Value {
@@ -4782,8 +4642,7 @@ mod tests {
     }
 
     /// A yarn block missing optional sub-fields must still parse, applying the
-    /// documented defaults (factor 1.0, beta_fast 32.0, beta_slow 1.0,
-    /// attention_factor 1.0, original_max_pos 8192).
+    /// documented defaults (factor 1.0, beta_fast 32.0, beta_slow 1.0, attention_factor 1.0, original_max_pos 8192).
     #[test]
     fn parse_yarn_scaling_applies_defaults_for_missing_fields() {
         let v: serde_json::Value = serde_json::from_str(r#"{"rope_type": "yarn"}"#).unwrap();
@@ -4805,25 +4664,10 @@ mod tests {
         assert!((y.attention_factor - 0.707).abs() < 1e-5);
     }
 
-    // ---------------------------------------------------------------------------
     // Red-phase tests: GGUF config.json read bug + plugins-dir scan branch
-    // ---------------------------------------------------------------------------
 
     /// Regression test for the GGUF config.json read bug.
-    ///
-    /// The bug (model_loader.rs ~line 2760-2763, now extracted to
-    /// `read_sibling_config_json`) built a *path string* instead of reading
-    /// file contents:
-    ///   `dir.join("config.json").to_str().map(|s| s.to_string())`
-    /// which passed "/path/to/config.json" as `config_raw`. `from_hf_config_json`
-    /// would then try to parse that path string as JSON and fail, silently
-    /// falling through to the plugins-dir scan instead of using the sibling
-    /// config.json.
-    ///
-    /// This test exercises `read_sibling_config_json` directly — the exact helper
-    /// the GGUF load path uses — and verifies it returns the file *contents*,
-    /// not a path string. A regression that reverts to the old buggy behavior
-    /// would break this test.
+    /// The bug (model_loader.rs ~line 2760-2763, now extracted to `read_sibling_config_json`) built a *path string* instead of.
     #[test]
     fn read_sibling_config_json_reads_file_contents_not_path() {
         // Build a temp dir with a fake .gguf path and sibling config.json.
@@ -4876,20 +4720,8 @@ mod tests {
         );
     }
 
-    /// Red target: the plugins-dir scan branch of `resolve_arch_compat_spec`
-    /// must actually find and match a .grimplugin file in
-    /// `grim_plugins_dir()`.
-    ///
-    /// This is the exact path the entire HF plugin-generation workflow depends
-    /// on, and it has zero existing test coverage. The test writes a .grimplugin
-    /// JSON to a temp dir, sets `GRIM_PLUGINS_DIR` to point at it, and calls
-    /// `resolve_arch_compat_spec` with an arch_str that only matches via the
-    /// plugins-dir file (not via inline config).
-    ///
-    /// In the Red phase this test exercises the existing branch — it should PASS
-    /// if the branch is correctly wired (which we're verifying), and the real
-    /// work is making sure the CLI install step puts files in the right place
-    /// for this branch to find them.
+    /// Red target: the plugins-dir scan branch of `resolve_arch_compat_spec` must actually find and match a .grimplugin file in `grim_plugins_dir()`.
+    /// This is the exact path the entire HF plugin-generation workflow depends on, and it has.
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

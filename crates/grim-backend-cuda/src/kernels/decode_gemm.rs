@@ -1,8 +1,4 @@
-//! Decode-shaped FP16 GEMM CUDA kernel.
-//!
-//! Ported from grim-backend-rocm `kernels/decode_gemm.rs`.
-//! Small-M (decode batch) FP16 GEMM: C[M,N] = A[M,K] @ B[K,N], f32 accumulate, FP16 out.
-//! Uses `__half` (CUDA) in place of `_Float16` (HIP).
+//! Decode-shaped FP16 GEMM CUDA kernel. Ported from grim-backend-rocm `kernels/decode_gemm.rs`.
 
 pub const DECODE_GEMM_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -15,8 +11,7 @@ extern "C" __global__ void grim_decode_gemm_f16(
     int stride_a, int stride_b, int stride_c)
 {
     // Decode-shape FP16 GEMM: C[M,N] = A[M,K] @ B[K,N], f32 accumulate, FP16 out.
-    // One thread per output element. F32 accumulation avoids catastrophic
-    // cancellation at small M. Validated parity with cuBLAS at M=1..8.
+    // One thread per output element.
     const int idx   = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = M * N;
     if (idx >= total) return;

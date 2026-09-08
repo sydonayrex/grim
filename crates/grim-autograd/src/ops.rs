@@ -1,5 +1,4 @@
 //! Backward ops implementation for autograd tape entries (WI-T1 item 3).
-//!
 //! Provides reverse-mode backward implementations for MatMul, Add, Scale, and fused LoRA application.
 
 use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme};
@@ -7,17 +6,7 @@ use grim_tensor::{DType, Device, Error, Shape, Storage, Tensor, error::Result};
 use std::sync::Arc;
 
 // DoRA (Weight-Decomposed LoRA) forward pass.
-//
 // Implements the weight-decomposed LoRA from the Unsloth/DoRA paper.
-//
-// Mathematical formulas from the plan spec:
-// 1. Directional matrix: V = W_0 + γ * B @ A
-// 2. Column-wise L2 norm for output row i: n_i = ||V[i,:]||_2 = sqrt(sum_j V[i,j]^2 + ε)
-// 3. Normalized directional matrix: V_hat[i,j] = V[i,j] / n_i
-// 4. Effective weight: W_eff[i,j] = m_i * V_hat[i,j]
-// 5. Output for input X: Y = X @ W_eff^T
-//
-// Returns Y = X @ W_eff^T.
 
 pub fn dora_forward(
     x: &Tensor,
@@ -153,15 +142,7 @@ pub fn dora_forward(
     ))
 }
 
-/// DoRA backward pass.
-///
-/// Computes gradients w.r.t. all inputs:
-/// - ∇W_eff = out_grad^T @ X
-/// - ∇m_i = sum_j (∇W_eff[i,j] * V_hat[i,j])
-/// - ∇V[i,j] = (m_i / n_i) * (∇W_eff[i,j] - V_hat[i,j] * sum_k(∇W_eff[i,k] * V_hat[i,k]))
-/// - ∇B = scale * (∇V @ A^T)
-/// - ∇A = scale * (B^T @ ∇V)
-/// - ∇X = out_grad @ W_eff
+/// DoRA backward pass. Computes gradients w.r.t.
 pub fn dora_backward(
     out_grad: &Tensor,
     x: &Tensor,
@@ -240,9 +221,8 @@ pub fn dora_backward(
         })
         .collect();
 
-    // Step 1: ∇W_eff = out_grad^T @ X
-    // out_grad shape: [batch, out_features], X shape: [batch, in_features]
-    // grad_w_eff shape: [out_features, in_features]
+    // Step 1: ∇W_eff = out_grad^T @ X out_grad shape:
+    // [batch, out_features], X shape: [batch, in_features] grad_w_eff shape: [out_features, in_features]
     let mut grad_w_eff_vec = vec![0.0f32; out_features * in_features];
     for i in 0..out_features {
         for j in 0..in_features {
@@ -278,9 +258,8 @@ pub fn dora_backward(
         }
     }
 
-    // Step 4: ∇B = scale * (∇V @ A^T)
-    // grad_v shape: [out_features, in_features], A shape: [rank, in_features]
-    // grad_b shape: [out_features, rank]
+    // Step 4: ∇B = scale * (∇V @ A^T) grad_v
+    // shape: [out_features, in_features], A shape: [rank, in_features] grad_b shape: [out_features, rank]
     let mut grad_b_vec = vec![0.0f32; out_features * rank];
     for i in 0..out_features {
         for r in 0..rank {
@@ -292,9 +271,8 @@ pub fn dora_backward(
         }
     }
 
-    // Step 5: ∇A = scale * (B^T @ ∇V)
-    // grad_v shape: [out_features, in_features], B shape: [out_features, rank]
-    // grad_a shape: [rank, in_features]
+    // Step 5: ∇A = scale * (B^T @ ∇V) grad_v
+    // shape: [out_features, in_features], B shape: [out_features, rank] grad_a shape: [rank, in_features]
     let mut grad_a_vec = vec![0.0f32; rank * in_features];
     for r in 0..rank {
         for j in 0..in_features {
@@ -307,11 +285,7 @@ pub fn dora_backward(
     }
 
     // Step 6: ∇X = out_grad @ W_eff, where W_eff[i,j] = m_i * V_hat[i,j].
-    // out_grad shape: [batch, out_features], W_eff shape: [out_features, in_features]
-    // grad_x shape: [batch, in_features]
-    // [P1-17 fix: this used ∇W_eff (the weight gradient) in place of W_eff
-    // itself — a wrong-but-nonzero grad_x that the old sanity test missed and
-    // the finite-difference check catches.]
+    // out_grad shape: [batch, out_features], W_eff shape: [out_features, in_features] grad_x shape: [batch, in_features] [P1-17 fix: this.
     let mut grad_x_vec = vec![0.0f32; batch * in_features];
     for b_idx in 0..batch {
         for j in 0..in_features {
@@ -344,8 +318,7 @@ pub fn dora_backward(
     );
 
     // In DoRA, V = W_base + scale * (B @ A), so dL/dW_base = dL/dV.
-    // For parameter-frozen adapters, downstream TrainableParam filtering zeroes unneeded updates;
-    // computing dL/dW_base = grad_v ensures full-parameter and fine-tuning scopes learn properly.
+    // For parameter-frozen adapters, downstream TrainableParam filtering zeroes unneeded updates; computing dL/dW_base = grad_v ensures full-parameter.
     let grad_w_base = Tensor::new(
         Arc::from(dev.from_cpu(&grad_v_vec, &out_shape_w, DType::F32)?),
         out_shape_w.clone(),
@@ -441,8 +414,7 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
 }
 
 /// Compute backward gradients for matrix multiplication `output = A @ B`.
-///
-/// Returns `(grad_a, grad_b)`. CONTRACT: `out_grad`, `a`, and `b` must have matching dimensions.
+/// Returns `(grad_a, grad_b)`.
 pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
     let dev = crate::pick_device_for_tensor(&args.out_grad);
     let (a_dims, b_dims) = (args.a.shape().dims(), args.b.shape().dims());
@@ -498,14 +470,8 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
             _ => &empty_scales,
         };
 
-        // Audit fix (grim-autograd A3): this fused path serves the
-        // WEIGHT-STYLE contract C = A @ Bᵀ with B stored [n, k] — the layout
-        // every production caller (streaming_forward record_matmul,
-        // transpose_b = true) and the dx kernels themselves use. The
-        // previous gate also admitted the DOCUMENTED non-transposed contract
-        // (B [k, n]) whose grads are garbage through these kernels (both
-        // wrong on gfx1201 vs the CPU reference); that case now falls back
-        // to the verified host loops.
+        // Audit fix (grim-autograd A3): this fused path serves the WEIGHT-STYLE contract C = A @ Bᵀ with B stored [n, k] - the layout every production caller (streaming_forward record_matmul, transpose_b = true) and the dx kernels themselves use.
+        // The previous gate also admitted the DOCUMENTED non-transposed contract (B [k, n]) whose grads are.
         if !args.transpose_a
             && args.transpose_b
             && (b_on_rocm || b_on_cuda || b_on_vulkan || b_on_metal)
@@ -531,9 +497,8 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                 args.a.device().clone(),
             );
 
-            // grad_b: dB_stored[p][q] = sum_i G[i][p] * A[i][q] — computed on
-            // host (B is the small trainable matrix; no device transpose
-            // primitive exists).
+            // grad_b: dB_stored[p][q] = sum_i G[i][p] * A[i][q] - computed on host
+            // (B is the small trainable matrix; no device transpose primitive exists).
             let a_host = args.a.to_vec_f32()?;
             let g_host = args.out_grad.to_vec_f32()?;
             let (n_stored, k_stored) = (args.b.shape().dims()[0], args.b.shape().dims()[1]);
@@ -567,9 +532,8 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
     let mut db_vec = vec![0.0f32; b_dims[0] * b_dims[1]];
 
     if !args.transpose_a && !args.transpose_b {
-        // dA = G @ B^T  where G is [m,n], B is [k,n], dA is [m,k].
-        // dA[i,j] = sum_l G[i,l] * B[j,l]
-        // Loop order i,j,l keeps both g_vec and b_vec sequential in l (cache-friendly).
+        // dA = G @ B^T where G is [m,n], B is [k,n], dA is [m,k].
+        // dA[i,j] = sum_l G[i,l] * B[j,l] Loop order i,j,l keeps both g_vec and b_vec sequential.
         for i in 0..m {
             for j in 0..k {
                 let mut sum = 0.0f32;
@@ -581,9 +545,8 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                 da_vec[i * k + j] = sum;
             }
         }
-        // dB = A^T @ G  where A is [m,k], G is [m,n], dB is [k,n].
-        // dB[i,j] = sum_l A[l,i] * G[l,j]
-        // Loop order i,j,l keeps both a_vec and g_vec sequential in l.
+        // dB = A^T @ G where A is [m,k], G is [m,n], dB is [k,n].
+        // dB[i,j] = sum_l A[l,i] * G[l,j] Loop order i,j,l keeps both a_vec and g_vec sequential.
         for i in 0..k {
             for j in 0..n {
                 let mut sum = 0.0f32;
@@ -596,18 +559,6 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
     } else {
         // Transposed gradient computation using the verified backward formulas.
         // Derived from C = A_op @ B_op and standard matrix calculus.
-        //
-        // For trans_a only (C = A^T @ B, A stored as MxK, B stored as KxN):
-        //   dA_stored = B @ G^T  ->  dA[p][q] = sum_l B[p][l] * G[q][l]
-        //   dB_stored = A @ G    ->  dB[p][q] = sum_i A[p][i] * G[i][q]
-        //
-        // For trans_b only (C = A @ B^T, A stored as MxK, B stored as KxN):
-        //   dA_stored = G @ B    ->  dA[p][q] = sum_l G[p][l] * B[l][q]
-        //   dB_stored = G^T @ A  ->  dB[p][q] = sum_i G[i][p] * A[i][q]
-        //
-        // For both transposed (C = A^T @ B^T):
-        //   dA_stored = B @ G^T  ->  dA[p][q] = sum_l B[p][l] * G[q][l]  (same as trans_a)
-        //   dB_stored = G @ A    ->  dB[p][q] = sum_i G[p][i] * A[q][i]   (derived: dB^T = A^T @ G)
 
         let use_bg_for_da = !args.transpose_a; // when A is not transposed, use dA = G @ B
 
@@ -645,9 +596,8 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         }
 
         if args.transpose_b {
-            // dB_stored = G^T @ A = A^T @ G  (transpose of the standard dB)
-            // dB[p][q] = sum_i G[i][p] * A[i][q]
-            // Reordered to i,p,q so A[i][q] and G[i][p] are sequential in p for fixed i.
+            // dB_stored = G^T @ A = A^T @ G (transpose of the standard dB) dB[p][q] = sum_i
+            // G[i][p] * A[i][q] Reordered to i,p,q so A[i][q] and G[i][p] are sequential in p for fixed i.
             for i in 0..a_dims[0] {
                 let g_base = i * b_dims[0];
                 let a_base = i * a_dims[1];
@@ -763,9 +713,7 @@ fn reduce_broadcast_gradient(grad: &Tensor, target_shape: &Shape) -> Result<Tens
 }
 
 /// Compute backward routing for elementwise add `output = LHS + RHS`.
-///
-/// If broadcasting occurred (e.g. `[batch, seq, dim]` + `[dim]`), the gradient for the
-/// broadcasted operand is summed along the broadcast dimensions.
+/// If broadcasting occurred (e.g.
 pub fn add_backward(args: &AddArgs) -> Result<(Tensor, Tensor)> {
     let grad_lhs = if let Some(ref target) = args.lhs_shape {
         reduce_broadcast_gradient(&args.out_grad, target)?
@@ -783,7 +731,6 @@ pub fn add_backward(args: &AddArgs) -> Result<(Tensor, Tensor)> {
 }
 
 /// Compute backward gradient for scaling `output = input * factor`.
-///
 /// Returns `grad_input = out_grad * factor`.
 pub fn scale_backward(args: &ScaleArgs) -> Result<Tensor> {
     let dev = crate::pick_device_for_tensor(&args.input_grad);
@@ -818,7 +765,6 @@ fn transpose_matrix(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 }
 
 /// Compute backward gradients for fused LoRA forward pass: `output = base + scale * (x @ A^T) @ B^T`.
-///
 /// Returns `(grad_base, grad_x, grad_a, grad_b)`.
 pub fn lora_backward(
     out_grad: &Tensor,
@@ -858,8 +804,7 @@ pub fn lora_backward(
     };
 
     // Fallback: transpose via CPU for all backends.
-    // [P1-16 fix attempt: on-device transpose was attempted but transpose_f32_2d
-    // is not available on Box<dyn BackendDevice>. CPU round-trip is the safe fallback.]
+    // [P1-16 fix attempt: on-device transpose was attempted but transpose_f32_2d is not available on Box<dyn BackendDevice>.
 
     let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) && b_dims.len() == 2 {
         b.storage().clone()
@@ -945,13 +890,7 @@ pub fn lora_backward(
 }
 
 /// SwiGLU backward: `output = silu(gate) * up`.
-///
-/// Returns `(d_gate, d_up)` where:
-/// - `d_gate = dw * up * silu'(gate)`
-/// - `d_up = dw * silu(gate)`
-///
-/// On ROCm, dispatches to the `grim_silu_mul_backward` HIP kernel for
-/// device-resident computation. Falls back to CPU vector math otherwise.
+/// Returns `(d_gate, d_up)` where: - `d_gate = dw * up * silu'(gate)` - `d_up =.
 pub fn silu_mul_backward(gate: &Tensor, up: &Tensor, dw: &Tensor) -> Result<(Tensor, Tensor)> {
     let n = gate.shape().elem_count();
     let dev = crate::pick_device_for_tensor(gate);
@@ -1015,17 +954,8 @@ pub fn silu_mul_backward(gate: &Tensor, up: &Tensor, dw: &Tensor) -> Result<(Ten
 
     Ok((d_gate, d_up))
 }
-///
-/// Computes a codebook-quantized low-rank update. `BA = B @ A` is quantized per
-/// output row against a set of scalar codebooks before being applied, so the
-/// effective adaptation only ever reads from a small centroid table.
-///
-/// Steps:
-/// 1. `BA = B @ A`, shape `[d_out, d_in]`.
-/// 2. Each output row `i` is assigned a codebook `q(i) = i % num_codebooks`.
-/// 3. `index_ij = argmin_k |BA[i,j] - codebook[q(i)][k]|` (nearest centroid).
-/// 4. `ĥBA[i,j] = codebook[q(i)][index_ij]`.
-/// 5. `Y = scale * X @ ĥBA^T` (LoRA-style delta; the caller adds the base output).
+/// Computes a codebook-quantized low-rank update.
+/// `BA = B @ A` is quantized per output row against a set of scalar.
 pub fn vera_forward(
     x: &Tensor,
     a: &Tensor,
@@ -1120,17 +1050,7 @@ pub fn vera_forward(
 }
 
 /// VeRA backward pass (straight-through estimator).
-///
-/// The quantize/dequantize step is treated as the identity for gradient flow:
-/// the gradient of the dequantized update `ĥBA` is passed straight through to
-/// `BA`, and from there to `A` and `B`. Codebook centroids receive the gradient
-/// of the elements assigned to them (the "quantize gradient before updating
-/// codebook vectors" rule).
-///
-/// Returns `(grad_base, grad_x, grad_a, grad_b, grad_codebook)` where
-/// `grad_base = out_grad` (base-weight path) and `grad_codebook` has shape
-/// `[num_codebooks, codebook_size]` (flattened centroid gradients per codebook;
-/// all used codebooks must have equal length).
+/// The quantize/dequantize step is treated as the identity for gradient flow: the gradient of the.
 pub fn vera_backward(
     out_grad: &Tensor,
     x: &Tensor,
@@ -1288,11 +1208,7 @@ pub fn vera_backward(
 }
 
 /// Apply a LoRA adapter to a linear projection output during forward pass and record the operation on `tape`.
-///
-/// If a LoRA adapter is registered and enabled for `(layer_idx, point)` in `autograd_reg`,
-/// this function computes `output = base + scale * (x @ A^T) @ B^T`, registers trainable parameters `A` and `B`
-/// on `tape`, and records a `LoRAApply` tape entry. Returns `(output_tensor_id, output_tensor)`.
-/// If no adapter is enabled at this point, returns `(base_id, base)`.
+/// If a LoRA adapter is registered and enabled for `(layer_idx, point)` in `autograd_reg`, this function.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_and_record_lora(
     autograd_reg: &crate::registry::AutogradRegistry,
@@ -1376,9 +1292,7 @@ pub fn apply_and_record_lora(
 }
 
 /// Fused SwiGLU + LoRA MLP activation forward pass helper.
-///
-/// Evaluates Gate and Up linear projections with LoRA adapters (if registered),
-/// applies SwiGLU activation (`silu(gate) * up`), and registers the resulting activation on `tape`.
+/// Evaluates Gate and Up linear projections with LoRA adapters (if registered), applies SwiGLU activation (`silu(gate).
 #[allow(clippy::too_many_arguments)]
 pub fn fused_swiglu_lora_mlp(
     autograd_reg: &crate::registry::AutogradRegistry,
@@ -1448,16 +1362,7 @@ pub struct FakeQuantInt4Args {
 }
 
 /// Forward: fake-quantize `input` to int4 and dequantize back to f32.
-///
-/// The computation is:
-/// 1. `q = clamp(round(input / scale) - zero_point, 0, 2^num_bits - 1)`
-/// 2. `dequant = (q + zero_point) * scale`
-///
-/// The STE (Straight-Through Estimator) backward rule passes the
-/// gradient of the dequantized output straight through to the
-/// input, bypassing the non-differentiable clamp/round quantization.
-/// This is the standard STE approach for QAT (Quantization-Aware
-/// Training) with int4 fake quantization.
+/// The computation is: 1.
 pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
     let data = args.input.to_vec_f32()?;
     let qmin: f32 = 0.0;
@@ -1485,16 +1390,7 @@ pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
 }
 
 /// Reverse-mode autodiff for RMSNorm layer: `y = (x / rms) * weight`.
-///
-/// Mathematical contract:
-/// - `x`: Input tensor of shape `[..., hidden_dim]`
-/// - `weight`: Learnable scale parameter of shape `[hidden_dim]`
-/// - `out_grad`: Incoming loss gradient w.r.t. output `y`, shape `[..., hidden_dim]`
-/// - `eps`: Numerical epsilon for variance stabilization
-///
-/// Returns `(dx, dweight)` where:
-/// - `dweight[j] = sum_{batch} out_grad[..., j] * (x[..., j] / rms)`
-/// - `dx[i] = (weight[i] / rms) * out_grad[i] - (x[i] / (hidden_dim * rms^3)) * sum_j(out_grad[j] * weight[j] * x[j])`
+/// Mathematical contract: - `x`: Input tensor of shape `[..., hidden_dim]` - `weight`: Learnable scale parameter.
 pub fn rmsnorm_backward(
     x: &Tensor,
     weight: &Tensor,
@@ -1587,13 +1483,7 @@ pub fn rmsnorm_backward(
 }
 
 /// Reverse-mode autodiff for Rotary Position Embedding (RoPE).
-///
-/// Mathematical contract:
-/// - RoPE is an orthogonal rotation matrix $R(\theta)$.
-/// - Backward w.r.t. input $x$ is matrix-vector multiply by $R(\theta)^T = R(-\theta)$.
-/// - For pairs $(g_0, g_1)$ rotated by $(\cos \theta, \sin \theta)$, the backward gradient is:
-///   $dx_0 = g_0 \cos \theta + g_1 \sin \theta$
-///   $dx_1 = -g_0 \sin \theta + g_1 \cos \theta$
+/// Mathematical contract: - RoPE is an orthogonal rotation matrix $R(\theta)$.
 pub fn rope_backward(out_grad: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let dev = crate::pick_device_for_tensor(out_grad);
     if let grim_tensor::Device::Rocm(_) = out_grad.device() {
@@ -1670,11 +1560,7 @@ pub fn rope_backward(out_grad: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Te
 }
 
 /// Reverse-mode autodiff for Softmax activation along the last dimension.
-///
-/// Mathematical contract:
-/// - `softmax_out`: Forward softmax probabilities $s$, $\sum_j s_j = 1$.
-/// - `out_grad`: Incoming loss gradient $g$.
-/// - Returns $dx_i = s_i \cdot (g_i - \sum_j g_j \cdot s_j)$.
+/// Mathematical contract: - `softmax_out`: Forward softmax probabilities $s$, $\sum_j s_j = 1$.
 pub fn softmax_backward(out_grad: &Tensor, softmax_out: &Tensor) -> Result<Tensor> {
     let dev = crate::pick_device_for_tensor(out_grad);
     if let grim_tensor::Device::Rocm(_) = out_grad.device() {
@@ -1737,14 +1623,7 @@ pub fn softmax_backward(out_grad: &Tensor, softmax_out: &Tensor) -> Result<Tenso
 }
 
 /// Reverse-mode autodiff for token embedding lookup table.
-///
-/// Mathematical contract:
-/// - `out_grad`: Incoming gradients for token activations, shape `[seq_len, hidden_dim]`
-/// - `token_ids`: Token indices corresponding to rows in `out_grad`
-/// - `vocab_size`: Total vocabulary dimension of embedding weight matrix `[vocab_size, hidden_dim]`
-/// - `hidden_dim`: Embedding vector dimension
-///
-/// Accumulates row gradients via scatter-add: `dweight[token_ids[i]] += out_grad[i]`.
+/// Mathematical contract: - `out_grad`: Incoming gradients for token activations, shape `[seq_len, hidden_dim]` - `token_ids`: Token.
 pub fn embedding_backward(
     out_grad: &Tensor,
     token_ids: &[u32],
@@ -1807,9 +1686,8 @@ pub fn embedding_backward(
     ))
 }
 
-/// Backward: STE — gradient passes through as identity (gradient of
-/// quantize+dequant w.r.t. input is 1.0 everywhere in the STE
-/// approximation, ignoring the non-differentiable clamp/round).
+/// Backward: STE - gradient passes through as identity (gradient of quantize+dequant w.r.t.
+/// input is 1.0 everywhere in the STE approximation, ignoring the non-differentiable clamp/round).
 pub fn fake_quant_int4_backward(_args: &FakeQuantInt4Args, grad_output: &Tensor) -> Result<Tensor> {
     // STE: dx = grad_output * 1.0 (identity through quantize).
     let grad_data = grad_output.to_vec_f32()?;
@@ -1818,8 +1696,7 @@ pub fn fake_quant_int4_backward(_args: &FakeQuantInt4Args, grad_output: &Tensor)
 }
 
 /// OFT (Orthogonal Fine-Tuning) forward pass.
-/// Multiplies the base weight by an orthogonal expansion:
-/// W_out = W + scale * (r^T @ (r @ W))
+/// Multiplies the base weight by an orthogonal expansion: W_out = W + scale * (r^T.
 pub fn oft_forward(
     w: &[f32],
     r_factor: &[f32],
@@ -2286,8 +2163,7 @@ mod tests {
 
         let y = vera_forward(&x, &a, &b, &codebook, 1.0, 1).unwrap();
         let data = y.to_vec_f32().unwrap();
-        // BA rows: [1,-2], [0.5,-1], [-0.5,1] → quantized with {-2,1}:
-        //   row0 [1,-2] → [1,-2]; row1 [0.5,-1] → [1,-2]; row2 [-0.5,1] → [-2,1] (tie → first).
+        // BA rows: [1,-2], [0.5,-1], [-0.5,1] → quantized with {-2,1}: row0 [1,-2] → [1,-2]; row1 [0.5,-1] → [1,-2]; row2 [-0.5,1] → [-2,1] (tie → first).
         // Y = x @ ĥBA^T, x=[1,2]: row0 1*1+2*(-2)=-3; row1 -3; row2 1*(-2)+2*1=0.
         assert_eq!(data, vec![-3.0, -3.0, 0.0]);
     }
@@ -2339,8 +2215,7 @@ mod tests {
         assert!(vera_backward(&out_grad, &x, &a, &b, &codebook, 1.0).is_err());
     }
 
-    /// Sanity check for DoRA backward: verifies gradients are produced with
-    /// correct shapes and non-zero values (catches catastrophic sign/zero bugs).
+    /// Sanity check for DoRA backward: verifies gradients are produced with correct shapes and non-zero values (catches catastrophic sign/zero bugs).
     /// [P1-17 fix: add basic coverage for dora_backward.]
     #[test]
     fn dora_backward_sanity() {
@@ -2419,11 +2294,8 @@ mod tests {
         );
     }
 
-    /// Reference DoRA forward, host-side, used only by the finite-difference
-    /// grad check below. W_eff[i,j] = m_i * V[i,j] / ||V_i||, with
-    /// V = W_0 + scale * (B @ A); y = x @ W_eff^T.
-    /// Loss is `sum(out_grad * y)`, so dLoss/dparam is exactly what
-    /// `dora_backward` returns for that `out_grad`.
+    /// Reference DoRA forward, host-side, used only by the finite-difference grad check below.
+    /// W_eff[i,j] = m_i * V[i,j] / ||V_i||, with V = W_0 + scale * (B.
     #[allow(clippy::too_many_arguments)]
     fn dora_ref_loss(
         g: &[f32],
@@ -2468,12 +2340,7 @@ mod tests {
     }
 
     /// Finite-difference numerical grad check for `dora_backward`.
-    ///
-    /// The sanity test above only proves gradients are non-zero; a
-    /// sign/transpose/norm slip produces wrong-but-nonzero values and slips
-    /// through. This compares every returned gradient element against a
-    /// central-difference estimate of the same loss.
-    /// [P1-17: real numerical grad check.]
+    /// The sanity test above only proves gradients are non-zero; a sign/transpose/norm slip produces wrong-but-nonzero values.
     #[test]
     fn dora_backward_matches_finite_difference() {
         let (batch, in_f, out_f, rank) = (2usize, 4usize, 3usize, 2usize);

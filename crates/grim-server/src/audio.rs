@@ -1,8 +1,5 @@
 //! Audio decoding, Mel spectrogram front-end, and transcription response structures.
-//!
-//! Provides CPU-based WAV decoding (16-bit PCM / 32-bit float to normalized mono f32)
-//! and 80-channel log-mel filterbank extraction (25ms window, 10ms hop at 16kHz)
-//! compatible with OpenAI Whisper models.
+//! Provides CPU-based WAV decoding (16-bit PCM / 32-bit float to normalized mono f32) and 80-channel.
 
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
@@ -163,11 +160,8 @@ impl MelFrontend {
         }
     }
 
-    /// Compute the mel filterbank weights once. Triangular filters spaced on the
-    /// mel scale between `f_min` and `f_max`, each spanning two adjacent center
-    /// frequencies — the standard librosa/Slaney mel filterbank. The result is
-    /// `[n_mels, n_fft/2+1]` weights; `mel_out[f][bin]` is the contribution of
-    /// FFT bin `f` to mel band `m`.
+    /// Compute the mel filterbank weights once.
+    /// Triangular filters spaced on the mel scale between `f_min` and `f_max`, each spanning two adjacent.
     fn mel_filterbank(&self, f_min: f32, f_max: f32) -> Vec<f32> {
         let n_bins = self.n_fft / 2 + 1;
         let sample_rate = self.sample_rate as f32;
@@ -249,10 +243,7 @@ impl MelFrontend {
     }
 
     /// Extract `[n_mels, n_frames]` log-mel filterbank features from 16kHz audio.
-    ///
-    /// Real pipeline: Hann window → Discrete Fourier Transform power spectrum
-    /// → triangular mel filterbank (HTK scale, Slaney area-normalized)
-    /// → log10 clamp. This produces accurate 80-bin mel spectrogram representations.
+    /// Real pipeline: Hann window → Discrete Fourier Transform power spectrum → triangular mel filterbank (HTK.
     pub fn extract_mel(&self, audio: &[f32]) -> (Vec<f32>, usize) {
         if audio.is_empty() {
             return (vec![0.0f32; self.n_mels], 1);

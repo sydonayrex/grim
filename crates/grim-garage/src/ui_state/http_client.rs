@@ -1,7 +1,5 @@
-//! HTTP client — fetches models, datasets, devices, and starts jobs from
-//! the local grim-garage axum API. The client runtime invokes this on
-//! startup and on refresh; tests use the in-process mock to confirm wire
-//! formats match what the server returns.
+//! HTTP client - fetches models, datasets, devices, and starts jobs from the local grim-garage axum API.
+//! The client runtime invokes this on startup and on refresh; tests use the in-process mock.
 
 use serde::Deserialize;
 
@@ -25,8 +23,7 @@ struct DevicesEnvelope {
 }
 
 /// Job summary mirroring the wire format returned by `/api/train/jobs`.
-/// Held as a private DTO here so neither the UI nor the server depends
-/// on the other for this type.
+/// Held as a private DTO here so neither the UI nor the server depends on.
 #[derive(Debug, Deserialize, Clone)]
 pub struct JobSummaryDto {
     pub job_id: String,
@@ -60,9 +57,8 @@ impl GarageClient {
 
     // ----- live GETs against the local backend -----
 
-    /// `GET /api/models`. Returns the parsed list, or an error on
-    /// network / parse failure so the poller can skip that endpoint
-    /// for this round.
+    /// `GET /api/models`. Returns the parsed list, or an error on network /
+    /// parse failure so the poller can skip that endpoint for this round.
     pub async fn get_models(&self) -> Result<Vec<ModelEntry>, String> {
         let body = self.get_json("/api/models").await?;
         self.parse_models(&body).map_err(|e| e.to_string())
@@ -87,9 +83,8 @@ impl GarageClient {
         Ok(env.jobs)
     }
 
-    /// Tiny async GET using tokio's TcpStream — no heavyweight reqwest
-    /// dep needed. Trims the response body at the first empty line of
-    /// the chunked encoding or at connection close.
+    /// Tiny async GET using tokio's TcpStream - no heavyweight reqwest dep needed.
+    /// Trims the response body at the first empty line of the chunked encoding or at.
     async fn get_json(&self, path: &str) -> Result<String, String> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let host_port_path = url

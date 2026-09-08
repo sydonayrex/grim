@@ -1,14 +1,5 @@
-//! WI-SB3: TTFT/ITL A/B harness support.
-//!
-//! Owns the results-file protocol (§setup-4 of `scythe2_syd_beasty_plan.md`):
-//! every hardware sample appends one JSON line
-//! `{wi, order, metric, value, commit, ts}` to
-//! `docs/benchmarks/scythe2_syd_beasty_results.jsonl`, and the WI-INF4
-//! verdict rule (mean TTFT overhead ≤ 5 %, p95 ITL overhead ≤ 2 %) is
-//! computed here so the example driver stays a thin loop and the math is
-//! unit-testable off-box. The gate is evaluated PER ordinal order
-//! (`format_ab_report` prints one line per order) — the pooled verdict is
-//! reported alongside, but a per-order FAIL must not hide under pooling.
+//! WI-SB3: TTFT/ITL A/B harness support. Owns the results-file protocol (§setup-4 of `scythe2_syd_beasty_plan.md`): every hardware sample appends one JSON line `{wi, order, metric, value, commit, ts}` to `docs/benchmarks/scythe2_syd_beasty_results.jsonl`, and the WI-INF4
+//! verdict rule (mean TTFT overhead ≤ 5 %, p95 ITL overhead ≤ 2 %) is computed here so the example driver stays a thin loop and the math is unit-testable off-box.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,9 +9,8 @@ pub fn default_results_path() -> PathBuf {
     PathBuf::from("docs/benchmarks/scythe2_syd_beasty_results.jsonl")
 }
 
-/// One measured request from an A/B leg. Latencies are engine-reported
-/// (`last_ttft_ms` / `last_itl_ms` / `tokens_per_sec_ema`); `throttle_pct`
-/// rides along with every sample per the plan's thermal-drift risk note.
+/// One measured request from an A/B leg. Latencies are engine-reported (`last_ttft_ms` / `last_itl_ms`
+/// / `tokens_per_sec_ema`); `throttle_pct` rides along with every sample per the plan's thermal-drift risk note.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScytheAbSample {
     pub arm_on: bool,
@@ -99,11 +89,8 @@ pub struct StoredMetric {
     pub metric: String,
     pub value: f64,
     pub prompt_tokens: usize,
-    /// Unix-seconds stamp from the §setup-4 line; 0 for legacy rows without
-    /// one. Verdict computations filter on this — see `parse_samples_since`
-    /// and the WI-INF4 measurement-defect note (a cumulative report that
-    /// mixes rows from different campaigns mixes fault-era data into the
-    /// verdict; the ts-filtered computation is authoritative).
+    /// Unix-seconds stamp from the §setup-4 line; 0 for legacy rows without one.
+    /// Verdict computations filter on this - see `parse_samples_since` and the WI-INF4 measurement-defect note (a cumulative.
     pub ts: u64,
 }
 
@@ -113,10 +100,8 @@ pub fn parse_samples(jsonl: &str) -> Vec<StoredMetric> {
     parse_samples_since(jsonl, 0)
 }
 
-/// Like [`parse_samples`], but keeps only rows stamped `>= since_ts` (unix
-/// seconds). `since_ts == 0` keeps everything (same as [`parse_samples`]).
-/// Rows without a `ts` field (legacy, stamped 0) never survive a nonzero
-/// cutoff so a filtered verdict can never silently include unstaleable data.
+/// Like [`parse_samples`], but keeps only rows stamped `>= since_ts` (unix seconds).
+/// `since_ts == 0` keeps everything (same as [`parse_samples`]).
 pub fn parse_samples_since(jsonl: &str, since_ts: u64) -> Vec<StoredMetric> {
     parse_samples_impl(jsonl, Some(since_ts))
 }
@@ -130,9 +115,8 @@ fn parse_samples_impl(jsonl: &str, since_ts: Option<u64>) -> Vec<StoredMetric> {
             let value = v.get("value")?.as_f64()?;
             let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
             if let Some(cutoff) = since_ts {
-                // cutoff == 0 disables filtering entirely (the unfiltered
-                // `parse_samples` view); a nonzero cutoff also drops
-                // unstamped (ts == 0) rows.
+                // cutoff == 0 disables filtering entirely (the unfiltered `parse_samples` view);
+                // a nonzero cutoff also drops unstamped (ts == 0) rows.
                 if cutoff > 0 && (ts == 0 || ts < cutoff) {
                     return None;
                 }
@@ -173,9 +157,8 @@ fn percentile(values: &[f64], p: f64) -> Option<f64> {
     sorted.get(idx).copied()
 }
 
-/// The WI-INF4 verdict rule applied to pooled samples from both legs:
-/// mean-TTFT overhead ≤ 5 % AND p95-ITL overhead ≤ 2 %. `None` when either
-/// arm has no data — a verdict is never invented from half an experiment.
+/// The WI-INF4 verdict rule applied to pooled samples from both legs: mean-TTFT overhead ≤ 5 % AND p95-ITL overhead ≤ 2 %.
+/// `None` when either arm has no data - a verdict is never invented from half.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScytheAbVerdict {
     pub ttft_overhead_pct: f64,
@@ -271,9 +254,8 @@ pub fn format_ab_report(on: &[StoredMetric], off: &[StoredMetric]) -> String {
         .ok();
     }
 
-    // Per-order verdict lines (the WI-INF4 gate is evaluated per ordinal
-    // order — the 2026-08-23c campaign failed S-first while F-first passed;
-    // a pooled-only verdict hides exactly that asymmetry).
+    // Per-order verdict lines (the WI-INF4 gate is evaluated per ordinal order - the
+    // 2026-08-23c campaign failed S-first while F-first passed; a pooled-only verdict hides exactly that asymmetry).
     let mut orders: Vec<&str> = on
         .iter()
         .chain(off.iter())
@@ -426,9 +408,8 @@ mod tests {
         };
         let base = mk(false, &[100.0, 100.0, 100.0, 100.0], &[10.0; 4]);
 
-        // Comfortably inside both budgets ⇒ eligible (p95 of 4 samples is
-        // their max; the exact-boundary case is floating-point knife-edge
-        // territory and deliberately not asserted).
+        // Comfortably inside both budgets ⇒ eligible (p95 of 4 samples is their
+        // max; the exact-boundary case is floating-point knife-edge territory and deliberately not asserted).
         let at_budget = mk(
             true,
             &[104.0, 105.0, 104.0, 105.0],
@@ -453,12 +434,8 @@ mod tests {
         assert!(scythe_ab_verdict(&at_budget, &[]).is_none());
     }
 
-    /// WI-INF4 measurement-defect fix: `parse_samples` once returned every
-    /// row in the file, so a cumulative verdict mixed stale fault-era rows
-    /// into the computation (the plan's validation log documents the
-    /// 28.5 %-vs-2.4 % ITL discrepancy this caused). `parse_samples_since`
-    /// drops unstamped and pre-cutoff rows so a filtered verdict can never
-    /// include unstampable data.
+    /// WI-INF4 measurement-defect fix: `parse_samples` once returned every row in the file, so a cumulative verdict mixed stale fault-era rows into the computation (the plan's validation log documents the 28.5 %-vs-2.4 % ITL discrepancy this caused).
+    /// `parse_samples_since` drops unstamped and pre-cutoff rows so a filtered verdict can never include unstampable data.
     #[test]
     fn test_parse_samples_since_filters_stale_campaign_rows() {
         let current = sample(true, 2048, 120.0, 9.5).to_json_lines("fresh01", 1_700_500);
@@ -492,9 +469,8 @@ mod tests {
         );
     }
 
-    /// The WI-INF4 gate is per ordinal order: the 2026-08-23c campaign
-    /// passed F-first and failed S-first on ITL. A pooled-only report would
-    /// hide that; the report must print one verdict line per order.
+    /// The WI-INF4 gate is per ordinal order: the 2026-08-23c campaign passed F-first and failed S-first on ITL.
+    /// A pooled-only report would hide that; the report must print one verdict line per order.
     #[test]
     fn test_report_prints_per_order_verdicts() {
         let mk_arm = |arm_on: bool, order: &str, itl: f64| -> Vec<StoredMetric> {

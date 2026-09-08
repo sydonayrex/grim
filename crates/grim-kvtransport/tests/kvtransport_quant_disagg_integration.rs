@@ -145,8 +145,7 @@ fn test_network_kv_transport_tcp_loopback_streaming() {
     let k_payload = vec![0.42f32; 4 * 16];
     let v_payload = vec![0.84f32; 4 * 16];
 
-    let send_res =
-        client.send_block_remote(2, 0, &k_payload, &v_payload, 16, &addr.to_string());
+    let send_res = client.send_block_remote(2, 0, &k_payload, &v_payload, 16, &addr.to_string());
     assert!(
         send_res.is_ok(),
         "Client should successfully send KV block to loopback receiver: {:?}",

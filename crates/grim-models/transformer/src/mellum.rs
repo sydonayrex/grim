@@ -1,38 +1,5 @@
-//! Compatibility loader for `JetBrains/Mellum2-12B-A2.5B-Thinking`
-//! (HuggingFace `model_type = "mellum"`).
-//!
-//! ## What this model is
-//!
-//! Mellum2 is a **sparse-MoE** CausalLM with Llama-style attention:
-//!
-//! * 28 layers, each with sliding-window or full attention and a sparse MoE FFN.
-//! * MoE: 64 routed experts, `num_experts_per_tok = 8`, softmax router,
-//!   no shared expert, `routed_scaling_factor = 1.0`.
-//! * Attention: 32 query heads, 4 KV heads, `head_dim = 128`,
-//!   sliding window = 1024, `use_sliding_window = true`.
-//! * Yarn RoPE: `rope_theta = 500000.0`, `factor = 16.0`,
-//!   `original_max_position_embeddings = 8192`, `beta_fast = 32.0`,
-//!   `beta_slow = 1.0`, `attention_factor = 1.2772588722239782`.
-//! * `max_position_embeddings = 131072`, `rms_norm_eps = 1e-06`.
-//! * Vocabulary: 98304 tokens (SentencePiece).
-//!
-//! ## Compatibility status
-//!
-//! Mellum2 shares the Llama-style transformer backbone with Qwen3-MoE and
-//! other sparse-MoE models in grim. The `Mellum` struct wraps `Llama` with
-//! a per-layer MoE spec (softmax router, 64 experts, 8 per token, no shared
-//! expert).
-//!
-//! RoPE / attention fidelity:
-//! * Mellum2 uses **YaRN** RoPE on its full-attention layers. The loader
-//!   parses `rope_parameters.full_attention` (factor, beta_fast, beta_slow,
-//!   original_max_position_embeddings, attention_factor) and threads it into
-//!   every full-attention layer's `RopeConfig` so the GPU `rope_launch_yarn`
-//!   path applies the frequency ramp + magnitude correction.
-//! * Mellum2 mixes full-attention and sliding-window layers: the last
-//!   `max_window_layers` layers run sliding-window attention with plain RoPE,
-//!   the rest run full attention with YaRN. `max_window_layers = 0` ⇒ all
-//!   layers are full-attention-with-YaRN (the common Mellum2 config).
+//! Compatibility loader for `JetBrains/Mellum2-12B-A2.5B-Thinking` (HuggingFace `model_type = "mellum"`).
+//! ## What this model is Mellum2 is a **sparse-MoE** CausalLM with Llama-style attention: * 28.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -45,18 +12,10 @@ use crate::block::{AttentionType, LayerAttentionSpec};
 use crate::model::{Llama, LlamaConfig};
 use crate::moe_block::MoESpec;
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for JetBrains/Mellum2-12B-A2.5B-Thinking.
-///
-/// Matches the HuggingFace `config.json` fields:
-/// `vocab_size=98304, hidden_size=2304, num_attention_heads=32,
-/// num_key_value_heads=4, head_dim=128, num_hidden_layers=28,
-/// intermediate_size=7168, moe_intermediate_size=896, num_experts=64,
-/// num_experts_per_tok=8, rms_norm_eps=1e-06, rope_theta=500000.0,
-/// max_position_embeddings=131072, sliding_window=1024`.
+/// Matches the HuggingFace `config.json` fields: `vocab_size=98304, hidden_size=2304, num_attention_heads=32, num_key_value_heads=4, head_dim=128, num_hidden_layers=28, intermediate_size=7168, moe_intermediate_size=896, num_experts=64, num_experts_per_tok=8,.
 #[derive(Debug, Clone)]
 pub struct MellumConfig {
     pub vocab_size: usize,
@@ -73,8 +32,7 @@ pub struct MellumConfig {
     pub rope_theta: f32,
     pub max_seq_len: usize,
     pub sliding_window: usize,
-    /// Number of trailing layers that use sliding-window attention with plain
-    /// RoPE; the remaining (earlier) layers use full attention with YaRN.
+    /// Number of trailing layers that use sliding-window attention with plain RoPE; the remaining (earlier) layers use full attention with YaRN.
     /// `0` ⇒ all layers are full-attention-with-YaRN.
     pub max_window_layers: usize,
     /// YaRN RoPE parameters parsed from `rope_parameters.full_attention`.
@@ -95,9 +53,7 @@ impl ModelConfig for MellumConfig {
 
 impl MellumConfig {
     /// Build from the raw HuggingFace `config.json` `serde_json::Value`.
-    ///
-    /// Panics are avoided: every field is read with a `get` + `as_*` + fallback
-    /// so a slightly different Mellum variant still parses.
+    /// Panics are avoided: every field is read with a `get` + `as_*` + fallback so.
     pub fn from_hf(value: &serde_json::Value) -> Self {
         let u = |k: &str| value.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let f = |k: &str| value.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -143,10 +99,8 @@ impl MellumConfig {
             }
         };
 
-        // YaRN RoPE parameters live under `rope_parameters.full_attention`
-        // (Mellum2's actual layout). Fall back to a flat `rope_scaling` block
-        // for other variants. Missing fields default to the documented
-        // Mellum2 YaRN constants so a slightly different checkpoint still works.
+        // YaRN RoPE parameters live under `rope_parameters.full_attention` (Mellum2's actual layout).
+        // Fall back to a flat `rope_scaling` block for other variants.
         let yarn = value
             .get("rope_parameters")
             .and_then(|rp| rp.get("full_attention"))
@@ -204,9 +158,7 @@ impl MellumConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model — Llama backbone with per-layer MoE spec
-// ---------------------------------------------------------------------------
+// Model - Llama backbone with per-layer MoE spec
 
 pub struct Mellum {
     pub cfg: MellumConfig,
@@ -257,10 +209,8 @@ impl Mellum {
 
         let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); num_layers];
 
-        // Per-layer attention specs. Mellum2 mixes full-attention-with-YaRN
-        // layers (the earlier layers) and sliding-window layers (the trailing
-        // `max_window_layers` layers, which use plain RoPE). `max_window_layers
-        // = 0` ⇒ every layer is full-attention-with-YaRN.
+        // Per-layer attention specs. Mellum2 mixes full-attention-with-YaRN layers (the earlier layers)
+        // and sliding-window layers (the trailing `max_window_layers` layers, which use plain RoPE).
         let attn_specs: Vec<LayerAttentionSpec> = (0..num_layers)
             .map(|i| {
                 let is_sliding =
@@ -322,9 +272,7 @@ impl CausalLm for Mellum {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Architecture dispatch
-// ---------------------------------------------------------------------------
 
 impl MellumConfig {
     /// Whether this config represents a MoE model.

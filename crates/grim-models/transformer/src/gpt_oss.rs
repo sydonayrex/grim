@@ -1,10 +1,5 @@
-//! GPT-OSS open-architecture Transformer with Grouped Query Attention (GQA),
-//! NeoX RoPE, and fine-grained SwiGLU / MoE feed-forward layers.
-//!
-//! # Architecture Details
-//! - **Attention**: GQA with RoPE rotation in half-split (NeoX) layout.
-//! - **Feed Forward**: SwiGLU gated linear projections ($x \cdot \text{SiLU}(x \cdot W_{\text{gate}}) \cdot W_{\text{up}} \cdot W_{\text{down}}$).
-//! - **Normalization**: Pre-attention and pre-FFN RMSNorm with configurable epsilon.
+//! GPT-OSS open-architecture Transformer with Grouped Query Attention (GQA), NeoX RoPE, and fine-grained SwiGLU / MoE feed-forward layers.
+//! # Architecture Details - **Attention**: GQA with RoPE rotation in half-split (NeoX) layout.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for GPT-OSS models.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -67,9 +60,7 @@ impl ModelConfig for GptOssConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Feed Forward / SwiGLU Block
-// ---------------------------------------------------------------------------
 
 /// SwiGLU feed-forward projection block for GPT-OSS.
 pub struct GptOssMlp {
@@ -80,9 +71,7 @@ pub struct GptOssMlp {
 
 impl GptOssMlp {
     /// Load MLP projections from checkpoint weight source.
-    ///
-    /// # Contract
-    /// Loads `gate_proj`, `up_proj`, and `down_proj` from the provided weight scope.
+    /// # Contract Loads `gate_proj`, `up_proj`, and `down_proj` from the provided weight scope.
     pub fn load(ws: &WeightSource<'_>, in_dim: usize, hidden_dim: usize) -> Result<Self> {
         let gate_proj = Linear::load_shape(&ws.scoped("gate_proj"), [in_dim, hidden_dim])?;
         let up_proj = Linear::load_shape(&ws.scoped("up_proj"), [in_dim, hidden_dim])?;
@@ -97,15 +86,24 @@ impl GptOssMlp {
     /// Construct mock MLP for unit tests.
     pub fn random(in_dim: usize, hidden_dim: usize) -> Self {
         let gate_proj = Linear::from_tensor(
-            cpu_tensor(vec![0.01f32; hidden_dim * in_dim], Shape::new(vec![hidden_dim, in_dim])),
+            cpu_tensor(
+                vec![0.01f32; hidden_dim * in_dim],
+                Shape::new(vec![hidden_dim, in_dim]),
+            ),
             None,
         );
         let up_proj = Linear::from_tensor(
-            cpu_tensor(vec![0.01f32; hidden_dim * in_dim], Shape::new(vec![hidden_dim, in_dim])),
+            cpu_tensor(
+                vec![0.01f32; hidden_dim * in_dim],
+                Shape::new(vec![hidden_dim, in_dim]),
+            ),
             None,
         );
         let down_proj = Linear::from_tensor(
-            cpu_tensor(vec![0.01f32; in_dim * hidden_dim], Shape::new(vec![in_dim, hidden_dim])),
+            cpu_tensor(
+                vec![0.01f32; in_dim * hidden_dim],
+                Shape::new(vec![in_dim, hidden_dim]),
+            ),
             None,
         );
         Self {
@@ -125,9 +123,7 @@ impl GptOssMlp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Transformer Decoder Block
-// ---------------------------------------------------------------------------
 
 /// Single GPT-OSS Transformer decoder layer.
 pub struct GptOssBlock {
@@ -146,7 +142,11 @@ pub struct GptOssBlock {
 
 impl GptOssBlock {
     /// Load transformer decoder block from checkpoint weight source.
-    pub fn load(ws: &WeightSource<'_>, cfg: &GptOssConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &GptOssConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -186,9 +186,7 @@ impl GptOssBlock {
     }
 
     /// Forward pass through attention and SwiGLU feed-forward layer.
-    ///
-    /// GPU-first: Q/K/V and attention run on the tensor's device; the host
-    /// path is only reached through the fused-kernel fallback guard.
+    /// GPU-first: Q/K/V and attention run on the tensor's device; the host path is only reached.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.attn_norm.forward(x)?;
@@ -197,12 +195,8 @@ impl GptOssBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -230,9 +224,7 @@ impl GptOssBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 /// GPT-OSS Causal Language Model.
 pub struct GptOss {
@@ -289,7 +281,10 @@ impl GptOss {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -342,7 +337,11 @@ impl CausalLm for GptOss {
             .into_iter()
             .map(|p| p as u32)
             .collect();
-        let ids: Vec<u32> = input_ids.to_vec_f32()?.into_iter().map(|t| t as u32).collect();
+        let ids: Vec<u32> = input_ids
+            .to_vec_f32()?
+            .into_iter()
+            .map(|t| t as u32)
+            .collect();
         let seq_len = ids.len();
 
         // GPU-first embedding gather: only the gathered rows exist as a new
@@ -364,9 +363,7 @@ impl CausalLm for GptOss {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -383,6 +380,7 @@ mod tests {
         assert_eq!(cfg.head_dim, 128);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_gpt_oss_swiglu_numerics() {
         let mlp = GptOssMlp::random(16, 32);
@@ -392,6 +390,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_gpt_oss_forward_and_session_state() {
         let mut cfg = GptOssConfig::default();
         cfg.vocab_size = 64;
@@ -405,7 +404,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![3.0, 11.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 64]);
 
         let last_h = session.get_last_hidden_state();

@@ -1,9 +1,5 @@
 //! OASIS: Online Activation Subspace Projection for Low-Rank Activation Compression.
-//!
 //! Repurposed from OASIS (arXiv:2604.09406) with unbiased-linear-safety (arXiv:2605.01255).
-//! Projects intermediate linear layer forward activations onto an online low-rank basis subspace
-//! matrix Q [d, p], saving activation memory during training without loss of first-order gradient fidelity.
-//! Subspace updates use warm-started power iteration (O(d·p)) rather than costly per-step SVD.
 
 use grim_quant::soul_eater::subspace_newton_schulz_step;
 
@@ -124,12 +120,8 @@ mod tests {
 
     #[test]
     fn test_oasis_subspace_known_projection() {
-        // d = 4, p = 2
-        // basis = canonical projection to first 2 dims:
-        // [ [1, 0],
-        //   [0, 1],
-        //   [0, 0],
-        //   [0, 0] ]
+        // d = 4, p = 2 basis = canonical projection to first
+        // 2 dims: [ [1, 0], [0, 1], [0, 0], [0, 0] ]
         let mut basis = vec![0.0f32; 4 * 2];
         basis[0] = 1.0;
         basis[3] = 1.0;

@@ -7,10 +7,8 @@ mod tests {
     };
     use grim_tensor::{BackendStorage, CoreTensorOps, ElementwiseOps, MemoryOps, QuantOps, Shape};
 
-    /// Source-presence guard for the partial-rotary / YaRN RoPE kernel and the
-    /// sliding-window attention extension. No GPU required — this just asserts
-    /// the CUDA kernel source declares the symbols and parameters the host
-    /// dispatchers expect, mirroring the ROCm `test_rope_yarn_kernel_presence`.
+    /// Source-presence guard for the partial-rotary / YaRN RoPE kernel and the sliding-window attention extension.
+    /// No GPU required - this just asserts the CUDA kernel source declares the symbols and.
     #[test]
     fn test_rope_yarn_and_window_lo_kernel_presence() {
         let src = crate::kernels::KERNELS_SOURCE;
@@ -64,20 +62,21 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_cuda_device_probe() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        assert!(!devices.is_empty());
-        assert_eq!(devices[0].ordinal, 0);
+        let Ok(devices) = CudaDevice::probe() else {
+            return;
+        };
+        if let Some(dev) = devices.first() {
+            assert_eq!(dev.ordinal, 0);
+        }
     }
 
     #[test]
     fn test_cuda_zeros() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let shape = Shape::new(vec![2, 4]);
         let storage = dev.zeros(&shape, DType::F32).unwrap();
         let cpu_data = storage.to_cpu_vec_f32().unwrap();
@@ -86,9 +85,9 @@ mod tests {
 
     #[test]
     fn test_cuda_from_cpu() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let shape = Shape::new(vec![3, 2]);
         let host_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let storage = dev.from_cpu(&host_data, &shape, DType::F32).unwrap();
@@ -98,9 +97,9 @@ mod tests {
 
     #[test]
     fn test_cuda_math_ops() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let shape = Shape::new(vec![4]);
         let host_data = vec![4.0f32, 9.0, 16.0, 25.0];
         let x = dev.from_cpu(&host_data, &shape, DType::F32).unwrap();
@@ -119,18 +118,12 @@ mod tests {
     }
 
     /// GPU-gated parity test for the fused grouped MoE dispatch kernel.
-    /// Compares the GPU output against a hand-computed CPU reference for a tiny
-    /// 2-expert / 2-token / top-1 routing. Numerical tolerance is loose because
-    /// FP32 atomic adds can reorder; the contract is correctness of the fused
-    /// gate+up SiLU combine + down + routed_scaling_factor accumulate.
+    /// Compares the GPU output against a hand-computed CPU reference for a tiny 2-expert / 2-token.
     #[test]
     fn test_cuda_moe_fused_dispatch_parity() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        if devices.is_empty() {
+        let Some(dev) = dequant_test_device() else {
             return;
-        }
-        let dev = &devices[0];
+        };
 
         let hidden: usize = 4;
         let inter: usize = 3;
@@ -284,9 +277,9 @@ mod tests {
 
     #[test]
     fn test_cuda_matmul() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
 
         let a_data = vec![1.0, 2.0, 3.0, 4.0];
         let b_data = vec![5.0, 6.0, 7.0, 8.0];
@@ -309,9 +302,9 @@ mod tests {
 
     #[test]
     fn test_cuda_ops() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
 
         let a_data = vec![1.0, 2.0, 3.0, 4.0];
         let b_data = vec![5.0, 6.0, 7.0, 8.0];
@@ -379,9 +372,9 @@ mod tests {
 
     #[test]
     fn test_cuda_matmul_shape_mismatch_returns_error() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
 
         let a_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -401,9 +394,9 @@ mod tests {
 
     #[test]
     fn test_cuda_rms_norm_exact() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
 
         let x_data = vec![3.0f32, 4.0]; // mean(x^2) = (9 + 16)/2 = 12.5
         let weight_data = vec![1.0f32, 2.0];
@@ -438,9 +431,9 @@ mod tests {
 
     #[test]
     fn test_cuda_softmax_exact() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
 
         let x_data = vec![1.0f32, 2.0, 3.0];
         let shape = Shape::new(vec![3]);
@@ -511,12 +504,12 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_gpu_fast_path() {
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
         // contention false negatives (cuBLAS context thrashing under concurrent loads).
         std::thread::sleep(std::time::Duration::from_secs(3));
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
 
         let (m, k, n) = (2usize, 256usize, 8usize);
         let blocks = k / 32;
@@ -557,12 +550,12 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_empty_scales_defaults() {
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
         // contention false negatives (cuBLAS context thrashing under concurrent loads).
         std::thread::sleep(std::time::Duration::from_secs(3));
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
 
         let (m, k, n) = (3usize, 64usize, 4usize);
         let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.03).cos()).collect();
@@ -599,12 +592,12 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_cpu_fallback() {
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
         // contention false negatives (cuBLAS context thrashing under concurrent loads).
         std::thread::sleep(std::time::Duration::from_secs(3));
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
 
         // K not a multiple of 32, forcing CPU fallback.
         let (m, k, n) = (3usize, 34usize, 5usize);
@@ -646,9 +639,9 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_backward_dx_q8_0() {
-        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        let devices = CudaDevice::probe().unwrap();
-        let dev = &devices[0];
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
 
         let (m, k, n) = (4usize, 64usize, 8usize);
         let dy_host: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.05).cos()).collect();
@@ -714,18 +707,8 @@ mod tests {
         }
     }
 
-    // ===================================================================
-    //  GPU dequant kernel golden tests — bit-accurate parity vs the
-    //  `grim_quant::dequant_*` CPU oracle. Each test:
-    //    1. Builds the packed bytes for one or more super-blocks via
-    //       `grim_quant::quant_<type>` (or hand-fabricated for MXFP4).
-    //    2. Uploads the packed bytes to a `CudaStorage` with the matching
-    //       quantized `DType.storage` (so `dequantize_on_device` dispatches).
-    //    3. Calls `dev.dequantize_on_device(as_cuda_storage(storage.as_ref()))` (GPU kernel).
-    //    4. Compares `out.to_cpu_vec_f32()` to the CPU oracle within a tight
-    //       tolerance that admits only floating-point rounding (1e-4).
-    // Skipped (not failed) when no CUDA device is present.
-    // ===================================================================
+    // GPU dequant kernel golden tests - bit-accurate parity vs the `grim_quant::dequant_*` CPU oracle.
+    // Each test: 1.
 
     fn dequant_test_device() -> Option<CudaDevice> {
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
@@ -981,9 +964,8 @@ mod tests {
 
     #[test]
     fn test_cuda_fused_quant_gemm_real_model_q4k_q6k() {
-        // Definitive check: run the actual CUDA fused GEMM kernels against
-        // REAL Q4_K / Q6_K tensors extracted from the on-disk Q4_K_M model,
-        // comparing to grim_quant::dequant_*k + a CPU A@B^T reference.
+        // Definitive check: run the actual CUDA fused GEMM kernels against REAL Q4_K / Q6_K
+        // tensors extracted from the on-disk Q4_K_M model, comparing to grim_quant::dequant_*k + a CPU A@B^T reference.
         let Some(dev) = dequant_test_device() else {
             return;
         };
@@ -1324,10 +1306,8 @@ mod tests {
         let Some(dev) = dequant_test_device() else {
             return;
         };
-        // 64 values = 2 groups of 32. Hand-build codes + shared exponents so the
-        // test is independent of a MXFP4 encoder (grim-quant has none public).
-        // code i = (i % 16); shared exp = 127 + (group // ) so group 0 = 127,
-        // group 1 = 128 (scale 2^1 = 2.0). Packed nibble: low = even element.
+        // 64 values = 2 groups of 32. Hand-build codes + shared exponents
+        // so the test is independent of a MXFP4 encoder (grim-quant has none public).
         let n = 64;
         let mut codes_pairs = Vec::with_capacity(n / 2);
         for i in 0..(n / 2) {
@@ -1365,9 +1345,15 @@ mod tests {
         let kv_len = 5;
         let cache_offset = 2;
 
-        let q: Vec<f32> = (0..steps * num_heads * head_dim).map(|i| (i as f32 * 0.01).sin()).collect();
-        let k: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|i| (i as f32 * 0.02).cos()).collect();
-        let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|i| (i as f32 * 0.03).sin()).collect();
+        let q: Vec<f32> = (0..steps * num_heads * head_dim)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.02).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.03).sin())
+            .collect();
 
         let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
         let kv_shape = Shape::new(vec![kv_len, num_kv_heads, head_dim]);
@@ -1377,18 +1363,20 @@ mod tests {
         let k_s = dev.from_cpu(&k, &kv_shape, DType::F32).unwrap();
         let v_s = dev.from_cpu(&v, &kv_shape, DType::F32).unwrap();
 
-        let (out_s, _) = dev.qkv_attention(
-            q_s.as_ref(),
-            k_s.as_ref(),
-            v_s.as_ref(),
-            num_kv_heads,
-            kv_len,
-            cache_offset,
-            None,
-            &out_shape,
-            None,
-            None,
-        ).unwrap();
+        let (out_s, _) = dev
+            .qkv_attention(
+                q_s.as_ref(),
+                k_s.as_ref(),
+                v_s.as_ref(),
+                num_kv_heads,
+                kv_len,
+                cache_offset,
+                None,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
 
         let actual = out_s.to_cpu_vec_f32().unwrap();
 

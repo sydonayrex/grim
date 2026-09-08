@@ -26,12 +26,7 @@ void grim_qkv_attention(
     float inv_sqrt_d,
     int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
                         // Pass 0 for full causal attention (no window).
-    // WI-F2 — fused O-projection epilogue. When fuse_o != 0, `out` is
-    // [seq_len, o_dim] (host pre-zeroed) and the per-head normalized
-    // attention vector is multiplied by this head's slice of `o_proj_w`
-    // (row-major [num_heads*head_dim, o_dim]) and accumulated across heads
-    // with atomicAdd instead of being written per-head. Pass o_proj_w=null,
-    // o_dim=0, fuse_o=0 for the unfused per-head output path.
+                        // WI-F2 - fused O-projection epilogue.
     const float* __restrict__ o_proj_w,
     int o_dim,
     int fuse_o,
@@ -41,10 +36,7 @@ void grim_qkv_attention(
     int has_alibi
 ) {
     // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
-    // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts)
-    // or 256 on CDNA (Wave64: 4 wavefronts) — see fusion.rs:78 / roc_device.rs:8145.
-    // num_waves is derived at runtime from blockDim.x (line ~74), so the LDS
-    // wave-merge loop sees the true wave count on either arch.
+    // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
     const int i = blockIdx.x;             // query position (0..seq_len)
     const int h = blockIdx.y;             // head index
     if (i >= seq_len || h >= num_heads) return;
@@ -54,45 +46,22 @@ void grim_qkv_attention(
     const int q_per_kv = num_heads / num_kv_heads;
     const int kv_head = h / q_per_kv;
 
-    // Pointers to this head's q column / kv column. Layouts (Phase-1 contract):
-    //   q: [seq_len, num_heads, head_dim]       -> q_offset = (i * num_heads + h) * head_dim
-    //   k: [kv_seq_len, num_kv_heads, head_dim] -> k_offset = (j * num_kv_heads + kv_head) * head_dim
-    //   v: same as k (separate buffer)
-    //   out: [seq_len, num_heads, head_dim]
+    // Pointers to this head's q column / kv column.
+    // Layouts (Phase-1 contract): q: [seq_len, num_heads, head_dim] -> q_offset = (i * num_heads + h).
     const int q_offset = (i * num_heads + h) * head_dim;
 
     // Cache offset: query position i within this call is at absolute position
     // (cache_offset + i). All past K/V positions are valid up to that.
     const int abs_i = cache_offset + i;
 
-    // ──────────────────────────────────────────────────────────────────────
-    // Phase 1: online softmax. Running max + running weighted sum, no full
-    // score vector materialized; kv_seq_len may exceed the LDS budget.
-    //
-    // Each thread owns one output dim d in [0, head_dim).
-    // Wave-cross accumulations within a block are reduced via shfl_xor (per
-    // wavefront) then combined across wavefronts in LDS by wave 0.
-    //
-    // The causal KV walk is split across all `num_waves` wavefronts in the
-    // block (quarter-stride partitioning for 4 waves; generalizes to N), each
-    // owning a slice of the sequence. At the end, wave 0 combines the
-    // per-wavefront partials in shared memory LDS.
-    //
-    // Wave size is resolved at runtime via warpSize: 32 on RDNA2 (gfx1036),
-    // 64 on CDNA. The host launch sets block_dim_x = 128 on Wave32 / 256 on
-    // Wave64 (fusion.rs:78, roc_device.rs:8145), so num_waves = blockDim.x /
-    // wave_size is 4 on either arch. No single-wavefront fallback path
-    // exists — head_dim is capped at 256 and partitioned across lanes.
-    // ──────────────────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────── Phase 1: online softmax.
+    // Running max + running weighted sum, no full score vector materialized; kv_seq_len may exceed the.
     const int tid = threadIdx.x;
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-    // num_waves = actual launched block size / wave size. Uses blockDim.x (not a
-    // compile-time constant) so it matches the real launch: 128 on gfx1036
-    // (Wave32 -> 4 wavefronts) or 256 on CDNA (Wave64 -> 4 wavefronts). The
-    // host sets block_dim_x = 128 for Wave32 (fusion.rs:78, roc_device.rs:8145),
-    // so this resolves to 4 waves on gfx1036 — the value the LDS merge loop needs.
+    // num_waves = actual launched block size / wave size.
+    // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
     const int num_waves = blockDim.x / wave_size;
 
     const int d = lane_id;
@@ -109,18 +78,14 @@ void grim_qkv_attention(
         return;
     }
 
-    // Per-wavefront partials published to LDS for the wave-0 merge. Sized to
-    // worst-case 8 wavefronts (RDNA iGPU Wave32 + block 256 host path) and
-    // head dimensions up to 256.
+    // Per-wavefront partials published to LDS for the wave-0 merge.
+    // Sized to worst-case 8 wavefronts (RDNA iGPU Wave32 + block 256 host path) and head.
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
     __shared__ float s_acc[8][260];
 
-    // Causal KV range for this query: [lo, hi) where:
-    //   hi = min(abs_i + 1, kv_seq_len)  (standard causal upper bound)
-    //   lo = window_lo                    (0 for full attention; sliding lower bound for SWA)
-    // `window_lo` is pre-computed on the host as max(0, abs_i - window + 1) so
-    // the kernel stays branch-free for the common full-causal case (window_lo == 0).
+    // Causal KV range for this query: [lo, hi) where: hi = min(abs_i + 1, kv_seq_len) (standard causal upper bound) lo = window_lo (0 for full attention; sliding lower
+    // bound for SWA) `window_lo` is pre-computed on the host as max(0, abs_i - window + 1) so the kernel stays branch-free for the common full-causal case (window_lo == 0).
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
     const int lo = window_lo;             // 0 for full causal; >= 0 for SWA
     const int range_len = hi - lo;        // may be 0 if lo >= hi (empty window)
@@ -141,11 +106,8 @@ void grim_qkv_attention(
     const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
     const int kv_stride = num_kv_heads * head_dim;
 
-    // Stage this lane's strided slice of q into registers ONCE. The previous
-    // form re-fetched the whole q head from global memory on every KV token
-    // and walked a 256-iteration branchy loop per lane; here each lane does
-    // <=8 MACs per token and the wavefront-uniform score is produced by a
-    // __shfl_xor butterfly.
+    // Stage this lane's strided slice of q into registers ONCE.
+    // The previous form re-fetched the whole q head from global memory on every KV token.
     float q_reg[8];
     #pragma unroll
     for (int chunk = 0; chunk < 8; ++chunk) {
@@ -189,9 +151,7 @@ void grim_qkv_attention(
         }
     }
 
-    // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform
-    // (all lanes see same j_start/j_end loop range). Wave 0 (lane 0) publishes
-    // the max/sum state.
+    // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform (all lanes see same j_start/j_end loop range).
     if (lane_id == 0) {
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
@@ -250,10 +210,8 @@ void grim_qkv_attention(
             }
         }
     } else {
-        // WI-F2 fused O-projection epilogue. Each wave-0 lane owns its
-        // strided slice of the head_dim axis; per output column oc the lane
-        // partial is butterfly-reduced across the wavefront and lane 0
-        // atomically accumulates into the (host-zeroed) fused output row.
+        // WI-F2 fused O-projection epilogue. Each wave-0 lane owns its strided slice of the head_dim axis; per output column oc
+        // the lane partial is butterfly-reduced across the wavefront and lane 0 atomically accumulates into the (host-zeroed) fused output row.
         for (int oc = 0; oc < o_dim; ++oc) {
             float partial = 0.0f;
             #pragma unroll
@@ -320,11 +278,8 @@ void grim_qkv_attention_paged(
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-    // num_waves = actual launched block size / wave size. Uses blockDim.x (not a
-    // compile-time constant) so it matches the real launch: 128 on gfx1036
-    // (Wave32 -> 4 wavefronts) or 256 on CDNA (Wave64 -> 4 wavefronts). The
-    // host sets block_dim_x = 128 for Wave32 (fusion.rs:78, roc_device.rs:8145),
-    // so this resolves to 4 waves on gfx1036 — the value the LDS merge loop needs.
+    // num_waves = actual launched block size / wave size.
+    // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
     const int num_waves = blockDim.x / wave_size;
 
     const int d = lane_id;
@@ -366,8 +321,7 @@ void grim_qkv_attention_paged(
     // Walk this wavefront's K/V slice [lo + j_start, lo + j_end).
     for (int j = lo + j_start; j < lo + j_end; ++j) {
         // KV index space is [0, kv_seq_len); causal upper bound is abs_i.
-        // (lo already lowers the bound in the partition; this guards the edge on
-        // the last wave where j_end may overshoot abs_i+1 if range_len % num_waves.)
+        // (lo already lowers the bound in the partition; this guards the edge on the last.
         if (j > abs_i || j >= kv_seq_len) break;
 
         // Decompose j into (block b, token t within page)
@@ -488,11 +442,8 @@ void grim_tree_attention(
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-    // num_waves = actual launched block size / wave size. Uses blockDim.x (not a
-    // compile-time constant) so it matches the real launch: 128 on gfx1036
-    // (Wave32 -> 4 wavefronts) or 256 on CDNA (Wave64 -> 4 wavefronts). The
-    // host sets block_dim_x = 128 for Wave32 (fusion.rs:78, roc_device.rs:8145),
-    // so this resolves to 4 waves on gfx1036 — the value the LDS merge loop needs.
+    // num_waves = actual launched block size / wave size.
+    // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
     const int num_waves = blockDim.x / wave_size;
 
     const int d = lane_id;
@@ -631,18 +582,8 @@ void grim_qkv_attention_wmma(
     int o_dim,
     int fuse_o
 ) {
-    // One block = one wave = one 16-query tile of a single head. The
-    // 16-query x 16-key score tile is staged in shared memory and filled
-    // with explicit dot products.
-    //
-    // WHY NOT rocwmma fragments here (WI-SB6 follow-up, measured on
-    // gfx1201/ROCm via hipRTC, 2026-08-23): load_matrix_sync + mma_sync
-    // silently produce an all-zero accumulator for f32 fragments on this
-    // target — the historical kernel shipped exactly that failure as its
-    // whole "score". The scalar dot below is verified against the CPU
-    // reference to the last bit (probe: 0.62628216 == host S00 x sqrt(d)).
-    // If attention is ever redesigned for real fragment tiling (multiple Q
-    // rows AND K columns per mma, fp16 inputs), revisit this decision.
+    // One block = one wave = one 16-query tile of a single head.
+    // The 16-query x 16-key score tile is staged in shared memory and filled with explicit.
     (void)o_proj_w; (void)o_dim; (void)fuse_o; (void)out_max; (void)out_sum;
 
     const int h = blockIdx.y;
@@ -987,14 +928,11 @@ pub fn launch_paged_attention(
     kv_seq_len: u32,
     cache_offset: u32,
     window_lo: i32, // sliding-window lower bound; 0 = full causal
-    // WI-X5: autotuner block-dim override. `None` keeps the wavefront-aware
-    // default of 4 waves per block. Overrides must be whole-wavefront
-    // multiples within the kernel's 8-wave LDS budget or they are ignored.
+    // WI-X5: autotuner block-dim override. `None` keeps the wavefront-aware default of 4 waves per block.
     block_dim_override: Option<u32>,
 ) -> Result<(), crate::Error> {
     // The kernel bakes in a hard cap at head_dim > 256 (writes NaN + returns).
-    // Reject unsupported head_dim at the wrapper so callers get a clear error
-    // rather than silent NaN output. [P1-9 fix.]
+    // Reject unsupported head_dim at the wrapper so callers get a clear error rather than silent.
     if head_dim > 256 {
         return Err(crate::Error::Backend(format!(
             "qkv_attention: head_dim {} exceeds kernel cap of 256",
@@ -1040,9 +978,8 @@ pub fn launch_paged_attention(
 
     let wf = dev.wavefront_size() as u32;
     let grid_dim = crate::HipDim3::new(batch, num_heads, 1);
-    // WI-X5: honor the autotuner override when it respects the kernel's
-    // wavefront-multiple / 8-wave LDS invariants; otherwise keep the default
-    // 4-waves-per-block launch (W32→128 threads, W64→256 threads).
+    // WI-X5: honor the autotuner override when it respects the kernel's wavefront-multiple /
+    // 8-wave LDS invariants; otherwise keep the default 4-waves-per-block launch (W32→128 threads, W64→256 threads).
     let block_x = match block_dim_override {
         Some(d) if d % wf == 0 && d / wf <= 8 => d,
         _ => wf * 4,
@@ -1072,9 +1009,8 @@ pub fn launch_paged_attention(
     let mut ksl = kv_seq_len as i32;
     let mut co = cache_offset as i32;
     let mut isd = inv_sqrt_d;
-    // Sliding-window lower bound (0 for full causal; >=0 for SWA). Mirrors the
-    // non-paged wrapper's host-side `window_lo_i` computation. Laguna-S-2.1
-    // uses seq_len==1 decode, so the block-wide bound is exact.
+    // Sliding-window lower bound (0 for full causal; >=0 for SWA).
+    // Mirrors the non-paged wrapper's host-side `window_lo_i` computation.
     let mut wlo = window_lo;
 
     dev.launch_compute_kernel(
@@ -1456,14 +1392,8 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("for (int dim = 0; dim < 256; ++dim)"));
     }
 
-    /// Structural regression for the attention score path (WI-SB6
-    /// follow-up). History, in order: (1) fragments loaded from single-token
-    /// vectors with `frag_qk.x[0]` as the score — wrong math everywhere it
-    /// compiled; (2) a genuine 16Q x 16K fragment tile — correct math but
-    /// rocwmma f32 load/mma silently yields an all-zero accumulator under
-    /// hipRTC on gfx1201 (measured 2026-08-23). The shipped kernel stages a
-    /// real 16x16 score tile in shared memory filled by explicit dot
-    /// products; these patterns must never regress.
+    /// Structural regression for the attention score path (WI-SB6 follow-up).
+    /// History, in order: (1) fragments loaded from single-token vectors with `frag_qk.x[0]` as the score -.
     #[test]
     fn wmma_attention_source_rejects_vector_as_matrix_fragments() {
         // The original one-vector fragment loads and single-lane score read.
@@ -1601,9 +1531,8 @@ mod tests {
                 }
             }
         }
-        // Host ground truth gates BOTH device paths independently: the tiled
-        // kernel and the scalar reference must each match this CPU softmax,
-        // so a shared regression in one cannot hide behind the other.
+        // Host ground truth gates BOTH device paths independently: the tiled kernel and the scalar reference must
+        // each match this CPU softmax, so a shared regression in one cannot hide behind the other.
         for (i, (w, h)) in wmma_res.iter().zip(&host_exp).enumerate() {
             assert!(
                 (w - h).abs() < 1e-4,
@@ -1628,10 +1557,8 @@ mod tests {
         }
     }
 
-    /// Edge-tile companion to `test_wmma_qkv_attention_gpu_parity`: head_dim
-    /// leaves a scalar tail (48 % 16), seq_len spans two 16-row query tiles,
-    /// and a nonzero cache_offset shifts the causal horizon. PASSED first on
-    /// gfx1201 with the tiled rewrite (2026-08-23).
+    /// Edge-tile companion to `test_wmma_qkv_attention_gpu_parity`: head_dim leaves a scalar tail (48 % 16), seq_len spans two 16-row query tiles, and a nonzero cache_offset shifts the causal horizon.
+    /// PASSED first on gfx1201 with the tiled rewrite (2026-08-23).
     #[test]
     fn test_wmma_qkv_attention_gpu_parity_untiled_shapes() {
         if !crate::gpu_test_enabled() {

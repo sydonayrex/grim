@@ -2,9 +2,9 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test embedding_backward_parity`.
 
+use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::backend::AutogradOps;
 use grim_tensor::{CoreTensorOps, DType, Shape};
-use grim_backend_vulkan::VulkanDevice;
 
 #[test]
 fn embedding_backward_matches_cpu_reference() {

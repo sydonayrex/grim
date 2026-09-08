@@ -1,9 +1,5 @@
 //! WavTokenizer Vocos ConvNeXt acoustic codec decoder and iSTFT waveform synthesizer.
-//!
-//! # Architecture Details
-//! - **Codebook Lookup**: Maps discrete audio tokens to latent feature vectors `(B, latent_dim, T)`.
-//! - **Vocos Backbone**: Depthwise ConvNeXt blocks with adaptive bandwidth LayerNorm (`AdaLayerNorm`).
-//! - **iSTFT Synthesis**: Linear projection to magnitude/phase spectrogram bins followed by inverse STFT overlap-add.
+//! # Architecture Details - **Codebook Lookup**: Maps discrete audio tokens to latent feature vectors `(B,.
 
 use std::f32::consts::PI;
 
@@ -14,9 +10,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for WavTokenizer decoder.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -67,9 +61,7 @@ impl ModelConfig for WavTokenizerDecConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // AdaLayerNorm
-// ---------------------------------------------------------------------------
 
 /// Bandwidth-conditioned adaptive layer normalization.
 pub struct AdaLayerNorm {
@@ -137,9 +129,7 @@ impl AdaLayerNorm {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ConvNeXtBlock
-// ---------------------------------------------------------------------------
 
 /// 1D ConvNeXt block with depthwise convolution and adaptive normalization.
 pub struct ConvNeXtBlock {
@@ -263,9 +253,7 @@ impl ConvNeXtBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // iSTFT Head
-// ---------------------------------------------------------------------------
 
 /// Inverse Short-Time Fourier Transform synthesis head.
 pub struct ISTFTHead {
@@ -340,9 +328,7 @@ impl ISTFTHead {
     }
 }
 
-// ---------------------------------------------------------------------------
 // WavTokenizerDec Model
-// ---------------------------------------------------------------------------
 
 /// WavTokenizer complete acoustic decoder model.
 pub struct WavTokenizerDec {

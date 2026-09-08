@@ -1,7 +1,5 @@
 //! Keyboard-navigable selection menu for autocomplete and model picker.
-//!
-//! Returns styled `Line` vectors so callers can place the menu with
-//! `Paragraph::new(lines)` without coupling to ratatui's `Frame`.
+//! Returns styled `Line` vectors so callers can place the menu with `Paragraph::new(lines)` without coupling to.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -145,10 +143,7 @@ impl SelectList {
     }
 
     /// Render the visible window as styled lines.
-    ///
-    /// When `filtered` has more items than `max_visible`, a `(n/N)` scroll
-    /// indicator is appended. The window is centered on `selected` when
-    /// possible, otherwise clamped to the start or end.
+    /// When `filtered` has more items than `max_visible`, a `(n/N)` scroll indicator is appended.
     pub fn render(&self, width: u16) -> Vec<Line<'static>> {
         if self.filtered.is_empty() {
             return vec![Line::from(Span::styled(
@@ -191,10 +186,7 @@ impl SelectList {
         }
         if self.filtered.len() > self.max_visible {
             let info = format!("  ({}/{})", self.selected + 1, self.filtered.len());
-            lines.push(Line::from(Span::styled(
-                info,
-                self.theme.scroll_info_style,
-            )));
+            lines.push(Line::from(Span::styled(info, self.theme.scroll_info_style)));
         }
         lines
     }

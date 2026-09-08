@@ -9,14 +9,6 @@ use grim_tensor::error::{Error, Result};
 pub const COMM_FUSE_KERNEL_SOURCE: &str = r#"
 // CommFuse decomposed P2P epilogue kernel (scythe2.md §3 Pillar 3, WI-6).
 // Writes the local GEMM output shard directly to the peer GPU's output buffer.
-//
-// Parameters:
-//   local_out  — device pointer to this rank's GEMM result [M × N_local]
-//   peer_out   — BAR1-mapped pointer to the peer GPU's accumulation buffer [M × N_total]
-//   col_offset — column offset of this rank's shard in the peer buffer
-//   m          — batch dimension
-//   n_local    — number of columns in this shard
-//   n_total    — total output columns in the peer buffer
 extern "C" __global__ void grim_comm_fuse_p2p_epilogue(
     const float* __restrict__ local_out,
     float*       __restrict__ peer_out,

@@ -61,7 +61,9 @@ pub fn list_sessions() -> Vec<SessionMeta> {
     let mut out: Vec<SessionMeta> = Vec::new();
     for dir in [sessions_dir(), std::env::current_dir().ok()] {
         let Some(dir) = dir else { continue };
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if !path.extension().map(|x| x == "jsonl").unwrap_or(false) {
@@ -78,7 +80,11 @@ pub fn list_sessions() -> Vec<SessionMeta> {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            out.push(SessionMeta { path, title, modified });
+            out.push(SessionMeta {
+                path,
+                title,
+                modified,
+            });
         }
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then(b.title.cmp(&a.title)));

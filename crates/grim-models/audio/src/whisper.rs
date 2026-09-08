@@ -1,12 +1,5 @@
-//! Whisper-shaped audio encoder-decoder.
-//!
-//! - Encoder: a stack of pre-norm self-attention blocks (full attention
-//!   over the audio frame sequence fed by `raw_to_features`).
-//! - Decoder: same shape as a small `CausalLm`-style transformer but with
-//!   cross-attention to the encoder output.
-//!
-//! For phase 7 the modeling is structural and F32/CPU. ROCm kernels for
-//! the cross-attention path land in phase 4.
+//! Whisper-shaped audio encoder-decoder. - Encoder: a stack of pre-norm self-attention
+//! blocks (full attention over the audio frame sequence fed by `raw_to_features`).
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
@@ -17,13 +10,8 @@ use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 use grim_core::rng::SimpleRng;
 
-/// Whisper-shaped config.
-///
-/// Serde-serializable so it can be built straight from a model's
-/// `config.json` (every audio checkpoint in `models/audio/` ships one) via
-/// [`WhisperConfig::from_hf`], which accepts both the HuggingFace
-/// transformers key set (`d_model`, `encoder_layers`, …) and OpenAI's
-/// original Whisper key set (`n_audio_state`, `n_audio_layer`, …).
+/// Whisper-shaped config. Serde-serializable so it can be built straight from a model's `config.json` (every audio checkpoint in `models/audio/` ships one) via
+/// [`WhisperConfig::from_hf`], which accepts both the HuggingFace transformers key set (`d_model`, `encoder_layers`, …) and OpenAI's original Whisper key set (`n_audio_state`, `n_audio_layer`, …).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhisperConfig {
     pub vocab_size: usize,
@@ -58,11 +46,7 @@ impl Default for WhisperConfig {
 
 impl WhisperConfig {
     /// Build a config from a parsed `config.json`.
-    ///
-    /// Accepts HuggingFace transformers Whisper keys (preferred) and falls
-    /// back to OpenAI's original naming when the HF keys are absent. Any
-    /// missing field keeps its [`Default`] value, so partial configs (like
-    /// Kokoro/MeanVC2-style minimal JSON) still load.
+    /// Accepts HuggingFace transformers Whisper keys (preferred) and falls back to OpenAI's original naming when the.
     pub fn from_hf(json: &serde_json::Value) -> Self {
         let get = |keys: &[&str]| -> Option<serde_json::Value> {
             keys.iter().find_map(|k| json.get(*k)).cloned()
@@ -70,10 +54,8 @@ impl WhisperConfig {
         let as_usize =
             |v: Option<serde_json::Value>| v.and_then(|v| v.as_u64()).map(|v| v as usize);
         let d = Self::default();
-        // Loud-fallback discipline (mirrors the sage_attention precedent):
-        // a partial config silently loading as whisper-tiny-shaped is a
-        // design choice, but the caller must hear about it — a wrong default
-        // shape produces confidently wrong inference.
+        // Loud-fallback discipline (mirrors the sage_attention precedent): a partial config silently loading as whisper-tiny-shaped is a design
+        // choice, but the caller must hear about it - a wrong default shape produces confidently wrong inference.
         let missing = |keys: &[&str]| keys.iter().all(|k| json.get(*k).is_none());
         let mut fell_back: Vec<&'static str> = Vec::new();
         if missing(&["encoder_attention_heads", "n_audio_head", "n_text_head"]) {
@@ -648,9 +630,8 @@ impl WhisperDecoderBlock {
             .forward(&cpu_tensor(after_self.clone(), Shape::new(vec![seq, d])))?;
         let cross_normed_data = cross_normed.to_vec_f32()?;
 
-        // GPU dispatch path: cross-attention HIP kernel (Phase 2 — mambo5.md Item 13).
+        // GPU dispatch path: cross-attention HIP kernel (Phase 2 - mambo5.md Item 13).
         // When device is Rocm, dispatch to `BackendDevice::cross_attention`.
-        // Falls back to CPU `cross_attn` on any failure or CPU device.
         let cross_attn_out = if let Device::Rocm(ordinal) = self.device {
             #[cfg(feature = "rocm")]
             {
@@ -735,10 +716,8 @@ impl WhisperDecoderBlock {
         Ok(cpu_tensor(out, Shape::new(vec![seq, d])))
     }
 
-    /// GPU dispatch path for Whisper cross-attention via
-    /// `BackendDevice::cross_attention` (Phase 2 — mambo5.md Item 13).
+    /// GPU dispatch path for Whisper cross-attention via `BackendDevice::cross_attention` (Phase 2 - mambo5.md Item 13).
     /// Q is projected per decoder step; K/V projected once per encode pass.
-    /// Encoder K/V projected once, reused across decoder steps.
     #[cfg(feature = "rocm")]
     fn cross_attention_gpu(
         &self,
@@ -753,7 +732,7 @@ impl WhisperDecoderBlock {
         ordinal: usize,
     ) -> Result<Vec<f32>> {
         use grim_backend_rocm::RocmDevice;
-        use grim_tensor::{CoreTensorOps, AttentionOps};
+        use grim_tensor::{AttentionOps, CoreTensorOps};
 
         let dev = RocmDevice::try_new(ordinal)?;
 
@@ -840,10 +819,8 @@ pub struct Whisper {
     pub output: Linear,
 }
 
-/// Whisper sinusoidal position table: `n` rows of `d_model` values, starting at
-/// absolute position `offset`. Matches OpenAI Whisper's
-/// `sinusoids()` (log-spaced timescales, `[sin | cos]` halves).
-/// [P1-33 fix: positional information for encoder and decoder.]
+/// Whisper sinusoidal position table: `n` rows of `d_model` values, starting at absolute position `offset`.
+/// Matches OpenAI Whisper's `sinusoids()` (log-spaced timescales, `[sin | cos]` halves).
 fn sinusoid_positions(d_model: usize, n: usize, offset: usize) -> Vec<f32> {
     let half = d_model / 2;
     let mut out = vec![0.0f32; n * d_model];
@@ -957,11 +934,8 @@ impl Whisper {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for Whisper. Whisper is an audio
-    /// encoder–decoder with cross-attention in the decoder; like T5, the
-    /// cross-attention sharding adds symmetrical constraints beyond a plain
-    /// column/row split, and the block `forward` calls plain `Linear::forward`
-    /// with no all-reduce hook. Refused until both land.
+    /// Tensor-parallel load entry for Whisper. Whisper is an audio encoder-decoder with cross-attention in the decoder; like T5, the cross-attention
+    /// sharding adds symmetrical constraints beyond a plain column/row split, and the block `forward` calls plain `Linear::forward` with no all-reduce hook.
     pub fn load_tp(
         device: Device,
         ws: &WeightSource<'_>,
@@ -1037,9 +1011,8 @@ impl Whisper {
             )));
         }
         let mel_data = mel.to_vec_f32()?;
-        // Shape validated as (n_mels, frames) above; must transpose to (frames, n_mels)
-        // for the projection. Without this transpose, data is scrambled for n_mels != frames.
-        // [P1-33 fix: transpose mel matrix after shape check.]
+        // Shape validated as (n_mels, frames) above; must transpose to (frames, n_mels) for the projection.
+        // Without this transpose, data is scrambled for n_mels != frames.
         let transposed: Vec<f32> = (0..frames)
             .flat_map(|f| {
                 let row: Vec<f32> = (0..mel_bins).map(|m| mel_data[m * frames + f]).collect();
@@ -1048,8 +1021,7 @@ impl Whisper {
             .collect();
         let mel_t = cpu_tensor(transposed, Shape::new(vec![frames, mel_bins]));
         let proj = self.enc_in_proj.forward(&mel_t)?;
-        // Encoder positional embeddings: Whisper adds a fixed sinusoidal table
-        // to the convolution/projection output before the encoder blocks.
+        // Encoder positional embeddings: Whisper adds a fixed sinusoidal table to the convolution/projection output before the encoder blocks.
         // [P1-33 fix: encoder positional embeddings.]
         let mut proj_data = proj.to_vec_f32()?;
         add_positions(&mut proj_data, self.cfg.d_model, 0);
@@ -1079,9 +1051,8 @@ impl Whisper {
             )));
         }
         let emb = self.tok_emb.forward(&ids, seq_len, self.cfg.d_model)?;
-        // Decoder positional embeddings. `decode_step` is passed the full id
-        // prefix and recomputes attention over it, so absolute positions start
-        // at 0 for row 0. [P1-33 fix: decoder positional embeddings.]
+        // Decoder positional embeddings. `decode_step` is passed the full id prefix and recomputes
+        // attention over it, so absolute positions start at 0 for row 0.
         let mut emb_data = emb.to_vec_f32()?;
         add_positions(&mut emb_data, self.cfg.d_model, 0);
         let mut cur = cpu_tensor(emb_data, Shape::new(vec![seq_len, self.cfg.d_model]));
@@ -1358,13 +1329,8 @@ mod golden_attention {
         (sum_sq / v.len() as f32 + 1e-5).sqrt()
     }
 
-    // ==================================================================
     // Test 1: Encoder self-attention with hand-constructed identity weights.
-    //
-    //   x = [1, 2, -1, -2], seq=1, d=4, nh=1
-    //   Q=K=V=O = I  →  attn_out = x  →  output = x + attn_out = 2x
-    //   FFN zeroed → output = 2x = [2, 4, -2, -4]
-    // ==================================================================
+    // x = [1, 2, -1, -2], seq=1, d=4, nh=1 Q=K=V=O = I → attn_out =.
     #[test]
     fn golden_whisper_self_attn_hand_constructed_weights() {
         let d_model = 4;
@@ -1408,20 +1374,8 @@ mod golden_attention {
         }
     }
 
-    // ==================================================================
     // Test 2: Decoder cross-attention with identity weights.
-    //
-    //   h = [1,2,3,4], seq=1, d=4, nh=1
-    //   enc_out = [[1,1,1,1], [1,1,1,1]] (2 frames)
-    //   All Q/K/V/O = I, FFN zeroed
-    //
-    //   Self-attn: after_self = h + h = [2,4,6,8]
-    //   Cross-attn: q=[2,4,6,8], k=v=[1,1,1,1] each frame
-    //     scores = 20/2 = 10 per frame, softmax uniform = 0.5 each
-    //     weighted v = [1,1,1,1]
-    //     after_cross = [2,4,6,8] + [1,1,1,1] = [3,5,7,9]
-    //   FFN zeroed → output = [3,5,7,9]
-    // ==================================================================
+    // h = [1,2,3,4], seq=1, d=4, nh=1 enc_out = [[1,1,1,1], [1,1,1,1]] (2 frames) All Q/K/V/O =.
     #[test]
     fn golden_whisper_cross_attn_encoder_decoder_interaction() {
         let d_model = 4;
@@ -1476,21 +1430,8 @@ mod golden_attention {
         }
     }
 
-    // ==================================================================
     // Test 3: FFN still works after attention wiring.
-    //
-    //   Encoder block with zeroed Q/K/V/O (attn_out=0) and
-    //   hand-constructed FFN: W_fc0 = 2×I, W_fc1 = 0.5×I
-    //   Input x = [1, -1, 2, -2], seq=1, d=4
-    //
-    //   after_attn = x  (attn zeroed)
-    //   fc1(norm(x)) = fc1(x) = 2x
-    //   gelu(2x) → via shared gelu()
-    //   fc2(gelu(2x)) = 0.5 * gelu(2x)
-    //   output = after_attn + ffn_out = x + 0.5 * gelu(2x)
-    //
-    //   Expected computed via same gelu() function for exact match.
-    // ==================================================================
+    // Encoder block with zeroed Q/K/V/O (attn_out=0) and hand-constructed FFN: W_fc0 = 2×I, W_fc1 = 0.5×I.
     #[test]
     fn golden_whisper_ffn_still_works_after_attn_wiring() {
         let d_model = 4;

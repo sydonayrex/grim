@@ -35,9 +35,8 @@ impl PromptHistory {
         }
     }
 
-    /// Case-insensitive substring search, newest-first, prefix matches ranked
-    /// above infix matches. Empty query returns newest-first listing.
-    /// Index (position in entries) breaks same-second timestamp ties.
+    /// Case-insensitive substring search, newest-first, prefix matches ranked above infix matches.
+    /// Empty query returns newest-first listing.
     pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
         let q = query.to_lowercase();
         let mut scored: Vec<(usize, i64, usize, String)> = self
@@ -91,7 +90,7 @@ impl PromptHistory {
         }
         let tmp = dir.join("history.jsonl.tmp");
         std::fs::write(&tmp, out).is_ok()
-            && std::fs::rename(&tmp, &dir.join("history.jsonl")).is_ok()
+            && std::fs::rename(&tmp, dir.join("history.jsonl")).is_ok()
     }
 }
 

@@ -9,7 +9,7 @@ use grim_core::model::{
     AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig, SsmState, StatefulSequence,
 };
 use grim_nn::{Linear, RmsNorm};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 /// Validate that a loaded weight tensor has the expected shape, returning a
 /// descriptive `Error::Shape` when it does not.
@@ -56,11 +56,7 @@ impl ModelConfig for RwkvConfig {
 }
 
 /// Per-session RWKV recurrence state (batch = 1).
-///
-/// Layout: `data[layer][slot][channel]` flattened, slot order
-/// `[attn_xx, attn_aa, attn_bb, attn_pp, ffn_xx]` — the RWKV-4 five-buffer
-/// state: token-shift carries (`*_xx`) and the WKV numerator/denominator/max
-/// triples (`aa`/`bb`/`pp`).
+/// Layout: `data[layer][slot][channel]` flattened, slot order `[attn_xx, attn_aa, attn_bb, attn_pp, ffn_xx]` - the RWKV-4 five-buffer state:.
 #[derive(Clone, Debug)]
 pub struct RwkvState {
     pub data: Vec<f32>,
@@ -135,10 +131,8 @@ pub struct RwkvBlock {
     pub channel_mix_receptance: Linear,
     pub channel_mix_value: Linear,
     pub device: Device,
-    /// RWKV-4 recurrence parameters, `[hidden]` each. Loaded from real
-    /// checkpoints (`att.time_mix_k/r`, `att.time_decay`, `att.time_first`,
-    /// `ffn.time_mix_k/r`); synthetic/test models get neutral defaults so
-    /// the recurrence still runs (documented in the audit).
+    /// RWKV-4 recurrence parameters, `[hidden]` each.
+    /// Loaded from real checkpoints (`att.time_mix_k/r`, `att.time_decay`, `att.time_first`, `ffn.time_mix_k/r`); synthetic/test models get neutral defaults so the.
     pub tm_mix_k: Vec<f32>,
     pub tm_mix_v: Vec<f32>,
     pub tm_mix_r: Vec<f32>,
@@ -216,9 +210,8 @@ impl RwkvBlock {
             "ffn.value",
         )?;
 
-        // RWKV-4 recurrence parameters. Real checkpoints carry them; absent
-        // tensors (synthetic models) get neutral defaults — mixes of 0.5 and
-        // a mild decay/first pair — so the state threading still exercises.
+        // RWKV-4 recurrence parameters. Real checkpoints carry them; absent tensors (synthetic models) get neutral defaults -
+        // mixes of 0.5 and a mild decay/first pair - so the state threading still exercises.
         let vec_param = |name: &str, default: f32| -> Vec<f32> {
             ws.get(Shape::new(vec![cfg.hidden_size]), name)
                 .map(|t| {
@@ -230,10 +223,8 @@ impl RwkvBlock {
         let tm_mix_k = vec_param("att.time_mix_k", 0.5);
         let tm_mix_v = vec_param("att.time_mix_v", 0.5);
         let tm_mix_r = vec_param("att.time_mix_r", 0.5);
-        // Both buffers are stored RAW in log space by v4 checkpoints
-        // (decay is ADDED to the running max between tokens; first is added
-        // to the current key inside the step). Defaults are mild synthetic
-        // values, not transforms of real ones.
+        // Both buffers are stored RAW in log space by v4 checkpoints (decay is ADDED to the running max between tokens; first is added to the current key inside the step).
+        // Defaults are mild synthetic values, not transforms of real ones.
         let time_decay = vec_param("att.time_decay", -0.6);
         let time_first = vec_param("att.time_first", 3.0);
         let ffn_tm_mix_k = vec_param("ffn.time_mix_k", 0.5);
@@ -268,22 +259,8 @@ impl RwkvBlock {
         })
     }
 
-    /// Forward ONE token through this block, threading the RWKV-4 recurrence
-    /// state.
-    ///
-    /// Canonical v4 single-token recurrence:
-    ///
-    /// * attention token-shift: k/v/r project `tm·x + (1-tm)·xx_prev`
-    ///   (xx_prev = previous token's post-norm hidden);
-    /// * WKV one-token update per channel:
-    ///   `ww = time_first + k; p = max(pp, k); e1 = exp(pp-p); e2 = exp(ww-p);
-    ///    y = (e1·aa + e2·v)/(e1·bb + e2); aa' = num; bb' = den;
-    ///    pp' = p + time_decay` (log-space);
-    /// * channel-mix token-shift with ReLU on the mixed key.
-    ///
-    /// GPU-first: WKV recurrence and channel-mix gating run on device via
-    /// dedicated kernels (`rwkv_wkv_recurrence`, `rwkv_channel_mix_full`).
-    /// State (aa, bb, pp, ffn_xx) is uploaded/downloaded around device calls.
+    /// Forward ONE token through this block, threading the RWKV-4 recurrence state.
+    /// Canonical v4 single-token recurrence: * attention token-shift: k/v/r project `tm·x + (1-tm)·xx_prev` (xx_prev = previous.
     pub fn step(&self, x: &Tensor, layer_idx: usize, state: &mut RwkvState) -> Result<Tensor> {
         let dim = self.cfg_hidden();
         let x_vec = x.to_vec_f32()?;
@@ -316,26 +293,62 @@ impl RwkvBlock {
         let flat = |t: &Tensor, row: usize| -> Result<Vec<f32>> {
             Ok(t.to_vec_f32()?[row * dim..(row + 1) * dim].to_vec())
         };
-        let k_t = self.time_mix_key.forward(&cpu_tensor(flat(&mixed, 0)?, Shape::new(vec![1, dim])))?;
-        let v_t = self.time_mix_value.forward(&cpu_tensor(flat(&mixed, 1)?, Shape::new(vec![1, dim])))?;
-        let r_t = self.time_mix_receptance.forward(&cpu_tensor(flat(&mixed, 2)?, Shape::new(vec![1, dim])))?;
+        let k_t = self
+            .time_mix_key
+            .forward(&cpu_tensor(flat(&mixed, 0)?, Shape::new(vec![1, dim])))?;
+        let v_t = self
+            .time_mix_value
+            .forward(&cpu_tensor(flat(&mixed, 1)?, Shape::new(vec![1, dim])))?;
+        let r_t = self
+            .time_mix_receptance
+            .forward(&cpu_tensor(flat(&mixed, 2)?, Shape::new(vec![1, dim])))?;
 
         // Upload state to device
         let aa_s = dev.from_cpu(aa, &Shape::new(vec![dim]), DType::F32)?;
         let bb_s = dev.from_cpu(bb, &Shape::new(vec![dim]), DType::F32)?;
         let pp_s = dev.from_cpu(pp, &Shape::new(vec![dim]), DType::F32)?;
-        let aa_t = Tensor::new(Arc::from(aa_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
-        let bb_t = Tensor::new(Arc::from(bb_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
-        let pp_t = Tensor::new(Arc::from(pp_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
+        let aa_t = Tensor::new(
+            Arc::from(aa_s),
+            Shape::new(vec![dim]),
+            DType::F32,
+            k_t.provenance().clone(),
+            x.device().clone(),
+        );
+        let bb_t = Tensor::new(
+            Arc::from(bb_s),
+            Shape::new(vec![dim]),
+            DType::F32,
+            k_t.provenance().clone(),
+            x.device().clone(),
+        );
+        let pp_t = Tensor::new(
+            Arc::from(pp_s),
+            Shape::new(vec![dim]),
+            DType::F32,
+            k_t.provenance().clone(),
+            x.device().clone(),
+        );
 
         // Upload time_first and time_decay
         let tf_s = dev.from_cpu(&self.time_first, &Shape::new(vec![dim]), DType::F32)?;
         let td_s = dev.from_cpu(&self.time_decay, &Shape::new(vec![dim]), DType::F32)?;
-        let tf_t = Tensor::new(Arc::from(tf_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
-        let td_t = Tensor::new(Arc::from(td_s), Shape::new(vec![dim]), DType::F32, k_t.provenance().clone(), x.device().clone());
+        let tf_t = Tensor::new(
+            Arc::from(tf_s),
+            Shape::new(vec![dim]),
+            DType::F32,
+            k_t.provenance().clone(),
+            x.device().clone(),
+        );
+        let td_t = Tensor::new(
+            Arc::from(td_s),
+            Shape::new(vec![dim]),
+            DType::F32,
+            k_t.provenance().clone(),
+            x.device().clone(),
+        );
 
         // Device WKV recurrence (updates aa, bb, pp in-place)
-        let wkv_out_shape = Shape::new(vec![dim]);
+        let wkv_out_shape = Shape::new(vec![1, dim]);
         let (wkv_out_s, _h) = dev.rwkv_wkv_recurrence(
             k_t.storage().as_ref(),
             v_t.storage().as_ref(),
@@ -358,7 +371,13 @@ impl RwkvBlock {
         pp.copy_from_slice(&pp_new);
 
         // Output projection on device
-        let wkv_out_t = Tensor::new(Arc::from(wkv_out_s), wkv_out_shape, DType::F32, k_t.provenance().clone(), x.device().clone());
+        let wkv_out_t = Tensor::new(
+            Arc::from(wkv_out_s),
+            Shape::new(vec![1, dim]),
+            DType::F32,
+            k_t.provenance().clone(),
+            x.device().clone(),
+        );
         let att_out = self.time_mix_output.forward(&wkv_out_t)?;
         let x_res1 = grim_nn::modules::add_on_device(x, &att_out)?;
 
@@ -376,8 +395,12 @@ impl RwkvBlock {
         }
 
         // Projections on device
-        let ffn_r = self.channel_mix_receptance.forward(&cpu_tensor(ffn_r_in, Shape::new(vec![1, dim])))?;
-        let ffn_k = self.channel_mix_key.forward(&cpu_tensor(ffn_k_in, Shape::new(vec![1, dim])))?;
+        let ffn_r = self
+            .channel_mix_receptance
+            .forward(&cpu_tensor(ffn_r_in, Shape::new(vec![1, dim])))?;
+        let ffn_k = self
+            .channel_mix_key
+            .forward(&cpu_tensor(ffn_k_in, Shape::new(vec![1, dim])))?;
 
         // Channel-mix gating: sigmoid(r) * relu(k) — CPU (elementwise, data already on host)
         let gate_vec = ffn_k.to_vec_f32()?;
@@ -387,7 +410,9 @@ impl RwkvBlock {
             let sig_r = 1.0 / (1.0 + (-r_vec[i]).exp());
             gated[i] = sig_r * gate_vec[i].max(0.0);
         }
-        let ffn_v = self.channel_mix_value.forward(&cpu_tensor(gated, Shape::new(vec![1, dim])))?;
+        let ffn_v = self
+            .channel_mix_value
+            .forward(&cpu_tensor(gated, Shape::new(vec![1, dim])))?;
 
         // Residual: x_res1 + ffn_out
         let out = grim_nn::modules::add_on_device(&x_res1, &ffn_v)?;
@@ -418,12 +443,8 @@ impl Rwkv {
         Self::load_tp(ws, cfg, device, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for RWKV. RWKV is a recurrent (time-mix)
-    /// model: like Mamba, the recurrent path has no row-parallel all-reduce
-    /// semantics, so column/row sharding of the time-/channel-mix matrices
-    /// would change the recurrence rather than parallelise a matmul. A safe
-    /// `load_tp` needs a bespoke RWKV sharding plan. Refuses `world_size > 1`
-    /// until then.
+    /// Tensor-parallel load entry for RWKV. RWKV is a recurrent (time-mix) model: like Mamba, the recurrent path has no
+    /// row-parallel all-reduce semantics, so column/row sharding of the time-/channel-mix matrices would change the recurrence rather than parallelise a matmul.
     pub fn load_tp(
         ws: &grim_nn::WeightSource<'_>,
         cfg: RwkvConfig,
@@ -441,8 +462,7 @@ impl Rwkv {
             .pp("emb")
             .get(Shape::new(vec![cfg.vocab_size, cfg.hidden_size]), "weight")?
             .to_vec_f32()?;
-        // RWKV embedding is [vocab_size, hidden_size] — use as a gather table,
-        // NOT a Linear matrix multiply.
+        // RWKV embedding is [vocab_size, hidden_size] - use as a gather table, NOT a Linear matrix multiply.
         // [P1-32 fix: emb is an embedding table, not a Linear.]
         if emb_weight.len() != cfg.vocab_size * cfg.hidden_size {
             return Err(Error::Shape(format!(
@@ -514,9 +534,8 @@ impl StatefulSequence for Rwkv {
         })
     }
 
-    /// Step the whole model over `input`'s tokens IN ORDER, threading the
-    /// recurrence across tokens AND calls. Returns logits for the LAST
-    /// position.
+    /// Step the whole model over `input`'s tokens IN ORDER, threading the recurrence across tokens AND calls.
+    /// Returns logits for the LAST position.
     fn step(&self, state: &mut dyn SsmState, input: &Tensor) -> Result<Tensor> {
         let s = state
             .as_any_mut()
@@ -567,10 +586,8 @@ impl CausalLm for Rwkv {
         _positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        // Audit fix (grim-models): the recurrence state now lives on the
-        // SESSION and advances across calls — the pre-fix code created a
-        // fresh state per call (and the recurrence math itself ignored
-        // state), so decode was context-free after prefill.
+        // Audit fix (grim-models): the recurrence state now lives on the SESSION and advances across calls - the pre-fix code
+        // created a fresh state per call (and the recurrence math itself ignored state), so decode was context-free after prefill.
         if session.model_state().is_none() {
             session.set_model_state(Box::new(self.init_state(1)));
         }
@@ -680,10 +697,8 @@ mod audit_tests {
         cpu_tensor(vec![v], Shape::new(vec![1]))
     }
 
-    /// Audit gate: the recurrence state must persist on the session across
-    /// CausalLm::forward calls — the second call's logits through one
-    /// session must equal explicit init→step→step threading — and the
-    /// session position must advance.
+    /// Audit gate: the recurrence state must persist on the session across CausalLm::forward calls - the second
+    /// call's logits through one session must equal explicit init→step→step threading - and the session position must advance.
     #[test]
     fn rwkv_forward_keeps_state_across_calls() {
         let model = tiny_rwkv();
@@ -709,9 +724,8 @@ mod audit_tests {
         );
     }
 
-    /// Audit gate: the recurrence must actually MATTER — the same final
-    /// token after different histories produces different logits. (The
-    /// pre-fix model was memoryless by construction and failed this.)
+    /// Audit gate: the recurrence must actually MATTER - the same final token after different histories produces different logits.
+    /// (The pre-fix model was memoryless by construction and failed this.)
     #[test]
     fn rwkv_recurrence_changes_output_with_history() {
         let model = tiny_rwkv();
@@ -740,11 +754,8 @@ mod audit_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Numeric reference test (audit follow-up): the WKV recurrence was previously
-// tested only for state threading, never for value correctness against an
-// independent recomputation of the v4 update.
-// ---------------------------------------------------------------------------
+// Numeric reference test (audit follow-up): the WKV recurrence was previously tested only for
+// state threading, never for value correctness against an independent recomputation of the v4 update.
 
 #[cfg(test)]
 mod wkv_numeric_reference_tests {
@@ -752,9 +763,8 @@ mod wkv_numeric_reference_tests {
     use grim_backend_cpu::cpu_tensor;
     use grim_nn::Linear;
 
-    /// Build a hand-constructed single-layer RWKV block with known weights:
-    /// identity-ish projections (diagonal weights) so the reference math
-    /// stays inspectable, plus nontrivial mix/decay parameters.
+    /// Build a hand-constructed single-layer RWKV block with known weights: identity-ish projections
+    /// (diagonal weights) so the reference math stays inspectable, plus nontrivial mix/decay parameters.
     fn test_block() -> RwkvBlock {
         let hidden = 4usize;
         let diag = |scale: f32| {
@@ -808,10 +818,10 @@ mod wkv_numeric_reference_tests {
         }
     }
 
-    /// One block step vs an independent f64 recomputation of the documented
-    /// v4 time-mix + WKV + channel-mix math, run for TWO tokens so the
-    /// state carry (aa/bb/pp and the token-shift slots) is value-checked.
+    /// One block step vs an independent f64 recomputation of the documented v4 time-mix + WKV +
+    /// channel-mix math, run for TWO tokens so the state carry (aa/bb/pp and the token-shift slots) is value-checked.
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn rwkv_wkv_two_steps_match_f64_reference() {
         let b = test_block();
         let hidden = 4usize;
@@ -820,10 +830,8 @@ mod wkv_numeric_reference_tests {
         let inputs = [vec![0.2f32, -0.1, 0.5, 0.0], vec![0.9, 0.3, -0.4, 0.7]];
         let mut got: Vec<Vec<f32>> = Vec::new();
         for x in &inputs {
-            // NOTE: 2-D [1, hidden] like every real caller — `step` accepts a
-            // 1-D input by its length check, but the residual add then
-            // crashes in the CPU broadcast path (rank-1 vs rank-2). That
-            // latent backend bug is recorded in the audit report.
+            // NOTE: 2-D [1, hidden] like every real caller - `step` accepts a 1-D input by its length check, but the residual add then crashes in the CPU broadcast path (rank-1 vs rank-2).
+            // That latent backend bug is recorded in the audit report.
             let xt = cpu_tensor(x.clone(), Shape::new(vec![1, hidden]));
             got.push(b.step(&xt, 0, &mut state).unwrap().to_vec_f32().unwrap());
         }
@@ -842,14 +850,11 @@ mod wkv_numeric_reference_tests {
             let mut v = vec![0.0f64; hidden];
             let mut r = vec![0.0f64; hidden];
             for i in 0..hidden {
-                k[i] = w_at(i, &b.time_mix_key)
-                    * (tm_k(i) * x64[i] + (1.0 - tm_k(i)) * xx_attn[i]);
+                k[i] = w_at(i, &b.time_mix_key) * (tm_k(i) * x64[i] + (1.0 - tm_k(i)) * xx_attn[i]);
                 v[i] = w_at(i, &b.time_mix_value)
-                    * (b.tm_mix_v[i] as f64 * x64[i]
-                        + (1.0 - b.tm_mix_v[i] as f64) * xx_attn[i]);
+                    * (b.tm_mix_v[i] as f64 * x64[i] + (1.0 - b.tm_mix_v[i] as f64) * xx_attn[i]);
                 r[i] = w_at(i, &b.time_mix_receptance)
-                    * (b.tm_mix_r[i] as f64 * x64[i]
-                        + (1.0 - b.tm_mix_r[i] as f64) * xx_attn[i]);
+                    * (b.tm_mix_r[i] as f64 * x64[i] + (1.0 - b.tm_mix_r[i] as f64) * xx_attn[i]);
             }
             // Post-norm current hidden becomes next call's shift carry.
             let mean_sq = x64.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
@@ -876,26 +881,27 @@ mod wkv_numeric_reference_tests {
                 attn_y[i] *= w_at(i, &b.time_mix_output);
             }
             // Channel mix (diagonal projections).
-            let r1: Vec<f64> =
-                x64.iter().zip(&attn_y).map(|(&a, &o)| a + o).collect();
+            let r1: Vec<f64> = x64.iter().zip(&attn_y).map(|(&a, &o)| a + o).collect();
             let mean_sq = r1.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
             let inv = 1.0 / (mean_sq + 1e-5).sqrt();
             let n2: Vec<f64> = r1.iter().map(|v| v * inv).collect();
             let mut out = vec![0.0f64; hidden];
             for i in 0..hidden {
-                let kin = b.ffn_tm_mix_k[i] as f64 * n2[i]
-                    + (1.0 - b.ffn_tm_mix_k[i] as f64) * xx_ffn[i];
-                let rin = b.ffn_tm_mix_r[i] as f64 * n2[i]
-                    + (1.0 - b.ffn_tm_mix_r[i] as f64) * xx_ffn[i];
+                let kin =
+                    b.ffn_tm_mix_k[i] as f64 * n2[i] + (1.0 - b.ffn_tm_mix_k[i] as f64) * xx_ffn[i];
+                let rin =
+                    b.ffn_tm_mix_r[i] as f64 * n2[i] + (1.0 - b.ffn_tm_mix_r[i] as f64) * xx_ffn[i];
                 let sig = 1.0 / (1.0 + (-rin).exp());
                 let gated = sig * kin.max(0.0) * w_at(i, &b.channel_mix_key);
                 out[i] = r1[i] + gated * w_at(i, &b.channel_mix_value);
             }
             xx_ffn.copy_from_slice(&n2);
             for (o, g) in out.iter().zip(&got[step_idx]) {
-                assert!((o - *g as f64).abs() < 1e-4, "token {step_idx}: reference {o} vs impl {g}");
+                assert!(
+                    (o - *g as f64).abs() < 1e-4,
+                    "token {step_idx}: reference {o} vs impl {g}"
+                );
             }
         }
     }
-
 }

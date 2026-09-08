@@ -1,8 +1,5 @@
 //! Continuous Batch Reordering & 3-Path Dispatch Orchestrator for ROCm.
-//!
-//! Reorders mixed-workload batches into contiguous `[Decode : Extend : Prefill]`
-//! partitions before attention dispatch, eliminating KV-cache thrashing and
-//! memory layout conversions.
+//! Reorders mixed-workload batches into contiguous `[Decode : Extend : Prefill]` partitions before attention dispatch, eliminating.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestCategory {

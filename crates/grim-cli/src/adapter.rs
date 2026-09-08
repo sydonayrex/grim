@@ -1,10 +1,5 @@
-//! `grim adapter` — runtime LoRA adapter management against a live server.
-//!
-//! Wraps `POST /v1/adapters/load`, `GET /v1/adapters`, and
-//! `DELETE /v1/adapters/:name` so zero-downtime adapter swaps are scriptable
-//! without curl. The server-side loader is honest about what it can apply:
-//! logits-projection pairs load at runtime; per-layer projections (Q/K/V/O/
-//! Gate/Up/Down) report 409 with the `grim merge` bake path.
+//! `grim adapter` - runtime LoRA adapter management against a live server.
+//! Wraps `POST /v1/adapters/load`, `GET /v1/adapters`, and `DELETE /v1/adapters/:name` so zero-downtime adapter swaps are scriptable without.
 
 use clap::Subcommand;
 use grim_core::error::{Error, Result};

@@ -68,9 +68,8 @@ pub struct DeviceScratchPool {
 }
 
 impl DeviceScratchPool {
-    /// Build a new, empty pool. State lives in atomic counters and a [see: `get()`]
-    // Bucket entries are raw device pointers that only the pool mutex dereferences;
-    // the Arc is deliberately shared across threads despite the pointer type.
+    /// Build a new, empty pool. State lives in atomic counters and a [see: `get()`] Bucket entries are raw
+    /// device pointers that only the pool mutex dereferences; the Arc is deliberately shared across threads despite the pointer type.
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -97,9 +96,8 @@ impl DeviceScratchPool {
                 let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
                 let mut status = unsafe { hipMalloc(&mut p, layout.size) };
                 if status != crate::hipSuccess {
-                    // The scratch pool also serves temporary activations. Use
-                    // managed memory as the last allocation tier when VRAM
-                    // is exhausted; hipFree remains valid for both kinds.
+                    // The scratch pool also serves temporary activations.
+                    // Use managed memory as the last allocation tier when VRAM is exhausted; hipFree remains valid.
                     status = unsafe { hipMallocManaged(&mut p, layout.size, 1) };
                 }
                 check_hip("scratch pool allocation", status)?;

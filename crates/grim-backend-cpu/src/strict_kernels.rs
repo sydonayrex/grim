@@ -1,11 +1,5 @@
-//! Strict-mode deterministic kernels — §5.8.
-//!
-//! Three predicates:
-//! 1. `strict_matmul` — bit-stable scalar matmul (no SIMD reorder, no FMA reassoc).
-//! 2. `strict_softmax` — stable max-subtract, deterministic iteration.
-//! 3. `strict_attention` — matches matmul + softmax iteration order.
-//!
-//! Intentionally slower; `SIMD_DISABLED` keeps deterministic cost visible.
+//! Strict-mode deterministic kernels - §5.8.
+//! Three predicates: 1.
 
 use crate::cpu_tensor;
 use grim_tensor::{Shape, SoftmaxPartial};
@@ -139,12 +133,6 @@ pub fn strict_attention_tensor(
 
 /// Partial online-softmax attention for hybrid CPU/GPU offload (WI 3.4.2).
 /// Math-for-math port of `woody_attention_online_f32` in grim-backend-rocm.
-/// Returns `SoftmaxPartial` per `(head, query_token)` over `[j_start, j_end)`.
-/// Merge disjoint ranges via [`grim_tensor::merge_partials`].
-///
-/// Layout (matches GPU kernel): Q=`[seq_len, num_heads, head_dim]` row-major;
-/// K/V=`[kv_seq_len, num_kv_heads, head_dim]` row-major.
-/// Causal mask: `hi = min(cache_offset + qt + 1, kv_seq_len)`. GQA: `kv_head = h / q_per_kv`.
 #[allow(clippy::too_many_arguments)]
 pub fn strict_attention_partial_online(
     q: &[f32],
@@ -324,13 +312,8 @@ mod tests {
         }
     }
 
-    // ====================================================================
-    // WI 3 — Gate 3.6.1: hybrid CPU/GPU attention correctness parity.
-    //
-    // Ground truth = single-chunk full-range partial; hybrid path = same
-    // computation split into chunks merged via `merge_partials`. Pure CPU,
-    // no GPU required — validates the merge formula foundation for §3.4.3.
-    // ====================================================================
+    // WI 3 - Gate 3.6.1: hybrid CPU/GPU attention correctness parity.
+    // Ground truth = single-chunk full-range partial; hybrid path = same computation split into chunks merged.
 
     /// Deterministic LCG for reproducible test inputs.
     fn lcg_f32(seed: u32) -> u32 {
@@ -411,9 +394,8 @@ mod tests {
     ) -> Vec<f32> {
         let mut out = Vec::with_capacity(seq_len * num_heads * head_dim);
         for qt_head in 0..seq_len * num_heads {
-            // We need per-(qt, head) partials, but the kernel returns them
-            // all at once. Compute the full set for each chunk and pick the
-            // right index.
+            // We need per-(qt, head) partials, but the kernel returns them all at once.
+            // Compute the full set for each chunk and pick the right index.
             let mut partials_for_this: Vec<grim_tensor::SoftmaxPartial> = Vec::new();
             for win in chunk_boundaries.windows(2) {
                 let j_start = win[0];

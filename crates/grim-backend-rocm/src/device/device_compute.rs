@@ -12,25 +12,25 @@ use grim_tensor::{
     SamplingOps, Shape,
 };
 
-use crate::device::gemm_tuning::{lookup_gemm_config, lookup_gemm_config_for_shape, lookup_solution_index};
+use crate::device::gemm_tuning::{
+    lookup_gemm_config, lookup_gemm_config_for_shape, lookup_solution_index,
+};
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, as_rocm, check_hip,
-    dev_ptr, dtype_f32, hipFree, hipFreeAsync, hipMemAdvise, hipMemsetAsync,
-    hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload,
-    hipSuccess, jit_compile_hsaco, linear_launch, rocblas_gemm_ex,
-    rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm,
-    rocblas_status_success, select_gemm_algo, upload_device_buffer, warp_rows_launch,
-    HipDim3, QkvAttentionFusionConfig, QuantMode, RmsNormMatMulFusionConfig,
-    ROCBLAS_GEMM_FLAGS_NONE, RocblasInt, RocblasOperation, RocmHandle,
+    HipDim3, QkvAttentionFusionConfig, QuantMode, ROCBLAS_GEMM_FLAGS_NONE,
+    RmsNormMatMulFusionConfig, RocblasInt, RocblasOperation, RocmHandle, arg,
+    arith_to_compute_dtype, arith_to_rocblas_dtype, as_rocm, check_hip, dev_ptr, dtype_f32,
+    hipFree, hipFreeAsync, hipMemAdvise, hipMemsetAsync, hipModuleGetFunction,
+    hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSuccess, jit_compile_hsaco,
+    linear_launch, rocblas_gemm_ex, rocblas_gemm_strided_batched_ex, rocblas_set_stream,
+    rocblas_sgemm, rocblas_status_success, select_gemm_algo, upload_device_buffer,
+    warp_rows_launch,
 };
 
 impl CoreTensorOps for RocmDevice {
-    /// Audit B5: delegate to the device-resident `grim_transpose_2d_f32` HIP
-    /// kernel via the existing inherent helper — the tensor never leaves GPU
-    /// memory (the helper synchronizes the kernel launch internally, so the
-    /// returned handle is trivially ready).
+    /// Audit B5: delegate to the device-resident `grim_transpose_2d_f32` HIP kernel via the existing inherent helper - the tensor
+    /// never leaves GPU memory (the helper synchronizes the kernel launch internally, so the returned handle is trivially ready).
     fn transpose_2d(
         &self,
         x: &dyn BackendStorage,
@@ -41,7 +41,6 @@ impl CoreTensorOps for RocmDevice {
         let out = self.transpose_f32_2d(x, rows, cols)?;
         Ok((out, Box::new(ReadyHandle)))
     }
-
 
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         // P1-3: raw HIP ops below bind to the calling thread's current
@@ -59,10 +58,8 @@ impl CoreTensorOps for RocmDevice {
 
         let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
 
-        // If a graph-capture session is active, record an async memset on the
-        // capture stream; otherwise enqueue async on the active stream so
-        // zeroing stays stream-ordered instead of blocking the host (the old
-        // default-stream hipMemset was a device-wide serialization point).
+        // If a graph-capture session is active, record an async memset on the capture stream; otherwise enqueue async on the
+        // active stream so zeroing stays stream-ordered instead of blocking the host (the old default-stream hipMemset was a device-wide serialization point).
         let res = match self.active_capture_stream() {
             Some(capture_stream) => unsafe {
                 hipMemsetAsync(dev_ptr_void, 0, storage.bytes, capture_stream)
@@ -87,7 +84,6 @@ impl CoreTensorOps for RocmDevice {
         Ok(Box::new(storage))
     }
 
-
     fn from_cpu(
         &self,
         data: &[f32],
@@ -101,7 +97,6 @@ impl CoreTensorOps for RocmDevice {
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
 
-
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -110,7 +105,6 @@ impl CoreTensorOps for RocmDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.matmul_op(a, b, out_shape, crate::autotune::GemmOp::Other)
     }
-
 
     fn matmul_with_solution(
         &self,
@@ -122,12 +116,8 @@ impl CoreTensorOps for RocmDevice {
         #[cfg(feature = "rocm-profile")]
         println!("[rocprofiler-sdk] Begin marker span: matmul_with_solution");
 
-        // P1-3: this is the plain `matmul` dispatch path — rocBLAS executes
-        // on the calling thread's current device, which after the
-        // context-neutral `try_new` is typically ordinal 0 on multi-GPU
-        // boxes. Pin before any alloc or rocBLAS call or the GEMM launches
-        // cross-device and silently writes zeros (rank-1 LM-head zeroing,
-        // 2026-08-23e — reproduced by examples/f32_matmul_probe).
+        // P1-3: this is the plain `matmul` dispatch path - rocBLAS executes on the calling thread's current device, which after the context-neutral `try_new` is typically ordinal 0 on multi-GPU boxes.
+        // Pin before any alloc or rocBLAS call or the GEMM launches cross-device and silently writes.
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
         // For matmul on GPU, both inputs must be RocmStorage (or we need to copy them to the device first)
@@ -199,9 +189,8 @@ impl CoreTensorOps for RocmDevice {
 
         // Get rocBLAS handle and execute gemm_ex with the provided solution_index
         let handle = self.get_rocblas_handle()?;
-        // Bind the rocBLAS handle to the active stream so GEMM executes on the
-        // correct stream and the returned ComputeHandle synchronizes correctly.
-        // [P0-17 fix: previously missing — caused sync-lie and split-K race.]
+        // Bind the rocBLAS handle to the active stream so GEMM executes on the correct stream and the returned ComputeHandle synchronizes correctly.
+        // [P0-17 fix: previously missing - caused sync-lie and split-K race.]
         let _ = unsafe { rocblas_set_stream(handle, self.active_stream()) };
 
         let alpha: f32 = 1.0f32;
@@ -286,7 +275,6 @@ impl CoreTensorOps for RocmDevice {
         Ok((Box::new(out_storage), compute_handle))
     }
 
-
     fn add(
         &self,
         a: &dyn BackendStorage,
@@ -325,7 +313,6 @@ impl CoreTensorOps for RocmDevice {
         ))
     }
 
-
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -362,7 +349,6 @@ impl CoreTensorOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn silu_mul(
         &self,
@@ -401,7 +387,6 @@ impl CoreTensorOps for RocmDevice {
         ))
     }
 
-
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -420,7 +405,11 @@ impl CoreTensorOps for RocmDevice {
         if x_dims.is_empty() {
             return Err(Error::Shape("rms_norm: empty input".into()));
         }
-        let row_len = out.dims().last().copied().ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
+        let row_len = out
+            .dims()
+            .last()
+            .copied()
+            .ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -450,7 +439,6 @@ impl CoreTensorOps for RocmDevice {
         ))
     }
 
-
     fn softmax(
         &self,
         x: &dyn BackendStorage,
@@ -466,7 +454,10 @@ impl CoreTensorOps for RocmDevice {
         if x_dims.is_empty() {
             return Err(Error::Shape("softmax: empty input".into()));
         }
-        let row_len = x_dims.last().copied().ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
+        let row_len = x_dims
+            .last()
+            .copied()
+            .ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -491,7 +482,6 @@ impl CoreTensorOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn embedding(
         &self,
@@ -550,9 +540,8 @@ impl CoreTensorOps for RocmDevice {
                 arg(&mut total_i),
             ],
         )?;
-        // The fused kernel reads idx_ptr from the GPU. Free stream-ordered so
-        // the release happens after the kernel's reads; this is also
-        // graph-capturable (the capture path previously leaked the buffer).
+        // The fused kernel reads idx_ptr from the GPU.
+        // Free stream-ordered so the release happens after the kernel's reads; this is also graph-capturable (the.
         unsafe {
             let free_stream = stream
                 .as_ref()
@@ -565,7 +554,6 @@ impl CoreTensorOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn advise(
         &self,
@@ -585,10 +573,8 @@ impl CoreTensorOps for RocmDevice {
             None => return Ok(()), // Unallocated or CPU-side: no-op
         };
 
-        // Correctness Gate: Probe XNACK. If disabled, pageable unified memory
-        // migrations fail — and there is nothing useful to substitute: the old
-        // fallback issued a whole-tensor self-copy on the null stream, which
-        // was a no-op for data but a device-wide serialization point.
+        // Correctness Gate: Probe XNACK. If disabled, pageable unified memory migrations fail - and there is nothing useful to substitute: the
+        // old fallback issued a whole-tensor self-copy on the null stream, which was a no-op for data but a device-wide serialization point.
         if !self.props.xnack_enabled {
             return Ok(());
         }
@@ -623,11 +609,7 @@ impl CoreTensorOps for RocmDevice {
     }
 }
 
-
-
 impl ElementwiseOps for RocmDevice {
-
-
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -658,7 +640,6 @@ impl ElementwiseOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn add_scalar(
         &self,
@@ -691,7 +672,6 @@ impl ElementwiseOps for RocmDevice {
         ))
     }
 
-
     fn sub_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -701,7 +681,6 @@ impl ElementwiseOps for RocmDevice {
         self.add_scalar(x, -scalar, out)
     }
 
-
     fn div_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -710,7 +689,6 @@ impl ElementwiseOps for RocmDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         self.mul_scalar(x, 1.0 / scalar, out)
     }
-
 
     fn sqrt(
         &self,
@@ -740,7 +718,6 @@ impl ElementwiseOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn recip(
         &self,
@@ -807,8 +784,6 @@ impl ElementwiseOps for RocmDevice {
     }
 }
 
-
-
 impl SamplingOps for RocmDevice {
     fn sample_on_device(
         &self,
@@ -844,10 +819,7 @@ impl SamplingOps for RocmDevice {
                 .map(|(idx, _)| idx as u32)
                 .ok_or_else(|| Error::Backend("sample_on_device: empty logits".into()));
         }
-        let max_logit = cpu_logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_logit = cpu_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         if !max_logit.is_finite() {
             return Err(Error::Backend(format!(
                 "sample_on_device: logits have non-finite maximum ({max_logit})"
@@ -899,11 +871,7 @@ impl SamplingOps for RocmDevice {
     }
 }
 
-
-
 impl FusionOps for RocmDevice {
-
-
     fn fused_mxfp4_gemm_qk_norm_rope_kv(
         &self,
         x: &dyn BackendStorage,
@@ -953,7 +921,6 @@ impl FusionOps for RocmDevice {
         )
     }
 
-
     /// Broadcast 1-D bias tensor `[out_dim]` into 2-D storage `[batch, out_dim]` via `grim_broadcast_bias`.
     fn broadcast_bias(
         &self,
@@ -997,12 +964,8 @@ impl FusionOps for RocmDevice {
         ))
     }
 
-
-    /// In-place scale+bias epilogue on a `[batch, out_dim]` GEMM output via
-    /// `grim_scale_bias_epilogue`. Plain rocBLAS has no epilogue-fusion API, so
-    /// this standalone kernel is the required post-GEMM step for W8A8-style
-    /// per-token × per-channel scaling. `a_scale`/`b_scale`/`bias` may be
-    /// `None`; kernel treats absent scale as 1.0 and absent bias as 0.0.
+    /// In-place scale+bias epilogue on a `[batch, out_dim]` GEMM output via `grim_scale_bias_epilogue`.
+    /// Plain rocBLAS has no epilogue-fusion API, so this standalone kernel is the required post-GEMM step.
     fn scale_bias_epilogue(
         &self,
         out: &dyn BackendStorage,
@@ -1018,9 +981,8 @@ impl FusionOps for RocmDevice {
                 "scale_bias_epilogue: out lacks a valid device pointer".into(),
             ));
         }
-        // `_a_s` / `_b_s` / `_bt_s` hold borrows that keep the underlying storage
-        // allocations alive until after the kernel launch; only the raw pointers are
-        // forwarded into the kernel args.
+        // `_a_s` / `_b_s` / `_bt_s` hold borrows that keep the underlying storage allocations alive
+        // until after the kernel launch; only the raw pointers are forwarded into the kernel args.
         let (_a_s, a_ptr): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match a_scale {
             Some(s) => {
                 let s = as_rocm(s)?;
@@ -1072,11 +1034,7 @@ impl FusionOps for RocmDevice {
     }
 }
 
-
-
 impl AutogradOps for RocmDevice {
-
-
     /// SwiGLU backward: `(df, de) = silu_mul_backward(e, g, dw)`.
     /// `df` = gradient w.r.t. `g` (up), `de` = gradient w.r.t. `e` (gate).
     fn silu_mul_backward(
@@ -1129,7 +1087,6 @@ impl AutogradOps for RocmDevice {
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
-
 
     fn rmsnorm_backward(
         &self,
@@ -1188,7 +1145,6 @@ impl AutogradOps for RocmDevice {
         ))
     }
 
-
     fn rope_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1237,7 +1193,6 @@ impl AutogradOps for RocmDevice {
         ))
     }
 
-
     fn softmax_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1280,11 +1235,8 @@ impl AutogradOps for RocmDevice {
         ))
     }
 
-
-    /// P3 (4th fused backward kernel): scatter-add embedding gradient on
-    /// device — `dweight[token_ids[t], :] += out_grad[t, :]`. Token ids are
-    /// uploaded as a small U32 buffer; dweight is zero-filled first, then
-    /// atomically accumulated.
+    /// P3 (4th fused backward kernel): scatter-add embedding gradient on device - `dweight[token_ids[t], :] += out_grad[t, :]`.
+    /// Token ids are uploaded as a small U32 buffer; dweight is zero-filled first, then atomically.
     fn embedding_backward(
         &self,
         out_grad: &dyn BackendStorage,
@@ -1356,11 +1308,7 @@ impl AutogradOps for RocmDevice {
     }
 }
 
-
-
 impl OptimizerOps for RocmDevice {
-
-
     fn fused_adamw_step(
         &self,
         p: &dyn BackendStorage,
@@ -1424,7 +1372,6 @@ impl OptimizerOps for RocmDevice {
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
 
-
     fn fused_lion_step(
         &self,
         p: &dyn BackendStorage,
@@ -1471,7 +1418,6 @@ impl OptimizerOps for RocmDevice {
         )?;
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
-
 
     fn fused_madam_step(
         &self,
@@ -1540,9 +1486,7 @@ impl OptimizerOps for RocmDevice {
     }
 }
 
-
 impl RocmDevice {
-
     /// WI 2.4.4-2c — dispatch `grim_decode_gemm_f16` and return the [see: `launch_compute_kernel`, `DecodeGemmConfig::enabled`]
     pub(crate) fn launch_decode_gemm_f16(
         &self,
@@ -1845,10 +1789,8 @@ impl RocmDevice {
         let mut nn = n as i32;
         let mut sk = split_k as i32;
 
-        // The reduction entry point must match the partials' element type:
-        // the historical f16-only kernel silently corrupted every F32/BF16
-        // split-K GEMM (f32 partials read as _Float16, f16 bits written
-        // back into the f32 output buffer).
+        // The reduction entry point must match the partials' element type: the historical f16-only kernel silently corrupted every
+        // F32/BF16 split-K GEMM (f32 partials read as _Float16, f16 bits written back into the f32 output buffer).
         let entry = match partials_storage.dtype.arith {
             ArithType::F32 => "grim_split_k_reduction_f32",
             ArithType::BF16 => "grim_split_k_reduction_bf16",
@@ -1879,10 +1821,8 @@ impl RocmDevice {
         self.launch_compute_kernel_with_solution(entry, grid, block, args, None, 0)
     }
 
-    /// JIT compile source or fetch cached binary. When a `HardwareSpec` is supplied, the
-    /// cache key incorporates the hardware fingerprint (wavefront/lds/cu/mp/threads) via
-    /// `JitCacheKey::from_spec`, so parametrized kernels for different hardware don't
-    /// collide. Without a spec, falls back to the legacy (entry, arch, hash) key.
+    /// JIT compile source or fetch cached binary.
+    /// When a `HardwareSpec` is supplied, the cache key incorporates the hardware fingerprint (wavefront/lds/cu/mp/threads) via `JitCacheKey::from_spec`,.
     pub fn jit_compile_or_cache(
         &self,
         source: &str,
@@ -1925,9 +1865,7 @@ impl RocmDevice {
     }
 
     /// Benchmark kernel execution time in milliseconds using HIP events.
-    /// Loads the module, resolves the entry, launches once on the device stream bracketed by
-    /// start/stop events, and returns the elapsed GPU time. Falls back to a conservative
-    /// constant if any HIP call fails so the FCP search still returns a valid winner.
+    /// Loads the module, resolves the entry, launches once on the device stream bracketed by start/stop.
     pub fn time_kernel_ms(
         &self,
         hsaco: &std::path::Path,
@@ -1940,9 +1878,8 @@ impl RocmDevice {
             hipEventSynchronize, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
             hipModuleUnload,
         };
-        // P1-3: module load, events and the launch all bind to the calling
-        // thread's current device — pin to the owning ordinal so autotune
-        // timing runs on the device it is tuning for.
+        // P1-3: module load, events and the launch all bind to the calling thread's current device -
+        // pin to the owning ordinal so autotune timing runs on the device it is tuning for.
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut start_event: *mut c_void = std::ptr::null_mut();
         let mut stop_event: *mut c_void = std::ptr::null_mut();
@@ -2022,9 +1959,7 @@ impl RocmDevice {
     }
 
     /// Store empirically discovered winning tile configuration into the autotuner cache.
-    /// `winner_ms` is the measured GPU time of the winning candidate; persisted as
-    /// `cycles_per_invocation` (ns-scale u64) so cached entries carry the measurement.
-    /// Intern `s` as a `&'static str`, leaking each unique value exactly once.
+    /// `winner_ms` is the measured GPU time of the winning candidate; persisted as `cycles_per_invocation` (ns-scale u64).
     pub(crate) fn intern_str(&self, s: &str) -> &'static str {
         if let Ok(mut set) = self.str_interner.lock() {
             if let Some(existing) = set.get(s) {
@@ -2083,11 +2018,7 @@ impl RocmDevice {
         crate::device::hardware_spec::HardwareSpec::from(self)
     }
 
-    /// Read-through tile-cache lookup. On a hit, maps the stored `AutotuneConfig` back to a
-    /// `TileConfig`. On a miss, runs `fcp_fallback_tile_search` (compile + GPU-time a small
-    /// constrained candidate set, keep the fastest), which self-persists the winner via
-    /// `store_tune_cache` so subsequent calls for the same shape are a table hit, not a
-    /// re-measure. This is the Phase 5 wiring that makes the empirical FCP search fire.
+    /// Read-through tile-cache lookup. On a hit, maps the stored `AutotuneConfig` back to a `TileConfig`.
     pub fn get_or_tune_tiles(
         &self,
         entry: &str,
@@ -2136,9 +2067,8 @@ impl RocmDevice {
         crate::kernels::tile_picker::fcp_fallback_tile_search(self, spec, entry, dims, shape_class)
     }
 
-    /// Op-tagged GEMM. `op` drives the `ShapeClass` via `ShapeClass::from_op`: `LmHead`
-    /// selects the TLOLog tile arm (wide block_n for the vocab-dominated output column);
-    /// everything else bins by M as before (from_op(Other, m) == from_m(m)).
+    /// Op-tagged GEMM. `op` drives the `ShapeClass` via `ShapeClass::from_op`: `LmHead` selects the TLOLog tile arm (wide block_n
+    /// for the vocab-dominated output column); everything else bins by M as before (from_op(Other, m) == from_m(m)).
     pub(crate) fn matmul_op(
         &self,
         a: &dyn BackendStorage,
@@ -2194,15 +2124,8 @@ impl RocmDevice {
             )));
         }
 
-        // P1-3 context discipline: rocBLAS executes against the CALLING
-        // THREAD's current HIP device, not the handle's construction device.
-        // `try_new` is context-neutral (restores the caller's device on
-        // return), so on a multi-GPU box the thread typically sits on
-        // ordinal 0 here while every pointer below belongs to `self.ordinal`
-        // — a cross-device GEMM that silently writes zeros or page-faults
-        // (the rank-1 LM-head zeroing, 2026-08-23e). Pin the whole dispatch:
-        // output alloc, split-K partials + reduction, rocBLAS sgemm/gemm_ex,
-        // and the WMMA fallback all share this guard's scope.
+        // P1-3 context discipline: rocBLAS executes against the CALLING THREAD's current HIP device, not the handle's construction device.
+        // `try_new` is context-neutral (restores the caller's device on return), so on a multi-GPU box the.
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
         // Allocate output GPU storage with the actual input precision
@@ -2213,10 +2136,8 @@ impl RocmDevice {
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
 
-        // WI-SB6 production routing: GRIM_SCYTHE_RING=1 rides F32 GEMMs
-        // (the dense-layer op of every decode step) through the ScytheRing
-        // persistent dispatch wave instead of the rocBLAS direct path.
-        // Benchmark-gated, never default — see device::scythe_route.
+        // WI-SB6 production routing: GRIM_SCYTHE_RING=1 rides F32 GEMMs (the dense-layer op of every decode step) through the ScytheRing persistent dispatch wave instead of the rocBLAS direct path.
+        // Benchmark-gated, never default - see device::scythe_route.
         if dtype_out.arith == ArithType::F32 && crate::device::scythe_route::ring_routing_enabled()
         {
             let stream = crate::device::scythe_route::route_gemm(
@@ -2270,9 +2191,8 @@ impl RocmDevice {
             )?;
 
             let handle = self.get_rocblas_handle()?;
-            // Bind the rocBLAS handle to the active stream so GEMM executes on the
-            // correct stream and the returned ComputeHandle synchronizes correctly.
-            // [P0-17 fix: previously missing — caused sync-lie and split-K race.]
+            // Bind the rocBLAS handle to the active stream so GEMM executes on the correct stream and the returned ComputeHandle synchronizes correctly.
+            // [P0-17 fix: previously missing - caused sync-lie and split-K race.]
             let _ = unsafe { rocblas_set_stream(handle, self.active_stream()) };
             let alpha: f32 = 1.0f32;
             let beta: f32 = 0.0f32;
@@ -2466,9 +2386,8 @@ impl RocmDevice {
         Ok((Box::new(out_storage), compute_handle))
     }
 
-    /// Public hook for the engine layer to tag the lm_head / logit-projection GEMM, so the
-    /// dispatch layer classifies it as `ShapeClass::TLOLog` (op-identity) and selects the
-    /// distinct wide-N tile regardless of M. This is the jit-mgpu.md §4.2 dispatch-layer tag.
+    /// Public hook for the engine layer to tag the lm_head / logit-projection GEMM, so the dispatch layer classifies it as `ShapeClass::TLOLog` (op-identity) and selects the distinct wide-N tile regardless of M.
+    /// This is the jit-mgpu.md §4.2 dispatch-layer tag.
     pub fn matmul_lm_head(
         &self,
         a: &dyn BackendStorage,
@@ -2478,13 +2397,8 @@ impl RocmDevice {
         self.matmul_op(a, b, out_shape, crate::autotune::GemmOp::LmHead)
     }
 
-    /// WI-F1 — Fused QKV projection GEMM. `qkv_weight` must be the load-time
-    /// concatenation of the per-layer Q/K/V projection weights along the
-    /// output dim — row-major `[hidden, q_dim + k_dim + v_dim]`, built once at
-    /// model load via [`crate::fusion::concat_qkv_weights`] (never per forward
-    /// pass). Produces all three projections in a single GEMM launch;
-    /// downstream attention reads q/k/v by offset into the fused output, so
-    /// the projection stage drops from 3 launches to 1 for every layer.
+    /// WI-F1 - Fused QKV projection GEMM. `qkv_weight` must be the load-time concatenation of the per-layer Q/K/V projection weights along the
+    /// output dim - row-major `[hidden, q_dim + k_dim + v_dim]`, built once at model load via [`crate::fusion::concat_qkv_weights`] (never per forward pass).
     pub fn fused_qkv_proj(
         &self,
         x: &dyn BackendStorage,
@@ -2518,15 +2432,8 @@ impl RocmDevice {
         self.matmul_op(x, qkv_weight, out_shape, crate::autotune::GemmOp::Attention)
     }
 
-    /// WI-F2 — Fused attention output projection. Runs the same fused QKV
-    /// attention kernel (`grim_qkv_attention`) with the O-projection applied
-    /// in the kernel epilogue: each head's normalized attention vector is
-    /// multiplied by its slice of `o_proj` (row-major
-    /// `[num_heads*head_dim, o_dim]`) and accumulated across heads in-kernel,
-    /// avoiding the HBM round-trip of writing per-head attention output and
-    /// re-reading it for a separate GEMM. `out_shape` is `[seq_len, o_dim]`.
-    /// The unfused path (`qkv_attention` + matmul) remains the reference and
-    /// fallback; arch gating of this fusion is a follow-up under green.
+    /// WI-F2 - Fused attention output projection.
+    /// Runs the same fused QKV attention kernel (`grim_qkv_attention`) with the O-projection applied in the kernel.
     pub fn fused_attn_o_proj(
         &self,
         q: &dyn BackendStorage,
@@ -2682,9 +2589,8 @@ impl RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
-    /// WI-M2/M3: stamp (self_dev, ctx_dev) for the drift gates and print the
-    /// launch trace — called while this device's P1-3 guard is held, so the
-    /// recorded `ctx_dev` is the context the kernel actually launches under.
+    /// WI-M2/M3: stamp (self_dev, ctx_dev) for the drift gates and print the launch trace - called while this
+    /// device's P1-3 guard is held, so the recorded `ctx_dev` is the context the kernel actually launches under.
     fn stamp_launch_post_pin(&self, trace_on: bool, entry: &str, grid: HipDim3) {
         if !(trace_on || cfg!(test)) {
             return;
@@ -2712,19 +2618,8 @@ impl RocmDevice {
         solution_index: Option<i32>,
         shared_mem_bytes: usize,
     ) -> Result<*mut c_void> {
-        // Fast path: a previously resolved hipFunction for this
-        // (entry, grid-shape, solution_index) launches directly — no source
-        // rebuild, no seahash, no CString, no module-cache walk. Same
-        // solution_index is required because different indices map to
-        // different on-disk hsaco files (cache_key includes _sol{N}).
-        // WI-M2: every launch stamps (self_dev, ctx_dev). Under
-        // GRIM_ALLOC_TRACE it prints; in unit-test builds the WI-M3 drift
-        // gates read the same pair back through the util atomics. With both
-        // off this compiles to exactly the previous no-op.
-        // The stamp is taken INSIDE each launch path AFTER the P1-3 device
-        // pin (`stamp_launch_post_pin`) — capturing the ambient context at
-        // function entry would record the caller's stale context instead of
-        // the one the kernel actually executes under.
+        // Fast path: a previously resolved hipFunction for this (entry, grid-shape, solution_index) launches directly - no source rebuild, no seahash, no CString, no module-cache walk.
+        // Same solution_index is required because different indices map to different on-disk hsaco files (cache_key includes.
         let trace_on = std::env::var("GRIM_ALLOC_TRACE").is_ok();
         if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
             eprintln!("[launch-done] {}", entry);
@@ -2737,10 +2632,8 @@ impl RocmDevice {
             .and_then(|c| c.get(&fast_key).copied());
         if let Some(func) = cached_func {
             if !func.is_null() {
-                // P1-3 discipline: the launching thread's HIP context may be
-                // parked on another device (profiler probes, multi-device
-                // loaders). Pin THIS device or the kernel executes against
-                // foreign pointers — observed as GPU page faults on gfx1201.
+                // P1-3 discipline: the launching thread's HIP context may be parked on another device (profiler probes, multi-device loaders).
+                // Pin THIS device or the kernel executes against foreign pointers - observed as GPU page.
                 let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 self.stamp_launch_post_pin(trace_on, entry, grid);
                 let stream = self.active_stream();
@@ -2765,17 +2658,13 @@ impl RocmDevice {
             }
         }
 
-        // Build the kernel source. Under `jit-hw-adaptive`, inject hardware-specific #defines
-        // (wavefront/LDS/CU + tile geometry) via `compute_kernel_source_with_spec` and route the
-        // compile through the fingerprinted `jit_compile_or_cache`. Otherwise fall back to the
-        // static source + legacy cache key.
+        // Build the kernel source. Under `jit-hw-adaptive`, inject hardware-specific #defines (wavefront/LDS/CU +
+        // tile geometry) via `compute_kernel_source_with_spec` and route the compile through the fingerprinted `jit_compile_or_cache`.
         #[cfg(feature = "jit-hw-adaptive")]
         let (path, lowered_name, cache_key) = {
             let spec = self.hardware_spec();
-            // `launch_compute_kernel` is a generic launcher (no GEMM M/N/K in its signature), so
-            // infer a coarse (m, n) from the grid dims; the per-op TLOLog tagging is handled at
-            // the `matmul_op` layer, not here. K is unknown to the generic launcher; use a
-            // conservative default — split-K is derived from the real K inside `pick_tiles`.
+            // `launch_compute_kernel` is a generic launcher (no GEMM M/N/K in its signature), so infer a coarse (m, n) from the grid dims; the per-op TLOLog tagging is handled at the `matmul_op` layer, not here.
+            // K is unknown to the generic launcher; use a conservative default - split-K is derived.
             let (m_val, n_val) = if grid.y > 1 { (grid.x, grid.y) } else { (1, 1) };
             let shape_class = crate::autotune::ShapeClass::from_m(m_val as usize);
             let dims = crate::kernels::tile_picker::ShapeDims::new(m_val, n_val, 64);
@@ -2830,11 +2719,8 @@ impl RocmDevice {
         let entry_c = std::ffi::CString::new(lowered_name.as_str())
             .map_err(|e| Error::Backend(format!("entry CString: {}", e)))?;
 
-        // Load the HIP module once per unique kernel; reuse the cached module +
-        // Pin the current device to self.ordinal before loading: the JIT pipeline
-        // queries CapabilityProfiler which sweeps every device and can leave the
-        // thread on a foreign ordinal. Loading a gfx1201 hsaco on gfx1200 yields
-        // HIP error 209 (no binary for device).
+        // Load the HIP module once per unique kernel; reuse the cached module + Pin the current device to self.ordinal before loading: the JIT pipeline queries CapabilityProfiler which sweeps every device and can leave the thread on a foreign ordinal.
+        // Loading a gfx1201 hsaco on gfx1200 yields HIP error 209 (no binary for device).
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         self.stamp_launch_post_pin(trace_on, entry, grid);
         let mut module_cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -3101,11 +2987,8 @@ impl RocmDevice {
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
 
-    /// LFM2-style fused QKV projection: MXFP4 GEMM (C = x @ W_qkv) followed by
-    /// per-head QK-Norm + RoPE (YaRN-aware). Mirrors `fused_rmsnorm_mxfp4_gemm_rope_kv`
-    /// but applies the normalization *after* the projection (QK-norm) instead of
-    /// before it, matching QK-norm attention (e.g. LFM2). The input `x` is expected
-    /// to already carry any pre-attention RMSNorm the model applies.
+    /// LFM2-style fused QKV projection: MXFP4 GEMM (C = x @ W_qkv) followed by per-head QK-Norm + RoPE (YaRN-aware).
+    /// Mirrors `fused_rmsnorm_mxfp4_gemm_rope_kv` but applies the normalization *after* the projection (QK-norm) instead of before it, matching.
     pub fn fused_mxfp4_gemm_qk_norm_rope_kv(
         &self,
         x: &dyn BackendStorage,
@@ -3196,7 +3079,10 @@ impl RocmDevice {
         if x_dims.is_empty() {
             return Err(Error::Shape("fused_add_rms_norm: empty input".into()));
         }
-        let row_len = x_dims.last().copied().ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
+        let row_len = x_dims
+            .last()
+            .copied()
+            .ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
         let total = out_shape.elem_count();
         let y_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
@@ -3469,12 +3355,8 @@ impl RocmDevice {
             }
             let log_sum_exp = max_logit + sum_exp.ln();
 
-            // Cross-entropy with optional label smoothing:
-            //   loss = -sum_v q(v) * log_softmax(v)
-            // where log_softmax(v) = row_logits[v] - log_sum_exp, and the
-            // target distribution is q(target) = confident, q(other) = uniform.
-            // This collapses to: confident * (log_sum_exp - logit_target)
-            //   + uniform * (vocab_size * log_sum_exp - sum(row_logits)).
+            // Cross-entropy with optional label smoothing: loss = -sum_v q(v) * log_softmax(v) where log_softmax(v) = row_logits[v] - log_sum_exp, and the target distribution is q(target) = confident, q(other) = uniform.
+            // This collapses to: confident * (log_sum_exp - logit_target) + uniform * (vocab_size * log_sum_exp -.
             let log_target = log_sum_exp - row_logits[target_token];
             let sum_logits: f32 = row_logits.iter().sum();
             let smooth_loss = uniform * ((vocab_size as f32) * log_sum_exp - sum_logits);
@@ -3504,4 +3386,3 @@ impl RocmDevice {
         Ok((avg_loss, Box::new(grad_storage) as Box<dyn BackendStorage>))
     }
 }
-

@@ -21,9 +21,12 @@ fn test_prefill_compact_partitioning() {
 #[test]
 fn test_prefill_compact_device_gate() {
     // Gate on ROCm device probe
-    let device_visible = match grim_backend_rocm::device::roc_device::RocmDevice::probe_one(0) {
-        Ok(true) => true,
-        _ => false,
-    };
-    println!("ROCm device visible for prefill compact test: {}", device_visible);
+    let device_visible = matches!(
+        grim_backend_rocm::device::roc_device::RocmDevice::probe_one(0),
+        Ok(true)
+    );
+    println!(
+        "ROCm device visible for prefill compact test: {}",
+        device_visible
+    );
 }

@@ -1,37 +1,5 @@
 //! SCYTHE-2 C²PLR controller + PlacementCache + persistent ring (WI-4 / WI-7).
-//!
-//! ## Architecture (scythe2.md §3, §5.3)
-//!
-//! The `C2plrController` is the online router that emits a per-layer
-//! `(placement, partition, route)` triple. It is called once per (layer, shape,
-//! epoch) tuple on a `PlacementCache` miss (cache miss path = prefill or
-//! capability-epoch refresh); decode-path cache hits are ~50 ns/layer array
-//! lookups.
-//!
-//! Budget reconciliation (scythe2.md §3.4, retuned to the measured SB3
-//! figures — `benches/scythe2_decide_miss.rs`, release host-side):
-//! - **Decode cache-hit path**: ~50 ns/layer × N_layers ≤ 4 µs (32-layer 7B),
-//!   0.04% of the 10 ms ITL budget.
-//! - **Prefill cache-miss path**: ~2 µs/layer × N_layers ≤ 64 µs (32-layer),
-//!   0.04% of the 150 ms prefill budget. The end-to-end WI-INF4 A/B
-//!   (2026-08-23c) confirmed the decision cost is invisible in TTFT
-//!   (−0.09 %/−0.00 % overhead, F/S).
-//!
-//! ## Staleness safety (scythe2.md §3.5)
-//! - Mode A (stale `partition`): suboptimal, never incorrect.
-//! - Mode B (stale `placement` when GPU left): prevented by the synchronous
-//!   `bump_epoch` from the device-lost path — see `on_gpu_leave`.
-//! - Mode C (stale `route`): falls back to T1 host-bounce, never a fault.
-//!
-//! ## Persistent dispatch ring (scythe2.md §3, Pillar 3, WI-7)
-//! `ScytheRing` / `ScytheTaskDescriptor` implement the lock-free VRAM ring
-//! described in scythe2.md §5.3 (Concordia `2606.23521` + GPREEMPT ATC '25).
-//! The host writes 32-byte task descriptors; the device-resident persistent
-//! kernel polls and dispatches in <0.1 µs.
-//!
-//! Skill attribution:
-//! - `rust-ffi-grim` §1 — `#[repr(C, align(32))]` on `ScytheTaskDescriptor`.
-//! - `rust-ffi-grim` §3 — `cargo check` gate after each WI.
+//! ## Architecture (scythe2.md §3, §5.3) The `C2plrController` is the online router that emits a per-layer.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -44,15 +12,8 @@ use grim_tensor::backend::{GpuCapability, ScytheLink, ScythePlacement};
 
 // ── PlacementCache (§3.4 load-bearing type) ───────────────────────────────────
 
-/// Cache key that makes two forward passes share a placement iff they share a
-/// `(layer_id, shape_bucket, capability_epoch)` triple.
-///
-/// `shape_bucket` power-of-2 quantizes `seq_len × batch` so that autoregressive
-/// decode (which increments `seq_len` by 1 per token) stays cache-stable across
-/// an entire generation (scythe2.md §3.4).
-///
-/// `capability_epoch` is bumped by `CapabilityProfiler` every ~100 ms (§3.6)
-/// or on GPU join/leave (§3.5 mode B).
+/// Cache key that makes two forward passes share a placement iff they share a `(layer_id, shape_bucket, capability_epoch)` triple.
+/// `shape_bucket` power-of-2 quantizes `seq_len × batch` so that autoregressive decode (which increments `seq_len` by 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlacementKey {
     /// Unique layer index (fingerprint table row).
@@ -65,17 +26,9 @@ pub struct PlacementKey {
 
 /// Per-forward placement cache. The fast path is an array indexed by `layer_id`
 /// for the common case (same `shape_bucket`, same `epoch`) → O(1), ~50 ns.
-///
-/// This is the **load-bearing type** that makes per-layer routing compatible
-/// with the 10 ms ITL budget (scythe2.md §3.4). A design that recomputed every
-/// layer every forward pass would blow the ITL budget by 3–8×.
 pub struct PlacementCache {
-    /// Fast path: `fast[layer_id]` holds the last-inserted placement for
-    /// this layer together with the shape bucket it was decided at.
-    /// Cleared by `bump_epoch`. F7 (audit): the bucket is tracked PER LAYER
-    /// — the old single global `last_bucket` made interleaved buckets across
-    /// layers (farm/pipeline concurrency) spuriously miss valid entries and
-    /// pay the ~2 µs `decide_miss` instead of the ~50 ns hit.
+    /// Fast path: `fast[layer_id]` holds the last-inserted placement for this layer together with the shape bucket it was decided at.
+    /// Cleared by `bump_epoch`.
     fast: Vec<Option<(u16, ScythePlacement)>>,
     /// Slow path: arbitrary `(layer_id, bucket, epoch)` → placement.
     full: HashMap<PlacementKey, ScythePlacement>,
@@ -96,11 +49,6 @@ impl PlacementCache {
 
     /// Decode-path lookup. Returns `Some(&placement)` on a hit (~50 ns), or
     /// `None` on a miss (caller must run the expensive `decide_miss()`).
-    ///
-    /// A miss occurs when:
-    /// 1. `layer_id` was never placed (first prefill after startup).
-    /// 2. The shape bucket changed (e.g., prompt length crossed a power-of-2).
-    /// 3. The capability epoch bumped (thermal throttle, GPU leave).
     pub fn get(&self, layer_id: u32, shape_bucket: u16) -> Option<&ScythePlacement> {
         // Fast path: array index by layer_id; valid only when this layer's
         // own stored bucket matches the requested one.
@@ -145,11 +93,7 @@ impl PlacementCache {
     }
 
     /// Called when `CAPABILITY_EPOCH` bumps (~100 ms cadence, or GPU leave).
-    ///
-    /// Clears the fast path so the next forward pass re-runs `decide_miss()`
-    /// for every layer. This is the mode-B safety gate (scythe2.md §3.5):
-    /// if a GPU left, the cleared fast path prevents any forward from
-    /// dispatching to the gone GPU.
+    /// Clears the fast path so the next forward pass re-runs `decide_miss()` for every layer.
     pub fn bump_epoch(&mut self) {
         self.current_epoch = self.current_epoch.wrapping_add(1);
         self.fast.fill(None);
@@ -177,35 +121,11 @@ impl PlacementCache {
 
 // ── C2plrController ───────────────────────────────────────────────────────────
 
-/// Layer fingerprint — 16-dimensional feature vector describing the layer's
-/// compute profile for the WaveTune bilinear predictor.
-///
-/// Populated at model-load time from layer config (MLP vs attention vs norm),
-/// GEMM dimensions, etc.
+/// Layer fingerprint - 16-dimensional feature vector describing the layer's compute profile for the WaveTune bilinear predictor.
+/// Populated at model-load time from layer config (MLP vs attention vs norm), GEMM dimensions, etc.
 pub type LayerFingerprint = [f32; 16];
 
-/// The 2-layer MLP controller π_θ (≈8 KB).
-///
-/// Inputs per forward: `(layer_fingerprint[16], input_shape[4],
-/// capability_profile[K×6], link_state[K×K], thermal_state[K])`.
-/// Outputs: `(placement_logits[K], partition_alpha[K], route_logits[3])`.
-///
-/// Training: Gumbel-Softmax over placement, STE over route, Lagrangian
-/// budget dual-ascent after each optimizer step (scythe2.md §4 Pillar 4).
-///
-/// ## Cache semantics
-/// `decide()` is the public entry point. It checks `cache` first; only on a
-/// miss does it run the expensive `decide_miss()` (WaveTune bilinear eval +
-/// MLP forward + Gumbel sample, measured ~2 µs/layer host-side in release —
-/// `benches/scythe2_decide_miss.rs`, SB3 campaign).
-///
-/// Measured end-to-end cost (WI-INF4 A/B verdict, 2026-08-23c, release,
-/// 30 samples/arm/order on the syd-beasty pair): mean TTFT overhead
-/// −0.09 %/−0.00 % (F/S — the per-decision cost is invisible in TTFT) and
-/// p95 ITL overhead −18.56 %/+2.43 % (F/S) — the ITL budget (≤2 %) is
-/// exceeded only in the S-first ordinal order's decode tail, which is why
-/// `GRIM_SCYTHE_INFERENCE` stays opt-in. Retune placement against that tail
-/// before revisiting the default.
+/// The 2-layer MLP controller π_θ (≈8 KB). Inputs per forward: `(layer_fingerprint[16], input_shape[4], capability_profile[K×6], link_state[K×K], thermal_state[K])`.
 pub struct C2plrController {
     /// Layer fingerprints indexed by `layer_id`.
     pub layer_fps: Vec<LayerFingerprint>,
@@ -222,19 +142,14 @@ pub struct C2plrController {
     pub budget_ms: f64,
     /// The placement cache — load-bearing for the ITL budget (§3.4).
     pub cache: PlacementCache,
-    /// Number of GPUs the controller was constructed for. `decide_miss`
-    /// validates that the live `caps.len()` matches this — a mismatch means
-    /// the farm topology changed without a `bump_epoch`, which is a bug.
+    /// Number of GPUs the controller was constructed for.
+    /// `decide_miss` validates that the live `caps.len()` matches this - a mismatch means the farm topology.
     num_gpus: usize,
 }
 
 impl C2plrController {
     /// Construct a controller for `num_layers` layers and `num_gpus` GPUs.
-    ///
     /// MLP weights are initialised near-zero (the controller learns online).
-    /// The HetAuto MCTS offline seed (scythe2.md §4 Pillar 2) would populate
-    /// `theta_w1`/`theta_w2` before the first forward; until then the controller
-    /// falls back to round-robin placement.
     pub fn new(num_layers: usize, num_gpus: usize, budget_ms: f64) -> Self {
         // Input dim: 16 (fingerprint) + 4 (shape) + num_gpus*6 (caps) + num_gpus*num_gpus (links) + num_gpus (thermal)
         let input_dim = 16 + 4 + num_gpus * 6 + num_gpus * num_gpus + num_gpus;
@@ -253,11 +168,7 @@ impl C2plrController {
     }
 
     /// Per-forward entry point (scythe2.md §5.3).
-    ///
     /// Hits the cache first; calls `decide_miss()` only on a miss.
-    /// Aggregate per-forward overhead (measured, release host-side):
-    /// - Decode (cache hit): ~50 ns/layer × N_layers.
-    /// - Prefill/refresh (miss): ~2 µs/layer × N_layers.
     pub fn decide(
         &mut self,
         layer_id: u32,
@@ -280,13 +191,8 @@ impl C2plrController {
             .clone()
     }
 
-    /// Load-aware variant of [`C2plrController::decide`] (WI-SB1 finding):
-    /// the shape-keyed PlacementCache is load-blind — a placement decided
-    /// for idle ranks is reused verbatim even after the rank-load vector
-    /// changed (concurrent farm pins or external GPU utilization). Callers
-    /// that pass *adjusted* caps reflecting any non-zero load must use this
-    /// entry so the argmin actually sees them. Still refreshes the cache so
-    /// subsequent idle-shaped lookups stay coherent.
+    /// Load-aware variant of [`C2plrController::decide`] (WI-SB1 finding): the shape-keyed PlacementCache is load-blind - a placement decided for idle ranks is reused verbatim even after the rank-load vector changed (concurrent farm pins or external GPU utilization).
+    /// Callers that pass *adjusted* caps reflecting any non-zero load must use this entry so the.
     pub fn decide_forced(
         &mut self,
         layer_id: u32,
@@ -303,16 +209,7 @@ impl C2plrController {
     }
 
     /// Expensive path: WaveTune bilinear eval + MLP forward + Gumbel sample.
-    ///
-    /// Measured at ~2 µs/layer host-side in release (`benches/
-    /// scythe2_decide_miss.rs`); the ~10 µs figure in scythe2.md §3.4 was
-    /// the pre-implementation estimate. This is a
-    /// *deterministic table lookup*, not a candidate loop — the WaveTune
-    /// `2604.10187` §4.4–4.5 mechanism is one bilinear eval + one anchor
-    /// retrieval, not an iterative search.
-    ///
-    /// When the MLP weights are zero (before online learning converges), the
-    /// controller falls back to a balanced round-robin placement.
+    /// Measured at ~2 µs/layer host-side in release (`benches/ scythe2_decide_miss.rs`); the ~10 µs figure in scythe2.md.
     fn decide_miss(
         &self,
         layer_id: u32,
@@ -320,14 +217,11 @@ impl C2plrController {
         caps: &[GpuCapability],
         links: &[ScytheLink],
     ) -> ScythePlacement {
-        // Validate that the live capability profile matches the farm the
-        // controller was constructed for. A mismatch means the topology
-        // changed without a `bump_epoch` — a caller bug. We don't panic
-        // (the controller must stay up), but we clamp to the configured size.
+        // Validate that the live capability profile matches the farm the controller was constructed for.
+        // A mismatch means the topology changed without a `bump_epoch` - a caller bug.
         let k = caps.len().max(1).min(self.num_gpus.max(1));
 
-        // ── WaveTune bilinear latency eval (§3.4 Table-A) ──────────────────
-        // For each GPU, estimate GEMM latency from TFLOPS and shape.
+        // ── WaveTune bilinear latency eval (§3.4 Table-A) ────────────────── For each GPU, estimate GEMM latency from TFLOPS and shape.
         // This is the offline structural-coefficient lookup (one division per GPU).
         let m = shape.first().copied().unwrap_or(1);
         let n = shape.get(1).copied().unwrap_or(1);
@@ -344,8 +238,7 @@ impl C2plrController {
             })
             .collect();
 
-        // ── MLP forward (§3.4, §4 Pillar 4) ───────────────────────────────
-        // Build input vector and run the 2-layer MLP.
+        // ── MLP forward (§3.4, §4 Pillar 4) ─────────────────────────────── Build input vector and run the 2-layer MLP.
         // If weights are zero → output is zero → fallback to round-robin below.
         let input_dim = 16 + 4 + k * 6 + k * k + k;
         let mut input = vec![0.0f32; input_dim];
@@ -394,13 +287,8 @@ impl C2plrController {
             output_dim,
         );
 
-        // ── Placement selection ─────────────────────────────────────────────
-        // Placement logits: argmax over first K elements. With an untrained
-        // (all-zero) MLP every logit is identical, and a naive argmax pins
-        // every layer to rank 0 — on an asymmetric pair that may be the
-        // *slower* card. When the logits carry no signal (all equal), ship
-        // the WaveTune bilinear estimate alone (WI-INF5 first cut): pick the
-        // GPU with the lowest predicted GEMM latency.
+        // ── Placement selection ───────────────────────────────────────────── Placement logits: argmax over first K elements.
+        // With an untrained (all-zero) MLP every logit is identical, and a naive argmax pins every.
         let placement_logits = &logits[..k.min(logits.len())];
         let logits_carry_no_signal = placement_logits.windows(2).all(|w| w[0] == w[1]);
         let best_gpu = if logits_carry_no_signal {
@@ -420,14 +308,8 @@ impl C2plrController {
                 .unwrap_or(0)
         };
 
-        // F6 (audit): single-rank routing is the intended design — the only
-        // multi-rank ScythePlacement consumer is grim-cli's hand-built
-        // data-parallel gradient sync, which bypasses this controller. The
-        // softmax-over-partition-logits computation that used to live here
-        // fed exactly one discarded slice (`split_counts` tops the sole
-        // rank off to 100% regardless); it is deleted rather than "fixed"
-        // so the output no longer implies multi-rank support that doesn't
-        // exist.
+        // F6 (audit): single-rank routing is the intended design - the only multi-rank ScythePlacement consumer is grim-cli's hand-built data-parallel gradient sync, which bypasses this controller.
+        // The softmax-over-partition-logits computation that used to live here fed exactly one discarded slice (`split_counts` tops.
 
         // ── Route selection ─────────────────────────────────────────
         let route_link = if k == 1 {
@@ -439,14 +321,8 @@ impl C2plrController {
                 .unwrap_or(ScytheLink::Host)
         };
 
-        // ── Lagrangian budget check ─────────────────────────────────────────
-        // Compare this layer's estimated GEMM latency against the *per-layer*
-        // budget slice (total budget / num_layers), not the whole end-to-end
-        // budget. The previous code compared one GEMM against `budget_ms`
-        // directly, which made the fallback effectively never fire (a single
-        // GEMM almost never exceeds the full prefill/ITL budget). The per-layer
-        // slice is the honest threshold: if this layer would consume more than
-        // its fair share on the chosen GPU, reroute to the lowest-latency GPU.
+        // ── Lagrangian budget check ───────────────────────────────────────── Compare this layer's estimated GEMM latency against the *per-layer* budget slice (total budget / num_layers), not the whole end-to-end budget.
+        // The previous code compared one GEMM against `budget_ms` directly, which made the fallback effectively never.
         let num_layers = self.layer_fps.len().max(1);
         let per_layer_budget = self.budget_ms / num_layers as f64;
         let selected =
@@ -471,32 +347,22 @@ impl C2plrController {
         }
     }
 
-    /// Online update after a batch — dual ascent on λ + MLP gradient step.
-    ///
-    /// Called every optimizer step (not every micro-batch) to update the
-    /// Lagrangian dual variable and the MLP weights with a simple gradient
-    /// estimate (scythe2.md §4 Pillar 4).
+    /// Online update after a batch - dual ascent on λ + MLP gradient step.
+    /// Called every optimizer step (not every micro-batch) to update the Lagrangian dual variable and the.
     pub fn update(&mut self, observed_latency_ms: f64, placements: &[ScythePlacement]) {
         // Lagrangian dual ascent: λ ← λ + α(t̂_total - T_budget).
-        // The step size α = 0.01 is the standard dual-ascent learning rate;
-        // larger values oscillate, smaller values converge too slowly for
-        // the ~100 ms capability-epoch cadence (scythe2.md §3.6).
+        // The step size α = 0.01 is the standard dual-ascent learning rate; larger values oscillate,.
         const DUAL_STEP_SIZE: f64 = 0.01;
         const MLP_LR: f32 = 0.001;
         let constraint_violation = observed_latency_ms - self.budget_ms;
         self.lambda = (self.lambda + DUAL_STEP_SIZE * constraint_violation).max(0.0);
 
-        // ── MLP gradient step (scythe2.md §4 Pillar 4) ────────────────────────
-        // Approximate policy gradient: penalise weights that led to placements
-        // on GPUs contributing to budget overruns, weighted by the violation
-        // magnitude. When λ is high (chronic overruns), the penalty scales up,
-        // pushing the MLP toward lower-latency placements.
+        // ── MLP gradient step (scythe2.md §4 Pillar 4) ──────────────────────── Approximate policy gradient: penalise weights that led to placements on GPUs contributing to budget overruns, weighted by the violation magnitude.
+        // When λ is high (chronic overruns), the penalty scales up, pushing the MLP toward lower-latency.
         let penalty = (self.lambda * constraint_violation.abs().max(0.0)) as f32;
         if penalty > 0.0 && !placements.is_empty() {
-            // Build a per-GPU blame signal: GPUs that appear more often in the
-            // placements get a larger gradient push. This is a REINFORCE-style
-            // credit assignment without the full autograd tape — the controller
-            // runs online and must be lightweight.
+            // Build a per-GPU blame signal: GPUs that appear more often in the placements get a larger gradient push.
+            // This is a REINFORCE-style credit assignment without the full autograd tape - the controller runs.
             let mut gpu_blame = vec![0.0f32; self.num_gpus];
             for p in placements {
                 for &rank in &p.ranks {
@@ -507,9 +373,8 @@ impl C2plrController {
             }
             let total_blame: f32 = gpu_blame.iter().sum();
             if total_blame > 0.0 {
-                // Normalise blame and apply as gradient noise to W2 columns
-                // that correspond to placement logits. This nudges the MLP
-                // output distribution away from the over-used GPUs.
+                // Normalise blame and apply as gradient noise to W2 columns that correspond to placement logits.
+                // This nudges the MLP output distribution away from the over-used GPUs.
                 let hidden_dim = self.hidden_dim;
                 let output_dim = self.num_gpus + self.num_gpus + 3;
                 for (oi, &blame) in gpu_blame.iter().enumerate() {
@@ -534,17 +399,14 @@ impl C2plrController {
     }
 
     /// Notify the cache that a GPU left the farm (mode-B safety, §3.5).
-    ///
-    /// Must be called from the ROCm device-lost path *before* the next
-    /// `decide()` so that no cached placement dispatches to the gone GPU.
+    /// Must be called from the ROCm device-lost path *before* the next `decide()` so that no.
     pub fn on_gpu_leave(&mut self, ordinal: usize) {
         log::info!("[scythe2] GPU {ordinal} left — clearing PlacementCache (mode-B safety)");
         self.cache.on_gpu_leave();
     }
 
-    /// Number of GPUs this controller was constructed for. The engine reads
-    /// this when re-sizing the controller to a newly loaded model's depth
-    /// (WI-INF2: one controller per loaded model).
+    /// Number of GPUs this controller was constructed for.
+    /// The engine reads this when re-sizing the controller to a newly loaded model's depth (WI-INF2:.
     pub fn num_gpus(&self) -> usize {
         self.num_gpus
     }
@@ -553,10 +415,7 @@ impl C2plrController {
 // ── Bucketizing ───────────────────────────────────────────────────────────────
 
 /// Map a shape to a power-of-2 bucket index.
-///
-/// Autoregressive decode increments `seq_len` by 1 per token. Bucketizing to
-/// the next power of 2 keeps decode tokens in the same bucket for an entire
-/// generation window, making the fast-path cache-stable (scythe2.md §3.4).
+/// Autoregressive decode increments `seq_len` by 1 per token.
 pub fn bucketize(shape: &[usize]) -> u16 {
     let seq = shape.get(1).copied().unwrap_or(1).max(1);
     seq.next_power_of_two().trailing_zeros() as u16
@@ -597,25 +456,7 @@ fn mlp_forward(w1: &[f32], w2: &[f32], x: &[f32], hidden: usize, out: usize) -> 
 // ── ScytheRing + ScytheTaskDescriptor (WI-7) ─────────────────────────────────
 
 /// 32-byte task descriptor for the lock-free VRAM ring (scythe2.md §5.3).
-///
-/// The device-resident persistent kernel (Concordia `2606.23521`) polls these
-/// descriptors at HBM bandwidth. The host writes a descriptor and the GPU
-/// picks it up in <0.1 µs. `#[repr(C, align(32))]` guarantees cache-line
-/// alignment per the FFI skill (rust-ffi-grim §1.1).
-///
-/// Opcodes:
-/// - 0 = nop (slot is free)
-/// - 1 = column-GEMM shard
-/// - 2 = row-GEMM shard
-/// - 3 = attention (QKV)
-/// - 4 = norm (RMSNorm / RoPE — replicated)
-/// - 5 = CommFuse reduce (fan-in)
-/// - 6 = MoE dispatch (WI-Charon-3): `weight_ptr` points to a
-///   device-resident [`MoETaskDescriptor`] carrying the MoE-specific
-///   geometry (hidden/inter/num_experts/top_k/quant_mode/schedule).
-///   The persistent kernel casts `weight_ptr` to `MoETaskDescriptor*`
-///   and calls the Charon forward kernel inline — no separate
-///   `hipLaunchKernel`, matching how opcodes 0–5 already work.
+/// The device-resident persistent kernel (Concordia `2606.23521`) polls these descriptors at HBM bandwidth.
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScytheTaskDescriptor {
@@ -638,40 +479,14 @@ pub struct ScytheTaskDescriptor {
     /// Slot status: 0 = pending, 1 = running, 2 = complete.
     pub status: u32,
     // Pad to 32 bytes (already 44 bytes with u64×4 + u32×5 = 52; using 52 → next align(32) = 64).
-    // Since ScytheTaskDescriptor is repr(C, align(32)) and 52 bytes, the struct occupies 64 bytes
-    // (rounded up to the next multiple of align(32)=32 → 64). This is fine for the ring.
+    // Since ScytheTaskDescriptor is repr(C, align(32)) and 52 bytes, the struct occupies 64 bytes (rounded up.
 }
 
-// ── WI-Charon-3: MoE task descriptor + opcode 6 ──────────────────────────────
-//
-// The plan (charon_kernel_plan_v3.md §3 WI-Charon-3) calls for a companion
-// descriptor carrying the MoE-specific geometry the generic
-// `ScytheTaskDescriptor` (m/n/k + 4 pointers) can't express: hidden dim,
-// inter dim, batch count, routed-scaling factor, expert-bank pointers, the
-// sorted-routing schedule, and quant mode.
-//
-// The integration point is ONE new opcode (6 = MoE dispatch) on the existing
-// `ScytheRing` infrastructure — NOT a parallel dispatch mechanism. The host
-// enqueues a `ScytheTaskDescriptor` with `opcode = 6` and `weight_ptr`
-// pointing to a device-resident `MoETaskDescriptor`; the persistent kernel
-// casts `weight_ptr` to `MoETaskDescriptor*` and calls the Charon kernel
-// inline, matching how opcodes 0–5 already work (no separate
-// `hipLaunchKernel`). See `charon_multigpu_plan.md` + `kernel2.md` (the
-// proposal this implements, verified sound against the real source).
-//
-// `MoETaskDescriptor` is `#[repr(C, align(32))]` to match
-// `ScytheTaskDescriptor`'s cache-line alignment (rust-ffi-grim §1.1 — same
-// FFI discipline, since the device reads this struct at HBM bandwidth). It
-// does NOT duplicate `input_ptr` / `output_ptr` / `peer_ptr` — those live on
-// the parent `ScytheTaskDescriptor` and map directly. Only MoE-specific
-// geometry appears here, per the plan's "complement, don't duplicate" rule.
+// ── WI-Charon-3: MoE task descriptor + opcode 6 ────────────────────────────── The plan (charon_kernel_plan_v3.md §3 WI-Charon-3) calls for a companion descriptor carrying the MoE-specific geometry the generic `ScytheTaskDescriptor` (m/n/k + 4 pointers) can't express: hidden dim, inter dim, batch count, routed-scaling factor, expert-bank pointers, the sorted-routing schedule, and quant mode.
+// The integration point is ONE new opcode (6 = MoE dispatch) on the existing `ScytheRing`.
 
 /// Quantization mode for a Charon MoE dispatch (WI-Charon-3).
-///
-/// Mirrors the 7 forward kernel variants in `charon.rs`:
-/// `grim_moe_fused_dispatch` (FP32) + 6 quantized variants. Kept as a `u32`
-/// tag (not a Rust `enum`) so the on-device struct has a stable FFI layout
-/// the HIP kernel can `match` on without depending on Rust enum ABI.
+/// Mirrors the 7 forward kernel variants in `charon.rs`: `grim_moe_fused_dispatch` (FP32) + 6 quantized variants.
 pub type MoeQuantMode = u32;
 
 /// MoE quant modes (WI-Charon-3). Values pinned by tests so the kernel and
@@ -692,20 +507,7 @@ pub mod moe_quant_mode {
 }
 
 /// MoE-specific geometry companion to `ScytheTaskDescriptor` (WI-Charon-3).
-///
-/// The host enqueues a `ScytheTaskDescriptor { opcode: 6, weight_ptr: ptr to
-/// MoETaskDescriptor, input_ptr/output_ptr/peer_ptr: as usual, ... }`. The
-/// device-side persistent kernel casts `weight_ptr` to
-/// `MoETaskDescriptor*` and dispatches the matching Charon forward variant.
-///
-/// Layout: 80 bytes raw (u32×7 + f32 + u64×6) → 96 bytes under
-/// `align(32)` (two cache lines). This is 1.5× the parent
-/// `ScytheTaskDescriptor`'s 64B footprint — the extra half-line is the
-/// cost of carrying six 64-bit pointers (gate/up/down weights + the three
-/// F3 schedule arrays) the kernel's pointer interfaces need. A future
-/// optimization can pack gate/up/down into a single stride-indexed
-/// `expert_weights_ptr` to drop back to one cache line; held off here to
-/// keep the descriptor-to-kernel call site pointer-arithmetic-free.
+/// The host enqueues a `ScytheTaskDescriptor { opcode: 6, weight_ptr: ptr to MoETaskDescriptor, input_ptr/output_ptr/peer_ptr: as usual,.
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug)]
 pub struct MoETaskDescriptor {
@@ -727,20 +529,15 @@ pub struct MoETaskDescriptor {
     /// Routed scaling factor (DeepSeek/Laguna convention — scales routed,
     /// not shared). f32 to match the kernel's `float` argument.
     pub routed_scaling_factor: f32,
-    /// Device pointer to the expert gate weights, flattened as
-    /// `[num_experts, inter*hidden]` (row-major, the layout
-    /// `grim_moe_fused_grouped` expects).
+    /// Device pointer to the expert gate weights, flattened
+    /// as `[num_experts, inter*hidden]` (row-major, the layout `grim_moe_fused_grouped` expects).
     pub gate_w_ptr: u64,
     /// Device pointer to the expert up weights, `[num_experts, inter*hidden]`.
     pub up_w_ptr: u64,
     /// Device pointer to the expert down weights, `[num_experts, hidden*inter]`.
     pub down_w_ptr: u64,
-    /// Device pointer to `sorted_token_ids` (u32[num_tokens_post_padded]) —
-    /// F3 (audit) Option A: the routing schedule is carried as THREE
-    /// INDEPENDENT pointers, matching the convention every real Charon
-    /// call site in `roc_device.rs` already uploads (the previous single
-    /// `schedule_ptr` + contiguous-offset contract matched no producer and
-    /// had no host-side packing step).
+    /// Device pointer to `sorted_token_ids` (u32[num_tokens_post_padded]) - F3 (audit) Option A: the routing schedule is carried as THREE INDEPENDENT pointers, matching the convention every
+    /// real Charon call site in `roc_device.rs` already uploads (the previous single `schedule_ptr` + contiguous-offset contract matched no producer and had no host-side packing step).
     pub token_ids_ptr: u64,
     /// Device pointer to `sorted_expert_ids` (u32[num_tokens_post_padded]).
     pub expert_ids_ptr: u64,
@@ -770,18 +567,10 @@ impl Default for MoETaskDescriptor {
 }
 
 impl MoETaskDescriptor {
-    /// Upload this descriptor to device-visible memory on `device` and
-    /// return the device address the caller MUST pass to
-    /// [`Self::enqueue_via`].
-    ///
-    /// F4 (audit): `enqueue_via` used to stuff `self as *const Self as u64`
-    /// — a HOST address — into `weight_ptr`, which the persistent kernel
-    /// dereferences as a device pointer. Making the upload an explicit step
-    /// mirrors the pattern the device-gated test already used
-    /// (`dev.from_cpu_bytes(...)` then use that pointer) and makes the
-    /// host-pointer mistake impossible to reintroduce silently.
+    /// Upload this descriptor to device-visible memory on `device` and return the device address the caller MUST pass to [`Self::enqueue_via`].
+    /// F4 (audit): `enqueue_via` used to stuff `self as *const Self as u64` - a HOST.
     pub fn upload(&self, device: &RocmDevice) -> grim_backend_rocm::Result<u64> {
-                let bytes = unsafe {
+        let bytes = unsafe {
             std::slice::from_raw_parts(
                 self as *const Self as *const u8,
                 std::mem::size_of::<Self>(),
@@ -800,24 +589,14 @@ impl MoETaskDescriptor {
             .downcast_ref::<RocmStorage>()
             .and_then(|rs| rs.device_ptr_u64())
             .ok_or_else(|| grim_backend_rocm::Error::Backend("MoE upload: no device ptr".into()))?;
-        // Keep the storage alive for the process lifetime — the ring's
-        // opcode-6 arm dereferences this pointer whenever the wave runs, so
-        // it must outlive the enqueue. Leaking a 96-byte device buffer per
-        // MoE layer is negligible against the expert weights it describes.
+        // Keep the storage alive for the process lifetime - the ring's opcode-6 arm dereferences this pointer whenever the wave runs, so it must outlive the enqueue.
+        // Leaking a 96-byte device buffer per MoE layer is negligible against the expert weights it.
         std::mem::forget(storage);
         Ok(ptr)
     }
 
-    /// Build the parent `ScytheTaskDescriptor` that enqueues this MoE task
-    /// onto the `ScytheRing`. The parent carries `opcode = 6` and
-    /// `moe_dev_ptr` — the DEVICE address returned by [`Self::upload`] — in
-    /// `weight_ptr`; the input/output/peer pointers flow through from the
-    /// caller (the activations buffer, the local output buffer, and the
-    /// optional peer-output buffer for cross-GPU combine).
-    ///
-    /// This is the host-side enqueue path called by WI-EP2's cross-GPU
-    /// dispatch planner once it has partitioned (token, expert) pairs into
-    /// local/remote and built the schedule.
+    /// Build the parent `ScytheTaskDescriptor` that enqueues this MoE task onto the `ScytheRing`.
+    /// The parent carries `opcode = 6` and `moe_dev_ptr` - the DEVICE address returned by [`Self::upload`].
     pub fn enqueue_via(
         moe_dev_ptr: u64,
         input_ptr: u64,
@@ -832,8 +611,7 @@ impl MoETaskDescriptor {
         ScytheTaskDescriptor {
             opcode: 6, // MoE dispatch (WI-Charon-3)
             // m/n/k are unused for opcode 6 (geometry lives in the
-            // MoETaskDescriptor); zero them for determinism so device-side
-            // dumps read cleanly.
+            // MoETaskDescriptor); zero them for determinism so device-side dumps read cleanly.
             m: 0,
             n: 0,
             k: 0,
@@ -845,11 +623,8 @@ impl MoETaskDescriptor {
         }
     }
 
-    /// Validate the descriptor's geometry before enqueue. Pure: returns
-    /// `Err` on a struct that would cause the device kernel to read
-    /// out-of-bounds or launch a zero-grid. Mirrors the validation
-    /// discipline of `charon::validate_grouped_inputs` and
-    /// `charon_backward::validate_backward_inputs`.
+    /// Validate the descriptor's geometry before enqueue.
+    /// Pure: returns `Err` on a struct that would cause the device kernel to read out-of-bounds.
     pub fn validate(&self) -> Result<(), String> {
         if self.hidden == 0 || self.inter == 0 || self.num_tokens == 0 {
             return Err(format!(
@@ -869,10 +644,8 @@ impl MoETaskDescriptor {
                 self.top_k, self.num_experts
             ));
         }
-        // Weight pointers may legitimately be zero in a host-side test that
-        // only validates geometry (no device buffer yet). Only flag the
-        // schedule pointers as required — a MoE dispatch with no routing
-        // schedule is always wrong.
+        // Weight pointers may legitimately be zero in a host-side test that only validates geometry (no device buffer yet).
+        // Only flag the schedule pointers as required - a MoE dispatch with no routing schedule.
         if self.token_ids_ptr == 0 || self.expert_ids_ptr == 0 || self.weights_ptr == 0 {
             return Err(
                 "MoETaskDescriptor: token_ids_ptr/expert_ids_ptr/weights_ptr must be non-null"
@@ -883,55 +656,35 @@ impl MoETaskDescriptor {
     }
 }
 
-// ── WI-EP2 — Cross-GPU MoE token dispatch planner (host-side) ────────────────
-//
-// charon_kernel_plan_v3.md §3 WI-EP2 (revised per WI-Charon-3): the cross-GPU
-// token dispatch planner partitions (token, expert) pairs into local/remote,
-// batches remote transfers by destination rank, and emits `ScytheTaskDescriptor`s
-// (opcode 6) onto `ScytheRing` rather than a bespoke dispatch-plan type.
-//
-// Host-pure: the partition logic consumes the router's `(indices, weights)`
-// output + an `ExpertPlacementMap` (WI-EP1) + the local rank, and decides for
-// each (token, expert) pair whether it runs locally or needs a peer transfer.
-// The actual peer transfer (peer_status → to_route_link → copy_via_route) is
-// device-gated; this planner produces the descriptor stream the device side
-// will consume.
-//
-// Output: one `MoETaskDescriptor` per remote BATCH (grouped by destination
-// rank for efficient peer-DMA chunking), plus a `LocalDispatch` summary for
-// the local Charon kernel launch. The host enqueues each remote descriptor
-// via `MoETaskDescriptor::enqueue_via(...)` → `ScytheRing::enqueue(...)`.
+// ── WI-EP2 - Cross-GPU MoE token dispatch planner (host-side) ──────────────── charon_kernel_plan_v3.md §3 WI-EP2 (revised per WI-Charon-3): the cross-GPU token dispatch planner partitions (token, expert) pairs into local/remote, batches remote transfers by destination rank, and emits `ScytheTaskDescriptor`s (opcode 6) onto `ScytheRing` rather than a bespoke dispatch-plan type.
+// Host-pure: the partition logic consumes the router's `(indices, weights)` output + an `ExpertPlacementMap` (WI-EP1) +.
 
 use grim_nn::moe::ExpertPlacementMap;
-use grim_tensor::{MemoryOps};
+use grim_tensor::MemoryOps;
 
 /// One (token, routed-expert, combine-weight) triple from the router's output.
-/// The planner consumes a flat stream of these and partitions them by
-/// destination rank.
+/// The planner consumes a flat stream of these and partitions them by destination rank.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RoutedPair {
     /// Token index in the batch.
     pub token: u32,
     /// Expert index the router routed this token to.
     pub expert: u32,
-    /// Combine weight (softmax or sigmoid, depending on router kind) the
-    /// router assigned to this (token, expert) pair. Threaded through to the
-    /// kernel as `sorted_weights[s]`.
+    /// Combine weight (softmax or sigmoid, depending on router kind) the router assigned to this (token, expert) pair.
+    /// Threaded through to the kernel as `sorted_weights[s]`.
     pub combine_weight: f32,
 }
 
-/// The local rank's share of the dispatch — pairs that run on this rank's
-/// owned experts, no peer transfer needed. The host launches the local
-/// Charon kernel directly on these; no `ScytheRing` enqueue.
+/// The local rank's share of the dispatch - pairs that run on this rank's owned experts, no peer transfer needed.
+/// The host launches the local Charon kernel directly on these; no `ScytheRing` enqueue.
 #[derive(Debug, Clone, Default)]
 pub struct LocalDispatch {
     /// Pairs (token, expert, combine_weight) bound for the local rank.
     pub pairs: Vec<RoutedPair>,
 }
 
-/// One remote batch — all pairs in this batch share a destination rank and
-/// will be transferred together (one peer-DMA chunk per batch). The host
-/// emits a `MoETaskDescriptor` per batch via `MoETaskDescriptor::enqueue_via`.
+/// One remote batch - all pairs in this batch share a destination rank and will be transferred together (one peer-DMA chunk per batch).
+/// The host emits a `MoETaskDescriptor` per batch via `MoETaskDescriptor::enqueue_via`.
 #[derive(Debug, Clone)]
 pub struct RemoteBatch {
     /// Destination rank (the rank that owns the experts in this batch).
@@ -952,23 +705,12 @@ pub struct MoeDispatchPlan {
 }
 
 impl MoeDispatchPlan {
-    /// Build the dispatch plan by partitioning `pairs` per `placement` and
-    /// the local rank.
-    ///
-    /// Pairs whose expert is owned by the local rank go into `local`; the
-    /// rest are batched by destination rank into `remote`. The batching is
-    /// stable (preserves input order within each batch) so the device-side
-    /// schedule (`sorted_token_ids` / `sorted_expert_ids` / `sorted_weights`)
-    /// is deterministic given the router's output order.
-    ///
-    /// Host-pure: no device calls. The on-device peer transfer (WI-EP2's
-    /// `peer_status → to_route_link → copy_via_route` reuse) consumes the
-    /// `remote` batches at dispatch time and is device-gated.
+    /// Build the dispatch plan by partitioning `pairs` per `placement` and the local rank.
+    /// Pairs whose expert is owned by the local rank go into `local`; the rest are.
     pub fn build(pairs: &[RoutedPair], placement: &ExpertPlacementMap, local_rank: usize) -> Self {
         let mut local = LocalDispatch::default();
-        // Remote batches indexed by dest_rank; collected in a Vec-of-Vec then
-        // flattened to preserve per-rank input order. `num_ranks+1` slots so
-        // every valid dest_rank has a home.
+        // Remote batches indexed by dest_rank; collected in a Vec-of-Vec then flattened to preserve per-rank input order.
+        // `num_ranks+1` slots so every valid dest_rank has a home.
         let mut by_rank: Vec<Vec<RoutedPair>> = vec![Vec::new(); placement.num_ranks];
         for &p in pairs {
             let dest = placement.rank_of(p.expert as usize).unwrap_or(local_rank); // unmapped expert → fall back to local
@@ -978,8 +720,7 @@ impl MoeDispatchPlan {
                 by_rank[dest].push(p);
             } else {
                 // Defensive: dest out of range of placement's num_ranks.
-                // Treat as local so the forward completes (with a logged
-                // warning at the call site) rather than dropping the pair.
+                // Treat as local so the forward completes (with a logged warning at the call site).
                 local.pairs.push(p);
             }
         }
@@ -994,34 +735,22 @@ impl MoeDispatchPlan {
         Self { local, remote }
     }
 
-    /// Total number of pairs across local + all remote batches. Must equal
-    /// the input pair count (the planner never drops a pair). Pinned by the
-    /// test gate.
+    /// Total number of pairs across local + all remote batches.
+    /// Must equal the input pair count (the planner never drops a pair).
     pub fn total_pairs(&self) -> usize {
         let local = self.local.pairs.len();
         let remote: usize = self.remote.iter().map(|b| b.pairs.len()).sum();
         local + remote
     }
 
-    /// True iff every pair in `remote` is bound for a rank other than
-    /// `local_rank`. Pinned by the test gate — a regression where a local
-    /// pair leaked into a remote batch (or vice versa) would cause a
-    /// duplicate or dropped expert evaluation on the device.
+    /// True iff every pair in `remote` is bound for a rank other than `local_rank`.
+    /// Pinned by the test gate - a regression where a local pair leaked into a.
     pub fn remote_excludes_local_rank(&self, local_rank: usize) -> bool {
         self.remote.iter().all(|b| b.dest_rank != local_rank)
     }
 
-    /// Emit one `MoETaskDescriptor` per remote batch, suitable for
-    /// `ScytheRing::enqueue` via `MoETaskDescriptor::enqueue_via(...)`. The
-    /// caller supplies the per-batch geometry (hidden/inter/etc.) and device
-    /// pointers (gate_w/up_w/down_w/schedule + input/output/peer); this
-    /// method only varies the geometry the planner actually knows about
-    /// (num_tokens, num_experts, top_k). The caller fills the rest.
-    ///
-    /// This is the host-side enqueue path called by WI-EP2's orchestrator
-    /// once the plan is built. The actual `ScytheRing::enqueue` call is
-    /// device-gated (the ring's slots are device-resident); the descriptor
-    /// construction here is pure.
+    /// Emit one `MoETaskDescriptor` per remote batch, suitable for `ScytheRing::enqueue` via `MoETaskDescriptor::enqueue_via(...)`.
+    /// The caller supplies the per-batch geometry (hidden/inter/etc.) and device pointers (gate_w/up_w/down_w/schedule + input/output/peer); this method.
     pub fn emit_remote_descriptors(
         &self,
         template: &MoETaskDescriptor,
@@ -1030,10 +759,8 @@ impl MoeDispatchPlan {
             .iter()
             .map(|batch| {
                 let mut desc = *template;
-                // Per-batch geometry: the number of tokens in this remote
-                // batch is the pair count (each pair is one token-expert
-                // evaluation). The device-side schedule flattens these into
-                // the sorted arrays the Charon kernel expects.
+                // Per-batch geometry: the number of tokens in this remote batch is the pair count (each pair is one token-expert evaluation).
+                // The device-side schedule flattens these into the sorted arrays the Charon kernel expects.
                 desc.num_tokens = batch.pairs.len() as u32;
                 (batch.dest_rank, desc)
             })
@@ -1042,12 +769,7 @@ impl MoeDispatchPlan {
 }
 
 /// Lock-free VRAM ring of `ScytheTaskDescriptor` slots.
-///
 /// The host enqueues by writing `slots[head % capacity]` and advancing `head`.
-/// The device-resident kernel dequeues by polling `slots[tail % capacity].status`
-/// and advancing `tail`. Both accesses use `Relaxed` / `Release`-`Acquire`
-/// pairs for the status field because the descriptor writes happen before the
-/// status write.
 pub struct ScytheRing {
     /// Ring capacity (number of slots). Must be a power of 2 for fast modulo.
     pub capacity: u32,
@@ -1135,16 +857,14 @@ impl ScytheRing {
         self.len() >= self.capacity
     }
 
-    /// WI-SB6: device-resident slot array backing this ring (when constructed
-    /// with [`ScytheRing::with_device`]). The persistent-dispatch launcher
-    /// consumes this pointer.
+    /// WI-SB6: device-resident slot array backing this ring (when constructed with [`ScytheRing::with_device`]).
+    /// The persistent-dispatch launcher consumes this pointer.
     pub fn slots_storage(&self) -> Option<&RocmStorage> {
         self._device_storage.as_ref()
     }
 
-    /// WI-SB6 resident mode: route descriptor uploads through an explicit
-    /// (non-blocking control) stream so they never queue behind the eternal
-    /// worker on the pool stream. `0` = default active-stream behavior.
+    /// WI-SB6 resident mode: route descriptor uploads through an explicit (non-blocking control) stream so they never queue behind the eternal worker on the pool stream.
+    /// `0` = default active-stream behavior.
     pub fn set_upload_stream(&self, stream: u64) {
         self.upload_stream.store(stream, Ordering::Release);
     }
@@ -1157,10 +877,8 @@ impl ScytheRing {
         }
     }
 
-    /// Enqueue a task descriptor and, for a device-backed ring, upload its
-    /// complete 64-byte payload with one pinned async H2D copy. Because status
-    /// is in that same payload, descriptor fields and status become visible as
-    /// one device-side transfer; CPU-only rings retain head/tail bookkeeping.
+    /// Enqueue a task descriptor and, for a device-backed ring, upload its complete 64-byte payload with one pinned async H2D copy.
+    /// Because status is in that same payload, descriptor fields and status become visible as one.
     pub fn enqueue(&self, desc: ScytheTaskDescriptor) -> Result<u32, ScytheTaskDescriptor> {
         let slot_counter = loop {
             let head = self.head.load(Ordering::Acquire);
@@ -1208,8 +926,7 @@ impl ScytheRing {
                 }
             };
             if copy_result.is_err() {
-                // Copy failed — roll back the CAS increment so the consumer
-                // doesn't poll a slot that will never be filled (infinite hang).
+                // Copy failed - roll back the CAS increment so the consumer doesn't poll a slot that will never be filled (infinite hang).
                 // [P1-42 fix: CAS rollback on copy failure.]
                 let _ = self.head.compare_exchange_weak(
                     slot_counter.wrapping_add(1),
@@ -1330,13 +1047,8 @@ impl ScytheRing {
     }
 }
 
-// ── WI-SB6: engine-loop execution seam ────────────────────────────────────────
-//
-// Batches of descriptors flow host→ring→persistent-wave→complete without any
-// per-op host launch. Slice-1 semantics are batch-synchronous: `run_batch`
-// launches one bounded worker for the submitted task count and synchronizes;
-// a resident wave that keeps polling across engine ticks (stop-flag driven)
-// is the follow-up once parity is proven.
+// ── WI-SB6: engine-loop execution seam ──────────────────────────────────────── Batches of descriptors flow host→ring→persistent-wave→complete without any per-op host launch.
+// Slice-1 semantics are batch-synchronous: `run_batch` launches one bounded worker for the submitted task count and.
 pub struct ScytheRingExec {
     pub ring: ScytheRing,
     device: std::sync::Arc<RocmDevice>,
@@ -1350,10 +1062,8 @@ pub struct ScytheRingExec {
     worker_stream: std::sync::atomic::AtomicPtr<c_void>,
     /// Non-blocking stream for head/stop/tail control traffic.
     control_stream: std::sync::atomic::AtomicPtr<c_void>,
-    /// Pinned 4-byte staging cell for control-plane values. Async copies
-    /// from/to PAGEABLE memory degrade to device-synchronizing transfers and
-    /// deadlock behind a resident wave — this pinned cell keeps them truly
-    /// asynchronous.
+    /// Pinned 4-byte staging cell for control-plane values.
+    /// Async copies from/to PAGEABLE memory degrade to device-synchronizing transfers and deadlock behind a resident wave.
     control_cell: Mutex<RocmPinnedBuffer<u8>>,
 }
 
@@ -1367,7 +1077,7 @@ impl ScytheRingExec {
             arith: grim_tensor::ArithType::U32,
             storage: grim_tensor::dtype::Storage::Native,
         };
-                let scalar = |v: u32| -> grim_backend_rocm::Result<Box<dyn grim_tensor::BackendStorage>> {
+        let scalar = |v: u32| -> grim_backend_rocm::Result<Box<dyn grim_tensor::BackendStorage>> {
             let bytes = v.to_ne_bytes().to_vec();
             let st = device
                 .as_ref()
@@ -1413,9 +1123,8 @@ impl ScytheRingExec {
         self.worker_stream.load(Ordering::Acquire)
     }
 
-    /// Async copy of one u32 between host buffer and device control scalar on
-    /// the CONTROL stream, followed by a control-stream sync. Never ordered
-    /// behind the resident worker.
+    /// Async copy of one u32 between host buffer and device control scalar on the CONTROL stream, followed by a control-stream sync.
+    /// Never ordered behind the resident worker.
     fn control_copy_u32(&self, dev_ptr: *mut c_void, value: &mut [u8; 4], to_device: bool) {
         use grim_backend_rocm::HipMemcpyKind;
         let diag = std::env::var_os("GRIM_RING_DIAG").is_some();
@@ -1428,11 +1137,8 @@ impl ScytheRingExec {
         } else {
             HipMemcpyKind::DeviceToHost
         };
-        // Pinned-to-pinned async copy on the non-blocking control stream,
-        // fenced by a CONTROL-STREAM-ONLY sync. A pageable host buffer here
-        // degrades the async copy to a staged transfer that synchronizes
-        // against outstanding device work — i.e., it deadlocks behind the
-        // resident wave (the exact hang observed 2026-08-24).
+        // Pinned-to-pinned async copy on the non-blocking control stream, fenced by a CONTROL-STREAM-ONLY sync.
+        // A pageable host buffer here degrades the async copy to a staged transfer that synchronizes.
         let t0 = std::time::Instant::now();
         if diag {
             log::info!("[cc-diag] enter to_dev={to_device}");
@@ -1467,11 +1173,8 @@ impl ScytheRingExec {
     }
 
     fn write_head_device(&self, value: u32) -> grim_backend_rocm::Result<()> {
-        // WI-SB6: MUST go through the pinned-cell control path. The previous
-        // implementation used memcpy_with_xnack_fallback, whose fresh-stream
-        // hipStreamSynchronize drains ALL outstanding device work — with a
-        // resident wave polling forever, that sync never returns (the
-        // 2026-08-24 flush hang).
+        // WI-SB6: MUST go through the pinned-cell control path.
+        // The previous implementation used memcpy_with_xnack_fallback, whose fresh-stream hipStreamSynchronize drains ALL outstanding device work - with.
         let ptr = self
             .head
             .as_ref()
@@ -1560,11 +1263,7 @@ impl ScytheRingExec {
     }
 
     /// WI-SB6 fix (2026-08-24): publish ALL pending submissions at once.
-    /// Called only AFTER every descriptor payload upload has completed on
-    /// the control stream, so a resident worker can never claim a
-    /// half-visible descriptor. (F5 audit cleanup: the write-only host-side
-    /// `published_head` mirror was removed — the device head scalar is the
-    /// single source of truth.)
+    /// Called only AFTER every descriptor payload upload has completed on the control stream, so a.
     pub fn publish_head(&mut self) -> grim_backend_rocm::Result<()> {
         let h = self.ring.head.load(Ordering::Acquire);
         self.write_head_device(h)
@@ -1598,10 +1297,8 @@ impl ScytheRingExec {
 
     // ── WI-SB6 resident-wave mode ──────────────────────────────────────────
 
-    /// Launch ONE persistent worker that survives idle gaps: submit via
-    /// [`Self::submit_*`] + [`Self::flush`], poll [`Self::completed`], and
-    /// terminate with [`Self::shutdown`]. The wave exits only through the
-    /// stop flag.
+    /// Launch ONE persistent worker that survives idle gaps: submit via [`Self::submit_*`] + [`Self::flush`], poll [`Self::completed`], and terminate with [`Self::shutdown`].
+    /// The wave exits only through the stop flag.
     pub fn launch_resident(&mut self) -> grim_backend_rocm::Result<()> {
         if self.worker.is_some() {
             return Ok(());
@@ -1737,20 +1434,8 @@ impl ScytheRingExec {
 
 // ── WI-SB4a: contiguous layer-pipeline placement ─────────────────────────────
 
-/// Plan per-layer device placement for a model about to be registered in farm
-/// mode: the controller `decide()`s for every layer index over the live caps,
-/// then short same-rank runs are absorbed into their predecessor so activation
-/// transfers only ever happen at a bounded number of run boundaries
-/// (`Llama::set_layer_devices` consumes the resulting full-length map;
-/// boundary hops == number of runs − 1).
-///
-/// `min_run` is the smallest contiguous run worth paying a transfer for;
-/// passes smaller than that ping-pong devices for no bandwidth win. A value
-/// of `0` keeps every per-layer pick untouched.
-///
-/// The caller maps rank → device (farm replicas use `Device::Rocm(rank)`);
-/// this function stays rank-space so host tests can exercise the merge and
-/// hop guarantees without any GPU present.
+/// Plan per-layer device placement for a model about to be registered in farm mode: the controller `decide()`s for every layer index over the live caps, then short same-rank runs are absorbed into their predecessor so activation transfers only ever happen at a bounded number of run boundaries (`Llama::set_layer_devices` consumes the resulting full-length map; boundary hops == number of runs − 1).
+/// `min_run` is the smallest contiguous run worth paying a transfer for; passes smaller than that.
 pub fn plan_contiguous_layer_placement(
     num_layers: usize,
     num_ranks: usize,
@@ -1777,10 +1462,8 @@ pub fn plan_contiguous_layer_placement(
     absorb_short_runs(&per_layer, min_run)
 }
 
-/// WI-SB4a merge rule: every run shorter than `min_run` is absorbed into the
-/// run before it (the leading run absorbs forward instead). Pure so the
-/// hop-bound gate can pin its contract: output has ≤ as many runs as input,
-/// never zero runs for non-empty input, and total length is preserved.
+/// WI-SB4a merge rule: every run shorter than `min_run` is absorbed into the run before it (the leading run absorbs forward instead).
+/// Pure so the hop-bound gate can pin its contract: output has ≤ as many runs.
 pub fn absorb_short_runs(per_layer: &[usize], min_run: usize) -> Vec<usize> {
     if per_layer.is_empty() || min_run == 0 {
         return per_layer.to_vec();
@@ -1804,10 +1487,8 @@ pub fn absorb_short_runs(per_layer: &[usize], min_run: usize) -> Vec<usize> {
         } else {
             kept.push((rank, len));
         }
-        // A leading short run pushed alone can be re-absorbed by the next
-        // long run on the next iteration only via `kept`; handle the case
-        // where it stays at the head by leaving it — head transfers are free
-        // (the tensor starts wherever prefill starts).
+        // A leading short run pushed alone can be re-absorbed by the next long run on the next iteration only via `kept`; handle
+        // the case where it stays at the head by leaving it - head transfers are free (the tensor starts wherever prefill starts).
     }
     // Expand back to full length.
     let mut out = Vec::with_capacity(per_layer.len());
@@ -1825,9 +1506,8 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// WI-SB4a host gate: the merge rule preserves total length, never
-    /// increases run count, and bounds boundary hops — a ping-pong map
-    /// collapses to at most one hop under min-run smoothing.
+    /// WI-SB4a host gate: the merge rule preserves total length, never increases run count, and bounds
+    /// boundary hops - a ping-pong map collapses to at most one hop under min-run smoothing.
     #[test]
     fn test_absorb_short_runs_hop_bound() {
         // Identity when min_run = 0.
@@ -1846,9 +1526,8 @@ mod tests {
         assert_eq!(absorb_short_runs(&[1], 2), vec![1]);
     }
 
-    /// WI-SB4a host gate: the planner produces a full-length map whose hop
-    /// count never exceeds what the merge rule allows, using the same
-    /// synthetic-caps pattern as the untrained-MLP gate.
+    /// WI-SB4a host gate: the planner produces a full-length map whose hop count never exceeds
+    /// what the merge rule allows, using the same synthetic-caps pattern as the untrained-MLP gate.
     #[test]
     fn test_plan_contiguous_layer_placement_shape() {
         let caps = vec![farm_caps_for_plan(8.0, 0), farm_caps_for_plan(80.0, 1)];
@@ -1931,13 +1610,8 @@ mod tests {
         eprintln!("[test] 32-layer cache-hit: {elapsed_us:.2} µs");
     }
 
-    /// WI-4 gate B: 32-layer aggregate decide_miss must be <2 ms
-    /// (≤1.3% of the 150 ms prefill budget).
-    /// F7 (audit): interleaving two shape buckets across layers must not
-    /// invalidate either layer's fast-path entry. The pre-fix global
-    /// `last_bucket` made layer 0's still-valid entry miss whenever layer 1
-    /// decided at a different bucket — silently paying ~2 µs/layer
-    /// `decide_miss` on every hit.
+    /// WI-4 gate B: 32-layer aggregate decide_miss must be <2 ms (≤1.3% of the 150 ms prefill budget).
+    /// F7 (audit): interleaving two shape buckets across layers must not invalidate either layer's fast-path entry.
     #[test]
     fn test_interleaved_buckets_keep_per_layer_fast_path() {
         let mut cache = PlacementCache::new(2);
@@ -2021,11 +1695,8 @@ mod tests {
         }
     }
 
-    /// WI-INF5 gate (first cut): an untrained (all-zero) MLP produces
-    /// identical placement logits for every GPU; the controller must fall
-    /// back to the WaveTune bilinear latency estimate alone (argmin) instead
-    /// of sticky rank 0. On `syd-beasty`'s asymmetric pair this is what stops
-    /// every layer landing on whichever card happens to be ordinal 0.
+    /// WI-INF5 gate (first cut): an untrained (all-zero) MLP produces identical placement logits for every GPU; the controller must fall back to the WaveTune bilinear latency estimate alone (argmin) instead of sticky rank 0.
+    /// On `syd-beasty`'s asymmetric pair this is what stops every layer landing on whichever card happens.
     #[test]
     fn test_untrained_mlp_prefers_faster_gpu() {
         let num_layers = 4;
@@ -2067,11 +1738,8 @@ mod tests {
         }
     }
 
-    /// WI-SB0 gate (needs ≥2 HIP devices): extend the untrained-MLP gate to
-    /// the profiler's *measured* capabilities. On syd-beasty's asymmetric
-    /// pair the WaveTune argmin fallback must pick the measured-fast card,
-    /// and it must do so in BOTH rank orders — slow-on-rank-0 and
-    /// fast-on-rank-0 — which is what stops sticky-rank-0 placement.
+    /// WI-SB0 gate (needs ≥2 HIP devices): extend the untrained-MLP gate to the profiler's *measured* capabilities.
+    /// On syd-beasty's asymmetric pair the WaveTune argmin fallback must pick the measured-fast card, and it.
     #[test]
     fn test_real_measured_caps_prefer_faster_gpu_both_orders() {
         let profiler = grim_backend_rocm::CapabilityProfiler::new();
@@ -2111,9 +1779,8 @@ mod tests {
         }
     }
 
-    /// `sync_epoch` must clear the fast path when the global capability epoch
-    /// moved, so the next decide re-runs against fresh capabilities (the
-    /// engine tick's WI-INF2 staleness pull).
+    /// `sync_epoch` must clear the fast path when the global capability epoch moved, so
+    /// the next decide re-runs against fresh capabilities (the engine tick's WI-INF2 staleness pull).
     #[test]
     fn test_sync_epoch_clears_fast_path() {
         let num_layers = 4;
@@ -2229,23 +1896,13 @@ mod tests {
         );
     }
 
-    // ── WI-Charon-3: MoETaskDescriptor size/alignment + integration ──────────
-    //
-    // The plan's WI-Charon-3 gates:
-    //   (1) `MoETaskDescriptor` size/alignment assertions, compiles.
-    //   (2) integration test: engine enqueue → ring dispatch → kernel reads
-    //       back correct fields. Host-testable structure (the descriptor
-    //       round-trip through the ring is pure Rust); device-gated final
-    //       dispatch (opcode-6 firing a Charon launch) per gate (3).
-    //   (3) device-gated for the actual opcode-6 dispatch firing correctly
-    //       on real hardware.
+    // ── WI-Charon-3: MoETaskDescriptor size/alignment + integration ────────── The plan's WI-Charon-3 gates: (1) `MoETaskDescriptor` size/alignment assertions, compiles.
+    // (2) integration test: engine enqueue → ring dispatch → kernel reads back correct fields.
 
     #[test]
     fn moe_task_descriptor_is_cache_line_aligned() {
-        // rust-ffi-grim §1.1: `#[repr(C, align(32))]` for FFI structs read
-        // by a persistent kernel at HBM bandwidth. The alignment must be
-        // exactly 32 (cache line) so a mutant that drops the align attribute
-        // or weakens it to 8/16 fails.
+        // rust-ffi-grim §1.1: `#[repr(C, align(32))]` for FFI structs read by a persistent kernel at HBM bandwidth.
+        // The alignment must be exactly 32 (cache line) so a mutant that drops the align.
         assert_eq!(
             std::mem::align_of::<MoETaskDescriptor>(),
             32,
@@ -2255,26 +1912,8 @@ mod tests {
 
     #[test]
     fn moe_task_descriptor_size_fits_two_cache_lines() {
-        // Size budget: the descriptor carries 4 unavoidable 64-bit pointers
-        // (gate/up/down weights + schedule) + 8 geometry u32s + 1 f32 +
-        // 1 u32 pad = 68B raw → 96B under align(32).
-        //
-        // The plan calls for "64-byte-effective sizing" matching
-        // `ScytheTaskDescriptor`. We can't hit 64B without losing the
-        // kernel's existing 3-separate-pointer interface (gate/up/down) —
-        // the alternative is a single `expert_weights_ptr` with a fixed
-        // stride (`gate | up | down` concatenated), which IS a valid
-        // follow-up optimization the plan explicitly green-lights ("only
-        // MoE-specific geometry needs new fields" — packing 3 pointers
-        // into 1 is exactly that kind of geometry compression). For now we
-        // hold the 3-pointer interface (matches `grim_moe_fused_grouped`'s
-        // signature verbatim, so the descriptor-to-kernel call needs no
-        // pointer arithmetic) and accept the 1.5-cache-line footprint.
-        //
-        // The bound stays at TWO cache lines (96B) so the persistent kernel
-        // reads the descriptor in at most two HBM transactions; a future
-        // field addition that pushes past 96B regresses that and is caught
-        // here.
+        // Size budget: the descriptor carries 4 unavoidable 64-bit pointers (gate/up/down weights + schedule) + 8 geometry u32s + 1 f32 + 1 u32 pad = 68B raw → 96B under align(32).
+        // The plan calls for "64-byte-effective sizing" matching `ScytheTaskDescriptor`.
         let size = std::mem::size_of::<MoETaskDescriptor>();
         assert_eq!(
             size, 96,
@@ -2294,10 +1933,8 @@ mod tests {
 
     #[test]
     fn moe_task_descriptor_default_is_fp32_and_unit_rsf() {
-        // Default quant mode is FP32 (the base case all variants branch
-        // from) and routed_scaling_factor is 1.0 (no scaling) — a mutant
-        // that flips either default would silently change dispatch behavior
-        // for any caller that forgets to set them.
+        // Default quant mode is FP32 (the base case all variants branch from) and routed_scaling_factor is 1.0 (no scaling) -
+        // a mutant that flips either default would silently change dispatch behavior for any caller that forgets to set them.
         let d = MoETaskDescriptor::default();
         assert_eq!(d.quant_mode, moe_quant_mode::FP32);
         assert_eq!(d.routed_scaling_factor, 1.0);
@@ -2313,9 +1950,8 @@ mod tests {
 
     #[test]
     fn moe_quant_mode_discriminants_are_distinct_and_match_kernel_variants() {
-        // Pin the discriminants so the kernel's `match (quant_mode)` and
-        // the host agree. A renumbering on either side silently dispatches
-        // the wrong variant; this test catches that.
+        // Pin the discriminants so the kernel's `match (quant_mode)` and the host agree.
+        // A renumbering on either side silently dispatches the wrong variant; this test catches that.
         let modes = [
             moe_quant_mode::FP32,
             moe_quant_mode::FP8,
@@ -2407,14 +2043,8 @@ mod tests {
         assert!(bad.validate().is_err(), "null weights_ptr must fail");
     }
 
-    /// Integration gate (WI-Charon-3 gate 2, host-testable half): the
-    /// `enqueue_via` builder produces a `ScytheTaskDescriptor` with opcode
-    /// 6, `weight_ptr` correctly pointing at the `MoETaskDescriptor`, and
-    /// the input/output/peer pointers threaded through. A round-trip
-    /// through `ScytheRing::enqueue` (which takes a `ScytheTaskDescriptor`)
-    /// succeeds and the dequeued descriptor preserves the opcode-6 + ptr
-    /// pairing. The device-side dispatch (kernel reading the descriptor)
-    /// is device-gated per gate (3).
+    /// Integration gate (WI-Charon-3 gate 2, host-testable half): the `enqueue_via` builder produces a `ScytheTaskDescriptor` with opcode 6, `weight_ptr` correctly pointing at the `MoETaskDescriptor`, and the input/output/peer pointers threaded through.
+    /// A round-trip through `ScytheRing::enqueue` (which takes a `ScytheTaskDescriptor`) succeeds and the dequeued descriptor preserves the.
     #[test]
     fn moe_descriptor_enqueues_via_scythe_ring_as_opcode_6() {
         let _moe_desc = MoETaskDescriptor {
@@ -2456,10 +2086,8 @@ mod tests {
         // Status starts pending (host writes; device flips to running/complete).
         assert_eq!(task.status, 0);
 
-        // Round-trip through the ring: enqueue the descriptor, dequeue it,
-        // confirm the opcode-6 + pointer pairing survives. This is the
-        // host-testable half of gate (2); the device-side "kernel reads
-        // the fields correctly" half is device-gated.
+        // Round-trip through the ring: enqueue the descriptor, dequeue it, confirm the opcode-6 + pointer pairing survives.
+        // This is the host-testable half of gate (2); the device-side "kernel reads the fields correctly".
         let ring = ScytheRing::new(4);
         assert!(ring.is_empty());
         let slot = ring
@@ -2468,24 +2096,17 @@ mod tests {
         assert_eq!(slot, 0, "first enqueue must take slot 0");
         let dequeued = ring.dequeue();
         assert_eq!(dequeued, 0, "first dequeue must read slot 0");
-        // Reconstruct what the device would see: the task at slot 0 (host
-        // wrote it before enqueue returned; in a GPU-less test env the ring
-        // doesn't touch device memory, so the in-process `task` value is the
-        // source of truth). Verify opcode + weight_ptr pairing.
+        // Reconstruct what the device would see: the task at slot 0 (host wrote it before enqueue returned; in a GPU-less test env the ring doesn't touch device memory, so the in-process `task` value is the source of truth).
+        // Verify opcode + weight_ptr pairing.
         assert_eq!(task.opcode, 6);
         assert_eq!(task.weight_ptr, moe_dev_ptr);
     }
 
-    // ── WI-EP2 — Cross-GPU token dispatch planner tests ──────────────────────
-    //
-    // The plan requires: "partitions (token, expert) pairs into local/remote,
-    // batches remote transfers by destination rank, emits ScytheTaskDescriptors
-    // (opcode 6) onto ScytheRing." All three behaviors are host-testable; the
-    // actual peer transfer is device-gated.
+    // ── WI-EP2 - Cross-GPU token dispatch planner tests ────────────────────── The plan requires: "partitions (token, expert) pairs into local/remote, batches remote
+    // transfers by destination rank, emits ScytheTaskDescriptors (opcode 6) onto ScytheRing." All three behaviors are host-testable; the actual peer transfer is device-gated.
 
-    /// Helper: build a 2-rank placement where rank 0 owns experts {0, 1} and
-    /// rank 1 owns experts {2, 3}. Predictable assignment for the partition
-    /// tests.
+    /// Helper: build a 2-rank placement where rank 0 owns experts {0, 1} and rank 1 owns experts {2, 3}.
+    /// Predictable assignment for the partition tests.
     fn ep_map_2ranks_4experts_split() -> ExpertPlacementMap {
         // caps equal so the greedy allocator alternates: e0→r0, e1→r1,
         // e2→r0, e3→r1. Gives the {0,2}→r0, {1,3}→r1 split.
@@ -2534,8 +2155,7 @@ mod tests {
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, /*local_rank*/ 0);
         // rank 0 owns experts {0, 2}; rank 1 owns {1, 3}.
-        // Local (rank 0): pairs (t0,e0), (t2,e2). Remote (rank 1): (t1,e1),
-        // (t3,e3).
+        // Local (rank 0): pairs (t0,e0), (t2,e2).
         assert_eq!(plan.local.pairs.len(), 2);
         assert_eq!(plan.local.pairs[0].token, 0);
         assert_eq!(plan.local.pairs[1].token, 2);
@@ -2650,10 +2270,8 @@ mod tests {
 
     #[test]
     fn ep2_top_k_pairs_share_token_across_ranks() {
-        // top_k=2: one token routed to two experts that live on different
-        // ranks. The planner must produce BOTH a local pair and a remote
-        // batch for the same token — a regression that de-duplicated by
-        // token would silently drop one expert evaluation.
+        // top_k=2: one token routed to two experts that live on different ranks.
+        // The planner must produce BOTH a local pair and a remote batch for the same.
         let map = ep_map_2ranks_4experts_split();
         // token 0 routed to experts {0, 1} (rank 0 and rank 1 respectively).
         let pairs = vec![
@@ -2737,12 +2355,8 @@ mod tests {
 
     #[test]
     fn ep2_emit_remote_descriptors_round_trips_via_scythe_ring() {
-        // End-to-end host-side: build a plan, emit descriptors, enqueue each
-        // via MoETaskDescriptor::enqueue_via → ScytheRing::enqueue, dequeue,
-        // and verify the opcode-6 + pointer pairing survives the ring.
-        // This is the host-testable half of WI-EP2's "emits onto ScytheRing"
-        // contract; the device-side dispatch (kernel reading the descriptor
-        // fields) is device-gated.
+        // End-to-end host-side: build a plan, emit descriptors, enqueue each via MoETaskDescriptor::enqueue_via → ScytheRing::enqueue, dequeue, and verify the opcode-6 + pointer pairing survives the ring.
+        // This is the host-testable half of WI-EP2's "emits onto ScytheRing" contract; the device-side dispatch (kernel.
         let map = ep_map_2ranks_4experts_split();
         let pairs = vec![
             RoutedPair {
@@ -2761,9 +2375,8 @@ mod tests {
         let descriptors = plan.emit_remote_descriptors(&template);
         assert_eq!(descriptors.len(), 1, "one remote batch");
 
-        // Enqueue the descriptor onto a fresh ring. F4: the weight_ptr the
-        // ring carries is the DEVICE address a real caller obtains from
-        // `MoETaskDescriptor::upload` — never the host struct's address.
+        // Enqueue the descriptor onto a fresh ring.
+        // F4: the weight_ptr the ring carries is the DEVICE address a real caller obtains from.
         let ring = ScytheRing::new(4);
         let (dest_rank, _desc) = &descriptors[0];
         let moe_dev_ptr = 0x9000u64;
@@ -2784,11 +2397,8 @@ mod tests {
 
     #[test]
     fn ep2_unmapped_expert_falls_back_to_local() {
-        // Defensive: an expert id outside the placement map's range falls
-        // back to local rather than crashing the planner. The on-device
-        // Charon kernel would handle the bogus expert id by reading garbage
-        // weights — surfaced as a validation error upstream. The planner's
-        // job here is just "don't drop the pair silently."
+        // Defensive: an expert id outside the placement map's range falls back to local rather than crashing the planner.
+        // The on-device Charon kernel would handle the bogus expert id by reading garbage weights -.
         let map = ep_map_2ranks_4experts_split(); // 4 experts (0..3)
         let pairs = vec![
             RoutedPair {
@@ -2807,28 +2417,11 @@ mod tests {
         assert_eq!(plan.total_pairs(), 1, "pair is not dropped");
     }
 
-    // ── WI-EP3: Cross-GPU combine host-side scaffolding and tests ───────────
-    //
-    // WI-EP3 (charon_kernel_plan_v3.md): "cross-GPU combine — activates Charon's
-    // existing but never-fired `peer_out`/`col_offset`/`n_total` kernel parameters,
-    // following `comm_fuse_reduce`'s exact device-assembly-plus-RCCL pattern
-    // (dtype-gated: F32 device path, CPU fallback for other dtypes, matching
-    // precedent exactly rather than inventing a new fallback rule)."
-    //
-    // This module provides the host-side scaffolding to:
-    // 1. Partition remote combine work by destination rank (leveraging
-    //    MoeDispatchPlan's RemoteBatch structure)
-    // 2. Assemble partial outputs via device-side D2D memcpy (mirroring
-    //    comm_fuse_reduce's row-by-row assembly)
-    // 3. Optionally invoke RCCL all-reduce for cross-GPU expert output combine
-    // 4. Provide device-gated integration test scaffolding
+    // ── WI-EP3: Cross-GPU combine host-side scaffolding and tests ─────────── WI-EP3 (charon_kernel_plan_v3.md): "cross-GPU combine - activates Charon's existing but never-fired `peer_out`/`col_offset`/`n_total` kernel parameters, following `comm_fuse_reduce`'s exact device-assembly-plus-RCCL pattern (dtype-gated: F32 device path, CPU fallback for other dtypes, matching precedent exactly rather than inventing a new fallback rule)." This module provides the host-side scaffolding to: 1.
+    // Partition remote combine work by destination rank (leveraging MoeDispatchPlan's RemoteBatch structure) 2.
 
-    /// Represents a remote expert output shard that needs to be combined
-    /// across GPUs. Mirrors the `comm_fuse_reduce` partial pattern.
-    ///
-    /// Note: storage is `Option<Box<dyn BackendStorage>>` since the actual
-    /// device storage is allocated on the device side; host-side planning
-    /// only needs the metadata (expert, dest_rank, col_offset, etc.).
+    /// Represents a remote expert output shard that needs to be combined across GPUs.
+    /// Mirrors the `comm_fuse_reduce` partial pattern.
     pub struct ExpertPartial {
         /// Optional device storage for this expert's partial output [m, n_local].
         /// `None` during host-side planning; filled by device-side allocation.
@@ -2859,10 +2452,7 @@ mod tests {
     }
 
     /// Combine plan for cross-GPU expert output reduction.
-    ///
-    /// Produced by [`MoeDispatchPlan::build_combine_plan`] using the remote
-    /// batches from the dispatch plan. Each remote batch becomes a combine
-    /// task targeting a specific destination rank.
+    /// Produced by [`MoeDispatchPlan::build_combine_plan`] using the remote batches from the dispatch plan.
     #[derive(Debug)]
     pub struct MoeCombinePlan {
         /// The local rank this plan is for
@@ -2884,12 +2474,7 @@ mod tests {
 
     impl MoeDispatchPlan {
         /// Build a combine plan from the dispatch plan's remote batches.
-        ///
-        /// Each remote batch becomes a `RemoteCombineBatch` with expert partials
-        /// ready for device-side assembly. The combine plan mirrors the
-        /// `comm_fuse_reduce` pattern: device-side row-by-row D2D assembly
-        /// into a combined buffer, then optional RCCL all-reduce if multiple
-        /// ranks contributed to the same expert.
+        /// Each remote batch becomes a `RemoteCombineBatch` with expert partials ready for device-side assembly.
         pub fn build_combine_plan(
             &self,
             local_rank: usize,
@@ -2923,10 +2508,7 @@ mod tests {
                     .into_iter()
                     .map(|(expert, group)| {
                         // Merge group into single partial per expert.
-                        // Sum combine weights for repeated expert selections (standard
-                        // MoE top-k combine semantics), not average. Also set col_offset
-                        // from the first entry's actual column offset.
-                        // [P1-31 fix: sum not average; set col_offset.]
+                        // Sum combine weights for repeated expert selections (standard MoE top-k combine semantics), not average.
                         let n_cols = group.len();
                         let total_weight: f32 = group.iter().map(|g| g.combine_weight).sum();
                         let first = group.into_iter().next().unwrap();
@@ -2958,14 +2540,8 @@ mod tests {
         }
     }
 
-    /// Assemble expert partials on device (F32 path) — mirrors `comm_fuse_reduce`.
-    ///
-    /// Device-side assembly: row-by-row D2D memcpy to place each partial at its
-    /// column offset. If `rccl_handle` is provided and `num_gpus > 1`, performs
-    /// an `ncclAllReduce` on the assembled buffer.
-    ///
-    /// This is the host-side scaffolding; the actual device memcpy/RCCl calls
-    /// are implemented in `RocmDevice::comm_fuse_reduce` (device-gated).
+    /// Assemble expert partials on device (F32 path) - mirrors `comm_fuse_reduce`.
+    /// Device-side assembly: row-by-row D2D memcpy to place each partial at its column offset.
     #[cfg(feature = "rocm-mem")]
     pub fn assemble_moe_combine_f32(
         _device: &grim_backend_rocm::RocmDevice,
@@ -2973,8 +2549,7 @@ mod tests {
         _output_shape: (usize, usize),
     ) -> grim_tensor::error::Result<Box<dyn grim_tensor::BackendStorage>> {
         // This is a stub for the device-gated implementation.
-        // The actual implementation lives in RocmDevice::comm_fuse_reduce
-        // and is tested there.
+        // The actual implementation lives in RocmDevice::comm_fuse_reduce and is tested there.
         Err(grim_tensor::error::grim_backend_rocm::Error::Backend(
             "assemble_moe_combine_f32: device-gated, requires GPU".into(),
         ))
@@ -3109,31 +2684,11 @@ mod tests {
         assert!(combine.remote_batches.is_empty());
     }
 
-    // ── WI-EP4: Cross-GPU expert gradient combine host-side scaffolding ──────
-    //
-    // WI-EP4 (charon_kernel_plan_v3.md): "Expert-scoped gradient combine —
-    // only ranks that actually touched a given expert this step participate in
-    // its all-reduce/point-to-point sum, using ExpertPlacementMap to determine
-    // membership; router gradient gets separate full-batch treatment. Reuses
-    // RcclAllReduce/sum_gradients_device — confirmed already real and already
-    // used for LoRA gradient sync."
-    //
-    // This module provides the host-side scaffolding for the backward pass
-    // gradient combine:
-    // 1. Identify which ranks need to participate in gradient combine for each
-    //    expert (based on ExpertPlacementMap and which ranks actually computed
-    //    that expert's forward)
-    // 2. Build gradient combine plans per expert
-    // 3. Provide device-gated stubs for the actual all-reduce (delegates to
-    //    RcclAllReduce::sum_gradients_device)
-    // 4. Router gradient handled separately (full-batch all-reduce across all
-    //    ranks, since every rank's tokens influence the router)
+    // ── WI-EP4: Cross-GPU expert gradient combine host-side scaffolding ────── WI-EP4 (charon_kernel_plan_v3.md): "Expert-scoped gradient combine - only ranks that actually touched a given expert this step participate in its all-reduce/point-to-point sum, using ExpertPlacementMap to determine membership; router gradient gets separate full-batch treatment.
+    // Reuses RcclAllReduce/sum_gradients_device - confirmed already real and already used for LoRA gradient sync." This module.
 
-    /// Gradient combine plan for one expert.
-    ///
-    /// Identifies which ranks need to participate in the gradient all-reduce
-    //  for this expert, and provides the metadata needed for the device-side
-    //  all-reduce.
+    /// Gradient combine plan for one expert. Identifies which ranks need to participate in the
+    /// gradient all-reduce for this expert, and provides the metadata needed for the device-side all-reduce.
     pub struct ExpertGradientCombinePlan {
         /// The expert index
         pub expert: usize,
@@ -3160,9 +2715,7 @@ mod tests {
     }
 
     /// Full gradient combine plan for one MoE layer.
-    ///
-    /// Contains per-expert combine plans plus the router gradient plan
-    //  (which is always a full-batch all-reduce across all ranks).
+    /// Contains per-expert combine plans plus the router gradient plan (which is always a full-batch all-reduce.
     pub struct MoeGradientCombinePlan {
         /// Per-expert combine plans
         pub expert_plans: Vec<ExpertGradientCombinePlan>,
@@ -3171,9 +2724,7 @@ mod tests {
     }
 
     /// Router gradient combine plan (always full-batch all-reduce).
-    ///
-    //  Every rank's tokens influence the router, so router gradients
-    //  are always combined across all ranks.
+    /// Every rank's tokens influence the router, so router gradients are always combined across all ranks.
     pub struct RouterGradientCombinePlan {
         /// All ranks participate
         pub participating_ranks: Vec<usize>,
@@ -3182,15 +2733,8 @@ mod tests {
     }
 
     impl MoeDispatchPlan {
-        /// Build the gradient combine plan from the forward dispatch plan
-        //  and the expert placement map.
-        ///
-        //  For each expert, identifies which ranks computed its forward
-        //  (i.e., which ranks have valid gradients to contribute). The
-        //  expert's owner rank is the one that owns the expert weights.
-        ///
-        //  Router gradient is always a full-batch all-reduce across all
-        //  ranks (since every token influences the router).
+        /// Build the gradient combine plan from the forward dispatch plan and the expert placement map.
+        /// For each expert, identifies which ranks computed its forward (i.e., which ranks have valid gradients.
         pub fn build_gradient_combine_plan(
             &self,
             placement: &ExpertPlacementMap,
@@ -3213,9 +2757,8 @@ mod tests {
                     continue;
                 }
 
-                // The owner rank always participates: it holds the expert weights
-                // and computes weight gradients. Remote batch destination ranks
-                // participate if tokens were dispatched to them for this expert.
+                // The owner rank always participates: it holds the expert weights and computes weight gradients.
+                // Remote batch destination ranks participate if tokens were dispatched to them for this expert.
                 let mut participating_ranks: Vec<usize> = vec![owner_rank];
 
                 for batch in &self.remote {
@@ -3259,9 +2802,7 @@ mod tests {
     }
 
     /// Device-gated expert gradient all-reduce coordinator.
-    ///
-    /// Iterates through `ExpertGradientCombinePlan` pointer sets and invokes
-    /// `RcclAllReduce::sum_gradients_device` when RCCL handle is present.
+    /// Iterates through `ExpertGradientCombinePlan` pointer sets and invokes `RcclAllReduce::sum_gradients_device` when RCCL handle is present.
     #[cfg(feature = "rocm-mem")]
     pub fn all_reduce_expert_gradients_f32(
         device: &grim_backend_rocm::RocmDevice,
@@ -3287,7 +2828,6 @@ mod tests {
     }
 
     /// Device-gated router gradient all-reduce coordinator.
-    ///
     /// Combines router gradients across all participating ranks via `RcclAllReduce::sum_gradients_device`.
     #[cfg(feature = "rocm-mem")]
     pub fn all_reduce_router_gradients_f32(
@@ -3329,9 +2869,8 @@ mod tests {
         // rank 1: owns e1,e3 → participates in e1 (local) and e3 (local)
         let grad_plan = plan.build_gradient_combine_plan(&map, 2, 0);
 
-        // Expert 1: rank 1 (owner) participates. Rank 0 dispatched remotely
-        // but does not hold weight gradients — only the owner rank joins the
-        // weight-gradient all-reduce.
+        // Expert 1: rank 1 (owner) participates. Rank 0 dispatched remotely but does
+        // not hold weight gradients - only the owner rank joins the weight-gradient all-reduce.
         let e1 = grad_plan
             .expert_plans
             .iter()

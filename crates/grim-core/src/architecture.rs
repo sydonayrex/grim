@@ -1,8 +1,5 @@
 //! Centralized model architecture enumeration and tensor naming registry for Grim.
-//!
-//! Provides `ModelArchitecture` matching llama.cpp specifications and a unified
-//! `TensorNamingRegistry` for translating tensor names across GGUF, HuggingFace,
-//! and Grim internal representations.
+//! Provides `ModelArchitecture` matching llama.cpp specifications and a unified `TensorNamingRegistry` for translating tensor names across GGUF,.
 
 use crate::model::ModalityHint;
 use std::collections::HashMap;
@@ -175,8 +172,6 @@ pub enum ModelArchitecture {
 impl ModelArchitecture {
     /// Parse string identifier into `ModelArchitecture` enum variant.
     /// Matches GGUF `general.architecture` strings and HuggingFace `model_type` values.
-    // Deliberate inherent constructor: ~50 workspace-wide call sites rely on
-    // the infallible signature (unknown ids map to `Unknown`, not an Err).
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let s_lower = s.to_lowercase();
@@ -339,7 +334,9 @@ impl ModelArchitecture {
             "muse-glimmer" | "museglimmer" | "muse_glimmer" => Self::MuseGlimmer,
             "solar_open2" | "solaropen2" | "solar-open2" => Self::SolarOpen2,
             "gpt_oss" | "gpt-oss" | "gptoss" => Self::GptOss,
-            "granite_moe_hybrid" | "granite-moe-hybrid" | "granitemoehybrid" => Self::GraniteMoeHybrid,
+            "granite_moe_hybrid" | "granite-moe-hybrid" | "granitemoehybrid" => {
+                Self::GraniteMoeHybrid
+            }
             "exaone4_5" | "exaone4.5" | "exaone-4.5" => Self::Exaone45,
             "glm4_moe_lite" | "glm4-moe-lite" | "glm4moelite" => Self::Glm4MoeLite,
             "longcat_flash" | "longcat-flash" | "longcat" => Self::LongCatFlash,
@@ -527,10 +524,8 @@ impl ModelArchitecture {
             | Self::GemmaEmbedding
             | Self::PanguEmbed
             | Self::LlamaEmbed => ModalityHint::VisionEncoder,
-            // Audio families: ASR enc-dec (Whisper) and codec decoders
-            // (WavTokenizer) route through the enc-dec hint; TTS
-            // (Kokoro/StyleTTS2) and vocoders (Vocos/iSTFTNet) get their own
-            // hints matching the KokoroConfig/VocosConfig ModelConfig impls.
+            // Audio families: ASR enc-dec (Whisper) and codec decoders (WavTokenizer) route through the enc-dec hint;
+            // TTS (Kokoro/StyleTTS2) and vocoders (Vocos/iSTFTNet) get their own hints matching the KokoroConfig/VocosConfig ModelConfig impls.
             Self::Whisper | Self::WavTokenizerDec => ModalityHint::AudioEncoderDecoder,
             Self::Kokoro | Self::StyleTts2 => ModalityHint::TextToSpeech,
             Self::Vocos => ModalityHint::AudioVocoder,
@@ -654,16 +649,7 @@ pub struct TensorNamingRegistry;
 
 impl TensorNamingRegistry {
     /// Return the canonical GGUF tensor name for a given role and layer index.
-    ///
-    /// NOTE: `_arch` is intentionally unused — this returns the STANDARD
-    /// Llama-family GGUF naming for every architecture. That is correct for
-    /// llama.cpp-style exports but WRONG for architectures with non-standard
-    /// tensor naming (Falcon's `transformer.word_embeddings`, GPT-J's
-    /// `transformer.wte`, Mellum's `ffn_gate_inp`, …): those callers must
-    /// use [`TensorNamingRegistry::remap_hf_to_gguf`], which is
-    /// architecture-aware. The parameter is kept in the signature so call
-    /// sites state their architecture explicitly and a future
-    /// architecture-aware rename is a local change.
+    /// NOTE: `_arch` is intentionally unused - this returns the STANDARD Llama-family GGUF naming for every.
     #[allow(unused_variables)]
     pub fn gguf_name(
         _arch: ModelArchitecture,
@@ -713,11 +699,8 @@ impl TensorNamingRegistry {
     pub fn remap_hf_to_gguf(arch: ModelArchitecture, num_layers: usize) -> HashMap<String, String> {
         let mut map = HashMap::new();
 
-        // Common default HF -> GGUF mappings.
-        // These handle the most common name variants that appear across the
-        // HF ecosystem: with/without `model.` prefix, internal canonical
-        // names from older loaders (`tok_embeddings`, `layers.N.attn.wq`
-        // style), and the standard HF naming patterns.
+        // Common default HF -> GGUF mappings. These handle the most common name variants that appear across the HF
+        // ecosystem: with/without `model.` prefix, internal canonical names from older loaders (`tok_embeddings`, `layers.N.attn.wq` style), and the standard HF naming patterns.
         map.insert(
             "model.embed_tokens.weight".to_string(),
             "token_embd.weight".to_string(),
@@ -884,10 +867,8 @@ impl TensorNamingRegistry {
                 );
             }
             ModelArchitecture::GptNeoX => {
-                // GPT-NeoX (HF: `gpt_neox.layers.{i}.*`): merged QKV
-                // (`attention.query_key_value.weight`), `dense_h_to_4h`/
-                // `dense_4h_to_h` MLP (no gate), `input_layernorm` +
-                // `post_attention_layernorm`.
+                // GPT-NeoX (HF: `gpt_neox.layers.{i}.*`): merged QKV (`attention.query_key_value.weight`), `dense_h_to_4h`/
+                // `dense_4h_to_h` MLP (no gate), `input_layernorm` + `post_attention_layernorm`.
                 map.insert(
                     "gpt_neox.embed_in.weight".to_string(),
                     "token_embd.weight".to_string(),
@@ -926,9 +907,7 @@ impl TensorNamingRegistry {
                 );
             }
             ModelArchitecture::Mpt => {
-                // MPT (HF: `transformer.blocks.{i}.*`): merged Wqkv
-                // (`attn.Wqkv.weight`), `attn.out_proj`, `norm_1`/`norm_2`,
-                // `ffn.up_proj`/`down_proj`.
+                // MPT (HF: `transformer.blocks.{i}.*`): merged Wqkv (`attn.Wqkv.weight`), `attn.out_proj`, `norm_1`/`norm_2`, `ffn.up_proj`/`down_proj`.
                 map.insert(
                     "transformer.wte.weight".to_string(),
                     "token_embd.weight".to_string(),
@@ -967,12 +946,8 @@ impl TensorNamingRegistry {
                 );
             }
             ModelArchitecture::Bloom => {
-                // Bloom (HF: `transformer.h.{i}.*`): merged QKV
-                // (`self_attention.query_key_value.weight`), `self_attention.dense`,
-                // `input_layernorm`/`post_attention_layernorm`,
-                // `mlp.dense_h_to_4h`/`dense_4h_to_h` — structurally near-identical
-                // to Falcon but with `word_embeddings` root (also mapped above
-                // via the Falcon arm's root, kept here for independence).
+                // Bloom (HF: `transformer.h.{i}.*`): merged QKV (`self_attention.query_key_value.weight`), `self_attention.dense`, `input_layernorm`/`post_attention_layernorm`, `mlp.dense_h_to_4h`/`dense_4h_to_h` - structurally near-identical to Falcon but
+                // with `word_embeddings` root (also mapped above via the Falcon arm's root, kept here for independence).
                 map.insert(
                     "transformer.word_embeddings.weight".to_string(),
                     "token_embd.weight".to_string(),
@@ -1034,9 +1009,8 @@ impl TensorNamingRegistry {
                         format!("{hf_p}self_attn.o_proj.weight"),
                         format!("{gg_p}attn_output.weight"),
                     );
-                    // Laguna-S-2.1 attention output gate (per-head softplus gate,
-                    // applied before o_proj). GGUF name matches llama.cpp
-                    // `LLM_TENSOR_ATTN_GATE` -> `blk.{i}.attn_gate.weight`.
+                    // Laguna-S-2.1 attention output gate (per-head softplus gate, applied before o_proj).
+                    // GGUF name matches llama.cpp `LLM_TENSOR_ATTN_GATE` -> `blk.{i}.attn_gate.weight`.
                     map.insert(
                         format!("{hf_p}self_attn.g_proj.weight"),
                         format!("{gg_p}attn_gate.weight"),
@@ -1183,16 +1157,8 @@ impl TensorNamingRegistry {
                 }
             }
             ModelArchitecture::Mellum => {
-                // Mellum2 GGUF uses a different MoE tensor naming convention than
-                // the default Qwen3-MoE mapping. The GGUF (quantized by Unsloth)
-                // stores:
-                //   ffn_gate_inp.weight  = [hidden, num_experts]  (router gate)
-                //   ffn_gate_exps.weight = [num_experts, ffn_inter, hidden] (3D)
-                //   ffn_up_exps.weight   = [num_experts, ffn_inter, hidden] (3D)
-                //   ffn_down_exps.weight = [num_experts, ffn_inter, hidden] (3D)
-                // The attention uses standard Llama naming (attn_q/k/v/output,
-                // attn_norm). Unlike Qwen3-MoE, there is no `ffn_gate.weight`
-                // (singular) — the router is always `ffn_gate_inp.weight`.
+                // Mellum2 GGUF uses a different MoE tensor naming convention than the default Qwen3-MoE mapping.
+                // The GGUF (quantized by Unsloth) stores: ffn_gate_inp.weight = [hidden, num_experts] (router gate) ffn_gate_exps.weight = [num_experts,.
                 for i in 0..num_layers {
                     let hf_p = format!("model.layers.{i}.");
                     let gg_p = format!("blk.{i}.");
@@ -1265,9 +1231,8 @@ impl TensorNamingRegistry {
                         format!("{il_p}ffn_norm.weight"),
                         format!("{gg_p}ffn_norm.weight"),
                     );
-                    // Router gate: Mellum uses `ffn_gate_inp.weight` (NOT
-                    // `ffn_gate.weight`). This is the key difference from the
-                    // default mapping.
+                    // Router gate: Mellum uses `ffn_gate_inp.weight` (NOT `ffn_gate.weight`).
+                    // This is the key difference from the default mapping.
                     map.insert(
                         format!("{hf_p}mlp.gate_proj.weight"),
                         format!("{gg_p}ffn_gate_inp.weight"),
@@ -1310,9 +1275,7 @@ impl TensorNamingRegistry {
             }
             _ => {
                 // Default Llama-family HF -> GGUF mappings per layer.
-                // Covers both `model.layers.N.xxx` (standard HF) and
-                // `layers.N.attn.xxx` / `layers.N.ffn.xxx` (internal loader
-                // canonical names used by Grim's Llama implementation).
+                // Covers both `model.layers.N.xxx` (standard HF) and `layers.N.attn.xxx` / `layers.N.ffn.xxx` (internal loader canonical names used by.
                 for i in 0..num_layers {
                     let hf_p = format!("model.layers.{i}.");
                     let gg_p = format!("blk.{i}.");
@@ -1391,15 +1354,8 @@ impl TensorNamingRegistry {
                         format!("{il_p}ffn.w_down.weight"),
                         format!("{gg_p}ffn_down.weight"),
                     );
-                    // --- MoE expert-indexed tensor names (WI-M1) ---
-                    // llama.cpp stores per-expert FFN weights as 3D tensors
-                    // (experts are the OUTERMOST dimension):
-                    //   ffn_gate_exps.weight = [n_experts, inter, hidden]
-                    //   ffn_up_exps.weight   = [n_experts, inter, hidden]
-                    //   ffn_down_exps.weight = [n_experts, inter, hidden]
-                    // Each expert's `[inter, hidden]` block is sliced out; the
-                    // down projection is transposed to `[hidden, inter]` for the
-                    // `Linear` (out=hidden, in=inter). Matches `ExpertBank::load`.
+                    // --- MoE expert-indexed tensor names (WI-M1) --- llama.cpp stores per-expert FFN weights as 3D tensors (experts are the OUTERMOST dimension): ffn_gate_exps.weight = [n_experts, inter, hidden] ffn_up_exps.weight  = [n_experts, inter, hidden] ffn_down_exps.weight = [n_experts, inter, hidden] Each expert's `[inter, hidden]` block is sliced out; the down projection is transposed to `[hidden, inter]` for the `Linear` (out=hidden, in=inter).
+                    // Matches `ExpertBank::load`.
                     map.insert(
                         format!("{hf_p}mlp.experts.gate_proj.weight"),
                         format!("{gg_p}ffn_gate_exps.weight"),
@@ -1426,9 +1382,6 @@ impl TensorNamingRegistry {
                     );
                     // Router gate (the dedup router, NOT the expert bank).
                     // HF convention for Qwen2/3-MoE / Mixtral is `mlp.gate.weight`.
-                    // Resolves to the GGUF router tensor `ffn_gate_inp.weight`
-                    // (kept distinct from `mlp.gate_proj.weight`, which some archs
-                    // also use for the same router — see below).
                     map.insert(
                         format!("{hf_p}mlp.gate.weight"),
                         format!("{gg_p}ffn_gate_inp.weight"),
@@ -1515,10 +1468,8 @@ mod tests {
         );
     }
 
-    /// Audio model families found in `models/audio/` (Kokoro-82m TTS,
-    /// MeanVC2 voice conversion with its `"model_type": "DiT"` config) plus
-    /// Whisper ASR must parse and route to the right modality hint instead
-    /// of collapsing into `Unknown`/`TextInTextOut`.
+    /// Audio model families found in `models/audio/` (Kokoro-82m TTS, MeanVC2 voice conversion with its `"model_type": "DiT"` config)
+    /// plus Whisper ASR must parse and route to the right modality hint instead of collapsing into `Unknown`/`TextInTextOut`.
     #[test]
     fn test_audio_architecture_parsing_and_modality() {
         assert_eq!(
@@ -1581,9 +1532,8 @@ mod tests {
             "blk.0.attn_q.weight"
         );
 
-        // MoE remap split: router gate vs expert bank must resolve to distinct
-        // GGUF tensors. `mlp.gate.weight` (Qwen2/3-MoE / Mixtral router) maps to
-        // the router `ffn_gate_inp.weight`, NOT the expert bank.
+        // MoE remap split: router gate vs expert bank must resolve to distinct GGUF tensors.
+        // `mlp.gate.weight` (Qwen2/3-MoE / Mixtral router) maps to the router `ffn_gate_inp.weight`, NOT the expert bank.
         let moe = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Qwen3Moe, 4);
         assert_eq!(
             moe.get("model.layers.0.mlp.gate.weight").unwrap(),
@@ -1594,10 +1544,8 @@ mod tests {
                 .unwrap(),
             "blk.0.ffn_gate_exps.weight"
         );
-        // Qwen2/3-MoE has no per-layer `mlp.gate_proj.weight` (that key is the
-        // dense-Llama FFN gate, correctly mapped to `ffn_gate.weight` above).
-        // The Qwen3-MoE "always-on" shared expert's gate is the meaningful
-        // sibling of the router and must land on `ffn_gate_she.weight`.
+        // Qwen2/3-MoE has no per-layer `mlp.gate_proj.weight` (that key is the dense-Llama FFN gate, correctly mapped to `ffn_gate.weight` above).
+        // The Qwen3-MoE "always-on" shared expert's gate is the meaningful sibling of the router and must.
         assert_eq!(
             moe.get("model.layers.0.mlp.shared_expert.gate_proj.weight")
                 .unwrap(),
@@ -1605,11 +1553,8 @@ mod tests {
         );
     }
 
-    /// Regression lock for the pre-existing Qwen2/3-MoE `mlp.gate_proj.weight`
-    /// semantics: in dense Llama-family checkpoints `mlp.gate_proj` is the FFN
-    /// gate (`ffn_gate.weight`), NOT the MoE router. The router lives in
-    /// `mlp.gate.weight` (see above). This guards against a future refactor
-    /// that accidentally re-maps the dense gate to the router tensor.
+    /// Regression lock for the pre-existing Qwen2/3-MoE `mlp.gate_proj.weight` semantics: in dense Llama-family checkpoints `mlp.gate_proj` is the FFN gate (`ffn_gate.weight`), NOT the MoE router.
+    /// The router lives in `mlp.gate.weight` (see above).
     #[test]
     fn test_dense_llama_gate_proj_is_not_moe_router() {
         let dense = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Llama, 32);
@@ -1630,11 +1575,8 @@ mod tests {
         );
     }
 
-    /// P2-26a: regression lock for the per-family HF -> GGUF canonical
-    /// mappings added for the non-Llama families that previously fell through
-    /// to the wrong Llama-style default. (Kept separate from
-    /// `test_tensor_naming_registry` because that test's pre-existing Qwen3-MoE
-    /// `mlp.gate.weight` assertion fails independently of these mappings.)
+    /// P2-26a: regression lock for the per-family HF -> GGUF canonical mappings added for the non-Llama families that previously fell through to the wrong Llama-style default.
+    /// (Kept separate from `test_tensor_naming_registry` because that test's pre-existing Qwen3-MoE `mlp.gate.weight` assertion fails independently of these.
     #[test]
     fn test_p2_26a_family_hf_mappings() {
         let falcon = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Falcon, 32);

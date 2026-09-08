@@ -1,14 +1,11 @@
 //! Multi-GPU FSDP (Fully Sharded Data Parallel) module for CUDA.
-//!
-//! Provides ZeRO-3 / FSDP distributed training primitives across multiple CUDA GPUs,
-//! backed by real cross-rank collective communication via [`ParallelCommunicator`]
-//! (NCCL device collectives or high-speed `HostStagingRing` synchronization).
+//! Provides ZeRO-3 / FSDP distributed training primitives across multiple CUDA GPUs, backed by real cross-rank.
 
-use std::sync::Arc;
-use grim_tensor::Shape;
-use grim_tensor::error::{Error, Result};
 use crate::device::parallel_comm::ParallelCommunicator;
 use crate::memory::storage::CudaStorage;
+use grim_tensor::Shape;
+use grim_tensor::error::{Error, Result};
+use std::sync::Arc;
 
 /// Configuration for CUDA Parallel GPU FSDP sharding.
 #[derive(Debug, Clone)]
@@ -42,7 +39,10 @@ pub type ConsumerDpConfig = ConsumerFsdpConfig;
 pub type ConsumerZeroPlanner = ConsumerFsdpGroup;
 
 impl ConsumerFsdpGroup {
-    pub fn new(config: ConsumerFsdpConfig, comm: Option<Arc<ParallelCommunicator>>) -> Result<Self> {
+    pub fn new(
+        config: ConsumerFsdpConfig,
+        comm: Option<Arc<ParallelCommunicator>>,
+    ) -> Result<Self> {
         if config.world_size == 0 {
             return Err(Error::Backend("world_size must be >= 1".into()));
         }
@@ -205,7 +205,9 @@ impl ConsumerFsdpGroup {
         if let Some(comm) = &self.comm {
             comm.reduce_scatter_storage(local_full_grad, sharded_dst, stream)?;
         } else {
-            if let (Some(s_ptr), Some(d_ptr)) = (local_full_grad.device_ptr(), sharded_dst.device_ptr()) {
+            if let (Some(s_ptr), Some(d_ptr)) =
+                (local_full_grad.device_ptr(), sharded_dst.device_ptr())
+            {
                 let offset_bytes = self.config.rank * sharded_dst.bytes();
                 unsafe {
                     crate::device::handles::cudaMemcpy(
@@ -228,8 +230,8 @@ impl ConsumerFsdpGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::device::parallel_comm::HostStagingRing;
+    use std::sync::Arc;
 
     #[test]
     fn test_cuda_fsdp_multi_rank_all_gather() -> Result<()> {
@@ -237,10 +239,16 @@ mod tests {
         let ring = Arc::new(HostStagingRing::new(world_size));
 
         let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(
-            0, world_size, vec![0, 1], ring.clone(),
+            0,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
         let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(
-            1, world_size, vec![0, 1], ring.clone(),
+            1,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
 
         let cfg0 = ConsumerFsdpConfig {
@@ -278,10 +286,16 @@ mod tests {
         let ring = Arc::new(HostStagingRing::new(world_size));
 
         let comm0 = Arc::new(ParallelCommunicator::with_shared_staging(
-            0, world_size, vec![0, 1], ring.clone(),
+            0,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
         let comm1 = Arc::new(ParallelCommunicator::with_shared_staging(
-            1, world_size, vec![0, 1], ring.clone(),
+            1,
+            world_size,
+            vec![0, 1],
+            ring.clone(),
         )?);
 
         let cfg0 = ConsumerFsdpConfig {

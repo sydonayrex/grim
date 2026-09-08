@@ -14,8 +14,8 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::quant_q4k;
-use grim_tensor::{ArithType, DType, KQuantScheme, Shape, Storage,
-    CoreTensorOps, MemoryOps, QuantOps,
+use grim_tensor::{
+    ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape, Storage,
 };
 use std::panic;
 

@@ -1,22 +1,5 @@
-//! WASM Component Sandbox Runtime Loader.
-//!
-//! §6.1: Sandboxes third-party plugins using execution limits (fuel and memory
-//! caps) and capability grants. Prevents unauthorized system calls or memory
-//! access outside the sandbox boundaries. Uses wasmtime for runtime isolation.
-//!
-//! Grant enforcement (§6.4, deny-by-default):
-//!   Every WASM plugin starts with **no** host imports linked. Capabilities
-//!   are added only when the manifest's grants block (`[plugin.grants]` or
-//!   top-level `[grants]` + `[scopes]`) explicitly enables them:
-//!     - `network = false` (default) → no WASI socket imports linked.
-//!     - `filesystem = []` (default) → no WASI filesystem imports linked.
-//!     - `request_metadata = false` (default) → no grim host-call for request
-//!       metadata linked.
-//!   A plugin that calls an unlinked import traps at instantiation with a
-//!   clear `unknown import` error rather than being silently permitted.
-//!   A grant that this build cannot honor (the wasmtime dependency carries
-//!   no WASI implementation, so no preopens or sockets can ever be linked)
-//!   is rejected at plugin-load time — loudly, never as a silent trap.
+//! WASM Component Sandbox Runtime Loader. §6.1: Sandboxes third-party plugins
+//! using execution limits (fuel and memory caps) and capability grants.
 
 use crate::{PluginGrants, PluginLimits, ProcessorPlugin, TokenizerPlugin};
 use grim_core::Sampler;
@@ -24,22 +7,7 @@ use grim_tensor::error::{Error, Result};
 use std::sync::Arc;
 
 /// WIT (WebAssembly Interface Types) definition for sampler plugins.
-/// §6.1.1 — WIT Interface Definition (inline for doc reference).
-///
-/// ```wit
-/// package grim:plugin@0.1.0;
-///
-/// interface sampler {
-///   get-name: func() -> string;
-///   sample: func(logits-ptr: i32, logits-len: i32,
-///                history-ptr: i32, history-len: i32) -> result<i32, string>;
-///   memory-usage: func() -> i32;
-/// }
-///
-/// world grim-sampler {
-///   export sampler;
-/// }
-/// ```
+/// §6.1.1 - WIT Interface Definition (inline for doc reference).
 pub const WIT_SAMPLER_INTERFACE: &str = include_str!("wit/sampler.wit");
 pub const WIT_TOKENIZER_INTERFACE: &str = include_str!("wit/tokenizer.wit");
 pub const WIT_PROCESSOR_INTERFACE: &str = include_str!("wit/processor.wit");
@@ -52,9 +20,8 @@ pub struct WasmSampler {
     /// exports remain valid for the lifetime of this sampler.
     #[cfg(feature = "wasm-sandbox")]
     instance: Option<wasmtime::Instance>,
-    /// The store is behind a Mutex because `Func::call` and `Memory::write`
-    /// require `AsContextMut` (mutable access), but `Sampler::sample` takes
-    /// `&self`.
+    /// The store is behind a Mutex because `Func::call` and
+    /// `Memory::write` require `AsContextMut` (mutable access), but `Sampler::sample` takes `&self`.
     #[cfg(feature = "wasm-sandbox")]
     store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
 }
@@ -83,9 +50,8 @@ pub struct WasmProcessor {
 pub struct WasmPluginLoader {
     pub name: String,
     pub limits: PluginLimits,
-    /// Capability grants parsed from the manifest. Deny-by-default: every
-    /// field that is false means the corresponding host import is NOT linked
-    /// into the Wasmtime linker, so calling it traps with a clear error.
+    /// Capability grants parsed from the manifest.
+    /// Deny-by-default: every field that is false means the corresponding host import is NOT linked into.
     pub grants: PluginGrants,
     fuel_consumed: u64,
     memory_allocated_mb: u32,
@@ -114,27 +80,13 @@ impl WasmPluginLoader {
     }
 
     /// Create a sampler from WASM bytes, enforcing all manifest grants.
-    ///
-    /// Grant enforcement: a grant this build cannot link (network,
-    /// filesystem, request_metadata — none have host implementations here)
-    /// is rejected with a clear error at plugin-load time. Otherwise the
-    /// Wasmtime `Linker` is built with no host functions at all, so any
-    /// import the module declares traps at instantiation time with an
-    /// `"unknown import"` error — the plugin cannot silently bypass the
-    /// sandbox by calling an unlinked function.
+    /// Grant enforcement: a grant this build cannot link (network, filesystem, request_metadata - none have host.
     #[cfg(feature = "wasm-sandbox")]
     pub fn create_sampler(&self, wasm_bytes: &[u8]) -> Result<Arc<dyn Sampler>> {
         use wasmtime::{Config, Engine as WasmtimeEngine, Linker, Module, Store};
 
-        // ----- Grant validation (before any compilation: fail at load) -----
-        // Deny-by-default grants are correct with an empty linker — a plugin
-        // importing WASI then traps at instantiation with wasmtime's
-        // "unknown import" error. But a *granted* capability that this build
-        // cannot link must not degrade to that same trap (the plugin author
-        // asked for a real capability and silently got nothing), so it errors
-        // here instead. The wasmtime dependency carries no WASI
-        // implementation (no wasi-common / wasmtime-wasi), so network and
-        // filesystem grants can never be linked in this build.
+        // ----- Grant validation (before any compilation: fail at load) ----- Deny-by-default grants are correct with an empty linker - a plugin importing WASI then traps at instantiation with wasmtime's "unknown import" error.
+        // But a *granted* capability that this build cannot link must not degrade to that same.
         if self.grants.network {
             return Err(Error::Backend(format!(
                 "plugin '{}': network grant cannot be honored — this build links no \
@@ -183,13 +135,7 @@ impl WasmPluginLoader {
                 .map_err(|e| Error::Backend(format!("set_fuel failed: {e}")))?;
         }
 
-        // Build the linker. Nothing is linked — deny-by-default. Grants were
-        // validated above: reaching here means every grant is off, so any
-        // import the module declares (WASI filesystem, sockets, grim host
-        // calls) is left unlinked. This is where granted scopes would be
-        // linked as WASI preopens once the dependency set carries a WASI
-        // implementation (`wasmtime-wasi`), preopening exactly
-        // `grants.filesystem` and nothing else.
+        // Build the linker. Nothing is linked - deny-by-default.
         let linker: Linker<()> = Linker::new(&engine);
 
         // Instantiate — any unlinked import causes a trap here, not at call time.
@@ -408,15 +354,9 @@ impl Sampler for WasmSampler {
                 .ok_or_else(|| Error::Backend("WASM module missing 'memory' export".into()))?;
 
             let logits_vec: Vec<f32> = logits.to_vec_f32()?;
-            let logits_bytes: Vec<u8> = logits_vec
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
+            let logits_bytes: Vec<u8> = logits_vec.iter().flat_map(|f| f.to_le_bytes()).collect();
 
-            let history_bytes: Vec<u8> = history
-                .iter()
-                .flat_map(|u| u.to_le_bytes())
-                .collect();
+            let history_bytes: Vec<u8> = history.iter().flat_map(|u| u.to_le_bytes()).collect();
 
             let logits_len = logits_bytes.len() as i32;
             let history_len = history_bytes.len() as i32;
@@ -588,9 +528,9 @@ impl ProcessorPlugin for WasmProcessor {
                 .ok_or_else(|| Error::Backend("WasmProcessor instance unavailable".into()))?;
 
             if let Some(func) = instance.get_func(&mut *store, "preprocess") {
-                let typed = func
-                    .typed::<(i32, i32), i32>(&*store)
-                    .map_err(|e| Error::Backend(format!("invalid signature for 'preprocess': {e}")))?;
+                let typed = func.typed::<(i32, i32), i32>(&*store).map_err(|e| {
+                    Error::Backend(format!("invalid signature for 'preprocess': {e}"))
+                })?;
                 if let Some(fuel) = self.limits.fuel_per_invocation {
                     let _ = store.set_fuel(fuel);
                 }
@@ -623,9 +563,9 @@ impl ProcessorPlugin for WasmProcessor {
                 .ok_or_else(|| Error::Backend("WasmProcessor instance unavailable".into()))?;
 
             if let Some(func) = instance.get_func(&mut *store, "postprocess") {
-                let typed = func
-                    .typed::<(i32, i32), i32>(&*store)
-                    .map_err(|e| Error::Backend(format!("invalid signature for 'postprocess': {e}")))?;
+                let typed = func.typed::<(i32, i32), i32>(&*store).map_err(|e| {
+                    Error::Backend(format!("invalid signature for 'postprocess': {e}"))
+                })?;
                 if let Some(fuel) = self.limits.fuel_per_invocation {
                     let _ = store.set_fuel(fuel);
                 }

@@ -1,16 +1,5 @@
 //! Mamba-2 SSD architecture (step-wise CPU body).
-//!
-//! Block contract (per `Mamba2Config`): pre-norm → `in_proj` producing
-//! `(x, z, B, C)` with group-shared B/C (n_groups ≤ n_heads, GQA-style) →
-//! head-chunked selective SSM with a per-head scalar decay
-//! `A[h] = -exp(A_log[h])` (Mamba-2's defining difference vs Mamba-1's
-//! `(d_inner, d_state)` A matrix) → SiLU z-gate → D skip → `out_proj`.
-//!
-//! Fidelity note (mirrors the Mamba-1 body in `lib.rs`): this is a
-//! step-wise recurrence with bias-only discretization
-//! `dt = softplus(dt_bias[h])`, and the short conv is carried in weights but
-//! not applied (same "skipped in v1" contract). Chunked parallel scan, conv,
-//! and time-varying dt are the GPU-kernel work items.
+//! Block contract (per `Mamba2Config`): pre-norm → `in_proj` producing `(x, z, B, C)` with group-shared B/C.
 
 use std::any::Any;
 
@@ -102,9 +91,8 @@ fn silu(x: f32) -> f32 {
 
 impl Mamba2Block {
     pub fn random(cfg: &Mamba2Config, rng: &mut grim_core::rng::SimpleRng) -> Self {
-        // Single group (n_groups = 1): all heads share one B/C — the smallest
-        // valid Mamba-2 grouping. Multi-group loading is a weight-loader work
-        // item once a real Mamba-2 checkpoint pipeline exists.
+        // Single group (n_groups = 1): all heads share one B/C - the smallest valid Mamba-2 grouping.
+        // Multi-group loading is a weight-loader work item once a real Mamba-2 checkpoint pipeline exists.
         let n_groups = 1usize;
         // in_proj: hidden → 2*d_inner + 2*n_groups*d_state (x, z, B, C).
         let group_state = n_groups * cfg.d_state;
@@ -203,9 +191,8 @@ impl Mamba2Block {
         for (yi, &zi) in y.iter_mut().zip(z.iter()) {
             *yi *= silu(zi);
         }
-        // Advance the position cursor: MambaState documents `pos` as the
-        // per-call token count and Mamba-1's step advances it — the Mamba-2
-        // step must too, or speculative snapshots read a stale position.
+        // Advance the position cursor: MambaState documents `pos` as the per-call token count and Mamba-1's step
+        // advances it - the Mamba-2 step must too, or speculative snapshots read a stale position.
         state.pos += 1;
         let out_t = cpu_tensor(y, Shape::new(vec![1, self.d_inner]));
         let out = self.out_proj.forward(&out_t)?;
@@ -347,9 +334,8 @@ impl CausalLm for Mamba2 {
         _positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        // SSM state lives on the session and advances across calls (same
-        // contract as Mamba-1: a fresh state per call would make decode
-        // context-free after the first token).
+        // SSM state lives on the session and advances across calls (same contract as
+        // Mamba-1: a fresh state per call would make decode context-free after the first token).
         if session.model_state().is_none() {
             session.set_model_state(Box::new(self.init_state(1)));
         }
@@ -427,9 +413,8 @@ mod tests {
         assert_eq!(ms.d_state, 4);
     }
 
-    /// A nonzero A_log must actually decay the state: stepping the same
-    /// token repeatedly with a fixed B/C stream drives the state magnitude
-    /// below the first-step magnitude (the recurrence is contractive).
+    /// A nonzero A_log must actually decay the state: stepping the same token repeatedly with a
+    /// fixed B/C stream drives the state magnitude below the first-step magnitude (the recurrence is contractive).
     #[test]
     fn mamba2_recurrence_is_contractive() {
         let model = Mamba2::random(Device::Cpu, cfg());

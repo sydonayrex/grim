@@ -12,18 +12,17 @@ use grim_tensor::{BackendStorage, CoreTensorOps, QuantOps, Shape};
 
 use crate::device::cuda_device::CudaDevice;
 use crate::device::handles::{
-    cublasSgemm_v2, cuLaunchKernel, cuModuleGetFunction, cudaMemcpy, cudaMemcpyDeviceToHost,
-    CUBLAS_OP_N, CUBLAS_STATUS_SUCCESS, CUfunction, CudaHandle,
+    CUBLAS_OP_N, CUBLAS_STATUS_SUCCESS, CUfunction, CudaHandle, cuLaunchKernel,
+    cuModuleGetFunction, cublasSgemm_v2, cudaMemcpy, cudaMemcpyDeviceToHost,
 };
 use crate::device::jit_cache::compile_and_load_kernel;
 use crate::memory::storage::{
-    cuda_dequant_quantized_storage, read_length_prefixed, stage_packed_bytes, CudaStorage,
+    CudaStorage, cuda_dequant_quantized_storage, read_length_prefixed, stage_packed_bytes,
 };
 
 impl CudaDevice {
     /// Launches the fused Q8_0 quantized GEMM on a 2-D grid.
-    /// out[M,N] = a[M,K] · b_q8[K,N]; b is int8 raw bytes with per-32-element
-    /// block scales; requires K % 32 == 0. Runs on the default stream.
+    /// out[M,N] = a[M,K] · b_q8[K,N]; b is int8 raw bytes with per-32-element block scales; requires.
     fn launch_quantized_matmul_q8_0(
         &self,
         a_ptr: *const c_void,
@@ -95,10 +94,8 @@ impl CudaDevice {
         }))
     }
 
-    /// Launches a standalone dequant kernel of signature
-    /// `(const u8* packed, float* out, int n_blocks)` — one thread per
-    /// 256-weight super-block. Used by the Q5_K/Q6_K/IQ4/IQ3/IQ2 family.
-    /// `n` is the number of super-blocks; grid = ceil(n/256), block = 256.
+    /// Launches a standalone dequant kernel of signature `(const u8* packed, float* out, int n_blocks)` - one thread per 256-weight super-block.
+    /// Used by the Q5_K/Q6_K/IQ4/IQ3/IQ2 family.
     fn launch_dequant_generic(
         &self,
         kernel_name: &str,
@@ -129,10 +126,8 @@ impl CudaDevice {
             ];
 
             const BLOCK_SIZE: u32 = 256;
-            // The dequantization kernels (grim_dequant_q8_0, etc.) expect one
-            // thread per output weight, checking `id >= n_blocks * 32` (or
-            // weights_per_block). So the grid must cover n_blocks *
-            // weights_per_block threads, not just n_blocks.
+            // The dequantization kernels (grim_dequant_q8_0, etc.) expect one thread per output weight, checking `id >= n_blocks * 32` (or weights_per_block).
+            // So the grid must cover n_blocks * weights_per_block threads, not just n_blocks.
             let total_weights = n_blocks.checked_mul(weights_per_block).ok_or_else(|| {
                 Error::Backend("launch_dequant_generic: total weight count overflow".into())
             })?;
@@ -224,9 +219,8 @@ impl CudaDevice {
         }))
     }
 
-    /// Launches `grim_dequant_mxfp4(codes, exps, out, n_values)` — one thread
-    /// per value. `codes` is packed E2M1 nibbles (2/byte); `exps` holds one
-    /// E8M0 shared exponent per 32-element group.
+    /// Launches `grim_dequant_mxfp4(codes, exps, out, n_values)` - one thread per value.
+    /// `codes` is packed E2M1 nibbles (2/byte); `exps` holds one E8M0 shared exponent per 32-element group.
     fn launch_dequant_mxfp4(
         &self,
         codes_ptr: *const c_void,
@@ -316,15 +310,8 @@ impl CudaDevice {
         }))
     }
 
-    /// Dequantize a CUDA-resident packed `CudaStorage` to a new F32 `CudaStorage`
-    /// entirely on device, returning the F32 storage. Falls back to
-    /// `Err(Backend)` for block types without a device kernel so the caller
-    /// (`to_cpu_vec_f32`) can use the bit-accurate host path. This is the
-    /// primary mechanism by which the quantized GEMM path stays on-GPU.
-    ///
-    /// Block byte-size table (matches `grim_quant::dequant_*`):
-    ///   Q5_K=176, Q6_K=210, IQ4_NL=170, IQ4_XS=136, IQ3_XXS=96,
-    ///   IQ3_S=110, IQ2_XXS=66, IQ2_XS=74, IQ2_S=82. All are 256 weights/block.
+    /// Dequantize a CUDA-resident packed `CudaStorage` to a new F32 `CudaStorage` entirely on device, returning the F32 storage.
+    /// Falls back to `Err(Backend)` for block types without a device kernel so the caller (`to_cpu_vec_f32`).
     pub fn dequantize_on_device(&self, packed: &CudaStorage) -> Result<CudaStorage> {
         let elem_count = packed.shape.elem_count();
         let packed_ptr = Self::dev_ptr_or_err("dequantize_on_device", packed)? as *const c_void;
@@ -440,16 +427,14 @@ impl CudaDevice {
         }
         let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
         let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(out)", &out)?;
-        let handle = self.launch_dequant_generic(kernel, packed_ptr, out_ptr, n_blocks, weights_per_block)?;
+        let handle =
+            self.launch_dequant_generic(kernel, packed_ptr, out_ptr, n_blocks, weights_per_block)?;
         handle.synchronize()?;
         Ok(out)
     }
 
-    /// Quantize a CUDA-resident F32 `CudaStorage` into packed quantized bytes,
-    /// entirely on-device — the device-side mirror of `grim_quant::quant_*`.
-    ///
-    /// Returns a new `CudaStorage` holding the packed bytes with the
-    /// appropriate `Storage` dtype. Currently supports Q8_0 and FP8 (E4M3).
+    /// Quantize a CUDA-resident F32 `CudaStorage` into packed quantized bytes, entirely on-device - the device-side mirror of `grim_quant::quant_*`.
+    /// Returns a new `CudaStorage` holding the packed bytes with the appropriate `Storage` dtype.
     pub fn quantize_on_device(
         &self,
         x: &CudaStorage,
@@ -842,8 +827,6 @@ impl CudaDevice {
 }
 
 impl QuantOps for CudaDevice {
-
-
     fn quantized_matmul(
         &self,
         a: &dyn BackendStorage,
@@ -873,11 +856,8 @@ impl QuantOps for CudaDevice {
                         Error::Backend("quantized_matmul: failed to allocate output buffer".into())
                     })? as *mut c_void;
 
-                    // Q8_0: check if B data uses the real 34-byte packed layout
-                    // (f16_scale + 32 i8 codes per block) or the simplified raw-u8 layout.
+                    // Q8_0: check if B data uses the real 34-byte packed layout (f16_scale + 32 i8 codes per block) or the simplified raw-u8 layout.
                     // For real packed data, extract per-block f16 scales from the headers.
-                    // For simplified data (k*n raw u8 bytes), use the externally-provided
-                    // b_scales directly.
                     let blocks_per_col = k / 32;
                     let scale_len = n * blocks_per_col;
 
@@ -1003,24 +983,15 @@ impl QuantOps for CudaDevice {
                     let b_ptr = Self::dev_ptr_or_err("quantized_matmul b", b_s)?;
                     let out_ptr = Self::dev_ptr_or_err("quantized_matmul out", &out_storage)?;
 
-                    let handle = self.launch_fused_quant_gemm(
-                        kernel_name,
-                        a_ptr,
-                        b_ptr,
-                        out_ptr,
-                        m,
-                        n,
-                        k,
-                    )?;
+                    let handle =
+                        self.launch_fused_quant_gemm(kernel_name, a_ptr, b_ptr, out_ptr, m, n, k)?;
                     return Ok((Box::new(out_storage), handle));
                 }
             }
         }
 
-        // ── CPU fallback: format-accurate dequantization via grim_quant ──────
-        // Dispatches on `format` so every supported variant uses its canonical
-        // bit-unpacking algorithm. Non-supported formats return Err immediately
-        // rather than producing silently wrong output.
+        // ── CPU fallback: format-accurate dequantization via grim_quant ────── Dispatches on `format` so every supported variant uses its canonical bit-unpacking algorithm.
+        // Non-supported formats return Err immediately rather than producing silently wrong output.
         tracing::warn!(
             "CUDA quantized_matmul: falling back to CPU for format {format:?} \
              (m={m}, k={k}, n={n})"
@@ -1052,14 +1023,11 @@ impl QuantOps for CudaDevice {
         };
 
         // Dequantize B using the canonical grim_quant function for `format`.
-        // CONTRACT: every arm must produce exactly `k * n` f32 values in
-        // row-major order matching the B[K, N] layout expected by the GEMM below.
+        // CONTRACT: every arm must produce exactly `k * n` f32 values in row-major order matching.
         let b_dequant: Vec<f32> = match format {
             grim_tensor::QuantFormat::Q8_0 => {
-                // Layout detection: if b_scales is non-empty with the correct length,
-                // use the simplified layout (raw u8 at 32-byte stride with external scales).
-                // Otherwise, check if the byte layout matches real packed Q8_0 (34-byte blocks
-                // with embedded f16 scales).
+                // Layout detection: if b_scales is non-empty with the correct length, use the simplified layout (raw u8 at 32-byte stride with external scales).
+                // Otherwise, check if the byte layout matches real packed Q8_0 (34-byte blocks with embedded f16.
                 let blocks_per_col = k / 32;
                 let real_packed_size = n * blocks_per_col * 34;
                 let use_simplified = !b_scales.is_empty() && b_scales.len() == n * blocks_per_col;
@@ -1185,7 +1153,6 @@ impl QuantOps for CudaDevice {
         ))
     }
 
-
     fn quantized_matmul_backward_dx(
         &self,
         dy: &dyn BackendStorage,
@@ -1235,16 +1202,7 @@ impl QuantOps for CudaDevice {
             cuda_dequant_quantized_storage(&b_bytes, b_scales, b_elem_count, &b_storage.dtype)?;
 
         // Re-upload B as F32, then compute dX = dY @ B^T directly via cuBLAS.
-        //
-        // The generic `matmul` cannot be reused here: its column-major
-        // transpose trick assumes the forward orientation (inner dim K is the
-        // leading dimension of B), which only holds when m == n == k and breaks
-        // for the backward shape dY[M,N] @ B^T[N,K] -> dX[M,K].
-        //
-        // Correct row-major GEMM for dX[M,K] = dY[M,N] @ B^T[N,K]:
-        //   C_col(K,M) = B_col(K,N) * A_col(N,M)
-        // where B^T row-major [N,K] read column-major is B [K,N] (lda = K), and
-        // dY row-major [M,N] read column-major is dY^T [N,M] (ldb = N).
+        // The generic `matmul` cannot be reused here: its column-major transpose trick assumes the forward orientation.
         let b_shape = b_storage.shape().clone();
         let (b_rows, b_cols) = (b_shape.dims()[0], b_shape.dims()[1]);
         let mut b_t = vec![0.0f32; b_elem_count];
@@ -1321,7 +1279,6 @@ impl QuantOps for CudaDevice {
         Ok((Box::new(dx_storage), compute_handle))
     }
 
-
     fn quantize(
         &self,
         x: &dyn BackendStorage,
@@ -1334,7 +1291,6 @@ impl QuantOps for CudaDevice {
         let out = self.quantize_on_device(x_storage, format)?;
         Ok(Box::new(out))
     }
-
 
     fn fused_quant_gemm(
         &self,
@@ -1392,8 +1348,7 @@ impl QuantOps for CudaDevice {
         }
         let (m, k) = (a_dims[0], a_dims[1]);
         // GGUF packed weight b is [out_dim, in_dim] = [N, K].
-        // In fused GEMM (A @ B^T), K matches b_dims[1] if b is untransposed [N, K],
-        // or b_dims[0] if b_dims was transposed to [K, N].
+        // In fused GEMM (A @ B^T), K matches b_dims[1] if b is untransposed [N, K],.
         let (n, k2) = if b_dims[0] == k {
             (b_dims[1], b_dims[0])
         } else {
@@ -1414,9 +1369,8 @@ impl QuantOps for CudaDevice {
         let out = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
         let out_ptr = Self::dev_ptr_or_err("fused_quant_gemm out", &out)?;
 
-        // For Q8_0, pass the packed unsigned char* directly — the new kernel
-        // (grim_fused_quant_gemm_q8_0_packed) reads f16 scales and i8 codes
-        // from the 34-byte blocks on-device.
+        // For Q8_0, pass the packed unsigned char* directly - the new kernel
+        // (grim_fused_quant_gemm_q8_0_packed) reads f16 scales and i8 codes from the 34-byte blocks on-device.
         let b_ptr = if format == grim_tensor::QuantFormat::Q8_0 {
             let b_storage = b
                 .as_any()
@@ -1441,7 +1395,6 @@ impl QuantOps for CudaDevice {
     }
 }
 
-
 impl grim_format::convert::GpuDequant for CudaDevice {
     fn dequantize(
         &self,
@@ -1460,4 +1413,3 @@ impl grim_format::convert::GpuDequant for CudaDevice {
         }
     }
 }
-

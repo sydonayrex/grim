@@ -1,18 +1,5 @@
 //! PyTorch `.pth` and TorchScript `.pt` checkpoint reader.
-//!
-//! Parses PyTorch ZIP containers (legacy `torch.save` archives and JIT
-//! exports — both store entries uncompressed) and interprets the pickle
-//! stream with a small stack VM so tensors come out with their real names,
-//! shapes, strides, and dtypes. Implements [`TensorProvider`] so
-//! `grim_nn::WeightSource` can load real checkpoints (e.g. the Kokoro-82M
-//! `.pth` under `models/audio/`) without a Python runtime.
-//!
-//! Supported pickle surface is the subset PyTorch emits for state dicts:
-//! `PROTO/FRAME`, marks + tuples/lists/dicts, `GLOBAL`/`STACK_GLOBAL`,
-//! `REDUCE` of `_rebuild_tensor_v2` / `_rebuild_tensor` /
-//! `_rebuild_parameter`, `BINPERSID` storage references, memo ops, and the
-//! integer/string/bool atom opcodes. Anything else degrades to an opaque
-//! value that is skipped during tensor extraction.
+//! Parses PyTorch ZIP containers (legacy `torch.save` archives and JIT exports - both store entries uncompressed).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -125,9 +112,7 @@ impl TensorProvider for PthProvider {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ZIP container (stored entries only — what torch.save / torch.jit emit)
-// ---------------------------------------------------------------------------
+// ZIP container (stored entries only - what torch.save / torch.jit emit)
 
 fn parse_zip_entries(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
     // Primary path: central directory (authoritative sizes, required for
@@ -135,9 +120,8 @@ fn parse_zip_entries(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
     if let Some(map) = parse_central_directory(bytes) {
         return Ok(map);
     }
-    // Fallback: streamed/truncated containers with no EOCD — walk local
-    // headers sequentially (only valid when sizes are inline, i.e. no
-    // data-descriptor flag).
+    // Fallback: streamed/truncated containers with no EOCD - walk local headers sequentially (only valid when sizes are inline, i.e.
+    // no data-descriptor flag).
     Ok(parse_local_headers(bytes))
 }
 
@@ -260,9 +244,7 @@ fn find_u32_le(bytes: &[u8], sig: u32) -> Option<usize> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pickle stack VM
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -732,9 +714,7 @@ fn ints_of(v: &Val) -> Vec<i64> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tensor extraction from the unpickled object graph
-// ---------------------------------------------------------------------------
 
 fn elem_size_and_dtype(dtype_key: &str) -> Option<(usize, DType)> {
     let native = |arith: ArithType| DType {

@@ -1,9 +1,5 @@
 //! Qwen2-VL vision-language multimodal transformer with ViT encoder and M-RoPE.
-//!
-//! # Architecture Details
-//! - **ViT Vision Encoder**: Window-attention transformer with spatial merging and projection into text space.
-//! - **Multimodal RoPE (M-RoPE)**: 3-dimensional rotary position encoding partitioned into temporal, height, and width components `[16, 24, 24]`.
-//! - **Text Backbone**: GQA transformer with SwiGLU activations and RMSNorm pre-layer normalization.
+//! # Architecture Details - **ViT Vision Encoder**: Window-attention transformer with spatial merging and projection into.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -11,9 +7,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Tensor};
 
-// ---------------------------------------------------------------------------
 // Vision Config & Encoder
-// ---------------------------------------------------------------------------
 
 /// Configuration for Qwen2-VL visual feature extraction backbone.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,9 +76,7 @@ impl Qwen2VlVisionEncoder {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Qwen2-VL text-vision model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -144,9 +136,7 @@ impl ModelConfig for Qwen2VlConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 /// Transformer layer with GQA attention and M-RoPE position embedding.
 pub struct Qwen2VlBlock {
@@ -224,9 +214,8 @@ impl Qwen2VlBlock {
         })
     }
 
-    /// GPU-first forward: Q/K/V, RoPE, KV-cache concat, attention and the
-    /// SwiGLU MLP all run on the tensor's device. Host paths are only
-    /// reached through the fused-kernel fallback guards.
+    /// GPU-first forward: Q/K/V, RoPE, KV-cache concat, attention and the SwiGLU MLP all run on the tensor's device.
+    /// Host paths are only reached through the fused-kernel fallback guards.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -240,12 +229,8 @@ impl Qwen2VlBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -292,9 +277,7 @@ impl Qwen2VlBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 /// Full Qwen2-VL model with vision encoder and language model decoder.
 pub struct Qwen2Vl {

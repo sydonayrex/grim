@@ -1,30 +1,5 @@
 //! Fused RMSNorm + MXFP4 GEMM + RoPE and Tiled MXFP4 GEMM HIP kernels for ROCm.
-//!
-//! Implements high-throughput Microscaling FP4 (OCP MXFP4: 4-bit E2M1 codes +
-//! 8-bit E8M0 shared exponents per 32-element micro-block) matrix multiplication:
-//!
-//! 1. `grim_fused_rmsnorm_mxfp4_gemm_rope_kv`: End-to-end fused attention projection
-//!    (RMSNorm -> MXFP4 GEMM -> RoPE -> direct VRAM write / KV-cache update).
-//! 2. `grim_fused_rmsnorm_mxfp4_gemm`: Fused MLP projection (RMSNorm -> MXFP4 GEMM).
-//! 3. `grim_mxfp4_gemm_tiled`: Tiled 2D batched GEMM for standalone MXFP4 linear layers.
-//! 4. `grim_mxfp4_backward_gemm`: Backward GEMM (dX = dY @ B^T) dequantizing B on-the-fly.
-//! 5. `grim_mxfp4_gemm_splitk` + `grim_mxfp4_splitk_reduce`: split-K pair for
-//!    skinny-M decode GEMMs (M <= 8), where a plain (M, N/threads) grid leaves
-//!    most CUs idle.
-//!
-//! Perf notes (decode-path review):
-//! - Weight codes are read as `uint4` (16 B = 32 codes = exactly one MXFP4
-//!   micro-block) instead of 16 scalar byte loads.
-//! - Activations are read as `float4` (K is a multiple of 32, so offsets stay
-//!   16B-aligned; the launcher validates this).
-//! - The E8M0 block scale is computed once per 32-element block
-//!   (`exp2f(e - 127)`) instead of calling `ldexpf` per element.
-//! - RoPE pairs: the partner column's GEMM result is fetched from the adjacent
-//!   lane with one `__shfl_xor_sync` instead of recomputing the entire K-long
-//!   dot product (which used to double the QK GEMM cost for rotary dims).
-//!   Warp bases are multiples of 32 (blockDim.x is a power of two >= 32) and
-//!   RoPE pairs are adjacent (2i, 2i+1), so both lanes of a pair always live
-//!   in the same warp.
+//! Implements high-throughput Microscaling FP4 (OCP MXFP4: 4-bit E2M1 codes + 8-bit E8M0 shared exponents per.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
@@ -48,11 +23,8 @@ __device__ __forceinline__ float mxfp4_block_scale(unsigned char shared_exp) {
     return exp2f((float)(int)shared_exp - 127.0f);
 }
 
-// Accumulate one 32-element MXFP4 micro-block into `acc`, vectorizing the
-// code stream as one uint4 (16 B) and the activation stream as float4s.
-// `a_row` points at A[row*K + block_k*32] (as float4*); `gamma4` optionally
-// points at gamma[block_k*32] (as float4*) and is applied elementwise (null
-// for the un-normalized kernels).
+// Accumulate one 32-element MXFP4 micro-block into `acc`, vectorizing the code stream as one uint4 (16 B) and the activation stream as float4s.
+// `a_row` points at A[row*K + block_k*32] (as float4*); `gamma4` optionally points at gamma[block_k*32] (as float4*).
 __device__ __forceinline__ float mxfp4_dot_block(
     const float4* __restrict__ a_row,
     const float4* __restrict__ gamma4,        // may be null
@@ -89,19 +61,8 @@ __device__ __forceinline__ float mxfp4_dot_block(
     return acc;
 }
 
-// ---------------------------------------------------------------------------
-// 1. Fused RMSNorm + MXFP4 QKV GEMM + RoPE + Direct KV Cache Scatter
-// ---------------------------------------------------------------------------
-//
-// Fuses:
-//   1. In-LDS RMSNorm: x_norm = (x / rms(x)) * gamma
-//   2. On-the-fly MXFP4 GEMM for Q, K, V projections
-//   3. In-register Rotary Position Embedding (RoPE) for Q and K
-//   4. Direct scatter to VRAM Q buffer and persistent VRAM KV cache (K, V)
-//
-// Grid: (M, (N_q + N_k + N_v + 31) / 32)
-// Block: (32, 1) or (64, 1) or (256, 1)
-// ---------------------------------------------------------------------------
+// 1. Fused RMSNorm + MXFP4 QKV GEMM +
+// RoPE + Direct KV Cache Scatter Fuses: 1.
 __global__ void __launch_bounds__(256)
 grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
     const float* __restrict__ x,                // [M, K]
@@ -176,9 +137,8 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
             scale,
             acc);
     }
-    // Apply the RMSNorm scale post-accumulation (mathematically identical to
-    // normalizing x per element: rms factors out of the dot product; gamma
-    // does NOT factor out and is applied inside the block helper).
+    // Apply the RMSNorm scale post-accumulation (mathematically identical to normalizing x per element: rms factors out
+    // of the dot product; gamma does NOT factor out and is applied inside the block helper).
     acc *= rms;
 
     // Phase 3 & 4: RoPE rotation and direct scatter to Q / KV Cache
@@ -205,9 +165,8 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
             cos_a *= mscale;
             sin_a *= mscale;
 
-            // Partner GEMM result lives in the adjacent lane (col ^ 1); both
-            // lanes of a RoPE pair are in the same warp, so one shuffle
-            // replaces the full partner-column dot-product recompute.
+            // Partner GEMM result lives in the adjacent lane (col ^ 1); both lanes of a
+            // RoPE pair are in the same warp, so one shuffle replaces the full partner-column dot-product recompute.
             float partner_acc = __shfl_xor(acc, 1, warpSize);
 
             if (is_odd) {
@@ -257,9 +216,7 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
     }
 }
 
-// ---------------------------------------------------------------------------
-// 2. Fused RMSNorm + MXFP4 GEMM (e.g. for MLP gate/up/down projections)
-// ---------------------------------------------------------------------------
+// 2. Fused RMSNorm + MXFP4 GEMM (e.g.
 __global__ void __launch_bounds__(256)
 grim_fused_rmsnorm_mxfp4_gemm(
     const float* __restrict__ x,                // [M, K]
@@ -321,9 +278,7 @@ grim_fused_rmsnorm_mxfp4_gemm(
     out[row * N + col] = acc;
 }
 
-// ---------------------------------------------------------------------------
 // 3. Tiled 2D MXFP4 GEMM (Standalone Linear Matmul C = A @ B)
-// ---------------------------------------------------------------------------
 __global__ void __launch_bounds__(256)
 grim_mxfp4_gemm_tiled(
     const float* __restrict__ A,                // [M, K]
@@ -358,13 +313,8 @@ grim_mxfp4_gemm_tiled(
     C[row * N + col] = acc;
 }
 
-// ---------------------------------------------------------------------------
-// 3b. Split-K MXFP4 GEMM for skinny-M decode (M <= 8)
-// ---------------------------------------------------------------------------
-// With M=1 a plain (N/threads) grid occupies only a handful of CUs. Slice K
-// across `gridDim.z` splits, write per-split partials, then reduce. The
-// reduction kernel below sums the splits in a fixed order, keeping results
-// deterministic across launches.
+// 3b. Split-K MXFP4 GEMM for skinny-M decode (M <= 8) With
+// M=1 a plain (N/threads) grid occupies only a handful of CUs.
 __global__ void __launch_bounds__(64)
 grim_mxfp4_gemm_splitk(
     const float* __restrict__ A,                // [M, K]
@@ -424,18 +374,8 @@ grim_mxfp4_splitk_reduce(
     C[idx] = acc;
 }
 
-// ---------------------------------------------------------------------------
-// LFM2-style: per-head QK-Norm + RoPE (consumes a raw QKV GEMM output)
-// ---------------------------------------------------------------------------
-// Fuses the post-projection normalization used by QK-norm models (e.g. LFM2):
-//   1. Per-head RMSNorm over `head_dim` applied to Q and K (using gamma_qk)
-//   2. Rotary Position Embedding (RoPE), YaRN-aware via inv_freq + mscale
-//   3. Scatter to q_out / k_cache / v_cache (V is copied raw, unnormalized)
-// The raw QKV `gemm_out = x @ W_qkv` is produced by a separate GEMM launch
-// (see `grim_mxfp4_gemm_tiled` + the backend launcher). This split keeps the
-// per-head reduction (which needs the whole head vector) out of the GEMM grid.
-// Grid: (M * (num_q_heads + 2*num_kv_heads) + 63) / 64 threads, block 64.
-// ---------------------------------------------------------------------------
+// LFM2-style: per-head QK-Norm + RoPE (consumes a raw QKV GEMM output) Fuses the post-projection normalization used by QK-norm models (e.g.
+// LFM2): 1.
 __global__ void __launch_bounds__(256)
 grim_qk_norm_rope(
     const float* __restrict__ gemm_out,   // [M, N_total] raw QKV (N_total = N_q + 2*N_k)
@@ -537,16 +477,8 @@ grim_qk_norm_rope(
     }
 }
 
-// ---------------------------------------------------------------------------
-// 4. Backward MXFP4 GEMM (dA = dY @ B^T)
-// ---------------------------------------------------------------------------
-// Coalescing fix: the naive one-thread-per-(row,k) form strides through
-// B_codes[n][block_k] with a K/2-byte stride per n — the worst possible
-// access pattern. This form has each thread own up to 32 consecutive k
-// (one micro-block row of dA) and walk N in the inner loop: dY[row, n] is
-// contiguous in n (coalesced across the warp's rows share), and each
-// 16-byte code group / exponent byte is loaded once per thread instead of
-// once per element.
+// 4. Backward MXFP4 GEMM (dA = dY @ B^T) Coalescing fix: the naive one-thread-per-(row,k) form
+// strides through B_codes[n][block_k] with a K/2-byte stride per n - the worst possible access pattern.
 __global__ void __launch_bounds__(256)
 grim_mxfp4_backward_gemm(
     const float* __restrict__ dY,               // [M, N]
@@ -598,6 +530,113 @@ grim_mxfp4_backward_gemm(
     }
 }
 
+// 5. Fused NVFP4 GEMV with LDS caching and cooperative Wave reduction (M=1..4)
+// Layout per 16 weights: 9 bytes (1 byte E8M0 scale + 8 bytes 4-bit codes).
+__global__ void __launch_bounds__(256)
+grim_nvfp4_gemv(
+    const float* __restrict__ A,                // [M, K]
+    const unsigned char* __restrict__ B_packed, // [N, (K/16)*9]
+    float* __restrict__ C,                      // [M, N]
+    int M,
+    int N,
+    int K
+) {
+    // 1 CTA handles one (row, col) output dot-product or 1 col with 256 threads cooperating.
+    const int col = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= M || col >= N) return;
+
+    __shared__ float s_red[256];
+    const int tid = threadIdx.x;
+    const int blocks_per_col = K / 16;
+    const size_t col_bytes_stride = (size_t)blocks_per_col * 9;
+    const unsigned char* b_col = B_packed + (size_t)col * col_bytes_stride;
+    const float* a_row = A + (size_t)row * K;
+
+    float acc = 0.0f;
+
+    // Grid-stride over 16-element sub-blocks
+    for (int b = tid; b < blocks_per_col; b += blockDim.x) {
+        const unsigned char* blk = b_col + (size_t)b * 9;
+        float scale = mxfp4_block_scale(blk[0]);
+        const unsigned char* codes = blk + 1;
+        const float* a_ptr = a_row + b * 16;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned char c_byte = codes[i];
+            float w0 = MXFP4_E2M1_LUT[c_byte & 0x0F] * scale;
+            float w1 = MXFP4_E2M1_LUT[(c_byte >> 4) & 0x0F] * scale;
+            acc += a_ptr[i * 2 + 0] * w0;
+            acc += a_ptr[i * 2 + 1] * w1;
+        }
+    }
+
+    // Cooperative reduction using RDNA Wave shuffle (Wave32 or Wave64)
+    #pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        acc += __shfl_down(acc, offset, warpSize);
+    }
+
+    const int lane = tid % warpSize;
+    const int wid = tid / warpSize;
+    if (lane == 0) {
+        s_red[wid] = acc;
+    }
+    __syncthreads();
+
+    // Final inter-wave reduction in LDS by first wave
+    if (wid == 0) {
+        int num_warps = blockDim.x / warpSize;
+        float wave_sum = (lane < num_warps) ? s_red[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+            wave_sum += __shfl_down(wave_sum, offset, warpSize);
+        }
+        if (lane == 0) {
+            C[(size_t)row * N + col] = wave_sum;
+        }
+    }
+}
+
+// 6. Tiled NVFP4 GEMM (M > 4 batch GEMM)
+__global__ void __launch_bounds__(256)
+grim_nvfp4_gemm_tiled(
+    const float* __restrict__ A,                // [M, K]
+    const unsigned char* __restrict__ B_packed, // [N, (K/16)*9]
+    float* __restrict__ C,                      // [M, N]
+    int M,
+    int N,
+    int K
+) {
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    const int blocks_per_col = K / 16;
+    const size_t col_bytes_stride = (size_t)blocks_per_col * 9;
+    const unsigned char* b_col = B_packed + (size_t)col * col_bytes_stride;
+    const float* a_row = A + (size_t)row * K;
+
+    float acc = 0.0f;
+    for (int b = 0; b < blocks_per_col; ++b) {
+        const unsigned char* blk = b_col + (size_t)b * 9;
+        float scale = mxfp4_block_scale(blk[0]);
+        const unsigned char* codes = blk + 1;
+        const float* a_ptr = a_row + b * 16;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned char c_byte = codes[i];
+            float w0 = MXFP4_E2M1_LUT[c_byte & 0x0F] * scale;
+            float w1 = MXFP4_E2M1_LUT[(c_byte >> 4) & 0x0F] * scale;
+            acc += a_ptr[i * 2 + 0] * w0 + a_ptr[i * 2 + 1] * w1;
+        }
+    }
+
+    C[(size_t)row * N + col] = acc;
+}
+
 } // extern "C"
 "#;
 
@@ -611,10 +650,13 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_fused_rmsnorm_mxfp4_gemm"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_gemm_tiled"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_backward_gemm"));
+        assert!(KERNEL_SOURCE.contains("grim_nvfp4_gemv"));
+        assert!(KERNEL_SOURCE.contains("grim_nvfp4_gemm_tiled"));
         assert!(KERNEL_SOURCE.contains("mxfp4_decode_fast"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_gemm_splitk"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_splitk_reduce"));
         assert!(KERNEL_SOURCE.contains("__shfl_xor"));
+        assert!(KERNEL_SOURCE.contains("__shfl_down"));
         assert!(KERNEL_SOURCE.contains("mxfp4_block_scale"));
     }
 }

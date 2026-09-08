@@ -1,21 +1,10 @@
 //! Preshuffled Vector-Tiled KV-Cache Attention for ROCm (AITER Layout Parity).
-//!
-//! Organizes KV cache into vector-tiled 128-bit memory segments (float4 stride):
-//! - K_cache: [num_blocks, num_heads, head_dim / 4, block_size, 4]
-//! - V_cache: [num_blocks, num_heads, block_size / 4, head_dim, 4]
-//!
-//! Enabling zero-conversion, maximum-bandwidth vector loads across AMD CDNA & RDNA.
+//! Organizes KV cache into vector-tiled 128-bit memory segments (float4 stride): - K_cache: [num_blocks, num_heads, head_dim.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// Reshape and Cache into Preshuffled Layout
-// ---------------------------------------------------------------------------
-//
-// Grid: (num_tokens, num_heads)
-// Block: (head_dim, 1)
-// ---------------------------------------------------------------------------
+// Reshape and Cache into Preshuffled Layout Grid: (num_tokens, num_heads) Block: (head_dim, 1)
 __global__ void grim_reshape_and_cache_preshuffled(
     const float* __restrict__ key,         // [num_tokens, num_heads, head_dim]
     const float* __restrict__ value,       // [num_tokens, num_heads, head_dim]
@@ -56,15 +45,8 @@ __global__ void grim_reshape_and_cache_preshuffled(
     v_cache[v_cache_idx] = v_val;
 }
 
-// ---------------------------------------------------------------------------
-// Preshuffled Paged Attention Decode Kernel
-// ---------------------------------------------------------------------------
-//
-// Reads preshuffled K and V caches with aligned 128-bit vector loads.
-//
-// Grid: (num_seqs, num_heads)
-// Block: (head_dim, 1)
-// ---------------------------------------------------------------------------
+// Preshuffled Paged Attention Decode Kernel Reads preshuffled K and V caches with aligned 128-bit vector loads.
+// Grid: (num_seqs, num_heads) Block: (head_dim, 1)
 __global__ void grim_preshuffled_paged_attention(
     const float* __restrict__ q,              // [num_seqs, num_heads, head_dim]
     const float* __restrict__ k_cache,        // [num_blocks, num_heads, head_dim / 4, block_size, 4]

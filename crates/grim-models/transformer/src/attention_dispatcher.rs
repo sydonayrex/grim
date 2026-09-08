@@ -1,8 +1,5 @@
 //! Universal 3-Tier Attention Dispatcher for GRIM.
-//!
-//! Routes multi-head, grouped-query, DeepSeek MLA, Paged Quantized KV,
-//! and SageAttention requests across hardware matrix cores, universal compute shaders,
-//! and CPU fallback implementations.
+//! Routes multi-head, grouped-query, DeepSeek MLA, Paged Quantized KV, and SageAttention requests across hardware matrix cores,.
 
 use grim_tensor::dtype::QuantFormat;
 use grim_tensor::tensor::Tensor;
@@ -94,25 +91,7 @@ impl AttentionDispatcher {
     }
 
     /// Execute a StandardGqa attention request end-to-end.
-    ///
-    /// This is the wiring point between the dispatcher's tier classification
-    /// and actual execution: the shared fused-or-scalar path
-    /// (`shared_attention::fused_or_scalar_attention`) tries the device
-    /// kernel (`BackendDevice::qkv_attention` — Tier 1/2 depending on the
-    /// backend's implementation) and falls back to the reference scalar loop
-    /// (Tier 3) when the backend returns `Unimplemented`. The selected tier
-    /// is returned alongside the result for logging/telemetry.
-    ///
-    /// Non-GQA topologies (MLA, paged-quantized, Sage) are dispatched by
-    /// their owning paths: MLA via `BackendDevice::mla_absorbed_decode` in
-    /// the DeepSeek loaders, paged via `block.rs::paged_self_attention`,
-    /// Sage via the ROCm `sage_attention` entry.
-    /// `has_hardware_matrix` is CALLER-SUPPLIED (audit M10): the dispatcher
-    /// cannot know the backend's matrix-core support from a `Device` enum
-    /// alone, and the previous hardcoded `false` made the returned tier
-    /// claim Tier2 even when the fused kernel ran on hardware matrix cores.
-    /// Pass the capability you queried from the backend; CPU devices still
-    /// always classify Tier3.
+    /// This is the wiring point between the dispatcher's tier classification and actual execution: the shared.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_gqa(
         q: &[f32],

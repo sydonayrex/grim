@@ -1,9 +1,5 @@
 //! Frecency-based file ranking for autocomplete.
-//!
-//! Borrowed from the opencode-dev pattern: track file open frequency +
-//! recency and use it to rank autocomplete suggestions. Higher score = more
-//! likely to be relevant. Score decays with time so recently-opened files
-//! rank above historically-frequent but stale ones.
+//! Borrowed from the opencode-dev pattern: track file open frequency + recency and use it to.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,10 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Maximum number of entries to retain.
 const MAX_ENTRIES: usize = 1000;
 
-/// A frecency tracker for file paths.
-///
-/// Stores frequency + last-open-timestamp per path. Scores are computed on
-/// read so the ranking always reflects current time.
+/// A frecency tracker for file paths. Stores frequency + last-open-timestamp per path.
 #[derive(Debug, Clone, Default)]
 pub struct Frecency {
     entries: HashMap<String, FrecencyEntry>,
@@ -79,7 +72,9 @@ impl Frecency {
     pub fn rank(&self, a: &str, b: &str) -> std::cmp::Ordering {
         let score_a = self.score(a);
         let score_b = self.score(b);
-        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 
     /// Number of tracked entries.
@@ -124,8 +119,7 @@ impl Frecency {
 }
 
 /// Calculate frecency score: frequency / (1 + days_since_open).
-/// A file opened 10 times today scores ~10. A file opened 10 times 10 days
-/// ago scores ~1.0.
+/// A file opened 10 times today scores ~10.
 fn calculate_score(frequency: u64, last_open_millis: u64) -> f64 {
     let now = unix_millis();
     let days_since = (now.saturating_sub(last_open_millis)) as f64 / 86_400_000.0;
@@ -169,7 +163,10 @@ mod tests {
         f.record_open("rare.txt");
 
         assert_eq!(f.rank("popular.txt", "rare.txt"), std::cmp::Ordering::Less); // popular first
-        assert_eq!(f.rank("rare.txt", "popular.txt"), std::cmp::Ordering::Greater);
+        assert_eq!(
+            f.rank("rare.txt", "popular.txt"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]

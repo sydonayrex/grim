@@ -1,26 +1,5 @@
-//! Mixture-of-Experts primitives.
-//!
-//! This module provides the architecture-agnostic building blocks for MoE
-//! inference: an [`ExpertBank`] (per-expert feed-forward triples), an
-//! [`MoeRouter`] (softmax-top-k or sigmoid+bias-top-k gating), and an
-//! [`MoeFfn`] that routes tokens to selected experts and combines their
-//! outputs (plus an optional shared expert).
-//!
-//! Design notes (per the project's verifiable-correctness discipline):
-//!
-//! * The forward path implemented here is the **correct-but-unoptimized CPU
-//!   reference**. It materializes each selected expert's contribution and
-//!   weighted-sums them. A fused/grouped GPU GEMM (WI-M5) is a separate,
-//!   non-blocking performance item and must remain parity-checked against this
-//!   reference.
-//! * Router math (softmax / sigmoid / top-k / bias-application) is computed in
-//!   host Rust over the gate logits pulled to CPU. This keeps the selection
-//!   logic unit-testable with hand-computed expectations and avoids depending
-//!   on backend kernels that may not exist on every device.
-//! * No architecture-specific naming or assumptions leak in here. Per-arch
-//!   differences (router kind, shared expert presence, top-k, tensor name
-//!   mapping) are supplied by the caller (`architecture.rs` map + the per-arch
-//!   loader in `grim-models-transformer`).
+//! Mixture-of-Experts primitives. This module provides the architecture-agnostic building blocks for MoE inference: an [`ExpertBank`] (per-expert feed-forward triples), an [`MoeRouter`] (softmax-top-k
+//! or sigmoid+bias-top-k gating), and an [`MoeFfn`] that routes tokens to selected experts and combines their outputs (plus an optional shared expert).
 
 use grim_backend_cpu::cpu_tensor;
 #[cfg(feature = "cuda-mem")]
@@ -38,28 +17,20 @@ use grim_tensor::dtype::{
 };
 
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendStorage, Device, Tensor,
-    CoreTensorOps,
-};
+use grim_tensor::{BackendStorage, CoreTensorOps, Device, Tensor};
 use std::sync::Arc;
 
 use crate::modules::{ExpertParallelConfig, Linear};
 use crate::varbuilder::WeightSource;
 
-// ---------------------------------------------------------------------------
 // Router
-// ---------------------------------------------------------------------------
 
-/// Router gating strategy. `SoftmaxTopK` covers Qwen2/3-MoE, GLM4-MoE,
-/// Granite-MoE, etc. `SigmoidTopKWithBias` covers Laguna (sigmoid gate logits
-/// plus a learned per-expert bias added **at selection time only**, never to
-/// the combine weights).
+/// Router gating strategy. `SoftmaxTopK` covers Qwen2/3-MoE, GLM4-MoE, Granite-MoE, etc.
 #[derive(Debug, Clone)]
 pub enum RouterKind {
     SoftmaxTopK,
-    /// Sigmoid gate logits plus a learned per-expert bias added **at selection
-    /// time only**, never to the combine weights. The bias tensor itself is
-    /// loaded from the checkpoint (`exp_probs_b`) and passed to `MoeRouter::new`.
+    /// Sigmoid gate logits plus a learned per-expert bias added **at selection time only**, never to the combine weights.
+    /// The bias tensor itself is loaded from the checkpoint (`exp_probs_b`) and passed to `MoeRouter::new`.
     SigmoidTopKWithBias,
 }
 
@@ -108,13 +79,8 @@ impl MoeRouter {
         }
     }
 
-    /// Route a `[batch, hidden]` input.
-    ///
-    /// Returns, per token, the selected expert indices and their combine
-    /// weights (already normalized over the selected set). The selection for
-    /// `SigmoidTopKWithBias` adds the correction bias to the sigmoid scores
-    /// *only* for ranking; the returned combine weights are the unbiased
-    /// sigmoid values of the selected experts.
+    /// Route a `[batch, hidden]` input. Returns, per token, the selected expert
+    /// indices and their combine weights (already normalized over the selected set).
     #[allow(clippy::type_complexity)]
     pub fn route(
         &self,
@@ -151,13 +117,7 @@ impl MoeRouter {
             order.sort_by(|&a, &b| sel_scores[b].partial_cmp(&sel_scores[a]).unwrap());
             let chosen = &order[..k];
 
-            // Combine weights.
-            //   * SoftmaxTopK: the softmax probabilities over the chosen
-            //     logits (inherently normalized).
-            //   * SigmoidTopKWithBias: the **unbiased** sigmoid gate values of
-            //     the chosen experts, used directly as combine weights (NOT
-            //     renormalized). The correction bias is applied only at
-            //     selection time, above — never to the combine weights.
+            // Combine weights. * SoftmaxTopK: the softmax probabilities over the chosen logits (inherently normalized).
             let raw: Vec<f32> = match &self.kind {
                 RouterKind::SoftmaxTopK => {
                     let logits: Vec<f32> = chosen.iter().map(|&i| row[i]).collect();
@@ -175,9 +135,7 @@ impl MoeRouter {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Expert bank
-// ---------------------------------------------------------------------------
 
 /// Holds the per-expert SwiGLU feed-forward triples `{gate, up, down}`.
 pub struct ExpertBank {
@@ -186,21 +144,11 @@ pub struct ExpertBank {
     pub down: Vec<Linear>,
 }
 
-// ── Quant workstream: per-expert bank splitters ──────────────────────────────
-//
-// These decompress/split BANK-level packed blobs (Storage::W4A16 /
-// Storage::GroupInt / Storage::WNA16) into per-expert slabs for
-// `ExpertBank::load_quantized`. W4A16 and GPTQ stay packed per expert —
-// `Linear::forward` -> `quantized_matmul` routes their storage dtypes to the
-// marlin/gptq fused kernels by dtype match. WNA16 has no packed GEMM yet, so
-// its experts dequantize on host here (documented load-time strategy).
+// ── Quant workstream: per-expert bank splitters ────────────────────────────── These decompress/split BANK-level packed blobs (Storage::W4A16 / Storage::GroupInt / Storage::WNA16) into per-expert slabs for `ExpertBank::load_quantized`.
+// W4A16 and GPTQ stay packed per expert - `Linear::forward` -> `quantized_matmul` routes their storage dtypes.
 
 /// Split a Marlin-style W4A16 bank into per-expert blobs.
-///
-/// Bank layout (`Storage::W4A16` contract, N = num_experts * out rows):
-/// `[codes (N*K/8) u32 LE][scales (N*groups) f32 LE]`. Both segments are
-/// row-major over OUTPUT channels, so expert e's slab is two contiguous
-/// sub-slices reassembled as `[codes_e][scales_e]`.
+/// Bank layout (`Storage::W4A16` contract, N = num_experts * out rows): `[codes (N*K/8) u32 LE][scales (N*groups).
 pub(crate) fn w4a16_split_bank(
     bytes: &[u8],
     num_experts: usize,
@@ -238,11 +186,8 @@ pub(crate) fn w4a16_split_bank(
     Ok(blobs)
 }
 
-/// Split an AWQ bank into per-expert three-segment prefixed blobs:
-/// `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales (f16)]`.
-///
+/// Split an AWQ bank into per-expert three-segment prefixed blobs: `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales (f16)]`.
 /// AWQ weights are packed column-major over `[K, N]` where `N = num_experts * out`.
-/// Each expert owns column range `[e * out, (e + 1) * out)`.
 pub(crate) fn awq_split_bank(
     bytes: &[u8],
     bits: u8,
@@ -415,13 +360,8 @@ pub(crate) fn w8a8_fp8_split_bank(
     Ok(blobs)
 }
 
-/// Split a GPTQ/GroupInt bank into per-expert four-segment prefixed blobs
-/// matching `roc_device::gptq_segment_offsets`:
-/// `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales][u64 gi_len][g_idx]`.
-///
-/// Expert e owns output columns [e*n_e, (e+1)*n_e) of the [K, N]-packed
-/// weight. Requires n_e divisible by values-per-word so packed words never
-/// straddle experts. g_idx is shared across experts and copied whole.
+/// Split a GPTQ/GroupInt bank into per-expert four-segment prefixed blobs matching `roc_device::gptq_segment_offsets`: `[u64 qw_len][qweight][u64 qz_len][qzeros][u64 sc_len][scales][u64 gi_len][g_idx]`.
+/// Expert e owns output columns [e*n_e, (e+1)*n_e) of the [K, N]-packed weight.
 pub(crate) fn gptq_split_bank(
     bytes: &[u8],
     bits: u8,
@@ -467,11 +407,8 @@ pub(crate) fn gptq_split_bank(
         let c0 = e * out;
         let mut blob = Vec::new();
 
-        // qweight: ONE u32 word per (K-chunk, column); each word packs vpw
-        // consecutive in_idx codes for that column. Layout is
-        // [K/vpw chunks][N words] — so each expert's run is `out` whole
-        // words per chunk at column offset c0 (contiguous because we require
-        // out % vpw == 0).
+        // qweight: ONE u32 word per (K-chunk, column); each word packs vpw consecutive in_idx codes for that column.
+        // Layout is [K/vpw chunks][N words] - so each expert's run is `out` whole words per.
         blob.extend_from_slice(&u64le(k.div_ceil(vpw) * out * 4));
         for chunk in 0..k.div_ceil(vpw) {
             let src = qw_data + chunk * n * 4 + c0 * 4;
@@ -506,10 +443,8 @@ pub(crate) fn gptq_split_bank(
     Ok(blobs)
 }
 
-/// WNA16 has no packed GEMM yet: dequantize on host at load time (the
-/// documented strategy for backends without a fused kernel). Blob layout:
-/// `[u32 n_bit][u32 blocks][codes MSB-first][f16 block scales][f32 ts]`,
-/// 256-weight blocks. Returns NATIVE-F32 per-expert slabs.
+/// WNA16 has no packed GEMM yet: dequantize on host at load time (the documented strategy for backends without a fused kernel).
+/// Blob layout: `[u32 n_bit][u32 blocks][codes MSB-first][f16 block scales][f32 ts]`, 256-weight blocks.
 pub(crate) fn wna16_split_or_dequant(
     bytes: &[u8],
     num_experts: usize,
@@ -597,17 +532,8 @@ impl ExpertBank {
         self.gate.len()
     }
 
-    /// Load experts from a GGUF-style 3D weight layout. Matches the in-repo
-    /// Lfm2 MoE loader's naming and layout convention:
-    ///   `ffn_gate_exps.weight` = `[n_experts, inter, hidden]`
-    ///   `ffn_up_exps.weight`   = `[n_experts, inter, hidden]`
-    ///   `ffn_down_exps.weight` = `[n_experts, hidden, inter]`
-    /// (experts are the OUTERMOST dimension).
-    ///
-    /// Quantized checkpoints (KQuant / FloatPack / MXFP4 / ...) keep each
-    /// expert's packed bytes resident on the target device — no full-model
-    /// host-f32 mirror is materialized. Native (F32/F16/BF16) checkpoints use
-    /// the host-f32 path.
+    /// Load experts from a GGUF-style 3D weight layout.
+    /// Matches the in-repo Lfm2 MoE loader's naming and layout convention: `ffn_gate_exps.weight` = `[n_experts, inter, hidden]`.
     pub fn load(
         ws: &WeightSource<'_>,
         num_experts: usize,
@@ -630,14 +556,8 @@ impl ExpertBank {
         )
     }
 
-    /// Load experts from a GGUF-style 3D weight layout where ALL three tensors
-    /// (gate/up/down) are stored as `[n_experts, hidden, inter]` (Mellum2 /
-    /// Unsloth-quantized GGUFs).
-    ///
-    /// Each expert's `[hidden, inter]` block is sliced out. Gate/up are
-    /// transposed to `[inter, hidden]` for the Linear (in=inter, out=hidden).
-    /// Down is used as-is (already `[hidden, inter]`, correct for Linear
-    /// out=hidden, in=inter).
+    /// Load experts from a GGUF-style 3D weight layout where ALL three tensors (gate/up/down) are stored as `[n_experts, hidden, inter]` (Mellum2 / Unsloth-quantized GGUFs).
+    /// Each expert's `[hidden, inter]` block is sliced out.
     pub fn load_transposed(
         ws: &WeightSource<'_>,
         num_experts: usize,
@@ -659,13 +579,7 @@ impl ExpertBank {
         )
     }
 
-    /// Shared loader. `projections` lists `(tensor_name, out_dim, in_dim)` per
-    /// projection as stored per-expert in the checkpoint.
-    ///
-    /// GGUF stores `ne` fastest-first, so a tensor with file dims
-    /// `[in, out, n_experts]` reads back as `[n_experts, out, in]` and each
-    /// expert's `out * in` elements are contiguous in the packed stream — the
-    /// slice math is identical for every projection.
+    /// Shared loader. `projections` lists `(tensor_name, out_dim, in_dim)` per projection as stored per-expert in the checkpoint.
     fn load_impl(
         ws: &WeightSource<'_>,
         num_experts: usize,
@@ -693,12 +607,8 @@ impl ExpertBank {
     ) -> Result<Self, grim_tensor::error::Error> {
         use grim_tensor::dtype::{FloatPackScheme, Storage};
 
-        // Process ONE projection at a time. Each projection's full packed bank
-        // is fetched, sliced across all `num_experts`, and fully consumed
-        // before the next projection's bank is fetched — so at most ONE full
-        // packed bank (not three) is resident at once. This bounds peak
-        // packed-byte RSS to ~1.4 GB/layer for Mellum2-class MoE instead of
-        // ~4.2 GB and fixes the OOM that previously killed the load mid-way.
+        // Process ONE projection at a time. Each projection's full packed bank is fetched, sliced across all `num_experts`, and fully consumed
+        // before the next projection's bank is fetched - so at most ONE full packed bank (not three) is resident at once.
         let mut gate = Vec::with_capacity(num_experts);
         let mut up = Vec::with_capacity(num_experts);
         let mut down = Vec::with_capacity(num_experts);
@@ -721,13 +631,8 @@ impl ExpertBank {
                 Storage::FloatPack(FloatPackScheme::MxFp4)
             );
 
-            // Quant workstream wiring: per-expert extraction for the
-            // compressed-tensors formats. W4A16 and GroupInt (GPTQ) stay
-            // packed per expert — `Linear::forward` -> `quantized_matmul`
-            // routes them to the marlin/gptq fused kernels by storage dtype.
-            // WNA16 has no packed GEMM yet, so its experts are dequantized on
-            // host here (load-time strategy; a device dequant service exists
-            // for resident-blob use in grim-backend-rocm).
+            // Quant workstream wiring: per-expert extraction for the compressed-tensors formats.
+            // W4A16 and GroupInt (GPTQ) stay packed per expert - `Linear::forward` -> `quantized_matmul` routes them to.
             let per_expert_blobs: Option<Vec<Vec<u8>>> = match &raw.dtype.storage {
                 Storage::W4A16(w4) => Some(w4a16_split_bank(
                     &raw.bytes,
@@ -767,9 +672,8 @@ impl ExpertBank {
             for e in 0..num_experts {
                 let per_expert = elem_count / num_experts;
                 if let Some(blobs) = &per_expert_blobs {
-                    // Split-blob path: each expert's reassembled blob carries
-                    // the bank's storage dtype so `Linear::forward` keeps
-                    // routing it to the format's fused kernel / dequant arm.
+                    // Split-blob path: each expert's reassembled blob carries the bank's storage dtype so
+                    // `Linear::forward` keeps routing it to the format's fused kernel / dequant arm.
                     let rt = grim_tensor::provider::RawTensor {
                         bytes: blobs[e].clone(),
                         shape: vec![*out, *in_],
@@ -786,17 +690,8 @@ impl ExpertBank {
                     continue;
                 }
                 let (bytes, dtype): (Vec<u8>, grim_tensor::dtype::DType) = if is_framed_mxfp4 {
-                    // MXFP4 rides the fused dequant-GEMM path through
-                    // `Linear::forward` -> `quantized_matmul` (ROCm dispatch at
-                    // roc_device.rs:2607), so keep it packed on-device as MXFP4
-                    // instead of dequantizing on the host and requantizing to
-                    // Q8_0. That host round-trip was the load tax: it ran
-                    // serially per expert, in the layer loop, and it silently
-                    // swapped the dtype the kernel was expecting.
-                    //
-                    // Slice this expert's codes/exps out of the framed bank
-                    // and re-wrap in the length-prefixed [codes][exps]
-                    // framing `quantized_matmul` expects.
+                    // MXFP4 rides the fused dequant-GEMM path through `Linear::forward` -> `quantized_matmul` (ROCm dispatch at roc_device.rs:2607), so keep it packed on-device as MXFP4 instead of dequantizing on the host and requantizing to Q8_0.
+                    // That host round-trip was the load tax: it ran serially per expert, in the layer.
                     let (codes, exps) = split_mxfp4_framed(&raw.bytes)?;
                     let codes_per = per_expert / 2;
                     let exps_per = per_expert.div_ceil(32);
@@ -874,10 +769,8 @@ impl ExpertBank {
             let mut lins = Vec::with_capacity(3);
             for (v, out, in_) in &flat {
                 let block = slice_expert(v, e, *out, *in_);
-                // GGUF row-major per expert is [out, in] when the bank stores
-                // [n_experts, out, in] — matches Linear directly. gate/up banks
-                // store [inter, hidden] (out=inter) and down stores
-                // [hidden, inter] (out=hidden), so no transpose is needed.
+                // GGUF row-major per expert is [out, in] when the bank stores [n_experts, out, in] - matches Linear directly.
+                // gate/up banks store [inter, hidden] (out=inter) and down stores [hidden, inter] (out=hidden), so no transpose.
                 lins.push(Linear::from_tensor(
                     cpu_tensor(block, Shape::new(vec![*out, *in_])),
                     bias_opt(has_bias, *out),
@@ -905,15 +798,10 @@ impl ExpertBank {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE FFN
-// ---------------------------------------------------------------------------
 
-/// On-device resident copy of the flattened expert weight banks for the ROCm
-/// fused MoE dispatch. Built once on first `forward_rocm` call and reused for
-/// the session's lifetime, so expert weights never round-trip host↔device on
-/// every forward call. Rebuilt only when the resident set (expert count and
-/// weight shapes) changes.
+/// On-device resident copy of the flattened expert weight banks for the ROCm fused MoE dispatch.
+/// Built once on first `forward_rocm` call and reused for the session's lifetime, so expert weights.
 #[cfg(feature = "rocm-mem")]
 struct RocmResidentWeights {
     gate: Arc<dyn BackendStorage>,
@@ -925,14 +813,7 @@ struct RocmResidentWeights {
 
 #[cfg(feature = "rocm-mem")]
 /// Dequantize one expert weight tensor to row-major F32 on `ordinal`.
-///
-/// Native storages ride `to_vec_f32`. Packed formats use their own GPU
-/// launchers at materialization time:
-/// - W4A16: marlin kernel over an identity activation — C = I @ deq(B)ᵀ is
-///   the transposed weight; host-transposed back to row-major after readback.
-/// - GroupInt (GPTQ): forward kernel with identity activation — C = I @ D is
-///   exactly the row-major [K=out, N=in] dequantized weight.
-/// - WNA16: `dequant_wna16_to_f32` decodes the resident blob directly.
+/// Native storages ride `to_vec_f32`.
 pub(crate) fn rocm_dequant_expert_weight(
     weight: &Tensor,
     ordinal: usize,
@@ -1129,12 +1010,8 @@ impl RocmResidentWeights {
         let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
         let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
         for e in 0..num_experts {
-            // Audit-wiring fix (quant workstream): W4A16 / GroupInt / WNA16
-            // packed experts were reinterpreted by to_vec_f32 as raw f32
-            // (nibble codes read as floats -> 1e16-scale garbage / NaN in
-            // every routed forward). Dequantize them properly at
-            // materialization time through the format's own GPU launcher or
-            // dequant service instead.
+            // Audit-wiring fix (quant workstream): W4A16 / GroupInt / WNA16 packed experts were reinterpreted by to_vec_f32 as raw f32 (nibble codes read as floats -> 1e16-scale garbage / NaN in every routed forward).
+            // Dequantize them properly at materialization time through the format's own GPU launcher or dequant service.
             for (flat_dst, lin) in [
                 (&mut gate_flat, &experts.gate[e]),
                 (&mut up_flat, &experts.up[e]),
@@ -1175,8 +1052,7 @@ impl RocmResidentWeights {
     }
 }
 
-/// CUDA resident expert-weight cache: flattened gate/up/down buffers
-/// uploaded to the device once and reused across forward calls.
+/// CUDA resident expert-weight cache: flattened gate/up/down buffers uploaded to the device once and reused across forward calls.
 /// Mirrors [`RocmResidentWeights`] for the CUDA backend.
 #[cfg(feature = "cuda-mem")]
 struct CudaResidentWeights {
@@ -1234,11 +1110,8 @@ impl CudaResidentWeights {
     }
 }
 
-/// Compute the actual packed byte size of one expert's weight given its dtype
-/// and element count. Works for any quant format: MXFP4/MXFP8/FP8 (float-pack),
-/// Q4_K/Q5_K/Q6_K/IQ2/3/4/NF4/FP4/block-quant (KQuant/block), and native
-/// fp16/f32/BF16. Returns the byte size that the PlanBuilder should use for
-/// budget accounting.
+/// Compute the actual packed byte size of one expert's weight given its dtype and element count.
+/// Works for any quant format: MXFP4/MXFP8/FP8 (float-pack), Q4_K/Q5_K/Q6_K/IQ2/3/4/NF4/FP4/block-quant (KQuant/block), and native fp16/f32/BF16.
 fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
     match dtype.storage {
         // Float-pack formats (MXFP4, MXFP8, FP8 block): packed bytes per element
@@ -1313,19 +1186,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
 }
 
 /// Detect the MoE-resident HBM budget from hardware, subtracting reservations.
-///
-/// Uses `hipMemGetInfo` (via `RocmDevice::query_device_vram_bytes`) to get total
-/// device memory, then subtracts estimated reservations for:
-/// - Driver/kernel overhead (~1-2 GB typical)
-/// - Kernel launch buffers, HIP streams, rocBLAS handles (~100-200 MB)
-/// - KV cache reservation (configurable, default 0 — caller should account separately)
-/// - Activation workspace for the current batch (configurable, default 0)
-///
-/// The remainder is the budget available for resident expert weights.
-/// For GDDR-only systems (Radeon), this is the GDDR capacity minus reservations.
-/// For hybrid systems, this is the HBM capacity minus reservations.
-///
-/// Returns `None` if VRAM probing fails or the device has 0 bytes (e.g., CPU fallback).
+/// Uses `hipMemGetInfo` (via `RocmDevice::query_device_vram_bytes`) to get total device memory, then subtracts estimated reservations for: -.
 pub fn detect_moe_budget(
     ordinal: usize,
     _kv_cache_reservation_bytes: usize,
@@ -1420,10 +1281,8 @@ impl MoeFfn {
         routed_scaling_factor: f32,
     ) -> Self {
         let n_experts = experts.gate.len();
-        // Compute per-expert byte costs from the ACTUAL packed/precision dtype
-        // of each expert's weights — works for any quant format (MXFP4/MXFP8/FP8/
-        // Q4_K/Q5_K/Q6_K/IQ2/3/4 variants/NF4/FP4/block-quant) as well as native
-        // fp16/f32. The PlanBuilder uses these real costs for budget-feasible selection.
+        // Compute per-expert byte costs from the ACTUAL packed/precision dtype of each expert's weights - works for any quant format (MXFP4/MXFP8/FP8/ Q4_K/Q5_K/Q6_K/IQ2/3/4 variants/NF4/FP4/block-quant) as well as native fp16/f32.
+        // The PlanBuilder uses these real costs for budget-feasible selection.
         let (bytes_per_expert, hbm_budget) = if n_experts > 0 {
             let mut total_bytes = 0usize;
             for e in 0..n_experts {
@@ -1461,9 +1320,8 @@ impl MoeFfn {
         } else {
             (0, 0)
         };
-        // int8 cost is ~half the actual packed cost (used when demoting fp16 experts
-        // to a tighter format). For already-int8/quantized formats, demotion would
-        // mean a further quantize step; we approximate as half.
+        // int8 cost is ~half the actual packed cost (used when demoting fp16 experts to a tighter format).
+        // For already-int8/quantized formats, demotion would mean a further quantize step; we approximate as half.
         let bytes_per_int8 = (bytes_per_expert / 2).max(1);
         let plan_builder = PlanBuilder::new(bytes_per_expert, bytes_per_int8, hbm_budget);
 
@@ -1484,14 +1342,8 @@ impl MoeFfn {
 
     /// Correct-but-unoptimized CPU reference forward for `[batch, hidden]`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
-        // WI-M5: when the activation already lives on the Vulkan device (the
-        // model was loaded onto Vulkan) and there is no shared/always-on
-        // expert to fold in, dispatch the fused grouped MoE kernel instead of
-        // materializing every expert on the CPU. Router selection still runs on
-        // the host (matches the CPU reference); only the expert GEMMs move to
-        // GPU fast paths. Each mirrors `grim_moe_fused_dispatch` on the
-        // respective backend; on any backend hiccup we fall through to the
-        // verified CPU reference so the fused path is never wrong.
+        // WI-M5: when the activation already lives on the Vulkan device (the model was loaded onto Vulkan) and there is no shared/always-on expert to fold in, dispatch the fused grouped MoE kernel instead of materializing every expert on the CPU.
+        // Router selection still runs on the host (matches the CPU reference); only the expert GEMMs.
         #[cfg(feature = "cuda-mem")]
         if matches!(x.device(), Device::Cuda(_)) && self.shared_expert.is_none() {
             if let Ok(out) = self.forward_cuda(x) {
@@ -1518,11 +1370,8 @@ impl MoeFfn {
             }
         }
 
-
-        // R2 — deterministic dispatch path (UniEP idea). When enabled,
-        // `forward_deterministic` replaces the CPU reference below. It is
-        // bitwise-identical (property-tested) but packs tokens into
-        // expert-ordered slots so the same routing drives a fused GPU kernel.
+        // R2 - deterministic dispatch path (UniEP idea).
+        // When enabled, `forward_deterministic` replaces the CPU reference below.
         #[cfg(feature = "moe-deterministic-dispatch")]
         {
             return self.forward_deterministic(x);
@@ -1573,20 +1422,8 @@ impl MoeFfn {
     }
 
     /// Deterministic batched multi-LoRA MoE forward (UniEP/R2 idea).
-    ///
-    /// Bitwise-identical to [`MoeFfn::forward`] on CPU but routes through
-    /// [`DeterministicTokenMap`]: tokens are packed into expert-ordered slots
-    /// (conflict-free destination addressing via exclusive prefix sums), each
-    /// expert is evaluated on its packed slots, then results are combined back
-    /// per-token. The packing is what enables a fused comm-compute mega-kernel on
-    /// GPU; on CPU it is a correctness-equivalent reorganization that a property
-    /// test proves matches the reference accumulation order exactly.
-    ///
-    /// The combine step deliberately replicates the reference's floating-point
-    /// operation order (`routed += w * y`, THEN `out += rsf * routed`) rather than
-    /// folding `routed_scaling_factor` per-term, so results are bitwise identical
-    /// to `forward` under IEEE-754 (non-associative FP addition otherwise
-    /// diverges).
+    /// Bitwise-identical to [`MoeFfn::forward`] on CPU but routes through [`DeterministicTokenMap`]: tokens are packed into expert-ordered slots.
+    #[allow(clippy::needless_range_loop)]
     pub fn forward_deterministic(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         use crate::moe_deterministic::{DeterministicTokenMap, ScoreboardSync};
 
@@ -1620,7 +1457,8 @@ impl MoeFfn {
                 let top_k = map.top_k;
                 let total_routed = map.total_routed_instances;
 
-                let dest_slots_u32: Vec<u32> = map.destination_slots.iter().map(|&s| s as u32).collect();
+                let dest_slots_u32: Vec<u32> =
+                    map.destination_slots.iter().map(|&s| s as u32).collect();
                 let offsets_u32: Vec<u32> = map.global_offsets.iter().map(|&o| o as u32).collect();
                 let counts_u32: Vec<u32> = map.expert_counts.iter().map(|&c| c as u32).collect();
 
@@ -1634,17 +1472,19 @@ impl MoeFfn {
                     router_weights.push(weights[t_idx][k_idx]);
                 }
 
-                let launch_config = grim_backend_rocm::kernels::moe_mega_kernel::MoeMegaLaunchConfig::new(
-                    batch,
-                    hidden,
-                    inter,
-                    num_experts,
-                    top_k,
-                    self.routed_scaling_factor,
-                    32,
-                );
+                let launch_config =
+                    grim_backend_rocm::kernels::moe_mega_kernel::MoeMegaLaunchConfig::new(
+                        batch,
+                        hidden,
+                        inter,
+                        num_experts,
+                        top_k,
+                        self.routed_scaling_factor,
+                        32,
+                    );
 
-                let scoreboard = ScoreboardSync::new(launch_config.num_tiles, launch_config.tile_size);
+                let scoreboard =
+                    ScoreboardSync::new(launch_config.num_tiles, launch_config.tile_size);
                 let (arrivals, ready) = scoreboard.to_device_buffers();
 
                 let resident = {
@@ -1673,16 +1513,34 @@ impl MoeFfn {
                     }
                 };
 
-                let gate_r = resident.0.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-                let up_r = resident.1.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-                let down_r = resident.2.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+                let gate_r = resident
+                    .0
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .unwrap();
+                let up_r = resident
+                    .1
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .unwrap();
+                let down_r = resident
+                    .2
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .unwrap();
 
                 let x_storage: &dyn BackendStorage = &**x.storage();
-                if let Some(x_rocm) = x_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>() {
+                if let Some(x_rocm) = x_storage
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                {
                     let out_shape = Shape::new(vec![batch, hidden]);
                     let dev = RocmDevice::try_new(ordinal)?;
                     let out_box = dev.zeros(&out_shape, DType::F32)?;
-                    let out_storage = out_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+                    let out_storage = out_box
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .unwrap();
 
                     dev.launch_moe_mega_dispatch(
                         x_rocm,
@@ -1727,9 +1585,7 @@ impl MoeFfn {
         let mut packed = vec![0.0f32; map.total_routed_instances * hidden];
         map.pack_activations(&flat, hidden, &mut packed)?;
 
-        // 3. Evaluate every (token, expert) slot independently. Each slot holds
-        //    one token's activation; the expert sees the same input the reference
-        //    passes to `expert_forward(e, x[t])`, so outputs are bitwise equal.
+        // 3. Evaluate every (token, expert) slot independently.
         let mut packed_outputs = vec![0.0f32; map.total_routed_instances * hidden];
         for slot in 0..map.total_routed_instances {
             let (_, expert_id, _) = map.reverse_map[slot];
@@ -1774,6 +1630,7 @@ impl MoeFfn {
 
     /// Expert Parallel (EP) forward pass: routes tokens, packs them by destination rank,
     /// evaluates through local/sharded expert banks, and combines weighted returns.
+    #[allow(clippy::needless_range_loop)]
     pub fn forward_expert_parallel(
         &self,
         x: &Tensor,
@@ -1787,12 +1644,8 @@ impl MoeFfn {
         for rank in 0..ep_config.world_size {
             let slots = &metadata.rank_dispatch_slots[rank];
             let tokens = &dispatched_tokens[rank];
-            let evaluated = EpTokenDispatcher::evaluate_local_experts(
-                &self.experts,
-                ep_config,
-                tokens,
-                slots,
-            )?;
+            let evaluated =
+                EpTokenDispatcher::evaluate_local_experts(&self.experts, ep_config, tokens, slots)?;
             returned_per_rank.push(evaluated);
         }
 
@@ -1811,11 +1664,7 @@ impl MoeFfn {
     }
 
     /// MoE-aware bandwidth-adaptive hybrid decode forward pass.
-    ///
-    /// # Contract
-    /// Partitions active routed experts into GPU resident/fills ($\mathcal{H} \cup \mathcal{F}$)
-    /// and CPU host-RAM misses ($\mathcal{C}$) using the empirical $q^*$ policy.
-    /// Evaluates both branches and merges partial sums: $y = y_{\text{GPU}} + y_{\text{CPU}}$.
+    /// # Contract Partitions active routed experts into GPU resident/fills ($\mathcal{H} \cup \mathcal{F}$) and CPU host-RAM.
     pub fn forward_moe_aware_hybrid(
         &self,
         x: &Tensor,
@@ -1895,17 +1744,7 @@ impl MoeFfn {
     }
 
     /// Vulkan dispatch of the fused grouped MoE kernel (WI-M5).
-    ///
-    /// Flattens each expert's gate/up/down weights into the single contiguous
-    /// `[num_experts, inter, hidden]` / `[num_experts, hidden, inter]` buffers
-    /// the shader expects, expands top-k routing into flat token/expert/weight
-    /// arrays, and launches one workgroup per routed (token, expert) pair. The
-    /// router selection is identical to the CPU reference (host-computed), so
-    /// the only behavioral difference is the expert GEMMs running on the GPU.
-    ///
-    /// NOTE: weights are pulled to the host and re-uploaded as one buffer here
-    /// (a host round-trip). It is correct and matches the CPU reference; caching
-    /// the flattened weight buffers on first use is a follow-up optimization.
+    /// Flattens each expert's gate/up/down weights into the single contiguous `[num_experts, inter, hidden]` / `[num_experts, hidden,.
     #[cfg(feature = "vulkan-mem")]
     fn forward_vulkan(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let (indices, weights) = self.router.route(x)?;
@@ -1990,12 +1829,8 @@ impl MoeFfn {
         ))
     }
 
-    /// CUDA dispatch of the fused grouped MoE kernel (WI-M5). Mirrors
-    /// `forward_vulkan`: expands top-k routing into flat token/expert/weight
-    /// arrays and calls `CudaDevice::moe_fused_dispatch_resident` against
-    /// device-resident weight buffers (P2-1: weights are uploaded once and
-    /// cached across forward calls, eliminating the per-call host round-trip).
-    /// The activation `x` is already `CudaStorage` (model runs on CUDA).
+    /// CUDA dispatch of the fused grouped MoE kernel (WI-M5).
+    /// Mirrors `forward_vulkan`: expands top-k routing into flat token/expert/weight arrays and calls `CudaDevice::moe_fused_dispatch_resident` against device-resident weight.
     #[cfg(feature = "cuda-mem")]
     fn forward_cuda(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let ordinal = match x.device() {
@@ -2028,10 +1863,8 @@ impl MoeFfn {
             });
         }
 
-        // Resident expert-weight fast path: the flattened gate/up/down banks
-        // are uploaded to the device once and reused across forward calls
-        // (P2-1). The cache is rebuilt only when the resident set — expert
-        // count plus weight shapes — actually changes.
+        // Resident expert-weight fast path: the flattened gate/up/down banks are uploaded to the device once and reused across forward calls (P2-1).
+        // The cache is rebuilt only when the resident set - expert count plus weight shapes.
         let (gate_buf, up_buf, down_buf) = {
             let mut guard = self.cuda_weights.lock().unwrap_or_else(|e| e.into_inner());
             let key = (num_experts, hidden, inter);
@@ -2123,13 +1956,8 @@ impl MoeFfn {
         ))
     }
 
-    /// Metal dispatch of the fused grouped MoE kernel (WI-M5). Mirrors
-    /// `forward_vulkan`/`forward_cuda`: flattens expert weights, expands top-k
-    /// routing into flat (token, expert, weight) arrays, and runs the MSL
-    /// `grim_moe_fused_dispatch` kernel. The router arrays are f32-backed
-    /// (Metal has no integer storage in this crate) and the shader casts them
-    /// back to `int`. On any backend hiccup the caller falls back to the
-    /// verified CPU reference.
+    /// Metal dispatch of the fused grouped MoE kernel (WI-M5).
+    /// Mirrors `forward_vulkan`/`forward_cuda`: flattens expert weights, expands top-k routing into flat (token, expert, weight) arrays, and.
     #[cfg(feature = "metal-mem")]
     fn forward_metal(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let ordinal = match x.device() {
@@ -2283,8 +2111,7 @@ impl MoeFfn {
         let out_shape = Shape::new(vec![batch, hidden]);
 
         // Update per-expert routing hotness from this call's router weights.
-        // Each token's routing weights indicate how much each expert was used;
-        // accumulate to track which experts are "hot" over time.
+        // Each token's routing weights indicate how much each expert was used; accumulate to track which.
         {
             let mut hotness = self.hotness.lock().unwrap();
             for (token_indices, token_weights) in indices.iter().zip(weights.iter()) {
@@ -2294,22 +2121,15 @@ impl MoeFfn {
             }
         }
 
-        // PlanBuilder: decide which experts deserve fp16 residency under the
-        // HBM budget. Called on every call with the updated hotness; the plan
-        // is cached for the resident-set rebuild (cache-miss path below).
+        // PlanBuilder: decide which experts deserve fp16 residency under the HBM budget.
+        // Called on every call with the updated hotness; the plan is cached for the resident-set.
         let plan = self
             .plan_builder
             .build(&self.hotness.lock().unwrap(), false);
         *self.cached_plan.lock().unwrap() = Some(plan.clone());
 
-        // Resident expert-weight fast path: the flattened gate/up/down banks
-        // are uploaded to the device once and reused across forward calls
-        // (P2-1). The cache is rebuilt only when the resident set changes.
-        // PlanBuilder directs which experts are worth keeping resident; the
-        // current build uploads all experts (the PlanBuilder selects the subset
-        // that fits the HBM budget, but the full upload happens once per
-        // fingerprint change — cold experts would use the int8 dequant path
-        // in a full implementation).
+        // Resident expert-weight fast path: the flattened gate/up/down banks are uploaded to the device once and reused across forward calls (P2-1).
+        // The cache is rebuilt only when the resident set changes.
         let resident = {
             let mut guard = self.rocm_weights.lock().unwrap_or_else(|e| e.into_inner());
             let key = (num_experts, hidden, inter);
@@ -2366,9 +2186,7 @@ impl MoeFfn {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Host math helpers
-// ---------------------------------------------------------------------------
 
 fn softmax(v: &[f32]) -> Vec<f32> {
     let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2446,9 +2264,7 @@ fn bias_opt(has_bias: bool, dim: usize) -> Option<Tensor> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Expert Parallel (EP) Token Dispatcher and Combiner
-// ---------------------------------------------------------------------------
 
 /// Metadata recording token routing per rank for dispatch and combine.
 #[derive(Debug, Clone)]
@@ -2470,6 +2286,7 @@ pub struct EpTokenDispatcher;
 
 impl EpTokenDispatcher {
     /// Inspects router outputs and packs tokens into per-rank dispatch groups.
+    #[allow(clippy::needless_range_loop)]
     pub fn plan_dispatch(
         x: &Tensor,
         indices: &[Vec<usize>],
@@ -2567,7 +2384,10 @@ impl EpTokenDispatcher {
             }
         }
 
-        Ok(cpu_tensor(out_vec, Shape::new(vec![num_tokens, hidden_dim])))
+        Ok(cpu_tensor(
+            out_vec,
+            Shape::new(vec![num_tokens, hidden_dim]),
+        ))
     }
 }
 
@@ -2576,61 +2396,27 @@ fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
-// ===========================================================================
-// WI-C — Router-distilled lookahead predictor + PlanBuilder + SRP/SCH gate
-// ===========================================================================
-//
-// The predict leg of P-DAFD (PROBE 2602.00509, MxMoE 2505.05799, DynaExq
-// 2511.15015, SRP/SCH 2505.16056). This is the genuinely novel composition —
-// no published system fuses dispatch AND predicts AND varies per-expert
-// precision. All three components below are host-side and unit-testable
-// without a GPU: the falsifiable core of WI-C (G-C1/C2/C3) does NOT require
-// hardware (plan §5).
-//
-// Honesty valves (do not weaken):
-// * G-C2 scores the predictor against *actual next-layer routing* (Hit@k ≥
-//   0.80), not output parity — a predictor wrong in an interesting way
-//   cannot be rescued by the kernel producing the right answer.
-// * G-C3 requires the feature to beat its own off-switch (pre-registered
-//   Δ ≥ +0.05 Hit@k or PPL) or it is recorded as FAIL "prediction adds no
-//   signal", never "≈acceptable".
-// * The SRP/SCH confidence gate is mandatory (§5): below-threshold routing
-//   consistency disables prediction, falling back to WI-B reactive matching.
+// WI-C - Router-distilled lookahead predictor + PlanBuilder + SRP/SCH gate The predict leg of P-DAFD (PROBE 2602.00509, MxMoE 2505.05799, DynaExq 2511.15015, SRP/SCH 2505.16056).
+// This is the genuinely novel composition - no published system fuses dispatch AND predicts AND.
 
-// ---------------------------------------------------------------------------
-// LookaheadPredictor — gate-initialized low-rank distilled router copy
-// ---------------------------------------------------------------------------
+// LookaheadPredictor - gate-initialized low-rank distilled router copy
 
-/// A tiny distilled copy of `MoeRouter::gate` that forecasts the *next*
-/// layer's activated-expert distribution from the current layer's gate
-/// logits (PROBE 2602.00509, "gate-initialized" lookahead).
-///
-/// The predictor is a single low-rank linear: `predicted_next_logits =
-/// current_logits @ W_distill`, where `W_distill` is `[num_experts,
-/// num_experts]` initialized to a per-expert identity (the "gate-init"
-/// prior that next-layer routing ≈ this-layer routing). It runs host-side;
-/// output = predicted histogram (softmax over the predicted logits) + a
-/// per-expert hotness vector (the predicted top-k probabilities).
-///
-/// Distillation updates `W_distill` online from observed (current → next)
-/// routing pairs; v1 uses a closed-form ridge update, no GPU.
+/// A tiny distilled copy of `MoeRouter::gate` that forecasts the *next* layer's activated-expert distribution from the current layer's gate logits (PROBE 2602.00509, "gate-initialized" lookahead).
+/// The predictor is a single low-rank linear: `predicted_next_logits = current_logits @ W_distill`, where `W_distill` is.
 pub struct LookaheadPredictor {
     /// `W_distill`, `[num_experts, num_experts]` row-major.
     pub distill: Vec<f32>,
     pub num_experts: usize,
     /// Top-k the predictor forecasts hotness for.
     pub top_k: usize,
-    /// Whether the SRP/SCH gate has enabled prediction. When `false`,
-    /// `predict` returns the identity prior (this-layer routing unchanged),
-    /// i.e. the WI-B reactive fallback.
+    /// Whether the SRP/SCH gate has enabled prediction.
+    /// When `false`, `predict` returns the identity prior (this-layer routing unchanged), i.e.
     pub enabled: bool,
 }
 
 impl LookaheadPredictor {
-    /// Build a gate-initialized predictor: `W_distill = I` (next-layer ≈
-    /// current-layer routing, the strongest uninformed prior). `enabled`
-    /// starts `true`; the SRP/SCH gate sets it `false` when the model's
-    /// routing consistency is below threshold.
+    /// Build a gate-initialized predictor: `W_distill = I` (next-layer ≈ current-layer routing, the strongest uninformed prior).
+    /// `enabled` starts `true`; the SRP/SCH gate sets it `false` when the model's routing consistency is.
     pub fn new_gate_initialized(num_experts: usize, top_k: usize) -> Self {
         let mut distill = vec![0.0f32; num_experts * num_experts];
         for i in 0..num_experts {
@@ -2644,13 +2430,8 @@ impl LookaheadPredictor {
         }
     }
 
-    /// Predict the next layer's activated-expert distribution from this
-    /// layer's gate logits.
-    ///
-    /// Returns `(predicted_top_k_indices, predicted_top_k_probs)` — the
-    /// forecast hot set and their normalized probabilities. When `enabled`
-    /// is `false`, returns the current-layer top-k unchanged (the reactive
-    /// fallback that adds no prediction signal — G-C3's off-switch).
+    /// Predict the next layer's activated-expert distribution from this layer's gate logits.
+    /// Returns `(predicted_top_k_indices, predicted_top_k_probs)` - the forecast hot set and their normalized probabilities.
     pub fn predict(&self, current_logits: &[f32]) -> (Vec<usize>, Vec<f32>) {
         assert_eq!(
             current_logits.len(),
@@ -2659,8 +2440,7 @@ impl LookaheadPredictor {
         );
         if !self.enabled {
             // Identity prior: next-layer routing ≈ this-layer routing.
-            // Skip the distill matrix multiply entirely — the off-switch
-            // must not consult W_distill at all.
+            // Skip the distill matrix multiply entirely - the off-switch must not consult W_distill at all.
             return self.top_k_from_logits(current_logits);
         }
         // predicted_next_logits[j] = sum_i current_logits[i] * W[i, j]
@@ -2675,9 +2455,8 @@ impl LookaheadPredictor {
         self.top_k_from_logits(&pred)
     }
 
-    /// Softmax over `logits`, then take `top_k` by probability and renormalize
-    /// the selected probabilities over the chosen set (mirrors
-    /// `MoeRouter::route`'s SoftmaxTopK combine-weight convention).
+    /// Softmax over `logits`, then take `top_k` by probability and renormalize the
+    /// selected probabilities over the chosen set (mirrors `MoeRouter::route`'s SoftmaxTopK combine-weight convention).
     fn top_k_from_logits(&self, logits: &[f32]) -> (Vec<usize>, Vec<f32>) {
         let probs = softmax(logits);
         let mut order: Vec<usize> = (0..self.num_experts).collect();
@@ -2693,10 +2472,8 @@ impl LookaheadPredictor {
         (chosen, chosen_probs)
     }
 
-    /// One closed-form ridge distillation step from an observed
-    /// (current_logits → next_layer_activated_set) pair. Strength `lr ∈
-    /// (0, 1]`; v1 uses a Hebbian-style update pulling `W[i, j]` toward the
-    /// co-activation signal `current_logits[i] * next_onehot[j]`.
+    /// One closed-form ridge distillation step from an observed (current_logits → next_layer_activated_set) pair.
+    /// Strength `lr ∈ (0, 1]`; v1 uses a Hebbian-style update pulling `W[i, j]` toward the.
     pub fn distill_step(&mut self, current_logits: &[f32], next_activated: &[usize], lr: f32) {
         let mut next_onehot = vec![0.0f32; self.num_experts];
         for &e in next_activated {
@@ -2716,10 +2493,8 @@ impl LookaheadPredictor {
     }
 }
 
-/// Score prediction Hit@k: the fraction of the realized top-k set that the
-/// predictor's top-k forecast captured. `1.0` = perfect overlap, `0.0` =
-/// no overlap. This is the G-C2 metric (≥0.80 bar), scored against actual
-/// next-layer routing — not output parity.
+/// Score prediction Hit@k: the fraction of the realized top-k set that the predictor's top-k forecast captured.
+/// `1.0` = perfect overlap, `0.0` = no overlap.
 pub fn prediction_hit_at_k(predicted: &[usize], realized: &[usize]) -> f32 {
     if realized.is_empty() {
         return 0.0;
@@ -2728,22 +2503,18 @@ pub fn prediction_hit_at_k(predicted: &[usize], realized: &[usize]) -> f32 {
     hits as f32 / realized.len() as f32
 }
 
-// ---------------------------------------------------------------------------
-// PlanBuilder — DynaExq-budget-feasible resident-set + precision plan
-// ---------------------------------------------------------------------------
+// PlanBuilder - DynaExq-budget-feasible resident-set + precision plan
 
-/// Per-expert precision in the resident set (MxMoE 2505.05799 mixed-precision
-/// flavor). Hot experts stay fp16; cold experts fall back to int8 (via the
-/// existing `q*k_gemm` dequant path) to fit the HBM envelope.
+/// Per-expert precision in the resident set (MxMoE 2505.05799 mixed-precision flavor).
+/// Hot experts stay fp16; cold experts fall back to int8 (via the existing `q*k_gemm` dequant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertPrecision {
     Fp16,
     Int8,
 }
 
-/// A budget-feasible resident-set plan: which experts are hot (fp16
-/// resident) vs cold (int8 fallback), under the HBM byte envelope. Output
-/// of `PlanBuilder::build`.
+/// A budget-feasible resident-set plan: which experts are hot (fp16 resident) vs cold (int8 fallback), under the HBM byte envelope.
+/// Output of `PlanBuilder::build`.
 #[derive(Debug, Clone)]
 pub struct ResidentPlan {
     pub precision: Vec<ExpertPrecision>,
@@ -2765,8 +2536,7 @@ pub struct PlanBuilder {
 
 impl PlanBuilder {
     /// Construct with per-expert byte costs and the total HBM envelope.
-    /// `bytes_per_expert_fp16` is the full `[inter, hidden] × 3` triple;
-    /// `bytes_per_expert_int8` is the quantized size (typically fp16/2).
+    /// `bytes_per_expert_fp16` is the full `[inter, hidden] × 3` triple; `bytes_per_expert_int8` is the quantized size (typically.
     pub fn new(
         bytes_per_expert_fp16: usize,
         bytes_per_expert_int8: usize,
@@ -2779,10 +2549,8 @@ impl PlanBuilder {
         }
     }
 
-    /// Build a resident plan from a per-expert hotness vector (predicted or
-    /// observed routing frequency). The hottest experts are kept fp16 up
-    /// to the budget; the rest demote to int8. `prediction_driven` labels
-    /// the plan for G-C3's off-switch comparison.
+    /// Build a resident plan from a per-expert hotness vector (predicted or observed routing frequency).
+    /// The hottest experts are kept fp16 up to the budget; the rest demote to int8.
     pub fn build(&self, hotness: &[f32], prediction_driven: bool) -> ResidentPlan {
         let n = hotness.len();
         // Rank experts by hotness (desc); ties broken by index for stability.
@@ -2796,20 +2564,16 @@ impl PlanBuilder {
 
         let mut precision = vec![ExpertPrecision::Int8; n];
         let mut used = 0usize;
-        // Greedy: promote experts to fp16 in hotness order while the *upgrade*
-        // cost (fp16 bytes − int8 bytes) stays within the HBM upgrade budget.
-        // The all-int8 floor is the always-resident baseline and is not counted
-        // against `hbm_budget_bytes` (an empty/zero budget still keeps the int8
-        // floor resident).
+        // Greedy: promote experts to fp16 in hotness order while the *upgrade* cost (fp16 bytes − int8 bytes) stays within the HBM upgrade budget.
+        // The all-int8 floor is the always-resident baseline and is not counted against `hbm_budget_bytes` (an empty/zero.
         let _baseline = n * self.bytes_per_expert_int8;
         for &e in &order {
             let upgrade_cost = self
                 .bytes_per_expert_fp16
                 .saturating_sub(self.bytes_per_expert_int8);
             if used + upgrade_cost <= self.hbm_budget_bytes {
-                // budget == 0 means nothing gets promoted beyond the int8 baseline
-                // (the `|| budget == 0` clause was removed — it contradicted the
-                // doc comment which says zero budget keeps everything at int8).
+                // budget == 0 means nothing gets promoted beyond the int8 baseline (the `|| budget == 0`
+                // clause was removed - it contradicted the doc comment which says zero budget keeps everything at int8).
                 precision[e] = ExpertPrecision::Fp16;
                 used += upgrade_cost;
             } else {
@@ -2834,21 +2598,10 @@ impl PlanBuilder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SRP/SCH confidence gate — mandatory prediction on/off valve
-// ---------------------------------------------------------------------------
+// SRP/SCH confidence gate - mandatory prediction on/off valve
 
-/// Compute the model's local-routing-consistency (SRP/SCH 2505.16056) from
-/// a trace of consecutive-layer routing decisions. Returns the fraction of
-/// (layer, token, expert) triples that recur in the next layer — a measure
-/// of how predictable the routing is. Below `threshold`, the
-/// `LookaheadPredictor` is disabled (§5: the gate is mandatory, not
-/// optional — don't claim prediction works on models it measurably can't).
-///
-/// `trace[t]` = the activated-expert set for token row `t` across layers;
-/// the outer Vec is layers, inner Vec is per-token activated experts. We
-/// score the per-token set-overlap between adjacent layers averaged over
-/// tokens and layer-transitions.
+/// Compute the model's local-routing-consistency (SRP/SCH 2505.16056) from a trace of consecutive-layer routing decisions.
+/// Returns the fraction of (layer, token, expert) triples that recur in the next layer -.
 pub fn routing_consistency(trace: &[Vec<Vec<usize>>]) -> f32 {
     if trace.len() < 2 {
         return 0.0; // need at least two layers to measure consistency
@@ -2876,10 +2629,8 @@ pub fn routing_consistency(trace: &[Vec<Vec<usize>>]) -> f32 {
     total_overlap / total_sets as f32
 }
 
-/// Apply the SRP/SCH gate to a predictor: if the trace's routing
-/// consistency is below `threshold`, disable prediction (set
-/// `predictor.enabled = false`) so it falls back to the reactive WI-B
-/// matching. Returns the measured consistency so the caller can log it.
+/// Apply the SRP/SCH gate to a predictor: if the trace's routing consistency is below `threshold`, disable prediction (set `predictor.enabled = false`) so it falls back to the reactive WI-B matching.
+/// Returns the measured consistency so the caller can log it.
 pub fn apply_srp_sch_gate(
     predictor: &mut LookaheadPredictor,
     trace: &[Vec<Vec<usize>>],
@@ -2890,35 +2641,8 @@ pub fn apply_srp_sch_gate(
     consistency
 }
 
-// ===========================================================================
-// WI-EP1 — ExpertPlacementMap (host-side, no device required)
-// ===========================================================================
-//
-// charon_kernel_plan_v3.md §3 WI-EP1: "ExpertPlacementMap — which GPU owns
-// which expert, built via `C2plrController::decide()` at expert granularity,
-// capacity-proportional fallback tested under both homogeneous and mixed-GPU
-// synthetic cases."
-//
-// The placement *logic* is host-testable without a device: it consumes the
-// `GpuCapability` snapshots the host already gathers (VRAM, TFLOPS, throttle)
-// and assigns each expert to a rank proportional to that rank's capacity.
-// The on-device dispatch (experts actually firing on their assigned ranks) is
-// device-gated; this struct is the host-side planner that feeds WI-EP2's
-// cross-GPU token dispatch and WI-EP3's combine.
-//
-// Two placement policies:
-//   * `CapacityProportional` — split experts across ranks proportional to a
-//     capacity metric (VRAM, TFLOPS, or a blend). The default; the plan's
-//     "capacity-proportional fallback" requirement.
-//   * `Controller` — defer to `C2plrController::decide()` per expert (the
-//     online-learning path). When the controller's MLP weights are zero
-//     (fresh controller), `decide` falls back to round-robin, so this policy
-//     degrades gracefully; capacity-proportional is the explicit fallback for
-//     the controller's cold-start case.
-//
-// Both policies produce the same `ExpertPlacementMap` shape: a per-expert →
-// rank assignment plus the per-rank load fraction (used by WI-EP2 to size
-// remote-transfer batches and by WI-EP3 to size combine buffers).
+// WI-EP1 - ExpertPlacementMap (host-side, no device required) charon_kernel_plan_v3.md §3 WI-EP1: "ExpertPlacementMap - which GPU owns which expert, built via `C2plrController::decide()` at expert granularity, capacity-proportional fallback tested under both homogeneous and mixed-GPU synthetic cases." The placement *logic* is host-testable without a device: it consumes the `GpuCapability` snapshots the host already gathers (VRAM, TFLOPS, throttle) and assigns each expert to a rank proportional to that rank's capacity.
+// The on-device dispatch (experts actually firing on their assigned ranks) is device-gated; this struct is.
 
 use grim_tensor::GpuCapability;
 
@@ -2926,55 +2650,36 @@ use grim_tensor::GpuCapability;
 /// capacity-proportional policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CapacityMetric {
-    /// Free VRAM in bytes (`GpuCapability::vram_free_bytes`). The default —
-    /// VRAM is the hard ceiling on expert count per rank, so weighting by
-    /// VRAM avoids OOM on the small-VRAM rank.
+    /// Free VRAM in bytes (`GpuCapability::vram_free_bytes`).
+    /// The default - VRAM is the hard ceiling on expert count per rank, so weighting.
     #[default]
     VramBytes,
-    /// Effective FP16 TFLOPS (`GpuCapability::tflops_fp16`). Better
-    /// throughput-optimal than VRAM when all ranks have enough VRAM but
-    /// differ in compute (e.g. an Instinct paired with a Radeon).
+    /// Effective FP16 TFLOPS (`GpuCapability::tflops_fp16`).
+    /// Better throughput-optimal than VRAM when all ranks have enough VRAM but differ in compute (e.g.
     Tflops,
-    /// `tflops_fp16 * (1.0 - throttle_pct)` — TFLOPS discounted by the
-    /// current thermal throttle fraction. The reactive metric; the right
-    /// choice under sustained load where throttle is the real bottleneck.
+    /// `tflops_fp16 * (1.0 - throttle_pct)` - TFLOPS discounted by the current thermal throttle fraction.
+    /// The reactive metric; the right choice under sustained load where throttle is the real bottleneck.
     ThrottledTflops,
 }
 
 /// Per-expert → rank assignment for one MoE layer (WI-EP1).
-///
-/// Produced by [`ExpertPlacementMap::build`]. Immutable after construction;
-/// the host rebuilds it when the capability epoch bumps (thermal throttle,
-/// GPU leave) — matches `PlacementCache::sync_epoch`'s invalidation cadence.
+/// Produced by [`ExpertPlacementMap::build`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpertPlacementMap {
     /// `rank_of_expert[e]` = the rank that owns expert `e`.
     pub rank_of_expert: Vec<usize>,
     /// `num_ranks` total (length of the `caps` slice the map was built from).
     pub num_ranks: usize,
-    /// `load_fraction[r]` = fraction of experts assigned to rank `r`
-    /// (`count_on_rank[r] / num_experts`). Used by WI-EP2 to size remote-
-    /// transfer batches and by WI-EP3 to size combine buffers.
+    /// `load_fraction[r]` = fraction of experts assigned to rank `r` (`count_on_rank[r] / num_experts`).
+    /// Used by WI-EP2 to size remote- transfer batches and by WI-EP3 to size combine buffers.
     pub load_fraction: Vec<f32>,
     /// The metric the assignment was weighted by (for diagnostics / replay).
     pub metric: CapacityMetric,
 }
 
 impl ExpertPlacementMap {
-    /// Build a placement map that distributes `num_experts` across the ranks
-    /// described by `caps`, proportional to the chosen capacity `metric`.
-    ///
-    /// The assignment is **greedy by remainder**: each expert goes to the
-    /// rank with the most remaining capacity (capacity_assigned_so_far ≤
-    /// rank's total capacity). This is the standard largest-remainder
-    /// proportional allocation — it minimizes the max load imbalance vs.
-    /// naive round-robin, and it's deterministic given the `caps` order
-    /// (ties broken by ordinal, lowest first — stable across runs).
-    ///
-    /// Host-pure: no device calls. The capacity values come from whatever
-    /// populated `caps` (CapabilityProfiler in production, hand-set values in
-    /// tests). The plan's "homogeneous and mixed-GPU synthetic cases" both
-    /// flow through this same function — the test suite exercises each.
+    /// Build a placement map that distributes `num_experts` across the ranks described by `caps`, proportional to the chosen capacity `metric`.
+    /// The assignment is **greedy by remainder**: each expert goes to the rank with the most.
     pub fn build(num_experts: usize, caps: &[GpuCapability], metric: CapacityMetric) -> Self {
         assert!(
             num_ranks_nonzero(caps),
@@ -2982,16 +2687,14 @@ impl ExpertPlacementMap {
         );
         let num_ranks = caps.len();
         let capacities: Vec<f64> = caps.iter().map(|c| capacity_of(c, metric)).collect();
-        // Greedy largest-remainder: track each rank's assigned load (in the
-        // same capacity units) and place each expert on the rank with the
-        // most remaining headroom.
+        // Greedy largest-remainder: track each rank's assigned load (in the same capacity units)
+        // and place each expert on the rank with the most remaining headroom.
         let mut assigned_load = vec![0.0f64; num_ranks];
         let mut rank_of_expert = vec![0usize; num_experts];
         let mut count_on_rank = vec![0usize; num_ranks];
         for rank_slot in rank_of_expert.iter_mut() {
-            // Per-expert capacity cost = 1 unit of "expert load"; we measure
-            // each rank's load as `assigned_load / capacity`, so the rank
-            // with the lowest normalized load has the most headroom.
+            // Per-expert capacity cost = 1 unit of "expert load"; we measure each rank's load as
+            // `assigned_load / capacity`, so the rank with the lowest normalized load has the most headroom.
             let (best_rank, _) = (0..num_ranks)
                 .map(|r| {
                     let normalized_load = if capacities[r] > 0.0 {
@@ -3041,10 +2744,8 @@ impl ExpertPlacementMap {
         self.rank_of(expert) == Some(rank)
     }
 
-    /// The maximum load imbalance ratio across ranks
-    /// (`max_load / min_load`). 1.0 = perfectly balanced; the
-    /// capacity-proportional policy targets ≤ 1.0 + (1 / num_experts) for
-    /// homogeneous farms. Pinned by the test gate.
+    /// The maximum load imbalance ratio across ranks (`max_load / min_load`).
+    /// 1.0 = perfectly balanced; the capacity-proportional policy targets ≤ 1.0 + (1 / num_experts) for.
     pub fn max_imbalance(&self) -> f32 {
         let counts: Vec<f32> = (0..self.num_ranks)
             .map(|r| self.count_on_rank(r) as f32)
@@ -3069,9 +2770,7 @@ fn num_ranks_nonzero(caps: &[GpuCapability]) -> bool {
 }
 
 /// Extract a scalar capacity from a `GpuCapability` per the chosen metric.
-/// Returns `f64` for stable division; never negative (a zero capacity means
-/// "this rank can't host experts" — the greedy allocator then starves it,
-/// which is the correct behavior for a broken/OOM rank).
+/// Returns `f64` for stable division; never negative (a zero capacity means "this rank can't host.
 fn capacity_of(c: &GpuCapability, metric: CapacityMetric) -> f64 {
     match metric {
         CapacityMetric::VramBytes => c.vram_free_bytes as f64,
@@ -3082,17 +2781,14 @@ fn capacity_of(c: &GpuCapability, metric: CapacityMetric) -> f64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — synthetic, hand-computed, CPU-only
-// ---------------------------------------------------------------------------
+// Tests - synthetic, hand-computed, CPU-only
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Build a tiny MoE with 4 experts, top-2, hidden=4, inter=4.
-    /// Gate weights chosen so token selects experts 0 and 2; combine weights
-    /// hand-derived in the test body.
+    /// Gate weights chosen so token selects experts 0 and 2; combine weights hand-derived in the.
     fn build_synthetic(
         kind: RouterKind,
         shared: Option<ExpertTriple>,
@@ -3112,11 +2808,8 @@ mod tests {
         let n = 4;
         let top_k = 2;
 
-        // Gate: out=n, in=hidden. forward computes x @ W^T, so with x=[1,0,0,0]
-        // the gate logits are W's column 0: gate_logits[j] = W[j][0].
-        // Set W's column 0 so logits = [3.0, 0.1, 2.0, -1.0]:
-        //   expert0 -> high, expert2 -> high, expert1 low, expert3 lowest.
-        // softmax([3,0.1,2,-1]) top-2 = {0, 2}.
+        // Gate: out=n, in=hidden. forward computes x @ W^T, so with
+        // x=[1,0,0,0] the gate logits are W's column 0: gate_logits[j] = W[j][0].
         let mut gate_w = vec![0.0f32; n * hidden];
         gate_w[0] = 3.0; // expert 0 gate logit
         gate_w[hidden] = 0.1; // expert 1
@@ -3189,14 +2882,8 @@ mod tests {
 
     #[test]
     fn forward_matches_hand_computed() {
-        // x=[1,0,0,0]; expert e acts as: h = silu(x) * x (since gate=up=diag(e+1),
-        // x has only dim0=1) -> silu(1*(e+1)) * 1*(e+1)? careful:
-        //   gate(x) = (e+1)*x -> [ (e+1), 0,0,0 ] (inter=4, only dim0)
-        //   up(x)   = x        -> [ 1, 0,0,0 ]
-        //   silu(gate) = silu(e+1) on dim0, 0 elsewhere
-        //   h = silu(gate) * up = [ silu(e+1), 0,0,0 ]
-        //   down(h) = h (diag) -> [ silu(e+1), 0,0,0 ]  (hidden=4)
-        // So expert e output dim0 = silu(e+1).
+        // x=[1,0,0,0]; expert e acts as: h = silu(x) * x (since gate=up=diag(e+1), x has only dim0=1) -> silu(1*(e+1)) * 1*(e+1)?
+        // careful: gate(x) = (e+1)*x -> [ (e+1), 0,0,0 ] (inter=4, only dim0) up(x) = x.
         let m = build_synthetic(RouterKind::SoftmaxTopK, None, None);
         let out = m.forward(&token()).unwrap();
         let v = out.to_vec_f32().unwrap();
@@ -3299,9 +2986,8 @@ mod tests {
         assert!(probs[0] > probs[1], "hotter expert first");
     }
 
-    /// G-C1: distillation shifts the forecast toward observed next-layer
-    /// activations. After distilling (current→expert 3 activated), expert 3
-    /// rises in the forecast.
+    /// G-C1: distillation shifts the forecast toward observed next-layer activations.
+    /// After distilling (current→expert 3 activated), expert 3 rises in the forecast.
     #[test]
     fn predictor_distillation_shifts_forecast() {
         let mut p = LookaheadPredictor::new_gate_initialized(4, 2);
@@ -3320,9 +3006,8 @@ mod tests {
         );
     }
 
-    /// G-C2: Hit@k = 1.0 for identical sets, 0.0 for disjoint, and the
-    /// fraction for partial overlap. This is the prediction-accuracy metric
-    /// scored against actual next-layer routing (not output parity).
+    /// G-C2: Hit@k = 1.0 for identical sets, 0.0 for disjoint, and the fraction for partial overlap.
+    /// This is the prediction-accuracy metric scored against actual next-layer routing (not output parity).
     #[test]
     fn prediction_hit_at_k_scoring() {
         assert_eq!(prediction_hit_at_k(&[0, 1], &[0, 1]), 1.0); // identical
@@ -3331,9 +3016,8 @@ mod tests {
         assert_eq!(prediction_hit_at_k(&[0, 1], &[]), 0.0); // empty realized
     }
 
-    /// G-C2 (the gate itself): a predictor distilled on a trace where the
-    /// next layer's routing is highly consistent must hit ≥0.80 against
-    /// held-out realized routing. We use a synthetic consistent trace.
+    /// G-C2 (the gate itself): a predictor distilled on a trace where the next layer's routing is highly consistent must hit ≥0.80 against held-out realized routing.
+    /// We use a synthetic consistent trace.
     #[test]
     fn predictor_hits_threshold_on_consistent_trace() {
         // 6 experts, top-2. Build a trace where layer L+1 = layer L (perfect
@@ -3351,11 +3035,8 @@ mod tests {
         );
     }
 
-    /// G-C3 (falsifiable): prediction must beat its own off-switch. With a
-    /// consistent trace, the enabled predictor promotes the hot experts to
-    /// fp16; the disabled (off-switch) predictor falls back to int8 for
-    /// more experts. The budget-kept quality (fp16 resident count) must
-    /// improve by the pre-registered Δ.
+    /// G-C3 (falsifiable): prediction must beat its own off-switch.
+    /// With a consistent trace, the enabled predictor promotes the hot experts to fp16; the disabled.
     #[test]
     fn prediction_beats_its_off_switch_on_consistent_trace() {
         // 8 experts, each fp16 expert = 1000 bytes, int8 = 500 bytes,
@@ -3381,10 +3062,8 @@ mod tests {
             .iter()
             .filter(|p| **p == ExpertPrecision::Fp16)
             .count();
-        // Prediction must keep the hot set fp16; the off-switch (flat)
-        // either ties or keeps fewer of the *right* experts. The
-        // pre-registered utility Δ: the predictor keeps experts {0,1,2}
-        // fp16 — verify the hot three are fp16 in the prediction plan.
+        // Prediction must keep the hot set fp16; the off-switch (flat) either ties or keeps fewer of the *right* experts.
+        // The pre-registered utility Δ: the predictor keeps experts {0,1,2} fp16 - verify the hot three.
         assert!(
             plan_pred.precision[0] == ExpertPrecision::Fp16
                 && plan_pred.precision[1] == ExpertPrecision::Fp16
@@ -3404,9 +3083,7 @@ mod tests {
     #[test]
     fn plan_builder_respects_hbm_budget() {
         // 4 experts, fp16=1000, int8=400, budget=1500.
-        // Baseline (all int8) = 1600. Budget 1500 < 1600 → can only upgrade
-        // partially. Upgrade cost = 600/expert. 1500 allows floor at... we
-        // measure upgrade budget separately.
+        // Baseline (all int8) = 1600.
         let builder = PlanBuilder::new(1000, 400, 1500);
         let hotness = vec![1.0, 0.5, 0.3, 0.1];
         let plan = builder.build(&hotness, true);
@@ -3420,9 +3097,8 @@ mod tests {
         );
     }
 
-    /// G-C1: SRP/SCH routing consistency = 1.0 for identical adjacent
-    /// layers, →0 for disjoint, and the gate disables prediction below
-    /// threshold (mandatory valve, §5).
+    /// G-C1: SRP/SCH routing consistency = 1.0 for identical adjacent layers, →0
+    /// for disjoint, and the gate disables prediction below threshold (mandatory valve, §5).
     #[test]
     fn srp_sch_gate_disables_prediction_below_threshold() {
         // Consistent trace: every layer routes token 0 to {0,1}.
@@ -3455,10 +3131,8 @@ mod tests {
         assert!(c2 < 0.5);
     }
 
-    /// G-C2 negative case: when prediction is disabled by the SRP/SCH gate,
-    /// the predictor returns the identity prior (current top-k), so Hit@k
-    /// on a *different* next-layer routing is low — confirming the gate
-    /// honestly reports "no signal" rather than fabricating agreement.
+    /// G-C2 negative case: when prediction is disabled by the SRP/SCH gate, the predictor returns the identity prior (current top-k), so
+    /// Hit@k on a *different* next-layer routing is low - confirming the gate honestly reports "no signal" rather than fabricating agreement.
     #[test]
     fn disabled_predictor_reports_no_signal_on_inconsistent_next() {
         let mut p = LookaheadPredictor::new_gate_initialized(4, 2);
@@ -3474,31 +3148,22 @@ mod tests {
         );
     }
 
-    /// G-C3 off-switch programmatic enforcement: `predict()` must actually
-    /// consult `self.enabled`. With a non-identity `W_distill`, the buggy
-    /// implementation (which ignored `enabled`) would return the distilled
-    /// forecast instead of the identity prior. This test would have caught
-    /// that: it sets `enabled=false` and a W that *would* change the top-k
-    /// if consulted, then verifies the identity prior is returned unchanged.
+    /// G-C3 off-switch programmatic enforcement: `predict()` must actually consult `self.enabled`.
+    /// With a non-identity `W_distill`, the buggy implementation (which ignored `enabled`) would return the distilled forecast.
     #[test]
     fn disabled_predictor_returns_identity_prior_not_distilled() {
         let mut p = LookaheadPredictor::new_gate_initialized(4, 2);
         p.enabled = false;
         // Current logits: top-2 = {0 (5.0), 2 (4.0)}.
         let cur = [5.0, 0.0, 4.0, 0.0];
-        // Overwrite W_distill to swap experts 0↔1: if predict() consulted
-        // W, the forecast would shift toward expert 1 (logit 5.0 lands on
-        // column 1 instead of column 0).
+        // Overwrite W_distill to swap experts 0↔1: if predict() consulted W, the forecast would
+        // shift toward expert 1 (logit 5.0 lands on column 1 instead of column 0).
         p.distill[0] = 0.0; // W[0,0] = 0 (was 1.0)
         p.distill[1] = 1.0; // W[0,1] = 1 (was 0.0)
         p.distill[4] = 1.0; // W[1,0] = 1 (was 0.0)
         p.distill[5] = 0.0; // W[1,1] = 0 (was 1.0)
-        // With the buggy code (W consulted despite enabled=false):
-        //   pred[0] = cur[0]*0 + cur[1]*1 = 0.0
-        //   pred[1] = cur[0]*1 + cur[1]*0 = 5.0
-        //   softmax → top-2 = {1, 2} (WRONG — off-switch changed the forecast)
-        // With the fix (identity prior, W ignored):
-        //   softmax(cur) → top-2 = {0, 2} (CORRECT — identity prior)
+        // With the buggy code (W consulted despite enabled=false): pred[0] = cur[0]*0 + cur[1]*1 = 0.0 pred[1] = cur[0]*1 + cur[1]*0 = 5.0 softmax → top-2
+        // = {1, 2} (WRONG - off-switch changed the forecast) With the fix (identity prior, W ignored): softmax(cur) → top-2 = {0, 2} (CORRECT - identity prior)
         let (idx, _) = p.predict(&cur);
         assert_eq!(
             idx,
@@ -3508,13 +3173,8 @@ mod tests {
         );
     }
 
-    // =======================================================================
-    // WI-EP1 — ExpertPlacementMap synthetic-case unit tests.
-    // The plan requires: "capacity-proportional fallback tested under both
-    // homogeneous and mixed-GPU synthetic cases." These pin the placement
-    // logic without a device — the device-side dispatch (experts actually
-    // firing on their assigned ranks) is device-gated per WI-EP2/EP3.
-    // =======================================================================
+    // WI-EP1 - ExpertPlacementMap synthetic-case unit tests.
+    // The plan requires: "capacity-proportional fallback tested under both homogeneous and mixed-GPU synthetic cases." These pin.
 
     /// Helper: build a `GpuCapability` with the load-bearing fields set.
     fn cap(ordinal: usize, vram_gib: u64, tflops: f32, throttle: f32) -> GpuCapability {
@@ -3531,8 +3191,7 @@ mod tests {
     #[test]
     fn ep1_homogeneous_farm_balances_evenly() {
         // Two identical Instinct GPUs (same VRAM, same TFLOPS, no throttle).
-        // With 8 experts the capacity-proportional policy must split 4/4 —
-        // the max_imbalance ratio is exactly 1.0.
+        // With 8 experts the capacity-proportional policy must split 4/4 - the max_imbalance ratio is exactly.
         let caps = [cap(0, 64, 100.0, 0.0), cap(1, 64, 100.0, 0.0)];
         let map = ExpertPlacementMap::build(8, &caps, CapacityMetric::VramBytes);
         assert_eq!(map.num_ranks, 2);
@@ -3557,11 +3216,8 @@ mod tests {
 
     #[test]
     fn ep1_mixed_gpu_farm_weights_by_capacity() {
-        // Mixed farm: an Instinct (rank 0, 128 GiB) paired with a consumer
-        // Radeon (rank 1, 16 GiB) — an 8:1 VRAM ratio. The
-        // capacity-proportional policy must give the Instinct ~8× the
-        // experts. With 9 experts the largest-remainder split is 8 on rank
-        // 0, 1 on rank 1 (the closest integer approximation to 8:1).
+        // Mixed farm: an Instinct (rank 0, 128 GiB) paired with a consumer Radeon (rank 1, 16 GiB) - an 8:1 VRAM ratio.
+        // The capacity-proportional policy must give the Instinct ~8× the experts.
         let caps = [cap(0, 128, 100.0, 0.0), cap(1, 16, 30.0, 0.0)];
         let map = ExpertPlacementMap::build(9, &caps, CapacityMetric::VramBytes);
         // The Instinct (rank 0) must hold the lion's share.
@@ -3574,9 +3230,8 @@ mod tests {
             map.count_on_rank(0) > map.count_on_rank(1),
             "higher-capacity rank must hold more experts",
         );
-        // The ratio should approximate the VRAM ratio (8:1) within the
-        // integer-allocation granularity. 8/1, 7/2, or 9/0 are all within
-        // one expert of the ideal 8:1 split.
+        // The ratio should approximate the VRAM ratio (8:1) within the integer-allocation granularity.
+        // 8/1, 7/2, or 9/0 are all within one expert of the ideal 8:1 split.
         let r0 = map.count_on_rank(0) as f32;
         let r1 = map.count_on_rank(1) as f32;
         let ratio = r0 / r1.max(1.0);
@@ -3588,9 +3243,8 @@ mod tests {
 
     #[test]
     fn ep1_tflops_metric_shifts_balance_vs_vram() {
-        // Two ranks with equal VRAM but different TFLOPS. The VRAM metric
-        // balances 50/50; the TFLOPS metric shifts toward the faster rank.
-        // This pins that the metric selector actually changes the policy.
+        // Two ranks with equal VRAM but different TFLOPS.
+        // The VRAM metric balances 50/50; the TFLOPS metric shifts toward the faster rank.
         let caps = [cap(0, 64, 100.0, 0.0), cap(1, 64, 50.0, 0.0)];
         let map_vram = ExpertPlacementMap::build(8, &caps, CapacityMetric::VramBytes);
         let map_tflops = ExpertPlacementMap::build(8, &caps, CapacityMetric::Tflops);
@@ -3618,9 +3272,7 @@ mod tests {
     #[test]
     fn ep1_throttled_tflops_reacts_to_thermal() {
         // Two identical ranks, but rank 1 is thermal-throttled to 50%.
-        // Under `ThrottledTflops`, the throttle rank should hold fewer
-        // experts; under plain `Tflops` (which ignores throttle), the split
-        // would be 50/50. This pins the reactive metric.
+        // Under `ThrottledTflops`, the throttle rank should hold fewer experts; under plain `Tflops` (which ignores throttle),.
         let caps = [cap(0, 64, 100.0, 0.0), cap(1, 64, 100.0, 0.5)];
         let map = ExpertPlacementMap::build(8, &caps, CapacityMetric::ThrottledTflops);
         assert!(
@@ -3634,9 +3286,8 @@ mod tests {
 
     #[test]
     fn ep1_three_rank_homogeneous_balances_within_one_expert() {
-        // Three identical ranks, 10 experts. Perfect 10/3 isn't integer, so
-        // the split should be 4/3/3 (the closest integer approximation to
-        // 10/3 per rank). max_imbalance = 4/3 ≈ 1.33.
+        // Three identical ranks, 10 experts. Perfect 10/3 isn't integer, so the
+        // split should be 4/3/3 (the closest integer approximation to 10/3 per rank).
         let caps = [
             cap(0, 64, 100.0, 0.0),
             cap(1, 64, 100.0, 0.0),
@@ -3662,11 +3313,8 @@ mod tests {
 
     #[test]
     fn ep1_zero_capacity_rank_starves_not_overloads() {
-        // Rank 1 has zero free VRAM (OOM / no capacity). The greedy
-        // allocator must STARVE it (assign zero experts there), not
-        // round-robin onto an OOM rank. This is the safety property:
-        // capacity-proportional fallback never places an expert where it
-        // can't fit.
+        // Rank 1 has zero free VRAM (OOM / no capacity).
+        // The greedy allocator must STARVE it (assign zero experts there), not round-robin onto an OOM.
         let caps = [cap(0, 64, 100.0, 0.0), cap(1, 0, 100.0, 0.0)];
         let map = ExpertPlacementMap::build(8, &caps, CapacityMetric::VramBytes);
         assert_eq!(
@@ -3837,11 +3485,8 @@ mod tests {
         }
     }
 
-    /// R2 property test: the deterministic dispatch path must be BITWISE
-    /// identical to the CPU reference across routing kinds, shared-expert
-    /// presence, routed_scaling_factor values, and multi-token batches. This is
-    /// the correctness gate that lets the same DeterministicTokenMap drive a
-    /// fused GPU mega-kernel without changing output numerics.
+    /// R2 property test: the deterministic dispatch path must be BITWISE identical to the CPU reference across routing kinds, shared-expert presence, routed_scaling_factor values, and multi-token batches.
+    /// This is the correctness gate that lets the same DeterministicTokenMap drive a fused GPU mega-kernel.
     #[cfg(feature = "moe-deterministic-dispatch")]
     #[test]
     fn deterministic_dispatch_is_bitwise_identical_to_reference() {
@@ -3859,7 +3504,13 @@ mod tests {
                         let gate = identity_linear(hidden, inter);
                         let up = identity_linear(hidden, inter);
                         let down = identity_linear(hidden, inter);
-                        ExpertTriple { gate, up, down, inter, hidden }
+                        ExpertTriple {
+                            gate,
+                            up,
+                            down,
+                            inter,
+                            hidden,
+                        }
                     };
                     check_parity(kind.clone(), Some(shared), rsf, batch);
                 }
@@ -3868,12 +3519,7 @@ mod tests {
     }
 
     #[cfg(feature = "moe-deterministic-dispatch")]
-    fn check_parity(
-        kind: RouterKind,
-        shared: Option<ExpertTriple>,
-        rsf: f32,
-        batch: usize,
-    ) {
+    fn check_parity(kind: RouterKind, shared: Option<ExpertTriple>, rsf: f32, batch: usize) {
         let hidden = 4;
         let moe = build_synthetic_rsf(kind.clone(), shared, None, rsf);
         // Distinct tokens so packing exercises multiple slots.
@@ -3887,7 +3533,11 @@ mod tests {
         let input = cpu_tensor(xs, Shape::new(vec![batch, hidden]));
 
         let ref_out = moe.forward(&input).unwrap().to_vec_f32().unwrap();
-        let det_out = moe.forward_deterministic(&input).unwrap().to_vec_f32().unwrap();
+        let det_out = moe
+            .forward_deterministic(&input)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
 
         assert_eq!(
             ref_out.len(),
@@ -3911,9 +3561,6 @@ mod tests {
         for i in 0..rows.min(cols) {
             w[i * cols + i] = 1.0;
         }
-        Linear::from_tensor(
-            cpu_tensor(w, Shape::new(vec![rows, cols])),
-            None,
-        )
+        Linear::from_tensor(cpu_tensor(w, Shape::new(vec![rows, cols])), None)
     }
 }

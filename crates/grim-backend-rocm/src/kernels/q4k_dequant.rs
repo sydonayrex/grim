@@ -1,22 +1,5 @@
 //! Standalone Q4_K dequantization HIP kernel for ROCm (Crow Tier).
-//! [see: `block_q4_K`]
-//!
-//! Layout (verified against `grim_quant::dequant_q4k`): each 144-byte
-//! super-block holds 256 weights. Bytes:
-//!   [0..2]   d    = f16 super-block scale
-//!   [2..4]   min  = f16 super-block minimum scale
-//!   [4..16]  scales (12 bytes, packed 6-bit sub-block scales/mins)
-//!   [16..144] 128 bytes = 256 × 4-bit nibbles
-//!
-//! Nibble interleaving (grim-specific, NOT the GGML per-sub-block layout):
-//! for pair index `k` in 0..4, byte `qs[32*k+j]` (j in 0..32) holds
-//!   lo nibble → sub-block `2k`,   weight j
-//!   hi nibble → sub-block `2k+1`, weight j
-//! scale/min for sub-block `s`:
-//!   s<4:  sc = scales[s]&63,             m = scales[s+4]&63
-//!   s>=4: sc = (scales[s+4]&0x0F)|((scales[s-4]>>6)<<4),
-//!         m  = (scales[s+4]>>4) |((scales[s]>>6)<<4)  [ggml "q[j-0]"]
-//! value = d * sc * q - min * m
+//! [see: `block_q4_K`] Layout (verified against `grim_quant::dequant_q4k`): each 144-byte super-block holds 256 weights.
 
 /// HIP source for `grim_dequant_q4k`.
 pub const KERNEL_SOURCE: &str = r#"
@@ -40,11 +23,8 @@ extern "C" {
             sc = scales[s] & 63;
             m  = scales[s + 4] & 63;
         } else {
-            // Upstream ggml get_scale_min_k4 (ggml-quants.c): sc's top 2
-            // bits come from scales[s-4]; m's top 2 bits come from
-            // scales[s] itself ("q[j-0]" upstream). scales[s-4] in the m
-            // line reads a different byte and corrupts min values for
-            // sub-blocks 4..7.
+            // Upstream ggml get_scale_min_k4 (ggml-quants.c): sc's top 2 bits come from scales[s-4]; m's top 2 bits come from scales[s] itself ("q[j-0]" upstream).
+            // scales[s-4] in the m line reads a different byte and corrupts min values for sub-blocks.
             sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
             m  = (scales[s + 4] >> 4)  | ((scales[s] >> 6) << 4);
         }
@@ -92,10 +72,8 @@ mod tests {
         }
     }
 
-    // Host mirror of `dequant_q4k_grim_element` in KERNEL_SOURCE. Kept in lockstep
-    // with the HIP device function so the kernel's bit-level arithmetic can be
-    // validated against the CPU oracle `grim_quant::dequant_q4k` without a ROCm
-    // device (the dispatch trusts this parity).
+    // Host mirror of `dequant_q4k_grim_element` in KERNEL_SOURCE.
+    // Kept in lockstep with the HIP device function so the kernel's bit-level arithmetic can be.
     fn dequant_q4k_grim_element_host(blk: &[u8], w: usize) -> f32 {
         let d = fp16_to_f32_host(blk[0], blk[1]);
         let dmin = fp16_to_f32_host(blk[2], blk[3]);
@@ -198,9 +176,8 @@ mod tests {
             let min_bits = 0x3400u16 + (min_exp as u16) * 0x400;
             buf[2..4].copy_from_slice(&min_bits.to_le_bytes());
             for v in &mut buf[4..16] {
-                // FULL byte range: the cross-byte high bits must stay live,
-                // otherwise the scales[s-4]/scales[s] m-line variants are
-                // indistinguishable and the fixture cannot catch that bug.
+                // FULL byte range: the cross-byte high bits must stay live, otherwise the
+                // scales[s-4]/scales[s] m-line variants are indistinguishable and the fixture cannot catch that bug.
                 *v = next(&mut rng_state);
             }
             for v in &mut buf[16..144] {

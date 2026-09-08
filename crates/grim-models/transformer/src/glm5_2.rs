@@ -1,9 +1,5 @@
 //! Compatibility loader and native model for `zai-org/GLM-5.2` (HuggingFace `model_type = "glm5_2"`).
-//!
-//! # Architecture Details
-//! - **Fused QKV**: Input is projected to query, key, and value vectors in a single fused linear projection.
-//! - **Mixture-of-Experts (MoE)**: Top-k routing over sparse expert MLPs (`dense_h_to_4h -> gelu -> dense_4h_to_h`).
-//! - **Post/Pre Attention LayerNorms**: RMSNorm or LayerNorm on transformer blocks with rotary position encodings.
+//! # Architecture Details - **Fused QKV**: Input is projected to query, key, and value vectors.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -246,11 +242,7 @@ impl Glm52Block {
     }
 
     /// GPU-first forward for the fused-QKV attention path.
-    ///
-    /// Kernel gap: the fused `query_key_value` projection has no device
-    /// column-split primitive, so the Q/K/V split stays host-side (one pull of
-    /// the fused activation per forward). RoPE, KV-cache concat, attention and
-    /// the residual adds all run on the tensor's device.
+    /// Kernel gap: the fused `query_key_value` projection has no device column-split primitive, so the Q/K/V split.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -338,9 +330,7 @@ impl Glm52Block {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct Glm52 {
     pub cfg: Glm52Config,

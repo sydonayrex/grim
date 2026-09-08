@@ -1,10 +1,5 @@
-//! Zhipu GLM-4 MoE Lite architecture with fine-grained routed MoE,
-//! dedicated shared expert pathways, and GQA/MLA attention.
-//!
-//! # Architecture Details
-//! - **Attention**: GQA with RoPE rotation.
-//! - **Feed Forward**: Fine-grained MoE with 64 experts (top-4 routed) and dedicated shared expert.
-//! - **Normalization**: Pre-attention and pre-FFN RMSNorm.
+//! Zhipu GLM-4 MoE Lite architecture with fine-grained routed MoE, dedicated shared expert pathways, and GQA/MLA attention.
+//! # Architecture Details - **Attention**: GQA with RoPE rotation.
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
@@ -13,9 +8,7 @@ use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for GLM-4 MoE Lite.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,9 +62,7 @@ impl ModelConfig for Glm4MoeLiteConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MoE Block
-// ---------------------------------------------------------------------------
 
 struct Glm4Expert {
     gate_proj: Linear,
@@ -94,8 +85,8 @@ impl Glm4Expert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = self.gate_proj.forward(x)?;
         let u = self.up_proj.forward(x)?;
-        let act = grim_nn::modules::silu_mul_on_device(&g, &u)
-            .map_err(grim_core::error::Error::from)?;
+        let act =
+            grim_nn::modules::silu_mul_on_device(&g, &u).map_err(grim_core::error::Error::from)?;
         Ok(self.down_proj.forward(&act)?)
     }
 }
@@ -164,9 +155,7 @@ impl Glm4LiteMoeBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct Glm4MoeLiteBlock {
     pub wq: Linear,
@@ -183,7 +172,11 @@ pub struct Glm4MoeLiteBlock {
 }
 
 impl Glm4MoeLiteBlock {
-    pub fn load(ws: &WeightSource<'_>, cfg: &Glm4MoeLiteConfig, _tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        cfg: &Glm4MoeLiteConfig,
+        _tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -222,9 +215,8 @@ impl Glm4MoeLiteBlock {
         })
     }
 
-    /// GPU-first forward: Q/K RoPE, attention and the residual adds run on
-    /// the tensor's device. Host paths are only reached through the
-    /// fused-kernel fallback guards and the (host-side) MoE routing pull.
+    /// GPU-first forward: Q/K RoPE, attention and the residual adds run on the tensor's device.
+    /// Host paths are only reached through the fused-kernel fallback guards and the (host-side) MoE routing.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
@@ -233,12 +225,8 @@ impl Glm4MoeLiteBlock {
         let k = self.wk.forward(&normed_attn)?;
         let v = self.wv.forward(&normed_attn)?;
 
-        let q = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &q,
-            self.num_heads,
-            positions,
-        )?;
+        let q =
+            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
         let k = crate::shared_attention::rope_2d_on_device(
             &self.rope,
             &k,
@@ -272,9 +260,7 @@ impl Glm4MoeLiteBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model
-// ---------------------------------------------------------------------------
 
 pub struct Glm4MoeLite {
     pub cfg: Glm4MoeLiteConfig,
@@ -328,7 +314,10 @@ impl Glm4MoeLite {
             None,
         );
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output = Linear::from_tensor(
@@ -402,9 +391,7 @@ impl CausalLm for Glm4MoeLite {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -420,6 +407,7 @@ mod tests {
         assert_eq!(cfg.num_experts_per_tok, 4);
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_glm4_moe_lite_forward_and_session_state() {
         let mut cfg = Glm4MoeLiteConfig::default();
@@ -434,7 +422,9 @@ mod tests {
         let input_ids = cpu_tensor(vec![2.0, 6.0], Shape::new(vec![2]));
         let positions = cpu_tensor(vec![0.0, 1.0], Shape::new(vec![2]));
 
-        let logits = model.forward(session.as_mut(), &input_ids, &positions, &[]).unwrap();
+        let logits = model
+            .forward(session.as_mut(), &input_ids, &positions, &[])
+            .unwrap();
         assert_eq!(logits.shape().dims(), &[2, 32]);
 
         let last_h = session.get_last_hidden_state();

@@ -1,16 +1,5 @@
-//! Bolt-on adapter attachment, detachment, and permanent merge using the
-//! `backup2` residual slot (WI-T8).
-//!
-//! Provides `attach_bolt_on`, `detach_bolt_on`, and `merge_bolt_on` functions
-//! operating directly on `.grim` tensor files.
-//!
-//! - `attach_bolt_on` reversibly quantizes a low-rank update `ΔW = scale·B@A`
-//!   into pre-allocated `backup2` capacity without format resizes.
-//! - `detach_bolt_on` zeroes the `backup2` byte regions, reverting the tensor.
-//! - `merge_bolt_on` permanently bakes the residual into the primary weight
-//!   stream (per-row 256-byte packing, matching the CPU `dequant_row` decoder
-//!   and the bolt-on read/write path), then clears `backup1`/`backup2` so the
-//!   slot is freed and detachment becomes impossible.
+//! Bolt-on adapter attachment, detachment, and permanent merge using the `backup2` residual slot (WI-T8).
+//! Provides `attach_bolt_on`, `detach_bolt_on`, and `merge_bolt_on` functions operating directly on `.grim` tensor files.
 
 use crate::format::{
     GrimFile, OUTLIER_RECORD_BYTES, WaveSize, pack_row_bpw_for_wave, read_kv_block,
@@ -27,7 +16,6 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Attach a trained LoRA adapter `ΔW = scale * B @ A` into the `backup2` slot of a named base tensor in a `.grim` file.
-///
 /// CONTRACT: The base tensor's `GrimTensorExt` must have `backup2` provisioned with matching dimensions and non-zero `codes_size`.
 pub fn attach_bolt_on(
     grim_path: &Path,
@@ -190,21 +178,8 @@ pub fn detach_bolt_on(grim_path: &Path, tensor_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Merge a trained LoRA adapter `ΔW = (scale / rank) * B @ A` permanently into
-/// the primary weight stream of a named tensor in a `.grim` file.
-///
-/// The effective f32 weights are first reconstructed exactly as the CPU
-/// `dequant_row` decoder produces them (primary + `backup1` when
-/// `gptq_ordered > 0` + `backup2` + outlier corrections), the adapter is
-/// added, and the result is re-packed into the primary codes at the tensor's
-/// `default_bpw` with per-row 256-byte packing. The outlier stream is baked
-/// in and cleared, `backup1`/`backup2` are cleared (slot freed), and
-/// `gptq_ordered` is reset to 0 so the tensor decodes as a native pipeline.
-///
-/// Because the metadata (gptq ordering + backup declarations) must change,
-/// the whole file is rewritten atomically through a temp file: every other
-/// tensor's raw payload bytes are copied verbatim so their relative backup /
-/// distinct layouts are preserved to the byte.
+/// Merge a trained LoRA adapter `ΔW = (scale / rank) * B @ A` permanently into the primary weight stream of a named tensor in a `.grim` file.
+/// The effective f32 weights are first reconstructed exactly as the CPU `dequant_row` decoder produces them.
 pub fn merge_bolt_on(
     grim_path: &Path,
     tensor_name: &str,
@@ -376,10 +351,8 @@ pub fn merge_bolt_on(
         wave: src.wave,
     };
 
-    // Rewrite atomically through a unique temp file: fsync the temp data to
-    // stable storage first, then rename it over the target so readers never
-    // observe a partially-written `.grim`. The unique name means concurrent
-    // merges cannot collide on the same temp path.
+    // Rewrite atomically through a unique temp file: fsync the temp data to stable storage first, then rename it over the target so readers never observe a partially-written `.grim`.
+    // The unique name means concurrent merges cannot collide on the same temp path.
     let tmp = temp_path(grim_path);
     let result = (|| -> Result<()> {
         let out_file = File::create(&tmp).map_err(Error::Io)?;
@@ -399,9 +372,8 @@ pub fn merge_bolt_on(
         }
 
         writer.flush().map_err(Error::Io)?;
-        // Flush the buffer into the kernel AND to stable storage before the
-        // atomic rename — the old file is only replaced once the new data is
-        // durable on disk.
+        // Flush the buffer into the kernel AND to stable storage before the atomic rename
+        // - the old file is only replaced once the new data is durable on disk.
         writer.get_ref().sync_all().map_err(Error::Io)?;
         drop(writer);
 
@@ -625,9 +597,8 @@ fn decode_code(data: &[u8], idx: usize, bpw: u8) -> u32 {
         (high_part << low_bits) | low_part
     }
 }
-/// F2b: overwrite a `.grim` tensor's rows with new f32 values — the
-/// full-parameter counterpart of [`merge_bolt_on`] (delta step removed,
-/// same dequant→repack→reassemble pipeline).
+/// F2b: overwrite a `.grim` tensor's rows with new f32 values -
+/// the full-parameter counterpart of [`merge_bolt_on`] (delta step removed, same dequant→repack→reassemble pipeline).
 pub fn overwrite_tensor_f32(grim_path: &Path, tensor_name: &str, values: &[f32]) -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)

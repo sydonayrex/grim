@@ -2,12 +2,12 @@
 
 use grim_backend_rocm::RocmDevice;
 use grim_quant::fp8_e4m3_to_f32;
+use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 use grim_tensor::{
     Shape,
     dtype::{ArithType, BlockDtype, DType, Storage},
 };
 use std::panic;
-use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps};
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 

@@ -1,19 +1,12 @@
 //! Diagnostics formatting helpers for the grim tui sidebar.
-//!
-//! Reused from the worker-side `snapshot` and the UI render path. Pure
-//! functions — no engine access. Format helpers are tested directly.
-//!
-//! `sidebar_lines()` returns plain strings (preserved for unit tests).
-//! `sidebar_styled_lines()` returns styled ratatui Lines for the live UI.
+//! Reused from the worker-side `snapshot` and the UI render path.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use grim_speculative::Strategy;
 
-// ---------------------------------------------------------------------------
 // Brand color palette (mirrors grim-garage CSS variables).
-// ---------------------------------------------------------------------------
 
 /// Primary neon purple: #a855f7 — used for section headers and live values.
 const C_PURPLE: Color = Color::Rgb(168, 85, 247);
@@ -104,10 +97,7 @@ pub fn bar(used: u64, total: u64) -> String {
 }
 
 /// Per-model / per-turn snapshot rendered as the diagnostics sidebar.
-///
-/// Every telemetry field is optional because the engine can legitimately
-/// return `None` (prefill not yet run, no tokens generated, etc.). We never
-/// invent a number to fill a gap — `n/a` is correct there.
+/// Every telemetry field is optional because the engine can legitimately return `None` (prefill not yet.
 #[derive(Debug, Default, Clone)]
 pub struct DiagnosticsSnapshot {
     /// Model id chosen by the user.
@@ -272,14 +262,10 @@ pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Styled variant (used by the live TUI; sidebar_lines kept for unit tests).
-// ---------------------------------------------------------------------------
 
 /// Build a gradient-colored bar gauge Line.
-///
 /// Color selection: green below 60%, amber 60-84%, red at 85%+.
-/// Width is fixed at 16 fill cells so it fits a narrow sidebar.
 fn bar_line(used: u64, total: u64) -> Line<'static> {
     let pct = ratio_percent(used, total) as usize;
     let fill = pct * 16 / 100;
@@ -299,7 +285,6 @@ fn bar_line(used: u64, total: u64) -> Line<'static> {
 }
 
 /// Render a key/value pair as a single styled Line.
-///
 /// Key uses soft-purple, value uses white (for readable contrast).
 fn kv(key: &'static str, value: String, value_color: Color) -> Line<'static> {
     Line::from(vec![
@@ -309,10 +294,7 @@ fn kv(key: &'static str, value: String, value_color: Color) -> Line<'static> {
 }
 
 /// Render `snap` as styled ratatui Lines for the sidebar panel.
-///
-/// Contrast contract: all text is white or light-colored on the dark terminal
-/// background. Purple is used only for key labels and section accents, never
-/// as body text color on its own.
+/// Contrast contract: all text is white or light-colored on the dark terminal background.
 pub fn sidebar_styled_lines(snap: &DiagnosticsSnapshot) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
 
@@ -320,15 +302,27 @@ pub fn sidebar_styled_lines(snap: &DiagnosticsSnapshot) -> Vec<Line<'static>> {
     if snap.loading {
         out.push(Line::from(vec![
             Span::styled("model     ", Style::default().fg(C_PURPLE_SOFT)),
-            Span::styled("loading...", Style::default().fg(C_AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "loading...",
+                Style::default().fg(C_AMBER).add_modifier(Modifier::BOLD),
+            ),
         ]));
     } else if let Some(name) = &snap.model_name {
         let quant = snap.quant.as_deref().unwrap_or("");
         out.push(Line::from(vec![
             Span::styled("model     ", Style::default().fg(C_PURPLE_SOFT)),
-            Span::styled(name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(
-                if quant.is_empty() { String::new() } else { format!(" ({})", quant) },
+                name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if quant.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", quant)
+                },
                 Style::default().fg(C_MUTED),
             ),
         ]));
@@ -370,7 +364,11 @@ pub fn sidebar_styled_lines(snap: &DiagnosticsSnapshot) -> Vec<Line<'static>> {
     }
 
     // Decode speed: highlight live values in purple.
-    let tps_color = if snap.decode_tps.is_some() { C_PURPLE } else { C_MUTED };
+    let tps_color = if snap.decode_tps.is_some() {
+        C_PURPLE
+    } else {
+        C_MUTED
+    };
     out.push(kv("decode", format_tps(snap.decode_tps), tps_color));
     if let Some(t) = snap.turn_tps {
         out.push(kv(
@@ -388,7 +386,10 @@ pub fn sidebar_styled_lines(snap: &DiagnosticsSnapshot) -> Vec<Line<'static>> {
 
     // KV cache.
     if snap.kv_total_bytes > 0 {
-        out.push(Line::from(Span::styled("kv cache", Style::default().fg(C_PURPLE_SOFT))));
+        out.push(Line::from(Span::styled(
+            "kv cache",
+            Style::default().fg(C_PURPLE_SOFT),
+        )));
         out.push(bar_line(snap.kv_used_bytes, snap.kv_total_bytes));
         out.push(Line::from(Span::styled(
             format!(
@@ -406,7 +407,10 @@ pub fn sidebar_styled_lines(snap: &DiagnosticsSnapshot) -> Vec<Line<'static>> {
 
     // Context usage.
     if snap.ctx_limit > 0 {
-        out.push(Line::from(Span::styled("context", Style::default().fg(C_PURPLE_SOFT))));
+        out.push(Line::from(Span::styled(
+            "context",
+            Style::default().fg(C_PURPLE_SOFT),
+        )));
         out.push(bar_line(snap.ctx_used, snap.ctx_limit));
         out.push(Line::from(Span::styled(
             format!("{} / {} tok", snap.ctx_used, snap.ctx_limit),
@@ -425,7 +429,10 @@ pub fn sidebar_styled_lines(snap: &DiagnosticsSnapshot) -> Vec<Line<'static>> {
 
     // VRAM.
     if snap.vram_total_bytes > 0 {
-        out.push(Line::from(Span::styled("vram", Style::default().fg(C_PURPLE_SOFT))));
+        out.push(Line::from(Span::styled(
+            "vram",
+            Style::default().fg(C_PURPLE_SOFT),
+        )));
         out.push(bar_line(snap.vram_used_bytes, snap.vram_total_bytes));
         out.push(Line::from(Span::styled(
             format!(
@@ -441,7 +448,10 @@ pub fn sidebar_styled_lines(snap: &DiagnosticsSnapshot) -> Vec<Line<'static>> {
 
     // System RAM.
     if snap.ram_total_bytes > 0 {
-        out.push(Line::from(Span::styled("ram", Style::default().fg(C_PURPLE_SOFT))));
+        out.push(Line::from(Span::styled(
+            "ram",
+            Style::default().fg(C_PURPLE_SOFT),
+        )));
         out.push(bar_line(snap.ram_used_bytes, snap.ram_total_bytes));
         out.push(Line::from(Span::styled(
             format!(

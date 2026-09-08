@@ -1,7 +1,7 @@
 use grim_backend_rocm::autotune::{AutotuneConfig, ShapeClass};
 use grim_backend_rocm::device::hardware_spec::HardwareSpec;
 use grim_backend_rocm::kernels::charon::default_variant_table;
-use grim_backend_rocm::kernels::tile_picker::{pick_tiles, ShapeDims};
+use grim_backend_rocm::kernels::tile_picker::{ShapeDims, pick_tiles};
 use grim_backend_rocm::peer_access::P2PTopology;
 use grim_tensor::dtype::{ArithType, DType, Storage};
 
@@ -70,9 +70,15 @@ fn test_attention_window_stride_saturating_arithmetic_bounds() {
     ] {
         let w_sub = window_size.saturating_sub(1);
         let win_lo = abs_first.saturating_sub(w_sub);
-        assert!(win_lo <= abs_first, "Lower bound must never exceed current position");
+        assert!(
+            win_lo <= abs_first,
+            "Lower bound must never exceed current position"
+        );
         let active_len = abs_first - win_lo + 1;
-        assert!(active_len >= 1, "Active window slice length must be positive");
+        assert!(
+            active_len >= 1,
+            "Active window slice length must be positive"
+        );
     }
 }
 

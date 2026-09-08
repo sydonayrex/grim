@@ -10,16 +10,13 @@ use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 use crate::device::roc_device::{CharonBackwardResult, RocmDevice};
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFree, hipMemset, hipStreamSynchronize,
-    hipSuccess, upload_device_buffer, HipDim3, RocmHandle,
+    HipDim3, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFree, hipMemset,
+    hipStreamSynchronize, hipSuccess, upload_device_buffer,
 };
 
 impl RocmDevice {
     /// `tests/golden_charon_moe_gpu.rs` ($\le 10^{-3}$ max-abs-diff).
-    ///
-    /// Caller wiring lives in `grim_nn::moe::MoeFfn::forward_rocm`
-    /// (gated on the `rocm-mem` feature), reached when the activation is on
-    /// `Device::Rocm`. That path routes through `moe_fused_dispatch` below.
+    /// Caller wiring lives in `grim_nn::moe::MoeFfn::forward_rocm` (gated on the `rocm-mem` feature), reached when the activation is.
     pub fn launch_charon_fused_dispatch(
         &self,
         activations: &RocmStorage,
@@ -55,10 +52,8 @@ impl RocmDevice {
             inter,
         )?;
 
-        // Zero the output buffer before launch: the kernel accumulates per-
-        // expert contributions via `atomicAdd`, so any stale bytes in the
-        // output storage would be added into the result. This mirrors the
-        // `BackendDevice::zeros` path (hipMemset, roc_device.rs:1363).
+        // Zero the output buffer before launch: the kernel accumulates per- expert contributions via `atomicAdd`, so any stale bytes in the output storage would be added into the result.
+        // This mirrors the `BackendDevice::zeros` path (hipMemset, roc_device.rs:1363).
         check_hip("charon hipMemset(output, 0)", unsafe {
             hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
         })?;
@@ -84,8 +79,7 @@ impl RocmDevice {
         let block_dim = HipDim3::new(plan.block_x, 1, 1);
 
         // Upload the routing arrays (tokens, experts, weights) to the device.
-        // These are freed after the launch synchronizes (mirroring the
-        // embedding path's transient-buffer discipline).
+        // These are freed after the launch synchronizes (mirroring the embedding path's transient-buffer discipline).
         let mut tok_ptr = upload_device_buffer(self.ordinal, &assignment.tokens)?;
         let mut exp_ptr = upload_device_buffer(self.ordinal, &assignment.experts)?;
         let mut w_ptr = upload_device_buffer(self.ordinal, &assignment.weights)?;
@@ -172,12 +166,8 @@ impl RocmDevice {
         )
     }
 
-    /// Fused MoE dispatch against weight buffers that are already resident on
-    /// the device. Unlike [`Self::moe_fused_dispatch`], no host `&[f32]`
-    /// weight arrays are uploaded per call — callers keep the flattened
-    /// gate/up/down buffers resident across forward calls (see
-    /// `grim_nn::moe::MoeFfn::forward_rocm`), so the per-call cost is limited
-    /// to the routing arrays and the output allocation.
+    /// Fused MoE dispatch against weight buffers that are already resident on the device.
+    /// Unlike [`Self::moe_fused_dispatch`], no host `&[f32]` weight arrays are uploaded per call - callers keep the.
     pub fn moe_fused_dispatch_resident(
         &self,
         activations: &RocmStorage,
@@ -529,16 +519,7 @@ impl RocmDevice {
     }
 
     /// Device launcher for the #1 token-sorted (grouped) fused MoE dispatch.
-    ///
-    /// Mirrors `launch_charon_fused_dispatch` but feeds the sorted routing
-    /// layout (`SortedRouting`) produced by `moe_align_block_size` and calls
-    /// `grim_moe_fused_grouped`. The in-kernel math is identical to the
-    /// sortless path (gate+up fused → SiLU → down → weighted accumulate), so
-    /// the high-perf fused structure is preserved across quantizations — only
-    /// the work ordering changes (grouped by expert, no per-pair atomics
-    /// contention beyond the necessary top-k>1 accumulation).
-    ///
-    /// Device-gated: only callable with real `RocmStorage` device buffers.
+    /// Mirrors `launch_charon_fused_dispatch` but feeds the sorted routing layout (`SortedRouting`) produced by `moe_align_block_size` and calls `grim_moe_fused_grouped`.
     #[allow(dead_code)]
     pub(crate) fn launch_charon_grouped_dispatch(
         &self,
@@ -568,10 +549,8 @@ impl RocmDevice {
         )
     }
 
-    /// WI-F3 — grouped dispatch against a caller-selected kernel entry, so
-    /// `CharonSelector` variants can route to the WMMA grouped kernel
-    /// (`grim_moe_fused_grouped_wmma`) or the scalar grouped kernel via
-    /// `kernels::charon::grouped_dispatch_entry`. Same host/sort contract.
+    /// WI-F3 - grouped dispatch against a caller-selected kernel entry, so `CharonSelector` variants can route to the WMMA grouped kernel (`grim_moe_fused_grouped_wmma`) or the scalar grouped kernel via `kernels::charon::grouped_dispatch_entry`.
+    /// Same host/sort contract.
     pub(crate) fn launch_charon_grouped_dispatch_entry(
         &self,
         activations: &RocmStorage,
@@ -678,12 +657,7 @@ impl RocmDevice {
     }
 
     /// Device launcher for the #2 FP8 W8A8 token-sorted grouped dispatch.
-    ///
-    /// Mirrors `launch_charon_grouped_dispatch` (same sorted layout + grid/block)
-    /// but weights are FP8 E4M3 bytes with per-block-16 scales + per-token act
-    /// scale. Calls `grim_moe_fused_grouped_fp8`, reusing the identical
-    /// in-register fused math so the high-perf structure is preserved across
-    /// quantization (vLLM W8A8 contract).
+    /// Mirrors `launch_charon_grouped_dispatch` (same sorted layout + grid/block) but weights are FP8 E4M3 bytes with per-block-16.
     #[allow(dead_code)]
     pub(crate) fn launch_charon_grouped_dispatch_fp8(
         &self,
@@ -1136,11 +1110,8 @@ impl RocmDevice {
         Ok(stream)
     }
 
-    /// Launcher for the unified IQ/K-quant grouped MoE kernel
-    /// (`grim_moe_fused_grouped_iqk`). `format_id` selects the super-block
-    /// decode (0 iq4nl .. 11 q3k); each expert's weights occupy one 256-weight
-    /// super-block of `BLOCK_BYTES[format_id]` bytes. Mirrors
-    /// `launch_charon_grouped_dispatch_q80` otherwise.
+    /// Launcher for the unified IQ/K-quant grouped MoE kernel (`grim_moe_fused_grouped_iqk`).
+    /// `format_id` selects the super-block decode (0 iq4nl ..
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_charon_grouped_dispatch_iqk(
         &self,
@@ -1580,23 +1551,8 @@ impl RocmDevice {
         Ok(stream)
     }
 
-    /// (`tests/golden_charon_moe_gpu.rs`, G-A4). Takes plain host `f32`
-    /// buffers + a routing assignment, uploads them, zeros the output,
-    /// launches `grim_moe_fused_dispatch`, and reads the result back.
-    ///
-    /// Expert weight layout: `[num_experts, inter*hidden]` (gate/up) and
-    /// `[num_experts, hidden*inter]` (down), expert outermost — matching
-    /// `ExpertBank::gate[e].weight` / `down[e].weight` row-major layout so
-    /// the kernel's `gw + exp*inter*hidden` stride is correct.
-    ///
-    /// This is the only public surface the integration tests need; it does
-    /// not expose `RocmStorage` or raw device pointers.
-    ///
-    /// VERIFIED(gpu-verify): Diagnostic roundtrip methods synchronize the
-    /// stream and download output to host RAM via `to_cpu_vec_f32()`.
-    /// Production inference through `moe_fused_dispatch_resident` /
-    /// `grim_nn::moe::MoeFfn::forward_rocm` keeps output on `Device::Rocm`
-    /// without host copies (verified in `tests/moe_ffn_device_chaining_parity.rs`).
+    /// (`tests/golden_charon_moe_gpu.rs`, G-A4).
+    /// Takes plain host `f32` buffers + a routing assignment, uploads them, zeros the output, launches.
     pub fn charon_fused_dispatch_roundtrip(
         &self,
         activations: &[f32],
@@ -1653,12 +1609,8 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    /// Host-to-host roundtrip for the #1 token-sorted (grouped) fused MoE
-    /// dispatch. Mirrors `charon_fused_dispatch_roundtrip` but token-sorts the
-    /// routing (vLLM `moe_align_block_size`) and launches
-    /// `grim_moe_fused_grouped`. Used by the cross-kernel parity golden test
-    /// that proves the grouped path produces identical numerics to the
-    /// sortless path on gfx1036 (G-A4 extension for WI-A).
+    /// Host-to-host roundtrip for the #1 token-sorted (grouped) fused MoE dispatch.
+    /// Mirrors `charon_fused_dispatch_roundtrip` but token-sorts the routing (vLLM `moe_align_block_size`) and launches `grim_moe_fused_grouped`.
     pub fn charon_grouped_dispatch_roundtrip(
         &self,
         activations: &[f32],
@@ -1720,13 +1672,8 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    /// WI-F3 — WMMA grouped MoE dispatch roundtrip: sorts via
-    /// `moe_align_block_size`, then launches the WMMA/tensor-core grouped
-    /// kernel (`grim_moe_fused_grouped_wmma`, the
-    /// `CharonVariant::LargeGroupPrefill` dispatch target via
-    /// `kernels::charon::grouped_dispatch_entry`) and reads the result back.
-    /// On non-WMMA arches (gfx1036/RDNA2) the kernel compiles to the scalar
-    /// fallback, so this roundtrip is parity-safe everywhere.
+    /// WI-F3 - WMMA grouped MoE dispatch roundtrip: sorts via `moe_align_block_size`, then launches the WMMA/tensor-core grouped kernel (`grim_moe_fused_grouped_wmma`, the `CharonVariant::LargeGroupPrefill` dispatch target via `kernels::charon::grouped_dispatch_entry`) and reads the result back.
+    /// On non-WMMA arches (gfx1036/RDNA2) the kernel compiles to the scalar fallback, so this roundtrip is.
     pub fn charon_grouped_dispatch_wmma_roundtrip(
         &self,
         activations: &[f32],
@@ -1788,15 +1735,10 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    // -----------------------------------------------------------------------
-    // Charon MoE backward launcher (P2 — WI-Charon-1 device dispatch)
-    // -----------------------------------------------------------------------
+    // Charon MoE backward launcher (P2 - WI-Charon-1 device dispatch)
 
-    /// Device launcher for the FP32 Charon MoE backward kernel
-    /// (`grim_moe_fused_grouped_backward`). Mirrors
-    /// `launch_charon_grouped_dispatch`: validates inputs, zero-initialises the
-    /// four atomicAdd output buffers, plans the grouped grid/block from the
-    /// sorted routing arrays, uploads sorted routing arrays, and launches.
+    /// Device launcher for the FP32 Charon MoE backward kernel (`grim_moe_fused_grouped_backward`).
+    /// Mirrors `launch_charon_grouped_dispatch`: validates inputs, zero-initialises the four atomicAdd output buffers, plans the grouped grid/block from.
     pub(crate) fn launch_charon_grouped_backward(
         &self,
         activations: &RocmStorage,
@@ -1877,10 +1819,8 @@ impl RocmDevice {
         let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
         let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
 
-        // Kernel arg order matches grim_moe_fused_grouped_backward signature:
-        // activations, gate_w, up_w, down_w, d_y, d_gate_w, d_up_w, d_down_w,
-        // d_x, sorted_token_ids, sorted_expert_ids, sorted_weights,
-        // hidden, inter, num_tokens, block_size, routed_scaling_factor
+        // Kernel arg order matches grim_moe_fused_grouped_backward signature: activations, gate_w, up_w, down_w, d_y,
+        // d_gate_w, d_up_w, d_down_w, d_x, sorted_token_ids, sorted_expert_ids, sorted_weights, hidden, inter, num_tokens, block_size, routed_scaling_factor
         let mut a = a_ptr as *mut c_void;
         let mut gw = expert_gate_w_ptr as *mut c_void;
         let mut uw = expert_up_w_ptr as *mut c_void;
@@ -1942,11 +1882,7 @@ impl RocmDevice {
     }
 
     /// Host-to-host roundtrip for the Charon MoE backward kernel.
-    ///
-    /// Uploads all inputs (activations, expert weights, d_y) and the sorted
-    /// routing arrays to the device, launches `grim_moe_fused_grouped_backward`,
-    /// and downloads the four gradient buffers (`d_gate_w`, `d_up_w`,
-    /// `d_down_w`, `d_x`). Used by the P2 device verifier test.
+    /// Uploads all inputs (activations, expert weights, d_y) and the sorted routing arrays to the device,.
     pub fn charon_grouped_backward_roundtrip(
         &self,
         activations: &[f32],
@@ -2038,11 +1974,8 @@ impl RocmDevice {
         })
     }
 
-    /// Host-to-host roundtrip for the #3 MXFP4 (E2M1 + E8M0) token-sorted grouped
-    /// dispatch. Takes packed E2M1 weight codes + E8M0 shared-exponent bytes
-    /// (one exp per 32-element group along the contraction dim) for gate/up/down,
-    /// token-sorts via `moe_align_block_size`, and launches
-    /// `grim_moe_fused_grouped_mxfp4`. Used by the MXFP4-vs-FP32 KAT golden test.
+    /// Host-to-host roundtrip for the #3 MXFP4 (E2M1 + E8M0) token-sorted grouped dispatch.
+    /// Takes packed E2M1 weight codes + E8M0 shared-exponent bytes (one exp per 32-element group along.
     pub fn charon_grouped_dispatch_roundtrip_mxfp4(
         &self,
         activations: &[f32],
@@ -2175,10 +2108,8 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    /// Host-to-host roundtrip for the #4 MXFP8 (E4M3 + E8M0) token-sorted grouped
-    /// dispatch. Takes E4M3 weight codes (1 byte each, NOT packed) + one E8M0
-    /// shared-exponent byte per 32-element group, reusing the identical in-register
-    /// gate/up/SiLU/down math. Used by the MXFP8-vs-FP32 KAT (WI-A / G-A4 extension).
+    /// Host-to-host roundtrip for the #4 MXFP8 (E4M3 + E8M0) token-sorted grouped dispatch.
+    /// Takes E4M3 weight codes (1 byte each, NOT packed) + one E8M0 shared-exponent byte per.
     pub fn charon_grouped_dispatch_roundtrip_mxfp8(
         &self,
         activations: &[f32],
@@ -2311,10 +2242,8 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    /// Takes Q8_0 weight bytes (f16 scale + i8 per 32 weights) + per-token act
-    /// scale, token-sorts via `moe_align_block_size`, and launches
-    /// `grim_moe_fused_grouped_q80` reusing the identical in-register math. Used
-    /// by the Q8_0-vs-FP32 KAT golden test (WI-5 / G-A4 extension).
+    /// Takes Q8_0 weight bytes (f16 scale + i8 per 32 weights) + per-token act scale, token-sorts via `moe_align_block_size`, and launches `grim_moe_fused_grouped_q80` reusing the identical in-register math.
+    /// Used by the Q8_0-vs-FP32 KAT golden test (WI-5 / G-A4 extension).
     pub fn charon_grouped_dispatch_roundtrip_q80(
         &self,
         activations: &[f32],
@@ -2408,11 +2337,8 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    /// Generic host-to-host roundtrip for the unified IQ/K-quant token-sorted
-    /// grouped dispatch. `format_id` selects the super-block decode (0 iq4nl ..
-    /// 11 q3k); `block_bytes` is `BLOCK_BYTES[format_id]`. Each expert's weights
-    /// occupy one super-block of `block_bytes` bytes. Used by the IQ/K-vs-FP32
-    /// KAT golden tests.
+    /// Generic host-to-host roundtrip for the unified IQ/K-quant token-sorted grouped dispatch.
+    /// `format_id` selects the super-block decode (0 iq4nl ..
     pub fn charon_grouped_dispatch_roundtrip_iqk(
         &self,
         activations: &[f32],
@@ -2507,9 +2433,8 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    /// token-sorts via `moe_align_block_size`, and launches
-    /// `grim_moe_fused_grouped_fp8` reusing the identical in-register math. Used
-    /// by the FP8-vs-FP32 KAT golden test (WI-A / G-A4 extension for WI-2).
+    /// token-sorts via `moe_align_block_size`, and launches `grim_moe_fused_grouped_fp8` reusing the identical in-register math.
+    /// Used by the FP8-vs-FP32 KAT golden test (WI-A / G-A4 extension for WI-2).
     pub fn charon_grouped_dispatch_roundtrip_fp8(
         &self,
         activations: &[f32],
@@ -2623,13 +2548,9 @@ impl RocmDevice {
         self.synchronize();
         out_storage.to_cpu_vec_f32()
     }
-
-
 }
 
-
 impl RocmDevice {
-
     /// Compute dynamic Expert Parallel Load Balancing (EPLB) greedy LPT placement.
     pub fn eplb_balance_experts(
         &self,
@@ -2652,9 +2573,8 @@ impl RocmDevice {
         crate::device::batch_orchestrator::BatchReorderer::plan(sequences)
     }
 
-    /// Launch one bounded Scythe persistent worker. The worker is intentionally
-    /// launched as a single 128-thread block: the callable Charon device
-    /// function uses that block cooperatively and processes the complete task.
+    /// Launch one bounded Scythe persistent worker.
+    /// The worker is intentionally launched as a single 128-thread block: the callable Charon device function.
     pub fn launch_scythe_persistent_dispatch(
         &self,
         slots: &dyn BackendStorage,
@@ -2694,10 +2614,8 @@ impl RocmDevice {
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
 
-    /// WI-SB6: launch the persistent worker on an EXPLICIT non-blocking
-    /// stream. The batch-mode wrapper above uses the device active stream;
-    /// resident mode must own its stream so control traffic on other streams
-    /// is never ordered behind this eternally-polling kernel.
+    /// WI-SB6: launch the persistent worker on an EXPLICIT non-blocking stream.
+    /// The batch-mode wrapper above uses the device active stream; resident mode must own its stream.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_scythe_persistent_dispatch_on(
         &self,

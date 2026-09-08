@@ -1,8 +1,5 @@
 //! Pinned Buffer Lease and Stale Lock Monitor.
-//!
-//! Tracks active host-pinned / device-pinned buffer leases during asynchronous
-//! cross-node transfers and device copies. Automatically reclaims abandoned leases
-//! on worker timeouts or connection drops to prevent permanent memory deadlocks.
+//! Tracks active host-pinned / device-pinned buffer leases during asynchronous cross-node transfers and device copies.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -72,7 +69,10 @@ impl PinLeaseMonitor {
 
         for (&id, lease) in self.leases.iter_mut() {
             if lease.status == LeaseStatus::Active
-                && now.checked_duration_since(lease.acquired_at).unwrap_or_default() > lease.timeout
+                && now
+                    .checked_duration_since(lease.acquired_at)
+                    .unwrap_or_default()
+                    > lease.timeout
             {
                 lease.status = LeaseStatus::TimedOut;
                 expired.push(id);

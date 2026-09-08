@@ -27,11 +27,8 @@ pub type RocblasInt = i32;
 #[derive(Debug, Clone, Copy)]
 pub struct RocblasHandle(pub *mut c_void);
 
-// NOTE: RocblasHandle is Send (can be moved between threads) but NOT Sync —
-// rocblas_set_stream mutates the handle's internal active-stream state, so
-// concurrent rocblas_gemm_ex calls from multiple threads sharing a handle can
-// execute a GEMM on the wrong stream. Callers must serialize access (e.g. via
-// Mutex) if sharing across threads.
+// NOTE: RocblasHandle is Send (can be moved between threads) but NOT Sync - rocblas_set_stream mutates the handle's internal active-stream state, so concurrent rocblas_gemm_ex calls from multiple threads sharing a handle can execute a GEMM on the wrong stream.
+// Callers must serialize access (e.g.
 unsafe impl Send for RocblasHandle {}
 
 #[link(name = "rocblas", kind = "dylib")]

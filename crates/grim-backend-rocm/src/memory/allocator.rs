@@ -18,9 +18,8 @@ pub struct RocmCachingAllocator {
     cached_bytes: Mutex<usize>,
     /// Soft cap on `cached_bytes`. Once exceeded, freed buffers are actually [see: `hipFree`]
     cap_bytes: usize,
-    /// Device ordinal this allocator serves. Pinned around every driver call
-    /// so a thread whose HIP context drifted to another device cannot
-    /// `hipMalloc`/`hipFree` against the wrong one (WI-M1 context discipline).
+    /// Device ordinal this allocator serves. Pinned around every driver call so a thread whose
+    /// HIP context drifted to another device cannot `hipMalloc`/`hipFree` against the wrong one (WI-M1 context discipline).
     ordinal: usize,
     /// Count of real `hipMalloc` calls (misses). Always incremented.
     malloc_count: AtomicUsize,
@@ -64,9 +63,8 @@ impl RocmCachingAllocator {
             return Ok(ptr_u64 as *mut c_void);
         }
 
-        // WI-M1: `hipMalloc` allocates in the calling thread's current device
-        // context. Pin this allocator's ordinal — a pool miss from a drifted
-        // thread must not materialise the buffer on another device.
+        // WI-M1: `hipMalloc` allocates in the calling thread's current device context.
+        // Pin this allocator's ordinal - a pool miss from a drifted thread must not materialise.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
         let res = check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) });
@@ -81,9 +79,8 @@ impl RocmCachingAllocator {
 
     /// Return a buffer to the pool (or actually free it if over cap).
     pub fn free(&self, ptr: *mut c_void, bytes: usize) {
-        // TEMP-DIAG (GGUF fault hunt): GRIM_ALLOC_NO_POOL=1 makes every free
-        // a synchronized real release, ruling pool reuse in/out as the cause
-        // of the "Page not present" GPU fault.
+        // TEMP-DIAG (GGUF fault hunt): GRIM_ALLOC_NO_POOL=1 makes every free a synchronized real release, ruling
+        // pool reuse in/out as the cause of the "Page not present" GPU fault.
         if std::env::var("GRIM_ALLOC_NO_POOL").is_ok() {
             // WI-M1: pin the owning ordinal for the real release (see below).
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
@@ -101,12 +98,7 @@ impl RocmCachingAllocator {
         };
         if over_cap || ptr.is_null() {
             // Use hipFreeAsync on the null stream instead of hipDeviceSynchronize + hipFree.
-            // hipFreeAsync enqueues the release after all currently submitted work on the
-            // null stream, avoiding a full-device stall. Falls back to sync hipFree if the
-            // async path is unavailable (pre-ROCm-5.4 drivers return an error code).
-            // CONTRACT: ptr must not be reused by the caller after this call returns.
-            // WI-M1: pin the owning ordinal — a real release issued from a
-            // drifted thread's context frees into the wrong device's pool.
+            // hipFreeAsync enqueues the release after all currently submitted work on the null stream, avoiding a.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             unsafe {
                 let res = crate::hipFreeAsync(ptr, std::ptr::null_mut());
@@ -129,9 +121,8 @@ impl RocmCachingAllocator {
 
     /// Release every pooled buffer back to the driver. Mirrors `torch.cuda.empty_cache()`.
     pub fn empty_cache(&self) {
-        // Pin the device (P1-7 discipline): hipDeviceSynchronize targets the
-        // calling thread's current device, which may differ from `self.ordinal`
-        // on a multi-GPU host where another device's teardown ran on this thread.
+        // Pin the device (P1-7 discipline): hipDeviceSynchronize targets the calling thread's current device, which may
+        // differ from `self.ordinal` on a multi-GPU host where another device's teardown ran on this thread.
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         unsafe {
             let _ = crate::hipDeviceSynchronize();

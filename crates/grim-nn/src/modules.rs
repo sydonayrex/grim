@@ -10,9 +10,7 @@ use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, DType, Device, Tensor,
-    CoreTensorOps,
-};
+use grim_tensor::{BackendDevice, CoreTensorOps, DType, Device, Tensor};
 
 use crate::varbuilder::WeightSource;
 
@@ -21,12 +19,8 @@ use grim_backend_cuda::CudaDevice;
 #[cfg(feature = "rocm-mem")]
 use grim_backend_rocm::RocmDevice;
 
-/// Pick the `BackendDevice` that matches the storage location of `x` so
-/// arithmetic ops dispatch to GPU kernels when the tensor lives on a GPU.
+/// Pick the `BackendDevice` that matches the storage location of `x` so arithmetic ops dispatch to GPU kernels when the tensor lives on a GPU.
 /// Falls back to CPU if the requested backend is unavailable in this build.
-///
-/// WI-Host-1 #4: returns `Arc<dyn BackendDevice>` to avoid allocating a fresh `Box`
-/// wrapper on every operation dispatch.
 pub fn pick_device_for_tensor(x: &Tensor) -> Arc<dyn BackendDevice> {
     pick_device_for_storage_device(x.device())
 }
@@ -93,10 +87,8 @@ pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
-/// Row gather `weight[indices, :]` dispatched on-device without copying the
-/// embedding table to the host. The `embedding` kernel is a required
-/// `BackendStorage` trait method, so every backend implements it; the host
-/// fallback only covers kernel errors on exotic storages.
+/// Row gather `weight[indices, :]` dispatched on-device without copying the embedding table to the host.
+/// The `embedding` kernel is a required `BackendStorage` trait method, so every backend implements it; the.
 pub fn embedding_gather_on_device(
     weight: &Tensor,
     indices: &[u32],
@@ -105,11 +97,10 @@ pub fn embedding_gather_on_device(
 ) -> Result<Tensor> {
     let dev = pick_device_for_tensor(weight);
     let out_shape = Shape::new(vec![seq_len, dim]);
-    // Kernel contract: a 2-D `[vocab, dim]` table. Some legacy loaders (and
-    // tests) build Linear-shaped embeddings whose storage is transposed —
-    // those keep the flat host-gather semantics below.
-    let table_is_kernel_shaped = weight.shape().rank() == 2
-        && weight.shape().dim(1).map(|d| d == dim).unwrap_or(false);
+    // Kernel contract: a 2-D `[vocab, dim]` table.
+    // Some legacy loaders (and tests) build Linear-shaped embeddings whose storage is transposed - those keep.
+    let table_is_kernel_shaped =
+        weight.shape().rank() == 2 && weight.shape().dim(1).map(|d| d == dim).unwrap_or(false);
     if table_is_kernel_shaped {
         if let Ok((s, _handle)) =
             CoreTensorOps::embedding(&*dev, weight.storage().as_ref(), indices, &out_shape)
@@ -151,17 +142,8 @@ pub fn is_kernel_unimplemented(e: &Error) -> bool {
     matches!(e, Error::Unimplemented(_))
 }
 
-/// WI-SB4a: stage an activation onto `target` for contiguous layer-pipeline
-/// execution. Same-device calls are free clones; cross-device moves stage
-/// through host memory (`from_cpu`) so no backend-specific peer support is
-/// required. The SCYTHE-2 WI-INF3 routing path keeps its own P2P fast path
-/// (`streaming_forward::transfer_to_device`) for same-PCI-domain ROCm pairs —
-/// this helper is deliberately the simple, always-correct variant.
-///
-/// On builds without the target's backend compiled in, the storage lands on
-/// the CPU fallback while carrying `target` as its device tag, which is what
-/// makes hermetic split-vs-unsplit parity gates possible off-box ("fake
-/// segments mapped to CPU").
+/// WI-SB4a: stage an activation onto `target` for contiguous layer-pipeline execution.
+/// Same-device calls are free clones; cross-device moves stage through host memory (`from_cpu`) so no backend-specific.
 pub fn move_to_device(x: &Tensor, target: &Device) -> Result<Tensor> {
     if x.device() == target {
         return Ok(x.clone());
@@ -177,12 +159,8 @@ pub fn move_to_device(x: &Tensor, target: &Device) -> Result<Tensor> {
     ))
 }
 
-/// Pick a `BackendDevice` for a storage `Device` directly (without an
-/// owning `Tensor`), used when reconstructing a tensor from CPU-side
-/// bytes but needing to land it back on the original device.
+/// Pick a `BackendDevice` for a storage `Device` directly (without an owning `Tensor`), used when reconstructing a tensor from CPU-side bytes but needing to land it back on the original device.
 /// Falls back to CPU if the requested backend is unavailable in this build.
-///
-/// WI-Host-1 #4: returns process-wide cached `Arc<dyn BackendDevice>` to avoid per-op heap churn.
 pub fn pick_device_for_storage_device(d: &Device) -> Arc<dyn BackendDevice> {
     static CPU_DEV: std::sync::OnceLock<Arc<CpuDevice>> = std::sync::OnceLock::new();
     match d {
@@ -216,17 +194,13 @@ pub fn pick_device_for_storage_device(d: &Device) -> Arc<dyn BackendDevice> {
     }
 }
 
-/// Add two tensors element-wise with broadcasting, dispatching to the
-/// device that owns `a`'s storage. This replaces the CPU-only
-/// `grim_backend_cpu::add_tensors` which hardcodes `CpuDevice` and
-/// panics ("storage is not CpuStorage") when called with ROCm tensors.
+/// Add two tensors element-wise with broadcasting, dispatching to the device that owns `a`'s storage.
+/// This replaces the CPU-only `grim_backend_cpu::add_tensors` which hardcodes `CpuDevice` and panics ("storage is not CpuStorage") when.
 pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = pick_device_for_tensor(a);
 
-    // Handle broadcasting: if b has fewer dimensions than a (e.g. b is
-    // [S, H] and a is [1, S, H]), repeat b to match a's shape so that
-    // backends without native broadcasting (e.g. CUDA) don't read past
-    // b's memory.
+    // Handle broadcasting: if b has fewer dimensions than a (e.g.
+    // b is [S, H] and a is [1, S, H]), repeat b to match a's.
     let b_adjusted = if a.shape().dims().len() != b.shape().dims().len() {
         // Compute the broadcast shape (a's shape) and repeat b to fill it.
         let out_shape = a.shape();
@@ -236,7 +210,8 @@ pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         if out_elems % b_elems != 0 {
             return Err(Error::Shape(format!(
                 "add_tensors: cannot broadcast b={:?} to a={:?}",
-                b.shape(), a.shape()
+                b.shape(),
+                a.shape()
             )));
         }
         let repeats = out_elems / b_elems;
@@ -292,11 +267,7 @@ impl Default for TensorParallelConfig {
 
 impl TensorParallelConfig {
     /// Read TP rank / world size from the environment.
-    ///
     /// - `GRIM_TP_SIZE` → `world_size` (defaults to 1).
-    /// - `GRIM_TP_RANK` → `rank` (defaults to 0).
-    ///
-    /// Returns `None` when `GRIM_TP_SIZE` is unset or `1` (single-device).
     pub fn from_env() -> Option<Self> {
         let world_size = std::env::var("GRIM_TP_SIZE")
             .ok()
@@ -309,9 +280,8 @@ impl TensorParallelConfig {
         Some(Self { rank, world_size })
     }
 
-    /// Validate the rank/world_size contract: `world_size >= 1` and
-    /// `rank < world_size`. Returns `Err(Unsupported)` (via the caller's
-    /// `Result`) misconfigured config rather than silently degrading.
+    /// Validate the rank/world_size contract: `world_size >= 1` and `rank < world_size`.
+    /// Returns `Err(Unsupported)` (via the caller's `Result`) misconfigured config rather than silently degrading.
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.world_size == 0 {
             return Err(
@@ -362,9 +332,7 @@ impl Default for ExpertParallelConfig {
 
 impl ExpertParallelConfig {
     /// Read EP rank / world size from the environment.
-    ///
     /// - `GRIM_EP_SIZE` → `world_size` (defaults to 1).
-    /// - `GRIM_EP_RANK` → `rank` (defaults to 0).
     pub fn from_env(num_total_experts: usize) -> Option<Self> {
         let world_size = std::env::var("GRIM_EP_SIZE")
             .ok()
@@ -410,24 +378,15 @@ impl ExpertParallelConfig {
     /// Returns the target rank that hosts `expert_id`.
     pub fn rank_for_expert(&self, expert_id: usize) -> usize {
         let experts_per_rank = self.num_total_experts.div_ceil(self.world_size.max(1));
-        if experts_per_rank == 0 {
-            0
-        } else {
-            (expert_id / experts_per_rank).min(self.world_size - 1)
-        }
+        expert_id
+            .checked_div(experts_per_rank)
+            .map(|r| r.min(self.world_size - 1))
+            .unwrap_or(0)
     }
 }
 
 /// Refuse tensor parallelism for architecture `arch` when `tp.world_size > 1`.
-///
-/// Used by `Foo::load_tp` stubs for architectures whose `forward` path does
-/// not yet consume `ColumnParallelLinear`/`RowParallelLinear` (or whose
-/// attention layout — fused QKV, MLA, enc/dec cross-attn, SSM/RWKV — would
-/// require bespoke sharding math). Returns the typed `Unsupported` error the
-/// caller bubbles up so the multi-process TP path **fails loudly** rather than
-/// loading sharded-but-unreduced weights that silently corrupt output.
-///
-/// `world_size == 1` (or default) passes through.
+/// Used by `Foo::load_tp` stubs for architectures whose `forward` path does not yet consume `ColumnParallelLinear`/`RowParallelLinear` (or.
 pub fn require_single_device(
     tp: TensorParallelConfig,
     arch: &str,
@@ -444,9 +403,8 @@ pub fn require_single_device(
     Ok(())
 }
 
-/// Column-parallel linear layer (§4.1): weights are pre-sharded at load
-/// (each rank holds `out_features / world_size` rows), so `forward` is just
-/// the inner `Linear::forward`. No CPU output-slicing needed.
+/// Column-parallel linear layer (§4.1): weights are pre-sharded at load (each rank holds `out_features / world_size` rows), so `forward` is just the inner `Linear::forward`.
+/// No CPU output-slicing needed.
 #[derive(Clone)]
 pub struct ColumnParallelLinear {
     /// The full Linear; its weight tensor is already the rank's shard.
@@ -485,17 +443,8 @@ impl ColumnParallelLinear {
     }
 }
 
-/// Row-parallel linear layer (§4.1): weights are pre-sharded at load
-/// (each rank holds `in_features / world_size` columns), so `forward` is
-/// the inner matmul + a device-side `all_reduce("sum")` to sum partial
-/// outputs across TP ranks. If the active backend has no `all_reduce`
-/// implementation (e.g. CUDA, which inherits the trait default
-/// `Err(Unimplemented)`), `forward` **propagates the error** rather than
-/// returning the un-reduced partial output — see `require_single_device`
-/// for the rationale: returning a per-rank partial as if it were the
-/// all-reduced sum silently corrupts every downstream activation. Set
-/// `GRIM_TP_SIZE=1` (or use a backend with a real collective impl such as
-/// ROCm/RCCL, Vulkan, or Metal) to run single-device.
+/// Row-parallel linear layer (§4.1): weights are pre-sharded at load (each rank holds `in_features / world_size` columns), so `forward` is the inner matmul + a device-side `all_reduce("sum")` to sum partial outputs across TP ranks.
+/// If the active backend has no `all_reduce` implementation (e.g.
 #[derive(Clone)]
 pub struct RowParallelLinear {
     pub inner: Linear,
@@ -508,10 +457,7 @@ impl RowParallelLinear {
     }
 
     /// Forward: inner matmul of pre-sharded input + device-side `all_reduce`.
-    ///
-    /// On `all_reduce` failure the error is propagated (not silently
-    /// degraded) — a backend without a collective impl cannot produce a
-    /// correct TP>1 forward, so a hard error is preferable to wrong output.
+    /// On `all_reduce` failure the error is propagated (not silently degraded) - a backend without a.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.inner.forward(x)?;
         if self.tp_config.world_size > 1 {
@@ -572,11 +518,8 @@ pub struct Linear {
 }
 
 impl Linear {
-    /// Load a Linear layer.
-    ///
-    /// GGUF stores matrix weights as `[out_dim, in_dim]` (rows = output units,
-    /// columns = input units). This matches llama.cpp's convention: `y = x @ W^T`,
-    /// so `Linear` pre-transposes `w_t` once during load for fast device matmuls.
+    /// Load a Linear layer. GGUF stores matrix weights as
+    /// `[out_dim, in_dim]` (rows = output units, columns = input units).
     pub fn load(
         ws: &WeightSource<'_>,
         in_dim: usize,
@@ -742,31 +685,14 @@ impl Linear {
                         if qmm_trace {
                             eprintln!("[linear] branch=quantized_matmul fallback");
                         }
-                        // No fused kernel (e.g. CPU): fall back to the explicit
-                        // dequant + GEMM path. `quantized_matmul` reads the packed
-                        // bytes from `w_t` (GGUF [out,in] layout), dequants into a
-                        // [k,n] row-major buffer, and runs the GEMM — it does NOT
-                        // depend on `transpose_last_two` having relabeled storage.
-                        // Falling back to plain `matmul` here would pass the
-                        // still-quantized bytes to a function expecting F32 [k,n]
-                        // and trip ShapeMismatch on non-square layers (e.g.
-                        // MiniCPM5's wq is [2048,1536]). Scales are embedded in
-                        // the K-quant block layout, so an empty slice is fine for
-                        // Q4_K/Q5_K/Q6_K (the only K-quant formats we dispatch
-                        // here); Q8_0 is handled by its own block header.
+                        // No fused kernel (e.g. CPU): fall back to the explicit dequant + GEMM path.
                         dev.quantized_matmul(a_storage, b_storage, &[], fmt, &out_shape)?
                     }
                     Err(e) => return Err(e),
                 }
             } else {
                 // Quantized storage without a QuantFormat mapping (e.g.
-                // FloatPack(MxFp4)): plain `matmul` would misread the packed
-                // bytes as F32. Route through `quantized_matmul`, whose ROCm
-                // dispatch matches on the storage dtype (the `format`
-                // parameter is unused there) and has per-format fused
-                // dequant-GEMM kernels; backends without the override
-                // materialize F32 weights at load time and never reach this
-                // branch.
+                // FloatPack(MxFp4)): plain `matmul` would misread the packed bytes as F32.
                 dev.quantized_matmul(
                     a_storage,
                     b_storage,
@@ -778,16 +704,8 @@ impl Linear {
         } else {
             CoreTensorOps::matmul(&*dev, a_storage, b_storage, &out_shape)?
         };
-        // WI-Host-1: dropped `h.synchronize()?` here. The host-side pipeline
-        // stall it forced on every `Linear::forward` call (twice per layer:
-        // matmul + bias-add) is a real throughput hit on GPU backends, and
-        // the sync is redundant — the returned storage `Arc` is a device
-        // buffer handle that synchronizes lazily on the first real read
-        // (`to_vec_f32`, `to_cpu_vec_f32`, the next op's dispatch). The plan
-        // keeps synchronization at the outer inference boundary (before
-        // sampling), not inside every primitive. CPU is unaffected
-        // (`CpuDevice::synchronize` is a no-op — verified by the existing
-        // `test_linear_forward_with_bias_hand_calculated` etc.).
+        // WI-Host-1: dropped `h.synchronize()?` here.
+        // The host-side pipeline stall it forced on every `Linear::forward` call (twice per layer: matmul +.
         let _ = h;
         let mat_out = Tensor::new(
             Arc::from(out_s),
@@ -828,24 +746,8 @@ impl Linear {
 }
 
 fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
-    // GGUF stores Linear weights as [out_dim, in_dim] (rows = output units,
-    // columns = input units). The CPU/CUDA/Vulkan/Metal `matmul` kernels all
-    // consume B in [k, n] = [in_dim, out_dim] row-major layout (they compute
-    // `C = A @ B` with B indexed as `b[p*n + j]`), so we must transpose the
-    // GGUF [out,in] storage to [in,out].
-    //
-    // ROCm is the exception: its fused dequant-GEMM kernel reads B directly as
-    // [out_dim, in_dim] (it indexes `col` over the output dim), so for
-    // quantized weights we only relabel the shape to [out,in] without moving
-    // bytes (the kernel handles the layout).
-    //
-    // The historical comment claimed CPU "keeps GGUF [in,out] layout as-is"
-    // and "F32 matmul consumes [in,out] directly", but that is incorrect:
-    // the CPU GEMM (`gemm_scalar`/`gemv_row`) indexes `b[p*n + j]`, requiring
-    // [k,n]=[in,out]. This was silently correct for square Llama weights
-    // (num_heads*head_dim == hidden_size) where [out,in] and [in,out] share
-    // the same shape; non-square layers like MiniCPM5 (16*128=2048 != 1536)
-    // expose the bug as a ShapeMismatch (expected [15,1536] got [2048,1536]).
+    // GGUF stores Linear weights as [out_dim, in_dim] (rows = output units, columns = input units).
+    // The CPU/CUDA/Vulkan/Metal `matmul` kernels all consume B in [k, n] = [in_dim, out_dim] row-major layout.
     let dims = t.shape().dims().to_vec();
     if dims.len() != 2 {
         return Err(Error::Shape("transpose_last_two: only 2-D".into()));
@@ -864,10 +766,8 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
         ));
     }
 
-    // ROCm F32 on-device path: transpose in device memory (`grim_transpose_2d_f32`),
-    // avoiding the host `to_vec_f32` (DtoH) + `from_cpu` (H2D) round trip below.
-    // Only reached for non-quantized ROCm weights (quantized took the relabel
-    // fast path above), so the input is plain F32 storage on the device.
+    // ROCm F32 on-device path: transpose in device memory (`grim_transpose_2d_f32`), avoiding the host `to_vec_f32` (DtoH) + `from_cpu` (H2D) round trip below.
+    // Only reached for non-quantized ROCm weights (quantized took the relabel fast path above), so the.
     #[cfg(feature = "rocm-mem")]
     if let Device::Rocm(ordinal) = t.device() {
         let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
@@ -881,10 +781,8 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
         ));
     }
 
-    // All other cases (CPU/CUDA/Vulkan/Metal, F32 or quantized): genuinely
-    // transpose the data so `w_t` is in [in,out]=[k,n] row-major layout.
-    // Quantized tensors reaching here are already dequantized to F32 in
-    // `WeightSource::get` for CPU, so `to_vec_f32` works uniformly.
+    // All other cases (CPU/CUDA/Vulkan/Metal, F32 or quantized): genuinely transpose the data so `w_t` is in [in,out]=[k,n] row-major layout.
+    // Quantized tensors reaching here are already dequantized to F32 in `WeightSource::get` for CPU, so `to_vec_f32`.
     let src = t.to_vec_f32()?;
     let mut out = vec![0.0f32; a * b];
     for i in 0..a {
@@ -908,13 +806,7 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
 }
 
 /// Broadcast a 1-D bias `[out_dim]` to `[batch, out_dim]` by tiling.
-///
-/// WI-Host-1 gate (1): the CPU-path output of this function is pinned by
-/// `host1_rms_rope_broadcast_bias_cpu_path_parity` as the verification
-/// target for the deferred native HIP kernel replacement. The current
-/// implementation round-trips through `to_vec_f32()` → CPU tile →
-/// `from_cpu()` on every `Linear::forward` call with a bias — the plan's
-/// Broadcast a 1-D bias tensor to a 2-D batch shape on CPU or device.
+/// WI-Host-1 gate (1): the CPU-path output of this function is pinned by `host1_rms_rope_broadcast_bias_cpu_path_parity` as the.
 pub fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
     let new_shape = Shape::new(vec![batch, out_dim]);
     if b.device().is_cpu() {
@@ -971,10 +863,8 @@ impl RmsNorm {
             self.eps,
             &out_shape,
         )?;
-        // WI-Host-1: dropped `h.synchronize()?`. Same lazy-sync rationale as
-        // `Linear::forward` (see the matmul-sync comment there): the stall is
-        // redundant because the returned storage synchronizes on first read.
-        // The plan keeps synchronization at the outer inference boundary.
+        // WI-Host-1: dropped `h.synchronize()?`. Same lazy-sync rationale as `Linear::forward` (see the matmul-sync comment
+        // there): the stall is redundant because the returned storage synchronizes on first read.
         let _ = h;
         Ok(Tensor::new(
             Arc::from(s),
@@ -1042,13 +932,7 @@ pub struct Embedding {
 
 impl Embedding {
     /// Load an embedding table, accepting layout variations and token size discrepancies.
-    ///
     /// Standard checkpoints store `[vocab, dim]` (row-major: tokens × hidden).
-    /// Legacy GGUF checkpoints may store `[dim, vocab]` (column-major) or carry
-    /// padded vocabulary rows `[actual_vocab, dim]`.
-    /// The contract guarantees that the returned weight is normalized to
-    /// `[actual_vocab, dim]` row-major storage (rows = tokens), matching the
-    /// layout expected by downstream gathering and tied linear heads.
     pub fn load(ws: &WeightSource<'_>, vocab: usize, dim: usize) -> Result<Self> {
         // Probe `[vocab, dim]`. On exact shape match, use as-is on the target device.
         if let Ok(t) = ws.get([vocab, dim], "weight") {
@@ -1056,11 +940,8 @@ impl Embedding {
                 // Native (F32/BF16/F16) embedding: already on-device, pass through.
                 return Ok(Self { weight: t });
             }
-            // Quantized embedding (e.g. GGUF token_embd Q8_0 on ROCm): `ws.get`
-            // keeps the packed bytes resident on-device, so dequantizing via
-            // `to_vec_f32()` + re-upload would be a DtoH→H2D round trip. Instead
-            // dequantize the host bytes once and upload as an F32 table in a
-            // single H2D — the layout `grim_embedding` reads.
+            // Quantized embedding (e.g. GGUF token_embd Q8_0 on ROCm): `ws.get` keeps the packed bytes
+            // resident on-device, so dequantizing via `to_vec_f32()` + re-upload would be a DtoH→H2D round trip.
             return Ok(Self {
                 weight: ws.get_f32([vocab, dim], "weight")?,
             });
@@ -1128,10 +1009,8 @@ impl Embedding {
         let out_shape = Shape::new(vec![seq_len, dim]);
         let (s, h) =
             CoreTensorOps::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
-        // WI-Host-1 #3: dropped `h.synchronize()?` here. Same lazy-sync rationale
-        // as `Linear::forward` (see the matmul-sync comment there): the stall is
-        // redundant because the returned storage synchronizes on first read, and
-        // CPU backends are unaffected (`CpuDevice::synchronize` is a no-op).
+        // WI-Host-1 #3: dropped `h.synchronize()?` here.
+        // Same lazy-sync rationale as `Linear::forward` (see the matmul-sync comment there): the stall is redundant because.
         let _ = h;
         Ok(Tensor::new(
             Arc::from(s),
@@ -1174,10 +1053,8 @@ impl Embedding {
 
 pub use grim_tensor::{RopeConfig, YaRNParams};
 
-/// Materialize a gather-source tensor to F32 on its device. Embedding
-/// lookups read raw weight rows as f32 (e.g. the ROCm `grim_embedding`
-/// kernel), so quantized-resident packed storage must be dequantized before
-/// it can serve as an embedding table. Non-quantized tensors pass through.
+/// Materialize a gather-source tensor to F32 on its device.
+/// Embedding lookups read raw weight rows as f32 (e.g.
 fn dequantize_for_gather(t: Tensor) -> Result<Tensor> {
     if !t.dtype().is_quantized() {
         return Ok(t);
@@ -1421,10 +1298,6 @@ mod tests {
     fn test_rope_forward_pos_nonzero_rotation_hand_calculated() {
         // dim = 2, base = 100.0 => inv_freq[0] = 1.0 / 100.0^0 = 1.0.
         // pos = 2 => theta = 2.0 * 1.0 = 2.0 rad.
-        // cos(2.0) = -0.41614684, sin(2.0) = 0.9092974
-        // x = [1.0, 2.0]
-        // x'[0] = 1.0 * cos(2.0) - 2.0 * sin(2.0) = -0.41614684 - 1.8185948 = -2.2347416
-        // x'[1] = 1.0 * sin(2.0) + 2.0 * cos(2.0) = 0.9092974 - 0.8322937 = 0.0770037
         let rope = Rope::new(2, 100.0);
         let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 1, 2]));
         let y = rope.forward(&x, &[2]).expect("rope pos 2 forward");
@@ -1475,9 +1348,8 @@ mod tests {
         );
     }
 
-    // YaRN magnitude correction applies the attention_factor mscale (here 1.0)
-    // and the frequency ramp. With mscale=1.0 the rotation magnitude must match
-    // plain RoPE at the rotated positions when factor is 1.0 (no extrapolation).
+    // YaRN magnitude correction applies the attention_factor mscale (here 1.0) and the frequency ramp.
+    // With mscale=1.0 the rotation magnitude must match plain RoPE at the rotated positions when factor.
     #[test]
     fn test_rope_yarn_factor_one_matches_plain() {
         let plain = Rope::from_config(RopeConfig::new(4, 10000.0));
@@ -1543,9 +1415,8 @@ mod tests {
         let y = cp.forward(&x).expect("cp forward");
         let out = y.to_vec_f32().expect("to vec");
         assert_eq!(out.len(), 2);
-        // Same as Linear::forward: x@[0.5,1.5;-1,2]^T + bias
-        // row0: 1*0.5 + 2*1.5 + 0.1 = 3.6
-        // row1: 1*(-1.0) + 2*2.0 + (-0.2) = 2.8
+        // Same as Linear::forward: x@[0.5,1.5;-1,2]^T + bias row0: 1*0.5 + 2*1.5 +
+        // 0.1 = 3.6 row1: 1*(-1.0) + 2*2.0 + (-0.2) = 2.8
         assert!((out[0] - 3.6).abs() < 1e-5, "got {}", out[0]);
         assert!((out[1] - 2.8).abs() < 1e-5, "got {}", out[1]);
     }
@@ -1594,11 +1465,8 @@ mod tests {
         assert_eq!(rp.inner().weight.shape().dims(), &[2, 2]);
     }
 
-    /// RowParallelLinear forward with world_size > 1 on a backend lacking an
-    /// `all_reduce` impl (CPU inherits the trait default `Err(Unimplemented)`)
-    /// must **propagate the error** instead of silently returning the
-    /// per-rank partial output as the all-reduced sum. Regression guard for
-    /// the silent-correctness-bug fixed alongside this test.
+    /// RowParallelLinear forward with world_size > 1 on a backend lacking an `all_reduce` impl (CPU inherits the trait default `Err(Unimplemented)`) must **propagate the error** instead of silently returning the per-rank partial output as the all-reduced sum.
+    /// Regression guard for the silent-correctness-bug fixed alongside this test.
     #[test]
     fn test_row_parallel_forward_no_collective_errors_loudly() {
         let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
@@ -1629,31 +1497,8 @@ mod tests {
         );
     }
 
-    // =======================================================================
-    // WI-Host-1 gate (1) — CPU-path numeric parity for RmsNorm / Rope /
-    // broadcast_bias.
-    //
-    // The plan's WI-Host-1 gate (1) requires:
-    // > `RmsNorm`/`Rope`/`broadcast_bias` numeric parity vs current CPU-path
-    // > output within tight tolerance, so the fix doesn't silently change
-    // > numerics while removing the roundtrip.
-    //
-    // These tests pin the CURRENT CPU-path output as golden values within a
-    // TIGHT tolerance (1e-5 abs) so the deferred native HIP kernel
-    // replacement (WI-Host-1 #1 RoPE, #2 broadcast_bias) has a verification
-    // target: when the native kernel lands, run these tests against the
-    // GPU-backed path and the output must match these CPU-pinned goldens
-    // within the same tolerance. A native kernel that drifts (wrong angle,
-    // wrong tile order, wrong broadcast axis) shows up as a golden-value
-    // mismatch well above 1e-5.
-    //
-    // Distinct from the existing `test_rms_norm_forward_hand_calculated` /
-    // `test_rope_forward_rotation_identity_at_pos0`: those use loose 1e-4
-    // tolerance and the trivial pos=0 identity case; these use tight 1e-5
-    // and NON-TRIVIAL inputs (non-unit weights, non-zero positions, batched
-    // broadcast) so the goldens actually exercise the math the native kernel
-    // must reproduce.
-    // =======================================================================
+    // WI-Host-1 gate (1) - CPU-path numeric parity for RmsNorm / Rope / broadcast_bias.
+    // The plan's WI-Host-1 gate (1) requires: > `RmsNorm`/`Rope`/`broadcast_bias` numeric parity vs current CPU-path > output.
 
     #[test]
     fn host1_rms_norm_cpu_path_pinned_for_native_kernel_parity() {
@@ -1692,10 +1537,7 @@ mod tests {
     #[test]
     fn host1_rope_cpu_path_pinned_for_native_kernel_parity() {
         // RoPE with NON-zero position (exercises the actual rotation), dim=4.
-        // For each half-pair (i, i+half):
-        //   out[i]      = x[i] * cos(pos*inv_freq[i]) - x[i+half] * sin(...)
-        //   out[i+half] = x[i+half] * cos(...) + x[i] * sin(...)
-        // where inv_freq[i] = 1 / base^(2i/d).
+        // For each half-pair (i, i+half): out[i] = x[i] * cos(pos*inv_freq[i]) - x[i+half] * sin(...) out[i+half].
         let rope = Rope::new(4, 10000.0);
         // dim=4 → half=2; inv_freq[0] = 1 (2*0/4=0), inv_freq[1] = 1/10000^0.5 = 0.01.
         // pos=5: angle[0] = 5*1 = 5 rad, angle[1] = 5*0.01 = 0.05 rad.
@@ -1756,9 +1598,8 @@ mod tests {
                 "broadcast_bias CPU-path golden mismatch at [{i}]: got {got:.8}, want {want:.8}",
             );
         }
-        // Pin the batch boundary: element [out_dim] must equal element [0]
-        // (start of the second tile) — a mutant that tiles along the wrong
-        // axis would break this.
+        // Pin the batch boundary: element [out_dim] must equal element [0] (start of the
+        // second tile) - a mutant that tiles along the wrong axis would break this.
         assert!(
             (v[out_dim] - v[0]).abs() < 1e-6,
             "broadcast_bias must tile along the batch axis (v[out_dim] should equal v[0])",
@@ -1769,11 +1610,8 @@ mod tests {
 
     #[test]
     fn host1_embedding_forward_drops_synchronize_parity() {
-        // WI-Host-1 #3 (extended): Embedding::forward dropped `h.synchronize()?`
-        // for the same lazy-sync rationale as Linear/RmsNorm. The CPU path is
-        // unaffected (CpuDevice::synchronize is a no-op), so the golden
-        // output must match exactly. This test pins the output so the sync
-        // drop can't silently change numerics.
+        // WI-Host-1 #3 (extended): Embedding::forward dropped `h.synchronize()?` for the same lazy-sync rationale as Linear/RmsNorm.
+        // The CPU path is unaffected (CpuDevice::synchronize is a no-op), so the golden output must match.
         let table = vec![0.1, 0.2, 0.3, 0.4, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let weight = cpu_tensor(table, Shape::new(vec![3, 4]));
         let emb = Embedding { weight };
@@ -1898,7 +1736,6 @@ pub enum LayerCache {
 }
 
 /// Depthwise 1D causal convolution `out = conv1d(x, weight, bias)`.
-///
 /// Contract: applies depthwise per-channel 1D causal convolution along sequence dimension.
 pub fn short_conv1d(
     x: &Tensor,
@@ -2050,9 +1887,8 @@ impl MlaAttention {
         let (b, s, _d) = (dims[0], dims[1], dims[2]);
         let dev = pick_device_for_tensor(x);
 
-        // The projection matmuls (`Linear::forward`) require 2-D [tokens, dim]
-        // input. Flatten the [b, s, d] batch into [b*s, d]; all per-token
-        // slicing below indexes by the flattened token index `bs = b*s`.
+        // The projection matmuls (`Linear::forward`) require 2-D [tokens, dim] input.
+        // Flatten the [b, s, d] batch into [b*s, d]; all per-token slicing below indexes by.
         let bs = b * s;
         let d_in = dims[2];
         let x_2d = if dims.len() == 3 {
@@ -2087,13 +1923,7 @@ impl MlaAttention {
         let v_stride = self.num_heads * self.v_head_dim;
 
         // Split Q into per-head [nope | rope] and KV into per-head [nope | rope | v].
-        //
         // Layout: q_nope/k_nope are [b*s*num_heads, nope_dim] (row = (bi*s+si)*num_heads+hi).
-        // q_rope/k_rope are [b*num_heads, s, rope_dim] (row = bi*num_heads+hi, col = si)
-        // so that RoPE (which expects [B, S, D]) applies position `si` to head `hi` of
-        // batch `bi` — matching the read-back indexing below. The original code wrote
-        // q_rope/k_rope in [b, s, heads, D] order but labeled the tensor [b*heads, s, D],
-        // causing RoPE to rotate the wrong (position, head) pair for s > 1 (prefill).
         let mut q_nope = vec![0.0f32; b * s * qn_stride];
         let mut q_rope = vec![0.0f32; b * self.num_heads * s * self.qk_rope_head_dim];
         let mut k_nope = vec![0.0f32; b * s * qn_stride];
@@ -2178,12 +2008,8 @@ impl MlaAttention {
         let q_rope = self.rope.forward(&q_rope_t, positions)?.to_vec_f32()?;
         let k_rope = self.rope.forward(&k_rope_t, positions)?.to_vec_f32()?;
 
-        // Audit fix (grim-models): with a cache attached, this call's
-        // post-RoPE K rows and V rows are APPENDED to the per-layer history
-        // and attention runs over the full [0 .. past+s) window — real
-        // incremental decode. The pre-fix implementation ignored its cache
-        // parameter entirely (`_cache`), so every decode step attended only
-        // to itself. Batch-1 (engine serving shape).
+        // Audit fix (grim-models): with a cache attached, this call's post-RoPE K rows and V rows are APPENDED to the per-layer history and attention runs over the full [0 ..
+        // past+s) window - real incremental decode.
         if let Some(c) = cache {
             if b != 1 {
                 return Err(grim_tensor::error::Error::Shape(
@@ -2308,9 +2134,8 @@ impl MlaAttention {
             }
         }
 
-        // `out` is laid out as [bs, num_heads * v_head_dim] (flattened b*s tokens),
-        // so materialize it as 2-D for the output projection matmul, then reshape
-        // the result back to [b, s, d_out] to match the residual-add contract.
+        // `out` is laid out as [bs, num_heads * v_head_dim] (flattened b*s tokens), so materialize it as 2-D for
+        // the output projection matmul, then reshape the result back to [b, s, d_out] to match the residual-add contract.
         let out_shape = Shape::new(vec![bs, self.num_heads * self.v_head_dim]);
         let out_t = Tensor::new(
             Arc::from(dev.from_cpu(&out, &out_shape, DType::F32)?),
@@ -2440,10 +2265,8 @@ mod mla_attention_tests {
 
     #[test]
     fn mla_causal_window_is_bounded() {
-        // Structural guard: position t may only attend t2 in 0..=t. With a
-        // constant input the softmax is uniform over that window, so output[t]
-        // equals the mean of V over the window — and crucially never depends on
-        // a future position. The forward must run and stay finite.
+        // Structural guard: position t may only attend t2 in 0..=t.
+        // With a constant input the softmax is uniform over that window, so output[t] equals the.
         let mla = tiny_mla();
         let x = sample_input();
         let out = mla.forward(&x, &[0, 1, 2], None).unwrap();
@@ -2536,8 +2359,7 @@ impl KdaAttention {
                     for ki in 0..self.head_dim {
                         for vi in 0..self.v_dim {
                             let diff = v_tok[vi] - a_t[vi];
-                            // Single b_scale application (matches ROCm kernel at
-                            // compute_kernels.rs:372 which scales only the prediction).
+                            // Single b_scale application (matches ROCm kernel at compute_kernels.rs:372 which scales only the prediction).
                             // [P1-38 fix: removed duplicate b_scale from update.]
                             state[ki * self.v_dim + vi] += diff * k_tok[ki];
                         }
@@ -2743,8 +2565,7 @@ impl Conv1d {
     }
 
     /// Load a `Conv1d` module from a `WeightSource`.
-    // Parameters mirror the serialized Conv1d layout 1:1; grouping them into
-    // a struct would just relocate the argument list.
+    /// Parameters mirror the serialized Conv1d layout 1:1; grouping them into a struct would just relocate.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         ws: &WeightSource<'_>,
@@ -3019,11 +2840,8 @@ mod mla_cache_tests {
     use grim_backend_cpu::cpu_tensor;
     use grim_tensor::Shape;
 
-    /// Audit gate (grim-models): MlaAttention's cached decode path must
-    /// produce the SAME activations as a full prefill over the identical
-    /// sequence — one [1,2] pass with no cache vs two [1,1] passes sharing
-    /// an MlaKvCache. The pre-fix implementation ignored its cache
-    /// parameter entirely, making incremental decode self-attentive only.
+    /// Audit gate (grim-models): MlaAttention's cached decode path must produce the SAME activations as a full prefill over the identical sequence - one [1,2] pass with no cache vs two [1,1] passes sharing an MlaKvCache.
+    /// The pre-fix implementation ignored its cache parameter entirely, making incremental decode self-attentive only.
     #[test]
     fn mla_cached_decode_matches_full_prefill() {
         let hidden = 8usize;

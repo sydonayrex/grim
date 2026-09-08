@@ -1,8 +1,5 @@
 //! Shared preference trainer for DPO, KTO, SimPO, ORPO, and GRPO (WI-T7 / F7).
-//!
-//! Provides unified sequence log-probability reduction, preference loss evaluation,
-//! and exact log-softmax vector-Jacobian product (VJP) gradient computation for
-//! alignment fine-tuning across CLI training and Garage distributed workers.
+//! Provides unified sequence log-probability reduction, preference loss evaluation, and exact log-softmax vector-Jacobian product (VJP) gradient.
 
 use crate::preference_loss::{dpo_loss, grpo_loss, kto_loss, orpo_odds_ratio_loss, simpo_loss};
 use grim_tensor::error::{Error, Result};
@@ -87,13 +84,8 @@ impl PreferenceTrainer {
         Self::new(PreferenceStepConfig::default())
     }
 
-    /// Compute cumulative sequence log-probability $\sum_{t} \log P(y_t | x, y_{<t})$
-    /// over non-ignored target tokens using numerically stable log-softmax.
-    ///
-    /// # Contract
-    /// `logits.len() == targets.len() * vocab_size`.
-    /// Tokens with `target == ignore_index` are excluded from the sum and count.
-    /// Returns `(total_logp, valid_token_count)`.
+    /// Compute cumulative sequence log-probability $\sum_{t} \log P(y_t | x, y_{<t})$ over non-ignored target tokens using numerically stable log-softmax.
+    /// # Contract `logits.len() == targets.len() * vocab_size`.
     pub fn compute_sequence_logps(
         logits: &[f32],
         targets: &[u32],
@@ -133,12 +125,8 @@ impl PreferenceTrainer {
         (total_logp, valid_count)
     }
 
-    /// Compute preference loss and per-sample logp scalar gradients $\frac{\partial \mathcal{L}}{\partial \log \pi_\theta(y_w)}$
-    /// and $\frac{\partial \mathcal{L}}{\partial \log \pi_\theta(y_l)}$.
-    ///
-    /// # Contract
-    /// Evaluates the configured preference loss (`Dpo`, `Kto`, `Simpo`, `Orpo`, `Grpo`) and
-    /// returns `(loss_val, chosen_logp_grad, rejected_logp_grad)`.
+    /// Compute preference loss and per-sample logp scalar gradients $\frac{\partial \mathcal{L}}{\partial \log \pi_\theta(y_w)}$ and $\frac{\partial \mathcal{L}}{\partial \log \pi_\theta(y_l)}$.
+    /// # Contract Evaluates the configured preference loss (`Dpo`, `Kto`, `Simpo`, `Orpo`, `Grpo`) and returns `(loss_val,.
     #[allow(clippy::too_many_arguments)]
     pub fn compute_preference_step(
         &self,
@@ -251,13 +239,7 @@ impl PreferenceTrainer {
         }
     }
 
-    /// Compute exact vector-Jacobian product (VJP) gradient for cross-entropy / log-softmax:
-    /// \[
-    /// \frac{\partial \mathcal{L}}{\partial z_{t, v}} = \frac{\partial \mathcal{L}}{\partial \log \pi} \cdot (\mathbb{I}(v = y_t) - P(v))
-    /// \]
-    ///
-    /// # Contract
-    /// `logits.len() == targets.len() * vocab_size`.
+    /// Compute exact vector-Jacobian product (VJP) gradient for cross-entropy / log-softmax: \[ \frac{\partial \mathcal{L}}{\partial z_{t, v}} = \frac{\partial \mathcal{L}}{\partial \log \pi} \cdot (\mathbb{I}(v = y_t) - P(v)) \] # Contract `logits.len() == targets.len() * vocab_size`.
     /// Returns the full gradient tensor $\nabla_{\text{logits}} \mathcal{L}$ of size `[seq_len * vocab_size]`.
     pub fn compute_log_softmax_vjp(
         logits: &[f32],

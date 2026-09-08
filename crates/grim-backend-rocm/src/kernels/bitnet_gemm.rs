@@ -1,18 +1,11 @@
 //! BitNet b1.58 (1.58-bit Ternary W1.58A8) GEMM for ROCm.
-//!
-//! Implements 2-bit packed ternary matrix multiplication (weights in {-1, 0, +1})
-//! with zero-multiplication integer additions and subtractions.
+//! Implements 2-bit packed ternary matrix multiplication (weights in {-1, 0, +1}) with zero-multiplication integer additions.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// BitNet b1.58 Ternary GEMM Kernel (W1.58A8)
-// ---------------------------------------------------------------------------
-//
-// Grid: ((N + 15) / 16, (M + 15) / 16)
-// Block: (16, 16)
-// ---------------------------------------------------------------------------
+// BitNet b1.58 Ternary GEMM Kernel (W1.58A8) Grid: ((N + 15)
+// / 16, (M + 15) / 16) Block: (16, 16)
 __global__ void grim_bitnet_gemm_w158a8(
     const float* __restrict__ A,                // [M, K] activations
     const unsigned char* __restrict__ B_ternary,// [N, K/4] 2-bit packed ternary weights
@@ -56,9 +49,7 @@ __global__ void grim_bitnet_gemm_w158a8(
     C[row * N + col] = acc * total_scale;
 }
 
-// ---------------------------------------------------------------------------
 // INT8 Activation Variant for Peak Integer Throughput
-// ---------------------------------------------------------------------------
 __global__ void grim_bitnet_gemm_w158a8_int8(
     const signed char* __restrict__ A_int8,     // [M, K] INT8 activations
     const unsigned char* __restrict__ B_ternary,// [N, K/4] 2-bit packed weights

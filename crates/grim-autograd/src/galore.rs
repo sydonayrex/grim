@@ -1,8 +1,5 @@
 //! GaLore (Gradient Low-Rank Projection) Optimizer.
-//!
-//! Projects full-rank matrix gradients G in R^{m x n} into low-rank subspace
-//! G_{low} = P^T G (r << min(m, n)), maintaining AdamW momentum/variance states
-//! purely in the low-rank subspace and reconstructing updates via alpha * P * U.
+//! Projects full-rank matrix gradients G in R^{m x n} into low-rank subspace G_{low} = P^T.
 
 use crate::param::{ParamId, TrainableParam, TrainableParams};
 use grim_format::train::TrainState;

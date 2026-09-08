@@ -163,11 +163,8 @@ pub struct LaunchConfig {
     pub block_k: u32,
     pub split_k: u32,
     pub threads: u32,
-    // WRECK-7: occupancy-tuning fields. waves_per_cu_target: target active wavefronts
-    // per CU (occupancy governor); max_registers: VGPR budget per thread (→ hiprtc
-    // -maxrregcount or __launch_bounds__ maxInstPerThread); vector_width: SIMD width
-    // for global loads (4 or 8 for RDNA); lds_double_buffer: ping-pong LDS for
-    // overlap load/compute.
+    // WRECK-7: occupancy-tuning fields. waves_per_cu_target: target active wavefronts per CU (occupancy governor); max_registers: VGPR budget per thread (→ hiprtc -maxrregcount
+    // or __launch_bounds__ maxInstPerThread); vector_width: SIMD width for global loads (4 or 8 for RDNA); lds_double_buffer: ping-pong LDS for overlap load/compute.
     pub waves_per_cu_target: u32,
     pub max_registers: u32,
     pub vector_width: u32,
@@ -251,11 +248,7 @@ pub fn charon_scalar_candidates(arch: &str, device_smem_limit: u32) -> Vec<Launc
 }
 
 /// Tuning knob for the UniEP persistent-SM MoE Mega-Kernel.
-/// Parameterizes the tuple (wdisp, Ndisp, Nrelay):
-/// - `num_sm_blocks`: active persistent SM blocks running task queues.
-/// - `block_threads`: threadblock dimension (wavefronts per block).
-/// - `tile_size`: scoreboard synchronization granularity.
-/// - `n_relay_tasks`: on-device multicast relay worker count.
+/// Parameterizes the tuple (wdisp, Ndisp, Nrelay): - `num_sm_blocks`: active persistent SM blocks running task queues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MoeMegaKnob {
     pub num_sm_blocks: usize,
@@ -267,7 +260,11 @@ pub struct MoeMegaKnob {
 impl MoeMegaKnob {
     /// Generates candidate tuning configurations for MoE mega-kernel on a given GPU architecture.
     pub fn candidate_grid(cu_count: usize) -> Vec<Self> {
-        let sm_counts = [cu_count.saturating_div(2).max(1), cu_count.max(1), cu_count.saturating_mul(2).max(2)];
+        let sm_counts = [
+            cu_count.saturating_div(2).max(1),
+            cu_count.max(1),
+            cu_count.saturating_mul(2).max(2),
+        ];
         let threads_opts = [128, 256];
         let tile_sizes = [8, 16, 32];
         let relay_opts = [0, 4];
@@ -291,15 +288,8 @@ impl MoeMegaKnob {
     }
 }
 
-/// Subspace decomposition for CharTuner scalar candidates. Instead of the
-/// full Cartesian product of [8,16,32,64] × [32,64,128] × [32,64] × [1,2,4]
-/// × [64,128,256], this partitions the M-N-K search into subspaces keyed by
-/// whether the shape is "tall" (M≫N), "wide" (N≫M), or "square" (M≈N), then
-/// prunes invalid configs inside each subspace using the occupancy pre-check.
-///
-/// WRECK-2: this reduces the candidate count from ~144 to ~36-72 per subspace,
-/// cutting autotune bench time on large decode shapes without losing the winning
-/// config (the shape-class signal determines which subspace is searched).
+/// Subspace decomposition for CharTuner scalar candidates.
+/// Instead of the full Cartesian product of [8,16,32,64] × [32,64,128] × [32,64] × [1,2,4] ×.
 pub fn charon_scalar_candidates_subspace(
     arch: &str,
     device_smem_limit: u32,
@@ -365,14 +355,12 @@ pub struct AutotuneConfig {
     pub grid_stride: u32,
     #[serde(default)]
     pub cycles_per_invocation: u64,
-    /// Spec-decode draft length — the number of tokens the draft model proposes
-    /// per step. Surface as an autotune knob because draft length interacts with
-    /// acceptor threshold and target-model latency to determine net throughput.
+    /// Spec-decode draft length - the number of tokens the draft model proposes per step.
+    /// Surface as an autotune knob because draft length interacts with acceptor threshold and target-model latency.
     #[serde(default = "AutotuneConfig::default_spec_gamma")]
     pub spec_gamma: u32,
-    /// Spec-decode acceptance threshold (0..1). Lower = faster accept, higher =
-    /// better quality match. Autotuned against acceptance rate on calibration
-    /// prompts.
+    /// Spec-decode acceptance threshold (0..1).
+    /// Lower = faster accept, higher = better quality match.
     #[serde(default)]
     pub spec_acceptance_threshold: f32,
     /// Stochastic acceptance roll-off (0..1). 0 = greedy accept, 1 = fully
@@ -452,9 +440,8 @@ impl Default for OccupancyTuning {
     }
 }
 
-/// Pre-tuned occupancy block-size band choices (gfx103x/110x/120x, no
-/// per-shape Ncu sweep). These are the default occupant bands for
-/// `TuningMode::Preset` [salamander.md §3.6 block-size presets].
+/// Pre-tuned occupancy block-size band choices (gfx103x/110x/120x, no per-shape Ncu sweep).
+/// These are the default occupant bands for `TuningMode::Preset` [salamander.md §3.6 block-size presets].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockSizeBand {
     /// Conservative: 64 threads / 1 WMMA warp fragment — safest LDS/reg
@@ -481,8 +468,7 @@ impl BlockSizeBand {
 }
 
 /// Which autotuning mode governs launch-config selection.
-/// [salamander.md §3.6 tuning modes: Baseline, Preset(BlockSizeBand), Tuned,
-/// Ncu]
+/// [salamander.md §3.6 tuning modes: Baseline, Preset(BlockSizeBand), Tuned, Ncu]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuningMode {
     /// Default: baseline grid/block from device count; no tuned configs.
@@ -490,14 +476,11 @@ pub enum TuningMode {
     /// Pick launch configs from the `BlockSizeBand` uniforms; no per-shape
     /// search. Fast, conservative, and reproducible across machines.
     Preset(BlockSizeBand),
-    /// Enhanced baseline: run a short tiled search over tile widths on the
-    /// device at first use, then reuse. Not Ncu-heavy — no launch-overhead
-    /// sweep or executable-analyzer Ncu.
+    /// Enhanced baseline: run a short tiled search over tile widths on the device at first use, then reuse.
+    /// Not Ncu-heavy - no launch-overhead sweep or executable-analyzer Ncu.
     Tuned,
     /// Ncu-driven tuner (feature-gated to the `ncu` Cargo feature).
-    /// Requires `nvcc/ncu` at runtime; heavy, slow, and not shipped by
-    /// default. Only valid on devices once `ncu` has produced a JSON
-    /// profile.
+    /// Requires `nvcc/ncu` at runtime; heavy, slow, and not shipped by default.
     #[cfg(feature = "ncu")]
     Ncu,
 }
@@ -509,8 +492,7 @@ impl Default for TuningMode {
 }
 
 /// Tuning-mode + per-slot occupancy tuning + tuning solution storage.
-/// [salamander.md §3.6: tuning modes, block-size presets, occupancy fields,
-/// tuning solution storage]
+/// [salamander.md §3.6: tuning modes, block-size presets, occupancy fields, tuning solution storage]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AutotunerConfig {
     /// Which autotuning mode governs launch-config selection for this tuner.
@@ -520,10 +502,8 @@ pub struct AutotunerConfig {
     /// can round-trip through the device's JSON tuning store.
     #[serde(default)]
     pub occupancy: OccupancyTuning,
-    /// Tuning solution snapshot keyed by `(kernel, arch)`. Stored separately
-    /// from the in-memory `Autotuner` (which is keyed by `KernelKey` + slot).
-    /// This is the on-disk tuning store that `store_tuning_solution`/`
-    /// load_tuning_solution` write/read.
+    /// Tuning solution snapshot keyed by `(kernel, arch)`.
+    /// Stored separately from the in-memory `Autotuner` (which is keyed by `KernelKey` + slot).
     #[serde(default)]
     pub tuning_solutions: Vec<TuningSolution>,
 }
@@ -533,17 +513,13 @@ pub struct AutotunerConfig {
 pub struct TuningSolution {
     /// Kernel entry name (e.g. `grim_qkv_attention`, `grim_rmsnorm`).
     pub kernel: String,
-    /// GPU arch (e.g. `gfx1100`). The arch field must match the device's
-    /// current arch before the solution is applied — mismatched solutions
-    /// are never used (safety gate).
+    /// GPU arch (e.g. `gfx1100`).
     pub arch: String,
     /// Slot selector: shape class + representative shape that this solution
     /// was tuned for. Used to match a solve to the right launches.
     pub slot: TuningSlot,
-    /// The launch config produced by tuning. For preset/tuned modes this
-    /// is the block-dim/occupancy fields the kernel launcher reads; for the
-    /// `Ncu` mode it is the Ncu-derived config (feature-gated, unavailable
-    /// unless `ncu` feature is on).
+    /// The launch config produced by tuning. For preset/tuned modes this is the block-dim/occupancy fields the kernel launcher
+    /// reads; for the `Ncu` mode it is the Ncu-derived config (feature-gated, unavailable unless `ncu` feature is on).
     #[serde(default)]
     pub config: AutotuneConfig,
 }
@@ -572,9 +548,8 @@ impl Default for TuningSlot {
     }
 }
 
-///
-/// Encapsulates model geometry (`hidden`, `inter`, `num_experts`, `top_k`)
-/// and coarse `skew_bucket` (quantized routing skew 0..7) to index MoE tuned configs.
+/// Encapsulates model geometry (`hidden`, `inter`, `num_experts`, `top_k`) and coarse
+/// `skew_bucket` (quantized routing skew 0..7) to index MoE tuned configs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MoeKernelKey {
     pub kernel: String,
@@ -1049,9 +1024,7 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // WRECK-11: spec-decode tuning — surface gamma/threshold/alpha + structure tests.
-    // =========================================================================
+    // WRECK-11: spec-decode tuning - surface gamma/threshold/alpha + structure tests.
 
     #[test]
     fn autotune_config_spec_fields_default_values() {
@@ -1138,9 +1111,7 @@ mod tests {
         assert!((r_high.spec_alpha - 1.0).abs() < 1e-6);
     }
 
-    // =========================================================================
-    // WRECK-2: CharTuner subspace pruning — structure tests.
-    // =========================================================================
+    // WRECK-2: CharTuner subspace pruning - structure tests.
 
     #[test]
     fn charon_scalar_candidates_subspace_decode_prunes_m64() {

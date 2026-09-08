@@ -1,14 +1,5 @@
-//! `SpeculativeCausalLm` — the default-on wrapper that turns a plain
-//! `CausalLm` into a speculatively-accelerated one.
-//!
-//! §5.3. Architecture:
-//! - If the target implements `NativeMtp`, use that (zero-config).
-//! - Else if a `DraftBackbone` + `MarkovHead` + `ConfidenceHead`
-//!   bundle is attached, use the DSpark path.
-//! - Else fall back to plain autoregressive decoding.
-//!
-//! Callers of `CausalLm::forward` never see the wrapper; it's chosen at
-//! model-load time based on what the model supports.
+//! `SpeculativeCausalLm` - the default-on wrapper that turns a plain `CausalLm` into a speculatively-accelerated one.
+//! §5.3.
 
 use std::sync::{Arc, Mutex};
 
@@ -53,9 +44,8 @@ pub struct SpeculativeTelemetry {
     pub min_accept_rate: f64,
     /// Whether acceptance rate has drifted below the threshold warranting draft refresh.
     pub should_adapt: bool,
-    /// Current PID-tuned draft depth for the DSpark path (None on other
-    /// strategies). T2-4 follow-up: the depth tuner now drives the draft
-    /// block length instead of the old hardcoded K=3.
+    /// Current PID-tuned draft depth for the DSpark path (None on other strategies).
+    /// T2-4 follow-up: the depth tuner now drives the draft block length instead of the old.
     pub draft_depth_k: Option<u64>,
 }
 
@@ -151,9 +141,8 @@ impl SpeculativeCausalLm {
         }
     }
 
-    /// Construct from a target + optional bundle or native MTP. Selects strategy automatically.
-    /// Selection priority: DSpark (if bundle attached) > native MTP (if model
-    /// implements `NativeMtp`) > plain.
+    /// Construct from a target + optional bundle or native MTP.
+    /// Selects strategy automatically.
     pub fn auto_with_native_mtp(
         target: Box<dyn CausalLm>,
         draft: Option<Arc<dyn DraftBackbone>>,
@@ -302,9 +291,8 @@ impl SpeculativeCausalLm {
                 let prefix = scored.tokens[..verify_len].to_vec();
                 let _bias = markov.bias(&prefix, &scored.base_logits)?;
 
-                // Phase 5: Verification step on Target Causal LM
-                // CRIT-3: The target must receive the extended input (original + draft tokens)
-                // to produce logits for all draft positions
+                // Phase 5: Verification step on Target Causal LM CRIT-3: The target must receive
+                // the extended input (original + draft tokens) to produce logits for all draft positions
                 let extended_input =
                     self.extend_input_ids(input_ids, &scored.tokens[..verify_len])?;
                 let extended_positions = self.extend_positions(positions, verify_len)?;
@@ -321,13 +309,8 @@ impl SpeculativeCausalLm {
                     .cloned()
                     .unwrap_or_else(|| grim_core::rng::SimpleRng::new(0x9E37_79B9_7F4A_7C15));
 
-                // Rejection-sampling validation loop (§5.3)
-                // Correctly index logits as flat [seq, vocab_size] row-major,
-                // apply per-row softmax, and use the standard ratio test with per-request randomness.
+                // Rejection-sampling validation loop (§5.3) Correctly index logits as flat [seq, vocab_size] row-major, apply per-row softmax, and use the standard ratio test with per-request randomness.
                 // Target logits cover [0..context_len) rows (original input positions).
-                // Draft logits cover [0..verify_len) rows (draft positions).
-                // Verify draft position i against target position (context_len + i).
-                // [P1-18 fix: unified indexing — context_len = original input length.]
                 let context_len = input_ids.shape().elem_count();
                 let mut accepted_count = 0;
                 for i in 0..verify_len {
@@ -356,7 +339,6 @@ impl SpeculativeCausalLm {
 
                 // CRIT-5: Properly commit/rollback KV cache based on accepted count.
                 // tentative_append(verify_len) must have added >= accepted_count slots.
-                // [P1-20 fix: assert verify_len >= accepted_count before commit.]
                 if accepted_count > verify_len {
                     return Err(Error::Session(format!(
                         "speculative KV contract violation: accepted_count ({accepted_count}) > \
@@ -400,10 +382,8 @@ impl SpeculativeCausalLm {
                     .unwrap()
                     .update(accepted_count, verify_len);
 
-                // Return logits for the accepted tokens. Accepted token rows start at
-                // context_len (the original input length) since target forward returned
-                // [context_len + verify_len, vocab_size] and draft positions map to
-                // target positions context_len + i. [P1-18 fix.]
+                // Return logits for the accepted tokens. Accepted token rows start at context_len (the original input length) since
+                // target forward returned [context_len + verify_len, vocab_size] and draft positions map to target positions context_len + i.
                 let accepted_logits = self.extract_accepted_logits(
                     &target_logits,
                     accepted_count,
@@ -450,11 +430,8 @@ impl SpeculativeCausalLm {
             self.target
                 .forward(session, &extended_input, &extended_positions, adapters)?;
 
-        // 4. Rejection sampling / validation loop (§5.3)
-        // The target logits tensor has shape [S + verify_len, vocab_size] where S =
-        // len(original_input). Draft token i's target logit row is at offset
-        // (S + i) * vocab_size, NOT i * vocab_size.
-        // Draft logits have shape [verify_len, vocab_size] — no offset needed.
+        // 4. Rejection sampling / validation loop (§5.3) The target logits
+        // tensor has shape [S + verify_len, vocab_size] where S = len(original_input).
         let target_probs = target_logits.to_vec_f32()?;
         let vocab_size = draft_block.base_logits.shape().dims()[1];
         let draft_logits = draft_block.base_logits.to_vec_f32()?;
@@ -527,8 +504,7 @@ impl SpeculativeCausalLm {
         let last_pos = pos.last().copied().unwrap_or(-1.0);
         if pos.is_empty() && num_new > 0 {
             // Empty positions: first draft token starts at position 0.
-            // last_pos will be -1.0, so we get 0, 1, 2, ... — correct.
-            // Guard: ensure we never emit a negative position.
+            // last_pos will be -1.0, so we get 0, 1, 2, ...
             for i in 0..num_new {
                 pos.push(i as f32);
             }
@@ -542,8 +518,7 @@ impl SpeculativeCausalLm {
     }
 
     /// Extract logits for only the accepted tokens.
-    /// `context_len` is the length of the original (non-draft) input;
-    /// accepted token rows start at offset `context_len * vocab_size`.
+    /// `context_len` is the length of the original (non-draft) input; accepted token rows start at offset.
     fn extract_accepted_logits(
         &self,
         target_logits: &Tensor,
@@ -750,8 +725,7 @@ mod tests {
         // 3. Verify that the penultimate hidden state is successfully captured in the session
         let captured_hidden = session.get_last_hidden_state().unwrap();
         let hidden_shape = captured_hidden.shape();
-        // Hidden state shape is [1, 1 + verify_len, hidden_size] because the
-        // target receives the extended input (original token + draft tokens).
+        // Hidden state shape is [1, 1 + verify_len, hidden_size] because the target receives the extended input (original token + draft tokens).
         // choose_verify_len enforces min_verify_len=1, so verify_len >= 1.
         assert_eq!(hidden_shape.dims(), &[1, 2, 16]); // [1, 1+verify_len, hidden_size]
 
@@ -779,8 +753,7 @@ mod tests {
     }
 
     /// T2-4 (closed): the DSpark draft depth K is PID-tuned, not hardcoded 3.
-    /// With a target that accepts every draft (uniform logits ⇒ ratio 1), the
-    /// tuner ramps K to its max and the drafted block grows accordingly.
+    /// With a target that accepts every draft (uniform logits ⇒ ratio 1), the tuner ramps.
     #[test]
     fn test_dspark_depth_ramps_up_with_full_acceptance() {
         let cfg = grim_models_transformer::LlamaConfig {
@@ -833,9 +806,8 @@ mod tests {
         );
     }
 
-    /// A drafter whose base logits are one-hot on its drafted token against a
-    /// uniform target gives p_target/p_draft ≈ 0 — every draft rejected, so
-    /// the tuner must collapse K to its minimum instead of staying at 3.
+    /// A drafter whose base logits are one-hot on its drafted token against a uniform target gives p_target/p_draft ≈
+    /// 0 - every draft rejected, so the tuner must collapse K to its minimum instead of staying at 3.
     struct AlwaysRejectedDraft;
 
     impl DraftBackbone for AlwaysRejectedDraft {

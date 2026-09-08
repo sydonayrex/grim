@@ -1,8 +1,5 @@
 //! Output-exact memory-sovereign certificates and semantic-demand bounds.
-//!
-//! Implements formal certificate tuples $\mathcal{C} = (I, B, A, E, L)$ based on
-//! Stepanek (arXiv:2608.23805), providing mathematical proof of memory residency,
-//! worst-case prefill semantic-demand lower bounds, and verified non-OOM guarantees.
+//! Implements formal certificate tuples $\mathcal{C} = (I, B, A, E, L)$ based on Stepanek (arXiv:2608.23805),.
 
 use crate::architecture::ModelArchitecture;
 use crate::error::{Error, Result};
@@ -38,7 +35,11 @@ pub struct BoundaryVector {
 
 impl BoundaryVector {
     /// Standard boundary vector for single or multi-GPU environments.
-    pub fn standard(host_allowance_bytes: u64, device_capacity_bytes: u64, reserve_bytes: u64) -> Self {
+    pub fn standard(
+        host_allowance_bytes: u64,
+        device_capacity_bytes: u64,
+        reserve_bytes: u64,
+    ) -> Self {
         Self {
             host_allowance_bytes,
             device_capacity_bytes,
@@ -101,10 +102,7 @@ pub struct MemoryCertificate {
 
 impl MemoryCertificate {
     /// Certify a model configuration against given hardware boundaries.
-    ///
-    /// # Mathematical Contracts
-    /// 1. Full Residency: $\text{TotalDemand} \le \text{DeviceCapacity} - \text{Reserve}$
-    /// 2. Feasible Storage-Backed: $\text{TotalDemand} \le \text{HostAllowance} + \text{DeviceCapacity} - \text{Reserve}$
+    /// # Mathematical Contracts 1.
     pub fn certify(
         hparams: &ArchHyperparameters,
         boundaries: BoundaryVector,
@@ -117,7 +115,9 @@ impl MemoryCertificate {
             hparams.compute_detailed_memory_bounds(target_seq_len, batch_size, bytes_per_elem);
 
         let total_required = semantic_demand + kv_bytes + act_bytes;
-        let device_usable = boundaries.device_capacity_bytes.saturating_sub(boundaries.operator_reserve_bytes);
+        let device_usable = boundaries
+            .device_capacity_bytes
+            .saturating_sub(boundaries.operator_reserve_bytes);
         let combined_usable = (boundaries.host_allowance_bytes + boundaries.device_capacity_bytes)
             .saturating_sub(boundaries.operator_reserve_bytes);
 
@@ -161,6 +161,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_dense_model_residency_certification() {
         let mut hp = ArchHyperparameters::default();
         hp.vocab_size = 32000;
@@ -172,8 +173,13 @@ mod tests {
         hp.head_dim = 128;
 
         // 24 GiB GPU, 16 GiB host, 1 GiB reserve
-        let boundaries = BoundaryVector::standard(16 * 1024 * 1024 * 1024, 24 * 1024 * 1024 * 1024, 1024 * 1024 * 1024);
-        let cert = MemoryCertificate::certify(&hp, boundaries, 4096, 1, 2, "oracle-dense-7b").unwrap();
+        let boundaries = BoundaryVector::standard(
+            16 * 1024 * 1024 * 1024,
+            24 * 1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        );
+        let cert =
+            MemoryCertificate::certify(&hp, boundaries, 4096, 1, 2, "oracle-dense-7b").unwrap();
 
         assert!(cert.is_full_residency_certified);
         assert!(cert.is_storage_backed_feasible);
@@ -181,6 +187,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_moe_model_semantic_demand_and_bounds() {
         let mut hp = ArchHyperparameters::default();
         hp.architecture = ModelArchitecture::Qwen3Moe;
@@ -196,8 +203,13 @@ mod tests {
         hp.expert_feed_forward_length = Some(1408);
 
         // 24 GiB GPU, 64 GiB host
-        let boundaries = BoundaryVector::standard(64 * 1024 * 1024 * 1024, 24 * 1024 * 1024 * 1024, 1024 * 1024 * 1024);
-        let cert = MemoryCertificate::certify(&hp, boundaries, 32768, 1, 2, "oracle-qwen3-moe").unwrap();
+        let boundaries = BoundaryVector::standard(
+            64 * 1024 * 1024 * 1024,
+            24 * 1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        );
+        let cert =
+            MemoryCertificate::certify(&hp, boundaries, 32768, 1, 2, "oracle-qwen3-moe").unwrap();
 
         assert!(cert.is_storage_backed_feasible);
         assert_eq!(cert.inventory.total_expert_count, 64 * 48);
@@ -205,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_impossible_envelope_fails_closed() {
         let mut hp = ArchHyperparameters::default();
         hp.num_layers = 128;
@@ -212,8 +225,16 @@ mod tests {
         hp.intermediate_size = 65536;
 
         // Tiny 2 GiB device, 2 GiB host
-        let boundaries = BoundaryVector::standard(2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024);
-        let err = MemoryCertificate::certify(&hp, boundaries, 8192, 1, 2, "oracle-fail").unwrap_err();
-        assert!(err.to_string().contains("exceeds combined hardware envelope"));
+        let boundaries = BoundaryVector::standard(
+            2 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        );
+        let err =
+            MemoryCertificate::certify(&hp, boundaries, 8192, 1, 2, "oracle-fail").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeds combined hardware envelope")
+        );
     }
 }

@@ -1,10 +1,5 @@
 //! Dynamic library (.so/.dylib/.dll) plugin loader.
-//!
-//! §6.1: Uses `libloading` to dynamically open process-shared plugin libraries and resolve
-//! their exported `GrimPluginVTable` entry points.
-//!
-//! ⚠️ SECURITY NOTE: dylib plugins run in process memory. A crash takes the engine down.
-//! This is for performance-critical extensions only. First-party and reviewed plugins required.
+//! §6.1: Uses `libloading` to dynamically open process-shared plugin libraries and resolve their exported `GrimPluginVTable` entry.
 
 use crate::{GrimPluginVTable, PluginCapabilities, PluginManifest, Sampler};
 use grim_tensor::error::{Error, Result};
@@ -13,9 +8,8 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-/// Upper bound on the number of bytes scanned when reading a plugin name
-/// from the vtable's `name` pointer. Guards against unbounded C-string reads
-/// on untrusted plugin data.
+/// Upper bound on the number of bytes scanned when reading a plugin name from the vtable's `name` pointer.
+/// Guards against unbounded C-string reads on untrusted plugin data.
 const MAX_NAME_BYTES: usize = 1024;
 
 /// Loaded dylib plugin with its vtable and optional sampler.
@@ -27,24 +21,16 @@ pub struct DylibPluginLoader {
 }
 
 /// Sampler backed by a dylib plugin's FFI vtable.
-///
-/// Holds the opaque plugin-allocated handle returned by `sampler_factory`
-/// and the `sampler_sample` fn pointer used to drive `Sampler::sample`. The
-/// handle is owned and freed via the vtable's `teardown` surface on drop.
+/// Holds the opaque plugin-allocated handle returned by `sampler_factory` and the `sampler_sample` fn pointer used to.
 struct DylibSampler {
     name: String,
-    /// Keeps the owning library mapped for as long as any sampler built from
-    /// it is alive. Without this, dropping the `DylibPluginLoader` unloads the
-    /// library while `sample_fn`/`teardown` are still callable.
-    /// [P1-29 fix: sampler owns a refcount on the library.]
+    /// Keeps the owning library mapped for as long as any sampler built from it is alive.
+    /// Without this, dropping the `DylibPluginLoader` unloads the library while `sample_fn`/`teardown` are still callable.
     #[cfg(feature = "dylib-loading")]
     _lib: Arc<libloading::Library>,
     handle: *mut std::os::raw::c_void,
-    /// `logits_len` is an **f32 element count** here (the dylib ABI takes a
-    /// native `*const f32`). The WASM backend passes a **byte** length instead,
-    /// because that is the natural unit for wasm linear memory. Plugin authors
-    /// must use the unit matching the backend they target.
-    /// [P1-29: unit mismatch documented per-backend, not silently unified.]
+    /// `logits_len` is an **f32 element count** here (the dylib ABI takes a native `*const f32`).
+    /// The WASM backend passes a **byte** length instead, because that is the natural unit for.
     sample_fn: extern "C" fn(
         handle: *mut std::os::raw::c_void,
         logits_ptr: *const f32,
@@ -55,12 +41,8 @@ struct DylibSampler {
     teardown: extern "C" fn(),
 }
 
-// SAFETY: The plugin's handle is opaque host-owned memory. We treat it as a
-// `Send`+`Sync` raw token because `sample_fn`/`teardown` are plain C
-// `extern "C"` fn pointers (no captured Rust state, no thread affinity) and
-// the plugin contract (§6.1) requires sampler entrypoints be reentrant /
-// thread-safe when invoked. The `Arc<dyn Sampler>` that wraps this is what
-// the registry shares across axum tasks.
+// SAFETY: The plugin's handle is opaque host-owned memory.
+// We treat it as a `Send`+`Sync` raw token because `sample_fn`/`teardown` are plain C `extern "C"`.
 unsafe impl Send for DylibSampler {}
 unsafe impl Sync for DylibSampler {}
 
@@ -110,20 +92,7 @@ impl Sampler for DylibSampler {
 
 impl DylibPluginLoader {
     /// Loads a dynamic library plugin and binds its FFI vtable.
-    ///
-    /// # Integrity verification
-    ///
-    /// If `manifest.sha256` is `Some`, the file at `path` is hashed with SHA-256
-    /// before `libloading::Library::new` is called. A mismatch returns an `Err`
-    /// naming the plugin and both digests. If `sha256` is `None`, the file is
-    /// loaded without a hash check and a warning is emitted once per load
-    /// (callers that require pinned hashes should set `require_pinned_hash` or
-    /// ensure manifests carry `sha256`).
-    ///
-    /// # Safety
-    ///
-    /// The dylib runs in-process. A crash in the plugin takes the engine down.
-    /// Use process isolation for untrusted third-party binaries.
+    /// # Integrity verification If `manifest.sha256` is `Some`, the file at `path` is hashed with SHA-256.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::load_with_manifest(path, None)
     }
@@ -145,11 +114,8 @@ impl DylibPluginLoader {
         unsafe {
             let path = path.as_ref();
 
-            // ABI enforcement: a manifest whose abi_version does not match
-            // this engine is rejected BEFORE the library is touched. Reading
-            // a foreign vtable layout is undefined behavior, so this check
-            // must gate the load, not trail it. (Audit fix: validate_abi
-            // existed but was only ever called from a unit test.)
+            // ABI enforcement: a manifest whose abi_version does not match this engine is rejected BEFORE the library is touched.
+            // Reading a foreign vtable layout is undefined behavior, so this check must gate the load,.
             if let Some(m) = manifest {
                 crate::validate_abi(m, crate::ENGINE_ABI_VERSION)?;
             }
@@ -200,9 +166,7 @@ impl DylibPluginLoader {
     }
 
     /// Compute the SHA-256 digest of a file as a lowercase hex string.
-    ///
-    /// Uses a streaming reader so large plugin binaries do not need to be fully
-    /// loaded into RAM.
+    /// Uses a streaming reader so large plugin binaries do not need to be fully loaded.
     #[allow(dead_code)]
     pub(crate) fn compute_sha256_file(path: &Path) -> Result<String> {
         let mut file = std::fs::File::open(path)
@@ -222,18 +186,9 @@ impl DylibPluginLoader {
     }
 
     /// Initialize the plugin. Calls the vtable's init function if present.
-    /// Uses `catch_unwind` to isolate panics in the plugin (§6.1.2).
-    ///
-    /// NOTE: `catch_unwind` only guards Rust panics (unwinding across the FFI
-    /// boundary). It does NOT contain FFI-level crashes — segfaults, `abort()`,
-    /// or other C-level faults still take down the engine; process isolation is
-    /// required for those.
     pub fn init(&self) -> Result<()> {
-        // Wrap in catch_unwind to prevent plugin panics from crashing the engine
-        // The FFI functions are plain C calls - we use a raw pointer to avoid
-        // the catch_unwind panic-payload type constraints
-        // NOTE: catch_unwind only catches Rust panics, NOT FFI-level crashes
-        // (segfaults, aborts) — containing those requires process isolation.
+        // Wrap in catch_unwind to prevent plugin panics from crashing the engine The FFI functions are plain C calls - we use a raw pointer
+        // to avoid the catch_unwind panic-payload type constraints NOTE: catch_unwind only catches Rust panics, NOT FFI-level crashes (segfaults, aborts) - containing those requires process isolation.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // FFI functions are safe to call - the unsafe is in loading them
             (self.vtable.init)(std::ptr::null_mut());
@@ -277,10 +232,8 @@ impl DylibPluginLoader {
                 return "unknown".to_string();
             }
             unsafe {
-                // Bounded scan: never trust an unbounded CStr scan on a pointer
-                // sourced from untrusted plugin data. Walk at most MAX_NAME_BYTES
-                // looking for a NUL terminator before treating the pointer as a
-                // valid C string.
+                // Bounded scan: never trust an unbounded CStr scan on a pointer sourced from untrusted plugin data.
+                // Walk at most MAX_NAME_BYTES looking for a NUL terminator before treating the pointer as a.
                 let mut buf = [0u8; MAX_NAME_BYTES];
                 let mut len = 0usize;
                 while len < MAX_NAME_BYTES {
@@ -304,11 +257,7 @@ impl DylibPluginLoader {
     }
 
     /// Create a sampler from this plugin if it provides one.
-    ///
-    /// Requires the plugin's vtable to expose both `sampler_factory` (which
-    /// allocates an opaque plugin-side sampler handle) and `sampler_sample`
-    /// (which drives `Sampler::sample` on that handle). If either is missing
-    /// the plugin is rejected before it can run any user code.
+    /// Requires the plugin's vtable to expose both `sampler_factory` (which allocates an opaque plugin-side sampler handle).
     pub fn create_sampler(&self) -> Result<Arc<dyn Sampler>> {
         let caps = self.capabilities();
         if !caps.contains(PluginCapabilities::SAMPLER) {
@@ -328,10 +277,8 @@ impl DylibPluginLoader {
             )
         })?;
 
-        // §6.1.2: sampler_factory is a plain C call; isolate panics so a
-        // buggy/malicious plugin can't unwind through the FFI boundary.
-        // NOTE: catch_unwind only guards Rust panics — NOT FFI-level crashes
-        // (segfaults, aborts); containing those requires process isolation.
+        // §6.1.2: sampler_factory is a plain C call; isolate panics so a buggy/malicious plugin can't unwind through the FFI boundary.
+        // NOTE: catch_unwind only guards Rust panics - NOT FFI-level crashes (segfaults, aborts); containing those requires.
         let handle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sampler_factory()))
             .map_err(|_| Error::Backend("Plugin sampler_factory panicked".into()))?;
         if handle.is_null() {
@@ -367,11 +314,8 @@ mod tests {
 
     #[test]
     fn test_dylib_loader_memory_layout() {
-        // Verify the vtable is #[repr(C)] and ABI-stable. A loose lower bound:
-        // the vtable has at least one u32 (abi_version) plus several fn-pointer
-        // fields (name, capabilities, init, model_factory, sampler_factory,
-        // sampler_sample, teardown). New Option<fn> fields only grow the struct,
-        // so this `>=` check stays valid as the vtable surface evolves.
+        // Verify the vtable is #[repr(C)] and ABI-stable.
+        // A loose lower bound: the vtable has at least one u32 (abi_version) plus several fn-pointer.
         let vtable_size = std::mem::size_of::<GrimPluginVTable>();
         let expected =
             std::mem::size_of::<u32>() * 7 + std::mem::size_of::<Option<extern "C" fn()>>();
@@ -452,10 +396,8 @@ mod tests {
         let _ = std::fs::remove_file(&temp_file);
     }
 
-    /// Audit fix gate: a manifest whose abi_version mismatches the engine
-    /// must be rejected by the LOAD PATH itself — before the file is even
-    /// opened (the error names the ABI, not a library-load failure). The
-    /// pre-fix loader only ever ran validate_abi from a unit test.
+    /// Audit fix gate: a manifest whose abi_version mismatches the engine must be rejected by the LOAD PATH itself - before the file is even opened (the error names the ABI, not a library-load failure).
+    /// The pre-fix loader only ever ran validate_abi from a unit test.
     #[test]
     fn dylib_load_path_enforces_abi_version() {
         let temp_dir = std::env::temp_dir();
@@ -505,9 +447,8 @@ mod tests {
 
         let computed = DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash");
 
-        // Verify against a known value (computed externally)
-        // SHA256("test content for sha256") = 587c8c2b5c9d1e5b3f6a7e8d9c0b1a2f3e4d5c6b7a8d9e0f1a2b3c4d5e6f7a8b
-        // We'll just verify it's consistent by computing twice
+        // Verify against a known value (computed externally) SHA256("test content for
+        // sha256") = 587c8c2b5c9d1e5b3f6a7e8d9c0b1a2f3e4d5c6b7a8d9e0f1a2b3c4d5e6f7a8b We'll just verify it's consistent by computing twice
         let computed2 =
             DylibPluginLoader::compute_sha256_file(&temp_file).expect("compute hash again");
         assert_eq!(

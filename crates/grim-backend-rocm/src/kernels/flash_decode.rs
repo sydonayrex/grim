@@ -1,19 +1,11 @@
 //! FlashDecoding (Split-KV Parallel Attention) for long-context single-token decode.
-//!
-//! Divides the sequence dimension into `K_splits` independent thread blocks,
-//! computes partial online softmax statistics in parallel, and merges partials
-//! in a second reduction stage, saturating GPU Compute Units on long contexts.
+//! Divides the sequence dimension into `K_splits` independent thread blocks, computes partial online softmax statistics in.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// FlashDecoding Stage 1: Partial Online Softmax per Sequence Chunk
-// ---------------------------------------------------------------------------
-//
-// Grid: (num_heads, num_splits)
-// Block: (128, 1) or (256, 1) — thread index d corresponds to head dimension.
-// ---------------------------------------------------------------------------
+// FlashDecoding Stage 1: Partial Online Softmax per Sequence Chunk Grid: (num_heads, num_splits) Block:
+// (128, 1) or (256, 1) - thread index d corresponds to head dimension.
 __global__ void grim_flash_decode_stage1(
     const float* __restrict__ q,          // [num_heads, head_dim]
     const float* __restrict__ k_tensor,   // [kv_seq_len, num_kv_heads, head_dim]
@@ -109,13 +101,8 @@ __global__ void grim_flash_decode_stage1(
     }
 }
 
-// ---------------------------------------------------------------------------
 // FlashDecoding Stage 2: Merge Partials Across Sequence Splits
-// ---------------------------------------------------------------------------
-//
-// Grid: (num_heads, 1)
-// Block: (128, 1) or (256, 1)
-// ---------------------------------------------------------------------------
+// Grid: (num_heads, 1) Block: (128, 1) or (256, 1)
 __global__ void grim_flash_decode_stage2(
     const float* __restrict__ mid_out,  // [num_splits, num_heads, head_dim]
     const float* __restrict__ mid_max,  // [num_splits, num_heads]

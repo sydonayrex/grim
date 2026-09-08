@@ -1,9 +1,5 @@
 //! CUDA graph capture and replay for the fused decode step (F10).
-//!
-//! GraphCaptureManager captures a closure recorded stream into a
-//! DecodeGraph, caches it per-shape key, and replays by DecodeGraphKey.
-//! Fixed decode batch buckets ( in {1, 2, 4, 8, 16, 32}$) enable zero-overhead
-//! graph launches without re-instantiation across dynamic batch workloads.
+//! GraphCaptureManager captures a closure recorded stream into a DecodeGraph, caches it per-shape key, and replays.
 
 use std::collections::HashMap;
 use std::ffi::c_void;

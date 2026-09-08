@@ -1,19 +1,11 @@
 //! DeepSeek Multi-Head Latent Attention (MLA) Matrix-Absorbed Decode kernel.
-//!
-//! Performs decode attention directly against the compressed 576-dim latent
-//! KV-cache (512-dim `c_kv` + 64-dim `k_pe`), using pre-absorbed query projections
-//! ($Q_C = Q \cdot W^{UK}$) to eliminate multi-head Key/Value materialization.
+//! Performs decode attention directly against the compressed 576-dim latent KV-cache (512-dim `c_kv` + 64-dim `k_pe`),.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// DeepSeek MLA Matrix-Absorbed Decode Kernel
-// ---------------------------------------------------------------------------
-//
-// Grid: (num_heads, 1)
-// Block: (256, 1) or (512, 1) — thread index mapped across latent dimension.
-// ---------------------------------------------------------------------------
+// DeepSeek MLA Matrix-Absorbed Decode Kernel Grid: (num_heads, 1) Block: (256,
+// 1) or (512, 1) - thread index mapped across latent dimension.
 __global__ void grim_mla_absorbed_decode(
     const float* __restrict__ q_absorbed, // [num_heads, kv_lora_rank] (Q * W_UK)
     const float* __restrict__ q_rope,     // [num_heads, qk_rope_dim]
@@ -116,10 +108,8 @@ __global__ void grim_mla_absorbed_decode(
         for (int v = tid; v < v_head_dim; v += block_size) {
             float v_acc = 0.0f;
             for (int c = 0; c < kv_lora_rank && c < 512; ++c) {
-                // Per-head w_uv block: base offset (kv_b rows layout puts
-                // each head's block after `nope` skipped rows) plus the
-                // per-head stride; 0 stride = one shared matrix for all
-                // heads (legacy single-head launches).
+                // Per-head w_uv block: base offset (kv_b rows layout puts each head's block after `nope` skipped rows)
+                // plus the per-head stride; 0 stride = one shared matrix for all heads (legacy single-head launches).
                 long w_base = (long)w_uv_offset_words + (long)h * w_uv_head_stride_words;
                 v_acc += w_uv[w_base + v * kv_lora_rank + c] * s_latent[c];
             }

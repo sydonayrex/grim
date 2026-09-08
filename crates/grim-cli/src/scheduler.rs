@@ -7,9 +7,8 @@ pub async fn cmd_scheduler(addr: &str) -> Result<()> {
         .build()
         .map_err(|e| grim_core::Error::Config(format!("failed to build client: {e}")))?;
     let mut val: Option<serde_json::Value> = None;
-    // F-2: try the dedicated /scheduler surface first, then fall back to
-    // /status — both carry the scheduler snapshot on current servers, but
-    // older builds only answer /status.
+    // F-2: try the dedicated /scheduler surface first, then fall back to /status -
+    // both carry the scheduler snapshot on current servers, but older builds only answer /status.
     for path in ["/scheduler", "/status"] {
         for scheme in ["http", "https"] {
             let url = format!("{scheme}://{addr}{path}");

@@ -6,30 +6,29 @@ pub mod batch_orchestrator;
 /// SCYTHE-2 WI-2: live GPU capability profiler.
 pub mod capability_profiler;
 pub mod cubecl;
-pub mod eplb;
-pub mod gemm_tuning;
-pub mod handles;
-pub mod hardware_spec;
-pub mod helpers;
-pub mod jit_cache;
 pub mod device_attention;
 pub mod device_compute;
 pub mod device_quant;
 pub mod device_recurrent;
 pub mod device_routing;
 pub mod device_serve;
+pub mod eplb;
+pub mod gemm_tuning;
+pub mod handles;
+pub mod hardware_spec;
+pub mod helpers;
+pub mod jit_cache;
 pub mod layout;
 pub mod moe_hybrid_exec;
-pub mod probe;
 pub mod parallel_comm;
+pub mod probe;
 pub mod roc_device;
 pub mod rocblas;
 pub mod scythe_route;
 pub mod util;
 
-/// Integration-test shims for the GPTQ fused dequant-GEMM path. These are
-/// thin public forwardings to `pub(crate)` launchers so `tests/` binaries can
-/// exercise real device kernels without widening the production API.
+/// Integration-test shims for the GPTQ fused dequant-GEMM path.
+/// These are thin public forwardings to `pub(crate)` launchers so `tests/` binaries can exercise real device.
 #[cfg(feature = "gpu-test-shims")]
 pub mod gptq_test_shim {
     use crate::memory::storage::RocmStorage;

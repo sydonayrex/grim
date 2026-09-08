@@ -1,9 +1,5 @@
 //! Compatibility loader and native implementation for `google/diffusiongemma-26B-A4B-it`.
-//!
-//! # Architecture Details
-//! - **Block Diffusion Attention**: Bidirectional self-attention within 256-token canvas blocks paired with causal prompt context.
-//! - **GeGLU FFN**: GELU-gated linear units with post-feedforward normalization.
-//! - **GQA Attention**: Grouped Query Attention with RMSNorm normalization.
+//! # Architecture Details - **Block Diffusion Attention**: Bidirectional self-attention within 256-token canvas blocks paired with.
 
 use std::sync::Arc;
 
@@ -12,15 +8,12 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, WeightSource};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-// ---------------------------------------------------------------------------
 // Device helpers
-// ---------------------------------------------------------------------------
 
-/// Upload host f32 rows onto `device` (GPU-first). Used to hand results of
-/// documented kernel-gap host loops back to the device residency of their
-/// inputs instead of leaving the residual stream on CPU.
+/// Upload host f32 rows onto `device` (GPU-first).
+/// Used to hand results of documented kernel-gap host loops back to the device residency of.
 fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -> Result<Tensor> {
     let shape = Shape::new(vec![rows, cols]);
     let dev = grim_nn::modules::pick_device_for_storage_device(device);
@@ -34,9 +27,7 @@ fn f32_rows_on_device(device: &Device, data: &[f32], rows: usize, cols: usize) -
     ))
 }
 
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 
 /// Configuration for Diffusion-Gemma model architecture.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -101,9 +92,7 @@ impl DiffusionGemmaConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Block
-// ---------------------------------------------------------------------------
 
 pub struct DiffusionGemmaBlock {
     pub wq: Linear,
@@ -176,9 +165,8 @@ impl DiffusionGemmaBlock {
         })
     }
 
-    /// Device-first: attention runs on-device via `dev.qkv_attention` (GQA +
-    /// causal + KV cache). RoPE runs through the device kernel. The host path
-    /// only runs when the backend lacks the rope/qkv_attention kernels.
+    /// Device-first: attention runs on-device via `dev.qkv_attention` (GQA + causal + KV cache).
+    /// RoPE runs through the device kernel.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -205,9 +193,18 @@ impl DiffusionGemmaBlock {
                 pos_ext.push(pos);
             }
         }
-        let q3 = crate::block::reshaped_view(&q, &Shape::new(vec![1, seq_len * self.num_heads, self.head_dim]))?;
+        let q3 = crate::block::reshaped_view(
+            &q,
+            &Shape::new(vec![1, seq_len * self.num_heads, self.head_dim]),
+        )?;
         let (rope_q_s, _) = dev.rope(q3.storage().as_ref(), &pos_ext, &rope_cfg, q3.shape())?;
-        let q_rope_tmp = Tensor::new(Arc::from(rope_q_s), q3.shape().clone(), DType::F32, q.provenance().clone(), x.device().clone());
+        let q_rope_tmp = Tensor::new(
+            Arc::from(rope_q_s),
+            q3.shape().clone(),
+            DType::F32,
+            q.provenance().clone(),
+            x.device().clone(),
+        );
         let q_rope = crate::block::reshaped_view(&q_rope_tmp, &Shape::new(vec![seq_len, q_dim]))?;
 
         // Device RoPE for K
@@ -217,9 +214,18 @@ impl DiffusionGemmaBlock {
                 pos_kv.push(pos);
             }
         }
-        let k3 = crate::block::reshaped_view(&k, &Shape::new(vec![1, seq_len * self.num_kv_heads, self.head_dim]))?;
+        let k3 = crate::block::reshaped_view(
+            &k,
+            &Shape::new(vec![1, seq_len * self.num_kv_heads, self.head_dim]),
+        )?;
         let (rope_k_s, _) = dev.rope(k3.storage().as_ref(), &pos_kv, &rope_cfg, k3.shape())?;
-        let k_rope_tmp = Tensor::new(Arc::from(rope_k_s), k3.shape().clone(), DType::F32, k.provenance().clone(), x.device().clone());
+        let k_rope_tmp = Tensor::new(
+            Arc::from(rope_k_s),
+            k3.shape().clone(),
+            DType::F32,
+            k.provenance().clone(),
+            x.device().clone(),
+        );
         let k_rope = crate::block::reshaped_view(&k_rope_tmp, &Shape::new(vec![seq_len, kv_dim]))?;
 
         // KV cache: append new K/V to device-resident history
@@ -229,12 +235,48 @@ impl DiffusionGemmaBlock {
             let full_shape = Shape::new(vec![new_total, kv_dim]);
             let k_grown = dev.alloc_storage(&full_shape, DType::F32)?;
             let v_grown = dev.alloc_storage(&full_shape, DType::F32)?;
-            dev.copy_slice_range(k_grown.as_ref(), 0, prev_k.storage().as_ref(), 0, total_prev * kv_dim)?;
-            dev.copy_slice_range(k_grown.as_ref(), total_prev * kv_dim, k_rope.storage().as_ref(), 0, seq_len * kv_dim)?;
-            dev.copy_slice_range(v_grown.as_ref(), 0, prev_v.storage().as_ref(), 0, total_prev * kv_dim)?;
-            dev.copy_slice_range(v_grown.as_ref(), total_prev * kv_dim, v.storage().as_ref(), 0, seq_len * kv_dim)?;
-            let k_t = Tensor::new(Arc::from(k_grown), full_shape.clone(), DType::F32, k.provenance().clone(), x.device().clone());
-            let v_t = Tensor::new(Arc::from(v_grown), full_shape.clone(), DType::F32, v.provenance().clone(), x.device().clone());
+            dev.copy_slice_range(
+                k_grown.as_ref(),
+                0,
+                prev_k.storage().as_ref(),
+                0,
+                total_prev * kv_dim,
+            )?;
+            dev.copy_slice_range(
+                k_grown.as_ref(),
+                total_prev * kv_dim,
+                k_rope.storage().as_ref(),
+                0,
+                seq_len * kv_dim,
+            )?;
+            dev.copy_slice_range(
+                v_grown.as_ref(),
+                0,
+                prev_v.storage().as_ref(),
+                0,
+                total_prev * kv_dim,
+            )?;
+            dev.copy_slice_range(
+                v_grown.as_ref(),
+                total_prev * kv_dim,
+                v.storage().as_ref(),
+                0,
+                seq_len * kv_dim,
+            )?;
+            let k_t = Tensor::new(
+                Arc::from(k_grown),
+                full_shape.clone(),
+                DType::F32,
+                k.provenance().clone(),
+                x.device().clone(),
+            );
+            let v_t = Tensor::new(
+                Arc::from(v_grown),
+                full_shape.clone(),
+                DType::F32,
+                v.provenance().clone(),
+                x.device().clone(),
+            );
             *kv_cache = Some((k_t.clone(), v_t.clone()));
             (k_t, v_t)
         } else {
@@ -272,8 +314,20 @@ impl DiffusionGemmaBlock {
                 let mut q_vec = q_rope.to_vec_f32()?;
                 let mut k_vec = k_all.to_vec_f32()?;
                 let v_vec = v_all.to_vec_f32()?;
-                crate::qwen35::apply_rope_neox(&mut q_vec, positions, self.num_heads, self.head_dim, 10000.0);
-                crate::qwen35::apply_rope_neox(&mut k_vec, positions, self.num_kv_heads, self.head_dim, 10000.0);
+                crate::qwen35::apply_rope_neox(
+                    &mut q_vec,
+                    positions,
+                    self.num_heads,
+                    self.head_dim,
+                    10000.0,
+                );
+                crate::qwen35::apply_rope_neox(
+                    &mut k_vec,
+                    positions,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    10000.0,
+                );
                 let q_rot = cpu_tensor(q_vec, Shape::new(vec![seq_len, q_dim]));
                 let k_rot = cpu_tensor(k_vec, Shape::new(vec![total_kv_len, kv_dim]));
                 let v_t2 = cpu_tensor(v_vec, Shape::new(vec![total_kv_len, kv_dim]));
@@ -286,17 +340,22 @@ impl DiffusionGemmaBlock {
                 for s_loop in 0..seq_len {
                     for h in 0..self.num_heads {
                         let kv_h = h / kv_group_size;
-                        let q_slice = &q_heads[s_loop * q_dim + h * self.head_dim..s_loop * q_dim + (h + 1) * self.head_dim];
+                        let q_slice = &q_heads[s_loop * q_dim + h * self.head_dim
+                            ..s_loop * q_dim + (h + 1) * self.head_dim];
                         let mut scores = vec![0.0f32; total_kv_len];
                         for t in 0..total_kv_len {
-                            let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim..t * kv_dim + (kv_h + 1) * self.head_dim];
-                            let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
+                            let k_slice = &k_heads[t * kv_dim + kv_h * self.head_dim
+                                ..t * kv_dim + (kv_h + 1) * self.head_dim];
+                            let dot: f32 =
+                                q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                             scores[t] = dot * scale;
                         }
                         let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let exp_scores: Vec<f32> = scores.iter().map(|s| (s - max_score).exp()).collect();
+                        let exp_scores: Vec<f32> =
+                            scores.iter().map(|s| (s - max_score).exp()).collect();
                         let sum_exp: f32 = exp_scores.iter().sum();
-                        let weights: Vec<f32> = exp_scores.iter().map(|e| e / (sum_exp + 1e-12)).collect();
+                        let weights: Vec<f32> =
+                            exp_scores.iter().map(|e| e / (sum_exp + 1e-12)).collect();
                         for d in 0..self.head_dim {
                             let mut acc = 0.0f32;
                             for t in 0..total_kv_len {
@@ -338,9 +397,7 @@ impl DiffusionGemmaBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Model & Session
-// ---------------------------------------------------------------------------
 
 pub struct DiffusionGemma {
     pub cfg: DiffusionGemmaConfig,

@@ -1,4 +1,3 @@
-
 //! Primary `CudaDevice` struct and mathematical tensor trait implementations.
 
 use std::collections::HashMap;
@@ -9,29 +8,27 @@ use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::DType;
 use grim_tensor::error::{Error, Result};
 pub use grim_tensor::{
-    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps,
-    CoreTensorOps, ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps,
-    RecurrentOps, SamplingOps, Shape,
+    AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps, CoreTensorOps,
+    ElementwiseOps, FusionOps, GraphCaptureOps, MemoryOps, OptimizerOps, QuantOps, RecurrentOps,
+    SamplingOps, Shape,
 };
 
 use crate::autotune::{CudaAutotuner, CudaTileConfig, GemmOp};
 use crate::caps::CudaCaps;
 use crate::device::cublas::CublasHandle;
 use crate::device::handles::{
-    cublasCreate_v2, cuLaunchKernel, cuModuleGetFunction,
-    cudaDeviceGetAttribute, cudaGetDeviceCount,
-    cudaMemGetInfo, cudaSetDevice, cudaSuccess, CUBLAS_STATUS_SUCCESS,
-    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-    CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT, CUfunction, CudaHandle,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT,
+    CUBLAS_STATUS_SUCCESS, CUfunction, CudaHandle, cuLaunchKernel, cuModuleGetFunction,
+    cublasCreate_v2, cudaDeviceGetAttribute, cudaGetDeviceCount, cudaMemGetInfo, cudaSetDevice,
+    cudaSuccess,
 };
 use crate::device::jit_cache::compile_and_load_kernel;
 use crate::memory::storage::CudaStorage;
 
-/// Lazily-initialized pool of one `CudaDevice` per ordinal, so every caller —
-/// in particular `to_cpu_vec_f32` on quantized weights — reuses a single cuBLAS
-/// handle per GPU instead of creating (and leaking) one per tensor.
+/// Lazily-initialized pool of one `CudaDevice` per ordinal, so every caller - in particular `to_cpu_vec_f32` on quantized
+/// weights - reuses a single cuBLAS handle per GPU instead of creating (and leaking) one per tensor.
 static DEVICE_POOL: LazyLock<Mutex<HashMap<usize, CudaDevice>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -56,8 +53,11 @@ impl CudaDevice {
         if let Some(dev) = pool.get(&ordinal) {
             return Ok(dev.clone());
         }
-        unsafe {
-            cudaSetDevice(ordinal as i32);
+        let set_res = unsafe { cudaSetDevice(ordinal as i32) };
+        if set_res != cudaSuccess {
+            return Err(Error::Backend(format!(
+                "cudaSetDevice failed for device {ordinal} (code {set_res})"
+            )));
         }
         let mut handle_ptr: *mut c_void = std::ptr::null_mut();
         let cublas_handle = unsafe {
@@ -149,9 +149,7 @@ impl CudaDevice {
     }
 
     /// Return the tile config for a (m,n,k) GEMM shape tagged by op-identity.
-    /// cuBLAS (the current CUDA GEMM path) ignores this — the autotuner is the
-    /// ROCm-parity dispatch glue; the tile config is logged for diagnostics and
-    /// will drive a custom-kernel path once one exists.
+    /// cuBLAS (the current CUDA GEMM path) ignores this - the autotuner is the ROCm-parity dispatch.
     pub fn gemm_tile_config(&self, m: usize, n: usize, k: usize, op: GemmOp) -> CudaTileConfig {
         self.autotuner
             .search_tile_config(&self.caps, m, n, k, Some(op))
@@ -176,9 +174,8 @@ impl CudaDevice {
         // into `count`. The pointer is valid and initialized; this is a read-only query.
         let res = unsafe { cudaGetDeviceCount(&mut count) };
         if res != cudaSuccess {
-            // Log the error so operators can diagnose CUDA init failures
-            // (e.g. driver/runtime version mismatch, no GPU, exclusive mode).
-            // Common codes: 35=cudaErrorInsufficientDriver, 100=cudaErrorNoDevice.
+            // Log the error so operators can diagnose CUDA init failures (e.g.
+            // driver/runtime version mismatch, no GPU, exclusive mode).
             eprintln!(
                 "[grim-backend-cuda] cudaGetDeviceCount failed (error code: {res}). \
                  Common causes: driver/runtime mismatch (code 35), no GPU (code 100), \
@@ -194,9 +191,7 @@ impl CudaDevice {
         for i in 0..count {
             match CudaDevice::new(i as usize) {
                 Ok(dev) => devices.push(dev),
-                Err(e) => eprintln!(
-                    "[grim-backend-cuda] CudaDevice::new({i}) failed: {e}"
-                ),
+                Err(e) => eprintln!("[grim-backend-cuda] CudaDevice::new({i}) failed: {e}"),
             }
         }
         if devices.is_empty() {
@@ -256,7 +251,6 @@ impl CudaDevice {
 
     /// Launches a 1-D grid kernel from KERNELS_SOURCE with signature (ptr*, int n).
     /// Args are *mut c_void slots in declaration order; grid = ceil(n/256), block = (256,1,1).
-    /// Runs on the default stream; returns an async handle.
     pub(crate) fn launch_rank1_kernel(
         &self,
         kernel_name: &str,
@@ -265,9 +259,8 @@ impl CudaDevice {
     ) -> Result<Box<dyn ComputeHandle>> {
         let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
         let mut func: CUfunction = std::ptr::null_mut();
-        // SAFETY: `cuModuleGetFunction` resolves a PTX kernel name to a callable
-        // function handle within the loaded module. `func` is initialized to null
-        // and checked on error; the module was loaded for this device.
+        // SAFETY: `cuModuleGetFunction` resolves a PTX kernel name to a callable function handle within the loaded module.
+        // `func` is initialized to null and checked on error; the module was loaded for this.
         unsafe {
             let func_name = std::ffi::CString::new(kernel_name)
                 .map_err(|e| Error::Backend(format!("invalid kernel name {kernel_name:?}: {e}")))?;
@@ -304,15 +297,11 @@ impl CudaDevice {
             completed: Arc::new(Mutex::new(false)),
         }))
     }
-
-
 }
 
 ///
 /// Ties together all granular sub-traits to allow `Arc<dyn BackendDevice>` dispatch across the engine.
 impl grim_tensor::BackendDevice for CudaDevice {}
-
-
 
 /// Returns (free_bytes, total_bytes) VRAM via cudaMemGetInfo.
 pub fn vram_info(ordinal: usize) -> Option<(u64, u64)> {
@@ -329,12 +318,7 @@ pub fn vram_info(ordinal: usize) -> Option<(u64, u64)> {
 }
 
 /// WI-1: live compute utilization for `ordinal`.
-///
-/// Scope note (per WI-1): `grim-backend-cuda` does not link NVML, and adding
-/// NVML is out of scope for this WI. Returns `None` rather than fabricating a
-/// value from indirect signals — `null` on the wire is the honest answer.
+/// Scope note (per WI-1): `grim-backend-cuda` does not link NVML, and adding NVML is out of.
 pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
     None
 }
-
-

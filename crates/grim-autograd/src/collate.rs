@@ -1,8 +1,5 @@
 //! Padding-free training and variable-length sequence packing.
-//!
-//! Enables efficient training by colocating multiple short sequences into
-//! single batches, reducing padding waste. Matches Unsloth's varlen
-//! training path for long context fine-tuning.
+//! Enables efficient training by colocating multiple short sequences into single batches, reducing padding waste.
 
 use grim_tensor::{
     CoreTensorOps, DType, Shape, Tensor,

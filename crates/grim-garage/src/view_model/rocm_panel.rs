@@ -1,10 +1,5 @@
-//! ROCm toggles panel — four Checkbox/Toggle pairs:
-//!  - `rmsnorm_matmul`        (RmsNorm+MatMul fusion HIP kernel)
-//!  - `qkv_attention`         (QKV projection+Attention fusion)
-//!  - `auto_wavefront`       (auto-detect 32 vs 64 wavefront size)
-//!  - `xnack`                 (XNACK-aware unified memory)
-//!
-//! Plus a one-line device summary derived from the GPU probe.
+//! ROCm toggles panel - four Checkbox/Toggle pairs: - `rmsnorm_matmul` (RmsNorm+MatMul fusion HIP kernel) - `qkv_attention` (QKV projection+Attention fusion) - `auto_wavefront`
+//! (auto-detect 32 vs 64 wavefront size) - `xnack` (XNACK-aware unified memory) Plus a one-line device summary derived from the GPU probe.
 
 use crate::backend::BackendProbe;
 use crate::ui_state::display::DisplayState;

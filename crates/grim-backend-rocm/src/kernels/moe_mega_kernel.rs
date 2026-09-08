@@ -1,27 +1,14 @@
 //! MoE Fused Comm-Compute Mega-Kernel (R2 GPU / UniEP Persistent-Worker Model).
-//!
-//! Implements a single persistent-SM HIP kernel that packs tokens by expert, evaluates
-//! SwiGLU projections, and combines outputs under asynchronous scoreboard synchronization.
-//!
-//! Design:
-//! - Persistent 1D grid of NSM threadblocks polling a linearized task space via global atomic cursors.
-//! - Task space:
-//!   * `[0, Ncomm)`: Comm-Workers pack tokens into deterministic expert buffers and update scoreboard arrivals.
-//!   * `[Ncomm, Ncomm + Ncomp)`: Comp-Workers poll `ScoreboardSync::tile_ready` and execute fused GroupGEMM.
-//!   * `[Ncomm + Ncomp, Ncomm + Ncomp + Nrelay)`: Relay-Workers multicast on-GPU tokens across co-located experts.
-//!
-//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 — 2026-08-30
+//! Implements a single persistent-SM HIP kernel that packs tokens by expert, evaluates SwiGLU projections, and.
 
-use std::ffi::c_void;
 use grim_tensor::error::{Error, Result};
+use std::ffi::c_void;
 
 /// HIP source for the MoE persistent-SM mega-kernel.
 pub const MOE_MEGA_KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-    // ────────────────────────────────────────────────────────────────────
-    // grim_moe_mega_kernel — Persistent-Worker Comm-Compute Mega-Kernel
-    // ────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────── grim_moe_mega_kernel - Persistent-Worker Comm-Compute Mega-Kernel ────────────────────────────────────────────────────────────────────
     __global__ void grim_moe_mega_kernel(
         const float* __restrict__ activations,            // [batch, hidden]
         const float* __restrict__ expert_gate_w,          // [num_experts, inter * hidden]
@@ -214,7 +201,7 @@ impl MoeMegaLaunchConfig {
         let total_routed_instances = batch * top_k;
         let tile_size = 16;
         let num_tiles = if total_routed_instances > 0 {
-            (total_routed_instances + tile_size - 1) / tile_size
+            total_routed_instances.div_ceil(tile_size)
         } else {
             0
         };

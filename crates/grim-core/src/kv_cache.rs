@@ -1,28 +1,17 @@
-//! `KvCache` trait — model-agnostic contract for serving inference state.
-//!
-//! `grim-memory` (§5.1) ships the paged-KV implementation; SSM/Mamba uses
-//! a separate `SsmState` trait (in phase 7). The contract here is the
-//! common interface every cache implementation honors; speculative-decoding
-//! integration (§5.3) uses `tentative_append` / `commit` / `rollback_to`.
+//! `KvCache` trait - model-agnostic contract for serving inference state.
+//! `grim-memory` (§5.1) ships the paged-KV implementation; SSM/Mamba uses a separate `SsmState` trait (in phase 7).
 
 use grim_tensor::Tensor;
 
 use crate::error::Result;
 
-/// Block-addressed KV cache. Backed by a shared pool of physical blocks
-/// (§5.1). Sequences address memory through a logical block table; the
-/// physical blocks come from a `KvBlockPool`.
-///
-/// `tentative_append` / `commit` / `rollback_to` support speculative
-/// decoding (§5.3): draft tokens are written provisionally, then either
-/// committed (accepted prefix) or rolled back off before the next iteration.
+/// Block-addressed KV cache. Backed by a shared pool of physical blocks (§5.1).
 pub trait KvCache: Send {
     /// Append a single slot for the next token.
     fn append_slot(&mut self) -> Result<()>;
 
-    /// Tentatively append `n` slots for draft tokens. The slots are
-    /// visible to subsequent forward passes but may be rolled back via
-    /// `rollback_to` or committed via `commit`.
+    /// Tentatively append `n` slots for draft tokens.
+    /// The slots are visible to subsequent forward passes but may be rolled back via `rollback_to`.
     fn tentative_append(&mut self, n: usize) -> Result<()>;
 
     /// After a speculative verification, commit the first `accepted_len`
@@ -49,23 +38,17 @@ pub trait KvCache: Send {
     fn current_v(&self) -> Result<Tensor>;
 
     /// Store key/value tensors into the most recently allocated slot.
-    /// Called by `Session::append_kv` after `append_slot()` to write
-    /// the actual K/V data into the block identified by the slot.
+    /// Called by `Session::append_kv` after `append_slot()` to write the actual K/V data into the block identified.
     fn store_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()>;
 
-    /// True when this cache is backed by a paged KV store that can be fed
-    /// directly to the paged-attention kernel (physical page tensors +
-    /// a logical block table). Models consult this to decide whether to
-    /// dispatch through `append_kv_layer` + `paged_kv_handles`.
+    /// True when this cache is backed by a paged KV store that can be fed directly to the paged-attention kernel (physical page tensors + a logical block table).
+    /// Models consult this to decide whether to dispatch through `append_kv_layer` + `paged_kv_handles`.
     fn has_paged_kv(&self) -> bool {
         false
     }
 
     /// Append the key/value tensors for one layer into the paged store.
-    /// `k`/`v` carry `seq` tokens (shape `[seq, num_kv_heads, head_dim]` or
-    /// `[seq, num_kv_heads * head_dim]`); each token is written into its own
-    /// slot in the layer's page tensor. Per-layer page buffers are grown
-    /// lazily, so no upfront layer count is required.
+    /// `k`/`v` carry `seq` tokens (shape `[seq, num_kv_heads, head_dim]` or `[seq, num_kv_heads * head_dim]`); each token.
     fn append_kv_layer(&mut self, _layer: usize, _k: &Tensor, _v: &Tensor) -> Result<()> {
         Ok(())
     }
@@ -82,25 +65,20 @@ pub trait KvCache: Send {
         None
     }
 
-    /// Device-resident block table matching the `grim_qkv_attention_paged`
-    /// kernel's `BlockTableEntry` ABI, cached across decode steps so the
-    /// paged-attention path doesn't re-upload it per layer per token.
-    /// Default `None` — implementors without a device buffer fall back to the
-    /// host-side upload each call.
+    /// Device-resident block table matching the `grim_qkv_attention_paged` kernel's `BlockTableEntry` ABI, cached across decode steps so the paged-attention path doesn't re-upload it per layer per token.
+    /// Default `None` - implementors without a device buffer fall back to the host-side upload each.
     fn block_table_gpu_handle(
         &self,
     ) -> Option<std::sync::Arc<dyn grim_tensor::backend::BackendStorage>> {
         None
     }
 
-    /// Seed the start of the cache with already-computed prefix blocks from
-    /// a shared pool (RadixAttention-style prefix reuse, §5.1). The default
-    /// is a no-op for caches that don't support cross-sequence sharing.
+    /// Seed the start of the cache with already-computed prefix blocks from a shared pool (RadixAttention-style prefix reuse, §5.1).
+    /// The default is a no-op for caches that don't support cross-sequence sharing.
     fn seed_prefix(&mut self, _blocks: &[usize]) {}
 
-    /// Return the physical block ids currently backing this cache, in token
-    /// order. Used by the engine to register a computed prefix into the
-    /// shared pool's radix tree. Empty by default.
+    /// Return the physical block ids currently backing this cache, in token order.
+    /// Used by the engine to register a computed prefix into the shared pool's radix tree.
     fn prefix_physical_ids(&self) -> Vec<usize> {
         Vec::new()
     }
@@ -115,10 +93,8 @@ pub trait KvCache: Send {
         None
     }
 
-    /// Valid token count stored in physical block `block_id` (handoffs must
-    /// preserve it; deriving from the zero-padded buffer length would mark
-    /// every block fully valid). `None` when the cache does not track
-    /// per-block fill state.
+    /// Valid token count stored in physical block `block_id` (handoffs must preserve it; deriving from the zero-padded buffer length would mark every block fully valid).
+    /// `None` when the cache does not track per-block fill state.
     fn block_num_tokens(&self, _block_id: usize) -> Option<usize> {
         None
     }
@@ -135,11 +111,8 @@ pub trait KvCache: Send {
     }
 }
 
-/// A lightweight in-memory [`KvCache`] for tests (audit gap: callers
-/// previously had to pull in the heavyweight grim-memory paged store to test
-/// against the trait). Stores per-token K/V rows in flat vectors and honors
-/// the speculative `tentative_append`/`commit`/`rollback_to` contract by
-/// tracking a tentative length separately from the committed length.
+/// A lightweight in-memory [`KvCache`] for tests (audit gap: callers previously had to pull in the heavyweight grim-memory paged store to test against the trait).
+/// Stores per-token K/V rows in flat vectors and honors the speculative `tentative_append`/`commit`/`rollback_to` contract by tracking.
 #[derive(Debug, Clone, Default)]
 pub struct MockKvCache {
     num_heads: usize,
@@ -234,9 +207,8 @@ impl KvCache for MockKvCache {
 mod mock_kv_cache_tests {
     use super::*;
 
-    /// The mock must honor the speculative contract: tentative slots are
-    /// visible in `len` but discarded by rollback, and commit folds only
-    /// the accepted count.
+    /// The mock must honor the speculative contract: tentative slots are visible in
+    /// `len` but discarded by rollback, and commit folds only the accepted count.
     #[test]
     fn mock_kv_cache_speculative_contract() {
         let mut kv = MockKvCache::new(2, 4);
@@ -254,7 +226,10 @@ mod mock_kv_cache_tests {
         // Roll back past a block boundary.
         kv.rollback_to(2).unwrap();
         assert_eq!(kv.len(), 2);
-        assert_eq!(kv.current_k().unwrap().to_vec_f32().unwrap().len(), 2 * 2 * 4);
+        assert_eq!(
+            kv.current_k().unwrap().to_vec_f32().unwrap().len(),
+            2 * 2 * 4
+        );
     }
 
     /// store_kv writes into the newest slot and is readable back.
@@ -262,10 +237,18 @@ mod mock_kv_cache_tests {
     fn mock_kv_cache_store_and_read() {
         let mut kv = MockKvCache::new(1, 2);
         kv.append_slot().unwrap();
-        let k = grim_backend_cpu::cpu_tensor(vec![1.5f32, -2.0], grim_tensor::Shape::new(vec![1, 2]));
-        let v = grim_backend_cpu::cpu_tensor(vec![3.0f32, 4.0], grim_tensor::Shape::new(vec![1, 2]));
+        let k =
+            grim_backend_cpu::cpu_tensor(vec![1.5f32, -2.0], grim_tensor::Shape::new(vec![1, 2]));
+        let v =
+            grim_backend_cpu::cpu_tensor(vec![3.0f32, 4.0], grim_tensor::Shape::new(vec![1, 2]));
         kv.store_kv(&k, &v).unwrap();
-        assert_eq!(kv.current_k().unwrap().to_vec_f32().unwrap(), vec![1.5, -2.0]);
-        assert_eq!(kv.current_v().unwrap().to_vec_f32().unwrap(), vec![3.0, 4.0]);
+        assert_eq!(
+            kv.current_k().unwrap().to_vec_f32().unwrap(),
+            vec![1.5, -2.0]
+        );
+        assert_eq!(
+            kv.current_v().unwrap().to_vec_f32().unwrap(),
+            vec![3.0, 4.0]
+        );
     }
 }

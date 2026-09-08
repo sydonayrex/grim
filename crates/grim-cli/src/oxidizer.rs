@@ -9,17 +9,17 @@ use grim_backend_rocm::{
     WeightLayout, enforce_attention_precision, is_attention_projection, resolve_weight_layout,
 };
 use grim_format::GgufProvider;
+use grim_format::fusion::build_transformer_ir;
 use grim_format::gguf::{
     GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp, GrimLayoutHint, GrimMetadata,
     GrimRocmlProfile, GrimTrainQuantMode, read_gguf, read_tensor_bytes,
 };
 use grim_quant::{
-    FisherCalibrationSample, ImportanceScores, QuantFormat, RcoConfig,
-    RewrittenTensorData, TensorRewritePlan, compute_fisher_diagonal, compute_importance_scores,
-    dequant_q4k, dequant_q80, rco_search, rewrite_tensor_data,
+    FisherCalibrationSample, ImportanceScores, QuantFormat, RcoConfig, RewrittenTensorData,
+    TensorRewritePlan, compute_fisher_diagonal, compute_importance_scores, dequant_q4k,
+    dequant_q80, rco_search, rewrite_tensor_data,
 };
 use grim_tensor::provider::TensorProvider;
-use grim_format::fusion::build_transformer_ir;
 
 const OXIDIZER_VERSION: u32 = 1;
 
@@ -145,9 +145,7 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Calibration batch for Fisher/Hessian diagonal computation
-// ---------------------------------------------------------------------------
 
 /// Holds a batch of calibration samples. Each sample has input activations and
 /// output gradients for weight tensors. Empty samples fall back to CPU heuristic.

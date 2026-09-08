@@ -2,9 +2,9 @@
 //!
 //! Run with `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-vulkan --test graph_capture_parity`.
 
+use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::backend::{CoreTensorOps, GraphCaptureOps};
 use grim_tensor::{DType, Shape};
-use grim_backend_vulkan::VulkanDevice;
 
 #[test]
 fn graph_capture_records_and_replays() {
@@ -14,8 +14,12 @@ fn graph_capture_records_and_replays() {
     }
     let dev = VulkanDevice::new();
     let shape = Shape::new(vec![256]);
-    let a = dev.from_cpu(&vec![1.0f32; 256], &shape, DType::F32).unwrap();
-    let b = dev.from_cpu(&vec![2.0f32; 256], &shape, DType::F32).unwrap();
+    let a = dev
+        .from_cpu(&vec![1.0f32; 256], &shape, DType::F32)
+        .unwrap();
+    let b = dev
+        .from_cpu(&vec![2.0f32; 256], &shape, DType::F32)
+        .unwrap();
 
     // Capture
     GraphCaptureOps::begin_graph_capture(&dev, "test_add").unwrap();
@@ -29,12 +33,7 @@ fn graph_capture_records_and_replays() {
 
     // Verify the captured computation produced correct output
     let v = sum.to_cpu_vec_f32().unwrap();
-    for i in 0..256 {
-        assert!(
-            (v[i] - 3.0).abs() < 1e-6,
-            "idx {}: {} != 3.0",
-            i,
-            v[i]
-        );
+    for (i, val) in v.iter().enumerate() {
+        assert!((val - 3.0).abs() < 1e-6, "idx {}: {} != 3.0", i, val);
     }
 }
