@@ -535,7 +535,8 @@ impl VulkanDevice {
             return Err(Error::Shape("Vulkan matmul: inputs must be 2D".into()));
         }
         let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
+        // SPEED-ROC-16: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+        let (n, k2) = (b_dims[0], b_dims[1]);
         if k != k2 {
             return Err(Error::ShapeMismatch {
                 expected: a_dims.to_vec(),
@@ -564,7 +565,8 @@ impl VulkanDevice {
                 for col in 0..n {
                     let mut sum = 0.0f32;
                     for p in 0..k {
-                        sum += a_vec[row * k + p] * b_vec[p * n + col];
+                        // B stored (N, K): element (col, p) at col*k + p.
+                        sum += a_vec[row * k + p] * b_vec[col * k + p];
                     }
                     c_vec[row * n + col] = sum;
                 }

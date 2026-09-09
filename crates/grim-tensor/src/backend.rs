@@ -140,7 +140,12 @@ pub enum MemAdvice {
 pub trait CoreTensorOps {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>>;
 
-    /// 2-D `a @ b` matmul: `a` is `(M, K)`, `b` is `(K, N)`, returns `(M, N)`.
+    /// 2-D matmul. `a` is `(M, K)`; `b` is the natural weight `(N, K)`
+    /// (out_features × in_features, the on-disk layout) and the implementation
+    /// computes `C = A @ B^T`, returning `(M, N)`.
+    /// SPEED-ROC-16: the contract was widened from `b = (K, N)` / `C = A @ B` so
+    /// the ROCm WMMA decode path (`grim_wmma_gemm_b_transposed`) can be fed the
+    /// un-transposed weight and avoid a silent layout mismatch.
     fn matmul(
         &self,
         a: &dyn BackendStorage,

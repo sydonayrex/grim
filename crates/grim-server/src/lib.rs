@@ -419,8 +419,7 @@ fn sample_on_device(
     let storage = as_rocm(&**t.storage())
         .map_err(|e| format!("sample_on_device: not a ROCm storage: {e}"))?;
 
-    let dev = RocmDevice::try_new(ordinal)
-        .map_err(|e| format!("sample_on_device: RocmDevice::try_new: {e}"))?;
+    let dev = RocmDevice::shared(ordinal);
     let temperature: f32 = params
         .temperature
         .or_else(|| {

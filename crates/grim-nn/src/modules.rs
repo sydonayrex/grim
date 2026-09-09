@@ -755,7 +755,9 @@ impl Linear {
         let batch = x.shape().elem_count() / in_dim;
 
         let a_storage = x.storage().as_ref();
-        let b_storage = self.w_t.storage().as_ref();
+        // SPEED-ROC-16: matmul's `b` operand is now the natural weight (N, K)
+        // and computes C = A @ B^T, so pass the un-transposed weight directly.
+        let b_storage = self.weight.storage().as_ref();
 
         let out_shape = Shape::new(vec![batch, out_dim]);
         let qmm_trace = std::env::var_os("GRIM_QMM_TRACE").is_some();

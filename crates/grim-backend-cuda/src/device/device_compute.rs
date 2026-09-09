@@ -45,7 +45,8 @@ impl CudaDevice {
             return Err(Error::Shape("matmul expects 2-D inputs".into()));
         }
         let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
+        // SPEED-ROC-16: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+        let (n, k2) = (b_dims[0], b_dims[1]);
         if k != k2 {
             return Err(Error::ShapeMismatch {
                 expected: a_dims.to_vec(),
@@ -96,21 +97,23 @@ impl CudaDevice {
         })? as *mut c_void;
 
         unsafe {
+            // SPEED-ROC-16: C = A @ B^T, B stored (N, K). transB=T transposes B's
+            // (N, K) layout to (K, N) for the multiply; lda=K, ldb=K, ldc=M.
             let status = cublasSgemm_v2(
                 handle,
                 CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                n as i32,
+                CUBLAS_OP_T,
                 m as i32,
+                n as i32,
                 k as i32,
                 &alpha,
-                b_ptr as *const f32,
-                n as i32,
                 a_ptr as *const f32,
+                k as i32,
+                b_ptr as *const f32,
                 k as i32,
                 &beta,
                 out_ptr as *mut f32,
-                n as i32,
+                m as i32,
             );
             if status != CUBLAS_STATUS_SUCCESS {
                 return Err(Error::Backend(format!(
