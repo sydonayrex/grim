@@ -30,8 +30,8 @@ This guide walks new contributors through setting up a development environment f
 ## Step 1: Clone the repository
 
 ```bash
-git clone https://github.com/Nelsk/Grim.git
-cd Grim
+git clone https://github.com/sydonayrex/grim.git
+cd grim
 ```
 
 ## Step 2: Build the project

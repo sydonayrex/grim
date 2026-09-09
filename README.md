@@ -18,8 +18,8 @@ Grim provides execution and fine-tuning of neural network models without relianc
 ## Quick Start
 
 ```bash
-git clone https://github.com/Nelsk/Grim.git
-cd Grim
+git clone https://github.com/sydonayrex/grim.git
+cd grim
 cargo build --release
 cargo test --workspace
 # Build artifact is `grim-cli`; installing it as `grim` is shown in
