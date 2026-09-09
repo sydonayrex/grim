@@ -394,3 +394,97 @@ pub fn sample_logits_on_device_at(
 // Keep `Error` in scope for future error-path extensions; silence unused warn.
 #[allow(unused)]
 fn _error_type_witness(_: Error) {}
+
+// ── Double-buffered pinned logits fallback (WI-X3) ─────────────────────────
+//
+// When the device sampler cannot absorb the request's sampling semantics
+// (constrained grammar, GRIM_CPU_SAMPLER=1), the CPU still needs the logits.
+// The naive path calls `to_cpu_vec_f32()` which allocates a Vec<f32> per step
+// and does a blocking synchronous D2H copy.
+//
+// PinnedLogitsBuf replaces that: it holds two pinned (page-locked) host
+// buffers sized for the maximum vocabulary.  Each call to
+// `read_logits_to_pinned` issues an async DMA into slot[ping], synchronises
+// on that copy's stream, and returns a &[f32] into pinned memory — zero heap
+// allocation on the hot path.  The caller pings between slots so the GPU can
+// overlap the next kernel with the prior copy (future: overlap with stream).
+
+use crate::memory::pinned::RocmPinnedBuffer;
+
+/// Double-buffered page-locked host buffer for vocab-sized logit readback.
+/// Allocate once at session start; reuse across every decode step.
+pub struct PinnedLogitsBuf {
+    bufs: [RocmPinnedBuffer<f32>; 2],
+    ping: usize,
+}
+
+impl PinnedLogitsBuf {
+    /// Allocate two pinned host buffers each capable of holding `max_vocab` f32 elements.
+    pub fn alloc(max_vocab: usize) -> Result<Self> {
+        Ok(Self {
+            bufs: [
+                RocmPinnedBuffer::alloc(max_vocab)?,
+                RocmPinnedBuffer::alloc(max_vocab)?,
+            ],
+            ping: 0,
+        })
+    }
+
+    /// D2H copy the last `vocab` elements of `logits` into the active pinned slot.
+    /// Synchronises on the copy before returning so the slice is CPU-readable.
+    /// Advances the ping index for the next call.
+    ///
+    /// Returns a slice into pinned memory — valid until the next call to this fn.
+    pub fn read_logits_to_pinned(
+        &mut self,
+        device: &RocmDevice,
+        logits: &RocmStorage,
+        vocab: usize,
+    ) -> Result<&[f32]> {
+        let slot = self.ping;
+        self.ping ^= 1;
+
+        // Validate: need at least vocab * 4 bytes on device.
+        let needed_bytes = vocab * std::mem::size_of::<f32>();
+        if logits.bytes() < needed_bytes {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "PinnedLogitsBuf::read: logits too small ({} bytes) for vocab {vocab}",
+                logits.bytes()
+            )));
+        }
+        if self.bufs[slot].len() < vocab {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "PinnedLogitsBuf::read: pinned slot too small ({} elems) for vocab {vocab}",
+                self.bufs[slot].len()
+            )));
+        }
+
+        // Offset into the tail: the engine's logit table can be wider than vocab.
+        let tail_offset = logits.bytes() - needed_bytes;
+        let src_ptr = {
+            let base = logits
+                .device_ptr_u64()
+                .ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(
+                        "PinnedLogitsBuf::read: logits has no device ptr".into(),
+                    )
+                })?;
+            (base + tail_offset as u64) as *const c_void
+        };
+        let dst_ptr = self.bufs[slot].as_mut_ptr() as *mut c_void;
+
+        // Pin thread to owning device so the DMA lands in the right HIP context.
+        let _guard = DeviceGuard::set(device.ordinal as i32);
+        let stream = device.active_stream();
+
+        check_hip("PinnedLogitsBuf hipMemcpyAsync D2H", unsafe {
+            hipMemcpyAsync(dst_ptr, src_ptr, needed_bytes, HipMemcpyKind::DeviceToHost, stream)
+        })?;
+        check_hip("PinnedLogitsBuf hipStreamSynchronize", unsafe {
+            hipStreamSynchronize(stream)
+        })?;
+
+        Ok(&self.bufs[slot].as_slice()[..vocab])
+    }
+}
+

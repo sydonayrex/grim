@@ -306,7 +306,8 @@ impl CoreTensorOps for CpuDevice {
             return Err(Error::Shape("matmul expects 2-D inputs".into()));
         }
         let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
+        // SPEED-ROC-16: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+        let (n, k2) = (b_dims[0], b_dims[1]);
         if k != k2 {
             return Err(Error::ShapeMismatch {
                 expected: a_dims.to_vec(),
@@ -319,8 +320,8 @@ impl CoreTensorOps for CpuDevice {
             )));
         }
         let mut out = vec![0.0f32; m * n];
-        // All slices sized by shape assertions; dispatch is a safe Rust fn.
-        gemm_dispatch(a.data(), b.data(), &mut out, m, n, k);
+        // SPEED-ROC-16: C = A @ B^T with B stored (N, K).  out[i,j] = sum_k A[i,k]*B[j,k].
+        gemm_b_transposed(a.data(), b.data(), &mut out, m, n, k);
         Ok((
             Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
             Box::new(ReadyHandle),
@@ -2158,6 +2159,25 @@ pub(crate) fn gemm_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: 
     // Scalar fallback (compiled when `oxiblas` is disabled).
     #[cfg(not(feature = "oxiblas"))]
     gemm_scalar(a, b, out, m, n, k);
+}
+
+/// SPEED-ROC-16: `(M,K) @ (N,K)^T → (M,N)`. out[i,j] = sum_k A[i,k] * B[j,k].
+/// M==1 reduces to a single dot-product per output column (GEMV-like).
+pub(crate) fn gemm_b_transposed(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
+    for o in out[..m * n].iter_mut() {
+        *o = 0.0;
+    }
+    for i in 0..m {
+        for j in 0..n {
+            let a_row = &a[i * k..(i + 1) * k];
+            let b_row = &b[j * k..(j + 1) * k];
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                acc += a_row[p] * b_row[p];
+            }
+            out[i * n + j] = acc;
+        }
+    }
 }
 
 /// GEMV fast path for M=1: `y = A[0] · B`. Walks K rows of B sequentially.

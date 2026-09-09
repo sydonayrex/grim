@@ -2485,13 +2485,15 @@ impl MetalDevice {
                 let dims_b = b.shape().dims();
                 let m = dims_a[0];
                 let k = dims_a[1];
-                let n = dims_b[1];
+                // SPEED-ROC-16: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+                let n = dims_b[0];
                 let mut c_vec = vec![0.0f32; m * n];
                 unsafe {
+                    // RowMajor C[M,N] = A[M,K] * B[N,K]^T. trans_b=Trans (112); ldb=K.
                     cblas_sgemm(
                         101, // RowMajor
-                        111, // NoTrans
-                        111, // NoTrans
+                        111, // NoTrans (A)
+                        112, // Trans (B)
                         m as i32,
                         n as i32,
                         k as i32,
@@ -2499,7 +2501,7 @@ impl MetalDevice {
                         a_vec.as_ptr(),
                         k as i32,
                         b_vec.as_ptr(),
-                        n as i32,
+                        k as i32,
                         0.0,
                         c_vec.as_mut_ptr(),
                         n as i32,
@@ -2547,7 +2549,8 @@ impl MetalDevice {
                     return Err(Error::Shape("Metal matmul expects 2-D inputs".into()));
                 }
                 let (m, k) = (a_dims[0], a_dims[1]);
-                let (k2, n) = (b_dims[0], b_dims[1]);
+                // SPEED-ROC-16: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+                let (n, k2) = (b_dims[0], b_dims[1]);
                 if k != k2 {
                     return Err(Error::ShapeMismatch {
                         expected: a_dims.to_vec(),

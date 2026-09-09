@@ -155,7 +155,8 @@ impl CoreTensorOps for RocmDevice {
         }
 
         let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
+        // SPEED-ROC-16: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+        let (n, k2) = (b_dims[0], b_dims[1]);
 
         if k != k2 {
             return Err(Error::ShapeMismatch {
@@ -217,9 +218,13 @@ impl CoreTensorOps for RocmDevice {
                 let compute_type = arith_to_compute_dtype(dtype_out.arith);
                 let alpha_ptr = &alpha as *const f32 as *const c_void;
                 let beta_ptr = &beta as *const f32 as *const c_void;
+                // SPEED-ROC-16: C = A @ B^T, B stored (N, K). Row-major data is read by
+                // rocBLAS as its transpose; to get C_colmajor[N,M] = B @ A^T we pass
+                // b_ptr with transA=Trans (→ op(A)=[N,K]) and a_ptr with transB=NoTrans
+                // (→ op(B)=[K,M]=A^T): m=N, n=M, k=K, lda=K, ldb=K, ldc=N.
                 rocblas_gemm_ex(
                     handle,
-                    RocblasOperation::None,
+                    RocblasOperation::Transpose,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
@@ -227,7 +232,7 @@ impl CoreTensorOps for RocmDevice {
                     alpha_ptr,
                     b_ptr_void,
                     b_type,
-                    n as RocblasInt,
+                    k as RocblasInt,
                     a_ptr_void,
                     a_type,
                     k as RocblasInt,
@@ -239,7 +244,6 @@ impl CoreTensorOps for RocmDevice {
                     out_type,
                     n as RocblasInt,
                     compute_type,
-                    // Wire `lookup_solution_index` to `algo` so rocBLAS actually [see: `select_gemm_algo(0)`, `standard`]
                     select_gemm_algo(solution_index),
                     solution_index as RocblasInt,
                     ROCBLAS_GEMM_FLAGS_NONE,
@@ -247,14 +251,14 @@ impl CoreTensorOps for RocmDevice {
             } else {
                 rocblas_sgemm(
                     handle,
-                    RocblasOperation::None,
+                    RocblasOperation::Transpose,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
                     k as RocblasInt,
                     &alpha,
                     b_ptr_void as *const f32,
-                    n as RocblasInt,
+                    k as RocblasInt,
                     a_ptr_void as *const f32,
                     k as RocblasInt,
                     &beta,
@@ -1705,9 +1709,11 @@ impl RocmDevice {
         let beta_ptr = &beta as *const f32 as *const c_void;
         let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, ArithType::F16);
         unsafe {
+            // SPEED-ROC-16: C = A @ B^T, B stored (N, K). transA=Trans, transB=NoTrans;
+            // m=N, n=M, k=K, A=b_ptr (lda=K), B=a_ptr (ldb=K), C=D=out (ldc/ldd=N).
             let mut status = rocblas_gemm_ex(
                 handle,
-                RocblasOperation::None,
+                RocblasOperation::Transpose,
                 RocblasOperation::None,
                 n as RocblasInt,
                 m as RocblasInt,
@@ -1715,7 +1721,7 @@ impl RocmDevice {
                 alpha_ptr,
                 b_ptr_void,
                 rocblas_datatype::f16_r,
-                n as RocblasInt,
+                k as RocblasInt,
                 a_ptr_void,
                 rocblas_datatype::f16_r,
                 k as RocblasInt,
@@ -1736,7 +1742,7 @@ impl RocmDevice {
                 // fall back to default standard rocBLAS algorithm.
                 status = rocblas_gemm_ex(
                     handle,
-                    RocblasOperation::None,
+                    RocblasOperation::Transpose,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
@@ -1744,7 +1750,7 @@ impl RocmDevice {
                     alpha_ptr,
                     b_ptr_void,
                     rocblas_datatype::f16_r,
-                    n as RocblasInt,
+                    k as RocblasInt,
                     a_ptr_void,
                     rocblas_datatype::f16_r,
                     k as RocblasInt,
@@ -2499,11 +2505,13 @@ impl RocmDevice {
             return Err(Error::Shape("matmul expects inputs with rank >= 2".into()));
         }
 
+        // SPEED-ROC-16: a is [M, K], b is the natural weight [N, K]; matmul computes
+        // C = A @ B^T, so the shared dim is the trailing K of both operands.
         let k = a_dims[a_dims.len() - 1];
         let m = a.shape().elem_count() / k;
 
-        let n = b_dims[b_dims.len() - 1];
-        let k2 = b.shape().elem_count() / n;
+        let k2 = b_dims[b_dims.len() - 1];
+        let n = b.shape().elem_count() / k2;
 
         if k != k2 {
             return Err(Error::ShapeMismatch {
@@ -2621,9 +2629,14 @@ impl RocmDevice {
                 let alpha_ptr = &alpha as *const f32 as *const c_void;
                 let beta_ptr = &beta as *const f32 as *const c_void;
 
+                // SPEED-ROC-16: C = A @ B^T, B=[N,K], A=[M,K], split along K.
+                // Mirror non-split-K rocBLAS layout: pass b_ptr as rocBLAS A with Transpose,
+                // a_ptr as rocBLAS B with None. m=N, n=M, k=k_part.
+                // lda=k (B full row stride), stride_a=k_part (advance k_part cols per batch).
+                // ldb=k (A full row stride), stride_b=k_part (advance k_part cols per batch).
                 rocblas_gemm_strided_batched_ex(
                     handle,
-                    RocblasOperation::None,
+                    RocblasOperation::Transpose,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
@@ -2631,8 +2644,8 @@ impl RocmDevice {
                     alpha_ptr,
                     b_ptr_void,
                     b_type,
-                    n as RocblasInt,
-                    (k_part * n) as i64,
+                    k as RocblasInt,
+                    k_part as i64,
                     a_ptr_void,
                     a_type,
                     k as RocblasInt,
@@ -2723,10 +2736,33 @@ impl RocmDevice {
                         }
                     }
                 }
-                // WI 2.4.4-2(a) — decode GEMM bake-off confirmed rocBLAS wins across served shapes
-                // (up to 5.2x faster than grim_decode_gemm_f16 at batch 1..8).
-                let stream =
-                    self.launch_rocblas_gemm_f16(a_storage, b_storage, &out_storage, m, n, k)?;
+                // SPEED-ROC-16: B is now [N, K] row-major — exactly what R3 expects.
+                // WMMA-T R3 wins the bake-off at 453µs vs 805µs rocBLAS for decode shapes.
+                let stream = self.launch_wmma_gemm_b_transposed(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                )?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        }
+
+        // ─── RDNA3/4 + F16: route all M through b_transposed launcher ─────
+        // launch_wmma_gemm_b_transposed internally dispatches:
+        //   RDNA4/UDNA + m >= 16 → R4 multi-wave (16x64 tile, 2 waves)
+        //   everything else      → R3 single-wave (16x32 tile, 1 wave)
+        // RDNA3 always stays on R3 (the internal is_rdna4 guard blocks R4).
+        // Decode shapes (m <= 8) already returned above; prefill lands here.
+        {
+            let is_rdna3_or_newer = matches!(
+                crate::quantization::gcn_arch(&self.gpu_target),
+                crate::quantization::GcnArch::RDNA3
+                    | crate::quantization::GcnArch::RDNA4
+                    | crate::quantization::GcnArch::UDNA
+            );
+            if is_rdna3_or_newer && dtype_out.arith == ArithType::F16 {
+                let stream = self.launch_wmma_gemm_b_transposed(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                )?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok((Box::new(out_storage), compute_handle));
             }
@@ -2776,9 +2812,13 @@ impl RocmDevice {
                 let compute_type = arith_to_compute_dtype(dtype_out.arith);
                 let alpha_ptr = &alpha as *const f32 as *const c_void;
                 let beta_ptr = &beta as *const f32 as *const c_void;
+                // SPEED-ROC-16: C = A @ B^T, B stored (N, K). Row-major data is read by
+                // rocBLAS as its transpose; to get C_colmajor[N,M] = B @ A^T we pass
+                // b_ptr with transA=Trans (→ op(A)=[N,K]) and a_ptr with transB=NoTrans
+                // (→ op(B)=[K,M]=A^T): m=N, n=M, k=K, lda=K, ldb=K, ldc=N.
                 rocblas_gemm_ex(
                     handle,
-                    RocblasOperation::None,
+                    RocblasOperation::Transpose,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
@@ -2786,7 +2826,7 @@ impl RocmDevice {
                     alpha_ptr,
                     b_ptr_void,
                     b_type,
-                    n as RocblasInt,
+                    k as RocblasInt,
                     a_ptr_void,
                     a_type,
                     k as RocblasInt,
@@ -2798,7 +2838,6 @@ impl RocmDevice {
                     out_type,
                     n as RocblasInt,
                     compute_type,
-                    // Wire `lookup_solution_index` to `algo` so rocBLAS actually [see: `select_gemm_algo(0)`, `standard`]
                     select_gemm_algo(solution_index),
                     solution_index as RocblasInt,
                     ROCBLAS_GEMM_FLAGS_NONE,
@@ -2806,14 +2845,14 @@ impl RocmDevice {
             } else {
                 rocblas_sgemm(
                     handle,
-                    RocblasOperation::None,
+                    RocblasOperation::Transpose,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
                     k as RocblasInt,
                     &alpha,
                     b_ptr_void as *const f32,
-                    n as RocblasInt,
+                    k as RocblasInt,
                     a_ptr_void as *const f32,
                     k as RocblasInt,
                     &beta,
@@ -2984,7 +3023,20 @@ impl RocmDevice {
         let q_ptr = dev_ptr(q_s)?;
         let k_ptr = dev_ptr(k_s)?;
         let v_ptr = dev_ptr(v_s)?;
-        let o_proj_ptr = dev_ptr(o_s)?;
+        // SPEED-ROC-16: the fused grim_qkv_attention kernel hardcodes a [K, N]
+        // o_proj index (`o_proj_w[(h*head_dim+d)*o_dim + oc]`), but the new matmul
+        // contract delivers o_proj in [N, K]. Transpose to [K, N] for the kernel.
+        let o_proj_kn = if o_dim == num_heads * head_dim {
+            let src = o_s.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                Error::Backend("fused_attn_o_proj: o_proj is not RocmStorage".into())
+            })?;
+            let transposed = self.transpose_f32_2d(src, o_dim, num_heads * head_dim)?;
+            let transposed_s =
+                as_rocm(transposed.as_ref())?;
+            dev_ptr(transposed_s)?
+        } else {
+            dev_ptr(o_s)?
+        };
 
         let mut qptr = q_ptr;
         let mut kptr = k_ptr;
@@ -3001,7 +3053,7 @@ impl RocmDevice {
         let mut isd: f32 = 1.0 / (head_dim as f32).sqrt();
         let mut wlo: i32 = 0;
         let mut softcap: f32 = self.attn_logit_softcap();
-        let mut oproj_ptr = o_proj_ptr;
+        let mut oproj_ptr = o_proj_kn;
         let mut odim = o_dim as i32;
         let mut fuseo: i32 = 1;
         let mut alibi_ptr: u64 = 0;
