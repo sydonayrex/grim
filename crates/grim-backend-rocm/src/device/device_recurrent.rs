@@ -27,7 +27,6 @@ impl RecurrentOps for RocmDevice {
                 "short_conv1d: inputs lack valid device ptr".into(),
             ));
         }
-        let total = out_shape.elem_count();
         let storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -40,10 +39,17 @@ impl RecurrentOps for RocmDevice {
         let mut st_ptr = dev_ptr(st_s)?;
 
         let dims = out_shape.dims();
-        let mut batch = dims[0] as i32;
-        let mut channels = dims[2] as i32;
+        // `out_shape` is [batch, ..., channels] flattenable; LFM2 decode passes 1-D [channels].
+        // Kernel contract (see compute_kernels.rs `grim_short_conv1d_causal_step`): total = batch * channels,
+        // output row = (batch, channel) pairs; `x` and `out` are laid out with `channels` innermost.
+        let mut channels = *dims.last().unwrap_or(&1) as i32;
+        let mut batch = (dims[..dims.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1)) as i32;
         let mut k_size = (w_s.bytes / (channels as usize * 4)) as i32;
 
+        let total = (batch * channels) as usize;
         let (grid, block) = linear_launch(total);
         self.launch_compute_kernel(
             "grim_short_conv1d_causal_step",
