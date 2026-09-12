@@ -20,7 +20,7 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 1 | 1b device-base RoPE | ⚠️ | `pos_base_dev` + `rope_dev_base` wired for decode (block.rs:158,631-673,1124,1265-1269); legacy `apply_rope_multi_head` still builds per-token Vec for prefill/fallback (block.rs:823,860-872,699,1523,1751). `rope_dev_base_into` not used by block.rs |
 | 1 | 1c attention graph capture in block.rs | ✅ | `device_graph_decode_attention` (block.rs): kv_append + qkv_attention_dev + bump with device `past_dev` counter, `pos_base_dev` aliased; gated `GRIM_DECODE_GRAPH=1`; CPU-reference parity test + fuse_o test green on gfx1201 |
 | 2 | 2a `shared_attention::fused_qkv_project` | ✅ | shared_attention.rs:103-122 |
-| 2 | 2b wire high-traffic models | ⚠️ | gemma, falcon_h1, exaone4_5, dots3_note, hy_v4 wired (decode-only, seq==1, GRIM_FUSED_QKV gated). Remaining: chameleon/commandr (qk-norm), gptj (custom rope), qwen35/qwen38_flash_next — need per-model handling |
+| 2 | 2b wire high-traffic models | ⚠️ | 9 models wired (decode-only, seq==1, GRIM_FUSED_QKV gated): gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon (qk_norm via fused_qkv_project_raw), commandr, gptj (custom rope), qwen38_flash_next. Remaining: qwen35 (Option projections + hybrid SSM attention) |
 | 3 | 3a shared MoE / Charon grouped dispatch | ❌ | No `shared_moe` module. deepseek2/32/4, kimi_k3 use per-expert loops; bailingmoe2/3, mellum use generic moe blocks; `grep charon crates/grim-models` = 0 hits. Charon grouped dispatch exists in backend (charon.rs:1449,1562) but only engine scythe2.rs:485-520 consumes it |
 | 3 | 3b SwiGLU in Charon epilogue | ⚠️ | Kernel-level done (inline silu×up in charon.rs:59-60,130-131,253-254,341-342,403-404; charon_wmma.rs:93-94) — but no model routes through Charon, so zero production benefit yet |
 | 3 | 3c rmsnorm fused into MoE gate | ❌ | No rmsnorm in charon kernels; models call separate norm before MoE gate |
@@ -589,7 +589,7 @@ Phase 6 is the final capstone — requires all prior phases.
 
 | Metric | Baseline | Target |
 |---|---|---|
-| Models with fused QKV GEMV | 1 (LFM2) | ≥ 11 (block.rs family + gemma, falcon_h1, exaone4_5, dots3_note, hy_v4) — 5 shared_attention models wired; remaining need per-model qk-norm/rope handling |
+| Models with fused QKV GEMV | 1 (LFM2) | 10+ (block.rs llama-family + gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon, commandr, gptj, qwen38_flash_next); qwen35 remaining |
 | Models with device-base RoPE | 1 (LFM2) | ≥ 20 |
 | MoE FFN launches per token | ~num_experts × 4 | ~num_experts × 2 |
 | Kernel files | 59 | ≤ 50 (after cleanup) |
