@@ -1071,3 +1071,163 @@ fn dot4_fp8_gemv_parity() {
         std::env::set_var("GRIM_DOT_GEMV", "0");
     }
 }
+
+/// Phase 4.5f: `dot4_q2k_q81_gemv` (sudot4 + two-dot decomposition) must match
+/// the CPU dequant reference. Fixture encodes grim's Q2_K layout (84 bytes /
+/// 256 weights) and the CPU side mirrors the kernel's Q8_1 activation quant.
+#[test]
+fn dot4_q2k_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe { std::env::set_var("GRIM_DOT_GEMV", "1"); }
+
+    let m = 1usize;
+    let n = 32usize;
+    let k = 256usize;
+
+    let mut seed = 0x5152u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 3.0).collect();
+
+    let f16_bits = |v: f32| -> [u8; 2] { half::f16::from_f32(v).to_le_bytes() };
+    let mut b_bytes = vec![0u8; n * 84];
+    for col in 0..n {
+        let blk = &mut b_bytes[col * 84..(col + 1) * 84];
+        let d = 0.02 + rand().abs() * 0.02;
+        let dmin = 0.01 + rand().abs() * 0.01;
+        blk[80..82].copy_from_slice(&f16_bits(d));
+        blk[82..84].copy_from_slice(&f16_bits(dmin));
+        for sub in 0..16 {
+            let sc = (rand() as u8) % 16;
+            let mi = (rand() as u8) % 16;
+            blk[sub] = sc | (mi << 4);
+            for w in 0..16 {
+                let q = (rand() as u8) % 4;
+                blk[16 + sub * 4 + w / 4] |= q << ((w % 4) * 2);
+            }
+        }
+    }
+
+    let q2k_dtype = DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q2K) };
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_bytes, &Shape::new(vec![b_bytes.len()]), q2k_dtype)
+        .expect("upload q2k weights");
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], grim_tensor::QuantFormat::Q8_0, &out_shape)
+        .expect("quantized_matmul dot4 q2k");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+
+    // CPU reference: mirror the GPU dot4 path exactly. The GPU reconstructs each
+    // activation as code_i * d_a (from grim_quantize_q8_1) and dots against the
+    // dequantized weight. Quantize the CPU activations identically so the only
+    // difference is GPU-vs-CPU float summation order.
+    let q81_block = |vals: &[f32]| -> (f32, Vec<i8>) {
+        let amax = vals.iter().fold(0.0f32, |mx, v| mx.max(v.abs()));
+        let d = amax / 127.0;
+        let inv = if amax > 1e-9 { 127.0 / amax } else { 0.0 };
+        let codes = vals.iter().map(|&v| (v * inv).round() as i8).collect::<Vec<_>>();
+        (d, codes)
+    };
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let b_deq = grim_quant::dequant_q2k(&b_bytes[col * 84..(col + 1) * 84], k).expect("dequant_q2k");
+        let mut acc = 0.0f32;
+        for blk in 0..k / 32 {
+            let vals = &a_f32[blk * 32..(blk + 1) * 32];
+            let (d_a, codes) = q81_block(vals);
+            for i in 0..32 {
+                acc += (codes[i] as f32) * d_a * b_deq[blk * 32 + i];
+            }
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot4-q2k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(diff < 0.5, "dot4 Q2_K GEMV diverges from CPU reference: {diff}");
+    unsafe { std::env::set_var("GRIM_DOT_GEMV", "0"); }
+}
+
+/// Phase 4.5f: `dot4_q3k_q81_gemv` (sudot4 + two-dot + sign-plane correction)
+/// must match the CPU dequant reference. Fixture encodes grim's Q3_K layout
+/// (110 bytes / 256 weights, llama.cpp spec).
+#[test]
+fn dot4_q3k_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe { std::env::set_var("GRIM_DOT_GEMV", "1"); }
+
+    let m = 1usize;
+    let n = 32usize;
+    let k = 256usize;
+
+    let mut seed = 0x3353_0000u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 3.0).collect();
+    let f16_bits = |v: f32| -> [u8; 2] { half::f16::from_f32(v).to_le_bytes() };
+
+    let mut b_bytes = vec![0u8; n * 110];
+    for col in 0..n {
+        let blk = &mut b_bytes[col * 110..(col + 1) * 110];
+        for i in 0..32 { blk[i] = rand().to_bits() as u8; }
+        for i in 0..64 { blk[32 + i] = rand().to_bits() as u8; }
+        for i in 0..12 { blk[96 + i] = rand().to_bits() as u8; }
+        blk[108..110].copy_from_slice(&f16_bits(0.01));
+    }
+
+    let q3k_dtype = DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q3K) };
+    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_bytes, &Shape::new(vec![b_bytes.len()]), q3k_dtype)
+        .expect("upload q3k weights");
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], grim_tensor::QuantFormat::Q8_0, &out_shape)
+        .expect("quantized_matmul dot4 q3k");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+
+    // CPU reference: mirror the GPU dot4 path exactly (activation = code * d_a).
+    let q81_block = |vals: &[f32]| -> (f32, Vec<i8>) {
+        let amax = vals.iter().fold(0.0f32, |mx, v| mx.max(v.abs()));
+        let d = amax / 127.0;
+        let inv = if amax > 1e-9 { 127.0 / amax } else { 0.0 };
+        let codes = vals.iter().map(|&v| (v * inv).round() as i8).collect::<Vec<_>>();
+        (d, codes)
+    };
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let b_deq = grim_quant::dequant_q3k(&b_bytes[col * 110..(col + 1) * 110], k).expect("dequant_q3k");
+        let mut acc = 0.0f32;
+        for blk in 0..k / 32 {
+            let vals = &a_f32[blk * 32..(blk + 1) * 32];
+            let (d_a, codes) = q81_block(vals);
+            for i in 0..32 {
+                acc += (codes[i] as f32) * d_a * b_deq[blk * 32 + i];
+            }
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot4-q3k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(diff < 0.5, "dot4 Q3_K GEMV diverges from CPU reference: {diff}");
+    unsafe { std::env::set_var("GRIM_DOT_GEMV", "0"); }
+}
