@@ -487,8 +487,32 @@ impl QuantOps for RocmDevice {
             }
             DTypeStorage::Block(BlockDtype::Fp8)
             | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
+                // Phase 4.5c: M=1 decode routes to the fp8 dot4 GEMV (RDNA4
+                // dot11-insts V_DOT4_F32_FP8_FP8; activations quantized to
+                // E4M3 in-register). WMMA/MFMA GEMM stays the prefill path.
+                // Escape hatch: GRIM_DOT_GEMV=0.
+                let is_rdna34 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if is_rdna34 && m == 1 && !dot_disabled && k % 32 == 0 {
+                    self.launch_dot4_fp8_gemv(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
+                }
                 // gfx1200+ uses MFMA for FP8 throughput; other architectures use scalar.
-                if self.gpu_target.starts_with("gfx12") {
+                else if self.gpu_target.starts_with("gfx12") {
                     self.launch_fused_dequant_gemm_fp8_mfma(
                         a_storage,
                         b_storage,

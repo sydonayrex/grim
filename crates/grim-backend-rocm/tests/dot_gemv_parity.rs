@@ -11,7 +11,8 @@
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::AttentionOps;
 use grim_tensor::{
-    ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape, Storage,
+    ArithType, BlockDtype, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape,
+    Storage,
 };
 use std::sync::Mutex;
 
@@ -915,5 +916,158 @@ fn silu_mul_quant_q81_parity() {
             let q_ref = ref_q[j];
             assert!((q_gpu - q_ref).abs() <= 1, "quant mismatch at blk {blk} j {j}: gpu {q_gpu} vs ref {q_ref}");
         }
+    }
+}
+
+/// Phase 4.5c: f32 -> E4M3 with RNE — mirrors `grim_f32_to_fp8_e4m3` in
+/// dot_gemv.rs bit-for-bit so the CPU reference uses identical activations.
+fn f32_to_fp8_e4m3_host(f: f32) -> u8 {
+    if f.is_nan() {
+        return 0x7F;
+    }
+    let sign: u8 = if f.is_sign_negative() { 0x80 } else { 0x00 };
+    let a = f.abs();
+    if a >= 480.0 {
+        return sign | 0x7E; // saturate to 448
+    }
+    let bits = a.to_bits();
+    let m = bits & 0x7F_FFFF;
+    let e = ((bits >> 23) & 0xFF) as i32;
+    if e == 0 {
+        return sign; // f32 subnormals are below E4M3 min
+    }
+    let big_e = e - 120; // E4M3 exponent (bias 7)
+    if big_e >= 1 {
+        let mut q = m >> 20;
+        let r = m & 0xF_FFFF;
+        if r > 0x8_0000 || (r == 0x8_0000 && (q & 1) == 1) {
+            q += 1;
+        }
+        let mut big_e = big_e;
+        if q == 8 {
+            q = 0;
+            big_e += 1;
+        }
+        if big_e > 15 {
+            return sign | 0x7E; // saturate to 448
+        }
+        return sign | ((big_e as u8) << 3) | q as u8;
+    }
+    // Subnormal: value * 512 = 1.m * 2^(E+2), round to 3-bit code.
+    let sh = (21 - big_e) as u32;
+    let mant = 0x80_0000u32 | m;
+    let mut q = mant >> sh;
+    let r = mant & ((1u32 << sh) - 1);
+    let half = 1u32 << (sh - 1);
+    if r > half || (r == half && (q & 1) == 1) {
+        q += 1;
+    }
+    if q == 0 {
+        return sign;
+    }
+    sign | q as u8
+}
+
+/// Mirrors `fp8_e4m3_to_float_hip` (shared_device_fns.rs).
+fn fp8_e4m3_to_f32_host(val: u8) -> f32 {
+    let sign = (val >> 7) & 1 == 1;
+    let exp = ((val >> 3) & 0x0F) as i32;
+    let mant = (val & 0x07) as i32;
+    if exp == 0xF {
+        if mant == 7 {
+            return f32::NAN;
+        }
+        return if sign { -448.0 } else { 448.0 };
+    }
+    let res = if exp != 0 {
+        (1.0 + mant as f32 / 8.0) * (2.0f32).powi(exp - 7)
+    } else {
+        mant as f32 / 512.0
+    };
+    if sign {
+        -res
+    } else {
+        res
+    }
+}
+
+/// Phase 4.5c: `dot4_fp8_gemv` (V_DOT4_F32_FP8_FP8, activations quantized to
+/// E4M3 in-register) must match a CPU reference that performs the identical
+/// E4M3 quantization + dequantization.
+#[test]
+fn dot4_fp8_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let m = 1usize;
+    let n = 128usize;
+    let k = 256usize;
+
+    let mut seed = 0xC0FFEEu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    // Activations in the E4M3-normal range; weights encoded from f32 values.
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 4.0).collect();
+    let b_vals: Vec<f32> = (0..n * k).map(|_| rand() * 16.0).collect();
+    let b_bytes: Vec<u8> = b_vals.iter().map(|&v| f32_to_fp8_e4m3_host(v)).collect();
+
+    let fp8_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::Block(BlockDtype::Fp8),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![b_bytes.len()]),
+        fp8_dtype,
+    )
+    .expect("upload fp8 weights");
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Fp8,
+            &out_shape,
+        )
+        .expect("quantized_matmul dot4 fp8");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+    assert_eq!(c_dev.len(), m * n);
+
+    // CPU reference: decode E4M3 weights, quantize activations identically, dot.
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            let b = fp8_e4m3_to_f32_host(b_bytes[col * k + kk]);
+            let a = fp8_e4m3_to_f32_host(f32_to_fp8_e4m3_host(a_f32[kk]));
+            acc += a * b;
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot4-fp8-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(
+        diff < 1e-2,
+        "dot4 FP8 GEMV diverges from CPU reference: {diff}"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
     }
 }

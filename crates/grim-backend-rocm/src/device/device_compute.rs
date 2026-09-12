@@ -2204,6 +2204,50 @@ impl RocmDevice {
         )
     }
 
+    /// Phase 4.5c: FP8 E4M3 GEMV via V_DOT4_F32_FP8_FP8 (RDNA4 dot11-insts).
+    /// A is f32 [M,K] (quantized to E4M3 in-kernel), B is E4M3 column-major [N,K].
+    pub(crate) fn launch_dot4_fp8_gemv(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_fp8_gemv: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_fp8_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_fp8_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_fp8_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// SPEED-DOT: Q4_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
     pub(crate) fn launch_dot4_q4k_q81_gemv(
         &self,
