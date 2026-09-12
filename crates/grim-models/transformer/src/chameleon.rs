@@ -77,6 +77,9 @@ pub struct ChameleonBlock {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub swin_norm: bool,
+    /// Fused Q8_0 QKV projection blob on ROCm (Phase 2b). Issues 1 dot4 GEMV
+    /// instead of 3 when single-token decoding.
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 }
 
 impl ChameleonBlock {
@@ -128,6 +131,11 @@ impl ChameleonBlock {
 
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
+        // Phase 2b: build a fused Q8_0 QKV projection blob when all three
+        // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
+        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
+            .map(std::sync::Arc::new);
+
         Ok(Self {
             wq,
             wk,
@@ -145,6 +153,7 @@ impl ChameleonBlock {
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
             swin_norm: cfg.swin_norm,
+            wqkv_q80_fused,
         })
     }
 
@@ -159,9 +168,16 @@ impl ChameleonBlock {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.attn_norm.forward(x)?;
 
-        let q = self.wq.forward(&normed_attn)?;
-        let k = self.wk.forward(&normed_attn)?;
-        let v = self.wv.forward(&normed_attn)?;
+        // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV instead
+        // of 3 separate GEMVs; per-head Q/K norm and RoPE follow as usual.
+        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
+            crate::shared_attention::fused_qkv_project_raw(&normed_attn, self.wqkv_q80_fused.as_ref().unwrap())?
+        } else {
+            let q = self.wq.forward(&normed_attn)?;
+            let k = self.wk.forward(&normed_attn)?;
+            let v = self.wv.forward(&normed_attn)?;
+            (q, k, v)
+        };
 
         // Per-head Q/K norm before RoPE (host kernel gap, re-uploaded once).
         let q = match self.q_norm {
@@ -441,6 +457,7 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 8,
             swin_norm: false,
+            wqkv_q80_fused: None,
         };
 
         let model = Chameleon {

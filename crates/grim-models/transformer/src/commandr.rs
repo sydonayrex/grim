@@ -103,6 +103,9 @@ pub struct CommandRBlock {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    /// Fused Q8_0 QKV projection blob on ROCm (Phase 2b). Issues 1 dot4 GEMV
+    /// instead of 3 when single-token decoding.
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 }
 
 impl CommandRBlock {
@@ -138,6 +141,11 @@ impl CommandRBlock {
         let mlp = CommandRMlp::load(&ws.scoped("mlp"), cfg.hidden_size, cfg.intermediate_size)?;
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
+        // Phase 2b: build a fused Q8_0 QKV projection blob when all three
+        // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
+        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
+            .map(std::sync::Arc::new);
+
         Ok(Self {
             wq,
             wk,
@@ -151,6 +159,7 @@ impl CommandRBlock {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
+            wqkv_q80_fused,
         })
     }
 
@@ -160,18 +169,32 @@ impl CommandRBlock {
         let seq_len = x.shape().dims()[0];
         let normed = self.input_layernorm.forward(x)?;
 
-        let q = self.wq.forward(&normed)?;
-        let k = self.wk.forward(&normed)?;
-        let v = self.wv.forward(&normed)?;
+        // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
+        // (quantize + fused dot4 + RoPE) instead of 3 separate GEMV + RoPE.
+        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
+            crate::shared_attention::fused_qkv_project(
+                &normed,
+                self.wqkv_q80_fused.as_ref().unwrap(),
+                &self.rope,
+                self.num_heads,
+                self.num_kv_heads,
+                positions,
+            )?
+        } else {
+            let q = self.wq.forward(&normed)?;
+            let k = self.wk.forward(&normed)?;
+            let v = self.wv.forward(&normed)?;
 
-        let q =
-            crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
-        let k = crate::shared_attention::rope_2d_on_device(
-            &self.rope,
-            &k,
-            self.num_kv_heads,
-            positions,
-        )?;
+            let q =
+                crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
+            let k = crate::shared_attention::rope_2d_on_device(
+                &self.rope,
+                &k,
+                self.num_kv_heads,
+                positions,
+            )?;
+            (q, k, v)
+        };
 
         // GPU-first: fused tensor-level attention; on backends that reject the kernel call (e.g.
         // no fused kernel) fall back to the host-history entry, which degrades to the scalar reference.

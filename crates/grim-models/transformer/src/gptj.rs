@@ -96,6 +96,9 @@ pub struct GptJBlock {
     pub num_heads: usize,
     pub head_dim: usize,
     pub rotary_dim: usize,
+    /// Fused Q8_0 QKV projection blob on ROCm (Phase 2b). Issues 1 dot4 GEMV
+    /// instead of 3 when single-token decoding.
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 }
 
 impl GptJBlock {
@@ -114,7 +117,12 @@ impl GptJBlock {
         let ln_1 = RmsNorm::load(&ws.scoped("ln_1"), cfg.hidden_size, cfg.layer_norm_epsilon)?;
 
         let mlp = GptJMlp::load(&ws.scoped("mlp"), cfg.hidden_size)?;
-        let rope = Rope::new(cfg.rotary_dim, cfg.rope_theta);
+        let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
+
+        // Phase 2b: build a fused Q8_0 QKV projection blob when all three
+        // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
+        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&q_proj, &k_proj, &v_proj)
+            .map(std::sync::Arc::new);
 
         Ok(Self {
             q_proj,
@@ -127,6 +135,7 @@ impl GptJBlock {
             num_heads: cfg.num_attention_heads,
             head_dim: cfg.head_dim,
             rotary_dim: cfg.rotary_dim,
+            wqkv_q80_fused,
         })
     }
 
@@ -136,9 +145,16 @@ impl GptJBlock {
         let seq_len = x.shape().dims()[0];
         let normed = self.ln_1.forward(x)?;
 
-        let q = self.q_proj.forward(&normed)?;
-        let k = self.k_proj.forward(&normed)?;
-        let v = self.v_proj.forward(&normed)?;
+        // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV instead
+        // of 3 separate GEMVs; GPT-J's full-width rope is applied after.
+        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
+            crate::shared_attention::fused_qkv_project_raw(&normed, self.wqkv_q80_fused.as_ref().unwrap())?
+        } else {
+            let q = self.q_proj.forward(&normed)?;
+            let k = self.k_proj.forward(&normed)?;
+            let v = self.v_proj.forward(&normed)?;
+            (q, k, v)
+        };
 
         // GPT-J is partial-rotary (block `rope` carries rotary_dim), but this loader always rotated the
         // FULL head_dim at theta 10000 - mirror that with a full-width rope on-device.
