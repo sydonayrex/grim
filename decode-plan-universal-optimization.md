@@ -154,7 +154,7 @@ forward() structure.
 - Internally: quantize q8_1 → fused GEMV → zero-copy slicing → RoPE → returns
 - Models call this instead of `wq/wk/wv.forward` + separate rope
 
-### Sub-step 2b: Wire into high-traffic models  — **[⚠️ PARTIAL — gemma/falcon_h1/exaone4_5 done (decode-only), ~17 shared_attention callers remain]**
+### Sub-step 2b: Wire into high-traffic models  — **[⚠️ PARTIAL — 9 models wired (gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon, commandr, gptj, qwen38_flash_next); qwen35 deferred (Option + SSM)]**
 - **gemma** (6 wq/wk/wv calls), **falcon_h1** (9 calls), **exaone4_5** (3 calls):
   replace the 3-GEMV block with `fused_qkv_project` when fused blob is available
 - Add `build_fused_qkv_q80` call in each model's weight loading (gated on ROCm + Q8_0)
@@ -178,7 +178,7 @@ into fewer launches, leveraging the existing Charon grouped-dispatch infrastruct
 This is ~4 launches × num_experts × num_layers per token. With 8 experts × 16 layers = 512
 launches per token for attention + FFN.
 
-### Sub-step 3a: Wire Charon grouped dispatch into MoE models that don't use it  — **[❌ REMAINING — no shared_moe; all 8 MoE models use per-expert loops, zero Charon adoption]**
+### Sub-step 3a: Wire Charon grouped dispatch into MoE models that don't use it  — **[⚠️ PARTIAL — shared_moe module exists, deepseek2 delegates; deepseek32/4/kimi_k3 per-expert loops remain; full Charon grouped-kernel adoption needs stacked weights + checkpoint verification]**
 - deepseek2/32/4, bailingmoe2/3, kimi_k3, mellum each implement `forward_moe_device`
   individually. Consolidate into a shared `shared_moe::fused_moe_dispatch` that calls
   Charon's `grouped_dispatch` internally
