@@ -189,21 +189,173 @@ total launch count and improving data locality.
 
 ---
 
+## PHASE 4.5: ISA-specific quantized GEMV kernels (sudot4 / sudot8 / fp8 / bf16)
+
+**Goal:** Extend the proven sudot4 GEMV pattern (currently Q8_0-only) to every quant
+format whose block structure can decompose into dot-product instructions available on
+gfx1201 (RDNA4). Eliminates the per-format WMMA GEMV fallback for M=1 decode (WMMA
+wastes 15/16 rows at m=1 — 6.25% tensor utilization vs 100% for GEMV).
+
+### Available dot-product builtins on gfx1201 (RDNA4)
+
+| Builtin | ISA feature | Types | Throughput | gfx1201 |
+|---|---|---|---|---|
+| `sudot4` | dot8-insts | i8 × i8 (signed/unsigned mix), i32 acc | 4 elem/inst | ✅ confirmed |
+| `sudot8` | dot8-insts | i8 × i8 (signed/unsigned mix), i32 acc | 8 elem/inst | ✅ confirmed |
+| `udot4` | dot7-insts | u8 × u8, u32 acc | 4 elem/inst | ✅ confirmed |
+| `udot8` | dot7-insts | u8 × u8, u32 acc | 8 elem/inst | ✅ confirmed |
+| `fdot2_f16_f16` | dot9-insts | f16 × f16, f16 acc | 2 elem/inst | ✅ confirmed |
+| `fdot2_f32_bf16` | dot12-insts | f32 × bf16, f32 acc | 2 elem/inst | ✅ confirmed |
+| `dot4_f32_fp8_fp8` | dot11-insts | fp8 × fp8, f32 acc | 4 elem/inst | ✅ RDNA4 |
+| `dot4_f32_bf8_bf8` | dot11-insts | bf8 × bf8, f32 acc | 4 elem/inst | ✅ RDNA4 |
+| `sdot4` / `sdot8` | dot1-insts | i8 × i8 (all signed) | 4/8 elem/inst | ❌ REMOVED on RDNA4 |
+| `fdot2` | dot10-insts | f32 × f32, f32 acc | 2 elem/inst | ✅ confirmed |
+
+### Sub-step 4.5a: Q4_K fused GEMV via sudot4 (nibble unpack + two-dot decomposition)
+
+**Why:** Q4_K is the most common quant format after Q8_0. Currently decoded via WMMA
+fused dequant GEMM (6.25% tensor utilization at M=1). The dot4 GEMV approach achieves
+100% lane utilization.
+
+**Q4_K block layout** (144 bytes per 256-weight super-block):
+- 2 bytes f16 `d` (super-block scale)
+- 2 bytes f16 `dmin` (super-block min)
+- 12 bytes: 6-bit scales + 6-bit mins for 8 sub-blocks of 32
+- 128 bytes: 256 × 4-bit unsigned nibbles (packed 2-per-byte)
+
+**Dequant formula per element:** `value = d * sc * q - dmin * mi`
+where `q` ∈ [0,15] (4-bit), `sc`/`mi` are 6-bit scale/min per sub-block.
+
+**Two-dot decomposition trick** (llama.cpp MMQ pattern):
+```
+dot = Σ(a_i × (d·sc·q_i − dmin·mi))
+    = d·sc·Σ(a_i × q_i) − dmin·mi·Σ(a_i)
+      ─────────────────   ────────────
+      positive dot (1)     correction dot (2)
+```
+- **Dot (1):** `sudot4(q8_1_codes_i8, q4_nibbles_unpacked_i8)` — needs nibble unpacking
+- **Dot (2):** `Σ(a_i)` — already computed as the `sum` field in Q8_1 by `grim_quantize_q8_1`
+
+**Nibble unpacking in registers:**
+```c
+// Each byte holds two 4-bit values; unpack to two i8 values
+unsigned char b = qs[j];
+int8_t lo = b & 0x0F;        // 0..15
+int8_t hi = (b >> 4) & 0x0F; // 0..15
+// Pack 4 nibbles into an i32 for sudot4
+int packed = lo0 | (hi0 << 8) | (lo1 << 16) | (hi1 << 24);
+```
+The unpacking is done in registers (no extra memory reads) — the nibbles are already
+loaded as part of the 128-byte weight data.
+
+**Kernel design:**
+- Grid: `(N/4, M)` — same as Q8_0 dot4 GEMV
+- Per output column: iterate Q4_K super-blocks, for each sub-block:
+  1. Unpack 32 nibbles → 32 i8 values (8 sudot4 calls with 4 elements each)
+  2. Compute `pos_dot` = sudot4(activation_codes, unpacked_nibbles)
+  3. Look up `sc`, `mi` from the 6-bit packed scales
+  4. Read `sum` from the Q8_1 activation block (at bytes [2..4])
+  5. `sub_result = d * sc * pos_dot - dmin * mi * activation_sum`
+  6. Accumulate into the column result
+
+**Block layout mapping:**
+- Q4_K super-block: 144 bytes → 8 sub-blocks × 32 elements
+- Q8_1 activation block: 36 bytes → 32 i8 codes + fp16 d + fp16 sum
+- One Q4_K super-block consumes 8 Q8_1 activation blocks (256 elements)
+
+**Expected speedup vs WMMA at M=1:** WMMA at 6.25% utilization processes 256 rows in
+one tile. The dot4 GEMV processes 1 row with 100% utilization. For N=1024 output
+columns, WMMA needs 256/16 = 16 tile iterations; dot4 needs N/4 = 256 wave dispatches.
+The crossover depends on N and head_dim, but for LFM2 shapes (N=1024, K=1024) the dot4
+GEMV was already proven faster for Q8_0.
+
+### Sub-step 4.5b: Q8_0 throughput upgrade via sudot8
+
+**Why:** `sudot8` processes 8 i8 elements per instruction (vs sudot4's 4) — 2× throughput
+for the same register pressure. The Q8_0 × Q8_1 GEMV already feeds i8×i8 to sudot4;
+switching to sudot8 halves the inner-loop instruction count.
+
+**Change:**
+- In `grim_dot4_q80_q81_gemv`: replace 2 × `sudot4` with 1 × `sudot8`
+- Each sudot8 takes two i32 operands (8 bytes total) and an i32 accumulator
+- The Q8_1 activation block has 32 i8 codes = 8 bytes = 2 × i32 → exactly 1 sudot8
+- The Q8_0 weight block has 32 i8 codes = 32 bytes → 4 × sudot8 per weight block
+  (vs 8 × sudot4 currently)
+- **Instruction count: 8 sudot4 → 4 sudot8 per 32-element block = 2× fewer**
+
+**Compatibility:** same ISA feature (`dot8-insts`), same accumulator type. Drop-in
+replacement — just change the builtin call and the packing.
+
+### Sub-step 4.5c: FP8 GEMV via dot4_f32_fp8_fp8
+
+**Why:** FP8 (E4M3) quantized models are increasingly common. The RDNA4 `dot11-insts`
+provides native fp8×fp8 dot4 with f32 accumulation — no integer quantization needed.
+
+**Kernel design:**
+- Weights stored as native FP8 (1 byte each)
+- Activations quantized to FP8 (or stored as FP8)
+- `dot4_f32_fp8_fp8(acc, weight_fp8_packed, act_fp8_packed, 0)` directly
+- Per-block scale multiplication at the end (FP8 has wider dynamic range than int8)
+- No nibble unpacking needed — FP8 IS 8 bits, feeds directly to the instruction
+
+**Applicability:** models quantized to FP8 (E4M3) or FP4 with per-block FP8 scales.
+
+### Sub-step 4.5d: BF16 GEMV via fdot2_f32_bf16
+
+**Why:** BF16 models (Llama/Mistral BF16 checkpoints) currently run through the f32
+GEMV path (no hardware dot instruction used). The `fdot2_f32_bf16` (dot12-insts)
+provides native bf16×bf16 dot2 with f32 accumulation.
+
+**Kernel design:**
+- Weights and activations stored as BF16 (2 bytes each)
+- `fdot2_f32_bf16(acc, w_pair, a_pair, 0)` — processes 2 bf16 elements per instruction
+- For 32-element blocks: 16 instructions per block
+- No quantize/dequantize step needed — direct hardware dot product
+
+**Applicability:** all BF16 models. The dot2 throughput (2 elem/inst) is lower than
+sudot4 (4 elem/inst), but for BF16 the alternative is a full fp32 GEMV (no dot
+instruction) — so this is still a significant improvement.
+
+### Sub-step 4.5e: f16 hardware dot2 upgrade for existing dot2 path
+
+**Why:** the existing `dot2_q80_gemv` uses inline asm `v_dot2_f32_f16` which is
+actually `fdot2_f16_f16` (dot9-insts). Upgrading to the builtin ensures correct
+ISA targeting and enables the compiler to optimize register allocation.
+
+**Change:**
+- Replace inline asm with `__builtin_amdgcn_fdot2_f16_f16(a, b, c)` intrinsic
+- Same hardware instruction, cleaner code, better compiler optimization
+
+### Verification
+- Each GEMV: parity vs CPU dequant-reference (same tolerance as existing tests)
+- Q4_K GEMV: byte-exact vs `grim_quant::dequant_q4k` reference (same two-dot decomposition)
+- sudot8 upgrade: bit-identical to sudot4 path (same math, different instruction width)
+- FP8 GEMV: parity vs host FP8 dequant reference
+- BF16 GEMV: parity vs host BF16 dequant reference
+- Perf: M=1 GEMV for each format must beat the WMMA GEMM fallback at the same shape
+
+---
+
 ## PHASE 5: Kernel consolidation (remove superseded kernels)
 
 **Goal:** Remove kernels that are superseded by fused-ops variants, reducing the kernel
 JIT compilation footprint and maintenance burden.
 
-### Sub-step 5a: Remove per-quant GEMV kernels superseded by WMMA fused dequant
+### Sub-step 5a: Remove per-quant GEMV kernels superseded by WMMA fused dequant AND dot4 GEMV
 - The `quantized_matmul` dispatch already prefers WMMA fused dequant for Q4K/Q5K/Q6K/
   Q2K/Q3K/IQ* — the standalone per-quant GEMV kernels are dead code:
-  - `q4k_gemm.rs` (349 LOC) — superseded by `launch_wmma_fused_dequant_q4k`
-  - `q5k_gemm.rs` (119 LOC) — superseded by WMMA
-  - `q6k_gemm.rs` (114 LOC) — superseded by WMMA
+  - `q4k_gemm.rs` (349 LOC) — superseded by `launch_wmma_fused_dequant_q4k` (prefill)
+    AND by Phase 4.5a sudot4 Q4_K GEMV (decode M=1)
+  - `q5k_gemm.rs` (119 LOC) — superseded by WMMA + Phase 4.5a dot4 pattern
+  - `q6k_gemm.rs` (114 LOC) — superseded by WMMA + dot4 pattern
   - `q2k_gemm.rs` (107 LOC) — superseded by WMMA
   - `q3k_gemm.rs` (142 LOC) — superseded by WMMA
+  - `q8_0_dequant.rs` (41 LOC) — KEEP: used by `dequantize_q8_0_host`
+  - `dot_gemv.rs` dot2 path — KEEP: used as A/B test fallback for Q8_0
+- After Phase 4.5 lands, the per-format GEMV dispatch in `quantized_matmul` routes
+  decode (M=1) to the appropriate dot4/sudot8 kernel for EVERY format — making the
+  WMMA GEMM the prefill path and the dot4 GEMV the decode path (no overlap)
 - Only remove after verifying no model routes to these directly (check dispatch order)
-- Keep `q8_0_dequant.rs` (41 LOC) — used by `dequantize_q8_0_host`
 
 ### Sub-step 5b: Remove redundant attention kernels
 - `flash_decode.rs` vs `qkv_attention.rs` vs `sage_attention.rs` — audit which models
@@ -257,15 +409,20 @@ models that route through the shared infrastructure.
 Phase 1 (block.rs)          ← highest leverage, benefits 6+ models immediately
   ↓
 Phase 2 (shared_attention)  ← benefits ~20 models
-  ↓
-Phase 3 (MoE/Charon)        ← independent, benefits 8 MoE models
-  ↓
+  ↓                        ↘
+Phase 3 (MoE/Charon)         Phase 4.5 (ISA GEMV: Q4_K, sudot8, FP8, BF16)
+  ↓                        ↙
 Phase 4 (fused ops)         ← benefits ALL models, builds on Phases 1-2
   ↓
-Phase 5 (cleanup)           ← after Phase 4 confirms no regressions
+Phase 5 (cleanup)           ← after Phase 4 + 4.5 confirm no regressions
   ↓
 Phase 6 (decode graph)      ← after Phases 1-4 stabilize the compute topology
 ```
+
+Phase 4.5 (ISA GEMV) can run in parallel with Phase 3 (MoE) — it extends the
+dot4 GEMV to new quant formats and does not depend on MoE restructuring.
+Phase 5 cleanup should wait for BOTH Phase 4 and 4.5 to confirm which kernels
+are truly superseded.
 
 Phases 1+2 can run in parallel with Phase 3 (different model subsets).
 Phase 4 requires Phases 1-2 landed (so the fused ops feed into the right dispatch paths).
@@ -285,6 +442,10 @@ Phase 6 is the final capstone — requires all prior phases.
 | Stable buffers increase VRAM usage | Buffers are fixed-size for decode (steps=1); total added VRAM is O(num_layers × hidden) — negligible vs KV cache |
 | 151 models can't all be updated individually | Focus on shared infrastructure (block.rs, shared_attention, shared_moe); models that route through these get the optimization for free |
 | rocBLAS handle not bound to capture stream during graph capture | `begin_graph_capture` already binds rocblas; verify for all kernel types |
+| Q4_K nibble unpacking overhead eats sudot4 throughput gain | Unpacking is 4 AND/SHIFT ops per 4 elements — negligible vs the sudot4 instruction; measure vs WMMA at target shape to confirm |
+| sudot8 accumulator overflow (8 i8×i8 products in i32) | Max |product| = 8 × 127 × 127 = 129,032 — fits easily in i32 (2.1B range); safe for any block size ≤ 4096 |
+| FP8 (E4M3) limited dynamic range causes precision loss vs int8 | FP8 has ~2 decimal digits of precision; verify per-block scale compensates; fallback to sudot4 int8 path if parity fails |
+| Q4_K two-dot decomposition drifts for large block sums | The `sum` correction term grows with block size; Q4_K uses 32-element sub-blocks (same as Q8_0/Q8_1) so the correction is bounded; verify against `dequant_q4k` reference |
 
 ---
 
@@ -300,3 +461,5 @@ Phase 6 is the final capstone — requires all prior phases.
 | Decode tok/s (LFM2.5-350M-Q8_0) | 625 (already achieved) | ≥ 625 (no regression) |
 | Decode tok/s (qwen2-7B-Q8_0, if testable) | TBD | measurable improvement |
 | Parity | — | All models: identical tokens stock vs optimized |
+| Quant formats with decode-optimized GEMV (M=1 dot4/sudot8) | 1 (Q8_0) | ≥ 4 (Q8_0, Q4_K, Q8_0-sudot8, FP8) |
+| Per-token kernel launch reduction (all opts vs stock) | 0% | ≥ 60% (Phases 1-4 combined) |
