@@ -128,6 +128,44 @@ fn per_expert_loop(
     Ok(out_t)
 }
 
+/// Compute per-token top-k routing from flat gate logits. `logits_v` has layout
+/// `[seq_len, num_experts]`. Returns one `TokenRouting` per token (sorted by raw
+/// logit, descending) with softmax-normalized combine weights (no architecture
+/// scaling applied — multiply by `routed_scaling_factor` at dispatch time).
+pub fn route_topk(
+    logits_v: &[f32],
+    num_experts: usize,
+    top_k: usize,
+) -> Result<Vec<TokenRouting>> {
+    let seq_len = if num_experts == 0 { 0 } else { logits_v.len() / num_experts };
+    let mut out = Vec::with_capacity(seq_len);
+    for s in 0..seq_len {
+        let row = &logits_v[s * num_experts..(s + 1) * num_experts];
+        let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let k = top_k.min(num_experts);
+        let topk = &indexed[..k];
+        let mut entry: Vec<(usize, f32)> = topk.iter().map(|(idx, _)| (*idx, 0.0)).collect();
+        let weights = normalize_weights(topk);
+        for (j, (idx, _)) in topk.iter().enumerate() {
+            entry[j] = (*idx, weights[j]);
+        }
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// Softmax-normalize the top-k combine weights.
+pub fn normalize_weights(topk: &[(usize, f32)]) -> Vec<f32> {
+    if topk.is_empty() {
+        return Vec::new();
+    }
+    let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
+    let sum_e: f32 = exps.iter().sum();
+    exps.iter().map(|e| e / (sum_e + 1e-12)).collect()
+}
+
 fn expert_forward(expert: &MoeExpert, x: &Tensor) -> Result<Tensor> {
     let lift = |r: std::result::Result<Tensor, grim_tensor::Error>| r.map_err(grim_core::error::Error::from);
     let gate = lift(expert.gate.forward(x))?;
