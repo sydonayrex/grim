@@ -60,8 +60,14 @@ const GOLDEN_TOKENS: [u32; 12] = [
 // against both the Item 1 fused-QKV path and the Item 2 device-base-RoPE path,
 // so a forward/sampler mutant that shifts the distribution fails even with a
 // refreshed golden.
+// NOTE: re-pinned 2026-09-11 after fixing two latent bugs in
+// `grim_qkv_attention_dev` (scores were missing the inv_sqrt_d scale and the
+// wave-merge indexed LDS by lane instead of wave). The prior golden carried a
+// degenerate repetition tail (1463 x5) symptomatic of the wrong attention
+// temperature. The fixed kernel matches a CPU GQA reference exactly (block.rs
+// device_graph_decode_attention_parity).
 const GOLDEN_TOKENS_GPU: [u32; 12] = [
-    7, 2, 535, 509, 519, 767, 1268, 1463, 1463, 1463, 1463, 1463,
+    7, 2, 1463, 40131, 28528, 3624, 26298, 509, 570, 767, 508, 523,
 ];
 
 /// Prompt and expected GGUF metadata for the sleipnir model. These values are
