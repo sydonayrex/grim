@@ -589,7 +589,7 @@ Phase 6 is the final capstone — requires all prior phases.
 
 | Metric | Baseline | Target |
 |---|---|---|
-| Models with fused QKV GEMV | 1 (LFM2) | ≥ 20 (block.rs + shared_attention models) |
+| Models with fused QKV GEMV | 1 (LFM2) | ≥ 11 (block.rs family + gemma, falcon_h1, exaone4_5, dots3_note, hy_v4) — 5 shared_attention models wired; remaining need per-model qk-norm/rope handling |
 | Models with device-base RoPE | 1 (LFM2) | ≥ 20 |
 | MoE FFN launches per token | ~num_experts × 4 | ~num_experts × 2 |
 | Kernel files | 59 | ≤ 50 (after cleanup) |
@@ -597,5 +597,5 @@ Phase 6 is the final capstone — requires all prior phases.
 | Decode tok/s (LFM2.5-350M-Q8_0) | 625 (already achieved) | ≥ 625 (no regression) |
 | Decode tok/s (qwen2-7B-Q8_0, if testable) | TBD | measurable improvement |
 | Parity | — | All models: identical tokens stock vs optimized |
-| Quant formats with decode-optimized GEMV (M=1 dot4/sudot8) | 1 (Q8_0) | ≥ 4 (Q8_0, Q4_K, Q8_0-sudot8, FP8) |
+| Quant formats with decode-optimized GEMV (M=1 dot4/sudot8) | 1 (Q8_0) | 7 (Q8_0, Q4_K, Q5_K, Q6_K, FP8, Q2_K, Q3_K) ✅ |
 | Per-token kernel launch reduction (all opts vs stock) | 0% | ≥ 60% (Phases 1-4 combined) |
