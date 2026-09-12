@@ -58,13 +58,19 @@ impl QuantOps for RocmDevice {
             ),
         };
         let k = a_storage.shape().dims().last().copied().unwrap_or(0);
-        if std::env::var_os("GRIM_QMM_TRACE").is_some() {
+        static QMM_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some()) {
             eprintln!(
                 "[qmm] ordinal={} m={m} n={n} k={k} b_dtype={:?}",
                 self.ordinal,
                 b_storage.dtype().storage
             );
         }
+        // SPEED-ROC: WMMA dispatch threshold; env-overridable (GRIM_WMM_MAX_M).
+        let wmma_max_m: usize = std::env::var("GRIM_WMM_MAX_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
 
         let out_storage = RocmStorage::alloc_gpu(
             out_shape,
@@ -79,45 +85,297 @@ impl QuantOps for RocmDevice {
         use grim_tensor::{BlockDtype, FloatPackScheme, KQuantScheme};
         match b_storage.dtype().storage {
             DTypeStorage::KQuant(KQuantScheme::Q4K) => {
-                self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
+                // SPEED-ROC: On RDNA3/4, use WMMA kernel for decode/small-prefill.
+                let is_rdna34 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
+                if is_rdna34 && m <= wmma_max_m {
+                    self.launch_wmma_fused_dequant_q4k(
+                        a_storage, b_storage, &out_storage, m, n, k,
+                    )?;
+                } else {
+                    self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::Q5K) => {
-                self.launch_fused_dequant_gemm_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                let is_rdna34 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
+                if is_rdna34 && m <= wmma_max_m {
+                    self.launch_wmma_fused_dequant_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_fused_dequant_gemm_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::Q6K) => {
-                self.launch_fused_dequant_gemm_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                let is_rdna34 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
+                if is_rdna34 && m <= wmma_max_m {
+                    self.launch_wmma_fused_dequant_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_fused_dequant_gemm_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::Q2K) => {
-                self.launch_fused_dequant_gemm_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
+                let is_rdna34 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
+                if is_rdna34 && m <= wmma_max_m {
+                    self.launch_wmma_fused_dequant_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_fused_dequant_gemm_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::Q3K) => {
-                self.launch_fused_dequant_gemm_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
+                let is_rdna34 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
+                if is_rdna34 && m <= wmma_max_m {
+                    self.launch_wmma_fused_dequant_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_fused_dequant_gemm_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => {
-                self.launch_fused_dequant_gemm_iq2xxs(a_storage, b_storage, &out_storage, m, n, k)?;
+                self.launch_iq_wmma_fallback(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                    Self::launch_wmma_fused_dequant_iq2xxs,
+                    Self::launch_fused_dequant_gemm_iq2xxs,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2XS) => {
-                self.launch_fused_dequant_gemm_iq2xs(a_storage, b_storage, &out_storage, m, n, k)?;
+                self.launch_iq_wmma_fallback(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                    Self::launch_wmma_fused_dequant_iq2xs,
+                    Self::launch_fused_dequant_gemm_iq2xs,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2S) => {
-                self.launch_fused_dequant_gemm_iq2s(a_storage, b_storage, &out_storage, m, n, k)?;
+                self.launch_iq_wmma_fallback(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                    Self::launch_wmma_fused_dequant_iq2s,
+                    Self::launch_fused_dequant_gemm_iq2s,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ3XXS) => {
-                self.launch_fused_dequant_gemm_iq3xxs(a_storage, b_storage, &out_storage, m, n, k)?;
+                self.launch_iq_wmma_fallback(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                    Self::launch_wmma_fused_dequant_iq3xxs,
+                    Self::launch_fused_dequant_gemm_iq3xxs,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ3S) => {
-                self.launch_fused_dequant_gemm_iq3s(a_storage, b_storage, &out_storage, m, n, k)?;
+                self.launch_iq_wmma_fallback(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                    Self::launch_wmma_fused_dequant_iq3s,
+                    Self::launch_fused_dequant_gemm_iq3s,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
-                self.launch_fused_dequant_gemm_iq4nl(a_storage, b_storage, &out_storage, m, n, k)?;
+                self.launch_iq_wmma_fallback(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                    Self::launch_wmma_fused_dequant_iq4nl,
+                    Self::launch_fused_dequant_gemm_iq4nl,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4XS) => {
-                self.launch_fused_dequant_gemm_iq4xs(a_storage, b_storage, &out_storage, m, n, k)?;
+                self.launch_iq_wmma_fallback(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                    Self::launch_wmma_fused_dequant_iq4xs,
+                    Self::launch_fused_dequant_gemm_iq4xs,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::Q80) => {
                 // Q8_0 uses the fused dequant+GEMM kernel (34-byte blocks → F32), matching
                 // the other KQuant schemes rather than falling back to dequant+matmul.
-                self.launch_fused_dequant_gemm_q8_0(a_storage, b_storage, &out_storage, m, n, k)?;
+                // SPEED-ROC: On RDNA3/4, use the WMMA fused-dequant kernel for decode (M=1)
+                // and small prefill. Falls back to scalar/LDS-tiled for larger prefill.
+                let is_rdna34 = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
+                // SPEED-ROC: measured A/B — fp32 GEMv (20.5 ms/tok) LOSES to the
+                // 4-tile WMMA kernel (14.3 ms/tok) at m=1: RDNA3/4 removed the
+                // scalar `dot1-insts` feature (`__builtin_amdgcn_sdot4` needs
+                // dot1-insts, absent on gfx1100/gfx1201), so the int8-dot GEMV
+                // kernel can't compile. (The VOP3 vector `v_dot4_i32_i8` IS still
+                // present on RDNA4, but WMMA tensor tiles are faster.) GEMV kernel
+                // source removed from the JIT aggregate (P3+ cleanup).
+                if is_rdna34 && m <= wmma_max_m {
+                    // Decode/small-prefill: WMMA kernel is fastest for small M.
+                    // SPEED-DOT (space-balls.md): M=1 decode GEMV via VOP3
+                    // `v_dot4_i32_i8` — WMMA wastes 15/16 rows at m=1 (rows
+                    // 1..15 multiply zeroed A, 6.25% tensor utilization); the
+                    // dot4 kernel runs one wave per output column at 100%
+                    // utilization with the Q8_0 scale hoisted out of the loop.
+                    // SPEED-DOT: Q8_0 x Q8_1 GEMV via V_DOT4_I32_IU8 (__builtin_amdgcn_sudot4).
+                    // Active by default for m <= wmma_max_m unless disabled via GRIM_DOT_GEMV=0.
+                    static DOT_GEMV_CFG: std::sync::OnceLock<(bool, bool)> =
+                        std::sync::OnceLock::new();
+                    let (dot_disabled, use_legacy_dot2) = *DOT_GEMV_CFG.get_or_init(|| {
+                        (
+                            matches!(
+                                std::env::var("GRIM_DOT_GEMV").as_deref(),
+                                Ok("0" | "false" | "off")
+                            ),
+                            matches!(
+                                std::env::var("GRIM_DOT_GEMV_LEGACY").as_deref(),
+                                Ok("1" | "true" | "on")
+                            ),
+                        )
+                    });
+                    if !dot_disabled
+                        && k % 32 == 0
+                        && !Self::is_fp16_activation(a_storage)
+                    {
+                        if use_legacy_dot2 && m == 1 {
+                            let act_f16 = RocmStorage::alloc_gpu(
+                                &Shape::new(vec![k]),
+                                DType {
+                                    arith: ArithType::F16,
+                                    storage: DTypeStorage::Native,
+                                },
+                                &self.allocator,
+                                self.ordinal,
+                            )?;
+                            let _ = self.quantize_fp16(a_storage, &act_f16)?;
+                            self.launch_dot2_q80_gemv(
+                                &act_f16, b_storage, &out_storage, n, k,
+                            )?;
+                            drop(act_f16);
+                        } else {
+                            // Q8_1 format: 36 bytes per 32-element block
+                            let q81_bytes = (k / 32) * 36 * m;
+                            let shape = Shape::new(vec![q81_bytes]);
+                            let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                            let need_alloc = match buf_guard.as_ref() {
+                                Some(s) => s.bytes < q81_bytes,
+                                None => true,
+                            };
+                            if need_alloc {
+                                *buf_guard = Some(RocmStorage::alloc_gpu(
+                                    &shape,
+                                    DType {
+                                        arith: ArithType::U8,
+                                        storage: DTypeStorage::Native,
+                                    },
+                                    &self.allocator,
+                                    self.ordinal,
+                                )?);
+                            }
+                            // SPEED-DOT-OPFUSE: a U8-typed activation is an
+                            // already-packed q8_1 buffer (produced by the fused
+                            // grim_rmsnorm_quant_i8 in the model layer) — skip
+                            // the quantize launch entirely.
+                            let a_prequant =
+                                a_storage.dtype().arith == ArithType::U8;
+                            if a_prequant {
+                                drop(buf_guard);
+                                self.launch_dot4_q80_q81_gemv(
+                                    a_storage, b_storage, &out_storage, m, n, k,
+                                )?;
+                            } else {
+                                let act_q81 = buf_guard.as_ref().unwrap();
+                                let _ =
+                                    self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                                self.launch_dot4_q80_q81_gemv(
+                                    act_q81, b_storage, &out_storage, m, n, k,
+                                )?;
+                            }
+                        }
+                    }
+                    // SPEED-ROC: if the activation is already FP16 in global
+                    // memory, use the FP16-input kernel to halve A-read bandwidth.
+                    else if Self::is_fp16_activation(a_storage) {
+                        self.launch_wmma_fused_dequant_q8_0_fp16(
+                            a_storage, b_storage, &out_storage, m, n, k,
+                        )?;
+                    } else if std::env::var("GRIM_FP16_ACT").as_deref()
+                        == Ok("1")
+                    {
+                        // Env-gated pre-quantize path: convert FP32 activations
+                        // to FP16 on-device, then run the FP16-input WMMA
+                        // kernel.  Proves the bandwidth-saving dispatch without
+                        // requiring callers to materialize FP16 activations.
+                        let fp16_buf = RocmStorage::alloc_gpu(
+                            a_storage.shape(),
+                            DType {
+                                arith: ArithType::F16,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?;
+                        let q_stream = self.quantize_fp16(a_storage, &fp16_buf)?;
+                        // Quantize and GEMM run on the active stream in order;
+                        // synchronize the quantize before reusing a_storage is
+                        // unnecessary — a_storage is read-only here.
+                        let _ = q_stream;
+                        // Optional self-verify (GRIM_FP16_VERIFY=1): dequantize
+                        // the FP16 buffer back to FP32 and confirm the
+                        // round-trip matches the original activation within
+                        // FP16 tolerance.  This exercises dequantize_fp16 and
+                        // pins the quantize/dequantize kernel contract.
+                        if std::env::var("GRIM_FP16_VERIFY").as_deref() == Ok("1")
+                        {
+                            let n_el = a_storage.shape().elem_count();
+                            let verify_buf = RocmStorage::alloc_gpu(
+                                a_storage.shape(),
+                                dtype_f32(),
+                                &self.allocator,
+                                self.ordinal,
+                            )?;
+                            let dv = self.dequantize_fp16(&fp16_buf, &verify_buf)?;
+                            let _ = dv;
+                            let original = a_storage.to_cpu_vec_f32()?;
+                            let roundtrip = verify_buf.to_cpu_vec_f32()?;
+                            drop(verify_buf);
+                            let mut max_diff = 0.0f32;
+                            for i in 0..n_el {
+                                max_diff =
+                                    max_diff.max((original[i] - roundtrip[i]).abs());
+                            }
+                            if max_diff > 1e-3_f32 {
+                                return Err(Error::Backend(format!(
+                                    "FP16 activation round-trip exceeded tol: max_diff={max_diff}"
+                                )));
+                            }
+                            if std::env::var_os("GRIM_QMM_TRACE").is_some() {
+                                eprintln!("[qmm] FP16 act round-trip OK max_diff={max_diff}");
+                            }
+                        }
+                        self.launch_wmma_fused_dequant_q8_0_fp16(
+                            &fp16_buf, b_storage, &out_storage, m, n, k,
+                        )?;
+                        // fp16_buf dropped after the GEMM launch is enqueued;
+                        // single-stream ordering keeps it live long enough.
+                        drop(fp16_buf);
+                    } else {
+                        self.launch_wmma_fused_dequant_q8_0(
+                            a_storage, b_storage, &out_storage, m, n, k,
+                        )?;
+                    }
+                } else {
+                    self.launch_fused_dequant_gemm_q8_0(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::Block(BlockDtype::Fp8)
             | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
@@ -985,6 +1243,14 @@ impl QuantOps for RocmDevice {
 }
 
 impl RocmDevice {
+    /// Returns `true` when the activation storage holds native FP16 data
+    /// (`ArithType::F16` + `DTypeStorage::Native`).  The FP16-input WMMA
+    /// kernels read such activations directly, halving A-read bandwidth.
+    pub(crate) fn is_fp16_activation(storage: &RocmStorage) -> bool {
+        storage.dtype().arith == ArithType::F16
+            && matches!(storage.dtype().storage, DTypeStorage::Native)
+    }
+
     /// Launch the JIT compiled fused dequantization GEMM kernel for [see: `b_storage`, `Storage::ResidualPacked`]
     pub(crate) fn launch_fused_dequant_gemm_f16(
         &self,
@@ -1463,6 +1729,33 @@ impl RocmDevice {
         ("grim_fused_dequant_gemm_iq4xs", "iq4xs", 256, 136),
         ("grim_fused_dequant_gemm_q8_0", "q8_0", 32, 34),
     ];
+
+    /// SPEED-ROC: dispatch helper for IQ-family formats.
+    /// Uses WMMA kernel on RDNA3/4 for small M (decode), falls back to scalar otherwise.
+    fn launch_iq_wmma_fallback(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        wmma_method: fn(&Self, &RocmStorage, &RocmStorage, &RocmStorage, usize, usize, usize) -> Result<*mut c_void>,
+        scalar_method: fn(&Self, &RocmStorage, &RocmStorage, &RocmStorage, usize, usize, usize) -> Result<*mut c_void>,
+    ) -> Result<()> {
+        let is_rdna34 = matches!(
+            crate::quantization::gcn_arch(&self.gpu_target),
+            crate::quantization::GcnArch::RDNA3
+                | crate::quantization::GcnArch::RDNA4
+                | crate::quantization::GcnArch::UDNA
+        );
+        if is_rdna34 && m <= 4 {
+            wmma_method(self, a, b, out, m, n, k)?;
+        } else {
+            scalar_method(self, a, b, out, m, n, k)?;
+        }
+        Ok(())
+    }
 
     /// SPEED-ROC-8: per-format opt-in flag (GRIM_Q5K_TILED, GRIM_IQ4XS_TILED,
     /// GRIM_Q8_0_TILED, ...). Cached per format tag; default off — the scalar
@@ -2524,7 +2817,70 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // SPEED-ROC: row-count-aware dispatch — when N is large (e.g. down
+        // projection where N == hidden_dim), the 4-col-per-thread variant
+        // shares the activation read across 4 weight dequants, halving L2
+        // traffic.  Env-gated via GRIM_ROWS4_MIN_N (0 = disabled).
+        let rows4_min_n: usize = std::env::var("GRIM_ROWS4_MIN_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if rows4_min_n > 0 && n >= rows4_min_n && n % 4 == 0 {
+            return self.launch_fused_dequant_gemm_q8_0_rows4(a, b, out, m, n, k);
+        }
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q8_0", a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC: Q8_0 NUM_ROWS=4 launcher — each thread computes 4 consecutive
+    /// output columns sharing one activation read.  Grid covers M*(N/4) slots.
+    pub(crate) fn launch_fused_dequant_gemm_q8_0_rows4(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: a has no device ptr".into()))?;
+        let b_ptr = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: b has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let cols_per_thread: u64 = 4;
+        let n_slots = (n / cols_per_thread as usize) as u64;
+        let total_slots: u64 = (m as u64)
+            .checked_mul(n_slots)
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: m*(n/4) overflow".into()))?;
+        let grid_x: u32 = (total_slots.div_ceil(BLOCK_SIZE as u64))
+            .try_into()
+            .map_err(|_| Error::Backend("fused_dequant_gemm_q8_0_rows4: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_q8_0_rows4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
     pub(crate) fn launch_fused_dequant_backward_gemm_q8_0(
         &self,

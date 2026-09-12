@@ -205,6 +205,9 @@ enum Commands {
         /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama. Sets server default; overridable per request.
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
+        /// Minimum tokens before EOS is allowed (0 = no minimum). Helps prevent premature stopping on small models.
+        #[arg(long, default_value = "0")]
+        min_tokens: u32,
     },
     /// Diagnostics TUI chat interface.
     Tui {
@@ -1216,6 +1219,7 @@ async fn main() -> Result<()> {
             seed,
             device,
             repeat_penalty,
+            min_tokens,
         } => {
             if !config.is_empty() {
                 unsafe {
@@ -1318,6 +1322,7 @@ async fn main() -> Result<()> {
                         max_tokens,
                         seed,
                         repeat_penalty,
+                        min_tokens,
                     )
                     .await?;
                 } else {

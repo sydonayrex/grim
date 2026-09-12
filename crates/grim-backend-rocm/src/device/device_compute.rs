@@ -28,6 +28,24 @@ use crate::{
     warp_rows_launch,
 };
 
+/// Fused QKV weight blob for the ROCm decode path (Item 1): the concatenated
+/// Q8_0 weights `[n_q + 2·n_kv, hidden]` plus the per-head row counts needed to
+/// slice the single GEMV output back into q/k/v.
+pub struct FusedQkvWeights {
+    pub storage: RocmStorage,
+    pub n_q: usize,
+    pub n_k: usize,
+    pub n_v: usize,
+    pub hidden: usize,
+}
+
+impl FusedQkvWeights {
+    /// Total number of output columns = n_q + n_k + n_v (= n_q + 2·n_kv for GQA).
+    pub fn n_total(&self) -> usize {
+        self.n_q + self.n_k + self.n_v
+    }
+}
+
 impl CoreTensorOps for RocmDevice {
     /// Audit B5: delegate to the device-resident `grim_transpose_2d_f32` HIP kernel via the existing inherent helper - the tensor
     /// never leaves GPU memory (the helper synchronizes the kernel launch internally, so the returned handle is trivially ready).
@@ -398,13 +416,10 @@ impl CoreTensorOps for RocmDevice {
         eps: f32,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = as_rocm(x)?;
-        let w_s = as_rocm(weight)?;
-        if !x_s.device_ptr_is_valid() || !w_s.device_ptr_is_valid() {
-            return Err(Error::Backend(
-                "rms_norm: inputs lack a valid device pointer".into(),
-            ));
-        }
+        // Accept both RocmStorage and RocmStorageView (byte-offset views) via the
+        // BackendStorage trait — no downcast, so views flow through untouched.
+        let mut x_ptr = crate::device::util::dev_ptr_dyn(x)?;
+        let mut w_ptr = crate::device::util::dev_ptr_dyn(weight)?;
         let x_dims = x.shape().dims();
         if x_dims.is_empty() {
             return Err(Error::Shape("rms_norm: empty input".into()));
@@ -417,8 +432,6 @@ impl CoreTensorOps for RocmDevice {
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
-        let mut x_ptr = dev_ptr(x_s)?;
-        let mut w_ptr = dev_ptr(w_s)?;
         let mut row_len_i = row_len as i32;
         let mut eps_f = eps;
         let mut total_i = total as i32;
@@ -2000,6 +2013,647 @@ impl RocmDevice {
         )
     }
 
+    /// SPEED-ROC: WMMA fused-dequant Q8_0 GEMM launcher (RDNA3/4).
+    /// Computes C[M,N] = A[M,K] @ B^T where B is Q8_0 packed.
+    /// Uses rocWMMA 16×16×16 tensor-core tiles with inline Q8_0 dequantization.
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_q8_0(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q80_gemm: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q80_gemm: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q80_gemm: out has no device ptr".into()))?;
+
+        // 16×16 output tile per block, 1 wavefront (32 threads, wave32).
+        let grid_x = n.div_ceil(64) as u32;
+        let grid_y = m.div_ceil(16) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_fused_dequant_q8_0",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// SPEED-ROC: FP16-input Q8_0 WMMA launcher — reads activations as
+    /// `_Float16` directly (no per-element cast), halving A-read bandwidth.
+    /// Kernel: `grim_wmma_fused_dequant_q8_0_fp16`.
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_q8_0_fp16(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q80_gemm_fp16: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q80_gemm_fp16: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q80_gemm_fp16: out has no device ptr".into()))?;
+        let grid_x = n.div_ceil(64) as u32;
+        let grid_y = m.div_ceil(16) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_wmma_fused_dequant_q8_0_fp16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch grim_quantize_q8_1 activation quantizer.
+    pub fn launch_quantize_q8_1(
+        &self,
+        src: &RocmStorage,
+        dst: &RocmStorage,
+        m: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let src_ptr = src
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_q8_1: src has no device ptr".into()))?;
+        let dst_ptr = dst
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_q8_1: dst has no device ptr".into()))?;
+        let n_q_blocks = k / 32;
+        let total_blocks = (n_q_blocks * m) as u32;
+        let grid_dim = HipDim3::new(total_blocks, 1, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut sptr = src_ptr;
+        let mut dptr = dst_ptr;
+        let mut kk = k as i32;
+        let mut mm = m as i32;
+        self.launch_compute_kernel(
+            "grim_quantize_q8_1",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut sptr),
+                arg(&mut dptr),
+                arg(&mut kk),
+                arg(&mut mm),
+            ],
+        )
+    }
+
+    /// SPEED-DOT: Q8_0 x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
+    pub(crate) fn launch_dot4_q80_q81_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// SPEED-DOT-FUSED (Item 1): fuse Q/K/V projections into ONE dot4 GEMV.
+    ///
+    /// `wqkv_q80` is the byte-concatenated weight blob `[n_q + 2·n_kv, hidden]`
+    /// (all Q rows, then all K rows, then all V rows — each a Q8_0-packed row of
+    /// `(hidden/32)·34` bytes). A single `grim_dot4_q80_q81_gemv` launch with
+    /// `N = n_q + 2·n_kv` writes the fused `attn_out [1, n_q + 2·n_kv]` f32, which
+    /// the caller slices into q/k/v via [`crate::memory::view::RocmStorageView`].
+    /// Replaces three separate GEMV launches (3 → 1) on the ROCm decode path.
+    ///
+    /// `act_q81` is the already-packed q8_1 activation (U8-typed) shared by all
+    /// three projections. Requires M==1 (decode) and `hidden % 32 == 0`.
+    pub fn launch_fused_qkv_dot4(
+        &self,
+        act_q81: &RocmStorage,
+        wqkv_q80: &RocmStorage,
+        n_q: usize,
+        n_kv: usize,
+        hidden: usize,
+    ) -> Result<Box<dyn BackendStorage>> {
+        if hidden == 0 || hidden % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_fused_qkv_dot4: hidden must be a non-zero multiple of 32, got {hidden}"
+            )));
+        }
+        let n_total = n_q
+            .checked_add(n_kv.checked_mul(2).ok_or_else(|| {
+                Error::Backend("launch_fused_qkv_dot4: n_kv overflow".into())
+            })?)
+            .ok_or_else(|| Error::Backend("launch_fused_qkv_dot4: n_q+n_kv overflow".into()))?;
+        if wqkv_q80.shape().elem_count() != n_total * hidden {
+            return Err(Error::Backend(format!(
+                "launch_fused_qkv_dot4: weight blob has {} elements, expected {} (n_total={} * hidden={})",
+                wqkv_q80.shape().elem_count(),
+                n_total * hidden,
+                n_total,
+                hidden
+            )));
+        }
+        let out_shape = Shape::new(vec![n_total]);
+        let out_storage = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_dot4_q80_q81_gemv(act_q81, wqkv_q80, &out_storage, 1, n_total, hidden)?;
+        Ok(Box::new(out_storage))
+    }
+
+    /// SPEED-DOT: Q8_0 GEMV via `V_DOT2_F32_f16` at M=1 (RDNA3/4).
+    /// Grid (N,1,1), block (32,1,1) — one wave per output column, 100% lane
+    /// SPEED-DOT-FUSED (Item 1): build the concatenated Q8_0 weight blob
+    /// `[n_q + 2·n_kv, hidden]` from the three projection weight storages.
+    ///
+    /// Reads the raw Q8_0 bytes of each weight (D2H), concatenates them in
+    /// row order Q∥K∥V, and re-uploads ONE device buffer. One-time cost at model
+    /// load. Each weight must be Q8_0 with the same `hidden` (K) dimension and
+    /// `hidden % 32 == 0`. Returns the fused storage plus the per-head row counts
+    /// so the caller can slice the GEMV output.
+    pub fn build_fused_qkv_q80(
+        &self,
+        wq: &dyn BackendStorage,
+        wk: &dyn BackendStorage,
+        wv: &dyn BackendStorage,
+    ) -> Result<FusedQkvWeights> {
+        let q80 = DType {
+            arith: ArithType::F32,
+            storage: DTypeStorage::KQuant(grim_tensor::dtype::KQuantScheme::Q80),
+        };
+        for (name, w) in [("wq", wq), ("wk", wk), ("wv", wv)] {
+            if w.dtype().storage != q80.storage {
+                return Err(Error::Backend(format!(
+                    "build_fused_qkv_q80: {name} must be Q8_0, got {:?}",
+                    w.dtype().storage
+                )));
+            }
+        }
+        let q_dims = wq.shape().dims();
+        let k_dims = wk.shape().dims();
+        let v_dims = wv.shape().dims();
+        if q_dims.len() != 2 || k_dims.len() != 2 || v_dims.len() != 2 {
+            return Err(Error::Backend(
+                "build_fused_qkv_q80: weights must be 2D [rows, hidden]".into(),
+            ));
+        }
+        let n_q = q_dims[0];
+        let n_k = k_dims[0];
+        let n_v = v_dims[0];
+        let hidden_q = q_dims[1];
+        let hidden_k = k_dims[1];
+        let hidden_v = v_dims[1];
+        if hidden_q != hidden_k || hidden_k != hidden_v {
+            return Err(Error::Backend(format!(
+                "build_fused_qkv_q80: hidden dims must match (got {hidden_q}/{hidden_k}/{hidden_v})"
+            )));
+        }
+        let hidden = hidden_q;
+        if hidden == 0 || hidden % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "build_fused_qkv_q80: hidden must be a non-zero multiple of 32, got {hidden}"
+            )));
+
+        }
+        // Raw Q8_0 bytes of each weight (D2H). Each row is (hidden/32)*34 bytes.
+        let q_bytes = as_rocm(wq)?.copy_to_host()?;
+        let k_bytes = as_rocm(wk)?.copy_to_host()?;
+        let v_bytes = as_rocm(wv)?.copy_to_host()?;
+        let mut fused = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
+        fused.extend_from_slice(&q_bytes);
+        fused.extend_from_slice(&k_bytes);
+        fused.extend_from_slice(&v_bytes);
+        let n_total = n_q + n_k + n_v;
+        let fused_shape = Shape::new(vec![n_total, hidden]);
+        let fused_storage = RocmStorage::copy_from_host_raw_bytes(
+            &fused,
+            &fused_shape,
+            q80,
+            &self.allocator,
+            self.ordinal,
+        )?;
+        Ok(FusedQkvWeights {
+            storage: fused_storage,
+            n_q,
+            n_k,
+            n_v,
+            hidden,
+        })
+    }
+
+    /// SPEED-DOT: Q8_0 GEMV via `V_DOT2_F32_f16` at M=1 (RDNA3/4).
+    /// utilization vs WMMA's 1/16 at m=1. Requires K % 32 == 0 (Q8_0 layout).
+    /// Activations arrive as packed fp16 (exact same precision as the WMMA
+    /// path's internal cast); dot4_i32_i8 is UNSIGNED-only on gfx12, so the
+    /// signed fp16 dot is the vector-dot primitive for Q8_0 codes.
+    pub(crate) fn launch_dot2_q80_gemv(
+        &self,
+        act_f16: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_f16
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_q80_gemv: act_f16 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_q80_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_q80_gemv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(n as u32, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot2_q80_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// SPEED-ROC: WMMA fused-dequant Q4_K GEMM launcher (RDNA3/4).
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_q4k(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q4k_gemm: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q4k_gemm: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_q4k_gemm: out has no device ptr".into()))?;
+
+        let grid_x = n.div_ceil(64) as u32;
+        let grid_y = m.div_ceil(16) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_fused_dequant_q4k",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// SPEED-ROC: WMMA fused-dequant Q5_K GEMM launcher (RDNA3/4).
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_q5k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q5k", a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC: WMMA fused-dequant Q2_K GEMM launcher (RDNA3/4).
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_q2k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q2k", a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC: WMMA fused-dequant Q3_K GEMM launcher (RDNA3/4).
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_q3k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q3k", a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC: WMMA fused-dequant Q6_K GEMM launcher (RDNA3/4).
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_q6k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q6k", a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC: WMMA fused-dequant IQ-family GEMM launchers (RDNA3/4).
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_iq2xxs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xxs", a, b, out, m, n, k)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_iq2xs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xs", a, b, out, m, n, k)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_iq2s(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2s", a, b, out, m, n, k)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_iq3xxs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3xxs", a, b, out, m, n, k)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_iq3s(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3s", a, b, out, m, n, k)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_iq4nl(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4nl", a, b, out, m, n, k)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_fused_dequant_iq4xs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4xs", a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC: Quantize FP32 activations to FP16 for WMMA GEMM input.
+    /// Reduces activation memory bandwidth by 2× (4 bytes → 2 bytes per element).
+    /// Called by prefill producers that want the FP16-input WMMA kernel path.
+    pub(crate) fn quantize_fp16(
+        &self,
+        src: &RocmStorage,
+        dst: &RocmStorage,
+    ) -> Result<*mut c_void> {
+        let src_ptr = src.device_ptr.ok_or_else(|| {
+            Error::Backend("quantize_fp16: src has no device ptr".into())
+        })?;
+        let dst_ptr = dst.device_ptr.ok_or_else(|| {
+            Error::Backend("quantize_fp16: dst has no device ptr".into())
+        })?;
+        let n = src.shape().elem_count();
+        const BLOCK_SIZE: usize = 256;
+        let grid_x = (n.div_ceil(BLOCK_SIZE)) as u32;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut sptr = src_ptr;
+        let mut dptr = dst_ptr;
+        let mut nn = n as i32;
+        self.launch_compute_kernel(
+            "grim_quantize_fp16",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut nn)],
+        )
+    }
+
+    /// SPEED-ROC: Dequantize FP16 activations back to FP32 (if needed).
+    pub(crate) fn dequantize_fp16(
+        &self,
+        src: &RocmStorage,
+        dst: &RocmStorage,
+    ) -> Result<*mut c_void> {
+        let src_ptr = src.device_ptr.ok_or_else(|| {
+            Error::Backend("dequantize_fp16: src has no device ptr".into())
+        })?;
+        let dst_ptr = dst.device_ptr.ok_or_else(|| {
+            Error::Backend("dequantize_fp16: dst has no device ptr".into())
+        })?;
+        let n = src.shape().elem_count();
+        const BLOCK_SIZE: usize = 256;
+        let grid_x = (n.div_ceil(BLOCK_SIZE)) as u32;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut sptr = src_ptr;
+        let mut dptr = dst_ptr;
+        let mut nn = n as i32;
+        self.launch_compute_kernel(
+            "grim_dequantize_fp16",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut nn)],
+        )
+    }
+
+    /// SPEED-ROC: FP8 E4M3 WMMA GEMM launcher (RDNA4 only, 383 TFLOPS).
+    #[allow(dead_code)]
+    pub(crate) fn launch_wmma_gemm_fp8_e4m3(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_quant("grim_wmma_gemm_fp8_e4m3", a, b, out, m, n, k)
+    }
+
+    /// SPEED-ROC: overwrite a device-resident tensor's storage with host f32
+    /// values in place (no alloc) — decode-loop hot path reuse.
+    pub fn write_f32_into(&self, storage: &dyn BackendStorage, host: &[f32]) -> Result<()> {
+        let rs = as_rocm(storage)?;
+        rs.write_host_f32(host)
+    }
+
+    /// SPEED-ROC: launch a compute kernel on an *explicit* stream (used by
+    /// graph capture, which records only calls issued on the capture stream).
+    /// Falls back to the aggregate-source JIT path; resolves the function from
+    /// the (entry, grid, solution) cache when warm.
+    pub fn launch_compute_kernel_on_stream(
+        &self,
+        entry: &str,
+        grid: HipDim3,
+        block: HipDim3,
+        args: &mut [*mut c_void],
+        stream: *mut c_void,
+        shared_mem_bytes: usize,
+    ) -> Result<*mut c_void> {
+        // Kernel must be pre-resolved by a prior eager launch (the graph-capture
+        // pattern: eager launch warms the JIT + function cache, then capture
+        // replays via this stream-bound entry point).
+        let fast_key = (self.intern_str(entry), grid.x, grid.y, None);
+        let cached_func = self
+            .resolved_kernel_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&fast_key).copied())
+            .ok_or_else(|| Error::Backend(format!(
+                "launch_compute_kernel_on_stream: {entry} not pre-resolved —                  issue an eager launch before capturing"
+            )))?;
+        if cached_func.is_null() {
+            return Err(Error::Backend(format!("{entry}: null cached function")));
+        }
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let args_ptr = args.as_mut_ptr();
+        check_hip("hipModuleLaunchKernel (stream)", unsafe {
+            hipModuleLaunchKernel(
+                cached_func, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                shared_mem_bytes as u32, stream, args_ptr, std::ptr::null_mut(),
+            )
+        })?;
+        Ok(stream)
+    }
+
+    /// Shared launcher body for all WMMA fused-dequant quant GEMM kernels.
+    fn launch_wmma_fused_dequant_quant(
+        &self,
+        name: &str,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{name}: a has no device ptr")))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{name}: b has no device ptr")))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend(format!("{name}: out has no device ptr")))?;
+
+        let grid_x = n.div_ceil(64) as u32;
+        let grid_y = m.div_ceil(16) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(128, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Launch the standalone FP8 GEMM kernel (gfx1200+ native MFMA,
     #[allow(dead_code)]
     pub(crate) fn launch_fp8_gemm_rdna4(
@@ -3122,10 +3776,19 @@ impl RocmDevice {
         solution_index: Option<i32>,
         shared_mem_bytes: usize,
     ) -> Result<*mut c_void> {
+        // SPEED-GRAPH: inside a segment-replay bracket the host code runs for
+        // bookkeeping only — the recorded HIP graph re-enqueues every launch
+        // in one shot, so individual launches are suppressed here.
+        if crate::device::segment_replay::SEGMENT_SUPPRESS.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(std::ptr::null_mut());
+        }
         // Fast path: a previously resolved hipFunction for this (entry, grid-shape, solution_index) launches directly - no source rebuild, no seahash, no CString, no module-cache walk.
         // Same solution_index is required because different indices map to different on-disk hsaco files (cache_key includes.
-        let trace_on = std::env::var("GRIM_ALLOC_TRACE").is_ok();
-        if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
+        // SPEED-CEREMONY: the env probe used to run TWICE per launch (~1-3 µs each
+        // on glibc's environ lock) — hoisted to a one-time process static.
+        static ALLOC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace_on = *ALLOC_TRACE.get_or_init(|| std::env::var("GRIM_ALLOC_TRACE").is_ok());
+        if trace_on {
             eprintln!("[launch-done] {}", entry);
         }
         // SPEED-ROC-12: intern once per unique entry (one leaked &str) — the

@@ -73,7 +73,7 @@ fn backend_unavailable(name: &str, why: &str) -> grim_core::error::Error {
 
 /// Resolve the device for an explicit selection string (`"rocm"`, `"cuda:1"`, `"auto"`, ...); `None` means auto-detect.
 /// Split from [`probe_device`] so the unavailable-backend error path is unit-testable without mutating the process environment.
-fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
+pub(crate) fn probe_device_with(requested: Option<&str>) -> Result<(Device, String)> {
     if let Some(s) = requested
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty() && s != "auto")
@@ -247,6 +247,7 @@ pub async fn cmd_run(
     max_tokens: usize,
     seed: u64,
     repeat_penalty: f32,
+    min_tokens: u32,
 ) -> Result<()> {
     let prompt = prompt.unwrap_or_else(|| "Hello".to_string());
 
@@ -434,6 +435,7 @@ pub async fn cmd_run(
         top_k,
         repeat_penalty,
         thinking_level: grim_core::sampler::ThinkingLevel::Default,
+        min_tokens: 0,
     };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
@@ -512,6 +514,12 @@ pub async fn cmd_run(
     let mut first_pass = true;
     let mut generated_tokens: Vec<u32> = Vec::new();
 
+    // SPEED-ROC: decode-step tensors preallocated on first decode pass and
+    // rewritten in place afterwards (write_f32_into) — no per-token device
+    // allocs on the Rocm hot path.
+    let mut decode_input: Option<grim_tensor::Tensor> = None;
+    let mut decode_pos: Option<grim_tensor::Tensor> = None;
+
     // Generation loop
     while generated < max_tokens {
         // Prefill on first pass to populate KV caches; decode one token at a time after.
@@ -524,7 +532,8 @@ pub async fn cmd_run(
             vec![*tokens.last().unwrap() as f32]
         };
 
-        // Build tensor from selected token(s)
+        // Build tensor from selected token(s). Prefill + first decode step
+        // allocate; later decode steps rewrite the preallocated buffers.
         let n_tokens = input_ids.len();
         let shape = grim_tensor::Shape::new(vec![n_tokens]);
         let float_tokens = input_ids;
@@ -540,20 +549,61 @@ pub async fn cmd_run(
         let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
         let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
 
+        // SPEED-ROC: decode steps reuse preallocated [1]-shape tensors —
+        // write_f32_into replaces build_tensor (no per-token device alloc).
+        // Prefill + first decode step allocate; first decode step seeds the
+        // reuse buffers. Non-Rocm devices keep the per-step build path.
+        let (input_tensor, positions_tensor) =
+            if !is_prefill && decode_input.is_some() && decode_pos.is_some() {
+                if let Device::Rocm(ordinal) = &device {
+                    let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+                    dev.write_f32_into(decode_input.as_ref().unwrap().storage().as_ref(), &float_tokens)?;
+                    dev.write_f32_into(decode_pos.as_ref().unwrap().storage().as_ref(), &positions)?;
+                }
+                (
+                    decode_input.as_ref().unwrap(),
+                    decode_pos.as_ref().unwrap(),
+                )
+            } else {
+                if !is_prefill {
+                    decode_input = Some(input_tensor);
+                    decode_pos = Some(positions_tensor);
+                    (
+                        decode_input.as_ref().unwrap(),
+                        decode_pos.as_ref().unwrap(),
+                    )
+                } else {
+                    (&input_tensor, &positions_tensor)
+                }
+            };
+
         let logits =
-            CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
+            CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?;
 
-        // Get logits for last token position only
-        let logits_vec = logits.to_vec_f32()?;
-        let last_start = logits_vec.len().saturating_sub(vocab);
-        let last_logits = &logits_vec[last_start..];
+        // SPEED-ROC: on decode steps (single-row logits) sample straight from the
+        // device tensor via the WI-X3 GPU sampler — skips the full-vocab D2H +
+        // CPU sampling that dominated per-token overhead. Prefill (multi-row) and
+        // repeat-penalty-active steps fall back to the CPU sampler.
+        let gpu_sample_ok = logits.shape().elem_count() == vocab
+            && std::env::var("GRIM_CPU_SAMPLER").is_err()
+            && matches!(device, Device::Rocm(_))
+            && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
 
-        // Single-position logits tensor so sampler sees next-token distribution only, not full sequence.
-        let last_shape = grim_tensor::Shape::new(vec![vocab]);
-        let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
+        let next_token = if gpu_sample_ok {
+            sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated)?
+        } else {
+            // Get logits for last token position only
+            let logits_vec = logits.to_vec_f32()?;
+            let last_start = logits_vec.len().saturating_sub(vocab);
+            let last_logits = &logits_vec[last_start..];
 
-        // Sample from last-position logits only.
-        let next_token = sampler.sample(&last_logits_tensor, &history)?;
+            // Single-position logits tensor so sampler sees next-token distribution only, not full sequence.
+            let last_shape = grim_tensor::Shape::new(vec![vocab]);
+            let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
+
+            // Sample from last-position logits only.
+            sampler.sample(&last_logits_tensor, &history)?
+        };
 
         // Accumulate tokens; decode full sequence at end for correct BPE boundary handling.
         generated_tokens.push(next_token);
@@ -563,13 +613,24 @@ pub async fn cmd_run(
         history.push(next_token);
         generated += 1;
 
-        // Check for EOS or ChatML stop tokens
+        // Check for EOS or ChatML stop tokens, respecting min_tokens budget.
         if let Some(tok) = &tokenizer {
-            let is_eos = tok.eos_token_id.map_or(false, |id| next_token == id)
-                || tok.token_to_id.get("<|im_end|>").copied() == Some(next_token)
-                || tok.token_to_id.get("<|endoftext|>").copied() == Some(next_token)
-                || tok.token_to_id.get("</s>").copied() == Some(next_token);
-            if is_eos {
+            let stop_tokens: Vec<u32> = vec![
+                tok.token_to_id.get("<|im_end|>").copied(),
+                tok.token_to_id.get("<|endoftext|>").copied(),
+                tok.token_to_id.get("</s>").copied(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+
+            if grim_core::sampler::should_stop(
+                next_token,
+                generated as u32,
+                min_tokens,
+                tok.eos_token_id,
+                &stop_tokens,
+            ) {
                 eprintln!(
                     "[grim] EOS token {} reached, stopping generation.",
                     next_token
@@ -688,6 +749,7 @@ pub fn init_generation(
         top_k,
         repeat_penalty,
         thinking_level: grim_core::sampler::ThinkingLevel::Default,
+        min_tokens: 0,
     };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
@@ -721,6 +783,36 @@ pub fn init_generation(
 }
 
 /// Build an F32 tensor from host data. Eliminates 5-way device match duplication.
+/// SPEED-ROC: sample one token entirely on the GPU via the WI-X3 device sampler.
+/// Reads the caller's device-resident logits tensor — no D2H, no CPU sort.
+/// RNG stream advances per step: `SamplingOps::sample_on_device` packs the
+/// position into the high 32 bits of `seed` (see `device_sampler::sample_impl`).
+#[allow(clippy::too_many_arguments)]
+fn sample_on_rocm(
+    device: &Device,
+    logits: &grim_tensor::Tensor,
+    _vocab: usize,
+    params: &SamplingParams,
+    seed: u64,
+    step: usize,
+) -> Result<u32> {
+    use grim_tensor::SamplingOps;
+    let Device::Rocm(ordinal) = device else {
+        return Err(grim_core::error::Error::Unimplemented(
+            "sample_on_rocm requires a ROCm device".into(),
+        ));
+    };
+    let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+    let step_seed = (seed & 0xffff_ffff) | ((step as u64) << 32);
+    Ok(dev.sample_on_device(
+        logits.storage().as_ref(),
+        params.temperature,
+        params.top_p,
+        params.top_k,
+        step_seed,
+    )?)
+}
+
 fn build_tensor(
     data: &[f32],
     shape: &grim_tensor::Shape,
@@ -861,6 +953,7 @@ pub async fn cmd_run_interactive(
         top_k,
         repeat_penalty,
         thinking_level: grim_core::sampler::ThinkingLevel::Default,
+        min_tokens: 0,
     };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
@@ -945,6 +1038,11 @@ pub async fn cmd_run_interactive(
         let mut first_pass = true;
         let mut generated_tokens: Vec<u32> = Vec::new();
 
+        // SPEED-ROC: per-turn decode tensor reuse (reset each turn —
+        // positions depend on total_tokens which shifts between turns).
+        let mut decode_input: Option<grim_tensor::Tensor> = None;
+        let mut decode_pos: Option<grim_tensor::Tensor> = None;
+
         while generated < max_tokens {
             let is_prefill = first_pass;
             let input_ids: Vec<f32> = if first_pass {
@@ -956,7 +1054,6 @@ pub async fn cmd_run_interactive(
 
             let n_tokens = input_ids.len();
             let shape = grim_tensor::Shape::new(vec![n_tokens]);
-            let input_tensor = build_tensor(&input_ids, &shape, &device)?;
 
             let positions: Vec<f32> = if is_prefill {
                 (0..n_tokens).map(|i| (total_tokens + i) as f32).collect()
@@ -964,19 +1061,63 @@ pub async fn cmd_run_interactive(
                 vec![(total_tokens + n_tokens - 1) as f32]
             };
             let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
-            let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
+
+            // SPEED-ROC: decode steps reuse preallocated [1]-shape tensors
+            // (write_f32_into, no per-token alloc). Prefill + first decode
+            // step allocate and seed the reuse buffers.
+            let input_tensor;
+            let positions_tensor;
+            let it;
+            let pt;
+            if !is_prefill && decode_input.is_some() && decode_pos.is_some() {
+                if let Device::Rocm(ordinal) = &device {
+                    let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+                    dev.write_f32_into(
+                        decode_input.as_ref().unwrap().storage().as_ref(),
+                        &input_ids,
+                    )?;
+                    dev.write_f32_into(
+                        decode_pos.as_ref().unwrap().storage().as_ref(),
+                        &positions,
+                    )?;
+                }
+                input_tensor = decode_input.as_ref().unwrap();
+                positions_tensor = decode_pos.as_ref().unwrap();
+            } else {
+                it = build_tensor(&input_ids, &shape, &device)?;
+                pt = build_tensor(&positions, &pos_shape, &device)?;
+                if !is_prefill {
+                    decode_input = Some(it.clone());
+                    decode_pos = Some(pt.clone());
+                    input_tensor = decode_input.as_ref().unwrap();
+                    positions_tensor = decode_pos.as_ref().unwrap();
+                } else {
+                    input_tensor = &it;
+                    positions_tensor = &pt;
+                }
+            };
 
             let logits =
                 CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
 
-            let logits_vec = logits.to_vec_f32()?;
-            let last_start = logits_vec.len().saturating_sub(vocab);
-            let last_logits = &logits_vec[last_start..];
+            // SPEED-ROC: GPU-direct sampling on decode steps — see one-shot loop.
+            let gpu_sample_ok = logits.shape().elem_count() == vocab
+                && std::env::var("GRIM_CPU_SAMPLER").is_err()
+                && matches!(device, Device::Rocm(_))
+                && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
 
-            let last_shape = grim_tensor::Shape::new(vec![vocab]);
-            let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
+            let next_token = if gpu_sample_ok {
+                sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated)?
+            } else {
+                let logits_vec = logits.to_vec_f32()?;
+                let last_start = logits_vec.len().saturating_sub(vocab);
+                let last_logits = &logits_vec[last_start..];
 
-            let next_token = sampler.sample(&last_logits_tensor, &history)?;
+                let last_shape = grim_tensor::Shape::new(vec![vocab]);
+                let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
+
+                sampler.sample(&last_logits_tensor, &history)?
+            };
 
             generated_tokens.push(next_token);
             tokens.push(next_token);

@@ -48,6 +48,15 @@ pub fn dev_ptr(s: &RocmStorage) -> Result<u64> {
         .ok_or_else(|| Error::Backend("RocmStorage has no device pointer".into()))
 }
 
+/// Like [`dev_ptr`] but via the `BackendStorage` trait, so it also accepts a
+/// [`crate::memory::view::RocmStorageView`] (a byte-offset view over a parent
+/// allocation). Used by ops that must consume views without copying.
+pub fn dev_ptr_dyn(s: &dyn BackendStorage) -> Result<*mut c_void> {
+    s.device_ptr()
+        .map(|p| p as *mut c_void)
+        .ok_or_else(|| Error::Backend("storage has no device pointer".into()))
+}
+
 /// Helper: turn a mutable borrow of a kernel argument into the [see: `*mut c_void`]
 pub fn arg<T>(v: &mut T) -> *mut c_void {
     v as *mut T as *mut c_void
@@ -75,13 +84,28 @@ pub struct DeviceGuard {
     prev: i32,
 }
 
+thread_local! {
+    /// SPEED-CEREMONY: cached HIP current device for this thread (-1 = unknown).
+    /// All steady-state device switches route through [`DeviceGuard`] (direct
+    /// `hipSetDevice` calls exist only in one-time constructors), so the cache
+    /// stays coherent. Saves 3 driver calls per launch (get + set + restore).
+    static CUR_DEV: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
 impl DeviceGuard {
     pub fn set(ordinal: i32) -> Self {
+        let cur = CUR_DEV.with(|c| c.get());
+        if cur == ordinal {
+            // Already pinned to the target device — no driver calls, no restore.
+            emit_ctx_trace("DeviceGuard", ordinal, cur);
+            return Self { prev: -1 };
+        }
         let mut prev: i32 = 0;
         unsafe {
             let _ = crate::device::handles::hipGetDevice(&mut prev);
             let _ = crate::device::handles::hipSetDevice(ordinal);
         }
+        CUR_DEV.with(|c| c.set(ordinal));
         emit_ctx_trace("DeviceGuard", ordinal, prev);
         Self { prev }
     }
@@ -89,9 +113,13 @@ impl DeviceGuard {
 
 impl Drop for DeviceGuard {
     fn drop(&mut self) {
+        if self.prev < 0 {
+            return; // no-op guard — thread was already on the target device
+        }
         unsafe {
             let _ = crate::device::handles::hipSetDevice(self.prev);
         }
+        CUR_DEV.with(|c| c.set(self.prev));
     }
 }
 

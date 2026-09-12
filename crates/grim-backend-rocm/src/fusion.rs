@@ -38,14 +38,18 @@ pub struct QkvAttentionFusionConfig {
 
 impl Default for QkvAttentionFusionConfig {
     fn default() -> Self {
-        // Default = true: the backend runs the QKV fused kernel inline
+        // Default = true: the backend runs the QKV fused kernel inline.
+        // wavefront_size = 32: matches RDNA1-4 (wave32). The device overrides
+        // this with the probed value before every launch, but the default must
+        // NOT be 64 — on RDNA4 any kernel launched with 256 threads (wave64
+        // assumption) would mismatch the rocWMMA wave32-only requirement.
         Self {
             enabled: true,
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
             max_seq_len: 4096,
-            wavefront_size: 64,
+            wavefront_size: 32,
             quant_mode: QuantMode::Fp32,
         }
     }
@@ -95,9 +99,13 @@ pub struct DecodeGemmConfig {
 
 impl Default for DecodeGemmConfig {
     fn default() -> Self {
+        // wavefront_size = 32: RDNA4 default (wave32). The device overrides
+        // this with the probed value before every launch; the default must
+        // match the RDNA assumption (128-thread blocks) to avoid latent bugs
+        // if any code path uses Default::default() without overriding.
         Self {
             enabled: true,
-            wavefront_size: 64,
+            wavefront_size: 32,
         }
     }
 }
@@ -113,9 +121,11 @@ pub struct FusedDequantGemmConfig {
 
 impl Default for FusedDequantGemmConfig {
     fn default() -> Self {
+        // wavefront_size = 32: RDNA4 default (wave32). The device overrides
+        // this with the probed value before every launch.
         Self {
             enabled: true,
-            wavefront_size: 64,
+            wavefront_size: 32,
         }
     }
 }
@@ -219,13 +229,15 @@ pub struct KvDequantAttentionConfig {
 
 impl Default for KvDequantAttentionConfig {
     fn default() -> Self {
+        // wavefront_size = 32: RDNA4 default (wave32). The device overrides
+        // this with the probed value before every launch.
         Self {
             enabled: false,
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
             quant_format: KvQuantFormat::Fp16,
-            wavefront_size: 64,
+            wavefront_size: 32,
         }
     }
 }
@@ -234,13 +246,14 @@ impl KvDequantAttentionConfig {
     /// Build a config from a legacy `quant_bits` integer, preserving backward compat for existing call sites that haven't migrated to KvQuantFormat yet.
     /// When `quant_bits == 4`, maps to Q4K (the existing nibble-dequant behavior is preserved via the.
     pub fn from_legacy_quant_bits(quant_bits: u8) -> Self {
+        // wavefront_size = 32: RDNA4 default (wave32); device overrides at launch.
         Self {
             enabled: true,
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
             quant_format: KvQuantFormat::from_legacy_quant_bits(quant_bits, true),
-            wavefront_size: 64,
+            wavefront_size: 32,
         }
     }
 }
@@ -256,9 +269,14 @@ pub struct WmmaGemmConfig {
 
 impl Default for WmmaGemmConfig {
     fn default() -> Self {
+        // wavefront_size = 32: RDNA4 default (wave32). This config gates the
+        // WMMA GEMM kernel dispatch, which on RDNA4 REQUIRES wave32 mode
+        // (rocWMMA 2.2 static_assert: "only wave32 for gfx12"). A default of
+        // 64 would be wrong if any path uses Default::default() unoverridden.
+        // The device also overrides this with the probed value before launch.
         Self {
             enabled: true,
-            wavefront_size: 64,
+            wavefront_size: 32,
         }
     }
 }

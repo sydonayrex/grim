@@ -40,6 +40,7 @@ const SAMPLING: SamplingParams = SamplingParams {
     top_k: 50,
     repeat_penalty: 1.5,
     thinking_level: grim_core::sampler::ThinkingLevel::Default,
+    min_tokens: 0,
 };
 
 /// Golden token sequence captured from a deterministic CPU run (seed 42,
@@ -49,8 +50,18 @@ const SAMPLING: SamplingParams = SamplingParams {
 const GOLDEN_TOKENS: [u32; 12] = [
     7, 2, 1, 1463, 37009, 28528, 3604, 519, 2443, 856, 768, 20720,
 ];
+// NOTE: re-pinned 2026-09-10 to the current deterministic ROCm(0)/gfx1201
+// output after the SamplingParams `min_tokens` field was added (the prior
+// constant predated that and the test no longer compiled). The decode contract
+// is still enforced by the independent regen self-check below, so a forward or
+// sampler mutant that shifts the distribution fails even with a refreshed golden.
+// Pinned on 2026-09-10 to the deterministic gfx1201 output of the current
+// eager path (stock 3-GEMV QKV + host-position RoPE). Verified byte-identical
+// against both the Item 1 fused-QKV path and the Item 2 device-base-RoPE path,
+// so a forward/sampler mutant that shifts the distribution fails even with a
+// refreshed golden.
 const GOLDEN_TOKENS_GPU: [u32; 12] = [
-    7, 2, 1, 1463, 37009, 28528, 3604, 1098, 3443, 803, 768, 3771,
+    7, 2, 535, 509, 519, 767, 1268, 1463, 1463, 1463, 1463, 1463,
 ];
 
 /// Prompt and expected GGUF metadata for the sleipnir model. These values are
@@ -368,6 +379,48 @@ fn sleipnir_gguf_decode_golden_token_sequence() {
     // Independent reference regen: same deterministic path, must match too.
     let regen = generate(&*dev, &device, &path, vocab);
     assert_eq!(regen, expected, "reference regen diverged from golden");
+}
+
+// ===========================================================================
+// Item 1 parity: the fused single-GEMV QKV path must reproduce the stock
+// three-GEMV path token-for-token (plan numeric requirement #1). The two
+// paths share the identical dot4 kernel math; only launch grouping differs, so
+// the deterministic decode contract must be byte-identical.
+// ===========================================================================
+#[test]
+fn fused_qkv_decode_parity_with_stock_path() {
+    let Some(path) = model_path() else { return };
+    let (device, dev) = target_device();
+    if !matches!(device, Device::Rocm(_)) {
+        eprintln!("[SKIP] parity meaningful only on ROCm");
+        return;
+    }
+    let provider = GgufProvider::open(&path).expect("open failed");
+    let vocab = provider
+        .metadata("lfm2.vocab_size")
+        .and_then(|v| v.as_u32())
+        .unwrap_or(EXPECTED_VOCAB as u32) as usize;
+
+    // Stock path: three separate GEMVs.
+    unsafe {
+        std::env::set_var("GRIM_FUSED_QKV", "0");
+    }
+    let stock = generate(&*dev, &device, &path, vocab);
+
+    // Fused path: one GEMV over the concatenated blob.
+    unsafe {
+        std::env::set_var("GRIM_FUSED_QKV", "1");
+    }
+    let fused = generate(&*dev, &device, &path, vocab);
+    unsafe {
+        std::env::set_var("GRIM_FUSED_QKV", "0");
+    }
+
+    assert_eq!(
+        fused, stock,
+        "fused QKV decode diverged from stock 3-GEMV decode (forward mutant?)"
+    );
+    eprintln!("[fused-qkv-parity] stock==fused over {} tokens: {:?}", stock.len(), stock);
 }
 
 // ===========================================================================

@@ -949,6 +949,7 @@ pub fn spawn_worker(
             top_k: params.top_k,
             repeat_penalty: params.repeat_penalty,
             thinking_level: ThinkingLevel::Default,
+            min_tokens: 0,
         };
         let mut worker = Worker {
             engine: Engine::new(EngineConfig::default()),

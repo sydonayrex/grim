@@ -1336,6 +1336,7 @@ async fn chat_handler(
                 top_k: 40,
                 repeat_penalty: 1.0,
                 thinking_level: grim_core::sampler::ThinkingLevel::Default,
+                min_tokens: 0,
             },
             seed,
         ))

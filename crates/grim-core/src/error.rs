@@ -24,6 +24,9 @@ pub enum Error {
 
     #[error("not implemented: {0}")]
     Unimplemented(String),
+
+    #[error("backend error: {0}")]
+    Backend(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -901,6 +901,184 @@ void grim_qkv_attention_paged_quant(
         }
     }
 }
+
+// Item 3 — device-side KV append. Replaces the host-offset `copy_slice_into`:
+// each thread reads `past = *past_dev` ON DEVICE, computes its own destination
+// offset `past*kv_stride + tid`, and copies one element. Offsets are computed
+// entirely on-device so the append is graph-capturable (no host scalar baked in).
+// Grid (steps*kv_stride,1,1), block (256,1,1); handles tails via the `if` guard.
+extern "C" __global__ void grim_kv_append(
+    float* __restrict__ k_arena,
+    const float* __restrict__ k_rot,
+    const int* __restrict__ past_dev,
+    int kv_stride,
+    int steps
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = steps * kv_stride;
+    if (tid >= total) return;
+    const int past = *past_dev;
+    k_arena[past * kv_stride + tid] = k_rot[tid];
+}
+
+// Item 3 — device-total attention variant. Identical math to `grim_qkv_attention`
+// EXCEPT the KV length `kv_seq_len` is read from a device scalar (`total_dev`)
+// instead of being baked in as a host parameter. This makes the attention node
+// graph-capturable even though `past` changes every token: total_dev is a graph
+// input pointer, replayed with the live value. Only the kv_seq_len parameter is
+// replaced; cache_offset is dropped (decode is always steps==1 at abs position
+// total-1, which the caller passes as part of total_dev semantics via total only).
+extern "C" __global__ void grim_qkv_attention_dev(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) out[q_offset + d] = nanf("");
+        }
+        return;
+    }
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+    // Device-driven KV length. `total_dev` holds the pre-step past count (it is
+    // bumped by grim_bump_i32 AFTER this attention node), and `steps` is the
+    // number of rows appended by the preceding kv_append node — so the live KV
+    // length during this attention is `*total_dev + steps`. `steps` is a
+    // graph-safe constant (1 for decode), so replay N times re-derives the right
+    // total from the live total_dev each time.
+    const int kv_seq_len = *total_dev + steps;
+    // Decode: single query at absolute position (kv_seq_len - 1).
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    const float* __restrict__ k_head = &k_tensor[kv_head * head_dim];
+    const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
+    const int kv_stride = num_kv_heads * head_dim;
+    float q_reg[8];
+    if (thread_active) {
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
+        }
+    }
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = lo + j;
+        float score = 0.0f;
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) {
+                score += q_reg[c] * k_head[kv_idx * kv_stride + idx];
+            }
+        }
+        for (int off = wave_size / 2; off > 0; off >>= 1)
+            score += __shfl_xor(score, off);
+        if (lane_id == 0 && thread_active) {
+            if (softcap > 0.0f) {
+                float t = score / softcap;
+                score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
+            }
+            if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+            float mw = fmaxf(running_max, score);
+            float scale_a = expf(running_max - mw);
+            float scale_b = expf(score - mw);
+            running_sum = running_sum * scale_a + scale_b;
+            for (int c = 0; c < 4; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim)
+                    out_acc[c] = out_acc[c] * scale_a + scale_b * v_head[kv_idx * kv_stride + idx];
+            }
+            running_max = mw;
+        }
+        __syncthreads();
+    }
+    // Wave-0 LDS merge (same pattern as grim_qkv_attention).
+    if (thread_active) {
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) {
+                if (wave_id == 0) { s_max[lane_id] = running_max; s_sum[lane_id] = running_sum; }
+                s_acc[wave_id][lane_id] = out_acc[c];
+            }
+        }
+    }
+    __syncthreads();
+    if (wave_id == 0 && thread_active) {
+        float m_final = s_max[0];
+        for (int w = 1; w < num_waves; ++w) m_final = fmaxf(m_final, s_max[w]);
+        float sum_final = 0.0f;
+        float acc_final[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int w = 0; w < num_waves; ++w) {
+            float mw = s_max[w];
+            float uw = s_sum[w];
+            float scale_a = expf(m_final - mw);
+            float scale_b = expf(mw - m_final);
+            sum_final = sum_final * scale_a + uw * scale_b;
+            for (int c = 0; c < 4; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim) {
+                    acc_final[c] = acc_final[c] * scale_a + s_acc[w][lane_id] * scale_b;
+                }
+            }
+        }
+        float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) out[q_offset + idx] = acc_final[c] * inv_sum;
+        }
+    }
+}
+
+// Item 3 — device-side counter bump. `*past_dev += steps`. LAST node of the
+// decode graph: graphs may mutate their own buffers, and replaying N times
+// increments exactly N times. Single-thread scalar op.
+extern "C" __global__ void grim_bump_i32(
+    int* __restrict__ past_dev,
+    int steps
+) {
+    *past_dev += steps;
+}
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1382,6 +1560,199 @@ pub fn launch_paged_attention_quant(
     Ok(())
 }
 
+/// Item 3 launcher: `grim_kv_append`. Copies `steps*kv_stride` elements from
+/// `k_rot` into `k_arena` at the device-computed offset `*past_dev * kv_stride`.
+pub fn launch_kv_append(
+    dev: &crate::RocmDevice,
+    k_arena: &dyn BackendStorage,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    kv_stride: usize,
+    steps: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let total = steps * kv_stride;
+    let arena_s = k_arena
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append: k_arena must be RocmStorage".into()))?;
+    let rot_s = k_rot
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append: k_rot must be RocmStorage".into()))?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append: past_dev must be RocmStorage".into()))?;
+    let mut arena_ptr = arena_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append: k_arena has no device ptr".into()))?;
+    let mut rot_ptr = rot_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append: k_rot has no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut steps_i = steps as i32;
+    let (grid, block) = crate::device::util::linear_launch(total);
+    dev.launch_compute_kernel(
+        "grim_kv_append",
+        grid,
+        block,
+        &mut [
+            arg(&mut arena_ptr),
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut stride_i),
+            arg(&mut steps_i),
+        ],
+    )
+}
+
+/// Item 3 launcher: `grim_qkv_attention_dev`. Same math as `launch_qkv_attention`
+/// but reads the KV length from a device scalar `total_dev` instead of a host
+/// `kv_seq_len` parameter, making the node graph-capturable.
+pub fn launch_qkv_attention_dev(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_tensor: &dyn BackendStorage,
+    v_tensor: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    const KERNEL: &str = "grim_qkv_attention_dev";
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{}: head_dim {} exceeds kernel cap of 256",
+            KERNEL, head_dim
+        )));
+    }
+    let q_s = q
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: q must be RocmStorage", KERNEL)))?;
+    let k_s = k_tensor
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: k must be RocmStorage", KERNEL)))?;
+    let v_s = v_tensor
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: v must be RocmStorage", KERNEL)))?;
+    let out_s = out
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: out must be RocmStorage", KERNEL)))?;
+    let om_s = out_max
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: out_max must be RocmStorage", KERNEL)))?;
+    let os_s = out_sum
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: out_sum must be RocmStorage", KERNEL)))?;
+    let total_s = total_dev
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: total_dev must be RocmStorage", KERNEL)))?;
+    let oproj_s = o_proj_w
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: o_proj_w must be RocmStorage", KERNEL)))?;
+    let alibi_s = alibi_slopes
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: alibi_slopes must be RocmStorage", KERNEL)))?;
+    let mut q_ptr = q_s.device_ptr.ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = k_s.device_ptr.ok_or_else(|| crate::Error::Backend("k has no ptr".into()))?;
+    let mut v_ptr = v_s.device_ptr.ok_or_else(|| crate::Error::Backend("v has no ptr".into()))?;
+    let mut o_ptr = out_s.device_ptr.ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s.device_ptr.ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s.device_ptr.ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s.device_ptr.ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut asl = alibi_s.device_ptr.ok_or_else(|| crate::Error::Backend("alibi has no ptr".into()))?;
+    let mut ha = has_alibi as i32;
+    let mut opptr = oproj_s.device_ptr.ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, 1);
+    let block_dim = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        KERNEL,
+        grid_dim,
+        block_dim,
+        &mut [
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut o_ptr),
+            arg(&mut om_ptr),
+            arg(&mut os_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut asl),
+            arg(&mut ha),
+        ],
+    )
+}
+
+/// Item 3 launcher: `grim_bump_i32`. Increments `*past_dev += steps`. Single
+/// thread; the mutable `past_dev` pointer is a graph input so each replay bumps
+/// the live counter.
+pub fn launch_bump_i32(
+    dev: &crate::RocmDevice,
+    past_dev: &dyn BackendStorage,
+    steps: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev must be RocmStorage".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev has no device ptr".into()))?;
+    let mut steps_i = steps as i32;
+    dev.launch_compute_kernel(
+        "grim_bump_i32",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [arg(&mut past_ptr), arg(&mut steps_i)],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1764,6 +2135,216 @@ mod tests {
             let out_vec = out_storage.to_cpu_vec_f32().unwrap();
             assert_eq!(out_vec.len(), (batch * num_heads * head_dim) as usize);
             assert!(out_vec[0].is_finite());
+        }
+    }
+
+    // ── Item 3 parity tests ────────────────────────────────────────────────
+
+    fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
+        let len = std::mem::size_of_val(slice);
+        unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, len) }
+    }
+
+    /// `grim_kv_append` with a device-side past must match the host-offset
+    /// `copy_slice_into` result, byte-exact, for past ∈ {0, 17, 500}.
+    #[test]
+    fn test_kv_append_dev_parity() {
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        use grim_tensor::MemoryOps;
+        let kv_stride = 128usize;
+        let steps = 1usize;
+        let max_past = 600usize;
+        let arena_rows = max_past + steps;
+
+        let mut seed = 0xAFF1CEu64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6363136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let k_rot: Vec<f32> = (0..steps * kv_stride).map(|_| rand()).collect();
+
+        for past in [0usize, 17, 500] {
+            // Host reference: copy k_rot into a fresh arena at offset past*stride.
+            let mut arena_ref = vec![0.0f32; arena_rows * kv_stride];
+            arena_ref[past * kv_stride..past * kv_stride + steps * kv_stride]
+                .copy_from_slice(&k_rot);
+
+            // Device path: grim_kv_append reads past from device memory.
+            let arena_dev = vec![0.0f32; arena_rows * kv_stride];
+            let arena_storage =
+                dev.from_cpu(&arena_dev, &Shape::new(vec![arena_rows * kv_stride]), DType::F32)
+                    .unwrap();
+            let rot_storage =
+                dev.from_cpu(&k_rot, &Shape::new(vec![steps * kv_stride]), DType::F32).unwrap();
+            let past_val = past as u32;
+            let past_dev = MemoryOps::from_cpu_bytes(
+                &dev,
+                as_u8_slice(&[past_val]),
+                &Shape::new(vec![1]),
+                DType::U32,
+            )
+            .unwrap();
+            launch_kv_append(
+                &dev,
+                arena_storage.as_ref(),
+                rot_storage.as_ref(),
+                past_dev.as_ref(),
+                kv_stride,
+                steps,
+            )
+            .unwrap();
+            dev.synchronize();
+
+            let arena_got = arena_storage.to_cpu_vec_f32().unwrap();
+            assert_eq!(
+                arena_got, arena_ref,
+                "kv_append dev-offset mismatch at past={past}"
+            );
+        }
+    }
+
+    /// `grim_bump_i32` increments a device scalar. After 5 bumps of 1 the value
+    /// must read back as 5 (counter contract).
+    #[test]
+    fn test_bump_monotonic() {
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        use grim_tensor::MemoryOps;
+        let steps = 1usize;
+        let past_val = 0u32;
+        let past_storage = MemoryOps::from_cpu_bytes(
+            &dev,
+            as_u8_slice(&[past_val]),
+            &Shape::new(vec![1]),
+            DType::U32,
+        )
+        .unwrap();
+        for _ in 0..5 {
+            launch_bump_i32(&dev, past_storage.as_ref(), steps).unwrap();
+        }
+        dev.synchronize();
+        let raw = past_storage
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .unwrap()
+            .copy_to_host()
+            .unwrap();
+        let got = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        assert_eq!(got, 5, "past_dev should be 5 after 5 bumps of 1");
+    }
+
+    /// `grim_qkv_attention_dev` (device-total attention) must match the
+    /// host-scalar `dev.qkv_attention` at the same total KV length, max_diff ≤ 1e-5.
+    /// past ∈ {0, 17, 500}: total = past + steps.
+    #[test]
+    fn test_qkv_attention_dev_parity() {
+        let Ok(dev) = crate::RocmDevice::try_new(0) else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        use grim_tensor::{AttentionOps, CoreTensorOps, MemoryOps};
+        let num_heads = 4usize;
+        let num_kv_heads = 4usize;
+        let head_dim = 64usize;
+        let steps = 1usize;
+        let kv_stride = num_kv_heads * head_dim;
+
+        let mut seed = 0xDECAFEu64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6363136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        for past in [0usize, 17, 500] {
+            let total = past + steps;
+            // K/V arenas sized to total rows (the appended row occupies [past, total)).
+            let k_data: Vec<f32> = (0..total * kv_stride).map(|_| rand()).collect();
+            let v_data: Vec<f32> = (0..total * kv_stride).map(|_| rand()).collect();
+            let q_data: Vec<f32> = (0..steps * num_heads * head_dim).map(|_| rand()).collect();
+
+            let k_shape = Shape::new(vec![total, num_kv_heads, head_dim]);
+            let v_shape = k_shape.clone();
+            let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+            let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+
+            let q_st = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
+            let k_st = dev.from_cpu(&k_data, &k_shape, DType::F32).unwrap();
+            let v_st = dev.from_cpu(&v_data, &v_shape, DType::F32).unwrap();
+
+            // Reference: host-scalar attention with the same total + cache_offset.
+            let (ref_st, _rh) = dev
+                .qkv_attention(
+                    q_st.as_ref(),
+                    k_st.as_ref(),
+                    v_st.as_ref(),
+                    num_kv_heads,
+                    total,
+                    past as u32,
+                    None,
+                    &out_shape,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let ref_v = ref_st.to_cpu_vec_f32().unwrap();
+
+            // Device path: grim_qkv_attention_dev reads total = *past_dev + steps.
+            let out_st = dev.alloc_storage(&out_shape, DType::F32).unwrap();
+            let out_max = dev.alloc_storage(&Shape::new(vec![num_heads]), DType::F32).unwrap();
+            let out_sum = dev.alloc_storage(&Shape::new(vec![num_heads]), DType::F32).unwrap();
+            let dummy = dev.alloc_storage(&Shape::new(vec![1]), DType::F32).unwrap();
+            let past_val = past as u32;
+            let past_dev_st = MemoryOps::from_cpu_bytes(
+                &dev,
+                as_u8_slice(&[past_val]),
+                &Shape::new(vec![1]),
+                DType::U32,
+            )
+            .unwrap();
+            let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+            let stream = launch_qkv_attention_dev(
+                &dev,
+                q_st.as_ref(),
+                k_st.as_ref(),
+                v_st.as_ref(),
+                out_st.as_ref(),
+                out_max.as_ref(),
+                out_sum.as_ref(),
+                past_dev_st.as_ref(),
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                steps as u32,
+                steps as u32,
+                inv_sqrt_d,
+                0,
+                0.0,
+                dummy.as_ref(),
+                0,
+                0,
+                dummy.as_ref(),
+                0,
+            )
+            .unwrap();
+            let _ = stream;
+            dev.synchronize();
+
+            let got = out_st.to_cpu_vec_f32().unwrap();
+            let diff = got
+                .iter()
+                .zip(&ref_v)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("[qkv-attn-dev-parity] past={past} total={total} max_diff={diff:.8}");
+            assert!(
+                diff < 1e-5,
+                "qkv_attention_dev diverges at past={past}: max_diff={diff}"
+            );
         }
     }
 }

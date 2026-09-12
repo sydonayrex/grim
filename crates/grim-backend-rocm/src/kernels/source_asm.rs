@@ -20,9 +20,25 @@ pub fn compute_kernel_source() -> String {
     // F-1: the IQ-family fused dequant+GEMM kernels (incl.
     // grim_fused_dequant_gemm_q8_0) live in their own translation unit and were never appended to the JIT source,.
     s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
+    // SPEED-DOT-OPFUSE: fused RMSNorm + int8 q8_1 quantization (decode path
+    // op-count reduction — one launch replaces norm + quant). Feeds
+    // grim_dot4_q80_q81_gemv's packed A_q81 layout directly.
+    s.push_str(crate::kernels::rmsnorm_quant::KERNEL_SOURCE);
+    // SPEED-DOT: VOP3 dot-product GEMV (M=1 decode). After iq_gemm — reuses
+    // fp16_to_float_device from shared_device_fns (pushed first). Arch-guarded
+    // to RDNA3/4 inside the source itself.
+    s.push_str(crate::kernels::dot_gemv::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     if !skip_rocwma {
         s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
+        // SPEED-ROC: All block-quantized WMMA GEMM kernels (Q8_0, Q4_K, Q5_K, Q2_K, Q3_K, Q6_K).
+        // Consolidated cooperative-LDS source — generated, not a const (KERNEL_SOURCE is empty).
+        s.push_str(&crate::kernels::wmma_quantized_gemm::quant_kernel_source());
+        // SPEED-ROC: WMMA fused-dequant IQ-family GEMM (RDNA3/4).
+        // Must come AFTER iq_gemm (reuses dequant_iqXX device helpers).
+        s.push_str(crate::kernels::wmma_iq_gemm::KERNEL_SOURCE);
+        // SPEED-ROC: FP8 E4M3 WMMA GEMM — 383 TFLOPS on RDNA4 (2x FP16).
+        s.push_str(crate::kernels::wmma_fp8_gemm::KERNEL_SOURCE);
     }
     s.push_str(crate::kernels::q8_0_dequant::KERNEL_SOURCE);
     // grim_dequant_q4k must ride in the same aggregate unit — without this

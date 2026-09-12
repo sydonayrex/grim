@@ -39,6 +39,31 @@ extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
     out[i] = 1.0f / x[i];
 }
 
+// ── SPEED-ROC: FP32 → FP16 Activation Quantization ──────────────────────────
+// Converts FP32 activations to FP16 in-place for WMMA GEMM input.
+// Reduces activation memory bandwidth by 2× (4 bytes → 2 bytes per element).
+
+extern "C" __global__ void grim_quantize_fp16(
+    const float* __restrict__ src,
+    _Float16* __restrict__ dst,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = (_Float16)src[i];
+}
+
+// FP16 → FP32 dequantization (for output conversion if needed).
+extern "C" __global__ void grim_dequantize_fp16(
+    const _Float16* __restrict__ src,
+    float* __restrict__ dst,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = (float)src[i];
+}
+
 // ── On-device Fused Optimizer Step Kernels ───────────────────────────────────
 
 extern "C" __global__ void grim_fused_adamw_step(
@@ -161,6 +186,43 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     int si = rem / half;
     int i = rem - si * half;
     float pos = (float)positions[si];
+    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
+    float val = pos * freq;
+    float sin_val = sinf(val);
+    float cos_val = cosf(val);
+    int base_idx = (bi * s + si) * d;
+    int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+    int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
+    float x1 = x[a_idx];
+    float x2 = x[b_idx];
+    out[a_idx] = x1 * cos_val - x2 * sin_val;
+    out[b_idx] = x2 * cos_val + x1 * sin_val;
+}
+
+// Item 2: device-base RoPE for the decode path. Reads the base position ONCE
+// from device memory (`pos_base`, uploaded per generation) and derives each
+// step's position as `pos_base + si` internally — so the host never builds and
+// uploads a per-layer per-token `positions[]` Vec. Same fp32 rotation math as
+// `grim_rope`; only the position source changes. `steps` (s) is the number of
+// query positions in this call (1 for decode); each is rotated by base+si.
+extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int* pos_base,
+                                              float* out,
+                                              int b, int s, int d, int half, float base,
+                                              int interleaved, int num_heads) {
+    // One thread per (batch, step, dim-half-pair) element. `s` is the flattened
+    // query length = num_heads * steps. All heads within the same step share one
+    // position, so the step index is `si / num_heads` and the position is
+    // `base + step_idx` — exactly mirroring the host-position `grim_rope` with
+    // positions[] = [base+t repeated num_heads times per step].
+    int total = b * s * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int bi = idx / (s * half);
+    int rem = idx - bi * (s * half);
+    int si = rem / half;
+    int i = rem - si * half;
+    int step_idx = (num_heads > 0) ? (si / num_heads) : si;
+    float pos = (float)(*pos_base + (unsigned int)step_idx);
     float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
     float val = pos * freq;
     float sin_val = sinf(val);
@@ -880,6 +942,32 @@ mod tests {
         assert!(
             OTHER_KERNEL_SOURCE.contains("grim_all_reduce_accum_bf16"),
             "grim_all_reduce_accum_bf16 kernel missing from OTHER_KERNEL_SOURCE"
+        );
+    }
+
+    // ── SPEED-ROC: FP16 activation quantization tests ──────────────────────────
+
+    #[test]
+    fn source_contains_fp16_quantize_kernel() {
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_quantize_fp16"),
+            "FP16 quantization kernel must be JIT-discoverable"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_dequantize_fp16"),
+            "FP16 dequantization kernel must be JIT-discoverable"
+        );
+    }
+
+    #[test]
+    fn fp16_kernel_converts_types() {
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("(_Float16)src[i]"),
+            "quantize kernel must cast float to _Float16"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("(float)src[i]"),
+            "dequantize kernel must cast _Float16 to float"
         );
     }
 }

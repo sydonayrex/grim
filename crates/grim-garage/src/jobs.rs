@@ -1760,7 +1760,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         job.use_pissa,
         job.use_olora,
         job.olora_lambda,
-        job.use_spectral_qlora,
+        job.use_spectral_qlora || mode == TrainingMode::SoulEater,
     );
     let scope = if mode == TrainingMode::Bf16Full {
         AutogradScope::FullParameter
@@ -1788,6 +1788,15 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         None
     } else {
         Some(&pissa_base_weights)
+    };
+
+    let effective_optimizer = if mode == TrainingMode::SpectralQLoRA
+        || mode == TrainingMode::SoulEater
+        || job.use_spectral_qlora
+    {
+        grim_autograd::OptimizerKind::Muon
+    } else {
+        job.optimizer
     };
 
     // Real multi-rank path: each rank owns a model, registry, optimizer, and
@@ -1874,7 +1883,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 inj_reg.clone(),
                 scope,
                 pissa_base_weights,
-                job.optimizer,
+                effective_optimizer,
                 job.learning_rate as f32,
             ) {
                 Ok(replica) => replicas.push(replica),
@@ -2065,13 +2074,6 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 .await;
             return;
         }
-    };
-
-    // SPECTRAL-QLORA: override optimizer to Muon when the mode or flag is set.
-    let effective_optimizer = if mode == TrainingMode::SpectralQLoRA || job.use_spectral_qlora {
-        grim_autograd::OptimizerKind::Muon
-    } else {
-        job.optimizer
     };
 
     let mut optimizer =

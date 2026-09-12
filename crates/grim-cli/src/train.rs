@@ -803,7 +803,13 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         return Ok(());
     }
 
-    let mut optimizer = grim_autograd::Optimizer::new(opts.optimizer, opts.lr)
+    let effective_optimizer = if is_soul_eater || opts.use_spectral_qlora || mode_lower == "spectral-qlora" {
+        grim_autograd::OptimizerKind::Muon
+    } else {
+        opts.optimizer
+    };
+
+    let mut optimizer = grim_autograd::Optimizer::new(effective_optimizer, opts.lr)
         .map_err(|e| Error::Session(e.to_string()))?;
 
     // Read existing sidecar if resuming checkpoint

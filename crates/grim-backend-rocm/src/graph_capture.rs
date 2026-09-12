@@ -97,6 +97,11 @@ impl GraphCaptureManager {
 
     /// Bind the manager to a device with explicit capacity.
     pub(crate) fn for_device_with_capacity(_dev: &RocmDevice, max_entries: usize) -> Self {
+        Self::with_capacity(max_entries)
+    }
+
+    /// Create a manager with explicit cache capacity (no device binding).
+    pub fn with_capacity(max_entries: usize) -> Self {
         Self {
             capture_stream: Mutex::new(None),
             state: Mutex::new(GraphCacheState::default()),
@@ -222,6 +227,14 @@ impl GraphCaptureManager {
         state.lru.push(key);
         state.cache.insert(key, g.clone());
         Ok(g)
+    }
+
+    /// Check whether a graph is cached for `key` (without capturing).
+    pub fn has_graph(&self, key: DecodeGraphKey) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.cache.contains_key(&key))
+            .unwrap_or(false)
     }
 
     /// Replay the cached graph for `key`. Returns `Err` if no capture

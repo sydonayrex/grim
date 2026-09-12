@@ -8,7 +8,9 @@ use grim_tensor::Device;
 /// PPL sliding-window size in tokens.
 const PPL_WINDOW: usize = 2048;
 
-/// Resolve the eval device from `GRIM_BACKEND` / `GRIM_FORCE_DEVICE` (`rocm[:ord]`, `cuda[:ord]`); anything else stays CPU.
+/// Resolve the eval device: explicit `GRIM_BACKEND` / `GRIM_FORCE_DEVICE`
+/// (`rocm[:ord]`, `cuda[:ord]`) wins; otherwise auto-probe ROCm and fall back
+/// to CPU only when no GPU is present — same GPU-first precedence as `run`.
 /// Kept local to the lib crate - `run.rs`'s probe lives in the binary target.
 fn resolve_device() -> Device {
     let requested = std::env::var("GRIM_BACKEND")
@@ -25,6 +27,15 @@ fn resolve_device() -> Device {
         Device::Rocm(ord(0))
     } else if s.starts_with("cuda") {
         Device::Cuda(ord(0))
+    } else if s.is_empty() || s == "auto" {
+        // GPU-first auto-detect: probe ROCm, else CPU (match `run` precedence).
+        if let Ok(devices) = grim_backend_rocm::RocmDevice::probe() {
+            if let Some(first) = devices.first() {
+                eprintln!("[eval] auto-detected ROCm GPU {}", first.ordinal());
+                return Device::Rocm(first.ordinal());
+            }
+        }
+        Device::Cpu
     } else {
         Device::Cpu
     }
