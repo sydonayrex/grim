@@ -355,12 +355,76 @@ ISA targeting and enables the compiler to optimize register allocation.
 - Replace inline asm with `__builtin_amdgcn_fdot2_f16_f16(a, b, c)` intrinsic
 - Same hardware instruction, cleaner code, better compiler optimization
 
+### Sub-step 4.5f: Q2_K / Q3_K GEMV via sudot4 + bit-field extraction
+
+**Why:** Q2_K (2-bit) and Q3_K (3-bit) are linear quant formats (scale × code, like Q4_K)
+so the two-dot decomposition applies. The challenge is unpacking: 2-bit and 3-bit codes do
+not align to byte/nibble boundaries, requiring per-element bit-field extraction.
+
+**Q2_K unpacking via V_BFE_U32:**
+```c
+// Each byte holds 4 × 2-bit unsigned values (0..3)
+// V_BFE_U32 extracts each field in 1 instruction
+int q0 = V_BFE_U32(packed, 0, 2);  // bits [1:0]
+int q1 = V_BFE_U32(packed, 2, 2);  // bits [3:2]
+int q2 = V_BFE_U32(packed, 4, 2);  // bits [5:4]
+int q3 = V_BFE_U32(packed, 6, 2);  // bits [7:6]
+// Pack 4 extracted values into an i32 for sudot4
+int packed4 = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+```
+Unpack cost: ~1 instruction per element (V_BFE) + 0.25 sudot4 per element for the dot.
+Two-dot decomposition: `d·sc·Σ(a×q)` (Q2_K has no min offset — the scale encodes it).
+**Net: ~1.25 instructions per element** — worse than Q4_K (0.5/elem) but still usable.
+
+**Q3_K unpacking:**
+Q3_K packs 3-bit magnitude codes + a 1-bit sign plane. The 3-bit fields don't align to
+byte boundaries — V_BFE extracts each field in 1 instruction (same as Q2_K), plus a sign
+extraction from the hmask byte. Two-dot decomposition: `d·sc·(q × sign)`.
+**Net: ~1.5-2.25 instructions per element** — higher than Q4_K but still viable.
+
+**Assessment:** Q2_K/Q3_K GEMV via sudot4 is technically feasible. The unpack overhead is
+higher than Q4_K (which unpacks 2 elements per byte with just AND+SHIFT), but for decode
+M=1 it still achieves better lane utilization than WMMA (6.25%). Implementation should be
+prioritized AFTER Q4_K and Q5_K (which have simpler unpacking and higher model usage).
+
+### Sub-step 4.5g: IQ format compute strategy (NOT dot-GEMV)
+
+**Why NOT dot instructions:** IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS use **codebook lookup**
+(a 16-entry non-linear table) instead of linear `scale × code`. There is no ISA dot
+instruction that can perform a lookup-then-dot — the values are not linear in the code.
+
+**IQ4_NL/IQ4_XS codebook values** (kvalues_iq4nl): {-127, -104, -83, -65, -49, -35, -22,
+-10, 1, 13, 25, 38, 53, 69, 87, 107} — ALL fit in signed i8 (-128..127).
+
+**Optimal GPU compute strategy for IQ4:**
+1. **Register-LUT via V_PERM_B32**: the 16-entry i8 codebook fits in 4 × i32 registers
+   (16 bytes). V_PERM_B32 selects 4 bytes from 8 source bytes using a per-byte 4-bit
+   selector. For a 16-byte codebook: 2 V_PERM calls (lo/hi 8 bytes) + 1 V_CNDMASK_B32
+   (select by MSB of the 4-bit code) = **3 instructions per codebook lookup**.
+2. After lookup: multiply by activation and accumulate (V_FMA or V_PK_FMA for 2×
+   packed throughput)
+3. Scale by the per-super-block f16 scale
+
+**For IQ2/IQ3 formats** (smaller codebooks or 2-bit/3-bit indices):
+- IQ2_XXS/XS/S: 16-entry codebook, 2-bit index — only 4 entries are addressable per
+  code. Requires the super-block scales to be applied per sub-block.
+- IQ3_XXS/S: 32-entry codebook, 3-bit index — 32 entries × i8 = 32 bytes = 8 registers.
+  Requires 3 V_PERM calls + select for each lookup.
+- These formats have such low precision (2-3 bits) that the WMMA fused dequant GEMM
+  (which does the codebook lookup in LDS, amortized over a 16×16 tile) is likely the
+  best approach for both prefill AND decode.
+
+**Assessment:** IQ formats should continue using the WMMA fused dequant GEMM for decode.
+The optimization opportunity for IQ formats is in LDS lookup efficiency, not in
+dot-product instruction selection.
+
 ### Verification
 - Each GEMV: parity vs CPU dequant-reference (same tolerance as existing tests)
 - Q4_K GEMV: byte-exact vs `grim_quant::dequant_q4k` reference (same two-dot decomposition)
-- sudot8 upgrade: bit-identical to sudot4 path (same math, different instruction width)
+- Q2_K/Q3_K GEMV: parity vs CPU reference (same two-dot decomposition)
 - FP8 GEMV: parity vs host FP8 dequant reference
 - BF16 GEMV: parity vs host BF16 dequant reference
+- IQ formats: continue with WMMA fused dequant (already correct)
 - Perf: M=1 GEMV for each format must beat the WMMA GEMM fallback at the same shape
 
 ---
