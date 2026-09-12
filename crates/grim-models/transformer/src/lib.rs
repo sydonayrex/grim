@@ -110,6 +110,8 @@ pub mod mla_common;
 pub mod model;
 /// Shared MoE block (router + expert bank + optional shared expert).
 pub mod moe_block;
+/// Shared MoE dispatch (Phase 3a): Charon grouped-kernel + per-expert fallback.
+pub mod shared_moe;
 pub mod mpt;
 pub mod multimodal;
 pub mod muse_glimmer;
