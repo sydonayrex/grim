@@ -108,10 +108,19 @@ pub fn fused_qkv_project(
     num_kv_heads: usize,
     positions: &[u32],
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    let (q, k, v) = fused_qkv_dot4_decode(norm_x, fused)?;
+    let (q, k, v) = fused_qkv_project_raw(norm_x, fused)?;
     let q_rot = rope_2d_on_device(rope, &q, num_heads, positions)?;
     let k_rot = rope_2d_on_device(rope, &k, num_kv_heads, positions)?;
     Ok((q_rot, k_rot, v))
+}
+
+/// Fused Q8_0 QKV projection returning PRE-ROPE q, k, v. Use this when the model
+/// applies per-head Q/K RMS-norm between projection and RoPE (chameleon, commandr).
+pub fn fused_qkv_project_raw(
+    norm_x: &Tensor,
+    fused: &grim_backend_rocm::FusedQkvWeights,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    fused_qkv_dot4_decode(norm_x, fused)
 }
 
 /// Helper to build FusedQkvWeights if Q, K, V are all Q8_0 on ROCm.
