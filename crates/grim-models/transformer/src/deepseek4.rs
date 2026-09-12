@@ -645,113 +645,70 @@ impl DeepSeek4Moe {
     /// Device-resident MoE: token rows are extracted D2D, experts run on-device (Linear + `silu_mul_on_device`), and the weighted sum accumulates on-device.
     /// `Ok(None)` = backend lacks a needed kernel (`is_kernel_unimplemented`); caller uses the host path.
     fn forward_moe_device(&self, x: &Tensor, logits_v: &[f32]) -> Result<Option<Tensor>> {
-        let seq_len = x.shape().dims()[0];
-        let hidden_dim = x.shape().dims()[1];
-        let num_exp = self.experts.len();
+        let seq_len = x.shape().dims().first().copied().unwrap_or(0);
+        if seq_len == 0 {
+            return Ok(Some(x.clone()));
+        }
         let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
 
-        let Some(out_st) = or_host_fallback(dev.zeros(x.shape(), DType::F32))? else {
-            return Ok(None);
+        // Sqrt-Softplus gating (DeepSeek-V4): s(x) = sqrt(softplus(x)).
+        // Routings are normalized to sum to 1; routed_scaling_factor is applied
+        // by the shared dispatch.
+        let routings: Vec<crate::shared_moe::TokenRouting> = {
+            let num_exp = self.experts.len();
+            let mut out = Vec::with_capacity(seq_len);
+            for s in 0..seq_len {
+                let row = &logits_v[s * num_exp..(s + 1) * num_exp];
+                let mut indexed: Vec<(usize, f32)> = row
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(idx, l)| {
+                        let sp = if l > 20.0 { l } else { (1.0 + l.exp()).ln() };
+                        (idx, sp.sqrt())
+                    })
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let k = self.num_experts_per_tok.min(num_exp);
+                let topk = &indexed[..k];
+                let sum_w: f32 = topk.iter().map(|(_, w)| *w).sum();
+                let entry: Vec<(usize, f32)> = topk
+                    .iter()
+                    .map(|(idx, w)| (*idx, w / (sum_w + 1e-12)))
+                    .collect();
+                out.push(entry);
+            }
+            out
         };
 
-        for s in 0..seq_len {
-            let row = &logits_v[s * num_exp..(s + 1) * num_exp];
-            // Sqrt-Softplus gating: s(x) = sqrt(softplus(x)) = sqrt(ln(1 + exp(x)))
-            let mut indexed: Vec<(usize, f32)> = row
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(idx, l)| {
-                    let sp = if l > 20.0 { l } else { (1.0 + l.exp()).ln() };
-                    (idx, sp.sqrt())
-                })
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
+        let experts: Vec<crate::shared_moe::MoeExpert> = self
+            .experts
+            .iter()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.w1.clone(),
+                up: e.w3.clone(),
+                down: e.w2.clone(),
+            })
+            .collect();
+        let shared_expert = self.shared_experts.as_ref().map(|e| crate::shared_moe::MoeExpert {
+            gate: e.w1.clone(),
+            up: e.w3.clone(),
+            down: e.w2.clone(),
+        });
 
-            let sum_w: f32 = topk.iter().map(|(_, w)| *w).sum();
-            let weights: Vec<f32> = topk
-                .iter()
-                .map(|(_, w)| (w / (sum_w + 1e-12)) * self.routed_scaling_factor)
-                .collect();
-
-            // Token row stays on-device (D2D extraction).
-            let tok_shape = Shape::new(vec![1, hidden_dim]);
-            let Some(token_st) = or_host_fallback(dev.alloc_storage(&tok_shape, DType::F32))?
-            else {
-                return Ok(None);
-            };
-            if or_host_fallback(dev.copy_slice_range(
-                token_st.as_ref(),
-                0,
-                x.storage().as_ref(),
-                s * hidden_dim,
-                hidden_dim,
-            ))?
-            .is_none()
-            {
-                return Ok(None);
-            }
-            let token_x = Tensor::new(
-                Arc::from(token_st),
-                tok_shape,
-                DType::F32,
-                QuantProvenance::default(),
-                x.device().clone(),
-            );
-
-            let mut acc: Option<Tensor> = None;
-            for (i, (exp_idx, _)) in topk.iter().enumerate() {
-                let w = weights[i];
-                let exp_out = self.experts[*exp_idx].forward(&token_x)?;
-                let Some((scaled_st, _h)) = or_host_fallback(dev.mul_scalar(
-                    exp_out.storage().as_ref(),
-                    w,
-                    exp_out.shape(),
-                ))?
-                else {
-                    return Ok(None);
-                };
-                let scaled = Tensor::new(
-                    Arc::from(scaled_st),
-                    exp_out.shape().clone(),
-                    DType::F32,
-                    QuantProvenance::default(),
-                    exp_out.device().clone(),
-                );
-                acc = Some(match acc {
-                    Some(a) => grim_nn::modules::add_on_device(&a, &scaled)?,
-                    None => scaled,
-                });
-            }
-            if let Some(acc) = acc {
-                if or_host_fallback(dev.copy_slice_into(
-                    out_st.as_ref(),
-                    acc.storage().as_ref(),
-                    s * hidden_dim,
-                    hidden_dim,
-                ))?
-                .is_none()
-                {
-                    return Ok(None);
-                }
-            }
+        if dev.zeros(&Shape::new(vec![1]), DType::F32).is_err() {
+            return Ok(None);
         }
 
-        let mut out_t = Tensor::new(
-            Arc::from(out_st),
-            x.shape().clone(),
-            DType::F32,
-            QuantProvenance::default(),
-            x.device().clone(),
-        );
-
-        if let Some(ref shared) = self.shared_experts {
-            let sh_out = shared.forward(x)?;
-            out_t = grim_nn::modules::add_on_device(&out_t, &sh_out)?;
-        }
-
-        Ok(Some(out_t))
+        crate::shared_moe::fused_moe_dispatch(
+            dev.as_ref(),
+            x,
+            &experts,
+            shared_expert.as_ref(),
+            &routings,
+            self.routed_scaling_factor,
+        )
+        .map(Some)
     }
 
     /// Host routing reference path - the documented FALLBACK (CPU device, or GPU backends missing the copy/mul primitives).

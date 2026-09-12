@@ -522,7 +522,7 @@ impl DeepSeek2Moe {
         let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
 
         // Compute per-token top-k routing (indices + normalized combine weights).
-        let routings = route_topk(logits_v, self.experts.len(), self.num_experts_per_tok)?;
+        let routings = crate::shared_moe::route_topk(logits_v, self.experts.len(), self.num_experts_per_tok)?;
 
         // Map per-expert FFN weights into the shared MoE expert shape.
         let experts: Vec<crate::shared_moe::MoeExpert> = self
@@ -608,42 +608,7 @@ impl DeepSeek2Moe {
     }
 }
 
-/// Compute per-token top-k routing from flat gate logits. `logits_v` has layout
-/// `[seq_len, num_experts]`. Returns one `TokenRouting` (sorted by raw logit,
-/// descending) per token with softmax-normalized combine weights.
-fn route_topk(
-    logits_v: &[f32],
-    num_experts: usize,
-    top_k: usize,
-) -> Result<Vec<crate::shared_moe::TokenRouting>> {
-    let seq_len = if num_experts == 0 { 0 } else { logits_v.len() / num_experts };
-    let mut out = Vec::with_capacity(seq_len);
-    for s in 0..seq_len {
-        let row = &logits_v[s * num_experts..(s + 1) * num_experts];
-        let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let k = top_k.min(num_experts);
-        let topk = &indexed[..k];
-        let mut entry: Vec<(usize, f32)> = topk.iter().map(|(idx, _)| (*idx, 0.0)).collect();
-        let weights = normalize_weights(topk);
-        for (j, (idx, _)) in topk.iter().enumerate() {
-            entry[j] = (*idx, weights[j]);
-        }
-        out.push(entry);
-    }
-    Ok(out)
-}
-
-/// Softmax-normalize the top-k combine weights.
-fn normalize_weights(topk: &[(usize, f32)]) -> Vec<f32> {
-    if topk.is_empty() {
-        return Vec::new();
-    }
-    let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
-    let sum_e: f32 = exps.iter().sum();
-    exps.iter().map(|e| e / (sum_e + 1e-12)).collect()
-}
+// Block
 
 // Block
 
