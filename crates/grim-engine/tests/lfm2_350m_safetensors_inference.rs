@@ -89,6 +89,7 @@ fn lfm2_350m_safetensors_rocm_inference_and_prompt_answering() {
         top_k: 50,
         repeat_penalty: 1.5,
         thinking_level: grim_core::sampler::ThinkingLevel::Default,
+        min_tokens: 0,
     }
     .into_sampler(42);
     let mut generated_ids = Vec::new();
