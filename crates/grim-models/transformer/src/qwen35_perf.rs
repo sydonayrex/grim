@@ -215,6 +215,7 @@ impl Qwen35Block {
             rope_theta: cfg.rope_theta,
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
+            wqkv_q80_fused: None,
         })
     }
 }

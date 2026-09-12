@@ -181,6 +181,10 @@ pub struct Qwen35Block {
     pub rope_theta: f32,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    /// Fused Q8_0 QKV projection blob on ROCm (Phase 2b). Only built when all
+    /// three projections are present AND row-exact (no TP padding); issues
+    /// 1 dot4 GEMV instead of 3 on single-token decode.
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 }
 
 impl Qwen35Block {
@@ -335,6 +339,31 @@ impl Qwen35Block {
             tp,
         )?;
 
+        // Phase 2b: fused Q8_0 QKV blob — only when all three projections are
+        // present AND row-exact (some TP shards pad rows to a minimum width;
+        // the stock path cuts them via `exact()` but the fused GEMV cannot).
+        let wqkv_q80_fused = if is_full_attention {
+            let row_exact = |w: Option<&Linear>, want_rows: usize| {
+                w.map(|l| l.weight.shape().dims().first().copied().unwrap_or(0) == want_rows)
+                    .unwrap_or(false)
+            };
+            if row_exact(wq.as_ref(), q_dim)
+                && row_exact(wk.as_ref(), kv_dim)
+                && row_exact(wv.as_ref(), kv_dim)
+            {
+                crate::shared_attention::build_fused_qkv_q80(
+                    wq.as_ref().unwrap(),
+                    wk.as_ref().unwrap(),
+                    wv.as_ref().unwrap(),
+                )
+                .map(std::sync::Arc::new)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             device,
             attn_norm,
@@ -366,6 +395,7 @@ impl Qwen35Block {
             rope_theta: cfg.rope_theta,
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
+            wqkv_q80_fused,
         })
     }
 
@@ -435,39 +465,52 @@ impl Qwen35Block {
                 )
             };
 
-            let q_dev = match self.wq.as_ref() {
-                Some(wq) => exact(wq.forward(&x_normed)?, seq_len, q_dim)?,
-                None => Tensor::new(
-                    dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
-                        .into(),
-                    Shape::new(vec![seq_len, q_dim]),
-                    DType::F32,
-                    x_normed.provenance().clone(),
-                    x_normed.device().clone(),
-                ),
-            };
-            let k_dev_t = match self.wk.as_ref() {
-                Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
-                None => Tensor::new(
-                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
-                        .into(),
-                    Shape::new(vec![seq_len, kv_dim]),
-                    DType::F32,
-                    x_normed.provenance().clone(),
-                    x_normed.device().clone(),
-                ),
-            };
-            let v_dev_t = match self.wv.as_ref() {
-                Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
-                None => Tensor::new(
-                    dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
-                        .into(),
-                    Shape::new(vec![seq_len, kv_dim]),
-                    DType::F32,
-                    x_normed.provenance().clone(),
-                    x_normed.device().clone(),
-                ),
-            };
+            // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
+            // (pre-rope) instead of 3 separate GEMVs; the same rope_ext and
+            // arena-attention path follow unchanged.
+            let (q_dev, k_dev_t, v_dev_t) =
+                if seq_len == 1 && self.wqkv_q80_fused.is_some() {
+                    let (fq, fk, fv) = crate::shared_attention::fused_qkv_project_raw(
+                        &x_normed,
+                        self.wqkv_q80_fused.as_ref().unwrap(),
+                    )?;
+                    (fq, fk, fv)
+                } else {
+                    let q_dev = match self.wq.as_ref() {
+                        Some(wq) => exact(wq.forward(&x_normed)?, seq_len, q_dim)?,
+                        None => Tensor::new(
+                            dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                                .into(),
+                            Shape::new(vec![seq_len, q_dim]),
+                            DType::F32,
+                            x_normed.provenance().clone(),
+                            x_normed.device().clone(),
+                        ),
+                    };
+                    let k_dev_t = match self.wk.as_ref() {
+                        Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
+                        None => Tensor::new(
+                            dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
+                                .into(),
+                            Shape::new(vec![seq_len, kv_dim]),
+                            DType::F32,
+                            x_normed.provenance().clone(),
+                            x_normed.device().clone(),
+                        ),
+                    };
+                    let v_dev_t = match self.wv.as_ref() {
+                        Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
+                        None => Tensor::new(
+                            dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
+                                .into(),
+                            Shape::new(vec![seq_len, kv_dim]),
+                            DType::F32,
+                            x_normed.provenance().clone(),
+                            x_normed.device().clone(),
+                        ),
+                    };
+                    (q_dev, k_dev_t, v_dev_t)
+                };
 
             let q_rope = rope_ext(&q_dev, self.num_heads)?;
             let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
@@ -1055,6 +1098,7 @@ mod tests {
             rope_theta: cfg.rope_theta,
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
+            wqkv_q80_fused: None,
         };
 
         let x = cpu_tensor(
