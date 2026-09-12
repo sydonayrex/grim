@@ -3,8 +3,152 @@
 
 use grim_core::error::Result;
 use grim_nn::modules::pick_device_for_storage_device;
-use grim_tensor::{DType, Device, Shape, Tensor};
+use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
+
+/// Single-token decode dot4 GEMV over fused Q8_0 weights [n_q + 2*n_kv, hidden].
+/// Produces (q, k, v) device tensors.
+pub fn fused_qkv_dot4_decode(
+    norm_x: &Tensor,
+    fused: &grim_backend_rocm::FusedQkvWeights,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+        Device::Rocm(o) => *o,
+        _ => 0,
+    });
+    let hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
+    let m = 1usize;
+    let n_blocks = hidden / 32;
+    let q81_bytes = n_blocks * 36 * m;
+    let act_q81 = Tensor::new(
+        Arc::from(dev.zeros(
+            &Shape::new(vec![q81_bytes]),
+            DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+        )?),
+        Shape::new(vec![q81_bytes]),
+        DType {
+            arith: grim_tensor::ArithType::U8,
+            storage: grim_tensor::Storage::Native,
+        },
+        grim_tensor::QuantProvenance::GrimNative,
+        norm_x.device().clone(),
+    );
+    let x_rocm = norm_x
+        .storage()
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("norm_x is RocmStorage on fused path");
+    let act_rocm = act_q81
+        .storage()
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("act_q81 is RocmStorage");
+    dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
+
+    let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
+    let out_arc: Arc<dyn grim_tensor::BackendStorage> = Arc::from(out);
+    let q_bytes = fused.n_q * 4;
+    let k_bytes = fused.n_k * 4;
+    let v_bytes = fused.n_v * 4;
+    let q_view = grim_backend_rocm::RocmStorageView::from_offset(
+        out_arc.clone(),
+        0,
+        q_bytes,
+        Shape::new(vec![1, fused.n_q]),
+    )?;
+    let k_view = grim_backend_rocm::RocmStorageView::from_offset(
+        out_arc.clone(),
+        q_bytes,
+        k_bytes,
+        Shape::new(vec![1, fused.n_k]),
+    )?;
+    let v_view = grim_backend_rocm::RocmStorageView::from_offset(
+        out_arc,
+        q_bytes + k_bytes,
+        v_bytes,
+        Shape::new(vec![1, fused.n_v]),
+    )?;
+    let dev_obj = norm_x.device().clone();
+    let q = Tensor::new(
+        Arc::new(q_view),
+        Shape::new(vec![1, fused.n_q]),
+        DType::F32,
+        grim_tensor::QuantProvenance::GrimNative,
+        dev_obj.clone(),
+    );
+    let k = Tensor::new(
+        Arc::new(k_view),
+        Shape::new(vec![1, fused.n_k]),
+        DType::F32,
+        grim_tensor::QuantProvenance::GrimNative,
+        dev_obj.clone(),
+    );
+    let v = Tensor::new(
+        Arc::new(v_view),
+        Shape::new(vec![1, fused.n_v]),
+        DType::F32,
+        grim_tensor::QuantProvenance::GrimNative,
+        dev_obj,
+    );
+    Ok((q, k, v))
+}
+
+/// High-level helper taking normalized input + fused QKV blob + rope -> (q_rot, k_rot, v).
+/// Falls back or projects directly on device without host roundtrips.
+pub fn fused_qkv_project(
+    norm_x: &Tensor,
+    fused: &grim_backend_rocm::FusedQkvWeights,
+    rope: &grim_nn::Rope,
+    num_heads: usize,
+    num_kv_heads: usize,
+    positions: &[u32],
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (q, k, v) = fused_qkv_dot4_decode(norm_x, fused)?;
+    let q_rot = rope_2d_on_device(rope, &q, num_heads, positions)?;
+    let k_rot = rope_2d_on_device(rope, &k, num_kv_heads, positions)?;
+    Ok((q_rot, k_rot, v))
+}
+
+/// Helper to build FusedQkvWeights if Q, K, V are all Q8_0 on ROCm.
+pub fn build_fused_qkv_q80(
+    wq: &grim_nn::Linear,
+    wk: &grim_nn::Linear,
+    wv: &grim_nn::Linear,
+) -> Option<grim_backend_rocm::FusedQkvWeights> {
+    let device = wq.weight.device().clone();
+    if !matches!(&device, Device::Rocm(_)) || std::env::var("GRIM_FUSED_QKV").as_deref() == Ok("0") {
+        return None;
+    }
+    let is_q80 = |s: &grim_tensor::Tensor| {
+        matches!(
+            s.dtype().storage,
+            grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+        )
+    };
+    if is_q80(&wq.weight) && is_q80(&wk.weight) && is_q80(&wv.weight) {
+        let ordinal = match &device {
+            Device::Rocm(o) => *o,
+            _ => 0,
+        };
+        match grim_backend_rocm::RocmDevice::try_new(ordinal) {
+            Ok(rocm_dev) => rocm_dev
+                .build_fused_qkv_q80(
+                    wq.weight.storage().as_ref(),
+                    wk.weight.storage().as_ref(),
+                    wv.weight.storage().as_ref(),
+                )
+                .ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    }
+}
 
 /// Inputs are flat host buffers with the layouts the scalar loops already use: - `q`: `[steps, num_heads, head_dim]` (post-RoPE) - `k_history` / `v_history`: `[kv_len, num_kv_heads, head_dim]`, already extended with the current step's keys/values (so `kv_len >= steps` and `cache_offset = kv_len - steps`).
 /// Returns a `[steps, num_heads * head_dim]` tensor on `device`.

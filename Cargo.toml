@@ -30,6 +30,7 @@ members = [
     "crates/grim-autograd",
     "crates/grim-garage",
     "crates/grim-constrain",
+    "crates/grim-compress",
     "crates/grim-compressed-tensors",
     "crates/grim-backend-tests",
 ]
@@ -86,6 +87,7 @@ grim-kvtransport   = { path = "crates/grim-kvtransport" }
     grim-autograd      = { path = "crates/grim-autograd" }
 grim-garage        = { path = "crates/grim-garage" }
 grim-constrain     = { path = "crates/grim-constrain" }
+grim-compress      = { path = "crates/grim-compress" }
 grim-compressed-tensors = { path = "crates/grim-compressed-tensors" }
 
 # External (only commonly-needed / safe defaults; backends add their own)

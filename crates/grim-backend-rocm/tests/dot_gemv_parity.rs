@@ -401,3 +401,519 @@ fn rope_dev_base_parity() {
         assert!(diff < 1e-6, "rope_dev_base diverges at base={base}: {diff}");
     }
 }
+
+/// SPEED-DOT (Phase 4.5a): `dot4_q4k_q81_gemv` (sudot4 + nibble unpack + two-dot decomposition)
+/// matches the CPU reference within quantization tolerance.
+#[test]
+fn dot4_q4k_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let m = 1usize;
+    let n = 128usize;
+    let k = 256usize; // 1 Q4_K superblock per row
+
+    let mut seed = 0x1337u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q4k(&b_f32).expect("quant_q4k");
+
+    let q4k_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q4K),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![b_bytes.len()]),
+        q4k_dtype,
+    )
+    .expect("upload q4k weights");
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    // Call through quantized_matmul with M=1 on ROCm (which routes through dot4_q4k_q81_gemv)
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q4K,
+            &out_shape,
+        )
+        .expect("quantized_matmul dot4 q4k");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+    assert_eq!(c_dev.len(), m * n);
+
+    // Compute CPU reference: dequantize Q4_K weights then matmul
+    let mut c_cpu = vec![0.0f32; m * n];
+    let row_bytes = (k / 256) * 144;
+    for col in 0..n {
+        let brow = &b_bytes[col * row_bytes..(col + 1) * row_bytes];
+        let b_deq = grim_quant::dequant_q4k(brow, k).expect("dequant_q4k");
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a_f32[kk] * b_deq[kk];
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot4-q4k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(
+        diff < 0.5,
+        "dot4 Q4_K GEMV diverges from CPU reference: {diff}"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+
+/// SPEED-DOT: Q5_K dot4 GEMV execution and parity test at M=1 decode.
+#[test]
+fn dot4_q5k_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let m = 1usize;
+    let n = 256usize;
+    let k = 512usize;
+
+    let mut seed = 0x5555u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q5k(&b_f32).expect("quant_q5k");
+
+    let q5k_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q5K),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![b_bytes.len()]),
+        q5k_dtype,
+    )
+    .expect("upload q5k weights");
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q5K,
+            &out_shape,
+        )
+        .expect("quantized_matmul dot4 q5k");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+    assert_eq!(c_dev.len(), m * n);
+
+    // Compute CPU reference: dequantize Q5_K weights then matmul
+    let mut c_cpu = vec![0.0f32; m * n];
+    let row_bytes = (k / 256) * 176;
+    for col in 0..n {
+        let brow = &b_bytes[col * row_bytes..(col + 1) * row_bytes];
+        let b_deq = grim_quant::dequant_q5k(brow, k).expect("dequant_q5k");
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a_f32[kk] * b_deq[kk];
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot4-q5k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(
+        diff < 0.5,
+        "dot4 Q5_K GEMV diverges from CPU reference: {diff}"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+
+/// SPEED-DOT: Q6_K dot4 GEMV execution and parity test at M=1 decode.
+#[test]
+fn dot4_q6k_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let m = 1usize;
+    let n = 256usize;
+    let k = 512usize;
+
+    let mut seed = 0x6666u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q6k(&b_f32).expect("quant_q6k");
+
+    let q6k_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q6K),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![b_bytes.len()]),
+        q6k_dtype,
+    )
+    .expect("upload q6k weights");
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q6K,
+            &out_shape,
+        )
+        .expect("quantized_matmul dot4 q6k");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+    assert_eq!(c_dev.len(), m * n);
+
+    // Compute CPU reference: dequantize Q6_K weights then matmul
+    let mut c_cpu = vec![0.0f32; m * n];
+    let row_bytes = (k / 256) * 210;
+    for col in 0..n {
+        let brow = &b_bytes[col * row_bytes..(col + 1) * row_bytes];
+        let b_deq = grim_quant::dequant_q6k(brow, k).expect("dequant_q6k");
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a_f32[kk] * b_deq[kk];
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot4-q6k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(
+        diff < 0.5,
+        "dot4 Q6_K GEMV diverges from CPU reference: {diff}"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+
+/// SPEED-DOT-FUSED (Phase 4c): `launch_fused_gate_up_dot4` matches CPU reference.
+#[test]
+fn fused_gate_up_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let hidden = 1024usize;
+    let n_gate = 1024usize;
+    let n_up = 1024usize;
+
+    let mut seed = 0xCAFEu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let act: Vec<f32> = (0..hidden).map(|_| rand()).collect();
+    let w_gate_f32: Vec<f32> = (0..n_gate * hidden).map(|_| rand()).collect();
+    let w_up_f32: Vec<f32> = (0..n_up * hidden).map(|_| rand()).collect();
+
+    let q80 = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q80),
+    };
+    let q81_dev = {
+        let q81_bytes = host_quantize_q8_1(&act, 1, hidden);
+        MemoryOps::from_cpu_bytes(
+            &dev,
+            &q81_bytes,
+            &Shape::new(vec![q81_bytes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .expect("upload q81 act")
+    };
+    let wg_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &pack_q80(&w_gate_f32, n_gate, hidden),
+        &Shape::new(vec![n_gate, hidden]),
+        q80.clone(),
+    )
+    .expect("upload wg");
+    let wu_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &pack_q80(&w_up_f32, n_up, hidden),
+        &Shape::new(vec![n_up, hidden]),
+        q80.clone(),
+    )
+    .expect("upload wu");
+
+    let gate_cpu = reference_q80(&act, &pack_q80(&w_gate_f32, n_gate, hidden), 1, n_gate, hidden);
+    let up_cpu = reference_q80(&act, &pack_q80(&w_up_f32, n_up, hidden), 1, n_up, hidden);
+
+    let fused = dev
+        .build_fused_gate_up_q80(wg_dev.as_ref(), wu_dev.as_ref())
+        .expect("build fused gate up");
+    let q81_rocm = q81_dev
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("q81 is RocmStorage");
+    let fused_out = dev
+        .launch_fused_gate_up_dot4(q81_rocm, &fused.storage, fused.n_gate, fused.n_up, fused.hidden)
+        .expect("fused gate up gemv");
+    let fused_vec = fused_out.to_cpu_vec_f32().expect("fused d2h");
+    let n_total = fused.n_total();
+    assert_eq!(fused_vec.len(), n_total, "fused output length");
+
+    let gate_fused = &fused_vec[0..n_gate];
+    let up_fused = &fused_vec[n_gate..n_total];
+
+    let tol = 0.2;
+    let gate_diff = max_diff(&gate_cpu, gate_fused);
+    let up_diff = max_diff(&up_cpu, up_fused);
+    eprintln!(
+        "[fused-gate-up-parity] n_gate={n_gate} n_up={n_up} hidden={hidden} gate_diff={gate_diff:.4} up_diff={up_diff:.4}"
+    );
+    assert!(gate_diff < tol, "gate diverges from CPU reference: {gate_diff}");
+    assert!(up_diff < tol, "up diverges from CPU reference: {up_diff}");
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+
+
+/// SPEED-DOT-OPFUSE (Phase 4a): `rmsnorm_rope` matches unfused RMSNorm then RoPE.
+#[test]
+fn rmsnorm_rope_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+
+    let heads = 4usize;
+    let steps = 1usize;
+    let head_dim = 64usize;
+    let out_shape = Shape::new(vec![1, steps * heads, head_dim]);
+    let total_elems = heads * steps * head_dim;
+
+    let mut seed = 0x5EEDu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let x: Vec<f32> = (0..total_elems).map(|_| rand()).collect();
+    let w: Vec<f32> = (0..head_dim).map(|_| rand().abs() + 0.5).collect();
+    let eps = 1e-5f32;
+    let rope_cfg = grim_tensor::RopeConfig::new(head_dim, 10000.0);
+
+    let x_dev = CoreTensorOps::from_cpu(&dev, &x, &out_shape, DType::F32).unwrap();
+    let w_dev = CoreTensorOps::from_cpu(&dev, &w, &Shape::new(vec![head_dim]), DType::F32).unwrap();
+
+    let positions = vec![42u32; steps * heads];
+
+    // Reference: run on CPU / unfused math
+    let mut ref_out = vec![0.0f32; total_elems];
+    for h in 0..(heads * steps) {
+        let base = h * head_dim;
+        let mut ss = 0.0f32;
+        for i in 0..head_dim {
+            let v = x[base + i];
+            ss += v * v;
+        }
+        let inv_rms = 1.0f32 / (ss / head_dim as f32 + eps).sqrt();
+        let mut normed = vec![0.0f32; head_dim];
+        for i in 0..head_dim {
+            normed[i] = x[base + i] * inv_rms * w[i];
+        }
+        // apply RoPE
+        let half = head_dim / 2;
+        let pos = positions[h] as f32;
+        for i in 0..half {
+            let freq = 1.0f32 / 10000.0f32.powf((2.0 * i as f32) / head_dim as f32);
+            let val = pos * freq;
+            let sin_val = val.sin();
+            let cos_val = val.cos();
+            let a_idx = base + 2 * i;
+            let b_idx = base + 2 * i + 1;
+            let x1 = normed[2 * i];
+            let x2 = normed[2 * i + 1];
+            ref_out[a_idx] = x1 * cos_val - x2 * sin_val;
+            ref_out[b_idx] = x2 * cos_val + x1 * sin_val;
+        }
+    }
+
+    // Fused kernel on device
+    let (fused_st, handle) = dev
+        .rmsnorm_rope(
+            x_dev.as_ref(),
+            Some(w_dev.as_ref()),
+            &positions,
+            &rope_cfg,
+            &out_shape,
+            eps,
+        )
+        .expect("rmsnorm_rope launch");
+    handle.synchronize().expect("sync handle");
+    let dev_out = fused_st.to_cpu_vec_f32().expect("d2h");
+
+    let diff = max_diff(&ref_out, &dev_out);
+    eprintln!("[rmsnorm-rope-parity] max_diff={diff:.8}");
+    assert!(diff < 1e-5, "rmsnorm_rope diverges: {diff}");
+}
+
+/// SPEED-DOT-OPFUSE (Phase 4d): `grim_silu_mul_quant_q8_1` parity test.
+#[test]
+fn silu_mul_quant_q81_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+
+    let k = 256usize; // 8 blocks of 32
+    let mut seed = 0xDEADC0DEu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 6.0 - 3.0
+    };
+
+    let gate_host: Vec<f32> = (0..k).map(|_| rand()).collect();
+    let up_host: Vec<f32> = (0..k).map(|_| rand()).collect();
+
+    let shape = Shape::new(vec![1, k]);
+    let gate_dev = CoreTensorOps::from_cpu(&dev, &gate_host, &shape, DType::F32).expect("h2d gate");
+    let up_dev = CoreTensorOps::from_cpu(&dev, &up_host, &shape, DType::F32).expect("h2d up");
+
+    let n_blocks = k / 32;
+    let q81_bytes = n_blocks * 36;
+    let dst_storage = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![q81_bytes]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )
+    .expect("alloc q81 dst");
+
+    let g_rocm = gate_dev
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let u_rocm = up_dev
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let dst_rocm = dst_storage
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+
+    dev.launch_silu_mul_quant_q8_1(g_rocm, u_rocm, dst_rocm, k)
+        .expect("launch silu_mul_quant_q8_1");
+    dev.synchronize();
+
+    let gpu_bytes = dst_rocm.copy_to_host().expect("d2h");
+
+    // Reference CPU calculation
+    for blk in 0..n_blocks {
+        let base = blk * 32;
+        let mut act = [0.0f32; 32];
+        let mut amax = 0.0f32;
+        for j in 0..32 {
+            let g = gate_host[base + j];
+            let u = up_host[base + j];
+            let silu = g / (1.0f32 + (-g).exp());
+            let val = silu * u;
+            act[j] = val;
+            amax = amax.max(val.abs());
+        }
+
+        let d = amax / 127.0f32;
+        let inv_d = if amax > 1e-9f32 { 127.0f32 / amax } else { 0.0f32 };
+        let mut fsum = 0.0f32;
+        let mut ref_q = [0i8; 32];
+        for j in 0..32 {
+            let mut q = (act[j] * inv_d).round() as i32;
+            if q > 127 { q = 127; }
+            if q < -127 { q = -127; }
+            ref_q[j] = q as i8;
+            fsum += q as f32;
+        }
+
+        let blk_offset = blk * 36;
+        let d_raw = u16::from_le_bytes([gpu_bytes[blk_offset], gpu_bytes[blk_offset + 1]]);
+        let s_raw = u16::from_le_bytes([gpu_bytes[blk_offset + 2], gpu_bytes[blk_offset + 3]]);
+        let d_gpu = half::f16::from_bits(d_raw).to_f32();
+        let s_gpu = half::f16::from_bits(s_raw).to_f32();
+
+        let d_ref_f16 = half::f16::from_f32(d).to_f32();
+        let s_ref_f16 = half::f16::from_f32(fsum * d).to_f32();
+
+        assert!((d_gpu - d_ref_f16).abs() < 1e-4, "scale d mismatch at blk {blk}: gpu {d_gpu} vs ref {d_ref_f16}");
+        assert!((s_gpu - s_ref_f16).abs() < 1e-3, "sum s mismatch at blk {blk}: gpu {s_gpu} vs ref {s_ref_f16}");
+
+        for j in 0..32 {
+            let q_gpu = gpu_bytes[blk_offset + 4 + j] as i8;
+            let q_ref = ref_q[j];
+            assert!((q_gpu - q_ref).abs() <= 1, "quant mismatch at blk {blk} j {j}: gpu {q_gpu} vs ref {q_ref}");
+        }
+    }
+}

@@ -124,7 +124,7 @@ pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
 pub use crate::memory::view::RocmStorageView;
-pub use crate::device::device_compute::FusedQkvWeights;
+pub use crate::device::device_compute::{FusedGateUpWeights, FusedQkvWeights};
 
 pub use crate::device::helpers::{
     check_hip, hip_stream_synchronize, hip_stream_synchronize_after_copy, jit_compile_hsaco,

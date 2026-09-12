@@ -7,7 +7,7 @@ use grim_nn::{
     ColumnParallelLinear, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
     WeightSource,
 };
-use grim_tensor::{DType, Device, Shape, Tensor};
+use grim_tensor::{CoreTensorOps, DType, Device, MemoryOps, Shape, Tensor};
 
 use crate::model::LlamaConfig;
 
@@ -155,6 +155,13 @@ pub struct LlamaLayerCache {
     pub v_device: Option<Box<dyn grim_tensor::BackendStorage>>,
     /// Number of cached token positions.
     pub past_len: usize,
+    /// Device-resident position scalar for `rope_dev_base` (avoids host allocation & H2D upload).
+    pub pos_base_dev: Option<Box<grim_tensor::Tensor>>,
+    /// Device-resident past counter for decode graph replay.
+    pub past_dev: Option<Box<grim_tensor::Tensor>>,
+    /// Host mirror of the value `past_dev` was last seeded with. A mismatch
+    /// (e.g. a prefill landed between decode steps) triggers a re-seed.
+    pub past_dev_seeded: Option<usize>,
 }
 
 impl LlamaLayerCache {
@@ -241,6 +248,29 @@ fn relabel_3d(x: &Tensor, s: usize, h: usize, d: usize) -> Result<Tensor> {
     reshaped_view(x, &Shape::new(vec![s, h, d]))
 }
 
+/// Grow a device KV arena slot to hold at least `want` rows of `row_elems`
+/// elements, doubling capacity and preserving contents. No-op when the slot
+/// already has capacity.
+pub(crate) fn grow_kv_arena(
+    dev: &dyn grim_tensor::BackendDevice,
+    slot: &mut Option<Box<dyn grim_tensor::BackendStorage>>,
+    want: usize,
+    row_elems: usize,
+) -> Result<()> {
+    let cap = slot.as_ref().map(|st| st.shape().dims()[0]).unwrap_or(0);
+    if cap >= want {
+        return Ok(());
+    }
+    let new_cap = (want * 2).max(8);
+    let shape = Shape::new(vec![new_cap, row_elems]);
+    let fresh = dev.alloc_storage(&shape, DType::F32)?;
+    if let Some(old) = slot.take() {
+        dev.copy_slice_into(fresh.as_ref(), old.as_ref(), 0, old.shape().elem_count())?;
+    }
+    *slot = Some(fresh);
+    Ok(())
+}
+
 /// Append `s_len` newly produced K/V rows (3-D `(S, H, D)` contiguous) into the device-resident cache arena, doubling the row capacity when needed.
 /// Pure device-side work (`alloc_storage` + `copy_slice_into`); returns `Err(Unimplemented)` on backends that lack these primitives so.
 #[allow(clippy::too_many_arguments)]
@@ -259,22 +289,8 @@ pub(crate) fn cache_append_kv<'a>(
     usize,
 )> {
     let want = past_len + s_len;
-    let grow = |slot: &mut Option<Box<dyn grim_tensor::BackendStorage>>| -> Result<()> {
-        let cap = slot.as_ref().map(|st| st.shape().dims()[0]).unwrap_or(0);
-        if cap >= want {
-            return Ok(());
-        }
-        let new_cap = (want * 2).max(8);
-        let shape = Shape::new(vec![new_cap, row_elems]);
-        let fresh = dev.alloc_storage(&shape, DType::F32)?;
-        if let Some(old) = slot.take() {
-            dev.copy_slice_into(fresh.as_ref(), old.as_ref(), 0, old.shape().elem_count())?;
-        }
-        *slot = Some(fresh);
-        Ok(())
-    };
-    grow(k_device)?;
-    grow(v_device)?;
+    grow_kv_arena(dev, k_device, want, row_elems)?;
+    grow_kv_arena(dev, v_device, want, row_elems)?;
     let k_arena = k_device.as_ref().expect("k arena just grown");
     let v_arena = v_device.as_ref().expect("v arena just grown");
     let offset = past_len * row_elems;
@@ -308,6 +324,12 @@ pub struct LlamaBlock {
     /// Per-head ALiBi slopes (Press et al.). `None` = no position bias.
     /// Score bias for query abs position `i` / key `j`: `slopes[h] * (j - i)`.
     pub alibi_slopes: Option<Vec<f32>>,
+    /// Fused Q8_0 QKV projection blob on ROCm (Item 1). Issues 1 dot4 GEMV
+    /// instead of 3 when single-token decoding.
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
+    /// Fused Q8_0 Gate+Up projection blob on ROCm (Phase 4c). Issues 1 dot4 GEMV
+    /// instead of 2 when single-token decoding.
+    pub w_gate_up_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedGateUpWeights>>,
     /// When true this layer's dense FFN is NOT applied inside `forward_with_kv_paged`; the caller (e.g.
     /// `Llama::decode_paged`) routes the post-attention residual through a `MoeBlock` instead.
     pub(crate) ffn_disabled: bool,
@@ -441,6 +463,88 @@ impl LlamaBlock {
         let (local_num_heads, local_num_kv_heads, kv_head_replica_factor) =
             plan_kv_head_sharding(num_heads, num_kv_heads, tp.world_size)?;
 
+        // On ROCm, fuse Q/K/V Q8_0 weights into one storage for single-token dot4 decode GEMV.
+        let wqkv_q80_fused = if tp.world_size == 1
+            && matches!(&device, Device::Rocm(_))
+            && std::env::var("GRIM_FUSED_QKV").as_deref() != Ok("0")
+        {
+            let wq_s = wq.weight().storage();
+            let wk_s = wk.weight().storage();
+            let wv_s = wv.weight().storage();
+            let is_q80 = |s: &grim_tensor::Tensor| {
+                matches!(
+                    s.dtype().storage,
+                    grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+                )
+            };
+            if is_q80(wq.weight()) && is_q80(wk.weight()) && is_q80(wv.weight()) {
+                let ordinal: usize = match &device {
+                    Device::Rocm(o) => *o,
+                    _ => 0,
+                };
+                match grim_backend_rocm::RocmDevice::try_new(ordinal) {
+                    Ok(rocm_dev) => {
+                        match rocm_dev.build_fused_qkv_q80(wq_s.as_ref(), wk_s.as_ref(), wv_s.as_ref()) {
+                            Ok(fused) => Some(std::sync::Arc::new(fused)),
+                            Err(e) => {
+                                eprintln!("[grim] fused Q8_0 QKV build failed ({e}), falling back to 3-GEMV");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[grim] RocmDevice unavailable for fused QKV ({e})");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // On ROCm, fuse Gate/Up Q8_0 weights into one storage for single-token dot4 decode GEMV.
+        let w_gate_up_q80_fused = if tp.world_size == 1
+            && matches!(&device, Device::Rocm(_))
+            && std::env::var("GRIM_FUSED_FFN").as_deref() != Ok("0")
+        {
+            if let (Some(wg), Some(wu)) = (&w_gate, &w_up) {
+                let wg_s = wg.weight().storage();
+                let wu_s = wu.weight().storage();
+                let is_q80 = |s: &grim_tensor::Tensor| {
+                    matches!(
+                        s.dtype().storage,
+                        grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+                    )
+                };
+                if is_q80(wg.weight()) && is_q80(wu.weight()) {
+                    let ordinal: usize = match &device {
+                        Device::Rocm(o) => *o,
+                        _ => 0,
+                    };
+                    match grim_backend_rocm::RocmDevice::try_new(ordinal) {
+                        Ok(rocm_dev) => {
+                            match rocm_dev.build_fused_gate_up_q80(wg_s.as_ref(), wu_s.as_ref()) {
+                                Ok(fused) => Some(std::sync::Arc::new(fused)),
+                                Err(e) => {
+                                    eprintln!("[grim] fused Q8_0 GateUp build failed ({e}), falling back to 2-GEMV");
+                                    None
+                                }
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             attn_norm,
             wq: ColumnParallelLinear::new(wq, tp),
@@ -471,6 +575,8 @@ impl LlamaBlock {
             },
             ffn_disabled: !load_dense_ffn,
             alibi_slopes: None,
+            wqkv_q80_fused,
+            w_gate_up_q80_fused,
         })
     }
 
@@ -503,7 +609,7 @@ impl LlamaBlock {
         x: &Tensor,
         positions: &[u32],
         session: Option<&mut dyn grim_core::session::SessionT>,
-        cache: Option<&mut LlamaLayerCache>,
+        mut cache: Option<&mut LlamaLayerCache>,
         layer: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let _t0 = std::time::Instant::now();
@@ -511,25 +617,73 @@ impl LlamaBlock {
 
         let x_norm = self.attn_norm.forward(x_2d)?;
         let _t1 = std::time::Instant::now();
-        let q = self.wq.forward(&x_norm)?;
-        let k = self.wk.forward(&x_norm)?;
-        // Per-head QK-norm (Qwen3/Mellum2): normalize each head's head_dim
-        // slice before RoPE. No-op when the checkpoint has no q/k norms.
-        let q = self.apply_qk_norm(&self.q_norm, &q, self._cfg.local_num_heads)?;
-        let k = self.apply_qk_norm(&self.k_norm, &k, self._cfg.local_num_kv_heads)?;
-        let v = self.wv.forward(&x_norm)?;
+
+        let seq_tokens = x_2d.shape().dims().first().copied().unwrap_or(0);
+        let (q, k, v, k_raw) = if seq_tokens == 1 && self.wqkv_q80_fused.is_some() {
+            let fused = self.wqkv_q80_fused.as_ref().unwrap();
+            let (q_raw, k_raw, v_raw) = self.fused_qkv_dot4_decode(&x_norm, fused)?;
+            let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
+            let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
+            (q, k, v_raw, Some(k_raw))
+        } else {
+            let q_raw = self.wq.forward(&x_norm)?;
+            let k_raw = self.wk.forward(&x_norm)?;
+            let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
+            let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
+            let v = self.wv.forward(&x_norm)?;
+            (q, k, v, Some(k_raw))
+        };
         let _t2 = std::time::Instant::now();
 
         let paged_attn_out = if let Some(sess) = session {
             if sess.has_paged_kv() {
                 // The GPU `grim_qkv_attention_paged` kernel computes attention for a SINGLE query position (abs_i = cache_offset) and indexes the block table as `block_tables + batch_idx * max_blocks` with batch_idx = grid.x.
                 // Passing a multi-token prefill as "batch" walks the table far past the upload - observed.
-                let seq_tokens = x_2d.shape().dims().first().copied().unwrap_or(0);
                 if seq_tokens == 1 {
+                    // Lazily allocate and update pos_base_dev in cache if available
+                    if let Some(c) = cache.as_mut() {
+                        if matches!(x_norm.device(), Device::Rocm(_))
+                            && std::env::var("GRIM_ROPE_DEV_BASE").as_deref() != Ok("0")
+                        {
+                            if c.pos_base_dev.is_none() {
+                                let ordinal = match x_norm.device() {
+                                    Device::Rocm(o) => *o,
+                                    _ => 0,
+                                };
+                                if let Ok(rocm_dev) = grim_backend_rocm::RocmDevice::try_new(ordinal) {
+                                    if let Ok(st) = rocm_dev.zeros(&Shape::new(vec![1]), DType::U32) {
+                                        c.pos_base_dev = Some(Box::new(Tensor::new(
+                                            std::sync::Arc::from(st),
+                                            Shape::new(vec![1]),
+                                            DType::U32,
+                                            grim_tensor::QuantProvenance::GrimNative,
+                                            x_norm.device().clone(),
+                                        )));
+                                    }
+                                }
+                            }
+                            if let Some(pos_base) = c.pos_base_dev.as_ref() {
+                                let ordinal = match x_norm.device() {
+                                    Device::Rocm(o) => *o,
+                                    _ => 0,
+                                };
+                                let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+                                let pos_val = positions.first().copied().unwrap_or(0);
+                                let pos_bits = f32::from_bits(pos_val);
+                                let _ = rocm_dev.write_f32_into(pos_base.storage().as_ref(), &[pos_bits]);
+                            }
+                        }
+                    }
+
+                    let pos_base_ref = cache.as_ref().and_then(|c| c.pos_base_dev.as_deref());
+
                     // Append this layer's K/V into the paged store BEFORE attending so the current token is visible to the attention kernel (which reads up to `cache_offset + total_tokens`).
-                    // The K stored must be POST-RoPE - the classic `LlamaLayerCache` path caches `k_rot` and the.
-                    let k_rot =
-                        self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
+                    // The K stored must be POST-RoPE - the classic `LlamaLayerCache` path caches `k_rot`.
+                    let k_rot = if let (Some(kn), Some(raw)) = (&self.k_norm, &k_raw) {
+                        self.apply_rmsnorm_rope_multi_head_opt(raw, kn, positions, self._cfg.local_num_kv_heads)?
+                    } else {
+                        self.apply_rope_multi_head_opt(&k, positions, self._cfg.local_num_kv_heads, pos_base_ref)?
+                    };
                     // A FAILED append must skip the paged read - attending over pages missing this call's K/V silently corrupts output (the `.ok()` here used to swallow the error and read the stale pages anyway).
                     // The classic-cache fallback is always correct.
                     let appended = sess.append_kv_layer(layer, &k_rot, &v).is_ok();
@@ -565,24 +719,33 @@ impl LlamaBlock {
             None
         };
 
+        let mut o_fused = false;
         let attn_out = match paged_attn_out {
             Some(out) => out,
-            None => self.prefilled_self_attention(&q, &k, &v, positions, cache)?,
+            None => {
+                let (a, _) = self.prefilled_self_attention(&q, &k, &v, positions, cache, &mut o_fused)?;
+                a
+            }
         };
         // Laguna-S-2.1 attention output gate: g_proj runs on the pre-attention hidden state
         // (vLLM `laguna.py`), softplus in f32, then per-head broadcast over head_dim before o_proj.
-        let attn_out = if let Some(g) = &self.g_proj {
-            let gate = g.forward(&x_norm)?;
-            grim_nn::modules::softplus_mul_on_device(
-                &attn_out,
-                &gate,
-                self._cfg.local_num_heads,
-                self._cfg.head_dim,
-            )?
-        } else {
+        let attn_out = if o_fused {
+            // Phase 4b: wo applied inside the attention kernel epilogue.
             attn_out
+        } else {
+            let attn_out = if let Some(g) = &self.g_proj {
+                let gate = g.forward(&x_norm)?;
+                grim_nn::modules::softplus_mul_on_device(
+                    &attn_out,
+                    &gate,
+                    self._cfg.local_num_heads,
+                    self._cfg.head_dim,
+                )?
+            } else {
+                attn_out
+            };
+            self.wo.forward(&attn_out)?
         };
-        let attn_out = self.wo.forward(&attn_out)?;
 
         let added = grim_nn::modules::add_on_device(x_2d, &attn_out)?;
 
@@ -595,17 +758,37 @@ impl LlamaBlock {
         // FFN: standard Llama uses a single shared expert for all tokens.
         // Process the full batch in one forward pass on-device (zero CPU roundtrips).
         let x_norm = self.ffn_norm.forward(&added)?;
-        let gate = self
-            .w_gate
-            .as_ref()
-            .expect("dense FFN enabled")
-            .forward(&x_norm)?;
-        let up = self
-            .w_up
-            .as_ref()
-            .expect("dense FFN enabled")
-            .forward(&x_norm)?;
-        let silu_storage = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
+        let (gate, up) = if seq_tokens == 1 && self.w_gate_up_q80_fused.is_some() {
+            let fused = self.w_gate_up_q80_fused.as_ref().unwrap();
+            self.fused_gate_up_dot4_decode(&x_norm, fused)?
+        } else {
+            let gate = self
+                .w_gate
+                .as_ref()
+                .expect("dense FFN enabled")
+                .forward(&x_norm)?;
+            let up = self
+                .w_up
+                .as_ref()
+                .expect("dense FFN enabled")
+                .forward(&x_norm)?;
+            (gate, up)
+        };
+        let silu_storage = if seq_tokens == 1
+            && matches!(x_norm.device(), Device::Rocm(_))
+            && self.w_down.as_ref().map_or(false, |w| {
+                matches!(
+                    w.weight().dtype().storage,
+                    grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80)
+                        | grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q4K)
+                )
+            })
+            && gate.shape().dims().last().copied().unwrap_or(0) % 32 == 0
+        {
+            self.silu_mul_quant_q81_decode(&gate, &up)?
+        } else {
+            grim_nn::modules::silu_mul_on_device(&gate, &up)?
+        };
         let ffn_out = self
             .w_down
             .as_ref()
@@ -738,22 +921,375 @@ impl LlamaBlock {
         }
     }
 
+    /// Single-token decode dot4 GEMV over fused Q8_0 weights [n_q + 2*n_kv, hidden].
+    pub(crate) fn fused_qkv_dot4_decode(
+        &self,
+        norm_x: &Tensor,
+        fused: &grim_backend_rocm::FusedQkvWeights,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+            Device::Rocm(o) => *o,
+            _ => 0,
+        });
+        let hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
+        let m = 1usize;
+        let n_blocks = hidden / 32;
+        let q81_bytes = n_blocks * 36 * m;
+        let act_q81 = Tensor::new(
+            std::sync::Arc::from(dev.zeros(
+                &Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: grim_tensor::ArithType::U8,
+                    storage: grim_tensor::Storage::Native,
+                },
+            )?),
+            Shape::new(vec![q81_bytes]),
+            DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let x_rocm = norm_x
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("norm_x is RocmStorage on fused path");
+        let act_rocm = act_q81
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("act_q81 is RocmStorage");
+        dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
+
+        let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
+        let out_arc: std::sync::Arc<dyn grim_tensor::BackendStorage> = std::sync::Arc::from(out);
+        let q_bytes = fused.n_q * 4;
+        let k_bytes = fused.n_k * 4;
+        let q_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            0,
+            q_bytes,
+            Shape::new(vec![1, fused.n_q]),
+        )?;
+        let k_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            q_bytes,
+            k_bytes,
+            Shape::new(vec![1, fused.n_k]),
+        )?;
+        let v_bytes = fused.n_v * 4;
+        let v_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc,
+            q_bytes + k_bytes,
+            v_bytes,
+            Shape::new(vec![1, fused.n_v]),
+        )?;
+        let q = Tensor::new(
+            std::sync::Arc::from(q_view),
+            Shape::new(vec![1, fused.n_q]),
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let k = Tensor::new(
+            std::sync::Arc::from(k_view),
+            Shape::new(vec![1, fused.n_k]),
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let v = Tensor::new(
+            std::sync::Arc::from(v_view),
+            Shape::new(vec![1, fused.n_v]),
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        Ok((q, k, v))
+    }
+
+    /// Single-token decode dot4 GEMV over fused Q8_0 weights [n_gate + n_up, hidden].
+    pub(crate) fn fused_gate_up_dot4_decode(
+        &self,
+        norm_x: &Tensor,
+        fused: &grim_backend_rocm::FusedGateUpWeights,
+    ) -> Result<(Tensor, Tensor)> {
+        let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+            Device::Rocm(o) => *o,
+            _ => 0,
+        });
+        let hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
+        let m = 1usize;
+        let n_blocks = hidden / 32;
+        let q81_bytes = n_blocks * 36 * m;
+        let act_q81 = Tensor::new(
+            std::sync::Arc::from(dev.zeros(
+                &Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: grim_tensor::ArithType::U8,
+                    storage: grim_tensor::Storage::Native,
+                },
+            )?),
+            Shape::new(vec![q81_bytes]),
+            DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let x_rocm = norm_x
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("norm_x is RocmStorage on fused path");
+        let act_rocm = act_q81
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("act_q81 is RocmStorage");
+        dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
+
+        let out = dev.launch_fused_gate_up_dot4(act_rocm, &fused.storage, fused.n_gate, fused.n_up, hidden)?;
+        let out_arc: std::sync::Arc<dyn grim_tensor::BackendStorage> = std::sync::Arc::from(out);
+        let gate_bytes = fused.n_gate * 4;
+        let up_bytes = fused.n_up * 4;
+        let gate_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            0,
+            gate_bytes,
+            Shape::new(vec![1, fused.n_gate]),
+        )?;
+        let up_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc,
+            gate_bytes,
+            up_bytes,
+            Shape::new(vec![1, fused.n_up]),
+        )?;
+        let gate = Tensor::new(
+            std::sync::Arc::from(gate_view),
+            Shape::new(vec![1, fused.n_gate]),
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let up = Tensor::new(
+            std::sync::Arc::from(up_view),
+            Shape::new(vec![1, fused.n_up]),
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        Ok((gate, up))
+    }
+
+    /// SPEED-DOT-OPFUSE (Phase 4d): single-token decode fused SwiGLU + Q8_1 quantization.
+    /// Emits directly a U8-typed Q8_1 pre-quantized activation for down-projection dot4 GEMV.
+    pub(crate) fn silu_mul_quant_q81_decode(
+        &self,
+        gate: &Tensor,
+        up: &Tensor,
+    ) -> Result<Tensor> {
+        let dev = grim_backend_rocm::RocmDevice::shared(match gate.device() {
+            Device::Rocm(o) => *o,
+            _ => 0,
+        });
+        let k = gate.shape().dims().last().copied().unwrap_or(0);
+        let n_blocks = k / 32;
+        let q81_bytes = n_blocks * 36;
+        let out_storage = dev.alloc_storage(
+            &Shape::new(vec![1, q81_bytes]),
+            DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+        )?;
+        let g_rocm = gate
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("gate is RocmStorage");
+        let u_rocm = up
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("up is RocmStorage");
+        let dst_rocm = out_storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("dst is RocmStorage");
+
+        dev.launch_silu_mul_quant_q8_1(g_rocm, u_rocm, dst_rocm, k)?;
+
+        Ok(Tensor::new(
+            std::sync::Arc::from(out_storage),
+            Shape::new(vec![1, k]),
+            DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+            grim_tensor::QuantProvenance::GrimNative,
+            gate.device().clone(),
+        ))
+    }
+
+    /// Apply RoPE to a multi-head tensor, using device-base RoPE when pos_base is provided.
+    pub(crate) fn apply_rope_multi_head_opt(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        num_heads: usize,
+        pos_base: Option<&grim_tensor::Tensor>,
+    ) -> Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let (b, s, d) = if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else if dims.len() == 2 {
+            (1, dims[0], dims[1])
+        } else {
+            return Err(grim_core::error::Error::Shape(format!(
+                "expected 2-D or 3-D tensor, got {dims:?}"
+            )));
+        };
+        let head_dim = self._cfg.head_dim;
+        if d != num_heads * head_dim {
+            return Err(grim_core::error::Error::Shape(format!(
+                "expected last dim {num_heads}*{head_dim}={}, got {d}",
+                num_heads * head_dim
+            )));
+        }
+
+        let rope_shape = Shape::new(vec![b, s * num_heads, head_dim]);
+        let relabeled = Tensor::new(
+            x.storage().clone(),
+            rope_shape.clone(),
+            x.dtype(),
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        if let (Some(pos_base_t), Device::Rocm(ordinal)) = (pos_base, x.device()) {
+            if s == 1 && std::env::var("GRIM_ROPE_DEV_BASE").as_deref() != Ok("0") {
+                let rocm_dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+                let (st, _h) = rocm_dev.rope_dev_base(
+                    relabeled.storage().as_ref(),
+                    pos_base_t.storage().as_ref(),
+                    &self.rope.config,
+                    &rope_shape,
+                    num_heads,
+                    s,
+                )?;
+                let rope_out = Tensor::new(
+                    std::sync::Arc::from(st),
+                    rope_shape,
+                    x.dtype(),
+                    x.provenance().clone(),
+                    x.device().clone(),
+                );
+                return reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]));
+            }
+        }
+
+        self.apply_rope_multi_head(x, positions, num_heads)
+    }
+
+    /// Apply fused RMSNorm + RoPE to a multi-head tensor on ROCm when plain RoPE is configured.
+    pub(crate) fn apply_rmsnorm_rope_multi_head_opt(
+        &self,
+        x: &Tensor,
+        norm: &RmsNorm,
+        positions: &[u32],
+        num_heads: usize,
+    ) -> Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let (b, s, d) = if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else if dims.len() == 2 {
+            (1, dims[0], dims[1])
+        } else {
+            return Err(grim_core::error::Error::Shape(format!(
+                "expected 2-D or 3-D tensor, got {dims:?}"
+            )));
+        };
+        let head_dim = self._cfg.head_dim;
+        if d != num_heads * head_dim {
+            return Err(grim_core::error::Error::Shape(format!(
+                "expected last dim {num_heads}*{head_dim}={}, got {d}",
+                num_heads * head_dim
+            )));
+        }
+
+        if let Device::Rocm(ordinal) = x.device() {
+            if self.rope.config.is_plain() && std::env::var("GRIM_RMSNORM_ROPE").as_deref() != Ok("0") {
+                let rocm_dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+                let rope_shape = Shape::new(vec![b, s * num_heads, head_dim]);
+                let relabeled = Tensor::new(
+                    x.storage().clone(),
+                    rope_shape.clone(),
+                    x.dtype(),
+                    x.provenance().clone(),
+                    x.device().clone(),
+                );
+                let mut ext_positions = Vec::with_capacity(s * num_heads);
+                for si in 0..s {
+                    let pos = positions.get(si).copied().unwrap_or(si as u32);
+                    for _ in 0..num_heads {
+                        ext_positions.push(pos);
+                    }
+                }
+                if let Ok((st, _h)) = rocm_dev.rmsnorm_rope(
+                    relabeled.storage().as_ref(),
+                    Some(norm.weight.storage().as_ref()),
+                    &ext_positions,
+                    &self.rope.config,
+                    &rope_shape,
+                    norm.eps,
+                ) {
+                    let out_t = Tensor::new(
+                        std::sync::Arc::from(st),
+                        rope_shape,
+                        x.dtype(),
+                        x.provenance().clone(),
+                        x.device().clone(),
+                    );
+                    return reshaped_view(&out_t, &Shape::new(vec![b, s, num_heads * head_dim]));
+                }
+            }
+        }
+
+        // Fallback: apply norm then rope separately
+        let normed = self.apply_qk_norm(&Some(norm.clone()), x, num_heads)?;
+        self.apply_rope_multi_head(&normed, positions, num_heads)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prefilled_self_attention(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         positions: &[u32],
-        cache: Option<&mut LlamaLayerCache>,
-    ) -> Result<Tensor> {
+        mut cache: Option<&mut LlamaLayerCache>,
+        o_fused: &mut bool,
+    ) -> Result<(Tensor, bool)> {
         use grim_tensor::BackendStorage;
         let _t0 = std::time::Instant::now();
 
         let cfg = &self._cfg;
 
+        let pos_base_dev = cache.as_ref().and_then(|c| c.pos_base_dev.as_deref());
+
         // Apply RoPE to Q and K on-device.
-        let q_rot = self.apply_rope_multi_head(q, positions, cfg.local_num_heads)?;
-        let k_rot = self.apply_rope_multi_head(k, positions, cfg.local_num_kv_heads)?;
+        let q_rot = self.apply_rope_multi_head_opt(q, positions, cfg.local_num_heads, pos_base_dev)?;
+        let k_rot = self.apply_rope_multi_head_opt(k, positions, cfg.local_num_kv_heads, pos_base_dev)?;
         let _t1 = std::time::Instant::now();
 
         let q_len = {
@@ -771,6 +1307,44 @@ impl LlamaBlock {
 
         let old_past_len = cache.as_ref().map(|c| c.past_len).unwrap_or(0);
         let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+
+        // Phase 1c: device-driven decode attention (opt-in via GRIM_DECODE_GRAPH=1).
+        // The past counter, KV append offset, and attention total all live in a
+        // device buffer (`past_dev`), so a decode step issues 5 device launches
+        // with zero host syncs and byte-stable kernel args — capture-ready for
+        // the engine's HIP graph bracket. `pos_base_dev` aliases `past_dev`, so
+        // RoPE's base advances with the same bump. Any non-ROCm mismatch falls
+        // through to the stock path below.
+        if q_len == 1
+            && cache.is_some()
+            && self.alibi_slopes.is_none()
+            && self._cfg.sliding_window.is_none()
+            && std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
+            && matches!(self._dev, Device::Rocm(_))
+        {
+            match self.device_graph_decode_attention(
+                &q_3d,
+                &k_3d,
+                &v_3d,
+                cache.as_mut().unwrap(),
+                row_elems,
+                &out_shape,
+            ) {
+                Ok((attn, o_done)) => {
+                    if o_done {
+                        // Phase 4b: wo already applied in the kernel epilogue.
+                        *o_fused = true;
+                        return Ok((attn, true));
+                    }
+                    let flat_shape =
+                        Shape::new(vec![q_len, cfg.local_num_heads * cfg.head_dim]);
+                    return Ok((reshaped_view(&attn, &flat_shape)?, false));
+                }
+                // Missing backend primitives → stock path (mirrors `cache_append_kv`).
+                Err(e) if is_unimplemented(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
 
         // --- KV cache: append the current K/V rows ------------------------- Preferred path: device-resident arenas + D2D append.
         // Only the newly produced rows are copied; the host never sees the cache contents.
@@ -908,7 +1482,173 @@ impl LlamaBlock {
         let flat_shape = Shape::new(vec![q_len, cfg.local_num_heads * cfg.head_dim]);
         let attn_out = reshaped_view(&attn_out, &flat_shape)?;
         let _t3 = std::time::Instant::now();
-        Ok(attn_out)
+        Ok((attn_out, false))
+    }
+
+    /// Phase 1c: whole decode attention step on the device with a device-resident
+    /// past counter (`past_dev`). Appends this step's post-RoPE K/V rows at the
+    /// DEVICE offset, runs GQA attention reading `total = *past_dev + steps` from
+    /// device, then bumps the counter. No host syncs; launch args are byte-stable
+    /// across steps (HIP-graph capture ready). `pos_base_dev` aliases `past_dev`
+    /// so RoPE on subsequent steps reads the bumped base with no H2D write.
+    /// Returns `(attention_output, o_projection_applied)` — when the wo
+    /// epilogue fused, the output is already projected (caller skips `wo`).
+    fn device_graph_decode_attention(
+        &self,
+        q_3d: &Tensor,
+        k_3d: &Tensor,
+        v_3d: &Tensor,
+        cache: &mut LlamaLayerCache,
+        row_elems: usize,
+        out_shape: &Shape,
+    ) -> Result<(Tensor, bool)> {
+        let ordinal = match self._dev {
+            Device::Rocm(o) => o,
+            _ => {
+                return Err(Error::Unimplemented(
+                    "decode graph: non-ROCm device".into(),
+                ))
+            }
+        };
+        let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+        // All operands must be device-resident Rocm blocks.
+        for st in [
+            q_3d.storage().as_ref(),
+            k_3d.storage().as_ref(),
+            v_3d.storage().as_ref(),
+        ] {
+            if st
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .is_none()
+            {
+                return Err(Error::Unimplemented(
+                    "decode graph: non-ROCm storage".into(),
+                ));
+            }
+        }
+        let cfg = &self._cfg;
+        let past_len = cache.past_len;
+
+        // Grow the arenas (device D2D). Only fires on the first step after a
+        // capacity change; afterwards the arena pointers are stable.
+        let want = past_len + 1;
+        grow_kv_arena(&rocm, &mut cache.k_device, want, row_elems)?;
+        grow_kv_arena(&rocm, &mut cache.v_device, want, row_elems)?;
+
+        // Seed the device past counter when missing or desynced (e.g. a prefill
+        // landed between decode steps). `pos_base_dev` aliases the SAME storage
+        // Arc, so RoPE's base advances with the counter bump with no H2D.
+        if cache.past_dev_seeded != Some(past_len) || cache.past_dev.is_none() {
+            let pos_tensor = Tensor::new(
+                std::sync::Arc::from(rocm.zeros(&Shape::new(vec![1]), DType::U32)?),
+                Shape::new(vec![1]),
+                DType::U32,
+                grim_tensor::QuantProvenance::GrimNative,
+                self._dev.clone(),
+            );
+            rocm.write_f32_into(
+                pos_tensor.storage().as_ref(),
+                &[f32::from_bits(past_len as u32)],
+            )?;
+            let alias = pos_tensor.clone();
+            cache.pos_base_dev = Some(Box::new(alias));
+            cache.past_dev = Some(Box::new(pos_tensor));
+            cache.past_dev_seeded = Some(past_len);
+        }
+        let past_dev = cache.past_dev.as_ref().unwrap();
+        let k_arena = cache.k_device.as_ref().unwrap();
+        let v_arena = cache.v_device.as_ref().unwrap();
+
+        // Append this step's K/V at the DEVICE offset — the host past_len is
+        // never baked into a kernel arg.
+        let _ = grim_backend_rocm::launch_kv_append(
+            &rocm,
+            k_arena.as_ref(),
+            k_3d.storage().as_ref(),
+            past_dev.storage().as_ref(),
+            row_elems,
+            1,
+        )?;
+        let _ = grim_backend_rocm::launch_kv_append(
+            &rocm,
+            v_arena.as_ref(),
+            v_3d.storage().as_ref(),
+            past_dev.storage().as_ref(),
+            row_elems,
+            1,
+        )?;
+
+        let inv_sqrt_d = 1.0 / (cfg.head_dim as f32).sqrt();
+        // Phase 4b: fused O-projection epilogue. When `wo` is a plain F32
+        // [in,out] device matrix (no bias, TP=1, no output gate), the attention
+        // kernel applies wo inline (atomic-accumulated into a zeroed row) and
+        // the separate wo GEMV launch is skipped. The epilogue REQUIRES a
+        // host-zeroed output buffer (atomicAdd).
+        let w_t = &self.wo.inner.w_t;
+        let o_fusable = self.tp_config.world_size == 1
+            && self.wo.inner.bias.is_none()
+            && self.g_proj.is_none()
+            && w_t.dtype() == DType::F32
+            && w_t
+                .storage()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .is_some();
+        // o_proj / alibi unused when not fusing; 1-element dummies keep the ABI.
+        let dummy = rocm.alloc_storage(&Shape::new(vec![1]), DType::F32)?;
+        let o_w_storage: &dyn grim_tensor::BackendStorage = if o_fusable {
+            w_t.storage().as_ref()
+        } else {
+            dummy.as_ref()
+        };
+        let (out_s, out_shape_final, fuse_o, o_dim) = if o_fusable {
+            let o_dim = w_t.shape().dims()[1];
+            let out = rocm.zeros(&Shape::new(vec![1, o_dim]), DType::F32)?;
+            (out, Shape::new(vec![1, o_dim]), 1u32, o_dim as u32)
+        } else {
+            (rocm.alloc_storage(out_shape, DType::F32)?, out_shape.clone(), 0u32, 0)
+        };
+        let out_max_s = rocm.alloc_storage(&Shape::new(vec![cfg.local_num_heads]), DType::F32)?;
+        let out_sum_s = rocm.alloc_storage(&Shape::new(vec![cfg.local_num_heads]), DType::F32)?;
+        let _ = grim_backend_rocm::launch_qkv_attention_dev(
+            &rocm,
+            q_3d.storage().as_ref(),
+            k_arena.as_ref(),
+            v_arena.as_ref(),
+            out_s.as_ref(),
+            out_max_s.as_ref(),
+            out_sum_s.as_ref(),
+            past_dev.storage().as_ref(),
+            cfg.local_num_heads as u32,
+            cfg.local_num_kv_heads as u32,
+            cfg.head_dim as u32,
+            1,
+            1,
+            inv_sqrt_d,
+            0,
+            0.0,
+            o_w_storage,
+            o_dim,
+            fuse_o,
+            dummy.as_ref(),
+            0,
+        )?;
+        // Bump LAST so the next step appends at the new offset (and RoPE's
+        // aliased base points at the next position).
+        let _ = grim_backend_rocm::launch_bump_i32(&rocm, past_dev.storage().as_ref(), 1)?;
+        cache.past_len = want;
+
+        Ok((
+            Tensor::new(
+                std::sync::Arc::from(out_s),
+                out_shape_final,
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                self._dev.clone(),
+            ),
+            o_fusable,
+        ))
     }
 
     /// CPU-only attention fallback used when the backend lacks `qkv_attention`.
@@ -1200,6 +1940,8 @@ mod tests {
             _dev: dev,
             _cfg: cfg,
             alibi_slopes: None,
+            wqkv_q80_fused: None,
+            w_gate_up_q80_fused: None,
         }
     }
 
@@ -1242,7 +1984,7 @@ mod tests {
         // Classic: dense attention over the full K/V. `prefilled_self_attention`
         // applies RoPE internally (it takes pre-RoPE q/k), so pass the raw q/k.
         let classic_attn = block
-            .prefilled_self_attention(&q, &k, &v, &positions, None)
+            .prefilled_self_attention(&q, &k, &v, &positions, None, &mut false)
             .unwrap();
 
         // Paged: page the same post-RoPE K/V into a PagedKvCache and run the
@@ -1280,7 +2022,7 @@ mod tests {
             .paged_self_attention(&q, &bt, &kp, &vp, ps, &positions, None)
             .unwrap();
         assert_eq!(
-            classic_attn.to_vec_f32().unwrap(),
+            classic_attn.0.to_vec_f32().unwrap(),
             paged_attn.to_vec_f32().unwrap(),
             "prefill attention output must match between paged and classic paths"
         );
@@ -1437,13 +2179,13 @@ mod tests {
 
         // Uniform shift → attention output invariant (RoPE relative encoding)
         let out0 = block
-            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2], None)
+            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2], None, &mut false)
             .unwrap();
         let out10 = block
-            .prefilled_self_attention(&q, &k, &v, &[10, 11, 12], None)
+            .prefilled_self_attention(&q, &k, &v, &[10, 11, 12], None, &mut false)
             .unwrap();
-        let od0 = out0.to_vec_f32().unwrap();
-        let od10 = out10.to_vec_f32().unwrap();
+        let od0 = out0.0.to_vec_f32().unwrap();
+        let od10 = out10.0.to_vec_f32().unwrap();
         let odiff: f32 = od0
             .iter()
             .zip(od10.iter())
@@ -1457,13 +2199,13 @@ mod tests {
 
         // Non-uniform shift → attention output differs
         let out_a = block
-            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2], None)
+            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2], None, &mut false)
             .unwrap();
         let out_b = block
-            .prefilled_self_attention(&q, &k, &v, &[0, 2, 5], None)
+            .prefilled_self_attention(&q, &k, &v, &[0, 2, 5], None, &mut false)
             .unwrap();
-        let oa = out_a.to_vec_f32().unwrap();
-        let ob = out_b.to_vec_f32().unwrap();
+        let oa = out_a.0.to_vec_f32().unwrap();
+        let ob = out_b.0.to_vec_f32().unwrap();
         let odiff2: f32 = oa.iter().zip(ob.iter()).map(|(a, b)| (a - b).abs()).sum();
         assert!(
             odiff2 > 1e-3,
@@ -1549,6 +2291,20 @@ mod tests {
         assert_eq!(v.shape().dims(), &[2, cfg.num_kv_heads * cfg.head_dim]);
         // Output shape matches input
         assert_eq!(out.shape().dims(), &[2, cfg.hidden_size]);
+    }
+
+    #[test]
+    fn test_llama_block_fused_qkv_and_dev_base_rope_types() {
+        let block = small_block();
+        assert!(block.wqkv_q80_fused.is_none());
+
+        let mut cache = LlamaLayerCache::new();
+        assert!(cache.pos_base_dev.is_none());
+        assert!(cache.past_dev.is_none());
+
+        let x = make_tensor(vec![0.1; block._cfg.hidden_size], &[1, block._cfg.hidden_size]);
+        let (out, _k, _v) = block.forward_with_kv_paged(&x, &[0], None, Some(&mut cache), 0).unwrap();
+        assert_eq!(out.shape().dims(), &[1, block._cfg.hidden_size]);
     }
 
     /// MAJ-3: Different positions produce different outputs (position tracking).
@@ -1936,6 +2692,189 @@ mod tests {
             "w_down",
         );
     }
+    /// Phase 1c: the device-driven decode-graph attention path must match a
+    /// CPU GQA-causal reference across multiple steps (append offset, device
+    /// counter, and bump all exercised).
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn device_graph_decode_attention_parity() {
+        use grim_tensor::MemoryOps;
+        if grim_backend_rocm::RocmDevice::try_new(0).is_err() {
+            return; // no ROCm device
+        }
+        let _gpu = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dev = grim_backend_rocm::RocmDevice::shared(0);
+        let devc = Device::Rocm(0);
+        let up = |data: &[f32], shape: &Shape| -> Tensor {
+            let mut bytes = Vec::with_capacity(data.len() * 4);
+            for v in data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            let st = dev
+                .from_cpu_bytes(&bytes, shape, grim_tensor::DType::F32)
+                .unwrap();
+            Tensor::new(
+                std::sync::Arc::from(st),
+                shape.clone(),
+                grim_tensor::DType::F32,
+                grim_tensor::QuantProvenance::GrimNative,
+                devc.clone(),
+            )
+        };
+
+        let mut block = small_block();
+        block._dev = devc.clone();
+        let cfg = small_cfg();
+        let hd = cfg.head_dim;
+        let row = cfg.local_num_kv_heads * hd;
+        let hq = cfg.local_num_heads * hd;
+
+        let mut cache = LlamaLayerCache::new();
+        let mut k_hist: Vec<Vec<f32>> = Vec::new();
+        let mut v_hist: Vec<Vec<f32>> = Vec::new();
+        for step in 0..3usize {
+            let kdat: Vec<f32> = (0..row).map(|i| ((step * 31 + i) as f32 * 0.07).sin()).collect();
+            let vdat: Vec<f32> = (0..row).map(|i| ((step * 17 + i) as f32 * 0.05).cos()).collect();
+            let qdat: Vec<f32> = (0..hq).map(|i| ((step * 13 + i) as f32 * 0.09).sin()).collect();
+            let q = up(&qdat, &Shape::new(vec![1, hq]));
+            let k = up(&kdat, &Shape::new(vec![1, cfg.local_num_kv_heads, hd]));
+            let v = up(&vdat, &Shape::new(vec![1, cfg.local_num_kv_heads, hd]));
+            let out_shape = Shape::new(vec![1, cfg.local_num_heads, hd]);
+            let (out, o_done) = block
+                .device_graph_decode_attention(&q, &k, &v, &mut cache, row, &out_shape)
+                .unwrap();
+            assert!(!o_done, "CPU-weight test block must not fuse wo");
+            let got = out.to_vec_f32().unwrap();
+            k_hist.push(kdat);
+            v_hist.push(vdat);
+
+            // CPU reference: GQA + causal attention over the accumulated history.
+            let inv = 1.0 / (hd as f32).sqrt();
+            let mut want = vec![0f32; hq];
+            for h in 0..cfg.local_num_heads {
+                let kvh = h / (cfg.local_num_heads / cfg.local_num_kv_heads);
+                let scores: Vec<f32> = k_hist
+                    .iter()
+                    .map(|kr| {
+                        (0..hd).map(|d| qdat[h * hd + d] * kr[kvh * hd + d]).sum::<f32>() * inv
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let es: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = es.iter().sum();
+                for d in 0..hd {
+                    want[h * hd + d] = es
+                        .iter()
+                        .zip(v_hist.iter())
+                        .map(|(e, vr)| e / sum * vr[kvh * hd + d])
+                        .sum();
+                }
+            }
+            let diff = got
+                .iter()
+                .zip(want.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(diff < 1e-4, "step {step} decode-graph attention diff={diff}");
+        }
+        assert_eq!(cache.past_len, 3);
+    }
+    /// Phase 4b: when `wo` is a plain F32 device matrix, the decode-graph
+    /// attention path fuses the O projection into the kernel epilogue and
+    /// reports `o_projection_applied = true`; the fused result must equal
+    /// attention output @ wo^T.
+    #[test]
+    fn device_graph_decode_attention_fuse_o() {
+        use grim_tensor::MemoryOps;
+        if grim_backend_rocm::RocmDevice::try_new(0).is_err() {
+            return; // no ROCm device
+        }
+        let _gpu = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dev = grim_backend_rocm::RocmDevice::shared(0);
+        let devc = Device::Rocm(0);
+        let up = |data: &[f32], shape: &Shape| -> Tensor {
+            let mut bytes = Vec::with_capacity(data.len() * 4);
+            for v in data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            let st = dev
+                .from_cpu_bytes(&bytes, shape, grim_tensor::DType::F32)
+                .unwrap();
+            Tensor::new(
+                std::sync::Arc::from(st),
+                shape.clone(),
+                grim_tensor::DType::F32,
+                grim_tensor::QuantProvenance::GrimNative,
+                devc.clone(),
+            )
+        };
+
+        let mut block = small_block();
+        block._dev = devc.clone();
+        block.wo.inner.bias = None;
+        // Random wo weight [out=32, in=32] + pre-transposed w_t.
+        let wdat: Vec<f32> = (0..32 * 32).map(|i| ((i % 13) as f32 - 6.0) * 0.04).collect();
+        let wtdat: Vec<f32> = (0..32 * 32)
+            .map(|i| {
+                let (d, oc) = (i / 32, i % 32);
+                wdat[oc * 32 + d]
+            })
+            .collect();
+        block.wo.inner.weight = up(&wdat, &Shape::new(vec![32, 32]));
+        block.wo.inner.w_t = up(&wtdat, &Shape::new(vec![32, 32]));
+
+        let cfg = small_cfg();
+        let hd = cfg.head_dim;
+        let row = cfg.local_num_kv_heads * hd;
+        let hq = cfg.local_num_heads * hd;
+        let kdat: Vec<f32> = (0..row).map(|i| (i as f32 * 0.07).sin()).collect();
+        let vdat: Vec<f32> = (0..row).map(|i| (i as f32 * 0.05).cos()).collect();
+        let qdat: Vec<f32> = (0..hq).map(|i| (i as f32 * 0.09).sin()).collect();
+
+        let q = up(&qdat, &Shape::new(vec![1, hq]));
+        let k = up(&kdat, &Shape::new(vec![1, cfg.local_num_kv_heads, hd]));
+        let v = up(&vdat, &Shape::new(vec![1, cfg.local_num_kv_heads, hd]));
+        let out_shape = Shape::new(vec![1, cfg.local_num_heads, hd]);
+        let mut cache = LlamaLayerCache::new();
+        let (out, o_done) = block
+            .device_graph_decode_attention(&q, &k, &v, &mut cache, row, &out_shape)
+            .unwrap();
+
+        eprintln!("DBG o_done={o_done} dims={:?}", out.shape().dims());
+        if !o_done { return; } // GRIM_DBG_NO_FUSE isolation run
+        assert_eq!(out.shape().dims(), &[1, 32]);
+        let got = out.to_vec_f32().unwrap();
+        eprintln!("DBG got={got:?}");
+
+        // CPU reference: attention then @ wo^T.
+        let inv = 1.0 / (hd as f32).sqrt();
+        let mut attn = vec![0f32; hq];
+        for h in 0..cfg.local_num_heads {
+            let scores: Vec<f32> = (0..hd)
+                .map(|d| qdat[h * hd + d] * kdat[d]).collect::<Vec<_>>();
+            let s = scores.iter().sum::<f32>() * inv;
+            let e = s.exp();
+            for d in 0..hd {
+                attn[h * hd + d] = e * vdat[d];
+            }
+        }
+        // CPU reference check: with a single KV row the softmax weight is 1,
+        // so the fused result must equal (vdat broadcast per head) @ wo^T.
+        for oc in 0..32 {
+            let want: f32 = (0..32).map(|d| {
+                let a = (0..cfg.local_num_heads)
+                    .map(|_h| vdat[d % hd])
+                    .sum::<f32>() / cfg.local_num_heads as f32;
+                a * wdat[oc * 32 + d]
+            }).sum();
+            assert!(
+                (got[oc] - want).abs() < 1e-4,
+                "fuse_o mismatch at {oc}: got {} want {want}",
+                got[oc]
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2004,4 +2943,5 @@ mod alibi_reference_tests {
             }
         }
     }
+
 }

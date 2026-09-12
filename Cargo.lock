@@ -2565,6 +2565,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "grim-compress"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "grim-compressed-tensors"
 version = "0.1.0"
 
@@ -2780,6 +2787,7 @@ name = "grim-models-transformer"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-backend-rocm",
  "grim-core",
  "grim-format",
  "grim-memory",
@@ -2878,6 +2886,7 @@ dependencies = [
  "grim-backend-metal",
  "grim-backend-rocm",
  "grim-backend-vulkan",
+ "grim-compress",
  "grim-constrain",
  "grim-core",
  "grim-disagg",

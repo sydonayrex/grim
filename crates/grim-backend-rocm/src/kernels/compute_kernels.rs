@@ -236,6 +236,56 @@ extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int
     out[b_idx] = x2 * cos_val + x1 * sin_val;
 }
 
+// SPEED-DOT-OPFUSE (Phase 4a): fused RMSNorm + RoPE for Q/K paths.
+// Normalizes x with per-channel weights + eps, then applies RoPE rotation in the same kernel.
+// Avoids materializing the intermediate normalized tensor in HBM.
+extern "C" __global__ void grim_rmsnorm_rope(const float* __restrict__ x,
+                                             const float* __restrict__ norm_weight,
+                                             const unsigned int* __restrict__ positions,
+                                             float* __restrict__ out,
+                                             float eps,
+                                             int b, int s, int d, int half, float base,
+                                             int interleaved) {
+    int total = b * s * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int bi = idx / (s * half);
+    int rem = idx - bi * (s * half);
+    int si = rem / half;
+    int i = rem - si * half;
+
+    int base_idx = (bi * s + si) * d;
+
+    // First, compute RMSNorm scale across head_dim d for this vector
+    float ss = 0.0f;
+    for (int k = 0; k < d; ++k) {
+        float val = x[base_idx + k];
+        ss += val * val;
+    }
+    float inv_rms = 1.0f / sqrtf(ss / (float)d + eps);
+
+    float pos = (float)positions[si];
+    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
+    float val = pos * freq;
+    float sin_val = sinf(val);
+    float cos_val = cosf(val);
+
+    int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+    int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
+
+    int a_local = interleaved ? (2 * i) : i;
+    int b_local = interleaved ? (2 * i + 1) : (half + i);
+
+    float w1 = norm_weight ? norm_weight[a_local] : 1.0f;
+    float w2 = norm_weight ? norm_weight[b_local] : 1.0f;
+
+    float x1 = x[a_idx] * inv_rms * w1;
+    float x2 = x[b_idx] * inv_rms * w2;
+
+    out[a_idx] = x1 * cos_val - x2 * sin_val;
+    out[b_idx] = x2 * cos_val + x1 * sin_val;
+}
+
 // Fused Re-RoPE (Position Retargeting) kernel.
 // Un-rotates Key vectors from old_positions and re-rotates them to new_positions in a single pass via.
 extern "C" __global__ void grim_rerope(const float* k,
@@ -968,6 +1018,15 @@ mod tests {
         assert!(
             OTHER_KERNEL_SOURCE.contains("(float)src[i]"),
             "dequantize kernel must cast _Float16 to float"
+        );
+    }
+
+    /// SPEED-DOT-OPFUSE (Phase 4a): `grim_rmsnorm_rope` must be present in OTHER_KERNEL_SOURCE.
+    #[test]
+    fn test_rmsnorm_rope_kernel_presence() {
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_rmsnorm_rope"),
+            "grim_rmsnorm_rope kernel missing from OTHER_KERNEL_SOURCE"
         );
     }
 }

@@ -1278,6 +1278,87 @@ impl RocmDevice {
         ))
     }
 
+    /// SPEED-DOT-OPFUSE (Phase 4a): fused RMSNorm + RoPE for Q/K paths.
+    /// Normalizes x across head_dim d with optional norm_weight, then applies RoPE rotation
+    /// using positions.
+    pub fn rmsnorm_rope(
+        &self,
+        x_storage: &dyn BackendStorage,
+        norm_weight: Option<&dyn BackendStorage>,
+        positions: &[u32],
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+        eps: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dim = cfg.dim;
+        let base = cfg.base;
+        let x_s = as_rocm(x_storage)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend("rmsnorm_rope: x lacks valid device ptr".into()));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || out_dims[2] != dim {
+            return Err(Error::Shape(format!(
+                "rmsnorm_rope expects (B,S,D={}), got {:?}",
+                dim, out_dims
+            )));
+        }
+        let b = out_dims[0] as i32;
+        let s = out_dims[1] as i32;
+        let d = dim as i32;
+        let half = d / 2;
+        if positions.len() != s as usize {
+            return Err(Error::Shape(
+                "rmsnorm_rope: positions length must match seq_len".into(),
+            ));
+        }
+
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut w_ptr = match norm_weight {
+            Some(w) => dev_ptr(as_rocm(w)?)?,
+            None => 0u64,
+        };
+        let mut pos_ptr = upload_device_buffer(self.ordinal, positions)?;
+        let mut eps_f = eps;
+        let mut b_i = b;
+        let mut s_i = s;
+        let mut d_i = d;
+        let mut half_i = half;
+        let mut base_f = base;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
+
+        let total = (b * s * half) as usize;
+        let (grid, block) = linear_launch(total);
+
+        self.launch_compute_kernel(
+            "grim_rmsnorm_rope",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut w_ptr),
+                arg(&mut pos_ptr),
+                arg(&mut out_ptr),
+                arg(&mut eps_f),
+                arg(&mut b_i),
+                arg(&mut s_i),
+                arg(&mut d_i),
+                arg(&mut half_i),
+                arg(&mut base_f),
+                arg(&mut inter_i),
+            ],
+        )?;
+
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
     /// Launch LFM2-style fused QKV projection: MXFP4 GEMM (x @ W_qkv) followed by per-head QK-Norm + RoPE (YaRN-aware).
     /// The GEMM result is staged in a scratch buffer (or `out_all` if provided) and consumed.
     pub fn launch_fused_mxfp4_gemm_qk_norm_rope_kv(

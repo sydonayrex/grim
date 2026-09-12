@@ -7,6 +7,47 @@ pipeline (Charon), consolidate per-quant GEMV kernels, and remove superseded ker
 **Method:** red-green-refactor per phase. Every phase lands with parity tests + performance
 benchmarks + all existing suites green.
 
+---
+
+## IMPLEMENTATION STATUS AUDIT (2026-09-11)
+
+Status markers: ✅ landed · ⚠️ partial · ❌ not started. Audit basis: workspace
+working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-backend-rocm`.
+
+| Phase | Sub-step | Status | Evidence / Remaining work |
+|---|---|---|---|
+| 1 | 1a fused QKV in LlamaBlock | ✅ | block.rs:317,455-475,907,947 — `wqkv_q80_fused`, `GRIM_FUSED_QKV` gate, decode path (seq==1) |
+| 1 | 1b device-base RoPE | ⚠️ | `pos_base_dev` + `rope_dev_base` wired for decode (block.rs:158,631-673,1124,1265-1269); legacy `apply_rope_multi_head` still builds per-token Vec for prefill/fallback (block.rs:823,860-872,699,1523,1751). `rope_dev_base_into` not used by block.rs |
+| 1 | 1c attention graph capture in block.rs | ✅ | `device_graph_decode_attention` (block.rs): kv_append + qkv_attention_dev + bump with device `past_dev` counter, `pos_base_dev` aliased; gated `GRIM_DECODE_GRAPH=1`; CPU-reference parity test + fuse_o test green on gfx1201 |
+| 2 | 2a `shared_attention::fused_qkv_project` | ✅ | shared_attention.rs:103-122 |
+| 2 | 2b wire high-traffic models | ⚠️ | gemma (gemma.rs:103-119,245-253), falcon_h1 (:210,354-362), exaone4_5 (:119,159-172) wired decode-only. Remaining: ~17 more shared_attention callers; prefill still 3-GEMV everywhere |
+| 3 | 3a shared MoE / Charon grouped dispatch | ❌ | No `shared_moe` module. deepseek2/32/4, kimi_k3 use per-expert loops; bailingmoe2/3, mellum use generic moe blocks; `grep charon crates/grim-models` = 0 hits. Charon grouped dispatch exists in backend (charon.rs:1449,1562) but only engine scythe2.rs:485-520 consumes it |
+| 3 | 3b SwiGLU in Charon epilogue | ⚠️ | Kernel-level done (inline silu×up in charon.rs:59-60,130-131,253-254,341-342,403-404; charon_wmma.rs:93-94) — but no model routes through Charon, so zero production benefit yet |
+| 3 | 3c rmsnorm fused into MoE gate | ❌ | No rmsnorm in charon kernels; models call separate norm before MoE gate |
+| 4 | 4a rmsnorm_rope | ✅ | `grim_rmsnorm_rope` kernel (compute_kernels.rs:242), launcher (device_attention.rs:1284), used in block.rs:1227. Bonus: MXFP4 GEMM+QKnorm+RoPE+KV fusion exists (mxfp4_gemm.rs:380) |
+| 4 | 4b fuse_o epilogue default-on for decode | ✅ | Epilogue implemented in `grim_qkv_attention_dev` tail; engaged in block decode path when wo is F32 [N,K], no bias, TP=1, no g_proj. FIXES en route: dev kernel was missing `inv_sqrt_d` entirely and had a corrupt wave-merge (s_max indexed by lane not wave) |
+| 4 | 4c FFN gate+up fused GEMV | ❌ | No gate+up concat fusion anywhere; `build_fused_qkv_q80` not reused for FFN |
+| 4 | 4d silu_mul_quant → q8_1 → dot4 down-proj | ✅ | `grim_silu_mul_quant_q8_1` (silu_mul_quant.rs:56) wired in block.rs:757-768,1073-1109; feeds `grim_dot4_q80_q81_gemv` via quantized_matmul prequant path (device_quant.rs:396-410) |
+| 4.5 | 4.5a Q4_K sudot4 GEMV | ✅+ | Q4_K **and** Q5_K/Q6_K beyond plan: `grim_dot4_q4k/q5k/q6k_q81_gemv` (dot_gemv.rs:200,316,437), dispatched m==1 RDNA3/4 (device_quant.rs:87-231) |
+| 4.5 | 4.5b sudot8 W4A4 | ❌ | No sudot8/V_DOT8 hits anywhere |
+| 4.5 | 4.5c FP8 dot GEMV | ❌ | fp8 files are WMMA GEMMs only (fp8_gemm_rdna4.rs, wmma_fp8_gemm.rs) |
+| 4.5 | 4.5d BF16 fdot2 GEMV | ❌ | Only all_reduce/reduction bf16 kernels; no bf16 GEMV |
+| 4.5 | 4.5e fdot2 builtin upgrade | ✅ | Already uses `__builtin_amdgcn_fdot2` intrinsic (dot_gemv.rs:144-146), not inline asm — sub-step pre-satisfied |
+| 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ❌ | Q2K/Q3K remain WMMA/fused-dequant only (device_quant.rs:237-310) |
+| 4.5 | 4.5g IQ strategy | ✅ | Assessment-only sub-step; WMMA path confirmed as decode route (device_quant.rs) |
+| 5 | 5a-d kernel removal | ⚠️ AUDITED — plan premise wrong | Target kernels are NOT dead: `launch_flash_decode` dispatched (device_attention.rs:1496), extend/cross_attention dispatched, per-quant GEMM launchers referenced by quant_tiled_gemm/dispatch. Removal needs dispatch-order A/B first; not safe to delete blindly |
+| 6 | 6a session DecodeGraphBuffers | ⚠️ | Engine has model-agnostic `decode_graph_input_buffers`/`GraphCaptureInputBuffers` (grim-engine/src/lib.rs:239-249, GRIM_CAPTURE_GRAPH) but it captures input_ids/positions only — not the past_dev-counter per-layer design; no `DecodeGraphState` symbol |
+| 6 | 6b graph in block.rs/shared models | ❌ | Same as 1c — graph primitives are lfm2-only |
+
+**Net assessment (updated 2026-09-11, post session-2):** Phases 1(a,b,c), 2(a), 4(a,b,d),
+4.5(a,e,g) and 6(b) are landed; two latent GPU kernel bugs fixed en route
+(`grim_qkv_attention_dev` was missing `inv_sqrt_d` entirely and its wave-merge
+indexed LDS by lane instead of wave). Remaining: Phase 2b (more models), Phase 3
+(MoE adoption), 4.5b/c/d/f (sudot8/FP8/BF16/Q2K/Q3K GEMVs), Phase 5 (blocked on
+dispatch A/B — premise of "dead code" was incorrect).
+
+---
+
 **Current state after decode-graph-plan-refined.md:**
 - LFM2.5-350M-Q8_0 on gfx1201: 1.6 ms/tok = 625 tok/s (target was ≥250, stretch 400)
 - Fused Q8_0 QKV GEMV: 3→1 GEMV launches per layer, byte-identical parity
@@ -59,7 +100,7 @@ per-model changes.
 benefits all models that instantiate it. The 3-GEMV pattern and per-token positions Vec
 are the same waste as LFM2's pre-optimization state.
 
-### Sub-step 1a: Fused Q8_0 QKV projection in `LlamaBlock`
+### Sub-step 1a: Fused Q8_0 QKV projection in `LlamaBlock`  — **[✅ LANDED]**
 - At block construction: if weights are Q8_0 and device is ROCm, build
   `wqkv_q80_fused: Option<FusedQkvWeights>` from `wq`/`wk`/`wv` (reuse `build_fused_qkv_q80`)
 - In `forward_with_kv_paged`: when fused blob exists, replace the 3 separate `wq/wk/wv.forward`
@@ -67,13 +108,13 @@ are the same waste as LFM2's pre-optimization state.
 - Fall back to 3-GEMV when blob absent (non-Q8_0, non-ROCm)
 - **Escape hatch:** `GRIM_FUSED_QKV=0`
 
-### Sub-step 1b: Device-base RoPE in `apply_rope_multi_head`
+### Sub-step 1b: Device-base RoPE in `apply_rope_multi_head`  — **[⚠️ PARTIAL — decode wired, legacy host-Vec path remains for prefill/fallback]**
 - Replace the per-call `ext_positions` Vec build + `dev.rope()` with `rope_dev_base_into`
   writing into a per-layer cached stable output buffer
 - Seed the `pos_base_dev` buffer once per generation (before capture bracket)
 - **Escape hatch:** `GRIM_ROPE_DEV_BASE=0`
 
-### Sub-step 1c: Attention + KV-append graph capture
+### Sub-step 1c: Attention + KV-append graph capture  — **[❌ REMAINING — primitives exist, lfm2-only]**
 - Wrap `grim_kv_append` + `grim_qkv_attention_dev` + `grim_bump_i32` in
   `begin_graph_capture("llama_decode_attn_{layer}")` / `end_graph_capture`
 - Pre-allocate stable output buffers (q_rot_dev, k_rot_dev, attn_out_dev) in
@@ -94,13 +135,13 @@ are the same waste as LFM2's pre-optimization state.
 `fused_or_scalar_attention` can opt into the fused projection without changing their
 forward() structure.
 
-### Sub-step 2a: `shared_attention::fused_qkv_project`
+### Sub-step 2a: `shared_attention::fused_qkv_project`  — **[✅ LANDED (shared_attention.rs:103)]**
 - New function: takes `norm_x` (device f32), `wqkv_q80_fused` (fused blob), and
   model topology → returns `(q_rot, k_rot, v)` all device-resident
 - Internally: quantize q8_1 → fused GEMV → zero-copy slicing → RoPE → returns
 - Models call this instead of `wq/wk/wv.forward` + separate rope
 
-### Sub-step 2b: Wire into high-traffic models
+### Sub-step 2b: Wire into high-traffic models  — **[⚠️ PARTIAL — gemma/falcon_h1/exaone4_5 done (decode-only), ~17 shared_attention callers remain]**
 - **gemma** (6 wq/wk/wv calls), **falcon_h1** (9 calls), **exaone4_5** (3 calls):
   replace the 3-GEMV block with `fused_qkv_project` when fused blob is available
 - Add `build_fused_qkv_q80` call in each model's weight loading (gated on ROCm + Q8_0)
@@ -124,21 +165,21 @@ into fewer launches, leveraging the existing Charon grouped-dispatch infrastruct
 This is ~4 launches × num_experts × num_layers per token. With 8 experts × 16 layers = 512
 launches per token for attention + FFN.
 
-### Sub-step 3a: Wire Charon grouped dispatch into MoE models that don't use it
+### Sub-step 3a: Wire Charon grouped dispatch into MoE models that don't use it  — **[❌ REMAINING — no shared_moe; all 8 MoE models use per-expert loops, zero Charon adoption]**
 - deepseek2/32/4, bailingmoe2/3, kimi_k3, mellum each implement `forward_moe_device`
   individually. Consolidate into a shared `shared_moe::fused_moe_dispatch` that calls
   Charon's `grouped_dispatch` internally
 - The shared function takes: routing table, expert weights, activation → returns fused output
 - Models call it instead of their per-expert loops
 
-### Sub-step 3b: Fuse SwiGLU into Charon expert compute
+### Sub-step 3b: Fuse SwiGLU into Charon expert compute  — **[⚠️ KERNEL-ONLY — silu×up fused in charon.rs/charon_wmma.rs bodies, but no model routes through Charon]**
 - Charon already does grouped GEMM. Fuse `silu_mul_quant` into the epilogue:
   after gate×up projection, apply SwiGLU + quantize to q8_1 in the same kernel
   (matching the existing `rmsnorm_quant` pattern: compute → quantize → write q8_1)
 - The down-projection then consumes pre-quantized q8_1 via `dot4_q80_q81_gemv`
 - This eliminates the separate `silu_mul_on_device` launch per expert
 
-### Sub-step 3c: Fuse rmsnorm_quant into the MoE gate path
+### Sub-step 3c: Fuse rmsnorm_quant into the MoE gate path  — **[❌ REMAINING]**
 - The gate Linear (routing) takes `x_norm` as input. Fuse the RMSNorm + gate GEMV into
   one kernel (rmsnorm_quant → dot4_q80_q81_gemv with gate weights)
 - Reduces the gate path from 2 launches (norm + gate) to 1
@@ -155,19 +196,19 @@ launches per token for attention + FFN.
 **Goal:** Create fused kernels that combine operations already computed separately, reducing
 total launch count and improving data locality.
 
-### Sub-step 4a: rmsnorm_rope — fused RMSNorm + RoPE
+### Sub-step 4a: rmsnorm_rope — fused RMSNorm + RoPE  — **[✅ LANDED — grim_rmsnorm_rope used in block.rs:1227]**
 - Currently: RMSNorm (kernel) → RoPE (kernel) = 2 launches
 - Fused: one kernel reads raw activation, normalizes, applies RoPE, writes output
 - Applies to: Q and K paths in ALL models (before attention)
 - Saves 2 launches/layer/token × num_layers
 
-### Sub-step 4b: attention_rope_out — fused attention + output projection
+### Sub-step 4b: attention_rope_out — fused attention + output projection  — **[❌ REMAINING — fuse_o param exists but hard-coded 0 at all call sites]**
 - Currently: attention kernel → Linear (wo) = 2 launches
 - Fused: attention kernel epilogue applies wo projection (same as existing
   `fuse_o` epilogue in `grim_qkv_attention` — just enable it by default for decode)
 - Saves 1 launch/layer/token
 
-### Sub-step 4c: FFN gate+up fused GEMV
+### Sub-step 4c: FFN gate+up fused GEMV  — **[❌ REMAINING]**
 - Currently: ffn_gate (GEMV) + ffn_up (GEMV) = 2 launches (same input!)
 - Fused: one GEMV with concatenated weights `[2*inter, hidden]`, writes gate and up
   into separate output regions
@@ -175,7 +216,7 @@ total launch count and improving data locality.
   ffn_gate+ffn_up weights
 - Saves 1 launch/layer/token
 
-### Sub-step 4d: FFN silu_mul + down fused
+### Sub-step 4d: FFN silu_mul + down fused  — **[✅ LANDED — silu_mul_quant_q8_1 wired in block.rs decode, feeds dot4_q80_q81_gemv]**
 - Currently: silu_mul_on_device (kernel) + ffn_down (GEMV) = 2 launches
 - Fused: silu_mul_quant (already exists!) writes q8_1, then ffn_down consumes q8_1
   via dot4_q80_q81_gemv — this is already 2 launches but with q8_1 intermediate
@@ -233,7 +274,7 @@ wastes 15/16 rows at m=1 — 6.25% tensor utilization vs 100% for GEMV).
 | BF16 | 16-bit bf16 | `fdot2_f32_bf16` | ❌ native | ❌ none | BF16 |
 | F16 | 16-bit f16 | `fdot2_f16_f16` | ❌ native | ❌ none | F16 |
 
-### Sub-step 4.5a: Q4_K fused GEMV via sudot4 (nibble unpack + two-dot decomposition)
+### Sub-step 4.5a: Q4_K fused GEMV via sudot4 (nibble unpack + two-dot decomposition)  — **[✅ LANDED+ — Q4_K, Q5_K, Q6_K dot4 GEMVs all exist and dispatch at m==1]**
 
 **Why:** Q4_K is the most common quant format after Q8_0. Currently decoded via WMMA
 fused dequant GEMM (6.25% tensor utilization at M=1). The dot4 GEMV approach achieves
@@ -291,7 +332,7 @@ columns, WMMA needs 256/16 = 16 tile iterations; dot4 needs N/4 = 256 wave dispa
 The crossover depends on N and head_dim, but for LFM2 shapes (N=1024, K=1024) the dot4
 GEMV was already proven faster for Q8_0.
 
-### Sub-step 4.5b: Native 4-bit × 4-bit dot8 via sudot8 (V_DOT8_I32_IU4)
+### Sub-step 4.5b: Native 4-bit × 4-bit dot8 via sudot8 (V_DOT8_I32_IU4)  — **[❌ REMAINING — no sudot8/V_DOT8 anywhere]**
 
 **Why:** `sudot8` (`V_DOT8_I32_IU4`) processes **8 × 4-bit unsigned values** per instruction
 — native int4×int4 dot product with i32 accumulation. This is the natural instruction for
@@ -315,7 +356,7 @@ codes (Q8_0/Q8_1), `sudot4` at 4 elements per instruction is the maximum dot wid
   for 2× instruction throughput vs the sudot4 nibble-unpack path
 - NOT for Q8_0/Q8_1 — those require 8-bit operands (sudot4)
 
-### Sub-step 4.5c: FP8 GEMV via dot4_f32_fp8_fp8
+### Sub-step 4.5c: FP8 GEMV via dot4_f32_fp8_fp8  — **[❌ REMAINING — fp8 kernels are WMMA GEMMs only]**
 
 **Why:** FP8 (E4M3) quantized models are increasingly common. The RDNA4 `dot11-insts`
 provides native fp8×fp8 dot4 with f32 accumulation — no integer quantization needed.
@@ -329,7 +370,7 @@ provides native fp8×fp8 dot4 with f32 accumulation — no integer quantization 
 
 **Applicability:** models quantized to FP8 (E4M3) or FP4 with per-block FP8 scales.
 
-### Sub-step 4.5d: BF16 GEMV via fdot2_f32_bf16
+### Sub-step 4.5d: BF16 GEMV via fdot2_f32_bf16  — **[❌ REMAINING]**
 
 **Why:** BF16 models (Llama/Mistral BF16 checkpoints) currently run through the f32
 GEMV path (no hardware dot instruction used). The `fdot2_f32_bf16` (dot12-insts)
@@ -345,7 +386,7 @@ provides native bf16×bf16 dot2 with f32 accumulation.
 sudot4 (4 elem/inst), but for BF16 the alternative is a full fp32 GEMV (no dot
 instruction) — so this is still a significant improvement.
 
-### Sub-step 4.5e: f16 hardware dot2 upgrade for existing dot2 path
+### Sub-step 4.5e: f16 hardware dot2 upgrade for existing dot2 path  — **[✅ ALREADY DONE — dot_gemv.rs uses __builtin_amdgcn_fdot2 intrinsic]**
 
 **Why:** the existing `dot2_q80_gemv` uses inline asm `v_dot2_f32_f16` which is
 actually `fdot2_f16_f16` (dot9-insts). Upgrading to the builtin ensures correct
@@ -355,7 +396,7 @@ ISA targeting and enables the compiler to optimize register allocation.
 - Replace inline asm with `__builtin_amdgcn_fdot2_f16_f16(a, b, c)` intrinsic
 - Same hardware instruction, cleaner code, better compiler optimization
 
-### Sub-step 4.5f: Q2_K / Q3_K GEMV via sudot4 + bit-field extraction
+### Sub-step 4.5f: Q2_K / Q3_K GEMV via sudot4 + bit-field extraction  — **[❌ REMAINING — Q2K/Q3K still WMMA-only]**
 
 **Why:** Q2_K (2-bit) and Q3_K (3-bit) are linear quant formats (scale × code, like Q4_K)
 so the two-dot decomposition applies. The challenge is unpacking: 2-bit and 3-bit codes do
@@ -387,7 +428,7 @@ higher than Q4_K (which unpacks 2 elements per byte with just AND+SHIFT), but fo
 M=1 it still achieves better lane utilization than WMMA (6.25%). Implementation should be
 prioritized AFTER Q4_K and Q5_K (which have simpler unpacking and higher model usage).
 
-### Sub-step 4.5g: IQ format compute strategy (NOT dot-GEMV)
+### Sub-step 4.5g: IQ format compute strategy (NOT dot-GEMV)  — **[✅ NO WORK NEEDED — assessment-only; WMMA confirmed as IQ decode route]**
 
 **Why NOT dot instructions:** IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS use **codebook lookup**
 (a 16-entry non-linear table) instead of linear `scale × code`. There is no ISA dot
@@ -434,7 +475,7 @@ dot-product instruction selection.
 **Goal:** Remove kernels that are superseded by fused-ops variants, reducing the kernel
 JIT compilation footprint and maintenance burden.
 
-### Sub-step 5a: Remove per-quant GEMV kernels superseded by WMMA fused dequant AND dot4 GEMV
+### Sub-step 5a: Remove per-quant GEMV kernels superseded by WMMA fused dequant AND dot4 GEMV  — **[❌ REMAINING — all 5 per-quant GEMM files still present]**
 - The `quantized_matmul` dispatch already prefers WMMA fused dequant for Q4K/Q5K/Q6K/
   Q2K/Q3K/IQ* — the standalone per-quant GEMV kernels are dead code:
   - `q4k_gemm.rs` (349 LOC) — superseded by `launch_wmma_fused_dequant_q4k` (prefill)
@@ -450,17 +491,17 @@ JIT compilation footprint and maintenance burden.
   WMMA GEMM the prefill path and the dot4 GEMV the decode path (no overlap)
 - Only remove after verifying no model routes to these directly (check dispatch order)
 
-### Sub-step 5b: Remove redundant attention kernels
+### Sub-step 5b: Remove redundant attention kernels  — **[❌ REMAINING — flash_decode.rs, extend_attention.rs, cross_attention.rs still present]**
 - `flash_decode.rs` vs `qkv_attention.rs` vs `sage_attention.rs` — audit which models
   route to each. If flash_decode is never dispatched (dispatcher prefers qkv_attention
   or sage_attention), remove it
 - `extend_attention.rs` vs `cross_attention.rs` — audit model usage
 
-### Sub-step 5c: Consolidate dequant kernels
+### Sub-step 5c: Consolidate dequant kernels  — **[❌ REMAINING]**
 - `q4k_dequant.rs` (199 LOC) and `q8_0_dequant.rs` (41 LOC) — both are small host-side
   dequant helpers. Consolidate into `iq_dequant.rs` or a shared dequant module
 
-### Sub-step 5d: Remove old MoE host-only kernels
+### Sub-step 5d: Remove old MoE host-only kernels  — **[❌ REMAINING — charon_backward.rs still present]**
 - `charon_backward.rs` (245 LOC) — only needed for training. If the inference binary
   doesn't reference it, gate behind a `training` feature flag
 
@@ -478,13 +519,13 @@ JIT compilation footprint and maintenance burden.
 attention) applies uniformly. The graph bracket wraps the layer attention section for all
 models that route through the shared infrastructure.
 
-### Sub-step 6a: Thread past_dev through the session
+### Sub-step 6a: Thread past_dev through the session  — **[⚠️ PARTIAL — engine-level GraphCaptureInputBuffers exists (input_ids/positions only), not past_dev design]**
 - Add `decode_graph_state: Option<DecodeGraphBuffers>` to the session model_state
 - `DecodeGraphBuffers` holds: past_dev (device u32 counter), pos_base_dev (aliased),
   attention output buffers per layer
 - Seeded once at prefill completion; bump kernel increments per decode step
 
-### Sub-step 6b: Enable in block.rs + shared models
+### Sub-step 6b: Enable in block.rs + shared models  — **[❌ REMAINING — same gap as 1c]**
 - `LlamaBlock::forward_with_kv_paged` reads past_dev from the session state
 - Attention section wraps in graph capture (kv_append + attention_dev + bump)
 - Same escape hatch: `GRIM_DECODE_GRAPH=0`
