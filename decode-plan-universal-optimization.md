@@ -21,7 +21,7 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 1 | 1c attention graph capture in block.rs | ✅ | `device_graph_decode_attention` (block.rs): kv_append + qkv_attention_dev + bump with device `past_dev` counter, `pos_base_dev` aliased; gated `GRIM_DECODE_GRAPH=1`; CPU-reference parity test + fuse_o test green on gfx1201 |
 | 2 | 2a `shared_attention::fused_qkv_project` | ✅ | shared_attention.rs:103-122 |
 | 2 | 2b wire high-traffic models | ⚠️ | 9 models wired (decode-only, seq==1, GRIM_FUSED_QKV gated): gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon (qk_norm via fused_qkv_project_raw), commandr, gptj (custom rope), qwen38_flash_next. Remaining: qwen35 (Option projections + hybrid SSM attention) |
-| 3 | 3a shared MoE / Charon grouped dispatch | ❌ | No `shared_moe` module. deepseek2/32/4, kimi_k3 use per-expert loops; bailingmoe2/3, mellum use generic moe blocks; `grep charon crates/grim-models` = 0 hits. Charon grouped dispatch exists in backend (charon.rs:1449,1562) but only engine scythe2.rs:485-520 consumes it |
+| 3 | 3a shared MoE / Charon grouped dispatch | ⚠️ PARTIAL | `shared_moe` module created (transformer/src/shared_moe.rs) with `fused_moe_dispatch` + `per_expert_loop` fallback. deepseek2 device path refactored to delegate (`route_topk` + `normalize_weights` extracted, experts mapped to `MoeExpert`). deepseek32/4, kimi_k3 still use per-expert loops; Charon grouped-kernel adoption deferred (needs stacked [E,H,I] weight buffers + checkpoint verification). `grep charon crates/grim-models` = 0 model hits |
 | 3 | 3b SwiGLU in Charon epilogue | ⚠️ | Kernel-level done (inline silu×up in charon.rs:59-60,130-131,253-254,341-342,403-404; charon_wmma.rs:93-94) — but no model routes through Charon, so zero production benefit yet |
 | 3 | 3c rmsnorm fused into MoE gate | ❌ | No rmsnorm in charon kernels; models call separate norm before MoE gate |
 | 4 | 4a rmsnorm_rope | ✅ | `grim_rmsnorm_rope` kernel (compute_kernels.rs:242), launcher (device_attention.rs:1284), used in block.rs:1227. Bonus: MXFP4 GEMM+QKnorm+RoPE+KV fusion exists (mxfp4_gemm.rs:380) |
@@ -39,12 +39,24 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 6 | 6a session DecodeGraphBuffers | ⚠️ | Engine has model-agnostic `decode_graph_input_buffers`/`GraphCaptureInputBuffers` (grim-engine/src/lib.rs:239-249, GRIM_CAPTURE_GRAPH) but it captures input_ids/positions only — not the past_dev-counter per-layer design; no `DecodeGraphState` symbol |
 | 6 | 6b graph in block.rs/shared models | ❌ | Same as 1c — graph primitives are lfm2-only |
 
-**Net assessment (updated 2026-09-11, post session-2):** Phases 1(a,b,c), 2(a), 4(a,b,d),
-4.5(a,e,g) and 6(b) are landed; two latent GPU kernel bugs fixed en route
-(`grim_qkv_attention_dev` was missing `inv_sqrt_d` entirely and its wave-merge
-indexed LDS by lane instead of wave). Remaining: Phase 2b (more models), Phase 3
-(MoE adoption), 4.5b/d (deferred — no W4A4 activations / no BF16 checkpoints in
-the zoo), 4.5f (Q2_K/Q3_K). Decode-GEMV format coverage is now 7 (Q8_0, Q4_K, Q5_K, Q6_K, FP8,
+**Net assessment (updated 2026-09-12):** Phases 1(a,b,c), 2(a,b), 4(a,b,d), 4.5(a,c,e,f,g)
+and 6(b) are landed. 9 shared_attention models are wired with fused Q8_0 QKV.
+`shared_moe` module exists and deepseek2's MoE device path delegates to it. En
+route, two latent GPU kernel bugs were fixed (`grim_qkv_attention_dev` was missing
+`inv_sqrt_d` and its wave-merge indexed LDS by lane). Decode-GEMV M=1 coverage is
+7 formats (Q8_0, Q4_K, Q5_K, Q6_K, FP8, Q2_K, Q3_K) — exceeds the ≥4 target.
+
+**NOT completed (and why):**
+- **Phase 3 (full MoE/Charon):** deepseek32/4 and kimi_k3 still use per-expert
+  loops; Charon *grouped-kernel* adoption needs stacked [E,H,I] weight buffers and
+  checkpoint verification this environment cannot perform. SwiGLU-in-Charon
+  (3b) and rmsnorm-gate (3c) kernel pieces exist but no model routes through
+  Charon yet.
+- **qwen35:** `Option<Linear>` projections + hybrid SSM attention need bespoke
+  handling (deferred).
+- **Phase 5 cleanup:** audit showed the targeted kernels are NOT dead
+  (dispatched by device_attention / dispatch paths); removal needs a dispatch
+  A/B first.
 Q2_K, Q3_K) — exceeds the ≥4 success criterion.
 
 ---
