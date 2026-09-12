@@ -197,6 +197,128 @@ extern "C" __global__ void grim_dot2_q80_gemv(
 #define GRIM_Q4K_SUPERBLOCK_SIZE 256
 #define GRIM_Q4K_BYTES           144
 
+// ─── Phase 4.5c: FP8 E4M3 × FP8 E4M3 dot4 GEMV (dot11-insts, RDNA4) ───────
+// B is column-major E4M3 [N, K] (one byte per weight); A is f32 [M, K] and is
+// quantized to E4M3 in registers (RNE) before packing. Four products per
+// V_DOT4_F32_FP8_FP8 with f32 accumulation.
+
+__device__ __forceinline__ float grim_fdot4_fp8(float c, int a, int b) {
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_fdot4_f32_fp8_fp8)
+    return __builtin_amdgcn_fdot4_f32_fp8_fp8(c, a, b);
+#else
+    // Portable fallback: unpack 4 E4M3 codes per operand and fma in f32.
+    float acc = c;
+    for (int e = 0; e < 4; ++e) {
+        float av = fp8_e4m3_to_float_hip((unsigned char)((a >> (8 * e)) & 0xFF));
+        float bv = fp8_e4m3_to_float_hip((unsigned char)((b >> (8 * e)) & 0xFF));
+        acc = fmaf(av, bv, acc);
+    }
+    return acc;
+#endif
+}
+
+// f32 -> E4M3 (RNE). Mirrored in Rust by the GPU parity test.
+__device__ __forceinline__ unsigned char grim_f32_to_fp8_e4m3(float f) {
+    if (__builtin_isnan(f)) return 0x7F;
+    unsigned sign = __builtin_signbit(f) ? 0x80u : 0x00u;
+    float a = __builtin_fabsf(f);
+    if (__builtin_isinf(a) || a >= 480.0f) return (unsigned char)(sign | 0x7E); // saturate to 448
+    unsigned bits;
+    __builtin_memcpy(&bits, &a, 4);
+    unsigned m = bits & 0x7FFFFFu;
+    int e = (int)((bits >> 23) & 0xFFu);
+    if (e == 0) return (unsigned char)sign; // f32 subnormals are below E4M3 min
+    int E = e - 120; // E4M3 exponent (bias 7), 1.m23 * 2^(e-127) = 1.m3 * 2^(E-7)
+    if (E >= 1) {
+        // Normal: round 23-bit fraction to 3 bits, RNE.
+        unsigned q = m >> 20;
+        unsigned r = m & 0xFFFFFu;
+        if (r > 0x80000u || (r == 0x80000u && (q & 1u))) q++;
+        if (q == 8u) { q = 0; E++; }
+        if (E > 15) return (unsigned char)(sign | 0x7E); // overflow -> 448
+        return (unsigned char)(sign | ((unsigned)E << 3) | q);
+    }
+    // Subnormal: value * 512 = 1.m23 * 2^(E+2); round to 3-bit integer code.
+    int sh = 21 - E;
+    unsigned mant = 0x800000u | m;
+    unsigned q = mant >> sh;
+    unsigned r = mant & ((1u << sh) - 1u);
+    unsigned half = 1u << (sh - 1);
+    if (r > half || (r == half && (q & 1u))) q++;
+    if (q == 0) return (unsigned char)sign;
+    return (unsigned char)(sign | q);
+}
+
+__device__ __forceinline__ int grim_pack4_fp8(
+    const float* __restrict__ src) {
+    unsigned b0 = grim_f32_to_fp8_e4m3(src[0]);
+    unsigned b1 = grim_f32_to_fp8_e4m3(src[1]);
+    unsigned b2 = grim_f32_to_fp8_e4m3(src[2]);
+    unsigned b3 = grim_f32_to_fp8_e4m3(src[3]);
+    return (int)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+}
+
+extern "C" __global__ void grim_dot4_fp8_gemv(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_chunks = K / 32;
+    const float* a_row = A + (long long)row * K;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_fp8 + (long long)(col_base + j) * K
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Each lane processes one 32-element chunk per stride (same tiling as the
+    // Q8_0 dot4 GEMV): 8 fp8 dot4s per chunk.
+    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
+        const float* a_chunk = a_row + (long long)chunk * 32;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_chunk = b_col[j] + (long long)chunk * 32;
+            float acc = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 32; e += 4) {
+                int a4 = grim_pack4_fp8(a_chunk + e);
+                int b4;
+                __builtin_memcpy(&b4, b_chunk + e, 4);
+                acc = grim_fdot4_fp8(acc, a4, b4);
+            }
+            facc[j] += acc;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 extern "C" __global__ void grim_dot4_q4k_q81_gemv(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q4k,
