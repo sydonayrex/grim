@@ -198,18 +198,40 @@ wastes 15/16 rows at m=1 — 6.25% tensor utilization vs 100% for GEMV).
 
 ### Available dot-product builtins on gfx1201 (RDNA4)
 
-| Builtin | ISA feature | Types | Throughput | gfx1201 |
-|---|---|---|---|---|
-| `sudot4` | dot8-insts | i8 × i8 (signed/unsigned mix), i32 acc | 4 elem/inst | ✅ confirmed |
-| `sudot8` | dot8-insts | i8 × i8 (signed/unsigned mix), i32 acc | 8 elem/inst | ✅ confirmed |
-| `udot4` | dot7-insts | u8 × u8, u32 acc | 4 elem/inst | ✅ confirmed |
-| `udot8` | dot7-insts | u8 × u8, u32 acc | 8 elem/inst | ✅ confirmed |
-| `fdot2_f16_f16` | dot9-insts | f16 × f16, f16 acc | 2 elem/inst | ✅ confirmed |
-| `fdot2_f32_bf16` | dot12-insts | f32 × bf16, f32 acc | 2 elem/inst | ✅ confirmed |
-| `dot4_f32_fp8_fp8` | dot11-insts | fp8 × fp8, f32 acc | 4 elem/inst | ✅ RDNA4 |
-| `dot4_f32_bf8_bf8` | dot11-insts | bf8 × bf8, f32 acc | 4 elem/inst | ✅ RDNA4 |
-| `sdot4` / `sdot8` | dot1-insts | i8 × i8 (all signed) | 4/8 elem/inst | ❌ REMOVED on RDNA4 |
-| `fdot2` | dot10-insts | f32 × f32, f32 acc | 2 elem/inst | ✅ confirmed |
+| Builtin | HW Instruction | ISA feature | Operand Width | Elem/Inst | Acc | gfx1201 |
+|---|---|---|---|---|---|---|
+| `sudot4` | `V_DOT4_I32_IU8` | dot8-insts | **8-bit** (signed × unsigned) | 4 | i32 | ✅ confirmed |
+| `sudot8` | `V_DOT8_I32_IU4` | dot8-insts | **4-bit** (signed × unsigned) | 8 | i32 | ✅ confirmed |
+| `udot4` | `V_DOT4_U32_U8` | dot7-insts | **8-bit** (unsigned) | 4 | u32 | ✅ confirmed |
+| `udot8` | `V_DOT8_U32_U4` | dot7-insts | **4-bit** (unsigned) | 8 | u32 | ✅ confirmed |
+| `fdot2_f16_f16` | `V_DOT2_F16_F16` | dot9-insts | **16-bit** f16 × f16 | 2 | f16 | ✅ confirmed |
+| `fdot2_f32_bf16` | `V_DOT2_F32_BF16` | dot12-insts | **16-bit** bf16, f32 acc | 2 | f32 | ✅ confirmed |
+| `dot4_f32_fp8_fp8` | `V_DOT4_F32_FP8_FP8` | dot11-insts | **8-bit** fp8 E4M3 | 4 | f32 | ✅ RDNA4 |
+| `dot4_f32_bf8_bf8` | `V_DOT4_F32_BF8_BF8` | dot11-insts | **8-bit** bf8 E5M2 | 4 | f32 | ✅ RDNA4 |
+| `fdot2` | `V_DOT2_F32_F16` | dot10-insts | **32-bit** f32 × f32 | 2 | f32 | ✅ confirmed |
+| `sdot4` / `sdot8` | `V_DOT4_I32_I8` / `V_DOT8_I32_I8` | dot1-insts | all-signed | 4/8 | i32 | ❌ REMOVED on RDNA4 |
+
+**CRITICAL:** `sudot4` and `sudot8` process DIFFERENT operand widths:
+- `sudot4` → `V_DOT4_I32_IU8` → **8-bit** codes, 4 elements per instruction → for Q8_0/Q8_1
+- `sudot8` → `V_DOT8_I32_IU4` → **4-bit** codes, 8 elements per instruction → for Q4_K/int4
+- There is NO 8-bit dot8 instruction on RDNA4 — 8-bit dot products max out at 4 elements/inst
+
+### Quant format → ISA instruction coverage matrix
+
+| Format | Element Width | Dot Instruction | Unpack Required | Two-Dot (scale/min) | Act. Quant |
+|---|---|---|---|---|---|
+| Q8_0 | 8-bit signed | `sudot4` | ❌ direct | ❌ scale only | Q8_1 (8-bit) |
+| Q4_K | 4-bit unsigned | `sudot4` + nibble unpack | ✅ nibble → i8 | ✅ d·sc·dot − dmin·mi·Σ | Q8_1 (8-bit) |
+| Q4_K (W4A4) | 4-bit unsigned | `sudot8` | ❌ native 4-bit | ✅ same two-dot | 4-bit |
+| Q5_K | 5-bit | `sudot4` + bit-plane merge | ✅ nibble + 5th-bit | ✅ d·sc·dot − dmin·mi·Σ | Q8_1 (8-bit) |
+| Q6_K | 6-bit | `sudot4` + 6-bit unpack | ✅ 6-bit → i8 | ✅ d·sc·dot (no min) | Q8_1 (8-bit) |
+| Q2_K | 2-bit | `sudot4` (marginal) | ✅ 2-bit → i8 | ✅ scale/min | Q8_1 (8-bit) |
+| Q3_K | 3-bit | `sudot4` (marginal) | ✅ 3-bit → i8 | ✅ scale/min | Q8_1 (8-bit) |
+| IQ2/IQ3/IQ4 | varies | ❌ codebook lookup | N/A | N/A | N/A |
+| FP8 E4M3 | 8-bit fp8 | `dot4_f32_fp8_fp8` | ❌ native | per-block scale | FP8 |
+| FP8 E5M2 | 8-bit bf8 | `dot4_f32_bf8_bf8` | ❌ native | per-block scale | BF8 |
+| BF16 | 16-bit bf16 | `fdot2_f32_bf16` | ❌ native | ❌ none | BF16 |
+| F16 | 16-bit f16 | `fdot2_f16_f16` | ❌ native | ❌ none | F16 |
 
 ### Sub-step 4.5a: Q4_K fused GEMV via sudot4 (nibble unpack + two-dot decomposition)
 
@@ -269,22 +291,29 @@ columns, WMMA needs 256/16 = 16 tile iterations; dot4 needs N/4 = 256 wave dispa
 The crossover depends on N and head_dim, but for LFM2 shapes (N=1024, K=1024) the dot4
 GEMV was already proven faster for Q8_0.
 
-### Sub-step 4.5b: Q8_0 throughput upgrade via sudot8
+### Sub-step 4.5b: Native 4-bit × 4-bit dot8 via sudot8 (V_DOT8_I32_IU4)
 
-**Why:** `sudot8` processes 8 i8 elements per instruction (vs sudot4's 4) — 2× throughput
-for the same register pressure. The Q8_0 × Q8_1 GEMV already feeds i8×i8 to sudot4;
-switching to sudot8 halves the inner-loop instruction count.
+**Why:** `sudot8` (`V_DOT8_I32_IU4`) processes **8 × 4-bit unsigned values** per instruction
+— native int4×int4 dot product with i32 accumulation. This is the natural instruction for
+**W4A4 quantized models** (both weights and activations quantized to 4-bit) and for Q4_K
+weights paired with 4-bit-quantized activations.
 
-**Change:**
-- In `grim_dot4_q80_q81_gemv`: replace 2 × `sudot4` with 1 × `sudot8`
-- Each sudot8 takes two i32 operands (8 bytes total) and an i32 accumulator
-- The Q8_1 activation block has 32 i8 codes = 8 bytes = 2 × i32 → exactly 1 sudot8
-- The Q8_0 weight block has 32 i8 codes = 32 bytes → 4 × sudot8 per weight block
-  (vs 8 × sudot4 currently)
-- **Instruction count: 8 sudot4 → 4 sudot8 per 32-element block = 2× fewer**
+**CRITICAL:** `sudot8` processes **4-bit** operands (8 elements × 4 bits = 32 bits from one
+i32 register). It is NOT an 8-bit dot8 — that instruction does not exist on RDNA4. For 8-bit
+codes (Q8_0/Q8_1), `sudot4` at 4 elements per instruction is the maximum dot width.
 
-**Compatibility:** same ISA feature (`dot8-insts`), same accumulator type. Drop-in
-replacement — just change the builtin call and the packing.
+**Kernel design (W4A4 path):**
+- Weights: Q4_K 4-bit nibbles packed 2-per-byte — feed directly as i32 source operands
+- Activations: quantized to 4-bit unsigned (0..15) using the same sub-block boundaries
+- Per 32-element Q4_K sub-block: 4 × `sudot8` (32 elements / 8 per instruction)
+- Two-dot decomposition: scale×pos_dot − min×act_sum (same as sudot4 Q4_K path)
+- **Instruction count: 4 sudot8 per sub-block (vs 8 sudot4 with unpacking)**
+
+**When to use:**
+- W4A4 models (both weight and activation in 4-bit) — native, no unpack
+- Q4_K weights with runtime 4-bit activation quantization — trades activation precision
+  for 2× instruction throughput vs the sudot4 nibble-unpack path
+- NOT for Q8_0/Q8_1 — those require 8-bit operands (sudot4)
 
 ### Sub-step 4.5c: FP8 GEMV via dot4_f32_fp8_fp8
 
@@ -443,7 +472,8 @@ Phase 6 is the final capstone — requires all prior phases.
 | 151 models can't all be updated individually | Focus on shared infrastructure (block.rs, shared_attention, shared_moe); models that route through these get the optimization for free |
 | rocBLAS handle not bound to capture stream during graph capture | `begin_graph_capture` already binds rocblas; verify for all kernel types |
 | Q4_K nibble unpacking overhead eats sudot4 throughput gain | Unpacking is 4 AND/SHIFT ops per 4 elements — negligible vs the sudot4 instruction; measure vs WMMA at target shape to confirm |
-| sudot8 accumulator overflow (8 i8×i8 products in i32) | Max |product| = 8 × 127 × 127 = 129,032 — fits easily in i32 (2.1B range); safe for any block size ≤ 4096 |
+| sudot8 accumulator overflow (8 i4×i4 products in i32) | Max |product| = 8 × 15 × 15 = 1,800 — trivially fits in i32 (2.1B range); no overflow risk |
+| sudot8 requires 4-bit ACTIVATION — not applicable to Q8_1 activations | Reserve sudot8 for W4A4 models; use sudot4 with nibble unpacking for Q4_K × Q8_1 activations |
 | FP8 (E4M3) limited dynamic range causes precision loss vs int8 | FP8 has ~2 decimal digits of precision; verify per-block scale compensates; fallback to sudot4 int8 path if parity fails |
 | Q4_K two-dot decomposition drifts for large block sums | The `sum` correction term grows with block size; Q4_K uses 32-element sub-blocks (same as Q8_0/Q8_1) so the correction is bounded; verify against `dequant_q4k` reference |
 
