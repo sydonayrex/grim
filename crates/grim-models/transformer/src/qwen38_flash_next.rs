@@ -312,6 +312,9 @@ pub struct Qwen38FlashNextBlock {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub gated_residual_scale: f32,
+    /// Fused Q8_0 QKV projection blob on ROCm (Phase 2b). Issues 1 dot4 GEMV
+    /// instead of 3 when single-token decoding.
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 }
 
 impl Qwen38FlashNextBlock {
@@ -343,6 +346,11 @@ impl Qwen38FlashNextBlock {
         let moe_block = Qwen38MoeBlock::load(&ws.scoped("mlp"), cfg)?;
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
+        // Phase 2b: build a fused Q8_0 QKV projection blob when all three
+        // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
+        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
+            .map(std::sync::Arc::new);
+
         Ok(Self {
             wq,
             wk,
@@ -356,6 +364,7 @@ impl Qwen38FlashNextBlock {
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
             gated_residual_scale: 1.0 / (cfg.hc_count as f32).sqrt(),
+            wqkv_q80_fused,
         })
     }
 
@@ -363,9 +372,16 @@ impl Qwen38FlashNextBlock {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.attn_norm.forward(x)?;
 
-        let q = self.wq.forward(&normed_attn)?;
-        let k = self.wk.forward(&normed_attn)?;
-        let v = self.wv.forward(&normed_attn)?;
+        // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV instead
+        // of 3 separate GEMVs; the per-head RoPE closure is applied after.
+        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
+            crate::shared_attention::fused_qkv_project_raw(&normed_attn, self.wqkv_q80_fused.as_ref().unwrap())?
+        } else {
+            let q = self.wq.forward(&normed_attn)?;
+            let k = self.wk.forward(&normed_attn)?;
+            let v = self.wv.forward(&normed_attn)?;
+            (q, k, v)
+        };
 
         let _q_dim = self.num_heads * self.head_dim;
         let _kv_dim = self.num_kv_heads * self.head_dim;
