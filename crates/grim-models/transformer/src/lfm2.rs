@@ -8,7 +8,7 @@ use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm, add_tensors, broadcast_bias};
 use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
 /// Max KV-cache rows pre-allocated on the ROCm device for the fused MXFP4 QKV path.
@@ -53,7 +53,6 @@ impl ModelConfig for Lfm2Config {
     }
 }
 
-#[derive(Clone)]
 pub enum Lfm2LayerCache {
     ShortConv(Vec<f32>),
     Attention {
@@ -62,7 +61,94 @@ pub enum Lfm2LayerCache {
         /// Device-resident KV cache arena for the fused MXFP4 path (ROCm only).
         k_dev: Option<Box<Tensor>>,
         v_dev: Option<Box<Tensor>>,
+        /// Item 2: single device-resident base position (one u32) for device-base
+        /// RoPE on the decode path. Rotates Q/K by `base + step` without a
+        /// per-layer per-token host position upload. None until first use.
+        pos_base_dev: Option<Box<Tensor>>,
+        /// Item 3: single device-resident KV counter (one u32 == past token count)
+        /// for the whole-decode-step graph. Drives the on-device KV-append offset
+        /// and the attention total, eliminating per-token host scalars so the
+        /// entire decode step is graph-capturable. Aliased to pos_base_dev's
+        /// generation (replays increment it). None until first use.
+        past_dev: Option<Box<Tensor>>,
+        /// Item 3: preallocated stable device buffers reused across graph replays.
+        /// Allocated once at capture time so every replay writes to the SAME
+        /// device pointers (graph args stay byte-identical). q_rot/k_rot are the
+        /// RoPE outputs; attn_out is the attention output.
+        q_rot_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
+        k_rot_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
+        attn_out_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
     },
+}
+
+impl Clone for Lfm2LayerCache {
+    fn clone(&self) -> Self {
+        match self {
+            Self::ShortConv(st) => Self::ShortConv(st.clone()),
+            Self::Attention {
+                k, v, k_dev, v_dev, pos_base_dev, past_dev, ..
+            } => Self::Attention {
+                k: k.clone(),
+                v: v.clone(),
+                k_dev: k_dev.clone(),
+                v_dev: v_dev.clone(),
+                pos_base_dev: pos_base_dev.clone(),
+                past_dev: past_dev.clone(),
+                // Stable per-capture device buffers are NOT cloned — they are
+                // reallocated on each capture, and cloning an Arc<dyn
+                // BackendStorage> view would alias the wrong lifetime.
+                q_rot_dev: None,
+                k_rot_dev: None,
+                attn_out_dev: None,
+            },
+        }
+    }
+}
+
+impl Lfm2LayerCache {
+    /// Item 3: true when the past_dev counter buffer hasn't been allocated yet
+    /// (first decode step after prefill). Used to gate the one-time H2D seed
+    /// write outside the graph capture bracket.
+    pub fn past_dev_needs_init(&self) -> bool {
+        match self {
+            Lfm2LayerCache::Attention { past_dev, .. } => past_dev.is_none(),
+            _ => false,
+        }
+    }
+
+    /// Item 1 TDD 1: verify the fused Q8_0 QKV blob layout is row-order Q∥K∥V
+    /// with each blob contributing exactly its packed Q8_0 bytes. A full GPU
+    /// byte-parity test lives in grim-backend-rocm (`fused_qkv_gemv_parity`);
+    /// this test pins the host-side concatenation contract (row ordering and
+    /// total byte count) independently of the device.
+    #[cfg(test)]
+    fn verify_qkv_blob_layout(
+        q_bytes: &[u8],
+        k_bytes: &[u8],
+        v_bytes: &[u8],
+        row_bytes: usize,
+    ) {
+        let n_q = q_bytes.len() / row_bytes;
+        let n_k = k_bytes.len() / row_bytes;
+        let n_v = v_bytes.len() / row_bytes;
+        let mut fused = Vec::new();
+        fused.extend_from_slice(q_bytes);
+        fused.extend_from_slice(k_bytes);
+        fused.extend_from_slice(v_bytes);
+        let n_total = n_q + n_k + n_v;
+        assert_eq!(fused.len(), n_total * row_bytes, "byte count mismatch");
+        assert_eq!(fused[..q_bytes.len()], q_bytes[..], "Q rows misplaced");
+        assert_eq!(
+            fused[q_bytes.len()..q_bytes.len() + k_bytes.len()],
+            k_bytes[..],
+            "K rows misplaced"
+        );
+        assert_eq!(
+            fused[q_bytes.len() + k_bytes.len()..],
+            v_bytes[..],
+            "V rows misplaced"
+        );
+    }
 }
 
 pub struct Lfm2Block {
@@ -79,6 +165,10 @@ pub struct Lfm2Block {
     pub wqkv_exps: Option<Tensor>,
     pub gamma_q: Option<Tensor>,
     pub gamma_k: Option<Tensor>,
+    /// Fused Q8_0 QKV weights (ROCm only, Item 1). The concatenated blob
+    /// `[n_q + 2·n_kv, hidden]` lets the decode path issue ONE dot4 GEMV
+    /// instead of three. None on non-ROCm or non-Q8_0 builds.
+    pub wqkv_q80_fused: Option<grim_backend_rocm::FusedQkvWeights>,
     pub shortconv_in_proj: Option<Linear>,
     pub shortconv_conv: Option<Tensor>,
     pub shortconv_conv_vec: Option<Vec<f32>>,
@@ -168,6 +258,42 @@ impl Lfm2Block {
             )?
         } else {
             (None, None, None, None)
+        };
+
+        // Item 1: on ROCM, concatenate the three Q8_0 projection weight blobs into
+        // ONE storage so the decode path issues a single dot4 GEMV (3 → 1).
+        let wqkv_q80_fused = if !is_recurrent
+            && device
+                .as_ref()
+                .map(|d| matches!(d, Device::Rocm(_)))
+                .unwrap_or(false)
+            && std::env::var("GRIM_FUSED_QKV").as_deref() != Ok("0")
+        {
+            let wq_s = wq.as_ref().unwrap().weight.storage();
+            let wk_s = wk.as_ref().unwrap().weight.storage();
+            let wv_s = wv.as_ref().unwrap().weight.storage();
+            let ordinal: usize = match &device {
+                Some(Device::Rocm(o)) => *o,
+                _ => 0,
+            };
+            match grim_backend_rocm::RocmDevice::try_new(ordinal) {
+                Ok(dev) => match dev.build_fused_qkv_q80(wq_s.as_ref(), wk_s.as_ref(), wv_s.as_ref()) {
+                    Ok(fused) => {
+                        eprintln!("[grim] layer {layer_idx}: built fused Q8_0 QKV blob ({} rows)", fused.n_total());
+                        Some(fused)
+                    }
+                    Err(e) => {
+                        eprintln!("[grim] layer {layer_idx}: fused Q8_0 QKV build failed ({e}), falling back to 3-GEMV");
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[grim] layer {layer_idx}: RocmDevice unavailable for fused QKV ({e})");
+                    None
+                },
+            }
+        } else {
+            None
         };
 
         let (shortconv_in_proj, shortconv_conv, shortconv_conv_vec, shortconv_out_proj) =
@@ -316,6 +442,7 @@ impl Lfm2Block {
             wqkv_exps,
             gamma_q,
             gamma_k,
+            wqkv_q80_fused,
             shortconv_in_proj,
             shortconv_conv,
             shortconv_conv_vec,
@@ -430,7 +557,9 @@ impl Lfm2Block {
             let mut device_block_out: Option<Tensor> = None;
             if steps == 1 {
                 let device = norm_x.device().clone();
-                match self.shortconv_step_device(&proj, h_dim, l_cache, state, &device) {
+                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
+                    && matches!(device, Device::Rocm(_));
+                match self.shortconv_step_device(&proj, h_dim, l_cache, state, &device, decode_graph) {
                     Ok(Some(y_t)) => {
                         let block_out_2d =
                             self.shortconv_out_proj.as_ref().unwrap().forward(&y_t)?;
@@ -563,7 +692,9 @@ impl Lfm2Block {
 
             // Produce `q_rot_vec` (rotated, QK-normalized Q) and extend the K/V history.
             // Both the fused MXFP4 path and the F32 reference produce identical layouts so the attention.
-            let (q_rot_vec, arena_total): (Vec<f32>, Option<usize>) = if use_fused {
+            // `device_attn_out` is Some when the Item 3 device path computed the
+            // attention entirely on device — the caller skips the host dispatch.
+            let (q_rot_vec, arena_total, device_attn_out): (Vec<f32>, Option<usize>, Option<Tensor>) = if use_fused {
                 // The fused kernel appended the new K/V rows directly into
                 // the device arenas — attention can stay arena-resident.
                 let past = match cache {
@@ -575,11 +706,23 @@ impl Lfm2Block {
                 (
                     self.fused_qkv(&norm_x, cache, steps, hidden)?,
                     Some(past + steps),
+                    None,
                 )
             } else {
-                let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
-                let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
-                let v = self.wv.as_ref().unwrap().forward(&norm_x)?;
+                // Item 1: when a fused Q8_0 blob was built at load, ONE dot4 GEMV
+                // over `[n_q+2·n_kv, hidden]` replaces the three separate
+                // projection GEMVs (3 launches → 1). The shared f32 activation is
+                // quantized to q8_1 inline here (this base predates the OPFUSE
+                // pre-quantization path, so we quantize per call).
+                let fused_decode = self.wqkv_q80_fused.is_some();
+                let (q, k, v) = if fused_decode {
+                    self.fused_qkv_dot4_decode(&norm_x, self.wqkv_q80_fused.as_ref().unwrap())?
+                } else {
+                    let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
+                    let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
+                    let v = self.wv.as_ref().unwrap().forward(&norm_x)?;
+                    (q, k, v)
+                };
 
                 let q_2d = Tensor::new(
                     q.storage().clone(),
@@ -607,97 +750,239 @@ impl Lfm2Block {
                     Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / kv_stride,
                     _ => 0,
                 };
-                let q_positions: Vec<u32> = {
-                    let mut v = Vec::with_capacity(steps * self.num_heads);
-                    for t in 0..steps {
-                        for _ in 0..self.num_heads {
-                            v.push((cache_offset + t) as u32);
-                        }
-                    }
-                    v
-                };
-                let k_positions: Vec<u32> = {
-                    let mut v = Vec::with_capacity(steps * self.num_kv_heads);
-                    for t in 0..steps {
-                        for _ in 0..self.num_kv_heads {
-                            v.push((cache_offset + t) as u32);
-                        }
-                    }
-                    v
-                };
                 let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
-                let (q_rot_storage, _) =
-                    dev.rope(q_norm.storage().as_ref(), &q_positions, &rope_cfg, &q_shape)?;
-                let (k_rot_storage, _) =
-                    dev.rope(k_norm.storage().as_ref(), &k_positions, &rope_cfg, &k_shape)?;
 
-                let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
-                let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
-                let v_vec = v.to_vec_f32()?;
-
-                if cache.is_none() {
-                    *cache = Some(Lfm2LayerCache::Attention {
-                        k: vec![],
-                        v: vec![],
-                        k_dev: None,
-                        v_dev: None,
-                    });
-                }
-
-                let mut arena_total: Option<usize> = None;
-                let v_storage = v.storage();
-                match cache.as_mut().unwrap() {
-                    Lfm2LayerCache::Attention { k, v, k_dev, v_dev } => {
-                        let past = k.len() / kv_stride;
-                        k.extend_from_slice(&k_rot_vec);
-                        v.extend_from_slice(&v_vec);
-                        // WI-X2: mirror ONLY the new rows into preallocated device arenas so attention runs without re-uploading the whole history each decode step.
-                        // Falls back to the host-history path when the backend lacks the copies.
-                        if k_dev.is_none() {
-                            let shape = Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
-                            *k_dev = Some(Box::new(Tensor::new(
-                                Arc::from(dev.zeros(&shape, DType::F32)?),
-                                shape.clone(),
-                                DType::F32,
-                                QuantProvenance::GrimNative,
-                                norm_x.device().clone(),
-                            )));
-                            *v_dev = Some(Box::new(Tensor::new(
-                                Arc::from(dev.zeros(&shape, DType::F32)?),
-                                shape,
-                                DType::F32,
-                                QuantProvenance::GrimNative,
-                                norm_x.device().clone(),
-                            )));
-                        }
-                        let off_elems = past * kv_stride;
-                        let cnt_elems = steps * kv_stride;
-                        let k_ok = dev.copy_slice_into(
-                            k_dev.as_ref().unwrap().storage().as_ref(),
-                            k_rot_storage.as_ref(),
-                            off_elems,
-                            cnt_elems,
+                // Item 3: lazily allocate + seed the past counter (device u32)
+                // BEFORE RoPE so the decode-graph path can alias pos_base_dev to
+                // it — the bump kernel at the end of the graph increments this
+                // buffer, which updates both the RoPE base and the KV offset.
+                // The H2D seed write happens on the FIRST decode step only;
+                // it will abort the first graph-capture attempt (CAPTURE_POISON
+                // fallback → eager), after which past_dev is stable and the
+                // second capture attempt succeeds without any H2D inside.
+                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
+                    && matches!(norm_x.device(), Device::Rocm(_));
+                if decode_graph {
+                    // Ensure the cache exists, then seed past_dev/pos_base_dev on
+                    // first allocation (H2D write OUTSIDE any graph bracket —
+                    // the first capture attempt aborts via CAPTURE_POISON and
+                    // re-runs eagerly; subsequent attempts find the buffer
+                    // already seeded and capture cleanly).
+                    if cache.is_none() {
+                        *cache = Some(Lfm2LayerCache::Attention {
+                            k: vec![],
+                            v: vec![],
+                            k_dev: None,
+                            v_dev: None,
+                            pos_base_dev: None,
+                            past_dev: None,
+                            q_rot_dev: None,
+                            k_rot_dev: None,
+                            attn_out_dev: None,
+                        });
+                    }
+                    if cache.as_mut().unwrap().past_dev_needs_init() {
+                        let ordinal: usize = match norm_x.device() {
+                            Device::Rocm(o) => *o,
+                            _ => 0,
+                        };
+                        let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+                        let pos_tensor = Tensor::new(
+                            Arc::from(rocm_dev.zeros(&Shape::new(vec![1]), DType::U32)?),
+                            Shape::new(vec![1]),
+                            DType::U32,
+                            QuantProvenance::GrimNative,
+                            norm_x.device().clone(),
                         );
-                        let v_ok = dev.copy_slice_into(
-                            v_dev.as_ref().unwrap().storage().as_ref(),
-                            v_storage.as_ref(),
-                            off_elems,
-                            cnt_elems,
-                        );
-                        if k_ok.is_ok()
-                            && v_ok.is_ok()
-                            && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
-                        {
-                            arena_total = Some(past + steps);
+                        // Seed with the current past count.
+                        let pos_bits = f32::from_bits(cache_offset as u32);
+                        rocm_dev.write_f32_into(pos_tensor.storage().as_ref(), &[pos_bits])?;
+                        if let Lfm2LayerCache::Attention { pos_base_dev, past_dev, .. } = cache.as_mut().unwrap() {
+                            // Both point to the SAME storage Arc — writes via
+                            // one are visible to the other (true aliasing).
+                            *pos_base_dev = Some(Box::new(pos_tensor.clone()));
+                            *past_dev = Some(Box::new(pos_tensor));
                         }
                     }
-                    _ => {
-                        return Err(grim_core::error::Error::Session(
-                            "Mismatched Attention layer cache".into(),
-                        ));
-                    }
                 }
-                (q_rot_vec, arena_total)
+
+                // Item 2: device-base RoPE on the ROCM decode path. The base
+                // position lives in ONE persistent device buffer (`pos_base_dev`,
+                // a single u32) and the kernel derives each (head,step) position
+                // internally as `base + step` — eliminating the per-layer
+                // per-token host `positions[]` Vec build + upload. On non-ROCm,
+                // fall back to the host-position path.
+                let is_gpu = matches!(norm_x.device(), Device::Rocm(_));
+                let (q_rot_storage, k_rot_storage) = if is_gpu
+                    && std::env::var("GRIM_ROPE_DEV_BASE").as_deref() != Ok("0")
+                {
+                    let ordinal: usize = match norm_x.device() {
+                        Device::Rocm(o) => *o,
+                        _ => 0,
+                    };
+                    let rocm_dev =
+                        grim_backend_rocm::RocmDevice::shared(ordinal);
+                    // Lazily allocate the 1-element device position buffer, then
+                    // overwrite it in place each token (one 4-byte H2D write).
+                    let pos_base_dev_mut = match cache.as_mut().unwrap() {
+                        Lfm2LayerCache::Attention { pos_base_dev, .. } => pos_base_dev,
+                        _ => unreachable!("attention cache variant on gpu path"),
+                    };
+                    if pos_base_dev_mut.is_none() {
+                        let pos_tensor = Tensor::new(
+                            Arc::from(rocm_dev.zeros(&Shape::new(vec![1]), DType::U32)?),
+                            Shape::new(vec![1]),
+                            DType::U32,
+                            QuantProvenance::GrimNative,
+                            norm_x.device().clone(),
+                        );
+                        *pos_base_dev_mut = Some(Box::new(pos_tensor));
+                    }
+                    let pos_base = pos_base_dev_mut.as_ref().unwrap();
+                    // Item 3: in decode-graph mode the graph's bump kernel
+                    // increments past_dev (aliased to pos_base_dev) — the host
+                    // must NOT write it inside the capture bracket. The initial
+                    // seeding happened in the decode_graph block above.
+                    if !decode_graph {
+                        let pos_bits = f32::from_bits(cache_offset as u32);
+                        rocm_dev.write_f32_into(pos_base.storage().as_ref(), &[pos_bits])?;
+                    }
+
+                    let (q_rot, _) = rocm_dev.rope_dev_base(
+                        q_norm.storage().as_ref(),
+                        pos_base.storage().as_ref(),
+                        &rope_cfg,
+                        &q_shape,
+                        self.num_heads,
+                        steps,
+                    )?;
+                    let (k_rot, _) = rocm_dev.rope_dev_base(
+                        k_norm.storage().as_ref(),
+                        pos_base.storage().as_ref(),
+                        &rope_cfg,
+                        &k_shape,
+                        self.num_kv_heads,
+                        steps,
+                    )?;
+                    (q_rot, k_rot)
+                } else {
+                    let q_positions: Vec<u32> = {
+                        let mut v = Vec::with_capacity(steps * self.num_heads);
+                        for t in 0..steps {
+                            for _ in 0..self.num_heads {
+                                v.push((cache_offset + t) as u32);
+                            }
+                        }
+                        v
+                    };
+                    let k_positions: Vec<u32> = {
+                        let mut v = Vec::with_capacity(steps * self.num_kv_heads);
+                        for t in 0..steps {
+                            for _ in 0..self.num_kv_heads {
+                                v.push((cache_offset + t) as u32);
+                            }
+                        }
+                        v
+                    };
+                    let (q_rot, _) =
+                        dev.rope(q_norm.storage().as_ref(), &q_positions, &rope_cfg, &q_shape)?;
+                    let (k_rot, _) =
+                        dev.rope(k_norm.storage().as_ref(), &k_positions, &rope_cfg, &k_shape)?;
+                    (q_rot, k_rot)
+                };
+
+                // Item 3 device-driven decode path. When graph capture is enabled
+                // we must NOT host-sync (no to_cpu_vec_f32 / extend) and must NOT
+                // bake host scalars (past*kv_stride, total=past+steps) into
+                // launches — both abort HIP graph capture. Instead the past
+                // counter lives in a device buffer (`past_dev`) and the kernels
+                // derive offsets/totals on-device, so the whole step is
+                // graph-capturable. Falls back to the stock host path otherwise.
+                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
+                    && matches!(norm_x.device(), Device::Rocm(_));
+                if decode_graph {
+                    let (q_rot_vec, arena_total, device_attn) = self.decode_attention_device(
+                        q_rot_storage,
+                        k_rot_storage,
+                        v,
+                        norm_x.device(),
+                        cache,
+                        kv_stride,
+                        steps,
+                    )?;
+                    (q_rot_vec, arena_total, device_attn)
+                } else {
+                    let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
+                    let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
+                    let v_vec = v.to_vec_f32()?;
+
+                    if cache.is_none() {
+                        *cache = Some(Lfm2LayerCache::Attention {
+                            k: vec![],
+                            v: vec![],
+                            k_dev: None,
+                            v_dev: None,
+                            pos_base_dev: None,
+                            past_dev: None,
+                            q_rot_dev: None,
+                            k_rot_dev: None,
+                            attn_out_dev: None,
+                        });
+                    }
+
+                    let mut arena_total: Option<usize> = None;
+                    let v_storage = v.storage();
+                    match cache.as_mut().unwrap() {
+                        Lfm2LayerCache::Attention { k, v, k_dev, v_dev, .. } => {
+                            let past = k.len() / kv_stride;
+                            k.extend_from_slice(&k_rot_vec);
+                            v.extend_from_slice(&v_vec);
+                            if k_dev.is_none() {
+                                let shape = Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+                                *k_dev = Some(Box::new(Tensor::new(
+                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    shape.clone(),
+                                    DType::F32,
+                                    QuantProvenance::GrimNative,
+                                    norm_x.device().clone(),
+                                )));
+                                *v_dev = Some(Box::new(Tensor::new(
+                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    shape,
+                                    DType::F32,
+                                    QuantProvenance::GrimNative,
+                                    norm_x.device().clone(),
+                                )));
+                            }
+                            let off_elems = past * kv_stride;
+                            let cnt_elems = steps * kv_stride;
+                            let k_ok = dev.copy_slice_into(
+                                k_dev.as_ref().unwrap().storage().as_ref(),
+                                k_rot_storage.as_ref(),
+                                off_elems,
+                                cnt_elems,
+                            );
+                            let v_ok = dev.copy_slice_into(
+                                v_dev.as_ref().unwrap().storage().as_ref(),
+                                v_storage.as_ref(),
+                                off_elems,
+                                cnt_elems,
+                            );
+                            if k_ok.is_ok()
+                                && v_ok.is_ok()
+                                && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
+                            {
+                                arena_total = Some(past + steps);
+                            }
+                        }
+                        _ => {
+                            return Err(grim_core::error::Error::Session(
+                                "Mismatched Attention layer cache".into(),
+                            ));
+                        }
+                    }
+                    (q_rot_vec, arena_total, None)
+                }
             };
 
             if cache.is_none() {
@@ -706,12 +991,21 @@ impl Lfm2Block {
                     v: vec![],
                     k_dev: None,
                     v_dev: None,
+                    pos_base_dev: None,
+                    past_dev: None,
+                    q_rot_dev: None,
+                    k_rot_dev: None,
+                    attn_out_dev: None,
                 });
             }
 
             // WI-X2: prefer arena-resident attention (history never re-uploads);
             // fall back to the host-history path when the D2D mirror failed.
-            let attn_tensor = if let Some(total) = arena_total {
+            // Item 3: when the device-driven path already computed the attention
+            // on device, skip the host dispatch entirely.
+            let attn_tensor = if let Some(attn) = device_attn_out {
+                attn
+            } else if let Some(total) = arena_total {
                 let (kd, vd) = match cache.as_ref().unwrap() {
                     Lfm2LayerCache::Attention { k_dev, v_dev, .. } => (k_dev, v_dev),
                     _ => {
@@ -799,6 +1093,11 @@ impl Lfm2Block {
                 v: vec![],
                 k_dev: None,
                 v_dev: None,
+                pos_base_dev: None,
+                past_dev: None,
+                q_rot_dev: None,
+                k_rot_dev: None,
+                attn_out_dev: None,
             });
         }
         let (k_dev, v_dev) = match cache.as_mut().unwrap() {
@@ -952,6 +1251,250 @@ impl Lfm2Block {
         Ok(q_rot_vec)
     }
 
+    /// Item 1 (decode path): one dot4 GEMV over the concatenated Q8_0 QKV blob
+    /// `[n_q + 2·n_kv, hidden]` replaces three separate projection GEMVs.
+    /// `norm_x` is the single-token f32 activation `[1, hidden]`; we quantize it
+    /// to q8_1 inline, run the fused GEMV writing `[1, n_q + 2·n_kv]` f32, then
+    /// slice the output into (q, k, v). Returns device-resident storages.
+    fn fused_qkv_dot4_decode(
+        &self,
+        norm_x: &Tensor,
+        fused: &grim_backend_rocm::FusedQkvWeights,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+            Device::Rocm(o) => *o,
+            _ => 0,
+        });
+        let hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
+        let m = 1usize;
+        // Inline f32 → q8_1 quantization into a device buffer.
+        let n_blocks = hidden / 32;
+        let q81_bytes = n_blocks * 36 * m;
+        let act_q81 = Tensor::new(
+            Arc::from(dev.zeros(&Shape::new(vec![q81_bytes]), DType {
+                arith: ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            })?),
+            Shape::new(vec![q81_bytes]),
+            DType {
+                arith: ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+            QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let x_rocm = norm_x
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("norm_x is RocmStorage on fused path");
+        let act_rocm = act_q81
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("act_q81 is RocmStorage");
+        dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
+
+        let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
+        let out_arc: Arc<dyn grim_tensor::BackendStorage> = Arc::from(out);
+        let q_bytes = fused.n_q * 4;
+        let k_bytes = fused.n_k * 4;
+        let q_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            0,
+            q_bytes,
+            Shape::new(vec![fused.n_q]),
+        )?;
+        let k_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            q_bytes,
+            k_bytes,
+            Shape::new(vec![fused.n_k]),
+        )?;
+        let v_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc,
+            q_bytes + k_bytes,
+            k_bytes,
+            Shape::new(vec![fused.n_k]),
+        )?;
+        let q = Tensor::new(
+            Arc::from(q_view),
+            Shape::new(vec![self.num_heads, self.head_dim]),
+            DType::F32,
+            QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let k = Tensor::new(
+            Arc::from(k_view),
+            Shape::new(vec![self.num_kv_heads, self.head_dim]),
+            DType::F32,
+            QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let v = Tensor::new(
+            Arc::from(v_view),
+            Shape::new(vec![self.num_kv_heads, self.head_dim]),
+            DType::F32,
+            QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        Ok((q, k, v))
+    }
+
+    /// Item 3 device-driven attention path (graph-capturable). No host syncs, no
+    /// host scalars baked into launches:
+    ///  - past counter lives in `past_dev` (device u32); kernels derive their own
+    ///    offsets/totals from it, so replaying the captured graph N times reads
+    ///    the live counter each time.
+    ///  - `grim_kv_append` appends the rotated K/V rows to the device arenas at
+    ///    the on-device offset `*past_dev * kv_stride`.
+    ///  - `grim_qkv_attention_dev` reads `total = *past_dev + steps` from device.
+    ///  - `grim_bump_i32(past_dev, steps)` is the LAST node, incrementing the
+    ///    counter so the next replay sees the updated past.
+    /// `q_rot_storage`/`k_rot_storage` are device-resident f32; `v` is the raw
+    /// projection tensor. Returns the (host Q vec for the FFN path, arena_total).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_attention_device(
+        &self,
+        q_rot_storage: Box<dyn grim_tensor::BackendStorage>,
+        k_rot_storage: Box<dyn grim_tensor::BackendStorage>,
+        v: Tensor,
+        device: &Device,
+        cache: &mut Option<Lfm2LayerCache>,
+        kv_stride: usize,
+        steps: usize,
+    ) -> Result<(Vec<f32>, Option<usize>, Option<Tensor>)> {
+        let rocm_dev = grim_backend_rocm::RocmDevice::shared(match device {
+            Device::Rocm(o) => *o,
+            _ => 0,
+        });
+        if cache.is_none() {
+            *cache = Some(Lfm2LayerCache::Attention {
+                k: vec![],
+                v: vec![],
+                k_dev: None,
+                v_dev: None,
+                pos_base_dev: None,
+                past_dev: None,
+                q_rot_dev: None,
+                k_rot_dev: None,
+                attn_out_dev: None,
+            });
+        }
+        // Single mutable borrow: pull past_dev, k_dev, v_dev out together.
+        let (past_dev, k_dev, v_dev) = match cache.as_mut().unwrap() {
+            Lfm2LayerCache::Attention { past_dev, k_dev, v_dev, .. } => (past_dev, k_dev, v_dev),
+            _ => {
+                return Err(grim_core::error::Error::Session(
+                    "Mismatched Attention layer cache".into(),
+                ));
+            }
+        };
+        // Lazily allocate the per-generation past counter (device u32).
+        if past_dev.is_none() {
+            let pos_tensor = Tensor::new(
+                Arc::from(rocm_dev.zeros(&Shape::new(vec![1]), DType::U32)?),
+                Shape::new(vec![1]),
+                DType::U32,
+                QuantProvenance::GrimNative,
+                device.clone(),
+            );
+            *past_dev = Some(Box::new(pos_tensor));
+        }
+        let past_dev = past_dev.as_ref().unwrap();
+
+        // Allocate / reuse device KV arenas.
+        if k_dev.is_none() {
+            let shape = Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+            *k_dev = Some(Box::new(Tensor::new(
+                Arc::from(rocm_dev.zeros(&shape, DType::F32)?),
+                shape.clone(),
+                DType::F32,
+                QuantProvenance::GrimNative,
+                device.clone(),
+            )));
+            *v_dev = Some(Box::new(Tensor::new(
+                Arc::from(rocm_dev.zeros(&shape, DType::F32)?),
+                shape,
+                DType::F32,
+                QuantProvenance::GrimNative,
+                device.clone(),
+            )));
+        }
+        let k_arena = k_dev.as_ref().unwrap();
+        let v_arena = v_dev.as_ref().unwrap();
+        let v_storage = v.storage();
+
+        // Append rotated K/V rows at the on-device offset (no host scalar).
+        let stream = grim_backend_rocm::launch_kv_append(
+            &rocm_dev,
+            k_arena.storage().as_ref(),
+            k_rot_storage.as_ref(),
+            past_dev.storage().as_ref(),
+            kv_stride,
+            steps,
+        )?;
+        let _ = stream;
+        let stream = grim_backend_rocm::launch_kv_append(
+            &rocm_dev,
+            v_arena.storage().as_ref(),
+            v_storage.as_ref(),
+            past_dev.storage().as_ref(),
+            kv_stride,
+            steps,
+        )?;
+        let _ = stream;
+
+        // Online-softmax attention reading total = *past_dev + steps from device.
+        let out_shape = Shape::new(vec![steps, self.num_heads * self.head_dim]);
+        let inv_sqrt_d = 1.0 / (self.head_dim as f32).sqrt();
+        use grim_tensor::MemoryOps;
+        let out_s = rocm_dev.alloc_storage(&out_shape, DType::F32)?;
+        let out_max_s = rocm_dev.alloc_storage(&Shape::new(vec![self.num_heads]), DType::F32)?;
+        let out_sum_s = rocm_dev.alloc_storage(&Shape::new(vec![self.num_heads]), DType::F32)?;
+        // o_proj_w / alibi unused on the reference path; pass a 1-element dummy.
+        let dummy = rocm_dev.alloc_storage(&Shape::new(vec![1]), DType::F32)?;
+        let stream = grim_backend_rocm::launch_qkv_attention_dev(
+            &rocm_dev,
+            q_rot_storage.as_ref(),
+            k_arena.storage().as_ref(),
+            v_arena.storage().as_ref(),
+            out_s.as_ref(),
+            out_max_s.as_ref(),
+            out_sum_s.as_ref(),
+            past_dev.storage().as_ref(),
+            self.num_heads as u32,
+            self.num_kv_heads as u32,
+            self.head_dim as u32,
+            steps as u32,
+            steps as u32,
+            inv_sqrt_d,
+            0,
+            0.0,
+            dummy.as_ref(),
+            0,
+            0,
+            dummy.as_ref(),
+            0,
+        )?;
+        let _ = stream;
+        // Bump the counter LAST so the next replay appends at the new offset.
+        let stream = grim_backend_rocm::launch_bump_i32(&rocm_dev, past_dev.storage().as_ref(), steps)?;
+        let _ = stream;
+
+        // Wrap the device attention output as a Tensor for the caller.
+        let attn_out = Tensor::new(
+            Arc::from(out_s),
+            out_shape,
+            DType::F32,
+            QuantProvenance::GrimNative,
+            device.clone(),
+        );
+        Ok((Vec::new(), None, Some(attn_out)))
+    }
+
     /// Device-side per-token expert compute: extract the winning expert's weight block from the stacked `[E, F, H]` tensor, transpose on-device, matmul the token row, silu-gate with the up projection, then the down projection.
     /// All of it on the device; the host only sees the tiny gate-logit vector.
     fn shortconv_step_device(
@@ -961,6 +1504,7 @@ impl Lfm2Block {
         l_cache: usize,
         state: &mut [f32],
         device: &Device,
+        decode_graph: bool,
     ) -> Result<Option<Tensor>> {
         let dev = grim_nn::modules::pick_device_for_storage_device(device);
         let mut inner = || -> Result<Tensor> {
@@ -997,10 +1541,13 @@ impl Lfm2Block {
             let (y_st, _) = dev.mul(sum_st.as_ref(), c_st.as_ref(), &Shape::new(vec![1, h_dim]))?;
 
             // Slide the host state mirror with the new bx row.
-            let mut bx_h = bx_st.to_cpu_vec_f32()?;
-            bx_h.truncate(h_dim);
-            state.copy_within(h_dim.., 0);
-            state[(kc - 1) * h_dim..].copy_from_slice(&bx_h);
+            // When capturing a HIP graph, host syncs (D2H memcpy) abort graph capture with error 901.
+            if !decode_graph {
+                let mut bx_h = bx_st.to_cpu_vec_f32()?;
+                bx_h.truncate(h_dim);
+                state.copy_within(h_dim.., 0);
+                state[(kc - 1) * h_dim..].copy_from_slice(&bx_h);
+            }
 
             Ok(Tensor::new(
                 Arc::from(y_st),
@@ -1575,6 +2122,7 @@ mod audit_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
+            wqkv_q80_fused: None,
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 8,
@@ -1637,6 +2185,7 @@ mod audit_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
+            wqkv_q80_fused: None,
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 8,
@@ -1719,6 +2268,7 @@ mod shortconv_numeric_reference_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
+            wqkv_q80_fused: None,
             shortconv_in_proj: Some(lin(weights(1, 3 * hidden * hidden), 3 * hidden, hidden)),
             shortconv_conv: Some(grim_backend_cpu::cpu_tensor(
                 weights(2, hidden * l_cache),
@@ -1886,6 +2436,19 @@ mod shortconv_device_decode_tests {
     use super::*;
     use grim_nn::Linear;
 
+    /// Item 1 TDD 1: the fused Q8_0 QKV blob is row-order Q∥K∥V with byte-level
+    /// row ordering matching the split weights. Verifies the host-side
+    /// concatenation contract used by `build_fused_qkv_q80`.
+    #[test]
+    fn fused_qkv_load_matches_split() {
+        let hidden = 128usize;
+        let row_bytes = (hidden / 32) * 34; // Q8_0: 34 bytes per 32 elems
+        let q_blob = vec![1u8; 256 * row_bytes]; // n_q=256
+        let k_blob = vec![2u8; 128 * row_bytes]; // n_k=128
+        let v_blob = vec![3u8; 128 * row_bytes]; // n_v=128
+        Lfm2LayerCache::verify_qkv_blob_layout(&q_blob, &k_blob, &v_blob, row_bytes);
+    }
+
     /// WI-F gate: single-token forward (device `short_conv1d_causal_step` path) must match multi-token forward (host loop)
     /// - causal equivalence through the conv + gate + out_proj stack, including state evolution.
     #[test]
@@ -1930,6 +2493,7 @@ mod shortconv_device_decode_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
+            wqkv_q80_fused: None,
             shortconv_in_proj: Some(lin(weights(1, 3 * hidden * hidden), 3 * hidden, hidden)),
             shortconv_conv: Some(grim_backend_cpu::cpu_tensor(
                 weights(2, hidden * l_cache),

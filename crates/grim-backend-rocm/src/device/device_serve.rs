@@ -410,42 +410,37 @@ impl MemoryOps for RocmDevice {
         // P1-3: raw HIP ops below bind to the calling thread's current
         // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        let dst_s = as_rocm(dst)?;
-        let src_s = as_rocm(src)?;
-        if !dst_s.device_ptr_is_valid() || !src_s.device_ptr_is_valid() {
-            return Err(Error::Backend(
-                "copy_slice_range: inputs lack a valid device pointer".into(),
-            ));
-        }
-        if dst_s.device_ordinal() != src_s.device_ordinal() {
+        // Accept both RocmStorage and RocmStorageView via the trait — views carry
+        // a byte offset in their device_ptr, so the D2D copy lands correctly.
+        let dst_ptr_base = dst.device_ptr().ok_or_else(|| {
+            Error::Backend("copy_slice_range: dst lacks a device pointer".into())
+        })? as *mut c_void;
+        let src_ptr_base = src.device_ptr().ok_or_else(|| {
+            Error::Backend("copy_slice_range: src lacks a device pointer".into())
+        })? as *mut c_void;
+        if dst.device_ordinal() != src.device_ordinal() {
             return Err(Error::Backend(format!(
                 "copy_slice_range: cross-device D2D (dst ordinal {}, src ordinal {}) — \
                  use copy_via_route for routed transfers",
-                dst_s.device_ordinal(),
-                src_s.device_ordinal()
+                dst.device_ordinal(),
+                src.device_ordinal()
             )));
         }
-        if dst_elem_offset + count > dst_s.shape().elem_count() {
+        if dst_elem_offset + count > dst.shape().elem_count() {
             return Err(Error::Shape(format!(
                 "copy_slice_range: dst overflow (offset={dst_elem_offset} + count={count} > {})",
-                dst_s.shape().elem_count()
+                dst.shape().elem_count()
             )));
         }
-        if src_elem_offset + count > src_s.shape().elem_count() {
+        if src_elem_offset + count > src.shape().elem_count() {
             return Err(Error::Shape(format!(
                 "copy_slice_range: src overflow (offset={src_elem_offset} + count={count} > {})",
-                src_s.shape().elem_count()
+                src.shape().elem_count()
             )));
         }
         let bytes = count * std::mem::size_of::<f32>();
-        let dst_ptr = unsafe {
-            (dst_s.device_ptr_checked()? as *mut c_void)
-                .add(dst_elem_offset * std::mem::size_of::<f32>())
-        };
-        let src_ptr = unsafe {
-            (src_s.device_ptr_checked()? as *const c_void)
-                .add(src_elem_offset * std::mem::size_of::<f32>())
-        };
+        let dst_ptr = unsafe { dst_ptr_base.add(dst_elem_offset * std::mem::size_of::<f32>()) };
+        let src_ptr = unsafe { (src_ptr_base as *const c_void).add(src_elem_offset * std::mem::size_of::<f32>()) };
         check_hip("copy_slice_range: hipMemcpyAsync D2D", unsafe {
             hipMemcpyAsync(
                 dst_ptr,
@@ -459,7 +454,23 @@ impl MemoryOps for RocmDevice {
     }
 }
 
-impl GraphCaptureOps for RocmDevice {}
+impl GraphCaptureOps for RocmDevice {
+    fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        self.begin_graph_capture(key)
+    }
+
+    fn end_graph_capture(&self, key: &str) -> Result<()> {
+        self.end_graph_capture(key)
+    }
+
+    fn replay_graph(&self, key: &str) -> Result<bool> {
+        self.replay_graph(key)
+    }
+
+    fn has_captured_graph(&self, key: &str) -> bool {
+        self.has_captured_graph(key)
+    }
+}
 
 impl RocmDevice {
     /// Launch GPU Speculative Rejection Sampling kernel.

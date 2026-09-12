@@ -100,6 +100,59 @@ pub fn fused_or_scalar_attention(
     }
 }
 
+/// WI-X2: attention over a caller-maintained device KV arena with device-resident Q.
+/// Zero H2D copies for Q/K/V.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_arena_device(
+    q_st: &dyn grim_tensor::BackendStorage,
+    k_arena: &dyn grim_tensor::BackendStorage,
+    v_arena: &dyn grim_tensor::BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    if let Ok((storage, _handle)) = dev.qkv_attention(
+        q_st,
+        k_arena,
+        v_arena,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+        None,
+        None,
+    ) {
+        return Ok(Tensor::new(
+            Arc::from(storage),
+            out_shape.clone(),
+            DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            device.clone(),
+        ));
+    }
+    let q_vec = q_st.to_cpu_vec_f32()?;
+    fused_or_scalar_attention_arena(
+        &q_vec,
+        k_arena,
+        v_arena,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
 /// WI-X2: attention over a caller-maintained device KV arena (see `block.rs::cache_append_kv`).
 /// Only the per-step K/V rows cross H2D; the history stays resident, so decode cost is.
 #[allow(clippy::too_many_arguments)]

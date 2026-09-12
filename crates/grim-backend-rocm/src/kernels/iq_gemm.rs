@@ -679,6 +679,46 @@ extern "C" {
         dX[row * K + k_idx] = acc;
     }
 
+    // --- Q8_0 fused GEMM, NUM_ROWS=4 (row-count-aware) ---
+    // Each thread computes 4 consecutive output columns for the same activation
+    // row, sharing the A[row, k] read across 4 weight dequants.  When the
+    // activation vector is large (e.g. down projection: ~68 KB at K=intermediate),
+    // this halves L2 traffic vs. the 1-col-per-thread variant.  Grid covers
+    // M * (N/4) thread-slots; N must be a multiple of 4 (caller guards this).
+    __global__ void grim_fused_dequant_gemm_q8_0_rows4(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_q80,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const int cols_per_thread = 4;
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long slots = (unsigned long long)M * (N / cols_per_thread);
+        if (idx >= slots) return;
+        const int row = (int)(idx / (N / cols_per_thread));
+        const int col_base = (int)(idx % (N / cols_per_thread)) * cols_per_thread;
+        const int blocks_per_row = K / 32;
+        const int row_bytes = blocks_per_row * 34;
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        const unsigned char* b0 = B_q80 + col_base * row_bytes;
+        const unsigned char* b1 = B_q80 + (col_base + 1) * row_bytes;
+        const unsigned char* b2 = B_q80 + (col_base + 2) * row_bytes;
+        const unsigned char* b3 = B_q80 + (col_base + 3) * row_bytes;
+        for (int k = 0; k < K; ++k) {
+            const float a_val = A[row * K + k];
+            const int sb_idx = k / 32;
+            const int in_sb = k % 32;
+            acc0 += a_val * dequant_q80_standalone(b0 + sb_idx * 34, in_sb);
+            acc1 += a_val * dequant_q80_standalone(b1 + sb_idx * 34, in_sb);
+            acc2 += a_val * dequant_q80_standalone(b2 + sb_idx * 34, in_sb);
+            acc3 += a_val * dequant_q80_standalone(b3 + sb_idx * 34, in_sb);
+        }
+        C[row * N + col_base]     = acc0;
+        C[row * N + col_base + 1] = acc1;
+        C[row * N + col_base + 2] = acc2;
+        C[row * N + col_base + 3] = acc3;
+    }
+
 
 
 }
@@ -714,6 +754,7 @@ mod tests {
         check_kernel!("grim_fused_dequant_gemm_iq4xs");
         check_kernel!("grim_fused_dequant_backward_gemm_iq4xs");
         check_kernel!("grim_fused_dequant_gemm_q8_0");
+        check_kernel!("grim_fused_dequant_gemm_q8_0_rows4");
         check_kernel!("grim_fused_dequant_backward_gemm_q8_0");
     }
 }

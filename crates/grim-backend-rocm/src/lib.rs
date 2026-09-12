@@ -26,6 +26,7 @@ pub use std::sync::Arc;
 // Each sub-module owns its own implementation.
 
 pub mod autotune;
+pub mod decode_capture;
 pub mod device;
 pub mod fsdp;
 pub mod fusion;
@@ -122,6 +123,8 @@ pub use crate::memory::allocator::RocmCachingAllocator;
 pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
+pub use crate::memory::view::RocmStorageView;
+pub use crate::device::device_compute::FusedQkvWeights;
 
 pub use crate::device::helpers::{
     check_hip, hip_stream_synchronize, hip_stream_synchronize_after_copy, jit_compile_hsaco,
@@ -153,8 +156,9 @@ pub use fusion::{
 };
 
 pub use kernels::qkv_attention::{
-    BlockTableEntry, KvCacheQuantFormat, launch_paged_attention, launch_paged_attention_quant,
-    launch_qkv_attention_wmma, launch_tree_attention,
+    BlockTableEntry, KvCacheQuantFormat, launch_bump_i32, launch_kv_append, launch_paged_attention,
+    launch_paged_attention_quant, launch_qkv_attention_dev, launch_qkv_attention_wmma,
+    launch_tree_attention,
 };
 pub use kernels::tile_picker::run_install_tune;
 

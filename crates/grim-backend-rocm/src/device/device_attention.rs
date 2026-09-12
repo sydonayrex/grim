@@ -1116,6 +1116,168 @@ impl RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
+    /// Item 3: device-base RoPE writing into a CALLER-PROVIDED output buffer.
+    /// No allocation inside — required for HIP graph capture (stable pointers
+    /// across replays). Same kernel as `rope_dev_base`, different output target.
+    pub fn rope_dev_base_into(
+        &self,
+        q_storage: &dyn BackendStorage,
+        pos_base_dev: &dyn BackendStorage,
+        out_storage: &RocmStorage,
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+        num_heads: usize,
+        steps: usize,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dim = cfg.dim;
+        let base = cfg.base;
+        let q_s = as_rocm(q_storage)?;
+        let pos_s = as_rocm(pos_base_dev)?;
+        if !q_s.device_ptr_is_valid() || !pos_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "rope_dev_base_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || out_dims[2] != dim {
+            return Err(Error::Shape(format!(
+                "rope_dev_base_into expects (B,S,D={}), got {:?}",
+                dim, out_dims
+            )));
+        }
+        let b = out_dims[0] as i32;
+        let s = out_dims[1] as i32;
+        let expected_s = (num_heads * steps) as i32;
+        if s != expected_s {
+            return Err(Error::Shape(format!(
+                "rope_dev_base_into: out_shape middle dim {s} != num_heads({num_heads})*steps({steps})={expected_s}"
+            )));
+        }
+        let d = dim as i32;
+        let half = d / 2;
+
+        let mut out_ptr = dev_ptr(out_storage)?;
+        let mut x_ptr = dev_ptr(q_s)?;
+        let mut pos_ptr = dev_ptr(pos_s)?;
+        let mut b_i = b;
+        let mut s_i = s;
+        let mut d_i = d;
+        let mut half_i = half;
+        let mut base_f = base;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
+        let mut heads_i = num_heads as i32;
+
+        let total = (b * s * half) as usize;
+        let (grid, block) = linear_launch(total);
+
+        self.launch_compute_kernel(
+            "grim_rope_dev_base",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut pos_ptr),
+                arg(&mut out_ptr),
+                arg(&mut b_i),
+                arg(&mut s_i),
+                arg(&mut d_i),
+                arg(&mut half_i),
+                arg(&mut base_f),
+                arg(&mut inter_i),
+                arg(&mut heads_i),
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Item 2: device-base RoPE for the decode path. Instead of uploading a
+    /// per-layer per-token `positions[]` host vector, the single base position
+    /// lives in a device buffer (`pos_base_dev`, one u32) and the kernel derives
+    /// each step's position as `base + si` internally. Same fp32 math as `rope`.
+    ///
+    /// `pos_base_dev` must point to device memory holding one u32 (the absolute
+    /// position of step 0); `steps` query positions are rotated by base..base+steps-1.
+    /// `q_storage` is the per-head, RoPE-normalized Q/K (already reshaped to
+    /// `[1, heads*steps, head_dim]`). Returns the rotated storage.
+    pub fn rope_dev_base(
+        &self,
+        q_storage: &dyn BackendStorage,
+        pos_base_dev: &dyn BackendStorage,
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+        num_heads: usize,
+        steps: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dim = cfg.dim;
+        let base = cfg.base;
+        let q_s = as_rocm(q_storage)?;
+        let pos_s = as_rocm(pos_base_dev)?;
+        if !q_s.device_ptr_is_valid() || !pos_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "rope_dev_base: input lacks a valid device pointer".into(),
+            ));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || out_dims[2] != dim {
+            return Err(Error::Shape(format!(
+                "rope_dev_base expects (B,S,D={}), got {:?}",
+                dim, out_dims
+            )));
+        }
+        let b = out_dims[0] as i32;
+        let s = out_dims[1] as i32;
+        let expected_s = (num_heads * steps) as i32;
+        if s != expected_s {
+            return Err(Error::Shape(format!(
+                "rope_dev_base: out_shape middle dim {s} != num_heads({num_heads})*steps({steps})={expected_s}"
+            )));
+        }
+        let d = dim as i32;
+        let half = d / 2;
+
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut x_ptr = dev_ptr(q_s)?;
+        let mut pos_ptr = dev_ptr(pos_s)?;
+        let mut b_i = b;
+        let mut s_i = s;
+        let mut d_i = d;
+        let mut half_i = half;
+        let mut base_f = base;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
+        let mut heads_i = num_heads as i32;
+
+        let total = (b * s * half) as usize;
+        let (grid, block) = linear_launch(total);
+
+        self.launch_compute_kernel(
+            "grim_rope_dev_base",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut pos_ptr),
+                arg(&mut out_ptr),
+                arg(&mut b_i),
+                arg(&mut s_i),
+                arg(&mut d_i),
+                arg(&mut half_i),
+                arg(&mut base_f),
+                arg(&mut inter_i),
+                arg(&mut heads_i),
+            ],
+        )?;
+
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
     /// Launch LFM2-style fused QKV projection: MXFP4 GEMM (x @ W_qkv) followed by per-head QK-Norm + RoPE (YaRN-aware).
     /// The GEMM result is staged in a scratch buffer (or `out_all` if provided) and consumed.
     pub fn launch_fused_mxfp4_gemm_qk_norm_rope_kv(

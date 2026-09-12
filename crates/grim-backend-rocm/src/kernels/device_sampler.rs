@@ -256,16 +256,23 @@ fn sample_impl(
     seed: u32,
     position: u32,
 ) -> Result<u32> {
-    let out_storage = RocmStorage::alloc_gpu(
-        &Shape::new(vec![1usize]),
-        DType {
-            arith: ArithType::U32,
-            storage: DTypeStorage::Native,
-        },
-        &device.allocator,
-        device.ordinal,
-    )?;
-    let out_ptr = dev_ptr(&out_storage)?;
+    let mut buf_guard = match device.sampler_out_buf.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if buf_guard.is_none() {
+        *buf_guard = Some(RocmStorage::alloc_gpu(
+            &Shape::new(vec![1usize]),
+            DType {
+                arith: ArithType::U32,
+                storage: DTypeStorage::Native,
+            },
+            &device.allocator,
+            device.ordinal,
+        )?);
+    }
+    let out_storage = buf_guard.as_ref().unwrap();
+    let out_ptr = dev_ptr(out_storage)?;
 
     let mut logits_arg = logits_ptr;
     let mut out_arg = out_ptr;

@@ -260,3 +260,34 @@ fn capture_then_replay_undercuts_eager_loop() -> TestResult {
     dev.synchronize();
     Ok(())
 }
+
+#[test]
+fn rocm_device_implements_graph_capture_ops_trait() -> TestResult {
+    use grim_tensor::GraphCaptureOps;
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
+    let dyn_dev: &dyn GraphCaptureOps = &dev;
+    let key = "trait_graph_capture_test";
+    assert!(!dyn_dev.has_captured_graph(key));
+    assert!(!dyn_dev.replay_graph(key)?);
+
+    let m = 2usize;
+    let k = 4usize;
+    let n = 3usize;
+    let a: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.2).collect();
+    let c: Vec<f32> = (0..m * n).map(|i| i as f32 * 0.05).collect();
+    let w: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.1).collect();
+    let inputs = upload_inputs(&dev, &a, &b, &c, &w, m, k, n)?;
+
+    dyn_dev.begin_graph_capture(key)?;
+    let _ = run_compute(&dev, &inputs, m, k, n)?;
+    dyn_dev.end_graph_capture(key)?;
+
+    assert!(dyn_dev.has_captured_graph(key));
+    assert!(dyn_dev.replay_graph(key)?);
+    dev.synchronize();
+    Ok(())
+}

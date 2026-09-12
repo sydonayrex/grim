@@ -1061,33 +1061,13 @@ pub trait AutogradOps: CoreTensorOps + ElementwiseOps {
             owned_x_2d.as_ref()
         };
 
-        // A is [rank, in_features], A^T is [in_features, rank].
-        // x @ A^T requires A_T of shape [in_features, rank].
-        let (a_t_storage, a_t_handle) = self.transpose_2d(
-            a,
-            rank,
-            in_features_a,
-            &Shape::new(vec![in_features_a, rank]),
-        )?;
-        a_t_handle.synchronize()?;
-
         let h_2d_shape = Shape::new(vec![batch, rank]);
-        let (h_storage, h_handle) = self.matmul(x_storage_2d, a_t_storage.as_ref(), &h_2d_shape)?;
+        let (h_storage, h_handle) = self.matmul(x_storage_2d, a, &h_2d_shape)?;
         h_handle.synchronize()?;
-
-        // B is [out_features, rank], B^T is [rank, out_features] — same
-        // device-transpose treatment as A (B5).
-        let (b_t_storage, b_t_handle) = self.transpose_2d(
-            b,
-            out_features,
-            rank_b,
-            &Shape::new(vec![rank_b, out_features]),
-        )?;
-        b_t_handle.synchronize()?;
 
         let delta_2d_shape = Shape::new(vec![batch, out_features]);
         let (delta_storage, delta_handle) =
-            self.matmul(h_storage.as_ref(), b_t_storage.as_ref(), &delta_2d_shape)?;
+            self.matmul(h_storage.as_ref(), b, &delta_2d_shape)?;
         delta_handle.synchronize()?;
 
         let scale_buf_storage;

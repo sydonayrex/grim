@@ -40,7 +40,12 @@ pub async fn cmd_bench(
     if mode == "serve" {
         return cmd_bench_serve(port, concurrency, duration_secs).await;
     }
-    let device = Device::Cpu;
+    // SPEED: auto-probe GPU first (rocm → cuda → metal → vulkan), CPU as the
+    // fallback — same precedence as `grim run`. This was hardcoded `Device::Cpu`,
+    // which made `grim bench` a CPU-only benchmark even on GPU boxes.
+    let (device, device_label) = crate::run::probe_device_with(None)
+        .unwrap_or((Device::Cpu, "cpu".into()));
+    eprintln!("[grim bench] using device: {device_label}");
     // F-5: resolve catalog/cache names ("LFM2.5-350M-Q8_0", "name:gguf") to real paths before the extension dispatch, mirroring `grim run`.
     // A bare filename without an extension previously failed with "No such file".
     let model: Box<dyn CausalLm> = if let Some(path) = model_path {

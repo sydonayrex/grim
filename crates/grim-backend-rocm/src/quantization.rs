@@ -27,6 +27,63 @@ pub enum GcnArch {
     Other,
 }
 
+/// WMMA tile configuration selected per GPU architecture.
+///
+/// Different GCN families have different optimal tile sizes for rocWMMA kernels.
+/// RDNA3/4 can issue 2 WMMA operations per wave (dual N-tile), while RDNA2 and
+/// CDNA are limited to single N-tile per wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileConfig {
+    /// M dimension of the WMMA tile (always 16 for FP16 WMMA).
+    pub m: u32,
+    /// N dimension of the WMMA tile (16 or 32).
+    pub n: u32,
+    /// K dimension of the WMMA tile (always 16 for FP16 WMMA).
+    pub k: u32,
+    /// Whether to compute 2 N-tiles per wave (RDNA3/4 dual-issue).
+    pub dual_n: bool,
+}
+
+impl TileConfig {
+    /// Select the optimal tile configuration for the given GCN architecture.
+    pub fn for_arch(arch: GcnArch) -> Self {
+        match arch {
+            // RDNA3/4 support dual-issue WMMA (2× 16×16 per wave → effective 16×32).
+            GcnArch::RDNA3 | GcnArch::RDNA4 | GcnArch::UDNA => TileConfig {
+                m: 16,
+                n: 32,
+                k: 16,
+                dual_n: true,
+            },
+            // RDNA2 and CDNA: single 16×16 tile per wave.
+            _ => TileConfig {
+                m: 16,
+                n: 16,
+                k: 16,
+                dual_n: false,
+            },
+        }
+    }
+
+    /// Number of output columns computed per thread block.
+    pub fn n_per_block(self) -> u32 {
+        if self.dual_n {
+            self.n
+        } else {
+            self.n
+        }
+    }
+
+    /// Grid dimension for N given the number of output columns.
+    pub fn grid_x(self, n: usize) -> u32 {
+        if self.dual_n {
+            n.div_ceil(self.n as usize) as u32
+        } else {
+            n.div_ceil(self.n as usize) as u32
+        }
+    }
+}
+
 /// Bucket an `hipGetDeviceProperties::gcnArchName` value into a coarse [see: `GcnArch`, `":N"`, `gfx`, `gfx1200`]
 pub fn gcn_arch(name: &str) -> GcnArch {
     // Strip the optional `:N` revision suffix.
@@ -561,5 +618,53 @@ mod self_tests {
         let rna1 = arch_capability(GcnArch::RDNA1);
         assert!(!rna1.nvfp4_emulated);
         assert!(!rna1.supports(QuantMode::NvFp4Emulated));
+    }
+
+    #[test]
+    fn tile_config_rdna3_dual_n() {
+        let cfg = TileConfig::for_arch(GcnArch::RDNA3);
+        assert_eq!(cfg.m, 16);
+        assert_eq!(cfg.n, 32);
+        assert_eq!(cfg.k, 16);
+        assert!(cfg.dual_n);
+    }
+
+    #[test]
+    fn tile_config_rdna4_dual_n() {
+        let cfg = TileConfig::for_arch(GcnArch::RDNA4);
+        assert_eq!(cfg.n, 32);
+        assert!(cfg.dual_n);
+    }
+
+    #[test]
+    fn tile_config_udna_dual_n() {
+        let cfg = TileConfig::for_arch(GcnArch::UDNA);
+        assert_eq!(cfg.n, 32);
+        assert!(cfg.dual_n);
+    }
+
+    #[test]
+    fn tile_config_rdna2_single_n() {
+        let cfg = TileConfig::for_arch(GcnArch::RDNA2);
+        assert_eq!(cfg.n, 16);
+        assert!(!cfg.dual_n);
+    }
+
+    #[test]
+    fn tile_config_cnda_single_n() {
+        let cfg = TileConfig::for_arch(GcnArch::CDNA3);
+        assert_eq!(cfg.n, 16);
+        assert!(!cfg.dual_n);
+    }
+
+    #[test]
+    fn tile_config_grid_x() {
+        let cfg = TileConfig::for_arch(GcnArch::RDNA4);
+        assert_eq!(cfg.grid_x(1024), 32); // 1024 / 32 = 32
+        assert_eq!(cfg.grid_x(32), 1);
+        assert_eq!(cfg.grid_x(33), 2);
+        assert_eq!(cfg.grid_x(64), 2);
+        let cfg_r2 = TileConfig::for_arch(GcnArch::RDNA2);
+        assert_eq!(cfg_r2.grid_x(1024), 64); // 1024 / 16 = 64
     }
 }

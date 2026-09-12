@@ -14,7 +14,7 @@ use grim_tensor::{
 use crate::autotune::GemmOp;
 use crate::device::cuda_device::CudaDevice;
 use crate::device::handles::{
-    CUBLAS_OP_N, CUBLAS_STATUS_SUCCESS, CUfunction, CudaHandle, cuLaunchKernel,
+    CUBLAS_OP_N, CUBLAS_OP_T, CUBLAS_STATUS_SUCCESS, CUfunction, CudaHandle, cuLaunchKernel,
     cuModuleGetFunction, cublasSgemm_v2, cudaDeviceSynchronize, cudaFree, cudaMalloc, cudaMemcpy,
     cudaMemcpyHostToDevice, cudaSetDevice, cudaSuccess,
 };

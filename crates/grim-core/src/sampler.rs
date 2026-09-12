@@ -83,6 +83,9 @@ pub struct SamplingParams {
     pub repeat_penalty: f32,
     /// Controls model reasoning / thinking effort (Off, Default, Low, Medium, High, Custom).
     pub thinking_level: ThinkingLevel,
+    /// Minimum tokens to generate before EOS is allowed. Prevents premature stopping
+    /// on models that may emit EOS-biased logits early in the sequence. 0 = no minimum.
+    pub min_tokens: u32,
 }
 
 impl Default for SamplingParams {
@@ -95,6 +98,7 @@ impl Default for SamplingParams {
             top_k: 0,
             repeat_penalty: 1.0,
             thinking_level: ThinkingLevel::Default,
+            min_tokens: 0,
         }
     }
 }
@@ -109,6 +113,270 @@ impl SamplingParams {
             Box::new(TopPSampler::new(self, seed))
         }
     }
+}
+
+/// Pre-allocated sampling buffers to avoid per-token heap allocations.
+///
+/// Owns reusable working memory for the sampling pipeline: temperature-scaled
+/// logits, softmax exponentials, sort indices, and the top-p CDF. Reuse one
+/// `SamplerState` across all decode steps in a session.
+///
+/// Typical per-token allocation without `SamplerState`: ~5-7 heap allocations
+/// of vocab-size arrays (vocab = 128K → ~3.8 MB allocated per token). With
+/// `SamplerState`, zero heap allocations per token after construction.
+pub struct SamplerState {
+    /// Reused for temperature-scaled logits (and repeat-penalty output).
+    pub logits_buf: Vec<f32>,
+    /// Reused for softmax exponentials.
+    pub exp_buf: Vec<f32>,
+    /// Reused for sort indices (top-k and top-p).
+    pub idx_buf: Vec<usize>,
+    /// Reused for top-p CDF: (token_index, cumulative_probability).
+    pub cdf_buf: Vec<(usize, f32)>,
+}
+
+impl SamplerState {
+    /// Allocate a fresh `SamplerState` with capacity for `vocab_size` tokens.
+    pub fn with_capacity(vocab_size: usize) -> Self {
+        Self {
+            logits_buf: Vec::with_capacity(vocab_size),
+            exp_buf: Vec::with_capacity(vocab_size),
+            idx_buf: (0..vocab_size).collect(),
+            cdf_buf: Vec::with_capacity(vocab_size.min(4096)),
+        }
+    }
+
+    /// Reset internal buffers to length 0 (capacity preserved).
+    pub fn clear(&mut self) {
+        self.logits_buf.clear();
+        self.exp_buf.clear();
+        self.cdf_buf.clear();
+        // idx_buf is always 0..n; only the length prefix is valid per call.
+    }
+}
+
+/// Histogram-based partial top-k selection — O(n) instead of O(n log n).
+///
+/// Finds the `k` highest-logit tokens using a 128-bucket histogram over the
+/// logit range [-10, 10]. Tokens outside this range are clamped to the
+/// nearest bucket. Returns the index into `idx_buf` where the top-k tokens
+/// begin (tokens are sorted descending by logit within the result).
+///
+/// This matches the approach in llama.cpp's `llama_token_data_array_partial_sort`.
+fn histogram_top_k(
+    logits: &[f32],
+    idx_buf: &mut [usize],
+    k: usize,
+) -> usize {
+    const NBUCKETS: usize = 128;
+    const BUCKET_LOW: f32 = -10.0;
+    const BUCKET_HIGH: f32 = 10.0;
+    const BUCKET_SCALE: f32 = NBUCKETS as f32 / (BUCKET_HIGH - BUCKET_LOW);
+    const BUCKET_INTER: f32 = -BUCKET_LOW * BUCKET_SCALE;
+
+    // Build histogram: count tokens per bucket.
+    let mut histo = [0u32; NBUCKETS];
+    for &logit in logits.iter() {
+        let mut ib = (BUCKET_SCALE * logit + BUCKET_INTER) as i32;
+        ib = ib.clamp(0, NBUCKETS as i32 - 1);
+        histo[ib as usize] += 1;
+    }
+
+    // Find the highest bucket that contains the k-th token.
+    let mut nhave = 0usize;
+    let mut ib = NBUCKETS;
+    for b in (0..NBUCKETS).rev() {
+        nhave += histo[b] as usize;
+        if nhave >= k {
+            ib = b;
+            break;
+        }
+    }
+    if ib == NBUCKETS {
+        // All tokens fit in fewer than k buckets — return everything.
+        return 0;
+    }
+
+    // Collect tokens from buckets >= ib into idx_buf, sorted descending.
+    // First pass: copy indices from buckets above ib (already sorted by bucket).
+    let mut pos = 0usize;
+    for b in ((ib + 1)..NBUCKETS).rev() {
+        for (i, &logit) in logits.iter().enumerate() {
+            let mut bucket = (BUCKET_SCALE * logit + BUCKET_INTER) as i32;
+            bucket = bucket.clamp(0, NBUCKETS as i32 - 1);
+            if bucket as usize == b {
+                idx_buf[pos] = i;
+                pos += 1;
+            }
+        }
+    }
+
+    // Second pass: tokens in bucket ib — sort by descending logit.
+    let bucket_start = pos;
+    for (i, &logit) in logits.iter().enumerate() {
+        let mut bucket = (BUCKET_SCALE * logit + BUCKET_INTER) as i32;
+        bucket = bucket.clamp(0, NBUCKETS as i32 - 1);
+        if bucket as usize == ib {
+            idx_buf[pos] = i;
+            pos += 1;
+        }
+    }
+    // Sort the tokens within bucket ib by descending logit.
+    idx_buf[bucket_start..pos].sort_by(|&a, &b| {
+        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Return the start index of the top-k region.
+    // Tokens before `bucket_start` are from higher buckets (already sorted).
+    // Tokens from `bucket_start..pos` are from bucket ib (just sorted).
+    // The top-k is the first k tokens in this combined list.
+    if pos <= k {
+        0
+    } else {
+        // We may have collected more than k tokens from bucket ib.
+        // Return the start such that idx_buf[start..start+k] is the top-k.
+        pos.saturating_sub(k)
+    }
+}
+
+/// Optimized sampling using pre-allocated `SamplerState` buffers.
+///
+/// Pipeline: temperature-scale → histogram top-k → fused softmax + top-p CDF → draw.
+/// Zero heap allocations per token (all buffers reused from `state`).
+///
+/// Falls back to the scalar `sample_logits` for edge cases (greedy, non-finite).
+pub fn sample_logits_with_state<F>(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    repeat_penalty: f32,
+    history: &[u32],
+    rng: &mut F,
+    state: &mut SamplerState,
+) -> u32
+where
+    F: FnMut() -> u32,
+{
+    if temperature <= 0.0 {
+        let scaled = apply_repeat_penalty(logits, repeat_penalty, history);
+        return argmax_first(&scaled);
+    }
+
+    let n = logits.len();
+    state.clear();
+
+    // Apply repetition penalty + temperature scaling into logits_buf.
+    state.logits_buf.extend(logits.iter().map(|&x| {
+        if x.is_nan() {
+            f32::NEG_INFINITY
+        } else {
+            x / temperature
+        }
+    }));
+    // Apply repeat penalty in-place.
+    if repeat_penalty > 1.0 && !history.is_empty() {
+        let mut seen = std::collections::HashSet::with_capacity(history.len().min(1024));
+        for &tok in history {
+            if !seen.insert(tok) {
+                continue;
+            }
+            let i = tok as usize;
+            if i < state.logits_buf.len() {
+                if state.logits_buf[i] < 0.0 {
+                    state.logits_buf[i] *= repeat_penalty;
+                } else {
+                    state.logits_buf[i] /= repeat_penalty;
+                }
+            }
+        }
+    }
+
+    // Histogram top-k: find the top-k tokens into idx_buf.
+    let top_k = if top_k > 0 && (top_k as usize) < n {
+        top_k as usize
+    } else {
+        n
+    };
+    let topk_start = if top_k < n {
+        // Ensure idx_buf has the full index range.
+        if state.idx_buf.len() < n {
+            state.idx_buf = (0..n).collect();
+        }
+        histogram_top_k(&state.logits_buf, &mut state.idx_buf, top_k)
+    } else {
+        // No top-k truncation: use all tokens.
+        if state.idx_buf.len() != n {
+            state.idx_buf = (0..n).collect();
+        }
+        0
+    };
+    let topk_end = (topk_start + top_k).min(n);
+
+    // Fused softmax + top-p CDF build over the top-k tokens.
+    // First: find max logit among top-k for numerical stability.
+    let mut max_logit = f32::NEG_INFINITY;
+    for &idx in &state.idx_buf[topk_start..topk_end] {
+        if state.logits_buf[idx] > max_logit {
+            max_logit = state.logits_buf[idx];
+        }
+    }
+
+    // Compute exps and sum in one pass.
+    state.exp_buf.clear();
+    let mut sum_exps = 0.0f32;
+    for &idx in &state.idx_buf[topk_start..topk_end] {
+        let x = state.logits_buf[idx];
+        let exp_val = if x == f32::NEG_INFINITY || !x.is_finite() {
+            0.0
+        } else {
+            (x - max_logit).exp()
+        };
+        state.exp_buf.push(exp_val);
+        sum_exps += exp_val;
+    }
+
+    if sum_exps <= 0.0 || !max_logit.is_finite() {
+        return argmax_first(&state.logits_buf);
+    }
+
+    // Build CDF over top-k tokens, applying top-p cutoff.
+    state.cdf_buf.clear();
+    let mut cumulative = 0.0f32;
+    let mut cutoff = topk_end - topk_start;
+    if top_p < 1.0 {
+        for (j, &exp_val) in state.exp_buf.iter().enumerate() {
+            cumulative += exp_val / sum_exps;
+            let idx = state.idx_buf[topk_start + j];
+            state.cdf_buf.push((idx, cumulative));
+            if cumulative >= top_p {
+                cutoff = j + 1;
+                break;
+            }
+        }
+        if cutoff == 0 {
+            cutoff = 1;
+        }
+    } else {
+        for (j, &exp_val) in state.exp_buf.iter().enumerate() {
+            cumulative += exp_val / sum_exps;
+            let idx = state.idx_buf[topk_start + j];
+            state.cdf_buf.push((idx, cumulative));
+        }
+    }
+
+    if cumulative <= 0.0 {
+        return argmax_first(logits);
+    }
+
+    // Draw from CDF.
+    let draw = (rng() as f64 / (u32::MAX as f64)) * cumulative as f64;
+    for &(idx, c) in state.cdf_buf.iter().take(cutoff) {
+        if draw <= c as f64 {
+            return idx as u32;
+        }
+    }
+    state.cdf_buf[cutoff - 1].0 as u32
 }
 
 /// Greedy (argmax) sampler - used when `temperature == 0`.
@@ -351,6 +619,34 @@ where
     cdf.last().map(|(idx, _)| *idx as u32).unwrap_or(0)
 }
 
+/// Returns true if the given token is an end-of-sequence token for the provided tokenizer.
+/// Checks the model's native `eos_token_id` plus common chat-format stop tokens.
+pub fn is_eos_token(token: u32, eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> bool {
+    eos_token_id.map_or(false, |id| token == id) || stop_token_ids.contains(&token)
+}
+
+/// Determines whether generation should stop given the current state.
+///
+/// Returns `true` if `next_token` is an EOS token AND either:
+/// - `min_tokens` is 0 (no minimum), OR
+/// - `generated` >= `min_tokens` (minimum met)
+///
+/// This prevents premature EOS on models that emit EOS-biased logits early
+/// in the sequence (e.g. LFM2 with certain prompt patterns).
+pub fn should_stop(
+    next_token: u32,
+    generated: u32,
+    min_tokens: u32,
+    eos_token_id: Option<u32>,
+    stop_token_ids: &[u32],
+) -> bool {
+    if !is_eos_token(next_token, eos_token_id, stop_token_ids) {
+        return false;
+    }
+    // EOS generated — only stop if we've met the minimum token budget.
+    min_tokens == 0 || generated >= min_tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,9 +722,53 @@ mod tests {
             top_k: 40,
             repeat_penalty: 1.0,
             thinking_level: ThinkingLevel::Default,
+            min_tokens: 0,
         }
         .into_sampler(42);
         assert_eq!(sampler.name(), "greedy");
+    }
+
+    #[test]
+    fn should_stop_respects_min_tokens() {
+        let eos = Some(7u32);
+        let stops: &[u32] = &[];
+
+        // EOS token 7, min_tokens=0 → always stop
+        assert!(should_stop(7, 0, 0, eos, stops));
+        assert!(should_stop(7, 5, 0, eos, stops));
+
+        // EOS token 7, min_tokens=100, generated=5 → don't stop yet
+        assert!(!should_stop(7, 5, 100, eos, stops));
+
+        // EOS token 7, min_tokens=100, generated=100 → stop
+        assert!(should_stop(7, 100, 100, eos, stops));
+
+        // EOS token 7, min_tokens=100, generated=150 → stop
+        assert!(should_stop(7, 150, 100, eos, stops));
+
+        // Non-EOS token → never stop regardless of min_tokens
+        assert!(!should_stop(42, 5, 100, eos, stops));
+        assert!(!should_stop(42, 0, 0, eos, stops));
+    }
+
+    #[test]
+    fn should_stop_with_custom_stop_tokens() {
+        let eos = None;
+        let stops = &[7u32, 100, 200];
+
+        assert!(should_stop(7, 0, 0, eos, stops));
+        assert!(should_stop(100, 0, 0, eos, stops));
+        assert!(should_stop(200, 0, 0, eos, stops));
+        assert!(!should_stop(42, 0, 0, eos, stops));
+    }
+
+    #[test]
+    fn is_eos_token_checks_all_sources() {
+        assert!(is_eos_token(7, Some(7), &[]));
+        assert!(is_eos_token(7, None, &[7, 100]));
+        assert!(is_eos_token(100, Some(7), &[100]));
+        assert!(!is_eos_token(42, Some(7), &[100]));
+        assert!(!is_eos_token(0, None, &[]));
     }
 
     #[test]
@@ -457,5 +797,133 @@ mod tests {
             ThinkingLevel::Custom(50000).max_thinking_tokens(),
             Some(50000)
         );
+    }
+
+    // --- P1-F: SamplerState tests ---
+
+    #[test]
+    fn sampler_state_allocates_with_capacity() {
+        let state = SamplerState::with_capacity(128);
+        assert_eq!(state.logits_buf.capacity(), 128);
+        assert_eq!(state.exp_buf.capacity(), 128);
+        assert_eq!(state.idx_buf.len(), 128);
+        assert_eq!(state.idx_buf[0], 0);
+        assert_eq!(state.idx_buf[127], 127);
+    }
+
+    #[test]
+    fn sampler_state_clear_preserves_capacity() {
+        let mut state = SamplerState::with_capacity(64);
+        state.logits_buf.extend_from_slice(&[1.0, 2.0, 3.0]);
+        state.exp_buf.extend_from_slice(&[0.5, 0.5]);
+        state.cdf_buf.push((0, 1.0));
+        state.clear();
+        assert!(state.logits_buf.is_empty());
+        assert!(state.exp_buf.is_empty());
+        assert!(state.cdf_buf.is_empty());
+        assert_eq!(state.logits_buf.capacity(), 64);
+        assert_eq!(state.exp_buf.capacity(), 64);
+    }
+
+    // --- P1-F: histogram_top_k tests ---
+
+    #[test]
+    fn histogram_top_k_selects_highest_logits() {
+        let logits = vec![0.1, 5.0, 3.0, 1.0, 4.0, 2.0];
+        let mut idx_buf = (0..logits.len()).collect::<Vec<_>>();
+        let start = histogram_top_k(&logits, &mut idx_buf, 3);
+        // The top-3 indices (by logit) should be 1 (5.0), 4 (4.0), 2 (3.0).
+        let top3: Vec<usize> = idx_buf[start..start + 3].to_vec();
+        assert!(top3.contains(&1));
+        assert!(top3.contains(&4));
+        assert!(top3.contains(&2));
+        // And they should be sorted descending.
+        assert_eq!(top3, vec![1, 4, 2]);
+    }
+
+    #[test]
+    fn histogram_top_k_handles_k_equal_n() {
+        let logits = vec![1.0, 2.0, 3.0];
+        let mut idx_buf = (0..logits.len()).collect::<Vec<_>>();
+        let start = histogram_top_k(&logits, &mut idx_buf, 3);
+        assert_eq!(start, 0);
+        assert_eq!(idx_buf[..3], vec![2, 1, 0]);
+    }
+
+    // --- P1-F: sample_logits_with_state tests ---
+
+    #[test]
+    fn state_based_sample_matches_scalar_greedy() {
+        // With temperature 0, both paths should return argmax.
+        let logits = vec![0.1, 2.0, 0.5, -1.0];
+        let mut seed: u64 = 0x1234;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as u32
+        };
+        let mut state = SamplerState::with_capacity(logits.len());
+        let result = sample_logits_with_state(&logits, 0.0, 1.0, 0, 1.0, &[], &mut rng, &mut state);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn state_based_sample_respects_distribution() {
+        // With a sharply peaked distribution, the sampled token is the max almost always.
+        let logits = vec![0.0, 10.0, 0.0, 0.0];
+        let mut seed: u64 = 0x1234;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as u32
+        };
+        let mut state = SamplerState::with_capacity(logits.len());
+        let mut dominant = 0usize;
+        for _ in 0..1000 {
+            if sample_logits_with_state(&logits, 1.0, 0.95, 0, 1.0, &[], &mut rng, &mut state) == 1 {
+                dominant += 1;
+            }
+        }
+        assert!(dominant > 990, "dominant token should win ~always, got {dominant}");
+    }
+
+    #[test]
+    fn state_based_sample_excludes_low_prob_tokens() {
+        let logits = vec![4.0, 0.0, 0.0, 0.0];
+        let mut seed: u64 = 7;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as u32
+        };
+        let mut state = SamplerState::with_capacity(logits.len());
+        for _ in 0..200 {
+            assert_eq!(
+                sample_logits_with_state(&logits, 1.0, 0.5, 0, 1.0, &[], &mut rng, &mut state),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn state_based_sample_with_top_k() {
+        let logits = vec![1.0, 5.0, 3.0, 2.0, 4.0];
+        let mut seed: u64 = 42;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as u32
+        };
+        let mut state = SamplerState::with_capacity(logits.len());
+        // With top_k=2, only tokens 1 (5.0) and 4 (4.0) should be selected.
+        for _ in 0..500 {
+            let tok =
+                sample_logits_with_state(&logits, 1.0, 1.0, 2, 1.0, &[], &mut rng, &mut state);
+            assert!(tok == 1 || tok == 4, "top_k=2 should only select tokens 1 or 4, got {tok}");
+        }
     }
 }

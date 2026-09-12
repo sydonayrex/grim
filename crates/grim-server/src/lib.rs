@@ -1165,6 +1165,7 @@ async fn chat_completions(
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32,
         thinking_level,
+        min_tokens: body_obj.get("min_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
     };
     // A per-request seed keeps stochastic sampling reproducible for a given
     // (model, request) without a global RNG; temperature == 0 path ignores it.
@@ -1397,6 +1398,38 @@ async fn chat_completions(
             prompt_text
         );
     }
+
+    // Prompt compression: if the prompt is long and compression is enabled,
+    // compress the raw text before tokenization to reduce prefill cost and
+    // KV cache pressure. Uses extractive compression (TextRank + TF-IDF +
+    // position weighting + novelty scoring) — no neural inference, preserves
+    // original tokens verbatim. Gate: GRIM_COMPRESS_PROMPT=1.
+    let prompt_tokens: Vec<u32> = if std::env::var("GRIM_COMPRESS_PROMPT").as_deref() == Ok("1") {
+        let budget = grim_compress::DEFAULT_TOKEN_BUDGET;
+        if prompt_text.len() > budget * 4 {
+            // Only compress if the raw text is substantially larger than the budget
+            let compressed = grim_compress::compress_prompt(&prompt_text, budget);
+            if compressed != prompt_text {
+                eprintln!(
+                    "[grim-server] prompt compressed: {} chars -> {} chars",
+                    prompt_text.len(),
+                    compressed.len()
+                );
+                let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
+                let new_tokens = tok
+                    .as_ref()
+                    .map(|t| t.encode(&compressed))
+                    .unwrap_or_default();
+                if new_tokens.is_empty() { vec![1] } else { new_tokens }
+            } else {
+                prompt_tokens
+            }
+        } else {
+            prompt_tokens
+        }
+    } else {
+        prompt_tokens
+    };
 
     // P0-3.2: Vocab size for clamping sampled tokens into the model's actual range.
     // The engine's internal logits table is fixed at 65536 entries; a model with a smaller.

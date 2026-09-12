@@ -142,6 +142,35 @@ impl RocmStorage {
     }
 
     /// Copies data from host to GPU using the caching allocator + `hipMemcpy`. [see: `alloc_gpu`, `&[f32]`]
+    /// SPEED-ROC: overwrite this existing device buffer with host f32 data.
+    /// No reallocation — for fixed-shape hot-path reuse (decode loop).
+    pub fn write_host_f32(&self, host: &[f32]) -> Result<()> {
+        let need = host.len() * 4;
+        if self.bytes < need {
+            return Err(Error::Backend(format!(
+                "write_host_f32: buffer {} bytes < {} needed",
+                self.bytes, need
+            )));
+        }
+        let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let res = unsafe {
+            hipMemcpy(
+                dev_ptr_void,
+                host.as_ptr() as *const c_void,
+                need,
+                HipMemcpyKind::HostToDevice,
+            )
+        };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "write_host_f32: hipMemcpy failed {}",
+                res
+            )));
+        }
+        Ok(())
+    }
+
     pub fn copy_from_host(
         host_data: &[f32],
         shape: &Shape,
@@ -600,7 +629,7 @@ impl BackendStorage for RocmStorage {
 }
 
 /// Minimal host-side dequantizer for when a quantized tensor needs to be [see: `Vec<f32>`]
-fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>> {
+pub(crate) fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>> {
     let start = std::time::Instant::now();
     let result = match &dtype.storage {
         DTypeStorage::KQuant(KQuantScheme::Q80) => {

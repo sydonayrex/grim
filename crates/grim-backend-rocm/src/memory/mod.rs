@@ -6,3 +6,4 @@ pub mod hugepage;
 pub mod pinned;
 pub mod pool;
 pub mod storage;
+pub mod view;

@@ -247,9 +247,19 @@ pub struct RocmDevice {
     pub(crate) rccl: Mutex<Option<Arc<crate::rccl::RcclAllReduce>>>,
     /// Upload completion event for async H2D pipeline.
     pub(crate) upload_event: Mutex<Option<*mut c_void>>,
+    /// SPEED-CEREMONY: true between "upload event recorded" and "compute stream
+    /// fenced on it". Lets `active_stream()` skip the mutex + hipStreamWaitEvent
+    /// per launch when no stream-ordered upload is in flight.
+    pub(crate) upload_in_flight: AtomicBool,
     /// Attention logit softcapping cap (e.g. 50.0 for Gemma-2) stored as f32 bits.
     /// <= 0.0 disables.
     pub(crate) attn_logit_softcap: std::sync::atomic::AtomicU32,
+    /// SPEED-ROC: Preallocated 4-byte device buffer for the GPU stochastic sampler.
+    /// Reused every decode step, eliminating per-token hipMalloc overhead.
+    pub(crate) sampler_out_buf: Mutex<Option<RocmStorage>>,
+    /// SPEED-ROC: Preallocated buffer for activation quant (Q8_1) in dot4 GEMV.
+    /// Reused every decode GEMV, eliminating per-layer hipMalloc overhead.
+    pub(crate) act_q81_buf: Mutex<Option<RocmStorage>>,
 }
 
 // SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle caches) that is process-local and accessed only through the owning thread's HIP context.
@@ -719,7 +729,9 @@ impl RocmDevice {
             module_load_count: AtomicUsize::new(0),
             launch_counter: AtomicUsize::new(0),
             gpu_target: gpu_target.clone(),
-            capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH").is_ok(),
+            capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH")
+                .map(|v| v != "0" && v != "false" && v != "off")
+                .unwrap_or(false),
             capture_stream: RwLock::new(None),
             capture_active: AtomicBool::new(false),
             captured_graphs: Mutex::new(HashMap::new()),
@@ -771,8 +783,11 @@ impl RocmDevice {
             )),
             rccl: Mutex::new(None),
             upload_event: Mutex::new(None),
+            upload_in_flight: AtomicBool::new(false),
             graph_capture_mgr: Mutex::new(None),
             attn_logit_softcap: std::sync::atomic::AtomicU32::new(0),
+            sampler_out_buf: Mutex::new(None),
+            act_q81_buf: Mutex::new(None),
         }
     }
 
@@ -969,7 +984,7 @@ impl RocmDevice {
     /// SPEED-ROC-4: whether HIP graph capture is enabled for this device
     /// (`GRIM_CAPTURE_GRAPH`). Read by hot-path dispatchers to opt into
     /// capture/replay without poking private fields across modules.
-    pub(crate) fn graph_capture_enabled(&self) -> bool {
+    pub fn graph_capture_enabled(&self) -> bool {
         self.capture_enabled
     }
 
@@ -997,13 +1012,17 @@ impl RocmDevice {
         };
         // SPEED-ROC-1: if a stream-ordered upload is in flight on the transfer stream, fence this (compute) stream on its completion event so the prefetch can overlap the prior decode-step GEMM instead of racing it.
         // `hipStreamWaitEvent` is a no-op ordering edge; it does not block the host.
-        if !stream.is_null() {
+        if !stream.is_null() && self.upload_in_flight.load(Ordering::SeqCst) {
             if let Ok(guard) = self.upload_event.lock() {
                 if let Some(ev) = *guard {
                     if !ev.is_null() {
                         unsafe {
                             let _ = crate::hipStreamWaitEvent(stream, ev, 0);
                         }
+                        // Stream ordering makes this single fence cover every
+                        // later launch enqueued on the same stream — clear the
+                        // flag so subsequent launches skip mutex + WaitEvent.
+                        self.upload_in_flight.store(false, Ordering::SeqCst);
                     }
                 }
             }
@@ -1187,6 +1206,24 @@ impl RocmDevice {
             .contains_key(key)
     }
 
+    /// Drop the captured graph cached under `key` (5 lines). Required by Item 3:
+    /// a whole-decode-step graph is keyed on the session/generation, and buffers
+    /// change each turn/session, so the stale graph must be evicted on turn start
+    /// (or when device buffers are reallocated) and re-captured fresh.
+    pub fn drop_captured_graph(&self, key: &str) -> Result<()> {
+        let mut cache = self
+            .captured_graphs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(g) = cache.remove(key) {
+            unsafe {
+                let _ = hipGraphExecDestroy(g.exec);
+                let _ = hipGraphDestroy(g.graph);
+            }
+        }
+        Ok(())
+    }
+
     // WRECK-9: decode-step graph capture via GraphCaptureManager.
 
     /// Lazily-initialized GraphCaptureManager for decode-step graph capture.
@@ -1244,6 +1281,71 @@ impl RocmDevice {
         })?;
         mgr.replay(key)?;
         Ok(true)
+    }
+
+    /// Capture the full decode step (all transformer layers) under a shape+pointer
+    /// key via the GraphCaptureManager, then replay it. This is the "whole graph"
+    /// extension of `decode_graph_capture_and_replay` (which captures a single GEMM).
+    ///
+    /// The `record` closure runs the model's `decode_one` on the capture stream.
+    /// All intermediate allocations, kernel launches, and rocBLAS GEMMs are recorded
+    /// into a single HIP graph. Subsequent calls to `replay_decode_step` replay the
+    /// entire graph with one `hipGraphLaunch`.
+    ///
+    /// The key includes device pointers (SPEED-ROC-4) so that if the caching
+    /// allocator recycles any buffer, the key misses and the graph is re-captured.
+    pub fn capture_decode_step(
+        &self,
+        key: crate::graph_capture::DecodeGraphKey,
+        record: impl FnOnce(*mut c_void) -> Result<()> + Send,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        self.ensure_graph_capture_mgr();
+        let mgr = self
+            .graph_capture_mgr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mgr = mgr.as_ref().ok_or_else(|| {
+            Error::Backend("capture_decode_step: graph capture manager not initialized".into())
+        })?;
+        mgr.get_or_capture(key, record)?;
+        mgr.replay(key)?;
+        Ok(())
+    }
+
+    /// Replay a previously captured full decode-step graph.
+    ///
+    /// Returns `Err` if no graph has been captured for `key`. The replay is
+    /// asynchronous on the capture stream — callers must synchronize before
+    /// reading the output.
+    pub fn replay_decode_step(
+        &self,
+        key: crate::graph_capture::DecodeGraphKey,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mgr = self
+            .graph_capture_mgr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mgr = mgr.as_ref().ok_or_else(|| {
+            Error::Backend("replay_decode_step: graph capture manager not initialized".into())
+        })?;
+        mgr.replay(key)
+    }
+
+    /// Check whether a full decode-step graph is cached for `key`.
+    pub fn has_decode_step_graph(
+        &self,
+        key: crate::graph_capture::DecodeGraphKey,
+    ) -> bool {
+        let mgr = self
+            .graph_capture_mgr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match mgr.as_ref() {
+            Some(mgr) => mgr.has_graph(key),
+            None => false,
+        }
     }
 
     // =============================================================================
@@ -1576,6 +1678,7 @@ impl RocmDevice {
                 "hipEventRecord failed with code {r}"
             )));
         }
+        self.upload_in_flight.store(true, Ordering::SeqCst);
         // Retain the pin until the next device-wide synchronize (never free a
         // page-locked source while a stream-ordered copy may still read it).
         if let Ok(mut pins) = self.retained_pins.lock() {
@@ -1654,6 +1757,7 @@ impl RocmDevice {
                 "hipEventRecord failed with code {r}"
             )));
         }
+        self.upload_in_flight.store(true, Ordering::SeqCst);
         // If we cannot retain a private copy of the staging bytes (alloc
         // failure or poisoned pin list), fall back to a blocking sync of the
         // transfer stream — always correct, just slower.
