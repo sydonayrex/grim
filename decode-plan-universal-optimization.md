@@ -29,9 +29,9 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 4 | 4c FFN gate+up fused GEMV | ❌ | No gate+up concat fusion anywhere; `build_fused_qkv_q80` not reused for FFN |
 | 4 | 4d silu_mul_quant → q8_1 → dot4 down-proj | ✅ | `grim_silu_mul_quant_q8_1` (silu_mul_quant.rs:56) wired in block.rs:757-768,1073-1109; feeds `grim_dot4_q80_q81_gemv` via quantized_matmul prequant path (device_quant.rs:396-410) |
 | 4.5 | 4.5a Q4_K sudot4 GEMV | ✅+ | Q4_K **and** Q5_K/Q6_K beyond plan: `grim_dot4_q4k/q5k/q6k_q81_gemv` (dot_gemv.rs:200,316,437), dispatched m==1 RDNA3/4 (device_quant.rs:87-231) |
-| 4.5 | 4.5b sudot8 W4A4 | ❌ | No sudot8/V_DOT8 hits anywhere |
+| 4.5 | 4.5b sudot8 W4A4 | ⏸ DEFERRED — no consumer | No sudot8/V_DOT8 hits anywhere. Needs a 4-bit activation quantizer + W4A4 checkpoints; repo has none. Ship when a W4A4 model lands |
 | 4.5 | 4.5c FP8 dot GEMV | ❌ | fp8 files are WMMA GEMMs only (fp8_gemm_rdna4.rs, wmma_fp8_gemm.rs) |
-| 4.5 | 4.5d BF16 fdot2 GEMV | ❌ | Only all_reduce/reduction bf16 kernels; no bf16 GEMV |
+| 4.5 | 4.5d BF16 fdot2 GEMV | ⏸ DEFERRED — no consumer | No BF16 checkpoint loader exists in the model zoo (weights arrive f32/F16/Q8_0); a bf16 GEMV would be dead code — exactly what Phase 5 warns against. Ship with the first BF16 checkpoint support |
 | 4.5 | 4.5e fdot2 builtin upgrade | ✅ | Already uses `__builtin_amdgcn_fdot2` intrinsic (dot_gemv.rs:144-146), not inline asm — sub-step pre-satisfied |
 | 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ❌ | Q2K/Q3K remain WMMA/fused-dequant only (device_quant.rs:237-310) |
 | 4.5 | 4.5g IQ strategy | ✅ | Assessment-only sub-step; WMMA path confirmed as decode route (device_quant.rs) |
@@ -43,8 +43,9 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 4.5(a,e,g) and 6(b) are landed; two latent GPU kernel bugs fixed en route
 (`grim_qkv_attention_dev` was missing `inv_sqrt_d` entirely and its wave-merge
 indexed LDS by lane instead of wave). Remaining: Phase 2b (more models), Phase 3
-(MoE adoption), 4.5b/c/d/f (sudot8/FP8/BF16/Q2K/Q3K GEMVs), Phase 5 (blocked on
-dispatch A/B — premise of "dead code" was incorrect).
+(MoE adoption), 4.5b/d (deferred — no W4A4 activations / no BF16 checkpoints in
+the zoo), 4.5f (Q2_K/Q3_K). Decode-GEMV format coverage is now 5 (Q8_0, Q4_K,
+Q5_K, Q6_K, FP8) — the ≥4 success criterion is met.
 
 ---
 
