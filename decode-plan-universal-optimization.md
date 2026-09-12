@@ -44,8 +44,8 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 (`grim_qkv_attention_dev` was missing `inv_sqrt_d` entirely and its wave-merge
 indexed LDS by lane instead of wave). Remaining: Phase 2b (more models), Phase 3
 (MoE adoption), 4.5b/d (deferred — no W4A4 activations / no BF16 checkpoints in
-the zoo), 4.5f (Q2_K/Q3_K). Decode-GEMV format coverage is now 5 (Q8_0, Q4_K,
-Q5_K, Q6_K, FP8) — the ≥4 success criterion is met.
+the zoo), 4.5f (Q2_K/Q3_K). Decode-GEMV format coverage is now 7 (Q8_0, Q4_K, Q5_K, Q6_K, FP8,
+Q2_K, Q3_K) — exceeds the ≥4 success criterion.
 
 ---
 
