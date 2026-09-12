@@ -20,7 +20,7 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 1 | 1b device-base RoPE | ⚠️ | `pos_base_dev` + `rope_dev_base` wired for decode (block.rs:158,631-673,1124,1265-1269); legacy `apply_rope_multi_head` still builds per-token Vec for prefill/fallback (block.rs:823,860-872,699,1523,1751). `rope_dev_base_into` not used by block.rs |
 | 1 | 1c attention graph capture in block.rs | ✅ | `device_graph_decode_attention` (block.rs): kv_append + qkv_attention_dev + bump with device `past_dev` counter, `pos_base_dev` aliased; gated `GRIM_DECODE_GRAPH=1`; CPU-reference parity test + fuse_o test green on gfx1201 |
 | 2 | 2a `shared_attention::fused_qkv_project` | ✅ | shared_attention.rs:103-122 |
-| 2 | 2b wire high-traffic models | ⚠️ | 9 models wired (decode-only, seq==1, GRIM_FUSED_QKV gated): gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon (qk_norm via fused_qkv_project_raw), commandr, gptj (custom rope), qwen38_flash_next. Remaining: qwen35 (Option projections + hybrid SSM attention) |
+| 2 | 2b wire high-traffic models | ✅ | All 10 planned models wired (decode-only, seq==1, GRIM_FUSED_QKV gated): gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon (qk_norm via fused_qkv_project_raw), commandr, gptj (custom rope), qwen38_flash_next, qwen35 (full-attention layers; row-exact TP guard; SSM layers untouched). qwen35's own rope_ext reused so RoPE is byte-identical to stock |
 | 3 | 3a shared MoE / Charon grouped dispatch | ⚠️ PARTIAL | `shared_moe` module (transformer/src/shared_moe.rs) with `fused_moe_dispatch` + `per_expert_loop` fallback. All four MoE models (deepseek2/32/4, kimi_k3) delegate their device path to the shared dispatch (DS4 uses sqrt-softplus routing). `grep charon crates/grim-models` = 0 — Charon grouped-kernel adoption deferred (stacked [E,H,I] weight buffers + checkpoint verification needed) |
 | 3 | 3b SwiGLU in Charon epilogue | ⚠️ | Kernel-level done (inline silu×up in charon.rs:59-60,130-131,253-254,341-342,403-404; charon_wmma.rs:93-94) — but no model routes through Charon, so zero production benefit yet |
 | 3 | 3c rmsnorm fused into MoE gate | ❌ | No rmsnorm in charon kernels; models call separate norm before MoE gate |
@@ -47,13 +47,11 @@ route, two latent GPU kernel bugs were fixed (`grim_qkv_attention_dev` was missi
 7 formats (Q8_0, Q4_K, Q5_K, Q6_K, FP8, Q2_K, Q3_K) — exceeds the ≥4 target.
 
 **NOT completed (and why):**
-- **Phase 3 (full MoE/Charon):** deepseek32/4 and kimi_k3 still use per-expert
-  loops; Charon *grouped-kernel* adoption needs stacked [E,H,I] weight buffers and
-  checkpoint verification this environment cannot perform. SwiGLU-in-Charon
-  (3b) and rmsnorm-gate (3c) kernel pieces exist but no model routes through
-  Charon yet.
-- **qwen35:** `Option<Linear>` projections + hybrid SSM attention need bespoke
-  handling (deferred).
+- **Phase 3 (full MoE/Charon):** all four MoE models (deepseek2/32/4, kimi_k3)
+  now delegate their device path to shared_moe::fused_moe_dispatch, but Charon
+  *grouped-kernel* adoption needs stacked [E,H,I] weight buffers and checkpoint
+  verification this environment cannot perform. SwiGLU-in-Charon (3b) and
+  rmsnorm-gate (3c) kernel pieces exist but no model routes through Charon yet.
 - **Phase 5 cleanup:** audit showed the targeted kernels are NOT dead
   (dispatched by device_attention / dispatch paths); removal needs a dispatch
   A/B first.
@@ -154,7 +152,7 @@ forward() structure.
 - Internally: quantize q8_1 → fused GEMV → zero-copy slicing → RoPE → returns
 - Models call this instead of `wq/wk/wv.forward` + separate rope
 
-### Sub-step 2b: Wire into high-traffic models  — **[⚠️ PARTIAL — 9 models wired (gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon, commandr, gptj, qwen38_flash_next); qwen35 deferred (Option + SSM)]**
+### Sub-step 2b: Wire into high-traffic models  — **[✅ LANDED — all 10 planned models wired; qwen35's SSM layers intentionally untouched (fused blob only for full-attention layers, row-exact TP guard)]**
 - **gemma** (6 wq/wk/wv calls), **falcon_h1** (9 calls), **exaone4_5** (3 calls):
   replace the 3-GEMV block with `fused_qkv_project` when fused blob is available
 - Add `build_fused_qkv_q80` call in each model's weight loading (gated on ROCm + Q8_0)
@@ -601,7 +599,7 @@ Phase 6 is the final capstone — requires all prior phases.
 
 | Metric | Baseline | Target |
 |---|---|---|
-| Models with fused QKV GEMV | 1 (LFM2) | 10+ (block.rs llama-family + gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon, commandr, gptj, qwen38_flash_next); qwen35 remaining |
+| Models with fused QKV GEMV | 1 (LFM2) | 11+ (block.rs llama-family + all 10 planned shared_attention models incl. qwen35 full-attention layers) ✅ |
 | Models with device-base RoPE | 1 (LFM2) | ≥ 20 |
 | MoE FFN launches per token | ~num_experts × 4 | ~num_experts × 2 |
 | Kernel files | 59 | ≤ 50 (after cleanup) |
