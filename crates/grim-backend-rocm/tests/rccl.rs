@@ -256,6 +256,6 @@ fn kv_dequant_attention_config_default_is_disabled() -> TestResult {
     use grim_backend_rocm::KvDequantAttentionConfig;
     let cfg = KvDequantAttentionConfig::default();
     assert!(!cfg.enabled);
-    assert_eq!(cfg.wavefront_size, 64);
+    assert_eq!(cfg.wavefront_size, 32);
     Ok(())
 }

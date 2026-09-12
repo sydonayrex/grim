@@ -98,6 +98,7 @@ pub struct Exaone45Block {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 }
 
 impl Exaone45Block {
@@ -114,6 +115,9 @@ impl Exaone45Block {
         let wk = Linear::load_shape(&attn_ws.scoped("k_proj"), [cfg.hidden_size, kv_dim])?;
         let wv = Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim])?;
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
+
+        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
+            .map(std::sync::Arc::new);
 
         let input_layernorm = RmsNorm::load(
             &ws.scoped("input_layernorm"),
@@ -141,6 +145,7 @@ impl Exaone45Block {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
+            wqkv_q80_fused,
         })
     }
 
@@ -150,9 +155,23 @@ impl Exaone45Block {
         let seq_len = x.shape().dims()[0];
         let normed_attn = self.input_layernorm.forward(x)?;
 
-        let q = self.wq.forward(&normed_attn)?;
-        let k = self.wk.forward(&normed_attn)?;
-        let v = self.wv.forward(&normed_attn)?;
+        let (q, k, v) = if seq_len == 1 {
+            if let Some(fused) = &self.wqkv_q80_fused {
+                crate::shared_attention::fused_qkv_dot4_decode(&normed_attn, fused)?
+            } else {
+                (
+                    self.wq.forward(&normed_attn)?,
+                    self.wk.forward(&normed_attn)?,
+                    self.wv.forward(&normed_attn)?,
+                )
+            }
+        } else {
+            (
+                self.wq.forward(&normed_attn)?,
+                self.wk.forward(&normed_attn)?,
+                self.wv.forward(&normed_attn)?,
+            )
+        };
 
         let q =
             crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;

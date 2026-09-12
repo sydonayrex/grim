@@ -66,10 +66,18 @@ fn upload_inputs(
     Box<dyn grim_tensor::BackendStorage>,
 )> {
     let a_s = Shape::from_slice(&[m, k]);
-    let b_s = Shape::from_slice(&[k, n]);
+    // SPEED-ROC-16 matmul contract: b is [N, K] and C = A @ B^T. The fixture's
+    // row-major [K, N] data is transposed into the [N, K] layout here.
+    let b_s = Shape::from_slice(&[n, k]);
+    let mut b_t = vec![0.0f32; k * n];
+    for p in 0..k {
+        for j in 0..n {
+            b_t[j * k + p] = b[p * n + j];
+        }
+    }
     let out_s = Shape::from_slice(&[m, n]);
     let a_dev = CoreTensorOps::from_cpu(dev, a, &a_s, DType::F32)?;
-    let b_dev = CoreTensorOps::from_cpu(dev, b, &b_s, DType::F32)?;
+    let b_dev = CoreTensorOps::from_cpu(dev, &b_t, &b_s, DType::F32)?;
     let c_dev = CoreTensorOps::from_cpu(dev, c, &out_s, DType::F32)?;
     let w_dev = CoreTensorOps::from_cpu(dev, w, &out_s, DType::F32)?;
     Ok((a_dev, b_dev, c_dev, w_dev))

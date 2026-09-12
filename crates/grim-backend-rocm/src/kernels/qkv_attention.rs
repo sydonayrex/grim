@@ -1012,9 +1012,11 @@ extern "C" __global__ void grim_qkv_attention_dev(
                 score += q_reg[c] * k_head[kv_idx * kv_stride + idx];
             }
         }
+        // Wave-uniform total score (every lane holds the sum).
         for (int off = wave_size / 2; off > 0; off >>= 1)
             score += __shfl_xor(score, off);
-        if (lane_id == 0 && thread_active) {
+        score *= inv_sqrt_d;
+        if (thread_active) {
             if (softcap > 0.0f) {
                 float t = score / softcap;
                 score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
@@ -1031,48 +1033,84 @@ extern "C" __global__ void grim_qkv_attention_dev(
             }
             running_max = mw;
         }
-        __syncthreads();
     }
-    // Wave-0 LDS merge (same pattern as grim_qkv_attention).
-    if (thread_active) {
-        for (int c = 0; c < 4; ++c) {
-            int idx = d + c * wave_size;
-            if (idx < head_dim) {
-                if (wave_id == 0) { s_max[lane_id] = running_max; s_sum[lane_id] = running_sum; }
-                s_acc[wave_id][lane_id] = out_acc[c];
-            }
+    // Publish per-wavefront partials: max/sum are wave-uniform (lane 0 stores
+    // the wave's scalars); acc is per-lane strided. Empty waves keep
+    // running_max = -1e30 and are skipped by the merge (scale 0).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 4; ++c) {
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
         }
     }
     __syncthreads();
-    if (wave_id == 0 && thread_active) {
-        float m_final = s_max[0];
-        for (int w = 1; w < num_waves; ++w) m_final = fmaxf(m_final, s_max[w]);
-        float sum_final = 0.0f;
-        float acc_final[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int w = 0; w < num_waves; ++w) {
-            float mw = s_max[w];
-            float uw = s_sum[w];
-            float scale_a = expf(m_final - mw);
-            float scale_b = expf(mw - m_final);
-            sum_final = sum_final * scale_a + uw * scale_b;
+    if (wave_id != 0) return;
+
+    // Wave-0 merge of per-wave scalars (same pattern as grim_qkv_attention).
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Each lane reconstructs its strided slice of the normalized attention row.
+    float attn_reg[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        attn_reg[c] = 0.0f;
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+            attn_reg[c] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue: each wave-0 lane owns a strided
+        // slice of head_dim; per output column the lane partial is
+        // butterfly-reduced and lane 0 atomically accumulates into the
+        // (host-zeroed) fused output row. `out` here is [seq_len, o_dim].
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
             for (int c = 0; c < 4; ++c) {
                 int idx = d + c * wave_size;
                 if (idx < head_dim) {
-                    acc_final[c] = acc_final[c] * scale_a + s_acc[w][lane_id] * scale_b;
+                    partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
                 }
             }
-        }
-        float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
-        for (int c = 0; c < 4; ++c) {
-            int idx = d + c * wave_size;
-            if (idx < head_dim) out[q_offset + idx] = acc_final[c] * inv_sum;
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
         }
     }
 }
 
-// Item 3 — device-side counter bump. `*past_dev += steps`. LAST node of the
-// decode graph: graphs may mutate their own buffers, and replaying N times
-// increments exactly N times. Single-thread scalar op.
 extern "C" __global__ void grim_bump_i32(
     int* __restrict__ past_dev,
     int steps

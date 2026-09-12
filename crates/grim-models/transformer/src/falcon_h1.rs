@@ -102,6 +102,7 @@ pub struct FalconH1Block {
     pub w_up: Linear,
     pub w_down: Linear,
     pub rope: Rope,
+    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 
     pub ssm_in: Linear,
     pub ssm_out: Linear,
@@ -206,6 +207,9 @@ fn load_block(ws: &WeightSource<'_>, cfg: &FalconH1Config) -> Result<FalconH1Blo
 
     let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
+    let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
+        .map(std::sync::Arc::new);
+
     let ssm_in = Linear::load(&ws.pp("ssm_in"), cfg.hidden_size, cfg.ssm_in_dim(), false)?;
     let ssm_out = Linear::load(&ws.pp("ssm_out"), cfg.ssm_d_inner, cfg.hidden_size, false)?;
     let ssm_conv_w = ws.get([cfg.ssm_conv_dim(), cfg.ssm_d_conv], "ssm_conv1d.weight")?;
@@ -226,6 +230,7 @@ fn load_block(ws: &WeightSource<'_>, cfg: &FalconH1Config) -> Result<FalconH1Blo
         w_up,
         w_down,
         rope,
+        wqkv_q80_fused,
         ssm_in,
         ssm_out,
         ssm_conv_w,
@@ -345,12 +350,18 @@ fn forward_block_cpu(
         .forward(&wrap(h, seq_len, cfg.hidden_size, device)?)?;
     let normed = normed.to_vec_f32()?;
 
-    let q_t =
-        b.wq.forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?;
-    let k_t =
-        b.wk.forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?;
-    let v_t =
-        b.wv.forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?;
+    let normed_t = wrap(&normed, seq_len, cfg.hidden_size, device)?;
+    let (q_t, k_t, v_t) = if seq_len == 1 && b.wqkv_q80_fused.is_some() {
+        crate::shared_attention::fused_qkv_dot4_decode(
+            &normed_t,
+            b.wqkv_q80_fused.as_ref().unwrap(),
+        )?
+    } else {
+        let q_t = b.wq.forward(&normed_t)?;
+        let k_t = b.wk.forward(&normed_t)?;
+        let v_t = b.wv.forward(&normed_t)?;
+        (q_t, k_t, v_t)
+    };
 
     let attn_tensor = gqa_attn_with_cache(b, cfg, &q_t, &k_t, &v_t, positions, seq_len, cache)?;
     let attn_out = attn_tensor.to_vec_f32()?;

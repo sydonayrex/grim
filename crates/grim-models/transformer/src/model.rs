@@ -384,6 +384,8 @@ impl Llama {
                     kv_head_replica_factor: 1,
                 },
                 alibi_slopes: None,
+                wqkv_q80_fused: None,
+                w_gate_up_q80_fused: None,
             });
         }
 

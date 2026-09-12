@@ -46,6 +46,21 @@ impl FusedQkvWeights {
     }
 }
 
+/// Fused Gate+Up weight blob for dense SwiGLU FFN (Phase 4c).
+/// Concatenated Q8_0 weights `[n_gate + n_up, hidden]` for single-launch GEMV.
+pub struct FusedGateUpWeights {
+    pub storage: RocmStorage,
+    pub n_gate: usize,
+    pub n_up: usize,
+    pub hidden: usize,
+}
+
+impl FusedGateUpWeights {
+    pub fn n_total(&self) -> usize {
+        self.n_gate + self.n_up
+    }
+}
+
 impl CoreTensorOps for RocmDevice {
     /// Audit B5: delegate to the device-resident `grim_transpose_2d_f32` HIP kernel via the existing inherent helper - the tensor
     /// never leaves GPU memory (the helper synchronizes the kernel launch internally, so the returned handle is trivially ready).
@@ -2189,6 +2204,135 @@ impl RocmDevice {
         )
     }
 
+    /// SPEED-DOT: Q4_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
+    pub(crate) fn launch_dot4_q4k_q81_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q4k_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// SPEED-DOT: Q5_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
+    pub(crate) fn launch_dot4_q5k_q81_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q5k_q81_gemv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q5k_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q5k_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q5k_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// SPEED-DOT: Q6_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
+    pub(crate) fn launch_dot4_q6k_q81_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv: act_q81 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q6k_q81_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q6k_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// SPEED-DOT-FUSED (Item 1): fuse Q/K/V projections into ONE dot4 GEMV.
     ///
     /// `wqkv_q80` is the byte-concatenated weight blob `[n_q + 2·n_kv, hidden]`
@@ -2319,6 +2463,145 @@ impl RocmDevice {
             n_v,
             hidden,
         })
+    }
+
+    /// SPEED-DOT-FUSED (Phase 4c): build the concatenated Q8_0 weight blob
+    /// `[n_gate + n_up, hidden]` from gate and up projection weight storages.
+    pub fn build_fused_gate_up_q80(
+        &self,
+        w_gate: &dyn BackendStorage,
+        w_up: &dyn BackendStorage,
+    ) -> Result<FusedGateUpWeights> {
+        let q80 = DType {
+            arith: ArithType::F32,
+            storage: DTypeStorage::KQuant(grim_tensor::dtype::KQuantScheme::Q80),
+        };
+        for (name, w) in [("w_gate", w_gate), ("w_up", w_up)] {
+            if w.dtype().storage != q80.storage {
+                return Err(Error::Backend(format!(
+                    "build_fused_gate_up_q80: {name} must be Q8_0, got {:?}",
+                    w.dtype().storage
+                )));
+            }
+        }
+        let g_dims = w_gate.shape().dims();
+        let u_dims = w_up.shape().dims();
+        if g_dims.len() != 2 || u_dims.len() != 2 {
+            return Err(Error::Backend(
+                "build_fused_gate_up_q80: weights must be 2D [rows, hidden]".into(),
+            ));
+        }
+        let n_gate = g_dims[0];
+        let n_up = u_dims[0];
+        let hidden_g = g_dims[1];
+        let hidden_u = u_dims[1];
+        if hidden_g != hidden_u {
+            return Err(Error::Backend(format!(
+                "build_fused_gate_up_q80: hidden dims must match (got {hidden_g}/{hidden_u})"
+            )));
+        }
+        let hidden = hidden_g;
+        if hidden == 0 || hidden % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "build_fused_gate_up_q80: hidden must be a non-zero multiple of 32, got {hidden}"
+            )));
+        }
+        let g_bytes = as_rocm(w_gate)?.copy_to_host()?;
+        let u_bytes = as_rocm(w_up)?.copy_to_host()?;
+        let mut fused = Vec::with_capacity(g_bytes.len() + u_bytes.len());
+        fused.extend_from_slice(&g_bytes);
+        fused.extend_from_slice(&u_bytes);
+        let n_total = n_gate + n_up;
+        let fused_shape = Shape::new(vec![n_total, hidden]);
+        let fused_storage = RocmStorage::copy_from_host_raw_bytes(
+            &fused,
+            &fused_shape,
+            q80,
+            &self.allocator,
+            self.ordinal,
+        )?;
+        Ok(FusedGateUpWeights {
+            storage: fused_storage,
+            n_gate,
+            n_up,
+            hidden,
+        })
+    }
+
+    /// SPEED-DOT-FUSED (Phase 4c): fuse FFN gate+up projections into ONE dot4 GEMV.
+    pub fn launch_fused_gate_up_dot4(
+        &self,
+        act_q81: &RocmStorage,
+        fused_w: &RocmStorage,
+        n_gate: usize,
+        n_up: usize,
+        hidden: usize,
+    ) -> Result<Box<dyn BackendStorage>> {
+        if hidden == 0 || hidden % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_fused_gate_up_dot4: hidden must be a non-zero multiple of 32, got {hidden}"
+            )));
+        }
+        let n_total = n_gate.checked_add(n_up).ok_or_else(|| {
+            Error::Backend("launch_fused_gate_up_dot4: n_gate+n_up overflow".into())
+        })?;
+        if fused_w.shape().elem_count() != n_total * hidden {
+            return Err(Error::Backend(format!(
+                "launch_fused_gate_up_dot4: weight blob has {} elements, expected {} (n_total={} * hidden={})",
+                fused_w.shape().elem_count(),
+                n_total * hidden,
+                n_total,
+                hidden
+            )));
+        }
+        let out_shape = Shape::new(vec![n_total]);
+        let out_storage = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_dot4_q80_q81_gemv(act_q81, fused_w, &out_storage, 1, n_total, hidden)?;
+        Ok(Box::new(out_storage))
+    }
+
+    /// SPEED-DOT-OPFUSE (Phase 4d): fused SwiGLU + Q8_1 quantization for M=1 decode.
+    pub fn launch_silu_mul_quant_q8_1(
+        &self,
+        gate: &RocmStorage,
+        up: &RocmStorage,
+        dst_q81: &RocmStorage,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let g_ptr = gate
+            .device_ptr
+            .ok_or_else(|| Error::Backend("silu_mul_quant_q8_1: gate has no device ptr".into()))?;
+        let u_ptr = up
+            .device_ptr
+            .ok_or_else(|| Error::Backend("silu_mul_quant_q8_1: up has no device ptr".into()))?;
+        let dst_ptr = dst_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("silu_mul_quant_q8_1: dst has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(1, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut gptr = g_ptr;
+        let mut uptr = u_ptr;
+        let mut dptr = dst_ptr;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_silu_mul_quant_q8_1",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut gptr),
+                arg(&mut uptr),
+                arg(&mut dptr),
+                arg(&mut kk),
+            ],
+        )
     }
 
     /// SPEED-DOT: Q8_0 GEMV via `V_DOT2_F32_f16` at M=1 (RDNA3/4).
@@ -3441,6 +3724,7 @@ impl RocmDevice {
                 return Ok((Box::new(out_storage), compute_handle));
             }
         };
+        let _ = unsafe { rocblas_set_stream(handle, self.active_stream()) };
 
         let alpha: f32 = 1.0f32;
         let beta: f32 = 0.0f32;

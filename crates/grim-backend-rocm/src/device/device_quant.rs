@@ -85,14 +85,50 @@ impl QuantOps for RocmDevice {
         use grim_tensor::{BlockDtype, FloatPackScheme, KQuantScheme};
         match b_storage.dtype().storage {
             DTypeStorage::KQuant(KQuantScheme::Q4K) => {
-                // SPEED-ROC: On RDNA3/4, use WMMA kernel for decode/small-prefill.
+                // SPEED-DOT: On RDNA3/4, use vector dot4 GEMV for M=1 decode (100% tensor util vs 6.25% for WMMA).
                 let is_rdna34 = matches!(
                     crate::quantization::gcn_arch(&self.gpu_target),
                     crate::quantization::GcnArch::RDNA3
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
-                if is_rdna34 && m <= wmma_max_m {
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_q4k_q81_gemv(
+                            a_storage, b_storage, &out_storage, m, n, k,
+                        )?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        self.launch_dot4_q4k_q81_gemv(
+                            act_q81, b_storage, &out_storage, m, n, k,
+                        )?;
+                    }
+                } else if is_rdna34 && m <= wmma_max_m {
                     self.launch_wmma_fused_dequant_q4k(
                         a_storage, b_storage, &out_storage, m, n, k,
                     )?;
@@ -107,7 +143,43 @@ impl QuantOps for RocmDevice {
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
-                if is_rdna34 && m <= wmma_max_m {
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_q5k_q81_gemv(
+                            a_storage, b_storage, &out_storage, m, n, k,
+                        )?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        self.launch_dot4_q5k_q81_gemv(
+                            act_q81, b_storage, &out_storage, m, n, k,
+                        )?;
+                    }
+                } else if is_rdna34 && m <= wmma_max_m {
                     self.launch_wmma_fused_dequant_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else {
                     self.launch_fused_dequant_gemm_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -120,7 +192,43 @@ impl QuantOps for RocmDevice {
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
-                if is_rdna34 && m <= wmma_max_m {
+                let dot_disabled = matches!(
+                    std::env::var("GRIM_DOT_GEMV").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                    let q81_bytes = (k / 32) * 36 * m;
+                    let shape = Shape::new(vec![q81_bytes]);
+                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q81_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &shape,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                    if a_prequant {
+                        drop(buf_guard);
+                        self.launch_dot4_q6k_q81_gemv(
+                            a_storage, b_storage, &out_storage, m, n, k,
+                        )?;
+                    } else {
+                        let act_q81 = buf_guard.as_ref().unwrap();
+                        let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                        self.launch_dot4_q6k_q81_gemv(
+                            act_q81, b_storage, &out_storage, m, n, k,
+                        )?;
+                    }
+                } else if is_rdna34 && m <= wmma_max_m {
                     self.launch_wmma_fused_dequant_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else {
                     self.launch_fused_dequant_gemm_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
