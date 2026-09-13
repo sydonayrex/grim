@@ -44,6 +44,68 @@ pub struct RewrittenTensorData {
     pub wavefront_tiled: bool,
 }
 
+/// Dequantize OSTQuant W4A4 weights:
+/// Shape: [out_features, in_features] (or [N, K]).
+/// - `qweight`: [N, K / 8] as u32 (8 unsigned 4-bit nibbles per word)
+/// - `scales`: [N, K / group_size] as bf16
+/// - `zeros`: [N, K / group_size] as u8
+pub fn dequant_ostquant_w4a4(
+    qweight: &[u8],
+    scales: &[u8],
+    zeros: &[u8],
+    shape: &[usize],
+    group_size: usize,
+) -> Result<Vec<f32>> {
+    let out_features = *shape.first().ok_or_else(|| {
+        Error::Backend("dequant_ostquant_w4a4: shape missing out_features".into())
+    })?;
+    let in_features = *shape.get(1).ok_or_else(|| {
+        Error::Backend("dequant_ostquant_w4a4: shape missing in_features".into())
+    })?;
+
+    let n_groups = in_features.div_ceil(group_size);
+    let words_per_col = in_features / 8;
+    let mut out = vec![0.0f32; out_features * in_features];
+
+    for row in 0..out_features {
+        for g in 0..n_groups {
+            let sc_offset = (row * n_groups + g) * 2;
+            let zr_offset = row * n_groups + g;
+            if sc_offset + 2 > scales.len() || zr_offset >= zeros.len() {
+                return Err(Error::Backend("dequant_ostquant_w4a4: scales/zeros buffer out of bounds".into()));
+            }
+            let sc_bits = u16::from_le_bytes([scales[sc_offset], scales[sc_offset + 1]]);
+            let sc = f32::from_bits((sc_bits as u32) << 16);
+            let zr = zeros[zr_offset] as f32;
+
+            let words_in_grp = group_size / 8;
+            for w in 0..words_in_grp {
+                let qw_offset = (row * words_per_col + g * words_in_grp + w) * 4;
+                if qw_offset + 4 > qweight.len() {
+                    return Err(Error::Backend("dequant_ostquant_w4a4: qweight buffer out of bounds".into()));
+                }
+                let word = u32::from_le_bytes([
+                    qweight[qw_offset],
+                    qweight[qw_offset + 1],
+                    qweight[qw_offset + 2],
+                    qweight[qw_offset + 3],
+                ]);
+
+                for i in 0..8 {
+                    let nib = ((word >> (i * 4)) & 0xF) as f32;
+                    let val = sc * (nib - zr);
+                    let col_idx = g * group_size + w * 8 + i;
+                    if col_idx < in_features {
+                        out[row * in_features + col_idx] = val;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Dequantize grouped INT weights (EfficientQAT/GPTQ format).
 /// # Layout - `qweight`: packed low-bit weights (strided) - `qzeros`: per-group zero-points (uint16 for 2/3/4-bit,.
 pub fn dequant_gptq_group_int(

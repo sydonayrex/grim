@@ -929,6 +929,24 @@ impl QuantOps for RocmDevice {
                     sc_off,
                 )?;
             }
+            DTypeStorage::W4A4OstQuant(cfg) => {
+                // OSTQuant native W4A4 GEMV via sudot8 on RDNA4:
+                // resident packed blob: [u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros]
+                if k % 128 != 0 {
+                    return Err(Error::Backend(format!(
+                        "w4a4_ostquant quantized_matmul: K={k} must be divisible by 128"
+                    )));
+                }
+                self.launch_w4a4_ostquant_gemv_blob(
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                    cfg.group_size,
+                )?;
+            }
             DTypeStorage::W4A16(w4) => {
                 // Quant workstream wiring: Marlin-style fused W4A16 GEMM over
                 // the resident blob ([codes u32][scales f32], B stored [N, K/8]).
@@ -1401,8 +1419,8 @@ impl QuantOps for RocmDevice {
                     sc_off,
                 )?;
             }
-            DTypeStorage::W4A16(_) | DTypeStorage::EmbeddingWNA16Int => {
-                // Weight-only (W4A16) and embedding (EmbeddingWNA16Int) formats are
+            DTypeStorage::W4A16(_) | DTypeStorage::EmbeddingWNA16Int | DTypeStorage::W4A4OstQuant(_) => {
+                // Weight-only (W4A16), embedding (EmbeddingWNA16Int), and W4A4 (W4A4OstQuant) formats are
                 // inference-only: no weight-gradient kernel exists. Fail loudly.
                 return Err(Error::Backend(
                     "quantized_matmul_backward_dx: W4A16/EmbeddingWNA16Int have no backward \
@@ -4597,6 +4615,178 @@ impl RocmDevice {
         Ok((8, qz_data as i64, sc_data as i64))
     }
 
+    /// Compute the length-prefixed OSTQuant segment offsets for a packed
+    /// weight blob of `blob_bytes` bytes. Returns `(qw_off, sc_off, zr_off)`.
+    pub fn ostquant_segment_offsets(
+        group_size: usize,
+        k: usize,
+        n: usize,
+        blob_bytes: usize,
+    ) -> Result<(i64, i64, i64)> {
+        let words_per_col = k / 8;
+        let qw_len = n * words_per_col * 4;
+        let n_groups = k.div_ceil(group_size);
+        let sc_len = n * n_groups * 2; // bf16
+        let zr_len = n * n_groups;     // u8
+
+        // Layout: [u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros]
+        let sc_data = 8 + qw_len + 8;
+        let zr_data = sc_data + sc_len + 8;
+        let total_expected = zr_data + zr_len;
+
+        if blob_bytes != total_expected {
+            return Err(Error::Backend(format!(
+                "ostquant gemv: packed blob size {blob_bytes} does not match expected {total_expected} \
+                 for group_size={group_size} k={k} n={n}"
+            )));
+        }
+
+        Ok((8, sc_data as i64, zr_data as i64))
+    }
+
+    /// Launch OSTQuant W4A4 GEMV directly over the resident blob:
+    /// `[u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros]`
+    pub fn launch_w4a4_ostquant_gemv_blob(
+        &self,
+        a_storage: &RocmStorage,
+        blob_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<*mut c_void> {
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_w4a4_ostquant_gemv_blob: K={k} must be divisible by 128"
+            )));
+        }
+        let (qw_off, sc_off, zr_off) =
+            Self::ostquant_segment_offsets(group_size, k, n, blob_storage.bytes())?;
+
+        let blob_ptr = blob_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("ostquant gemv: blob has no device ptr".into()))?;
+
+        let n_groups = k / 128;
+        let codes_words = m * n_groups * 16;
+        let scales_elems = m * n_groups;
+        let sums_elems = m * n_groups;
+
+        let codes_bytes = codes_words * std::mem::size_of::<u32>();
+        let scales_bytes = scales_elems * std::mem::size_of::<f32>();
+        let sums_bytes = sums_elems * std::mem::size_of::<i32>();
+
+        let mut codes_guard = self.act_u4_codes_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let need_codes = match codes_guard.as_ref() {
+            Some(s) => s.bytes < codes_bytes,
+            None => true,
+        };
+        if need_codes {
+            *codes_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![codes_words]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+
+        let mut scales_guard = self.act_u4_scales_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let need_scales = match scales_guard.as_ref() {
+            Some(s) => s.bytes < scales_bytes,
+            None => true,
+        };
+        if need_scales {
+            *scales_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![scales_elems]),
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+
+        let mut sums_guard = self.act_u4_sums_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let need_sums = match sums_guard.as_ref() {
+            Some(s) => s.bytes < sums_bytes,
+            None => true,
+        };
+        if need_sums {
+            *sums_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![sums_elems]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+
+        let act_codes = codes_guard.as_ref().unwrap();
+        let act_scales = scales_guard.as_ref().unwrap();
+        let act_sums = sums_guard.as_ref().unwrap();
+
+        // Quantize activations to u4 groups
+        self.launch_quantize_u4_group128(
+            a_storage,
+            act_codes,
+            act_scales,
+            act_sums,
+            m,
+            k,
+        )?;
+
+        // Pointers into blob
+        let a_codes_ptr = act_codes.device_ptr.unwrap();
+        let a_scales_ptr = act_scales.device_ptr.unwrap();
+        let a_sums_ptr = act_sums.device_ptr.unwrap();
+        let b_qw_ptr = (blob_ptr as usize + qw_off as usize) as *mut c_void;
+        let b_sc_ptr = (blob_ptr as usize + sc_off as usize) as *mut c_void;
+        let b_zr_ptr = (blob_ptr as usize + zr_off as usize) as *mut c_void;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("ostquant gemv: out has no device ptr".into()))?;
+
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut a_c = a_codes_ptr;
+        let mut a_s = a_scales_ptr;
+        let mut a_sum = a_sums_ptr;
+        let mut b_qw = b_qw_ptr;
+        let mut b_sc = b_sc_ptr;
+        let mut b_zr = b_zr_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_dot8_w4a4_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a_c),
+                arg(&mut a_s),
+                arg(&mut a_sum),
+                arg(&mut b_qw),
+                arg(&mut b_sc),
+                arg(&mut b_zr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Audit-wiring (quant workstream): W4A16 blobs are a SINGLE packed segment pair - `[codes (N*K/8 u32)][scales (N*groups f32)]` per the `Storage::W4A16` layout contract -
     /// so the dense dispatch path needs a launcher that derives the scales pointer from the same device buffer instead of requiring two separate storages.
     pub fn launch_marlin_gemm_w4a16_blob(
@@ -4659,6 +4849,114 @@ impl RocmDevice {
                 arg(&mut kk),
                 arg(&mut gs),
             ],
+        )
+    }
+
+    /// Phase 4.5b: Launch OSTQuant W4A4 GEMV using native sudot8 on RDNA4 gfx1200/gfx1201.
+    /// Handles activation quantization into scratch buffers followed by grim_dot8_w4a4_gemv.
+    pub fn launch_w4a4_ostquant_gemv(
+        &self,
+        a_storage: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_w4a4_ostquant_gemv: K={k} must be divisible by 128"
+            )));
+        }
+        let n_groups = k / 128;
+        let codes_words = m * n_groups * 16;
+        let scales_elems = m * n_groups;
+        let sums_elems = m * n_groups;
+
+        // Ensure scratch buffers are allocated
+        let codes_bytes = codes_words * std::mem::size_of::<u32>();
+        let scales_bytes = scales_elems * std::mem::size_of::<f32>();
+        let sums_bytes = sums_elems * std::mem::size_of::<i32>();
+
+        let mut codes_guard = self.act_u4_codes_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let need_codes = match codes_guard.as_ref() {
+            Some(s) => s.bytes < codes_bytes,
+            None => true,
+        };
+        if need_codes {
+            *codes_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![codes_words]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+
+        let mut scales_guard = self.act_u4_scales_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let need_scales = match scales_guard.as_ref() {
+            Some(s) => s.bytes < scales_bytes,
+            None => true,
+        };
+        if need_scales {
+            *scales_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![scales_elems]),
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+
+        let mut sums_guard = self.act_u4_sums_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let need_sums = match sums_guard.as_ref() {
+            Some(s) => s.bytes < sums_bytes,
+            None => true,
+        };
+        if need_sums {
+            *sums_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![sums_elems]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+
+        let act_codes = codes_guard.as_ref().unwrap();
+        let act_scales = scales_guard.as_ref().unwrap();
+        let act_sums = sums_guard.as_ref().unwrap();
+
+        // Quantize activations to u4 groups
+        self.launch_quantize_u4_group128(
+            a_storage,
+            act_codes,
+            act_scales,
+            act_sums,
+            m,
+            k,
+        )?;
+
+        // Launch sudot8 W4A4 GEMV
+        self.launch_dot8_w4a4_gemv(
+            act_codes,
+            act_scales,
+            act_sums,
+            b_qweight,
+            b_scales,
+            b_zeros,
+            out_storage,
+            m,
+            n,
+            k,
         )
     }
 

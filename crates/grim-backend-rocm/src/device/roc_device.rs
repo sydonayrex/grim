@@ -2177,7 +2177,11 @@ impl RocmDevice {
     }
 }
 
-impl grim_tensor::BackendDevice for RocmDevice {}
+impl grim_tensor::BackendDevice for RocmDevice {
+    fn gpu_target_str(&self) -> String {
+        self.gpu_target.clone()
+    }
+}
 
 // to `device::gemm_tuning` — see that module.
 pub use crate::device::gemm_tuning::{

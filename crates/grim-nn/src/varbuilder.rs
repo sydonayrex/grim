@@ -794,6 +794,37 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
                 cfg.group_size,
             )
         }
+        Storage::W4A4OstQuant(cfg) => {
+            let mut cursor = 0;
+            let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
+                if *cursor + 8 > bytes.len() {
+                    return Err(Error::Backend("Truncated OSTQuant packed header".into()));
+                }
+                let len =
+                    u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+                *cursor += 8;
+                if *cursor + len > bytes.len() {
+                    return Err(Error::Backend(format!(
+                        "Truncated OSTQuant packed segment (expected {len} bytes)"
+                    )));
+                }
+                let segment = bytes[*cursor..*cursor + len].to_vec();
+                *cursor += len;
+                Ok(segment)
+            };
+
+            let qweight = read_segment(&raw.bytes, &mut cursor)?;
+            let scales = read_segment(&raw.bytes, &mut cursor)?;
+            let zeros = read_segment(&raw.bytes, &mut cursor)?;
+
+            grim_quant::dequant_ostquant_w4a4(
+                &qweight,
+                &scales,
+                &zeros,
+                &raw.shape,
+                cfg.group_size,
+            )
+        }
         Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => {
             // These W8A8 formats are resident-capable on ROCm/CUDA and reach the
             // fused dequant GEMM; host dequant isn't wired for them on the CPU fallback.

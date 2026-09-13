@@ -389,6 +389,8 @@ pub struct KimiK3Moe {
     pub experts: Vec<KimiK3Expert>,
     pub num_experts_per_tok: usize,
     pub routed_scaling_factor: f32,
+    /// Charon grouped-dispatch resident weight cache (Phase 3a).
+    pub charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl KimiK3Moe {
@@ -412,6 +414,7 @@ impl KimiK3Moe {
             experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
             routed_scaling_factor: cfg.routed_scaling_factor,
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
@@ -419,14 +422,74 @@ impl KimiK3Moe {
     /// Falls back to [`Self::forward_moe_host`] on CPU devices or when the backend lacks a needed primitive.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.gate.forward(x)?;
-        let logits_v = logits.to_vec_f32()?;
 
+        // Phase 3aD: D2D routing + dispatch; falls back to host routing when unavailable.
+        if x.device() != &Device::Cpu {
+            if let Some(out) = self.forward_moe_device_d2d(x, &logits)? {
+                return Ok(out);
+            }
+        }
+
+        let logits_v = logits.to_vec_f32()?;
         if x.device() != &Device::Cpu {
             if let Some(out) = self.forward_moe_device(x, &logits_v)? {
                 return Ok(out);
             }
         }
         self.forward_moe_host(x, &logits_v)
+    }
+
+    /// Phase 3c: fused RMSNorm + router-gate projection (single launch) followed
+    /// by routed expert dispatch. `norm` is the pre-MoE RMSNorm (the block's
+    /// `post_attention_layernorm`); `raw_x` is the un-normalized residual.
+    pub fn forward_pre_norm(&self, raw_x: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
+        let logits = norm.forward_fused_linear(raw_x, &self.gate)?;
+
+        if raw_x.device() != &Device::Cpu {
+            if let Some(out) = self.forward_moe_device_d2d(raw_x, &logits)? {
+                return Ok(out);
+            }
+        }
+
+        let logits_v = logits.to_vec_f32()?;
+        if raw_x.device() != &Device::Cpu {
+            if let Some(out) = self.forward_moe_device(raw_x, &logits_v)? {
+                return Ok(out);
+            }
+        }
+        self.forward_moe_host(raw_x, &logits_v)
+    }
+
+    /// Device-resident MoE (D2D): routing computed on-device, dispatch from
+    /// device-resident routing buffers. No gate-logits D2H, no routing-table H2D.
+    fn forward_moe_device_d2d(&self, x: &Tensor, logits: &Tensor) -> Result<Option<Tensor>> {
+        let seq_len = x.shape().dims().first().copied().unwrap_or(0);
+        if seq_len == 0 {
+            return Ok(Some(x.clone()));
+        }
+        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+
+        let experts: Vec<crate::shared_moe::MoeExpert> = self
+            .experts
+            .iter()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.gate_proj.clone(),
+                up: e.up_proj.clone(),
+                down: e.down_proj.clone(),
+            })
+            .collect();
+
+        crate::shared_moe::fused_moe_dispatch_from_logits(
+            dev.as_ref(),
+            x,
+            logits,
+            &experts,
+            None,
+            self.num_experts_per_tok,
+            self.routed_scaling_factor,
+            0, // route_mode: softmax
+            &self.charon_cache,
+        )
     }
 
     /// Device-resident MoE: token rows are extracted D2D, experts run on-device (Linear + `silu_mul_on_device`), and the weighted sum accumulates on-device.
@@ -461,6 +524,7 @@ impl KimiK3Moe {
             None,
             &routings,
             self.routed_scaling_factor,
+            &self.charon_cache,
         )
         .map(Some)
     }
@@ -553,8 +617,8 @@ impl KimiK3Block {
 
         let res1 = grim_nn::modules::add_on_device(x, &attn_out)?;
 
-        let normed_ffn = self.ffn_norm.forward(&res1)?;
-        let mlp_out = self.moe.forward(&normed_ffn)?;
+        // Phase 3c: fuse the pre-MoE RMSNorm into the router gate projection.
+        let mlp_out = self.moe.forward_pre_norm(&res1, &self.ffn_norm)?;
 
         grim_nn::modules::add_on_device(&res1, &mlp_out).map_err(grim_core::error::Error::from)
     }

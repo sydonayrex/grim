@@ -1616,6 +1616,12 @@ pub trait BackendDevice:
     + MemoryOps
     + GraphCaptureOps
 {
+    /// GCN target string for arch-gated behavior (e.g. "gfx1201", "gfx1036").
+    /// Empty when the backend has no GPU target (CPU).
+    fn gpu_target_str(&self) -> String {
+        String::new()
+    }
+
 }
 
 impl<T: CoreTensorOps + ?Sized> CoreTensorOps for std::sync::Arc<T> {

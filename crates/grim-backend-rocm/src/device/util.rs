@@ -37,9 +37,18 @@ pub fn warp_rows_launch(rows: usize) -> (crate::HipDim3, crate::HipDim3) {
 
 /// Helper: downcast a `BackendStorage` to `RocmStorage`, returning a
 pub fn as_rocm(s: &dyn BackendStorage) -> Result<&RocmStorage> {
-    s.as_any()
-        .downcast_ref::<RocmStorage>()
-        .ok_or_else(|| Error::Backend("expected RocmStorage input".into()))
+    s.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        // TEMP DEBUG: identify the caller feeding a CPU storage.
+        if std::env::var_os("GRIM_AS_ROCM_TRACE").is_some() {
+            eprintln!(
+                "[as-rocm-fail] dtype={:?} shape={:?} backtrace:\n{}",
+                s.dtype(),
+                s.shape().dims(),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        Error::Backend("expected RocmStorage input".into())
+    })
 }
 
 /// Helper: require a valid device pointer on a `RocmStorage`.

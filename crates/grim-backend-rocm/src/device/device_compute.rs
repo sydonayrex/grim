@@ -393,18 +393,15 @@ impl CoreTensorOps for RocmDevice {
         up: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let gate_s = as_rocm(gate)?;
-        let up_s = as_rocm(up)?;
-        if !gate_s.device_ptr_is_valid() || !up_s.device_ptr_is_valid() {
-            return Err(Error::Backend(
-                "silu_mul: inputs lack a valid device pointer".into(),
-            ));
-        }
+        // View-compatible: accept RocmStorage AND RocmStorageView (zero-copy
+        // slices, e.g. the fused gate+up output) via the trait device_ptr.
+        let gate_ptr_dyn = crate::device::util::dev_ptr_dyn(gate)?;
+        let up_ptr_dyn = crate::device::util::dev_ptr_dyn(up)?;
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
-        let mut gate_ptr = dev_ptr(gate_s)?;
-        let mut up_ptr = dev_ptr(up_s)?;
+        let mut gate_ptr = gate_ptr_dyn;
+        let mut up_ptr = up_ptr_dyn;
         let mut n = total as i32;
         let (grid, block) = linear_launch(total);
         self.launch_compute_kernel(

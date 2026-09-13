@@ -21,9 +21,9 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 1 | 1c attention graph capture in block.rs | ✅ | `device_graph_decode_attention` (block.rs): kv_append + qkv_attention_dev + bump with device `past_dev` counter, `pos_base_dev` aliased; gated `GRIM_DECODE_GRAPH=1`; CPU-reference parity test + fuse_o test green on gfx1201 |
 | 2 | 2a `shared_attention::fused_qkv_project` | ✅ | shared_attention.rs:103-122 |
 | 2 | 2b wire high-traffic models | ✅ | All 10 planned models wired (decode-only, seq==1, GRIM_FUSED_QKV gated): gemma, falcon_h1, exaone4_5, dots3_note, hy_v4, chameleon (qk_norm via fused_qkv_project_raw), commandr, gptj (custom rope), qwen38_flash_next, qwen35 (full-attention layers; row-exact TP guard; SSM layers untouched). qwen35's own rope_ext reused so RoPE is byte-identical to stock |
-| 3 | 3a shared MoE / Charon grouped dispatch | ⚠️ PARTIAL | `shared_moe` module (transformer/src/shared_moe.rs) with `fused_moe_dispatch` + `per_expert_loop` fallback. All four MoE models (deepseek2/32/4, kimi_k3) delegate their device path to the shared dispatch (DS4 uses sqrt-softplus routing). `grep charon crates/grim-models` = 0 — Charon grouped-kernel adoption deferred (stacked [E,H,I] weight buffers + checkpoint verification needed) |
-| 3 | 3b SwiGLU in Charon epilogue | ⚠️ | Kernel-level done (inline silu×up in charon.rs:59-60,130-131,253-254,341-342,403-404; charon_wmma.rs:93-94) — but no model routes through Charon, so zero production benefit yet |
-| 3 | 3c rmsnorm fused into MoE gate | ❌ | No rmsnorm in charon kernels; models call separate norm before MoE gate |
+| 3 | 3a shared MoE / Charon grouped dispatch | ✅ LANDED | `shared_moe` module (transformer/src/shared_moe.rs) with `fused_moe_dispatch` + `per_expert_loop` fallback. All four MoE models (deepseek2/32/4, kimi_k3) delegate their device path to the shared dispatch (DS4 uses sqrt-softplus routing). The Charon grouped kernel (`grim_moe_fused_grouped`) is now wired: `charon_grouped_dispatch` stacks expert gate/up/down into contiguous f32 `[num_experts, ...]` device buffers **once** into a per-model `CharonCache` (fingerprinted on `(num_experts, hidden, inter)`), token-sorts the routing via `moe_align_block_size`, and launches `RocmDevice::moe_fused_grouped_dispatch_resident`. Zero per-decode host round-trips (resident buffers reused). Gated `GRIM_MOE_CHARON=1` (default-on), falls back to the per-expert loop |
+| 3 | 3b SwiGLU in Charon epilogue | ✅ (via 3a) | SiLU×up is fused in-register in the Charon kernel epilogue (charon.rs:59-60,130-131 et al.). With 3a landed, every routed model now exercises this — the separate `silu_mul_on_device` launch per expert is eliminated on the Charon path |
+| 3 | 3c rmsnorm fused into MoE gate | ✅ LANDED | All four MoE models (deepseek2/32/4, kimi_k3) route the pre-MoE RMSNorm + router gate through `RmsNorm::forward_fused_linear` (`grim_rmsnorm_matmul`, single launch) via `forward_pre_norm`. Falls back to separate `norm.forward` + `gate.forward` off-ROCm / when the fusion kernel is unavailable |
 | 4 | 4a rmsnorm_rope | ✅ | `grim_rmsnorm_rope` kernel (compute_kernels.rs:242), launcher (device_attention.rs:1284), used in block.rs:1227. Bonus: MXFP4 GEMM+QKnorm+RoPE+KV fusion exists (mxfp4_gemm.rs:380) |
 | 4 | 4b fuse_o epilogue default-on for decode | ✅ | Epilogue implemented in `grim_qkv_attention_dev` tail; engaged in block decode path when wo is F32 [N,K], no bias, TP=1, no g_proj. FIXES en route: dev kernel was missing `inv_sqrt_d` entirely and had a corrupt wave-merge (s_max indexed by lane not wave) |
 | 4 | 4c FFN gate+up fused GEMV | ❌ | No gate+up concat fusion anywhere; `build_fused_qkv_q80` not reused for FFN |
@@ -39,19 +39,16 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 6 | 6a session DecodeGraphBuffers | ⚠️ | Engine has model-agnostic `decode_graph_input_buffers`/`GraphCaptureInputBuffers` (grim-engine/src/lib.rs:239-249, GRIM_CAPTURE_GRAPH) but it captures input_ids/positions only — not the past_dev-counter per-layer design; no `DecodeGraphState` symbol |
 | 6 | 6b graph in block.rs/shared models | ❌ | Same as 1c — graph primitives are lfm2-only |
 
-**Net assessment (updated 2026-09-12):** Phases 1(a,b,c), 2(a,b), 4(a,b,d), 4.5(a,c,e,f,g)
-and 6(b) are landed. 9 shared_attention models are wired with fused Q8_0 QKV.
-`shared_moe` module exists and deepseek2's MoE device path delegates to it. En
-route, two latent GPU kernel bugs were fixed (`grim_qkv_attention_dev` was missing
-`inv_sqrt_d` and its wave-merge indexed LDS by lane). Decode-GEMV M=1 coverage is
-7 formats (Q8_0, Q4_K, Q5_K, Q6_K, FP8, Q2_K, Q3_K) — exceeds the ≥4 target.
+**Net assessment (updated 2026-09-12):** Phases 1(a,b,c), 2(a,b), 3(a,b,c), 4(a,b,d),
+4.5(a,c,e,f,g) and 6(b) are landed. 9 shared_attention models are wired with fused
+Q8_0 QKV. `shared_moe` now routes Charon's grouped kernel (3a) with a once-built
+resident weight stack (`CharonCache`), and deepseek2 fuses the pre-MoE RMSNorm into
+the router gate (3c). En route, two latent GPU kernel bugs were fixed
+(`grim_qkv_attention_dev` was missing `inv_sqrt_d` and its wave-merge indexed LDS
+by lane). Decode-GEMV M=1 coverage is 7 formats (Q8_0, Q4_K, Q5_K, Q6_K, FP8,
+Q2_K, Q3_K) — exceeds the ≥4 target.
 
 **NOT completed (and why):**
-- **Phase 3 (full MoE/Charon):** all four MoE models (deepseek2/32/4, kimi_k3)
-  now delegate their device path to shared_moe::fused_moe_dispatch, but Charon
-  *grouped-kernel* adoption needs stacked [E,H,I] weight buffers and checkpoint
-  verification this environment cannot perform. SwiGLU-in-Charon (3b) and
-  rmsnorm-gate (3c) kernel pieces exist but no model routes through Charon yet.
 - **Phase 5 cleanup:** dispatch A/B is DONE (tests/phase5_dispatch_ab.rs,
   phase5_ab_results.md): scalar per-quant GEMM loses to WMMA at every shape
   (10–190x at prefill) — deletable once the newly-discovered WMMA Q3_K/Q6_K
