@@ -179,6 +179,8 @@ pub struct RocmDevice {
     pub(crate) props: RocmDeviceProps,
     handle_cache: Mutex<Option<RocblasHandle>>,
     pub(crate) stream_pool: Mutex<Vec<*mut c_void>>,
+    /// M1: Direct pointer to stream 0 from the pool, eliminating Mutex locks on active_stream()
+    pub(crate) default_stream: *mut c_void,
     pub(crate) hsaco_cache: HsacoKernelCache,
     /// WI 2.4.4-2 — opt-in switch for the JIT `grim_decode_gemm_f16` [see: `false`, `fusion::DecodeGemmConfig`, `Mutex`, `handle_cache`]
     pub(crate) decode_gemm_config: Mutex<DecodeGemmConfig>,
@@ -263,11 +265,15 @@ pub struct RocmDevice {
     pub(crate) sampler_out_buf: Mutex<Option<RocmStorage>>,
     /// SPEED-ROC: Preallocated buffer for activation quant (Q8_1) in dot4 GEMV.
     /// Reused every decode GEMV, eliminating per-layer hipMalloc overhead.
-    pub(crate) act_q81_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) act_q81_buf: RwLock<Option<RocmStorage>>,
     /// Phase 4.5b: Preallocated buffers for W4A4 activation quantization in sudot8 GEMV.
     pub(crate) act_u4_codes_buf: Mutex<Option<RocmStorage>>,
     pub(crate) act_u4_scales_buf: Mutex<Option<RocmStorage>>,
     pub(crate) act_u4_sums_buf: Mutex<Option<RocmStorage>>,
+    /// H2: Preallocated buffers for GPU reductions (reduce_sum, reduce_max, argmax).
+    pub(crate) reduce_partials_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) reduce_out_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) reduce_argmax_idxs_buf: Mutex<Option<RocmStorage>>,
 }
 
 // SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle caches) that is process-local and accessed only through the owning thread's HIP context.
@@ -720,6 +726,7 @@ impl RocmDevice {
                 xnack_enabled,
             },
             handle_cache: Mutex::new(handle_cache),
+            default_stream: streams.first().copied().unwrap_or(std::ptr::null_mut()),
             stream_pool: Mutex::new(streams),
             hsaco_cache: HsacoKernelCache::new(),
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
@@ -812,10 +819,13 @@ impl RocmDevice {
             graph_capture_mgr: Mutex::new(None),
             attn_logit_softcap: std::sync::atomic::AtomicU32::new(0),
             sampler_out_buf: Mutex::new(None),
-            act_q81_buf: Mutex::new(None),
+            act_q81_buf: RwLock::new(None),
             act_u4_codes_buf: Mutex::new(None),
             act_u4_scales_buf: Mutex::new(None),
             act_u4_sums_buf: Mutex::new(None),
+            reduce_partials_buf: Mutex::new(None),
+            reduce_out_buf: Mutex::new(None),
+            reduce_argmax_idxs_buf: Mutex::new(None),
         }
     }
 
@@ -1040,9 +1050,9 @@ impl RocmDevice {
             self.capture_stream
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .unwrap_or_else(|| self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut()))
+                .unwrap_or(self.default_stream)
         } else {
-            self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut())
+            self.default_stream
         };
         // SPEED-ROC-1: if a stream-ordered upload is in flight on the transfer stream, fence this (compute) stream on its completion event so the prefetch can overlap the prior decode-step GEMM instead of racing it.
         // `hipStreamWaitEvent` is a no-op ordering edge; it does not block the host.
