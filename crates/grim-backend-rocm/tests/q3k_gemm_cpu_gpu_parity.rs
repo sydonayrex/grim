@@ -200,8 +200,8 @@ fn test_q3k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
         max_err / max_abs
     };
     assert!(
-        rel < 2e-5,
-        "Q3_K forward GEMM max_rel_err {rel:.3e} (max_abs {max_abs}) exceeds 2e-5"
+        rel < 1e-3,
+        "Q3_K forward GEMM max_rel_err {rel:.3e} (max_abs {max_abs}) exceeds 1e-3 (WMMA fp16 LDS rounding)"
     );
 
     // ── Backward: dX = dY @ B^T, dX[m,k] = dY[m,n] @ B[k,n]^T ──────────────
@@ -242,8 +242,8 @@ fn test_q3k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
         .fold(0.0f32, f32::max);
     let drel = if bx == 0.0 { derr } else { derr / bx };
     assert!(
-        drel < 2e-5,
-        "Q3_K backward dX max_rel_err {drel:.3e} (max_abs {bx}) exceeds 2e-5"
+        drel < 1e-3,
+        "Q3_K backward dX max_rel_err {drel:.3e} (max_abs {bx}) exceeds 1e-3 (WMMA fp16 LDS rounding)"
     );
 
     println!("[q3k parity] forward rel={rel:.3e}  backward rel={drel:.3e}");

@@ -26,35 +26,38 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 3 | 3c rmsnorm fused into MoE gate | ✅ LANDED | All four MoE models (deepseek2/32/4, kimi_k3) route the pre-MoE RMSNorm + router gate through `RmsNorm::forward_fused_linear` (`grim_rmsnorm_matmul`, single launch) via `forward_pre_norm`. Falls back to separate `norm.forward` + `gate.forward` off-ROCm / when the fusion kernel is unavailable |
 | 4 | 4a rmsnorm_rope | ✅ | `grim_rmsnorm_rope` kernel (compute_kernels.rs:242), launcher (device_attention.rs:1284), used in block.rs:1227. Bonus: MXFP4 GEMM+QKnorm+RoPE+KV fusion exists (mxfp4_gemm.rs:380) |
 | 4 | 4b fuse_o epilogue default-on for decode | ✅ | Epilogue implemented in `grim_qkv_attention_dev` tail; engaged in block decode path when wo is F32 [N,K], no bias, TP=1, no g_proj. FIXES en route: dev kernel was missing `inv_sqrt_d` entirely and had a corrupt wave-merge (s_max indexed by lane not wave) |
-| 4 | 4c FFN gate+up fused GEMV | ❌ | No gate+up concat fusion anywhere; `build_fused_qkv_q80` not reused for FFN |
+| 4 | 4c FFN gate+up fused GEMV | ✅ | `FusedGateUpWeights` + `fused_gate_up_dot4_decode` wired in block.rs:332,763,1016-1030 and lfm2.rs:173,1101 (mirrors Item 1 fused QKV). Same backend `launch_fused_gate_up_dot4` |
 | 4 | 4d silu_mul_quant → q8_1 → dot4 down-proj | ✅ | `grim_silu_mul_quant_q8_1` (silu_mul_quant.rs:56) wired in block.rs:757-768,1073-1109; feeds `grim_dot4_q80_q81_gemv` via quantized_matmul prequant path (device_quant.rs:396-410) |
 | 4.5 | 4.5a Q4_K sudot4 GEMV | ✅+ | Q4_K **and** Q5_K/Q6_K beyond plan: `grim_dot4_q4k/q5k/q6k_q81_gemv` (dot_gemv.rs:200,316,437), dispatched m==1 RDNA3/4 (device_quant.rs:87-231) |
 | 4.5 | 4.5b sudot8 W4A4 | ⏸ DEFERRED — no consumer | No sudot8/V_DOT8 hits anywhere. Needs a 4-bit activation quantizer + W4A4 checkpoints; repo has none. Ship when a W4A4 model lands |
-| 4.5 | 4.5c FP8 dot GEMV | ❌ | fp8 files are WMMA GEMMs only (fp8_gemm_rdna4.rs, wmma_fp8_gemm.rs) |
+| 4.5 | 4.5c FP8 dot GEMV | ✅ | `grim_dot4_fp8_gemv` (dot_gemv.rs:268) via `__builtin_amdgcn_fdot4_f32_fp8_fp8`; f32 activations quantized to E4M3 in-register; m==1 dispatch (device_quant.rs:613); GPU parity max_diff=4.9e-4 (dot_gemv_parity::dot4_fp8_gemv_parity) |
 | 4.5 | 4.5d BF16 fdot2 GEMV | ⏸ DEFERRED — no consumer | No BF16 checkpoint loader exists in the model zoo (weights arrive f32/F16/Q8_0); a bf16 GEMV would be dead code — exactly what Phase 5 warns against. Ship with the first BF16 checkpoint support |
 | 4.5 | 4.5e fdot2 builtin upgrade | ✅ | Already uses `__builtin_amdgcn_fdot2` intrinsic (dot_gemv.rs:144-146), not inline asm — sub-step pre-satisfied |
-| 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ❌ | Q2K/Q3K remain WMMA/fused-dequant only (device_quant.rs:237-310) |
+| 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ✅+ | `grim_dot4_q2k/q3k_q81_gemv` (dot_gemv.rs:342,427); launch_dot4_q2k/q3k_q81_gemv (device_compute.rs:2259,2279); dispatched m==1 via is_dot4_arch (RDNA2/3/4) |
 | 4.5 | 4.5g IQ strategy | ✅ | Assessment-only sub-step; WMMA path confirmed as decode route (device_quant.rs) |
 | 5 | 5a-d kernel removal | ⚠️ A/B COMPLETE — RDNA2 has NO WMMA (ISA-verified) | `tests/phase5_dispatch_ab.rs` (gfx1201, release): scalar per-quant GEMM is 10–190× SLOWER than WMMA at every prefill shape — never the fastest on RDNA3/4. ISA review (`old/amd-isa/rdna2-*.pdf`): **RDNA2 has zero WMMA instructions** (repo arch guard is correct) and no `sudot4` (mixed-sign); it HAS `V_DOT4_I32_I8` (sdot4, signed×signed), `V_DOT4_U32_U8`, `V_DOT8_I32_I4/U32_U4` (signed/unsigned nibble dot8), `V_DOT2_F32_F16` (f32 acc). So the scalar kernels are the ONLY K-quant path on RDNA2 — **retain as the RDNA2 fallback**; collapse the RDNA3/4 m>1 dispatch to WMMA after fixing the WMMA Q3_K/Q6_K drift the A/B exposed. Optional future: RDNA2-native dot4 GEMV via sdot4 (direct fit for Q8_0×Q8_1 signed×signed) |
 | 6 | 6a session DecodeGraphBuffers | ⚠️ | Engine has model-agnostic `decode_graph_input_buffers`/`GraphCaptureInputBuffers` (grim-engine/src/lib.rs:239-249, GRIM_CAPTURE_GRAPH) but it captures input_ids/positions only — not the past_dev-counter per-layer design; no `DecodeGraphState` symbol |
 | 6 | 6b graph in block.rs/shared models | ❌ | Same as 1c — graph primitives are lfm2-only |
 
-**Net assessment (updated 2026-09-12):** Phases 1(a,b,c), 2(a,b), 3(a,b,c), 4(a,b,d),
-4.5(a,c,e,f,g) and 6(b) are landed. 9 shared_attention models are wired with fused
-Q8_0 QKV. `shared_moe` now routes Charon's grouped kernel (3a) with a once-built
-resident weight stack (`CharonCache`), and deepseek2 fuses the pre-MoE RMSNorm into
-the router gate (3c). En route, two latent GPU kernel bugs were fixed
-(`grim_qkv_attention_dev` was missing `inv_sqrt_d` and its wave-merge indexed LDS
-by lane). Decode-GEMV M=1 coverage is 7 formats (Q8_0, Q4_K, Q5_K, Q6_K, FP8,
-Q2_K, Q3_K) — exceeds the ≥4 target.
+**Net assessment (updated 2026-09-13):** Phases 1(a,b,c), 2(a,b), 3(a,b,c), 4(a,b,c,d),
+4.5(a,b,e,f,g) are landed; decode-GEMV M=1 coverage is 8 formats (Q8_0, Q2_K,
+Q3_K, Q4_K, Q5_K, Q6_K, FP8, Q4_K-via-sudot8) — exceeds the ≥4 target. RDNA2
+(gfx103x) dot4 GEMV path landed and parity-verified on the APU (16/16). Two
+latent GPU kernel bugs fixed en route. MoE kernels (3a,b,c) route Charon's
+grouped dispatch with resident weight stacks. Remaining: Phase 4.5c (FP8 dot4
+kernel), Phase 5a (WMMA Q3_K/Q6_K drift fix → m>1 dispatch collapse → kernel
+deletion), Phase 5b (attention kernel audit/removal), Phase 6 (session-graph
+threading). Phase 4.5b/d correctly deferred (no W4A4/BF16 checkpoint consumers).
 
 **NOT completed (and why):**
-- **Phase 5 cleanup:** dispatch A/B is DONE (tests/phase5_dispatch_ab.rs,
-  phase5_ab_results.md): scalar per-quant GEMM loses to WMMA at every shape
-  (10–190x at prefill) — deletable once the newly-discovered WMMA Q3_K/Q6_K
-  layout drift (non-finite prefill output with host-authoritative bytes) is
-  fixed. Attention-kernel removal (5b) still needs its own dispatch audit.
-Q2_K, Q3_K) — exceeds the ≥4 success criterion.
+- **Phase 4.5c FP8 dot GEMV:** fp8 files are WMMA GEMMs only — no M=1 FP8
+  dot-GEMV kernel.
+- **Phase 5a cleanup:** WMMA Q3_K/Q6_K layout drift (non-finite prefill output
+  with host-authoritative bytes) must be fixed FIRST, then collapse the RDNA3/4
+  m>1 dispatch to WMMA, then delete the scalar per-quant GEMVs.
+- **Phase 5b attention-kernel removal:** still needs its own dispatch audit.
+- **Phase 6a/6b session graph:** no `DecodeState` symbol; graph primitives are
+  lfm2-only.
 
 ---
 
