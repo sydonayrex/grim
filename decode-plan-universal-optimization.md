@@ -35,7 +35,7 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 4.5 | 4.5e fdot2 builtin upgrade | ✅ | Already uses `__builtin_amdgcn_fdot2` intrinsic (dot_gemv.rs:144-146), not inline asm — sub-step pre-satisfied |
 | 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ❌ | Q2K/Q3K remain WMMA/fused-dequant only (device_quant.rs:237-310) |
 | 4.5 | 4.5g IQ strategy | ✅ | Assessment-only sub-step; WMMA path confirmed as decode route (device_quant.rs) |
-| 5 | 5a-d kernel removal | ⚠️ A/B COMPLETE — evidence recorded | `tests/phase5_dispatch_ab.rs` (gfx1201, release): scalar per-quant GEMM is 10–190× SLOWER than WMMA at every prefill shape (e.g. Q2_K m=512: 395ms vs 2.15ms) and slower than dot4/WMMA at m=1 — never the fastest path. Verdict: SAFE to collapse the m>1 dispatch to WMMA and delete the scalar per-quant GEMM kernels — BUT the A/B also exposed WMMA Q3_K/Q6_K layout drift (non-finite outputs with host-authoritative bytes), which must be fixed FIRST or prefill for those formats breaks. dot4 stays the m==1 path (Q2_K/Q3_K/Q4_K-large-K) |
+| 5 | 5a-d kernel removal | ⚠️ A/B COMPLETE — RDNA3/4-only verdict | `tests/phase5_dispatch_ab.rs` (gfx1201, release): scalar per-quant GEMM is 10–190× SLOWER than WMMA at every prefill shape (e.g. Q2_K m=512: 395ms vs 2.15ms) — never the fastest path on RDNA3/4. Verdict: collapse the m>1 dispatch to WMMA **on RDNA3/4 only** and keep the scalar kernels as the RDNA2/older fallback — the WMMA template and dot4 kernels are arch-guarded to gfx1100+ and the dispatch gates on is_rdna34, so RDNA2 has ONLY the scalar path. Prerequisite before touching dispatch: fix the WMMA Q3_K/Q6_K layout drift the A/B exposed (non-finite outputs with host-authoritative bytes). dot4 stays the m==1 path (Q2_K/Q3_K/Q4_K-large-K) |
 | 6 | 6a session DecodeGraphBuffers | ⚠️ | Engine has model-agnostic `decode_graph_input_buffers`/`GraphCaptureInputBuffers` (grim-engine/src/lib.rs:239-249, GRIM_CAPTURE_GRAPH) but it captures input_ids/positions only — not the past_dev-counter per-layer design; no `DecodeGraphState` symbol |
 | 6 | 6b graph in block.rs/shared models | ❌ | Same as 1c — graph primitives are lfm2-only |
 
@@ -488,7 +488,7 @@ dot-product instruction selection.
 **Goal:** Remove kernels that are superseded by fused-ops variants, reducing the kernel
 JIT compilation footprint and maintenance burden.
 
-### Sub-step 5a: Remove per-quant GEMV kernels superseded by WMMA fused dequant AND dot4 GEMV  — **[A/B EVIDENCE RECORDED — scalar never fastest (see phase5_ab_results.md); deletable AFTER fixing WMMA Q3_K/Q6_K drift]**  — **[❌ REMAINING — all 5 per-quant GEMM files still present]**
+### Sub-step 5a: Remove per-quant GEMV kernels superseded by WMMA fused dequant AND dot4 GEMV  — **[A/B EVIDENCE RECORDED — scalar loses on RDNA3/4 (see phase5_ab_results.md) but IS the RDNA2-only path: retain as fallback, collapse RDNA3/4 dispatch to WMMA after fixing WMMA Q3_K/Q6_K drift]**  — **[❌ REMAINING — all 5 per-quant GEMM files still present]**
 - The `quantized_matmul` dispatch already prefers WMMA fused dequant for Q4K/Q5K/Q6K/
   Q2K/Q3K/IQ* — the standalone per-quant GEMV kernels are dead code:
   - `q4k_gemm.rs` (349 LOC) — superseded by `launch_wmma_fused_dequant_q4k` (prefill)
