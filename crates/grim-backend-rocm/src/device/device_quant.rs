@@ -138,7 +138,7 @@ impl QuantOps for RocmDevice {
                             act_q81, b_storage, &out_storage, m, n, k,
                         )?;
                     }
-                } else if is_rdna34 && m <= wmma_max_m {
+                } else if is_rdna34 {
                     self.launch_wmma_fused_dequant_q4k(
                         a_storage, b_storage, &out_storage, m, n, k,
                     )?;
@@ -199,7 +199,7 @@ impl QuantOps for RocmDevice {
                             act_q81, b_storage, &out_storage, m, n, k,
                         )?;
                     }
-                } else if is_rdna34 && m <= wmma_max_m {
+                } else if is_rdna34 {
                     self.launch_wmma_fused_dequant_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else {
                     self.launch_fused_dequant_gemm_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -258,7 +258,7 @@ impl QuantOps for RocmDevice {
                             act_q81, b_storage, &out_storage, m, n, k,
                         )?;
                     }
-                } else if is_rdna34 && m <= wmma_max_m {
+                } else if is_rdna34 {
                     self.launch_wmma_fused_dequant_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else {
                     self.launch_fused_dequant_gemm_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -311,7 +311,7 @@ impl QuantOps for RocmDevice {
                         let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && m <= wmma_max_m {
+                } else if is_rdna34 {
                     self.launch_wmma_fused_dequant_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else {
                     self.launch_fused_dequant_gemm_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -362,7 +362,7 @@ impl QuantOps for RocmDevice {
                         let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && m <= wmma_max_m {
+                } else if is_rdna34 {
                     self.launch_wmma_fused_dequant_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else {
                     self.launch_fused_dequant_gemm_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
