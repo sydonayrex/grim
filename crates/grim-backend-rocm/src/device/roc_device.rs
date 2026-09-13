@@ -260,6 +260,10 @@ pub struct RocmDevice {
     /// SPEED-ROC: Preallocated buffer for activation quant (Q8_1) in dot4 GEMV.
     /// Reused every decode GEMV, eliminating per-layer hipMalloc overhead.
     pub(crate) act_q81_buf: Mutex<Option<RocmStorage>>,
+    /// Phase 4.5b: Preallocated buffers for W4A4 activation quantization in sudot8 GEMV.
+    pub(crate) act_u4_codes_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) act_u4_scales_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) act_u4_sums_buf: Mutex<Option<RocmStorage>>,
 }
 
 // SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle caches) that is process-local and accessed only through the owning thread's HIP context.
@@ -788,6 +792,9 @@ impl RocmDevice {
             attn_logit_softcap: std::sync::atomic::AtomicU32::new(0),
             sampler_out_buf: Mutex::new(None),
             act_q81_buf: Mutex::new(None),
+            act_u4_codes_buf: Mutex::new(None),
+            act_u4_scales_buf: Mutex::new(None),
+            act_u4_sums_buf: Mutex::new(None),
         }
     }
 
@@ -1001,6 +1008,12 @@ impl RocmDevice {
     }
 
     /// The stream an op should dispatch onto: the capture stream when a session is
+    /// Public read-only access to this device's GCN target string (e.g.
+    /// "gfx1201", "gfx1036") for tests and capability gating.
+    pub fn gpu_target_str(&self) -> &str {
+        &self.gpu_target
+    }
+
     pub(crate) fn active_stream(&self) -> *mut c_void {
         let stream = if self.capture_active.load(Ordering::SeqCst) {
             self.capture_stream
