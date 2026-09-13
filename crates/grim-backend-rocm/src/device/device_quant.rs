@@ -395,11 +395,45 @@ impl QuantOps for RocmDevice {
                             ),
                         )
                     });
-                    if !dot_disabled
-                        && k % 32 == 0
-                        && !Self::is_fp16_activation(a_storage)
-                    {
-                        if use_legacy_dot2 && m == 1 {
+                    if !dot_disabled && !Self::is_fp16_activation(a_storage) {
+                        // N4: K80 fallback — round K down to a 32-multiple. A
+                        // tightly-packed Q8_0 buffer stores only K/32 full
+                        // blocks, so the missing tail weight is zero by
+                        // convention; dot4 over K_aligned is therefore exact.
+                        let k_aligned = k - (k % 32);
+                        if k_aligned >= 32 && (use_legacy_dot2 && m == 1) == false {
+                            let q81_bytes = (k_aligned / 32) * 36 * m;
+                            let shape = Shape::new(vec![q81_bytes]);
+                            let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                            let need_alloc = match buf_guard.as_ref() {
+                                Some(s) => s.bytes < q81_bytes,
+                                None => true,
+                            };
+                            if need_alloc {
+                                *buf_guard = Some(RocmStorage::alloc_gpu(
+                                    &shape,
+                                    DType {
+                                        arith: ArithType::U8,
+                                        storage: DTypeStorage::Native,
+                                    },
+                                    &self.allocator,
+                                    self.ordinal,
+                                )?);
+                            }
+                            let a_prequant = a_storage.dtype().arith == ArithType::U8;
+                            if a_prequant {
+                                drop(buf_guard);
+                                self.launch_dot4_q80_q81_gemv(
+                                    a_storage, b_storage, &out_storage, m, n, k_aligned,
+                                )?;
+                            } else {
+                                let act_q81 = buf_guard.as_ref().unwrap();
+                                let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k_aligned)?;
+                                self.launch_dot4_q80_q81_gemv(
+                                    act_q81, b_storage, &out_storage, m, n, k_aligned,
+                                )?;
+                            }
+                        } else if use_legacy_dot2 && m == 1 && k % 32 == 0 {
                             let act_f16 = RocmStorage::alloc_gpu(
                                 &Shape::new(vec![k]),
                                 DType {

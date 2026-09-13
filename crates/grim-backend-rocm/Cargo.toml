@@ -75,6 +75,12 @@ rccl = ["rocm"]
 # GPTQ fused dequant-GEMM launchers without widening the production API.
 gpu-test-shims = []
 
+# Phase 5d: Charon MoE backward (training-only). Gates the backward JIT kernel
+# source + its device_routing launchers/verifiers so the inference binary skips
+# compiling/launching a 245-LOC training kernel it never calls. Opt-in: the
+# device-verifier tests run with `cargo test --features training`.
+training = []
+
 # ── Quant variant feature gates ─────────────────────────────────────────────
 # Each gate controls one quant family's kernel modules, their wmma/charon/moe
 # siblings, and the corresponding HsaoKernelCache wiring. All gates default OFF
@@ -141,6 +147,10 @@ required-features = ["gpu-test-shims"]
 
 [[test]]
 name = "charon_compressed_gpu"
+required-features = ["gpu-test-shims"]
+
+[[example]]
+name = "bakeoff_decode_gemm"
 required-features = ["gpu-test-shims"]
 
 [dev-dependencies]

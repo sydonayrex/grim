@@ -593,12 +593,87 @@ pub struct Autotuner {
 impl Autotuner {
     /// Construct a tuner for a device on a specific arch. Infallible. [see: `get_or_tune`]
     pub fn for_device(device_ordinal: usize, gpu_arch: &'static str) -> Self {
-        Self {
+        let mut tuner = Self {
             device_ordinal,
             gpu_arch,
             cache: HashMap::new(),
             moe_cache: HashMap::new(),
             cache_dir: None,
+        };
+        tuner.preseed_standard_shapes();
+        tuner
+    }
+
+    /// Pre-populate in-memory defaults for standard LLM attention shapes (heads 8..32, head_dim 64/128, context lengths 256..65536)
+    /// to avoid first-token benchmark latency stalls when autotuning is enabled.
+    pub fn preseed_standard_shapes(&mut self) {
+        let arch = self.gpu_arch;
+        let head_counts = [8, 16, 24, 32];
+        let head_dims = [64, 128];
+        let kv_lengths = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+        for &nh in &head_counts {
+            for &hd in &head_dims {
+                for &kv_len in &kv_lengths {
+                    // Flash decode split-KV configuration
+                    let flash_key = KernelKey {
+                        kernel: "grim_flash_decode",
+                        gpu_arch: arch,
+                        m: nh,
+                        n: hd,
+                        k: kv_len.clamp(1, 1 << 16),
+                    };
+                    let heuristic_splits = (kv_len / 256).clamp(2, 64) as u32;
+                    self.cache.entry(flash_key).or_insert(AutotuneConfig {
+                        block_dim: 256,
+                        tile_kv: heuristic_splits,
+                        grid_stride: 1,
+                        cycles_per_invocation: 0,
+                        spec_gamma: 4,
+                        spec_acceptance_threshold: 0.6,
+                        spec_alpha: 0.0,
+                        split_k: 0,
+                    });
+
+                    // QKV attention dense block dimension
+                    let qkv_key = KernelKey {
+                        kernel: "grim_qkv_attention",
+                        gpu_arch: arch,
+                        m: nh,
+                        n: hd,
+                        k: kv_len.clamp(1, 1 << 16),
+                    };
+                    self.cache.entry(qkv_key).or_insert(AutotuneConfig {
+                        block_dim: 256,
+                        tile_kv: 64,
+                        grid_stride: 1,
+                        cycles_per_invocation: 0,
+                        spec_gamma: 4,
+                        spec_acceptance_threshold: 0.6,
+                        spec_alpha: 0.0,
+                        split_k: 0,
+                    });
+
+                    // QKV attention paged block dimension
+                    let paged_key = KernelKey {
+                        kernel: "grim_qkv_attention_paged",
+                        gpu_arch: arch,
+                        m: nh,
+                        n: hd,
+                        k: kv_len.clamp(1, 1 << 16),
+                    };
+                    self.cache.entry(paged_key).or_insert(AutotuneConfig {
+                        block_dim: 256,
+                        tile_kv: 64,
+                        grid_stride: 1,
+                        cycles_per_invocation: 0,
+                        spec_gamma: 4,
+                        spec_acceptance_threshold: 0.6,
+                        spec_alpha: 0.0,
+                        split_k: 0,
+                    });
+                }
+            }
         }
     }
 

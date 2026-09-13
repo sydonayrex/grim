@@ -11,6 +11,7 @@ pub fn compute_kernel_source() -> String {
     if !skip_rocwma {
         s.push_str(crate::kernels::charon_wmma::KERNEL_SOURCE);
     }
+    #[cfg(feature = "training")]
     s.push_str(crate::kernels::charon_backward::KERNEL_SOURCE);
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE);
@@ -40,7 +41,7 @@ pub fn compute_kernel_source() -> String {
         // SPEED-ROC: FP8 E4M3 WMMA GEMM — 383 TFLOPS on RDNA4 (2x FP16).
         s.push_str(crate::kernels::wmma_fp8_gemm::KERNEL_SOURCE);
     }
-    s.push_str(crate::kernels::q8_0_dequant::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q4k_dequant::Q8_0_DEQUANT_SOURCE);
     // grim_dequant_q4k must ride in the same aggregate unit — without this
     // append, hipModuleGetFunction fails with error 500 on first use.
     s.push_str(crate::kernels::q4k_dequant::KERNEL_SOURCE);
@@ -163,7 +164,7 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_qkv_attention"));
         // WMMA GEMM lives in wmma_gemm::KERNEL_SOURCE.
         assert!(src.contains("grim_wmma_gemm"));
-        // Q8_0 dequant kernel lives in q8_0_dequant::KERNEL_SOURCE.
+        // Q8_0 dequant kernel lives in q4k_dequant::Q8_0_DEQUANT_SOURCE.
         assert!(src.contains("grim_dequant_q8_0"));
     }
 

@@ -99,8 +99,8 @@ fn cached_col_shard_w_t(
         }
     }
     let dev = pick_device_for_storage_device(&Device::Rocm(ordinal));
-    let shape = Shape::new(vec![k, count]);
-    let storage = dev.from_cpu(&w_t, &shape, DType::F32)?;
+    let shape = Shape::new(vec![count, k]);
+    let storage = dev.from_cpu(&w_vec, &shape, DType::F32)?;
     let tensor = Tensor::new(
         Arc::from(storage),
         shape,
@@ -114,8 +114,8 @@ fn cached_col_shard_w_t(
     Ok(tensor)
 }
 
-/// Transposed `(count, out_features)` operand for a row shard, same contract
-/// as [`cached_col_shard_w_t`].
+/// Shard operand for a row shard under SPEED-ROC-16 (B is [out_features, count]),
+/// same contract as [`cached_col_shard_w_t`].
 fn cached_row_shard_w_t(
     layer_id: u32,
     ordinal: usize,
@@ -134,15 +134,9 @@ fn cached_row_shard_w_t(
     }
     let w_shard = slice_input_dim(weight, start, count)?;
     let w_vec = w_shard.storage().to_cpu_vec_f32()?;
-    let mut w_t = vec![0.0f32; count * out_features];
-    for ni in 0..out_features {
-        for ki in 0..count {
-            w_t[ki * out_features + ni] = w_vec[ni * count + ki];
-        }
-    }
     let dev = pick_device_for_storage_device(&Device::Rocm(ordinal));
-    let shape = Shape::new(vec![count, out_features]);
-    let storage = dev.from_cpu(&w_t, &shape, DType::F32)?;
+    let shape = Shape::new(vec![out_features, count]);
+    let storage = dev.from_cpu(&w_vec, &shape, DType::F32)?;
     let tensor = Tensor::new(
         Arc::from(storage),
         shape,
@@ -358,17 +352,11 @@ impl Scythe2Linear {
                     b_tensor.storage().as_ref()
                 }
                 _ => {
-                    // Slice the weight for this rank's column shard.
+                    // Slice the weight for this rank's column shard. Under SPEED-ROC-16, B is [count, k].
                     let w_shard = slice_output_dim(&self.full_weight, col_start, count)?;
                     let w_vec = w_shard.storage().to_cpu_vec_f32()?;
-                    let mut w_t = vec![0.0f32; k * count];
-                    for ni in 0..count {
-                        for ki in 0..k {
-                            w_t[ki * count + ni] = w_vec[ni * k + ki];
-                        }
-                    }
                     b_uploaded =
-                        rank_dev.from_cpu(&w_t, &Shape::new(vec![k, count]), DType::F32)?;
+                        rank_dev.from_cpu(&w_vec, &Shape::new(vec![count, k]), DType::F32)?;
                     b_uploaded.as_ref()
                 }
             };
@@ -519,20 +507,14 @@ impl Scythe2Linear {
                 )?,
                 _ => {
                     let w_vec = w_shard.storage().to_cpu_vec_f32()?;
-                    let mut w_t = vec![0.0f32; count * out_features];
-                    for ni in 0..out_features {
-                        for ki in 0..count {
-                            w_t[ki * out_features + ni] = w_vec[ni * count + ki];
-                        }
-                    }
                     let storage = rank_dev.from_cpu(
-                        &w_t,
-                        &Shape::new(vec![count, out_features]),
+                        &w_vec,
+                        &Shape::new(vec![out_features, count]),
                         DType::F32,
                     )?;
                     Tensor::new(
                         Arc::from(storage),
-                        Shape::new(vec![count, out_features]),
+                        Shape::new(vec![out_features, count]),
                         DType::F32,
                         self.full_weight.provenance().clone(),
                         rank_device.clone(),

@@ -1739,7 +1739,6 @@ fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32, depth: u32) -> Result<
 
 static WARNED_DTYPE_F64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WARNED_DTYPE_INT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static WARNED_DTYPE_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Warn once when a GGUF dtype loses precision under the canonical grim
 /// dtype mapping (value precision is not preserved).
@@ -1830,10 +1829,7 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::IQ2S),
         },
-        GgufDType::BF16 => {
-            warn_dtype_lossy("BF16", &WARNED_DTYPE_BF16);
-            DType::F16
-        }
+        GgufDType::BF16 => DType::BF16,
         GgufDType::MXFP4 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),

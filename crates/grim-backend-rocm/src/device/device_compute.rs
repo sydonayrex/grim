@@ -18,14 +18,14 @@ use crate::device::gemm_tuning::{
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    HipDim3, QkvAttentionFusionConfig, QuantMode, ROCBLAS_GEMM_FLAGS_NONE,
+    HipDim3, HipMemcpyKind, QkvAttentionFusionConfig, QuantMode, ROCBLAS_GEMM_FLAGS_NONE,
     RmsNormMatMulFusionConfig, RocblasInt, RocblasOperation, RocmHandle, arg,
     arith_to_compute_dtype, arith_to_rocblas_dtype, as_rocm, check_hip, dev_ptr, dtype_f32,
-    hipFree, hipFreeAsync, hipMemAdvise, hipMemsetAsync, hipModuleGetFunction,
-    hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSuccess, jit_compile_hsaco,
-    linear_launch, rocblas_gemm_ex, rocblas_gemm_strided_batched_ex, rocblas_set_stream,
-    rocblas_sgemm, rocblas_status_success, select_gemm_algo, upload_device_buffer,
-    warp_rows_launch,
+    hipFree, hipFreeAsync, hipMemAdvise, hipMemcpyAsync, hipMemsetAsync, hipModuleGetFunction,
+    hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipStreamSynchronize, hipSuccess,
+    jit_compile_hsaco, linear_launch, rocblas_gemm_ex, rocblas_gemm_strided_batched_ex,
+    rocblas_set_stream, rocblas_sgemm, rocblas_status_success, select_gemm_algo,
+    upload_device_buffer, warp_rows_launch,
 };
 
 /// Fused QKV weight blob for the ROCm decode path (Item 1): the concatenated
@@ -813,6 +813,11 @@ impl ElementwiseOps for RocmDevice {
     }
 
     fn reduce_sum(&self, x: &dyn BackendStorage) -> Result<f32> {
+        if let Ok(rocm_s) = as_rocm(x) {
+            if rocm_s.device_ptr_is_valid() && rocm_s.dtype().arith == ArithType::F32 {
+                return self.gpu_reduce_sum(rocm_s);
+            }
+        }
         let v = x.to_cpu_vec_f32()?;
         if v.is_empty() {
             return Err(Error::Backend("reduce_sum: empty tensor".into()));
@@ -821,6 +826,11 @@ impl ElementwiseOps for RocmDevice {
     }
 
     fn reduce_max(&self, x: &dyn BackendStorage) -> Result<f32> {
+        if let Ok(rocm_s) = as_rocm(x) {
+            if rocm_s.device_ptr_is_valid() && rocm_s.dtype().arith == ArithType::F32 {
+                return self.gpu_reduce_max(rocm_s);
+            }
+        }
         let v = x.to_cpu_vec_f32()?;
         v.iter()
             .copied()
@@ -829,6 +839,11 @@ impl ElementwiseOps for RocmDevice {
     }
 
     fn argmax(&self, x: &dyn BackendStorage) -> Result<u32> {
+        if let Ok(rocm_s) = as_rocm(x) {
+            if rocm_s.device_ptr_is_valid() && rocm_s.dtype().arith == ArithType::F32 {
+                return self.gpu_argmax(rocm_s);
+            }
+        }
         let v = x.to_cpu_vec_f32()?;
         v.iter()
             .enumerate()
@@ -861,17 +876,13 @@ impl SamplingOps for RocmDevice {
                 return Ok(token);
             }
         }
+        if temperature <= 0.0 {
+            // H2: Use GPU-resident argmax when greedy, avoiding full D2H vector copy
+            return self.argmax(logits);
+        }
         let cpu_logits = logits.to_cpu_vec_f32()?;
         if cpu_logits.is_empty() {
             return Err(Error::Backend("sample_on_device: empty logits".into()));
-        }
-        if temperature <= 0.0 {
-            return cpu_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx as u32)
-                .ok_or_else(|| Error::Backend("sample_on_device: empty logits".into()));
         }
         let max_logit = cpu_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         if !max_logit.is_finite() {
@@ -2751,20 +2762,37 @@ impl RocmDevice {
                 "build_fused_gate_up_q80: hidden must be a non-zero multiple of 32, got {hidden}"
             )));
         }
-        let g_bytes = as_rocm(w_gate)?.copy_to_host()?;
-        let u_bytes = as_rocm(w_up)?.copy_to_host()?;
-        let mut fused = Vec::with_capacity(g_bytes.len() + u_bytes.len());
-        fused.extend_from_slice(&g_bytes);
-        fused.extend_from_slice(&u_bytes);
         let n_total = n_gate + n_up;
         let fused_shape = Shape::new(vec![n_total, hidden]);
-        let fused_storage = RocmStorage::copy_from_host_raw_bytes(
-            &fused,
-            &fused_shape,
-            q80,
-            &self.allocator,
-            self.ordinal,
-        )?;
+        // N1: concat on-device (hipMemcpy D2D) — no host round-trip of the
+        // full weight blob at load time.
+        let fused_storage =
+            RocmStorage::alloc_gpu(&fused_shape, q80, &self.allocator, self.ordinal)?;
+        let dst = fused_storage.device_ptr_checked()? as *mut std::ffi::c_void;
+        let g_src = as_rocm(w_gate)?.device_ptr_checked()? as *const std::ffi::c_void;
+        let u_src = as_rocm(w_up)?.device_ptr_checked()? as *const std::ffi::c_void;
+        let g_bytes = as_rocm(w_gate)?.bytes;
+        let u_bytes = as_rocm(w_up)?.bytes;
+        unsafe {
+            check_hip(
+                "build_fused_gate_up_q80: D2D gate",
+                crate::device::handles::hipMemcpy(
+                    dst,
+                    g_src,
+                    g_bytes,
+                    crate::device::handles::HipMemcpyKind::DeviceToDevice,
+                ),
+            )?;
+            check_hip(
+                "build_fused_gate_up_q80: D2D up",
+                crate::device::handles::hipMemcpy(
+                    dst.add(g_bytes),
+                    u_src,
+                    u_bytes,
+                    crate::device::handles::HipMemcpyKind::DeviceToDevice,
+                ),
+            )?;
+        }
         Ok(FusedGateUpWeights {
             storage: fused_storage,
             n_gate,
@@ -2935,6 +2963,286 @@ impl RocmDevice {
             ],
         )
     }
+
+    /// H2: GPU tree reduction for sum.
+    /// Returns the scalar sum of all elements in `x_storage` without whole-buffer D2H copying.
+    pub(crate) fn gpu_reduce_sum(&self, x_storage: &RocmStorage) -> Result<f32> {
+        let n = x_storage.shape().elem_count();
+        if n == 0 {
+            return Err(Error::Backend("reduce_sum: empty tensor".into()));
+        }
+        let x_ptr = x_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gpu_reduce_sum: x has no device ptr".into()))?;
+
+        // Guard the active device context
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+
+        // Grid calculation: 256 threads per block, max 1024 blocks in stage 1
+        const BLOCK_SIZE: u32 = 256;
+        const MAX_BLOCKS: u32 = 1024;
+        let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
+
+        // Ensure preallocated buffers are large enough
+        let mut part_guard = self.reduce_partials_buf.write().unwrap_or_else(|e| e.into_inner());
+        if part_guard.as_ref().map_or(true, |b| b.shape().elem_count() < grid_blocks as usize) {
+            *part_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![MAX_BLOCKS as usize]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let partials_buf = part_guard.as_ref().unwrap();
+        let partials_ptr = dev_ptr(partials_buf)?;
+
+        let mut out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        if out_guard.is_none() {
+            *out_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![16usize]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let out_buf = out_guard.as_ref().unwrap();
+        let out_ptr = dev_ptr(out_buf)?;
+
+        // Launch stage 1
+        let mut x_p = x_ptr;
+        let mut part_p = partials_ptr;
+        let mut n_i = n as i32;
+        let _stream = self.launch_compute_kernel(
+            "grim_reduce_sum_stage1",
+            HipDim3::new(grid_blocks, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [
+                arg(&mut x_p),
+                arg(&mut part_p),
+                arg(&mut n_i),
+            ],
+        )?;
+
+        // Launch stage 2
+        let mut out_p = out_ptr;
+        let mut num_part = grid_blocks as i32;
+        let stream = self.launch_compute_kernel(
+            "grim_reduce_sum_stage2",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [
+                arg(&mut part_p),
+                arg(&mut out_p),
+                arg(&mut num_part),
+            ],
+        )?;
+
+        // D2H copy only 4 bytes of result
+        let mut res: f32 = 0.0f32;
+        check_hip("gpu_reduce_sum D2H", unsafe {
+            hipMemcpyAsync(
+                &mut res as *mut f32 as *mut c_void,
+                out_p as *mut c_void,
+                std::mem::size_of::<f32>(),
+                HipMemcpyKind::DeviceToHost,
+                stream,
+            )
+        })?;
+        check_hip("gpu_reduce_sum sync", unsafe {
+            hipStreamSynchronize(stream)
+        })?;
+
+        Ok(res)
+    }
+
+    /// H2: GPU tree reduction for max.
+    /// Returns the maximum scalar in `x_storage` without whole-buffer D2H copying.
+    pub(crate) fn gpu_reduce_max(&self, x_storage: &RocmStorage) -> Result<f32> {
+        let n = x_storage.shape().elem_count();
+        if n == 0 {
+            return Err(Error::Backend("reduce_max: empty tensor".into()));
+        }
+        let x_ptr = x_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gpu_reduce_max: x has no device ptr".into()))?;
+
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+
+        const BLOCK_SIZE: u32 = 256;
+        const MAX_BLOCKS: u32 = 1024;
+        let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
+
+        let mut part_guard = self.reduce_partials_buf.write().unwrap_or_else(|e| e.into_inner());
+        if part_guard.as_ref().map_or(true, |b| b.shape().elem_count() < grid_blocks as usize) {
+            *part_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![MAX_BLOCKS as usize]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let partials_buf = part_guard.as_ref().unwrap();
+        let partials_ptr = dev_ptr(partials_buf)?;
+
+        let mut out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        if out_guard.is_none() {
+            *out_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![16usize]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let out_buf = out_guard.as_ref().unwrap();
+        let out_ptr = dev_ptr(out_buf)?;
+
+        let mut x_p = x_ptr;
+        let mut part_p = partials_ptr;
+        let mut n_i = n as i32;
+        let _ = self.launch_compute_kernel(
+            "grim_reduce_max_stage1",
+            HipDim3::new(grid_blocks, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [
+                arg(&mut x_p),
+                arg(&mut part_p),
+                arg(&mut n_i),
+            ],
+        )?;
+
+        let mut out_p = out_ptr;
+        let mut num_part = grid_blocks as i32;
+        let stream = self.launch_compute_kernel(
+            "grim_reduce_max_stage2",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [
+                arg(&mut part_p),
+                arg(&mut out_p),
+                arg(&mut num_part),
+            ],
+        )?;
+
+        let mut res: f32 = 0.0f32;
+        check_hip("gpu_reduce_max D2H", unsafe {
+            hipMemcpyAsync(
+                &mut res as *mut f32 as *mut c_void,
+                out_p as *mut c_void,
+                std::mem::size_of::<f32>(),
+                HipMemcpyKind::DeviceToHost,
+                stream,
+            )
+        })?;
+        check_hip("gpu_reduce_max sync", unsafe {
+            hipStreamSynchronize(stream)
+        })?;
+
+        Ok(res)
+    }
+
+    /// H2: GPU tree reduction for argmax.
+    /// Returns the index of the maximum element in `x_storage` without whole-buffer D2H copying.
+    pub(crate) fn gpu_argmax(&self, x_storage: &RocmStorage) -> Result<u32> {
+        let n = x_storage.shape().elem_count();
+        if n == 0 {
+            return Err(Error::Backend("argmax: empty tensor".into()));
+        }
+        let x_ptr = x_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("gpu_argmax: x has no device ptr".into()))?;
+
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+
+        const BLOCK_SIZE: u32 = 256;
+        const MAX_BLOCKS: u32 = 1024;
+        let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
+
+        let mut part_guard = self.reduce_partials_buf.write().unwrap_or_else(|e| e.into_inner());
+        if part_guard.as_ref().map_or(true, |b| b.shape().elem_count() < grid_blocks as usize) {
+            *part_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![MAX_BLOCKS as usize]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let partials_buf = part_guard.as_ref().unwrap();
+        let partial_vals_ptr = dev_ptr(partials_buf)?;
+
+        let mut idxs_guard = self.reduce_argmax_idxs_buf.lock().unwrap_or_else(|e| e.into_inner());
+        if idxs_guard.as_ref().map_or(true, |b| b.shape().elem_count() < grid_blocks as usize) {
+            *idxs_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![MAX_BLOCKS as usize]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let idxs_buf = idxs_guard.as_ref().unwrap();
+        let partial_idxs_ptr = dev_ptr(idxs_buf)?;
+
+        let mut out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        if out_guard.is_none() {
+            *out_guard = Some(RocmStorage::alloc_gpu(
+                &Shape::new(vec![16usize]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?);
+        }
+        let out_buf = out_guard.as_ref().unwrap();
+        let out_ptr = dev_ptr(out_buf)?;
+
+        let mut x_p = x_ptr;
+        let mut part_v_p = partial_vals_ptr;
+        let mut part_i_p = partial_idxs_ptr;
+        let mut n_i = n as i32;
+        let _ = self.launch_compute_kernel(
+            "grim_argmax_stage1",
+            HipDim3::new(grid_blocks, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [
+                arg(&mut x_p),
+                arg(&mut part_v_p),
+                arg(&mut part_i_p),
+                arg(&mut n_i),
+            ],
+        )?;
+
+        let mut out_p = out_ptr;
+        let mut num_part = grid_blocks as i32;
+        let stream = self.launch_compute_kernel(
+            "grim_argmax_stage2",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(BLOCK_SIZE, 1, 1),
+            &mut [
+                arg(&mut part_v_p),
+                arg(&mut part_i_p),
+                arg(&mut out_p),
+                arg(&mut num_part),
+            ],
+        )?;
+
+        let mut res: u32 = 0u32;
+        check_hip("gpu_argmax D2H", unsafe {
+            hipMemcpyAsync(
+                &mut res as *mut u32 as *mut c_void,
+                out_p as *mut c_void,
+                std::mem::size_of::<u32>(),
+                HipMemcpyKind::DeviceToHost,
+                stream,
+            )
+        })?;
+        check_hip("gpu_argmax sync", unsafe {
+            hipStreamSynchronize(stream)
+        })?;
+
+        Ok(res)
+    }
+
 
     /// SPEED-ROC: WMMA fused-dequant Q4_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]

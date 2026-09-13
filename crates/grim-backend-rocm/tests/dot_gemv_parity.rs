@@ -1604,3 +1604,122 @@ fn dot8_w4a4_safetensors_loader_e2e() {
     assert!(non_zeros > 9000, "Output should contain non-zero values from GEMV execution, got {non_zeros}");
     eprintln!("[dot8_w4a4_safetensors_loader_e2e] Successfully loaded and executed sudot8 GEMV through Linear::forward!");
 }
+
+/// Phase 4.5d: BF16 × BF16 dot2 GEMV (V_DOT2_F32_BF16, dot12-insts on RDNA3/4).
+/// Tests launch_dot2_bf16_gemv and end-to-end matmul dispatch against the CPU reference.
+#[test]
+fn dot2_bf16_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    if !dev.gpu_target_str().starts_with("gfx12") && !dev.gpu_target_str().starts_with("gfx11") {
+        eprintln!("[SKIP] bf16 dot2 requires RDNA3/4 (gfx11/gfx12), got {}", dev.gpu_target_str());
+        return;
+    }
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    for m in [1usize, 2, 4] {
+        for (n, k) in [(64usize, 256usize), (128, 512)] {
+
+    let mut seed = 0xBEAF_1616u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 4.0).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand() * 4.0).collect();
+
+    let f32_to_bf16_u16 = |f: f32| -> u16 {
+        let bits = f.to_bits();
+        // Round to nearest even
+        let lsb = (bits >> 16) & 1;
+        let round_bit = (bits >> 15) & 1;
+        let sticky = (bits & 0x7FFF) != 0;
+        let add = round_bit & (lsb | (sticky as u32));
+        ((bits >> 16) + add) as u16
+    };
+
+    let bf16_u16_to_f32 = |u: u16| -> f32 {
+        let bits = (u as u32) << 16;
+        f32::from_bits(bits)
+    };
+
+    let a_bf16_u16: Vec<u16> = a_f32.iter().map(|&x| f32_to_bf16_u16(x)).collect();
+    let b_bf16_u16: Vec<u16> = b_f32.iter().map(|&x| f32_to_bf16_u16(x)).collect();
+
+    let a_bytes: Vec<u8> = a_bf16_u16.iter().flat_map(|&x| x.to_le_bytes()).collect();
+    let b_bytes: Vec<u8> = b_bf16_u16.iter().flat_map(|&x| x.to_le_bytes()).collect();
+
+    let bf16_dtype = DType {
+        arith: ArithType::BF16,
+        storage: Storage::Native,
+    };
+
+    let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &a_bytes,
+        &Shape::new(vec![m, k]),
+        bf16_dtype.clone(),
+    ).expect("upload A bf16");
+
+    let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![n, k]),
+        bf16_dtype.clone(),
+    ).expect("upload B bf16");
+
+    let out_shape = Shape::new(vec![m, n]);
+
+    // CPU reference: exact pairwise BF16 multiplications accumulated in F32
+    let mut c_cpu = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                let av = bf16_u16_to_f32(a_bf16_u16[row * k + i]);
+                let bv = bf16_u16_to_f32(b_bf16_u16[col * k + i]);
+                acc += av * bv;
+            }
+            c_cpu[row * n + col] = acc;
+        }
+    }
+
+    // Test through matmul dispatch (which routes to grim_dot2_bf16_gemv for m<=4, bf16)
+    let (c_matmul_storage, handle) = dev
+        .matmul(a_dev.as_ref(), b_dev.as_ref(), &out_shape)
+        .expect("matmul dispatch");
+    handle.synchronize().expect("sync matmul handle");
+
+    let c_matmul = c_matmul_storage.to_cpu_vec_f32().expect("to_cpu_vec_f32");
+    let diff_matmul = max_diff(&c_cpu, &c_matmul);
+    eprintln!("[dot2-bf16-gemv-dispatch-parity] m={m} n={n} k={k} max_diff={diff_matmul:.6}");
+    for i in 0..8.min(c_cpu.len()) {
+        eprintln!("  [{i}] cpu={:.4} gpu={:.4} (diff={:.4})", c_cpu[i], c_matmul[i], (c_cpu[i] - c_matmul[i]).abs());
+    }
+    // BF16 has 7-8 bits of mantissa (eps ~ 0.0078). Over K=256 dot product with values ~[-4, 4],
+    // accumulated sum is around tens to hundreds. Max relative error should be small (< 2%).
+    let mut max_rel_err = 0.0f32;
+    for (c, g) in c_cpu.iter().zip(c_matmul.iter()) {
+        let diff = (c - g).abs();
+        let denom = c.abs().max(g.abs()).max(1.0);
+        max_rel_err = max_rel_err.max(diff / denom);
+    }
+    eprintln!("[dot2-bf16-gemv-dispatch-parity] max_rel_err={max_rel_err:.6}");
+        assert!(
+            max_rel_err < 0.05,
+            "dot2 BF16 matmul dispatch diverges from CPU reference: rel_err={max_rel_err}, abs_diff={diff_matmul}"
+        );
+        }
+    }
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+

@@ -370,6 +370,7 @@ impl Llama {
                 }),
                 tp_config: tp,
                 ffn_disabled: false,
+                silu_q81_scratch: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 _dev: Device::Cpu,
                 _cfg: LlamaConfigRefs {
                     hidden_size: cfg.hidden_size,

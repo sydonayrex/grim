@@ -1,4 +1,8 @@
-//! Standalone Q4_K dequantization HIP kernel for ROCm (Crow Tier).
+//! Standalone per-block dequantization HIP kernels for ROCm (Crow Tier).
+//!
+//! Holds the device source for the Q4_K and Q8_0 flat-dequantize helpers:
+//! these unpack one quant super-block / block into F32 and are used by the
+//! host-side parity/diag paths (`dequantize_q4k_host`, `dequantize_q8_0_host`).
 //! [see: `block_q4_K`] Layout (verified against `grim_quant::dequant_q4k`): each 144-byte super-block holds 256 weights.
 
 /// HIP source for `grim_dequant_q4k`.
@@ -48,6 +52,36 @@ extern "C" {
         const unsigned char* blk = packed + b * 144;
         for (int w = 0; w < 256; ++w) {
             out[b * 256 + w] = dequant_q4k_grim_element(blk, w);
+        }
+    }
+
+}
+"#;
+
+/// HIP source for `grim_dequant_q8_0` — flat Q8_0 → F32 dequant (moved from the
+/// now-removed `kernels/q8_0_dequant.rs`). Each thread unpacks one 34-byte block.
+pub const Q8_0_DEQUANT_SOURCE: &str = r#"
+extern "C" {
+
+    #define QK8_0 32
+
+    /// Dequantize one Q8_0 block (34 bytes: 2-byte f16 delta + 32x int8 codes)
+    /// into 32 F32 values. Each output thread handles one block.
+    __global__ void grim_dequant_q8_0(
+        const unsigned char* __restrict__ packed,
+        float* __restrict__ out,
+        int n_blocks)
+    {
+        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        if (b >= n_blocks) return;
+
+        const unsigned char* blk = packed + b * (QK8_0 + 2);
+        unsigned short d_bits = *((const unsigned short*)blk);
+        float d = fp16_to_float_device(d_bits);
+
+        const signed char* qs = (const signed char*)(blk + 2);
+        for (int j = 0; j < QK8_0; ++j) {
+            out[b * QK8_0 + j] = d * (float)qs[j];
         }
     }
 

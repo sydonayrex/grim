@@ -194,3 +194,123 @@ fn run_case(
     );
     Ok(())
 }
+
+/// M4: single-token decode against a longer quantized cache must take the
+/// split-KV FlashDecoding path (dequant-to-f32 + grim_flash_decode_stage1/2)
+/// and still match the pure-float reference. The gate is lowered via
+/// GRIM_FLASH_DECODE_MIN_KV so the test runs without a 512-token cache.
+#[test]
+#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
+fn gpu_kv_dequant_decode_uses_split_kv_flashdecode() -> TestResult {
+    // SAFETY: single-threaded test process; the gate is read per-call.
+    unsafe { std::env::set_var("GRIM_FLASH_DECODE_MIN_KV", "2") };
+
+    let (num_heads, num_kv_heads, head_dim) = (8usize, 2usize, 128usize);
+    let cache_tokens = 8usize; // kv_seq_len
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
+
+    let shape = Shape::new(vec![cache_tokens, num_kv_heads, head_dim]);
+    let dtype = f32_dtype();
+
+    let synth = |seed: u64, elems: usize| {
+        (0..elems)
+            .map(|i| (i as f32).sin() * 0.5 + (seed as f32) * 1e-3)
+            .collect::<Vec<f32>>()
+    };
+    let k_data = synth(1, cache_tokens * num_kv_heads * head_dim);
+    let v_data = synth(2, cache_tokens * num_kv_heads * head_dim);
+    let q_data = synth(3, num_heads * head_dim); // one decode token
+
+    let cpu = CpuDevice::new();
+    let k_storage = Arc::from(cpu.from_cpu(&k_data, &shape, dtype.clone())?);
+    let v_storage = Arc::from(cpu.from_cpu(&v_data, &shape, dtype.clone())?);
+    let keys = Tensor::new(
+        k_storage,
+        shape.clone(),
+        dtype.clone(),
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    );
+    let values = Tensor::new(
+        v_storage,
+        shape.clone(),
+        dtype.clone(),
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    );
+
+    let gpu_compressor = LloydMaxCompressor::with_gpu_attn(
+        KvQuantConfig {
+            key_bits: 8,
+            value_bits: 8,
+            ..Default::default()
+        },
+        KvDequantAttentionConfig { enabled: true },
+    );
+    let block = gpu_compressor.compress(&keys, &values)?;
+
+    let q_shape = Shape::new(vec![1usize, num_heads, head_dim]);
+    let q_storage = Arc::from(cpu.from_cpu(&q_data, &q_shape, dtype.clone())?);
+    let query = Tensor::new(
+        q_storage,
+        q_shape.clone(),
+        dtype.clone(),
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    );
+
+    let gpu_dev: &dyn grim_tensor::BackendDevice = &dev;
+    let gpu_out = gpu_compressor.fused_attention(&block, &query, gpu_dev, Device::Rocm(0))?;
+
+    // Pure-float reference: decode token attends the full dequantized cache.
+    let (ref_keys, ref_values) =
+        gpu_compressor.dequantize_for_attention(&block, &cpu, Device::Cpu)?;
+    let ref_k = ref_keys.to_vec_f32()?;
+    let ref_v = ref_values.to_vec_f32()?;
+    let q_per_kv = num_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut ref_out = vec![0.0f32; num_heads * head_dim];
+    for h in 0..num_heads {
+        let kv_head = h / q_per_kv;
+        let mut scores = vec![0.0f32; cache_tokens];
+        let mut max_score = f32::NEG_INFINITY;
+        for (kt, score) in scores.iter_mut().enumerate() {
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q_data[h * head_dim + d]
+                    * ref_k[(kt * num_kv_heads + kv_head) * head_dim + d];
+            }
+            let s = dot * scale;
+            *score = s;
+            if s > max_score {
+                max_score = s;
+            }
+        }
+        let mut sum = 0.0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - max_score).exp();
+            sum += *s;
+        }
+        for d in 0..head_dim {
+            let mut val = 0.0f32;
+            for (kt, &score) in scores.iter().enumerate() {
+                val += score * ref_v[(kt * num_kv_heads + kv_head) * head_dim + d];
+            }
+            ref_out[h * head_dim + d] = val / sum;
+        }
+    }
+
+    let gpu_vec = gpu_out.to_vec_f32()?;
+    assert_eq!(gpu_vec.len(), ref_out.len(), "output length mismatch");
+    let max_err = gpu_vec
+        .iter()
+        .zip(ref_out.iter())
+        .map(|(g, r)| (g - r).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 0.05,
+        "M4 split-KV quantized-KV decode diverged from CPU reference: max_err={max_err}"
+    );
+    Ok(())
+}

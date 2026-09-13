@@ -7,7 +7,9 @@ use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
-use crate::device::roc_device::{CharonBackwardResult, CharonForwardStash, RocmDevice};
+use crate::device::roc_device::{CharonForwardStash, RocmDevice};
+#[cfg(feature = "training")]
+use crate::device::roc_device::CharonBackwardResult;
 use crate::memory::storage::RocmStorage;
 use crate::{
     HipDim3, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipFreeAsync, hipMemsetAsync,
@@ -1991,6 +1993,7 @@ impl RocmDevice {
 
     /// Device launcher for the FP32 Charon MoE backward kernel (`grim_moe_fused_grouped_backward`).
     /// Mirrors `launch_charon_grouped_dispatch`: validates inputs, zero-initialises the four atomicAdd output buffers, plans the grouped grid/block from.
+    #[cfg(feature = "training")]
     pub fn launch_charon_grouped_backward(
         &self,
         activations: &RocmStorage,
@@ -2155,6 +2158,7 @@ impl RocmDevice {
 
     /// Host-to-host roundtrip for the Charon MoE backward kernel.
     /// Uploads all inputs (activations, expert weights, d_y) and the sorted routing arrays to the device,.
+    #[cfg(feature = "training")]
     pub fn charon_grouped_backward_roundtrip(
         &self,
         activations: &[f32],
@@ -2184,6 +2188,7 @@ impl RocmDevice {
     }
 
     /// Host-to-host roundtrip for the Charon MoE backward kernel with optional stashing.
+    #[cfg(feature = "training")]
     pub fn charon_grouped_backward_roundtrip_stashed(
         &self,
         activations: &[f32],
@@ -2327,6 +2332,7 @@ impl RocmDevice {
 
     /// Benchmarks MoE backward step time (pure device kernel execution, excluding CPU-GPU uploads)
     /// comparing recompute (use_stash = false) vs stashed (use_stash = true).
+    #[cfg(feature = "training")]
     pub fn benchmark_charon_backward_step_time(
         &self,
         activations: &[f32],
