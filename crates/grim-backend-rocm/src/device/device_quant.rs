@@ -95,7 +95,7 @@ impl QuantOps for RocmDevice {
                 if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
-                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                     let need_alloc = match buf_guard.as_ref() {
                         Some(s) => s.bytes < q81_bytes,
                         None => true,
@@ -145,7 +145,7 @@ impl QuantOps for RocmDevice {
                 if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
-                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                     let need_alloc = match buf_guard.as_ref() {
                         Some(s) => s.bytes < q81_bytes,
                         None => true,
@@ -193,7 +193,7 @@ impl QuantOps for RocmDevice {
                 if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
-                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                     let need_alloc = match buf_guard.as_ref() {
                         Some(s) => s.bytes < q81_bytes,
                         None => true,
@@ -243,7 +243,7 @@ impl QuantOps for RocmDevice {
                     // Activations must be pre-quantized to Q8_1; quantize on the fly otherwise.
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
-                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                     let need_alloc = match buf_guard.as_ref() {
                         Some(s) => s.bytes < q81_bytes,
                         None => true,
@@ -283,7 +283,7 @@ impl QuantOps for RocmDevice {
                 if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
-                    let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                     let need_alloc = match buf_guard.as_ref() {
                         Some(s) => s.bytes < q81_bytes,
                         None => true,
@@ -418,7 +418,7 @@ impl QuantOps for RocmDevice {
                             // Q8_1 format: 36 bytes per 32-element block
                             let q81_bytes = (k / 32) * 36 * m;
                             let shape = Shape::new(vec![q81_bytes]);
-                            let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                             let need_alloc = match buf_guard.as_ref() {
                                 Some(s) => s.bytes < q81_bytes,
                                 None => true,
