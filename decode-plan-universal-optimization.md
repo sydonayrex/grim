@@ -30,8 +30,7 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 4 | 4d silu_mul_quant → q8_1 → dot4 down-proj | ✅ | `grim_silu_mul_quant_q8_1` (silu_mul_quant.rs:56) wired in block.rs:757-768,1073-1109; feeds `grim_dot4_q80_q81_gemv` via quantized_matmul prequant path (device_quant.rs:396-410) |
 | 4.5 | 4.5a Q4_K sudot4 GEMV | ✅+ | Q4_K **and** Q5_K/Q6_K beyond plan: `grim_dot4_q4k/q5k/q6k_q81_gemv` (dot_gemv.rs:200,316,437), dispatched m==1 RDNA3/4 (device_quant.rs:87-231) |
 | 4.5 | 4.5b sudot8 W4A4 | ✅ | OSTQuant W4A4 pipeline landed: `grim_dot8_w4a4_gemv` (V_DOT8_I32_IU4) + `grim_quantize_u4_group128` + `DTypeStorage::W4A4OstQuant` + safetensors loader e2e + qwen3 model parity tests — all green |
-| 4.5 | 4.5c FP8 dot GEMV | ✅ | `grim_dot4_fp8_gemv` (dot_gemv.rs:268) via `__builtin_amdgcn_fdot4_f32_fp8_fp8`; f32 activations quantized to E4M3 in-register; m==1 dispatch (device_quant.rs:613); GPU parity max_diff=4.9e-4 (dot_gemv_parity::dot4_fp8_gemv_parity) |
-| 4.5 | 4.5d BF16 fdot2 GEMV | ⏸ loader converts BF16→F16 | GGUF BF16 checkpoints ARE consumed (`GgufDType::BF16=30`) but the loader maps them to `DType::F16` with a lossy warning. A BF16 fdot2 GEMV (`V_DOT2_F32_BF16`, dot12-insts) requires: (1) loader change to keep BF16 storage, (2) fdot2 kernel. The consumer exists; the storage pipeline is the gap |
+| 4.5 | 4.5d BF16 fdot2 GEMV | ✅ | `grim_dot2_bf16_gemv` landed via `__builtin_amdgcn_fdot2_f32_bf16` (`dot12-insts`), GGUF loader maps `GgufDType::BF16` to `DType::BF16` without lossy F16 downcast; dispatched for $M \le 4$ on RDNA3/4 (`device_compute.rs`); GPU parity tests green across $M \in \{1, 2, 4\}$ (`dot2_bf16_gemv_parity`) |
 | 4.5 | 4.5e fdot2 builtin upgrade | ✅ | Already uses `__builtin_amdgcn_fdot2` intrinsic (dot_gemv.rs:144-146), not inline asm — sub-step pre-satisfied |
 | 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ✅+ | `grim_dot4_q2k/q3k_q81_gemv` (dot_gemv.rs:342,427); launch_dot4_q2k/q3k_q81_gemv (device_compute.rs:2259,2279); dispatched m==1 via is_dot4_arch (RDNA2/3/4) |
 | 4.5 | 4.5g IQ strategy | ✅ | Assessment-only sub-step; WMMA path confirmed as decode route (device_quant.rs) |
@@ -53,11 +52,23 @@ audit/removal), Phase 6 (session-graph threading). Phase 4.5b/d correctly deferr
   kernels (flash_decode, extend_attention, cross_attention, sage_attention)
   are actively dispatched from device_attention.rs (different attention
   topologies). None are dead — **retained**.
-- **Phase 6a session DecodeGraphBuffers:** SUPERSEDED by Phase 1c — block.rs
-  manages the graph state internally (past_dev counter, pos_base_dev aliasing,
-  device-driven attention, default-on for llama-family). The engine's existing
-  `decode_graph_input_buffers` handles the graph-capture bracket. No
-  session-level struct needed. Dispatch collapse (5a) and FP8 (4.5c) are LANDED.
+**Remaining audit items (M-series, verified UNCHANGED):**
+- **M2 autotune sweep:** correctly gated by GRIM_ATTENTION_AUTOTUNE=1 — real
+  launches only on explicit opt-in. Pre-populating .autotune_cache for expected
+  shapes is a deployment concern, not a code fix.
+- **M4 quantized-KV FlashDecoding:** kv_dequant_attention kernel has no
+  split-KV path. Long-context quantized-KV decode misses split-KV speedup.
+  Fix: dequantize K/V to F32 temp buffers at kv_seq_len>=512, then route
+  through the fp32 flash_decode (split-KV) path. Adds 2 dequant launches but
+  enables split-KV. Requires understanding the KvQuantFormat-specific
+  dequant kernels.
+- **M5 ScytheRing routing:** intentionally off by default, F32 GEMM only.
+  Multi-GPU expansion plan in plans/scythe-multi-gpu.md.
+
+**Completed audit items:**
+- **H5** arch hoist, **H1** grim_sub kernel, **M3** FlashDecoding gate 512,
+  **H2** GPU reduce verified, **H3** Mutex→RwLock, **C1/H4** FFN fusion wired
+  for llama-family + lfm2 (3 launches, not 5). Dispatch collapse (5a) and FP8 (4.5c) are LANDED.
 
 ---
 
@@ -383,11 +394,11 @@ provides native fp8×fp8 dot4 with f32 accumulation — no integer quantization 
 
 **Applicability:** models quantized to FP8 (E4M3) or FP4 with per-block FP8 scales.
 
-### Sub-step 4.5d: BF16 GEMV via fdot2_f32_bf16  — **[❌ REMAINING]**
+### Sub-step 4.5d: BF16 GEMV via fdot2_f32_bf16  — **[✅ LANDED (dot_gemv.rs:197, device_compute.rs:3938)]**
 
-**Why:** BF16 models (Llama/Mistral BF16 checkpoints) currently run through the f32
-GEMV path (no hardware dot instruction used). The `fdot2_f32_bf16` (dot12-insts)
-provides native bf16×bf16 dot2 with f32 accumulation.
+**Why:** BF16 models (Llama/Mistral BF16 checkpoints) previously ran through rocBLAS
+or unaccelerated FP32 GEMV. The `fdot2_f32_bf16` (`dot12-insts`, RDNA3/4)
+provides native BF16×BF16 dot2 with FP32 accumulation and BF16 output.
 
 **Kernel design:**
 - Weights and activations stored as BF16 (2 bytes each)
