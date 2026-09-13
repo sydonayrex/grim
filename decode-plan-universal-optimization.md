@@ -35,27 +35,24 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 4.5 | 4.5e fdot2 builtin upgrade | ✅ | Already uses `__builtin_amdgcn_fdot2` intrinsic (dot_gemv.rs:144-146), not inline asm — sub-step pre-satisfied |
 | 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ✅+ | `grim_dot4_q2k/q3k_q81_gemv` (dot_gemv.rs:342,427); launch_dot4_q2k/q3k_q81_gemv (device_compute.rs:2259,2279); dispatched m==1 via is_dot4_arch (RDNA2/3/4) |
 | 4.5 | 4.5g IQ strategy | ✅ | Assessment-only sub-step; WMMA path confirmed as decode route (device_quant.rs) |
-| 5 | 5a-d kernel removal | ⚠️ A/B COMPLETE — RDNA2 has NO WMMA (ISA-verified) | `tests/phase5_dispatch_ab.rs` (gfx1201, release): scalar per-quant GEMM is 10–190× SLOWER than WMMA at every prefill shape — never the fastest on RDNA3/4. ISA review (`old/amd-isa/rdna2-*.pdf`): **RDNA2 has zero WMMA instructions** (repo arch guard is correct) and no `sudot4` (mixed-sign); it HAS `V_DOT4_I32_I8` (sdot4, signed×signed), `V_DOT4_U32_U8`, `V_DOT8_I32_I4/U32_U4` (signed/unsigned nibble dot8), `V_DOT2_F32_F16` (f32 acc). So the scalar kernels are the ONLY K-quant path on RDNA2 — **retain as the RDNA2 fallback**; collapse the RDNA3/4 m>1 dispatch to WMMA after fixing the WMMA Q3_K/Q6_K drift the A/B exposed. Optional future: RDNA2-native dot4 GEMV via sdot4 (direct fit for Q8_0×Q8_1 signed×signed) |
+| 5 | 5a-d kernel removal | ✅ 5a-drift-fixed — Q3K/Q6K/Q5K WMMA dequant rewritten to canonical layout, GEMM parity green (1.6e-4/2.8e-4/5e-5). Dispatch collapse + kernel deletion ready | `tests/phase5_dispatch_ab.rs` (gfx1201, release): scalar per-quant GEMM is 10–190× SLOWER than WMMA at every prefill shape — never the fastest on RDNA3/4. ISA review (`old/amd-isa/rdna2-*.pdf`): **RDNA2 has zero WMMA instructions** (repo arch guard is correct) and no `sudot4` (mixed-sign); it HAS `V_DOT4_I32_I8` (sdot4, signed×signed), `V_DOT4_U32_U8`, `V_DOT8_I32_I4/U32_U4` (signed/unsigned nibble dot8), `V_DOT2_F32_F16` (f32 acc). So the scalar kernels are the ONLY K-quant path on RDNA2 — **retain as the RDNA2 fallback**; collapse the RDNA3/4 m>1 dispatch to WMMA after fixing the WMMA Q3_K/Q6_K drift the A/B exposed. Optional future: RDNA2-native dot4 GEMV via sdot4 (direct fit for Q8_0×Q8_1 signed×signed) |
 | 6 | 6a session DecodeGraphBuffers | ⚠️ | Engine has model-agnostic `decode_graph_input_buffers`/`GraphCaptureInputBuffers` (grim-engine/src/lib.rs:239-249, GRIM_CAPTURE_GRAPH) but it captures input_ids/positions only — not the past_dev-counter per-layer design; no `DecodeGraphState` symbol |
 | 6 | 6b graph in block.rs/shared models | ❌ | Same as 1c — graph primitives are lfm2-only |
 
-**Net assessment (updated 2026-09-13):** Phases 1(a,b,c), 2(a,b), 3(a,b,c), 4(a,b,c,d),
+**Net assessment (updated 2026-09-13, post Phase-5a drift fix):** Phases 1(a,b,c), 2(a,b), 3(a,b,c), 4(a,b,c,d),
 4.5(a,b,e,f,g) are landed; decode-GEMV M=1 coverage is 8 formats (Q8_0, Q2_K,
 Q3_K, Q4_K, Q5_K, Q6_K, FP8, Q4_K-via-sudot8) — exceeds the ≥4 target. RDNA2
 (gfx103x) dot4 GEMV path landed and parity-verified on the APU (16/16). Two
 latent GPU kernel bugs fixed en route. MoE kernels (3a,b,c) route Charon's
-grouped dispatch with resident weight stacks. Remaining: Phase 4.5c (FP8 dot4
-kernel), Phase 5a (WMMA Q3_K/Q6_K drift fix → m>1 dispatch collapse → kernel
-deletion), Phase 5b (attention kernel audit/removal), Phase 6 (session-graph
-threading). Phase 4.5b/d correctly deferred (no W4A4/BF16 checkpoint consumers).
+grouped dispatch with resident weight stacks. Remaining: Phase 5a (m>1 dispatch collapse +
+kernel deletion — drift fixed, safe to proceed), Phase 5b (attention kernel
+audit/removal), Phase 6 (session-graph threading). Phase 4.5b/d correctly deferred (no W4A4/BF16 checkpoint consumers).
 
 **NOT completed (and why):**
-- **Phase 4.5c FP8 dot GEMV:** fp8 files are WMMA GEMMs only — no M=1 FP8
-  dot-GEMV kernel.
-- **Phase 5a cleanup:** WMMA Q3_K/Q6_K layout drift (non-finite prefill output
-  with host-authoritative bytes) must be fixed FIRST, then collapse the RDNA3/4
-  m>1 dispatch to WMMA, then delete the scalar per-quant GEMVs.
-- **Phase 5b attention-kernel removal:** still needs its own dispatch audit.
+- **Phase 5a cleanup (dispatch collapse + kernel deletion):** drift fixed
+  (Q3K 1.6e-4, Q6K 2.8e-4, Q5K 5e-5), so the RDNA3/4 m>1 dispatch can now
+  collapse to WMMA and the scalar per-quant GEMVs are deletable.
+- **Phase 4.5c FP8 dot GEMV:** LANDED (`grim_dot4_fp8_gemv`), parity 4.9e-4.
 - **Phase 6a/6b session graph:** no `DecodeState` symbol; graph primitives are
   lfm2-only.
 
