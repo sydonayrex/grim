@@ -2148,7 +2148,7 @@ impl RocmDevice {
         let mut dptr = dst_ptr;
         let mut kk = k as i32;
         let mut mm = m as i32;
-        self.launch_compute_kernel(
+        let handle = self.launch_compute_kernel(
             "grim_quantize_q8_1",
             grid_dim,
             block_dim,
@@ -2158,7 +2158,17 @@ impl RocmDevice {
                 arg(&mut kk),
                 arg(&mut mm),
             ],
-        )
+        )?;
+
+        // RDNA2 (gfx103x APU, unified/GTT memory) visibility quirk: the
+        // immediately-following dot4 GEMV launch reads `dst` on the same
+        // stream, but on gfx1036 the consumer observed stale bytes unless a
+        // host-side barrier separates the producer and consumer launches
+        // (deterministic 75.9 divergence without it). The call is m==1
+        // decode-only, so the ~us sync cost is negligible. gfx1201 is
+        // unaffected but pays the same tiny cost for one shared code path.
+        self.synchronize();
+        Ok(handle)
     }
 
     /// SPEED-DOT: Q8_0 x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
@@ -2409,6 +2419,135 @@ impl RocmDevice {
             &mut [
                 arg(&mut aptr),
                 arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Phase 4.5b: Launch grim_quantize_u4_group128 activation quantizer (RDNA4 gfx1200/gfx1201).
+    pub fn launch_quantize_u4_group128(
+        &self,
+        src: &RocmStorage,
+        dst_codes: &RocmStorage,
+        dst_scales: &RocmStorage,
+        dst_sums: &RocmStorage,
+        m: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let src_ptr = src
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_u4_group128: src has no device ptr".into()))?;
+        let dst_codes_ptr = dst_codes
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_u4_group128: dst_codes has no device ptr".into()))?;
+        let dst_scales_ptr = dst_scales
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_u4_group128: dst_scales has no device ptr".into()))?;
+        let dst_sums_ptr = dst_sums
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_u4_group128: dst_sums has no device ptr".into()))?;
+
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "quantize_u4_group128: K={k} must be a multiple of 128"
+            )));
+        }
+        let n_groups = k / 128;
+        let total_blocks = (n_groups * m) as u32;
+        let grid_dim = HipDim3::new(total_blocks, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut sptr = src_ptr;
+        let mut dc_ptr = dst_codes_ptr;
+        let mut ds_ptr = dst_scales_ptr;
+        let mut dsum_ptr = dst_sums_ptr;
+        let mut kk = k as i32;
+        let mut mm = m as i32;
+        self.launch_compute_kernel(
+            "grim_quantize_u4_group128",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut sptr),
+                arg(&mut dc_ptr),
+                arg(&mut ds_ptr),
+                arg(&mut dsum_ptr),
+                arg(&mut kk),
+                arg(&mut mm),
+            ],
+        )
+    }
+
+    /// Phase 4.5b: W4A4 sudot8 GEMV via V_DOT8_I32_IU4 (RDNA4 gfx1200/gfx1201).
+    pub fn launch_dot8_w4a4_gemv(
+        &self,
+        a_codes: &RocmStorage,
+        a_scales: &RocmStorage,
+        a_sums: &RocmStorage,
+        b_qweight: &RocmStorage,
+        b_scales: &RocmStorage,
+        b_zeros: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_codes_ptr = a_codes
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: a_codes has no device ptr".into()))?;
+        let a_scales_ptr = a_scales
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: a_scales has no device ptr".into()))?;
+        let a_sums_ptr = a_sums
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: a_sums has no device ptr".into()))?;
+        let b_qw_ptr = b_qweight
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: b_qweight has no device ptr".into()))?;
+        let b_sc_ptr = b_scales
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: b_scales has no device ptr".into()))?;
+        let b_zr_ptr = b_zeros
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: b_zeros has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot8_w4a4_gemv: out has no device ptr".into()))?;
+
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "dot8_w4a4_gemv: K={k} must be divisible by 128"
+            )));
+        }
+
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut a_c = a_codes_ptr;
+        let mut a_s = a_scales_ptr;
+        let mut a_sum = a_sums_ptr;
+        let mut b_qw = b_qw_ptr;
+        let mut b_sc = b_sc_ptr;
+        let mut b_zr = b_zr_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_dot8_w4a4_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a_c),
+                arg(&mut a_s),
+                arg(&mut a_sum),
+                arg(&mut b_qw),
+                arg(&mut b_sc),
+                arg(&mut b_zr),
                 arg(&mut optr),
                 arg(&mut mm),
                 arg(&mut nn),

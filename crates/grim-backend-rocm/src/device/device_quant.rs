@@ -92,11 +92,21 @@ impl QuantOps for RocmDevice {
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
+                // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
+                // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
+                // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
+                let is_dot4_arch = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA2
+                        | crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
                 let dot_disabled = matches!(
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
@@ -143,11 +153,21 @@ impl QuantOps for RocmDevice {
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
+                // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
+                // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
+                // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
+                let is_dot4_arch = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA2
+                        | crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
                 let dot_disabled = matches!(
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
@@ -192,11 +212,21 @@ impl QuantOps for RocmDevice {
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
+                // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
+                // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
+                // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
+                let is_dot4_arch = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA2
+                        | crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
                 let dot_disabled = matches!(
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
@@ -241,11 +271,21 @@ impl QuantOps for RocmDevice {
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
+                // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
+                // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
+                // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
+                let is_dot4_arch = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA2
+                        | crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
                 let dot_disabled = matches!(
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     // Phase 4.5f: m==1 decode routes to the Q2_K dot4 GEMV.
                     // Activations must be pre-quantized to Q8_1; quantize on the fly otherwise.
                     let q81_bytes = (k / 32) * 36 * m;
@@ -284,11 +324,21 @@ impl QuantOps for RocmDevice {
                         | crate::quantization::GcnArch::RDNA4
                         | crate::quantization::GcnArch::UDNA
                 );
+                // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
+                // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
+                // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
+                let is_dot4_arch = matches!(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    crate::quantization::GcnArch::RDNA2
+                        | crate::quantization::GcnArch::RDNA3
+                        | crate::quantization::GcnArch::RDNA4
+                        | crate::quantization::GcnArch::UDNA
+                );
                 let dot_disabled = matches!(
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna34 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if is_dot4_arch && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.lock().unwrap_or_else(|e| e.into_inner());
