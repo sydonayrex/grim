@@ -360,7 +360,7 @@ impl AttentionOps for RocmDevice {
 
         // Split-KV FlashDecoding acceleration for long-context single-token decode
         if seq_len == 1
-            && kv_seq_len >= 1024
+            && kv_seq_len >= 512
             && window.is_none()
             && out_max.is_none()
             && out_sum.is_none()

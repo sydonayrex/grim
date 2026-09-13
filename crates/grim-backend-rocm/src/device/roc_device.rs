@@ -231,6 +231,10 @@ pub struct RocmDevice {
     pub(crate) launch_counter: AtomicUsize,
     /// GPU target this device was created for, captured at construction. Used to [see: `temp_env::with_var("GRIM_GPU_TARGET", ..)`]
     pub(crate) gpu_target: String,
+    /// Hoisted arch classification — set once at construction, read per quantized_matmul call.
+    pub(crate) is_rdna34: bool,
+    pub(crate) is_dot4_arch: bool,
+    pub(crate) wmma_max_m: usize,
     /// Whether graph capture/replay is enabled. Keyed off the `GRIM_CAPTURE_GRAPH`
     capture_enabled: bool,
     /// The dedicated capture stream, owned for the device's lifetime. Created lazily on [see: `begin_graph_capture`, `Drop`]
@@ -733,6 +737,23 @@ impl RocmDevice {
             module_load_count: AtomicUsize::new(0),
             launch_counter: AtomicUsize::new(0),
             gpu_target: gpu_target.clone(),
+            is_rdna34: matches!(
+                crate::quantization::gcn_arch(&gpu_target),
+                crate::quantization::GcnArch::RDNA3
+                    | crate::quantization::GcnArch::RDNA4
+                    | crate::quantization::GcnArch::UDNA
+            ),
+            is_dot4_arch: matches!(
+                crate::quantization::gcn_arch(&gpu_target),
+                crate::quantization::GcnArch::RDNA2
+                    | crate::quantization::GcnArch::RDNA3
+                    | crate::quantization::GcnArch::RDNA4
+                    | crate::quantization::GcnArch::UDNA
+            ),
+            wmma_max_m: std::env::var("GRIM_WMM_MAX_M")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
             capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH")
                 .map(|v| v != "0" && v != "false" && v != "off")
                 .unwrap_or(false),
