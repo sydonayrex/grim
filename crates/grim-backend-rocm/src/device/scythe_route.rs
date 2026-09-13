@@ -11,11 +11,15 @@ use grim_tensor::{BackendStorage, MemoryOps, Shape};
 use crate::device::roc_device::RocmDevice;
 use crate::memory::pinned::RocmPinnedBuffer;
 use crate::memory::storage::RocmStorage;
+use crate::peer_access::{self, LinkType};
 use crate::{Error, HipMemcpyKind, Result, hipMemcpyAsync, hipStreamSynchronize};
 
-/// Ring capacity for the production channel.
+/// Ring capacity for the persistent-dispatch ring.
 /// Power of two (ring index math), large enough that the host never laps the device.
-const RING_CAPACITY: u32 = 8;
+const RING_CAPACITY: u32 = 32;
+
+// Mirror of the opcode constant in kernels/scythe_persistent::KERNEL_SOURCE.
+const OP_ROW_GEMM: u32 = 2; // B is [N, K] → C = A @ B^T (matmul_op convention)
 
 /// `true` when `GRIM_SCYTHE_RING=1` is set — the SB6 production routing
 /// gate. Read once per matmul; cheap env lookup relative to a GEMM.
@@ -27,19 +31,22 @@ pub fn ring_routing_enabled() -> bool {
 
 /// One persistent channel per device ordinal: device-resident slot array plus the tail/head/stop scalars the wave polls.
 /// Owned for the process lifetime; the head/tail counters are monotonic, so a channel is single-use.
-struct RingChannel {
-    slots: Box<dyn BackendStorage>,
-    tail: Box<dyn BackendStorage>,
-    head: Box<dyn BackendStorage>,
-    stop: Box<dyn BackendStorage>,
+#[allow(dead_code)]
+pub struct RingChannel {
+    /// Peer link type per device ordinal (only populated for known peers).
+    pub peer_links: HashMap<usize, LinkType>,
+    pub slots: Box<dyn BackendStorage>,
+    pub tail: Box<dyn BackendStorage>,
+    pub head: Box<dyn BackendStorage>,
+    pub stop: Box<dyn BackendStorage>,
     /// Pinned 64-byte staging cell for the descriptor upload.
-    staging: RocmPinnedBuffer<u8>,
+    pub staging: RocmPinnedBuffer<u8>,
     /// Pinned 4-byte cell for the head publish.
-    head_cell: RocmPinnedBuffer<u8>,
-    slots_dev: u64,
-    head_dev: u64,
+    pub head_cell: RocmPinnedBuffer<u8>,
+    pub slots_dev: u64,
+    pub head_dev: u64,
     /// Host-side monotonic head counter (device head is published from it).
-    next_head: u32,
+    pub next_head: u32,
 }
 
 fn channels() -> &'static Mutex<HashMap<usize, Arc<Mutex<RingChannel>>>> {
@@ -52,6 +59,33 @@ fn channel_for(device: &RocmDevice) -> Result<Arc<Mutex<RingChannel>>> {
     if let Some(chan) = map.get(&device.ordinal()) {
         return Ok(Arc::clone(chan));
     }
+
+    // MG-1: discover peers and enable peer access to every reachable device.
+    // This runs ONCE per device ring channel (cold-start cost, not per-op).
+    let device_count = peer_access::enumerate_devices().unwrap_or(0);
+    let mut peer_links = HashMap::new();
+    for peer_ord in 0..device_count {
+        if peer_ord == device.ordinal() {
+            continue;
+        }
+        let link = match peer_access::peer_status(device.ordinal() as i32, peer_ord as i32) {
+            Ok(status) => match status {
+                peer_access::P2PStatus::P2P => LinkType::PeerDirect,
+                peer_access::P2PStatus::Pcie => LinkType::PeerDirect,
+                _ => LinkType::HostBounce,
+            },
+            Err(_) => LinkType::HostBounce,
+        };
+        if link != LinkType::HostBounce {
+            let _ = peer_access::enable_peer_access(device.ordinal() as i32, peer_ord as i32);
+        }
+        peer_links.insert(peer_ord, link);
+    }
+    eprintln!(
+        "[scythe-ring] device {} peer topology: {:?}",
+        device.ordinal(),
+        peer_links
+    );
     let u32_dtype = DType {
         arith: ArithType::U32,
         storage: DTypeStorage::Native,
@@ -75,6 +109,7 @@ fn channel_for(device: &RocmDevice) -> Result<Arc<Mutex<RingChannel>>> {
         .and_then(|rs| rs.device_ptr_u64())
         .ok_or_else(|| Error::Backend("ring channel head has no device ptr".into()))?;
     let chan = Arc::new(Mutex::new(RingChannel {
+        peer_links,
         slots: Box::new(slots),
         tail: scalar(0)?,
         head,
@@ -89,10 +124,15 @@ fn channel_for(device: &RocmDevice) -> Result<Arc<Mutex<RingChannel>>> {
     Ok(chan)
 }
 
-/// Pack one opcode-1 (column-GEMM) `ScytheTaskDescriptor` into `cell`.
+/// Pack one GEMM `ScytheTaskDescriptor` into `cell`.
 /// Byte layout (pinned by `test_task_descriptor_size` and the device-gated ring tests): opcode@0, m@4, n@8, k@12, input_ptr@16,.
+///
+/// `opcode` selects the B-matrix convention the kernel applies:
+/// OP_COL_GEMM (1) — B is [K, N], computes C = A @ B.
+/// OP_ROW_GEMM (2) — B is [N, K], computes C = A @ B^T (matmul_op convention).
 fn pack_gemm_descriptor(
     cell: &mut [u8],
+    opcode: u32,
     m: u32,
     n: u32,
     k: u32,
@@ -101,7 +141,7 @@ fn pack_gemm_descriptor(
     output: u64,
 ) {
     cell[..64].fill(0);
-    cell[0..4].copy_from_slice(&1u32.to_ne_bytes()); // opcode 1 = OP_COL_GEMM
+    cell[0..4].copy_from_slice(&opcode.to_ne_bytes());
     cell[4..8].copy_from_slice(&m.to_ne_bytes());
     cell[8..12].copy_from_slice(&n.to_ne_bytes());
     cell[12..16].copy_from_slice(&k.to_ne_bytes());
@@ -113,7 +153,7 @@ fn pack_gemm_descriptor(
 
 /// Route one F32 GEMM through the ring's persistent dispatch wave.
 /// Computes the same `out[m,n] = Σ_k a[m,k]·b[k,n]` (b row-major) as the rocBLAS path in `matmul_op`.
-pub(crate) fn route_gemm(
+pub fn route_gemm(
     device: &RocmDevice,
     stream: *mut c_void,
     a: &RocmStorage,
@@ -123,6 +163,11 @@ pub(crate) fn route_gemm(
     n: usize,
     k: usize,
 ) -> Result<*mut c_void> {
+    let stream = if stream.is_null() {
+        device.active_stream()
+    } else {
+        stream
+    };
     let (m, n, k) = (
         u32::try_from(m).map_err(|_| Error::Shape("ring route: m exceeds u32".into()))?,
         u32::try_from(n).map_err(|_| Error::Shape("ring route: n exceeds u32".into()))?,
@@ -147,7 +192,8 @@ pub(crate) fn route_gemm(
 
     {
         let cell = chan.staging.as_mut_slice();
-        pack_gemm_descriptor(cell, m, n, k, a_ptr, b_ptr, out_ptr);
+        // matmul_op feeds B in [N, K] form (C = A @ B^T) → OP_ROW_GEMM.
+        pack_gemm_descriptor(cell, OP_ROW_GEMM, m, n, k, a_ptr, b_ptr, out_ptr);
     }
     let dst = chan.slots_dev + slot as u64 * 64;
     device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
@@ -188,6 +234,395 @@ pub(crate) fn route_gemm(
     Ok(stream)
 }
 
+// ─── MG-2 + MG-3: cross-device routing ────────────────────────────────────
+
+/// Get (or create) the ring channel for a target device ordinal.
+/// Used when routing ops cross-device: the descriptor goes to the
+/// TARGET device's ring, not the caller's.
+#[allow(dead_code)]
+pub fn channel_for_ordinal(ordinal: usize) -> Result<Arc<Mutex<RingChannel>>> {
+    let dev = RocmDevice::try_new(ordinal)?;
+    channel_for(&dev)
+}
+
+/// Check if peer access is available between two device ordinals.
+#[allow(dead_code)]
+pub fn peer_link_type(src_ordinal: usize, dst_ordinal: usize) -> Option<LinkType> {
+    let map = channels().lock().unwrap_or_else(|e| e.into_inner());
+    let chan = map.get(&src_ordinal)?;
+    chan.lock().unwrap_or_else(|e| e.into_inner()).peer_links.get(&dst_ordinal).copied()
+}
+
+/// MG-2: route one GEMM through a specific device's ring channel.
+/// The caller specifies which device executes the GEMM; input/output
+/// pointers use peer-access-enabled addresses when crossing devices.
+#[allow(dead_code)]
+pub fn route_gemm_to(
+    target_ordinal: usize,
+    stream: *mut c_void,
+    a: &RocmStorage,
+    b: &RocmStorage,
+    out: &RocmStorage,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<*mut c_void> {
+    let dev = RocmDevice::try_new(target_ordinal)?;
+    route_gemm(&dev, stream, a, b, out, m, n, k)
+}
+
+/// MG-3: route an OP_COMMFUSE descriptor — copies src to both peer_dst
+/// (remote device memory, via peer access) and local_out (local memory).
+/// The persistent wave on the SOURCE device executes this inline.
+#[allow(dead_code)]
+pub fn route_commfuse(
+    device: &RocmDevice,
+    stream: *mut c_void,
+    src: &RocmStorage,
+    peer_dst: Option<u64>,
+    local_out: Option<u64>,
+    elem_count: usize,
+) -> Result<*mut c_void> {
+    let stream = if stream.is_null() {
+        device.active_stream()
+    } else {
+        stream
+    };
+    let src_ptr = src
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("commfuse: src has no device ptr".into()))?;
+    let peer_val = peer_dst.unwrap_or(0);
+    let local_val = local_out.unwrap_or(0);
+
+    let chan = channel_for(device)?;
+    let mut chan = chan.lock().unwrap_or_else(|e| e.into_inner());
+
+    let slot = chan.next_head % RING_CAPACITY;
+    let head_value = chan.next_head.wrapping_add(1);
+    chan.next_head = head_value;
+
+    {
+        let cell = chan.staging.as_mut_slice();
+        cell[..64].fill(0);
+        cell[0..4].copy_from_slice(&5u32.to_ne_bytes()); // opcode 5 = OP_COMMFUSE
+        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
+        cell[8..12].copy_from_slice(&1u32.to_ne_bytes()); // n = 1
+        cell[12..16].copy_from_slice(&1u32.to_ne_bytes()); // k = 1
+        cell[16..24].copy_from_slice(&src_ptr.to_ne_bytes());
+        cell[40..48].copy_from_slice(&peer_val.to_ne_bytes()); // peer_ptr
+        cell[32..40].copy_from_slice(&local_val.to_ne_bytes()); // output_ptr
+    }
+    let dst = chan.slots_dev + slot as u64 * 64;
+    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+
+    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
+    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
+    let rc = unsafe {
+        hipMemcpyAsync(
+            chan.head_dev as *mut c_void,
+            chan.head_cell.as_ptr() as *const c_void,
+            4,
+            HipMemcpyKind::HostToDevice,
+            stream,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::Backend(format!("commfuse: head publish failed {rc}")));
+    }
+    crate::device::helpers::check_hip("commfuse: head sync", unsafe {
+        hipStreamSynchronize(stream)
+    })?;
+
+    device.launch_scythe_persistent_dispatch(
+        chan.slots.as_ref(),
+        RING_CAPACITY,
+        chan.tail.as_ref(),
+        chan.head.as_ref(),
+        chan.stop.as_ref(),
+        1,
+        0,
+    )?;
+    Ok(stream)
+}
+
+/// MG-4: route an OP_PEER_REDUCE descriptor (all-reduce partials: result = local + peer).
+/// Executed inline by the persistent wave on `device`.
+#[allow(dead_code)]
+pub fn route_peer_reduce(
+    device: &RocmDevice,
+    stream: *mut c_void,
+    local: &RocmStorage,
+    peer: &RocmStorage,
+    out: &RocmStorage,
+    elem_count: usize,
+) -> Result<*mut c_void> {
+    let stream = if stream.is_null() {
+        device.active_stream()
+    } else {
+        stream
+    };
+    let local_ptr = local
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("peer_reduce: local has no device ptr".into()))?;
+    let peer_ptr = peer
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("peer_reduce: peer has no device ptr".into()))?;
+    let out_ptr = out
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("peer_reduce: out has no device ptr".into()))?;
+
+    let chan = channel_for(device)?;
+    let mut chan = chan.lock().unwrap_or_else(|e| e.into_inner());
+
+    let slot = chan.next_head % RING_CAPACITY;
+    let head_value = chan.next_head.wrapping_add(1);
+    chan.next_head = head_value;
+
+    {
+        let cell = chan.staging.as_mut_slice();
+        cell[..64].fill(0);
+        cell[0..4].copy_from_slice(&8u32.to_ne_bytes()); // opcode 8 = OP_PEER_REDUCE
+        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
+        cell[8..12].copy_from_slice(&1u32.to_ne_bytes()); // n = 1
+        cell[12..16].copy_from_slice(&1u32.to_ne_bytes()); // k = 1
+        cell[16..24].copy_from_slice(&local_ptr.to_ne_bytes()); // input_ptr = local
+        cell[40..48].copy_from_slice(&peer_ptr.to_ne_bytes());  // peer_ptr = peer
+        cell[32..40].copy_from_slice(&out_ptr.to_ne_bytes());   // output_ptr = result
+    }
+    let dst = chan.slots_dev + slot as u64 * 64;
+    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+
+    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
+    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
+    let rc = unsafe {
+        hipMemcpyAsync(
+            chan.head_dev as *mut c_void,
+            chan.head_cell.as_ptr() as *const c_void,
+            4,
+            HipMemcpyKind::HostToDevice,
+            stream,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::Backend(format!("peer_reduce: head publish failed {rc}")));
+    }
+    crate::device::helpers::check_hip("peer_reduce: head sync", unsafe {
+        hipStreamSynchronize(stream)
+    })?;
+
+    device.launch_scythe_persistent_dispatch(
+        chan.slots.as_ref(),
+        RING_CAPACITY,
+        chan.tail.as_ref(),
+        chan.head.as_ref(),
+        chan.stop.as_ref(),
+        1,
+        0,
+    )?;
+    Ok(stream)
+}
+
+/// MG-4: route an OP_PEER_BROADCAST descriptor: writes root's src to remote peer dst.
+#[allow(dead_code)]
+pub fn route_peer_broadcast(
+    device: &RocmDevice,
+    stream: *mut c_void,
+    src: &RocmStorage,
+    peer_dst: &RocmStorage,
+    elem_count: usize,
+) -> Result<*mut c_void> {
+    let stream = if stream.is_null() {
+        device.active_stream()
+    } else {
+        stream
+    };
+    let src_ptr = src
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("peer_broadcast: src has no device ptr".into()))?;
+    let dst_ptr = peer_dst
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("peer_broadcast: peer_dst has no device ptr".into()))?;
+
+    let chan = channel_for(device)?;
+    let mut chan = chan.lock().unwrap_or_else(|e| e.into_inner());
+
+    let slot = chan.next_head % RING_CAPACITY;
+    let head_value = chan.next_head.wrapping_add(1);
+    chan.next_head = head_value;
+
+    {
+        let cell = chan.staging.as_mut_slice();
+        cell[..64].fill(0);
+        cell[0..4].copy_from_slice(&9u32.to_ne_bytes()); // opcode 9 = OP_PEER_BROADCAST
+        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
+        cell[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        cell[12..16].copy_from_slice(&1u32.to_ne_bytes());
+        cell[16..24].copy_from_slice(&src_ptr.to_ne_bytes());  // input_ptr = src
+        cell[40..48].copy_from_slice(&dst_ptr.to_ne_bytes());  // peer_ptr = peer dst
+    }
+    let dst = chan.slots_dev + slot as u64 * 64;
+    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+
+    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
+    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
+    let rc = unsafe {
+        hipMemcpyAsync(
+            chan.head_dev as *mut c_void,
+            chan.head_cell.as_ptr() as *const c_void,
+            4,
+            HipMemcpyKind::HostToDevice,
+            stream,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::Backend(format!("peer_broadcast: head publish failed {rc}")));
+    }
+    crate::device::helpers::check_hip("peer_broadcast: head sync", unsafe {
+        hipStreamSynchronize(stream)
+    })?;
+
+    device.launch_scythe_persistent_dispatch(
+        chan.slots.as_ref(),
+        RING_CAPACITY,
+        chan.tail.as_ref(),
+        chan.head.as_ref(),
+        chan.stop.as_ref(),
+        1,
+        0,
+    )?;
+    Ok(stream)
+}
+
+/// MG-4: route an OP_PEER_GATHER descriptor: reads from remote peer src into local out.
+#[allow(dead_code)]
+pub fn route_peer_gather(
+    device: &RocmDevice,
+    stream: *mut c_void,
+    peer_src: &RocmStorage,
+    local_out: &RocmStorage,
+    elem_count: usize,
+) -> Result<*mut c_void> {
+    let stream = if stream.is_null() {
+        device.active_stream()
+    } else {
+        stream
+    };
+    let peer_ptr = peer_src
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("peer_gather: peer_src has no device ptr".into()))?;
+    let out_ptr = local_out
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("peer_gather: local_out has no device ptr".into()))?;
+
+    let chan = channel_for(device)?;
+    let mut chan = chan.lock().unwrap_or_else(|e| e.into_inner());
+
+    let slot = chan.next_head % RING_CAPACITY;
+    let head_value = chan.next_head.wrapping_add(1);
+    chan.next_head = head_value;
+
+    {
+        let cell = chan.staging.as_mut_slice();
+        cell[..64].fill(0);
+        cell[0..4].copy_from_slice(&10u32.to_ne_bytes()); // opcode 10 = OP_PEER_GATHER
+        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
+        cell[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        cell[12..16].copy_from_slice(&1u32.to_ne_bytes());
+        cell[40..48].copy_from_slice(&peer_ptr.to_ne_bytes()); // peer_ptr = remote peer src
+        cell[32..40].copy_from_slice(&out_ptr.to_ne_bytes());  // output_ptr = local out
+    }
+    let dst = chan.slots_dev + slot as u64 * 64;
+    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+
+    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
+    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
+    let rc = unsafe {
+        hipMemcpyAsync(
+            chan.head_dev as *mut c_void,
+            chan.head_cell.as_ptr() as *const c_void,
+            4,
+            HipMemcpyKind::HostToDevice,
+            stream,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::Backend(format!("peer_gather: head publish failed {rc}")));
+    }
+    crate::device::helpers::check_hip("peer_gather: head sync", unsafe {
+        hipStreamSynchronize(stream)
+    })?;
+
+    device.launch_scythe_persistent_dispatch(
+        chan.slots.as_ref(),
+        RING_CAPACITY,
+        chan.tail.as_ref(),
+        chan.head.as_ref(),
+        chan.stop.as_ref(),
+        1,
+        0,
+    )?;
+    Ok(stream)
+}
+
+// ─── MG-5: Cross-device dependency tracking ───────────────────────────────
+
+/// Record an event on `device`'s stream.
+/// Returns the raw `hipEvent_t` handle.
+#[allow(dead_code)]
+pub fn record_event_on(device: &RocmDevice, stream: *mut c_void) -> Result<*mut c_void> {
+    let stream = if stream.is_null() {
+        device.active_stream()
+    } else {
+        stream
+    };
+    let _guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
+    let mut event: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { crate::hipEventCreate(&mut event) };
+    if rc != 0 {
+        return Err(Error::Backend(format!("hipEventCreate failed {rc}")));
+    }
+    let rc = unsafe { crate::hipEventRecord(event, stream) };
+    if rc != 0 {
+        unsafe { crate::hipEventDestroy(event) };
+        return Err(Error::Backend(format!("hipEventRecord failed {rc}")));
+    }
+    Ok(event)
+}
+
+/// Enqueue a stream wait on an event recorded on a potentially foreign device.
+/// Enables cross-device zero-copy ordering without host sync when peer access is active.
+#[allow(dead_code)]
+pub fn stream_wait_event(
+    waiting_device: &RocmDevice,
+    waiting_stream: *mut c_void,
+    event: *mut c_void,
+) -> Result<()> {
+    if event.is_null() {
+        return Ok(());
+    }
+    let stream = if waiting_stream.is_null() {
+        waiting_device.active_stream()
+    } else {
+        waiting_stream
+    };
+    let _guard = crate::device::util::DeviceGuard::set(waiting_device.ordinal() as i32);
+    let rc = unsafe { crate::hipStreamWaitEvent(stream, event, 0) };
+    if rc != 0 {
+        return Err(Error::Backend(format!("hipStreamWaitEvent failed {rc}")));
+    }
+    Ok(())
+}
+
+/// Destroy a recorded event.
+#[allow(dead_code)]
+pub fn destroy_event(event: *mut c_void) {
+    if !event.is_null() {
+        unsafe {
+            let _ = crate::hipEventDestroy(event);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,7 +630,7 @@ mod tests {
     #[test]
     fn descriptor_packing_matches_device_abi() {
         let mut cell = [0u8; 64];
-        pack_gemm_descriptor(&mut cell, 3, 5, 7, 0x1000, 0x2000, 0x3000);
+        pack_gemm_descriptor(&mut cell, 1, 3, 5, 7, 0x1000, 0x2000, 0x3000);
         let u32_at = |off: usize| u32::from_ne_bytes(cell[off..off + 4].try_into().unwrap());
         let u64_at = |off: usize| u64::from_ne_bytes(cell[off..off + 8].try_into().unwrap());
         assert_eq!(u32_at(0), 1, "opcode 1 = OP_COL_GEMM");

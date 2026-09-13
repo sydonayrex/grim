@@ -252,9 +252,47 @@ impl ParallelCommunicator {
                 }
             }
             Ok(())
+        } else if self.backend == CommBackendType::P2pDirect && self.topology.world_size == 2 {
+            // In-place single-buffer fallback
+            let my_ordinal = self.topology.local_device_ordinal();
+            if let Ok(my_dev) = crate::RocmDevice::try_new(my_ordinal) {
+                let count = storage.shape.elem_count();
+                let _ = crate::device::scythe_route::route_peer_reduce(
+                    &my_dev,
+                    stream_u64 as *mut std::ffi::c_void,
+                    storage,
+                    storage,
+                    storage,
+                    count,
+                );
+            }
+            Ok(())
         } else {
             Ok(())
         }
+    }
+
+    /// MG-6: Tensor-parallel 2-device all-reduce across a local and peer partial tensor.
+    /// Executes ScytheRing `OP_PEER_REDUCE` directly across PCIe without host bounce.
+    pub fn all_reduce_sum_peer_pair(
+        &self,
+        local_storage: &RocmStorage,
+        peer_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        stream_u64: u64,
+    ) -> Result<()> {
+        let my_ordinal = self.topology.local_device_ordinal();
+        let my_dev = crate::RocmDevice::try_new(my_ordinal)?;
+        let count = local_storage.shape.elem_count();
+        crate::device::scythe_route::route_peer_reduce(
+            &my_dev,
+            stream_u64 as *mut std::ffi::c_void,
+            local_storage,
+            peer_storage,
+            out_storage,
+            count,
+        )?;
+        Ok(())
     }
 
     /// Gathers slices from all ranks into a concatenated destination buffer.

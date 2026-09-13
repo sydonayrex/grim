@@ -768,8 +768,8 @@ impl Linear {
                 self.w_t.dtype().storage
             );
         }
-        let (out_s, h) = if self.w_t.dtype().is_quantized() {
-            let quant_fmt = match &self.w_t.dtype().storage {
+        let (out_s, h) = if self.weight.dtype().is_quantized() {
+            let quant_fmt = match &self.weight.dtype().storage {
                 Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
                     Some(grim_tensor::QuantFormat::Q8_0)
                 }

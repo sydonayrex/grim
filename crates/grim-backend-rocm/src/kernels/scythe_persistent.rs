@@ -54,6 +54,9 @@ struct __align__(32) moe_task_descriptor_t {
 #define OP_COMMFUSE   5u
 #define OP_MOE        6u
 #define OP_ADD        7u
+#define OP_PEER_REDUCE    8u
+#define OP_PEER_BROADCAST 9u
+#define OP_PEER_GATHER    10u
 
 // Status codes.
 #define ST_PENDING  0u
@@ -185,6 +188,8 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                 unsigned int n_idx = idx % N;
                 float sum = 0.0f;
                 for (unsigned int k_idx = 0; k_idx < K; ++k_idx) {
+                    // COL_GEMM: b is [K, N] (C = A @ B   → B[k,n]).
+                    // ROW_GEMM: b is [N, K] (C = A @ B^T → B[n,k]).
                     float b_val = (desc->opcode == OP_COL_GEMM)
                         ? b[k_idx * N + n_idx]
                         : b[n_idx * K + k_idx];
@@ -280,6 +285,41 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
                 out[idx] = a[idx] + b[idx];
             }
+        } else if (desc->opcode == OP_PEER_REDUCE) {
+            // 2-device all-reduce: this device's partial + peer's partial.
+            // desc->input_ptr = local partial (read)
+            // desc->peer_ptr  = peer partial (read via peer access)
+            // desc->output_ptr = result (write)
+            // desc->m = element count
+            const float* local = (const float*)desc->input_ptr;
+            const float* peer = (const float*)desc->peer_ptr;
+            float* result = (float*)desc->output_ptr;
+            unsigned int elems = desc->m;
+            for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
+                result[idx] = local[idx] + peer[idx];
+            }
+        } else if (desc->opcode == OP_PEER_BROADCAST) {
+            // Broadcast: root device writes to peer_ptr (peer memory).
+            // desc->input_ptr = source data (on root device)
+            // desc->peer_ptr  = destination on peer device
+            // desc->m = element count
+            const float* src = (const float*)desc->input_ptr;
+            float* dst = (float*)desc->peer_ptr;
+            unsigned int elems = desc->m;
+            for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
+                dst[idx] = src[idx];
+            }
+        } else if (desc->opcode == OP_PEER_GATHER) {
+            // Gather: read from peer memory into local output.
+            // desc->peer_ptr  = source on peer device (read)
+            // desc->output_ptr = local destination (write)
+            // desc->m = element count
+            const float* src = (const float*)desc->peer_ptr;
+            float* dst = (float*)desc->output_ptr;
+            unsigned int elems = desc->m;
+            for (unsigned int idx = threadIdx.x; idx < elems; idx += blockDim.x) {
+                dst[idx] = src[idx];
+            }
         } else if (desc->opcode != OP_NOP) {
             if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
         }
@@ -349,6 +389,9 @@ mod tests {
             ("OP_ATTN", "3u"),
             ("OP_NORM", "4u"),
             ("OP_COMMFUSE", "5u"),
+        ("OP_PEER_REDUCE", "8u"),
+        ("OP_PEER_BROADCAST", "9u"),
+        ("OP_PEER_GATHER", "10u"),
             ("OP_MOE", "6u"),
             ("OP_ADD", "7u"),
         ] {

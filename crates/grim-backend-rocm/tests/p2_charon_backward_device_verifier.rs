@@ -1,6 +1,11 @@
 //! P2 device verifier — Charon MoE backward kernel produces correct
 //! `d_gate_w`/`d_up_w`/`d_down_w`/`d_x` on a real ROCm device.
 //!
+//! Phase 5d: this whole verifier is gated behind `--features training`
+//! (the backward kernel is training-only; the inference binary never calls it).
+
+#![cfg(feature = "training")]
+
 //! Strategy:
 //! 1. Build a small deterministic MoE (same geometry as the host-side
 //!    `charon_backward_grad_check.rs`: HIDDEN=4, INTER=3, NUM_EXPERTS=2,

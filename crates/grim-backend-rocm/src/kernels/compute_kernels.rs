@@ -44,6 +44,203 @@ extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
     out[i] = 1.0f / x[i];
 }
 
+// ── GPU Reductions: sum, max, argmax (tree reduction with shared memory) ──
+
+#define GRIM_REDUCE_BLOCK 256
+
+extern "C" __global__ void grim_reduce_sum_stage1(const float* __restrict__ x, float* __restrict__ partials, int n) {
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+
+    float acc = 0.0f;
+    for (int i = gid; i < n; i += stride) {
+        acc += x[i];
+    }
+
+    __shared__ float s_data[GRIM_REDUCE_BLOCK];
+    s_data[tid] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_data[tid] += s_data[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partials[blockIdx.x] = s_data[0];
+    }
+}
+
+extern "C" __global__ void grim_reduce_sum_stage2(const float* __restrict__ partials, float* __restrict__ out, int num_partials) {
+    const int tid = threadIdx.x;
+    float acc = 0.0f;
+    for (int i = tid; i < num_partials; i += blockDim.x) {
+        acc += partials[i];
+    }
+
+    __shared__ float s_data[GRIM_REDUCE_BLOCK];
+    s_data[tid] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_data[tid] += s_data[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[0] = s_data[0];
+    }
+}
+
+extern "C" __global__ void grim_reduce_max_stage1(const float* __restrict__ x, float* __restrict__ partials, int n) {
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+
+    float acc = -1e38f;
+    for (int i = gid; i < n; i += stride) {
+        float val = x[i];
+        if (val > acc || acc == -1e38f) {
+            acc = val;
+        }
+    }
+
+    __shared__ float s_data[GRIM_REDUCE_BLOCK];
+    s_data[tid] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_data[tid + s] > s_data[tid]) {
+                s_data[tid] = s_data[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partials[blockIdx.x] = s_data[0];
+    }
+}
+
+extern "C" __global__ void grim_reduce_max_stage2(const float* __restrict__ partials, float* __restrict__ out, int num_partials) {
+    const int tid = threadIdx.x;
+    float acc = -1e38f;
+    for (int i = tid; i < num_partials; i += blockDim.x) {
+        float val = partials[i];
+        if (val > acc || acc == -1e38f) {
+            acc = val;
+        }
+    }
+
+    __shared__ float s_data[GRIM_REDUCE_BLOCK];
+    s_data[tid] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_data[tid + s] > s_data[tid]) {
+                s_data[tid] = s_data[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[0] = s_data[0];
+    }
+}
+
+extern "C" __global__ void grim_argmax_stage1(
+    const float* __restrict__ x,
+    float* __restrict__ partial_vals,
+    unsigned int* __restrict__ partial_idxs,
+    int n
+) {
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+
+    float max_val = -1e38f;
+    int max_idx = -1;
+
+    for (int i = gid; i < n; i += stride) {
+        float val = x[i];
+        // For tie-breaking matching Iterator::max_by / argmax on CPU: last index wins (val >= max_val)
+        if (val >= max_val || max_idx == -1) {
+            max_val = val;
+            max_idx = i;
+        }
+    }
+
+    __shared__ float s_val[GRIM_REDUCE_BLOCK];
+    __shared__ int   s_idx[GRIM_REDUCE_BLOCK];
+    s_val[tid] = max_val;
+    s_idx[tid] = max_idx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            // Later thread index has greater original array indices; if >=, later wins
+            if (s_val[tid + s] > s_val[tid] || (s_val[tid + s] == s_val[tid] && s_idx[tid + s] > s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_vals[blockIdx.x] = s_val[0];
+        partial_idxs[blockIdx.x] = (s_idx[0] >= 0) ? (unsigned int)s_idx[0] : 0u;
+    }
+}
+
+extern "C" __global__ void grim_argmax_stage2(
+    const float* __restrict__ partial_vals,
+    const unsigned int* __restrict__ partial_idxs,
+    unsigned int* __restrict__ out_idx,
+    int num_partials
+) {
+    const int tid = threadIdx.x;
+    float max_val = -1e38f;
+    int max_idx = -1;
+
+    for (int i = tid; i < num_partials; i += blockDim.x) {
+        float val = partial_vals[i];
+        unsigned int idx = partial_idxs[i];
+        if (val > max_val || (val == max_val && (int)idx > max_idx) || max_idx == -1) {
+            max_val = val;
+            max_idx = (int)idx;
+        }
+    }
+
+    __shared__ float s_val[GRIM_REDUCE_BLOCK];
+    __shared__ int   s_idx[GRIM_REDUCE_BLOCK];
+    s_val[tid] = max_val;
+    s_idx[tid] = max_idx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid] || (s_val[tid + s] == s_val[tid] && s_idx[tid + s] > s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_idx[0] = (s_idx[0] >= 0) ? (unsigned int)s_idx[0] : 0u;
+    }
+}
+
 // ── SPEED-ROC: FP32 → FP16 Activation Quantization ──────────────────────────
 // Converts FP32 activations to FP16 in-place for WMMA GEMM input.
 // Reduces activation memory bandwidth by 2× (4 bytes → 2 bytes per element).
@@ -1033,5 +1230,15 @@ mod tests {
             OTHER_KERNEL_SOURCE.contains("grim_rmsnorm_rope"),
             "grim_rmsnorm_rope kernel missing from OTHER_KERNEL_SOURCE"
         );
+    }
+
+    #[test]
+    fn test_reduction_kernels_presence() {
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_reduce_sum_stage1"));
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_reduce_sum_stage2"));
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_reduce_max_stage1"));
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_reduce_max_stage2"));
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_argmax_stage1"));
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_argmax_stage2"));
     }
 }

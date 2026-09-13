@@ -141,13 +141,18 @@ pub use crate::device::util::{
 // ROCmDevice itself: large struct + every impl lives in `device::roc_device`.
 // Re-exported here so existing callers can keep using `RocmDevice::new(...)` etc.
 pub use crate::device::roc_device::{
-    CharonBackwardResult, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
+    FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
 };
+#[cfg(feature = "training")]
+pub use crate::device::roc_device::CharonBackwardResult;
 
 pub use crate::graph_capture::{
     DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey, GraphCaptureManager,
 };
 pub use crate::rccl::{RcclAllReduce, RocmMultiNodeGroup};
+pub use crate::device::parallel_comm::{
+    CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology,
+};
 
 pub use fusion::{
     DecodeGemmConfig, FusedDequantGemmConfig, HipKernelLaunch, KvDequantAttentionConfig,

@@ -271,8 +271,8 @@ pub struct RocmDevice {
     pub(crate) act_u4_scales_buf: Mutex<Option<RocmStorage>>,
     pub(crate) act_u4_sums_buf: Mutex<Option<RocmStorage>>,
     /// H2: Preallocated buffers for GPU reductions (reduce_sum, reduce_max, argmax).
-    pub(crate) reduce_partials_buf: Mutex<Option<RocmStorage>>,
-    pub(crate) reduce_out_buf: Mutex<Option<RocmStorage>>,
+    pub(crate) reduce_partials_buf: RwLock<Option<RocmStorage>>,
+    pub(crate) reduce_out_buf: RwLock<Option<RocmStorage>>,
     pub(crate) reduce_argmax_idxs_buf: Mutex<Option<RocmStorage>>,
 }
 
@@ -823,8 +823,8 @@ impl RocmDevice {
             act_u4_codes_buf: Mutex::new(None),
             act_u4_scales_buf: Mutex::new(None),
             act_u4_sums_buf: Mutex::new(None),
-            reduce_partials_buf: Mutex::new(None),
-            reduce_out_buf: Mutex::new(None),
+            reduce_partials_buf: RwLock::new(None),
+            reduce_out_buf: RwLock::new(None),
             reduce_argmax_idxs_buf: Mutex::new(None),
         }
     }

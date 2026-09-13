@@ -333,6 +333,11 @@ pub struct LlamaBlock {
     /// When true this layer's dense FFN is NOT applied inside `forward_with_kv_paged`; the caller (e.g.
     /// `Llama::decode_paged`) routes the post-attention residual through a `MoeBlock` instead.
     pub(crate) ffn_disabled: bool,
+    /// N2: reusable Q8_1 activation scratch for `silu_mul_quant_q81_decode`
+    /// (single-token decode). Avoids a fresh VRAM allocation per decode step.
+    pub(crate) silu_q81_scratch: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<dyn grim_tensor::BackendStorage>>>,
+    >,
 }
 
 impl LlamaBlock {
@@ -574,6 +579,7 @@ impl LlamaBlock {
                 sliding_window: spec.sliding_window,
             },
             ffn_disabled: !load_dense_ffn,
+            silu_q81_scratch: std::sync::Arc::new(std::sync::Mutex::new(None)),
             alibi_slopes: None,
             wqkv_q80_fused,
             w_gate_up_q80_fused,
@@ -1103,13 +1109,25 @@ impl LlamaBlock {
         let k = gate.shape().dims().last().copied().unwrap_or(0);
         let n_blocks = k / 32;
         let q81_bytes = n_blocks * 36;
-        let out_storage = dev.alloc_storage(
-            &Shape::new(vec![1, q81_bytes]),
-            DType {
-                arith: grim_tensor::ArithType::U8,
-                storage: grim_tensor::Storage::Native,
-            },
-        )?;
+        // N2: reuse the per-block Q8_1 scratch across decode steps instead of
+        // allocating fresh VRAM every call. Grown in place if a larger shape
+        // ever arrives.
+        let mut scratch = self.silu_q81_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let need_alloc = match scratch.as_ref() {
+            Some(s) => s.shape().elem_count() < q81_bytes,
+            None => true,
+        };
+        if need_alloc {
+            *scratch = Some(std::sync::Arc::from(dev.alloc_storage(
+                &Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: grim_tensor::ArithType::U8,
+                    storage: grim_tensor::Storage::Native,
+                },
+            )?));
+        }
+        let out_storage = scratch.as_ref().unwrap().clone();
+        drop(scratch);
         let g_rocm = gate
             .storage()
             .as_ref()
@@ -1123,6 +1141,7 @@ impl LlamaBlock {
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
             .expect("up is RocmStorage");
         let dst_rocm = out_storage
+            .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
             .expect("dst is RocmStorage");
@@ -1130,7 +1149,7 @@ impl LlamaBlock {
         dev.launch_silu_mul_quant_q8_1(g_rocm, u_rocm, dst_rocm, k)?;
 
         Ok(Tensor::new(
-            std::sync::Arc::from(out_storage),
+            out_storage,
             Shape::new(vec![1, k]),
             DType {
                 arith: grim_tensor::ArithType::U8,
@@ -1937,6 +1956,7 @@ mod tests {
             rope,
             tp_config: tp,
             ffn_disabled: false,
+            silu_q81_scratch: std::sync::Arc::new(std::sync::Mutex::new(None)),
             _dev: dev,
             _cfg: cfg,
             alibi_slopes: None,

@@ -109,9 +109,9 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
             .collect();
         for (j, cell) in want[r * n..(r + 1) * n].iter_mut().enumerate() {
             let mut acc = 0f32;
-            for p in 0..k {
-                acc += normed[p] * g_data[p * n + j];
-            }
+                for p in 0..k {
+                    acc += normed[p] * g_data[p * n + j];
+                }
             *cell = acc;
         }
     }
@@ -511,13 +511,15 @@ fn production_ring_routing_matmul_parity() {
     let k = 64usize;
     let n = 96usize;
     let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32) * 0.2 - 0.8).collect();
-    let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32) * 0.05 - 0.3).collect();
+    // b is the natural transposed weight [N, K] (matmul_op convention:
+    // C = A @ B^T, so the shared K is b's trailing dim).
+    let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32) * 0.05 - 0.3).collect();
 
     let a = dev
         .from_cpu(&a_data, &Shape::from_slice(&[m, k]), DType::F32)
         .expect("a");
     let b = dev
-        .from_cpu(&b_data, &Shape::from_slice(&[k, n]), DType::F32)
+        .from_cpu(&b_data, &Shape::from_slice(&[n, k]), DType::F32)
         .expect("b");
     let out_shape = Shape::from_slice(&[m, n]);
 

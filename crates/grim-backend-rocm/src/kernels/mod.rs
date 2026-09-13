@@ -53,7 +53,6 @@ pub mod q4k_dequant;
 pub mod q4k_gemm;
 pub mod q5k_gemm;
 pub mod q6k_gemm;
-pub mod q8_0_dequant;
 pub mod qkv_attention;
 pub mod quant_standalone;
 pub mod quant_tiled_gemm;

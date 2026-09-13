@@ -411,6 +411,103 @@ void grim_kv_dequant_attention(
         }
     }
 }
+
+// ─── M4: dequantize a quantized KV cache to f32 so decode attention can take
+// the split-KV FlashDecoding path. One block per (token, kv_head) row; the
+// output layout [kv_seq_len, num_kv_heads, head_dim] matches the packed row
+// order, so grim_flash_decode_stage1 consumes it directly.
+__device__ __forceinline__ float grim_kvrow_h2f(unsigned short bits) {
+    unsigned exp = (bits >> 10) & 0x1F;
+    unsigned mant = bits & 0x3FF;
+    if (exp == 0) return (mant == 0) ? 0.0f : ((float)mant * 5.9604644775390625e-8f);
+    if (exp == 31) return ((int)bits >> 31) ? -1e30f : 1e30f;
+    float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
+    return sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+}
+
+__device__ __forceinline__ float grim_kvrow_dequant_elem(
+    const unsigned char* __restrict__ row,  // byte offset of this (j, kv_head) row
+    const float* __restrict__ scales,       // legacy per-row scale table
+    int dim,
+    int head_dim,
+    int quant_bits,
+    int quant_format
+) {
+    if (quant_format == 0) {
+        return grim_kvrow_h2f(((const unsigned short*)row)[dim]);
+    }
+    if (quant_format == 1) {
+        const unsigned char* block = row + (dim / 32) * 34;
+        float delta = grim_kvrow_h2f(((const unsigned short*)block)[0]);
+        return delta * (float)((const signed char*)(block + 2))[dim % 32];
+    }
+    if (quant_format == 2) {
+        const unsigned char* sb = row + (dim / 256) * 144;
+        const unsigned short* h_ptr = (const unsigned short*)sb;
+        float d_val = grim_kvrow_h2f(h_ptr[0]);
+        float dmin_val = grim_kvrow_h2f(h_ptr[1]);
+        const unsigned char* sbytes = sb + 4;
+        const unsigned char* qs = sb + 16;
+        const int k = (dim % 256) / 64;
+        const int off = dim % 64;
+        const int s = 2 * k + (off >= 32 ? 1 : 0);
+        unsigned char sc, m;
+        if (s < 4) {
+            sc = sbytes[s] & 63;
+            m  = sbytes[s + 4] & 63;
+        } else {
+            sc = (sbytes[s + 4] & 0x0F) | ((sbytes[s - 4] >> 6) << 4);
+            m  = (sbytes[s + 4] >> 4)  | ((sbytes[s] >> 6) << 4);
+        }
+        unsigned char q_nib = (off < 32) ? (qs[32 * k + (off & 31)] & 0x0F)
+                                         : (qs[32 * k + (off & 31)] >> 4);
+        return d_val * (float)sc * (float)q_nib - dmin_val * (float)m;
+    }
+    if (quant_bits == 8) {
+        return (((float)((int)row[dim]) - 128.0f) / 127.0f) * scales[0];
+    }
+    // Legacy nibble (quant_bits == 4)
+    unsigned char byte = row[dim / 2];
+    float nib = (float)((dim % 2 == 0) ? (byte & 0xF) : (byte >> 4));
+    return (nib - 8.0f) / 7.0f * scales[0];
+}
+
+extern "C" __global__ void grim_kv_dequant_to_f32(
+    const unsigned char* __restrict__ tensor,
+    const float* __restrict__ scales,
+    float* __restrict__ out,   // [kv_seq_len, num_kv_heads, head_dim]
+    int num_kv_heads,
+    int head_dim,
+    int kv_seq_len,
+    int quant_bits,
+    int quant_format
+) {
+    const int row = blockIdx.x;               // j * num_kv_heads + kv_head
+    const int dim = threadIdx.x;
+    if (row >= kv_seq_len * num_kv_heads || dim >= head_dim) return;
+
+    const int row_bytes_fp16 = head_dim * 2;
+    const int row_bytes_q8_0 = ((head_dim + 31) / 32) * 34;
+    const int row_bytes_q4k = ((head_dim + 255) / 256) * 144;
+
+    int row_off;
+    if (quant_format == 0)      row_off = row * row_bytes_fp16;
+    else if (quant_format == 1) row_off = row * row_bytes_q8_0;
+    else if (quant_format == 2) row_off = row * row_bytes_q4k;
+    else if (quant_bits == 8)   row_off = row * head_dim;
+    else                        row_off = (row * head_dim) / 2;
+
+    float val;
+    if (quant_format == 0 || quant_format == 1 || quant_format == 2) {
+        val = grim_kvrow_dequant_elem(tensor + row_off, scales, dim, head_dim, quant_bits, quant_format);
+    } else {
+        // Legacy paths index the per-row scale from the flat table.
+        val = grim_kvrow_dequant_elem(tensor + row_off,
+                                      scales + row,
+                                      dim, head_dim, quant_bits, quant_format);
+    }
+    out[row * head_dim + dim] = val;
+}
 "#;
 
 #[cfg(test)]

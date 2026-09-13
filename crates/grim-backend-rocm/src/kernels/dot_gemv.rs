@@ -160,6 +160,91 @@ __device__ __forceinline__ float grim_fdot2_f32_f16(unsigned a, unsigned b, floa
 #endif
 }
 
+__device__ __forceinline__ float grim_fdot2_f32_bf16(unsigned a, unsigned b, float c) {
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_fdot2_f32_bf16)
+    return __builtin_amdgcn_fdot2_f32_bf16(
+        (__attribute__((__vector_size__(2 * sizeof(unsigned short)))) unsigned short)a,
+        (__attribute__((__vector_size__(2 * sizeof(unsigned short)))) unsigned short)b,
+        c, false);
+#else
+    // Software fallback for architectures without dot12-insts
+    unsigned int a0_bits = ((unsigned int)(a & 0xFFFF)) << 16;
+    unsigned int a1_bits = ((unsigned int)(a >> 16)) << 16;
+    unsigned int b0_bits = ((unsigned int)(b & 0xFFFF)) << 16;
+    unsigned int b1_bits = ((unsigned int)(b >> 16)) << 16;
+    float a0, a1, b0, b1;
+    __builtin_memcpy(&a0, &a0_bits, 4);
+    __builtin_memcpy(&a1, &a1_bits, 4);
+    __builtin_memcpy(&b0, &b0_bits, 4);
+    __builtin_memcpy(&b1, &b1_bits, 4);
+    return fmaf(a0, b0, fmaf(a1, b1, c));
+#endif
+}
+
+__device__ __forceinline__ unsigned short grim_float_to_bf16_rn(float f) {
+    unsigned int x;
+    __builtin_memcpy(&x, &f, 4);
+    unsigned int lsb = (x >> 16) & 1;
+    unsigned int rounding = 0x7fff + lsb;
+    x += rounding;
+    return (unsigned short)(x >> 16);
+}
+
+// ─── Phase 4.5d: BF16 × BF16 dot2 GEMV (V_DOT2_F32_BF16, dot12-insts) ─────
+// B is row-major/transposed natural weights [N, K] as BF16 (2 bytes/weight).
+// A is activation [M, K] as BF16 (2 bytes/act).
+// Accumulates natively in FP32 with 2 BF16 products per instruction, outputs BF16.
+extern "C" __global__ void grim_dot2_bf16_gemv(
+    const unsigned short* __restrict__ A,
+    const unsigned short* __restrict__ B,
+    unsigned short* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_pairs = K / 2;
+    const unsigned* a_row = (const unsigned*)(A + (long long)row * K);
+
+    const unsigned* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? (const unsigned*)(B + (long long)(col_base + j) * K)
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int p = lane; p < n_pairs; p += 32) {
+        unsigned a2 = a_row[p];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            unsigned b2 = b_col[j][p];
+            facc[j] = grim_fdot2_f32_bf16(a2, b2, facc[j]);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = grim_float_to_bf16_rn(facc[j]);
+        }
+    }
+}
+
 extern "C" __global__ void grim_dot2_q80_gemv(
     const unsigned short* __restrict__ act_f16,
     const unsigned char*  __restrict__ B_q80,
@@ -1133,6 +1218,18 @@ mod tests {
         assert!(
             KERNEL_SOURCE.contains("grim_dot2_q80_gemv"),
             "legacy dot2 GEMV retained for A/B testing"
+        );
+    }
+
+    #[test]
+    fn source_contains_dot2_bf16_gemv() {
+        assert!(
+            KERNEL_SOURCE.contains("grim_dot2_bf16_gemv"),
+            "missing dot2 BF16 GEMV kernel"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("grim_fdot2_f32_bf16"),
+            "missing fdot2 BF16 dot helper"
         );
     }
 }

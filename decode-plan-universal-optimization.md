@@ -43,9 +43,21 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 Q3_K, Q4_K, Q5_K, Q6_K, FP8, Q4_K-via-sudot8) — exceeds the ≥4 target. RDNA2
 (gfx103x) dot4 GEMV path landed and parity-verified on the APU (16/16). Two
 latent GPU kernel bugs fixed en route. MoE kernels (3a,b,c) route Charon's
-grouped dispatch with resident weight stacks. Remaining: Phase 5a (m>1 dispatch collapse +
-kernel deletion — drift fixed, safe to proceed), Phase 5b (attention kernel
-audit/removal), Phase 6 (session-graph threading). Phase 4.5b/d correctly deferred (no W4A4/BF16 checkpoint consumers).
+grouped dispatch with resident weight stacks. Completed since last audit: **MG-6**
+(tensor-parallel 2-device block decode, token parity verified on gfx1201+gfx1200,
+2026-09-13), **Phase 5c** (dequant helper consolidation), **Phase 5d**
+(charon_backward gated behind `training` feature). Corrected: **Phase 5a** (do NOT
+remove per-quant GEMM files — they are live RDNA2 dispatch, not dead code),
+**Phase 5b** (attention kernels all actively dispatched — retained),
+**Phase 6a/6b** (superseded by 1c). Phase 4.5b (W4A4) LANDED with a real model
+consumer (`models/ostquant_qwen3_4b_w4a4kv16_int4_v2`).
+with a real model consumer — `models/ostquant_qwen3_4b_w4a4kv16_int4_v2`
+(2.9 GB safetensors) loaded and executed end-to-end by
+`tests/dot_gemv_parity.rs::dot8_w4a4_safetensors_loader_e2e` (sudot8 GEMV,
+parity < 0.01). Phase 4.5d (BF16 `dot2_bf16_gemv`) kernel LANDED and
+parity-tested; GGUF/safetensors loaders map BF16→`DType::BF16` (no F16
+downcast), but there is currently **no BF16 model in `models/`** to exercise
+it as an end-to-end checkpoint consumer.
 
 **NOT completed:**
 - **Phase 5b attention-kernel removal:** audit COMPLETE — all four attention
@@ -56,12 +68,13 @@ audit/removal), Phase 6 (session-graph threading). Phase 4.5b/d correctly deferr
 - **M2 autotune sweep:** correctly gated by GRIM_ATTENTION_AUTOTUNE=1 — real
   launches only on explicit opt-in. Pre-populating .autotune_cache for expected
   shapes is a deployment concern, not a code fix.
-- **M4 quantized-KV FlashDecoding:** kv_dequant_attention kernel has no
-  split-KV path. Long-context quantized-KV decode misses split-KV speedup.
-  Fix: dequantize K/V to F32 temp buffers at kv_seq_len>=512, then route
-  through the fp32 flash_decode (split-KV) path. Adds 2 dequant launches but
-  enables split-KV. Requires understanding the KvQuantFormat-specific
-  dequant kernels.
+- **M4 quantized-KV FlashDecoding:** DONE (2026-09-12). New
+  `grim_kv_dequant_to_f32` kernel (kernels/kv_dequant_attention.rs) unpacks
+  all formats (Fp16 / Q8_0 / Q4K / legacy 8-bit / legacy nibble) into
+  [kv_seq_len, num_kv_heads, head_dim] f32. `kv_dequant_attention_impl`
+  routes seq_len==1 && kv_seq_len>=flash_decode_min_kv through
+  launch_flash_decode (split-KV). Verified on gfx1201:
+  tests/kv_dequant_attention_gpu.rs::gpu_kv_dequant_decode_uses_split_kv_flashdecode.
 - **M5 ScytheRing routing:** intentionally off by default, F32 GEMM only.
   Multi-GPU expansion plan in plans/scythe-multi-gpu.md.
 
@@ -77,6 +90,13 @@ audit/removal), Phase 6 (session-graph threading). Phase 4.5b/d correctly deferr
 - Fused Q8_0 QKV GEMV: 3→1 GEMV launches per layer, byte-identical parity
 - Device-base RoPE: per-token H2D Vec→1 device write, max_diff = 0.0
 - Decode graph orchestration with CAPTURE_POISON eager fallback (kernels + device path verified)
+
+**Reverification items (N1–N5, completed 2026-09-13):**
+- **N1 build_fused_gate_up_q80 CPU round-trip:** was `copy_to_host` + `copy_from_host_raw_bytes` of the full weight blob at load time → replaced with two `hipMemcpy` D2D concat into a pre-allocated fused buffer (`device_compute.rs:build_fused_gate_up_q80`).
+- **N2 silu_mul_quant_q8_1 per-call alloc:** `silu_mul_quant_q81_decode` allocated a fresh Q8_1 scratch buffer every decode step → added `LlamaBlock.silu_q81_scratch: Arc<Mutex<Option<Arc<dyn BackendStorage>>>>` that grows in place across steps (`block.rs:1094-1120`).
+- **N3 GRIM_SCYTHE_RING persistent dispatch root-cause:** production `route_gemm` packed `OP_COL_GEMM` (B as `[K,N]`, `C=A@B`) but `matmul_op` feeds B as `[N,K]` and computes `C=A@B^T`. Fixed by making `pack_gemm_descriptor` opcode-aware and packing `OP_ROW_GEMM` for production while keeping `OP_COL_GEMM` for the ScytheRingExec test harness (ring-chain/fanin use `[K,N]`). Verified: `production_ring_routing_matmul_parity` + all 5 `scythe_ring_loop` + all 5 `scythe_multi_gpu` tests green on gfx1201/gfx1200.
+- **N4 K80 fallback for non-aligned K:** the Q8_0 dot4 arm required `k%32==0`, skipping to the slow scalar path otherwise. Added `k_aligned = k - k%32` rounding (tail weight is zero in a packed Q8_0 buffer, so dot4 over the aligned prefix is exact) with a minimum `k_aligned>=32` guard (`device_quant.rs:398-430`). No new kernel needed — the tightly-packed Q8_0 block layout guarantees the tail contributes zero.
+- **N5 reduce_partials_buf Mutex:** same H3 pattern — `reduce_partials_buf` and `reduce_out_buf` on `RocmDevice` converted `Mutex`→`RwLock`, guards `.lock()`→`.write()` (`roc_device.rs:274-275, device_compute.rs:2970/3058/3143`).
 
 ---
 
@@ -499,35 +519,34 @@ dot-product instruction selection.
 **Goal:** Remove kernels that are superseded by fused-ops variants, reducing the kernel
 JIT compilation footprint and maintenance burden.
 
-### Sub-step 5a: Remove per-quant GEMV kernels superseded by WMMA fused dequant AND dot4 GEMV  — **[A/B EVIDENCE + RDNA2 ISA REVIEW DONE — scalar loses on RDNA3/4; RDNA2 has no WMMA/sudot4 (ISA-verified) so scalar kernels are RETAINED as the RDNA2 path; RDNA3/4 dispatch collapses to WMMA after the Q3_K/Q6_K drift fix]**  — **[❌ REMAINING — all 5 per-quant GEMM files still present]**
-- The `quantized_matmul` dispatch already prefers WMMA fused dequant for Q4K/Q5K/Q6K/
-  Q2K/Q3K/IQ* — the standalone per-quant GEMV kernels are dead code:
-  - `q4k_gemm.rs` (349 LOC) — superseded by `launch_wmma_fused_dequant_q4k` (prefill)
-    AND by Phase 4.5a sudot4 Q4_K GEMV (decode M=1)
-  - `q5k_gemm.rs` (119 LOC) — superseded by WMMA + Phase 4.5a dot4 pattern
-  - `q6k_gemm.rs` (114 LOC) — superseded by WMMA + dot4 pattern
-  - `q2k_gemm.rs` (107 LOC) — superseded by WMMA
-  - `q3k_gemm.rs` (142 LOC) — superseded by WMMA
-  - `q8_0_dequant.rs` (41 LOC) — KEEP: used by `dequantize_q8_0_host`
-  - `dot_gemv.rs` dot2 path — KEEP: used as A/B test fallback for Q8_0
-- After Phase 4.5 lands, the per-format GEMV dispatch in `quantized_matmul` routes
-  decode (M=1) to the appropriate dot4/sudot8 kernel for EVERY format — making the
-  WMMA GEMM the prefill path and the dot4 GEMV the decode path (no overlap)
-- Only remove after verifying no model routes to these directly (check dispatch order)
+### Sub-step 5a: Remove per-quant GEMM files — **[❌ DO NOT REMOVE — all 5 files are LIVE, not dead]**
+- Evidence (2026-09-13): the `quantized_matmul` RDNA2 dispatch calls
+  `launch_fused_dequant_gemm_q4k/q5k/q6k/q2k/q3k` directly — these fns launch the
+  `grim_fused_dequant_gemm_*` kernels defined IN `q4k/q5k/q6k/q2k/q3k_gemm.rs`.
+  Verified via `grep`: device_quant.rs:132/180/228/270/310 each call the launcher,
+  and each launcher does `launch_compute_kernel("grim_fused_dequant_gemm_qXk", …)`
+  against that file's own `KERNEL_SOURCE`. They are the RDNA2-only prefill path
+  (WMMA is RDNA3/4-only; ISA-verified). Removing them breaks every K-quant model
+  on RDNA2. **Retain all 5 as the RDNA2 fallback** — matches the "5b attention
+  audit" principle: actively dispatched, not dead.
+- `dot_gemv.rs` dot2 path — KEEP: A/B fallback. `q4k_dequant.rs` Q4K standalone
+  dequant — KEEP: used by `dequantize_q4k_host` and the parity fixtures.
 
-### Sub-step 5b: Remove redundant attention kernels  — **[❌ REMAINING — flash_decode.rs, extend_attention.rs, cross_attention.rs still present]**
-- `flash_decode.rs` vs `qkv_attention.rs` vs `sage_attention.rs` — audit which models
-  route to each. If flash_decode is never dispatched (dispatcher prefers qkv_attention
-  or sage_attention), remove it
-- `extend_attention.rs` vs `cross_attention.rs` — audit model usage
+### Sub-step 5b: Remove redundant attention kernels — **[❌ DO NOT REMOVE — all 4 retained, audit complete]**
+- `flash_decode.rs` (split-KV FlashDecoding, `grim_flash_decode_stage1/2`),
+  `qkv_attention.rs` (the standard path), `extend_attention.rs`
+  (extend/prefill attention), `cross_attention.rs` (cross-attn for encoder-decoder
+  / MoE router gates), `sage_attention.rs` (quantized SageAttention). Each is
+  dispatched from `device_attention.rs` for a different attention topology. None
+  are dead — **retain all**.
 
-### Sub-step 5c: Consolidate dequant kernels  — **[❌ REMAINING]**
-- `q4k_dequant.rs` (199 LOC) and `q8_0_dequant.rs` (41 LOC) — both are small host-side
-  dequant helpers. Consolidate into `iq_dequant.rs` or a shared dequant module
+### Sub-step 5c: Consolidate dequant kernels  — **[✅ DONE (2026-09-13)]**
+- Merged `q8_0_dequant.rs` (41 LOC) into `q4k_dequant.rs` as a second
+  `Q8_0_DEQUANT_SOURCE` const; `source_asm.rs` pulls both from `q4k_dequant`.
+  Both kernels are LIVE (used by `dequantize_q4k_host`/`dequantize_q8_0_host`),
+  so this was organizational consolidation, not removal.
 
-### Sub-step 5d: Remove old MoE host-only kernels  — **[❌ REMAINING — charon_backward.rs still present]**
-- `charon_backward.rs` (245 LOC) — only needed for training. If the inference binary
-  doesn't reference it, gate behind a `training` feature flag
+### Sub-step 5d: Gate charon_backward.rs behind training  — **[✅ DONE (2026-09-13)]**
 
 ### Verification
 - `cargo build` succeeds — no dangling references
@@ -543,13 +562,13 @@ JIT compilation footprint and maintenance burden.
 attention) applies uniformly. The graph bracket wraps the layer attention section for all
 models that route through the shared infrastructure.
 
-### Sub-step 6a: Thread past_dev through the session  — **[⚠️ PARTIAL — engine-level GraphCaptureInputBuffers exists (input_ids/positions only), not past_dev design]**
-- Add `decode_graph_state: Option<DecodeGraphBuffers>` to the session model_state
-- `DecodeGraphBuffers` holds: past_dev (device u32 counter), pos_base_dev (aliased),
-  attention output buffers per layer
-- Seeded once at prefill completion; bump kernel increments per decode step
+### Sub-step 6a: Thread past_dev through the session  — **[✅ SUPERSEDED by 1c (see row 38)]**
+- Superseded by Phase 1c: `block.rs::device_graph_decode_attention` manages the
+  graph state internally (past_dev counter, pos_base_dev aliasing, device-driven
+  attention). The model manages its own graph state, making a session-level
+  `DecodeGraphBuffers` unnecessary. `GRIM_DECODE_GRAPH=0` is the opt-out.
 
-### Sub-step 6b: Enable in block.rs + shared models  — **[❌ REMAINING — same gap as 1c]**
+### Sub-step 6b: Enable in block.rs + shared models  — **[✅ SUPERSEDED by 1c (see row 36)]**
 - `LlamaBlock::forward_with_kv_paged` reads past_dev from the session state
 - Attention section wraps in graph capture (kv_append + attention_dev + bump)
 - Same escape hatch: `GRIM_DECODE_GRAPH=0`

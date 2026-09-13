@@ -360,7 +360,7 @@ impl AttentionOps for RocmDevice {
 
         // Split-KV FlashDecoding acceleration for long-context single-token decode
         if seq_len == 1
-            && kv_seq_len >= 512
+            && kv_seq_len >= self.flash_decode_min_kv()
             && window.is_none()
             && out_max.is_none()
             && out_sum.is_none()
@@ -1673,6 +1673,22 @@ impl RocmDevice {
         )
     }
 
+    /// Minimum KV sequence length to trigger Split-KV FlashDecoding.
+    /// Can be overridden via `GRIM_FLASH_DECODE_MIN_KV`.
+    /// Defaults to 256 for RDNA3/4 (gfx11/gfx12) and 512 for other architectures.
+    pub(crate) fn flash_decode_min_kv(&self) -> usize {
+        if let Ok(v) = std::env::var("GRIM_FLASH_DECODE_MIN_KV") {
+            if let Ok(parsed) = v.parse::<usize>() {
+                return parsed;
+            }
+        }
+        if self.is_rdna34 {
+            256
+        } else {
+            512
+        }
+    }
+
     /// Split-KV count for FlashDecoding: consult the autotuner (persisted in `.autotune_cache/{gpu_target}.json`) keyed by `(num_heads, head_dim, kv_len)`; on miss return the static heuristic.
     /// With `GRIM_ATTENTION_AUTOTUNE=1` (and outside stream capture), a miss instead benchmarks candidate split counts with real.
     #[allow(clippy::too_many_arguments)]
@@ -2355,6 +2371,54 @@ impl RocmDevice {
         let mut qb = quant_bits_i;
         let mut qf = quant_format_i;
 
+        // M4: split-KV FlashDecoding for the quantized-KV path. For
+        // single-token decode with a long cache, dequantize K/V to f32 once
+        // and take the existing split-KV flash_decode path instead of the
+        // single-block fused kernel (same gate as the fp32 qkv_attention
+        // FlashDecoding path).
+        if seq_len == 1 && kv_seq_len >= self.flash_decode_min_kv() {
+            let k_f32 = self.launch_kv_dequant_to_f32(
+                k_s,
+                ks_s,
+                num_kv_heads,
+                config.head_dim,
+                kv_seq_len,
+                quant_bits,
+                config.quant_format,
+            )?;
+            let v_f32 = self.launch_kv_dequant_to_f32(
+                v_s,
+                vs_s,
+                num_kv_heads,
+                config.head_dim,
+                kv_seq_len,
+                quant_bits,
+                config.quant_format,
+            )?;
+            let num_splits = self.flash_decode_split_count(
+                q_s,
+                &k_f32,
+                &v_f32,
+                &storage,
+                config.num_heads,
+                num_kv_heads,
+                config.head_dim,
+                kv_seq_len,
+            );
+            let stream = self.launch_flash_decode(
+                q_s,
+                &k_f32,
+                &v_f32,
+                &storage,
+                config.num_heads,
+                num_kv_heads,
+                config.head_dim,
+                kv_seq_len,
+                num_splits,
+            )?;
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
+
         let stream = self.launch_compute_kernel(
             "grim_kv_dequant_attention",
             launch.grid_dim,
@@ -2397,6 +2461,56 @@ impl RocmDevice {
         );
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
+
+    /// M4: dequantize a packed quantized-KV cache into an f32 buffer of shape
+    /// [kv_seq_len, num_kv_heads, head_dim] (the layout `launch_flash_decode`
+    /// expects). One block per (token, kv_head) row, 256 threads per block.
+    fn launch_kv_dequant_to_f32(
+        &self,
+        tensor: &RocmStorage,
+        scales: &RocmStorage,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_seq_len: usize,
+        quant_bits: u32,
+        quant_format: crate::fusion::KvQuantFormat,
+    ) -> Result<RocmStorage> {
+        let rows = kv_seq_len * num_kv_heads;
+        let out = RocmStorage::alloc_gpu(
+            &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let t_ptr = dev_ptr(tensor)?;
+        let s_ptr = dev_ptr(scales)?;
+        let mut o_ptr = dev_ptr(&out)?;
+
+        let mut tp = t_ptr;
+        let mut sp = s_ptr;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ksl = kv_seq_len as i32;
+        let mut qb = quant_bits as i32;
+        let mut qf = quant_format.kernel_arg();
+
+        self.launch_compute_kernel(
+            "grim_kv_dequant_to_f32",
+            HipDim3::new(rows as u32, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut tp),
+                arg(&mut sp),
+                arg(&mut o_ptr),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut ksl),
+                arg(&mut qb),
+                arg(&mut qf),
+            ],
+        )?;
+        Ok(out)
     }
 
     /// Block-Quantized SageAttention HIP kernel launch.
