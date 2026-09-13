@@ -8,6 +8,11 @@ extern "C" __global__ void grim_add(float* a, float* b, float* c, int n) {
     c[i] = a[i] + b[i];
 }
 
+extern "C" __global__ void grim_sub(float* a, float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] - b[i];
+}
+
 extern "C" __global__ void grim_mul(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;

@@ -783,8 +783,33 @@ impl ElementwiseOps for RocmDevice {
         b: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let neg_b = self.mul_scalar(b, -1.0, out)?;
-        self.add(a, neg_b.0.as_ref(), out)
+        let a_s = as_rocm(a)?;
+        let b_s = as_rocm(b)?;
+        if !a_s.device_ptr_is_valid() || !b_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "sub: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let total = out.elem_count();
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut a_ptr = dev_ptr(a_s)?;
+        let mut b_ptr = dev_ptr(b_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_sub",
+            grid,
+            block,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut b_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        let handle = RocmHandle::new(None);
+        Ok((Box::new(storage), Box::new(handle)))
     }
 
     fn reduce_sum(&self, x: &dyn BackendStorage) -> Result<f32> {
@@ -2867,6 +2892,50 @@ impl RocmDevice {
         )
     }
 
+    /// Phase 4.5d: BF16 × BF16 GEMV via V_DOT2_F32_BF16 (RDNA3/4 dot12-insts).
+    /// A is BF16 [M, K], B is row-major/transposed BF16 weights [N, K].
+    pub(crate) fn launch_dot2_bf16_gemv(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_bf16_gemv: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_bf16_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot2_bf16_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot2_bf16_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// SPEED-ROC: WMMA fused-dequant Q4_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q4k(
@@ -3847,6 +3916,33 @@ impl RocmDevice {
             "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}, solution_index={}",
             m, n, k, tile_config, self.props.wavefront_size, solution_index
         );
+
+        // ─── Phase 4.5d: BF16 decode GEMV via V_DOT2_F32_BF16 (RDNA3/4 dot12-insts, m <= 4)
+        {
+            let is_rdna3_or_newer = matches!(
+                crate::quantization::gcn_arch(&self.gpu_target),
+                crate::quantization::GcnArch::RDNA3
+                    | crate::quantization::GcnArch::RDNA4
+                    | crate::quantization::GcnArch::UDNA
+            );
+            let dot_disabled = matches!(
+                std::env::var("GRIM_DOT_GEMV").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+            if is_rdna3_or_newer
+                && !dot_disabled
+                && dtype_out.arith == ArithType::BF16
+                && m <= 4
+                && k % 32 == 0
+            {
+                let stream = self.launch_dot2_bf16_gemv(
+                    a_storage, b_storage, &out_storage, m, n, k,
+                )?;
+                self.launch_counter.fetch_add(1, Ordering::SeqCst);
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        }
 
         // ─── WI 2.4.4-2 — decode GEMM dispatch (opt-in, F16-only, m ≤ 8) ───── [see: `ck_gemm.cpp`, `grim_decode_gemm_f16`]
         {
