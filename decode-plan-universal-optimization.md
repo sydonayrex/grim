@@ -48,13 +48,13 @@ grouped dispatch with resident weight stacks. Remaining: Phase 5a (m>1 dispatch 
 kernel deletion — drift fixed, safe to proceed), Phase 5b (attention kernel
 audit/removal), Phase 6 (session-graph threading). Phase 4.5b/d correctly deferred (no W4A4/BF16 checkpoint consumers).
 
-**NOT completed (and why):**
-- **Phase 5a cleanup (dispatch collapse + kernel deletion):** drift fixed
-  (Q3K 1.6e-4, Q6K 2.8e-4, Q5K 5e-5), so the RDNA3/4 m>1 dispatch can now
-  collapse to WMMA and the scalar per-quant GEMVs are deletable.
-- **Phase 4.5c FP8 dot GEMV:** LANDED (`grim_dot4_fp8_gemv`), parity 4.9e-4.
+**NOT completed:**
+- **Phase 5b attention-kernel removal:** audit COMPLETE — all four attention
+  kernels (flash_decode, extend_attention, cross_attention, sage_attention)
+  are actively dispatched from device_attention.rs (different attention
+  topologies). None are dead — **retained**.
 - **Phase 6a/6b session graph:** no `DecodeState` symbol; graph primitives are
-  lfm2-only.
+  lfm2-only. Dispatch collapse (5a) and FP8 (4.5c) are LANDED.
 
 ---
 
