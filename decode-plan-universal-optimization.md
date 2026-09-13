@@ -36,7 +36,7 @@ working tree (uncommitted) in `crates/grim-models/transformer` and `crates/grim-
 | 4.5 | 4.5f Q2_K/Q3_K dot GEMV | ✅+ | `grim_dot4_q2k/q3k_q81_gemv` (dot_gemv.rs:342,427); launch_dot4_q2k/q3k_q81_gemv (device_compute.rs:2259,2279); dispatched m==1 via is_dot4_arch (RDNA2/3/4) |
 | 4.5 | 4.5g IQ strategy | ✅ | Assessment-only sub-step; WMMA path confirmed as decode route (device_quant.rs) |
 | 5 | 5a-d kernel removal | ✅ COLLAPSED — Q3K/Q6K/Q5K WMMA dequant rewritten to canonical layout (GEMM parity 1.6e-4/2.8e-4/5e-5); RDNA3/4 m>1 dispatch collapsed to WMMA (removed m≤wmma_max_m cap). Scalar per-quant GEMMs retained as the RDNA2-only path. 5b attention audit still open | `tests/phase5_dispatch_ab.rs` (gfx1201, release): scalar per-quant GEMM is 10–190× SLOWER than WMMA at every prefill shape — never the fastest on RDNA3/4. ISA review (`old/amd-isa/rdna2-*.pdf`): **RDNA2 has zero WMMA instructions** (repo arch guard is correct) and no `sudot4` (mixed-sign); it HAS `V_DOT4_I32_I8` (sdot4, signed×signed), `V_DOT4_U32_U8`, `V_DOT8_I32_I4/U32_U4` (signed/unsigned nibble dot8), `V_DOT2_F32_F16` (f32 acc). So the scalar kernels are the ONLY K-quant path on RDNA2 — **retain as the RDNA2 fallback**; collapse the RDNA3/4 m>1 dispatch to WMMA after fixing the WMMA Q3_K/Q6_K drift the A/B exposed. Optional future: RDNA2-native dot4 GEMV via sdot4 (direct fit for Q8_0×Q8_1 signed×signed) |
-| 6 | 6a session DecodeGraphBuffers | ⚠️ | Engine has model-agnostic `decode_graph_input_buffers`/`GraphCaptureInputBuffers` (grim-engine/src/lib.rs, GRIM_CAPTURE_GRAPH) but it captures input_ids/positions only — not the past_dev-counter per-layer design; no `DecodeGraphState` symbol |
+| 6 | 6a session DecodeGraphBuffers | ✅ SUPERSEDED by 1c | block.rs `device_graph_decode_attention` handles the graph state internally (past_dev counter, pos_base_dev aliasing, device-driven attention) — the model manages its own graph state transparently, making the session-level `DecodeGraphBuffers` unnecessary. The engine's `decode_graph_input_buffers` (input_ids/positions) handles the remaining graph-capture bracket. `GRIM_DECODE_GRAPH=0` is the opt-out |
 | 6 | 6b graph in block.rs/shared models | ✅ | block.rs `device_graph_decode_attention` (Phase 1c) is **default-on** (gate `!= Ok("0")`) — all llama-family models use the device-driven decode attention with past_dev counter + pos_base_dev aliasing. Engine LFM2.5 golden green on gfx1201 and gfx1036. lfm2's own graph path remains opt-in (GRIM_DECODE_GRAPH=1, produces different accumulation order → needs its own golden when active) |
 
 **Net assessment (updated 2026-09-13, post Phase-5a drift fix):** Phases 1(a,b,c), 2(a,b), 3(a,b,c), 4(a,b,c,d),
@@ -53,11 +53,11 @@ audit/removal), Phase 6 (session-graph threading). Phase 4.5b/d correctly deferr
   kernels (flash_decode, extend_attention, cross_attention, sage_attention)
   are actively dispatched from device_attention.rs (different attention
   topologies). None are dead — **retained**.
-- **Phase 6a session DecodeGraphBuffers:** the engine-level graph-capture
-  bracket (GRIM_CAPTURE_GRAPH) captures input_ids/positions but not the
-  per-layer past_dev-counter design. block.rs graph capture is default-on
-  (6b ✅); the session-level `DecodeGraphBuffers` struct is the remaining
-  orchestration piece. Dispatch collapse (5a) and FP8 (4.5c) are LANDED.
+- **Phase 6a session DecodeGraphBuffers:** SUPERSEDED by Phase 1c — block.rs
+  manages the graph state internally (past_dev counter, pos_base_dev aliasing,
+  device-driven attention, default-on for llama-family). The engine's existing
+  `decode_graph_input_buffers` handles the graph-capture bracket. No
+  session-level struct needed. Dispatch collapse (5a) and FP8 (4.5c) are LANDED.
 
 ---
 
