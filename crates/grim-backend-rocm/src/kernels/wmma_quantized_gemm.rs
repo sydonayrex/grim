@@ -70,7 +70,7 @@ __device__ __forceinline__ void grim_deq_q5k(const unsigned char* blk, int w, fl
             m = (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4);
         }
         int qsb = 32 * k + j;
-        unsigned char hi = (unsigned char)((qh[j] >> 0) & 1) << 4;
+        unsigned char hi = (unsigned char)((qh[j] >> (2 * k + (off >= 32 ? 1 : 0))) & 1) << 4;
         unsigned char q = (off < 32) ? ((qs[qsb] & 0x0F) | hi) : (((qs[qsb] >> 4) & 0x0F) | hi);
         out[e] = d * (float)sc * (float)q - dmin * (float)m;
     }
@@ -93,35 +93,74 @@ __device__ __forceinline__ void grim_deq_q2k(const unsigned char* blk, int w, fl
 }
 
 __device__ __forceinline__ void grim_deq_q3k(const unsigned char* blk, int w, float* out) {
-    float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-    const unsigned char* qs = blk + 2;
-    const unsigned char* scales = blk + 66;
-    #pragma unroll
+    // Canonical block_q3_K layout (110 bytes / 256 weights), matching
+    // grim_quant::dequant_q3k byte-for-byte: hmask[32]@0, qs[64]@32,
+    // scales[12]@96 (ggml bit-shuffle -> 16 i8), d f16@108.
+    // value_i = d * (sc - 32) * (q - hmask_bit * 4).
+    const unsigned char* hmask = blk;
+    const unsigned char* qs = blk + 32;
+    const unsigned char* scales_raw = blk + 96;
+    float d = fp16_to_float_device(((const unsigned short*)blk)[54]); // byte 108
+
+    // ggml 12-byte scale shuffle -> 16 i8 (dequantize_row_q3_K).
+    unsigned aux0 = (unsigned)scales_raw[0] | ((unsigned)scales_raw[1] << 8)
+                  | ((unsigned)scales_raw[2] << 16) | ((unsigned)scales_raw[3] << 24);
+    unsigned aux1 = (unsigned)scales_raw[4] | ((unsigned)scales_raw[5] << 8)
+                  | ((unsigned)scales_raw[6] << 16) | ((unsigned)scales_raw[7] << 24);
+    unsigned tmp  = (unsigned)scales_raw[8] | ((unsigned)scales_raw[9] << 8)
+                  | ((unsigned)scales_raw[10] << 16) | ((unsigned)scales_raw[11] << 24);
+    unsigned kmask1 = 0x03030303u;
+    unsigned kmask2 = 0x0F0F0F0Fu;
+    int sc16[16];
+    unsigned a0 = (aux0 & kmask2) | ((tmp & kmask1) << 4);
+    unsigned a1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    unsigned a2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    unsigned a3 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    unsigned auxs[4] = { a0, a1, a2, a3 };
+    int _si = 0;
+    for (int j = 0; j < 4; ++j)
+        for (int b2 = 0; b2 < 4; ++b2) {
+            unsigned v = (auxs[j] >> (8 * b2)) & 0xFF;
+            sc16[j * 4 + b2] = (int)(v < 128u ? (int)v : (int)v - 256);
+        }
+
     for (int e = 0; e < 8; ++e) {
-        int wv = w + e;
-        int scale_idx = wv / 16;
-        unsigned char sc = (scales[scale_idx / 2] >> ((scale_idx % 2) * 4)) & 0x0F;
-        int qsb = wv / 4, qss = (wv % 4) * 2;
-        unsigned char q = (qs[qsb] >> qss) & 0x03;
-        out[e] = d * (float)sc * (float)q;
+        int idx = w + e;
+        int half = idx >> 7;
+        int sub = (idx & 0x7F) >> 5;
+        int p = idx & 0x1F;
+        int sc_idx = (half << 3) + (sub << 1) + (p >> 4);
+        int shift = sub << 1;
+        int q_code = ((qs[(half << 5) + p]) >> shift) & 3;
+        int hm_bit = (hmask[p] & (1u << (half * 4 + sub))) != 0 ? 0 : 4;
+        float dl = d * (float)(sc16[sc_idx] - 32);
+        out[e] = dl * (float)(q_code - hm_bit);
     }
 }
 
 __device__ __forceinline__ void grim_deq_q6k(const unsigned char* blk, int w, float* out) {
-    float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+    // Canonical block_q6_K layout (210 bytes / 256 weights), matching
+    // grim_quant::dequant_q6k and q6k_gemm.rs::dequant_q6k_element.
     const unsigned char* ql = blk;
     const unsigned char* qh = blk + 128;
     const signed char* scales = (const signed char*)(blk + 192);
-    #pragma unroll
+    float d = fp16_to_float_device(((const unsigned short*)blk)[104]); // byte 208
     for (int e = 0; e < 8; ++e) {
-        int wv = w + e;
-        float sc = (float)scales[wv / 16];
-        int qlb = wv / 4, qls = (wv % 4) * 2;
-        unsigned char qlv = (ql[qlb] >> qls) & 0x03;
-        int qhb = wv / 8, qhs = (wv % 8);
-        unsigned char qhv = (qh[qhb] >> qhs) & 0x01;
-        unsigned char q = (qhv << 2) | qlv;
-        out[e] = d * sc * (float)q;
+        int idx = w + e;
+        int n = idx >> 7;
+        int pos = idx & 0x7F;
+        int quarter = pos >> 5;
+        int l = pos & 0x1F;
+        int is = l >> 4;
+        int sc_idx = (n << 3) + is + (quarter << 1);
+        signed char sc = scales[sc_idx];
+        int ql_off = (n << 6) + l + ((quarter & 1) ? 32 : 0);
+        unsigned char ql_byte = ql[ql_off];
+        int nibble = (quarter & 2) ? (ql_byte >> 4) : (ql_byte & 0x0F);
+        unsigned char qh_byte = qh[(n << 5) + l];
+        int qh_bits = (qh_byte >> (quarter << 1)) & 0x03;
+        int q_code = nibble | (qh_bits << 4);
+        out[e] = d * (float)sc * ((float)q_code - 32.0f);
     }
 }
 "#;
