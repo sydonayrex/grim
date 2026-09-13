@@ -351,10 +351,10 @@ impl Qwen35Block {
                 && row_exact(wk.as_ref(), kv_dim)
                 && row_exact(wv.as_ref(), kv_dim)
             {
-                crate::shared_attention::build_fused_qkv_q80(
-                    wq.as_ref().unwrap(),
-                    wk.as_ref().unwrap(),
-                    wv.as_ref().unwrap(),
+                crate::shared_attention::build_fused_qkv_q80_opt(
+                    wq.as_ref(),
+                    wk.as_ref(),
+                    wv.as_ref(),
                 )
                 .map(std::sync::Arc::new)
             } else {

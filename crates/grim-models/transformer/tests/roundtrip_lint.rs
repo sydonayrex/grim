@@ -29,9 +29,9 @@ fn roundtrip_budget_not_exceeded() {
         ("commandr.rs", 5),
         ("delta_net_base.rs", 15),
         ("deepseek.rs", 9),
-        ("deepseek2.rs", 10),
-        ("deepseek4.rs", 10),
-        ("deepseek32.rs", 10),
+        ("deepseek2.rs", 11), // +1 Phase 3c fused-norm-gate logits pull (forward_pre_norm)
+        ("deepseek4.rs", 11), // +1 Phase 3c (forward_pre_norm)
+        ("deepseek32.rs", 11), // +1 Phase 3c (forward_pre_norm)
         ("falcon.rs", 10),
         ("falcon_h1.rs", 25), // WI-A: +4 test-module asserts; ratchet down in WI-G
         ("gemma.rs", 15),
@@ -52,6 +52,7 @@ fn roundtrip_budget_not_exceeded() {
         ("qwen35moe.rs", 6),
         ("qwen38_flash_next.rs", 20),
         ("shared_attention.rs", 8),
+        ("shared_moe.rs", 1), // Phase 3a: once-built Charon resident weight stack (not per-decode)
         ("solar_open2.rs", 2),
         ("t5.rs", 3),
         ("wav_tokenizer_dec.rs", 14),
@@ -69,7 +70,7 @@ fn roundtrip_budget_not_exceeded() {
         ("dots3_note.rs", 5),
         ("bailingmoe3.rs", 2),
         ("dbrx.rs", 3),
-        ("kimi_k3.rs", 25),
+        ("kimi_k3.rs", 26), // +1 Phase 3c (forward_pre_norm)
         ("lora.rs", 7),
         ("moe_block.rs", 1),
         ("model.rs", 7),

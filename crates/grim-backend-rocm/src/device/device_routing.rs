@@ -210,6 +210,222 @@ impl RocmDevice {
         Ok((out_storage, RocmHandle::new(Some(stream))))
     }
 
+    /// Fused grouped MoE dispatch against weight buffers that are already resident on the device.
+    ///
+    /// Stacks / takes contiguous `[num_experts, inter * hidden]` gate/up and `[num_experts, hidden * inter]` down weights,
+    /// token-sorts the routing assignment via `moe_align_block_size`, and launches `grim_moe_fused_grouped`.
+    pub fn moe_fused_grouped_dispatch_resident(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        up_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
+        let gate_r = gate_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        let stream = self.launch_charon_grouped_dispatch_entry(
+            activations,
+            gate_r.device_ptr_checked()?,
+            up_r.device_ptr_checked()?,
+            down_r.device_ptr_checked()?,
+            sorted,
+            &out_storage,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
+            "grim_moe_fused_grouped",
+            None,
+            None,
+        )?;
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
+    /// Device-side MoE routing (D2D): computes per-token top-k expert selection +
+    /// softmax-normalized combine weights entirely on-device via `grim_moe_route_topk`.
+    ///
+    /// `logits` is the gate projection output `[seq_len, num_experts]` (device-resident).
+    /// Writes sortless (token, expert, weight) triples into the three caller-owned
+    /// device buffers, sized `seq_len * top_k`. No host round-trip: the gate logits
+    /// never leave the device and the routing table is never re-uploaded H2D.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_route_topk_on_device(
+        &self,
+        logits: &RocmStorage,
+        bias: Option<&RocmStorage>,
+        out_tokens: &RocmStorage,
+        out_experts: &RocmStorage,
+        out_weights: &RocmStorage,
+        seq_len: usize,
+        num_experts: usize,
+        top_k: usize,
+        route_mode: i32,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let l_ptr = logits
+            .device_ptr
+            .ok_or_else(|| Error::Backend("moe_route_topk: logits has no device ptr".into()))?;
+        let bias_ptr = bias.and_then(|b| b.device_ptr).unwrap_or(0);
+        let ot_ptr = out_tokens
+            .device_ptr
+            .ok_or_else(|| Error::Backend("moe_route_topk: out_tokens has no device ptr".into()))?;
+        let oe_ptr = out_experts.device_ptr.ok_or_else(|| {
+            Error::Backend("moe_route_topk: out_experts has no device ptr".into())
+        })?;
+        let ow_ptr = out_weights.device_ptr.ok_or_else(|| {
+            Error::Backend("moe_route_topk: out_weights has no device ptr".into())
+        })?;
+
+        let mut l = l_ptr as *mut c_void;
+        let mut b = bias_ptr as *mut c_void;
+        let mut ot = ot_ptr as *mut c_void;
+        let mut oe = oe_ptr as *mut c_void;
+        let mut ow = ow_ptr as *mut c_void;
+        let mut seq_i = seq_len as i32;
+        let mut nexp_i = num_experts as i32;
+        let mut topk_i = top_k as i32;
+        let mut mode_i = route_mode;
+
+        self.launch_compute_kernel(
+            "grim_moe_route_topk",
+            HipDim3::new(seq_len as u32, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut l),
+                arg(&mut b),
+                arg(&mut ot),
+                arg(&mut oe),
+                arg(&mut ow),
+                arg(&mut seq_i),
+                arg(&mut nexp_i),
+                arg(&mut topk_i),
+                arg(&mut mode_i),
+            ],
+        )
+    }
+
+    /// Sortless Charon fused dispatch fed by device-resident routing buffers.
+    /// Unlike [`Self::moe_fused_dispatch`]/[`Self::moe_fused_dispatch_resident`], no
+    /// host `upload_device_buffer` of the routing table is performed — `routing_tokens`,
+    /// `routing_experts`, `routing_weights` are already on-device (produced by
+    /// [`Self::moe_route_topk_on_device`]), so the dispatch is fully D2D.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_fused_dispatch_resident_routing(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        up_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        routing_tokens: &RocmStorage,
+        routing_experts: &RocmStorage,
+        routing_weights: &RocmStorage,
+        num_pairs: usize,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
+        let gate_r = gate_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("resident_routing: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("resident_routing: out has no device ptr".into()))?;
+
+        // Zero output (atomicAdd accumulation).
+        check_hip("resident_routing hipMemset(output, 0)", unsafe {
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let block_x = crate::kernels::charon::choose_block_dim(num_pairs, wave);
+        let grid_x = if num_pairs == 0 {
+            0
+        } else {
+            (num_pairs as u32).div_ceil(block_x)
+        };
+        if grid_x == 0 {
+            return Ok((out_storage, RocmHandle::new(Some(self.active_stream()))));
+        }
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = gate_r.device_ptr_checked()? as *mut c_void;
+        let mut uw = up_r.device_ptr_checked()? as *mut c_void;
+        let mut dw = down_r.device_ptr_checked()? as *mut c_void;
+        let mut tok_ptr = routing_tokens.device_ptr_checked()? as *mut c_void;
+        let mut exp_ptr = routing_experts.device_ptr_checked()? as *mut c_void;
+        let mut w_ptr = routing_weights.device_ptr_checked()? as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_pairs_i = num_pairs as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_dispatch",
+            HipDim3::new(grid_x, 1, 1),
+            HipDim3::new(block_x, 1, 1),
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_pairs_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
     /// Launches the MoE fused comm-compute mega-kernel (UniEP persistent SM model).
     pub fn launch_moe_mega_dispatch(
         &self,

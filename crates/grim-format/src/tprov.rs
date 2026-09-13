@@ -413,6 +413,8 @@ pub struct SafetensorsProvider {
     /// AWQ checkpoints also use `.qweight` naming but a different layout;
     /// `quantize_config.json` decides which provider decodes the file.
     awq: Option<crate::awq::AwqProvider>,
+    /// OSTQuant W4A4 checkpoints with `ostquant_int4_packed` in `config.json`.
+    ostquant: Option<crate::ostquant::OstQuantProvider>,
     /// Detected external-toolkit producer (TorchAO/Quark/ModelOpt/FBGEMM).
     /// When `Some`, non-GPTQ/AWQ tensors are routed through the toolkit layout adapter so the correct `Storage`.
     toolkit_producer: Option<crate::convert::ToolkitProducer>,
@@ -449,23 +451,28 @@ impl SafetensorsProvider {
         }
 
         let has_qweight = info.keys().any(|k| k.ends_with(".qweight"));
-        // AWQ vs GPTQ: both stamp `.qweight` tensors.
-        // The sibling quantize_config.json is authoritative - `quant_method: "awq"` (or an AWQ-only config shape) routes to.
-        let awq = if has_qweight {
+        // Priority: OSTQuant -> AWQ -> GPTQ
+        let ostquant = if has_qweight {
+            crate::ostquant::OstQuantProvider::open(path).ok()
+        } else {
+            None
+        };
+        let awq = if has_qweight && ostquant.is_none() {
             crate::awq::AwqProvider::open(path).ok()
         } else {
             None
         };
-        let gptq = if has_qweight && awq.is_none() {
+        let gptq = if has_qweight && ostquant.is_none() && awq.is_none() {
             Some(crate::gptq::GptqProvider::open(path)?)
         } else {
             None
         };
 
         let mut tensors = info.clone();
-        if let Some(ref q) = awq
+        if let Some(ref q) = ostquant
             .as_ref()
             .map(|_| ())
+            .or_else(|| awq.as_ref().map(|_| ()))
             .or_else(|| gptq.as_ref().map(|_| ()))
         {
             let _ = q;
@@ -473,8 +480,26 @@ impl SafetensorsProvider {
                 !k.ends_with(".qweight")
                     && !k.ends_with(".qzeros")
                     && !k.ends_with(".scales")
+                    && !k.ends_with(".zeros")
                     && !k.ends_with(".g_idx")
             });
+        }
+        if let Some(ref o) = ostquant {
+            for (base_name, ost_info) in &o.tensors {
+                let qweight_name = format!("{}.qweight", base_name.strip_suffix(".weight").unwrap_or(base_name));
+                if let Some(qw_info) = info.get(&qweight_name) {
+                    tensors.insert(
+                        base_name.clone(),
+                        SafetensorInfo {
+                            name: base_name.clone(),
+                            dims: ost_info.shape.clone(),
+                            dtype_tag: qw_info.dtype_tag.clone(),
+                            data_start: qw_info.data_start,
+                            data_end: qw_info.data_end,
+                        },
+                    );
+                }
+            }
         }
         if let Some(ref g) = gptq {
             for (base_name, gptq_info) in &g.tensors {
@@ -525,6 +550,7 @@ impl SafetensorsProvider {
             data_region_start,
             gptq,
             awq,
+            ostquant,
             toolkit_producer,
         })
     }
@@ -552,6 +578,11 @@ impl SafetensorsProvider {
 
 impl TensorProvider for SafetensorsProvider {
     fn get(&self, name: &str) -> Result<RawTensor> {
+        if let Some(ref o) = self.ostquant {
+            if o.tensors.contains_key(name) {
+                return o.get(name);
+            }
+        }
         if let Some(ref a) = self.awq {
             if a.tensors.contains_key(name) {
                 return a.get(name);
@@ -618,6 +649,11 @@ impl TensorProvider for SafetensorsProvider {
     }
 
     fn get_packed(&self, name: &str) -> Result<RawTensor> {
+        if let Some(ref o) = self.ostquant {
+            if o.tensors.contains_key(name) {
+                return o.get_packed(name);
+            }
+        }
         if let Some(ref a) = self.awq {
             if a.tensors.contains_key(name) {
                 return a.get_packed(name);
@@ -632,6 +668,11 @@ impl TensorProvider for SafetensorsProvider {
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
+        if let Some(ref o) = self.ostquant {
+            if o.tensors.contains_key(name) {
+                return o.meta(name);
+            }
+        }
         if let Some(ref a) = self.awq {
             if a.tensors.contains_key(name) {
                 return a.meta(name);

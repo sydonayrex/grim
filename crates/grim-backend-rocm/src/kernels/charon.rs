@@ -164,6 +164,206 @@ extern "C" {
             sorted_token_ids, sorted_expert_ids, sorted_weights, out, hidden, inter,
             num_tokens, block_size, routed_scaling_factor, stash_hg, stash_hu);
     }
+
+    // ──────────────────────────────────────────────────────────────────── grim_moe_route_topk - device-side MoE routing (D2D).
+    // Computes per-token top-k expert selection + softmax-normalized combine weights
+    // entirely on-device, writing sortless (token, expert, weight) triples into three
+    // persistent device buffers. Keeps the gate logits resident — no D2H, no H2D
+    // re-upload of the routing table (see decode-plan-universal-optimization.md Phase 3aD).
+    // One block per token; threads stride over num_experts and block-reduce top-k.
+    __global__ void grim_moe_route_topk(
+        const float* __restrict__ logits,       // [seq_len, num_experts] row-major
+        const float* __restrict__ bias,         // [num_experts] or null (mode 2 only)
+        unsigned int* __restrict__ out_tokens,  // [seq_len * top_k]
+        unsigned int* __restrict__ out_experts, // [seq_len * top_k]
+        float* __restrict__ out_weights,        // [seq_len * top_k]
+        int seq_len, int num_experts, int top_k,
+        int route_mode)                         // 0 = softmax, 1 = sqrt-softplus, 2 = sigmoid+bias
+    {
+        const int tok = blockIdx.x;
+        if (tok >= seq_len) return;
+        const int tid = threadIdx.x;
+        const int block = blockDim.x;
+
+        const float* row = logits + (long long)tok * num_experts;
+
+        // Score: apply the architecture's gating transform before top-k selection.
+        __shared__ float s_val[256];
+
+        if (route_mode == 2) {
+            // Sigmoid + per-expert bias (MoeRouter::SigmoidTopKWithBias, laguna/maple/moe_block).
+            // Selection score = sigmoid(logit) + bias[i]; combine weight = sigmoid(logit) (unnormalized).
+            if (tid == 0) {
+                const int k = top_k < num_experts ? top_k : num_experts;
+                int chosen[64];
+                float chosen_v[64];
+                for (int i = 0; i < k; ++i) { chosen[i] = -1; chosen_v[i] = -1e30f; }
+                for (int v = 0; v < num_experts; ++v) {
+                    const float sig = 1.0f / (1.0f + __expf(-row[v]));
+                    const float score = sig + (bias != nullptr ? bias[v] : 0.0f);
+                    int pos = k - 1;
+                    if (score <= chosen_v[pos] && chosen[pos] >= 0) continue;
+                    while (pos > 0 && (chosen[pos - 1] < 0 || score > chosen_v[pos - 1])) {
+                        chosen[pos] = chosen[pos - 1];
+                        chosen_v[pos] = chosen_v[pos - 1];
+                        pos--;
+                    }
+                    chosen[pos] = v;
+                    chosen_v[pos] = score;
+                }
+                const long long base = (long long)tok * top_k;
+                for (int i = 0; i < top_k; ++i) {
+                    if (i < k && chosen[i] >= 0) {
+                        out_tokens[base + i]  = (unsigned int)tok;
+                        out_experts[base + i] = (unsigned int)chosen[i];
+                        out_weights[base + i] = 1.0f / (1.0f + __expf(-row[chosen[i]]));
+                    } else {
+                        out_tokens[base + i]  = (unsigned int)tok;
+                        out_experts[base + i] = 0u;
+                        out_weights[base + i] = 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+
+        if (route_mode == 1) {
+            // Sqrt-softplus (DeepSeek-V4): s(x) = sqrt(softplus(x)); softplus(x)=ln(1+e^x),
+            // with the l>20 linear guard to avoid exp overflow.
+            float local_max = -1e30f;
+            for (int v = tid; v < num_experts; v += block) {
+                const float l = row[v];
+                const float sp = (l > 20.0f) ? l : __logf(1.0f + __expf(l));
+                const float s = sqrtf(fmaxf(sp, 0.0f));
+                if (s > local_max) local_max = s;
+            }
+            s_val[tid] = local_max;
+            __syncthreads();
+            for (int stride = block / 2; stride > 0; stride >>= 1) {
+                if (tid < stride && s_val[tid + stride] > s_val[tid]) s_val[tid] = s_val[tid + stride];
+                __syncthreads();
+            }
+            const float max_s = s_val[0];
+            __syncthreads();
+
+            // Sum of all sqrt-softplus scores (normalization denominator).
+            float denom = 0.0f;
+            for (int v = tid; v < num_experts; v += block) {
+                const float l = row[v];
+                const float sp = (l > 20.0f) ? l : __logf(1.0f + __expf(l));
+                denom += sqrtf(fmaxf(sp, 0.0f));
+            }
+            s_val[tid] = denom;
+            __syncthreads();
+            for (int stride = block / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) s_val[tid] += s_val[tid + stride];
+                __syncthreads();
+            }
+            const float inv_z = 1.0f / fmaxf(s_val[0], 1e-30f);
+            __syncthreads();
+
+            if (tid == 0) {
+                const int k = top_k < num_experts ? top_k : num_experts;
+                int chosen[64];
+                float chosen_v[64];
+                for (int i = 0; i < k; ++i) { chosen[i] = -1; chosen_v[i] = -1e30f; }
+                for (int v = 0; v < num_experts; ++v) {
+                    const float l = row[v];
+                    const float sp = (l > 20.0f) ? l : __logf(1.0f + __expf(l));
+                    const float s = sqrtf(fmaxf(sp, 0.0f));
+                    int pos = k - 1;
+                    if (s <= chosen_v[pos] && chosen[pos] >= 0) continue;
+                    while (pos > 0 && (chosen[pos - 1] < 0 || s > chosen_v[pos - 1])) {
+                        chosen[pos] = chosen[pos - 1];
+                        chosen_v[pos] = chosen_v[pos - 1];
+                        pos--;
+                    }
+                    chosen[pos] = v;
+                    chosen_v[pos] = s;
+                }
+                const long long base = (long long)tok * top_k;
+                for (int i = 0; i < top_k; ++i) {
+                    if (i < k && chosen[i] >= 0) {
+                        out_tokens[base + i]  = (unsigned int)tok;
+                        out_experts[base + i] = (unsigned int)chosen[i];
+                        out_weights[base + i] = chosen_v[i] * inv_z;
+                    } else {
+                        out_tokens[base + i]  = (unsigned int)tok;
+                        out_experts[base + i] = 0u;
+                        out_weights[base + i] = 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+
+        // route_mode == 0: softmax top-k (the shared MoE default).
+        float lmax = -1e30f;
+        for (int v = tid; v < num_experts; v += block) {
+            if (row[v] > lmax) lmax = row[v];
+        }
+        s_val[tid] = lmax;
+        __syncthreads();
+        for (int stride = block / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && s_val[tid + stride] > s_val[tid]) s_val[tid] = s_val[tid + stride];
+            __syncthreads();
+        }
+        const float max_l = s_val[0];
+        __syncthreads();
+
+        // Pass 2: softmax denominator over ALL experts (stable), and gather top-k.
+        float denom = 0.0f;
+        for (int v = tid; v < num_experts; v += block) {
+            denom += __expf(row[v] - max_l);
+        }
+        s_val[tid] = denom;
+        __syncthreads();
+        for (int stride = block / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) s_val[tid] += s_val[tid + stride];
+            __syncthreads();
+        }
+        const float inv_z = 1.0f / fmaxf(s_val[0], 1e-30f);
+        __syncthreads();
+
+        // Pass 3: emit top-k. Each thread selects its own top-k candidates over its
+        // strided slice, then we reduce the *union* to the global top-k. For small
+        // num_experts (the common MoE case) this is cheap; we do a serial per-thread
+        // top-k and a final block-wide merge via a fixed-size shared array.
+        // Simple approach: one thread computes top-k serially (num_experts is small,
+        // typically 4-256), writes results directly.
+        if (tid == 0) {
+            // Serial top-k over num_experts via threshold refinement (safe for small N).
+            const int k = top_k < num_experts ? top_k : num_experts;
+            int chosen[64];
+            float chosen_v[64];
+            for (int i = 0; i < k; ++i) { chosen[i] = -1; chosen_v[i] = -1e30f; }
+            for (int v = 0; v < num_experts; ++v) {
+                const float lv = row[v];
+                // insertion sort into chosen (descending)
+                int pos = k - 1;
+                if (lv <= chosen_v[pos] && chosen[pos] >= 0) continue;
+                while (pos > 0 && (chosen[pos - 1] < 0 || lv > chosen_v[pos - 1])) {
+                    chosen[pos] = chosen[pos - 1];
+                    chosen_v[pos] = chosen_v[pos - 1];
+                    pos--;
+                }
+                chosen[pos] = v;
+                chosen_v[pos] = lv;
+            }
+            const long long base = (long long)tok * top_k;
+            for (int i = 0; i < top_k; ++i) {
+                if (i < k) {
+                    out_tokens[base + i]  = (unsigned int)tok;
+                    out_experts[base + i] = (unsigned int)chosen[i];
+                    out_weights[base + i] = __expf(chosen_v[i] - max_l) * inv_z;
+                } else {
+                    out_tokens[base + i]  = (unsigned int)tok;
+                    out_experts[base + i] = 0u;
+                    out_weights[base + i] = 0.0f;
+                }
+            }
+        }
+    }
 }
 
 // --- #2 FP8 W8A8 helpers + grouped kernel --------------------------------- E4M3 (4 exp, 3 mant, bias 7) decode, mirroring grim-quant::fp8_e4m3_to_f32 so the device path matches the host quantizer exactly (no hip_fp8.h include needed for the JIT).
@@ -1889,6 +2089,10 @@ mod tests {
         assert!(
             KERNEL_SOURCE.contains("charon_fused_bytes"),
             "GMEM traffic counter helper must be present for G-A5"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("grim_moe_route_topk"),
+            "Phase 3aD: device-side MoE routing entry must be JIT-discoverable"
         );
     }
 

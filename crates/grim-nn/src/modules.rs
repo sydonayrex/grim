@@ -985,6 +985,44 @@ impl RmsNorm {
             x.device().clone(),
         ))
     }
+
+    /// Phase 3c: Fused RMSNorm + Linear projection (e.g. router gate projection).
+    /// Computes `Linear(RMSNorm(x))` in a single GPU kernel launch on ROCm devices
+    /// when weights are unquantized and unbiased; falls back to `linear.forward(&self.forward(x)?)`.
+    pub fn forward_fused_linear(&self, x: &Tensor, linear: &Linear) -> Result<Tensor> {
+        #[cfg(feature = "rocm-mem")]
+        if let Device::Rocm(ord) = x.device() {
+            if linear.bias.is_none()
+                && !linear.weight.dtype().is_quantized()
+                && !x.dtype().is_quantized()
+                && x.shape().dims().len() >= 2
+            {
+                let rdev = grim_backend_rocm::RocmDevice::shared(*ord);
+                let in_dim = x.shape().dims().last().copied().unwrap_or(0);
+                let out_dim = linear.weight.shape().dim(0)?;
+                let batch = x.shape().elem_count() / in_dim;
+                let out_shape = Shape::new(vec![batch, out_dim]);
+
+                // linear.w_t has shape [in_dim, out_dim] which matches the kernel's (k, n) expectation
+                if let Ok((storage, _handle)) = rdev.rmsnorm_matmul(
+                    x.storage().as_ref(),
+                    self.weight.storage().as_ref(),
+                    linear.w_t.storage().as_ref(),
+                    self.eps,
+                    &out_shape,
+                ) {
+                    return Ok(Tensor::new(
+                        Arc::from(storage),
+                        out_shape,
+                        DType::F32,
+                        x.provenance().clone(),
+                        x.device().clone(),
+                    ));
+                }
+            }
+        }
+        linear.forward(&self.forward(x)?)
+    }
 }
 
 // ---------- LayerNorm ----------

@@ -129,6 +129,17 @@ pub fn build_fused_qkv_q80(
     wk: &grim_nn::Linear,
     wv: &grim_nn::Linear,
 ) -> Option<grim_backend_rocm::FusedQkvWeights> {
+    build_fused_qkv_q80_opt(Some(wq), Some(wk), Some(wv))
+}
+
+/// Helper to build FusedQkvWeights when Q, K, V projections are `Option<&Linear>`.
+/// Returns `None` if any projection is absent, not on ROCm, or not Q8_0.
+pub fn build_fused_qkv_q80_opt(
+    wq: Option<&grim_nn::Linear>,
+    wk: Option<&grim_nn::Linear>,
+    wv: Option<&grim_nn::Linear>,
+) -> Option<grim_backend_rocm::FusedQkvWeights> {
+    let (wq, wk, wv) = (wq?, wk?, wv?);
     let device = wq.weight.device().clone();
     if !matches!(&device, Device::Rocm(_)) || std::env::var("GRIM_FUSED_QKV").as_deref() == Ok("0") {
         return None;

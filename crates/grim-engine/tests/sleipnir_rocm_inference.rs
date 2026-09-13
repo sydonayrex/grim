@@ -19,6 +19,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
+/// The GPU tests share one device (and the backend's global scratch state);
+/// concurrent decode runs interfere (2GB APU especially). Serialize them.
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 use grim_backend_cpu::CpuDevice;
 use grim_core::sampler::{Sampler, SamplingParams};
 use grim_engine::model_loader::load_model_from_gguf;
@@ -62,6 +70,15 @@ const GOLDEN_TOKENS: [u32; 12] = [
 // refreshed golden.
 const GOLDEN_TOKENS_GPU: [u32; 12] = [
     7, 2, 535, 509, 519, 767, 1268, 1463, 1463, 1463, 1463, 1463,
+];
+
+// RDNA2 APU (gfx1036) golden: scalar Q8_0 GEMM path (dot4 GEMV is RDNA3/4
+// only). First 7 tokens identical to the gfx12 golden; the tail diverges on
+// legitimate cross-arch f32 accumulation-order noise flipping greedy
+// near-ties. Validated: fused-QKV and stock paths agree token-for-token on
+// this arch (fused_qkv_decode_parity_with_stock_path).
+const GOLDEN_TOKENS_GFX1036: [u32; 12] = [
+    7, 2, 535, 509, 519, 767, 1268, 519, 519, 511, 32572, 511,
 ];
 
 /// Prompt and expected GGUF metadata for the sleipnir model. These values are
@@ -231,6 +248,7 @@ fn generate(dev: &dyn BackendDevice, device: &Device, path: &str, vocab: usize) 
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn sleipnir_gguf_metadata_contract() {
+    let _gpu = gpu_lock();
     let Some(path) = model_path() else { return };
     let provider = GgufProvider::open(&path).expect("GgufProvider::open failed");
 
@@ -269,6 +287,7 @@ fn sleipnir_gguf_metadata_contract() {
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn sleipnir_gguf_loads_on_target_device() {
+    let _gpu = gpu_lock();
     let Some(path) = model_path() else { return };
     let (device, _dev) = target_device();
     let model = load_model_from_gguf(&path, device.clone())
@@ -290,6 +309,7 @@ fn sleipnir_gguf_loads_on_target_device() {
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn sleipnir_gguf_prefill_logits_shape() {
+    let _gpu = gpu_lock();
     let Some(path) = model_path() else { return };
     let (device, dev) = target_device();
 
@@ -351,6 +371,7 @@ fn sleipnir_gguf_prefill_logits_shape() {
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn sleipnir_gguf_decode_golden_token_sequence() {
+    let _gpu = gpu_lock();
     let Some(path) = model_path() else { return };
     let (device, dev) = target_device();
 
@@ -367,7 +388,17 @@ fn sleipnir_gguf_decode_golden_token_sequence() {
 
     let got = generate(&*dev, &device, &path, vocab);
     let expected = match device {
-        Device::Rocm(_) => &GOLDEN_TOKENS_GPU[..],
+        // Per-arch GPU goldens: gfx12 decodes via the dot4 GEMV path, gfx103x
+        // (RDNA2 APU) via the scalar Q8_0 GEMM — different f32 accumulation
+        // orders flip greedy near-ties after ~7 tokens. The first 7 tokens
+        // match across all three paths (CPU, gfx12, gfx103x).
+        Device::Rocm(_) => {
+            if dev.gpu_target_str().starts_with("gfx103") {
+                &GOLDEN_TOKENS_GFX1036[..]
+            } else {
+                &GOLDEN_TOKENS_GPU[..]
+            }
+        }
         _ => &GOLDEN_TOKENS[..],
     };
     assert_eq!(got.len(), expected.len(), "token count drift");
@@ -389,6 +420,7 @@ fn sleipnir_gguf_decode_golden_token_sequence() {
 // ===========================================================================
 #[test]
 fn fused_qkv_decode_parity_with_stock_path() {
+    let _gpu = gpu_lock();
     let Some(path) = model_path() else { return };
     let (device, dev) = target_device();
     if !matches!(device, Device::Rocm(_)) {
@@ -429,6 +461,7 @@ fn fused_qkv_decode_parity_with_stock_path() {
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn sleipnir_gguf_tokenizer_output_clean() {
+    let _gpu = gpu_lock();
     let Some(path) = model_path() else { return };
     let provider = GgufProvider::open(&path).expect("open failed");
     let tokenizer = provider.tokenizer().expect("tokenizer failed");

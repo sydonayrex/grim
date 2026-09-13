@@ -1220,14 +1220,29 @@ pub struct MoeFfn {
     pub routed_scaling_factor: f32,
     /// Per-expert routing hotness accumulator (updated each forward call).
     /// Used by PlanBuilder to decide which experts deserve fp16 residency.
+    ///
+    /// FROZEN (Phase 3aD): the fp16-residency planner (hotness → PlanBuilder →
+    /// ResidentPlan) was previously advanced by the now-removed host-side
+    /// routing readback in `forward_rocm`. The D2D dispatch keeps the whole
+    /// resident set in f32 (`RocmResidentWeights::build` flattens every expert),
+    /// so the plan is no longer consulted for weight residency. Retained for the
+    /// future per-expert-fp16 reintroduction; see `PlanBuilder`/`ResidentPlan`.
+    #[allow(dead_code)]
     hotness: std::sync::Mutex<Vec<f32>>,
     /// PlanBuilder for budget-feasible resident-set selection (P2-1 wiring).
+    #[allow(dead_code)]
     plan_builder: PlanBuilder,
     /// Cached resident plan from the last cache-miss rebuild.
+    #[allow(dead_code)]
     cached_plan: std::sync::Mutex<Option<ResidentPlan>>,
     /// ROCm resident expert-weight cache (see [`RocmResidentWeights`]).
     #[cfg(feature = "rocm-mem")]
     rocm_weights: std::sync::Mutex<Option<RocmResidentWeights>>,
+    /// ROCm resident router-gate cache: the gate weight dequantized to f32 and
+    /// uploaded once (when the checkpoint keeps the gate CPU-resident), for the
+    /// D2D `forward_rocm` gate projection. Keyed by `(num_experts, hidden)`.
+    #[cfg(feature = "rocm-mem")]
+    rocm_gate: std::sync::Mutex<Option<(usize, usize, Arc<dyn BackendStorage>)>>,
     /// CUDA resident expert-weight cache (see [`CudaResidentWeights`]).
     #[cfg(feature = "cuda-mem")]
     cuda_weights: std::sync::Mutex<Option<CudaResidentWeights>>,
@@ -1335,6 +1350,8 @@ impl MoeFfn {
             cached_plan: std::sync::Mutex::new(None),
             #[cfg(feature = "rocm-mem")]
             rocm_weights: std::sync::Mutex::new(None),
+            #[cfg(feature = "rocm-mem")]
+            rocm_gate: std::sync::Mutex::new(None),
             #[cfg(feature = "cuda-mem")]
             cuda_weights: std::sync::Mutex::new(None),
         }
@@ -2067,6 +2084,12 @@ impl MoeFfn {
     }
 
     /// ROCm HIP dispatch of the Charon fused MoE kernel.
+    ///
+    /// Phase 3aD: fully device-resident (D2D). The gate logits are computed
+    /// on-device and routed on-device via `grim_moe_route_topk` (softmax or
+    /// sigmoid+bias per the router kind), then dispatched from device-resident
+    /// routing buffers via `grim_moe_fused_dispatch`. No gate-logits D2H, no
+    /// routing-table H2D upload.
     #[cfg(feature = "rocm-mem")]
     fn forward_rocm(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let ordinal = match x.device() {
@@ -2077,8 +2100,7 @@ impl MoeFfn {
                 ));
             }
         };
-        let (indices, weights) = self.router.route(x)?;
-        let batch = indices.len();
+        let batch = x.shape().dims().first().copied().unwrap_or(0);
         let hidden = self
             .experts
             .down
@@ -2099,8 +2121,74 @@ impl MoeFfn {
             });
         }
 
-        let assignment =
-            grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)?;
+        // Compute gate logits on-device (no D2H). If the checkpoint keeps the gate
+        // CPU-resident, dequantize to f32 and upload once into `rocm_gate`; otherwise
+        // the gate is already on-device.
+        let num_gate_rows = self.router.gate.weight.shape().dim(0).unwrap_or(0);
+        let gate_on_rocm = matches!(self.router.gate.weight.device(), Device::Rocm(_));
+        let dev = RocmDevice::try_new(ordinal)?;
+        let gate_weight_storage: Arc<dyn BackendStorage> = if gate_on_rocm {
+            Arc::clone(self.router.gate.weight.storage())
+        } else {
+            let key = (num_gate_rows, hidden);
+            let cached = {
+                let guard = self.rocm_gate.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .as_ref()
+                    .and_then(|(r, h, arc)| if *r == key.0 && *h == key.1 {
+                        Some(Arc::clone(arc))
+                    } else {
+                        None
+                    })
+            };
+            if let Some(arc) = cached {
+                arc
+            } else {
+                let flat = rocm_dequant_expert_weight(&self.router.gate.weight, ordinal)?;
+                let uploaded = Arc::from(CoreTensorOps::from_cpu(
+                    &dev,
+                    &flat,
+                    &Shape::new(vec![flat.len()]),
+                    DType::F32,
+                )?);
+                let mut guard = self.rocm_gate.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some((key.0, key.1, Arc::clone(&uploaded)));
+                uploaded
+            }
+        };
+
+        let gate_rocm = gate_weight_storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| {
+                grim_tensor::error::Error::Backend("gate weight not RocmStorage".into())
+            })?;
+        let x_rocm_early = x
+            .storage()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| grim_tensor::error::Error::Backend("x is not RocmStorage".into()))?;
+        let logits_shape = Shape::new(vec![batch, num_experts]);
+        let (logits_storage, _h) =
+            dev.matmul(x_rocm_early, gate_rocm, &logits_shape)?;
+        let logits_rocm = logits_storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| {
+                grim_tensor::error::Error::Backend("gate logits not RocmStorage".into())
+            })?;
+
+        // Route mode + optional per-expert bias (sigmoid+bias gating).
+        let (route_mode, bias_rocm) = match self.router.kind {
+            RouterKind::SoftmaxTopK => (0, None),
+            RouterKind::SigmoidTopKWithBias => {
+                let bias_rocm = self.router.correction_bias.as_ref().and_then(|b| {
+                    let bs: &dyn BackendStorage = &**b.storage();
+                    bs.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>()
+                });
+                (2, bias_rocm)
+            }
+        };
 
         let x_storage: &dyn BackendStorage = &**x.storage();
         let x_rocm = x_storage
@@ -2110,26 +2198,7 @@ impl MoeFfn {
 
         let out_shape = Shape::new(vec![batch, hidden]);
 
-        // Update per-expert routing hotness from this call's router weights.
-        // Each token's routing weights indicate how much each expert was used; accumulate to track which.
-        {
-            let mut hotness = self.hotness.lock().unwrap();
-            for (token_indices, token_weights) in indices.iter().zip(weights.iter()) {
-                for (&expert, &w) in token_indices.iter().zip(token_weights.iter()) {
-                    hotness[expert] += w;
-                }
-            }
-        }
-
-        // PlanBuilder: decide which experts deserve fp16 residency under the HBM budget.
-        // Called on every call with the updated hotness; the plan is cached for the resident-set.
-        let plan = self
-            .plan_builder
-            .build(&self.hotness.lock().unwrap(), false);
-        *self.cached_plan.lock().unwrap() = Some(plan.clone());
-
-        // Resident expert-weight fast path: the flattened gate/up/down banks are uploaded to the device once and reused across forward calls (P2-1).
-        // The cache is rebuilt only when the resident set changes.
+        // Resident expert-weight stack (built once, reused). No per-call upload.
         let resident = {
             let mut guard = self.rocm_weights.lock().unwrap_or_else(|e| e.into_inner());
             let key = (num_experts, hidden, inter);
@@ -2157,12 +2226,61 @@ impl MoeFfn {
         };
 
         let dev = RocmDevice::try_new(ordinal)?;
-        let (out_storage, _handle) = dev.moe_fused_dispatch_resident(
+        let top_k = self.router.top_k.min(num_experts);
+        let num_pairs = batch * top_k;
+
+        // Device-resident routing buffers (sortless triples).
+        let tokens = dev.zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
+        )?;
+        let experts = dev.zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
+        )?;
+        let weights = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32)?;
+        let tokens_rocm = tokens
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| grim_tensor::error::Error::Backend("tokens not RocmStorage".into()))?;
+        let experts_rocm = experts
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| grim_tensor::error::Error::Backend("experts not RocmStorage".into()))?;
+        let weights_rocm = weights
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| grim_tensor::error::Error::Backend("weights not RocmStorage".into()))?;
+
+        // 1. Device-side routing (D2D).
+        dev.moe_route_topk_on_device(
+            logits_rocm,
+            bias_rocm,
+            tokens_rocm,
+            experts_rocm,
+            weights_rocm,
+            batch,
+            num_experts,
+            top_k,
+            route_mode,
+        )?;
+
+        // 2. Fully device-resident dispatch (no routing-table upload).
+        let (out_storage, _handle) = dev.moe_fused_dispatch_resident_routing(
             x_rocm,
             &*resident.0,
             &*resident.1,
             &*resident.2,
-            &assignment,
+            tokens_rocm,
+            experts_rocm,
+            weights_rocm,
+            num_pairs,
             &out_shape,
             hidden,
             inter,

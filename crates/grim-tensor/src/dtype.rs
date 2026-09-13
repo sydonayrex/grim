@@ -105,6 +105,8 @@ pub enum Storage {
     EmbeddingWNA16Int,
     /// AWQ: Activation-aware Weight Quantization format with column-packed codes and zero-points.
     Awq(AwqStorageConfig),
+    /// OSTQuant W4A4: 4-bit unsigned packed weights with group scales (bf16) and zeros (u8).
+    W4A4OstQuant(OstQuantConfig),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -208,6 +210,13 @@ pub struct AwqStorageConfig {
     pub group_size: usize,
 }
 
+/// Group configuration for `Storage::W4A4OstQuant`.
+/// Packed into 3 length-prefixed segments: qweight (u32), scales (bf16), zeros (u8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OstQuantConfig {
+    pub group_size: usize,
+}
+
 /// Bitwidth configuration for `Storage::ResidualPacked` column-major stream.
 /// Supports 256-byte aligned row strides with optional backup layers and outliers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -288,6 +297,10 @@ impl DType {
                 BlockDtype::Fp8Block16 => elem_count + (elem_count.div_ceil(16)) * 2,
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
+            Storage::W4A4OstQuant(cfg) => {
+                let group = cfg.group_size.max(1);
+                24 + elem_count.div_ceil(2) + (elem_count.div_ceil(group)) * 2 + elem_count.div_ceil(group)
+            }
             _ => elem_count * self.arith.byte_size(),
         }
     }

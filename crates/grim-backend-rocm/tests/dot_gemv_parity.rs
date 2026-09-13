@@ -130,7 +130,7 @@ fn run_quant_matmul(
 /// quantization tolerance at the LFM2.5 decode shapes.
 #[test]
 fn dot2_q80_parity_vs_cpu() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -225,7 +225,7 @@ fn pack_q80(w: &[f32], rows: usize, k: usize) -> Vec<u8> {
 /// into q/k/v) within 1e-4 — same kernel, same math, only launch grouping differs.
 #[test]
 fn fused_qkv_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -327,7 +327,7 @@ fn fused_qkv_gemv_parity() {
 /// the combined quantization tolerance.
 #[test]
 fn dot2_matches_wmma() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -358,7 +358,7 @@ fn dot2_matches_wmma() {
 /// math). Random q [1, heads*steps, head_dim] at base positions B ∈ {0, 17, 500}.
 #[test]
 fn rope_dev_base_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -407,7 +407,7 @@ fn rope_dev_base_parity() {
 /// matches the CPU reference within quantization tolerance.
 #[test]
 fn dot4_q4k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -487,7 +487,7 @@ fn dot4_q4k_gemv_parity() {
 /// SPEED-DOT: Q5_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
 fn dot4_q5k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -566,7 +566,7 @@ fn dot4_q5k_gemv_parity() {
 /// SPEED-DOT: Q6_K dot4 GEMV execution and parity test at M=1 decode.
 #[test]
 fn dot4_q6k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -645,7 +645,7 @@ fn dot4_q6k_gemv_parity() {
 /// SPEED-DOT-FUSED (Phase 4c): `launch_fused_gate_up_dot4` matches CPU reference.
 #[test]
 fn fused_gate_up_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -738,7 +738,7 @@ fn fused_gate_up_gemv_parity() {
 /// SPEED-DOT-OPFUSE (Phase 4a): `rmsnorm_rope` matches unfused RMSNorm then RoPE.
 #[test]
 fn rmsnorm_rope_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -819,7 +819,7 @@ fn rmsnorm_rope_parity() {
 /// SPEED-DOT-OPFUSE (Phase 4d): `grim_silu_mul_quant_q8_1` parity test.
 #[test]
 fn silu_mul_quant_q81_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -996,11 +996,18 @@ fn fp8_e4m3_to_f32_host(val: u8) -> f32 {
 /// E4M3 quantization + dequantization.
 #[test]
 fn dot4_fp8_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
     };
+    // FP8 dot4 uses V_DOT4_F32_FP8_FP8 (dot11-insts) — RDNA4 only. On
+    // RDNA2/3 the dispatch falls back to the scalar/WMMA fp8 GEMM whose
+    // numerics this dot4-specific parity fixture does not model.
+    if !dev.gpu_target_str().starts_with("gfx12") {
+        eprintln!("[SKIP] fp8 dot4 requires RDNA4 (gfx12), got {}", dev.gpu_target_str());
+        return;
+    }
     unsafe {
         std::env::set_var("GRIM_DOT_GEMV", "1");
     }
@@ -1077,7 +1084,7 @@ fn dot4_fp8_gemv_parity() {
 /// 256 weights) and the CPU side mirrors the kernel's Q8_1 activation quant.
 #[test]
 fn dot4_q2k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1163,7 +1170,7 @@ fn dot4_q2k_gemv_parity() {
 /// (110 bytes / 256 weights, llama.cpp spec).
 #[test]
 fn dot4_q3k_gemv_parity() {
-    let _lock = DOT_MUTEX.lock().unwrap();
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
@@ -1230,4 +1237,370 @@ fn dot4_q3k_gemv_parity() {
     eprintln!("[dot4-q3k-gemv-parity] n={n} k={k} max_diff={diff:.6}");
     assert!(diff < 0.5, "dot4 Q3_K GEMV diverges from CPU reference: {diff}");
     unsafe { std::env::set_var("GRIM_DOT_GEMV", "0"); }
+}
+
+/// Phase 4.5b: W4A4 GEMV via `sudot8` (v_dot8_i32_iu4 on RDNA4 gfx1200/gfx1201).
+/// Verifies the two-dot algebraic zero-point formulation and native dot8 accumulation
+/// against the CPU dequantization oracle.
+#[test]
+fn dot8_w4a4_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] dot8_w4a4_gemv requires RDNA4 (gfx1200/gfx1201)");
+        return;
+    }
+
+    let m = 1usize;
+    let n = 32usize;
+    let k = 256usize; // 2 groups of 128
+    let n_groups = k / 128;
+    let words_per_col = k / 8; // 32 words
+
+    let mut seed = 0x8888_0000u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    // Synthesize activation vector A [1, K]
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 2.5).collect();
+
+    // Synthesize weights B in OSTQuant layout:
+    // qweight: [N, K / 8] uint32
+    // scales: [N, K / 128] bf16 (represented as u16 bits)
+    // zeros: [N, K / 128] uint8
+    let mut b_qw = vec![0u32; n * words_per_col];
+    let mut b_sc = vec![0u16; n * n_groups];
+    let mut b_zr = vec![0u8; n * n_groups];
+
+    let bf16_bits = |v: f32| -> u16 {
+        let bits = v.to_bits();
+        (bits >> 16) as u16
+    };
+
+    for col in 0..n {
+        for g in 0..n_groups {
+            let sc_val = 0.001f32 * (1.0 + rand().abs());
+            b_sc[col * n_groups + g] = bf16_bits(sc_val);
+            b_zr[col * n_groups + g] = ((seed % 16) as u8).min(15);
+        }
+        for w in 0..words_per_col {
+            let mut word = 0u32;
+            for i in 0..8 {
+                let nib = ((seed.wrapping_add(w as u64 * 8 + i as u64)) % 16) as u32;
+                word |= (nib & 0xF) << (i * 4);
+            }
+            b_qw[col * words_per_col + w] = word;
+        }
+    }
+
+    let a_dev = grim_tensor::CoreTensorOps::from_cpu(
+        &dev,
+        &a_f32,
+        &Shape::new(vec![m, k]),
+        DType { arith: ArithType::F32, storage: Storage::Native },
+    ).expect("upload A");
+
+    let b_qw_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(b_qw.as_ptr() as *const u8, b_qw.len() * 4)
+    };
+    let b_sc_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(b_sc.as_ptr() as *const u8, b_sc.len() * 2)
+    };
+
+    let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        b_qw_bytes,
+        &Shape::new(vec![n, words_per_col]),
+        DType { arith: ArithType::U32, storage: Storage::Native },
+    ).expect("upload B qweight");
+
+    let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        b_sc_bytes,
+        &Shape::new(vec![n, n_groups]),
+        DType { arith: ArithType::BF16, storage: Storage::Native },
+    ).expect("upload B scales");
+
+    let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_zr,
+        &Shape::new(vec![n, n_groups]),
+        DType { arith: ArithType::U8, storage: Storage::Native },
+    ).expect("upload B zeros");
+
+    let out_shape = Shape::new(vec![m, n]);
+    let out_storage_boxed = grim_tensor::CoreTensorOps::zeros(
+        &dev,
+        &out_shape,
+        DType { arith: ArithType::F32, storage: Storage::Native },
+    ).expect("alloc out");
+
+    let a_rocm = grim_backend_rocm::as_rocm(a_dev.as_ref()).expect("a rocm");
+    let b_qw_rocm = grim_backend_rocm::as_rocm(b_qw_dev.as_ref()).expect("b_qw rocm");
+    let b_sc_rocm = grim_backend_rocm::as_rocm(b_sc_dev.as_ref()).expect("b_sc rocm");
+    let b_zr_rocm = grim_backend_rocm::as_rocm(b_zr_dev.as_ref()).expect("b_zr rocm");
+    let out_rocm = grim_backend_rocm::as_rocm(out_storage_boxed.as_ref()).expect("out rocm");
+
+    dev.launch_w4a4_ostquant_gemv(
+        a_rocm,
+        b_qw_rocm,
+        b_sc_rocm,
+        b_zr_rocm,
+        out_rocm,
+        m,
+        n,
+        k,
+    ).expect("launch_w4a4_ostquant_gemv");
+
+    let c_dev = grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref()).expect("d2h c");
+
+    // CPU reference:
+    // 1. Quantize activation A to unsigned 4-bit per 128-element group
+    // 2. Dequantize weights: W_i = scale_w * (nibble - zero_w)
+    // 3. Dot product: sum A_i * W_i
+    let mut a_deq = vec![0.0f32; k];
+    for g in 0..n_groups {
+        let grp_a = &a_f32[g * 128..(g + 1) * 128];
+        let max_val = grp_a.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let d = max_val / 15.0;
+        let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+        for i in 0..128 {
+            let q = (grp_a[i] * inv_d).round().clamp(0.0, 15.0);
+            a_deq[g * 128 + i] = q * d;
+        }
+    }
+
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let mut acc = 0.0f32;
+        for g in 0..n_groups {
+            let sc_bits = b_sc[col * n_groups + g];
+            let sc = f32::from_bits((sc_bits as u32) << 16);
+            let zr = b_zr[col * n_groups + g] as f32;
+
+            for w in 0..16 {
+                let word = b_qw[col * words_per_col + g * 16 + w];
+                for i in 0..8 {
+                    let nib = ((word >> (i * 4)) & 0xF) as f32;
+                    let w_val = sc * (nib - zr);
+                    acc += a_deq[g * 128 + w * 8 + i] * w_val;
+                }
+            }
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot8-w4a4-gemv-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(diff < 0.01, "dot8 W4A4 GEMV diverges from CPU reference: {diff}");
+}
+
+/// Phase 4.5b: W4A4 GEMV against real model weights from Qwen3-4B OSTQuant layout.
+#[test]
+fn dot8_w4a4_qwen3_model_tensor_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] dot8_w4a4_gemv requires RDNA4 (gfx1200/gfx1201)");
+        return;
+    }
+
+    let sample_path = std::path::Path::new("/drive/bigfast/grim/target/test_w4a4_qwen3_sample.bin");
+    if !sample_path.exists() {
+        eprintln!("[SKIP] sample weight binary not found at {:?}", sample_path);
+        return;
+    }
+
+    let bytes = std::fs::read(sample_path).expect("read sample binary");
+    assert!(bytes.len() >= 8);
+    let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let k = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let m = 1usize;
+    let n_groups = k / 128;
+    let words_per_col = k / 8;
+
+    let qw_bytes_len = n * words_per_col * 4;
+    let sc_bytes_len = n * n_groups * 2;
+    let zr_bytes_len = n * n_groups;
+
+    let qw_slice = &bytes[8..8 + qw_bytes_len];
+    let sc_slice = &bytes[8 + qw_bytes_len..8 + qw_bytes_len + sc_bytes_len];
+    let zr_slice = &bytes[8 + qw_bytes_len + sc_bytes_len..8 + qw_bytes_len + sc_bytes_len + zr_bytes_len];
+
+    let mut b_qw = vec![0u32; n * words_per_col];
+    for (i, chunk) in qw_slice.chunks_exact(4).enumerate() {
+        b_qw[i] = u32::from_le_bytes(chunk.try_into().unwrap());
+    }
+
+    let mut b_sc = vec![0u16; n * n_groups];
+    for (i, chunk) in sc_slice.chunks_exact(2).enumerate() {
+        b_sc[i] = u16::from_le_bytes(chunk.try_into().unwrap());
+    }
+
+    let b_zr = zr_slice.to_vec();
+
+    let mut seed = 0x1234_5678u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 1.5).collect();
+
+    let a_dev = grim_tensor::CoreTensorOps::from_cpu(
+        &dev,
+        &a_f32,
+        &Shape::new(vec![m, k]),
+        DType { arith: ArithType::F32, storage: Storage::Native },
+    ).expect("upload A");
+
+    let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        qw_slice,
+        &Shape::new(vec![n, words_per_col]),
+        DType { arith: ArithType::U32, storage: Storage::Native },
+    ).expect("upload B qweight");
+
+    let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        sc_slice,
+        &Shape::new(vec![n, n_groups]),
+        DType { arith: ArithType::BF16, storage: Storage::Native },
+    ).expect("upload B scales");
+
+    let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_zr,
+        &Shape::new(vec![n, n_groups]),
+        DType { arith: ArithType::U8, storage: Storage::Native },
+    ).expect("upload B zeros");
+
+    let out_shape = Shape::new(vec![m, n]);
+    let out_storage_boxed = grim_tensor::CoreTensorOps::zeros(
+        &dev,
+        &out_shape,
+        DType { arith: ArithType::F32, storage: Storage::Native },
+    ).expect("alloc out");
+
+    let a_rocm = grim_backend_rocm::as_rocm(a_dev.as_ref()).expect("a rocm");
+    let b_qw_rocm = grim_backend_rocm::as_rocm(b_qw_dev.as_ref()).expect("b_qw rocm");
+    let b_sc_rocm = grim_backend_rocm::as_rocm(b_sc_dev.as_ref()).expect("b_sc rocm");
+    let b_zr_rocm = grim_backend_rocm::as_rocm(b_zr_dev.as_ref()).expect("b_zr rocm");
+    let out_rocm = grim_backend_rocm::as_rocm(out_storage_boxed.as_ref()).expect("out rocm");
+
+    dev.launch_w4a4_ostquant_gemv(
+        a_rocm,
+        b_qw_rocm,
+        b_sc_rocm,
+        b_zr_rocm,
+        out_rocm,
+        m,
+        n,
+        k,
+    ).expect("launch_w4a4_ostquant_gemv");
+
+    let c_dev = grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref()).expect("d2h c");
+
+    // CPU reference:
+    let mut a_deq = vec![0.0f32; k];
+    for g in 0..n_groups {
+        let grp_a = &a_f32[g * 128..(g + 1) * 128];
+        let max_val = grp_a.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let d = max_val / 15.0;
+        let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+        for i in 0..128 {
+            let q = (grp_a[i] * inv_d).round().clamp(0.0, 15.0);
+            a_deq[g * 128 + i] = q * d;
+        }
+    }
+
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let mut acc = 0.0f32;
+        for g in 0..n_groups {
+            let sc_bits = b_sc[col * n_groups + g];
+            let sc = f32::from_bits((sc_bits as u32) << 16);
+            let zr = b_zr[col * n_groups + g] as f32;
+
+            for w in 0..16 {
+                let word = b_qw[col * words_per_col + g * 16 + w];
+                for i in 0..8 {
+                    let nib = ((word >> (i * 4)) & 0xF) as f32;
+                    let w_val = sc * (nib - zr);
+                    acc += a_deq[g * 128 + w * 8 + i] * w_val;
+                }
+            }
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot8-w4a4-qwen3-model-tensor-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(diff < 0.01, "dot8 W4A4 GEMV on real Qwen3 tensor diverges from CPU reference: {diff}");
+}
+
+#[test]
+fn dot8_w4a4_safetensors_loader_e2e() {
+    if std::env::var("GRIM_RUN_GPU_TEST").unwrap_or_default() != "1" {
+        eprintln!("skipping dot8_w4a4_safetensors_loader_e2e (GRIM_RUN_GPU_TEST!=1)");
+        return;
+    }
+    let model_path = "/drive/bigfast/grim/models/ostquant_qwen3_4b_w4a4kv16_int4_v2/model.safetensors";
+    if !std::path::Path::new(model_path).exists() {
+        eprintln!("skipping dot8_w4a4_safetensors_loader_e2e (model.safetensors not found)");
+        return;
+    }
+
+    let dev = RocmDevice::shared(0);
+    let prov = grim_format::tprov::SafetensorsProvider::open(model_path).expect("open safetensors");
+
+    let ws = grim_nn::varbuilder::WeightSource::new(
+        &prov,
+        DType { arith: ArithType::BF16, storage: Storage::Native },
+        grim_tensor::dtype::QuantProvenance::GrimNative,
+        grim_tensor::Device::Rocm(0),
+    );
+
+    // Load gate_proj using Linear::load under the scoped prefix
+    let linear = grim_nn::Linear::load(&ws.scoped("model.layers.0.mlp.gate_proj"), 2560, 9728, false)
+        .expect("Linear::load gate_proj");
+
+    assert!(matches!(
+        linear.weight.dtype().storage,
+        Storage::W4A4OstQuant(_)
+    ), "Loaded weight must have Storage::W4A4OstQuant, got {:?}", linear.weight.dtype().storage);
+
+    // Run forward with M=1
+    let a_data = vec![0.5f32; 2560];
+    let a_t = grim_tensor::CoreTensorOps::from_cpu(
+        dev.as_ref(),
+        &a_data,
+        &Shape::new(vec![1, 2560]),
+        DType { arith: ArithType::F32, storage: Storage::Native },
+    ).expect("upload activation");
+
+    let a_tensor = grim_tensor::Tensor::new(
+        std::sync::Arc::from(a_t),
+        Shape::new(vec![1, 2560]),
+        DType { arith: ArithType::F32, storage: Storage::Native },
+        grim_tensor::dtype::QuantProvenance::GrimNative,
+        grim_tensor::Device::Rocm(0),
+    );
+
+    let out = linear.forward(&a_tensor).expect("Linear::forward");
+    assert_eq!(out.shape().dims(), &[1, 9728]);
+
+    let out_v = out.to_vec_f32().expect("to_vec_f32");
+    assert_eq!(out_v.len(), 9728);
+    let non_zeros = out_v.iter().filter(|&&x| x.abs() > 1e-6).count();
+    assert!(non_zeros > 9000, "Output should contain non-zero values from GEMV execution, got {non_zeros}");
+    eprintln!("[dot8_w4a4_safetensors_loader_e2e] Successfully loaded and executed sudot8 GEMV through Linear::forward!");
 }

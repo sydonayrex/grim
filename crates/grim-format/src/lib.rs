@@ -12,6 +12,7 @@ pub mod fusion;
 pub mod gguf;
 pub mod gptq;
 pub mod onnx;
+pub mod ostquant;
 pub mod safetensors;
 pub mod spec;
 pub mod tokenizer;
@@ -22,6 +23,7 @@ pub mod train;
 pub mod weight_format;
 
 pub use awq::{AwqConfig, AwqProvider, AwqTensorInfo, pack_awq_group_int};
+pub use ostquant::{OstQuantMetadata, OstQuantProvider, OstQuantTensorInfo, pack_ostquant_native};
 pub use ftw::{FtwDirectLoader, FtwHeader, FtwHostBank, FtwQuantFormat};
 pub use fusion::{FusionGroup, TensorGraphIr, build_transformer_ir};
 pub use torch::{PthProvider, TorchTensorEntry};

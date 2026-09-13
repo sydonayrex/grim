@@ -590,6 +590,8 @@ pub struct DeepSeek4Moe {
     pub shared_experts: Option<DeepSeek4Expert>,
     pub num_experts_per_tok: usize,
     pub routed_scaling_factor: f32,
+    /// Charon grouped-dispatch resident weight cache (Phase 3a).
+    pub charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl DeepSeek4Moe {
@@ -625,6 +627,7 @@ impl DeepSeek4Moe {
             shared_experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
             routed_scaling_factor: cfg.routed_scaling_factor,
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
@@ -632,14 +635,80 @@ impl DeepSeek4Moe {
     /// Falls back to [`Self::forward_moe_host`] on CPU devices or when the backend lacks a needed primitive.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.gate.forward(x)?;
-        let logits_v = logits.to_vec_f32()?;
 
+        // Phase 3aD: D2D routing + dispatch (sqrt-softplus gating on-device).
+        if x.device() != &Device::Cpu {
+            if let Some(out) = self.forward_moe_device_d2d(x, &logits)? {
+                return Ok(out);
+            }
+        }
+
+        let logits_v = logits.to_vec_f32()?;
         if x.device() != &Device::Cpu {
             if let Some(out) = self.forward_moe_device(x, &logits_v)? {
                 return Ok(out);
             }
         }
         self.forward_moe_host(x, &logits_v)
+    }
+
+    /// Phase 3c: fused RMSNorm + router-gate projection (single launch) followed
+    /// by routed expert dispatch. `norm` is the pre-MoE RMSNorm (the block's
+    /// `post_attention_layernorm`); `raw_x` is the un-normalized residual.
+    pub fn forward_pre_norm(&self, raw_x: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
+        let logits = norm.forward_fused_linear(raw_x, &self.gate)?;
+
+        // DeepSeek-V4 uses sqrt-softplus gating (route_mode=1), handled on-device.
+        if raw_x.device() != &Device::Cpu {
+            if let Some(out) = self.forward_moe_device_d2d(raw_x, &logits)? {
+                return Ok(out);
+            }
+        }
+
+        let logits_v = logits.to_vec_f32()?;
+        if raw_x.device() != &Device::Cpu {
+            if let Some(out) = self.forward_moe_device(raw_x, &logits_v)? {
+                return Ok(out);
+            }
+        }
+        self.forward_moe_host(raw_x, &logits_v)
+    }
+
+    /// Device-resident MoE (D2D): routing computed on-device (sqrt-softplus), dispatch
+    /// from device-resident routing buffers. No gate-logits D2H, no routing-table H2D.
+    fn forward_moe_device_d2d(&self, x: &Tensor, logits: &Tensor) -> Result<Option<Tensor>> {
+        let seq_len = x.shape().dims().first().copied().unwrap_or(0);
+        if seq_len == 0 {
+            return Ok(Some(x.clone()));
+        }
+        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+
+        let experts: Vec<crate::shared_moe::MoeExpert> = self
+            .experts
+            .iter()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.w1.clone(),
+                up: e.w3.clone(),
+                down: e.w2.clone(),
+            })
+            .collect();
+        let shared_expert = self.shared_experts.as_ref().map(|e| crate::shared_moe::MoeExpert {
+            gate: e.w1.clone(),
+            up: e.w3.clone(),
+            down: e.w2.clone(),
+        });
+
+        crate::shared_moe::fused_moe_dispatch_from_logits(
+            dev.as_ref(),
+            x,
+            logits,
+            &experts,
+            shared_expert.as_ref(),
+            self.num_experts_per_tok,
+            self.routed_scaling_factor,
+            1, // route_mode: sqrt-softplus (DeepSeek-V4)
+            &self.charon_cache,
+        )
     }
 
     /// Device-resident MoE: token rows are extracted D2D, experts run on-device (Linear + `silu_mul_on_device`), and the weighted sum accumulates on-device.
@@ -707,6 +776,7 @@ impl DeepSeek4Moe {
             shared_expert.as_ref(),
             &routings,
             self.routed_scaling_factor,
+            &self.charon_cache,
         )
         .map(Some)
     }
@@ -825,13 +895,14 @@ impl DeepSeek4Block {
         let res1_t =
             grim_nn::modules::add_on_device(x, &mul_scalar_on_device(&attn_out, self.hc_mult)?)?;
 
-        let normed_ffn = self.ffn_norm.forward(&res1_t)?;
         let mlp_out = if let Some(ref mlp) = self.mlp {
+            let normed_ffn = self.ffn_norm.forward(&res1_t)?;
             mlp.forward(&normed_ffn)?
         } else if let Some(ref moe) = self.moe {
-            moe.forward(&normed_ffn)?
+            // Phase 3c: fuse the pre-MoE RMSNorm into the router gate projection.
+            moe.forward_pre_norm(&res1_t, &self.ffn_norm)?
         } else {
-            normed_ffn.clone()
+            self.ffn_norm.forward(&res1_t)?
         };
 
         grim_nn::modules::add_on_device(&res1_t, &mul_scalar_on_device(&mlp_out, self.hc_mult)?)
