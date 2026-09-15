@@ -354,12 +354,19 @@ impl Lfm2Block {
         let hidden = normed.shape().dims().last().copied().unwrap_or(0);
         let act = &buffers.act_q81_buf[layer_idx];
         let norm_rocm = dst_downcast(normed)?;
+        // Fused Q8_0 dot4 path: ONE quant + ONE fused GEMV replaces 3
+        // separate GEMVs. Works for any batch size — the quantize kernel
+        // quantizes the full [batch, hidden] activation in one launch, and
+        // the fused dot4 GEMV reads from the same [batch, hidden] activation
+        // and writes to the per-layer fused_qkv_out slot at [batch, n_q+2*n_kv].
+        // The per-token (m=1) hardcode is removed; m = buffers.batch.
         if let Some(fused) = self
             .wqkv_q80_fused
             .as_ref()
-            .filter(|_| buffers.batch <= 1 && dot_fused_ok(dev, hidden) && self.head_dim != 0)
+            .filter(|_| dot_fused_ok(dev, hidden) && self.head_dim != 0)
         {
-            dev.launch_quantize_q8_1(norm_rocm, act, 1, hidden)
+            let m = buffers.batch.max(1);
+            dev.launch_quantize_q8_1(norm_rocm, act, m, hidden)
                 .map_err(|e| grim_core::error::Error::Backend(format!("qkv quant: {e}")))?;
             let nkv = fused.n_k;
             dev.launch_fused_qkv_dot4_into(
@@ -443,14 +450,17 @@ impl Lfm2Block {
         let act = &buffers.act_q81_buf[layer_idx];
         let hidden = normed.shape().dims().last().copied().unwrap_or(0);
         // Fused gate+up (Q8_0 blob present): ONE dot4 GEMV into gate_up_buf,
-        // then slice halves into gate/up bufs. Else two quant-aware GEMVs.
+        // then slice halves into gate/up bufs. Works for any batch size —
+        // the quantize kernel quantizes [batch, hidden] and the fused GEMV
+        // writes to [batch, n_gate+n_up]. m = buffers.batch (not 1).
         if let Some(fused) = self
             .w_gate_up_q80_fused
             .as_ref()
-            .filter(|_| buffers.batch <= 1 && dot_fused_ok(dev, hidden))
+            .filter(|_| dot_fused_ok(dev, hidden))
         {
             let norm_rocm = dst_downcast(normed)?;
-            dev.launch_quantize_q8_1(norm_rocm, act, 1, hidden)
+            let m = buffers.batch.max(1);
+            dev.launch_quantize_q8_1(norm_rocm, act, m, hidden)
                 .map_err(|e| grim_core::error::Error::Backend(format!("gateup quant: {e}")))?;
             dev.launch_fused_gate_up_dot4_into(
                 act,
