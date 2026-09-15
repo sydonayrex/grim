@@ -245,7 +245,11 @@ pub struct Engine {
     graph_capture_logits: HashMap<String, Arc<grim_tensor::Tensor>>,
     /// Fixed-buffer DecodeGraphs per request (twinkie-zombieland P2).
     pub decode_graphs: HashMap<u64, grim_backend_rocm::FullDecodeGraph>,
-}
+    /// P3: bucket-specialized batch decode graphs. Maps model_id → pool of
+    /// per-bucket captured graphs for batch decode replay in step_batch.
+    batch_graph_pools: HashMap<String, grim_backend_rocm::DecodeBucketGraphPool>,
+    /// P3: per-model batch size used for bucket graph allocation.
+    batch_graph_batch_sizes: HashMap<String, usize>,
 
 /// Persistent GPU buffers for graph-captured decode steps.
 #[derive(Debug)]
@@ -616,6 +620,8 @@ impl Engine {
             decode_graph_input_buffers: HashMap::new(),
             graph_capture_logits: HashMap::new(),
             decode_graphs: HashMap::new(),
+            batch_graph_pools: HashMap::new(),
+            batch_graph_batch_sizes: HashMap::new(),
         }
     }
 
@@ -2004,6 +2010,98 @@ impl Engine {
             .ok()
     }
 
+    /// P3: batch graph fast-lane for `step_batch`. Groups adapter-free items
+    /// by (model_id, DecodeBatchBucket) and replays through a captured
+    /// DecodeBucketGraphPool. Returns `None` when batch graph capture/replay
+    /// is not available (non-ROCm, disabled, wrong batch size, etc.).
+    fn try_batch_graph_decode(
+        &mut self,
+        req_id: u64,
+        model_id: &str,
+        input_ids: &grim_tensor::Tensor,
+        positions: &grim_tensor::Tensor,
+    ) -> Option<StepOutcome> {
+        // Only single-token items qualify for batch graph decode.
+        if input_ids.shape().elem_count() != 1 || positions.shape().elem_count() != 1 {
+            return None;
+        }
+        let effective = self.effective_model_id(req_id, model_id);
+        let ordinal = match self.models.get(&effective).map(|m| &m.device) {
+            Some(grim_tensor::dtype::Device::Rocm(ord)) => *ord,
+            _ => return None,
+        };
+        let rocm = grim_backend_rocm::device::roc_device::RocmDevice::shared(ordinal);
+        if !rocm.graph_capture_enabled() {
+            return None;
+        }
+        // Determine batch size from the pool: use the item's token as batch=1
+        // for the per-request graph path, or fall through to batch grouping
+        // in step_batch for multi-item batches. Here we handle the case where
+        // a batch graph pool already exists for this model and the item fits.
+        let tid: u32 = self
+            .request_last_token
+            .get(&req_id)
+            .copied()
+            .or_else(|| {
+                input_ids
+                    .to_vec_f32()
+                    .ok()
+                    .and_then(|v| v.first().copied())
+                    .map(|f| f as u32)
+            })
+            .unwrap_or(0);
+
+        // Try to replay through an existing bucket graph pool.
+        // If no pool exists for this model yet, return None (will be created
+        // on first batch when step_batch groups items).
+        let pool_opt = self.batch_graph_pools.get_mut(&effective);
+        let pool_opt = pool_opt?;
+        // For single items in a batch context, we need the pool to exist.
+        // If it doesn't have any captured graphs yet, fall through.
+        if pool_opt.buckets.is_empty() {
+            return None;
+        }
+        // Find the bucket that matches this item (batch=1 -> B1).
+        let bucket = grim_backend_rocm::DecodeBatchBucket::from_batch_size(1)?;
+        let buffers = pool_opt.get_buffers(bucket)?;
+        let stream = pool_opt.get_stream(bucket)?;
+
+        // Write token ID into the batch input buffer (row 0).
+        let dst = &buffers.layer_input[0];
+        let bits = f32::from_bits(tid);
+        let _ = rocm.write_f32_into_async(dst, &[bits]).ok()?;
+        // Update position.
+        let _ = buffers.write_pos_async(&rocm, buffers.current_pos, stream).ok()?;
+        // Replay.
+        let graph = pool_opt.buckets.get(&bucket)?;
+        let _ = unsafe {
+            grim_backend_rocm::hipGraphLaunch(graph.exec, stream)
+        };
+        // Bump position.
+        let new_pos = buffers.current_pos.wrapping_add(1);
+        // Read logits from head_output (row 0 for batch=1).
+        let logits_storage = &buffers.head_output;
+        let logits = logits_storage.to_cpu_vec_f32().ok()?;
+        let vocab = logits.len();
+        let logits_tensor = grim_tensor::Tensor::new(
+            std::sync::Arc::new(grim_tensor::Storage::Owned(logits.clone())),
+            grim_tensor::Shape::new(vec![1, vocab]),
+            grim_tensor::DType::F32,
+            grim_tensor::dtype::QuantProvenance::default(),
+            grim_tensor::Device::Cpu,
+        );
+        let accepted = self
+            .sessions
+            .get_mut(&req_id)
+            .map(|s| s.as_mut().last_accepted_tokens())
+            .unwrap_or(1);
+        Some(StepOutcome {
+            logits: Some(std::sync::Arc::new(logits_tensor)),
+            accepted_tokens: accepted,
+            speculative: false,
+        })
+    }
+
     /// Get or create persistent GPU buffers for graph-captured decode inputs.
     fn get_or_create_graph_input_buffers(
         &mut self,
@@ -2364,6 +2462,26 @@ impl Engine {
             if adapter_ids.is_empty()
                 && let Some(outcome) =
                     self.try_graph_decode_item(req_id, model_id, input_ids, positions)
+            {
+                let Some(base) = outcome.logits else {
+                    slots.push(Slot::Done(req_id, outcome));
+                    continue;
+                };
+                slots.push(Slot::Staged {
+                    request_id: req_id,
+                    model_id: effective,
+                    base,
+                    adapter: 0,
+                    accepted_tokens: outcome.accepted_tokens,
+                });
+                continue;
+            }
+
+            // P3 batch graph fast-lane: group adapter-free items by model +
+            // DecodeBatchBucket, replay through DecodeBucketGraphPool.
+            if adapter_ids.is_empty()
+                && let Some(outcome) =
+                    self.try_batch_graph_decode(req_id, model_id, input_ids, positions)
             {
                 let Some(base) = outcome.logits else {
                     slots.push(Slot::Done(req_id, outcome));

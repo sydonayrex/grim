@@ -536,8 +536,10 @@ impl Lfm2Block {
         // RoPE IN PLACE with the device position base (no host positions
         // vector, no output alloc). Safe: each thread loads its pair before
         // storing it; pairs are disjoint across threads.
+        // P3: shape is [steps, nh, hd] where steps==batch — each batch item
+        // is one query position sharing the same base position.
         let rope_cfg = RopeConfig::new(hd, self.rope_theta);
-        let q3 = Shape::new(vec![1, nh * steps, hd]);
+        let q3 = Shape::new(vec![steps, nh, hd]);
         dev.rope_dev_base_into(
             &buffers.q_buf[layer_idx],
             &buffers.pos_dev,
@@ -548,7 +550,7 @@ impl Lfm2Block {
             steps,
         )
         .map_err(grim_core::error::Error::Tensor)?;
-        let k3 = Shape::new(vec![1, nkv * steps, hd]);
+        let k3 = Shape::new(vec![steps, nkv, hd]);
         dev.rope_dev_base_into(
             &buffers.k_buf[layer_idx],
             &buffers.pos_dev,

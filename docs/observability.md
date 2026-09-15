@@ -39,12 +39,40 @@ When running `grim serve`, Prometheus metrics are exposed via the `GET /metrics`
 
 ### Exposed Metric Keys
 
-- `grim_tokens_generated_total` (Counter): Total number of tokens generated across all requests.
-- `grim_request_duration_seconds` (Histogram): End-to-end request latency distribution.
-- `grim_time_to_first_token_seconds` (Histogram): Latency from request receipt to first token emission.
-- `grim_inter_token_latency_seconds` (Histogram): Time elapsed between consecutive decoded tokens.
-- `grim_running_requests` (Gauge): Current count of requests actively evaluating in the engine.
-- `grim_vram_allocated_bytes` (Gauge): Active GPU memory allocated in bytes.
+#### Throughput & Token Counters
+- `grim_prefill_tokens_per_second` (Gauge): Exponential moving average of prompt tokens prefilled per second.
+- `grim_decode_tokens_per_second` (Gauge): Exponential moving average of decode tokens generated per second during decode passes.
+- `grim_response_tokens_per_second` (Gauge): End-to-end response generation throughput (response tokens produced per second).
+- `grim_tokens_generated_total` (Counter): Cumulative decode and response tokens produced across all completed requests.
+- `grim_tokens_prefilled_total` (Counter): Cumulative prompt tokens prefilled across all scheduled passes.
+
+#### Latency Metrics
+- `grim_time_to_first_token_seconds` (Gauge): Latency from request receipt to first token emission in seconds.
+- `grim_time_to_first_token_ms` (Gauge): Latency to produce first token in milliseconds.
+- `grim_inter_token_latency_seconds` (Gauge): Inter-token decode latency in seconds.
+- `grim_inter_token_latency_ms` (Gauge): Inter-token decode latency in milliseconds.
+
+#### Memory & KV Cache Telemetry
+- `grim_kv_cache_used_bytes` (Gauge): Current KV cache memory allocated in bytes.
+- `grim_kv_cache_total_bytes` (Gauge): Total KV cache capacity in bytes.
+- `grim_kv_cache_blocks_used` (Gauge): Count of KV cache blocks currently allocated.
+- `grim_kv_cache_blocks_total` (Gauge): Total count of KV cache blocks available in block pool.
+- `grim_block_pool_usage` (Gauge): Ratio of used KV cache blocks to total capacity (`0.0` to `1.0`).
+- `grim_vram_used_bytes` (Gauge): Current VRAM memory allocated in bytes.
+- `grim_vram_total_bytes` (Gauge): Total available VRAM memory in bytes.
+- `grim_gpu_util_pct` (Gauge): Current GPU compute utilization percentage.
+
+#### Scheduler & Queues
+- `grim_scheduler_active_requests` (Gauge): Count of currently active requests executing in the scheduler.
+- `grim_scheduler_waiting_requests` (Gauge): Count of pending requests waiting in the scheduler queue.
+- `grim_scheduler_admitted_requests` (Counter): Cumulative count of admitted requests.
+- `grim_preemption_count` (Counter): Cumulative request preemptions.
+- `grim_active_sessions` (Gauge): Count of active LoRA adapters and inference sessions.
+
+#### Speculative Decoding
+- `grim_speculative_accept_rate_ema` (Gauge): Exponential moving average of speculative draft token acceptance rate.
+- `grim_speculative_drafted_tokens_total` (Counter): Total draft tokens proposed.
+- `grim_speculative_accepted_tokens_total` (Counter): Total draft tokens accepted.
 
 ---
 

@@ -754,6 +754,7 @@ pub fn scale_backward(args: &ScaleArgs) -> Result<Tensor> {
 }
 
 /// Transpose a row-major f32 matrix `[rows, cols]` into `[cols, rows]`.
+#[allow(dead_code)]
 fn transpose_matrix(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
     for i in 0..rows {
@@ -775,7 +776,7 @@ pub fn lora_backward(
 ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
     let grad_base = out_grad.clone();
     let dev = crate::pick_device_for_tensor(x);
-    use grim_tensor::{QuantProvenance, Shape};
+    use grim_tensor::QuantProvenance;
 
     let _x_vec = x.to_vec_f32()?;
     let a_vec = a.to_vec_f32()?;
@@ -803,66 +804,85 @@ pub fn lora_backward(
         b_dims[0]
     };
 
-    // Fallback: transpose via CPU for all backends.
-    // [P1-16 fix attempt: on-device transpose was attempted but transpose_f32_2d is not available on Box<dyn BackendDevice>.
+    // Direct numerical computation of gradients:
+    // Forward was:
+    //   h = x @ A^T  where x is [batch, in_features], A is [rank, in_features] => h is [batch, rank]
+    //   delta = h @ B^T where B is [out_features, rank] => delta is [batch, out_features]
+    //   output = base + scale * delta
+    //
+    // Backward from dL/dOutput = out_grad [batch, out_features]:
+    //   1. dL/dBase = out_grad
+    //   2. dL/dDelta = scale * out_grad
+    //   3. Since delta = h @ B^T:
+    //      dL/dh = dL/dDelta @ B = scale * (out_grad @ B) [batch, rank]
+    //      dL/dB = (dL/dDelta)^T @ h = scale * (out_grad^T @ h) [out_features, rank]
+    //   4. Since h = x @ A^T:
+    //      dL/dx = dL/dh @ A [batch, in_features]
+    //      dL/dA = (dL/dh)^T @ x [rank, in_features]
 
-    let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) && b_dims.len() == 2 {
-        b.storage().clone()
-    } else {
-        Arc::from(dev.from_cpu(&b_vec, &Shape::new(vec![out_features, rank]), DType::F32)?)
-    };
+    // Step 1: h [batch, rank] where h[b, r] = sum_k x[b, k] * A[r, k]
+    let mut h_vec = vec![0.0f32; batch * rank];
+    for b in 0..batch {
+        for r in 0..rank {
+            let mut sum = 0.0f32;
+            for k in 0..in_features {
+                sum += _x_vec[b * in_features + k] * a_vec[r * in_features + k];
+            }
+            h_vec[b * rank + r] = sum;
+        }
+    }
 
-    let a_storage = if matches!(a.device(), grim_tensor::Device::Rocm(_)) && a_dims.len() == 2 {
-        a.storage().clone()
-    } else {
-        Arc::from(dev.from_cpu(&a_vec, &Shape::new(vec![rank, in_features]), DType::F32)?)
-    };
+    // Step 2: dh [batch, rank] = scale * sum_o out_grad[b, o] * B[o, r]
+    let mut dh_vec = vec![0.0f32; batch * rank];
+    for b in 0..batch {
+        for r in 0..rank {
+            let mut sum = 0.0f32;
+            for o in 0..out_features {
+                sum += g_vec[b * out_features + o] * b_vec[o * rank + r];
+            }
+            dh_vec[b * rank + r] = sum * scale;
+        }
+    }
 
-    // a_t = transpose(a): [rank, in_features] -> [in_features, rank]
-    let a_t = transpose_matrix(&a_vec, rank, in_features);
-    let a_t_storage = dev.from_cpu(&a_t, &Shape::new(vec![in_features, rank]), DType::F32)?;
-    let (h_storage, _) = dev.matmul(
-        x.storage().as_ref(),
-        a_t_storage.as_ref(),
-        &Shape::new(vec![batch, rank]),
-    )?;
+    // Step 3: dB [out_features, rank] = scale * sum_b out_grad[b, o] * h[b, r]
+    let mut db_vec = vec![0.0f32; out_features * rank];
+    for o in 0..out_features {
+        for r in 0..rank {
+            let mut sum = 0.0f32;
+            for b in 0..batch {
+                sum += g_vec[b * out_features + o] * h_vec[b * rank + r];
+            }
+            db_vec[o * rank + r] = sum * scale;
+        }
+    }
 
-    let (dh_unscaled, _) = dev.matmul(
-        out_grad.storage().as_ref(),
-        b_storage.as_ref(),
-        &Shape::new(vec![batch, rank]),
-    )?;
-    let (dh_storage, _) =
-        dev.mul_scalar(dh_unscaled.as_ref(), scale, &Shape::new(vec![batch, rank]))?;
+    // Step 4: dA [rank, in_features] = sum_b dh[b, r] * x[b, k]
+    let mut da_vec = vec![0.0f32; rank * in_features];
+    for r in 0..rank {
+        for k in 0..in_features {
+            let mut sum = 0.0f32;
+            for b in 0..batch {
+                sum += dh_vec[b * rank + r] * _x_vec[b * in_features + k];
+            }
+            da_vec[r * in_features + k] = sum;
+        }
+    }
 
-    // g_t = transpose(g): [batch, out_features] -> [out_features, batch]
-    let g_t = transpose_matrix(&g_vec, batch, out_features);
-    let g_t_storage = dev.from_cpu(&g_t, &Shape::new(vec![out_features, batch]), DType::F32)?;
-    let (db_unscaled, _) = dev.matmul(
-        g_t_storage.as_ref(),
-        h_storage.as_ref(),
-        &Shape::new(vec![out_features, rank]),
-    )?;
-    let (db_storage, _) = dev.mul_scalar(
-        db_unscaled.as_ref(),
-        scale,
-        &Shape::new(vec![out_features, rank]),
-    )?;
+    // Step 5: dx [batch, in_features] = sum_r dh[b, r] * A[r, k]
+    let mut dx_vec = vec![0.0f32; batch * in_features];
+    for b in 0..batch {
+        for k in 0..in_features {
+            let mut sum = 0.0f32;
+            for r in 0..rank {
+                sum += dh_vec[b * rank + r] * a_vec[r * in_features + k];
+            }
+            dx_vec[b * in_features + k] = sum;
+        }
+    }
 
-    // dh_t = transpose(dh): [batch, rank] -> [rank, batch]
-    let dh_vec = dh_storage.to_cpu_vec_f32()?;
-    let dh_t = transpose_matrix(&dh_vec, batch, rank);
-    let dh_t_storage = dev.from_cpu(&dh_t, &Shape::new(vec![rank, batch]), DType::F32)?;
-    let (da_storage, _) = dev.matmul(
-        dh_t_storage.as_ref(),
-        x.storage().as_ref(),
-        &Shape::new(vec![rank, in_features]),
-    )?;
-    let (dx_storage, _) = dev.matmul(
-        dh_storage.as_ref(),
-        a_storage.as_ref(),
-        &Shape::new(vec![batch, in_features]),
-    )?;
+    let dx_storage = dev.from_cpu(&dx_vec, x.shape(), DType::F32)?;
+    let da_storage = dev.from_cpu(&da_vec, a.shape(), DType::F32)?;
+    let db_storage = dev.from_cpu(&db_vec, b.shape(), DType::F32)?;
 
     let grad_x = Tensor::new(
         Arc::from(dx_storage),

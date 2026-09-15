@@ -207,6 +207,10 @@ impl SpeculativeCausalLm {
         self.strategy
     }
 
+    pub fn target(&self) -> &dyn CausalLm {
+        &*self.target
+    }
+
     /// Query runtime speculative decoding telemetry snapshot.
     pub fn telemetry(&self) -> SpeculativeTelemetry {
         let (state, config) = {

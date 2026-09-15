@@ -551,24 +551,64 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("else {"));
     }
 
+    /// Split the main attention kernel into its K-dequant and V-dequant
+    /// sections. Raw substring counts across the whole source are stale:
+    /// helpers (`grim_kvrow_dequant_elem`, `grim_kv_dequant_to_f32`) repeat
+    /// the same `quant_format == N` discriminants outside the K/V loop.
+    fn kv_sections() -> (String, String) {
+        let src = KERNEL_SOURCE;
+        let k_mark = "K dequant + dot product";
+        let v_mark = "V dequant + accumulate";
+        // Main-kernel end: the first device helper after the kernel.
+        let helpers_mark = "grim_kvrow_h2f";
+        let k_start = src.find(k_mark).expect("K section marker");
+        let v_start = src.find(v_mark).expect("V section marker");
+        let end = src.find(helpers_mark).expect("helpers marker");
+        assert!(k_start < v_start && v_start < end);
+        (
+            src[k_start..v_start].to_string(),
+            src[v_start..end].to_string(),
+        )
+    }
+
     #[test]
     fn kv_dequant_attention_source_fp16_path_reads_k_and_v() {
         // Fp16 path must read both K and V rows (not just one).
-        let k_reads = KERNEL_SOURCE.matches("quant_format == 0").count();
-        // There are two quant_format == 0 blocks: one for K, one for V.
-        assert_eq!(k_reads, 2, "Fp16 path must have K and V dequant blocks");
+        let (k_sec, v_sec) = kv_sections();
+        assert!(
+            k_sec.contains("quant_format == 0"),
+            "Fp16 path must have a K dequant block"
+        );
+        assert!(
+            v_sec.contains("quant_format == 0"),
+            "Fp16 path must have a V dequant block"
+        );
     }
 
     #[test]
     fn kv_dequant_attention_source_q8_0_path_reads_k_and_v() {
-        let q8_reads = KERNEL_SOURCE.matches("quant_format == 1").count();
-        assert_eq!(q8_reads, 2, "Q8_0 path must have K and V dequant blocks");
+        let (k_sec, v_sec) = kv_sections();
+        assert!(
+            k_sec.contains("quant_format == 1"),
+            "Q8_0 path must have a K dequant block"
+        );
+        assert!(
+            v_sec.contains("quant_format == 1"),
+            "Q8_0 path must have a V dequant block"
+        );
     }
 
     #[test]
     fn kv_dequant_attention_source_q4k_path_reads_k_and_v() {
-        let q4k_reads = KERNEL_SOURCE.matches("quant_format == 2").count();
-        assert_eq!(q4k_reads, 2, "Q4K path must have K and V dequant blocks");
+        let (k_sec, v_sec) = kv_sections();
+        assert!(
+            k_sec.contains("quant_format == 2"),
+            "Q4K path must have a K dequant block"
+        );
+        assert!(
+            v_sec.contains("quant_format == 2"),
+            "Q4K path must have a V dequant block"
+        );
     }
 
     #[test]

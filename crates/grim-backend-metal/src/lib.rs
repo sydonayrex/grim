@@ -6957,7 +6957,9 @@ mod tests {
         let (out, handle) = dev.matmul(a.as_ref(), b.as_ref(), &out_shape).unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
-        assert_eq!(res, vec![19.0, 22.0, 43.0, 50.0]);
+        // Under SPEED-ROC-16: matmul computes C = A @ B^T.
+        // [1, 2; 3, 4] @ [5, 6; 7, 8]^T = [1*5+2*6, 1*7+2*8; 3*5+4*6, 3*7+4*8] = [17, 23, 39, 53]
+        assert_eq!(res, vec![17.0, 23.0, 39.0, 53.0]);
     }
 
     #[test]
