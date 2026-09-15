@@ -117,6 +117,7 @@ mod cuda_tests {
         top_k: 50,
         repeat_penalty: 1.5,
         thinking_level: grim_core::sampler::ThinkingLevel::Default,
+        min_tokens: 0,
     };
 
     const PROMPT: &str = "user\nwhat is the capital of france? \nassistant\n";

@@ -16,6 +16,10 @@ use crate::device::roc_device::RocmDevice;
 use crate::device::util::dtype_f32;
 use crate::memory::storage::RocmStorage;
 use crate::DTypeStorage;
+use crate::{
+    Shape, check_hip, hipGraphDestroy, hipGraphExecDestroy, hipGraphExecKernelNodeSetParams,
+    hipGraphInstantiate, hipMemcpyAsync, hipStreamBeginCapture, hipStreamEndCapture,
+};
 use crate::HipMemcpyKind;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, DType};
@@ -215,7 +219,7 @@ impl DecodeGraphBuffers {
                 dev.ordinal,
             )?);
             fused_qkv_out.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![nqk + 2 * nkk]),
+                &Shape::new(vec![batch, nqk + 2 * nkk]),
                 dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
@@ -611,7 +615,8 @@ pub fn write_embedding_to_buffer(
     dev.write_f32_into_async(dst, &[bits])
 }
 
-/// Batch version: write multiple token IDs into layer 0 input.
+/// P3 batch version: write multiple token IDs into layer_input[0] (shape [batch, hidden]).
+/// `token_ids` length must be <= dst shape[0] (batch).
 pub fn write_embeddings_to_buffer_batch(
     dev: &RocmDevice,
     dst: &RocmStorage,

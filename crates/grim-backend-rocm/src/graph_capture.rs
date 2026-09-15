@@ -313,9 +313,17 @@ impl DecodeBatchBucket {
 }
 
 /// Bucket-specialized graph manager for fixed-size autoregressive decode execution.
+/// P3: extended with batch capture/replay that owns the `DecodeGraphBuffers` per bucket
+/// so device pointers stay stable across replays (required for graph-keyed replay).
 #[derive(Debug, Default)]
 pub struct DecodeBucketGraphPool {
     buckets: HashMap<DecodeBatchBucket, Arc<DecodeGraph>>,
+    /// P3: persistent batch-sized buffers per bucket. Owned here so addresses
+    /// stay stable across replays — the graph was captured against these exact
+    /// device pointers, and the `DecodeGraphKey` includes them.
+    buffers: HashMap<DecodeBatchBucket, DecodeGraphBuffers>,
+    /// P3: per-bucket stream used for both capture and replay.
+    streams: HashMap<DecodeBatchBucket, *mut c_void>,
 }
 
 impl DecodeBucketGraphPool {
@@ -366,6 +374,162 @@ impl DecodeBucketGraphPool {
             )));
         }
         Ok(())
+    }
+
+    /// P3: Allocate persistent batch-sized `DecodeGraphBuffers` for a bucket.
+    /// These are owned by the pool so device pointers stay stable across replays.
+    /// `model` provides the weight shapes; `batch` must match `bucket.batch_size()`.
+    pub fn allocate_buffers_for_bucket(
+        &mut self,
+        bucket: DecodeBatchBucket,
+        dev: &RocmDevice,
+        num_layers: usize,
+        hidden_size: usize,
+        n_q: usize,
+        n_k: usize,
+        n_v: usize,
+        intermediate_size: usize,
+        max_ctx: usize,
+        vocab_size: usize,
+        num_heads: usize,
+    ) -> Result<()> {
+        let batch = bucket.batch_size();
+        if self.buffers.contains_key(&bucket) {
+            return Ok(());
+        }
+        let buffers = DecodeGraphBuffers::allocate(
+            dev,
+            num_layers,
+            hidden_size,
+            n_q,
+            n_k,
+            n_v,
+            intermediate_size,
+            max_ctx,
+            vocab_size,
+            num_heads,
+            batch,
+        )?;
+        self.buffers.insert(bucket, buffers);
+        // Allocate a dedicated stream per bucket for capture + replay.
+        let mut stream: *mut c_void = std::ptr::null_mut();
+        let res: HipErrorT = unsafe { hipStreamCreate(&mut stream) };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "DecodeBucketGraphPool: hipStreamCreate for bucket {:?} failed: {}",
+                bucket, res
+            )));
+        }
+        self.streams.insert(bucket, stream);
+        Ok(())
+    }
+
+    /// P3: Get the persistent buffers for a bucket (for input writes / logits reads).
+    pub fn get_buffers(&self, bucket: DecodeBatchBucket) -> Option<&DecodeGraphBuffers> {
+        self.buffers.get(&bucket)
+    }
+
+    /// P3: Get the stream for a bucket.
+    pub fn get_stream(&self, bucket: DecodeBatchBucket) -> Option<*mut c_void> {
+        self.streams.get(&bucket).copied()
+    }
+
+    /// P3: Capture a batch decode graph for a bucket. The closure records the
+    /// full model forward (all layers + output) on the bucket's stream. The
+    /// `buffers` must already be allocated via `allocate_buffers_for_bucket`.
+    ///
+    /// `token_ids` is a one-time seed input used during capture to drive the
+    /// model through all kernels — the graph records the kernel topology, not
+    /// the data, so replay with different token IDs is correct.
+    pub fn capture_batch_graph<F>(
+        &mut self,
+        bucket: DecodeBatchBucket,
+        dev: &RocmDevice,
+        model_fn: F,
+    ) -> Result<Arc<DecodeGraph>>
+    where
+        F: FnOnce(&mut DecodeGraph, &RocmDevice) -> Result<()> + Send,
+    {
+        let stream = self
+            .streams
+            .get(&bucket)
+            .copied()
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "No stream for bucket {:?} — call allocate_buffers_for_bucket first",
+                    bucket
+                ))
+            })?;
+
+        let buffers = self
+            .buffers
+            .get(&bucket)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "No buffers for bucket {:?} — call allocate_buffers_for_bucket first",
+                    bucket
+                ))
+            })?;
+
+        let mut graph = DecodeGraph::new(dev, buffers, stream);
+        // Record the model forward on the bucket's stream.
+        model_fn(&mut graph, dev)?;
+        // End capture: instantiate the graph.
+        graph.end_capture()?;
+        let arc = Arc::new(graph);
+        self.buckets.insert(bucket, arc.clone());
+        Ok(arc)
+    }
+
+    /// P3: Replay a batch decode graph. Writes `token_ids` into the bucket's
+    /// input buffer, updates `pos_dev`, then launches the graph in one call.
+    /// Returns the logits device storage for D2H or GPU sampling.
+    pub fn replay_batch(
+        &self,
+        bucket: DecodeBatchBucket,
+        dev: &RocmDevice,
+        token_ids: &[u32],
+    ) -> Result<&RocmStorage> {
+        let graph = self.buckets.get(&bucket).ok_or_else(|| {
+            Error::Backend(format!("No captured graph for bucket {:?}", bucket))
+        })?;
+        let buffers = self.buffers.get(&bucket).ok_or_else(|| {
+            Error::Backend(format!("No buffers for bucket {:?}", bucket))
+        })?;
+        let stream = self.streams.get(&bucket).copied().ok_or_else(|| {
+            Error::Backend(format!("No stream for bucket {:?}", bucket))
+        })?;
+
+        if token_ids.len() != bucket.batch_size() {
+            return Err(Error::Backend(format!(
+                "replay_batch: token_ids len {} != bucket batch_size {}",
+                token_ids.len(),
+                bucket.batch_size()
+            )));
+        }
+
+        // Write token IDs into layer 0 input.
+        write_embeddings_to_buffer_batch(dev, &buffers.layer_input[0], token_ids)?;
+
+        // Update position: pos_dev gets current_pos, then bump after replay.
+        buffers
+            .write_pos_async(dev, buffers.current_pos, stream)?;
+
+        // Launch the captured graph.
+        let res = unsafe { hipGraphLaunch(graph.exec, stream) };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipGraphLaunch failed on bucket {:?}: {}",
+                bucket, res
+            )));
+        }
+
+        // Bump position by batch size for next replay.
+        let new_pos = buffers.current_pos.wrapping_add(bucket.batch_size() as u32);
+        buffers.current_pos = new_pos;
+
+        Ok(&buffers.head_output)
     }
 }
 

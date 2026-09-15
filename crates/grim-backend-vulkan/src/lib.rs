@@ -2799,7 +2799,8 @@ mod tests {
         let devices = VulkanDevice::probe().unwrap();
         let dev = &devices[0];
 
-        // 1. Non-identity matrix multiplication: [1 2; 3 4] @ [5 6; 7 8] = [19 22; 43 50]
+        // 1. Non-identity matrix multiplication: under SPEED-ROC-16, C = A @ B^T.
+        // [1 2; 3 4] @ [5 6; 7 8]^T = [1*5+2*6, 1*7+2*8; 3*5+4*6, 3*7+4*8] = [17 23; 39 53]
         let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
         let b_data = vec![5.0f32, 6.0, 7.0, 8.0];
         let shape = Shape::new(vec![2, 2]);
@@ -2809,7 +2810,7 @@ mod tests {
 
         let (out_s, _handle) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &shape).unwrap();
         let res = out_s.to_cpu_vec_f32().unwrap();
-        assert_eq!(res, vec![19.0, 22.0, 43.0, 50.0]);
+        assert_eq!(res, vec![17.0, 23.0, 39.0, 53.0]);
 
         // 2. Shape mismatch error enforcement
         let bad_shape = Shape::new(vec![3, 2]);
@@ -3081,11 +3082,11 @@ mod tests {
         let (out, _h) = dev.matmul(a.as_ref(), b.as_ref(), &shape).unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
 
-        // Reference: [1 2; 3 4] @ [5 6; 7 8] = [19 22; 43 50], FP32 accumulation.
-        close_vulkan(res[0], 19.0, "bf16_matmul[0,0]");
-        close_vulkan(res[1], 22.0, "bf16_matmul[0,1]");
-        close_vulkan(res[2], 43.0, "bf16_matmul[1,0]");
-        close_vulkan(res[3], 50.0, "bf16_matmul[1,1]");
+        // Reference under SPEED-ROC-16: [1 2; 3 4] @ [5 6; 7 8]^T = [17 23; 39 53], FP32 accumulation.
+        close_vulkan(res[0], 17.0, "bf16_matmul[0,0]");
+        close_vulkan(res[1], 23.0, "bf16_matmul[0,1]");
+        close_vulkan(res[2], 39.0, "bf16_matmul[1,0]");
+        close_vulkan(res[3], 53.0, "bf16_matmul[1,1]");
     }
 
     // QKV attention golden test — hand-crafted Q/K/V, exact FP32 reference.

@@ -2558,11 +2558,19 @@ async fn metrics_endpoint(
         last_ttft,
         last_itl,
         spec_tele,
+        decode_tps,
+        prefill_tps,
+        total_tokens_gen,
+        total_tokens_pref,
+        kv_used_b,
+        kv_total_b,
+        kv_blocks_u,
+        kv_blocks_t,
     ) = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let active = engine.adapter_count();
         let sched = engine.scheduler_snapshot();
-        let (_, _, blocks_used, blocks_total) = engine.kv_cache_telemetry();
+        let (used_bytes, total_bytes, blocks_used, blocks_total) = engine.kv_cache_telemetry();
         let pool_usage = if blocks_total > 0 {
             blocks_used as f64 / blocks_total as f64
         } else {
@@ -2571,6 +2579,10 @@ async fn metrics_endpoint(
         let ttft = engine.last_ttft_ms();
         let itl = engine.last_itl_ms();
         let spec = engine.speculative_telemetry(None);
+        let dec_tps = engine.tokens_per_sec();
+        let pref_tps = engine.prefill_tokens_per_sec();
+        let tot_gen = engine.total_tokens_generated();
+        let tot_pref = engine.total_tokens_prefilled();
         (
             active,
             pool_usage,
@@ -2579,6 +2591,14 @@ async fn metrics_endpoint(
             ttft,
             itl,
             spec,
+            dec_tps,
+            pref_tps,
+            tot_gen,
+            tot_pref,
+            used_bytes,
+            total_bytes,
+            blocks_used,
+            blocks_total,
         )
     };
 
@@ -2668,24 +2688,68 @@ async fn metrics_endpoint(
          grim_vram_used_bytes {vram_used}\n\
          # HELP grim_vram_total_bytes Total available VRAM memory\n\
          # TYPE grim_vram_total_bytes gauge\n\
-         grim_vram_total_bytes {vram_total}\n",
+         grim_vram_total_bytes {vram_total}\n\
+         # HELP grim_tokens_generated_total Cumulative decode and response tokens produced\n\
+         # TYPE grim_tokens_generated_total counter\n\
+         grim_tokens_generated_total {total_tokens_gen}\n\
+         # HELP grim_tokens_prefilled_total Cumulative prompt tokens prefilled\n\
+         # TYPE grim_tokens_prefilled_total counter\n\
+         grim_tokens_prefilled_total {total_tokens_pref}\n\
+         # HELP grim_kv_cache_used_bytes Current KV cache memory allocated in bytes\n\
+         # TYPE grim_kv_cache_used_bytes gauge\n\
+         grim_kv_cache_used_bytes {kv_used_b}\n\
+         # HELP grim_kv_cache_total_bytes Total KV cache capacity in bytes\n\
+         # TYPE grim_kv_cache_total_bytes gauge\n\
+         grim_kv_cache_total_bytes {kv_total_b}\n\
+         # HELP grim_kv_cache_blocks_used Count of KV cache blocks currently allocated\n\
+         # TYPE grim_kv_cache_blocks_used gauge\n\
+         grim_kv_cache_blocks_used {kv_blocks_u}\n\
+         # HELP grim_kv_cache_blocks_total Total count of KV cache blocks in block pool\n\
+         # TYPE grim_kv_cache_blocks_total gauge\n\
+         grim_kv_cache_blocks_total {kv_blocks_t}\n",
         scheduler_snapshot.active_requests,
         scheduler_snapshot.waiting_requests,
         scheduler_snapshot.admitted_requests,
     );
 
+    if let Some(dec_tps) = decode_tps {
+        prometheus_text.push_str(&format!(
+            "# HELP grim_decode_tokens_per_second Exponential moving average of decode tokens generated per second\n\
+             # TYPE grim_decode_tokens_per_second gauge\n\
+             grim_decode_tokens_per_second {dec_tps:.2}\n\
+             # HELP grim_response_tokens_per_second Exponential moving average of response tokens emitted per second\n\
+             # TYPE grim_response_tokens_per_second gauge\n\
+             grim_response_tokens_per_second {dec_tps:.2}\n"
+        ));
+    }
+    if let Some(pref_tps) = prefill_tps {
+        prometheus_text.push_str(&format!(
+            "# HELP grim_prefill_tokens_per_second Exponential moving average of prompt tokens prefilled per second\n\
+             # TYPE grim_prefill_tokens_per_second gauge\n\
+             grim_prefill_tokens_per_second {pref_tps:.2}\n"
+        ));
+    }
+
     if let Some(ttft) = last_ttft {
+        let ttft_sec = ttft / 1000.0;
         prometheus_text.push_str(&format!(
             "# HELP grim_time_to_first_token_ms Latency to produce first token in milliseconds\n\
              # TYPE grim_time_to_first_token_ms gauge\n\
-             grim_time_to_first_token_ms {ttft:.2}\n"
+             grim_time_to_first_token_ms {ttft:.2}\n\
+             # HELP grim_time_to_first_token_seconds Latency to produce first token in seconds\n\
+             # TYPE grim_time_to_first_token_seconds gauge\n\
+             grim_time_to_first_token_seconds {ttft_sec:.4}\n"
         ));
     }
     if let Some(itl) = last_itl {
+        let itl_sec = itl / 1000.0;
         prometheus_text.push_str(&format!(
             "# HELP grim_inter_token_latency_ms Inter-token decode latency in milliseconds\n\
              # TYPE grim_inter_token_latency_ms gauge\n\
-             grim_inter_token_latency_ms {itl:.2}\n"
+             grim_inter_token_latency_ms {itl:.2}\n\
+             # HELP grim_inter_token_latency_seconds Inter-token decode latency in seconds\n\
+             # TYPE grim_inter_token_latency_seconds gauge\n\
+             grim_inter_token_latency_seconds {itl_sec:.6}\n"
         ));
     }
     if let Some(ref st) = spec_tele {
@@ -3664,6 +3728,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let scheduler = engine.scheduler_snapshot();
     let ttft_ms = engine.last_ttft_ms();
 
+    let prefill_tps = engine.prefill_tokens_per_sec().map(|v| v as f64);
+
     let default_model = get_default_model_from_config().unwrap_or_else(|| "default".to_string());
 
     // Build models with all telemetry integrated
@@ -3681,7 +3747,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             "kv_total_gb": kv_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             "ctx_limit": ctx_limit,
             "ttft_ms": ttft_ms,
-            "prefill_tps": serde_json::Value::Null,
+            "prefill_tps": prefill_tps,
             "decode_tps": tps
         }));
     }
@@ -4088,21 +4154,26 @@ async fn grim_generate(
         .and_then(|v| v.as_str())
         .unwrap_or("grim")
         .to_string();
-    let prompt = req.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    let prompt = req
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let mut payload = serde_json::json!({
         "model": model_name,
-        "messages": [{ "role": "user", "content": prompt }],
+        "messages": [{ "role": "user", "content": &prompt }],
         "stream": stream,
     });
     translate_options(&req, &mut payload);
 
+    let gen_start = std::time::Instant::now();
     let response = chat_completions(State(state), Json(payload)).await;
     if !response.status().is_success() {
         return response;
     }
-
+    let prompt_tokens = prompt.len().div_ceil(4) as u64;
     if stream {
         let (_parts, body) = response.into_parts();
         let body_stream = body.into_data_stream();
@@ -4178,15 +4249,16 @@ async fn grim_generate(
                                         (body_stream, buffer, false),
                                     ));
                                 }
+                                let elapsed = gen_start.elapsed().as_nanos() as u64;
                                 let final_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),
                                     "done": true,
-                                    "total_duration": 0,
+                                    "total_duration": elapsed,
                                     "load_duration": 0,
-                                    "prompt_eval_count": 0,
+                                    "prompt_eval_count": prompt_tokens,
                                     "eval_count": 0,
-                                    "eval_duration": 0
+                                    "eval_duration": elapsed
                                 });
                                 let chunk_str =
                                     format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
@@ -4215,16 +4287,19 @@ async fn grim_generate(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            let prompt_tokens = val["usage"]["prompt_tokens"].as_u64().unwrap_or(prompt.len().div_ceil(4) as u64);
+            let completion_tokens = val["usage"]["completion_tokens"].as_u64().unwrap_or(content.len().div_ceil(4) as u64);
+            let elapsed_nanos = gen_start.elapsed().as_nanos() as u64;
             let ollama_res = serde_json::json!({
                 "model": model_name,
                 "created_at": utc_now_rfc3339(),
                 "response": content,
                 "done": true,
-                "total_duration": 0,
+                "total_duration": elapsed_nanos,
                 "load_duration": 0,
-                "prompt_eval_count": 0,
-                "eval_count": 0,
-                "eval_duration": 0
+                "prompt_eval_count": prompt_tokens,
+                "eval_count": completion_tokens,
+                "eval_duration": elapsed_nanos
             });
             let mut res = Response::from_parts(
                 parts,
@@ -5232,6 +5307,12 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
         Some(tps) => serde_json::json!(tps),
         None => serde_json::Value::Null,
     };
+    let prefill_tps_json = match engine.prefill_tokens_per_sec() {
+        Some(tps) => serde_json::json!(tps),
+        None => serde_json::Value::Null,
+    };
+    let total_tokens_gen = engine.total_tokens_generated();
+    let total_tokens_pref = engine.total_tokens_prefilled();
     let ttft_json = match engine.last_ttft_ms() {
         Some(ttft) => serde_json::json!(ttft),
         None => serde_json::Value::Null,
@@ -5278,6 +5359,10 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
     serde_json::json!({
         "model_name": model_name,
         "tokens_per_sec": tps_json,
+        "decode_tokens_per_sec": tps_json,
+        "prefill_tokens_per_sec": prefill_tps_json,
+        "total_tokens_generated": total_tokens_gen,
+        "total_tokens_prefilled": total_tokens_pref,
         "ttft_ms": ttft_json,
         "itl_ms": itl_json,
         // WI-E2 contract block: acceptance rate + throughput in the shape the
@@ -5820,19 +5905,29 @@ const DASHBOARD_HTML: &str = r###"<!DOCTYPE html>
   <!-- Hero KPI Grid -->
   <section class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-label">Generation Speed</div>
+      <div class="kpi-label">Decode / Response Speed</div>
       <div class="kpi-val emerald" id="kpi-tps">—</div>
-      <div class="kpi-sub">Tokens / Sec</div>
+      <div class="kpi-sub">Decode Tokens / Sec</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Prefill Throughput</div>
+      <div class="kpi-val cyan" id="kpi-prefill-tps">—</div>
+      <div class="kpi-sub">Prompt Tokens / Sec</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Time to First Token</div>
       <div class="kpi-val cyan" id="kpi-ttft">—</div>
-      <div class="kpi-sub">Latency (ms)</div>
+      <div class="kpi-sub" id="kpi-ttft-sub">Latency (ms)</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Inter-Token Latency</div>
       <div class="kpi-val indigo" id="kpi-itl">—</div>
-      <div class="kpi-sub">Pacing (ms)</div>
+      <div class="kpi-sub" id="kpi-itl-sub">Pacing (ms)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Total Tokens Processed</div>
+      <div class="kpi-val emerald" id="kpi-tokens-total">—</div>
+      <div class="kpi-sub" id="kpi-tokens-sub">Gen: 0 · Prefill: 0</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Speculative Accept</div>
@@ -5980,12 +6075,32 @@ async function pollServerStats() {
     // 2. Hero KPIs
     const tps = data.tokens_per_sec;
     document.getElementById('kpi-tps').textContent = (typeof tps === 'number') ? tps.toFixed(1) : 'Idle';
+
+    const prefTps = data.prefill_tokens_per_sec;
+    document.getElementById('kpi-prefill-tps').textContent = (typeof prefTps === 'number') ? prefTps.toFixed(1) : 'Idle';
     
     const ttft = data.ttft_ms;
-    document.getElementById('kpi-ttft').textContent = (typeof ttft === 'number') ? `${ttft.toFixed(1)} ms` : '—';
+    if (typeof ttft === 'number') {
+      document.getElementById('kpi-ttft').textContent = `${ttft.toFixed(1)} ms`;
+      document.getElementById('kpi-ttft-sub').textContent = `${(ttft / 1000.0).toFixed(3)} s`;
+    } else {
+      document.getElementById('kpi-ttft').textContent = '—';
+      document.getElementById('kpi-ttft-sub').textContent = 'Latency';
+    }
 
     const itl = data.itl_ms;
-    document.getElementById('kpi-itl').textContent = (typeof itl === 'number') ? `${itl.toFixed(1)} ms` : '—';
+    if (typeof itl === 'number') {
+      document.getElementById('kpi-itl').textContent = `${itl.toFixed(1)} ms`;
+      document.getElementById('kpi-itl-sub').textContent = `${(itl / 1000.0).toFixed(4)} s`;
+    } else {
+      document.getElementById('kpi-itl').textContent = '—';
+      document.getElementById('kpi-itl-sub').textContent = 'Pacing';
+    }
+
+    const genTokens = data.total_tokens_generated || 0;
+    const prefTokens = data.total_tokens_prefilled || 0;
+    document.getElementById('kpi-tokens-total').textContent = (genTokens + prefTokens).toLocaleString();
+    document.getElementById('kpi-tokens-sub').textContent = `Gen: ${genTokens.toLocaleString()} · Prefill: ${prefTokens.toLocaleString()}`;
 
     const spec = data.speculative;
     if (spec && typeof spec.accept_rate_ema === 'number') {
@@ -6808,6 +6923,16 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("text/plain"));
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(body_str.contains("grim_tokens_generated_total 0"));
+        assert!(body_str.contains("grim_tokens_prefilled_total 0"));
+        assert!(body_str.contains("grim_kv_cache_used_bytes 0"));
+        assert!(body_str.contains("grim_kv_cache_total_bytes"));
+        assert!(body_str.contains("grim_kv_cache_blocks_used 0"));
+        assert!(body_str.contains("grim_kv_cache_blocks_total"));
     }
 
     #[tokio::test]
@@ -6851,6 +6976,8 @@ mod tests {
         assert!(html.contains("fetch('/api/stats')"));
         assert!(html.contains("spec-strat"));
         assert!(html.contains("spec-accept"));
+        assert!(html.contains("kpi-prefill-tps"));
+        assert!(html.contains("kpi-tokens-total"));
     }
 
     #[tokio::test]
@@ -6868,6 +6995,9 @@ mod tests {
         assert!(val.get("itl_ms").is_some());
         assert!(val.get("ttft_ms").is_some());
         assert!(val.get("speculative").is_some());
+        assert!(val.get("prefill_tokens_per_sec").is_some());
+        assert!(val.get("total_tokens_generated").is_some());
+        assert!(val.get("total_tokens_prefilled").is_some());
     }
 
     #[tokio::test]

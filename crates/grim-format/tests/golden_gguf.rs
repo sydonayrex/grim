@@ -253,6 +253,7 @@ fn map_gguf_dtype_to_grim_bpw_matches_bitwidth() {
     let cases: &[(GgufDType, u32)] = &[
         (GgufDType::F32, 0), // F32 → None, encoded as 0 in this test harness
         (GgufDType::F16, 16),
+        (GgufDType::BF16, 16),
         (GgufDType::I8, 8),
         (GgufDType::Q2K, 2),
         (GgufDType::Q3K, 3),
@@ -270,3 +271,12 @@ fn map_gguf_dtype_to_grim_bpw_matches_bitwidth() {
         }
     }
 }
+
+#[test]
+fn map_gguf_dtype_to_storage_bf16_preserves_bf16() {
+    let mapped = map_gguf_dtype_to_storage(GgufDType::BF16);
+    assert_eq!(mapped, DType::BF16, "GGUF BF16 must preserve BF16 storage");
+    assert_eq!(mapped.arith, ArithType::BF16);
+    assert!(matches!(mapped.storage, Storage::Native));
+}
+

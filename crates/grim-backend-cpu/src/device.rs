@@ -2604,20 +2604,21 @@ mod tests {
     fn backend_matmul_correct() {
         use grim_tensor::Shape;
         let dev = CpuDevice::new();
-        // Non-identity, non-symmetric matrices to expose access bugs.
-        // A: 2x3, B: 3x2, C: 2x2
+        // Under SPEED-ROC-16: B has shape [N, K]; C = A @ B^T has shape [M, N].
+        // A: 2x3, B: 2x3, C: 2x2
         let a_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_data = vec![1.0f32, 3.0, 5.0, 2.0, 4.0, 6.0];
         let a_shape = Shape::new(vec![2, 3]);
-        let b_shape = Shape::new(vec![3, 2]);
+        let b_shape = Shape::new(vec![2, 3]);
         let out_shape = Shape::new(vec![2, 2]);
         let a_s = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
         let b_s = dev.from_cpu(&b_data, &b_shape, DType::F32).unwrap();
         let (out_s, handle) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &out_shape).unwrap();
         assert!(handle.is_ready());
         let result = out_s.to_cpu_vec_f32().unwrap();
-        // Hand-computed: C[i][j] = sum_k A[i][k] * B[k][j] Row 0: 1*1 + 2*3 + 3*5 = 22, 1*2 + 2*4
-        // + 3*6 = 28 Row 1: 4*1 + 5*3 + 6*5 = 49, 4*2 + 5*4 + 6*6 = 64
+        // C[i][j] = sum_k A[i][k] * B[j][k]
+        // Row 0: 1*1 + 2*3 + 3*5 = 22, 1*2 + 2*4 + 3*6 = 28
+        // Row 1: 4*1 + 5*3 + 6*5 = 49, 4*2 + 5*4 + 6*6 = 64
         assert_eq!(result, vec![22.0, 28.0, 49.0, 64.0]);
     }
 

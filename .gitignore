@@ -24,3 +24,6 @@ package.lock.json
 *.log
 .hermes/
 .claude/
+rocprof_out_new/
+rocprof_trace_opt/
+rocprof_hip_out/

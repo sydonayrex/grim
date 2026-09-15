@@ -1128,25 +1128,12 @@ impl LlamaBlock {
         }
         let out_storage = scratch.as_ref().unwrap().clone();
         drop(scratch);
-        let g_rocm = gate
-            .storage()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("gate is RocmStorage");
-        let u_rocm = up
-            .storage()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("up is RocmStorage");
-        let dst_rocm = out_storage
-            .as_ref()
-            .as_any()
-            .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("dst is RocmStorage");
-
-        dev.launch_silu_mul_quant_q8_1(g_rocm, u_rocm, dst_rocm, k)?;
+        dev.launch_silu_mul_quant_q8_1(
+            gate.storage().as_ref(),
+            up.storage().as_ref(),
+            out_storage.as_ref(),
+            k,
+        )?;
 
         Ok(Tensor::new(
             out_storage,
