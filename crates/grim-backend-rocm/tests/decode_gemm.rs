@@ -16,21 +16,15 @@
 //! GPU-gated, mirroring the established `graph_capture.rs` pattern: these
 //! tests bail `Ok` when `GRIM_RUN_GPU_TESTS` is unset or no device is present.
 //!
-//! Dual-GPU test results (multi-GPU RDNA4 system, ROCm 7.2.53211):
-//!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
-//!   — 1/7 PASS (gate_2_6_4_harness_compiles_and_bails_without_gpu).
-//!   — 6/7 FAIL: hipModuleLoad failed: 209 — JIT-compiled decode GEMM kernel
-//!   module cannot be loaded on this system. The test harness compiles and the
-//!   CPU oracle logic works. Not a test logic issue — the HIP runtime on this
-//!   box cannot load the JIT module.
+//! Layout note (SPEED-ROC-16): the matmul contract is b = [N, K] natural,
+//! computing C = A @ B^T. Fixtures below size `b` as [n, k] and the oracle
+//! matches that contract. The old [K, N] / A@B fixtures were retired with the
+//! contract change (they read transposed garbage, diff ~1e1, unrelated to
+//! kernel precision).
 //!
-//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test decode_gemm
-//! RESULT: 1/7 PASS (gate_2_6_4_harness_compiles_and_bails_without_gpu — CPU-only compile guard),
-//!   6/7 FAIL with hipModuleLoad failed: 209. Each failing test invokes the JIT decode GEMM
-//!   kernel for a specific (m,k,n) shape, but the compiled .hipfb kernel is not registered in
-//!   HIP's module table for that context on this dual-GPU RDNA4 box. The JIT source compiles
-//!   and the CPU oracle logic is correct; the kernel simply isn't tied to these test shapes
-//!   at runtime.
+//! History: on an older dual-GPU RDNA4 box these tests failed with
+//! hipModuleLoad 209 (JIT module not loadable in that context). That
+//! environment issue is gone; current failures were layout skew, fixed above.
 
 use std::time::Instant;
 
@@ -51,14 +45,15 @@ fn gpu_device() -> Option<RocmDevice> {
     .ok()
 }
 
-/// Small host reference GEMM in f32, the independent oracle. `a`/`b`/`out`
-/// are row-major f32 views; result is written into `out` (len `m*n`).
+/// Small host reference GEMM in f32, the independent oracle, under the
+/// SPEED-ROC-16 contract: `a` is [M, K], `b` is natural [N, K], result
+/// `out` [M, N] is `A @ B^T`. All views row-major f32.
 fn host_gemm_f32(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
     for mi in 0..m {
         for ni in 0..n {
             let mut acc = 0f32;
             for ki in 0..k {
-                acc += a[mi * k + ki] * b[ki * n + ni];
+                acc += a[mi * k + ki] * b[ni * k + ki];
             }
             out[mi * n + ni] = acc;
         }
@@ -88,8 +83,9 @@ fn run_decode_kernel(
     k: usize,
     n: usize,
 ) -> TestResult<Vec<f32>> {
+    // SPEED-ROC-16: weight `b` is natural [N, K].
     let a_shape = Shape::from_slice(&[m, k]);
-    let b_shape = Shape::from_slice(&[k, n]);
+    let b_shape = Shape::from_slice(&[n, k]);
     let out_shape = Shape::from_slice(&[m, n]);
     let a_dev = CoreTensorOps::from_cpu(dev, a_data, &a_shape, DType::F16)?;
     let b_dev = CoreTensorOps::from_cpu(dev, b_data, &b_shape, DType::F16)?;
@@ -110,8 +106,9 @@ fn try_rocblas(
     k: usize,
     n: usize,
 ) -> TestResult<Option<Vec<f32>>> {
+    // SPEED-ROC-16: weight `b` is natural [N, K].
     let a_shape = Shape::from_slice(&[m, k]);
-    let b_shape = Shape::from_slice(&[k, n]);
+    let b_shape = Shape::from_slice(&[n, k]);
     let out_shape = Shape::from_slice(&[m, n]);
     let a_dev = CoreTensorOps::from_cpu(dev, a_data, &a_shape, DType::F16)?;
     let b_dev = CoreTensorOps::from_cpu(dev, b_data, &b_shape, DType::F16)?;

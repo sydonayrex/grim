@@ -27,6 +27,7 @@ pub use std::sync::Arc;
 
 pub mod autotune;
 pub mod decode_capture;
+pub mod decode_graph_buffers;
 pub mod device;
 pub mod fsdp;
 pub mod fusion;
@@ -66,8 +67,9 @@ pub use crate::device::handles::{
     HipGraphMemcpyNodeParams, HipMemcpyKind, HiprtcProgram, RocmDeviceProps, RocmHandle,
     WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipEventCreate, hipEventDestroy,
     hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync, hipGetDeviceCount,
-    hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy, hipGraphExecDestroy,
-    hipGraphExtendFromGlobalStream, hipGraphInstantiate, hipGraphLaunch, hipGraphUpload,
+    hipGetDeviceProperties, hipGraphAddKernelNode, hipGraphCreate, hipGraphDestroy,
+    hipGraphExecDestroy, hipGraphExecKernelNodeSetParams, hipGraphExtendFromGlobalStream,
+    hipGraphInstantiate, hipGraphLaunch, hipGraphUpload,
     hipHostFree, hipHostMalloc, hipMalloc, hipMallocManaged, hipMemAdvise, hipMemGetInfo,
     hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
     hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSetDevice,
@@ -149,6 +151,11 @@ pub use crate::device::roc_device::CharonBackwardResult;
 pub use crate::graph_capture::{
     DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey, GraphCaptureManager,
 };
+pub use crate::decode_graph_buffers::{
+    DecodeGraphBuffers, check_layer_topology, decode_graph_enabled, launch_attention,
+    launch_qkv_gemv, write_embedding_to_buffer,
+};
+pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
 pub use crate::rccl::{RcclAllReduce, RocmMultiNodeGroup};
 pub use crate::device::parallel_comm::{
     CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology,

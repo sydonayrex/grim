@@ -199,6 +199,8 @@ pub struct Engine {
     tuned_kv_compression_bit_width: u8,
     tokens_per_sec_ema: f32,
     total_tokens_generated: u64,
+    prefill_tokens_per_sec_ema: f32,
+    total_tokens_prefilled: u64,
     /// WI-E2: cumulative accepted tokens (speculative verification hits).
     accepted_tokens_total: u64,
     last_ttft_ms: Option<f64>,
@@ -237,6 +239,12 @@ pub struct Engine {
     /// Used by graph capture to enable in-place updates between replays.
     /// Maps request_id → (input_ids_gpu, positions_gpu).
     decode_graph_input_buffers: HashMap<u64, GraphCaptureInputBuffers>,
+    /// Captured-graph output handles per capture key. The graph rewrites the
+    /// same device buffers on every replay, so the first-capture logits `Arc`
+    /// stays valid and replay returns a clone — no `decode_one`, no D2H.
+    graph_capture_logits: HashMap<String, Arc<grim_tensor::Tensor>>,
+    /// Fixed-buffer DecodeGraphs per request (twinkie-zombieland P2).
+    pub decode_graphs: HashMap<u64, grim_backend_rocm::FullDecodeGraph>,
 }
 
 /// Persistent GPU buffers for graph-captured decode steps.
@@ -587,6 +595,8 @@ impl Engine {
             tuned_kv_compression_bit_width: 4,
             tokens_per_sec_ema: 0.0,
             total_tokens_generated: 0,
+            prefill_tokens_per_sec_ema: 0.0,
+            total_tokens_prefilled: 0,
             accepted_tokens_total: 0,
             last_ttft_ms: None,
             last_itl_ms: None,
@@ -604,6 +614,8 @@ impl Engine {
                 .map(|v| v != "0" && v != "false" && v != "off")
                 .unwrap_or(true),
             decode_graph_input_buffers: HashMap::new(),
+            graph_capture_logits: HashMap::new(),
+            decode_graphs: HashMap::new(),
         }
     }
 
@@ -964,6 +976,16 @@ impl Engine {
         }
     }
 
+    /// Returns the exponential moving average of prefilled prompt tokens per second.
+    /// Returns None if no model is loaded or no prompt tokens have been prefilled yet.
+    pub fn prefill_tokens_per_sec(&self) -> Option<f32> {
+        if self.models.is_empty() || self.total_tokens_prefilled == 0 {
+            None
+        } else {
+            Some(self.prefill_tokens_per_sec_ema)
+        }
+    }
+
     /// Most recent measured prefill time in milliseconds.
     /// `None` means no completed prefill has been observed yet; callers must not invent a latency.
     pub fn last_ttft_ms(&self) -> Option<f64> {
@@ -1021,6 +1043,11 @@ impl Engine {
     /// Total count of tokens generated since engine startup.
     pub fn total_tokens_generated(&self) -> u64 {
         self.total_tokens_generated
+    }
+
+    /// Total count of prompt tokens prefilled since engine startup.
+    pub fn total_tokens_prefilled(&self) -> u64 {
+        self.total_tokens_prefilled
     }
 
     /// Total count of speculative draft tokens accepted since engine startup.
@@ -1500,12 +1527,14 @@ impl Engine {
         let prefill = output.prefill_ids.clone();
         let had_prefill = !prefill.is_empty();
         let mut prefill_elapsed = Duration::ZERO;
+        let mut prefill_tokens_in_tick = 0usize;
         for id in prefill {
             if self.scheduler.is_paused(id) {
                 continue;
             }
             let pf_start = Instant::now();
-            self.drive_prefill(id)?;
+            let n_prefilled = self.drive_prefill(id)?;
+            prefill_tokens_in_tick += n_prefilled;
             prefill_elapsed += pf_start.elapsed();
         }
         let mut decode_elapsed = Duration::ZERO;
@@ -1578,6 +1607,20 @@ impl Engine {
         self.tuned_speculative_block_len = tuned_params.speculative_block_len;
         self.tuned_kv_compression_bit_width = tuned_params.kv_compression_bit_width;
 
+        // Accumulate prefill tokens and update prefill tokens/sec EMA
+        if prefill_tokens_in_tick > 0 && prefill_elapsed.as_secs_f32() > 0.0 {
+            let inst_prefill_tps = (prefill_tokens_in_tick as f32) / prefill_elapsed.as_secs_f32();
+            if self.prefill_tokens_per_sec_ema == 0.0 {
+                self.prefill_tokens_per_sec_ema = inst_prefill_tps;
+            } else {
+                self.prefill_tokens_per_sec_ema =
+                    0.7 * self.prefill_tokens_per_sec_ema + 0.3 * inst_prefill_tps;
+            }
+            self.total_tokens_prefilled += prefill_tokens_in_tick as u64;
+        } else if prefill_tokens_in_tick > 0 {
+            self.total_tokens_prefilled += prefill_tokens_in_tick as u64;
+        }
+
         // WI-E2: accumulate accepted tokens for the acceptance-rate metric.
         self.accepted_tokens_total += total_accepted as u64;
         let _ = (schedule_elapsed, total_accepted);
@@ -1596,14 +1639,15 @@ impl Engine {
 
     /// WI-M2 drift watch (gguf_multigpu_context_plan.md): hold the process-wide prefill latch up for the duration of the pass.
     /// While it is set, ANY HIP context switch to a non-zero device on any thread.
-    fn drive_prefill(&mut self, id: u64) -> Result<()> {
+    /// Returns the number of newly prefilled prompt tokens processed in this pass.
+    fn drive_prefill(&mut self, id: u64) -> Result<usize> {
         grim_backend_rocm::set_prefill_in_flight(true);
         let outcome = self.drive_prefill_inner(id);
         grim_backend_rocm::set_prefill_in_flight(false);
         outcome
     }
 
-    fn drive_prefill_inner(&mut self, id: u64) -> Result<()> {
+    fn drive_prefill_inner(&mut self, id: u64) -> Result<usize> {
         // Chunked prefill (F9 follow-on): the scheduler may carry several running copies of `id` (one per
         // pass, each with the cumulative consumed count), so take the LATEST bound, not the first copy's.
         let mut prompt_tokens = None;
@@ -1614,17 +1658,17 @@ impl Engine {
         }
         let prompt_tokens = match prompt_tokens {
             Some(p) => p,
-            None => return Ok(()),
+            None => return Ok(0),
         };
         if prompt_tokens == 0 {
-            return Ok(());
+            return Ok(0);
         }
         // Only the tokens the scheduler has budgeted but the engine has not yet prefilled run through the model.
         // Everything else (radix matching, KV registration, disagg handoff) still sees the full prompt below.
         let already = self.prefill_progress.get(&id).copied().unwrap_or(0);
         let target = consumed_tokens.min(prompt_tokens);
         if target <= already {
-            return Ok(()); // this pass budgeted no new prompt tokens
+            return Ok(0); // this pass budgeted no new prompt tokens
         }
         // Build the full input_ids tensor: use real token IDs if provided,
         // otherwise fall back to synthetic position indices (0..prompt_tokens) for backward compatibility.
@@ -1755,8 +1799,9 @@ impl Engine {
                     }
                 }
             }
+            return Ok(chunk_len);
         }
-        Ok(())
+        Ok(0)
     }
 
     /// Drives a decode step for sequence `id`, recording the outcome step.
@@ -1849,7 +1894,9 @@ impl Engine {
         // ROCm device, use persistent GPU buffers for inputs so the graph can
         // be replayed with in-place updates (matching the verified semantics
         // from tests/test_hip_graph_capture.rs).
-        let graph_capture = std::env::var("GRIM_CAPTURE_GRAPH").as_deref() == Ok("1")
+        let graph_capture = std::env::var("GRIM_CAPTURE_GRAPH")
+            .map(|v| v != "0" && v != "false" && v != "off")
+            .unwrap_or(true)
             && model_id.map_or(false, |mid| {
                 self.models
                     .get(mid)
@@ -1870,13 +1917,13 @@ impl Engine {
                     _ => return Err(Error::Backend("graph buffers must be on ROCm".into())),
                 };
                 // Update the persistent GPU buffers in-place with the new token/position.
-                // write_f32_into does a synchronous H2D copy into the existing buffer.
-                let rocm = grim_backend_rocm::device::roc_device::RocmDevice::new(ordinal);
-                rocm.write_f32_into(
+                // Async H2D on the active stream, ordered vs later launches — no host sync.
+                let rocm = grim_backend_rocm::device::roc_device::RocmDevice::shared(ordinal);
+                rocm.write_f32_into_async(
                     &**buffers.input_ids.storage(),
                     &[next_token as f32],
                 )?;
-                rocm.write_f32_into(
+                rocm.write_f32_into_async(
                     &**buffers.positions.storage(),
                     &[start_pos as f32],
                 )?;
@@ -1905,6 +1952,58 @@ impl Engine {
         }
     }
 
+    /// P4: per-item graph fast-lane for `step_batch`. Adapter-free single-token
+    /// decode items D2D-copy their inputs into the request's persistent GPU
+    /// buffers, then replay the captured graph. Returns `None` for anything
+    /// unsuitable (non-ROCm, disabled, multi-token prefill chunk, copy miss)
+    /// so the caller falls back to the eager batched path. Zero host traffic:
+    /// the 1-elem copies stay device-resident.
+    fn try_graph_decode_item(
+        &mut self,
+        req_id: u64,
+        model_id: &str,
+        input_ids: &grim_tensor::Tensor,
+        positions: &grim_tensor::Tensor,
+    ) -> Option<StepOutcome> {
+        if input_ids.shape().elem_count() != 1 || positions.shape().elem_count() != 1 {
+            return None;
+        }
+        let effective = self.effective_model_id(req_id, model_id);
+        let ordinal = match self.models.get(&effective).map(|m| &m.device) {
+            Some(grim_tensor::dtype::Device::Rocm(ord)) => *ord,
+            _ => return None,
+        };
+        let rocm = grim_backend_rocm::device::roc_device::RocmDevice::shared(ordinal);
+        if !rocm.graph_capture_enabled() {
+            return None;
+        }
+        let (input_clone, pos_clone) = {
+            let buffers = self
+                .get_or_create_graph_input_buffers(req_id, &effective)
+                .ok()?;
+            grim_tensor::MemoryOps::copy_slice_into(
+                &rocm,
+                &**buffers.input_ids.storage(),
+                input_ids.storage().as_ref(),
+                0,
+                1,
+            )
+            .ok()?;
+            grim_tensor::MemoryOps::copy_slice_into(
+                &rocm,
+                &**buffers.positions.storage(),
+                positions.storage().as_ref(),
+                0,
+                1,
+            )
+            .ok()?;
+            (buffers.input_ids.clone(), buffers.positions.clone())
+        };
+        let capture_key = format!("decode_req_{req_id}");
+        self.drive_forward_graph_capture(model_id, req_id, &input_clone, &pos_clone, &capture_key)
+            .ok()
+    }
+
     /// Get or create persistent GPU buffers for graph-captured decode inputs.
     fn get_or_create_graph_input_buffers(
         &mut self,
@@ -1920,7 +2019,7 @@ impl Engine {
                 grim_tensor::dtype::Device::Rocm(ord) => ord,
                 _ => return Err(Error::Config("graph capture requires ROCm device".into())),
             };
-            let rocm = grim_backend_rocm::device::roc_device::RocmDevice::new(ordinal);
+            let rocm = grim_backend_rocm::device::roc_device::RocmDevice::shared(ordinal);
             // Create persistent GPU buffers for token ID and position (1 x F32 each).
             // These are allocated once per request and updated in-place between replays,
             // matching the verified semantics from tests/test_hip_graph_capture.rs.
@@ -2062,68 +2161,148 @@ impl Engine {
             }
         };
 
-        let rocm = grim_backend_rocm::device::roc_device::RocmDevice::new(ordinal);
+        let rocm = grim_backend_rocm::device::roc_device::RocmDevice::shared(ordinal);
         if !rocm.graph_capture_enabled() {
             return self.drive_forward(model_id, request_id, input_ids, positions);
         }
 
-        let session = self
-            .sessions
-            .get_mut(&request_id)
-            .ok_or_else(|| Error::Config("no session for request".into()))?
-            .as_mut();
-        let live = self.scheduler.running.len() as f32 / self.config.max_num_seqs.max(1) as f32;
+        // P2: fixed-buffer DecodeGraph for Lfm2 on ROCm
+        if let Some(lfm2) = loaded
+            .model
+            .target()
+            .as_any()
+            .downcast_ref::<grim_models_transformer::Lfm2>()
+        {
+            let tid: u32 = self
+                .request_last_token
+                .get(&request_id)
+                .copied()
+                .or_else(|| {
+                    input_ids
+                        .to_vec_f32()
+                        .ok()
+                        .and_then(|v| v.first().copied())
+                        .map(|f| f as u32)
+                })
+                .unwrap_or(0);
 
-        if rocm.has_captured_graph(capture_key) {
-            // Replay path: the graph is already captured. The input buffers
-            // (token ID, position) are updated in-place by the model's decode_one
-            // BEFORE this branch — but since we skip decode_one on replay, the
-            // caller must have updated them. For now, we run decode_one to update
-            // the inputs, then replay the graph.
-            //
-            // NOTE: This is a simplified integration. A production version would
-            // maintain persistent GPU buffers for inputs and update them in-place
-            // (via write_f32_into) before replay, avoiding the eager decode_one call.
-            // The capture infrastructure (DecodeGraphCapture, capture_decode_step,
-            // replay_decode_step) supports this; the engine integration is a
-            // proof-of-concept that captures and replays the full decode graph.
-            let logits = loaded.model.decode_one(
-                session,
-                input_ids,
-                positions,
-                live,
-                self.scheduler.running.len(),
-                &adapters,
-            )?;
-            let accepted_tokens = session.last_accepted_tokens();
-            Ok(StepOutcome {
-                logits: Some(Arc::new(logits)),
-                accepted_tokens,
+            if !self.decode_graphs.contains_key(&request_id) {
+                let max_ctx = 4096;
+                match lfm2.get_or_create_decode_graph(max_ctx, 1) {
+                    Ok(mut g) => {
+                        if g.begin_capture().is_err() {
+                            return self.drive_forward(model_id, request_id, input_ids, positions);
+                        }
+                        let ok = lfm2.forward_capture(&mut g, tid).is_ok() && g.end_capture().is_ok();
+                        if !ok {
+                            let _ = g.abort_capture();
+                            return self.drive_forward(model_id, request_id, input_ids, positions);
+                        }
+                        g.buffers.current_pos = 1;
+                        self.decode_graphs.insert(request_id, g);
+                        if let Some(g) = self.decode_graphs.get(&request_id) {
+                            let _ = g.replay();
+                        }
+                    }
+                    Err(_) => {
+                        return self.drive_forward(model_id, request_id, input_ids, positions);
+                    }
+                }
+            } else {
+                let g = self.decode_graphs.get_mut(&request_id).unwrap();
+                if lfm2.forward_replay(g, tid).is_err() {
+                    self.decode_graphs.remove(&request_id);
+                    return self.drive_forward(model_id, request_id, input_ids, positions);
+                }
+                g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
+            }
+
+            let g = self.decode_graphs.get(&request_id).unwrap();
+            let logits_arc = match self.graph_capture_logits.get(capture_key) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let t = g.logits_tensor()?;
+                    let arc = Arc::new(t);
+                    self.graph_capture_logits
+                        .insert(capture_key.to_string(), arc.clone());
+                    arc
+                }
+            };
+            let accepted = self
+                .sessions
+                .get_mut(&request_id)
+                .map(|s| s.as_mut().last_accepted_tokens())
+                .unwrap_or(1);
+            return Ok(StepOutcome {
+                logits: Some(logits_arc),
+                accepted_tokens: accepted,
                 speculative: false,
-            })
-        } else {
-            // Capture path: run decode_one with the capture stream active.
-            // All ops dispatch on the capture stream automatically.
-            rocm.begin_graph_capture(capture_key)?;
-            let result = loaded.model.decode_one(
-                session,
-                input_ids,
-                positions,
-                live,
-                self.scheduler.running.len(),
-                &adapters,
-            );
-            rocm.end_graph_capture(capture_key)?;
-            // Replay immediately to execute the captured graph.
-            rocm.replay_graph(capture_key)?;
-            let logits = result?;
-            let accepted_tokens = session.last_accepted_tokens();
-            Ok(StepOutcome {
-                logits: Some(Arc::new(logits)),
-                accepted_tokens,
-                speculative: false,
-            })
+            });
         }
+
+        // Replay path: inputs already updated async above. No decode_one,
+        // no D2H — one hipGraphLaunch rewrites the capture-time output
+        // buffers, so the cached logits Arc stays valid with fresh data.
+        if rocm.has_captured_graph(capture_key) {
+            let replayed = rocm.replay_graph(capture_key)?;
+            if replayed {
+                if let Some(cached) = self.graph_capture_logits.get(capture_key).cloned() {
+                    let accepted = self
+                        .sessions
+                        .get_mut(&request_id)
+                        .map(|s| s.as_mut().last_accepted_tokens())
+                        .unwrap_or(1);
+                    return Ok(StepOutcome {
+                        logits: Some(cached),
+                        accepted_tokens: accepted,
+                        speculative: false,
+                    });
+                }
+                // Graph present but logits evicted — fall through to re-capture.
+                self.graph_capture_logits.remove(capture_key);
+                let _ = rocm.drop_captured_graph(capture_key);
+            } else {
+                self.graph_capture_logits.remove(capture_key);
+            }
+        }
+
+        // Capture path: run decode_one with the capture stream active.
+        // All ops dispatch on the capture stream automatically.
+        rocm.begin_graph_capture(capture_key)?;
+        // Scope borrows: session + model disjoint from logits cache insert below.
+        let (result, accepted, running) = {
+            let session = self
+                .sessions
+                .get_mut(&request_id)
+                .ok_or_else(|| Error::Config("no session for request".into()))?
+                .as_mut();
+            let live =
+                self.scheduler.running.len() as f32 / self.config.max_num_seqs.max(1) as f32;
+            let running = self.scheduler.running.len();
+            let loaded = self
+                .models
+                .get(model_id)
+                .ok_or_else(|| Error::Config(format!("unknown model {model_id}")))?;
+            let out = loaded.model.decode_one(
+                session, input_ids, positions, live, running, &adapters,
+            );
+            let acc = session.last_accepted_tokens();
+            (out, acc, running)
+        };
+        rocm.end_graph_capture(capture_key)?;
+        // Replay immediately to execute the captured graph.
+        rocm.replay_graph(capture_key)?;
+        let logits = result?;
+        // Cache output handle: replay rewrites the same device buffers, so
+        // future replays return this Arc with fresh contents — zero transfers.
+        self.graph_capture_logits
+            .insert(capture_key.to_string(), Arc::new(logits.clone()));
+        let _ = running;
+        Ok(StepOutcome {
+            logits: Some(Arc::new(logits)),
+            accepted_tokens: accepted,
+            speculative: false,
+        })
     }
 
     /// Public stepping API: drive one forward pass for `request_id` against a caller-supplied target model id, with caller-supplied adapters and an explicit input tensor.
@@ -2176,6 +2355,27 @@ impl Engine {
                 // Legacy path: adapters applied inside decode_one.
                 let outcome = self.drive_forward(model_id, req_id, input_ids, positions)?;
                 slots.push(Slot::Done(req_id, outcome));
+                continue;
+            }
+
+            // P4 graph fast-lane: adapter-free decode items replay the
+            // per-request captured graph (1 launch) instead of a full eager
+            // forward. Anything unsuitable returns None -> eager below.
+            if adapter_ids.is_empty()
+                && let Some(outcome) =
+                    self.try_graph_decode_item(req_id, model_id, input_ids, positions)
+            {
+                let Some(base) = outcome.logits else {
+                    slots.push(Slot::Done(req_id, outcome));
+                    continue;
+                };
+                slots.push(Slot::Staged {
+                    request_id: req_id,
+                    model_id: effective,
+                    base,
+                    adapter: 0,
+                    accepted_tokens: outcome.accepted_tokens,
+                });
                 continue;
             }
 
@@ -2616,6 +2816,8 @@ impl Engine {
         self.request_input_ids.remove(&id);
         self.prefill_progress.remove(&id);
         self.request_last_token.remove(&id);
+        self.decode_graphs.remove(&id);
+        self.decode_graph_input_buffers.remove(&id);
         // Release the farm slot so the controller's load view stays honest.
         // The rank stays counted for a short cooldown (see `scythe_admission_decision`) so the NEXT admission still.
         if let Some(rank) = self.scythe_pin.remove(&id) {
@@ -2710,6 +2912,9 @@ mod tests {
         let config = EngineConfig::default();
         let engine = Engine::new(config);
         assert_eq!(engine.tokens_per_sec(), None);
+        assert_eq!(engine.prefill_tokens_per_sec(), None);
+        assert_eq!(engine.total_tokens_generated(), 0);
+        assert_eq!(engine.total_tokens_prefilled(), 0);
         assert_eq!(engine.last_ttft_ms(), None);
         assert_eq!(engine.last_itl_ms(), None);
         assert!(engine.speculative_telemetry(None).is_none());

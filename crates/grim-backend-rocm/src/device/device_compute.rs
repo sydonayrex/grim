@@ -136,6 +136,44 @@ impl CoreTensorOps for RocmDevice {
         b: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // SPEED-FP32-GEMV: For FP32 weights with M=1 (decode) and large N,
+        // use the custom FP32 GEMV kernel instead of rocBLAS. rocBLAS is
+        // pathologically slow at M=1 GEMV due to workspace allocation and
+        // teardown per call. The custom kernel is ~3x faster.
+        let dims = out_shape.dims();
+        let m = dims[..dims.len().saturating_sub(1)].iter().product::<usize>().max(1);
+        let n = dims.last().copied().unwrap_or(0);
+        let k = a.shape().dims().last().copied().unwrap_or(0);
+        if m == 1 && n >= 2048 {
+            if let (Some(a_s), Some(b_s)) = (
+                a.as_any().downcast_ref::<RocmStorage>(),
+                b.as_any().downcast_ref::<RocmStorage>(),
+            ) {
+                let a_is_f32 = a_s.dtype().arith == ArithType::F32
+                    && matches!(a_s.dtype().storage, crate::DTypeStorage::Native);
+                let b_is_f32 = b_s.dtype().arith == ArithType::F32
+                    && matches!(b_s.dtype().storage, crate::DTypeStorage::Native);
+                if a_is_f32 && b_is_f32
+                    && a_s.device_ptr_is_valid()
+                    && b_s.device_ptr_is_valid()
+                {
+                    let out_storage = RocmStorage::alloc_gpu(
+                        out_shape,
+                        grim_tensor::DType {
+                            arith: ArithType::F32,
+                            storage: crate::DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
+                    let stream = self.launch_fp32_gemv(a_s, b_s, &out_storage, m, n, k)?;
+                    return Ok((
+                        Box::new(out_storage),
+                        Box::new(RocmHandle::new(Some(stream))),
+                    ));
+                }
+            }
+        }
         self.matmul_op(a, b, out_shape, crate::autotune::GemmOp::Other)
     }
 
@@ -863,6 +901,12 @@ impl SamplingOps for RocmDevice {
         seed: u64,
     ) -> Result<u32> {
         let vocab = logits.shape().dims().last().copied().unwrap_or(0);
+        // Greedy (temperature == 0): use the fast GPU-resident argmax kernel
+        // which avoids the full-vocab D2H copy that the stochastic sampler
+        // performs. This is the dominant decode path for temp=0.
+        if temperature <= 0.0 {
+            return self.argmax(logits);
+        }
         if let Ok(rocm_s) = as_rocm(logits) {
             if let Ok(Some(token)) = crate::kernels::device_sampler::sample_logits_on_device(
                 self,
@@ -875,10 +919,6 @@ impl SamplingOps for RocmDevice {
             ) {
                 return Ok(token);
             }
-        }
-        if temperature <= 0.0 {
-            // H2: Use GPU-resident argmax when greedy, avoiding full D2H vector copy
-            return self.argmax(logits);
         }
         let cpu_logits = logits.to_cpu_vec_f32()?;
         if cpu_logits.is_empty() {
@@ -2197,10 +2237,11 @@ impl RocmDevice {
         // immediately-following dot4 GEMV launch reads `dst` on the same
         // stream, but on gfx1036 the consumer observed stale bytes unless a
         // host-side barrier separates the producer and consumer launches
-        // (deterministic 75.9 divergence without it). The call is m==1
-        // decode-only, so the ~us sync cost is negligible. gfx1201 is
-        // unaffected but pays the same tiny cost for one shared code path.
-        self.synchronize();
+        // (deterministic 75.9 divergence without it). On gfx1201 / discrete GPUs,
+        // stream ordering guarantees visibility, so skip the host-side sync stall.
+        if !self.is_rdna34 {
+            self.synchronize();
+        }
         Ok(handle)
     }
 
@@ -2460,6 +2501,62 @@ impl RocmDevice {
         )
     }
 
+    /// SPEED-FP32-GEMV: custom FP32 matrix-vector multiply for the output
+    /// projection (lm_head). Replaces rocBLAS which is pathologically slow at M=1.
+    pub(crate) fn launch_fp32_gemv(
+        &self,
+        act: &dyn BackendStorage,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("fp32_gemv: act has no device ptr".into()))?;
+        let w_ptr = weight
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_gemv: weight has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fp32_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut wptr = w_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_fp32_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// twinkie-zombieland P1: launch dedicated F32 M=1 GEMV into pool slot.
+    pub fn launch_f32_gemv_into(
+        &self,
+        act: &dyn BackendStorage,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fp32_gemv(act, weight, out, 1, n, k)
+    }
+
     /// Phase 4.5b: Launch grim_quantize_u4_group128 activation quantizer (RDNA4 gfx1200/gfx1201).
     pub fn launch_quantize_u4_group128(
         &self,
@@ -2608,6 +2705,36 @@ impl RocmDevice {
         n_kv: usize,
         hidden: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let n_total = n_q
+            .checked_add(n_kv.checked_mul(2).ok_or_else(|| {
+                Error::Backend("launch_fused_qkv_dot4: n_kv overflow".into())
+            })?)
+            .ok_or_else(|| Error::Backend("launch_fused_qkv_dot4: n_q+n_kv overflow".into()))?;
+        let out_shape = Shape::new(vec![n_total]);
+        let out_storage = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_fused_qkv_dot4_into(act_q81, wqkv_q80, &out_storage, n_q, n_kv, hidden)?;
+        Ok(Box::new(out_storage))
+    }
+
+    /// Fused Q8_0 QKV GEMV writing into CALLER-PROVIDED `out` ([n_total]
+    /// F32) — no allocation inside. Graph-capture safe.
+    pub fn launch_fused_qkv_dot4_into(
+        &self,
+        act_q81: &RocmStorage,
+        wqkv_q80: &RocmStorage,
+        out: &RocmStorage,
+        n_q: usize,
+        n_kv: usize,
+        hidden: usize,
+    ) -> Result<*mut c_void> {
         if hidden == 0 || hidden % 32 != 0 {
             return Err(Error::Backend(format!(
                 "launch_fused_qkv_dot4: hidden must be a non-zero multiple of 32, got {hidden}"
@@ -2627,18 +2754,13 @@ impl RocmDevice {
                 hidden
             )));
         }
-        let out_shape = Shape::new(vec![n_total]);
-        let out_storage = RocmStorage::alloc_gpu(
-            &out_shape,
-            DType {
-                arith: ArithType::F32,
-                storage: DTypeStorage::Native,
-            },
-            &self.allocator,
-            self.ordinal,
-        )?;
-        self.launch_dot4_q80_q81_gemv(act_q81, wqkv_q80, &out_storage, 1, n_total, hidden)?;
-        Ok(Box::new(out_storage))
+        if out.shape().elem_count() != n_total {
+            return Err(Error::Backend(format!(
+                "launch_fused_qkv_dot4_into: out holds {} elems, need {n_total}",
+                out.shape().elem_count()
+            )));
+        }
+        self.launch_dot4_q80_q81_gemv(act_q81, wqkv_q80, out, 1, n_total, hidden)
     }
 
     /// SPEED-DOT: Q8_0 GEMV via `V_DOT2_F32_f16` at M=1 (RDNA3/4).
@@ -2810,6 +2932,34 @@ impl RocmDevice {
         n_up: usize,
         hidden: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let n_total = n_gate.checked_add(n_up).ok_or_else(|| {
+            Error::Backend("launch_fused_gate_up_dot4: n_gate+n_up overflow".into())
+        })?;
+        let out_shape = Shape::new(vec![n_total]);
+        let out_storage = RocmStorage::alloc_gpu(
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_fused_gate_up_dot4_into(act_q81, fused_w, &out_storage, n_gate, n_up, hidden)?;
+        Ok(Box::new(out_storage))
+    }
+
+    /// Fused Q8_0 gate+up GEMV writing into CALLER-PROVIDED `out`
+    /// ([n_gate+n_up] F32) — no allocation inside. Graph-capture safe.
+    pub fn launch_fused_gate_up_dot4_into(
+        &self,
+        act_q81: &RocmStorage,
+        fused_w: &RocmStorage,
+        out: &RocmStorage,
+        n_gate: usize,
+        n_up: usize,
+        hidden: usize,
+    ) -> Result<*mut c_void> {
         if hidden == 0 || hidden % 32 != 0 {
             return Err(Error::Backend(format!(
                 "launch_fused_gate_up_dot4: hidden must be a non-zero multiple of 32, got {hidden}"
@@ -2827,37 +2977,26 @@ impl RocmDevice {
                 hidden
             )));
         }
-        let out_shape = Shape::new(vec![n_total]);
-        let out_storage = RocmStorage::alloc_gpu(
-            &out_shape,
-            DType {
-                arith: ArithType::F32,
-                storage: DTypeStorage::Native,
-            },
-            &self.allocator,
-            self.ordinal,
-        )?;
-        self.launch_dot4_q80_q81_gemv(act_q81, fused_w, &out_storage, 1, n_total, hidden)?;
-        Ok(Box::new(out_storage))
+        if out.shape().elem_count() != n_total {
+            return Err(Error::Backend(format!(
+                "launch_fused_gate_up_dot4_into: out holds {} elems, need {n_total}",
+                out.shape().elem_count()
+            )));
+        }
+        self.launch_dot4_q80_q81_gemv(act_q81, fused_w, out, 1, n_total, hidden)
     }
 
     /// SPEED-DOT-OPFUSE (Phase 4d): fused SwiGLU + Q8_1 quantization for M=1 decode.
     pub fn launch_silu_mul_quant_q8_1(
         &self,
-        gate: &RocmStorage,
-        up: &RocmStorage,
-        dst_q81: &RocmStorage,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        dst_q81: &dyn BackendStorage,
         k: usize,
     ) -> Result<*mut c_void> {
-        let g_ptr = gate
-            .device_ptr
-            .ok_or_else(|| Error::Backend("silu_mul_quant_q8_1: gate has no device ptr".into()))?;
-        let u_ptr = up
-            .device_ptr
-            .ok_or_else(|| Error::Backend("silu_mul_quant_q8_1: up has no device ptr".into()))?;
-        let dst_ptr = dst_q81
-            .device_ptr
-            .ok_or_else(|| Error::Backend("silu_mul_quant_q8_1: dst has no device ptr".into()))?;
+        let g_ptr = crate::device::util::dev_ptr_dyn(gate)?;
+        let u_ptr = crate::device::util::dev_ptr_dyn(up)?;
+        let dst_ptr = crate::device::util::dev_ptr_dyn(dst_q81)?;
         let grid_dim = HipDim3::new(1, 1, 1);
         let block_dim = HipDim3::new(32, 1, 1);
         let mut gptr = g_ptr;
@@ -3447,6 +3586,14 @@ impl RocmDevice {
         rs.write_host_f32(host)
     }
 
+    /// Async variant on the active (or capture) stream. No host sync;
+    /// ordered vs later launches on the same stream. Falls back sync on null stream.
+    pub fn write_f32_into_async(&self, storage: &dyn BackendStorage, host: &[f32]) -> Result<()> {
+        let rs = as_rocm(storage)?;
+        let stream = self.active_stream();
+        rs.write_host_f32_async(host, stream)
+    }
+
     /// SPEED-ROC: launch a compute kernel on an *explicit* stream (used by
     /// graph capture, which records only calls issued on the capture stream).
     /// Falls back to the aggregate-source JIT path; resolves the function from
@@ -4012,6 +4159,35 @@ impl RocmDevice {
         out_shape: &Shape,
         op: crate::autotune::GemmOp,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // For matmul on GPU, both inputs must be RocmStorage (or we need to copy them to the device first)
+        let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => return Err(Error::Backend("matmul: input a is not RocmStorage".into())),
+        };
+        // Allocate output GPU storage with the actual input precision, then run
+        // the shared _into core (zero duplicated dispatch logic).
+        let dtype_out = DType {
+            arith: a_storage.dtype.arith,
+            storage: DTypeStorage::Native,
+        };
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_out, &self.allocator, self.ordinal)?;
+        let handle = self.matmul_op_into(a, b, &out_storage, op)?;
+        Ok((Box::new(out_storage), handle))
+    }
+
+    /// `C = A @ B^T` writing into CALLER-PROVIDED `out` — no allocation inside.
+    /// Required for HIP graph capture (stable pointers across replays); same
+    /// dispatch as [`Self::matmul_op`] (scythe route, split-K, dot paths,
+    /// WMMA, rocBLAS). `out` must hold `m*n` F32 elems for `a:[M,K]`,
+    /// `b:[N,K]`.
+    pub fn matmul_op_into(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &RocmStorage,
+        op: crate::autotune::GemmOp,
+    ) -> Result<Box<dyn ComputeHandle>> {
         #[cfg(feature = "rocm-profile")]
         println!("[rocprofiler-sdk] Begin marker span: matmul");
 
@@ -4054,11 +4230,13 @@ impl RocmDevice {
             });
         }
 
-        if out_shape.elem_count() != m * n {
+        if out.shape().elem_count() != m * n {
             return Err(Error::Shape(format!(
-                "expected out elem_count {}, got {:?}",
-                m * n,
-                out_shape.dims()
+                "matmul_op_into: out holds {} elems, need {}x{}={}",
+                out.shape().elem_count(),
+                m,
+                n,
+                m * n
             )));
         }
 
@@ -4066,13 +4244,17 @@ impl RocmDevice {
         // `try_new` is context-neutral (restores the caller's device on return), so on a multi-GPU box the.
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
 
-        // Allocate output GPU storage with the actual input precision
+        // Output precision follows the actual input precision.
         let dtype_out = DType {
             arith: a_storage.dtype.arith,
             storage: DTypeStorage::Native,
         };
-        let out_storage =
-            RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
+        if !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "matmul_op_into: out lacks a valid GPU device pointer".into(),
+            ));
+        }
+        let out_storage: &RocmStorage = out;
 
         // WI-SB6 production routing: GRIM_SCYTHE_RING=1 rides F32 GEMMs (the dense-layer op of every decode step) through the ScytheRing persistent dispatch wave instead of the rocBLAS direct path.
         // Benchmark-gated, never default - see device::scythe_route.
@@ -4090,7 +4272,7 @@ impl RocmDevice {
             )?;
             self.launch_counter.fetch_add(1, Ordering::SeqCst);
             let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-            return Ok((Box::new(out_storage), compute_handle));
+            return Ok(compute_handle);
         }
 
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution).
@@ -4217,7 +4399,7 @@ impl RocmDevice {
                 split_k_effective,
             )?;
             let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-            return Ok((Box::new(out_storage), compute_handle));
+            return Ok(compute_handle);
         }
         #[cfg(feature = "rocm-profile")]
         println!(
@@ -4248,7 +4430,7 @@ impl RocmDevice {
                 )?;
                 self.launch_counter.fetch_add(1, Ordering::SeqCst);
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
+                return Ok(compute_handle);
             }
         }
 
@@ -4290,7 +4472,7 @@ impl RocmDevice {
                             self.launch_counter.fetch_add(1, Ordering::SeqCst);
                             let compute_handle =
                                 Box::new(RocmHandle::new(Some(self.active_stream())));
-                            return Ok((Box::new(out_storage), compute_handle));
+                            return Ok(compute_handle);
                         }
                         Err(_) => {
                             // fall through to the direct launch below
@@ -4303,7 +4485,7 @@ impl RocmDevice {
                     a_storage, b_storage, &out_storage, m, n, k,
                 )?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
+                return Ok(compute_handle);
             }
         }
 
@@ -4325,7 +4507,7 @@ impl RocmDevice {
                     a_storage, b_storage, &out_storage, m, n, k,
                 )?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
+                return Ok(compute_handle);
             }
         }
 
@@ -4334,7 +4516,7 @@ impl RocmDevice {
             if self.should_use_wmma_path(None, dtype_out.arith) {
                 let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
+                return Ok(compute_handle);
             }
         }
 
@@ -4345,7 +4527,7 @@ impl RocmDevice {
             _ => {
                 let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
+                return Ok(compute_handle);
             }
         };
         let _ = unsafe { rocblas_set_stream(handle, self.active_stream()) };
@@ -4428,13 +4610,340 @@ impl RocmDevice {
                 // fall back seamlessly to WMMA HIP GEMM kernel.
                 let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
+                return Ok(compute_handle);
             }
             self.launch_counter.fetch_add(1, Ordering::SeqCst);
         };
 
         let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
-        Ok((Box::new(out_storage), compute_handle))
+        Ok(compute_handle)
+    }
+
+    /// `C = A @ B^T` (SPEED-ROC-16 contract) writing into CALLER-PROVIDED
+    /// `out` — no allocation inside. Mirrors the [`CoreTensorOps::matmul`]
+    /// dispatch (FP32-GEMV fast path, then [`Self::matmul_op_into`]).
+    /// Required for HIP graph capture: `out` is a stable pool address.
+    pub fn matmul_into(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let out_dims = out.shape().dims();
+        let m = out_dims[..out_dims.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1);
+        let n = out_dims.last().copied().unwrap_or(0);
+        let k = a.shape().dims().last().copied().unwrap_or(0);
+        if m == 1 && n >= 2048 {
+            if let (Some(a_s), Some(b_s)) = (
+                a.as_any().downcast_ref::<RocmStorage>(),
+                b.as_any().downcast_ref::<RocmStorage>(),
+            ) {
+                let a_is_f32 = a_s.dtype().arith == ArithType::F32
+                    && matches!(a_s.dtype().storage, crate::DTypeStorage::Native);
+                let b_is_f32 = b_s.dtype().arith == ArithType::F32
+                    && matches!(b_s.dtype().storage, crate::DTypeStorage::Native);
+                if a_is_f32
+                    && b_is_f32
+                    && a_s.device_ptr_is_valid()
+                    && b_s.device_ptr_is_valid()
+                {
+                    let stream = self.launch_fp32_gemv(a_s, b_s, out, m, n, k)?;
+                    return Ok(Box::new(RocmHandle::new(Some(stream))));
+                }
+            }
+        }
+        self.matmul_op_into(a, b, out, crate::autotune::GemmOp::Other)
+    }
+
+    /// Decode-only linear `y = a @ w^T` (m==1) writing into CALLER-PROVIDED
+    /// `out` ([1, N] pool slot) plus caller `act_q81` scratch — no allocation
+    /// inside. Mirrors the eager decode dispatch exactly so graph parity
+    /// holds (same kernels eager would pick):
+    /// - F32 weights -> [`Self::matmul_into`] (rocBLAS / FP32-GEMV fast path).
+    /// - Q80 weights -> quantize + sudot4 `dot4_q80_q81` (dot4 arch,
+    ///   `k_aligned>=32`), else WMMA fused-dequant.
+    /// - Q4K/Q5K/Q6K/Q2K/Q3K weights -> quantize + matching sudot4 dot
+    ///   (dot4 arch, `k%256==0`), else WMMA fused-dequant.
+    /// Anything else (IQ schemes, F16/BF16 acts, legacy/env-gated paths that
+    /// need their own scratch) -> `Unimplemented`, caller falls back eager.
+    /// `GRIM_DOT_GEMV=0` honored (forces WMMA legs).
+    pub fn linear_decode_into(
+        &self,
+        a: &dyn BackendStorage,
+        w: &RocmStorage,
+        out: &RocmStorage,
+        act_q81: &RocmStorage,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        use grim_tensor::KQuantScheme;
+        let a_dims = a.shape().dims();
+        let k = a_dims.last().copied().unwrap_or(0);
+        let m = a.shape().elem_count().checked_div(k.max(1)).unwrap_or(0);
+        if m != 1 {
+            return Err(Error::Unimplemented(
+                "linear_decode_into: decode-only (m==1)".into(),
+            ));
+        }
+        let n = out.shape().elem_count();
+        if w.shape().elem_count() % k.max(1) != 0 {
+            return Err(Error::Shape(format!(
+                "linear_decode_into: weight elems {} not a multiple of k={k}",
+                w.shape().elem_count()
+            )));
+        }
+        let w_n = w.shape().elem_count() / k.max(1);
+        if w_n != n {
+            return Err(Error::ShapeMismatch {
+                expected: vec![1, w_n],
+                got: vec![1, n],
+            });
+        }
+        let need_q81 = (k / 32) * 36;
+        let dot_disabled = matches!(
+            std::env::var("GRIM_DOT_GEMV").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        let f32_gemv_disabled = matches!(
+            std::env::var("GRIM_F32_GEMV").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        match &w.dtype().storage {
+            DTypeStorage::Native => {
+                if !f32_gemv_disabled {
+                    let stream = self.launch_f32_gemv_into(a, w, out, n, k)?;
+                    return Ok(Box::new(RocmHandle::new(Some(stream))));
+                }
+                self.matmul_into(a, w, out)?;
+                Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q80) => {
+                if act_q81.bytes < need_q81 {
+                    return Err(Error::Backend(format!(
+                        "linear_decode_into: act scratch {}B < {need_q81}B",
+                        act_q81.bytes
+                    )));
+                }
+                let k_aligned = k - (k % 32);
+                if self.is_dot4_arch && !dot_disabled && k_aligned >= 32 {
+                    self.launch_quantize_q8_1(
+                        a.as_any()
+                            .downcast_ref::<RocmStorage>()
+                            .ok_or_else(|| {
+                                Error::Backend("linear_decode_into: a not RocmStorage".into())
+                            })?,
+                        act_q81,
+                        m,
+                        k_aligned,
+                    )?;
+                    self.launch_dot4_q80_q81_gemv(act_q81, w, out, m, n, k_aligned)?;
+                    Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+                } else {
+                    self.launch_wmma_fused_dequant_q8_0(
+                        a.as_any()
+                            .downcast_ref::<RocmStorage>()
+                            .ok_or_else(|| {
+                                Error::Backend("linear_decode_into: a not RocmStorage".into())
+                            })?,
+                        w,
+                        out,
+                        m,
+                        n,
+                        k,
+                    )?;
+                    Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+                }
+            }
+            DTypeStorage::KQuant(scheme @ (KQuantScheme::Q4K
+            | KQuantScheme::Q5K
+            | KQuantScheme::Q6K
+            | KQuantScheme::Q2K
+            | KQuantScheme::Q3K)) => {
+                if act_q81.bytes < need_q81 {
+                    return Err(Error::Backend(format!(
+                        "linear_decode_into: act scratch {}B < {need_q81}B",
+                        act_q81.bytes
+                    )));
+                }
+                if !(self.is_dot4_arch && !dot_disabled && k % 256 == 0) {
+                    return Err(Error::Unimplemented(
+                        "linear_decode_into: K-quant needs dot4 arch + k%256==0 (else WMMA leg needs its own scratch)".into(),
+                    ));
+                }
+                let a_s = a
+                    .as_any()
+                    .downcast_ref::<RocmStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("linear_decode_into: a not RocmStorage".into())
+                    })?;
+                self.launch_quantize_q8_1(a_s, act_q81, m, k)?;
+                match scheme {
+                    KQuantScheme::Q4K => {
+                        self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?
+                    }
+                    KQuantScheme::Q5K => {
+                        self.launch_dot4_q5k_q81_gemv(act_q81, w, out, m, n, k)?
+                    }
+                    KQuantScheme::Q6K => {
+                        self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                    }
+                    KQuantScheme::Q2K => {
+                        self.launch_dot4_q2k_q81_gemv(act_q81, w, out, m, n, k)?
+                    }
+                    _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
+                };
+                Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+            }
+            _ => Err(Error::Unimplemented(
+                "linear_decode_into: unsupported weight dtype for graph decode".into(),
+            )),
+        }
+    }
+
+    /// `y = rms_norm(x, weight)` writing into CALLER-PROVIDED `out` — no
+    /// allocation inside. Same kernel as [`CoreTensorOps::rms_norm`].
+    /// `out_shape` carries row semantics explicitly (like
+    /// `rope_dev_base_into`): it may reshape flat storage, so QK-norm over
+    /// `[nh, hd]` rows can target a `[1, n]` slot and vice versa, provided
+    /// element counts agree. In-place (`out` aliases `x`) is safe: the
+    /// kernel reduces each row fully before storing it.
+    pub fn rms_norm_into(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &RocmStorage,
+        out_shape: &Shape,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        use crate::device::util::dev_ptr_dyn;
+        let mut x_ptr = dev_ptr_dyn(x)?;
+        let mut w_ptr = dev_ptr_dyn(weight)?;
+        let row_len = out_shape.dims().last().copied().ok_or_else(|| {
+            Error::Shape("rms_norm_into: empty out dims".into())
+        })?;
+        let total = out_shape.elem_count();
+        if x.shape().elem_count() != total || out.shape().elem_count() != total {
+            return Err(Error::Shape(format!(
+                "rms_norm_into: elem mismatch x={} out={} shape={total}",
+                x.shape().elem_count(),
+                out.shape().elem_count()
+            )));
+        }
+        if !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "rms_norm_into: out lacks a valid device pointer".into(),
+            ));
+        }
+        let mut out_ptr = dev_ptr(out)?;
+        let mut row_len_i = row_len as i32;
+        let mut eps_f = eps;
+        let mut total_i = total as i32;
+        let (grid, block) = warp_rows_launch(total / row_len.max(1));
+        self.launch_compute_kernel(
+            "grim_rms_norm",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut w_ptr),
+                arg(&mut out_ptr),
+                arg(&mut row_len_i),
+                arg(&mut eps_f),
+                arg(&mut total_i),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    /// `y = a + b` writing into CALLER-PROVIDED `out` — no allocation inside.
+    /// Same kernel as [`CoreTensorOps::add`]. In-place (`out` aliases an
+    /// input) is safe: strictly per-element.
+    pub fn add_into(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let a_s = as_rocm(a)?;
+        let b_s = as_rocm(b)?;
+        if !a_s.device_ptr_is_valid() || !b_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "add_into: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        if a.shape().elem_count() != total || b.shape().elem_count() != total {
+            return Err(Error::Shape(format!(
+                "add_into: elem mismatch a={} b={} out={total}",
+                a.shape().elem_count(),
+                b.shape().elem_count()
+            )));
+        }
+        if !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "add_into: out lacks a valid device pointer".into(),
+            ));
+        }
+        let mut out_ptr = dev_ptr(out)?;
+        let mut a_ptr = dev_ptr(a_s)?;
+        let mut b_ptr = dev_ptr(b_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_add",
+            grid,
+            block,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut b_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    /// `y = silu(gate) * up` writing into CALLER-PROVIDED `out` — no
+    /// allocation inside. Same kernel as [`CoreTensorOps::silu_mul`].
+    pub fn silu_mul_into(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let gate_ptr_dyn = crate::device::util::dev_ptr_dyn(gate)?;
+        let up_ptr_dyn = crate::device::util::dev_ptr_dyn(up)?;
+        let total = out.shape().elem_count();
+        if gate.shape().elem_count() != total || up.shape().elem_count() != total {
+            return Err(Error::Shape(format!(
+                "silu_mul_into: elem mismatch gate={} up={} out={total}",
+                gate.shape().elem_count(),
+                up.shape().elem_count()
+            )));
+        }
+        if !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "silu_mul_into: out lacks a valid device pointer".into(),
+            ));
+        }
+        let mut out_ptr = dev_ptr(out)?;
+        let mut gate_ptr = gate_ptr_dyn;
+        let mut up_ptr = up_ptr_dyn;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_silu_mul",
+            grid,
+            block,
+            &mut [
+                arg(&mut gate_ptr),
+                arg(&mut up_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
 
     /// Public hook for the engine layer to tag the lm_head / logit-projection GEMM, so the dispatch layer classifies it as `ShapeClass::TLOLog` (op-identity) and selects the distinct wide-N tile regardless of M.

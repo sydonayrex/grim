@@ -2534,6 +2534,17 @@ impl<T: MemoryOps + ?Sized> MemoryOps for std::sync::Arc<T> {
     ) -> Result<()> {
         (**self).copy_slice_into(dst, src, dst_elem_offset, count)
     }
+
+    fn copy_slice_range(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_elem_offset: usize,
+        src: &dyn BackendStorage,
+        src_elem_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        (**self).copy_slice_range(dst, dst_elem_offset, src, src_elem_offset, count)
+    }
 }
 
 impl<T: GraphCaptureOps + ?Sized> GraphCaptureOps for std::sync::Arc<T> {

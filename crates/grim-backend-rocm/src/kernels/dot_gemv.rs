@@ -73,6 +73,57 @@ extern "C" __global__ void grim_quantize_q8_1(
     }
 }
 
+// SPEED-FP32-GEMV: custom FP32 matrix-vector multiply for the output projection
+// (lm_head). rocBLAS is pathologically slow at M=1 GEMV (1.45 ms for N=65536,
+// K=1024) because it dispatches a full GEMM kernel with workspace allocation and
+// teardown per call. This kernel matches the proven dot4 pattern (1 wave per
+// block, 4 columns per block) for reliable JIT on RDNA4.
+extern "C" __global__ void grim_fp32_gemv(
+    const float* __restrict__ act,   // [M, K]
+    const float* __restrict__ weight, // [N, K]
+    float* __restrict__ out,         // [M, N]
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const float* a_row = act + (long long)row * K;
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+            ? (const unsigned char*)(weight + (long long)(col_base + j) * K)
+            : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int blk = lane; blk < K; blk += 32) {
+        float a = a_row[blk];
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            float b = ((const float*)b_col[j])[blk];
+            facc[j] += a * b;
+        }
+    }
+
+    // Shuffle reduction within the wave.
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            out[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 extern "C" __global__ void grim_dot4_q80_q81_gemv(
     const unsigned char* __restrict__ A_q81,
     const unsigned char* __restrict__ B_q80,

@@ -112,7 +112,8 @@ unsafe extern "C" {
     pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
     pub fn hipHostRegister(hostPtr: *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipHostUnregister(hostPtr: *mut c_void) -> HipErrorT;
-    pub fn hipMemcpy(
+    #[link_name = "hipMemcpy"]
+    fn raw_hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,
         count: usize,
@@ -125,7 +126,8 @@ unsafe extern "C" {
         size_bytes: usize,
         stream: *mut c_void,
     ) -> HipErrorT;
-    pub fn hipDeviceSynchronize() -> HipErrorT;
+    #[link_name = "hipDeviceSynchronize"]
+    fn raw_hipDeviceSynchronize() -> HipErrorT;
     /// Returns the most recent asynchronous error reported on any API call
     /// (including kernel launches), or success. Does not block.
     pub fn hipGetLastError() -> HipErrorT;
@@ -180,6 +182,19 @@ unsafe extern "C" {
     pub fn hipGraphUpload(exec: *mut c_void, stream: *mut c_void) -> HipErrorT;
     pub fn hipStreamBeginCapture(stream: *mut c_void, mode: u32) -> HipErrorT;
     pub fn hipStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> HipErrorT;
+    // Graph kernel node parameter update (for scalar updates between replays)
+    pub fn hipGraphExecKernelNodeSetParams(
+        graphExec: *mut c_void,
+        node: *mut c_void,
+        nodeParams: *const c_void,
+    ) -> HipErrorT;
+    pub fn hipGraphAddKernelNode(
+        pGraphNode: *mut *mut c_void,
+        graph: *mut c_void,
+        pDependencies: *const c_void,
+        numDependencies: usize,
+        pNodeParams: *const c_void,
+    ) -> HipErrorT;
 
     // Event FFI for autotune benchmarking
     pub fn hipEventCreate(event: *mut *mut c_void) -> HipErrorT;
@@ -219,6 +234,29 @@ unsafe extern "C" {
         blockSize: i32,
         dynamicSMemSize: usize,
     ) -> HipErrorT;
+}
+
+#[inline]
+#[allow(non_snake_case)]
+pub unsafe fn hipMemcpy(
+    dst: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    kind: HipMemcpyKind,
+) -> HipErrorT {
+    if std::env::var("GRIM_HIP_TRACE").is_ok() {
+        eprintln!("[hipMemcpy-trace] bytes={} kind={:?}\n{:?}", count, kind, std::backtrace::Backtrace::capture());
+    }
+    unsafe { raw_hipMemcpy(dst, src, count, kind) }
+}
+
+#[inline]
+#[allow(non_snake_case)]
+pub unsafe fn hipDeviceSynchronize() -> HipErrorT {
+    if std::env::var("GRIM_HIP_TRACE").is_ok() {
+        eprintln!("[hipDeviceSync-trace]\n{:?}", std::backtrace::Backtrace::capture());
+    }
+    unsafe { raw_hipDeviceSynchronize() }
 }
 
 // hiprtc lives in its own shared object, so it gets a separate link block.
