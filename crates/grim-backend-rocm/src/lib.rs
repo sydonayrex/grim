@@ -153,7 +153,7 @@ pub use crate::graph_capture::{
 };
 pub use crate::decode_graph_buffers::{
     DecodeGraphBuffers, check_layer_topology, decode_graph_enabled, launch_attention,
-    launch_qkv_gemv, write_embedding_to_buffer,
+    launch_qkv_gemv, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
 };
 pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
 pub use crate::rccl::{RcclAllReduce, RocmMultiNodeGroup};
@@ -168,9 +168,10 @@ pub use fusion::{
 };
 
 pub use kernels::qkv_attention::{
-    BlockTableEntry, KvCacheQuantFormat, launch_bump_i32, launch_kv_append, launch_paged_attention,
-    launch_paged_attention_quant, launch_qkv_attention_dev, launch_qkv_attention_wmma,
-    launch_tree_attention,
+    BlockTableEntry, KvCacheQuantFormat, launch_bump_i32, launch_bump_i32_slots,
+    launch_kv_append, launch_kv_append_batch, launch_paged_attention,
+    launch_paged_attention_quant, launch_qkv_attention_dev, launch_qkv_attention_dev_batch,
+    launch_qkv_attention_wmma, launch_tree_attention,
 };
 pub use kernels::tile_picker::run_install_tune;
 

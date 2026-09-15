@@ -120,9 +120,10 @@ impl DecodeGraphBuffers {
         let mut fused_qkv_out = Vec::with_capacity(num_layers);
         let mut k_arena = Vec::with_capacity(num_layers);
         let mut v_arena = Vec::with_capacity(num_layers);
-        // Q8_1 staging must cover the widest activation row (hidden vs inter).
+        // Q8_1 staging must cover the widest activation row (hidden vs inter),
+        // times one row per batch slot (P3).
         let q81_elems = hidden_size.max(intermediate_size).max(32);
-        let q81_bytes = (q81_elems / 32) * 36;
+        let q81_bytes = batch * (q81_elems / 32) * 36;
         let q81_dt = DType {
             arith: ArithType::U8,
             storage: DTypeStorage::Native,
@@ -200,13 +201,13 @@ impl DecodeGraphBuffers {
                 dev.ordinal,
             )?);
             attn_max_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![num_heads.max(1)]),
+                &Shape::new(vec![batch * num_heads.max(1)]),
                 dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
             )?);
             attn_sum_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![num_heads.max(1)]),
+                &Shape::new(vec![batch * num_heads.max(1)]),
                 dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
@@ -225,13 +226,13 @@ impl DecodeGraphBuffers {
                 dev.ordinal,
             )?);
             k_arena.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![max_ctx, nkk]),
+                &Shape::new(vec![batch * max_ctx, nkk]),
                 dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
             )?);
             v_arena.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![max_ctx, nvk]),
+                &Shape::new(vec![batch * max_ctx, nvk]),
                 dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
@@ -249,8 +250,10 @@ impl DecodeGraphBuffers {
             &dev.allocator,
             dev.ordinal,
         )?);
+        // One i32 position per batch slot (P3): the graph's append/bump
+        // kernels index `pos_dev[slot]`.
         let pos_dev = RocmStorage::alloc_gpu(
-            &Shape::new(vec![1]),
+            &Shape::new(vec![batch]),
             dt.clone(),
             &dev.allocator,
             dev.ordinal,
@@ -290,12 +293,54 @@ impl DecodeGraphBuffers {
         })
     }
 
-    /// 4-byte async H2D of `pos` into `pos_dev` on `stream`. Must run
-    /// BEFORE replay, never inside capture.
+    /// Async H2D of `pos` into `pos_dev` on `stream` — broadcast to every
+    /// batch slot. Must run BEFORE replay, never inside capture.
     pub fn write_pos_async(
         &mut self,
         dev: &RocmDevice,
         pos: u32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        self.write_pos_broadcast_async(dev, pos, stream)
+    }
+
+    /// Async H2D of `pos` broadcast into every slot of `pos_dev` on `stream`.
+    /// `current_pos` host mirror is updated to `pos`.
+    pub fn write_pos_broadcast_async(
+        &mut self,
+        dev: &RocmDevice,
+        pos: u32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let vals = vec![pos; self.batch.max(1)];
+        self.write_pos_slots_raw(dev, &vals, stream)?;
+        self.current_pos = pos;
+        Ok(())
+    }
+
+    /// Async H2D of per-slot positions into `pos_dev` (P3: requests in a
+    /// decode bucket may sit at different KV positions). `vals.len()` is
+    /// clamped to `batch`; missing slots keep their previous device values
+    /// (H2D writes them as 0 only when `vals` is shorter — callers should
+    /// pass exactly `batch` values).
+    pub fn write_pos_slots_async(
+        &mut self,
+        dev: &RocmDevice,
+        vals: &[u32],
+        stream: *mut c_void,
+    ) -> Result<()> {
+        self.write_pos_slots_raw(dev, vals, stream)?;
+        if let Some(&last) = vals.last() {
+            self.current_pos = last;
+        }
+        Ok(())
+    }
+
+    /// Raw per-slot write; does not touch the host position mirror.
+    fn write_pos_slots_raw(
+        &mut self,
+        dev: &RocmDevice,
+        vals: &[u32],
         stream: *mut c_void,
     ) -> Result<()> {
         let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
@@ -304,13 +349,16 @@ impl DecodeGraphBuffers {
             .device_ptr_u64()
             .ok_or_else(|| Error::Backend("pos_dev has no device ptr".into()))?
             as *mut c_void;
-        let mut host = pos;
-        // SAFETY: dst is device mem owned by pos_dev (4 bytes); host ptr valid for call.
+        let mut buf = vals.to_vec();
+        buf.resize(self.batch.max(1), 0);
+        let bytes = 4 * self.batch.max(1);
+        // SAFETY: dst is device mem owned by pos_dev (4*batch bytes); host buf
+        // has exactly that many valid bytes.
         let res: crate::HipErrorT = unsafe {
             hipMemcpyAsync(
                 dst,
-                &mut host as *mut u32 as *const c_void,
-                4,
+                buf.as_ptr() as *const c_void,
+                bytes,
                 HipMemcpyKind::HostToDevice,
                 stream,
             )
@@ -320,7 +368,6 @@ impl DecodeGraphBuffers {
                 "write_pos_async hipMemcpyAsync failed: {res}"
             )));
         }
-        self.current_pos = pos;
         Ok(())
     }
 }
@@ -606,6 +653,7 @@ pub fn launch_attention(k_arena: &RocmStorage, pos: u32, max_ctx: usize) -> Resu
 /// Async H2D of token embedding id into fixed input buffer (4 bytes).
 /// Thin wrapper so `lfm2_graph` + `run.rs` share one call site.
 /// Ordered vs later launches on the active stream — no host sync.
+/// Convention: `(dev, dst, token_id)` — matches `write_embeddings_to_buffer_batch`.
 pub fn write_embedding_to_buffer(
     dev: &RocmDevice,
     dst: &RocmStorage,
@@ -615,15 +663,37 @@ pub fn write_embedding_to_buffer(
     dev.write_f32_into_async(dst, &[bits])
 }
 
-/// P3 batch version: write multiple token IDs into layer_input[0] (shape [batch, hidden]).
-/// `token_ids` length must be <= dst shape[0] (batch).
+/// P3 batch version: write token IDs into layer_input[0] (shape [batch, hidden]).
+/// Each token id (as f32 bits) lands at the START of its slot row — matching
+/// the single-token stub layout per slot; the rest of the row is zeroed so no
+/// stale data from prior steps leaks. `token_ids.len()` must be <= batch.
 pub fn write_embeddings_to_buffer_batch(
     dev: &RocmDevice,
     dst: &RocmStorage,
     token_ids: &[u32],
 ) -> Result<()> {
-    let bits: Vec<f32> = token_ids.iter().map(|&t| f32::from_bits(t)).collect();
-    dev.write_f32_into_async(dst, &bits)
+    let dims = dst.shape.dims();
+    let (batch, hidden) = match dims.len() {
+        2 => (dims[0].max(1), dims[1].max(1)),
+        1 => (1, dims[0].max(1)),
+        _ => {
+            return Err(Error::Backend(format!(
+                "write_embeddings_to_buffer_batch: expected [batch, hidden] buffer, got {dims:?}"
+            )))
+        }
+    };
+    if token_ids.len() > batch {
+        return Err(Error::Backend(format!(
+            "write_embeddings_to_buffer_batch: {} token ids > batch {}",
+            token_ids.len(),
+            batch
+        )));
+    }
+    let mut buf = vec![0.0f32; batch * hidden];
+    for (slot, &t) in token_ids.iter().enumerate() {
+        buf[slot * hidden] = f32::from_bits(t);
+    }
+    dev.write_f32_into_async(dst, &buf)
 }
 
 /// Shape guard for per-layer graph recording (no alloc, no sync).
