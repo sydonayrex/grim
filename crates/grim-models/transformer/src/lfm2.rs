@@ -78,6 +78,17 @@ pub enum Lfm2LayerCache {
         q_rot_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
         k_rot_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
         attn_out_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
+        /// HIP graph capture: stable intermediate activation buffers.
+        /// Pre-allocated at capture time, reused across all replays.
+        graph_attn_norm_out: Option<Box<dyn grim_tensor::BackendStorage>>,
+        graph_attn_out: Option<Box<dyn grim_tensor::BackendStorage>>,
+        graph_ffn_norm_out: Option<Box<dyn grim_tensor::BackendStorage>>,
+        graph_ffn_gate_up: Option<Box<dyn grim_tensor::BackendStorage>>,
+        graph_ffn_activated: Option<Box<dyn grim_tensor::BackendStorage>>,
+        graph_ffn_down: Option<Box<dyn grim_tensor::BackendStorage>>,
+        graph_residual: Option<Box<dyn grim_tensor::BackendStorage>>,
+        /// Host-side mirror of device past counter (avoids D2H read per token).
+        dev_pos: usize,
     },
 }
 
@@ -86,7 +97,7 @@ impl Clone for Lfm2LayerCache {
         match self {
             Self::ShortConv(st) => Self::ShortConv(st.clone()),
             Self::Attention {
-                k, v, k_dev, v_dev, pos_base_dev, past_dev, ..
+                k, v, k_dev, v_dev, pos_base_dev, past_dev, dev_pos, ..
             } => Self::Attention {
                 k: k.clone(),
                 v: v.clone(),
@@ -100,6 +111,14 @@ impl Clone for Lfm2LayerCache {
                 q_rot_dev: None,
                 k_rot_dev: None,
                 attn_out_dev: None,
+                graph_attn_norm_out: None,
+                graph_attn_out: None,
+                graph_ffn_norm_out: None,
+                graph_ffn_gate_up: None,
+                graph_ffn_activated: None,
+                graph_ffn_down: None,
+                graph_residual: None,
+                dev_pos: *dev_pos,
             },
         }
     }
@@ -819,6 +838,14 @@ impl Lfm2Block {
                             q_rot_dev: None,
                             k_rot_dev: None,
                             attn_out_dev: None,
+                            graph_attn_norm_out: None,
+                            graph_attn_out: None,
+                            graph_ffn_norm_out: None,
+                            graph_ffn_gate_up: None,
+                            graph_ffn_activated: None,
+                            graph_ffn_down: None,
+                            graph_residual: None,
+                            dev_pos: 0,
                         });
                     }
                     if cache.as_mut().unwrap().past_dev_needs_init() {
@@ -967,6 +994,14 @@ impl Lfm2Block {
                             q_rot_dev: None,
                             k_rot_dev: None,
                             attn_out_dev: None,
+                            graph_attn_norm_out: None,
+                            graph_attn_out: None,
+                            graph_ffn_norm_out: None,
+                            graph_ffn_gate_up: None,
+                            graph_ffn_activated: None,
+                            graph_ffn_down: None,
+                            graph_residual: None,
+                            dev_pos: 0,
                         });
                     }
 
@@ -1036,6 +1071,14 @@ impl Lfm2Block {
                     q_rot_dev: None,
                     k_rot_dev: None,
                     attn_out_dev: None,
+                    graph_attn_norm_out: None,
+                    graph_attn_out: None,
+                    graph_ffn_norm_out: None,
+                    graph_ffn_gate_up: None,
+                    graph_ffn_activated: None,
+                    graph_ffn_down: None,
+                    graph_residual: None,
+                    dev_pos: 0,
                 });
             }
 
@@ -1144,6 +1187,14 @@ impl Lfm2Block {
                 q_rot_dev: None,
                 k_rot_dev: None,
                 attn_out_dev: None,
+                graph_attn_norm_out: None,
+                graph_attn_out: None,
+                graph_ffn_norm_out: None,
+                graph_ffn_gate_up: None,
+                graph_ffn_activated: None,
+                graph_ffn_down: None,
+                graph_residual: None,
+                dev_pos: 0,
             });
         }
         let (k_dev, v_dev) = match cache.as_mut().unwrap() {
@@ -1501,6 +1552,14 @@ impl Lfm2Block {
                 q_rot_dev: None,
                 k_rot_dev: None,
                 attn_out_dev: None,
+                graph_attn_norm_out: None,
+                graph_attn_out: None,
+                graph_ffn_norm_out: None,
+                graph_ffn_gate_up: None,
+                graph_ffn_activated: None,
+                graph_ffn_down: None,
+                graph_residual: None,
+                dev_pos: 0,
             });
         }
         // Single mutable borrow: pull past_dev, k_dev, v_dev out together.

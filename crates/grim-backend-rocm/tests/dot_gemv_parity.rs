@@ -1723,3 +1723,187 @@ fn dot2_bf16_gemv_parity() {
     }
 }
 
+/// RDNA2 APU (gfx103x) native sdot4 GEMV verification.
+///
+/// The existing `grim_dot4_q4k_q81_gemv` kernel is arch-guarded for gfx1030-1036 and
+/// the `quantized_matmul` dispatch routes K-quant M=1 to it via `is_dot4_arch`
+/// (which includes RDNA2) when `k % 256 == 0`. This test proves that path actually
+/// executes on the APU and matches the CPU reference — i.e. that RDNA2 gets the
+/// same dot4 speedup RDNA3/4 do, not the scalar fallback. Skipped if no APU.
+#[test]
+fn dot4_q4k_gemv_parity_on_rdna2_apu() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let Some(dev) = gpu_device_rdna2() else {
+        eprintln!("[SKIP] dot4_q4k_rdna2 needs a gfx103x APU (ordinal 2)");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+
+    let m = 1usize;
+    let n = 128usize;
+    let k = 256usize;
+
+    let mut seed = 0x51F4u64;
+    let mut rand = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q4k(&b_f32).expect("quant_q4k");
+    let q4k_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q4K),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::from_slice(&[b_bytes.len()]),
+        q4k_dtype,
+    )
+    .expect("upload q4k weights");
+    let a_dev =
+        CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::from_slice(&[m, k]), DType::F32).unwrap();
+    let out_shape = Shape::from_slice(&[m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q4K,
+            &out_shape,
+        )
+        .expect("quantized_matmul dot4 q4k on rdna2");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+
+    let row_bytes = (k / 256) * 144;
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let brow = &b_bytes[col * row_bytes..(col + 1) * row_bytes];
+        let b_deq = grim_quant::dequant_q4k(brow, k).expect("dequant_q4k");
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a_f32[kk] * b_deq[kk];
+        }
+        c_cpu[col] = acc;
+    }
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!(
+        "[dot4-q4k-rdna2] ordinal={} n={n} k={k} max_diff={diff:.6}",
+        dev.ordinal()
+    );
+    assert!(diff < 0.5, "RDNA2 Q4_K dot4 diverges: {diff}");
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+}
+
+/// Prefer the gfx103x APU (ordinal 2); fall back to any dot4-capable device.
+fn gpu_device_rdna2() -> Option<RocmDevice> {
+    for ordinal in [2usize, 0, 1] {
+        if let Ok(dev) = RocmDevice::try_new(ordinal) {
+            let arch = dev.gpu_target_str();
+            if arch.starts_with("gfx10") || arch.starts_with("gfx11") || arch.starts_with("gfx12") {
+                return Some(dev);
+            }
+        }
+    }
+    None
+}
+
+/// RDNA2 APU Q8_0 × Q8_1 dot4 GEMV parity.
+///
+/// The audit flagged Q8_0×Q8_1 as the "direct fit" for RDNA2 sdot4 (signed×signed,
+/// V_DOT4_I32_I8). The Q8_0 dispatch arm routes M=1 to `launch_dot4_q80_q81_gemv`
+/// for every arch with no `is_dot4_arch` guard, so the APU already takes the dot4
+/// path. This test proves it matches the CPU reference on the gfx1036.
+#[test]
+fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let Some(dev) = gpu_device_rdna2() else {
+        eprintln!("[SKIP] dot4_q80_rdna2 needs a gfx103x APU (ordinal 2)");
+        return;
+    };
+
+    let m = 1usize;
+    let n = 128usize;
+    let k = 256usize;
+
+    let mut seed = 0xA11CEu64;
+    let mut rand = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q80(&b_f32).expect("quant_q80");
+    let q80_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q80),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::from_slice(&[b_bytes.len()]),
+        q80_dtype,
+    )
+    .expect("upload q80 weights");
+    let a_dev =
+        CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::from_slice(&[m, k]), DType::F32).unwrap();
+    let out_shape = Shape::from_slice(&[m, n]);
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+    }
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q8_0,
+            &out_shape,
+        )
+        .expect("quantized_matmul dot4 q80 on rdna2");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+    }
+
+    let row_bytes = (k / 32) * 34;
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let brow = &b_bytes[col * row_bytes..(col + 1) * row_bytes];
+        let b_deq = grim_quant::dequant_q80(brow, k).expect("dequant_q80");
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a_f32[kk] * b_deq[kk];
+        }
+        c_cpu[col] = acc;
+    }
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!(
+        "[dot4-q80-rdna2] ordinal={} n={n} k={k} max_diff={diff:.6}",
+        dev.ordinal()
+    );
+    assert!(
+        diff < 0.5,
+        "RDNA2 Q8_0 dot4 diverges from CPU reference: {diff}"
+    );
+}
+

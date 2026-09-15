@@ -91,6 +91,7 @@ pub mod kimi_linear;
 pub mod kv_attention;
 pub mod laguna;
 pub mod lfm2;
+pub mod lfm2_graph;
 pub mod llada;
 pub mod lladamoe;
 pub mod llama4;

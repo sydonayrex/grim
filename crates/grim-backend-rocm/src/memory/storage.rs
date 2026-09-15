@@ -10,7 +10,7 @@ use grim_tensor::error::{Error, Result};
 // Re-exports used by the type's field types. The actual type declarations
 use crate::{
     DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, RocmDevice, Shape,
-    check_hip, hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipSuccess,
+    check_hip, hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipSuccess,
 };
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
@@ -165,6 +165,42 @@ impl RocmStorage {
         if res != hipSuccess {
             return Err(Error::Backend(format!(
                 "write_host_f32: hipMemcpy failed {}",
+                res
+            )));
+        }
+        Ok(())
+    }
+
+    /// Async H2D overwrite, no host sync. Caller must ensure `host` outlives
+    /// the enqueue (stack 4B inputs: copy completes before return on most
+    /// paths, but ordering vs later launches is via `stream`).
+    /// Later work on the same `stream` is ordered after the copy — no fence needed.
+    pub fn write_host_f32_async(&self, host: &[f32], stream: *mut c_void) -> Result<()> {
+        let need = host.len() * 4;
+        if self.bytes < need {
+            return Err(Error::Backend(format!(
+                "write_host_f32_async: buffer {} bytes < {} needed",
+                self.bytes, need
+            )));
+        }
+        if stream.is_null() {
+            return self.write_host_f32(host);
+        }
+        let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        // SAFETY: dst device mem owned by self; src host ptr valid for call.
+        let res = unsafe {
+            hipMemcpyAsync(
+                dev_ptr_void,
+                host.as_ptr() as *const c_void,
+                need,
+                HipMemcpyKind::HostToDevice,
+                stream,
+            )
+        };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "write_host_f32_async: hipMemcpyAsync failed {}",
                 res
             )));
         }

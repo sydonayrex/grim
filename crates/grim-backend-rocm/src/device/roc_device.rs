@@ -760,10 +760,10 @@ impl RocmDevice {
             wmma_max_m: std::env::var("GRIM_WMM_MAX_M")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(4),
+                .unwrap_or(16384),
             capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH")
                 .map(|v| v != "0" && v != "false" && v != "off")
-                .unwrap_or(false),
+                .unwrap_or(true),
             capture_stream: RwLock::new(None),
             capture_active: AtomicBool::new(false),
             captured_graphs: Mutex::new(HashMap::new()),
@@ -909,6 +909,12 @@ impl RocmDevice {
     /// Get current attention logit softcapping cap (or 0.0 if disabled).
     pub fn attn_logit_softcap(&self) -> f32 {
         f32::from_bits(self.attn_logit_softcap.load(Ordering::Relaxed))
+    }
+
+    /// Whether this GPU runs the V_DOT4/sudot4 M=1 decode family
+    /// (RDNA2+). Graph decode branches on this instead of probing types.
+    pub fn supports_dot4(&self) -> bool {
+        self.is_dot4_arch
     }
 
     /// `(hipMalloc_count, hipFree_count)` since this device was created — real driver
@@ -1437,8 +1443,9 @@ impl RocmDevice {
         if a_dims.len() != 2 || b_dims.len() != 2 {
             return Err(Error::Shape("matmul_batched expects 2-D inputs".into()));
         }
+        // SPEED-ROC-16: b is natural [N, K], computes C = A @ B^T (mirrors `matmul`).
         let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
+        let (n, k2) = (b_dims[0], b_dims[1]);
         if k != k2 {
             return Err(Error::ShapeMismatch {
                 expected: a_dims.to_vec(),
@@ -1458,9 +1465,9 @@ impl RocmDevice {
         for i in 1..batch {
             let ai = as_rocm(a[i])?;
             let bi = as_rocm(b[i])?;
-            if ai.shape().dims() != [m, k] || bi.shape().dims() != [k, n] {
+            if ai.shape().dims() != [m, k] || bi.shape().dims() != [n, k] {
                 return Err(Error::Shape(
-                    "matmul_batched: all batch entries must share shape [m,k]/[k,n]".into(),
+                    "matmul_batched: all batch entries must share shape [m,k]/[n,k]".into(),
                 ));
             }
             if ai.dtype != a0.dtype || bi.dtype != b0.dtype {
@@ -1536,11 +1543,13 @@ impl RocmDevice {
         // matmul_batched routes through the same autotune table as matmul.
         let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
 
-        // Row-major C[M,N] = A[M,K] @ B[K,N] via rocBLAS column-major recipe [see: `matmul`]
+        // SPEED-ROC-16: row-major C[M,N] = A[M,K] @ B[N,K]^T via rocBLAS
+        // column-major recipe [see: single `matmul`]: C_colmajor[N,M] = B @ A^T
+        // with b transA=Trans (op=[N,K]) and a transB=NoTrans (op=[K,M]).
         unsafe {
             let status = rocblas_gemm_strided_batched_ex(
                 handle,
-                RocblasOperation::None,
+                RocblasOperation::Transpose,
                 RocblasOperation::None,
                 n as RocblasInt,
                 m as RocblasInt,
@@ -1548,7 +1557,7 @@ impl RocmDevice {
                 &alpha as *const f32 as *const c_void,
                 b_packed.device_ptr_checked()? as *const c_void,
                 b_type,
-                n as RocblasInt,
+                k as RocblasInt,
                 (stride_b) as i64,
                 a_packed.device_ptr_checked()? as *const c_void,
                 a_type,

@@ -1099,21 +1099,35 @@ mod tests {
         Some(run_matmul_on_dev(&dev, a, a_dims, b, b_dims, out_dims))
     }
 
-    /// Reference row-major matmul: C[m,n] = sum_k A[m,k] * B[k,n].
+    /// Reference row-major matmul under the SPEED-ROC-16 contract:
+    /// C[m,n] = sum_k A[m,k] * B[n,k] (b is natural [N, K], computes A @ B^T).
     fn cpu_matmul(a: &[f32], a_dims: &[usize], b: &[f32], b_dims: &[usize]) -> Vec<f32> {
         let (m, k) = (a_dims[0], a_dims[1]);
-        let n = b_dims[1];
+        debug_assert_eq!(b_dims[1], k, "cpu_matmul: b must be [N, K]");
+        let n = b_dims[0];
         let mut c = vec![0.0f32; m * n];
         for i in 0..m {
             for j in 0..n {
                 let mut acc = 0.0f32;
                 for p in 0..k {
-                    acc += a[i * k + p] * b[p * n + j];
+                    acc += a[i * k + p] * b[j * k + p];
                 }
                 c[i * n + j] = acc;
             }
         }
         c
+    }
+
+    /// Transpose a row-major [rows, cols] matrix (for migrating old [K, N]
+    /// fixtures to the [N, K] contract without changing values' meaning).
+    fn transpose2d(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; v.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c * rows + r] = v[r * cols + c];
+            }
+        }
+        out
     }
 
     #[test]
@@ -1132,7 +1146,8 @@ mod tests {
             let mut b_storages: Vec<Box<dyn BackendStorage>> = Vec::new();
             for bi in 0..batch {
                 let av: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05) + bi as f32).collect();
-                let bv: Vec<f32> = (0..k * n)
+                // SPEED-ROC-16: b is [N, K] = [n, k].
+                let bv: Vec<f32> = (0..n * k)
                     .map(|i| (i as f32 * 0.05) - 0.5 + bi as f32)
                     .collect();
                 a_storages.push(
@@ -1140,7 +1155,7 @@ mod tests {
                         .unwrap(),
                 );
                 b_storages.push(
-                    dev.from_cpu(&bv, &Shape::from_slice(&[k, n]), DType::F32)
+                    dev.from_cpu(&bv, &Shape::from_slice(&[n, k]), DType::F32)
                         .unwrap(),
                 );
             }
@@ -1185,9 +1200,11 @@ mod tests {
         temp_env::with_var("GRIM_GPU_TARGET", Some("gfx90a"), || {
             let env = std::env::var(GPU_TEST_ENV).is_ok();
             let a_dims = [4usize, 8];
-            let b_dims = [8usize, 4];
+            // SPEED-ROC-16: b is [N, K] = [4, 8] (old [K, N] values transposed).
+            let b_dims = [4usize, 8];
             let a: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 + 1.0).collect();
-            let b: Vec<f32> = (0..32).map(|i| (i as f32 * 0.2) - 3.0).collect();
+            let b_old: Vec<f32> = (0..32).map(|i| (i as f32 * 0.2) - 3.0).collect();
+            let b = transpose2d(&b_old, 8, 4);
             let expected = cpu_matmul(&a, &a_dims, &b, &b_dims);
             let got = run_matmul_op(env, &a, &a_dims, &b, &b_dims, &[4, 4]);
             if let Some(out) = got {
@@ -1217,7 +1234,9 @@ mod tests {
         }
         let dev = RocmDevice::new(0);
         let a_dims = [16usize, 32];
-        let b_dims = [32usize, 16];
+        // SPEED-ROC-16: b is [N, K]; same element count reinterpreted (no
+        // numeric check here, only allocator reuse).
+        let b_dims = [16usize, 32];
         let a: Vec<f32> = (0..16 * 32).map(|i| (i as f32 * 0.01) - 1.0).collect();
         let b: Vec<f32> = (0..32 * 16).map(|i| i as f32 * 0.02).collect();
 
@@ -1701,13 +1720,14 @@ mod tests {
             let k = 32usize;
             let n = 16usize;
             let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05) - 1.0).collect();
-            let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.05) + 0.5).collect();
+            // SPEED-ROC-16: b is [N, K] = [n, k].
+            let b: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.05) + 0.5).collect();
             let w: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32 * 0.1)).collect();
             let a_s = dev
                 .from_cpu(&a, &Shape::from_slice(&[m, k]), DType::F32)
                 .unwrap();
             let b_s = dev
-                .from_cpu(&b, &Shape::from_slice(&[k, n]), DType::F32)
+                .from_cpu(&b, &Shape::from_slice(&[n, k]), DType::F32)
                 .unwrap();
             let w_s = dev
                 .from_cpu(&w, &Shape::from_slice(&[n]), DType::F32)
@@ -1716,12 +1736,13 @@ mod tests {
             let eps = 1e-5f32;
 
             // --- CPU reference (hardware-independent ground truth) ---
+            // SPEED-ROC-16: C = A @ B^T with b [N, K].
             let mut c_ref = vec![0f32; m * n];
             for i in 0..m {
                 for j in 0..n {
                     let mut s = 0f32;
                     for kk in 0..k {
-                        s += a[i * k + kk] * b[kk * n + j];
+                        s += a[i * k + kk] * b[j * k + kk];
                     }
                     c_ref[i * n + j] = s;
                 }
@@ -1815,13 +1836,14 @@ mod tests {
             let k = 128usize;
             let n = 64usize;
             let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01) - 1.0).collect();
-            let b: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.02).collect();
+            // SPEED-ROC-16: b is [N, K] = [n, k].
+            let b: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.02).collect();
             let w: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32 * 0.1)).collect();
             let a_s = dev
                 .from_cpu(&a, &Shape::from_slice(&[m, k]), DType::F32)
                 .unwrap();
             let b_s = dev
-                .from_cpu(&b, &Shape::from_slice(&[k, n]), DType::F32)
+                .from_cpu(&b, &Shape::from_slice(&[n, k]), DType::F32)
                 .unwrap();
             let w_s = dev
                 .from_cpu(&w, &Shape::from_slice(&[n]), DType::F32)

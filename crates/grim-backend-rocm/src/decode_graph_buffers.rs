@@ -1,0 +1,710 @@
+//! i-was-dumb-graph.md Phase 1-2 + Phase 6 scalar update + P3 batch parameterization.
+//!
+//! Fixed device buffer pool at stable addresses + HIP graph lifecycle.
+//! Decode forward is deterministic: same kernels, same topology each step,
+//! only input data changes. Pre-alloc once, capture once, replay via single
+//! `hipGraphLaunch`.
+//!
+//! No-sync rule inside capture: no D2H, no `hipDeviceSynchronize`, no host
+//! alloc. All writes via async H2D or kernel launches. GEMM stays in
+//! rocBLAS per Rule 0 — this module owns buffers + graph, not math.
+
+use std::ffi::c_void;
+use std::sync::Arc;
+
+use crate::device::roc_device::RocmDevice;
+use crate::device::util::dtype_f32;
+use crate::memory::storage::RocmStorage;
+use crate::DTypeStorage;
+use crate::HipMemcpyKind;
+use grim_tensor::error::{Error, Result};
+use grim_tensor::{ArithType, DType};
+
+/// Spec §Phase 1: owns all decode intermediates at fixed addresses.
+/// Allocated once at model load, never freed until unload.
+/// `batch` parameterizes all per-step slots as `[batch, dim]` so the same
+/// captured graph replays a whole decode batch in one `hipGraphLaunch`.
+#[derive(Debug)]
+pub struct DecodeGraphBuffers {
+    /// Per-layer buffers (indexed by layer_idx)
+    pub layer_input: Vec<RocmStorage>,   // [batch, hidden_size]
+    pub layer_output: Vec<RocmStorage>,  // [batch, hidden_size]
+    /// Attention-specific
+    pub q_buf: Vec<RocmStorage>,         // [batch, n_q]
+    pub k_buf: Vec<RocmStorage>,         // [batch, n_k]
+    pub v_buf: Vec<RocmStorage>,         // [batch, n_v]
+    pub attn_out_buf: Vec<RocmStorage>,  // [batch, n_q]
+    /// FFN-specific
+    pub gate_up_buf: Vec<RocmStorage>,   // [batch, 2*intermediate_size] (reserved: fused gate+up path)
+    pub gate_buf: Vec<RocmStorage>,      // [batch, intermediate_size]
+    pub up_buf: Vec<RocmStorage>,        // [batch, intermediate_size]
+    pub activated_buf: Vec<RocmStorage>, // [batch, intermediate_size]
+    /// Per-layer [batch, hidden] staging for norm outputs and GEMM results that
+    /// feed a residual add. Sequentially reused within a layer (stream order
+    /// preserves dependencies); never live across layers.
+    pub norm_buf: Vec<RocmStorage>,      // [batch, hidden_size]
+    /// Online-softmax partials for `launch_qkv_attention_dev`, kept in-pool
+    /// so capture allocates nothing.
+    pub attn_max_buf: Vec<RocmStorage>,  // [num_heads]
+    pub attn_sum_buf: Vec<RocmStorage>,  // [num_heads]
+    /// KV cache arenas (pre-allocated to max context)
+    pub k_arena: Vec<RocmStorage>,       // [max_ctx, n_k]
+    pub v_arena: Vec<RocmStorage>,       // [max_ctx, n_v]
+    /// Output projection
+    pub head_input: RocmStorage,         // [batch, hidden_size]
+    pub head_output: Arc<RocmStorage>,   // [batch, vocab_size]
+    /// Host-side position mirror. Device scalar lives in `pos_dev`;
+    /// kernels read pos from device so graph stays capturable.
+    pub current_pos: u32,
+    /// Single-u32 device buffer holding KV position. Updated before each
+    /// replay via one 4-byte async H2D (spec §Scalar second approach).
+    pub pos_dev: RocmStorage,
+    /// Shared read-only dummy ([1], zeros) for unused attention inputs
+    /// (o_proj weights with fuse_o=0, alibi slopes with has_alibi=0).
+    pub attn_dummy: RocmStorage,
+    /// Per-layer Q8_1 activation staging (U8 bytes) for fused/quant GEMVs.
+    /// Sized for max(hidden, intermediate): `(max/32)*36` bytes, reused
+    /// sequentially across QKV and gate+up projections (stream-ordered).
+    pub act_q81_buf: Vec<RocmStorage>,
+    /// Per-layer fused-QKV output staging ([n_q + 2*n_kv] F32); the three
+    /// Q/K/V slices are D2D-copied into `q/k/v_buf`.
+    pub fused_qkv_out: Vec<RocmStorage>,
+    pub num_layers: usize,
+    pub max_ctx: usize,
+    pub batch: usize,
+}
+
+impl DecodeGraphBuffers {
+    /// Allocate full pool on `dev`. Fails fast on OOM -> caller falls back eager.
+    /// `batch` parameterizes all per-token slots as `[batch, dim]`. `batch=1`
+    /// preserves the original single-token shape.
+    /// `num_heads` sizes the per-layer attention scratch (`attn_max/sum_buf`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate(
+        dev: &RocmDevice,
+        num_layers: usize,
+        hidden_size: usize,
+        n_q: usize,
+        n_k: usize,
+        n_v: usize,
+        intermediate_size: usize,
+        max_ctx: usize,
+        vocab_size: usize,
+        num_heads: usize,
+        batch: usize,
+    ) -> Result<Self> {
+        if num_layers == 0 || hidden_size == 0 || max_ctx == 0 || vocab_size == 0 || batch == 0 {
+            return Err(Error::Backend(
+                "DecodeGraphBuffers::allocate: zero dim".into(),
+            ));
+        }
+        let dt = dtype_f32();
+        let mut layer_input = Vec::with_capacity(num_layers);
+        let mut layer_output = Vec::with_capacity(num_layers);
+        let mut q_buf = Vec::with_capacity(num_layers);
+        let mut k_buf = Vec::with_capacity(num_layers);
+        let mut v_buf = Vec::with_capacity(num_layers);
+        let mut attn_out_buf = Vec::with_capacity(num_layers);
+        let mut gate_up_buf = Vec::with_capacity(num_layers);
+        let mut gate_buf = Vec::with_capacity(num_layers);
+        let mut up_buf = Vec::with_capacity(num_layers);
+        let mut activated_buf = Vec::with_capacity(num_layers);
+        let mut norm_buf = Vec::with_capacity(num_layers);
+        let mut attn_max_buf = Vec::with_capacity(num_layers);
+        let mut attn_sum_buf = Vec::with_capacity(num_layers);
+        let mut act_q81_buf = Vec::with_capacity(num_layers);
+        let mut fused_qkv_out = Vec::with_capacity(num_layers);
+        let mut k_arena = Vec::with_capacity(num_layers);
+        let mut v_arena = Vec::with_capacity(num_layers);
+        // Q8_1 staging must cover the widest activation row (hidden vs inter).
+        let q81_elems = hidden_size.max(intermediate_size).max(32);
+        let q81_bytes = (q81_elems / 32) * 36;
+        let q81_dt = DType {
+            arith: ArithType::U8,
+            storage: DTypeStorage::Native,
+        };
+        let hid = hidden_size.max(1);
+        let nqk = n_q.max(1);
+        let nkk = n_k.max(1);
+        let nvk = n_v.max(1);
+        let inter = intermediate_size.max(1);
+        for _ in 0..num_layers {
+            layer_input.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, hid]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            layer_output.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, hid]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            q_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, nqk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            k_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, nkk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            v_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, nvk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            attn_out_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, nqk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            gate_up_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, 2 * inter]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            gate_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, inter]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            up_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, inter]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            activated_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, inter]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            norm_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, hid]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            attn_max_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![num_heads.max(1)]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            attn_sum_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![num_heads.max(1)]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            act_q81_buf.push(RocmStorage::alloc_gpu_with_bytes(
+                &Shape::new(vec![q81_bytes]),
+                q81_dt.clone(),
+                q81_bytes,
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            fused_qkv_out.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![nqk + 2 * nkk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            k_arena.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![max_ctx, nkk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            v_arena.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![max_ctx, nvk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+        }
+        let head_input = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch, hid]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let head_output = Arc::new(RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch, vocab_size]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?);
+        let pos_dev = RocmStorage::alloc_gpu(
+            &Shape::new(vec![1]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let attn_dummy = RocmStorage::alloc_gpu(
+            &Shape::new(vec![1]),
+            dt,
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        Ok(Self {
+            layer_input,
+            layer_output,
+            q_buf,
+            k_buf,
+            v_buf,
+            attn_out_buf,
+            gate_up_buf,
+            gate_buf,
+            up_buf,
+            activated_buf,
+            norm_buf,
+            attn_max_buf,
+            attn_sum_buf,
+            k_arena,
+            v_arena,
+            head_input,
+            head_output,
+            current_pos: 0,
+            pos_dev,
+            attn_dummy,
+            act_q81_buf,
+            fused_qkv_out,
+            num_layers,
+            max_ctx,
+            batch,
+        })
+    }
+
+    /// 4-byte async H2D of `pos` into `pos_dev` on `stream`. Must run
+    /// BEFORE replay, never inside capture.
+    pub fn write_pos_async(
+        &mut self,
+        dev: &RocmDevice,
+        pos: u32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let dst = self
+            .pos_dev
+            .device_ptr_u64()
+            .ok_or_else(|| Error::Backend("pos_dev has no device ptr".into()))?
+            as *mut c_void;
+        let mut host = pos;
+        // SAFETY: dst is device mem owned by pos_dev (4 bytes); host ptr valid for call.
+        let res: crate::HipErrorT = unsafe {
+            hipMemcpyAsync(
+                dst,
+                &mut host as *mut u32 as *const c_void,
+                4,
+                HipMemcpyKind::HostToDevice,
+                stream,
+            )
+        };
+        if res != crate::hipSuccess {
+            return Err(Error::Backend(format!(
+                "write_pos_async hipMemcpyAsync failed: {res}"
+            )));
+        }
+        self.current_pos = pos;
+        Ok(())
+    }
+}
+
+/// Spec §Phase 2: wraps HIP graph state + fixed buffers.
+#[derive(Debug)]
+pub struct DecodeGraph {
+    pub graph: *mut c_void,
+    pub exec: *mut c_void,
+    pub stream: *mut c_void,
+    pub buffers: DecodeGraphBuffers,
+    pub is_captured: bool,
+    /// Kernel node whose scalar args change per step (KV append). Null ->
+    /// use `pos_dev` + async memcpy path instead.
+    pub kv_append_node: *mut c_void,
+    ordinal: usize,
+}
+
+// SAFETY: raw HIP handles owned by self, only touched on owning device.
+unsafe impl Send for DecodeGraph {}
+unsafe impl Sync for DecodeGraph {}
+
+impl DecodeGraph {
+    pub fn new(dev: &RocmDevice, buffers: DecodeGraphBuffers, stream: *mut c_void) -> Self {
+        Self {
+            graph: std::ptr::null_mut(),
+            exec: std::ptr::null_mut(),
+            stream,
+            buffers,
+            is_captured: false,
+            kv_append_node: std::ptr::null_mut(),
+            ordinal: dev.ordinal,
+        }
+    }
+
+    /// Allocate buffers + wrap. Single entry used by `get_or_create_decode_graph`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate(
+        dev: &RocmDevice,
+        stream: *mut c_void,
+        num_layers: usize,
+        hidden_size: usize,
+        n_q: usize,
+        n_k: usize,
+        n_v: usize,
+        intermediate_size: usize,
+        max_ctx: usize,
+        vocab_size: usize,
+        num_heads: usize,
+        batch: usize,
+    ) -> Result<Self> {
+        let buffers = DecodeGraphBuffers::allocate(
+            dev,
+            num_layers,
+            hidden_size,
+            n_q,
+            n_k,
+            n_v,
+            intermediate_size,
+            max_ctx,
+            vocab_size,
+            num_heads,
+            batch,
+        )?;
+        Ok(Self::new(dev, buffers, stream))
+    }
+
+    pub fn begin_capture(&mut self) -> Result<()> {
+        if !decode_graph_enabled() {
+            return Err(Error::Backend("decode graph disabled by env".into()));
+        }
+        if self.is_captured {
+            return Err(Error::Backend("begin_capture: already captured".into()));
+        }
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        // SAFETY: stream owned by device pool, valid for capture duration.
+        let res: crate::HipErrorT = unsafe { hipStreamBeginCapture(self.stream, 2) };
+        if res != crate::hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipStreamBeginCapture failed: {res}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Abort an open capture after a recording failure (e.g. a layer bailed
+    /// to eager fallback mid-capture). Ends the capture, destroys the partial
+    /// graph, leaves `is_captured=false`. Without this the stream stays in
+    /// capture mode and later D2H/H2D calls fail (hipMemcpyDtoH 906).
+    pub fn abort_capture(&mut self) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut graph: *mut c_void = std::ptr::null_mut();
+        // SAFETY: stream is under capture; graph out-ptr valid. Result ignored
+        // beyond cleanup: the partial graph is always discarded.
+        let _ = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
+        if !graph.is_null() {
+            unsafe {
+                let _ = hipGraphDestroy(graph);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn end_capture(&mut self) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let mut graph: *mut c_void = std::ptr::null_mut();
+        // SAFETY: stream is under capture; graph out-ptr valid.
+        let res: crate::HipErrorT = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
+        if res != crate::hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipStreamEndCapture failed: {res}"
+            )));
+        }
+        let mut exec: *mut c_void = std::ptr::null_mut();
+        // SAFETY: graph just captured, exec out-ptr valid.
+        let inst: crate::HipErrorT = unsafe {
+            hipGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if inst != crate::hipSuccess {
+            unsafe {
+                let _ = hipGraphDestroy(graph);
+            }
+            return Err(Error::Backend(format!(
+                "hipGraphInstantiate failed: {inst}"
+            )));
+        }
+        self.graph = graph;
+        self.exec = exec;
+        self.is_captured = true;
+        Ok(())
+    }
+
+    /// Replay entire graph in one launch. Caller must `write_pos_async`
+    /// + H2D input first, D2H logits after.
+    pub fn replay(&self) -> Result<()> {
+        if !self.is_captured || self.exec.is_null() {
+            return Err(Error::Backend("replay: graph not captured".into()));
+        }
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        // SAFETY: exec/stream owned, valid post-capture.
+        check_hip("hipGraphLaunch", unsafe {
+            crate::hipGraphLaunch(self.exec, self.stream)
+        })?;
+        Ok(())
+    }
+
+    /// Spec §Scalar: update KV-position kernel args before replay.
+    /// Calls real `hipGraphExecKernelNodeSetParams` when node known;
+    /// else caller uses `write_pos_async` device-buffer path.
+    pub fn update_kv_pos_params(&self, node_params: *const c_void) -> Result<()> {
+        if self.kv_append_node.is_null() {
+            return Err(Error::Unimplemented(
+                "no kv_append_node; use write_pos_async".into(),
+            ));
+        }
+        if node_params.is_null() {
+            return Err(Error::Backend("update_kv_pos_params: null params".into()));
+        }
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        // SAFETY: exec + node from capture; params point to valid node struct.
+        let res: crate::HipErrorT = unsafe {
+            hipGraphExecKernelNodeSetParams(self.exec, self.kv_append_node, node_params)
+        };
+        if res != crate::hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipGraphExecKernelNodeSetParams failed: {res}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Async 4-byte H2D input write (token id as f32 bits) into layer 0.
+    /// Runs BEFORE replay, never inside capture. Ordered vs replay on same stream.
+    pub fn write_input_async(&self, dev: &RocmDevice, token_id: u32) -> Result<()> {
+        let dst = self
+            .buffers
+            .layer_input
+            .first()
+            .ok_or_else(|| Error::Backend("write_input: no layers".into()))?;
+        let bits = f32::from_bits(token_id);
+        dev.write_f32_into_async(dst, &[bits])?;
+        Ok(())
+    }
+
+    /// Write a batch of token IDs into layer 0 input buffer (P3 batch decode).
+    /// `token_ids` must have length == `buffers.batch`.
+    pub fn write_input_batch_async(&self, dev: &RocmDevice, token_ids: &[u32]) -> Result<()> {
+        let dst = self
+            .buffers
+            .layer_input
+            .first()
+            .ok_or_else(|| Error::Backend("write_input_batch: no layers".into()))?;
+        let n = token_ids.len().min(self.buffers.batch);
+        let bits: Vec<f32> = token_ids[..n].iter().map(|&t| f32::from_bits(t)).collect();
+        dev.write_f32_into_async(dst, &bits)?;
+        Ok(())
+    }
+
+    /// Single D2H sync point AFTER replay (spec §Phase 5).
+    /// Reads `buffers.head_output` to host. Never call inside capture.
+    pub fn read_logits_f32(&self) -> Result<Vec<f32>> {
+        use grim_tensor::backend::BackendStorage;
+        self.buffers.head_output.to_cpu_vec_f32()
+    }
+
+    /// Access live device storage for logits (P0 GPU sampler path).
+    pub fn logits_device_storage(&self) -> &RocmStorage {
+        &self.buffers.head_output
+    }
+
+    /// Access live device-resident logits Tensor (zero-copy, zero D2H).
+    pub fn logits_tensor(&self) -> Result<grim_tensor::Tensor> {
+        use grim_tensor::backend::BackendStorage;
+        let shape = self.buffers.head_output.shape().clone();
+        let dtype = self.buffers.head_output.dtype();
+        let prov = self.buffers.head_output.provenance();
+        let dev = grim_tensor::Device::Rocm(self.ordinal);
+        let storage: Arc<dyn BackendStorage> = self.buffers.head_output.clone();
+        Ok(grim_tensor::Tensor::new(storage, shape, dtype, prov, dev))
+    }
+}
+
+impl Drop for DecodeGraph {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.exec.is_null() {
+                let _ = hipGraphExecDestroy(self.exec);
+                self.exec = std::ptr::null_mut();
+            }
+            if !self.graph.is_null() {
+                let _ = hipGraphDestroy(self.graph);
+                self.graph = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+/// Spec §Env: both flags disable. `=0/false/off` (case-insensitive `false/off`) = eager.
+pub fn decode_graph_enabled() -> bool {
+    for key in ["GRIM_DECODE_GRAPH", "GRIM_CAPTURE_GRAPH"] {
+        if let Ok(v) = std::env::var(key) {
+            if matches!(v.as_str(), "0" | "false" | "off" | "False" | "OFF") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Spec §Phase 6 helpers. GEMM stays in rocBLAS (Rule 0); these validate
+/// stable-address topology for capture. Real KV/attention launches live in
+/// `kernels::qkv_attention` (`launch_kv_append`, `launch_qkv_attention_dev`).
+pub fn launch_qkv_gemv(
+    k_arena: &RocmStorage,
+    pos: u32,
+    max_ctx: usize,
+) -> Result<()> {
+    let ptr = k_arena
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("launch_qkv_gemv: k_arena has no device ptr".into()))?;
+    if ptr == 0 {
+        return Err(Error::Backend("launch_qkv_gemv: null arena ptr".into()));
+    }
+    if (pos as usize) >= max_ctx {
+        return Err(Error::Backend(format!(
+            "launch_qkv_gemv: pos {pos} >= max_ctx {max_ctx}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate attention replay topology (stable pointers, in-range pos).
+pub fn launch_attention(k_arena: &RocmStorage, pos: u32, max_ctx: usize) -> Result<()> {
+    launch_qkv_gemv(k_arena, pos, max_ctx)
+}
+
+/// Async H2D of token embedding id into fixed input buffer (4 bytes).
+/// Thin wrapper so `lfm2_graph` + `run.rs` share one call site.
+/// Ordered vs later launches on the active stream — no host sync.
+pub fn write_embedding_to_buffer(
+    dev: &RocmDevice,
+    dst: &RocmStorage,
+    token_id: u32,
+) -> Result<()> {
+    let bits = f32::from_bits(token_id);
+    dev.write_f32_into_async(dst, &[bits])
+}
+
+/// Batch version: write multiple token IDs into layer 0 input.
+pub fn write_embeddings_to_buffer_batch(
+    dev: &RocmDevice,
+    dst: &RocmStorage,
+    token_ids: &[u32],
+) -> Result<()> {
+    let bits: Vec<f32> = token_ids.iter().map(|&t| f32::from_bits(t)).collect();
+    dev.write_f32_into_async(dst, &bits)
+}
+
+/// Shape guard for per-layer graph recording (no alloc, no sync).
+pub fn check_layer_topology(buffers: &DecodeGraphBuffers, layer_idx: usize) -> Result<()> {
+    if layer_idx >= buffers.num_layers {
+        return Err(Error::Backend(format!(
+            "forward_graph: layer {layer_idx} >= {}",
+            buffers.num_layers
+        )));
+    }
+    for (name, v) in [
+        ("layer_input", &buffers.layer_input),
+        ("layer_output", &buffers.layer_output),
+        ("q_buf", &buffers.q_buf),
+        ("k_buf", &buffers.k_buf),
+        ("v_buf", &buffers.v_buf),
+        ("attn_out_buf", &buffers.attn_out_buf),
+        ("gate_buf", &buffers.gate_buf),
+        ("up_buf", &buffers.up_buf),
+        ("activated_buf", &buffers.activated_buf),
+        ("norm_buf", &buffers.norm_buf),
+        ("attn_max_buf", &buffers.attn_max_buf),
+        ("attn_sum_buf", &buffers.attn_sum_buf),
+        ("act_q81_buf", &buffers.act_q81_buf),
+        ("fused_qkv_out", &buffers.fused_qkv_out),
+        ("k_arena", &buffers.k_arena),
+        ("v_arena", &buffers.v_arena),
+    ] {
+        let s = v
+            .get(layer_idx)
+            .ok_or_else(|| Error::Backend(format!("{name}[{layer_idx}] missing")))?;
+        s.device_ptr_checked()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_graph_disabled_by_either_flag() {
+        temp_env::with_var("GRIM_DECODE_GRAPH", Some("0"), || {
+            assert!(!decode_graph_enabled());
+        });
+        temp_env::with_var("GRIM_CAPTURE_GRAPH", Some("0"), || {
+            assert!(!decode_graph_enabled());
+        });
+        temp_env::with_vars(
+            [
+                ("GRIM_DECODE_GRAPH", None::<&str>),
+                ("GRIM_CAPTURE_GRAPH", None::<&str>),
+            ],
+            || assert!(decode_graph_enabled()),
+        );
+    }
+
+    #[test]
+    fn decode_graph_buffers_allocate_rejects_zero_batch() {
+        // Zero-dim guard fires before any HIP alloc; no GPU needed.
+        assert!(DecodeGraphBuffers::allocate(
+            &crate::device::roc_device::RocmDevice::shared(0),
+            1, 64, 64, 64, 64, 256, 8, 100, 8, 0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn launch_qkv_gemv_rejects_oob_pos() {
+        // No GPU needed: null-ptr path errors before any HIP call.
+        let alloc = std::sync::Arc::new(
+            crate::memory::allocator::RocmCachingAllocator::new(0, 1 << 20),
+        );
+        let st = RocmStorage::alloc_gpu_with_bytes(
+            &Shape::new(vec![8, 8]),
+            dtype_f32(),
+            8 * 8 * 4,
+            &alloc,
+            0,
+        );
+        // On CPU-only CI alloc fails -> fallback eager is correct behavior.
+        match st {
+            Ok(s) => {
+                assert!(launch_qkv_gemv(&s, 99999, 8).is_err());
+            }
+            Err(_) => {}
+        }
+    }
+}

@@ -18,10 +18,89 @@ use grim_engine::{
     model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
 };
 use grim_format::GgufTokenizer;
-use grim_models_transformer::{Lfm2Config, LlamaConfig};
+use grim_models_transformer::{Lfm2, Lfm2Config, LlamaConfig};
 use grim_tensor::CoreTensorOps;
 use grim_tensor::Device;
 use std::sync::Arc;
+
+enum GraphDecodeResult {
+    Sampled(u32),
+    Logits(grim_tensor::Tensor),
+}
+
+/// i-was-dumb-graph.md Phase 5 + twinkie-zombieland P0: decode-loop graph trigger (LFM2 + ROCm only).
+/// If GPU sampler can be used, samples directly from device logits with zero D2H!
+/// Falls back to reading logits to host only when repeat penalty or CPU sampler is forced.
+fn try_graph_decode_step(
+    model: &dyn CausalLm,
+    device: &Device,
+    token_id: u32,
+    vocab: usize,
+    graph: &mut Option<grim_backend_rocm::FullDecodeGraph>,
+    graph_failed: &mut bool,
+    sampling_params: &SamplingParams,
+    seed: u64,
+    step: usize,
+    allow_gpu_sample: bool,
+) -> Option<GraphDecodeResult> {
+    if *graph_failed || !grim_backend_rocm::decode_graph_enabled() {
+        return None;
+    }
+    if !matches!(device, Device::Rocm(_)) {
+        return None;
+    }
+    let lfm2 = model.as_any().downcast_ref::<Lfm2>()?;
+    // Lazily allocate once; stable addresses across steps.
+    if graph.is_none() {
+        match lfm2.get_or_create_decode_graph(4096) {
+            Ok(mut g) => {
+                // First step: capture. Any failure -> abort the open capture
+                // (else the stream stays capturing and later copies fail
+                // with hipMemcpyDtoH 906), then eager fallback.
+                if g.begin_capture().is_err() {
+                    *graph_failed = true;
+                    return None;
+                }
+                let ok = lfm2.forward_capture(&mut g, token_id).is_ok()
+                    && g.end_capture().is_ok();
+                if !ok {
+                    let _ = g.abort_capture();
+                    *graph_failed = true;
+                    return None;
+                }
+                // Seed pos for next replay.
+                g.buffers.current_pos = 1;
+                *graph = Some(g);
+                return None; // capture step ran eagerly path this token; replay from next.
+            }
+            Err(_) => {
+                *graph_failed = true;
+                return None;
+            }
+        }
+    }
+    let g = graph.as_mut()?;
+    if lfm2.forward_replay(g, token_id).is_err() {
+        *graph_failed = true;
+        *graph = None;
+        return None;
+    }
+    g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
+
+    if allow_gpu_sample {
+        if let Ok(tok) = sample_storage_on_rocm(device, g.logits_device_storage(), sampling_params, seed, step) {
+            return Some(GraphDecodeResult::Sampled(tok));
+        }
+    }
+
+    let flat = g.read_logits_f32().ok()?;
+    if flat.len() != vocab {
+        return None;
+    }
+    let shape = grim_tensor::Shape::new(vec![1, vocab]);
+    let tensor = build_tensor(&flat, &shape, device).ok()?;
+    Some(GraphDecodeResult::Logits(tensor))
+}
 
 /// Resolve the GPU ordinal for this TP rank's process.
 /// Only returns `Some` when multi-process TP is active (`GRIM_TP_SIZE > 1`).
@@ -520,7 +599,16 @@ pub async fn cmd_run(
     let mut decode_input: Option<grim_tensor::Tensor> = None;
     let mut decode_pos: Option<grim_tensor::Tensor> = None;
 
+    // i-was-dumb-graph.md Phase 5: full-model graph state. Allocated once,
+    // reused for stable addresses. `None` + `graph_failed` = eager fallback.
+    let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
+    let mut graph_failed = false;
+    // Owns the one prefill tensor pair so the borrow lives across the step.
+    let mut decode_prefill_cache: Vec<(grim_tensor::Tensor, grim_tensor::Tensor)> = Vec::new();
+
     // Generation loop
+    let mut decode_total_us: u64 = 0;
+    let mut decode_count: u64 = 0;
     while generated < max_tokens {
         // Prefill on first pass to populate KV caches; decode one token at a time after.
         // HIGH-3: save first_pass before input_ids block mutates it to avoid wrong positions.
@@ -532,39 +620,42 @@ pub async fn cmd_run(
             vec![*tokens.last().unwrap() as f32]
         };
 
-        // Build tensor from selected token(s). Prefill + first decode step
-        // allocate; later decode steps rewrite the preallocated buffers.
-        let n_tokens = input_ids.len();
-        let shape = grim_tensor::Shape::new(vec![n_tokens]);
-        let float_tokens = input_ids;
-        let _dtype = grim_tensor::dtype::DType::F32;
-        let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
-
-        // Forward pass with proper positions tensor (CRIT-1).
+        // Host vecs: no transfer yet. Positions value matches old logic
+        // (decode step pos = n_tokens-1 == 0 for [1] inputs).
+        let n_hint = input_ids.len();
         let positions: Vec<f32> = if is_prefill {
-            (0..n_tokens).map(|i| i as f32).collect()
+            (0..n_hint).map(|i| i as f32).collect()
         } else {
-            vec![n_tokens as f32 - 1.0]
+            vec![n_hint as f32 - 1.0]
         };
-        let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
-        let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
-
-        // SPEED-ROC: decode steps reuse preallocated [1]-shape tensors —
-        // write_f32_into replaces build_tensor (no per-token device alloc).
-        // Prefill + first decode step allocate; first decode step seeds the
-        // reuse buffers. Non-Rocm devices keep the per-step build path.
+        // SPEED-ROC: ROCm decode steps reuse preallocated [1]-shape tensors —
+        // async in-place update, zero H2D allocs on the reuse path (old code
+        // built + discarded two tensors per token). Non-Rocm: per-step build.
+        let rocm_reuse =
+            !is_prefill && matches!(device, Device::Rocm(_)) && decode_input.is_some() && decode_pos.is_some();
         let (input_tensor, positions_tensor) =
-            if !is_prefill && decode_input.is_some() && decode_pos.is_some() {
+            if rocm_reuse {
+                // Update in place async on the active stream, ordered vs forward.
                 if let Device::Rocm(ordinal) = &device {
                     let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
-                    dev.write_f32_into(decode_input.as_ref().unwrap().storage().as_ref(), &float_tokens)?;
-                    dev.write_f32_into(decode_pos.as_ref().unwrap().storage().as_ref(), &positions)?;
+                    dev.write_f32_into_async(decode_input.as_ref().unwrap().storage().as_ref(), &input_ids)?;
+                    dev.write_f32_into_async(decode_pos.as_ref().unwrap().storage().as_ref(), &positions)?;
                 }
                 (
                     decode_input.as_ref().unwrap(),
                     decode_pos.as_ref().unwrap(),
                 )
             } else {
+                // Build tensor from selected token(s). Prefill + first decode
+                // step allocate; later ROCm steps never reach here.
+                let n_tokens = input_ids.len();
+                let shape = grim_tensor::Shape::new(vec![n_tokens]);
+                let float_tokens = input_ids;
+                let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
+
+                // Forward pass with proper positions tensor (CRIT-1).
+                let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
+                let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
                 if !is_prefill {
                     decode_input = Some(input_tensor);
                     decode_pos = Some(positions_tensor);
@@ -573,36 +664,109 @@ pub async fn cmd_run(
                         decode_pos.as_ref().unwrap(),
                     )
                 } else {
-                    (&input_tensor, &positions_tensor)
+                    // Prefill temps: leak via small Vec to keep borrow simple.
+                    // One alloc on prefill only, never on decode.
+                    decode_prefill_cache.push((input_tensor, positions_tensor));
+                    let (i, p) = decode_prefill_cache.last().unwrap();
+                    (i, p)
                 }
             };
 
-        let logits =
-            CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?;
-
-        // SPEED-ROC: on decode steps (single-row logits) sample straight from the
-        // device tensor via the WI-X3 GPU sampler — skips the full-vocab D2H +
-        // CPU sampling that dominated per-token overhead. Prefill (multi-row) and
-        // repeat-penalty-active steps fall back to the CPU sampler.
-        let gpu_sample_ok = logits.shape().elem_count() == vocab
-            && std::env::var("GRIM_CPU_SAMPLER").is_err()
+        let step_start = std::time::Instant::now();
+        // Phase 5 trigger: LFM2 decode steps try single-launch replay first.
+        // Capture step + any miss fall through to eager (spec §Fallback).
+        let allow_gpu_sample = std::env::var("GRIM_CPU_SAMPLER").is_err()
             && matches!(device, Device::Rocm(_))
             && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
 
-        let next_token = if gpu_sample_ok {
-            sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated)?
+        let graph_hit = if !is_prefill {
+            let tid = tokens.last().copied().unwrap_or(0);
+            try_graph_decode_step(
+                &*model,
+                &device,
+                tid,
+                vocab,
+                &mut decode_graph,
+                &mut graph_failed,
+                &sampling_params,
+                seed,
+                generated,
+                allow_gpu_sample,
+            )
         } else {
-            // Get logits for last token position only
-            let logits_vec = logits.to_vec_f32()?;
-            let last_start = logits_vec.len().saturating_sub(vocab);
-            let last_logits = &logits_vec[last_start..];
+            None
+        };
 
-            // Single-position logits tensor so sampler sees next-token distribution only, not full sequence.
-            let last_shape = grim_tensor::Shape::new(vec![vocab]);
-            let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
+        let next_token = match graph_hit {
+            Some(GraphDecodeResult::Sampled(tok)) => {
+                let step_us = step_start.elapsed().as_micros() as u64;
+                decode_total_us += step_us;
+                decode_count += 1;
+                tok
+            }
+            Some(GraphDecodeResult::Logits(logits)) => {
+                let step_us = step_start.elapsed().as_micros() as u64;
+                decode_total_us += step_us;
+                decode_count += 1;
+                let logits_vec = logits.to_vec_f32()?;
+                let last_start = logits_vec.len().saturating_sub(vocab);
+                let last_logits = &logits_vec[last_start..];
+                let last_shape = grim_tensor::Shape::new(vec![vocab]);
+                let last_logits_tensor = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(
+                        grim_backend_cpu::CpuDevice::new().from_cpu(
+                            last_logits,
+                            &last_shape,
+                            grim_tensor::dtype::DType::F32,
+                        )?,
+                    ),
+                    last_shape,
+                    grim_tensor::dtype::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::default(),
+                    grim_tensor::Device::Cpu,
+                );
+                sampler.sample(&last_logits_tensor, &history)?
+            }
+            None => {
+                let logits = CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?;
+                let step_us = step_start.elapsed().as_micros() as u64;
+                if !is_prefill {
+                    decode_total_us += step_us;
+                    decode_count += 1;
+                }
 
-            // Sample from last-position logits only.
-            sampler.sample(&last_logits_tensor, &history)?
+                // SPEED-ROC: on decode steps (single-row logits) sample straight from the
+                // device tensor via the WI-X3 GPU sampler — skips the full-vocab D2H +
+                // CPU sampling that dominated per-token overhead. Prefill (multi-row) and
+                // repeat-penalty-active steps fall back to the CPU sampler.
+                let gpu_sample_ok = logits.shape().elem_count() == vocab
+                    && std::env::var("GRIM_CPU_SAMPLER").is_err()
+                    && matches!(device, Device::Rocm(_))
+                    && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
+
+                if gpu_sample_ok {
+                    sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated)?
+                } else {
+                    let logits_vec = logits.to_vec_f32()?;
+                    let last_start = logits_vec.len().saturating_sub(vocab);
+                    let last_logits = &logits_vec[last_start..];
+                    let last_shape = grim_tensor::Shape::new(vec![vocab]);
+                    let last_logits_tensor = grim_tensor::Tensor::new(
+                        std::sync::Arc::from(
+                            grim_backend_cpu::CpuDevice::new().from_cpu(
+                                last_logits,
+                                &last_shape,
+                                grim_tensor::dtype::DType::F32,
+                            )?,
+                        ),
+                        last_shape,
+                        grim_tensor::dtype::DType::F32,
+                        grim_tensor::dtype::QuantProvenance::default(),
+                        grim_tensor::Device::Cpu,
+                    );
+                    sampler.sample(&last_logits_tensor, &history)?
+                }
+            }
         };
 
         // Accumulate tokens; decode full sequence at end for correct BPE boundary handling.
@@ -653,6 +817,16 @@ pub async fn cmd_run(
     }
 
     println!("\n[grim] Done. Generated {} tokens.", generated);
+    if decode_count > 0 {
+        let avg_us = decode_total_us / decode_count;
+        let tps = 1_000_000.0 / avg_us as f64;
+        eprintln!(
+            "[grim] Decode: {:.2} ms/token avg ({} tokens, {:.0} tokens/sec)",
+            avg_us as f64 / 1000.0,
+            decode_count,
+            tps
+        );
+    }
     Ok(())
 }
 
@@ -787,11 +961,9 @@ pub fn init_generation(
 /// Reads the caller's device-resident logits tensor — no D2H, no CPU sort.
 /// RNG stream advances per step: `SamplingOps::sample_on_device` packs the
 /// position into the high 32 bits of `seed` (see `device_sampler::sample_impl`).
-#[allow(clippy::too_many_arguments)]
-fn sample_on_rocm(
+fn sample_storage_on_rocm(
     device: &Device,
-    logits: &grim_tensor::Tensor,
-    _vocab: usize,
+    storage: &dyn grim_tensor::BackendStorage,
     params: &SamplingParams,
     seed: u64,
     step: usize,
@@ -805,12 +977,24 @@ fn sample_on_rocm(
     let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
     let step_seed = (seed & 0xffff_ffff) | ((step as u64) << 32);
     Ok(dev.sample_on_device(
-        logits.storage().as_ref(),
+        storage,
         params.temperature,
         params.top_p,
         params.top_k,
         step_seed,
     )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_on_rocm(
+    device: &Device,
+    logits: &grim_tensor::Tensor,
+    _vocab: usize,
+    params: &SamplingParams,
+    seed: u64,
+    step: usize,
+) -> Result<u32> {
+    sample_storage_on_rocm(device, logits.storage().as_ref(), params, seed, step)
 }
 
 fn build_tensor(
