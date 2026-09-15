@@ -248,9 +248,12 @@ pub struct Engine {
     /// P3: bucket-specialized batch decode graphs. Maps model_id → pool of
     /// per-bucket captured graphs for batch decode replay in step_batch.
     batch_graph_pools: HashMap<String, grim_backend_rocm::DecodeBucketGraphPool>,
-    /// P3: per-model batch size used for bucket graph allocation.
-    batch_graph_batch_sizes: HashMap<String, usize>,
-
+    /// P3: pinned slot assignment per (model_id, bucket). A bucket graph's KV
+    /// arenas are per-slot, so a request MUST always land in the same slot:
+    /// the set/order captured here is pinned at first capture, and a group is
+    /// only replayed when its requests match the pin (otherwise eager).
+    batch_bucket_slots: HashMap<(String, u32), Vec<u64>>,
+}
 /// Persistent GPU buffers for graph-captured decode steps.
 #[derive(Debug)]
 pub struct GraphCaptureInputBuffers {
@@ -621,7 +624,7 @@ impl Engine {
             graph_capture_logits: HashMap::new(),
             decode_graphs: HashMap::new(),
             batch_graph_pools: HashMap::new(),
-            batch_graph_batch_sizes: HashMap::new(),
+            batch_bucket_slots: HashMap::new(),
         }
     }
 
@@ -2051,44 +2054,21 @@ impl Engine {
             })
             .unwrap_or(0);
 
-        // Try to replay through an existing bucket graph pool.
-        // If no pool exists for this model yet, return None (will be created
-        // on first batch when step_batch groups items).
-        let pool_opt = self.batch_graph_pools.get_mut(&effective);
-        let pool_opt = pool_opt?;
-        // For single items in a batch context, we need the pool to exist.
-        // If it doesn't have any captured graphs yet, fall through.
-        if pool_opt.buckets.is_empty() {
+        // Replay through an existing bucket graph pool: batch=1 (B1) bucket.
+        // Returns None when the pool or the captured graph does not exist yet —
+        // step_batch's grouping path creates pools on first multi-item batch.
+        let bucket = grim_backend_rocm::DecodeBatchBucket::B1;
+        let pool = self.batch_graph_pools.get_mut(&effective)?;
+        if !pool.contains_bucket(bucket) {
             return None;
         }
-        // Find the bucket that matches this item (batch=1 -> B1).
-        let bucket = grim_backend_rocm::DecodeBatchBucket::from_batch_size(1)?;
-        let buffers = pool_opt.get_buffers(bucket)?;
-        let stream = pool_opt.get_stream(bucket)?;
-
-        // Write token ID into the batch input buffer (row 0).
-        let dst = &buffers.layer_input[0];
-        let bits = f32::from_bits(tid);
-        let _ = rocm.write_f32_into_async(dst, &[bits]).ok()?;
-        // Update position.
-        let _ = buffers.write_pos_async(&rocm, buffers.current_pos, stream).ok()?;
-        // Replay.
-        let graph = pool_opt.buckets.get(&bucket)?;
-        let _ = unsafe {
-            grim_backend_rocm::hipGraphLaunch(graph.exec, stream)
-        };
-        // Bump position.
-        let new_pos = buffers.current_pos.wrapping_add(1);
-        // Read logits from head_output (row 0 for batch=1).
-        let logits_storage = &buffers.head_output;
+        let logits_storage = pool.replay_batch(bucket, &rocm, &[tid]).ok()?;
+        use grim_tensor::backend::BackendStorage as _;
         let logits = logits_storage.to_cpu_vec_f32().ok()?;
         let vocab = logits.len();
-        let logits_tensor = grim_tensor::Tensor::new(
-            std::sync::Arc::new(grim_tensor::Storage::Owned(logits.clone())),
+        let logits_tensor = grim_backend_cpu::cpu_tensor(
+            logits,
             grim_tensor::Shape::new(vec![1, vocab]),
-            grim_tensor::DType::F32,
-            grim_tensor::dtype::QuantProvenance::default(),
-            grim_tensor::Device::Cpu,
         );
         let accepted = self
             .sessions
@@ -2403,6 +2383,238 @@ impl Engine {
         })
     }
 
+    /// P3 pre-pass for `step_batch`: groups adapter-free, single-token Lfm2/ROCm
+    /// decode items per (model, power-of-2 bucket) and replays one captured batch
+    /// graph per group. Every failure leaves the items unprocessed for the
+    /// per-item eager/graph loop.
+    fn drive_batch_bucket_groups(
+        &mut self,
+        items: &[(u64, &str, &grim_tensor::Tensor, &grim_tensor::Tensor)],
+        out: &mut HashMap<usize, StepOutcome>,
+    ) {
+        if !grim_backend_rocm::decode_graph_enabled() {
+            return;
+        }
+        use grim_backend_rocm::DecodeBatchBucket;
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, &(req_id, model_id, input_ids, positions)) in items.iter().enumerate() {
+            if input_ids.shape().elem_count() != 1 || positions.shape().elem_count() != 1 {
+                continue;
+            }
+            let adapter_free = self
+                .request_adapters
+                .get(&req_id)
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            if !adapter_free {
+                continue;
+            }
+            let effective = self.effective_model_id(req_id, model_id);
+            let eligible = self.models.get(&effective).is_some_and(|m| {
+                matches!(m.device, grim_tensor::dtype::Device::Rocm(_))
+                    && m.model
+                        .target()
+                        .as_any()
+                        .downcast_ref::<grim_models_transformer::Lfm2>()
+                        .is_some()
+            });
+            if !eligible {
+                continue;
+            }
+            groups.entry(effective).or_default().push(idx);
+        }
+        for (model_id, idxs) in groups {
+            if idxs.len() < 2 {
+                continue;
+            }
+            // Slice into power-of-2 bucket chunks, largest first.
+            let mut rest = idxs.as_slice();
+            while rest.len() >= 2 {
+                let n = rest.len();
+                let bucket_size = [32usize, 16, 8, 4, 2]
+                    .into_iter()
+                    .find(|&b| b <= n)
+                    .unwrap();
+                let chunk = &rest[..bucket_size];
+                let bucket = match DecodeBatchBucket::from_batch_size(bucket_size) {
+                    Some(b) => b,
+                    None => {
+                        rest = &rest[1..];
+                        continue;
+                    }
+                };
+                let served = self
+                    .replay_bucket_group(&model_id, bucket, chunk, items, out)
+                    .unwrap_or(false);
+                if served {
+                    rest = &rest[bucket_size..];
+                } else {
+                    // Shrink: drop one item to eager rather than looping.
+                    rest = &rest[1..];
+                }
+            }
+        }
+    }
+
+    /// Replay one batch bucket graph for `idxs` (all items single-token,
+    /// adapter-free, same model). Returns Ok(true) when every item got logits.
+    /// Slot assignment (request → bucket row) is pinned on first capture so
+    /// each slot's KV arena stays bound to one request across steps.
+    fn replay_bucket_group(
+        &mut self,
+        model_id: &str,
+        bucket: grim_backend_rocm::DecodeBatchBucket,
+        idxs: &[usize],
+        items: &[(u64, &str, &grim_tensor::Tensor, &grim_tensor::Tensor)],
+        out: &mut HashMap<usize, StepOutcome>,
+    ) -> Result<bool> {
+        let bsz = bucket.batch_size();
+        if idxs.len() != bsz {
+            return Ok(false);
+        }
+        // Slot pinning: replay only when the request set matches the captured
+        // pin (order-insensitive membership, slot by pinned index).
+        let key = (model_id.to_string(), bsz as u32);
+        let pinned = self.batch_bucket_slots.get(&key).cloned();
+        let req_ids: Vec<u64> = idxs.iter().map(|&i| items[i].0).collect();
+        let order: Vec<usize> = if let Some(pin) = &pinned {
+            if pin.len() != bsz {
+                return Ok(false);
+            }
+            let mut ord = Vec::with_capacity(bsz);
+            for want in pin {
+                match req_ids.iter().position(|r| r == want) {
+                    Some(pos) => ord.push(pos),
+                    None => return Ok(false),
+                }
+            }
+            ord
+        } else {
+            (0..bsz).collect()
+        };
+
+        let ordinal = match &self.models.get(model_id).map(|m| m.device.clone()) {
+            Some(grim_tensor::dtype::Device::Rocm(ord)) => *ord,
+            _ => return Ok(false),
+        };
+        let rocm = grim_backend_rocm::device::roc_device::RocmDevice::shared(ordinal);
+        if !rocm.graph_capture_enabled() {
+            return Ok(false);
+        }
+        let lfm2 = match self
+            .models
+            .get(model_id)
+            .and_then(|m| m.model.target().as_any().downcast_ref::<grim_models_transformer::Lfm2>())
+        {
+            Some(l) => l,
+            None => return Ok(false),
+        };
+
+        // Tokens + positions in pinned slot order.
+        let mut token_ids: Vec<u32> = Vec::with_capacity(bsz);
+        let mut positions_u32: Vec<u32> = Vec::with_capacity(bsz);
+        for &oi in &order {
+            let (req_id, _model_id, input_ids, positions) = items[idxs[oi]];
+            let tid = self
+                .request_last_token
+                .get(&req_id)
+                .copied()
+                .or_else(|| {
+                    input_ids
+                        .to_vec_f32()
+                        .ok()
+                        .and_then(|v| v.first().copied())
+                        .map(|f| f as u32)
+                })
+                .unwrap_or(0);
+            let pos = positions
+                .to_vec_f32()
+                .ok()
+                .and_then(|v| v.first().copied())
+                .map(|f| f as u32)
+                .unwrap_or(0);
+            token_ids.push(tid);
+            positions_u32.push(pos);
+        }
+
+        // Lazily allocate + capture the bucket graph once.
+        {
+            let pool = self
+                .batch_graph_pools
+                .entry(model_id.to_string())
+                .or_insert_with(grim_backend_rocm::DecodeBucketGraphPool::new);
+            if !pool.contains_bucket(bucket) {
+                let cfg = &lfm2.cfg;
+                let max_ctx: usize = 4096;
+                let n_q = cfg.num_heads * cfg.head_dim;
+                let n_k = cfg.num_kv_heads * cfg.head_dim;
+                pool.allocate_buffers_for_bucket(
+                    bucket,
+                    &rocm,
+                    cfg.num_layers,
+                    cfg.hidden_size,
+                    n_q,
+                    n_k,
+                    n_k,
+                    cfg.intermediate_size,
+                    max_ctx,
+                    cfg.vocab_size,
+                    cfg.num_heads,
+                )?;
+                let seed = token_ids.clone();
+                pool.capture_batch_graph(bucket, |g| {
+                    lfm2
+                        .forward_capture_batch(g, &seed)
+                        .map_err(|e| grim_backend_rocm::Error::Backend(format!("{e}")))
+                })?;
+                self.batch_bucket_slots.insert(key, req_ids.clone());
+            }
+        }
+
+        let pool = self
+            .batch_graph_pools
+            .get_mut(model_id)
+            .ok_or_else(|| Error::Backend("batch pool missing after capture".into()))?;
+        let logits_storage = pool.replay_batch_with_pos(
+            bucket,
+            &rocm,
+            &token_ids,
+            &positions_u32,
+        )?;
+        use grim_tensor::backend::BackendStorage as _;
+        let logits = logits_storage.to_cpu_vec_f32()?;
+        let vocab = lfm2.cfg.vocab_size;
+        if vocab == 0 || logits.len() != bsz * vocab {
+            return Err(Error::Backend(format!(
+                "batch graph logits len {} != {bsz}*{vocab}",
+                logits.len()
+            )));
+        }
+        for (slot, &oi) in order.iter().enumerate() {
+            let idx = idxs[oi];
+            let (req_id, ..) = items[idx];
+            let row = logits[slot * vocab..(slot + 1) * vocab].to_vec();
+            let t = grim_backend_cpu::cpu_tensor(
+                row,
+                grim_tensor::Shape::new(vec![1, vocab]),
+            );
+            let accepted = self
+                .sessions
+                .get_mut(&req_id)
+                .map(|s| s.as_mut().last_accepted_tokens())
+                .unwrap_or(1);
+            out.insert(
+                idx,
+                StepOutcome {
+                    logits: Some(Arc::new(t)),
+                    accepted_tokens: accepted,
+                    speculative: false,
+                },
+            );
+        }
+        Ok(true)
+    }
+
     /// Public stepping API: drive one forward pass for `request_id` against a caller-supplied target model id, with caller-supplied adapters and an explicit input tensor.
     /// Returns the speculative wrapper's emitted logits.
     pub fn step_one(
@@ -2436,7 +2648,18 @@ impl Engine {
         }
         let mut slots: Vec<Slot> = Vec::with_capacity(items.len());
 
-        for &(req_id, model_id, input_ids, positions) in items {
+        // P3 pre-pass: group adapter-free, single-token, ROCm Lfm2 decode items
+        // per (effective model, power-of-2 bucket) and replay ONE captured batch
+        // graph per group. Items the graph cannot serve stay in the per-item
+        // loop below (adapters/eager fallbacks unaffected).
+        let mut prebatched: HashMap<usize, StepOutcome> = HashMap::new();
+        self.drive_batch_bucket_groups(items, &mut prebatched);
+
+        for (item_idx, &(req_id, model_id, input_ids, positions)) in items.iter().enumerate() {
+            if let Some(outcome) = prebatched.remove(&item_idx) {
+                slots.push(Slot::Done(req_id, outcome));
+                continue;
+            }
             let effective = self.effective_model_id(req_id, model_id);
             let strategy_plain = self
                 .models

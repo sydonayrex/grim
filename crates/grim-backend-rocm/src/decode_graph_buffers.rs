@@ -66,6 +66,10 @@ pub struct DecodeGraphBuffers {
     /// Shared read-only dummy ([1], zeros) for unused attention inputs
     /// (o_proj weights with fuse_o=0, alibi slopes with has_alibi=0).
     pub attn_dummy: RocmStorage,
+    /// Per-slot token-id staging ([batch] u32 in memory): replay writes fresh
+    /// token ids here BEFORE launch; the graph's embedding-gather node reads
+    /// them from device memory, so replayed logits track the input.
+    pub token_ids_dev: RocmStorage,
     /// Per-layer Q8_1 activation staging (U8 bytes) for fused/quant GEMVs.
     /// Sized for max(hidden, intermediate): `(max/32)*36` bytes, reused
     /// sequentially across QKV and gate+up projections (stream-ordered).
@@ -258,6 +262,12 @@ impl DecodeGraphBuffers {
             &dev.allocator,
             dev.ordinal,
         )?;
+        let token_ids_dev = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch.max(1)]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
         let attn_dummy = RocmStorage::alloc_gpu(
             &Shape::new(vec![1]),
             dt,
@@ -284,6 +294,7 @@ impl DecodeGraphBuffers {
             head_output,
             current_pos: 0,
             pos_dev,
+            token_ids_dev,
             attn_dummy,
             act_q81_buf,
             fused_qkv_out,
@@ -380,6 +391,12 @@ pub struct DecodeGraph {
     pub stream: *mut c_void,
     pub buffers: DecodeGraphBuffers,
     pub is_captured: bool,
+    /// True between `begin_capture` and `end_capture`/`abort_capture`.
+    /// Capture-time callers MUST NOT enqueue H2D writes of host-owned data:
+    /// an async H2D inside capture bakes the (dead) host pointer into a graph
+    /// memcpy node read at replay. Seed inputs are written eagerly before
+    /// `begin_capture` or per-replay from `forward_replay` (outside capture).
+    pub capturing: bool,
     /// Kernel node whose scalar args change per step (KV append). Null ->
     /// use `pos_dev` + async memcpy path instead.
     pub kv_append_node: *mut c_void,
@@ -398,6 +415,7 @@ impl DecodeGraph {
             stream,
             buffers,
             is_captured: false,
+            capturing: false,
             kv_append_node: std::ptr::null_mut(),
             ordinal: dev.ordinal,
         }
@@ -450,6 +468,7 @@ impl DecodeGraph {
                 "hipStreamBeginCapture failed: {res}"
             )));
         }
+        self.capturing = true;
         Ok(())
     }
 
@@ -463,6 +482,7 @@ impl DecodeGraph {
         // SAFETY: stream is under capture; graph out-ptr valid. Result ignored
         // beyond cleanup: the partial graph is always discarded.
         let _ = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
+        self.capturing = false;
         if !graph.is_null() {
             unsafe {
                 let _ = hipGraphDestroy(graph);
@@ -477,6 +497,7 @@ impl DecodeGraph {
         // SAFETY: stream is under capture; graph out-ptr valid.
         let res: crate::HipErrorT = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
         if res != crate::hipSuccess {
+            self.capturing = false;
             return Err(Error::Backend(format!(
                 "hipStreamEndCapture failed: {res}"
             )));
@@ -493,6 +514,7 @@ impl DecodeGraph {
             )
         };
         if inst != crate::hipSuccess {
+            self.capturing = false;
             unsafe {
                 let _ = hipGraphDestroy(graph);
             }
@@ -503,6 +525,7 @@ impl DecodeGraph {
         self.graph = graph;
         self.exec = exec;
         self.is_captured = true;
+        self.capturing = false;
         Ok(())
     }
 
@@ -663,10 +686,10 @@ pub fn write_embedding_to_buffer(
     dev.write_f32_into_async(dst, &[bits])
 }
 
-/// P3 batch version: write token IDs into layer_input[0] (shape [batch, hidden]).
-/// Each token id (as f32 bits) lands at the START of its slot row — matching
-/// the single-token stub layout per slot; the rest of the row is zeroed so no
-/// stale data from prior steps leaks. `token_ids.len()` must be <= batch.
+/// P3 batch version: write per-slot token IDs into `token_ids_dev`
+/// (shape [batch]) — token id bits per slot, one u32 per slot. For a
+/// 2-D `[batch, hidden]` destination, ids land at the start of each slot
+/// row (legacy stub layout). `token_ids.len()` must be <= batch.
 pub fn write_embeddings_to_buffer_batch(
     dev: &RocmDevice,
     dst: &RocmStorage,
@@ -675,7 +698,8 @@ pub fn write_embeddings_to_buffer_batch(
     let dims = dst.shape.dims();
     let (batch, hidden) = match dims.len() {
         2 => (dims[0].max(1), dims[1].max(1)),
-        1 => (1, dims[0].max(1)),
+        // [batch] token-id device buffer: contiguous, one slot per id.
+        1 => (dims[0].max(1), 1),
         _ => {
             return Err(Error::Backend(format!(
                 "write_embeddings_to_buffer_batch: expected [batch, hidden] buffer, got {dims:?}"

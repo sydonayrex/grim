@@ -240,7 +240,7 @@ fn lfm2_graph_capture_replay_records_kernels() {
     let plain = tiny_lfm2(&dev, 0, 2, false);
 
     // Pool allocates at stable addresses.
-    let mut graph = plain.get_or_create_decode_graph(16).unwrap();
+    let mut graph = plain.get_or_create_decode_graph(16, 1).unwrap();
     let in_ptr = graph.buffers.layer_input[0]
         .device_ptr_u64()
         .unwrap();
@@ -320,7 +320,7 @@ fn lfm2_graph_recurrent_falls_back_eager() {
     }
     let dev = RocmDevice::shared(0);
     let model = tiny_lfm2(&dev, 0, 1, false);
-    let graph = model.get_or_create_decode_graph(16).unwrap();
+    let graph = model.get_or_create_decode_graph(16, 1).unwrap();
 
     // A block with no QKV projections is recurrent-shaped: must refuse with
     // Unimplemented (caller falls back eager), never panic or record junk.
@@ -344,7 +344,7 @@ fn lfm2_graph_recurrent_falls_back_eager() {
 
     // write_embedding helper rejects CPU-backed dst instead of segfaulting.
     let cpu = grim_backend_cpu::cpu_tensor(vec![0.0f32; 4], Shape::new(vec![4]));
-    let err = write_embedding_to_buffer(3, cpu.storage().as_ref(), &dev).unwrap_err();
+    let err = write_embedding_to_buffer(&dev, cpu.storage().as_ref(), 3).unwrap_err();
     let _ = (model, graph);
     let _ = err;
 }
