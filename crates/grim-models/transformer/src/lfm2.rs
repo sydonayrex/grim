@@ -879,9 +879,15 @@ impl Lfm2Block {
                 // internally as `base + step` — eliminating the per-layer
                 // per-token host `positions[]` Vec build + upload. On non-ROCm,
                 // fall back to the host-position path.
+                //
+                // SCOPE: this block only runs in decode-graph mode. In eager
+                // mode the host `positions[]` path (item 2 fallback) is used.
+                // This prevents the `cache.as_mut().unwrap()` below from panicking
+                // when cache is None (first eager call before any graph setup).
                 let is_gpu = matches!(norm_x.device(), Device::Rocm(_));
                 let (q_rot_storage, k_rot_storage) = if is_gpu
                     && std::env::var("GRIM_ROPE_DEV_BASE").as_deref() != Ok("0")
+                    && decode_graph
                 {
                     let ordinal: usize = match norm_x.device() {
                         Device::Rocm(o) => *o,
