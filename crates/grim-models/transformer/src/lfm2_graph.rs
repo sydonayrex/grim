@@ -13,7 +13,7 @@
 use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::decode_graph_buffers::{
     DecodeGraph, DecodeGraphBuffers, check_layer_topology, decode_graph_enabled,
-    launch_attention, launch_qkv_gemv,
+    launch_attention, launch_qkv_gemv, write_embeddings_to_buffer_batch,
 };
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
@@ -128,8 +128,10 @@ impl Lfm2 {
         Ok(DecodeGraph::new(&dev, buffers, stream))
     }
 
-    /// Spec §Phase 3 capture path (single token). Records into graph; result
-    /// stays in `buffers.head_output`, no readback here.
+    /// Spec §Phase 3 capture path (single token). Enqueues the device-side
+    /// embedding gather (`token_ids_dev` → `layer_input[0]`) + all layers +
+    /// output norm/head. The seed write is eager H2D (during capture it is a
+    /// baked seed node; replays overwrite `token_ids_dev` first).
     pub fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
@@ -137,12 +139,12 @@ impl Lfm2 {
             ));
         }
         let dev = dev_for(self)?;
-        write_embedding_to_buffer(token_id, &graph.buffers.layer_input[0], &dev)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward_graph(i, &graph.buffers, &dev)?;
+        // Seed write is H2D of stack-owned bits — legal eagerly, FORBIDDEN
+        // inside capture (would bake the dead host pointer into the graph).
+        if !graph.capturing {
+            write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
         }
-        self.output_forward_graph(&graph.buffers, &dev)?;
-        Ok(())
+        self.embed_and_forward_graph(graph, &dev)
     }
 
     /// Spec §Phase 3 capture path (P3 batch). Records a whole batch into the
@@ -158,15 +160,30 @@ impl Lfm2 {
             ));
         }
         let dev = dev_for(self)?;
-        write_embeddings_to_buffer_batch(
-            &dev,
-            &graph.buffers.layer_input[0],
-            token_ids,
-        )?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward_graph(i, &graph.buffers, &dev)?;
+        if !graph.capturing {
+            write_embeddings_to_buffer_batch(&dev, &graph.buffers.token_ids_dev, token_ids)?;
         }
-        self.output_forward_graph(&graph.buffers, &dev)?;
+        self.embed_and_forward_graph(graph, &dev)
+    }
+
+    /// Device-side embedding gather (reads `token_ids_dev`, so replays see
+    /// fresh tokens), then the per-layer body and output head.
+    fn embed_and_forward_graph(&self, graph: &mut DecodeGraph, dev: &Dev) -> Result<()> {
+        let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.forward_graph(i, &graph.buffers, dev)?;
+        }
+        self.output_forward_graph(&graph.buffers, dev)?;
         Ok(())
     }
 
@@ -178,7 +195,7 @@ impl Lfm2 {
             ));
         }
         let dev = dev_for(self)?;
-        write_embedding_to_buffer(token_id, &graph.buffers.layer_input[0], &dev)?;
+        write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
         // Scalar update before replay: prefer SetParams when node known,
         // else 4-byte device-buffer path (spec §Scalar both options).
         let pos = graph.buffers.current_pos;
@@ -218,11 +235,7 @@ impl Lfm2 {
             )));
         }
         let dev = dev_for(self)?;
-        write_embeddings_to_buffer_batch(
-            &dev,
-            &graph.buffers.layer_input[0],
-            token_ids,
-        )?;
+        write_embeddings_to_buffer_batch(&dev, &graph.buffers.token_ids_dev, token_ids)?;
         let pos = graph.buffers.current_pos;
         if !graph.kv_append_node.is_null() {
             let _ = graph.update_kv_pos_params(std::ptr::null());
@@ -344,7 +357,7 @@ impl Lfm2Block {
         if let Some(fused) = self
             .wqkv_q80_fused
             .as_ref()
-            .filter(|_| dot_fused_ok(dev, hidden) && self.head_dim != 0)
+            .filter(|_| buffers.batch <= 1 && dot_fused_ok(dev, hidden) && self.head_dim != 0)
         {
             dev.launch_quantize_q8_1(norm_rocm, act, 1, hidden)
                 .map_err(|e| grim_core::error::Error::Backend(format!("qkv quant: {e}")))?;
@@ -434,7 +447,7 @@ impl Lfm2Block {
         if let Some(fused) = self
             .w_gate_up_q80_fused
             .as_ref()
-            .filter(|_| dot_fused_ok(dev, hidden))
+            .filter(|_| buffers.batch <= 1 && dot_fused_ok(dev, hidden))
         {
             let norm_rocm = dst_downcast(normed)?;
             dev.launch_quantize_q8_1(norm_rocm, act, 1, hidden)
@@ -504,16 +517,21 @@ impl Lfm2Block {
     ) -> Result<()> {
         check_layer_topology(buffers, layer_idx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        let steps = buffers.batch;
+        // P3: `steps` is the per-slot token count appended THIS replay (decode
+        // = 1). `batch` is the number of concurrent per-slot sequences; each
+        // slot's kernels use its own arena region and position scalar.
+        let steps = 1usize;
+        let batch = buffers.batch.max(1);
         let hd = self.head_dim;
         let nh = self.num_heads;
         let nkv = self.num_kv_heads;
         let kv_stride = nkv * hd;
+        let arena_slot_stride = buffers.max_ctx * kv_stride;
 
-        // QK-norm IN PLACE (row-wise over [heads, hd]; flat counts match
-        // [1, n]). Safe: the kernel reduces each row fully before storing.
+        // QK-norm IN PLACE (row-wise over [batch * heads, hd] slots; flat
+        // counts match [batch, n]). Safe: each row is normalized independently.
         if let (Some(qn), Some(kn)) = (self.attn_q_norm.as_ref(), self.attn_k_norm.as_ref()) {
-            let qn_shape = Shape::new(vec![nh, hd]);
+            let qn_shape = Shape::new(vec![batch * nh, hd]);
             dev.rms_norm_into(
                 &buffers.q_buf[layer_idx],
                 &**qn.weight.storage(),
@@ -522,7 +540,7 @@ impl Lfm2Block {
                 &qn_shape,
             )
             .map_err(grim_core::error::Error::Tensor)?;
-            let kn_shape = Shape::new(vec![nkv, hd]);
+            let kn_shape = Shape::new(vec![batch * nkv, hd]);
             dev.rms_norm_into(
                 &buffers.k_buf[layer_idx],
                 &**kn.weight.storage(),
@@ -539,7 +557,7 @@ impl Lfm2Block {
         // P3: shape is [steps, nh, hd] where steps==batch — each batch item
         // is one query position sharing the same base position.
         let rope_cfg = RopeConfig::new(hd, self.rope_theta);
-        let q3 = Shape::new(vec![steps, nh, hd]);
+        let q3 = Shape::new(vec![batch, nh * steps, hd]);
         dev.rope_dev_base_into(
             &buffers.q_buf[layer_idx],
             &buffers.pos_dev,
@@ -550,7 +568,7 @@ impl Lfm2Block {
             steps,
         )
         .map_err(grim_core::error::Error::Tensor)?;
-        let k3 = Shape::new(vec![steps, nkv, hd]);
+        let k3 = Shape::new(vec![batch, nkv * steps, hd]);
         dev.rope_dev_base_into(
             &buffers.k_buf[layer_idx],
             &buffers.pos_dev,
@@ -568,28 +586,32 @@ impl Lfm2Block {
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
         launch_attention(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        grim_backend_rocm::launch_kv_append(
+        grim_backend_rocm::launch_kv_append_batch(
             dev,
             &buffers.k_arena[layer_idx],
             &buffers.k_buf[layer_idx],
             &buffers.pos_dev,
             kv_stride,
             steps,
+            batch,
+            arena_slot_stride,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
-        grim_backend_rocm::launch_kv_append(
+        grim_backend_rocm::launch_kv_append_batch(
             dev,
             &buffers.v_arena[layer_idx],
             &buffers.v_buf[layer_idx],
             &buffers.pos_dev,
             kv_stride,
             steps,
+            batch,
+            arena_slot_stride,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
 
         // Attention writes DIRECTLY into pool slots: output, online-softmax
         // partials, and the shared read-only dummy. Zero allocs in capture.
-        grim_backend_rocm::launch_qkv_attention_dev(
+        grim_backend_rocm::launch_qkv_attention_dev_batch(
             dev,
             &buffers.q_buf[layer_idx],
             &buffers.k_arena[layer_idx],
@@ -611,10 +633,12 @@ impl Lfm2Block {
             0,
             &buffers.attn_dummy,
             0,
+            batch,
+            arena_slot_stride,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
-        // Bump LAST so the next replay appends at the new offset.
-        grim_backend_rocm::launch_bump_i32(dev, &buffers.pos_dev, steps)
+        // Bump LAST so the next replay appends at the new offset (per slot).
+        grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
             .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
         Ok(())
     }
@@ -666,12 +690,24 @@ pub fn add_graph(
 }
 
 /// Spec §Phase 3: async H2D of token id into fixed input buffer.
+/// Convention: `(dev, dst, token_id)` — matches `write_embeddings_to_buffer_batch`.
 pub fn write_embedding_to_buffer(
-    token_id: u32,
-    dst: &dyn grim_tensor::BackendStorage,
     dev: &grim_backend_rocm::RocmDevice,
+    dst: &dyn grim_tensor::BackendStorage,
+    token_id: u32,
 ) -> Result<()> {
     grim_backend_rocm::write_embedding_to_buffer(dev, dst_downcast(dst)?, token_id)
+        .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))
+}
+
+/// P3: async H2D of a batch of token ids into the fixed layer-0 input buffer.
+/// Thin wrapper that converts the backend error type.
+pub fn write_batch_embeddings(
+    dev: &Dev,
+    dst: &RocmStorage,
+    token_ids: &[u32],
+) -> Result<()> {
+    grim_backend_rocm::decode_graph_buffers::write_embeddings_to_buffer_batch(dev, dst, token_ids)
         .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))
 }
 

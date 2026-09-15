@@ -922,6 +922,12 @@ impl RocmDevice {
         self.allocator.stats()
     }
 
+    /// Public handle to this device's caching allocator (so external crates can
+    /// allocate raw `RocmStorage` in tests).
+    pub fn allocator_handle(&self) -> Arc<RocmCachingAllocator> {
+        Arc::clone(&self.allocator)
+    }
+
     /// Number of real `hipModuleLoad` calls since device creation. Cache hits are [see: `module_cache_loads_each_kernel_once`]
     pub fn module_load_stats(&self) -> usize {
         self.module_load_count.load(Ordering::SeqCst)
@@ -1045,6 +1051,7 @@ impl RocmDevice {
     }
 
     /// The stream an op should dispatch onto: the capture stream when a session is
+
     /// Public read-only access to this device's GCN target string (e.g.
     /// "gfx1201", "gfx1036") for tests and capability gating.
     pub fn gpu_target_str(&self) -> &str {

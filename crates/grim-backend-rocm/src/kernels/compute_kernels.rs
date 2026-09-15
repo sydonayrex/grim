@@ -401,16 +401,17 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     out[b_idx] = x2 * cos_val + x1 * sin_val;
 }
 
-// Item 2: device-base RoPE for the decode path. Reads the base position ONCE
-// from device memory (`pos_base`, uploaded per generation) and derives each
-// step's position as `pos_base + si` internally — so the host never builds and
-// uploads a per-layer per-token `positions[]` Vec. Same fp32 rotation math as
-// `grim_rope`; only the position source changes. `steps` (s) is the number of
-// query positions in this call (1 for decode); each is rotated by base+si.
+// Item 2: device-base RoPE for the decode path. Reads the base position per
+// batch slot from device memory (`pos_base[bi]`; legacy callers pass a [1]
+// buffer — bi is 0 there) and derives each step's position as `base+si`
+// internally — so the host never builds and uploads a per-layer per-token
+// `positions[]` Vec. Same fp32 rotation math as `grim_rope`; only the position
+// source changes. `steps` (s) is the number of query positions per slot (1 for
+// decode); each is rotated by base+si.
 extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int* pos_base,
-                                              float* out,
-                                              int b, int s, int d, int half, float base,
-                                              int interleaved, int num_heads) {
+                                               float* out,
+                                               int b, int s, int d, int half, float base,
+                                               int interleaved, int num_heads) {
     // One thread per (batch, step, dim-half-pair) element. `s` is the flattened
     // query length = num_heads * steps. All heads within the same step share one
     // position, so the step index is `si / num_heads` and the position is
@@ -424,7 +425,7 @@ extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int
     int si = rem / half;
     int i = rem - si * half;
     int step_idx = (num_heads > 0) ? (si / num_heads) : si;
-    float pos = (float)(*pos_base + (unsigned int)step_idx);
+    float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
     float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
     float val = pos * freq;
     float sin_val = sinf(val);

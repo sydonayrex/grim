@@ -903,22 +903,27 @@ void grim_qkv_attention_paged_quant(
 }
 
 // Item 3 — device-side KV append. Replaces the host-offset `copy_slice_into`:
-// each thread reads `past = *past_dev` ON DEVICE, computes its own destination
-// offset `past*kv_stride + tid`, and copies one element. Offsets are computed
-// entirely on-device so the append is graph-capturable (no host scalar baked in).
-// Grid (steps*kv_stride,1,1), block (256,1,1); handles tails via the `if` guard.
+// each thread reads `past = past_dev[slot]` ON DEVICE, computes its own destination
+// offset `slot*arena_slot_stride + past*kv_stride + local`, and copies one element.
+// Offsets are computed entirely on-device so the append is graph-capturable
+// (no host scalar baked in). `batch==1` → slot is always 0 (legacy layout).
 extern "C" __global__ void grim_kv_append(
     float* __restrict__ k_arena,
     const float* __restrict__ k_rot,
     const int* __restrict__ past_dev,
     int kv_stride,
-    int steps
+    int steps,
+    int batch,
+    int arena_slot_stride
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = steps * kv_stride;
+    const int per_slot = steps * kv_stride;
+    const int total = batch * per_slot;
     if (tid >= total) return;
-    const int past = *past_dev;
-    k_arena[past * kv_stride + tid] = k_rot[tid];
+    const int slot = (batch > 1) ? (tid / per_slot) : 0;
+    const int local = tid - slot * per_slot;
+    const int past = past_dev[slot];
+    k_arena[slot * arena_slot_stride + past * kv_stride + local] = k_rot[tid];
 }
 
 // Item 3 — device-total attention variant. Identical math to `grim_qkv_attention`
@@ -948,15 +953,21 @@ extern "C" __global__ void grim_qkv_attention_dev(
     int o_dim,
     int fuse_o,
     const float* __restrict__ alibi_slopes,
-    int has_alibi
+    int has_alibi,
+    int batch,
+    int arena_slot_stride
 ) {
-    // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
+    // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
+    // P3: blockIdx.z is the batch slot — every slot has its own arena region
+    // (`slot * arena_slot_stride`) and its own position scalar (`total_dev[slot]`).
+    const int slot = blockIdx.z;
     const int i = blockIdx.x;
     const int h = blockIdx.y;
     if (i >= seq_len || h >= num_heads) return;
     const int q_per_kv = num_heads / num_kv_heads;
     const int kv_head = h / q_per_kv;
-    const int q_offset = (i * num_heads + h) * head_dim;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
     const int tid = threadIdx.x;
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
@@ -974,13 +985,13 @@ extern "C" __global__ void grim_qkv_attention_dev(
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
     __shared__ float s_acc[8][260];
-    // Device-driven KV length. `total_dev` holds the pre-step past count (it is
-    // bumped by grim_bump_i32 AFTER this attention node), and `steps` is the
-    // number of rows appended by the preceding kv_append node — so the live KV
-    // length during this attention is `*total_dev + steps`. `steps` is a
-    // graph-safe constant (1 for decode), so replay N times re-derives the right
-    // total from the live total_dev each time.
-    const int kv_seq_len = *total_dev + steps;
+    // Device-driven KV length. `total_dev` holds the per-slot pre-step past
+    // count (bumped by grim_bump_i32 AFTER this attention node), and `steps` is
+    // the number of rows the preceding kv_append node appended IN EACH SLOT —
+    // so the live KV length during this attention is `total_dev[slot] + steps`.
+    // `steps` is a graph-safe constant (1 for decode), so replay N times
+    // re-derives the right total from the live per-slot total_dev each time.
+    const int kv_seq_len = total_dev[slot] + steps;
     // Decode: single query at absolute position (kv_seq_len - 1).
     const int abs_i = kv_seq_len - 1;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
@@ -993,8 +1004,8 @@ extern "C" __global__ void grim_qkv_attention_dev(
     float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
-    const float* __restrict__ k_head = &k_tensor[kv_head * head_dim];
-    const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
+    const float* __restrict__ k_head = &k_tensor[slot * arena_slot_stride + kv_head * head_dim];
+    const float* __restrict__ v_head = &v_tensor[slot * arena_slot_stride + kv_head * head_dim];
     const int kv_stride = num_kv_heads * head_dim;
     float q_reg[8];
     if (thread_active) {
@@ -1105,17 +1116,20 @@ extern "C" __global__ void grim_qkv_attention_dev(
                 partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
             }
             if (lane_id == 0 && partial != 0.0f) {
-                atomicAdd(&out[i * o_dim + oc], partial);
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
             }
         }
     }
 }
 
+// P3: per-slot position bump. Grid (batch,1,1)/(1,1,1) — thread b bumps
+// `past_dev[b] += steps`. batch=1 callers launch grid (1,1,1): slot 0.
 extern "C" __global__ void grim_bump_i32(
     int* __restrict__ past_dev,
     int steps
 ) {
-    *past_dev += steps;
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    past_dev[slot] += steps;
 }
 "#;
 
@@ -1633,6 +1647,7 @@ pub fn launch_kv_append(
     let mut stride_i = kv_stride as i32;
     let mut steps_i = steps as i32;
     let (grid, block) = crate::device::util::linear_launch(total);
+    // Legacy single-sequence path: batch=1 (slot always 0 in the kernel).
     dev.launch_compute_kernel(
         "grim_kv_append",
         grid,
@@ -1643,6 +1658,65 @@ pub fn launch_kv_append(
             arg(&mut past_ptr),
             arg(&mut stride_i),
             arg(&mut steps_i),
+            arg(&mut 1i32),
+            arg(&mut 0i32),
+        ],
+    )
+}
+
+/// P3 batched KV append: `k_rot` is `[batch, steps*kv_stride]` flat, arena is
+/// per-slot regions of `arena_slot_stride` elements each, `past_dev` has one
+/// i32 per slot. batch=1 with stride 0 matches the legacy kernel exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_batch(
+    dev: &crate::RocmDevice,
+    k_arena: &dyn BackendStorage,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    kv_stride: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let arena_s = k_arena
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_arena must be RocmStorage".into()))?;
+    let rot_s = k_rot
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_rot must be RocmStorage".into()))?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_batch: past_dev must be RocmStorage".into()))?;
+    let mut arena_ptr = arena_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_arena has no device ptr".into()))?;
+    let mut rot_ptr = rot_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_rot has no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_batch: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let total = batch.max(1) * steps * kv_stride;
+    let (grid, block) = crate::device::util::linear_launch(total);
+    dev.launch_compute_kernel(
+        "grim_kv_append",
+        grid,
+        block,
+        &mut [
+            arg(&mut arena_ptr),
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut stride_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
         ],
     )
 }
@@ -1672,6 +1746,44 @@ pub fn launch_qkv_attention_dev(
     fuse_o: u32,
     alibi_slopes: &dyn BackendStorage,
     has_alibi: u32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    launch_qkv_attention_dev_batch(
+        dev, q, k_tensor, v_tensor, out, out_max, out_sum, total_dev,
+        num_heads, num_kv_heads, head_dim, seq_len, steps, inv_sqrt_d,
+        window_lo, softcap, o_proj_w, o_dim, fuse_o, alibi_slopes, has_alibi,
+        1, 0,
+    )
+}
+
+/// P3 batched device-total attention: grid (seq_len, num_heads, batch).
+/// Per-slot: q/out stride `seq_len*num_heads*head_dim`, arena regions of
+/// `arena_slot_stride` elements, `total_dev[slot]` per-slot KV length.
+/// batch=1 with stride 0 matches the legacy kernel exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_dev_batch(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_tensor: &dyn BackendStorage,
+    v_tensor: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
     const KERNEL: &str = "grim_qkv_attention_dev";
     if head_dim > 256 {
@@ -1736,7 +1848,9 @@ pub fn launch_qkv_attention_dev(
     let mut asl = alibi_s.device_ptr.ok_or_else(|| crate::Error::Backend("alibi has no ptr".into()))?;
     let mut ha = has_alibi as i32;
     let mut opptr = oproj_s.device_ptr.ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
-    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, 1);
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
     dev.launch_compute_kernel(
         KERNEL,
@@ -1763,33 +1877,47 @@ pub fn launch_qkv_attention_dev(
             arg(&mut fo),
             arg(&mut asl),
             arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
         ],
     )
 }
 
 /// Item 3 launcher: `grim_bump_i32`. Increments `*past_dev += steps`. Single
-/// thread; the mutable `past_dev` pointer is a graph input so each replay bumps
-/// the live counter.
-pub fn launch_bump_i32(
-    dev: &crate::RocmDevice,
-    past_dev: &dyn BackendStorage,
-    steps: usize,
-) -> Result<*mut std::ffi::c_void, crate::Error> {
-    let past_s = past_dev
-        .as_any()
-        .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev must be RocmStorage".into()))?;
-    let mut past_ptr = past_s
-        .device_ptr
-        .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev has no device ptr".into()))?;
-    let mut steps_i = steps as i32;
-    dev.launch_compute_kernel(
-        "grim_bump_i32",
-        crate::HipDim3::new(1, 1, 1),
-        crate::HipDim3::new(1, 1, 1),
-        &mut [arg(&mut past_ptr), arg(&mut steps_i)],
-    )
-}
+    /// thread; the mutable `past_dev` pointer is a graph input so each replay bumps
+    /// the live counter.
+    pub fn launch_bump_i32(
+        dev: &crate::RocmDevice,
+        past_dev: &dyn BackendStorage,
+        steps: usize,
+    ) -> Result<*mut std::ffi::c_void, crate::Error> {
+        launch_bump_i32_slots(dev, past_dev, steps, 1)
+    }
+
+    /// P3: bump one i32 per batch slot. Grid (batch,1,1), thread b bumps
+    /// `past_dev[b] += steps`. batch=1 matches the legacy single-thread kernel.
+    pub fn launch_bump_i32_slots(
+        dev: &crate::RocmDevice,
+        past_dev: &dyn BackendStorage,
+        steps: usize,
+        batch: usize,
+    ) -> Result<*mut std::ffi::c_void, crate::Error> {
+        let past_s = past_dev
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev must be RocmStorage".into()))?;
+        let mut past_ptr = past_s
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev has no device ptr".into()))?;
+        let mut steps_i = steps as i32;
+        let b = batch.max(1) as u32;
+        dev.launch_compute_kernel(
+            "grim_bump_i32",
+            crate::HipDim3::new(b, 1, 1),
+            crate::HipDim3::new(1, 1, 1),
+            &mut [arg(&mut past_ptr), arg(&mut steps_i)],
+        )
+    }
 
 #[cfg(test)]
 mod tests {

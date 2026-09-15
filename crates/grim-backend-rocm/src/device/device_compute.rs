@@ -2554,7 +2554,52 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fp32_gemv(act, weight, out, 1, n, k)
+        // m = batch rows of `act` (shape [m, k]); out is [m, n].
+        let m = act.shape().elem_count() / k.max(1);
+        self.launch_fp32_gemv(act, weight, out, m.max(1), n, k)
+    }
+
+    /// Graph-capturable embedding gather: `out[slot*dim + j] = weight[idx[slot]*dim + j]`.
+    /// Unlike `embedding()`, indices are READ FROM DEVICE MEMORY (`indices`,
+    /// i32/u32 per slot), so the captured graph node sees fresh token ids on
+    /// each replay. `weight` must be an F32 native table `[vocab, dim]`.
+    pub fn launch_embedding_gather_dev_idx(
+        &self,
+        weight: &RocmStorage,
+        out: &RocmStorage,
+        indices: &RocmStorage,
+        dim: usize,
+        total: usize,
+    ) -> Result<*mut c_void> {
+        use grim_tensor::dtype::ArithType;
+        let dt = weight.dtype();
+        if dt.arith != ArithType::F32 || !matches!(dt.storage, crate::DTypeStorage::Native) {
+            return Err(Error::Unimplemented(
+                "embedding_gather_dev_idx: F32 native tables only (quant falls back eager)"
+                    .into(),
+            ));
+        }
+        let w_ptr = weight
+            .device_ptr
+            .ok_or_else(|| Error::Backend("embedding_gather: weight has no device ptr".into()))?;
+        let o_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("embedding_gather: out has no device ptr".into()))?;
+        let i_ptr = indices
+            .device_ptr
+            .ok_or_else(|| Error::Backend("embedding_gather: indices has no device ptr".into()))?;
+        let (grid, block) = crate::device::util::linear_launch(total);
+        let mut w = w_ptr;
+        let mut o = o_ptr;
+        let mut i = i_ptr;
+        let mut d = dim as i32;
+        let mut t = total as i32;
+        self.launch_compute_kernel(
+            "grim_embedding",
+            grid,
+            block,
+            &mut [arg(&mut w), arg(&mut o), arg(&mut i), arg(&mut d), arg(&mut t)],
+        )
     }
 
     /// Phase 4.5b: Launch grim_quantize_u4_group128 activation quantizer (RDNA4 gfx1200/gfx1201).
@@ -4681,12 +4726,21 @@ impl RocmDevice {
         let a_dims = a.shape().dims();
         let k = a_dims.last().copied().unwrap_or(0);
         let m = a.shape().elem_count().checked_div(k.max(1)).unwrap_or(0);
-        if m != 1 {
+        if m == 0 {
             return Err(Error::Unimplemented(
-                "linear_decode_into: decode-only (m==1)".into(),
+                "linear_decode_into: empty activation".into(),
             ));
         }
-        let n = out.shape().elem_count();
+        // P3: batch>1 decode rides the same kernels (fp32/dot4 GEMVs index
+        // rows via grid.y); all weight/output shapes are per-slot.
+        let out_total = out.shape().elem_count();
+        if m > 1 && out_total % m != 0 {
+            return Err(Error::ShapeMismatch {
+                expected: vec![m, out_total / m.max(1)],
+                got: out.shape().dims().to_vec(),
+            });
+        }
+        let n = if m == 1 { out_total } else { out_total / m };
         if w.shape().elem_count() % k.max(1) != 0 {
             return Err(Error::Shape(format!(
                 "linear_decode_into: weight elems {} not a multiple of k={k}",
@@ -4700,7 +4754,7 @@ impl RocmDevice {
                 got: vec![1, n],
             });
         }
-        let need_q81 = (k / 32) * 36;
+        let need_q81 = m * (k / 32) * 36;
         let dot_disabled = matches!(
             std::env::var("GRIM_DOT_GEMV").as_deref(),
             Ok("0" | "false" | "off")
@@ -5239,6 +5293,7 @@ impl RocmDevice {
                         std::ptr::null_mut(),
                     )
                 })?;
+                self.launch_counter.fetch_add(1, Ordering::SeqCst);
                 drop(_dev_guard);
                 return Ok(stream);
             }

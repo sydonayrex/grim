@@ -52,7 +52,7 @@ fn try_graph_decode_step(
     let lfm2 = model.as_any().downcast_ref::<Lfm2>()?;
     // Lazily allocate once; stable addresses across steps.
     if graph.is_none() {
-        match lfm2.get_or_create_decode_graph(4096) {
+        match lfm2.get_or_create_decode_graph(4096, 1) {
             Ok(mut g) => {
                 // First step: capture. Any failure -> abort the open capture
                 // (else the stream stays capturing and later copies fail
