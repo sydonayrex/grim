@@ -689,6 +689,9 @@ pub async fn cmd_run(
         let step_start = std::time::Instant::now();
         // Phase 5 trigger: LFM2 decode steps try single-launch replay first.
         // Capture step + any miss fall through to eager (spec §Fallback).
+        // B1 (plans/WI-device-repeat-penalty.md): no GPU repeat-penalty kernel
+        // exists yet, so penalty-active steps stay on the CPU sampler (full-vocab
+        // D2H). Do NOT "fix" by changing the 1.1 default — implement the WI.
         let allow_gpu_sample = std::env::var("GRIM_CPU_SAMPLER").is_err()
             && matches!(device, Device::Rocm(_))
             && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
@@ -754,6 +757,7 @@ pub async fn cmd_run(
                 // device tensor via the WI-X3 GPU sampler — skips the full-vocab D2H +
                 // CPU sampling that dominated per-token overhead. Prefill (multi-row) and
                 // repeat-penalty-active steps fall back to the CPU sampler.
+                // B1: see plans/WI-device-repeat-penalty.md for the device-side fix.
                 let gpu_sample_ok = logits.shape().elem_count() == vocab
                     && std::env::var("GRIM_CPU_SAMPLER").is_err()
                     && matches!(device, Device::Rocm(_))
