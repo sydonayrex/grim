@@ -1901,10 +1901,19 @@ impl Lfm2Block {
             if e >= e_count {
                 return None;
             }
-            let flat = t.to_vec_f32().ok()?;
-            let slice = flat[e * f * h..(e + 1) * f * h].to_vec();
+            // M1: slice the expert row via D2D copy — no host roundtrip. The
+            // stacked source stays resident (needed by Charon later); each
+            // expert Linear gets its own `[f, h]` device tensor once.
             let dev = grim_nn::modules::pick_device_for_storage_device(t.device());
-            let st = dev.from_cpu(&slice, &Shape::new(vec![f, h]), DType::F32).ok()?;
+            let st = dev.alloc_storage(&Shape::new(vec![f, h]), DType::F32).ok()?;
+            dev.copy_slice_range(
+                st.as_ref(),
+                0,
+                t.storage().as_ref(),
+                e * f * h,
+                f * h,
+            )
+            .ok()?;
             Some(Linear::from_tensor(
                 Tensor::new(
                     Arc::from(st),
@@ -1941,63 +1950,95 @@ impl Lfm2Block {
         let n_ff = self.ffn_gate.weight.shape().dims()[0];
 
         let gate_logits = self.ffn_gate_inp.as_ref().unwrap().forward(x)?;
-        let gate_vec = gate_logits.to_vec_f32()?;
 
-        let gate_vec = if let Some(bias) = &self.ffn_exp_probs_b {
-            let bias_vec = bias.to_vec_f32()?;
-            let mut g = gate_vec;
-            for i in 0..g.len() {
-                g[i] += bias_vec[i % bias_vec.len()];
-            }
-            g
+        // Device-resident routing first: `fused_moe_dispatch_from_logits` applies
+        // `grim_moe_route_topk` on-device instead of D2H'ing the logits to host.
+        // Absent/unsuitable kernels return Ok(None) and the host path below runs.
+        let d2d_gate_vec: Option<Vec<f32>> = if matches!(x.device(), Device::Rocm(_)) {
+            None // never needed: routing never round-trips host on this path
         } else {
-            gate_vec
+            Some(gate_logits.to_vec_f32()?)
         };
 
-        let mut probs = vec![0.0f32; steps * n_expert];
-        for s in 0..steps {
-            let mut max_s = f32::NEG_INFINITY;
-            for e in 0..n_expert {
-                max_s = max_s.max(gate_vec[s * n_expert + e]);
+        let gate_vec = match d2d_gate_vec {
+            Some(mut g) => {
+                if let Some(bias) = &self.ffn_exp_probs_b {
+                    let bias_vec = bias.to_vec_f32()?;
+                    for i in 0..g.len() {
+                        g[i] += bias_vec[i % bias_vec.len()];
+                    }
+                }
+                g
             }
-            let mut sum_s = 0.0f32;
-            for e in 0..n_expert {
-                probs[s * n_expert + e] = (gate_vec[s * n_expert + e] - max_s).exp();
-                sum_s += probs[s * n_expert + e];
-            }
-            if sum_s > 0.0 {
+            None => vec![],
+        };
+
+        let (mut probs, _gate_vec): (Vec<f32>, Vec<f32>) = if gate_vec.is_empty() {
+            // Routing ran on-device; host probs only needed as the last
+            // fallback — defer until then.
+            (Vec::new(), gate_vec)
+        } else {
+            let mut probs = vec![0.0f32; steps * n_expert];
+            for s in 0..steps {
+                let mut max_s = f32::NEG_INFINITY;
                 for e in 0..n_expert {
-                    probs[s * n_expert + e] /= sum_s;
+                    max_s = max_s.max(gate_vec[s * n_expert + e]);
+                }
+                let mut sum_s = 0.0f32;
+                for e in 0..n_expert {
+                    probs[s * n_expert + e] = (gate_vec[s * n_expert + e] - max_s).exp();
+                    sum_s += probs[s * n_expert + e];
+                }
+                if sum_s > 0.0 {
+                    for e in 0..n_expert {
+                        probs[s * n_expert + e] /= sum_s;
+                    }
                 }
             }
-        }
+            (probs, gate_vec)
+        };
 
         // M1 (PLAN-kernel-fusion): top-k fused dispatch through shared_moe.
-        // Charon grouped path stays device-resident; per-expert loop is the
-        // reference fallback. Legacy hand-rolled device path deleted (it
-        // re-uploaded + re-transposed expert weights per token and was top-1
-        // only, which UNDERROUTED real MoE checkpoints with n_expert_used>1).
+        // D2D routing first (no host round-trip); host-routed `fused_moe_dispatch`
+        // as fallback — identical combine semantics via TokenRouting.
         if let Some(experts) = self.moe_experts() {
-            let routings: Vec<crate::shared_moe::TokenRouting> = (0..steps)
-                .map(|s| {
-                    let row = &probs[s * n_expert..(s + 1) * n_expert];
-                    let k = self.n_expert_used.min(n_expert).max(1);
-                    let mut idx: Vec<usize> = (0..n_expert).collect();
-                    idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
-                    idx[..k].iter().map(|&e| (e, row[e])).collect()
-                })
-                .collect();
             let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
-            if let Ok(t) = crate::shared_moe::fused_moe_dispatch(
+            if let Ok(Some(t)) = crate::shared_moe::fused_moe_dispatch_from_logits(
                 dev.as_ref(),
                 x,
+                &gate_logits,
                 experts,
                 None,
-                &routings,
+                self.n_expert_used.max(1),
                 1.0,
+                0, // softmax (matches LFM2 cross-entropy gating + prior host probs)
                 &self.charon_cache,
             ) {
                 return Ok(t);
+            }
+            // Host-routed fallback (permits non-D2D backend): needs the
+            // softmax probs. Only computed then.
+            if !probs.is_empty() {
+                let routings: Vec<crate::shared_moe::TokenRouting> = (0..steps)
+                    .map(|s| {
+                        let row = &probs[s * n_expert..(s + 1) * n_expert];
+                        let k = self.n_expert_used.min(n_expert).max(1);
+                        let mut idx: Vec<usize> = (0..n_expert).collect();
+                        idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+                        idx[..k].iter().map(|&e| (e, row[e])).collect()
+                    })
+                    .collect();
+                if let Ok(t) = crate::shared_moe::fused_moe_dispatch(
+                    dev.as_ref(),
+                    x,
+                    experts,
+                    None,
+                    &routings,
+                    1.0,
+                    &self.charon_cache,
+                ) {
+                    return Ok(t);
+                }
             }
         }
 
@@ -2006,6 +2047,42 @@ impl Lfm2Block {
         let gate_exps_vec = self.ffn_gate_exps.as_ref().unwrap().to_vec_f32()?;
         let up_exps_vec = self.ffn_up_exps.as_ref().unwrap().to_vec_f32()?;
         let down_exps_vec = self.ffn_down_exps.as_ref().unwrap().to_vec_f32()?;
+
+        // Both fused paths failed — compute softmax probs from the D2H logits
+        // snapshot if not yet materialized (zero-cost on the ROCm D2D path
+        // only when arrive here, which should be rare; the legacy loop needs
+        // them).
+        if probs.is_empty() {
+            let logits_vec = gate_logits.to_vec_f32()?;
+            let logits_vec = if let Some(bias) = &self.ffn_exp_probs_b {
+                let bias_vec = bias.to_vec_f32()?;
+                logits_vec
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v + bias_vec[i % bias_vec.len()])
+                    .collect()
+            } else {
+                logits_vec
+            };
+            let mut probs_local = vec![0.0f32; steps * n_expert];
+            for s in 0..steps {
+                let mut max_s = f32::NEG_INFINITY;
+                for e in 0..n_expert {
+                    max_s = max_s.max(logits_vec[s * n_expert + e]);
+                }
+                let mut sum_s = 0.0f32;
+                for e in 0..n_expert {
+                    probs_local[s * n_expert + e] = (logits_vec[s * n_expert + e] - max_s).exp();
+                    sum_s += probs_local[s * n_expert + e];
+                }
+                if sum_s > 0.0 {
+                    for e in 0..n_expert {
+                        probs_local[s * n_expert + e] /= sum_s;
+                    }
+                }
+            }
+            probs = probs_local;
+        }
 
         for s in 0..steps {
             // M1: true top-k host fallback (was top-1). Sum `Σ_e p_e · expert_e(x)`
