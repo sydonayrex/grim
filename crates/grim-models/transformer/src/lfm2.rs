@@ -616,7 +616,16 @@ impl Lfm2Block {
             let mut device_block_out: Option<Tensor> = None;
             if steps == 1 {
                 let device = norm_x.device().clone();
-                let decode_graph = crate::decode_graph_active(&device);
+                // A1-revert (2026-09-16, measured on gfx1201/LFM2.5-350M-Q8_0):
+                // the ShortConv device step stays OPT-IN (`GRIM_DECODE_GRAPH=1`).
+                // Unifying it to default-on regressed greedy decode
+                // ("Hello! How can I assist you today" → "Hello!<|im_end|>");
+                // bisection isolated `shortconv_step_device`, NOT the RoPE
+                // seed or attention gates (both proven innocent). Re-unify
+                // only once the ShortConv device rework lands with a parity
+                // test (cf. `shortconv_decode_matches_prefill`).
+                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
+                    && matches!(device, Device::Rocm(_));
                 match self.shortconv_step_device(&proj, h_dim, l_cache, state, &device, decode_graph) {
                     Ok(Some(y_t)) => {
                         let block_out_2d =
