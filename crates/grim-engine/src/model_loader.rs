@@ -53,6 +53,27 @@ pub(crate) fn lfm2_mxfp4_qkv_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// M0 (PLAN-kernel-fusion): LFM2 MoE loader wiring. `(n_expert,
+/// n_expert_used, n_layer_dense_lead)` from checkpoint metadata instead of
+/// the hardcoded all-dense defaults that made `is_moe` permanently false.
+///
+/// `first_layer_with_expert` probes layer checkpoints (`ffn_gate_exps.weight`
+/// = expert weight presence, the same tensor-presence technique as `is_recr`
+/// detection just above); `None`/all-absent → all-dense (`num_layers`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lfm2_moe_fields(
+    n_expert: usize,
+    n_expert_used: usize,
+    first_layer_with_expert: Option<usize>,
+    num_layers: usize,
+) -> (usize, usize, usize) {
+    let n_layer_dense_lead = match first_layer_with_expert {
+        Some(i) => i,
+        None => num_layers,
+    };
+    (n_expert, n_expert_used, n_layer_dense_lead)
+}
+
 /// Resolve this process's tensor-parallel config from `GRIM_TP_*` and validate the `(rank, world_size)` contract.
 /// Returns the default `{rank:0, world_size:1}` when `GRIM_TP_SIZE` is unset or `1` (single-device).
 fn resolve_tp_config() -> Result<TensorParallelConfig> {
@@ -1286,6 +1307,25 @@ fn load_model_from_config(
 
             log::info!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
 
+            // M0: wire MoE fields from HF config; derive first-MoE layer from
+            // checkpoint tensor presence (expert weights = ffn_gate_exps).
+            let n_expert = config.num_local_experts.or(config.num_experts).unwrap_or(0);
+            let n_expert_used = config
+                .num_experts_per_tok
+                .unwrap_or(if n_expert > 0 { 2 } else { 1 });
+            let first_moe = if n_expert > 0 {
+                (0..num_layers).find(|i| {
+                    ws.pp("blk")
+                        .pp(&i.to_string())
+                        .get_unconstrained("ffn_gate_exps.weight")
+                        .is_ok()
+                })
+            } else {
+                None
+            };
+            let (n_expert, n_expert_used, n_layer_dense_lead) =
+                lfm2_moe_fields(n_expert, n_expert_used, first_moe, num_layers);
+
             let cfg = Lfm2Config {
                 vocab_size,
                 hidden_size,
@@ -1298,9 +1338,9 @@ fn load_model_from_config(
                 rope_theta,
                 n_shortconv_l_cache,
                 is_recr,
-                n_layer_dense_lead: num_layers, // all-dense unless metadata says otherwise
-                n_expert: 0,
-                n_expert_used: 1,
+                n_layer_dense_lead,
+                n_expert,
+                n_expert_used,
                 n_ff_exp: intermediate_size,
                 expert_weights_scale: 1.0,
                 expert_gating_func: 0,
@@ -3038,6 +3078,24 @@ fn load_model_with_providers(
                 .copied()
                 .map(|n| n as usize)
                 .unwrap_or(hparams.num_kv_heads);
+            // M0: wire MoE fields from GGUF hparams; derive first-MoE layer
+            // from checkpoint tensor presence (same technique as is_recr).
+            let n_expert = hparams.expert_count.unwrap_or(0);
+            let n_expert_used = hparams
+                .expert_used_count
+                .unwrap_or(if n_expert > 0 { 2 } else { 1 });
+            let first_moe = if n_expert > 0 {
+                (0..hparams.num_layers).find(|i| {
+                    ws.pp("blk")
+                        .pp(&i.to_string())
+                        .get_unconstrained("ffn_gate_exps.weight")
+                        .is_ok()
+                })
+            } else {
+                None
+            };
+            let (n_expert, n_expert_used, n_layer_dense_lead) =
+                lfm2_moe_fields(n_expert, n_expert_used, first_moe, hparams.num_layers);
             let cfg = Lfm2Config {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -3050,9 +3108,9 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 n_shortconv_l_cache,
                 is_recr: is_recr.clone(),
-                n_layer_dense_lead: hparams.num_layers, // all-dense unless metadata says otherwise
-                n_expert: 0,
-                n_expert_used: 1,
+                n_layer_dense_lead,
+                n_expert,
+                n_expert_used,
                 n_ff_exp: hparams.intermediate_size,
                 expert_weights_scale: 1.0,
                 expert_gating_func: 0,
@@ -4551,6 +4609,27 @@ mod tests {
         for v in ["1", "true", "on", ""] {
             with_var(Some(v), || assert!(lfm2_mxfp4_qkv_enabled(), "{v} must keep enabled"));
         }
+    }
+
+    /// M0 (PLAN-kernel-fusion): MoE field wiring. `is_moe = layer_idx >=
+    /// n_layer_dense_lead` (lfm2.rs), so an all-dense model must keep
+    /// `n_layer_dense_lead == num_layers`; a MoE checkpoint must lead some
+    /// layer to `is_moe == true` (dense_lead < num_layers).
+    #[test]
+    fn lfm2_moe_fields_wiring() {
+        // No experts: all-dense regardless of expert probe.
+        let (e, u, lead) = lfm2_moe_fields(0, 1, None, 16);
+        assert_eq!((e, u, lead), (0, 1, 16));
+        // Experts present but layers probed absent → still all-dense
+        // (checkpoint authority wins over metadata claim).
+        let (e, u, lead) = lfm2_moe_fields(8, 2, None, 16);
+        assert_eq!((e, u, lead), (8, 2, 16));
+        // Experts present, probes found: first MoE layer cuts dense_lead.
+        let (e, u, lead) = lfm2_moe_fields(8, 2, Some(12), 16);
+        assert_eq!((e, u, lead), (8, 2, 12));
+        // Zero-layer edge: lead stays num_layers.
+        let (_, _, lead) = lfm2_moe_fields(4, 2, None, 0);
+        assert_eq!(lead, 0);
     }
 
     #[test]
