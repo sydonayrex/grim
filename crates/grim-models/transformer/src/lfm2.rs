@@ -54,7 +54,16 @@ impl ModelConfig for Lfm2Config {
 }
 
 pub enum Lfm2LayerCache {
-    ShortConv(Vec<f32>),
+    /// ShortConv state: host mirror (row-major `[t, d]` layout, same as CPU path expects)
+    /// plus optional device-resident ring buffer (column-major `[d, kc]` layout matching the
+    /// HIP kernel contract). The device buffer is allocated once on first ROCm decode step and
+    /// updated in-place by `grim_short_conv1d_causal_step` — no per-token H2D or host transpose.
+    /// During HIP graph capture the host mirror is NOT synced (host syncs abort capture); it is
+    /// only refreshed on the non-capture path or when the device path falls back to CPU.
+    ShortConv {
+        host: Vec<f32>,
+        dev: Option<Box<dyn grim_tensor::BackendStorage>>,
+    },
     Attention {
         k: Vec<f32>,
         v: Vec<f32>,
@@ -95,7 +104,12 @@ pub enum Lfm2LayerCache {
 impl Clone for Lfm2LayerCache {
     fn clone(&self) -> Self {
         match self {
-            Self::ShortConv(st) => Self::ShortConv(st.clone()),
+            Self::ShortConv { host, .. } => Self::ShortConv {
+                host: host.clone(),
+                // Device ring is NOT cloned: it is model-step state, not a
+                // data blob — a cloned cache starts its device ring fresh.
+                dev: None,
+            },
             Self::Attention {
                 k, v, k_dev, v_dev, pos_base_dev, past_dev, dev_pos, ..
             } => Self::Attention {
@@ -596,14 +610,14 @@ impl Lfm2Block {
             let l_cache = *conv_shape.last().unwrap_or(&3);
 
             if cache.is_none() {
-                *cache = Some(Lfm2LayerCache::ShortConv(vec![
-                    0.0f32;
-                    h_dim * (l_cache - 1)
-                ]));
+                *cache = Some(Lfm2LayerCache::ShortConv {
+                    host: vec![0.0f32; h_dim * (l_cache - 1)],
+                    dev: None,
+                });
             }
 
-            let state = match cache.as_mut().unwrap() {
-                Lfm2LayerCache::ShortConv(st) => st,
+            let (state, dev_state) = match cache.as_mut().unwrap() {
+                Lfm2LayerCache::ShortConv { host, dev } => (host as &mut Vec<f32>, dev),
                 _ => {
                     return Err(grim_core::error::Error::Session(
                         "Mismatched ShortConv layer cache".into(),
@@ -626,7 +640,7 @@ impl Lfm2Block {
                 // test (cf. `shortconv_decode_matches_prefill`).
                 let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
                     && matches!(device, Device::Rocm(_));
-                match self.shortconv_step_device(&proj, h_dim, l_cache, state, &device, decode_graph) {
+                match self.shortconv_step_device(&proj, h_dim, l_cache, state, dev_state, &device, decode_graph) {
                     Ok(Some(y_t)) => {
                         let block_out_2d =
                             self.shortconv_out_proj.as_ref().unwrap().forward(&y_t)?;
@@ -1761,6 +1775,7 @@ impl Lfm2Block {
         h_dim: usize,
         l_cache: usize,
         state: &mut [f32],
+        dev_state: &mut Option<Box<dyn grim_tensor::BackendStorage>>,
         device: &Device,
         decode_graph: bool,
     ) -> Result<Option<Tensor>> {
@@ -1778,33 +1793,68 @@ impl Lfm2Block {
             let x_st = slice(2 * h_dim)?;
             let (bx_st, _) = dev.mul(b_st.as_ref(), x_st.as_ref(), &Shape::new(vec![h_dim]))?;
 
-            let mut st_cm = vec![0.0f32; kc * h_dim];
-            for t in 0..kc {
-                for d in 0..h_dim {
-                    st_cm[d * kc + t] = state[t * h_dim + d];
+            // S1: device-resident ring buffer (ROCm only — the HIP kernel
+            // updates `conv_state` IN PLACE; the CPU backend is read-only on
+            // conv_state, so a persistent ring would stay stale there).
+            // ROCm: allocated once from the host mirror's CURRENT contents
+            // (transposed [t,d] → [d,kc]), then updated in-place by the conv
+            // kernel — no per-token host transpose loop, no per-token H2D.
+            if dev_state.is_none() && matches!(device, Device::Rocm(_)) {
+                let mut st_cm = vec![0.0f32; kc * h_dim];
+                for t in 0..kc {
+                    for d in 0..h_dim {
+                        st_cm[d * kc + t] = state[t * h_dim + d];
+                    }
                 }
+                *dev_state = Some(dev.from_cpu(&st_cm, &Shape::new(vec![kc * h_dim]), DType::F32)?);
             }
-            let state_st = dev.from_cpu(&st_cm, &Shape::new(vec![kc * h_dim]), DType::F32)?;
+            // Non-ROCm: legacy per-call upload from the host mirror.
+            let state_st;
+            let state_ref: &dyn grim_tensor::BackendStorage = if let Some(ring) = dev_state.as_ref() {
+                ring.as_ref()
+            } else {
+                let mut st_cm = vec![0.0f32; kc * h_dim];
+                for t in 0..kc {
+                    for d in 0..h_dim {
+                        st_cm[d * kc + t] = state[t * h_dim + d];
+                    }
+                }
+                state_st = dev.from_cpu(&st_cm, &Shape::new(vec![kc * h_dim]), DType::F32)?;
+                state_st.as_ref()
+            };
 
             let conv_w = self.shortconv_conv.as_ref().unwrap();
             let (sum_st, _) = dev.short_conv1d_causal_step(
                 bx_st.as_ref(),
                 conv_w.storage().as_ref(),
                 None,
-                state_st.as_ref(),
+                state_ref,
                 &Shape::new(vec![h_dim]),
             )?;
             // Out storage must carry the consumer-facing 2-D shape —
             // Linear::forward reads the storage shape for matmul.
             let (y_st, _) = dev.mul(sum_st.as_ref(), c_st.as_ref(), &Shape::new(vec![1, h_dim]))?;
 
-            // Slide the host state mirror with the new bx row.
-            // When capturing a HIP graph, host syncs (D2H memcpy) abort graph capture with error 901.
+            // Mirror the ring back into the host state (transpose [d,kc] →
+            // [t,h_dim]) so the eager/prefill host path stays exact.
+            // ROCm: ring holds updated state post-kernel (in-place shift);
+            // CPU: read backends are read-only on conv_state, so the mirror
+            // is advanced from bx the old way. Skipped when capturing (host
+            // syncs abort HIP graphs; replay uses device state only).
             if !decode_graph {
-                let mut bx_h = bx_st.to_cpu_vec_f32()?;
-                bx_h.truncate(h_dim);
-                state.copy_within(h_dim.., 0);
-                state[(kc - 1) * h_dim..].copy_from_slice(&bx_h);
+                if dev_state.is_some() {
+                    let st_h = state_ref.to_cpu_vec_f32()?;
+                    for d in 0..h_dim {
+                        for t in 0..kc {
+                            state[t * h_dim + d] = st_h[d * kc + t];
+                        }
+                    }
+                } else {
+                    let mut bx_h = bx_st.to_cpu_vec_f32()?;
+                    bx_h.truncate(h_dim);
+                    state.copy_within(h_dim.., 0);
+                    state[(kc - 1) * h_dim..].copy_from_slice(&bx_h);
+                }
             }
 
             Ok(Tensor::new(
@@ -2679,11 +2729,11 @@ mod shortconv_numeric_reference_tests {
         // Causality gate: the cache must have advanced so a FOLLOW-UP call
         // sees the last two steps' bx values (state ring = last l_cache−1).
         match &cache {
-            Some(Lfm2LayerCache::ShortConv(st)) => {
+            Some(Lfm2LayerCache::ShortConv { host, .. }) => {
                 // After 3 steps with l_cache=3, the ring holds the LAST two
                 // steps' bx vectors — both must be non-zero.
                 assert!(
-                    st.iter().any(|&v| v != 0.0),
+                    host.iter().any(|&v| v != 0.0),
                     "shortconv cache must hold shifted bx history"
                 );
             }
