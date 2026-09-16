@@ -317,6 +317,59 @@ pub fn fused_or_scalar_attention_arena_device(
     )
 }
 
+/// PLAN-reduce-d2h-h2d A2: sticky device-kernel failure record + telemetry.
+///
+/// Once `qkv_attention` fails for a given `(num_heads, num_kv_heads,
+/// head_dim)` triple, re-attempting the device dispatch every token costs a
+/// failed launch per token with no chance of success. The sticky set skips
+/// the doomed dispatch and goes straight to the host fallback. Process
+/// lifetime only — never persisted — so a fixed kernel in a new binary gets
+/// a fresh attempt.
+static QKV_STICKY_FAILURES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, usize, usize)>>> =
+    std::sync::OnceLock::new();
+/// Device `qkv_attention` attempts (arena path).
+static QKV_DEVICE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times the arena path fell back to full-arena D2H + host attention.
+static QKV_ARENA_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn qkv_sticky_failed(key: (usize, usize, usize)) -> bool {
+    QKV_STICKY_FAILURES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map(|s| s.contains(&key))
+        .unwrap_or(false)
+}
+
+fn qkv_record_sticky_failure(key: (usize, usize, usize)) {
+    if let Ok(mut s) = QKV_STICKY_FAILURES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+    {
+        if s.insert(key) {
+            eprintln!("[grim] qkv_attention: device kernel failed for config (heads={}, kv_heads={}, head_dim={}); sticking to host fallback for this config (process lifetime only)",
+                key.0, key.1, key.2);
+        }
+    }
+}
+
+/// Runtime telemetry for the arena attention path: `(device_attempts,
+/// arena_fallbacks, sticky_failed_configs)`. Backs PCIe-traffic estimates
+/// with measured counts instead of static analysis. Exposed via
+/// `/api/stats` (`qkv_attention`).
+pub fn qkv_arena_fallback_stats() -> (u64, u64, usize) {
+    use std::sync::atomic::Ordering;
+    let sticky = QKV_STICKY_FAILURES
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    (
+        QKV_DEVICE_ATTEMPTS.load(Ordering::Relaxed),
+        QKV_ARENA_FALLBACKS.load(Ordering::Relaxed),
+        sticky,
+    )
+}
+
 /// WI-X2: attention over a caller-maintained device KV arena (see `block.rs::cache_append_kv`).
 /// Only the per-step K/V rows cross H2D; the history stays resident, so decode cost is.
 #[allow(clippy::too_many_arguments)]
@@ -339,28 +392,42 @@ pub fn fused_or_scalar_attention_arena(
     let dev = pick_device_for_storage_device(device);
     let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
     let cache_offset = kv_len.saturating_sub(steps);
-    if let Ok((storage, _handle)) = dev.qkv_attention(
-        q_st.as_ref(),
-        k_arena,
-        v_arena,
-        num_kv_heads,
-        kv_len,
-        cache_offset as u32,
-        window,
-        &out_shape,
-        None,
-        None,
-    ) {
-        return Ok(Tensor::new(
-            Arc::from(storage),
-            out_shape.clone(),
-            DType::F32,
-            grim_tensor::QuantProvenance::default(),
-            device.clone(),
-        ));
+    let cfg_key = (num_heads, num_kv_heads, head_dim);
+    // A2: skip the doomed device dispatch for configs that already failed
+    // this process lifetime; count every fallback for telemetry.
+    let attempt_device = !qkv_sticky_failed(cfg_key);
+    if attempt_device {
+        use std::sync::atomic::Ordering;
+        QKV_DEVICE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if let Ok((storage, _handle)) = dev.qkv_attention(
+            q_st.as_ref(),
+            k_arena,
+            v_arena,
+            num_kv_heads,
+            kv_len,
+            cache_offset as u32,
+            window,
+            &out_shape,
+            None,
+            None,
+        ) {
+            return Ok(Tensor::new(
+                Arc::from(storage),
+                out_shape.clone(),
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                device.clone(),
+            ));
+        }
+        qkv_record_sticky_failure(cfg_key);
     }
     // Fallback: materialize exactly `kv_len` rows (the arena may be larger than
     // the live history - capacity grows geometrically) and take the host-history path.
+    // A2: counted so PCIe-traffic estimates are measured, not derived.
+    {
+        use std::sync::atomic::Ordering;
+        QKV_ARENA_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
     let kv_stride = num_kv_heads * head_dim;
     let k_hist = k_arena.to_cpu_vec_f32()?;
     let v_hist = v_arena.to_cpu_vec_f32()?;
@@ -798,6 +865,21 @@ fn scalar_attention(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLAN-reduce-d2h-h2d A2: sticky failure records once per config and the
+    /// stats accessor reports it. Uses a sentinel key no real model uses.
+    #[test]
+    fn qkv_sticky_failure_records_once() {
+        let key = (usize::MAX, usize::MAX - 1, usize::MAX - 2);
+        assert!(!qkv_sticky_failed(key));
+        let (_, _, sticky_before) = qkv_arena_fallback_stats();
+        qkv_record_sticky_failure(key);
+        assert!(qkv_sticky_failed(key));
+        // Recording twice does not duplicate the entry.
+        qkv_record_sticky_failure(key);
+        let (_, _, sticky_after) = qkv_arena_fallback_stats();
+        assert_eq!(sticky_after, sticky_before + 1);
+    }
 
     /// Audit gate: the paged fallback's gather must follow the BLOCK TABLE, not assume the arena is linear history.
     /// Pages are filled with position-encoded values in permuted physical order; the gather must reconstruct linear.
