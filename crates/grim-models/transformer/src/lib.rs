@@ -10,6 +10,24 @@ pub fn is_unimplemented(e: &grim_core::error::Error) -> bool {
     )
 }
 
+/// PLAN-reduce-d2h-h2d A1: single unified gate for decode-graph fast path.
+///
+/// Mirrors `grim_backend_rocm::decode_graph_enabled()` polarity (opt-out:
+/// `GRIM_DECODE_GRAPH=0/false/off` disables) AND requires a ROCm device.
+/// Replaces four previously inconsistent inline checks (`lfm2.rs:619`,
+/// `lfm2.rs:822`, `lfm2.rs:974`, `block.rs:1328`) where two sites used
+/// opt-in (`== Ok("1")`, default off) and two used opt-out (`!= Ok("0")`,
+/// default on), causing capture to abort on ShortConv/RoPE-seed mismatch.
+pub fn decode_graph_active(device: &grim_tensor::Device) -> bool {
+    if !matches!(device, grim_tensor::Device::Rocm(_)) {
+        return false;
+    }
+    match std::env::var("GRIM_DECODE_GRAPH").as_deref() {
+        Ok("0") | Ok("false") | Ok("off") | Ok("False") | Ok("OFF") => false,
+        _ => true,
+    }
+}
+
 pub mod afmoe;
 pub mod apertus;
 pub mod arcee;
@@ -397,5 +415,61 @@ mod tests {
             v.iter().any(|x| *x != 0.0),
             "adapters must perturb the zero baseline"
         );
+    }
+
+    /// PLAN-reduce-d2h-h2d A1+A3: the unified gate is opt-out on ROCm,
+    /// off on non-ROCm regardless of env. All four call sites share it,
+    /// so ShortConv / RoPE-seed / attention / block gates agree.
+    #[test]
+    fn decode_graph_active_unified_gate() {
+        use crate::decode_graph_active;
+        let rocm = Device::Rocm(0);
+        let cpu = Device::Cpu;
+        // Default (no env): ON for ROCm, OFF for CPU.
+        temp_env::with_var("GRIM_DECODE_GRAPH", None::<&str>, || {
+            assert!(decode_graph_active(&rocm));
+            assert!(!decode_graph_active(&cpu));
+        });
+        // Explicit opt-out spellings disable even on ROCm.
+        for v in ["0", "false", "off", "False", "OFF"] {
+            temp_env::with_var("GRIM_DECODE_GRAPH", Some(v), || {
+                assert!(!decode_graph_active(&rocm), "expected {v} to disable");
+            });
+        }
+        // Opt-in spelling keeps it on; non-ROCm stays off regardless.
+        temp_env::with_var("GRIM_DECODE_GRAPH", Some("1"), || {
+            assert!(decode_graph_active(&rocm));
+            assert!(!decode_graph_active(&cpu));
+        });
+    }
+
+    /// PLAN-reduce-d2h-h2d A3: with all defaults, the RoPE device-base gate
+    /// (`GRIM_ROPE_DEV_BASE` opt-out + unified `decode_graph_active`) selects
+    /// the device-base path on ROCm. Pure gate-logic proxy — the kernel path
+    /// itself needs GPU to execute.
+    #[test]
+    fn rope_dev_base_gate_defaults_to_device_on_rocm() {
+        use crate::decode_graph_active;
+        let rocm = Device::Rocm(0);
+        temp_env::with_vars(
+            [
+                ("GRIM_DECODE_GRAPH", None::<&str>),
+                ("GRIM_ROPE_DEV_BASE", None::<&str>),
+            ],
+            || {
+                let rope_dev = std::env::var("GRIM_ROPE_DEV_BASE").as_deref() != Ok("0")
+                    && decode_graph_active(&rocm);
+                assert!(rope_dev, "default must take rope_dev_base on ROCm");
+            },
+        );
+        // Either flag opts out.
+        temp_env::with_var("GRIM_DECODE_GRAPH", Some("0"), || {
+            assert!(!decode_graph_active(&rocm));
+        });
+        temp_env::with_var("GRIM_ROPE_DEV_BASE", Some("0"), || {
+            let rope_dev = std::env::var("GRIM_ROPE_DEV_BASE").as_deref() != Ok("0")
+                && decode_graph_active(&rocm);
+            assert!(!rope_dev);
+        });
     }
 }
