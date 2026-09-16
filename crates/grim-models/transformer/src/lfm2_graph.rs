@@ -12,13 +12,14 @@
 
 use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::decode_graph_buffers::{
-    DecodeGraph, DecodeGraphBuffers, check_layer_topology, decode_graph_enabled,
+    DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
     launch_attention, launch_qkv_gemv, write_embeddings_to_buffer_batch,
 };
+use grim_backend_rocm::as_rocm;
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 
-use crate::lfm2::{Lfm2, Lfm2Block};
+use crate::lfm2::{Lfm2, Lfm2Block, Lfm2LayerCache};
 
 /// Spec §Phase 6 dims derived from config. `max_ctx` caps KV arenas.
 #[allow(clippy::type_complexity)]
@@ -126,6 +127,112 @@ impl Lfm2 {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
         Ok(DecodeGraph::new(&dev, buffers, stream))
+    }
+
+    /// A5 Phase 2 (WI-X2-PREFILL-ARENA): export device pointers + strides for
+    /// graph-arena seeding (`DecodeGraphBuffers::seed_kv_arena_from_eager`).
+    ///
+    /// `caches` is the session's per-layer cache vec (index-aligned with
+    /// `self.layers`; see `Lfm2::forward`). `valid_rows` is the number of
+    /// rows valid in every dense layer's device arena — supplied by the
+    /// caller from loop counters (prompt_len + decode steps so far), NOT
+    /// derived from the (possibly stale-on-device-path) host `k`/`v` mirrors.
+    ///
+    /// Returns one entry per layer: `Some` for dense attention layers whose
+    /// `k_dev`/`v_dev` arenas are present and ROCm-resident, `None` for
+    /// recurrent (ShortConv) layers. FAILS CLOSED: when `valid_rows > 0` and
+    /// any dense attention layer lacks arenas (never ran, wrong cache
+    /// variant, non-ROCm storage), returns `Err` so the caller falls back to
+    /// eager instead of capturing a prompt-blind graph. `valid_rows == 0`
+    /// yields all-`None` (nothing to seed; seed is then a no-op).
+    pub fn eager_kv_seed_sources<'a>(
+        &self,
+        caches: &'a [Option<Lfm2LayerCache>],
+        valid_rows: u32,
+    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
+        if caches.len() != self.layers.len() {
+            return Err(grim_core::error::Error::Session(format!(
+                "eager_kv_seed_sources: {} caches != {} layers",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(self.layers.len());
+        for (layer, cache) in self.layers.iter().zip(caches.iter()) {
+            // Recurrent layers keep host conv state — never seedable.
+            if layer.wq.is_none() {
+                out.push(None);
+                continue;
+            }
+            let (k_dev, v_dev) = match cache {
+                Some(Lfm2LayerCache::Attention { k_dev, v_dev, .. }) => (k_dev, v_dev),
+                _ => {
+                    if valid_rows > 0 {
+                        return Err(grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: dense layer missing attention cache"
+                                .into(),
+                        ));
+                    }
+                    out.push(None);
+                    continue;
+                }
+            };
+            let (k, v) = match (k_dev.as_deref(), v_dev.as_deref()) {
+                (Some(k), Some(v)) => (k, v),
+                _ => {
+                    if valid_rows > 0 {
+                        return Err(grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: dense layer missing device KV arenas"
+                                .into(),
+                        ));
+                    }
+                    out.push(None);
+                    continue;
+                }
+            };
+            let (k_rocm, v_rocm) = match (as_rocm(k.storage().as_ref()), as_rocm(v.storage().as_ref())) {
+                (Ok(k), Ok(v)) => (k, v),
+                _ => {
+                    if valid_rows > 0 {
+                        return Err(grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: KV arenas not ROCm-resident".into(),
+                        ));
+                    }
+                    out.push(None);
+                    continue;
+                }
+            };
+            let kv_stride = k_rocm.shape().dims().last().copied().unwrap_or(0);
+            if kv_stride == 0 {
+                if valid_rows > 0 {
+                    return Err(grim_core::error::Error::Session(
+                        "eager_kv_seed_sources: zero-width KV arena".into(),
+                    ));
+                }
+                out.push(None);
+                continue;
+            }
+            let (k_ptr, v_ptr) = match (k_rocm.device_ptr_u64(), v_rocm.device_ptr_u64()) {
+                (Some(k), Some(v)) if k != 0 && v != 0 => (k as *const f32, v as *const f32),
+                _ => {
+                    if valid_rows > 0 {
+                        return Err(grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: KV arenas have no device pointer".into(),
+                        ));
+                    }
+                    out.push(None);
+                    continue;
+                }
+            };
+            out.push(Some(EagerKvSource {
+                k_dev: k_ptr,
+                v_dev: v_ptr,
+                prefill_len: valid_rows,
+                kv_stride,
+                _anchor: std::marker::PhantomData,
+            }));
+        }
+        Ok(out)
     }
 
     /// Spec §Phase 3 capture path (single token). Enqueues the device-side

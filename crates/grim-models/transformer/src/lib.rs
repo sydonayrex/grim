@@ -263,7 +263,7 @@ pub use internlm2::{InternLm2, InternLm2Config};
 pub use jais::{Jais, JaisConfig};
 pub use jais2::{Jais2, Jais2Config};
 pub use kimi_linear::{KimiLinear, KimiLinearConfig};
-pub use lfm2::{Lfm2, Lfm2Config};
+pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
 pub use llada::{Llada, LladaConfig};
 pub use lladamoe::{LladaMoe, LladaMoeConfig};
 pub use llama_embed::{LlamaEmbed, LlamaEmbedConfig};

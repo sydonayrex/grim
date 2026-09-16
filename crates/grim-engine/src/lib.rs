@@ -2268,6 +2268,38 @@ impl Engine {
                 let max_ctx = 4096;
                 match lfm2.get_or_create_decode_graph(max_ctx, 1) {
                     Ok(mut g) => {
+                        // A5 Phase 2: seed graph KV arenas from the eager
+                        // device caches (fail-closed to eager). Runs outside
+                        // the capture bracket. `current_pos` on the session
+                        // (advanced by prior forwards) = valid arena rows.
+                        let seed_ok: std::result::Result<(), String> = (|| {
+                            let sess = self
+                                .sessions
+                                .get(&request_id)
+                                .ok_or_else(|| "no session".to_string())?;
+                            let valid_rows = sess.current_pos() as u32;
+                            let caches = sess
+                                .model_state()
+                                .and_then(|s| {
+                                    s.downcast_ref::<
+                                        Vec<Option<
+                                            grim_models_transformer::Lfm2LayerCache,
+                                        >>,
+                                    >()
+                                })
+                                .ok_or_else(|| "no LFM2 caches".to_string())?;
+                            let srcs = lfm2
+                                .eager_kv_seed_sources(caches, valid_rows)
+                                .map_err(|e| format!("export: {e}"))?;
+                            let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+                            g.buffers
+                                .seed_kv_arena_from_eager(&dev, &srcs)
+                                .map_err(|e| format!("seed: {e}"))
+                        })();
+                        if let Err(e) = seed_ok {
+                            eprintln!("[grim] decode-graph: KV seed failed for request {request_id} ({e}); eager fallback");
+                            return self.drive_forward(model_id, request_id, input_ids, positions);
+                        }
                         if g.begin_capture().is_err() {
                             return self.drive_forward(model_id, request_id, input_ids, positions);
                         }
@@ -2276,7 +2308,8 @@ impl Engine {
                             let _ = g.abort_capture();
                             return self.drive_forward(model_id, request_id, input_ids, positions);
                         }
-                        g.buffers.current_pos = 1;
+                        // `current_pos` already set by the KV seed
+                        // (`= valid_rows`); replays append after it.
                         self.decode_graphs.insert(request_id, g);
                         if let Some(g) = self.decode_graphs.get(&request_id) {
                             let _ = g.replay();
