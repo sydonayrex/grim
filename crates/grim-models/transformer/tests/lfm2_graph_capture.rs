@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::RocmDevice;
-use grim_models_transformer::lfm2::{Lfm2, Lfm2Block, Lfm2Config};
+use grim_models_transformer::lfm2::{Lfm2, Lfm2Block, Lfm2Config, Lfm2LayerCache};
 use grim_models_transformer::shared_moe::CharonCache;
 use grim_models_transformer::lfm2_graph::write_embedding_to_buffer;
 use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{BackendStorage, CoreTensorOps, DType, Device, Shape, Tensor};
+use grim_tensor::{BackendStorage, CoreTensorOps, DType, Device, MemoryOps, Shape, Storage, Tensor};
 
 fn rocm_tensor(dev: &RocmDevice, ordinal: usize, data: Vec<f32>, shape: Shape) -> Tensor {
     let storage = dev.from_cpu(&data, &shape, DType::F32).unwrap();
@@ -365,6 +365,25 @@ fn lfm2_graph_recurrent_falls_back_eager() {
 // tolerance (the capture path runs the same kernels as eager — only the
 // launch mechanism differs).
 
+
+fn rocm_tensor_bytes(
+    dev: &RocmDevice,
+    ordinal: usize,
+    data: Vec<u8>,
+    shape: Shape,
+    dtype: grim_tensor::DType,
+    _cap: usize,
+) -> grim_tensor::Tensor {
+    let storage = dev.from_cpu_bytes(&data, &shape, dtype.clone()).unwrap();
+    grim_tensor::Tensor::new(
+        std::sync::Arc::from(storage),
+        shape,
+        dtype,
+        grim_tensor::QuantProvenance::GrimNative,
+        Device::Rocm(ordinal),
+    )
+}
+
 fn moe_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
     let hidden = 32usize;
     let hd = 8usize;
@@ -702,4 +721,149 @@ fn lfm2_graph_shortconv_ring_advances_across_replays() {
         max_delta > 1e-6,
         "conv ring did not advance: identical logits across replays (max delta {max_delta})"
     );
+}
+
+
+/// MXFP4 decode-graph gap closure: a native-MXFP4 attention layer captures
+/// via the fused `grim_fused_mxfp4_gemm_qk_norm_rope_kv` node (projection +
+/// QK-norm + RoPE + K/V append in one kernel) and replays deterministically.
+#[test]
+fn lfm2_graph_mxfp4_layer_captures_and_replays() {
+    if !grim_backend_rocm::device::util::gpu_test_enabled()
+        || !RocmDevice::probe_one(0).unwrap_or(false)
+    {
+        eprintln!("skip: GPU test");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+    let hidden = 32usize;
+    let hd = 8usize;
+    let nh = 2usize;
+    let nkv = 1usize;
+    let inter = 64usize;
+    let n_q = nh * hd;
+    let n_kv = nkv * hd;
+
+    let mut b = attention_block(&dev, 0, hidden, n_q, n_kv, hd, inter, false);
+    // Pack the QKV weights to MXFP4 exactly like `build_fused_qkv_pack`:
+    // row-major Q∥K∥V concat, quant_mxfp4_matrix layout.
+    let mut concat = Vec::with_capacity(n_q * hidden + 2 * n_kv * hidden);
+    concat.extend(rand_vec(n_q * hidden, 11));
+    concat.extend(rand_vec(n_kv * hidden, 22));
+    concat.extend(rand_vec(n_kv * hidden, 33));
+    let (codes, exps) = grim_quant::quant_mxfp4_matrix(&concat, n_q + 2 * n_kv, hidden);
+    let codes_dtype = grim_tensor::DType {
+        arith: grim_tensor::ArithType::F32,
+        storage: Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::MxFp4),
+    };
+    let codes_shape = Shape::new(vec![n_q + 2 * n_kv, hidden]);
+    let codes_t = rocm_tensor_bytes(
+        &dev,
+        0,
+        codes,
+        codes_shape.clone(),
+        codes_dtype,
+        (n_q + 2 * n_kv) * hidden / 2 + (n_q + 2 * n_kv) * hidden / 32,
+    );
+    let exps_shape = Shape::new(vec![(n_q + 2 * n_kv) * hidden / 32]);
+    let exps_len = exps.len();
+    let exps_t = rocm_tensor_bytes(
+        &dev,
+        0,
+        exps,
+        exps_shape,
+        grim_tensor::DType {
+            arith: grim_tensor::ArithType::U8,
+            storage: Storage::Native,
+        },
+        exps_len,
+    );
+    // QK-norm gammas (positive, RMSNorm-style).
+    b.wqkv_codes = Some(codes_t);
+    b.wqkv_exps = Some(exps_t);
+    b.gamma_q = Some(rocm_tensor(&dev, 0, vec![1.0; hd], Shape::new(vec![hd])));
+    b.gamma_k = Some(rocm_tensor(&dev, 0, vec![1.0; hd], Shape::new(vec![hd])));
+
+    let model = tiny_lfm2_custom(&dev, 0, vec![b]);
+    assert!(model.layers[0].wqkv_codes.is_some());
+    let tokens = [7u32, 13, 19];
+    if std::env::var("GRIM_MXFP4_PARITY_DEBUG").is_ok() {
+        // Plain F32 model through the SAME harness: isolates harness bugs
+        // from fused-kernel wiring bugs (constant factor => harness).
+        let plain = tiny_lfm2_custom(&dev, 0, vec![attention_block(&dev, 0, hidden, n_q, n_kv, hd, inter, false)]);
+        let pr = capture_replay_logits(&plain, &tokens).unwrap();
+        let mut caches: Vec<Option<Lfm2LayerCache>> = vec![None, None];
+        for (i, &t) in tokens.iter().enumerate() {
+            let x = rocm_tensor(&dev, 0, {
+                let row = model.tok_embeddings.weight.to_vec_f32().unwrap();
+                row[t as usize * hidden..(t as usize + 1) * hidden].to_vec()
+            }, Shape::new(vec![1, hidden]));
+            let mut h = x;
+            for li in 0..plain.layers.len() {
+                h = plain.layers[li].forward(&h, &mut caches[li]).unwrap();
+            }
+            let n = plain.norm.weight.to_vec_f32().unwrap();
+            let mut hv = h.to_vec_f32().unwrap();
+            let msq: f32 = hv.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+            let inv = 1.0 / (msq + plain.cfg.rms_norm_eps).sqrt();
+            for v in hv.iter_mut() { *v *= inv; }
+            let w = plain.output.weight.to_vec_f32().unwrap();
+            let logits: Vec<f32> = (0..plain.cfg.vocab_size)
+                .map(|vi| (0..hidden).map(|d| w[vi * hidden + d] * hv[d] * n[d]).sum::<f32>())
+                .collect();
+            let worst: f32 = pr[i].iter().zip(&logits).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+            eprintln!("plain-m harness check token {t}: worst abs {worst:.4} (graph[:3]={:?} eager[:3]={:?})", &logits[..3], &pr[i][..3]);
+        }
+    }
+    let replay = capture_replay_logits(&model, &tokens).expect("mxfp4 capture/replay");
+    assert_eq!(replay.len(), 3);
+    let replay2 = capture_replay_logits(&model, &tokens).expect("mxfp4 capture/replay 2");
+    for (a_seq, b_seq) in replay.iter().zip(&replay2) {
+        for (a, b) in a_seq.iter().zip(b_seq) {
+            assert!((a - b).abs() < 1e-2, "replay nondeterminism: {a} vs {b}");
+        }
+    }
+
+    // Numeric cross-check vs the EAGER path: feed the same token sequence
+    // token-by-token through the blocks (each keeps its own KV history), so
+    // replay step i and eager step i see identical history. The graph path
+    // runs the same fused MXFP4 kernel — outputs must match within float
+    // noise of the attention reduction.
+    let mut caches: Vec<Option<Lfm2LayerCache>> = vec![None, None];
+    for (i, &t) in tokens.iter().enumerate() {
+        let x = rocm_tensor(
+            &dev,
+            0,
+            {
+                let row = model.tok_embeddings.weight.to_vec_f32().unwrap();
+                row[t as usize * hidden..(t as usize + 1) * hidden].to_vec()
+            },
+            Shape::new(vec![1, hidden]),
+        );
+        let mut h = x;
+        for li in 0..model.layers.len() {
+            h = model.layers[li].forward(&h, &mut caches[li]).unwrap();
+        }
+        // Head over the final hidden state.
+        let n = model.norm.weight.to_vec_f32().unwrap();
+        let mut hv = h.to_vec_f32().unwrap();
+        let msq: f32 = hv.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (msq + model.cfg.rms_norm_eps).sqrt();
+        for v in hv.iter_mut() { *v *= inv; }
+        let w = model.output.weight.to_vec_f32().unwrap();
+        let logits: Vec<f32> = (0..model.cfg.vocab_size)
+            .map(|vi| (0..hidden).map(|d| w[vi * hidden + d] * hv[d] * n[d]).sum::<f32>())
+            .collect();
+        let mut worst = 0.0f32;
+        for (a, b) in replay[i].iter().zip(&logits) {
+            worst = worst.max((a - b).abs() / (b.abs() + 1e-3));
+        }
+        eprintln!("mxfp4 parity token {t}: worst rel {worst:.4}");
+        eprintln!("  graph[:6] = {:?}", &replay[i][..6]);
+        eprintln!("  eager[:6] = {:?}", &logits[..6]);
+        assert!(
+            worst < 5e-2,
+            "token {t}: graph vs eager MXFP4 logits differ (worst rel {worst:.4})"
+        );
+    }
 }
