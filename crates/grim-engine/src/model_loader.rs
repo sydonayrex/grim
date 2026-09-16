@@ -3038,8 +3038,17 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
+            // M0/M2: per-layer kv-head counts live under the *actual* GGUF arch
+            // prefix (`lfm2moe.*` for the A1B checkpoint), not always `lfm2.*`.
+            // Probe both; treat the arch prefix as authoritative.
+            let lfm_moe_arch_key = match arch {
+                ModelArchitecture::Lfm2Moe => "lfm2moe",
+                _ => "lfm2",
+            };
+            let meta_key = |suffix: &str| -> String { format!("{lfm_moe_arch_key}.{suffix}") };
+
             let mut head_count_kv_vec: Vec<u32> = Vec::with_capacity(hparams.num_layers);
-            if let Some(arr_val) = get_meta_array(provider, "lfm2.attention.head_count_kv") {
+            if let Some(arr_val) = get_meta_array(provider, &meta_key("attention.head_count_kv")) {
                 for v in arr_val.iter().take(hparams.num_layers) {
                     let v: &grim_format::gguf::GgufValue = v;
                     let n: u32 = v.as_u32().unwrap_or_else(|| {
@@ -3056,7 +3065,7 @@ fn load_model_with_providers(
                 if i < head_count_kv_vec.len() {
                     continue;
                 }
-                let key = format!("lfm2.attention.head_count_kv.{i}");
+                let key = meta_key(&format!("attention.head_count_kv.{i}"));
                 let n: u32 = if let Some(val) = provider.metadata(&key) {
                     let val: &grim_format::gguf::GgufValue = val;
                     val.as_u32().unwrap_or(0u32)

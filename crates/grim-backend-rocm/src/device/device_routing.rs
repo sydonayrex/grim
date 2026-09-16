@@ -347,6 +347,45 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let stream = self.moe_fused_dispatch_resident_routing_into(
+            activations,
+            gate_buf,
+            up_buf,
+            down_buf,
+            routing_tokens,
+            routing_experts,
+            routing_weights,
+            num_pairs,
+            &out_storage,
+            hidden,
+            inter,
+            routed_scaling_factor,
+        )?;
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
+    /// M2 (PLAN-kernel-fusion): same launch as
+    /// [`Self::moe_fused_dispatch_resident_routing`] but writing into
+    /// CALLER-PROVIDED `out` — no allocation inside. Graph-capture-safe:
+    /// `out` is a stable pool address. Returns the stream used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_fused_dispatch_resident_routing_into(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        up_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        routing_tokens: &RocmStorage,
+        routing_experts: &RocmStorage,
+        routing_weights: &RocmStorage,
+        num_pairs: usize,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -359,9 +398,6 @@ impl RocmDevice {
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
-
-        let out_storage =
-            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
@@ -389,7 +425,7 @@ impl RocmDevice {
             (num_pairs as u32).div_ceil(block_x)
         };
         if grid_x == 0 {
-            return Ok((out_storage, RocmHandle::new(Some(self.active_stream()))));
+            return Ok(self.active_stream());
         }
 
         let mut a = a_ptr as *mut c_void;
@@ -425,7 +461,7 @@ impl RocmDevice {
             ],
         )?;
 
-        Ok((out_storage, RocmHandle::new(Some(stream))))
+        Ok(stream)
     }
 
     /// Launches the MoE fused comm-compute mega-kernel (UniEP persistent SM model).

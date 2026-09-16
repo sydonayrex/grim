@@ -39,7 +39,7 @@ fn roundtrip_budget_not_exceeded() {
         ("glm5_2.rs", 7),
         ("gpt2.rs", 11),
         ("kv_attention.rs", 1),
-        ("lfm2.rs", 27), // WI-F: +2 (device-path bx fetch + decode test); decode no longer pulls proj
+        ("lfm2.rs", 32), // WI-F: +2 bx fetch; M1: +5 one-time expert-slice reads in moe_expert_at (OnceLock-cached, never per-token)
         ("lib.rs", 4),
         ("mellum.rs", 0),
         ("minicpm.rs", 17),

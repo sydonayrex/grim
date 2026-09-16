@@ -2058,7 +2058,7 @@ impl Lfm2Block {
         })
     }
 
-    fn moe_experts(&self) -> Option<&Vec<crate::shared_moe::MoeExpert>> {
+    pub fn moe_experts(&self) -> Option<&Vec<crate::shared_moe::MoeExpert>> {
         self.moe_experts_cache.get_or_init(|| {
             (0..self.n_expert.max(1))
                 .map(|e| self.moe_expert_at(e))

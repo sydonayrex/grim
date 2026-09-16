@@ -4701,6 +4701,42 @@ impl RocmDevice {
         Ok(compute_handle)
     }
 
+    /// S2 (PLAN-kernel-fusion): elementwise `out = a * b` into
+    /// CALLER-PROVIDED `out` — no allocation inside. Graph-capture-safe
+    /// companion to [`Self::mul`] (same `grim_mul` kernel).
+    pub fn mul_into(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let a_s = as_rocm(a)?;
+        let b_s = as_rocm(b)?;
+        if !a_s.device_ptr_is_valid() || !b_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "mul_into: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        let mut out_ptr = dev_ptr(out)?;
+        let mut a_ptr = dev_ptr(a_s)?;
+        let mut b_ptr = dev_ptr(b_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_mul",
+            grid,
+            block,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut b_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// `C = A @ B^T` (SPEED-ROC-16 contract) writing into CALLER-PROVIDED
     /// `out` — no allocation inside. Mirrors the [`CoreTensorOps::matmul`]
     /// dispatch (FP32-GEMV fast path, then [`Self::matmul_op_into`]).

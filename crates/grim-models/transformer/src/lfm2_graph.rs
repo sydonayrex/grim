@@ -131,6 +131,19 @@ impl Lfm2 {
             vocab,
             nh,
             batch,
+            // M2/S2: MoE + ShortConv staging dims (0 = layer kind absent).
+            self.cfg.n_expert,
+            self.cfg.n_expert_used,
+            if self.layers.iter().any(|l| l.shortconv_in_proj.is_some()) {
+                self.cfg.hidden_size
+            } else {
+                0
+            },
+            if self.layers.iter().any(|l| l.shortconv_in_proj.is_some()) {
+                self.cfg.n_shortconv_l_cache.max(2)
+            } else {
+                0
+            },
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
         Ok(DecodeGraph::new(&dev, buffers, stream))
@@ -405,19 +418,25 @@ impl Lfm2Block {
         check_layer_topology(buffers, layer_idx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
         if !self.is_attention() {
-            return Err(grim_core::error::Error::Unimplemented(
-                "forward_graph: recurrent ShortConv keeps host conv state; use eager".into(),
-            ));
+            // S2 (PLAN-kernel-fusion): ShortConv layers capture via the device
+            // ring (`sc_state`) + staging buffers. Only a recurrent block with
+            // NO ShortConv weights remains uncapturable.
+            if self.shortconv_in_proj.is_none() {
+                return Err(grim_core::error::Error::Unimplemented(
+                    "forward_graph: recurrent block without ShortConv weights; use eager".into(),
+                ));
+            }
+            self.shortconv_forward_graph(layer_idx, buffers, dev)?;
+        } else {
+            self.attn_forward_graph(layer_idx, buffers, dev)?;
         }
         if self.is_moe {
-            return Err(grim_core::error::Error::Unimplemented(
-                "forward_graph: MoE routes on host; use eager".into(),
-            ));
+            // M2 (PLAN-kernel-fusion): MoE FFN sublayer — device routing +
+            // resident-weight grouped dispatch, all enqueued (capture-safe).
+            self.moe_forward_graph(layer_idx, buffers, dev)?;
+        } else {
+            self.ffn_forward_graph(layer_idx, buffers, dev)?;
         }
-        // Attention sublayer -> layer_output, then FFN sublayer curves into
-        // the next layer's input (or head_input for the last layer).
-        self.attn_forward_graph(layer_idx, buffers, dev)?;
-        self.ffn_forward_graph(layer_idx, buffers, dev)?;
         // Publish block output for the next layer (one D2D node).
         let n_layers = buffers.layer_input.len();
         let dst: &Storage = if layer_idx + 1 < n_layers {
@@ -851,3 +870,177 @@ mod tests {
         assert!("GRIM_DECODE_GRAPH".is_ascii());
     }
 }
+
+
+impl Lfm2Block {
+    /// S2 (PLAN-kernel-fusion): ShortConv sublayer + dense FFN tail, fully
+    /// enqueued. Conv state lives in the per-layer device ring
+    /// `buffers.sc_state[layer_idx]` (column-major `[h_dim, kc]`, the HIP
+    /// kernel's in-place layout); it is seeded on first use from the host
+    /// mirror OUTSIDE any capture bracket (first warmup forward), then
+    /// updated in-place by the conv kernel inside the graph. Batch is 1 for
+    /// the decode graph; batched ShortConv capture is a scoped follow-up.
+    fn shortconv_forward_graph(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+    ) -> Result<()> {
+        let in_proj = self.shortconv_in_proj.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("shortconv_forward_graph: missing in_proj".into())
+        })?;
+        let conv = self.shortconv_conv.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("shortconv_forward_graph: missing conv".into())
+        })?;
+        let out_proj = self.shortconv_out_proj.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("shortconv_forward_graph: missing out_proj".into())
+        })?;
+        let hidden = buffers.layer_input[layer_idx].shape().dims().last().copied().unwrap_or(0);
+        let act = &buffers.act_q81_buf[layer_idx];
+
+        // 1. attn-norm the residual into the staging slot, then the fused
+        //    in-projection GEMV [batch, 3*h_dim] (b∥x∥c per row).
+        dev.rms_norm_into(
+            &buffers.layer_input[layer_idx],
+            &**self.attn_norm.weight.storage(),
+            self.attn_norm.eps,
+            &buffers.norm_buf[layer_idx],
+            &buffers.layer_input[layer_idx].shape().clone(),
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        let normed: &Storage = &buffers.norm_buf[layer_idx];
+        linear_into(dev, normed, &in_proj.weight, &buffers.sc_proj_buf[layer_idx], act)?;
+
+        // 2. Split b∥x∥c (row 0; decode graph runs batch=1 — see doc).
+        dev.copy_slice_range(&buffers.sc_b[layer_idx], 0, &buffers.sc_proj_buf[layer_idx], 0, hidden)
+            .map_err(grim_core::error::Error::Tensor)?;
+        dev.copy_slice_range(&buffers.sc_c[layer_idx], 0, &buffers.sc_proj_buf[layer_idx], hidden, hidden)
+            .map_err(grim_core::error::Error::Tensor)?;
+        dev.copy_slice_range(&buffers.sc_x[layer_idx], 0, &buffers.sc_proj_buf[layer_idx], 2 * hidden, hidden)
+            .map_err(grim_core::error::Error::Tensor)?;
+
+        // 3. bx = b ⊙ x; causal conv step (updates the ring IN PLACE);
+        //    y = sum ⊙ c.
+        dev.mul_into(&buffers.sc_b[layer_idx], &buffers.sc_x[layer_idx], &buffers.sc_bx[layer_idx])
+            .map_err(|e| grim_core::error::Error::Backend(format!("sc mul bx: {e}")))?;
+        dev.short_conv1d_causal_step_into(
+            &buffers.sc_bx[layer_idx],
+            conv.storage().as_ref(),
+            None,
+            &buffers.sc_state[layer_idx],
+            &buffers.sc_sum[layer_idx],
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("sc conv: {e}")))?;
+        dev.mul_into(&buffers.sc_sum[layer_idx], &buffers.sc_c[layer_idx], &buffers.sc_y[layer_idx])
+            .map_err(|e| grim_core::error::Error::Backend(format!("sc mul c: {e}")))?;
+
+        // 4. Out projection into staging, then residual add in place
+        //    (layer_output currently holds the pre-block residual).
+        linear_into(
+            dev,
+            &buffers.sc_y[layer_idx],
+            &out_proj.weight,
+            &buffers.norm_buf[layer_idx],
+            act,
+        )?;
+        add_graph(
+            &buffers.layer_input[layer_idx],
+            &buffers.norm_buf[layer_idx],
+            &buffers.layer_output[layer_idx],
+            dev,
+        )
+    }
+
+    /// M2 (PLAN-kernel-fusion): MoE FFN sublayer, fully enqueued.
+    /// 1) ffn-norm into staging; 2) router gate GEMV into
+    /// `moe_gate_logits[l]`; 3) `grim_moe_route_topk` writes the sortless
+    /// routing triple into the graph's persistent routing buffers; 4) the
+    /// grouped-expert kernel reads resident stacked weights + the routing
+    /// triple and atomically accumulates into `moe_out[l]`; 5) residual add.
+    /// All launches hit fixed pool addresses — capture-safe after one warmup
+    /// pass builds the resident weight stack (an H2D at capture time would
+    /// abort; the caller's warmup guarantee makes every bracket call a hit).
+    fn moe_forward_graph(
+        &self,
+        layer_idx: usize,
+        buffers: &DecodeGraphBuffers,
+        dev: &Dev,
+    ) -> Result<()> {
+        let gate_inp = self.ffn_gate_inp.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("moe_forward_graph: missing router gate".into())
+        })?;
+        let hidden = buffers.layer_input[layer_idx].shape().dims().last().copied().unwrap_or(0);
+        let batch = buffers.batch.max(1);
+        let top_k = self.n_expert_used.min(self.n_expert).max(1);
+        let act = &buffers.act_q81_buf[layer_idx];
+
+        // 1. FFN norm of the attention residual into staging.
+        dev.rms_norm_into(
+            &buffers.layer_output[layer_idx],
+            &**self.ffn_norm.weight.storage(),
+            self.ffn_norm.eps,
+            &buffers.norm_buf[layer_idx],
+            &buffers.layer_output[layer_idx].shape().clone(),
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        let normed: &Storage = &buffers.norm_buf[layer_idx];
+
+        // 2. Router gate GEMV [batch, n_expert].
+        linear_into(dev, normed, &gate_inp.weight, &buffers.moe_gate_logits[layer_idx], act)?;
+
+        // 3. Resident scratch + stacked weights (cache hit after warmup).
+        let experts = self.moe_experts().ok_or_else(|| {
+            grim_core::error::Error::Backend("moe_forward_graph: expert weights missing".into())
+        })?;
+        let (tokens, experts_b, weights, gate_buf, up_buf, down_buf) =
+            crate::shared_moe::ensure_charon_scratch(
+                dev.ordinal(),
+                batch,
+                top_k,
+                experts,
+                &self.charon_cache,
+            )?;
+        let tokens_rocm = dst_downcast(tokens.as_ref())?;
+        let experts_rocm = dst_downcast(experts_b.as_ref())?;
+        let weights_rocm = dst_downcast(weights.as_ref())?;
+        dev.moe_route_topk_on_device(
+            &buffers.moe_gate_logits[layer_idx],
+            None,
+            tokens_rocm,
+            experts_rocm,
+            weights_rocm,
+            batch,
+            self.n_expert,
+            top_k,
+            0, // softmax routing (matches eager path)
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+        // 4. Grouped dispatch into the fixed moe_out slot.
+        let norm_rocm = dst_downcast(normed)?;
+        dev.moe_fused_dispatch_resident_routing_into(
+            norm_rocm,
+            gate_buf.as_ref(),
+            up_buf.as_ref(),
+            down_buf.as_ref(),
+            tokens_rocm,
+            experts_rocm,
+            weights_rocm,
+            batch * top_k,
+            &buffers.moe_out[layer_idx],
+            hidden,
+            experts[0].gate.weight.shape().dim(0).unwrap_or(0),
+            1.0,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
+
+        // 5. Residual add in place.
+        add_graph(
+            &buffers.layer_output[layer_idx],
+            &buffers.moe_out[layer_idx],
+            &buffers.layer_output[layer_idx],
+            dev,
+        )
+    }
+}
+
