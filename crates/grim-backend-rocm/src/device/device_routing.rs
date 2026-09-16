@@ -598,19 +598,49 @@ impl RocmDevice {
 
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        let stream = self.launch_charon_grouped_dispatch_w8a8_int8(
-            activations,
-            gate_r.device_ptr_checked()?,
-            up_r.device_ptr_checked()?,
-            down_r.device_ptr_checked()?,
-            ascale_r.device_ptr_checked()?,
-            sorted,
-            &out_storage,
-            hidden,
-            inter,
-            num_experts,
-            routed_scaling_factor,
-        )?;
+
+        // SPEED-DOT policy: decode-shaped W8A8-int8 MoE prefers the dot4/sudot4
+        // grouped kernel on RDNA2/3/4. `dot4_entry_for` gates on arch and
+        // returns None for training-unsafe paths (the dot4 kernels don't write
+        // the backward pre-activation stash); the scalar kernel stays the
+        // fallback so behavior off RDNA is unchanged.
+        let dot4_entry = crate::kernels::charon::dot4_entry_for(
+            crate::kernels::charon::CharonDot4Quant::W8A8Int8,
+            self.gcn_arch(),
+            false,
+        );
+        let stream = match dot4_entry {
+            Some(entry)
+                if hidden % 32 == 0 && inter % 32 == 0 =>
+            {
+                self.launch_charon_grouped_dispatch_dot4(
+                    entry,
+                    activations,
+                    gate_r.device_ptr_checked()?,
+                    up_r.device_ptr_checked()?,
+                    down_r.device_ptr_checked()?,
+                    ascale_r.device_ptr_checked()?,
+                    sorted,
+                    &out_storage,
+                    hidden,
+                    inter,
+                    routed_scaling_factor,
+                )?
+            }
+            _ => self.launch_charon_grouped_dispatch_w8a8_int8(
+                activations,
+                gate_r.device_ptr_checked()?,
+                up_r.device_ptr_checked()?,
+                down_r.device_ptr_checked()?,
+                ascale_r.device_ptr_checked()?,
+                sorted,
+                &out_storage,
+                hidden,
+                inter,
+                num_experts,
+                routed_scaling_factor,
+            )?,
+        };
         Ok((out_storage, RocmHandle::new(Some(stream))))
     }
 
@@ -1470,6 +1500,111 @@ impl RocmDevice {
         // The old per-launch hipStreamSynchronize blocked the host once per MoE
         // layer per step and serialized the next layer's enqueue; launch errors
         // are surfaced by launch_compute_kernel's own return code.
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let free_stream = self.active_stream();
+                let _ = hipFreeAsync(tok_ptr, free_stream);
+                let _ = hipFreeAsync(exp_ptr, free_stream);
+                let _ = hipFreeAsync(w_ptr, free_stream);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Generic launcher for the SPEED-DOT (dot4/sudot4) grouped MoE kernels.
+    /// All three variants (Q8_0, W8A8-int8, Q4_K) share the scalar grouped
+    /// kernel's argument shape — only the JIT entry differs. Callers resolve
+    /// the entry via `kernels::charon::dot4_entry_for` (arch + training gate).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_charon_grouped_dispatch_dot4(
+        &self,
+        entry: &str,
+        act_storage: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        // The dot4 kernels iterate 32-element activation blocks and index
+        // Q4_K sub-blocks positionally; misalignment breaks both.
+        if hidden % 32 != 0 || inter % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "charon_grouped_dot4: hidden/inter must be multiples of 32 (hidden={hidden}, inter={inter})"
+            )));
+        }
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        use crate::kernels::charon::plan_grouped_dispatch;
+
+        check_hip("charon_grouped_dot4 hipMemset(output, 0)", unsafe {
+            hipMemsetAsync(
+                out_storage.device_ptr.ok_or_else(|| {
+                    Error::Backend("charon_grouped_dot4: out has no device ptr".into())
+                })? as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(self.ordinal, &sorted.sorted_weights)?;
+
+        let mut a = act_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_dot4: activations has no device ptr".into())
+        })? as *mut c_void;
+        let mut gw = egate_w_ptr;
+        let mut uw = eup_w_ptr;
+        let mut dw = edown_w_ptr;
+        let mut ascale = a_scale_ptr;
+        let mut optr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_dot4: out has no device ptr".into()))?
+            as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            entry,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        // SPEED-ROC-2: stream-ordered free of the transient routing buffers.
         if self.active_capture_stream().is_none() {
             unsafe {
                 let free_stream = self.active_stream();
@@ -2905,6 +3040,97 @@ impl RocmDevice {
             inter,
             num_experts,
             format_id,
+            routed_scaling_factor,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
+    /// SPEED-DOT roundtrip: token-sorts via `moe_align_block_size` and
+    /// launches one of the dot4 grouped kernels (`entry`, resolved by
+    /// `kernels::charon::dot4_entry_for`). Weight bytes are the native packed
+    /// layout of the chosen quant (Q8_0: 34B/32, Q4_K: 144B/256,
+    /// W8A8-int8: prefix + codes + row scales). Used by the dot4-vs-scalar
+    /// parity test.
+    #[allow(clippy::too_many_arguments)]
+    pub fn charon_grouped_dispatch_roundtrip_dot4(
+        &self,
+        entry: &str,
+        activations: &[f32],
+        expert_gate_w_q: &[u8],
+        expert_up_w_q: &[u8],
+        expert_down_w_q: &[u8],
+        a_scale: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        let block_size = 128usize;
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w_q.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w_q.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w_q.len()]);
+        let as_shape = Shape::new(vec![a_scale.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            CoreTensorOps::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> = MemoryOps::from_cpu_bytes(
+            self,
+            expert_gate_w_q,
+            &gw_shape,
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+        )?;
+        let uw_storage: Box<dyn BackendStorage> = MemoryOps::from_cpu_bytes(
+            self,
+            expert_up_w_q,
+            &uw_shape,
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+        )?;
+        let dw_storage: Box<dyn BackendStorage> = MemoryOps::from_cpu_bytes(
+            self,
+            expert_down_w_q,
+            &dw_shape,
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+        )?;
+        let as_storage: Box<dyn BackendStorage> =
+            CoreTensorOps::from_cpu(self, a_scale, &as_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            MemoryOps::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_ptr = dev_ptr(as_rocm(gw_storage.as_ref())?)?;
+        let uw_ptr = dev_ptr(as_rocm(uw_storage.as_ref())?)?;
+        let dw_ptr = dev_ptr(as_rocm(dw_storage.as_ref())?)?;
+        let as_ptr = dev_ptr(as_rocm(as_storage.as_ref())?)?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        self.launch_charon_grouped_dispatch_dot4(
+            entry,
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            as_ptr,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
             routed_scaling_factor,
         )?;
         self.synchronize();

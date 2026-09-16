@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use grim_backend_rocm::RocmDevice;
 use grim_models_transformer::lfm2::{Lfm2, Lfm2Block, Lfm2Config};
+use grim_models_transformer::shared_moe::CharonCache;
 use grim_nn::{Embedding, Linear, RmsNorm};
 use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 
@@ -131,6 +132,7 @@ fn attention_block(
         head_dim: hd,
         rope_theta: 10000.0,
         eps: 1e-5,
+        charon_cache: CharonCache::new(),
     }
 }
 
