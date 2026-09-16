@@ -5,12 +5,7 @@ pub fn compute_kernel_source() -> String {
         String::with_capacity(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE.len() + 16384);
     s.push_str(crate::kernels::shared_device_fns::KERNEL_SOURCE);
     s.push_str(crate::kernels::charon::KERNEL_SOURCE);
-    // TEMP-DIAG (GGUF fault hunt): rocwmma-containing kernels can be excluded from
-    // the aggregate TU via GRIM_DISABLE_ROCWMA_KERNELS=1 to test module-poisoning on gfx1201.
-    let skip_rocwma = std::env::var("GRIM_DISABLE_ROCWMA_KERNELS").is_ok();
-    if !skip_rocwma {
-        s.push_str(crate::kernels::charon_wmma::KERNEL_SOURCE);
-    }
+    s.push_str(crate::kernels::charon_wmma::KERNEL_SOURCE);
     #[cfg(feature = "training")]
     s.push_str(crate::kernels::charon_backward::KERNEL_SOURCE);
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
@@ -30,17 +25,15 @@ pub fn compute_kernel_source() -> String {
     // to RDNA3/4 inside the source itself.
     s.push_str(crate::kernels::dot_gemv::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
-    if !skip_rocwma {
-        s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
-        // SPEED-ROC: All block-quantized WMMA GEMM kernels (Q8_0, Q4_K, Q5_K, Q2_K, Q3_K, Q6_K).
-        // Consolidated cooperative-LDS source — generated, not a const (KERNEL_SOURCE is empty).
-        s.push_str(&crate::kernels::wmma_quantized_gemm::quant_kernel_source());
-        // SPEED-ROC: WMMA fused-dequant IQ-family GEMM (RDNA3/4).
-        // Must come AFTER iq_gemm (reuses dequant_iqXX device helpers).
-        s.push_str(crate::kernels::wmma_iq_gemm::KERNEL_SOURCE);
-        // SPEED-ROC: FP8 E4M3 WMMA GEMM — 383 TFLOPS on RDNA4 (2x FP16).
-        s.push_str(crate::kernels::wmma_fp8_gemm::KERNEL_SOURCE);
-    }
+    // SPEED-ROC: All block-quantized WMMA GEMM kernels (Q8_0, Q4_K, Q5_K, Q2_K, Q3_K, Q6_K).
+    // Consolidated cooperative-LDS source — generated, not a const (KERNEL_SOURCE is empty).
+    s.push_str(&crate::kernels::wmma_quantized_gemm::quant_kernel_source());
+    // SPEED-ROC: WMMA fused-dequant IQ-family GEMM (RDNA3/4).
+    // Must come AFTER iq_gemm (reuses dequant_iqXX device helpers).
+    s.push_str(crate::kernels::wmma_iq_gemm::KERNEL_SOURCE);
+    // SPEED-ROC: FP8 E4M3 WMMA GEMM — 383 TFLOPS on RDNA4 (2x FP16).
+    s.push_str(crate::kernels::wmma_fp8_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::q4k_dequant::Q8_0_DEQUANT_SOURCE);
     // grim_dequant_q4k must ride in the same aggregate unit — without this
     // append, hipModuleGetFunction fails with error 500 on first use.
