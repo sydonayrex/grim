@@ -1,8 +1,10 @@
 # WI-X2-PREFILL-ARENA — device-resident prefill KV arenas (PLAN-reduce-d2h-h2d A5)
 
-Status: SCOPED. Seed primitive exists (`DecodeGraphBuffers::seed_kv_arena_from_eager`,
-now compiling + re-exported as `grim_backend_rocm::EagerKvSource`); end-to-end
-wiring is genuinely new control flow, not a gating fix — tracked here.
+Status: PHASE 2 IMPLEMENTED 2026-09-16 (branch `a5-prefill-arena`, gfx1201).
+Phase 1 needed NO code: verified the default ROCm path already writes
+RoPE(Q/K/V) into device arenas (`decode_attention_device`: `launch_kv_append`
+D2D + causal `launch_qkv_attention_dev`, any `steps`), so the plan's "no
+device-arena equivalent" premise was stale for the current tree.
 
 ## Why (measured problem)
 
@@ -85,3 +87,28 @@ Mirror `decode_attention_device` for `steps > 1`:
 
 - Changing `repeat_penalty` / `mxfp4` defaults (see B1/A4 — explicitly NOT to do).
 - Persisting anything across processes (see plan §5).
+
+## Implementation notes (2026-09-16, branch `a5-prefill-arena`)
+
+- `Lfm2::eager_kv_seed_sources` (`lfm2_graph.rs`): fail-closed export
+  (dense layer w/o arenas + `valid_rows>0` → `Err`); `valid_rows` from caller
+  loop counters, never from stale host mirrors. `Lfm2LayerCache` re-exported
+  at crate root for CLI/engine use.
+- CLI `try_graph_decode_step`: seed after alloc, before `begin_capture`;
+  `current_pos = valid_rows` comes from the seed (removed hardcoded `= 1`).
+- Engine capture site: same, `valid_rows` from `session.current_pos()`.
+- `tests/lfm2_seed_parity.rs`: seeded arenas bit-exact vs eager arenas +
+  fail-closed cases, green on gfx1201.
+- E2E (LFM2.5-350M-Q8_0, greedy): seed succeeds on hybrid models, then
+  capture still (correctly) falls back eager on ShortConv with the B3 line.
+- A1 CORRECTION (same session): unifying the ShortConv gate to default-on
+  regressed greedy decode (`"Hello! How can I assist you today"` →
+  `"Hello!<|im_end|>"`); bisected to `shortconv_step_device`, RoPE-seed and
+  attention gates proven innocent. ShortConv gate reverted to opt-in
+  (`GRIM_DECODE_GRAPH=1`) with a code comment; re-unify only with the
+  ShortConv device rework + parity cover.
+- KNOWN GAP (pre-existing, not A5): device-attention eager path output
+  differs from the stock host path on this model (`GRIM_DECODE_GRAPH=0`
+  gives sensible output; device path degenerates). Seed is bit-exact vs its
+  (device) source, so this blocks end-to-end graph-vs-eager parity validation
+  until the device numerics gap is closed. Flagged, not fixed here.

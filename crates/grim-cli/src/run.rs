@@ -18,7 +18,7 @@ use grim_engine::{
     model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
 };
 use grim_format::GgufTokenizer;
-use grim_models_transformer::{Lfm2, Lfm2Config, LlamaConfig};
+use grim_models_transformer::{Lfm2, Lfm2Config, Lfm2LayerCache, LlamaConfig};
 use grim_tensor::CoreTensorOps;
 use grim_tensor::Device;
 use std::sync::Arc;
@@ -44,6 +44,10 @@ fn try_graph_decode_step(
     step: usize,
     allow_gpu_sample: bool,
     history: &[u32],
+    // Session layer caches for A5 KV seeding (`None` → fail closed to eager).
+    caches: Option<&[Option<Lfm2LayerCache>]>,
+    // Rows valid in every dense arena (prompt_len + decode steps so far).
+    valid_rows: u32,
 ) -> Option<GraphDecodeResult> {
     if *graph_failed || !grim_backend_rocm::decode_graph_enabled() {
         return None;
@@ -56,6 +60,30 @@ fn try_graph_decode_step(
     if graph.is_none() {
         match lfm2.get_or_create_decode_graph(4096, 1) {
             Ok(mut g) => {
+                // A5 Phase 2: seed graph KV arenas from the eager device
+                // caches so replay attends prompt context. Runs OUTSIDE the
+                // capture bracket (D2D + H2D + sync are capture-poison).
+                // Any miss → eager fallback (fail-closed; never capture
+                // prompt-blind). Needs the ROCm ordinal for the seed copy.
+                let seed_ok = (|| -> std::result::Result<(), String> {
+                    let caches = caches.ok_or_else(|| "no session caches".to_string())?;
+                    let srcs = lfm2
+                        .eager_kv_seed_sources(caches, valid_rows)
+                        .map_err(|e| format!("export: {e}"))?;
+                    let Device::Rocm(ordinal) = device else {
+                        return Err("non-ROCm device".to_string());
+                    };
+                    let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+                    g.buffers
+                        .seed_kv_arena_from_eager(&dev, &srcs)
+                        .map_err(|e| format!("seed: {e}"))
+                })();
+                if let Err(e) = seed_ok {
+                    *graph_failed = true;
+                    *graph_fallback_step = Some(step);
+                    eprintln!("[grim] decode-graph: KV seed failed at step {step} ({e}); falling back to eager for the rest of this run");
+                    return None;
+                }
                 // First step: capture. Any failure -> abort the open capture
                 // (else the stream stays capturing and later copies fail
                 // with hipMemcpyDtoH 906), then eager fallback.
@@ -78,8 +106,8 @@ fn try_graph_decode_step(
                         end.as_ref().err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()));
                     return None;
                 }
-                // Seed pos for next replay.
-                g.buffers.current_pos = 1;
+                // Seed pos for next replay is set by the KV seed
+                // (`current_pos = valid_rows`); replays append after it.
                 *graph = Some(g);
                 return None; // capture step ran eagerly path this token; replay from next.
             }
@@ -698,6 +726,13 @@ pub async fn cmd_run(
 
         let graph_hit = if !is_prefill {
             let tid = tokens.last().copied().unwrap_or(0);
+            // A5: session layer caches feed KV seeding. `tokens` holds prompt
+            // + generated so far = rows valid in every dense arena.
+            let caches = session
+                .model_state
+                .as_ref()
+                .and_then(|s| s.downcast_ref::<Vec<Option<Lfm2LayerCache>>>())
+                .map(|v| v.as_slice());
             try_graph_decode_step(
                 &*model,
                 &device,
@@ -711,6 +746,8 @@ pub async fn cmd_run(
                 generated,
                 allow_gpu_sample,
                 &history,
+                caches,
+                tokens.len() as u32,
             )
         } else {
             None
