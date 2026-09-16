@@ -24,6 +24,7 @@ default = []
 [dev-dependencies]
 grim-memory = { workspace = true }
 grim-format = { workspace = true }
+temp-env = "0.3"
 
 
 [lints]

@@ -82,6 +82,21 @@ pub struct DecodeGraphBuffers {
     pub batch: usize,
 }
 
+/// PLAN-reduce-d2h-h2d (prefill seeding): one layer's eager device K/V source.
+/// Raw device pointers — caller guarantees they outlive the seed copy.
+pub struct EagerKvSource<'a> {
+    /// Device pointer to eager K rows (f32, `prefill_len × kv_stride`).
+    pub k_dev: *const f32,
+    /// Device pointer to eager V rows (f32, `prefill_len × kv_stride`).
+    pub v_dev: *const f32,
+    /// Valid rows in each buffer.
+    pub prefill_len: u32,
+    /// Elements per row (`num_kv_heads × head_dim`).
+    pub kv_stride: usize,
+    /// Borrow anchor so the pointers can't outlive the session caches.
+    pub _anchor: std::marker::PhantomData<&'a ()>,
+}
+
 impl DecodeGraphBuffers {
     /// Allocate full pool on `dev`. Fails fast on OOM -> caller falls back eager.
     /// `batch` parameterizes all per-token slots as `[batch, dim]`. `batch=1`
@@ -344,6 +359,104 @@ impl DecodeGraphBuffers {
         if let Some(&last) = vals.last() {
             self.current_pos = last;
         }
+        Ok(())
+    }
+
+    /// Seed the graph's KV arena from the eager prefill's per-layer K/V caches.
+    ///
+    /// The eager prefill (run before graph capture) populates device-resident K/V
+    /// buffers in the session's `Lfm2LayerCache`. The graph path uses its OWN
+    /// fixed arena (`k_arena`/`v_arena`) that starts empty — without seeding,
+    /// the captured graph's attention only sees decode tokens and never the
+    /// prompt, so greedy decode diverges from eager. This copies the prefill
+    /// K/V rows into the arena and sets `current_pos = prefill_len` so the
+    /// first decode step appends at the right offset and attends over the full
+    /// prompt context.
+    ///
+    /// `per_layer` is indexed by layer_idx; `None` for non-attention layers.
+    /// Each `EagerKvSource` describes the device buffer + valid row count.
+    pub fn seed_kv_arena_from_eager(
+        &mut self,
+        dev: &RocmDevice,
+        per_layer: &[Option<EagerKvSource<'_>>],
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let stream = dev.active_stream();
+        for (layer_idx, src) in per_layer.iter().enumerate() {
+            let Some(src) = src else { continue };
+            if src.prefill_len == 0 {
+                continue;
+            }
+            if layer_idx >= self.k_arena.len() {
+                return Err(Error::Backend(format!(
+                    "seed_kv_arena: layer {layer_idx} >= {}",
+                    self.k_arena.len()
+                )));
+            }
+            let n_rows = src.prefill_len;
+            let n_elem: usize = (n_rows as usize) * src.kv_stride;
+            // K arena row width must match the eager cache stride.
+            let arena_k_cols = self.k_arena[layer_idx].shape.dims().last().copied().unwrap_or(0);
+            let arena_v_cols = self.v_arena[layer_idx].shape.dims().last().copied().unwrap_or(0);
+            if arena_k_cols != src.kv_stride || arena_v_cols != src.kv_stride {
+                return Err(Error::Backend(format!(
+                    "seed_kv_arena: layer {layer_idx} arena width k={arena_k_cols} v={arena_v_cols} != kv_stride {}",
+                    src.kv_stride
+                )));
+            }
+            if n_elem > self.k_arena[layer_idx].shape.elem_count() {
+                return Err(Error::Backend(format!(
+                    "seed_kv_arena: layer {layer_idx} prefill {n_elem} > arena {}",
+                    self.k_arena[layer_idx].shape.elem_count()
+                )));
+            }
+            // SAFETY: src.k_dev/src.v_dev are device mem owned by the session
+            // caches (valid for the generation); dst is the graph arena. D2D
+            // copy on the active stream, ordered vs later launches.
+            let bytes = n_elem * std::mem::size_of::<f32>();
+            let dst_k = self.k_arena[layer_idx]
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("seed: k_arena has no ptr".into()))?
+                as *mut c_void;
+            let dst_v = self.v_arena[layer_idx]
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("seed: v_arena has no ptr".into()))?
+                as *mut c_void;
+            let src_k = src.k_dev as *const c_void;
+            let src_v = src.v_dev as *const c_void;
+            let res: crate::HipErrorT = unsafe {
+                crate::hipMemcpyAsync(
+                    dst_k,
+                    src_k,
+                    bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                    stream,
+                )
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!("seed_kv_arena: hipMemcpyAsync K failed: {res}")));
+            }
+            let res: crate::HipErrorT = unsafe {
+                crate::hipMemcpyAsync(
+                    dst_v,
+                    src_v,
+                    bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                    stream,
+                )
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!("seed_kv_arena: hipMemcpyAsync V failed: {res}")));
+            }
+        }
+        // Set the append position to the end of the seeded prefill so the first
+        // decode step appends at the right offset and attends over the prompt.
+        let prefill_len = per_layer.iter().find_map(|s| s.as_ref().map(|e| e.prefill_len)).unwrap_or(0);
+        self.current_pos = prefill_len as u32;
+        // Seed the device position scalar to match; the graph's bump kernel
+        // increments it on each replay, so it must start at prefill_len.
+        self.write_pos_async(dev, prefill_len as u32, stream)?;
+        dev.synchronize();
         Ok(())
     }
 

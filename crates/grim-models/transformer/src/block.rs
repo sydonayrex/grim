@@ -1314,7 +1314,8 @@ impl LlamaBlock {
         let old_past_len = cache.as_ref().map(|c| c.past_len).unwrap_or(0);
         let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
 
-        // Phase 1c: device-driven decode attention (opt-in via GRIM_DECODE_GRAPH=1).
+        // Phase 1c: device-driven decode attention (opt-out via GRIM_DECODE_GRAPH=0;
+        // default-on, unified via `crate::decode_graph_active` — see PLAN-reduce-d2h-h2d A1).
         // The past counter, KV append offset, and attention total all live in a
         // device buffer (`past_dev`), so a decode step issues 5 device launches
         // with zero host syncs and byte-stable kernel args — capture-ready for
@@ -1325,8 +1326,7 @@ impl LlamaBlock {
             && cache.is_some()
             && self.alibi_slopes.is_none()
             && self._cfg.sliding_window.is_none()
-            && std::env::var("GRIM_DECODE_GRAPH").as_deref() != Ok("0")
-            && matches!(self._dev, Device::Rocm(_))
+            && crate::decode_graph_active(&self._dev)
         {
             match self.device_graph_decode_attention(
                 &q_3d,

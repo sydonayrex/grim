@@ -616,8 +616,7 @@ impl Lfm2Block {
             let mut device_block_out: Option<Tensor> = None;
             if steps == 1 {
                 let device = norm_x.device().clone();
-                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
-                    && matches!(device, Device::Rocm(_));
+                let decode_graph = crate::decode_graph_active(&device);
                 match self.shortconv_step_device(&proj, h_dim, l_cache, state, &device, decode_graph) {
                     Ok(Some(y_t)) => {
                         let block_out_2d =
@@ -819,8 +818,7 @@ impl Lfm2Block {
                 // it will abort the first graph-capture attempt (CAPTURE_POISON
                 // fallback → eager), after which past_dev is stable and the
                 // second capture attempt succeeds without any H2D inside.
-                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
-                    && matches!(norm_x.device(), Device::Rocm(_));
+                let decode_graph = crate::decode_graph_active(norm_x.device());
                 if decode_graph {
                     // Ensure the cache exists, then seed past_dev/pos_base_dev on
                     // first allocation (H2D write OUTSIDE any graph bracket —
@@ -884,10 +882,13 @@ impl Lfm2Block {
                 // mode the host `positions[]` path (item 2 fallback) is used.
                 // This prevents the `cache.as_mut().unwrap()` below from panicking
                 // when cache is None (first eager call before any graph setup).
+                // A3: routed through the unified gate (not the stale local bool) so
+                // RoPE device-base agrees with the ShortConv/RoPE-seed/attention
+                // gates under all env-var states.
                 let is_gpu = matches!(norm_x.device(), Device::Rocm(_));
                 let (q_rot_storage, k_rot_storage) = if is_gpu
                     && std::env::var("GRIM_ROPE_DEV_BASE").as_deref() != Ok("0")
-                    && decode_graph
+                    && crate::decode_graph_active(norm_x.device())
                 {
                     let ordinal: usize = match norm_x.device() {
                         Device::Rocm(o) => *o,
@@ -971,8 +972,7 @@ impl Lfm2Block {
                 // counter lives in a device buffer (`past_dev`) and the kernels
                 // derive offsets/totals on-device, so the whole step is
                 // graph-capturable. Falls back to the stock host path otherwise.
-                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() != Ok("0")
-                    && matches!(norm_x.device(), Device::Rocm(_));
+                let decode_graph = crate::decode_graph_active(norm_x.device());
                 if decode_graph {
                     let (q_rot_vec, arena_total, device_attn) = self.decode_attention_device(
                         q_rot_storage,
