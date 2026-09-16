@@ -108,6 +108,13 @@ impl Lfm2 {
             ));
         }
         let dev = dev_for(self)?;
+        // G1 (PLAN-kernel-fusion): the graph runs on pool slot 0, which today
+        // coincides with the device's default stream. Post-replay sampling
+        // now uses `sample_logits_on_device_with_penalty_at_stream` bound to
+        // `graph.stream` explicitly — if this pool index ever changes (e.g.
+        // concurrent graphs), the sampler path remains correct, but any NEW
+        // post-replay consumer must likewise bind `graph.stream`, never the
+        // ambient `active_stream()`.
         let stream = dev
             .get_stream_from_pool(0)
             .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;

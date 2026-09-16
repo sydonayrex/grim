@@ -180,9 +180,9 @@ pub use kernels::tile_picker::run_install_tune;
 /// Single-block JIT kernel applying temperature scaling, top-k and top-p filtering entirely on device, then drawing.
 pub use crate::kernels::device_sampler::{
     DEVICE_REPEAT_PENALTY_SOURCE, DEVICE_SAMPLER_KERNEL_SOURCE, MAX_DEVICE_SAMPLER_VOCAB,
-    PinnedLogitsBuf, apply_repeat_penalty_on_device, sample_logits_on_device,
-    sample_logits_on_device_at, sample_logits_on_device_with_penalty,
-    sample_logits_on_device_with_penalty_at,
+    PinnedLogitsBuf, apply_repeat_penalty_on_device, apply_repeat_penalty_on_device_stream,
+    sample_logits_on_device, sample_logits_on_device_at, sample_logits_on_device_with_penalty,
+    sample_logits_on_device_with_penalty_at, sample_logits_on_device_with_penalty_at_stream,
 };
 
 pub use quantization::QuantMode;
