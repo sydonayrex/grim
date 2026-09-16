@@ -14,10 +14,11 @@ pub fn is_unimplemented(e: &grim_core::error::Error) -> bool {
 ///
 /// Mirrors `grim_backend_rocm::decode_graph_enabled()` polarity (opt-out:
 /// `GRIM_DECODE_GRAPH=0/false/off` disables) AND requires a ROCm device.
-/// Replaces four previously inconsistent inline checks (`lfm2.rs:619`,
-/// `lfm2.rs:822`, `lfm2.rs:974`, `block.rs:1328`) where two sites used
-/// opt-in (`== Ok("1")`, default off) and two used opt-out (`!= Ok("0")`,
-/// default on), causing capture to abort on ShortConv/RoPE-seed mismatch.
+/// Unifies the RoPE-seed (`lfm2.rs`), attention (`lfm2.rs`) and block
+/// (`block.rs`) gates, which previously disagreed opt-in vs opt-out.
+/// The ShortConv gate (`lfm2.rs` shortconv step) is deliberately NOT unified:
+/// default-on regressed greedy decode on gfx1201 (bisected 2026-09-16) and
+/// stays opt-in until the ShortConv device rework lands with parity cover.
 pub fn decode_graph_active(device: &grim_tensor::Device) -> bool {
     if !matches!(device, grim_tensor::Device::Rocm(_)) {
         return false;
@@ -262,7 +263,7 @@ pub use internlm2::{InternLm2, InternLm2Config};
 pub use jais::{Jais, JaisConfig};
 pub use jais2::{Jais2, Jais2Config};
 pub use kimi_linear::{KimiLinear, KimiLinearConfig};
-pub use lfm2::{Lfm2, Lfm2Config};
+pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
 pub use llada::{Llada, LladaConfig};
 pub use lladamoe::{LladaMoe, LladaMoeConfig};
 pub use llama_embed::{LlamaEmbed, LlamaEmbedConfig};
@@ -418,8 +419,9 @@ mod tests {
     }
 
     /// PLAN-reduce-d2h-h2d A1+A3: the unified gate is opt-out on ROCm,
-    /// off on non-ROCm regardless of env. All four call sites share it,
-    /// so ShortConv / RoPE-seed / attention / block gates agree.
+    /// off on non-ROCm regardless of env. The RoPE-seed / attention / block
+    /// call sites share it (the ShortConv site stays opt-in pending its
+    /// device rework), so the attention-side gates agree.
     #[test]
     fn decode_graph_active_unified_gate() {
         use crate::decode_graph_active;
