@@ -1148,10 +1148,74 @@ impl Lfm2Block {
             self.wo.as_ref().unwrap().forward(&attn_tensor)?
         };
 
-        let x_added = add_tensors(x, &block_out).map_err(grim_core::Error::Tensor)?;
+        let x_added_shape = x.shape().clone();
+        // F1 (PLAN-kernel-fusion): fuse residual add + FFN RMSNorm into one
+        // HIP kernel on ROCm. Falls back to the two-call path on shape/dtype
+        // mismatch or kernel miss (graceful degradation, same contract as
+        // the Q8_0 QKV fusion gate). `y_out` threads through as `x_added`
+        // for the final-residual path — no data lost.
+        // F1-guard: the fused kernel indexes all three inputs as flat
+        // row-major `[rows, row_len]` from element 0 — reshaped views sharing
+        // a larger (or offset) storage would read the wrong elements, so
+        // require exact storage/shape byte match (add_tensors handles views).
+        //
+        // ORDER TRAP (do not "simplify"): `RocmDevice::fused_add_rms_norm`
+        // is INHERENT-only (no FusionOps override), returning
+        // `(sum, norm)`, while the FusionOps trait default returns
+        // `(norm, sum)`. Call the concrete type directly so the order is
+        // unambiguous — never via `pick_device_for_storage_device`'s
+        // `Arc<dyn>` (which would silently run the unfused default AND
+        // swap the tuple).
+        let contiguous = |t: &Tensor| -> bool {
+            match grim_backend_rocm::as_rocm(t.storage().as_ref()) {
+                Ok(st) => st.bytes() == t.shape().elem_count() * std::mem::size_of::<f32>(),
+                Err(_) => false,
+            }
+        };
+        let (x_added, norm_x_ffn) = match x.device() {
+            Device::Rocm(ordinal) if contiguous(x)
+                && contiguous(&block_out)
+                && contiguous(&self.ffn_norm.weight) =>
+            {
+                let rocm_dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+                match rocm_dev.fused_add_rms_norm(
+                    x.storage().as_ref(),
+                    block_out.storage().as_ref(),
+                    self.ffn_norm.weight.storage().as_ref(),
+                    self.ffn_norm.eps,
+                    &x_added_shape,
+                ) {
+                    // Inherent order: (res_sum, norm_out).
+                    Ok((sum_s, norm_s, _handle)) => (
+                        Tensor::new(
+                            Arc::from(sum_s),
+                            x_added_shape.clone(),
+                            DType::F32,
+                            QuantProvenance::GrimNative,
+                            x.device().clone(),
+                        ),
+                        Tensor::new(
+                            Arc::from(norm_s),
+                            x_added_shape,
+                            DType::F32,
+                            QuantProvenance::GrimNative,
+                            x.device().clone(),
+                        ),
+                    ),
+                    Err(_) => {
+                        let xa = add_tensors(x, &block_out).map_err(grim_core::Error::Tensor)?;
+                        let n = self.ffn_norm.forward(&xa)?;
+                        (xa, n)
+                    }
+                }
+            }
+            _ => {
+                let xa = add_tensors(x, &block_out).map_err(grim_core::Error::Tensor)?;
+                let n = self.ffn_norm.forward(&xa)?;
+                (xa, n)
+            }
+        };
         let seq_tokens = x_added.shape().dims()[0];
-
-        let norm_x_ffn = self.ffn_norm.forward(&x_added)?;
         let ffn_out = if self.is_moe {
             self.forward_moe_ffn(&norm_x_ffn)?
         } else {
