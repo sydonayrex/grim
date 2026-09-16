@@ -11,7 +11,6 @@ use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
 use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
-use crate::shared_moe::{CharonCache, MoeExpert};
 
 /// Max KV-cache rows pre-allocated on the ROCm device for the fused MXFP4 QKV path.
 const LFM2_FUSED_KV_CACHE_LEN: usize = 4096;
@@ -653,7 +652,6 @@ impl Lfm2Block {
                     ));
                 }
             };
-            let host_state: &mut Vec<f32> = host;
 
             // WI-F: decode step (steps == 1) runs b·x, the depthwise causal conv and the c gate on-device (`mul` + `short_conv1d_causal_step` + `mul`), so `proj` never crosses D2H.
             // Only the new `bx` row is fetched (h_dim floats) to slide the host state mirror.
@@ -736,14 +734,14 @@ impl Lfm2Block {
                         let w_base = d * l_cache;
                         let mut sum = conv_kernel_vec[w_base + l_cache - 1] * bx[d];
                         for k in 0..l_cache - 1 {
-                            sum += conv_kernel_vec[w_base + k] * host_state[k * h_dim + d];
+                            sum += conv_kernel_vec[w_base + k] * state[k * h_dim + d];
                         }
                         y_out[step * h_dim + d] = c[d] * sum;
                         }
 
                         if l_cache > 1 {
-                        host_state.copy_within(h_dim.., 0);
-                        host_state[(l_cache - 2) * h_dim..].copy_from_slice(&bx);
+                        state.copy_within(h_dim.., 0);
+                        state[(l_cache - 2) * h_dim..].copy_from_slice(&bx);
                     }
                 }
 
@@ -2075,6 +2073,7 @@ impl Lfm2Block {
         let hidden = x.shape().dims().last().copied().unwrap_or(0);
         let steps = x.shape().dims()[0];
         let n_expert = self.n_expert;
+        let n_ff = self.ffn_gate.weight.shape().dims()[0];
 
         let gate_logits = self.ffn_gate_inp.as_ref().unwrap().forward(x)?;
 
