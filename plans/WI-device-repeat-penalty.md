@@ -1,7 +1,7 @@
 # WI-DEV-REPETITION-PENALTY — device-side repeat penalty (PLAN-reduce-d2h-h2d B1)
 
-Status: SCOPED (audit complete, kernel not yet implemented).
-Do NOT change `repeat_penalty` CLI default (`1.1`) to fix latency — fix the coupling.
+Status: IMPLEMENTED 2026-09-16 (kernel + plumbing + parity green on gfx1201).
+Do NOT change `repeat_penalty` CLI default (`1.1`) to fix latency — fixed via the coupling instead.
 
 ## B1 audit result (2026-09-16, verified in-tree)
 
@@ -80,3 +80,27 @@ Per-step H2D is O(unique history) u32s, re-uploaded each token ⇒ O(n²) total
 bytes over a run. For histories ≪ vocab this still beats 256KB/step D2H by
 ~100×. If histories routinely exceed ~16K tokens, promote to a persistent
 device ring buffer with append-only uploads (follow-up, not this WI).
+
+## Implementation notes (2026-09-16)
+
+- Pre-pass kernel + launcher: `kernels/device_sampler.rs`
+  (`DEVICE_REPEAT_PENALTY_SOURCE`, `apply_repeat_penalty_on_device` with
+  persistent grow-on-demand `penalty_hist_buf` on `RocmDevice`).
+- Same-TU registration in `kernels/source_asm.rs`; exports in `lib.rs`.
+- `SamplingOps::sample_on_device_with_penalty` (grim-tensor): default
+  `Unimplemented` so backends opt in; `RocmDevice` implements via
+  `sample_logits_on_device[_at]_with_penalty` (host dedup → H2D → pre-pass →
+  sampler; greedy mirrors CPU penalty-before-argmax). Pre-pass miss warns
+  once per process, then `Err` → caller CPU-fallback (never silently
+  unpenalized). Penalty mutates the [vocab] tail in place — safe: every
+  decode step fully overwrites the buffer before sampling.
+- CLI: penalty clauses removed from `allow_gpu_sample`/`gpu_sample_ok`;
+  device-sample `Err` degrades to CPU (was `?`-propagate).
+- Server: `SamplerParams.repeat_penalty` threaded from both chat
+  (`register_request_sampler_params`) and completions (`CompletionRequest`)
+  bodies; device path tries penalty-aware first, falls through to legacy;
+  completions CPU path also fixed to honor `repeat_penalty` (was default 1.0).
+- Verification: `tests/repeat_penalty_parity.rs` — bit-for-bit pre-pass parity
+  (penalties × histories incl. NaN/±inf/dupes/OOR) + greedy token parity, all
+  green on gfx1201; CLI e2e `repeat-penalty 1.1` device path output identical
+  to `GRIM_CPU_SAMPLER=1` on LFM2.5-350M-Q8_0.

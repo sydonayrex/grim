@@ -263,6 +263,9 @@ pub struct RocmDevice {
     /// SPEED-ROC: Preallocated 4-byte device buffer for the GPU stochastic sampler.
     /// Reused every decode step, eliminating per-token hipMalloc overhead.
     pub(crate) sampler_out_buf: Mutex<Option<RocmStorage>>,
+    /// B1 (PLAN-reduce-d2h-h2d): staging buffer for deduped repeat-penalty
+    /// history ids (u32). Grown on demand, reused every decode step.
+    pub(crate) penalty_hist_buf: Mutex<Option<RocmStorage>>,
     /// SPEED-ROC: Preallocated buffer for activation quant (Q8_1) in dot4 GEMV.
     /// Reused every decode GEMV, eliminating per-layer hipMalloc overhead.
     pub(crate) act_q81_buf: RwLock<Option<RocmStorage>>,
@@ -819,6 +822,7 @@ impl RocmDevice {
             graph_capture_mgr: Mutex::new(None),
             attn_logit_softcap: std::sync::atomic::AtomicU32::new(0),
             sampler_out_buf: Mutex::new(None),
+            penalty_hist_buf: Mutex::new(None),
             act_q81_buf: RwLock::new(None),
             act_u4_codes_buf: Mutex::new(None),
             act_u4_scales_buf: Mutex::new(None),

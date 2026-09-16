@@ -335,6 +335,10 @@ pub struct SamplerParams {
     pub top_k: Option<i32>,
     pub top_p: Option<f32>,
     pub seed: Option<u64>,
+    /// B1: request repeat penalty. Threaded to the device sampler so the
+    /// device path no longer silently ignores it (was: penalty dropped on
+    /// device, applied only on CPU fallback).
+    pub repeat_penalty: Option<f32>,
 }
 
 /// Per-request sampler params, keyed by request id.
@@ -363,6 +367,10 @@ fn register_request_sampler_params(
             .and_then(|v| v.as_f64())
             .map(|v| v as f32),
         seed: body_obj.get("seed").and_then(|v| v.as_u64()),
+        repeat_penalty: body_obj
+            .get("repeat_penalty")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
     };
     if let Ok(mut reg) = REQUEST_SAMPLER_PARAMS.lock() {
         reg.insert(request_id, params);
@@ -404,13 +412,21 @@ fn cpu_sample_fallback(
 
 /// WI-X3 device-side stochastic sampling: launch the Gumbel-max kernel on the resident ROCm logits (temperature/top-k/top-p on device) and copy back only the 4-byte token id.
 /// Sampling params come from the request registry (`register_request_sampler_params`); the `GRIM_SAMPLE_TEMPERATURE` / `GRIM_SAMPLE_TOP_K` / `GRIM_SAMPLE_SEED` env.
+/// B1: when `params.repeat_penalty > 1.0` and history is non-empty, the
+/// penalty pre-pass runs on-device first (previously the device path silently
+/// ignored the penalty). Penalty-kernel miss falls through to the legacy
+/// path, which itself falls back to CPU — never silently unpenalized.
 fn sample_on_device(
     t: &grim_tensor::Tensor,
     vocab_size: usize,
     step: u64,
     params: SamplerParams,
+    history: &[u32],
 ) -> std::result::Result<Option<u32>, String> {
-    use grim_backend_rocm::{RocmDevice, as_rocm, sample_logits_on_device_at};
+    use grim_backend_rocm::{
+        RocmDevice, as_rocm, sample_logits_on_device_at,
+        sample_logits_on_device_with_penalty_at,
+    };
 
     let ordinal = t
         .device()
@@ -454,6 +470,26 @@ fn sample_on_device(
         })
         .unwrap_or(0x9E37_79B9_7F4A_7C15);
     let seed = (step << 32) | (base_seed & 0xffff_ffff);
+
+    // B1: penalty-aware device path first (no-op + legacy equivalent when inactive).
+    let penalty = params.repeat_penalty.unwrap_or(1.0);
+    if penalty > 1.0 && !history.is_empty() {
+        match sample_logits_on_device_with_penalty_at(
+            &dev,
+            storage,
+            vocab_size,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+            step as u32,
+            penalty,
+            history,
+        ) {
+            Ok(tok) => return Ok(tok),
+            Err(e) => eprintln!("[grim-server] penalty sampler miss ({e}); trying legacy device path"),
+        }
+    }
 
     sample_logits_on_device_at(
         &dev,
@@ -559,7 +595,7 @@ fn sample_next_token(
                         .ok()
                         .and_then(|reg| reg.get(&request_id).copied())
                         .unwrap_or_default();
-                    match sample_on_device(&t, vocab_size, step, params) {
+                    match sample_on_device(&t, vocab_size, step, params, &history) {
                         Ok(Some(tok)) => Some(tok.min((vocab_size as u32).saturating_sub(1))),
                         // Ok(None): unsupported shape/vocab -> CPU fallback contract.
                         Ok(None) => None,
@@ -3384,6 +3420,8 @@ struct CompletionRequest {
     #[serde(default)]
     top_k: Option<i32>,
     #[serde(default)]
+    repeat_penalty: Option<f32>,
+    #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
     _stop: Option<serde_json::Value>,
@@ -3431,6 +3469,7 @@ async fn completions(
         top_k: payload.top_k,
         top_p: payload.top_p,
         seed: payload.seed,
+        repeat_penalty: payload.repeat_penalty,
     };
     if let Ok(mut reg) = REQUEST_SAMPLER_PARAMS.lock() {
         reg.insert(req_id, request_params);
@@ -3447,6 +3486,7 @@ async fn completions(
         temperature: payload.temperature.unwrap_or(1.0),
         top_p: payload.top_p.unwrap_or(1.0),
         top_k: payload.top_k.unwrap_or(0).max(0) as u32,
+        repeat_penalty: payload.repeat_penalty.unwrap_or(1.0),
         ..grim_core::sampler::SamplingParams::default()
     };
     let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =

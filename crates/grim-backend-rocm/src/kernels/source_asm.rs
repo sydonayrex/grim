@@ -89,6 +89,8 @@ pub fn compute_kernel_source() -> String {
     // WI-X3: GPU stochastic sampler (grim_sample_logits_stochastic) rides in
     // the same aggregate translation unit so `launch_compute_kernel` resolves it.
     s.push_str(crate::kernels::device_sampler::DEVICE_SAMPLER_KERNEL_SOURCE);
+    // B1: repeat-penalty pre-pass (grim_repeat_penalty_apply) — same TU requirement.
+    s.push_str(crate::kernels::device_sampler::DEVICE_REPEAT_PENALTY_SOURCE);
     s.push_str(crate::kernels::mxfp4_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::compressed_gemm::WEIGHT_NA16_KERNEL);
     s.push_str(crate::kernels::compressed_gemm::EMBEDDING_NA16_INT_KERNEL);
