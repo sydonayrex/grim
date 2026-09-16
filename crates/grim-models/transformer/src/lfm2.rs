@@ -11,6 +11,8 @@ use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
 use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
+use crate::shared_moe::{CharonCache, MoeExpert};
+
 /// Max KV-cache rows pre-allocated on the ROCm device for the fused MXFP4 QKV path.
 const LFM2_FUSED_KV_CACHE_LEN: usize = 4096;
 
@@ -284,8 +286,24 @@ impl Lfm2Block {
         };
 
         let device = wq.as_ref().map(|w| w.weight.device().clone());
+        // A4 (PLAN-reduce-d2h-h2d): the fused MXFP4 QKV pack is built ONLY when
+        // the loaded Q/K/V weights are ALREADY native MXFP4. Requantizing
+        // F32/Q8_0 weights at load is a quality-affecting recompute path the
+        // plan explicitly forbids ("F32 golden path") — for those formats the
+        // fused prefill kernel stays off. `GRIM_LFM2_MXFP4_QKV=0` still
+        // force-disables the pack for native-MXFP4 checkpoints.
+        let weights_native_mxfp4 = [wq.as_ref(), wk.as_ref(), wv.as_ref()].iter().all(|w| {
+            w.map(|lin| {
+                matches!(
+                    lin.weight.dtype().storage,
+                    Storage::FloatPack(FloatPackScheme::MxFp4)
+                )
+            })
+            .unwrap_or(false)
+        });
         let (wqkv_codes, wqkv_exps, gamma_q, gamma_k) = if !is_recurrent
             && cfg.mxfp4_qkv_attention
+            && weights_native_mxfp4
             && device
                 .as_ref()
                 .map(|d| matches!(d, Device::Rocm(_)))
@@ -635,6 +653,7 @@ impl Lfm2Block {
                     ));
                 }
             };
+            let host_state: &mut Vec<f32> = host;
 
             // WI-F: decode step (steps == 1) runs b·x, the depthwise causal conv and the c gate on-device (`mul` + `short_conv1d_causal_step` + `mul`), so `proj` never crosses D2H.
             // Only the new `bx` row is fetched (h_dim floats) to slide the host state mirror.
@@ -717,14 +736,14 @@ impl Lfm2Block {
                         let w_base = d * l_cache;
                         let mut sum = conv_kernel_vec[w_base + l_cache - 1] * bx[d];
                         for k in 0..l_cache - 1 {
-                            sum += conv_kernel_vec[w_base + k] * state[k * h_dim + d];
+                            sum += conv_kernel_vec[w_base + k] * host_state[k * h_dim + d];
                         }
                         y_out[step * h_dim + d] = c[d] * sum;
-                    }
+                        }
 
-                    if l_cache > 1 {
-                        state.copy_within(h_dim.., 0);
-                        state[(l_cache - 2) * h_dim..].copy_from_slice(&bx);
+                        if l_cache > 1 {
+                        host_state.copy_within(h_dim.., 0);
+                        host_state[(l_cache - 2) * h_dim..].copy_from_slice(&bx);
                     }
                 }
 
@@ -839,7 +858,15 @@ impl Lfm2Block {
                 let k_shape = Shape::new(vec![1, steps * self.num_kv_heads, self.head_dim]);
 
                 let cache_offset = match cache {
-                    Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / kv_stride,
+                    // A5: in prefill-arena mode the host `k` mirror stays
+                    // empty — the arena row count lives in `dev_pos`.
+                    Some(Lfm2LayerCache::Attention { k, dev_pos, .. }) => {
+                        if k.is_empty() {
+                            *dev_pos
+                        } else {
+                            k.len() / kv_stride
+                        }
+                    }
                     _ => 0,
                 };
                 let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
@@ -1018,6 +1045,107 @@ impl Lfm2Block {
                         steps,
                     )?;
                     (q_rot_vec, arena_total, device_attn)
+                } else if matches!(norm_x.device(), Device::Rocm(_))
+                    && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
+                {
+                    // A5 (WI-X2-PREFILL-ARENA): eager prefill/decode attention
+                    // with ZERO D2H/H2D. RoPE output stays device-resident,
+                    // K/V append into the device arenas D2D via copy_slice_into,
+                    // and attention runs through
+                    // `fused_or_scalar_attention_arena_device` (device Q). The
+                    // host `k`/`v` mirrors stay empty in this mode; `dev_pos`
+                    // tracks the arena row count so later steps derive
+                    // cache_offset without host state (see the cache_offset
+                    // selection below). Kernel failure inside
+                    // arena_device still degrades to its own host fallback.
+                    if cache.is_none() {
+                        *cache = Some(Lfm2LayerCache::Attention {
+                            k: vec![],
+                            v: vec![],
+                            k_dev: None,
+                            v_dev: None,
+                            pos_base_dev: None,
+                            past_dev: None,
+                            q_rot_dev: None,
+                            k_rot_dev: None,
+                            attn_out_dev: None,
+                            graph_attn_norm_out: None,
+                            graph_attn_out: None,
+                            graph_ffn_norm_out: None,
+                            graph_ffn_gate_up: None,
+                            graph_ffn_activated: None,
+                            graph_ffn_down: None,
+                            graph_residual: None,
+                            dev_pos: 0,
+                        });
+                    }
+                    let (past, total) = match cache.as_ref().unwrap() {
+                        Lfm2LayerCache::Attention { dev_pos, .. } => (*dev_pos, *dev_pos + steps),
+                        _ => {
+                            return Err(grim_core::error::Error::Session(
+                                "Mismatched Attention layer cache".into(),
+                            ));
+                        }
+                    };
+                    match cache.as_mut().unwrap() {
+                        Lfm2LayerCache::Attention { dev_pos, k_dev, v_dev, .. } => {
+                            if k_dev.is_none() {
+                                let shape =
+                                    Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+                                *k_dev = Some(Box::new(Tensor::new(
+                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    shape.clone(),
+                                    DType::F32,
+                                    QuantProvenance::GrimNative,
+                                    norm_x.device().clone(),
+                                )));
+                                *v_dev = Some(Box::new(Tensor::new(
+                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    shape,
+                                    DType::F32,
+                                    QuantProvenance::GrimNative,
+                                    norm_x.device().clone(),
+                                )));
+                            }
+                            let off_elems = past * kv_stride;
+                            let cnt_elems = steps * kv_stride;
+                            dev.copy_slice_into(
+                                k_dev.as_ref().unwrap().storage().as_ref(),
+                                k_rot_storage.as_ref(),
+                                off_elems,
+                                cnt_elems,
+                            )?;
+                            dev.copy_slice_into(
+                                v_dev.as_ref().unwrap().storage().as_ref(),
+                                v.storage().as_ref(),
+                                off_elems,
+                                cnt_elems,
+                            )?;
+                            *dev_pos = total;
+                        }
+                        _ => {
+                            return Err(grim_core::error::Error::Session(
+                                "Mismatched Attention layer cache".into(),
+                            ));
+                        }
+                    }
+                    let (kd, vd) = match cache.as_ref().unwrap() {
+                        Lfm2LayerCache::Attention { k_dev, v_dev, .. } => (k_dev, v_dev),
+                        _ => unreachable!("attention cache variant on rocm arena path"),
+                    };
+                    let attn = crate::shared_attention::fused_or_scalar_attention_arena_device(
+                        q_rot_storage.as_ref(),
+                        kd.as_ref().unwrap().storage().as_ref(),
+                        vd.as_ref().unwrap().storage().as_ref(),
+                        total,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        steps,
+                        None,
+                        norm_x.device(),
+                    )?;
+                    (Vec::new(), Some(total), Some(attn))
                 } else {
                     let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
                     let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
@@ -1947,7 +2075,6 @@ impl Lfm2Block {
         let hidden = x.shape().dims().last().copied().unwrap_or(0);
         let steps = x.shape().dims()[0];
         let n_expert = self.n_expert;
-        let n_ff = self.ffn_gate.weight.shape().dims()[0];
 
         let gate_logits = self.ffn_gate_inp.as_ref().unwrap().forward(x)?;
 
@@ -2149,6 +2276,10 @@ type FusedQkvPack = (
     Option<Tensor>,
 );
 
+/// A4: callers gate this on native-MXFP4 Q/K/V weights. For those inputs the
+/// dequant→`quant_mxfp4_matrix` roundtrip below is a lossless repack (E2M1
+/// codes decode exactly and requantize to identical codes/exponents) — it is
+/// a layout conversion, not a quality-affecting requant of a denser format.
 fn build_fused_qkv_pack(
     wq: &Linear,
     wk: &Linear,

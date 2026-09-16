@@ -1373,6 +1373,344 @@ extern "C" __global__ void grim_moe_fused_grouped_awq(
     }
 }
 
+// --- #10 SPEED-DOT grouped kernels (dot4 family: sdot4 RDNA2 / sudot4 RDNA3+) ──
+// Decode-shaped MoE forward for Q8_0 / W8A8-int8 / Q4_K experts. Structure
+// matches the grouped kernels above (one thread per sorted slot, atomicAdd
+// epilogue) but the gate/up contraction runs on V_DOT4_I32_I8 /
+// V_DOT4_I32_IU8 via grim_charon_sdot4 instead of per-element fp32 FMA.
+//
+// Loop order note: the activation row is contract-shared by every (h, j)
+// pair, so we iterate 32-wide activation blocks OUTSIDE a JBLK-wide expert
+// column chunk and quantize each activation block to Q8_1 exactly once per
+// (h, j-chunk). Down projection stays scalar (1 weight per column, dot4
+// would pay more in packing than it saves).
+//
+// The backward stash (stash_hg/stash_hu) is intentionally NOT written here:
+// these kernels are inference/decode-only. `dot4_entry_for` on the host
+// refuses to select them for training launches.
+
+__device__ __forceinline__ int grim_charon_sdot4(int a, int b, int c) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1035__) || defined(__gfx1036__)
+    // RDNA2: V_DOT4_I32_I8 (signed x signed, i32 acc). All B operands are
+    // < 128 unsigned codes, so signed B is equivalent.
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#else
+    // RDNA3/4: dot8-insts (sdot4 removed on RDNA4).
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#endif
+}
+
+// In-thread Q8_1 quantization of one 32-element activation block.
+// Mirrors grim_quantize_q8_1 (dot_gemv) but wave-reduction-free: the grouped
+// kernels are one-thread-per-token, so the block reduce is a serial loop.
+__device__ __forceinline__ void grim_charon_quant_q8_1_block(
+    const float* __restrict__ a, signed char* qi, float* d_out, float* sum_out) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 32; ++e) amax = fmaxf(amax, fabsf(a[e]));
+    const float d = amax / 127.0f;
+    const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+    float fsum = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 32; ++e) {
+        const signed char q = (signed char)__builtin_roundf(a[e] * inv_d);
+        qi[e] = q;
+        fsum += (float)q;
+    }
+    *d_out = d;
+    *sum_out = fsum;
+}
+
+// Pack 4 i8 codes into one i32 dot4 operand.
+__device__ __forceinline__ int grim_charon_pack_i8x4(
+    signed char q0, signed char q1, signed char q2, signed char q3) {
+    return ((int)q0 & 0xFF) | (((int)q1 & 0xFF) << 8)
+         | (((int)q2 & 0xFF) << 16) | (((int)q3 & 0xFF) << 24);
+}
+
+#define GRIM_CHARON_DOT4_JBLK 8
+
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1035__) || defined(__gfx1036__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+
+// Q4_K experts. Two-dot decomposition per 32-sub-block:
+//   value_i = d * sc * q_i - dmin * m
+//   dot(a, value) = d * sc * sum(a_i * q_i) - dmin * m * sum(a_i)
+extern "C" __global__ void grim_moe_fused_grouped_q4k_dot4(
+    const float* __restrict__ activations,
+    const unsigned char* __restrict__ egate_w,
+    const unsigned char* __restrict__ eup_w,
+    const unsigned char* __restrict__ edown_w,
+    const float* __restrict__ a_scale,
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+    const int q4k_expert_bytes = (hidden * inter / 256) * 144; // QK_K=256, Q4K_BYTES=144
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue; // padding
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * q4k_expert_bytes;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * q4k_expert_bytes;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * q4k_expert_bytes;
+
+        float acc = 0.0f;
+        for (int h = 0; h < hidden; ++h) {
+        acc = 0.0f;
+        for (int j0 = 0; j0 < inter; j0 += GRIM_CHARON_DOT4_JBLK) {
+            const int nj = (inter - j0) < GRIM_CHARON_DOT4_JBLK ? inter - j0 : GRIM_CHARON_DOT4_JBLK;
+            float gsum[GRIM_CHARON_DOT4_JBLK];
+            float usum[GRIM_CHARON_DOT4_JBLK];
+            for (int jj = 0; jj < nj; ++jj) { gsum[jj] = 0.0f; usum[jj] = 0.0f; }
+
+            for (int i0 = 0; i0 < hidden; i0 += 32) {
+                float da, suma;
+                signed char ai8[32];
+                grim_charon_quant_q8_1_block(a + i0, ai8, &da, &suma);
+
+                for (int jj = 0; jj < nj; ++jj) {
+                    const int j = j0 + jj;
+                    // Superblock/sub-block for weight (j, i0): g = j*hidden+i0.
+                    // hidden % 32 == 0 keeps i0-blocks inside one sub-block.
+                    const int g = j * hidden + i0;
+                    const int sb = g / 256;
+                    const int local = g - sb * 256;
+                    const int is = local / 32;
+                    const unsigned char* d = gw + (unsigned long long)sb * 144;
+                    const unsigned char* dpu = uw + (unsigned long long)sb * 144;
+                    float dd  = f16_to_f32(*(const unsigned short*)(d + 0));
+                    float dmn = f16_to_f32(*(const unsigned short*)(d + 2));
+                    float udd  = f16_to_f32(*(const unsigned short*)(dpu + 0));
+                    float udmin = f16_to_f32(*(const unsigned short*)(dpu + 2));
+
+                    int sc, m;
+                    if (is < 4) { sc = d[4 + is] & 63; m = d[4 + is + 4] & 63; }
+                    else { sc = (d[4 + is + 4] & 0x0F) | ((d[4 + is - 4] >> 6) << 4);
+                           m  = (d[4 + is + 4] >> 4)  | ((d[4 + is] >> 6) << 4); }
+                    int usc, um;
+                    if (is < 4) { usc = dpu[4 + is] & 63; um = dpu[4 + is + 4] & 63; }
+                    else { usc = (dpu[4 + is + 4] & 0x0F) | ((dpu[4 + is - 4] >> 6) << 4);
+                           um  = (dpu[4 + is + 4] >> 4)  | ((dpu[4 + is] >> 6) << 4); }
+
+                    const int group = is / 2;
+                    const int half = is % 2;
+                    const unsigned char* gq = d + 16 + group * 32;
+                    const unsigned char* uq = dpu + 16 + group * 32;
+
+                    int gpos = 0, upos = 0;
+#pragma unroll
+                    for (int e = 0; e < 32; e += 4) {
+                        const int a4 = grim_charon_pack_i8x4(ai8[e], ai8[e+1], ai8[e+2], ai8[e+3]);
+                        unsigned char g0 = gq[e], g1 = gq[e+1], g2 = gq[e+2], g3 = gq[e+3];
+                        unsigned char u0 = uq[e], u1 = uq[e+1], u2 = uq[e+2], u3 = uq[e+3];
+                        if (half) { g0 >>= 4; g1 >>= 4; g2 >>= 4; g3 >>= 4; }
+                        else { g0 &= 0x0F; g1 &= 0x0F; g2 &= 0x0F; g3 &= 0x0F; }
+                        if (half) { u0 >>= 4; u1 >>= 4; u2 >>= 4; u3 >>= 4; }
+                        else { u0 &= 0x0F; u1 &= 0x0F; u2 &= 0x0F; u3 &= 0x0F; }
+                        gpos = grim_charon_sdot4(a4, grim_charon_pack_i8x4((signed char)g0, (signed char)g1, (signed char)g2, (signed char)g3), gpos);
+                        upos = grim_charon_sdot4(a4, grim_charon_pack_i8x4((signed char)u0, (signed char)u1, (signed char)u2, (signed char)u3), upos);
+                    }
+                    gsum[jj] += dd * (float)sc * ((float)gpos * da) - dmn * (float)m * suma;
+                    usum[jj] += udd * (float)usc * ((float)upos * da) - udmin * (float)um * suma;
+                }
+            }
+
+            // Down projection (scalar): weights along inter at h*inter + j.
+            float dwt[GRIM_CHARON_DOT4_JBLK];
+            iqk_batch_decode(7, dw, h * inter + j0, nj, dwt);
+            for (int jj = 0; jj < nj; ++jj) {
+                const float gate = gsum[jj];
+                const float silu_g = gate / (1.0f + expf(-gate));
+                acc += dwt[jj] * (silu_g * usum[jj]);
+            }
+        }
+        atomicAdd(out + (unsigned long long)tok * hidden + h,
+                  routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+// Q8_0 experts. Weight block = 34 bytes: f16 scale + 32 i8 codes.
+extern "C" __global__ void grim_moe_fused_grouped_q80_dot4(
+    const float* __restrict__ activations,
+    const unsigned char* __restrict__ egate_w,
+    const unsigned char* __restrict__ eup_w,
+    const unsigned char* __restrict__ edown_w,
+    const float* __restrict__ a_scale,
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+    const int q80_expert_bytes = (hidden * inter / 32) * 34;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue;
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * q80_expert_bytes;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * q80_expert_bytes;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * q80_expert_bytes;
+
+        for (int h = 0; h < hidden; ++h) {
+        float acc = 0.0f;
+        for (int j0 = 0; j0 < inter; j0 += GRIM_CHARON_DOT4_JBLK) {
+            const int nj = (inter - j0) < GRIM_CHARON_DOT4_JBLK ? inter - j0 : GRIM_CHARON_DOT4_JBLK;
+            float gsum[GRIM_CHARON_DOT4_JBLK];
+            float usum[GRIM_CHARON_DOT4_JBLK];
+            for (int jj = 0; jj < nj; ++jj) { gsum[jj] = 0.0f; usum[jj] = 0.0f; }
+
+            for (int i0 = 0; i0 < hidden; i0 += 32) {
+                float da, suma;
+                signed char ai8[32];
+                grim_charon_quant_q8_1_block(a + i0, ai8, &da, &suma);
+
+                for (int jj = 0; jj < nj; ++jj) {
+                    const int j = j0 + jj;
+                    const int gblk = (j * hidden + i0) / 32;
+                    const unsigned char* gb = gw + (unsigned long long)gblk * 34;
+                    const unsigned char* ub = uw + (unsigned long long)gblk * 34;
+                    const float gd = f16_to_f32(*(const unsigned short*)(gb + 0));
+                    const float ud = f16_to_f32(*(const unsigned short*)(ub + 0));
+                    const signed char* gc = (const signed char*)(gb + 2);
+                    const signed char* uc = (const signed char*)(ub + 2);
+
+                    int gpos = 0, upos = 0;
+#pragma unroll
+                    for (int e = 0; e < 32; e += 4) {
+                        const int a4 = grim_charon_pack_i8x4(ai8[e], ai8[e+1], ai8[e+2], ai8[e+3]);
+                        const int b4 = grim_charon_pack_i8x4(gc[e], gc[e+1], gc[e+2], gc[e+3]);
+                        const int c4 = grim_charon_pack_i8x4(uc[e], uc[e+1], uc[e+2], uc[e+3]);
+                        gpos = grim_charon_sdot4(a4, b4, gpos);
+                        upos = grim_charon_sdot4(a4, c4, upos);
+                    }
+                    gsum[jj] += (float)gpos * da * gd;
+                    usum[jj] += (float)upos * da * ud;
+                }
+            }
+
+            // Down projection (scalar dequant), weights along inter.
+            for (int jj = 0; jj < nj; ++jj) {
+                const int j = j0 + jj;
+                const int dblk = (h * inter + j) / 32;
+                const unsigned char* db = dw + (unsigned long long)dblk * 34;
+                const float dd = f16_to_f32(*(const unsigned short*)(db + 0));
+                const float dc = (float)*(const signed char*)(db + 2 + (h * inter + j - dblk * 32));
+                const float gate = gsum[jj];
+                const float silu_g = gate / (1.0f + expf(-gate));
+                acc += dc * dd * (silu_g * usum[jj]);
+            }
+        }
+        atomicAdd(out + (unsigned long long)tok * hidden + h,
+                  routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+// CompressedTensors W8A8 int8 experts. Per-expert layout: 8-byte prefix,
+// inter*hidden i8 codes, inter f32 row scales (down: hidden rows).
+extern "C" __global__ void grim_moe_fused_grouped_w8a8_int8_dot4(
+    const float* __restrict__ activations,
+    const unsigned char* __restrict__ egate_w,
+    const unsigned char* __restrict__ eup_w,
+    const unsigned char* __restrict__ edown_w,
+    const float* __restrict__ a_scale,
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+    const unsigned long long gate_stride = 8 + (unsigned long long)inter * hidden + (unsigned long long)inter * 4;
+    const unsigned long long down_stride = 8 + (unsigned long long)hidden * inter + (unsigned long long)hidden * 4;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue;
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * gate_stride;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * gate_stride;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * down_stride;
+        const signed char* g_codes = (const signed char*)(gw + 8);
+        const signed char* u_codes = (const signed char*)(uw + 8);
+        const signed char* d_codes = (const signed char*)(dw + 8);
+        const float* g_scales = (const float*)(gw + 8 + (unsigned long long)inter * hidden);
+        const float* u_scales = (const float*)(uw + 8 + (unsigned long long)inter * hidden);
+        const float* d_scales = (const float*)(dw + 8 + (unsigned long long)hidden * inter);
+
+        for (int h = 0; h < hidden; ++h) {
+        float acc = 0.0f;
+        for (int j0 = 0; j0 < inter; j0 += GRIM_CHARON_DOT4_JBLK) {
+            const int nj = (inter - j0) < GRIM_CHARON_DOT4_JBLK ? inter - j0 : GRIM_CHARON_DOT4_JBLK;
+            float gsum[GRIM_CHARON_DOT4_JBLK];
+            float usum[GRIM_CHARON_DOT4_JBLK];
+            for (int jj = 0; jj < nj; ++jj) { gsum[jj] = 0.0f; usum[jj] = 0.0f; }
+
+            for (int i0 = 0; i0 < hidden; i0 += 32) {
+                float da, suma;
+                signed char ai8[32];
+                grim_charon_quant_q8_1_block(a + i0, ai8, &da, &suma);
+
+                for (int jj = 0; jj < nj; ++jj) {
+                    const int j = j0 + jj;
+                    const signed char* gr = g_codes + (unsigned long long)j * hidden + i0;
+                    const signed char* ur = u_codes + (unsigned long long)j * hidden + i0;
+                    int gpos = 0, upos = 0;
+#pragma unroll
+                    for (int e = 0; e < 32; e += 4) {
+                        const int a4 = grim_charon_pack_i8x4(ai8[e], ai8[e+1], ai8[e+2], ai8[e+3]);
+                        gpos = grim_charon_sdot4(a4, grim_charon_pack_i8x4(gr[e], gr[e+1], gr[e+2], gr[e+3]), gpos);
+                        upos = grim_charon_sdot4(a4, grim_charon_pack_i8x4(ur[e], ur[e+1], ur[e+2], ur[e+3]), upos);
+                    }
+                    gsum[jj] += (float)gpos * da * g_scales[j];
+                    usum[jj] += (float)upos * da * u_scales[j];
+                }
+            }
+
+            for (int jj = 0; jj < nj; ++jj) {
+                const int j = j0 + jj;
+                const float gate = gsum[jj];
+                const float silu_g = gate / (1.0f + expf(-gate));
+                acc += (float)d_codes[(unsigned long long)h * inter + j] * d_scales[h]
+                       * (silu_g * usum[jj]);
+            }
+        }
+        atomicAdd(out + (unsigned long long)tok * hidden + h,
+                  routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+#endif // RDNA dot4 arch guard
+
 "#;
 
 // Host launcher (parameter marshalling - pure, unit-testable without GPU)
@@ -1766,6 +2104,56 @@ pub fn grouped_dispatch_entry(variant: CharonVariant) -> &'static str {
     }
 }
 
+/// Quantized-expert families with a SPEED-DOT (dot4/sudot4) grouped kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharonDot4Quant {
+    /// GGUF Q8_0 weights (f16 scale + 32 i8 codes per block).
+    Q8_0,
+    /// CompressedTensors W8A8 per-row int8.
+    W8A8Int8,
+    /// GGUF Q4_K super-blocks.
+    Q4K,
+}
+
+/// SPEED-DOT grouped MoE entry for `quant`.
+pub fn grouped_dot4_entry(quant: CharonDot4Quant) -> &'static str {
+    match quant {
+        CharonDot4Quant::Q8_0 => "grim_moe_fused_grouped_q80_dot4",
+        CharonDot4Quant::W8A8Int8 => "grim_moe_fused_grouped_w8a8_int8_dot4",
+        CharonDot4Quant::Q4K => "grim_moe_fused_grouped_q4k_dot4",
+    }
+}
+
+/// Whether the JIT'd dot4 kernels exist for this arch. Mirrors the
+/// `#if defined(__gfx..)` guard around the #10 kernels in `KERNEL_SOURCE`:
+/// RDNA2 (dot1q/dot4-insts), RDNA3 (dot8-insts) and RDNA4 (sudot4 only —
+/// sdot4 opcode was removed) are covered; CDNA (gfx90a/gfx94x) is not.
+pub fn dot4_supported(gcn_arch: &str) -> bool {
+    // starts_with: hip gcnArchName can carry suffixes (e.g. "gfx1100-xm").
+    const DOT4_ARCHES: [&str; 11] = [
+        "gfx1030", "gfx1031", "gfx1032", "gfx1035", "gfx1036", "gfx1100", "gfx1101", "gfx1102",
+        "gfx1103", "gfx1200", "gfx1201",
+    ];
+    DOT4_ARCHES.iter().any(|a| gcn_arch.starts_with(a))
+}
+
+/// Dispatch resolution for the dot4 decode path. Returns `None` when the
+/// dot4 kernels must not run:
+/// - non-RDNA arch (no V_DOT4/V_SUDOT4 instructions),
+/// - training launches — the dot4 kernels don't write the
+///   `stash_hg`/`stash_hu` pre-activation stash the backward kernel reads,
+///   so a training forward must stay on the scalar/WMMA grouped variants.
+pub fn dot4_entry_for(
+    quant: CharonDot4Quant,
+    gcn_arch: &str,
+    training: bool,
+) -> Option<&'static str> {
+    if training || !dot4_supported(gcn_arch) {
+        return None;
+    }
+    Some(grouped_dot4_entry(quant))
+}
+
 impl CharonVariant {
     /// All v1 variants, in stable order (the selector's table index).
     pub const ALL: [Self; 3] = [
@@ -2129,6 +2517,49 @@ mod tests {
             helper.contains("for (int p = 0; p < n; ++p)"),
             "Item 1: the helper must have a per-weight inner loop"
         );
+    }
+
+    /// SPEED-DOT MoE: the dot4 grouped kernels must be JIT-discoverable by
+    /// name, and the sudot4 ISA helper must be present.
+    #[test]
+    fn dot4_grouped_entries_are_jit_discoverable() {
+        for entry in [
+            grouped_dot4_entry(CharonDot4Quant::Q8_0),
+            grouped_dot4_entry(CharonDot4Quant::W8A8Int8),
+            grouped_dot4_entry(CharonDot4Quant::Q4K),
+        ] {
+            assert!(
+                KERNEL_SOURCE.contains(entry),
+                "dot4 grouped entry {entry} must be JIT-discoverable"
+            );
+        }
+        assert!(
+            KERNEL_SOURCE.contains("grim_charon_sdot4"),
+            "sudot4/sdot4 ISA helper must be present"
+        );
+        // The kernels are inference-only: no backward stash writes.
+        let dot4_start = KERNEL_SOURCE.find("grim_moe_fused_grouped_q4k_dot4").unwrap();
+        let dot4_src = &KERNEL_SOURCE[dot4_start..];
+        let q4k_end = dot4_src.find("grim_moe_fused_grouped_q80_dot4").unwrap();
+        assert!(
+            !dot4_src[..q4k_end].contains("stash_hg"),
+            "dot4 kernels must not write the backward pre-activation stash"
+        );
+    }
+
+    /// SPEED-DOT MoE: arch gating + training gate on the dispatch resolver.
+    #[test]
+    fn dot4_entry_for_gates_arch_and_training() {
+        use CharonDot4Quant::*;
+        // RDNA2/3/4 all supported (sdot4 vs sudot4 selected in-device).
+        for arch in ["gfx1036", "gfx1100", "gfx1201"] {
+            assert_eq!(dot4_entry_for(Q4K, arch, false), Some("grim_moe_fused_grouped_q4k_dot4"));
+        }
+        // CDNA / unknown: no dot4.
+        assert_eq!(dot4_entry_for(Q8_0, "gfx90a", false), None);
+        assert_eq!(dot4_entry_for(Q8_0, "gfx9428", false), None);
+        // Training: backward reads the stash the dot4 kernels don't write.
+        assert_eq!(dot4_entry_for(Q4K, "gfx1100", true), None);
     }
 
     /// Wave mandate: block size must be a multiple of the device's wavefront size.

@@ -12,7 +12,7 @@ use crate::device::roc_device::RocmDevice;
 use crate::memory::pinned::RocmPinnedBuffer;
 use crate::memory::storage::RocmStorage;
 use crate::peer_access::{self, LinkType};
-use crate::{Error, HipMemcpyKind, Result, hipMemcpyAsync, hipStreamSynchronize};
+use crate::{Error, Result};
 
 /// Ring capacity for the persistent-dispatch ring.
 /// Power of two (ring index math), large enough that the host never laps the device.
@@ -130,6 +130,9 @@ fn channel_for(device: &RocmDevice) -> Result<Arc<Mutex<RingChannel>>> {
 /// `opcode` selects the B-matrix convention the kernel applies:
 /// OP_COL_GEMM (1) — B is [K, N], computes C = A @ B.
 /// OP_ROW_GEMM (2) — B is [N, K], computes C = A @ B^T (matmul_op convention).
+/// Kept for the descriptor-packing ABI test; the dispatch path now writes
+/// descriptors on-device via `grim_scythe_write_slot` (HIP-graph capturable).
+#[allow(dead_code)]
 fn pack_gemm_descriptor(
     cell: &mut [u8],
     opcode: u32,
@@ -190,35 +193,35 @@ pub fn route_gemm(
     let head_value = chan.next_head.wrapping_add(1);
     chan.next_head = head_value;
 
-    {
-        let cell = chan.staging.as_mut_slice();
-        // matmul_op feeds B in [N, K] form (C = A @ B^T) → OP_ROW_GEMM.
-        pack_gemm_descriptor(cell, OP_ROW_GEMM, m, n, k, a_ptr, b_ptr, out_ptr);
-    }
-    let dst = chan.slots_dev + slot as u64 * 64;
-    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+    // On-device descriptor write (Option A): grim_scythe_write_slot packs the
+    // 64-byte descriptor into the ring slot entirely on-device — no host staging,
+    // no H2D — so this enqueue is HIP-graph capturable. Replaces the legacy
+    // pinned-staging + copy_scythe_descriptor_async path.
+    crate::kernels::qkv_attention::launch_scythe_write_slot(
+        device,
+        chan.slots.as_ref(),
+        slot as usize,
+        OP_ROW_GEMM,
+        m,
+        n,
+        k,
+        a_ptr,
+        b_ptr,
+        out_ptr,
+        0, // peer_ptr
+    )?;
 
-    // Publish the head so the wave sees the new descriptor.
-    // Async on the same stream as the upload (ordered behind it), then a STREAM-scoped sync:.
-    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
-    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
-    let rc = unsafe {
-        hipMemcpyAsync(
-            chan.head_dev as *mut c_void,
-            chan.head_cell.as_ptr() as *const c_void,
-            4,
-            HipMemcpyKind::HostToDevice,
-            stream,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::Backend(format!(
-            "ring route: head publish failed with hip status {rc}"
-        )));
-    }
-    crate::device::helpers::check_hip("ring route: head publish sync", unsafe {
-        hipStreamSynchronize(stream)
-    })?;
+    // Publish the head so the wave sees the new descriptor. On-device kernel
+    // write (graph-capturable) instead of the legacy pinned-staging + H2D.
+    let head_store = chan
+        .head
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| Error::Backend("ring route: head must be RocmStorage".into()))?;
+    let head_ptr = head_store
+        .device_ptr
+        .ok_or_else(|| Error::Backend("ring route: head has no device ptr".into()))?;
+    crate::kernels::qkv_attention::launch_scythe_publish_head(device, head_ptr, head_value)?;
 
     // One bounded wave consumes exactly this task.
     // Everything is ordered on the caller's stream, so back-to-back routed GEMMs serialize behind their predecessors'.
@@ -301,37 +304,28 @@ pub fn route_commfuse(
     let head_value = chan.next_head.wrapping_add(1);
     chan.next_head = head_value;
 
-    {
-        let cell = chan.staging.as_mut_slice();
-        cell[..64].fill(0);
-        cell[0..4].copy_from_slice(&5u32.to_ne_bytes()); // opcode 5 = OP_COMMFUSE
-        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
-        cell[8..12].copy_from_slice(&1u32.to_ne_bytes()); // n = 1
-        cell[12..16].copy_from_slice(&1u32.to_ne_bytes()); // k = 1
-        cell[16..24].copy_from_slice(&src_ptr.to_ne_bytes());
-        cell[40..48].copy_from_slice(&peer_val.to_ne_bytes()); // peer_ptr
-        cell[32..40].copy_from_slice(&local_val.to_ne_bytes()); // output_ptr
-    }
-    let dst = chan.slots_dev + slot as u64 * 64;
-    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+    // On-device descriptor write (graph-capturable).
+    crate::kernels::qkv_attention::launch_scythe_write_slot(
+        device,
+        chan.slots.as_ref(),
+        slot as usize,
+        5, // OP_COMMFUSE
+        elem_count as u32,
+        1,
+        1,
+        src_ptr,
+        0, // weight_ptr unused
+        local_val,
+        peer_val,
+    )?;
 
-    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
-    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
-    let rc = unsafe {
-        hipMemcpyAsync(
-            chan.head_dev as *mut c_void,
-            chan.head_cell.as_ptr() as *const c_void,
-            4,
-            HipMemcpyKind::HostToDevice,
-            stream,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::Backend(format!("commfuse: head publish failed {rc}")));
-    }
-    crate::device::helpers::check_hip("commfuse: head sync", unsafe {
-        hipStreamSynchronize(stream)
-    })?;
+    let head_ptr = chan
+        .head
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| Error::Backend("commfuse: head has no device ptr".into()))?;
+    crate::kernels::qkv_attention::launch_scythe_publish_head(device, head_ptr, head_value)?;
 
     device.launch_scythe_persistent_dispatch(
         chan.slots.as_ref(),
@@ -378,37 +372,28 @@ pub fn route_peer_reduce(
     let head_value = chan.next_head.wrapping_add(1);
     chan.next_head = head_value;
 
-    {
-        let cell = chan.staging.as_mut_slice();
-        cell[..64].fill(0);
-        cell[0..4].copy_from_slice(&8u32.to_ne_bytes()); // opcode 8 = OP_PEER_REDUCE
-        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
-        cell[8..12].copy_from_slice(&1u32.to_ne_bytes()); // n = 1
-        cell[12..16].copy_from_slice(&1u32.to_ne_bytes()); // k = 1
-        cell[16..24].copy_from_slice(&local_ptr.to_ne_bytes()); // input_ptr = local
-        cell[40..48].copy_from_slice(&peer_ptr.to_ne_bytes());  // peer_ptr = peer
-        cell[32..40].copy_from_slice(&out_ptr.to_ne_bytes());   // output_ptr = result
-    }
-    let dst = chan.slots_dev + slot as u64 * 64;
-    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+    // On-device descriptor write (graph-capturable).
+    crate::kernels::qkv_attention::launch_scythe_write_slot(
+        device,
+        chan.slots.as_ref(),
+        slot as usize,
+        8, // OP_PEER_REDUCE
+        elem_count as u32,
+        1,
+        1,
+        local_ptr,
+        0, // weight_ptr unused
+        out_ptr,
+        peer_ptr,
+    )?;
 
-    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
-    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
-    let rc = unsafe {
-        hipMemcpyAsync(
-            chan.head_dev as *mut c_void,
-            chan.head_cell.as_ptr() as *const c_void,
-            4,
-            HipMemcpyKind::HostToDevice,
-            stream,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::Backend(format!("peer_reduce: head publish failed {rc}")));
-    }
-    crate::device::helpers::check_hip("peer_reduce: head sync", unsafe {
-        hipStreamSynchronize(stream)
-    })?;
+    let head_ptr = chan
+        .head
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| Error::Backend("peer_reduce: head has no device ptr".into()))?;
+    crate::kernels::qkv_attention::launch_scythe_publish_head(device, head_ptr, head_value)?;
 
     device.launch_scythe_persistent_dispatch(
         chan.slots.as_ref(),
@@ -450,36 +435,28 @@ pub fn route_peer_broadcast(
     let head_value = chan.next_head.wrapping_add(1);
     chan.next_head = head_value;
 
-    {
-        let cell = chan.staging.as_mut_slice();
-        cell[..64].fill(0);
-        cell[0..4].copy_from_slice(&9u32.to_ne_bytes()); // opcode 9 = OP_PEER_BROADCAST
-        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
-        cell[8..12].copy_from_slice(&1u32.to_ne_bytes());
-        cell[12..16].copy_from_slice(&1u32.to_ne_bytes());
-        cell[16..24].copy_from_slice(&src_ptr.to_ne_bytes());  // input_ptr = src
-        cell[40..48].copy_from_slice(&dst_ptr.to_ne_bytes());  // peer_ptr = peer dst
-    }
-    let dst = chan.slots_dev + slot as u64 * 64;
-    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+    // On-device descriptor write (graph-capturable).
+    crate::kernels::qkv_attention::launch_scythe_write_slot(
+        device,
+        chan.slots.as_ref(),
+        slot as usize,
+        9, // OP_PEER_BROADCAST
+        elem_count as u32,
+        1,
+        1,
+        src_ptr,
+        0, // weight_ptr unused
+        0, // output_ptr unused (peer broadcast writes to peer_dst directly)
+        dst_ptr,
+    )?;
 
-    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
-    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
-    let rc = unsafe {
-        hipMemcpyAsync(
-            chan.head_dev as *mut c_void,
-            chan.head_cell.as_ptr() as *const c_void,
-            4,
-            HipMemcpyKind::HostToDevice,
-            stream,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::Backend(format!("peer_broadcast: head publish failed {rc}")));
-    }
-    crate::device::helpers::check_hip("peer_broadcast: head sync", unsafe {
-        hipStreamSynchronize(stream)
-    })?;
+    let head_ptr = chan
+        .head
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| Error::Backend("peer_broadcast: head has no device ptr".into()))?;
+    crate::kernels::qkv_attention::launch_scythe_publish_head(device, head_ptr, head_value)?;
 
     device.launch_scythe_persistent_dispatch(
         chan.slots.as_ref(),
@@ -521,36 +498,28 @@ pub fn route_peer_gather(
     let head_value = chan.next_head.wrapping_add(1);
     chan.next_head = head_value;
 
-    {
-        let cell = chan.staging.as_mut_slice();
-        cell[..64].fill(0);
-        cell[0..4].copy_from_slice(&10u32.to_ne_bytes()); // opcode 10 = OP_PEER_GATHER
-        cell[4..8].copy_from_slice(&(elem_count as u32).to_ne_bytes()); // m = elem_count
-        cell[8..12].copy_from_slice(&1u32.to_ne_bytes());
-        cell[12..16].copy_from_slice(&1u32.to_ne_bytes());
-        cell[40..48].copy_from_slice(&peer_ptr.to_ne_bytes()); // peer_ptr = remote peer src
-        cell[32..40].copy_from_slice(&out_ptr.to_ne_bytes());  // output_ptr = local out
-    }
-    let dst = chan.slots_dev + slot as u64 * 64;
-    device.copy_scythe_descriptor_async(dst, chan.staging.as_ptr() as *const c_void, 64)?;
+    // On-device descriptor write (graph-capturable).
+    crate::kernels::qkv_attention::launch_scythe_write_slot(
+        device,
+        chan.slots.as_ref(),
+        slot as usize,
+        10, // OP_PEER_GATHER
+        elem_count as u32,
+        1,
+        1,
+        0, // input_ptr unused
+        0, // weight_ptr unused
+        out_ptr,
+        peer_ptr,
+    )?;
 
-    chan.head_cell.as_mut_slice()[..4].copy_from_slice(&head_value.to_ne_bytes());
-    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal() as i32);
-    let rc = unsafe {
-        hipMemcpyAsync(
-            chan.head_dev as *mut c_void,
-            chan.head_cell.as_ptr() as *const c_void,
-            4,
-            HipMemcpyKind::HostToDevice,
-            stream,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::Backend(format!("peer_gather: head publish failed {rc}")));
-    }
-    crate::device::helpers::check_hip("peer_gather: head sync", unsafe {
-        hipStreamSynchronize(stream)
-    })?;
+    let head_ptr = chan
+        .head
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .and_then(|s| s.device_ptr)
+        .ok_or_else(|| Error::Backend("peer_gather: head has no device ptr".into()))?;
+    crate::kernels::qkv_attention::launch_scythe_publish_head(device, head_ptr, head_value)?;
 
     device.launch_scythe_persistent_dispatch(
         chan.slots.as_ref(),
