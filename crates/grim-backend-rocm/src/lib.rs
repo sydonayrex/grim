@@ -152,8 +152,9 @@ pub use crate::graph_capture::{
     DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey, GraphCaptureManager,
 };
 pub use crate::decode_graph_buffers::{
-    DecodeGraphBuffers, check_layer_topology, decode_graph_enabled, launch_attention,
-    launch_qkv_gemv, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
+    DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
+    launch_attention, launch_qkv_gemv, write_embedding_to_buffer,
+    write_embeddings_to_buffer_batch,
 };
 pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
 pub use crate::rccl::{RcclAllReduce, RocmMultiNodeGroup};
