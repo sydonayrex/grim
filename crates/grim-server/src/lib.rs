@@ -5313,6 +5313,8 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
     };
     let total_tokens_gen = engine.total_tokens_generated();
     let total_tokens_pref = engine.total_tokens_prefilled();
+    let (qkv_attempts, qkv_fallbacks, qkv_sticky) =
+        grim_models_transformer::shared_attention::qkv_arena_fallback_stats();
     let ttft_json = match engine.last_ttft_ms() {
         Some(ttft) => serde_json::json!(ttft),
         None => serde_json::Value::Null,
@@ -5398,6 +5400,12 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
             "waiting_requests": sched.waiting_requests,
             "admitted_requests": sched.admitted_requests,
             "paused_requests": sched.paused_requests,
+        },
+        // PLAN-reduce-d2h-h2d A2: measured arena-attention fallback counts.
+        "qkv_attention": {
+            "device_attempts": qkv_attempts,
+            "arena_fallbacks": qkv_fallbacks,
+            "sticky_failed_configs": qkv_sticky,
         },
         "models": {
             "grim": grim_models,
