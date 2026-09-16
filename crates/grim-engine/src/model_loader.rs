@@ -3037,7 +3037,7 @@ fn load_model_with_providers(
             let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
         }
-        arch @ (ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe) => {
+        ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
             // M0/M2: per-layer kv-head counts live under the *actual* GGUF arch
             // prefix (`lfm2moe.*` for the A1B checkpoint), not always `lfm2.*`.
             // Probe both; treat the arch prefix as authoritative.
