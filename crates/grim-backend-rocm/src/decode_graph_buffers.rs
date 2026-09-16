@@ -452,10 +452,10 @@ impl DecodeGraphBuffers {
         // Set the append position to the end of the seeded prefill so the first
         // decode step appends at the right offset and attends over the prompt.
         let prefill_len = per_layer.iter().find_map(|s| s.as_ref().map(|e| e.prefill_len)).unwrap_or(0);
-        self.current_pos = prefill_len as u32;
+        self.current_pos = prefill_len;
         // Seed the device position scalar to match; the graph's bump kernel
         // increments it on each replay, so it must start at prefill_len.
-        self.write_pos_async(dev, prefill_len as u32, stream)?;
+        self.write_pos_async(dev, prefill_len, stream)?;
         dev.synchronize();
         Ok(())
     }
