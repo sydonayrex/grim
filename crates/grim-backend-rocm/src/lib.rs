@@ -179,8 +179,10 @@ pub use kernels::tile_picker::run_install_tune;
 /// WI-X3: GPU-native stochastic sampling (`grim_sample_logits_stochastic`, defined in `kernels::device_sampler`).
 /// Single-block JIT kernel applying temperature scaling, top-k and top-p filtering entirely on device, then drawing.
 pub use crate::kernels::device_sampler::{
-    DEVICE_SAMPLER_KERNEL_SOURCE, MAX_DEVICE_SAMPLER_VOCAB, PinnedLogitsBuf,
-    sample_logits_on_device, sample_logits_on_device_at,
+    DEVICE_REPEAT_PENALTY_SOURCE, DEVICE_SAMPLER_KERNEL_SOURCE, MAX_DEVICE_SAMPLER_VOCAB,
+    PinnedLogitsBuf, apply_repeat_penalty_on_device, sample_logits_on_device,
+    sample_logits_on_device_at, sample_logits_on_device_with_penalty,
+    sample_logits_on_device_with_penalty_at,
 };
 
 pub use quantization::QuantMode;

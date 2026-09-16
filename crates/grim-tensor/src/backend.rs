@@ -489,6 +489,37 @@ pub trait SamplingOps {
         }
         Ok(probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0))
     }
+
+    /// B1 (PLAN-reduce-d2h-h2d): on-device sampling WITH repeat penalty.
+    /// `history` holds already-generated token ids; entries `< vocab` with
+    /// `repeat_penalty > 1.0` penalize those logits before sampling (same
+    /// semantics as the CPU `apply_repeat_penalty`: dedup, `<0 ? *p : /p`).
+    /// Default: explicit `Unimplemented` — backends opt in individually so a
+    /// missing kernel can never silently sample WITHOUT the penalty. Callers
+    /// must fall back to the CPU sampler on `Err`.
+    fn sample_on_device_with_penalty(
+        &self,
+        logits: &dyn BackendStorage,
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        seed: u64,
+        repeat_penalty: f32,
+        history: &[u32],
+    ) -> Result<u32> {
+        let _ = (
+            logits,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            repeat_penalty,
+            history,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "sample_on_device_with_penalty not implemented for this backend".into(),
+        ))
+    }
 }
 
 /// Attention kernel family: RoPE application, dense/ALiBi/paged/tree/

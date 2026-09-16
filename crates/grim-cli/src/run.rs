@@ -43,6 +43,7 @@ fn try_graph_decode_step(
     seed: u64,
     step: usize,
     allow_gpu_sample: bool,
+    history: &[u32],
 ) -> Option<GraphDecodeResult> {
     if *graph_failed || !grim_backend_rocm::decode_graph_enabled() {
         return None;
@@ -101,7 +102,7 @@ fn try_graph_decode_step(
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
 
     if allow_gpu_sample {
-        if let Ok(tok) = sample_storage_on_rocm(device, g.logits_device_storage(), sampling_params, seed, step) {
+        if let Ok(tok) = sample_storage_on_rocm(device, g.logits_device_storage(), sampling_params, seed, step, history) {
             return Some(GraphDecodeResult::Sampled(tok));
         }
     }
@@ -689,12 +690,11 @@ pub async fn cmd_run(
         let step_start = std::time::Instant::now();
         // Phase 5 trigger: LFM2 decode steps try single-launch replay first.
         // Capture step + any miss fall through to eager (spec §Fallback).
-        // B1 (plans/WI-device-repeat-penalty.md): no GPU repeat-penalty kernel
-        // exists yet, so penalty-active steps stay on the CPU sampler (full-vocab
-        // D2H). Do NOT "fix" by changing the 1.1 default — implement the WI.
+        // B1: repeat penalty now applies on-device (pre-pass kernel), so the
+        // GPU sampler stays eligible on penalty-active steps. `Err` inside
+        // still falls back to the CPU sampler per call site below.
         let allow_gpu_sample = std::env::var("GRIM_CPU_SAMPLER").is_err()
-            && matches!(device, Device::Rocm(_))
-            && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
+            && matches!(device, Device::Rocm(_));
 
         let graph_hit = if !is_prefill {
             let tid = tokens.last().copied().unwrap_or(0);
@@ -710,6 +710,7 @@ pub async fn cmd_run(
                 seed,
                 generated,
                 allow_gpu_sample,
+                &history,
             )
         } else {
             None
@@ -755,17 +756,21 @@ pub async fn cmd_run(
 
                 // SPEED-ROC: on decode steps (single-row logits) sample straight from the
                 // device tensor via the WI-X3 GPU sampler — skips the full-vocab D2H +
-                // CPU sampling that dominated per-token overhead. Prefill (multi-row) and
-                // repeat-penalty-active steps fall back to the CPU sampler.
-                // B1: see plans/WI-device-repeat-penalty.md for the device-side fix.
+                // CPU sampling that dominated per-token overhead. Prefill (multi-row)
+                // steps fall back to the CPU sampler.
+                // B1: repeat penalty applies on-device now; a device-kernel miss
+                // degrades to CPU sampling (never errors the run).
                 let gpu_sample_ok = logits.shape().elem_count() == vocab
                     && std::env::var("GRIM_CPU_SAMPLER").is_err()
-                    && matches!(device, Device::Rocm(_))
-                    && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
+                    && matches!(device, Device::Rocm(_));
 
-                if gpu_sample_ok {
-                    sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated)?
+                let device_token: Option<u32> = if gpu_sample_ok {
+                    sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated, &history).ok()
                 } else {
+                    None
+                };
+                // CPU fallback closure (device-kernel miss or prefill shape).
+                let cpu_sample = || -> Result<u32> {
                     let logits_vec = logits.to_vec_f32()?;
                     let last_start = logits_vec.len().saturating_sub(vocab);
                     let last_logits = &logits_vec[last_start..];
@@ -783,8 +788,13 @@ pub async fn cmd_run(
                         grim_tensor::dtype::QuantProvenance::default(),
                         grim_tensor::Device::Cpu,
                     );
-                    sampler.sample(&last_logits_tensor, &history)?
-                }
+                    Ok(sampler.sample(&last_logits_tensor, &history)?)
+                };
+                let next_token = match device_token {
+                    Some(tok) => tok,
+                    None => cpu_sample()?,
+                };
+                next_token
             }
         };
 
@@ -990,12 +1000,15 @@ pub fn init_generation(
 /// Reads the caller's device-resident logits tensor — no D2H, no CPU sort.
 /// RNG stream advances per step: `SamplingOps::sample_on_device` packs the
 /// position into the high 32 bits of `seed` (see `device_sampler::sample_impl`).
+/// B1: repeat penalty applies on-device via `sample_on_device_with_penalty`
+/// (pre-pass kernel over host-deduped history ids); `Err` → caller CPU-fallback.
 fn sample_storage_on_rocm(
     device: &Device,
     storage: &dyn grim_tensor::BackendStorage,
     params: &SamplingParams,
     seed: u64,
     step: usize,
+    history: &[u32],
 ) -> Result<u32> {
     use grim_tensor::SamplingOps;
     let Device::Rocm(ordinal) = device else {
@@ -1005,12 +1018,14 @@ fn sample_storage_on_rocm(
     };
     let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
     let step_seed = (seed & 0xffff_ffff) | ((step as u64) << 32);
-    Ok(dev.sample_on_device(
+    Ok(dev.sample_on_device_with_penalty(
         storage,
         params.temperature,
         params.top_p,
         params.top_k,
         step_seed,
+        params.repeat_penalty,
+        history,
     )?)
 }
 
@@ -1022,8 +1037,9 @@ fn sample_on_rocm(
     params: &SamplingParams,
     seed: u64,
     step: usize,
+    history: &[u32],
 ) -> Result<u32> {
-    sample_storage_on_rocm(device, logits.storage().as_ref(), params, seed, step)
+    sample_storage_on_rocm(device, logits.storage().as_ref(), params, seed, step, history)
 }
 
 fn build_tensor(
@@ -1314,22 +1330,28 @@ pub async fn cmd_run_interactive(
                 CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
 
             // SPEED-ROC: GPU-direct sampling on decode steps — see one-shot loop.
+            // B1: penalty on-device; kernel miss degrades to CPU (never errors).
             let gpu_sample_ok = logits.shape().elem_count() == vocab
                 && std::env::var("GRIM_CPU_SAMPLER").is_err()
-                && matches!(device, Device::Rocm(_))
-                && (sampling_params.repeat_penalty <= 1.0 || history.is_empty());
+                && matches!(device, Device::Rocm(_));
 
-            let next_token = if gpu_sample_ok {
-                sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated)?
+            let device_token = if gpu_sample_ok {
+                sample_on_rocm(&device, &logits, vocab, &sampling_params, seed, generated, &history).ok()
             } else {
-                let logits_vec = logits.to_vec_f32()?;
-                let last_start = logits_vec.len().saturating_sub(vocab);
-                let last_logits = &logits_vec[last_start..];
+                None
+            };
+            let next_token = match device_token {
+                Some(tok) => tok,
+                None => {
+                    let logits_vec = logits.to_vec_f32()?;
+                    let last_start = logits_vec.len().saturating_sub(vocab);
+                    let last_logits = &logits_vec[last_start..];
 
-                let last_shape = grim_tensor::Shape::new(vec![vocab]);
-                let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
+                    let last_shape = grim_tensor::Shape::new(vec![vocab]);
+                    let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
 
-                sampler.sample(&last_logits_tensor, &history)?
+                    sampler.sample(&last_logits_tensor, &history)?
+                }
             };
 
             generated_tokens.push(next_token);

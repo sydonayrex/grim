@@ -223,10 +223,38 @@ extern "C" __global__ void grim_sample_logits_stochastic(
 }
 "#;
 
+/// B1 (PLAN-reduce-d2h-h2d): device-side repeat-penalty pre-pass.
+/// Applies the CPU-identical penalty (`logit<0 ? logit*p : logit/p`) in place
+/// to UNIQUE history ids. Host must dedup (mirror of CPU HashSet) so each
+/// logit is touched by exactly one thread — no races, no atomics.
+/// Unsigned bound check matches CPU `tok as usize < len` for ALL u32 inputs
+/// (incl. huge ids that would go negative as i32). NaN: `(NaN<0)` false →
+/// `NaN/p = NaN`, identical to CPU.
+pub const DEVICE_REPEAT_PENALTY_SOURCE: &str = r#"
+extern "C" __global__ void grim_repeat_penalty_apply(
+    float* __restrict__ logits,                // [vocab], modified in place
+    const unsigned int* __restrict__ hist_ids, // [hist_len] UNIQUE token ids
+    int hist_len,
+    int vocab_size,
+    float penalty                            // > 1.0 guaranteed by launcher
+) {
+    const int tid = threadIdx.x;
+    const int block = blockDim.x;
+    const unsigned int vocab_u = (unsigned int)vocab_size;
+    for (int i = tid; i < hist_len; i += block) {
+        const unsigned int u = hist_ids[i];
+        if (u < vocab_u) {
+            const float l = logits[u];
+            logits[u] = (l < 0.0f) ? l * penalty : l / penalty;
+        }
+    }
+}
+"#;
+
 use std::ffi::c_void;
 
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
-use grim_tensor::{ArithType, Error, Shape};
+use grim_tensor::{ArithType, ElementwiseOps, Error, Shape};
 
 use crate::{
     HipDim3, HipMemcpyKind, RocmDevice, RocmStorage, arg, check_hip, dev_ptr, hipMemcpyAsync,
@@ -396,6 +424,158 @@ pub fn sample_logits_on_device_at(
         (seed & 0xffff_ffff) as u32,
         position,
     )?))
+}
+
+/// B1 (PLAN-reduce-d2h-h2d): penalty-aware sampling. Host-dedups `history`
+/// (mirror of CPU HashSet), uploads unique ids, runs
+/// `grim_repeat_penalty_apply` as a same-stream pre-pass, then samples.
+/// NOTE: the penalty mutates the [vocab] logits tail IN PLACE on device —
+/// safe because every decode step fully overwrites the buffer before sampling.
+/// Returns `Ok(None)` under the same `validate_input` contract as the
+/// penalty-free entry points (caller falls back to CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn sample_logits_on_device_with_penalty(
+    device: &RocmDevice,
+    logits: &RocmStorage,
+    vocab: usize,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    seed: u64,
+    repeat_penalty: f32,
+    history: &[u32],
+) -> Result<Option<u32>> {
+    sample_logits_on_device_with_penalty_at(
+        device,
+        logits,
+        vocab,
+        temperature,
+        top_k,
+        top_p,
+        seed,
+        (seed >> 32) as u32,
+        repeat_penalty,
+        history,
+    )
+}
+
+/// B1: explicit-position variant (mirrors `sample_logits_on_device_at`).
+#[allow(clippy::too_many_arguments)]
+pub fn sample_logits_on_device_with_penalty_at(
+    device: &RocmDevice,
+    logits: &RocmStorage,
+    vocab: usize,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    seed: u64,
+    position: u32,
+    repeat_penalty: f32,
+    history: &[u32],
+) -> Result<Option<u32>> {
+    let Some(ptr) = validate_input(logits, vocab, temperature, top_p) else {
+        return Ok(None);
+    };
+    if repeat_penalty > 1.0 && !history.is_empty() {
+        let mut seen = std::collections::HashSet::with_capacity(history.len().min(1024));
+        let mut uniq = Vec::with_capacity(history.len().min(1024));
+        for &t in history {
+            if seen.insert(t) {
+                uniq.push(t);
+            }
+        }
+        if !uniq.is_empty() {
+            // Miss → Err → caller CPU-fallback. Warn once (per process) so a
+            // broken pre-pass can never silently degrade every token.
+            if let Err(e) = apply_repeat_penalty_on_device(device, ptr, vocab, &uniq, repeat_penalty) {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[grim] repeat-penalty pre-pass miss ({e}); CPU fallback");
+                }
+                return Err(e);
+            }
+        }
+    }
+    // Greedy shortcut mirrors `SamplingOps::sample_on_device`: exact argmax
+    // over penalty-modified logits (CPU applies penalty before argmax too).
+    if temperature <= 0.0 {
+        return Ok(Some(device.argmax(logits)?));
+    }
+    Ok(Some(sample_impl(
+        device,
+        ptr,
+        vocab,
+        temperature,
+        top_k,
+        top_p,
+        (seed & 0xffff_ffff) as u32,
+        position,
+    )?))
+}
+
+/// B1 (PLAN-reduce-d2h-h2d): device-side repeat-penalty pre-pass.
+/// `logits_ptr` must point at the [vocab] f32 tail (same pointer
+/// `validate_input` returns). `hist_ids` must be UNIQUE (host-deduped, mirror
+/// of the CPU HashSet) — duplicates would double-apply. No-op when
+/// `penalty <= 1.0` or `hist_ids` is empty (matches CPU early-out).
+/// Same-stream launch: call BEFORE the sampler kernel, no sync needed.
+pub fn apply_repeat_penalty_on_device(
+    device: &RocmDevice,
+    logits_ptr: u64,
+    vocab: usize,
+    hist_ids: &[u32],
+    penalty: f32,
+) -> Result<()> {
+    if penalty <= 1.0 || hist_ids.is_empty() || vocab == 0 {
+        return Ok(());
+    }
+    // Persistent staging buffer, grown on demand (history grows per step).
+    let needed = hist_ids.len();
+    let mut guard = match device.penalty_hist_buf.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let cap = guard.as_ref().map(|s| s.bytes() / 4).unwrap_or(0);
+    if guard.is_none() || cap < needed {
+        let grow = needed.max(64).next_power_of_two();
+        *guard = Some(RocmStorage::alloc_gpu(
+            &Shape::new(vec![grow]),
+            DType {
+                arith: ArithType::U32,
+                storage: DTypeStorage::Native,
+            },
+            &device.allocator,
+            device.ordinal,
+        )?);
+    }
+    let hist_storage = guard.as_ref().unwrap();
+    // Bit-preserving u32 view as f32 words for the byte-copy upload.
+    // SAFETY: u32/f32 identical size+align; len counted in 4-byte elements.
+    let words: &[f32] =
+        unsafe { std::slice::from_raw_parts(hist_ids.as_ptr() as *const f32, needed) };
+    device.write_f32_into_async(hist_storage, &words[..needed.min(hist_storage.bytes() / 4)])?;
+    let hist_ptr = dev_ptr(hist_storage)?;
+
+    let _dev_guard = DeviceGuard::set(device.ordinal as i32);
+    let mut logits_arg = logits_ptr;
+    let mut hist_arg = hist_ptr;
+    let mut len_i = hist_ids.len() as i32;
+    let mut vocab_i = vocab as i32;
+    let mut pen = penalty;
+    device.launch_compute_kernel(
+        "grim_repeat_penalty_apply",
+        HipDim3::new(1, 1, 1),
+        HipDim3::new(SAMPLER_BLOCK, 1, 1),
+        &mut [
+            arg(&mut logits_arg),
+            arg(&mut hist_arg),
+            arg(&mut len_i),
+            arg(&mut vocab_i),
+            arg(&mut pen),
+        ],
+    )?;
+    Ok(())
 }
 
 // Keep `Error` in scope for future error-path extensions; silence unused warn.
