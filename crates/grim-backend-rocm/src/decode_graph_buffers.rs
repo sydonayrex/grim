@@ -63,6 +63,25 @@ pub struct DecodeGraphBuffers {
     /// Single-u32 device buffer holding KV position. Updated before each
     /// replay via one 4-byte async H2D (spec §Scalar second approach).
     pub pos_dev: RocmStorage,
+    /// M2 (PLAN-kernel-fusion): MoE routing + output staging. Empty vecs when
+    /// the model has no MoE layers. Routing triple is shared across layers —
+    /// each layer writes then consumes it in stream order within its bracket.
+    pub moe_gate_logits: Vec<RocmStorage>, // [batch, n_expert] per layer
+    pub moe_out: Vec<RocmStorage>,         // [batch, hidden] per layer
+    pub moe_route_tokens: RocmStorage,     // [batch*top_k] u32
+    pub moe_route_experts: RocmStorage,    // [batch*top_k] u32
+    pub moe_route_weights: RocmStorage,    // [batch*top_k] f32
+    /// S2: ShortConv staging. Empty vecs when the model has no ShortConv
+    /// layers. `sc_state[l]` is the device-resident ring `[h_dim*(kc)]`
+    /// (column-major [d, kc], the HIP kernel's in-place layout).
+    pub sc_proj_buf: Vec<RocmStorage>, // [batch, 3*h_dim]
+    pub sc_b: Vec<RocmStorage>,        // [batch*h_dim]
+    pub sc_c: Vec<RocmStorage>,
+    pub sc_x: Vec<RocmStorage>,
+    pub sc_bx: Vec<RocmStorage>,
+    pub sc_sum: Vec<RocmStorage>,
+    pub sc_y: Vec<RocmStorage>,        // [batch, h_dim]
+    pub sc_state: Vec<RocmStorage>,    // [h_dim*(l_cache-1)] per layer
     /// Shared read-only dummy ([1], zeros) for unused attention inputs
     /// (o_proj weights with fuse_o=0, alibi slopes with has_alibi=0).
     pub attn_dummy: RocmStorage,
@@ -115,6 +134,10 @@ impl DecodeGraphBuffers {
         vocab_size: usize,
         num_heads: usize,
         batch: usize,
+        n_expert: usize,
+        top_k: usize,
+        sc_h_dim: usize,
+        sc_l_cache: usize,
     ) -> Result<Self> {
         if num_layers == 0 || hidden_size == 0 || max_ctx == 0 || vocab_size == 0 || batch == 0 {
             return Err(Error::Backend(
@@ -136,6 +159,19 @@ impl DecodeGraphBuffers {
         let mut attn_max_buf = Vec::with_capacity(num_layers);
         let mut attn_sum_buf = Vec::with_capacity(num_layers);
         let mut act_q81_buf = Vec::with_capacity(num_layers);
+        // M2/S2: MoE + ShortConv staging (empty when the model lacks those).
+        let moe_layers = n_expert > 0 && top_k > 0;
+        let sc_layers = sc_h_dim > 0 && sc_l_cache > 1;
+        let mut moe_gate_logits = Vec::with_capacity(if moe_layers { num_layers } else { 0 });
+        let mut moe_out = Vec::with_capacity(if moe_layers { num_layers } else { 0 });
+        let mut sc_proj_buf = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
+        let mut sc_b = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
+        let mut sc_c = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
+        let mut sc_x = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
+        let mut sc_bx = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
+        let mut sc_sum = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
+        let mut sc_y = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
+        let mut sc_state = Vec::with_capacity(if sc_layers { num_layers } else { 0 });
         let mut fused_qkv_out = Vec::with_capacity(num_layers);
         let mut k_arena = Vec::with_capacity(num_layers);
         let mut v_arena = Vec::with_capacity(num_layers);
@@ -285,10 +321,93 @@ impl DecodeGraphBuffers {
         )?;
         let attn_dummy = RocmStorage::alloc_gpu(
             &Shape::new(vec![1]),
-            dt,
+            dt.clone(),
             &dev.allocator,
             dev.ordinal,
         )?;
+        let push_all = |dev: &RocmDevice,
+                            dt: &DType,
+                            moe_gate_logits: &mut Vec<RocmStorage>,
+                            moe_out: &mut Vec<RocmStorage>,
+                            sc_proj_buf: &mut Vec<RocmStorage>,
+                            sc_b: &mut Vec<RocmStorage>,
+                            sc_c: &mut Vec<RocmStorage>,
+                            sc_x: &mut Vec<RocmStorage>,
+                            sc_bx: &mut Vec<RocmStorage>,
+                            sc_sum: &mut Vec<RocmStorage>,
+                            sc_y: &mut Vec<RocmStorage>,
+                            sc_state: &mut Vec<RocmStorage>|
+         -> Result<()> {
+            for _ in 0..num_layers {
+                if moe_layers {
+                    moe_gate_logits.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch, n_expert]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
+                    moe_out.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch, hidden_size]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
+                }
+                if sc_layers {
+                    let kc = sc_l_cache - 1;
+                    sc_proj_buf.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch, 3 * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                    sc_b.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                    sc_c.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                    sc_x.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                    sc_bx.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                    sc_sum.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                    sc_y.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![batch, sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                    sc_state.push(RocmStorage::alloc_gpu(
+                        &Shape::new(vec![sc_h_dim * kc]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                }
+            }
+            Ok(())
+        };
+        push_all(
+            dev,
+            &dt,
+            &mut moe_gate_logits,
+            &mut moe_out,
+            &mut sc_proj_buf,
+            &mut sc_b,
+            &mut sc_c,
+            &mut sc_x,
+            &mut sc_bx,
+            &mut sc_sum,
+            &mut sc_y,
+            &mut sc_state,
+        )?;
+        let (moe_route_tokens, moe_route_experts, moe_route_weights) = if moe_layers {
+            let np = batch * top_k;
+            let udt = DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: grim_tensor::Storage::Native,
+            };
+            (
+                RocmStorage::alloc_gpu(&Shape::new(vec![np]), udt.clone(), &dev.allocator, dev.ordinal)?,
+                RocmStorage::alloc_gpu(&Shape::new(vec![np]), udt, &dev.allocator, dev.ordinal)?,
+                RocmStorage::alloc_gpu(&Shape::new(vec![np]), dt.clone(), &dev.allocator, dev.ordinal)?,
+            )
+        } else {
+            // Unused dummy [1] f32 zeros keeps the fields non-null.
+            let d = RocmStorage::alloc_gpu(&Shape::new(vec![1]), dt.clone(), &dev.allocator, dev.ordinal)?;
+            let d2 = RocmStorage::alloc_gpu(&Shape::new(vec![1]), dt.clone(), &dev.allocator, dev.ordinal)?;
+            let d3 = RocmStorage::alloc_gpu(&Shape::new(vec![1]), dt.clone(), &dev.allocator, dev.ordinal)?;
+            (d, d2, d3)
+        };
+
         Ok(Self {
             layer_input,
             layer_output,
@@ -313,6 +432,19 @@ impl DecodeGraphBuffers {
             attn_dummy,
             act_q81_buf,
             fused_qkv_out,
+            moe_gate_logits,
+            moe_out,
+            moe_route_tokens,
+            moe_route_experts,
+            moe_route_weights,
+            sc_proj_buf,
+            sc_b,
+            sc_c,
+            sc_x,
+            sc_bx,
+            sc_sum,
+            sc_y,
+            sc_state,
             num_layers,
             max_ctx,
             batch,
@@ -562,6 +694,7 @@ impl DecodeGraph {
             vocab_size,
             num_heads,
             batch,
+            0, 0, 0, 0, // no MoE / ShortConv layers in this simplified constructor
         )?;
         Ok(Self::new(dev, buffers, stream))
     }

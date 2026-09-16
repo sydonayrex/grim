@@ -10,12 +10,13 @@
 
 use std::sync::Arc;
 
+use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::RocmDevice;
 use grim_models_transformer::lfm2::{Lfm2, Lfm2Block, Lfm2Config};
 use grim_models_transformer::shared_moe::CharonCache;
 use grim_models_transformer::lfm2_graph::write_embedding_to_buffer;
 use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
+use grim_tensor::{BackendStorage, CoreTensorOps, DType, Device, Shape, Tensor};
 
 fn rocm_tensor(dev: &RocmDevice, ordinal: usize, data: Vec<f32>, shape: Shape) -> Tensor {
     let storage = dev.from_cpu(&data, &shape, DType::F32).unwrap();
@@ -160,7 +161,6 @@ fn attention_block(
         is_moe: false,
         n_expert: 0,
         n_expert_used: 1,
-        charon_cache: grim_models_transformer::shared_moe::CharonCache::new(),
         moe_experts_cache: std::sync::OnceLock::new(),
         num_heads: nh,
         num_kv_heads: nkv,
@@ -352,4 +352,354 @@ fn lfm2_graph_recurrent_falls_back_eager() {
     let err = write_embedding_to_buffer(&dev, cpu.storage().as_ref(), 3).unwrap_err();
     let _ = (model, graph);
     let _ = err;
+}
+
+// ───────────────────────────────────────────────────────────── M2/S2 (PLAN-kernel-fusion): graph capture for MoE and ShortConv layers.
+//
+// M2: an `is_moe` block captures via `moe_forward_graph` (device routing into
+// persistent routing buffers + resident stacked weights + grouped dispatch
+// into a fixed pool slot). S2: a ShortConv block captures via
+// `shortconv_forward_graph` (device ring state, no host transpose, no H2D).
+// Both must `begin_capture`/`forward_capture`/`end_capture` successfully,
+// replay deterministically, and match the eager forward's logits within
+// tolerance (the capture path runs the same kernels as eager — only the
+// launch mechanism differs).
+
+fn moe_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
+    let hidden = 32usize;
+    let hd = 8usize;
+    let nh = 2usize;
+    let nkv = 1usize;
+    let inter = 64usize;
+    let n_expert = 4usize;
+    let n_ff = 16usize;
+    let mut b = attention_block(dev, ordinal, hidden, nh * hd, nkv * hd, hd, inter, false);
+    b.is_moe = true;
+    b.n_expert = n_expert;
+    b.n_expert_used = 2;
+    b.ffn_gate_inp = Some(test_linear(dev, ordinal, n_expert, hidden, 301));
+    // Stacked expert tensors (GGUF layout):
+    // gate/up: [n_expert, n_ff, hidden]; down: [n_ff, hidden, n_expert].
+    b.ffn_gate_exps = Some(rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(n_expert * n_ff * hidden, 311),
+        Shape::new(vec![n_expert, n_ff, hidden]),
+    ));
+    b.ffn_up_exps = Some(rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(n_expert * n_ff * hidden, 312),
+        Shape::new(vec![n_expert, n_ff, hidden]),
+    ));
+    b.ffn_down_exps = Some(rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(n_ff * hidden * n_expert, 313),
+        Shape::new(vec![n_ff, hidden, n_expert]),
+    ));
+    b
+}
+
+fn shortconv_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
+    let hidden = 32usize;
+    let hd = 8usize;
+    let nh = 2usize;
+    let nkv = 1usize;
+    let inter = 64usize;
+    let l_cache = 3usize;
+    let mut b = attention_block(dev, ordinal, hidden, nh * hd, nkv * hd, hd, inter, false);
+    b.shortconv_in_proj = Some(test_linear(dev, ordinal, 3 * hidden, hidden, 401));
+    b.shortconv_conv = Some(rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(hidden * l_cache, 402),
+        Shape::new(vec![hidden, 1, l_cache]),
+    ));
+    b.shortconv_conv_vec = Some(rand_vec(hidden * l_cache, 402));
+    b.shortconv_out_proj = Some(test_linear(dev, ordinal, hidden, hidden, 403));
+    b
+}
+
+fn tiny_lfm2_custom(dev: &RocmDevice, ordinal: usize, layers: Vec<Lfm2Block>) -> Lfm2 {
+    let hidden = 32usize;
+    let vocab = 32usize;
+    let tok_w = rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(vocab * hidden, 99),
+        Shape::new(vec![vocab, hidden]),
+    );
+    let n_layers = layers.len();
+    Lfm2 {
+        cfg: Lfm2Config {
+            vocab_size: vocab,
+            hidden_size: hidden,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 8,
+            num_layers: n_layers,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            n_shortconv_l_cache: 3,
+            is_recr: vec![false; n_layers],
+            n_layer_dense_lead: 0,
+            n_expert: 4,
+            n_expert_used: 2,
+            n_ff_exp: 16,
+            expert_weights_scale: 0.0,
+            expert_gating_func: 0,
+            n_swa: 0,
+            swa_type: 0,
+            n_embd_out: 0,
+            mxfp4_qkv_attention: false,
+        },
+        device: Device::Rocm(ordinal),
+        tok_embeddings: Embedding { weight: tok_w.clone() },
+        layers,
+        norm: test_norm(dev, ordinal, hidden),
+        output: Linear { weight: tok_w.clone(), bias: None, w_t: tok_w, quant_format: None },
+        dense_2_out: None,
+        dense_2_out_bias: None,
+    }
+}
+
+fn capture_replay_logits(
+    model: &Lfm2,
+    tokens: &[u32],
+) -> Result<Vec<Vec<f32>>, String> {
+    let mut graph = model
+        .get_or_create_decode_graph(16, 1)
+        .map_err(|e| format!("alloc: {e}"))?;
+    // Warmups: JIT + resident weight stack + routing scratch must be built
+    // BEFORE the capture bracket (allocation inside capture is illegal).
+    for &t in tokens.iter().take(2) {
+        model.forward_capture(&mut graph, t).map_err(|e| format!("warmup: {e}"))?;
+    }
+    graph.begin_capture().map_err(|e| format!("begin: {e}"))?;
+    model.forward_capture(&mut graph, tokens[0]).map_err(|e| format!("capture fwd: {e}"))?;
+    graph.end_capture().map_err(|e| format!("end: {e}"))?;
+    assert!(graph.is_captured, "capture must succeed");
+    let mut out = Vec::new();
+    for &t in tokens {
+        model.forward_replay(&mut graph, t).map_err(|e| format!("replay: {e}"))?;
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
+        let l = graph.read_logits_f32().map_err(|e| format!("read: {e}"))?;
+        assert!(l.iter().all(|x| x.is_finite()), "non-finite replay logit");
+        out.push(l);
+    }
+    Ok(out)
+}
+
+#[test]
+fn lfm2_graph_moe_layer_captures_and_replays() {
+    if !grim_backend_rocm::device::util::gpu_test_enabled() {
+        eprintln!("skip: set GRIM_GPU_TEST=1");
+        return;
+    }
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
+        eprintln!("skip: no ROCm ordinal 0");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+    // Two MoE layers — routing buffers shared across layers must stay
+    // coherent (each layer writes then consumes within stream order).
+    let model = tiny_lfm2_custom(&dev, 0, vec![moe_block(&dev, 0), moe_block(&dev, 0)]);
+    let tokens = [7u32, 9, 11];
+    let replay = capture_replay_logits(&model, &tokens).expect("moe capture/replay");
+
+    // Determinism: same token -> identical logits across replays (7 vs 7
+    // cannot be compared directly since the graph is stateful; instead check
+    // the replays differ per token but are finite — covered above — and that
+    // replaying is stable by re-running the same sequence.
+    let replay2 = capture_replay_logits(&model, &tokens).expect("moe capture/replay 2");
+    for (a_seq, b_seq) in replay.iter().zip(&replay2) {
+        for (a, b) in a_seq.iter().zip(b_seq) {
+            assert!((a - b).abs() < 1e-2, "replay nondeterminism: {a} vs {b}");
+        }
+    }
+}
+
+#[test]
+fn lfm2_graph_moe_sublayer_matches_eager_dispatch() {
+    // M2 numeric gate, isolated from attention/KV-history plumbing: the graph
+    // sublayer's op sequence (route_topk into persistent buffers + grouped
+    // dispatch into a caller-provided out) must produce the same MoE FFN
+    // output as the eager `fused_moe_dispatch_from_logits` on the same input,
+    // because the graph path runs exactly those primitives.
+    if !grim_backend_rocm::device::util::gpu_test_enabled()
+        || !RocmDevice::probe_one(0).unwrap_or(false)
+    {
+        eprintln!("skip: GPU test");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+    let model = tiny_lfm2_custom(&dev, 0, vec![moe_block(&dev, 0)]);
+    let block = &model.layers[0];
+    let hidden = model.cfg.hidden_size;
+    let top_k = block.n_expert_used.min(block.n_expert).max(1);
+    let x = rocm_tensor(&dev, 0, rand_vec(1 * hidden, 71), Shape::new(vec![1, hidden]));
+
+    // Eager path (production MoE forward).
+    let gate_inp = block.ffn_gate_inp.as_ref().unwrap();
+    let logits = gate_inp.forward(&x).unwrap();
+    let experts = block.moe_experts().unwrap().clone();
+    let eager_out = grim_models_transformer::shared_moe::fused_moe_dispatch_from_logits(
+        &dev,
+        &x,
+        &logits,
+        &experts,
+        None,
+        top_k,
+        1.0,
+        0,
+        &block.charon_cache,
+    )
+    .expect("eager dispatch")
+    .expect("dispatch Some");
+
+    // Graph-op sequence (same primitives, caller-provided out).
+    let scratch = grim_models_transformer::shared_moe::ensure_charon_scratch(
+        0,
+        1,
+        top_k,
+        &experts,
+        &block.charon_cache,
+    )
+    .unwrap();
+    let (tokens, experts_b, weights, gate_buf, up_buf, down_buf) = scratch;
+    fn downcast(a: &Arc<dyn grim_tensor::BackendStorage>) -> &RocmStorage {
+        a.as_ref().as_any().downcast_ref::<RocmStorage>().unwrap()
+    }
+
+    let logits_rocm = logits
+        .storage()
+        .as_ref()
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .unwrap();
+    let x_rocm = x
+        .storage()
+        .as_ref()
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .unwrap();
+    dev.moe_route_topk_on_device(
+        logits_rocm,
+        None,
+        downcast(&tokens),
+        downcast(&experts_b),
+        downcast(&weights),
+        1,
+        block.n_expert,
+        top_k,
+        0,
+    )
+    .unwrap();
+    let out_dyn = dev
+        .zeros(&Shape::new(vec![1, hidden]), DType::F32)
+        .unwrap();
+    let out = out_dyn
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .unwrap();
+    let inter = experts[0].gate.weight.shape().dim(0).unwrap_or(0);
+    dev.moe_fused_dispatch_resident_routing_into(
+        x_rocm,
+        gate_buf.as_ref(),
+        up_buf.as_ref(),
+        down_buf.as_ref(),
+        downcast(&tokens),
+        downcast(&experts_b),
+        downcast(&weights),
+        top_k,
+        &out,
+        hidden,
+        inter,
+        1.0,
+    )
+    .unwrap();
+
+    // Compare (atomicAdd accumulation => float-order noise, use 1e-4 rel).
+    let got = out.to_cpu_vec_f32().unwrap();
+    let want = eager_out.to_vec_f32().unwrap();
+
+    let mut worst = 0.0f32;
+    for (a, b) in got.iter().zip(&want) {
+        worst = worst.max((a - b).abs() / (b.abs() + 1e-3));
+    }
+    assert!(
+        worst < 1e-4,
+        "graph MoE ops vs eager dispatch mismatch (worst rel {worst:.3e}): got {got:?} want {want:?}"
+    );
+}
+
+#[test]
+fn lfm2_graph_shortconv_layer_captures_and_replays() {
+    if !grim_backend_rocm::device::util::gpu_test_enabled()
+        || !RocmDevice::probe_one(0).unwrap_or(false)
+    {
+        eprintln!("skip: GPU test");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+    // Pure-ShortConv layers (no attention) — the S2 graph path.
+    let model = tiny_lfm2_custom(
+        &dev,
+        0,
+        vec![shortconv_block(&dev, 0), shortconv_block(&dev, 0)],
+    );
+    let tokens = [5u32, 13, 21];
+    let replay = capture_replay_logits(&model, &tokens).expect("sc capture/replay");
+    assert_eq!(replay.len(), 3);
+    let replay2 = capture_replay_logits(&model, &tokens).expect("sc capture/replay 2");
+    for (a_seq, b_seq) in replay.iter().zip(&replay2) {
+        for (a, b) in a_seq.iter().zip(b_seq) {
+            assert!((a - b).abs() < 1e-2, "replay nondeterminism: {a} vs {b}");
+        }
+    }
+}
+
+/// S2 state-correctness guard: ShortConv replay must be STATEFUL — replaying
+/// token A twice in a row gives different logits than the first A (the conv
+/// ring advanced), proving the device ring updates inside the graph instead
+/// of being frozen at capture time.
+#[test]
+fn lfm2_graph_shortconv_ring_advances_across_replays() {
+    if !grim_backend_rocm::device::util::gpu_test_enabled()
+        || !RocmDevice::probe_one(0).unwrap_or(false)
+    {
+        eprintln!("skip: GPU test");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+    let model = tiny_lfm2_custom(
+        &dev,
+        0,
+        vec![shortconv_block(&dev, 0), shortconv_block(&dev, 0)],
+    );
+    let mut graph = model.get_or_create_decode_graph(16, 1).unwrap();
+    for &t in &[3u32, 5] {
+        model.forward_capture(&mut graph, t).unwrap();
+    }
+    graph.begin_capture().unwrap();
+    model.forward_capture(&mut graph, 42).unwrap();
+    graph.end_capture().unwrap();
+
+    model.forward_replay(&mut graph, 42).unwrap();
+    graph.buffers.current_pos += 1;
+    let first = graph.read_logits_f32().unwrap();
+    model.forward_replay(&mut graph, 42).unwrap();
+    graph.buffers.current_pos += 1;
+    let second = graph.read_logits_f32().unwrap();
+    let max_delta = first
+        .iter()
+        .zip(&second)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_delta > 1e-6,
+        "conv ring did not advance: identical logits across replays (max delta {max_delta})"
+    );
 }

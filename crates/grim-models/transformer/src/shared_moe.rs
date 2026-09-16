@@ -111,6 +111,115 @@ fn charon_enabled() -> bool {
 /// That is the exact math of the per-expert loop, cross-checked by
 /// `tests/golden_charon_moe_gpu.rs` (≤1e-3 max-abs-diff). On any other backend
 /// (or when the kernel is unavailable) it falls back to the per-expert loop.
+
+/// M2 (PLAN-kernel-fusion): resolve (lazily allocate, once per shape key) the
+/// device routing scratch triple + resident stacked expert weights that the
+/// Charon grouped dispatch consumes. Used by `fused_moe_dispatch_from_logits`
+/// and by the capture-safe graph path (`Lfm2Block::moe_forward_graph`), which
+/// must hit the already-allocated buffers inside a capture bracket — callers
+/// warm up once before `begin_capture` so every later call is a cache hit.
+pub fn ensure_charon_scratch(
+    ordinal: usize,
+    seq_len: usize,
+    top_k: usize,
+    experts: &[MoeExpert],
+    cache: &CharonCache,
+) -> Result<(
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+)> {
+    let rocm = Arc::new(grim_backend_rocm::RocmDevice::shared(ordinal));
+    let num_experts = experts.len();
+    let hidden = experts[0].gate.weight.shape().dim(1).unwrap_or(0);
+    let inter = experts[0].gate.weight.shape().dim(0).unwrap_or(0);
+    if num_experts == 0 || hidden == 0 || inter == 0 {
+        return Err(grim_core::error::Error::Backend(
+            "ensure_charon_scratch: degenerate expert dims".into(),
+        ));
+    }
+
+    let (tokens_buf, experts_buf, weights_buf) = {
+        let mut guard = cache.routing.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some((sl, tk, bufs)) if *sl == seq_len && *tk == top_k => (
+                Arc::clone(&bufs.tokens),
+                Arc::clone(&bufs.experts),
+                Arc::clone(&bufs.weights),
+            ),
+            _ => {
+                let num_pairs = seq_len * top_k;
+                let tokens = Arc::from(rocm.zeros(
+                    &Shape::new(vec![num_pairs]),
+                    DType {
+                        arith: grim_tensor::ArithType::U32,
+                        storage: grim_tensor::Storage::Native,
+                    },
+                )?);
+                let experts_b = Arc::from(rocm.zeros(
+                    &Shape::new(vec![num_pairs]),
+                    DType {
+                        arith: grim_tensor::ArithType::U32,
+                        storage: grim_tensor::Storage::Native,
+                    },
+                )?);
+                let weights = Arc::from(rocm.zeros(&Shape::new(vec![num_pairs]), DType::F32)?);
+                *guard = Some((
+                    seq_len,
+                    top_k,
+                    RoutingBuffers {
+                        tokens: Arc::clone(&tokens),
+                        experts: Arc::clone(&experts_b),
+                        weights: Arc::clone(&weights),
+                    },
+                ));
+                (tokens, experts_b, weights)
+            }
+        }
+    };
+
+    let (gate_buf, up_buf, down_buf) = {
+        let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (num_experts, hidden, inter);
+        match guard.as_ref() {
+            Some(r) if r.fingerprint == key => {
+                (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+            }
+            _ => {
+                let (gate_flat, up_flat, down_flat) =
+                    stack_expert_weights(experts, num_experts, hidden, inter)?;
+                let gate = Arc::from(rocm.from_cpu(
+                    &gate_flat,
+                    &Shape::new(vec![gate_flat.len()]),
+                    DType::F32,
+                )?);
+                let up = Arc::from(rocm.from_cpu(
+                    &up_flat,
+                    &Shape::new(vec![up_flat.len()]),
+                    DType::F32,
+                )?);
+                let down = Arc::from(rocm.from_cpu(
+                    &down_flat,
+                    &Shape::new(vec![down_flat.len()]),
+                    DType::F32,
+                )?);
+                *guard = Some(ResidentWeights {
+                    gate: Arc::clone(&gate),
+                    up: Arc::clone(&up),
+                    down: Arc::clone(&down),
+                    fingerprint: key,
+                });
+                (gate, up, down)
+            }
+        }
+    };
+
+    Ok((tokens_buf, experts_buf, weights_buf, gate_buf, up_buf, down_buf))
+}
+
 pub fn fused_moe_dispatch(
     dev: &dyn BackendDevice,
     x: &Tensor,

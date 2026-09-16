@@ -100,6 +100,8 @@ fn attention_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
         ffn_exp_probs_b: None,
         is_moe: false,
         n_expert: 0,
+        n_expert_used: 0,
+        moe_experts_cache: std::sync::OnceLock::new(),
         num_heads: nh,
         num_kv_heads: nkv,
         head_dim: hd,

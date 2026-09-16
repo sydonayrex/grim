@@ -262,6 +262,61 @@ impl RecurrentOps for RocmDevice {
 }
 
 impl RocmDevice {
+    /// S2 (PLAN-kernel-fusion): `short_conv1d_causal_step` writing into
+    /// CALLER-PROVIDED `out` — no allocation inside. Graph-capture-safe
+    /// companion to [`Self::short_conv1d_causal_step`] (same kernel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn short_conv1d_causal_step_into(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        conv_state: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let x_s = as_rocm(x)?;
+        let w_s = as_rocm(weight)?;
+        let st_s = as_rocm(conv_state)?;
+        if !x_s.device_ptr_is_valid() || !w_s.device_ptr_is_valid() || !st_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "short_conv1d_into: inputs lack valid device ptr".into(),
+            ));
+        }
+        let dims = out.shape().dims();
+        let mut channels = *dims.last().unwrap_or(&1) as i32;
+        let mut batch = (dims[..dims.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1)) as i32;
+        let mut k_size = (w_s.bytes / (channels as usize * 4)) as i32;
+        let mut out_ptr = dev_ptr(out)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut w_ptr = dev_ptr(w_s)?;
+        let mut b_ptr = match bias {
+            Some(b) => dev_ptr(as_rocm(b)?)?,
+            None => 0u64,
+        };
+        let mut st_ptr = dev_ptr(st_s)?;
+        let total = (batch * channels) as usize;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_short_conv1d_causal_step",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut w_ptr),
+                arg(&mut b_ptr),
+                arg(&mut st_ptr),
+                arg(&mut out_ptr),
+                arg(&mut batch),
+                arg(&mut channels),
+                arg(&mut k_size),
+            ],
+        )?;
+        Ok(())
+    }
+
     // ─── Phase 2: Selective Scan ──────────────────────────────────
 
     /// Launch the JIT compiled Mamba selective scan kernel (Wave64,
