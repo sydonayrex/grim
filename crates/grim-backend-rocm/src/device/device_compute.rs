@@ -892,6 +892,43 @@ impl ElementwiseOps for RocmDevice {
 }
 
 impl SamplingOps for RocmDevice {
+    /// B1 (PLAN-reduce-d2h-h2d): penalty-aware device sampling. Penalty
+    /// pre-pass + sample stay on-device (one small H2D for history ids, 4-byte
+    /// D2H for the token). `Err` (incl. `Ok(None)` from validation) → caller
+    /// falls back to the CPU sampler; never silently samples unpenalized.
+    fn sample_on_device_with_penalty(
+        &self,
+        logits: &dyn BackendStorage,
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        seed: u64,
+        repeat_penalty: f32,
+        history: &[u32],
+    ) -> Result<u32> {
+        let vocab = logits.shape().dims().last().copied().unwrap_or(0);
+        if let Ok(rocm_s) = as_rocm(logits) {
+            if let Ok(Some(token)) =
+                crate::kernels::device_sampler::sample_logits_on_device_with_penalty(
+                    self,
+                    rocm_s,
+                    vocab,
+                    temperature,
+                    top_k as i32,
+                    top_p,
+                    seed,
+                    repeat_penalty,
+                    history,
+                )
+            {
+                return Ok(token);
+            }
+        }
+        Err(Error::Backend(
+            "sample_on_device_with_penalty: device path unavailable".into(),
+        ))
+    }
+
     fn sample_on_device(
         &self,
         logits: &dyn BackendStorage,
