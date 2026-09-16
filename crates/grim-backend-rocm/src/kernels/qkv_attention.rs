@@ -1131,6 +1131,50 @@ extern "C" __global__ void grim_bump_i32(
     const int slot = blockIdx.x * blockDim.x + threadIdx.x;
     past_dev[slot] += steps;
 }
+
+// ScytheRing: write one 64-byte task descriptor into ring slot `slot_idx`
+// entirely on-device. Replaces host-pack + H2D so the enqueue is HIP-graph
+// capturable. Thread 0 writes the packed fields; the slot array is pre-zeroed
+// at alloc so status=PENDING and trailing bytes need no explicit clear.
+// Layout (native-endian, matches pack_gemm_descriptor):
+//   [0..4)  opcode  [4..8)  m  [8..12)  n  [12..16)  k
+//   [16..24) input_ptr  [24..32) weight_ptr  [32..40) output_ptr  [40..48) peer_ptr
+extern "C" __global__ void grim_scythe_write_slot(
+    unsigned char* __restrict__ slots_base,
+    unsigned int slot_idx,
+    unsigned int opcode,
+    unsigned int m,
+    unsigned int n,
+    unsigned int k,
+    unsigned long long input_ptr,
+    unsigned long long weight_ptr,
+    unsigned long long output_ptr,
+    unsigned long long peer_ptr
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        unsigned char* slot = slots_base + (unsigned long long)slot_idx * 64ull;
+        *(unsigned int*)(slot + 0)  = opcode;
+        *(unsigned int*)(slot + 4)  = m;
+        *(unsigned int*)(slot + 8)  = n;
+        *(unsigned int*)(slot + 12) = k;
+        *(unsigned long long*)(slot + 16) = input_ptr;
+        *(unsigned long long*)(slot + 24) = weight_ptr;
+        *(unsigned long long*)(slot + 32) = output_ptr;
+        *(unsigned long long*)(slot + 40) = peer_ptr;
+    }
+}
+
+// ScytheRing: publish the head counter on-device. Writes a single u32 to
+// head_dev so the persistent dispatch wave sees the new task count. On-device
+// (graph-capturable) instead of the legacy pinned-staging + H2D publish.
+extern "C" __global__ void grim_scythe_publish_head(
+    unsigned int* __restrict__ head_dev,
+    unsigned int head_value
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *head_dev = head_value;
+    }
+}
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1916,6 +1960,81 @@ pub fn launch_qkv_attention_dev_batch(
             crate::HipDim3::new(b, 1, 1),
             crate::HipDim3::new(1, 1, 1),
             &mut [arg(&mut past_ptr), arg(&mut steps_i)],
+        )
+    }
+
+    /// ScytheRing head publish — fully on-device (no pinned staging, no H2D).
+    /// Writes a single u32 head counter to head_dev. Launched as grid
+    /// (1,1,1)/block (1,1,1): thread 0 writes the value. HIP-graph capturable.
+    /// `head_dev_ptr` is the raw device address of the head scalar.
+    pub fn launch_scythe_publish_head(
+        dev: &crate::RocmDevice,
+        head_dev_ptr: u64,
+        head_value: u32,
+    ) -> Result<*mut std::ffi::c_void, crate::Error> {
+        let mut hp = head_dev_ptr;
+        let mut hv = head_value;
+        let handle = dev.launch_compute_kernel(
+            "grim_scythe_publish_head",
+            crate::HipDim3::new(1, 1, 1),
+            crate::HipDim3::new(1, 1, 1),
+            &mut [arg(&mut hp), arg(&mut hv)],
+        )?;
+        crate::device::helpers::check_hip("scythe_publish_head: sync", unsafe {
+            crate::hipStreamSynchronize(dev.active_stream())
+        })?;
+        Ok(handle)
+    }
+
+    /// ScytheRing descriptor write — fully on-device (no host pack, no H2D).
+    /// Writes one 64-byte task descriptor into ring slot `slot_idx`. Launched as
+    /// grid (1,1,1)/block (1,1,1): thread 0 packs the fields. This is HIP-graph
+    /// capturable, unlike the legacy pinned-staging + H2D path.
+    pub fn launch_scythe_write_slot(
+        dev: &crate::RocmDevice,
+        slots_base: &dyn BackendStorage,
+        slot_idx: usize,
+        opcode: u32,
+        m: u32,
+        n: u32,
+        k: u32,
+        input_ptr: u64,
+        weight_ptr: u64,
+        output_ptr: u64,
+        peer_ptr: u64,
+    ) -> Result<*mut std::ffi::c_void, crate::Error> {
+        let slots_s = slots_base
+            .as_any()
+            .downcast_ref::<crate::memory::storage::RocmStorage>()
+            .ok_or_else(|| crate::Error::Backend("scythe_write_slot: slots must be RocmStorage".into()))?;
+        let mut base_ptr = slots_s
+            .device_ptr
+            .ok_or_else(|| crate::Error::Backend("scythe_write_slot: slots have no device ptr".into()))?;
+        let mut slot = slot_idx as u32;
+        let mut op = opcode;
+        let mut mi = m;
+        let mut nn = n;
+        let mut kk = k;
+        let mut inp = input_ptr;
+        let mut wep = weight_ptr;
+        let mut outp = output_ptr;
+        let mut pep = peer_ptr;
+        dev.launch_compute_kernel(
+            "grim_scythe_write_slot",
+            crate::HipDim3::new(1, 1, 1),
+            crate::HipDim3::new(1, 1, 1),
+            &mut [
+                arg(&mut base_ptr),
+                arg(&mut slot),
+                arg(&mut op),
+                arg(&mut mi),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut inp),
+                arg(&mut wep),
+                arg(&mut outp),
+                arg(&mut pep),
+            ],
         )
     }
 
