@@ -4077,6 +4077,40 @@ mod tests {
         assert!(max_err < 1.5, "mxfp4 matrix max_err too high: {max_err}");
     }
 
+    /// A4 (PLAN-reduce-d2h-h2d): requantizing ALREADY-MXFP4 data must be a
+    /// lossless repack — identical codes and exponents. This is the license
+    /// for `build_fused_qkv_pack` to dequant→requant native-MXFP4 weights at
+    /// load: it is a layout conversion, not a quality-affecting requant.
+    #[test]
+    fn quant_mxfp4_matrix_repack_of_native_is_lossless() {
+        let k = 96usize; // multiple of 32, > 1 superblock per row
+        let rows = 3usize;
+        let seed_data: Vec<f32> = (0..rows * k).map(|i| ((i % 23) as f32 - 11.0) * 0.4).collect();
+        let (codes0, exps0) = quant_mxfp4_matrix(&seed_data, rows, k);
+
+        // Decode exactly like the kernels do: nibble order (even=low, odd=high),
+        // one E8M0 exponent per 32-element block per row.
+        let exps_per_row = k / 32;
+        let mut native = vec![0f32; rows * k];
+        for r in 0..rows {
+            for b in 0..exps_per_row {
+                let e = exps0[r * exps_per_row + b];
+                for i in 0..16 {
+                    let byte = codes0[r * (k / 2) + b * 16 + i];
+                    let k0 = r * k + b * 32 + i * 2;
+                    native[k0] = mxfp4_e2m1_to_f32(byte & 0x0F, e);
+                    native[k0 + 1] = mxfp4_e2m1_to_f32((byte >> 4) & 0x0F, e);
+                }
+            }
+        }
+        let (codes1, exps1) = quant_mxfp4_matrix(&native, rows, k);
+        assert_eq!(
+            codes0, codes1,
+            "codes must survive a quant→dequant→quant roundtrip"
+        );
+        assert_eq!(exps0, exps1, "E8M0 exponents must survive the roundtrip");
+    }
+
     #[test]
     fn roundtrip_q5k() {
         let data = vec![0u8; 176];

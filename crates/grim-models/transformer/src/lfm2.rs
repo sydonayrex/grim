@@ -11,6 +11,8 @@ use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
 use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
+use crate::shared_moe::{CharonCache, MoeExpert};
+
 /// Max KV-cache rows pre-allocated on the ROCm device for the fused MXFP4 QKV path.
 const LFM2_FUSED_KV_CACHE_LEN: usize = 4096;
 
@@ -54,7 +56,21 @@ impl ModelConfig for Lfm2Config {
 }
 
 pub enum Lfm2LayerCache {
-    ShortConv(Vec<f32>),
+    /// ShortConv state: host mirror (row-major `[t, d]`, last `l_cache-1` steps)
+    /// plus an optional device-resident ring buffer (column-major `[d, kc]`,
+    /// matching the HIP kernel contract in `short_conv1d_causal_step`).
+    ///
+    /// The device buffer is allocated once on the first decode step and updated
+    /// in-place by the kernel — no per-token H2D or host transpose. During HIP
+    /// graph capture the host mirror is NOT synced from the device (host syncs
+    /// abort capture with error 901); it is only refreshed on the non-capture
+    /// path or when the device buffer is NULL (CPU fallback).
+    ShortConv {
+        host: Vec<f32>,
+        /// Device-resident conv state ring buffer (column-major `[d, kc]`).
+        /// None on CPU or until the first ROCm decode call allocates it.
+        dev: Option<Box<Tensor>>,
+    },
     Attention {
         k: Vec<f32>,
         v: Vec<f32>,
@@ -95,7 +111,13 @@ pub enum Lfm2LayerCache {
 impl Clone for Lfm2LayerCache {
     fn clone(&self) -> Self {
         match self {
-            Self::ShortConv(st) => Self::ShortConv(st.clone()),
+            Self::ShortConv {
+                host,
+                dev,
+            } => Self::ShortConv {
+                host: host.clone(),
+                dev: dev.clone(),
+            },
             Self::Attention {
                 k, v, k_dev, v_dev, pos_base_dev, past_dev, dev_pos, ..
             } => Self::Attention {
@@ -205,6 +227,7 @@ pub struct Lfm2Block {
     pub ffn_exp_probs_b: Option<Tensor>,
     pub is_moe: bool,
     pub n_expert: usize,
+    pub charon_cache: CharonCache,
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -262,8 +285,24 @@ impl Lfm2Block {
         };
 
         let device = wq.as_ref().map(|w| w.weight.device().clone());
+        // A4 (PLAN-reduce-d2h-h2d): the fused MXFP4 QKV pack is built ONLY when
+        // the loaded Q/K/V weights are ALREADY native MXFP4. Requantizing
+        // F32/Q8_0 weights at load is a quality-affecting recompute path the
+        // plan explicitly forbids ("F32 golden path") — for those formats the
+        // fused prefill kernel stays off. `GRIM_LFM2_MXFP4_QKV=0` still
+        // force-disables the pack for native-MXFP4 checkpoints.
+        let weights_native_mxfp4 = [wq.as_ref(), wk.as_ref(), wv.as_ref()].iter().all(|w| {
+            w.map(|lin| {
+                matches!(
+                    lin.weight.dtype().storage,
+                    Storage::FloatPack(FloatPackScheme::MxFp4)
+                )
+            })
+            .unwrap_or(false)
+        });
         let (wqkv_codes, wqkv_exps, gamma_q, gamma_k) = if !is_recurrent
             && cfg.mxfp4_qkv_attention
+            && weights_native_mxfp4
             && device
                 .as_ref()
                 .map(|d| matches!(d, Device::Rocm(_)))
@@ -517,6 +556,7 @@ impl Lfm2Block {
             ffn_exp_probs_b,
             is_moe,
             n_expert: if is_moe { cfg.n_expert } else { 0 },
+            charon_cache: CharonCache::new(),
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
@@ -596,20 +636,18 @@ impl Lfm2Block {
             let l_cache = *conv_shape.last().unwrap_or(&3);
 
             if cache.is_none() {
-                *cache = Some(Lfm2LayerCache::ShortConv(vec![
-                    0.0f32;
-                    h_dim * (l_cache - 1)
-                ]));
+                *cache = Some(Lfm2LayerCache::ShortConv {
+                    host: vec![0.0f32; h_dim * (l_cache - 1)],
+                    dev: None,
+                });
             }
 
-            let state = match cache.as_mut().unwrap() {
-                Lfm2LayerCache::ShortConv(st) => st,
-                _ => {
-                    return Err(grim_core::error::Error::Session(
-                        "Mismatched ShortConv layer cache".into(),
-                    ));
-                }
+            let Lfm2LayerCache::ShortConv { host, .. } = cache.as_mut().unwrap() else {
+                return Err(grim_core::error::Error::Session(
+                    "Mismatched ShortConv layer cache".into(),
+                ));
             };
+            let host_state: &mut Vec<f32> = host;
 
             // WI-F: decode step (steps == 1) runs b·x, the depthwise causal conv and the c gate on-device (`mul` + `short_conv1d_causal_step` + `mul`), so `proj` never crosses D2H.
             // Only the new `bx` row is fetched (h_dim floats) to slide the host state mirror.
@@ -626,7 +664,7 @@ impl Lfm2Block {
                 // test (cf. `shortconv_decode_matches_prefill`).
                 let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
                     && matches!(device, Device::Rocm(_));
-                match self.shortconv_step_device(&proj, h_dim, l_cache, state, &device, decode_graph) {
+                match self.shortconv_step_device(&proj, h_dim, l_cache, host_state, &device, decode_graph) {
                     Ok(Some(y_t)) => {
                         let block_out_2d =
                             self.shortconv_out_proj.as_ref().unwrap().forward(&y_t)?;
@@ -692,14 +730,14 @@ impl Lfm2Block {
                         let w_base = d * l_cache;
                         let mut sum = conv_kernel_vec[w_base + l_cache - 1] * bx[d];
                         for k in 0..l_cache - 1 {
-                            sum += conv_kernel_vec[w_base + k] * state[k * h_dim + d];
+                            sum += conv_kernel_vec[w_base + k] * host_state[k * h_dim + d];
                         }
                         y_out[step * h_dim + d] = c[d] * sum;
-                    }
+                        }
 
-                    if l_cache > 1 {
-                        state.copy_within(h_dim.., 0);
-                        state[(l_cache - 2) * h_dim..].copy_from_slice(&bx);
+                        if l_cache > 1 {
+                        host_state.copy_within(h_dim.., 0);
+                        host_state[(l_cache - 2) * h_dim..].copy_from_slice(&bx);
                     }
                 }
 
@@ -814,7 +852,15 @@ impl Lfm2Block {
                 let k_shape = Shape::new(vec![1, steps * self.num_kv_heads, self.head_dim]);
 
                 let cache_offset = match cache {
-                    Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / kv_stride,
+                    // A5: in prefill-arena mode the host `k` mirror stays
+                    // empty — the arena row count lives in `dev_pos`.
+                    Some(Lfm2LayerCache::Attention { k, dev_pos, .. }) => {
+                        if k.is_empty() {
+                            *dev_pos
+                        } else {
+                            k.len() / kv_stride
+                        }
+                    }
                     _ => 0,
                 };
                 let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
@@ -993,6 +1039,107 @@ impl Lfm2Block {
                         steps,
                     )?;
                     (q_rot_vec, arena_total, device_attn)
+                } else if matches!(norm_x.device(), Device::Rocm(_))
+                    && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
+                {
+                    // A5 (WI-X2-PREFILL-ARENA): eager prefill/decode attention
+                    // with ZERO D2H/H2D. RoPE output stays device-resident,
+                    // K/V append into the device arenas D2D via copy_slice_into,
+                    // and attention runs through
+                    // `fused_or_scalar_attention_arena_device` (device Q). The
+                    // host `k`/`v` mirrors stay empty in this mode; `dev_pos`
+                    // tracks the arena row count so later steps derive
+                    // cache_offset without host state (see the cache_offset
+                    // selection below). Kernel failure inside
+                    // arena_device still degrades to its own host fallback.
+                    if cache.is_none() {
+                        *cache = Some(Lfm2LayerCache::Attention {
+                            k: vec![],
+                            v: vec![],
+                            k_dev: None,
+                            v_dev: None,
+                            pos_base_dev: None,
+                            past_dev: None,
+                            q_rot_dev: None,
+                            k_rot_dev: None,
+                            attn_out_dev: None,
+                            graph_attn_norm_out: None,
+                            graph_attn_out: None,
+                            graph_ffn_norm_out: None,
+                            graph_ffn_gate_up: None,
+                            graph_ffn_activated: None,
+                            graph_ffn_down: None,
+                            graph_residual: None,
+                            dev_pos: 0,
+                        });
+                    }
+                    let (past, total) = match cache.as_ref().unwrap() {
+                        Lfm2LayerCache::Attention { dev_pos, .. } => (*dev_pos, *dev_pos + steps),
+                        _ => {
+                            return Err(grim_core::error::Error::Session(
+                                "Mismatched Attention layer cache".into(),
+                            ));
+                        }
+                    };
+                    match cache.as_mut().unwrap() {
+                        Lfm2LayerCache::Attention { dev_pos, k_dev, v_dev, .. } => {
+                            if k_dev.is_none() {
+                                let shape =
+                                    Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+                                *k_dev = Some(Box::new(Tensor::new(
+                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    shape.clone(),
+                                    DType::F32,
+                                    QuantProvenance::GrimNative,
+                                    norm_x.device().clone(),
+                                )));
+                                *v_dev = Some(Box::new(Tensor::new(
+                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    shape,
+                                    DType::F32,
+                                    QuantProvenance::GrimNative,
+                                    norm_x.device().clone(),
+                                )));
+                            }
+                            let off_elems = past * kv_stride;
+                            let cnt_elems = steps * kv_stride;
+                            dev.copy_slice_into(
+                                k_dev.as_ref().unwrap().storage().as_ref(),
+                                k_rot_storage.as_ref(),
+                                off_elems,
+                                cnt_elems,
+                            )?;
+                            dev.copy_slice_into(
+                                v_dev.as_ref().unwrap().storage().as_ref(),
+                                v.storage().as_ref(),
+                                off_elems,
+                                cnt_elems,
+                            )?;
+                            *dev_pos = total;
+                        }
+                        _ => {
+                            return Err(grim_core::error::Error::Session(
+                                "Mismatched Attention layer cache".into(),
+                            ));
+                        }
+                    }
+                    let (kd, vd) = match cache.as_ref().unwrap() {
+                        Lfm2LayerCache::Attention { k_dev, v_dev, .. } => (k_dev, v_dev),
+                        _ => unreachable!("attention cache variant on rocm arena path"),
+                    };
+                    let attn = crate::shared_attention::fused_or_scalar_attention_arena_device(
+                        q_rot_storage.as_ref(),
+                        kd.as_ref().unwrap().storage().as_ref(),
+                        vd.as_ref().unwrap().storage().as_ref(),
+                        total,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        steps,
+                        None,
+                        norm_x.device(),
+                    )?;
+                    (Vec::new(), Some(total), Some(attn))
                 } else {
                     let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
                     let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
@@ -1856,16 +2003,113 @@ impl Lfm2Block {
         ))
     }
 
+    /// Build per-expert `MoeExpert` slices from LFM2's pre-stacked expert weight
+    /// tensors so they can be passed to the shared MoE dispatch.
+    ///
+    /// LFM2 stores expert weights as three flat tensors:
+    /// - `ffn_gate_exps`: `[n_expert, n_ff, hidden]`  (one `[n_ff, hidden]` gate per expert)
+    /// - `ffn_up_exps`:   `[n_expert, n_ff, hidden]`  (one `[n_ff, hidden]` up per expert)
+    /// - `ffn_down_exps`: `[n_ff, hidden, n_expert]`   (one `[n_ff, hidden]` down per expert,
+    ///   indexed by the last dim)
+    ///
+    /// Each returned `MoeExpert` owns a cloned `Linear` whose `weight` is the
+    /// per-expert 2-D slice in GGUF-native `[out_dim, in_dim]` layout
+    /// (`n_ff` → `hidden` for gate/up, `n_ff` → `hidden` for down).
+    fn make_lfm2_experts(
+        &self,
+    ) -> Result<Vec<MoeExpert>> {
+        let gate_exps = self.ffn_gate_exps.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Session("MoE gate_exps missing".into())
+        })?;
+        let up_exps = self.ffn_up_exps.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Session("MoE up_exps missing".into())
+        })?;
+        let down_exps = self.ffn_down_exps.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Session("MoE down_exps missing".into())
+        })?;
+        let n_expert = self.n_expert;
+        let n_ff = self.ffn_gate.weight.shape().dims()[0];
+        let hidden = self.ffn_gate.weight.shape().dims()[1];
+
+        let gate_flat = gate_exps.to_vec_f32()?;
+        let up_flat = up_exps.to_vec_f32()?;
+        let down_flat = down_exps.to_vec_f32()?;
+
+        let mut experts = Vec::with_capacity(n_expert);
+        for e in 0..n_expert {
+            // gate: [n_ff, hidden] at offset e*n_ff*hidden
+            let gate_w = cpu_tensor(
+                gate_flat[e * n_ff * hidden..(e + 1) * n_ff * hidden].to_vec(),
+                Shape::new(vec![n_ff, hidden]),
+            );
+            // up: [n_ff, hidden] at offset e*n_ff*hidden
+            let up_w = cpu_tensor(
+                up_flat[e * n_ff * hidden..(e + 1) * n_ff * hidden].to_vec(),
+                Shape::new(vec![n_ff, hidden]),
+            );
+            // down: [n_ff, hidden] — down_exps is [n_ff, hidden, n_expert],
+            // so expert e's slab starts at e * n_ff * hidden.
+            let down_w = cpu_tensor(
+                down_flat[e * n_ff * hidden..(e + 1) * n_ff * hidden].to_vec(),
+                Shape::new(vec![n_ff, hidden]),
+            );
+            experts.push(MoeExpert {
+                gate: Linear::from_tensor(gate_w, None),
+                up: Linear::from_tensor(up_w, None),
+                down: Linear::from_tensor(down_w, None),
+            });
+        }
+        Ok(experts)
+    }
+
     /// Top-1 routed MoE feed-forward.
-    /// Matches llama.cpp's `build_moe_ffn` gate/probs semantics with silu-gated experts.
+    ///
+    /// ROCm path (WI-X4): gate projection stays device-resident; routing is
+    /// computed on-device via `fused_moe_dispatch_from_logits` (Charon grouped
+    /// dispatch). The old path (`forward_moe_ffn_device`) round-tripped the
+    /// full expert stacks per forward and did ~10 kernel launches per token.
+    /// The new path keeps the gate logits device-resident and routes through
+    /// Charon's resident-weight cache (`self.charon_cache`).
+    ///
+    /// Fallback: when not on ROCm, or when `GRIM_MOE_CHARON=0`, or when the
+    /// kernel is unavailable, the legacy per-expert host loop runs so parity
+    /// is preserved. Non-MoE blocks never reach here (guarded by `self.is_moe`).
     fn forward_moe_ffn(&self, x: &Tensor) -> Result<Tensor> {
         let hidden = x.shape().dims().last().copied().unwrap_or(0);
         let steps = x.shape().dims()[0];
         let n_expert = self.n_expert;
-        let n_ff = self.ffn_gate.weight.shape().dims()[0];
 
         let gate_logits = self.ffn_gate_inp.as_ref().unwrap().forward(x)?;
+
+        // ROCm D2D path: routing on-device, expert weights cached in Charon.
+        if let Device::Rocm(_) = x.device() {
+            let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+            // Verify the backend can allocate (guards against missing primitives).
+            if dev.zeros(&Shape::new(vec![1]), DType::F32).is_ok() {
+                if let Ok(Some(experts)) = self.make_lfm2_experts().map(Some) {
+                    let routed = crate::shared_moe::fused_moe_dispatch_from_logits(
+                        dev.as_ref(),
+                        x,
+                        &gate_logits,
+                        &experts,
+                        None, // LFM2 has no shared expert
+                        1,    // top_k: LFM2 is top-1 (n_expert_used defaults to 1)
+                        1.0,  // routed_scaling_factor: no dedup gating in LFM2
+                        0,    // route_mode: softmax
+                        &self.charon_cache,
+                    )?;
+                    if let Some(t) = routed {
+                        return Ok(t);
+                    }
+                    // Charon path returned None (unavailable kernel); fall through
+                    // to the legacy host loop below.
+                }
+            }
+        }
+
+        // Legacy host-routing + per-expert loop (CPU reference + fallback).
         let gate_vec = gate_logits.to_vec_f32()?;
+        let n_ff = self.ffn_gate.weight.shape().dims()[0];
 
         let gate_vec = if let Some(bias) = &self.ffn_exp_probs_b {
             let bias_vec = bias.to_vec_f32()?;
@@ -1966,6 +2210,10 @@ type FusedQkvPack = (
     Option<Tensor>,
 );
 
+/// A4: callers gate this on native-MXFP4 Q/K/V weights. For those inputs the
+/// dequant→`quant_mxfp4_matrix` roundtrip below is a lossless repack (E2M1
+/// codes decode exactly and requantize to identical codes/exponents) — it is
+/// a layout conversion, not a quality-affecting requant of a denser format.
 fn build_fused_qkv_pack(
     wq: &Linear,
     wk: &Linear,
@@ -2318,6 +2566,7 @@ mod audit_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            charon_cache: CharonCache::new(),
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 8,
@@ -2372,6 +2621,7 @@ mod audit_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            charon_cache: CharonCache::new(),
             shortconv_in_proj: Some(Linear::from_tensor(
                 grim_backend_cpu::cpu_tensor(
                     vec![0.0f32; 192],
@@ -2484,6 +2734,7 @@ mod shortconv_numeric_reference_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            charon_cache: CharonCache::new(),
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: hidden,
@@ -2615,11 +2866,11 @@ mod shortconv_numeric_reference_tests {
         // Causality gate: the cache must have advanced so a FOLLOW-UP call
         // sees the last two steps' bx values (state ring = last l_cache−1).
         match &cache {
-            Some(Lfm2LayerCache::ShortConv(st)) => {
+            Some(Lfm2LayerCache::ShortConv { host, .. }) => {
                 // After 3 steps with l_cache=3, the ring holds the LAST two
                 // steps' bx vectors — both must be non-zero.
                 assert!(
-                    st.iter().any(|&v| v != 0.0),
+                    host.iter().any(|&v| v != 0.0),
                     "shortconv cache must hold shifted bx history"
                 );
             }
@@ -2710,6 +2961,7 @@ mod shortconv_device_decode_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            charon_cache: CharonCache::new(),
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: hidden,
