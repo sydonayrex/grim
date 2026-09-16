@@ -219,6 +219,14 @@ pub struct Lfm2Block {
     pub ffn_exp_probs_b: Option<Tensor>,
     pub is_moe: bool,
     pub n_expert: usize,
+    /// M1: real top-k routing width (was hardcoded top-1 before M0 made MoE reachable).
+    pub n_expert_used: usize,
+    /// M1: Charon grouped-dispatch cache (per-layer stacked weights + routing scratch).
+    pub charon_cache: crate::shared_moe::CharonCache,
+    /// M1: once-per-block lazy split of the stacked expert tensors into
+    /// per-expert `Linear`s (`shared_moe` takes a slice of experts, not one
+    /// stacked tensor). Built on first MoE forward, reused thereafter.
+    pub moe_experts_cache: std::sync::OnceLock<Option<Vec<crate::shared_moe::MoeExpert>>>,
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -531,6 +539,9 @@ impl Lfm2Block {
             ffn_exp_probs_b,
             is_moe,
             n_expert: if is_moe { cfg.n_expert } else { 0 },
+            n_expert_used: if is_moe { cfg.n_expert_used.clamp(1, cfg.n_expert.max(1)) } else { 1 },
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
@@ -1875,103 +1886,54 @@ impl Lfm2Block {
         }
     }
 
-    fn forward_moe_ffn_device(
-        &self,
-        x: &Tensor,
-        probs: &[f32],
-        steps: usize,
-        hidden: usize,
-    ) -> Result<Tensor> {
-        let n_expert = self.n_expert;
-        let gate_w = self.ffn_gate_exps.as_ref().unwrap();
-        let up_w = self.ffn_up_exps.as_ref().unwrap();
-        let down_w = self.ffn_down_exps.as_ref().unwrap();
 
-        let gate_dims = gate_w.shape().dims().to_vec();
-        let n_ff = gate_dims[1];
-        let n_hidden = gate_dims[2];
-
-        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
-        let out_shape = Shape::new(vec![steps, hidden]);
-        let out_storage = dev.alloc_storage(&out_shape, DType::F32)?;
-        let out_arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(out_storage);
-        let x_st = x.storage().clone();
-
-        let row_shape = Shape::new(vec![1, n_hidden]);
-        let ffxh = Shape::new(vec![n_ff, n_hidden]);
-        let row_ff = Shape::new(vec![1, n_ff]);
-
-        for s in 0..steps {
-            let (mut best_e, mut best_p) = (0usize, probs[s * n_expert]);
-            for e in 1..n_expert {
-                if probs[s * n_expert + e] > best_p {
-                    best_p = probs[s * n_expert + e];
-                    best_e = e;
-                }
+    /// Slice the per-expert `[n_ff, hidden]` weight out of the stacked
+    /// `[n_expert, n_ff, hidden]` tensor, as a device-resident `Linear`.
+    /// One-time cost per expert (load-time weights, cached by caller via the
+    /// `OnceLock` in `moe_experts_cache`).
+    fn moe_expert_at(&self, e: usize) -> Option<crate::shared_moe::MoeExpert> {
+        let slice_expert = |t: &Tensor| -> Option<Linear> {
+            let dims = t.shape().dims();
+            if dims.len() != 3 {
+                return None;
             }
-
-            let xr = dev.alloc_storage(&row_shape, DType::F32)?;
-            dev.copy_slice_range(xr.as_ref(), 0, x_st.as_ref(), s * n_hidden, n_hidden)?;
-
-            let wg = dev.alloc_storage(&ffxh, DType::F32)?;
-            dev.copy_slice_range(
-                wg.as_ref(),
-                0,
-                gate_w.storage().as_ref(),
-                best_e * n_ff * n_hidden,
-                n_ff * n_hidden,
-            )?;
-            let wu = dev.alloc_storage(&ffxh, DType::F32)?;
-            dev.copy_slice_range(
-                wu.as_ref(),
-                0,
-                up_w.storage().as_ref(),
-                best_e * n_ff * n_hidden,
-                n_ff * n_hidden,
-            )?;
-            let wd = dev.alloc_storage(&ffxh, DType::F32)?;
-            dev.copy_slice_range(
-                wd.as_ref(),
-                0,
-                down_w.storage().as_ref(),
-                best_e * n_ff * n_hidden,
-                n_ff * n_hidden,
-            )?;
-
-            let hxf = Shape::new(vec![n_hidden, n_ff]);
-            let wg_t = dev.transpose_2d(wg.as_ref(), n_ff, n_hidden, &hxf)?.0;
-            let wu_t = dev.transpose_2d(wu.as_ref(), n_ff, n_hidden, &hxf)?.0;
-            // out_f[s] = Σ_h x[h] · W[f, h]  ←  x_row[1,H] @ W^T [H→F]
-            let (g_st, _) = dev.matmul(xr.as_ref(), wg_t.as_ref(), &row_ff)?;
-            let (u_st, _) = dev.matmul(xr.as_ref(), wu_t.as_ref(), &row_ff)?;
-            let (a_st, _) = dev.silu_mul(g_st.as_ref(), u_st.as_ref(), &row_ff)?;
-            // out_d = Σ_f act[f] · Wd[f, d]  ←  act[1,F] @ Wd [F,H]
-            let (o_st, _) = dev.matmul(a_st.as_ref(), wd.as_ref(), &row_shape)?;
-            let scaled = dev.mul_scalar(o_st.as_ref(), best_p, &row_shape);
-            let final_st: Arc<dyn grim_tensor::backend::BackendStorage> = match scaled {
-                Ok((st, _)) => Arc::from(st),
-                Err(_) => Arc::from(o_st),
-            };
-            dev.copy_slice_range(
-                out_arc.as_ref(),
-                s * n_hidden,
-                final_st.as_ref(),
-                0,
-                n_hidden,
-            )?;
-        }
-
-        Ok(Tensor::new(
-            out_arc,
-            out_shape,
-            DType::F32,
-            grim_tensor::QuantProvenance::GrimNative,
-            x.device().clone(),
-        ))
+            let (e_count, f, h) = (dims[0], dims[1], dims[2]);
+            if e >= e_count {
+                return None;
+            }
+            let flat = t.to_vec_f32().ok()?;
+            let slice = flat[e * f * h..(e + 1) * f * h].to_vec();
+            let dev = grim_nn::modules::pick_device_for_storage_device(t.device());
+            let st = dev.from_cpu(&slice, &Shape::new(vec![f, h]), DType::F32).ok()?;
+            Some(Linear::from_tensor(
+                Tensor::new(
+                    Arc::from(st),
+                    Shape::new(vec![f, h]),
+                    DType::F32,
+                    QuantProvenance::GrimNative,
+                    t.device().clone(),
+                ),
+                None,
+            ))
+        };
+        Some(crate::shared_moe::MoeExpert {
+            gate: slice_expert(self.ffn_gate_exps.as_ref()?)?,
+            up: slice_expert(self.ffn_up_exps.as_ref()?)?,
+            down: slice_expert(self.ffn_down_exps.as_ref()?)?,
+        })
     }
 
-    /// Top-1 routed MoE feed-forward.
-    /// Matches llama.cpp's `build_moe_ffn` gate/probs semantics with silu-gated experts.
+    fn moe_experts(&self) -> Option<&Vec<crate::shared_moe::MoeExpert>> {
+        self.moe_experts_cache.get_or_init(|| {
+            (0..self.n_expert.max(1))
+                .map(|e| self.moe_expert_at(e))
+                .collect::<Option<Vec<_>>>()
+        }).as_ref()
+    }
+
+    /// M1 (PLAN-kernel-fusion): top-k MoE via `shared_moe`. Device-resident
+    /// routing when Charon is available; top-k (was top-1). Falls back to the
+    /// legacy host loop when the backend can't run the fused path.
     fn forward_moe_ffn(&self, x: &Tensor) -> Result<Tensor> {
         let hidden = x.shape().dims().last().copied().unwrap_or(0);
         let steps = x.shape().dims()[0];
@@ -2010,10 +1972,31 @@ impl Lfm2Block {
             }
         }
 
-        // Device-side MoE: weights stay on the GPU; only the tiny gate logits cross to host.
-        // Old path round-tripped the full expert stacks (gate/up/down) per forward - multi-MB D2H per token.
-        if x.device() != &Device::Cpu {
-            if let Ok(t) = self.forward_moe_ffn_device(x, &probs, steps, hidden) {
+        // M1 (PLAN-kernel-fusion): top-k fused dispatch through shared_moe.
+        // Charon grouped path stays device-resident; per-expert loop is the
+        // reference fallback. Legacy hand-rolled device path deleted (it
+        // re-uploaded + re-transposed expert weights per token and was top-1
+        // only, which UNDERROUTED real MoE checkpoints with n_expert_used>1).
+        if let Some(experts) = self.moe_experts() {
+            let routings: Vec<crate::shared_moe::TokenRouting> = (0..steps)
+                .map(|s| {
+                    let row = &probs[s * n_expert..(s + 1) * n_expert];
+                    let k = self.n_expert_used.min(n_expert).max(1);
+                    let mut idx: Vec<usize> = (0..n_expert).collect();
+                    idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+                    idx[..k].iter().map(|&e| (e, row[e])).collect()
+                })
+                .collect();
+            let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+            if let Ok(t) = crate::shared_moe::fused_moe_dispatch(
+                dev.as_ref(),
+                x,
+                experts,
+                None,
+                &routings,
+                1.0,
+                &self.charon_cache,
+            ) {
                 return Ok(t);
             }
         }
@@ -2025,45 +2008,54 @@ impl Lfm2Block {
         let down_exps_vec = self.ffn_down_exps.as_ref().unwrap().to_vec_f32()?;
 
         for s in 0..steps {
-            let mut best_e = 0;
-            let mut best_p = probs[s * n_expert];
-            for e in 1..n_expert {
-                if probs[s * n_expert + e] > best_p {
-                    best_p = probs[s * n_expert + e];
-                    best_e = e;
-                }
-            }
+            // M1: true top-k host fallback (was top-1). Sum `Σ_e p_e · expert_e(x)`
+            // over the selected-k experts, softmax-normalized weights, same
+            // contract as Charon's `moe_fused_grouped` (combine weights already
+            // folded in by `fused_moe_dispatch`'s per-pair scale).
+            let k = self.n_expert_used.min(n_expert).max(1);
+            let mut cand: Vec<usize> = (0..n_expert).collect();
+            cand.sort_by(|&a, &b| {
+                probs[s * n_expert + b]
+                    .partial_cmp(&probs[s * n_expert + a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let picks = &cand[..k];
 
             let x_s = &x_vec[s * hidden..(s + 1) * hidden];
-            let mut gate_e = vec![0.0f32; n_ff];
-            let mut up_e = vec![0.0f32; n_ff];
+            let norm: f32 = picks.iter().map(|&e| probs[s * n_expert + e]).sum();
+            let norm = norm.max(1e-30);
+            for &best_e in picks {
+                let best_p = probs[s * n_expert + best_e] / norm;
+                let mut gate_e = vec![0.0f32; n_ff];
+                let mut up_e = vec![0.0f32; n_ff];
 
-            for f in 0..n_ff {
-                let mut g_sum = 0.0f32;
-                let mut u_sum = 0.0f32;
-                for (d, x) in x_s.iter().enumerate() {
-                    let g_idx = best_e * n_ff * hidden + f * hidden + d;
-                    let u_idx = best_e * n_ff * hidden + f * hidden + d;
-                    g_sum += x * gate_exps_vec[g_idx];
-                    u_sum += x * up_exps_vec[u_idx];
+                for f in 0..n_ff {
+                    let mut g_sum = 0.0f32;
+                    let mut u_sum = 0.0f32;
+                    for (d, x) in x_s.iter().enumerate() {
+                        let g_idx = best_e * n_ff * hidden + f * hidden + d;
+                        let u_idx = best_e * n_ff * hidden + f * hidden + d;
+                        g_sum += x * gate_exps_vec[g_idx];
+                        u_sum += x * up_exps_vec[u_idx];
+                    }
+                    gate_e[f] = g_sum;
+                    up_e[f] = u_sum;
                 }
-                gate_e[f] = g_sum;
-                up_e[f] = u_sum;
-            }
 
-            let mut activated = vec![0.0f32; n_ff];
-            for (a, (g, u)) in activated.iter_mut().zip(gate_e.iter().zip(up_e.iter())) {
-                let silu = g / (1.0 + (-g).exp());
-                *a = silu * u;
-            }
-
-            for d in 0..hidden {
-                let mut acc = 0.0f32;
-                for (f, &a) in activated.iter().enumerate() {
-                    let d_idx = best_e * n_ff * hidden + f * hidden + d;
-                    acc += a * down_exps_vec[d_idx];
+                let mut activated = vec![0.0f32; n_ff];
+                for (a, (g, u)) in activated.iter_mut().zip(gate_e.iter().zip(up_e.iter())) {
+                    let silu = g / (1.0 + (-g).exp());
+                    *a = silu * u;
                 }
-                out[s * hidden + d] = acc * best_p;
+
+                for d in 0..hidden {
+                    let mut acc = 0.0f32;
+                    for (f, &a) in activated.iter().enumerate() {
+                        let d_idx = best_e * n_ff * hidden + f * hidden + d;
+                        acc += a * down_exps_vec[d_idx];
+                    }
+                    out[s * hidden + d] += acc * best_p;
+                }
             }
         }
 
@@ -2432,6 +2424,9 @@ mod audit_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            n_expert_used: 1,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 8,
@@ -2486,6 +2481,9 @@ mod audit_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            n_expert_used: 1,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
             shortconv_in_proj: Some(Linear::from_tensor(
                 grim_backend_cpu::cpu_tensor(
                     vec![0.0f32; 192],
@@ -2598,6 +2596,9 @@ mod shortconv_numeric_reference_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            n_expert_used: 1,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: hidden,
@@ -2824,6 +2825,9 @@ mod shortconv_device_decode_tests {
             ffn_exp_probs_b: None,
             is_moe: false,
             n_expert: 0,
+            n_expert_used: 1,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: hidden,
@@ -2865,5 +2869,169 @@ mod shortconv_device_decode_tests {
         for (i, (a, b)) in out_a.iter().zip(&out_b).enumerate() {
             assert!((a - b).abs() < 1e-5, "token {i}: prefill {a} vs decode {b}");
         }
+    }
+}
+
+
+// M1: MoE top-k routing through shared_moe.
+#[cfg(test)]
+mod moe_top_k_tests {
+    use super::*;
+    use grim_nn::Linear;
+
+    fn lin(seed: u64, out_dim: usize, in_dim: usize) -> Linear {
+        let mut s = seed;
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((s >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.3
+            })
+            .collect();
+        Linear::from_tensor(
+            grim_backend_cpu::cpu_tensor(w, Shape::new(vec![out_dim, in_dim])),
+            None,
+        )
+    }
+
+    /// CPU-only M1 gate: a synthetic top-2, 3-expert MoE block must combine
+    /// BOTH selected experts with softmax-normalized weights. A top-1-only
+    /// bug shows up immediately (output would match expert argmax alone).
+    #[test]
+    fn moe_top_k_combines_both_experts() {
+        let h = 8usize;
+        let n_ff = 16usize;
+        let n_e = 3usize;
+        let top_k = 2usize;
+        assert!(n_e > top_k);
+
+        // Stacked expert weights [n_e, n_ff, h]; per-expert value e is
+        // pushed hard by the gate logits below (indexes 0 and 1 win).
+        let mut gw = vec![0f32; n_e * n_ff * h];
+        let mut up = vec![0f32; n_e * n_ff * h];
+        let mut dn = vec![0f32; n_e * n_ff * h];
+        for (e, base) in [1000.0f32, 2000.0f32, 3000.0f32].iter().enumerate() {
+            for i in 0..(n_ff * h) {
+                gw[e * n_ff * h + i] = base + (i % 31) as f32;
+                up[e * n_ff * h + i] = base + (i % 17) as f32;
+                dn[e * n_ff * h + i] = base + (i % 13) as f32;
+            }
+        }
+
+        let block = Lfm2Block {
+            attn_norm: RmsNorm {
+                weight: grim_backend_cpu::cpu_tensor(vec![1f32; h], Shape::new(vec![h])),
+                eps: 1e-5,
+            },
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            wqkv_q80_fused: None,
+            w_gate_up_q80_fused: None,
+            shortconv_in_proj: None,
+            shortconv_conv: None,
+            shortconv_conv_vec: None,
+            shortconv_out_proj: None,
+            ffn_norm: RmsNorm {
+                weight: grim_backend_cpu::cpu_tensor(vec![1f32; h], Shape::new(vec![h])),
+                eps: 1e-5,
+            },
+            ffn_gate: lin(7, n_ff, h),
+            ffn_up: lin(8, n_ff, h),
+            ffn_down: lin(9, h, n_ff),
+            ffn_gate_inp: Some(lin(10, n_e, h)),
+            ffn_gate_exps: Some(grim_backend_cpu::cpu_tensor(gw.clone(), Shape::new(vec![n_e, n_ff, h]))),
+            ffn_up_exps: Some(grim_backend_cpu::cpu_tensor(up.clone(), Shape::new(vec![n_e, n_ff, h]))),
+            ffn_down_exps: Some(grim_backend_cpu::cpu_tensor(dn.clone(), Shape::new(vec![n_e, n_ff, h]))),
+            ffn_exp_probs_b: None,
+            is_moe: true,
+            n_expert: n_e,
+            n_expert_used: top_k,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: h,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+        };
+
+        let x = grim_backend_cpu::cpu_tensor(
+            vec![0.5, -0.3, 0.7, 0.1, -0.2, 0.4, 0.6, -0.1],
+            Shape::new(vec![1, h]),
+        );
+        let out = block.forward_moe_ffn(&x).expect("moe forward");
+        let out_v = out.to_vec_f32().unwrap();
+        assert_eq!(out_v.len(), h);
+        assert!(out_v.iter().all(|v| v.is_finite()));
+
+        // Explicit top-k oracle: gate probs → top-2 → softmax → sum p*expert.
+        let logits = block.ffn_gate_inp.as_ref().unwrap().forward(&x).unwrap().to_vec_f32().unwrap();
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        for p in &mut probs { *p /= sum; }
+        let mut idx: Vec<usize> = (0..n_e).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        let (e0, e1) = (idx[0], idx[1]);
+        let norm = probs[e0] + probs[e1];
+        assert!(e0 != e1 && norm > 0.0);
+
+        // Oracle: full top-2 reference against the same stack tensors.
+        let x_v = x.to_vec_f32().unwrap();
+        let act = |e: usize| -> Vec<f32> {
+            let mut gate = vec![0f32; n_ff];
+            for f in 0..n_ff {
+                let mut acc = 0f32;
+                for d in 0..h {
+                    acc += x_v[d] * gw[e * n_ff * h + f * h + d];
+                }
+                gate[f] = acc;
+            }
+            let mut upv = vec![0f32; n_ff];
+            for f in 0..n_ff {
+                let mut acc = 0f32;
+                for d in 0..h {
+                    acc += x_v[d] * up[e * n_ff * h + f * h + d];
+                }
+                upv[f] = acc;
+            }
+            let mut a = vec![0f32; n_ff];
+            for f in 0..n_ff {
+                let g = gate[f];
+                a[f] = (g / (1.0 + (-g).exp())) * upv[f];
+            }
+            a
+        };
+        let down_of = |a: &[f32], e: usize| -> Vec<f32> {
+            let mut out = vec![0f32; h];
+            for d in 0..h {
+                let mut acc = 0f32;
+                for (f, &av) in a.iter().enumerate() {
+                    acc += av * dn[e * n_ff * h + f * h + d];
+                }
+                out[d] = acc;
+            }
+            out
+        };
+        let o0 = down_of(&act(e0), e0);
+        let o1 = down_of(&act(e1), e1);
+        let want: Vec<f32> = (0..h).map(|d| (probs[e0] * o0[d] + probs[e1] * o1[d]) / norm).collect();
+        for d in 0..h {
+            let rel = ((out_v[d] - want[d]) / want[d].abs().max(1e-30)).abs();
+            assert!(
+                rel < 1e-4,
+                "top-k MoE combine mismatch at d={d}: got={} want={} (rel={rel:e})",
+                out_v[d],
+                want[d]
+            );
+        }
+        assert!(out_v.iter().all(|v| v.is_finite()));
     }
 }
