@@ -38,6 +38,21 @@ use grim_tensor::{Device, TensorProvider, YaRNParams};
 use serde::Deserialize;
 use std::path::Path;
 
+/// PLAN-reduce-d2h-h2d A4: load-time decision for the LFM2 fused MXFP4 QKV
+/// attention path. Default-on for the LFM2 family (the fused pack is built by
+/// quantizing the loaded weights at load time, so there is no separate
+/// "already-MXFP4" weight layout to detect — the win applies whenever the
+/// device is ROCm and the pack builds); escape hatch
+/// `GRIM_LFM2_MXFP4_QKV=0/false/off`. The `Lfm2Config` struct default stays
+/// `false` (F32 golden reference); only the loader opts in. The fused path
+/// additionally requires a ROCm device at `Lfm2::load` time (`lfm2.rs`), so
+/// CPU loads are unaffected by this flag.
+pub(crate) fn lfm2_mxfp4_qkv_enabled() -> bool {
+    std::env::var("GRIM_LFM2_MXFP4_QKV")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+        .unwrap_or(true)
+}
+
 /// Resolve this process's tensor-parallel config from `GRIM_TP_*` and validate the `(rank, world_size)` contract.
 /// Returns the default `{rank:0, world_size:1}` when `GRIM_TP_SIZE` is unset or `1` (single-device).
 fn resolve_tp_config() -> Result<TensorParallelConfig> {
@@ -1292,14 +1307,8 @@ fn load_model_from_config(
                 n_swa: 0,
                 swa_type: 0,
                 n_embd_out: 0,
-                // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (escape hatch: GRIM_LFM2_MXFP4_QKV=0/false/off)
-                mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
-                    .map(|v| {
-                        v != "0"
-                            && !v.eq_ignore_ascii_case("false")
-                            && !v.eq_ignore_ascii_case("off")
-                    })
-                    .unwrap_or(true),
+                // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (see `lfm2_mxfp4_qkv_enabled`).
+                mxfp4_qkv_attention: lfm2_mxfp4_qkv_enabled(),
             };
 
             let m = Lfm2::load_tp(&ws, cfg, tp)?;
@@ -3050,14 +3059,8 @@ fn load_model_with_providers(
                 n_swa: 0,
                 swa_type: 0,
                 n_embd_out: 0,
-                // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (escape hatch: GRIM_LFM2_MXFP4_QKV=0/false/off)
-                mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
-                    .map(|v| {
-                        v != "0"
-                            && !v.eq_ignore_ascii_case("false")
-                            && !v.eq_ignore_ascii_case("off")
-                    })
-                    .unwrap_or(true),
+                // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (see `lfm2_mxfp4_qkv_enabled`).
+                mxfp4_qkv_attention: lfm2_mxfp4_qkv_enabled(),
             };
             let m = Lfm2::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
@@ -4519,6 +4522,36 @@ pub fn load_diffusion_model_from_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLAN-reduce-d2h-h2d A4: load-time MXFP4 decision is default-on with an
+    /// opt-out escape hatch. No other test in this binary touches this var,
+    /// so save/set/restore here is race-free in practice.
+    #[test]
+    fn lfm2_mxfp4_qkv_load_decision() {
+        fn with_var(v: Option<&str>, f: impl FnOnce()) {
+            let prev = std::env::var("GRIM_LFM2_MXFP4_QKV").ok();
+            unsafe {
+                match v {
+                    Some(s) => std::env::set_var("GRIM_LFM2_MXFP4_QKV", s),
+                    None => std::env::remove_var("GRIM_LFM2_MXFP4_QKV"),
+                }
+            }
+            f();
+            unsafe {
+                match prev {
+                    Some(s) => std::env::set_var("GRIM_LFM2_MXFP4_QKV", s),
+                    None => std::env::remove_var("GRIM_LFM2_MXFP4_QKV"),
+                }
+            }
+        }
+        with_var(None, || assert!(lfm2_mxfp4_qkv_enabled()));
+        for v in ["0", "false", "off", "False", "OFF", "FALSE"] {
+            with_var(Some(v), || assert!(!lfm2_mxfp4_qkv_enabled(), "{v} must disable"));
+        }
+        for v in ["1", "true", "on", ""] {
+            with_var(Some(v), || assert!(lfm2_mxfp4_qkv_enabled(), "{v} must keep enabled"));
+        }
+    }
 
     #[test]
     fn load_from_path_picks_grim_extension() {
