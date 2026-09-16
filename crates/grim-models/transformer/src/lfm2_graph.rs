@@ -487,13 +487,47 @@ impl Lfm2Block {
         let hidden = normed.shape().dims().last().copied().unwrap_or(0);
         let act = &buffers.act_q81_buf[layer_idx];
         let norm_rocm = dst_downcast(normed)?;
-        // Fused Q8_0 dot4 path: ONE quant + ONE fused GEMV replaces 3
-        // separate GEMVs. Works for any batch size — the quantize kernel
-        // quantizes the full [batch, hidden] activation in one launch, and
-        // the fused dot4 GEMV reads from the same [batch, hidden] activation
-        // and writes to the per-layer fused_qkv_out slot at [batch, n_q+2*n_kv].
-        // The per-token (m=1) hardcode is removed; m = buffers.batch.
-        if let Some(fused) = self
+        let batch = buffers.batch.max(1);
+
+        // MXFP4 fused path (closes the decode-graph quant gap): ONE kernel
+        // does projection + QK-norm + RoPE + K/V append from native MXFP4
+        // codes. positions = `pos_dev` (u32 per batch slot) — the same source
+        // the kv-append/bump nodes use, so appended rows and the attention
+        // read offset stay consistent. The attention + bump tail below is
+        // shared with the other paths. In this branch the QK-norm/RoPE/append
+        // nodes are skipped (the fused kernel does them internally).
+        if let (Some(codes), Some(exps)) = (&self.wqkv_codes, &self.wqkv_exps) {
+            let gamma_q = self.gamma_q.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("mxfp4 fused qkv: missing gamma_q".into())
+            })?;
+            let gamma_k = self.gamma_k.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("mxfp4 fused qkv: missing gamma_k".into())
+            })?;
+            dev.fused_mxfp4_gemm_qk_norm_rope_kv(
+                normed,
+                gamma_q.storage().as_ref(),
+                gamma_k.storage().as_ref(),
+                codes.storage().as_ref(),
+                exps.storage().as_ref(),
+                Some(&buffers.q_buf[layer_idx]),
+                Some(&buffers.k_arena[layer_idx]),
+                Some(&buffers.v_arena[layer_idx]),
+                None,
+                Some(&buffers.pos_dev),
+                batch,
+                hidden,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.head_dim, // rotary_dim
+                self.rope_theta,
+                None,
+                1.0, // mscale
+                self.eps,
+                buffers.max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused mxfp4 qkv: {e}")))?;
+        } else if let Some(fused) = self
             .wqkv_q80_fused
             .as_ref()
             .filter(|_| dot_fused_ok(dev, hidden) && self.head_dim != 0)
@@ -537,7 +571,8 @@ impl Lfm2Block {
         }
 
         // 3-6. QK-norm + RoPE + append + attend + bump (real nodes).
-        self.attention_forward_graph(layer_idx, buffers, dev)?;
+        let mxfp4_fused = self.wqkv_codes.is_some() && self.wqkv_exps.is_some();
+        self.attention_forward_graph(layer_idx, buffers, dev, mxfp4_fused)?;
 
         // 7. O projection into staging, then residual add -> layer_output.
         //    norm_buf is free (step 1 consumed); stream order keeps it sound.
@@ -657,6 +692,7 @@ impl Lfm2Block {
         layer_idx: usize,
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
+        skip_norm_rope_append: bool,
     ) -> Result<()> {
         check_layer_topology(buffers, layer_idx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
@@ -671,6 +707,10 @@ impl Lfm2Block {
         let kv_stride = nkv * hd;
         let arena_slot_stride = buffers.max_ctx * kv_stride;
 
+        if skip_norm_rope_append {
+            // MXFP4 fused branch: QK-norm + RoPE + K/V append already done
+            // inside the single fused kernel — skip to attention + bump.
+        } else {
         // QK-norm IN PLACE (row-wise over [batch * heads, hd] slots; flat
         // counts match [batch, n]). Safe: each row is normalized independently.
         if let (Some(qn), Some(kn)) = (self.attn_q_norm.as_ref(), self.attn_k_norm.as_ref()) {
@@ -751,6 +791,7 @@ impl Lfm2Block {
             arena_slot_stride,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+        }
 
         // Attention writes DIRECTLY into pool slots: output, online-softmax
         // partials, and the shared read-only dummy. Zero allocs in capture.
