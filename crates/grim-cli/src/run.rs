@@ -130,6 +130,40 @@ fn try_graph_decode_step(
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
 
     if allow_gpu_sample {
+        // G1: launch the sampler on `g.stream` (the replay stream) so it is
+        // stream-ordered AFTER `hipGraphLaunch`. Ambient `active_stream()`
+        // would order only by today's implicit pool-0 == default_stream
+        // coincidence — a future split of graph/sampler streams would
+        // silently race. On miss (kernel not yet pre-resolved), sync the
+        // graph stream once and take the ambient path (one-time cost).
+        if let Device::Rocm(ordinal) = device {
+            let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+            let stream = g.stream;
+            let gate = sampling_params;
+            match grim_backend_rocm::sample_logits_on_device_with_penalty_at_stream(
+                &dev,
+                g.logits_device_storage(),
+                vocab,
+                gate.temperature,
+                gate.top_k as i32,
+                gate.top_p,
+                (seed & 0xffff_ffff) | ((step as u64) << 32),
+                step as u32,
+                gate.repeat_penalty,
+                history,
+                stream,
+            ) {
+                Ok(Some(tok)) => return Some(GraphDecodeResult::Sampled(tok)),
+                Ok(None) => {}
+                Err(_) => {
+                    // Order ambient sampler (active_stream) after the replayed
+                    // graph: one-time blocking sync (only on kernel-miss).
+                    let _ = unsafe {
+                        grim_backend_rocm::hipStreamSynchronize(stream)
+                    };
+                }
+            }
+        }
         if let Ok(tok) = sample_storage_on_rocm(device, g.logits_device_storage(), sampling_params, seed, step, history) {
             return Some(GraphDecodeResult::Sampled(tok));
         }

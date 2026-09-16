@@ -283,6 +283,7 @@ fn sample_impl(
     top_p: f32,
     seed: u32,
     position: u32,
+    explicit_stream: Option<*mut c_void>,
 ) -> Result<u32> {
     let mut buf_guard = match device.sampler_out_buf.lock() {
         Ok(g) => g,
@@ -315,22 +316,73 @@ fn sample_impl(
     // async copy lands in the right HIP context on multi-GPU boxes.
     let _dev_guard = DeviceGuard::set(device.ordinal as i32);
 
-    // Single block over a single logits row.
-    let stream = device.launch_compute_kernel(
-        "grim_sample_logits_stochastic",
-        HipDim3::new(1, 1, 1),
-        HipDim3::new(SAMPLER_BLOCK, 1, 1),
-        &mut [
-            arg(&mut logits_arg),
-            arg(&mut out_arg),
-            arg(&mut vocab_i),
-            arg(&mut temp),
-            arg(&mut topk),
-            arg(&mut topp),
-            arg(&mut seed_u),
-            arg(&mut pos),
-        ],
-    )?;
+    // G1: when the caller knows the producer stream (post-graph-replay
+    // sampling), launch + readback on THAT stream — ambient `active_stream()`
+    // during replay does NOT equal `graph.stream` by any enforced invariant.
+    // Requires the kernel pre-resolved (any prior eager launch of it, which
+    // every session with eager decode gets); `Err` → caller's ambient fallback
+    // (after a producer-stream sync).
+    let stream = if let Some(s) = explicit_stream {
+        let r = device.launch_compute_kernel_on_stream(
+            "grim_sample_logits_stochastic",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(SAMPLER_BLOCK, 1, 1),
+            &mut [
+                arg(&mut logits_arg),
+                arg(&mut out_arg),
+                arg(&mut vocab_i),
+                arg(&mut temp),
+                arg(&mut topk),
+                arg(&mut topp),
+                arg(&mut seed_u),
+                arg(&mut pos),
+            ],
+            s,
+            0,
+        );
+        match r {
+            Ok(_) => s,
+            Err(e) if format!("{e}").contains("not pre-resolved") => {
+                warmup_kernel(device, WarmupKind::Sampler)?;
+                device.launch_compute_kernel_on_stream(
+                    "grim_sample_logits_stochastic",
+                    HipDim3::new(1, 1, 1),
+                    HipDim3::new(SAMPLER_BLOCK, 1, 1),
+                    &mut [
+                        arg(&mut logits_arg),
+                        arg(&mut out_arg),
+                        arg(&mut vocab_i),
+                        arg(&mut temp),
+                        arg(&mut topk),
+                        arg(&mut topp),
+                        arg(&mut seed_u),
+                        arg(&mut pos),
+                    ],
+                    s,
+                    0,
+                )?;
+                s
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        // Ambient path: active stream (unchanged from before G1).
+        device.launch_compute_kernel(
+            "grim_sample_logits_stochastic",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(SAMPLER_BLOCK, 1, 1),
+            &mut [
+                arg(&mut logits_arg),
+                arg(&mut out_arg),
+                arg(&mut vocab_i),
+                arg(&mut temp),
+                arg(&mut topk),
+                arg(&mut topp),
+                arg(&mut seed_u),
+                arg(&mut pos),
+            ],
+        )?
+    };
 
     // D2H ONLY the 4-byte token id, ordered on the launch stream.
     let mut host_token: u32 = 0;
@@ -396,6 +448,7 @@ pub fn sample_logits_on_device(
         top_p,
         seed as u32,
         (seed >> 32) as u32,
+        None,
     )?))
 }
 
@@ -423,6 +476,7 @@ pub fn sample_logits_on_device_at(
         top_p,
         (seed & 0xffff_ffff) as u32,
         position,
+        None,
     )?))
 }
 
@@ -511,6 +565,7 @@ pub fn sample_logits_on_device_with_penalty_at(
         top_p,
         (seed & 0xffff_ffff) as u32,
         position,
+        None,
     )?))
 }
 
@@ -581,6 +636,236 @@ pub fn apply_repeat_penalty_on_device(
 // Keep `Error` in scope for future error-path extensions; silence unused warn.
 #[allow(unused)]
 fn _error_type_witness(_: Error) {}
+
+/// G1 helper: one throwaway launch of a kernel so
+/// `launch_compute_kernel_on_stream` can resolve it (the on-stream fast path
+/// refuses to JIT mid-call). Allocates a 1-element scratch of the given
+/// kernel's input kind and launches ambient (active stream), ordered
+/// whenever it runs (ambient, no producer-stream work pending).
+fn warmup_kernel(device: &RocmDevice, kind: WarmupKind) -> Result<()> {
+    let scratch_f = RocmStorage::alloc_gpu(
+        &Shape::new(vec![32]),
+        DType {
+            arith: ArithType::F32,
+            storage: DTypeStorage::Native,
+        },
+        &device.allocator,
+        device.ordinal,
+    )?;
+    let ptr = dev_ptr(&scratch_f)?;
+    let _dev_guard = DeviceGuard::set(device.ordinal as i32);
+    match kind {
+        WarmupKind::PenaltyPrepass => {
+            let ids = RocmStorage::alloc_gpu(
+                &Shape::new(vec![32]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &device.allocator,
+                device.ordinal,
+            )?;
+            let id_ptr = dev_ptr(&ids)?;
+            let mut lp = ptr;
+            let mut ip = id_ptr;
+            let mut len_i = 1i32;
+            let mut v_i = 32i32;
+            let mut p = 1.0f32;
+            device.launch_compute_kernel(
+                "grim_repeat_penalty_apply",
+                HipDim3::new(1, 1, 1),
+                HipDim3::new(SAMPLER_BLOCK, 1, 1),
+                &mut [arg(&mut lp), arg(&mut ip), arg(&mut len_i), arg(&mut v_i), arg(&mut p)],
+            )?;
+        }
+        WarmupKind::Sampler => {
+            let out = RocmStorage::alloc_gpu(
+                &Shape::new(vec![1]),
+                DType {
+                    arith: ArithType::U32,
+                    storage: DTypeStorage::Native,
+                },
+                &device.allocator,
+                device.ordinal,
+            )?;
+            let op = dev_ptr(&out)?;
+            let mut lp = ptr;
+            let mut op = op;
+            let mut v_i = 32i32;
+            let mut temp = 0.0f32;
+            let mut tk = 0i32;
+            let mut tp = 1.0f32;
+            let mut sd = 0u32;
+            let mut pos = 0i32;
+            device.launch_compute_kernel(
+                "grim_sample_logits_stochastic",
+                HipDim3::new(1, 1, 1),
+                HipDim3::new(SAMPLER_BLOCK, 1, 1),
+                &mut [
+                    arg(&mut lp),
+                    arg(&mut op),
+                    arg(&mut v_i),
+                    arg(&mut temp),
+                    arg(&mut tk),
+                    arg(&mut tp),
+                    arg(&mut sd),
+                    arg(&mut pos),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+enum WarmupKind {
+    PenaltyPrepass,
+    Sampler,
+}
+
+/// G1: B1 pre-pass on an explicit stream (post-graph-replay ordering).
+/// `Err` → caller falls back (ambient or CPU). Requires the penalty kernel
+/// pre-resolved (any prior eager launch).
+pub fn apply_repeat_penalty_on_device_stream(
+    device: &RocmDevice,
+    logits_ptr: u64,
+    vocab: usize,
+    hist_ids: &[u32],
+    penalty: f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    if penalty <= 1.0 || hist_ids.is_empty() || vocab == 0 {
+        return Ok(());
+    }
+    let needed = hist_ids.len();
+    let mut guard = match device.penalty_hist_buf.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let cap = guard.as_ref().map(|s| s.bytes() / 4).unwrap_or(0);
+    if guard.is_none() || cap < needed {
+        let grow = needed.max(64).next_power_of_two();
+        *guard = Some(RocmStorage::alloc_gpu(
+            &Shape::new(vec![grow]),
+            DType {
+                arith: ArithType::U32,
+                storage: DTypeStorage::Native,
+            },
+            &device.allocator,
+            device.ordinal,
+        )?);
+    }
+    let hist_storage = guard.as_ref().unwrap();
+    // SAFETY: u32/f32 identical size+align; len counted in 4-byte elements.
+    let words: &[f32] =
+        unsafe { std::slice::from_raw_parts(hist_ids.as_ptr() as *const f32, needed) };
+    let _dev_guard = DeviceGuard::set(device.ordinal as i32);
+    hist_storage.write_host_f32_async(&words[..needed.min(hist_storage.bytes() / 4)], stream)?;
+    let hist_ptr = dev_ptr(hist_storage)?;
+
+    let mut logits_arg = logits_ptr;
+    let mut hist_arg = hist_ptr;
+    let mut len_i = hist_ids.len() as i32;
+    let mut vocab_i = vocab as i32;
+    let mut pen = penalty;
+    let r = device.launch_compute_kernel_on_stream(
+        "grim_repeat_penalty_apply",
+        HipDim3::new(1, 1, 1),
+        HipDim3::new(SAMPLER_BLOCK, 1, 1),
+        &mut [
+            arg(&mut logits_arg),
+            arg(&mut hist_arg),
+            arg(&mut len_i),
+            arg(&mut vocab_i),
+            arg(&mut pen),
+        ],
+        stream,
+        0,
+    );
+    let r = match r {
+        Ok(x) => Ok(x),
+        Err(e) if format!("{e}").contains("not pre-resolved") => {
+            warmup_kernel(device, WarmupKind::PenaltyPrepass)?;
+            device.launch_compute_kernel_on_stream(
+                "grim_repeat_penalty_apply",
+                HipDim3::new(1, 1, 1),
+                HipDim3::new(SAMPLER_BLOCK, 1, 1),
+                &mut [
+                    arg(&mut logits_arg),
+                    arg(&mut hist_arg),
+                    arg(&mut len_i),
+                    arg(&mut vocab_i),
+                    arg(&mut pen),
+                ],
+                stream,
+                0,
+            )
+        }
+        Err(e) => Err(e),
+    };
+    r?;
+    Ok(())
+}
+
+/// G1: B1 + explicit stream, both penalty pre-pass AND sampler launch on
+/// `stream`. Returns `Ok(None)` via `validate_input` like the ambient entry.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_logits_on_device_with_penalty_at_stream(
+    device: &RocmDevice,
+    logits: &RocmStorage,
+    vocab: usize,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    seed: u64,
+    position: u32,
+    repeat_penalty: f32,
+    history: &[u32],
+    stream: *mut c_void,
+) -> Result<Option<u32>> {
+    let Some(ptr) = validate_input(logits, vocab, temperature, top_p) else {
+        return Ok(None);
+    };
+    if repeat_penalty > 1.0 && !history.is_empty() {
+        let mut seen = std::collections::HashSet::with_capacity(history.len().min(1024));
+        let mut uniq = Vec::with_capacity(history.len().min(1024));
+        for &t in history {
+            if seen.insert(t) {
+                uniq.push(t);
+            }
+        }
+        if !uniq.is_empty() {
+            apply_repeat_penalty_on_device_stream(
+                device, ptr, vocab, &uniq, repeat_penalty, stream,
+            )?;
+        }
+    }
+    if temperature <= 0.0 {
+        // Greedy: sampler kernel handles temp<=0 branch; pass through for
+        // stream-ordered correctness (ambient argmax would run unordered).
+        return Ok(Some(sample_impl(
+            device,
+            ptr,
+            vocab,
+            temperature,
+            top_k,
+            top_p,
+            (seed & 0xffff_ffff) as u32,
+            position,
+            Some(stream),
+        )?));
+    }
+    Ok(Some(sample_impl(
+        device,
+        ptr,
+        vocab,
+        temperature,
+        top_k,
+        top_p,
+        (seed & 0xffff_ffff) as u32,
+        position,
+        Some(stream),
+    )?))
+}
 
 // ── Double-buffered pinned logits fallback (WI-X3) ─────────────────────────
 //
