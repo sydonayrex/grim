@@ -202,7 +202,6 @@ pub struct Lfm2Block {
     /// Fused Q8_0 QKV weights (ROCm only, Item 1). The concatenated blob
     /// `[n_q + 2·n_kv, hidden]` lets the decode path issue ONE dot4 GEMV
     /// instead of three. None on non-ROCm or non-Q8_0 builds.
-    pub wqkv_q80_fused: Option<grim_backend_rocm::FusedQkvWeights>,
     /// Fused Q8_0 Gate+Up FFN weights (ROCm only, Phase 4c).
     pub w_gate_up_q80_fused: Option<grim_backend_rocm::FusedGateUpWeights>,
     pub shortconv_in_proj: Option<Linear>,
@@ -318,49 +317,6 @@ impl Lfm2Block {
             )?
         } else {
             (None, None, None, None)
-        };
-
-        // Item 1: on ROCM, concatenate the three Q8_0 projection weight blobs into
-        // ONE storage so the decode path issues a single dot4 GEMV (3 → 1).
-        let wqkv_q80_fused = if !is_recurrent
-            && device
-                .as_ref()
-                .map(|d| matches!(d, Device::Rocm(_)))
-                .unwrap_or(false)
-            // PERF-REGRESSION (Grim v Ollama speed test, GPU 1): the fused
-            // Q8_0 QKV blob path faults in release builds ("Page not present"
-            // GPU UAF, deterministic on LFM2.5-350M). Until the lifetime bug
-            // is root-caused (rocprof page-fault attribution), the blob is
-            // OPT-IN: set GRIM_FUSED_QKV=1 to enable. Decode falls back to
-            // per-layer quant-aware dot4 GEMVs — measured 241-389 tok/s,
-            // still ahead of Ollama's 358 on the same GPU.
-            && std::env::var("GRIM_FUSED_QKV").as_deref() == Ok("1")
-        {
-            let wq_s = wq.as_ref().unwrap().weight.storage();
-            let wk_s = wk.as_ref().unwrap().weight.storage();
-            let wv_s = wv.as_ref().unwrap().weight.storage();
-            let ordinal: usize = match &device {
-                Some(Device::Rocm(o)) => *o,
-                _ => 0,
-            };
-            match grim_backend_rocm::RocmDevice::try_new(ordinal) {
-                Ok(dev) => match dev.build_fused_qkv_q80(wq_s.as_ref(), wk_s.as_ref(), wv_s.as_ref()) {
-                    Ok(fused) => {
-                        eprintln!("[grim] layer {layer_idx}: built fused Q8_0 QKV blob ({} rows)", fused.n_total());
-                        Some(fused)
-                    }
-                    Err(e) => {
-                        eprintln!("[grim] layer {layer_idx}: fused Q8_0 QKV build failed ({e}), falling back to 3-GEMV");
-                        None
-                    }
-                },
-                Err(e) => {
-                    eprintln!("[grim] layer {layer_idx}: RocmDevice unavailable for fused QKV ({e})");
-                    None
-                },
-            }
-        } else {
-            None
         };
 
         let (shortconv_in_proj, shortconv_conv, shortconv_conv_vec, shortconv_out_proj) =
@@ -546,7 +502,6 @@ impl Lfm2Block {
             wqkv_exps,
             gamma_q,
             gamma_k,
-            wqkv_q80_fused,
             w_gate_up_q80_fused,
             shortconv_in_proj,
             shortconv_conv,
@@ -830,10 +785,7 @@ impl Lfm2Block {
                 // projection GEMVs (3 launches → 1). The shared f32 activation is
                 // quantized to q8_1 inline here (this base predates the OPFUSE
                 // pre-quantization path, so we quantize per call).
-                let fused_decode = self.wqkv_q80_fused.is_some();
-                let (q, k, v) = if fused_decode {
-                    self.fused_qkv_dot4_decode(&norm_x, self.wqkv_q80_fused.as_ref().unwrap())?
-                } else {
+                let (q, k, v) = {
                     let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
                     let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
                     let v = self.wv.as_ref().unwrap().forward(&norm_x)?;
@@ -1605,95 +1557,6 @@ impl Lfm2Block {
     /// `norm_x` is the single-token f32 activation `[1, hidden]`; we quantize it
     /// to q8_1 inline, run the fused GEMV writing `[1, n_q + 2·n_kv]` f32, then
     /// slice the output into (q, k, v). Returns device-resident storages.
-    fn fused_qkv_dot4_decode(
-        &self,
-        norm_x: &Tensor,
-        fused: &grim_backend_rocm::FusedQkvWeights,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
-            Device::Rocm(o) => *o,
-            _ => 0,
-        });
-        let hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
-        let m = 1usize;
-        // Inline f32 → q8_1 quantization into a device buffer.
-        let n_blocks = hidden / 32;
-        let q81_bytes = n_blocks * 36 * m;
-        let act_q81 = Tensor::new(
-            Arc::from(dev.zeros(&Shape::new(vec![q81_bytes]), DType {
-                arith: ArithType::U8,
-                storage: grim_tensor::Storage::Native,
-            })?),
-            Shape::new(vec![q81_bytes]),
-            DType {
-                arith: ArithType::U8,
-                storage: grim_tensor::Storage::Native,
-            },
-            QuantProvenance::GrimNative,
-            norm_x.device().clone(),
-        );
-        let x_rocm = norm_x
-            .storage()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("norm_x is RocmStorage on fused path");
-        let act_rocm = act_q81
-            .storage()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("act_q81 is RocmStorage");
-        if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
-            eprintln!("[trace] fused_qkv_dot4_decode enter hidden={hidden}");
-        }
-        dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
-
-        let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
-        let out_arc: Arc<dyn grim_tensor::BackendStorage> = Arc::from(out);
-        let q_bytes = fused.n_q * 4;
-        let k_bytes = fused.n_k * 4;
-        let q_view = grim_backend_rocm::RocmStorageView::from_offset(
-            out_arc.clone(),
-            0,
-            q_bytes,
-            Shape::new(vec![fused.n_q]),
-        )?;
-        let k_view = grim_backend_rocm::RocmStorageView::from_offset(
-            out_arc.clone(),
-            q_bytes,
-            k_bytes,
-            Shape::new(vec![fused.n_k]),
-        )?;
-        let v_view = grim_backend_rocm::RocmStorageView::from_offset(
-            out_arc,
-            q_bytes + k_bytes,
-            k_bytes,
-            Shape::new(vec![fused.n_k]),
-        )?;
-        let q = Tensor::new(
-            Arc::from(q_view),
-            Shape::new(vec![self.num_heads, self.head_dim]),
-            DType::F32,
-            QuantProvenance::GrimNative,
-            norm_x.device().clone(),
-        );
-        let k = Tensor::new(
-            Arc::from(k_view),
-            Shape::new(vec![self.num_kv_heads, self.head_dim]),
-            DType::F32,
-            QuantProvenance::GrimNative,
-            norm_x.device().clone(),
-        );
-        let v = Tensor::new(
-            Arc::from(v_view),
-            Shape::new(vec![self.num_kv_heads, self.head_dim]),
-            DType::F32,
-            QuantProvenance::GrimNative,
-            norm_x.device().clone(),
-        );
-        Ok((q, k, v))
-    }
 
     /// Phase 4c: fused Gate+Up dot4 GEMV for single-token decode.
     fn fused_gate_up_dot4_decode(
@@ -2639,7 +2502,6 @@ mod audit_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
-            wqkv_q80_fused: None,
             w_gate_up_q80_fused: None,
             shortconv_in_proj: None,
             shortconv_conv: None,
@@ -2685,8 +2547,7 @@ mod audit_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
-            wqkv_q80_fused: None,
-            w_gate_up_q80_fused: None,
+                w_gate_up_q80_fused: None,
             ffn_norm: RmsNorm {
                 weight: grim_backend_cpu::cpu_tensor(
                     vec![1.0f32; 8],
@@ -2808,7 +2669,6 @@ mod shortconv_numeric_reference_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
-            wqkv_q80_fused: None,
             w_gate_up_q80_fused: None,
             shortconv_in_proj: Some(lin(weights(1, 3 * hidden * hidden), 3 * hidden, hidden)),
             shortconv_conv: Some(grim_backend_cpu::cpu_tensor(
@@ -3037,7 +2897,6 @@ mod shortconv_device_decode_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
-            wqkv_q80_fused: None,
             w_gate_up_q80_fused: None,
             shortconv_in_proj: Some(lin(weights(1, 3 * hidden * hidden), 3 * hidden, hidden)),
             shortconv_conv: Some(grim_backend_cpu::cpu_tensor(
@@ -3164,7 +3023,6 @@ mod moe_top_k_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
-            wqkv_q80_fused: None,
             w_gate_up_q80_fused: None,
             shortconv_in_proj: None,
             shortconv_conv: None,
