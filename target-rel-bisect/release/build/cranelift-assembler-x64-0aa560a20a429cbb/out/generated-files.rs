@@ -1,3 +1,0 @@
-vec![
-  "/drive/bigfast/grim/target-rel-bisect/release/build/cranelift-assembler-x64-0aa560a20a429cbb/out/assembler.rs".into(),
-]

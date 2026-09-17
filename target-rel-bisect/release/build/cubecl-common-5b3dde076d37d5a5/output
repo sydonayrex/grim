@@ -1,3 +1,0 @@
-cargo:rustc-check-cfg=cfg(multi_threading)
-cargo:rustc-check-cfg=cfg(std_io)
-cargo:rustc-check-cfg=cfg(backtrace)
