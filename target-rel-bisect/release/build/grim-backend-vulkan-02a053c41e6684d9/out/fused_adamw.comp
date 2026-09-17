@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint total;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bc1;
+    float bc2;
+} params;
+
+layout(std430, binding = 0) buffer P { float p[]; };
+layout(std430, binding = 1) readonly buffer G { float g[]; };
+layout(std430, binding = 2) buffer M { float m[]; };
+layout(std430, binding = 3) buffer V { float v[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.total) return;
+
+    float grad = g[idx];
+    float param = p[idx];
+
+    // Decoupled weight decay
+    if (params.weight_decay != 0.0) {
+        param -= params.lr * params.weight_decay * param;
+    }
+
+    // Moment updates
+    float m_val = params.beta1 * m[idx] + (1.0 - params.beta1) * grad;
+    float v_val = params.beta2 * v[idx] + (1.0 - params.beta2) * grad * grad;
+
+    m[idx] = m_val;
+    v[idx] = v_val;
+
+    // Bias-corrected moment estimates
+    float m_hat = m_val / max(params.bc1, 1e-7);
+    float v_hat = v_val / max(params.bc2, 1e-7);
+
+    param -= params.lr * m_hat / (sqrt(v_hat) + params.eps);
+    p[idx] = param;
+}

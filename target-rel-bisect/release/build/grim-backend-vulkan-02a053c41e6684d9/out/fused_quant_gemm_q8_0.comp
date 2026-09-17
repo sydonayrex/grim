@@ -1,0 +1,97 @@
+#version 450
+
+// Fused quantize + GEMM (Q8_0 activations).
+// Computes C = A_quant @ B where A is quantized to Q8_0 on-the-fly per
+// 32-element K-block. Both A and B are F32 device-resident tensors.
+// This mirrors grim_quant::quant_q80 + matmul but fuses them into one kernel.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB { float B[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    float acc = 0.0;
+
+    // Iterate over K in 32-element blocks (Q8_0 block size).
+    for (uint bk = 0u; bk < K; bk += 32u) {
+        // Inline Q8_0 quantization of A[row, bk..bk+32].
+        // Each of the 16 ty lanes computes a partial amax over 2 elements,
+        // then we do a shared-memory reduction.
+        float local_max = 0.0;
+        for (uint i = 0u; i < 2u; ++i) {
+            uint k_idx = bk + ty * 2u + i;
+            if (row < M && k_idx < K) {
+                local_max = max(local_max, abs(A[row * K + k_idx]));
+            }
+        }
+        // Reduce across the 16 ty lanes using shared memory.
+        // We reuse the first column of s_a as scratch.
+        s_a[ty][0] = local_max;
+        barrier();
+        float amax = 0.0;
+        for (uint i = 0u; i < 16u; ++i) {
+            amax = max(amax, s_a[i][0]);
+        }
+        float scale = amax / 127.0;
+        float inv_scale = (scale > 0.0) ? (1.0 / scale) : 0.0;
+
+        // Load 16x16 tile: A quantized on-the-fly, B direct.
+        for (uint tile_i = 0u; tile_i < 2u; ++tile_i) {
+            uint k_tile = bk + tile_i * 16u;
+            uint a_k = k_tile + tx;
+            if (row < M && a_k < K) {
+                float val = A[row * K + a_k];
+                int q = int(round(val * inv_scale));
+                q = clamp(q, -128, 127);
+                s_a[ty][tx] = float(q) * scale;
+            } else {
+                s_a[ty][tx] = 0.0;
+            }
+
+            uint b_k = k_tile + ty;
+            if (col < N && b_k < K) {
+                s_b[ty][tx] = B[b_k * N + col];
+            } else {
+                s_b[ty][tx] = 0.0;
+            }
+
+            barrier();
+
+            for (uint k = 0u; k < 16u; ++k) {
+                acc += s_a[ty][k] * s_b[k][tx];
+            }
+
+            barrier();
+        }
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer Grad { float g[]; };
+layout(std430, binding = 1) readonly buffer LogProbs { float lp[]; };
+layout(std430, binding = 2) writeonly buffer Dx { float dx[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.size) return;
+
+    uint row = i / params.dim;
+    uint row_start = row * params.dim;
+    uint row_end = min(row_start + params.dim, params.size);
+
+    // Compute g_sum = Σ_j g_j for this row.
+    float g_sum = 0.0;
+    for (uint j = row_start; j < row_end; ++j) {
+        g_sum += g[j];
+    }
+
+    // dx_i = exp(log_p_i) * (g_i - g_sum)
+    dx[i] = exp(lp[i]) * (g[i] - g_sum);
+}

@@ -1,0 +1,76 @@
+#version 450
+// Paged QKV attention with sliding-window (SWA) support.
+//
+// Identical to qkv_attention_paged.comp but adds a host-computed
+// `window_lo = max(0, cache_offset - window + 1)` lower bound. The KV walk
+// runs over [window_lo, context_len) when has_window == 1u, else [0, context_len).
+// Decode-only (assumes context_len == current absolute query position).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;            // page_size
+    uint dim;             // (unused)
+    uint k;               // context_len (kv_seq_len)
+    uint n;               // head_dim
+    uint m;               // num_heads
+    float num_kv_heads;   // packed as f32 bits
+    uint window_lo;       // SWA lower bound; 0 when has_window == 0u
+    uint has_window;      // 0 => full causal, 1 => apply SWA lower bound
+} params;
+
+layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
+layout(std430, binding = 1) readonly buffer BufKCache { float KCache[]; };
+layout(std430, binding = 2) readonly buffer BufVCache { float VCache[]; };
+layout(std430, binding = 3) readonly buffer BufBlockTable { int BlockTable[]; };
+layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint head_dim = params.n;
+    uint num_heads = params.m;
+    uint num_kv_heads = uint(params.num_kv_heads + 0.5);
+    uint q_per_kv = num_heads / num_kv_heads;
+    uint context_len = params.k;
+    uint page_size = params.size;
+
+    uint tid = gl_GlobalInvocationID.x;
+    uint head_idx = gl_WorkGroupID.y;
+
+    if (tid >= head_dim || head_idx >= num_heads) return;
+
+    float scale = 1.0 / sqrt(float(head_dim));
+    float q_val = Q[head_idx * head_dim + tid] * scale;
+
+    float acc_out = 0.0;
+    float sum_exp = 0.0;
+    float max_score = -1e30;
+
+    uint lo = (params.has_window > 0u) ? params.window_lo : 0u;
+    for (uint pos = lo; pos < context_len; ++pos) {
+        uint logical_block = pos / page_size;
+        uint block_offset = pos % page_size;
+        int physical_block = BlockTable[logical_block];
+
+        uint kv_head = head_idx / q_per_kv;
+        uint k_idx = (uint(physical_block) * page_size + block_offset) * num_kv_heads * head_dim + kv_head * head_dim + tid;
+        float k_val = KCache[k_idx];
+
+        float score = q_val * k_val;
+        if (score > max_score) {
+            sum_exp = sum_exp * exp(max_score - score) + 1.0;
+            max_score = score;
+        } else {
+            sum_exp += exp(score - max_score);
+        }
+
+        float v_val = VCache[k_idx];
+        float p = exp(score - max_score);
+        acc_out += p * v_val;
+    }
+
+    if (sum_exp > 0.0) {
+        Out[head_idx * head_dim + tid] = acc_out / sum_exp;
+    } else {
+        Out[head_idx * head_dim + tid] = 0.0;
+    }
+}

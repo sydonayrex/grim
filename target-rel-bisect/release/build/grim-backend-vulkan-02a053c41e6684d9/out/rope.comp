@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_tokens;
+    uint head_dim;
+    uint num_heads;
+    uint unused0;
+    uint unused1;
+    float base;
+} params;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Pos { uint pos[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint half_dim = params.head_dim / 2u;
+    uint total = params.num_tokens * params.num_heads * half_dim;
+    if (idx >= total) return;
+
+    uint pair_idx = idx % half_dim;
+    uint head_idx = (idx / half_dim) % params.num_heads;
+    uint token_idx = idx / (half_dim * params.num_heads);
+
+    uint p = pos[token_idx];
+    float freq = 1.0 / pow(params.base, float(2u * pair_idx) / float(params.head_dim));
+    float val = float(p) * freq;
+    float cos_v = cos(val);
+    float sin_v = sin(val);
+
+    uint base_offset = (token_idx * params.num_heads + head_idx) * params.head_dim;
+    uint i0 = base_offset + pair_idx;
+    uint i1 = base_offset + pair_idx + half_dim;
+
+    float v0 = x[i0];
+    float v1 = x[i1];
+
+    y[i0] = v0 * cos_v - v1 * sin_v;
+    y[i1] = v0 * sin_v + v1 * cos_v;
+}

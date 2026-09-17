@@ -1,0 +1,7 @@
+cargo::rerun-if-changed=build.rs
+cargo::rerun-if-env-changed=ROCM_PATH
+cargo::rerun-if-env-changed=HIP_PATH
+cargo:rustc-cfg=feature="hip_53211"
+cargo::rustc-link-lib=dylib=hiprtc
+cargo::rustc-link-lib=dylib=amdhip64
+cargo::rustc-link-search=native=/opt/rocm/lib

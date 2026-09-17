@@ -1,0 +1,91 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint kv_seq_len;
+    uint block_size;
+    float scale;
+} params;
+
+layout(std430, binding = 0) readonly buffer Q { float q_in[]; };
+layout(std430, binding = 1) readonly buffer K { float k_in[]; };
+layout(std430, binding = 2) readonly buffer V { float v_in[]; };
+layout(std430, binding = 3) writeonly buffer Out { float out_buf[]; };
+
+shared float s_sub_dot[32];
+shared float s_scores[4096];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (h >= params.num_heads) return;
+
+    uint gqa_ratio = params.num_heads / max(params.num_kv_heads, 1u);
+    uint kv_h = h / max(gqa_ratio, 1u);
+
+    uint q_base = h * params.head_dim;
+
+    // 1. Block-scaled dot product attention
+    for (uint j = 0; j < params.kv_seq_len; ++j) {
+        uint k_base = (j * params.num_kv_heads + kv_h) * params.head_dim;
+        float dot = 0.0;
+        for (uint d = tid; d < params.head_dim; d += 256u) {
+            dot += q_in[q_base + d] * k_in[k_base + d];
+        }
+
+        #ifdef GL_KHR_shader_subgroup_arithmetic
+        dot = subgroupAdd(dot);
+        if (subgroupElect()) {
+            s_sub_dot[gl_SubgroupID] = dot;
+        }
+        barrier();
+        if (tid < 32u) {
+            float s = (tid < gl_NumSubgroups) ? s_sub_dot[tid] : 0.0;
+            s = subgroupAdd(s);
+            if (tid == 0u) {
+                s_scores[j] = s * params.scale;
+            }
+        }
+        barrier();
+        #else
+        if (tid == 0u) {
+            s_scores[j] = dot * params.scale;
+        }
+        barrier();
+        #endif
+    }
+
+    // 2. Softmax normalization
+    if (tid == 0u) {
+        float max_s = -1e20;
+        for (uint j = 0; j < params.kv_seq_len; ++j) {
+            if (s_scores[j] > max_s) max_s = s_scores[j];
+        }
+        float sum_e = 0.0;
+        for (uint j = 0; j < params.kv_seq_len; ++j) {
+            s_scores[j] = exp(s_scores[j] - max_s);
+            sum_e += s_scores[j];
+        }
+        float inv_sum = 1.0 / max(sum_e, 1e-8);
+        for (uint j = 0; j < params.kv_seq_len; ++j) {
+            s_scores[j] *= inv_sum;
+        }
+    }
+    barrier();
+
+    // 3. Value weighted sum
+    uint out_base = h * params.head_dim;
+    for (uint d = tid; d < params.head_dim; d += 256u) {
+        float acc = 0.0;
+        for (uint j = 0; j < params.kv_seq_len; ++j) {
+            uint v_base = (j * params.num_kv_heads + kv_h) * params.head_dim;
+            acc += s_scores[j] * v_in[v_base + d];
+        }
+        out_buf[out_base + d] = acc;
+    }
+}

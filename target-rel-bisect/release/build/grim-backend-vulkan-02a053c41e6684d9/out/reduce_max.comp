@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[]; };
+
+// Barrier-free (see reduce_sum.comp). -FLT_MAX identity: on finite inputs
+// this matches the host reduce_max exactly.
+void main() {
+    if (gl_GlobalInvocationID.x != 0) return;
+    float acc = -3.402823466e38;
+    for (uint i = 0; i < params.size; i++) {
+        acc = max(acc, x[i]);
+    }
+    y[0] = acc;
+}

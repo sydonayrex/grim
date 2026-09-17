@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.size) return;
+    uint row = id / params.dim;
+    float max_val = -1e30;
+    for (uint i = 0u; i < params.dim; ++i) {
+        max_val = max(max_val, x[row * params.dim + i]);
+    }
+    float sum = 0.0;
+    for (uint i = 0u; i < params.dim; ++i) {
+        sum += exp(x[row * params.dim + i] - max_val);
+    }
+    y[id] = exp(x[id] - max_val) / sum;
+}

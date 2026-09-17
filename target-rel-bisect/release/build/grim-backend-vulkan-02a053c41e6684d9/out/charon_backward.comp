@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer X {
+    float x_data[];       // [num_tokens, hidden]
+};
+layout(set = 0, binding = 1) readonly buffer GateW {
+    float gw_data[];      // [num_experts, inter, hidden]
+};
+layout(set = 0, binding = 2) readonly buffer UpW {
+    float uw_data[];      // [num_experts, inter, hidden]
+};
+layout(set = 0, binding = 3) readonly buffer DownW {
+    float dw_data[];      // [num_experts, hidden, inter]
+};
+layout(set = 0, binding = 4) readonly buffer Grad {
+    float g_data[];       // [num_tokens, hidden]
+};
+layout(set = 0, binding = 5) buffer DGradients {
+    float dg_data[];      // concatenated d_gate_w + d_up_w + d_down_w
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_experts;
+    uint hidden;
+    uint inter;
+    uint num_tokens;
+    uint m;
+    float eps;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total_dw = pc.num_experts * pc.hidden * pc.inter;
+    if (gid >= total_dw) return;
+
+    uint expert = gid / (pc.hidden * pc.inter);
+    uint rem = gid % (pc.hidden * pc.inter);
+    uint h = rem / pc.inter;
+    uint i = rem % pc.inter;
+
+    // d_down_w[expert, h, i] = Σ_tokens grad[token, h] * activated[token, expert, i]
+    // Structural scaffold: accumulate from all tokens. The real
+    // implementation needs the forward-pass activated values (which are
+    // not available to the backward pass without a recompute or save).
+    // This shader documents the atomic scatter-add pattern.
+    float grad_val = 0.0;
+    for (uint t = 0; t < pc.num_tokens; ++t) {
+        // Placeholder: real implementation needs activated[token, expert, i]
+        grad_val += g_data[t * pc.hidden + h] * 0.01;
+    }
+    atomicAdd(dg_data[gid], grad_val);
+}

@@ -1658,6 +1658,33 @@ pub fn launch_paged_attention_quant(
 
 /// Item 3 launcher: `grim_kv_append`. Copies `steps*kv_stride` elements from
 /// `k_rot` into `k_arena` at the device-computed offset `*past_dev * kv_stride`.
+/// P0-2 (PLAN-improve-grim-perf): accept both owning `RocmStorage` and
+/// non-owning `RocmStorageView` for the rotated-K/V operands — the fused
+/// Q8_0 QKV decode path produces `RocmStorageView` slices of one fused
+/// output buffer, and a hard downcast to `RocmStorage` turned that into a
+/// fatal error instead of a working append. Views never free, so borrowing
+/// their parent-backed device pointer here is sound.
+fn kv_rot_device_ptr(
+    s: &dyn BackendStorage,
+    label: &str,
+) -> std::result::Result<*mut std::ffi::c_void, crate::Error> {
+    if let Some(r) = s.as_any().downcast_ref::<crate::memory::storage::RocmStorage>() {
+        return r
+            .device_ptr
+            .map(|p| p as *mut std::ffi::c_void)
+            .ok_or_else(|| crate::Error::Backend(format!("kv_append: {label} has no device ptr").into()));
+    }
+    if let Some(v) = s.as_any().downcast_ref::<crate::memory::view::RocmStorageView>() {
+        let p = v.device_ptr_u64();
+        if p != 0 {
+            return Ok(p as *mut std::ffi::c_void);
+        }
+    }
+    Err(crate::Error::Backend(
+        format!("kv_append: {label} must be RocmStorage or RocmStorageView").into(),
+    ))
+}
+
 pub fn launch_kv_append(
     dev: &crate::RocmDevice,
     k_arena: &dyn BackendStorage,
@@ -1671,10 +1698,7 @@ pub fn launch_kv_append(
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
         .ok_or_else(|| crate::Error::Backend("kv_append: k_arena must be RocmStorage".into()))?;
-    let rot_s = k_rot
-        .as_any()
-        .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend("kv_append: k_rot must be RocmStorage".into()))?;
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot")?;
     let past_s = past_dev
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -1682,9 +1706,6 @@ pub fn launch_kv_append(
     let mut arena_ptr = arena_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("kv_append: k_arena has no device ptr".into()))?;
-    let mut rot_ptr = rot_s
-        .device_ptr
-        .ok_or_else(|| crate::Error::Backend("kv_append: k_rot has no device ptr".into()))?;
     let mut past_ptr = past_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("kv_append: past_dev has no device ptr".into()))?;
@@ -1726,10 +1747,7 @@ pub fn launch_kv_append_batch(
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
         .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_arena must be RocmStorage".into()))?;
-    let rot_s = k_rot
-        .as_any()
-        .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_rot must be RocmStorage".into()))?;
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_batch")?;
     let past_s = past_dev
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -1737,9 +1755,6 @@ pub fn launch_kv_append_batch(
     let mut arena_ptr = arena_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_arena has no device ptr".into()))?;
-    let mut rot_ptr = rot_s
-        .device_ptr
-        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_rot has no device ptr".into()))?;
     let mut past_ptr = past_s
         .device_ptr
         .ok_or_else(|| crate::Error::Backend("kv_append_batch: past_dev has no device ptr".into()))?;

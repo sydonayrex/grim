@@ -1,0 +1,113 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint kv_seq_len;
+    uint num_splits;
+    float scale;
+} params;
+
+layout(std430, binding = 0) readonly buffer Q { float q_in[]; };
+layout(std430, binding = 1) readonly buffer K { float k_in[]; };
+layout(std430, binding = 2) readonly buffer V { float v_in[]; };
+layout(std430, binding = 3) writeonly buffer VPartial { float v_partial[]; }; // [num_heads, num_splits, head_dim]
+layout(std430, binding = 4) writeonly buffer MPartial { float m_partial[]; }; // [num_heads, num_splits]
+layout(std430, binding = 5) writeonly buffer LPartial { float l_partial[]; }; // [num_heads, num_splits]
+
+shared float s_sub_dot[32];
+shared float s_scores[2048];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint split_idx = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (h >= params.num_heads || split_idx >= params.num_splits) return;
+
+    uint gqa_ratio = params.num_heads / max(params.num_kv_heads, 1u);
+    uint kv_h = h / max(gqa_ratio, 1u);
+
+    uint chunk_len = (params.kv_seq_len + params.num_splits - 1u) / params.num_splits;
+    uint start_pos = split_idx * chunk_len;
+    uint end_pos = min(start_pos + chunk_len, params.kv_seq_len);
+
+    if (start_pos >= end_pos) {
+        if (tid == 0u) {
+            uint split_offset = h * params.num_splits + split_idx;
+            m_partial[split_offset] = -1e20;
+            l_partial[split_offset] = 0.0;
+        }
+        for (uint d = tid; d < params.head_dim; d += 256u) {
+            v_partial[(h * params.num_splits + split_idx) * params.head_dim + d] = 0.0;
+        }
+        return;
+    }
+
+    uint local_len = end_pos - start_pos;
+    uint q_base = h * params.head_dim;
+
+    // 1. Partial Q.K dot products
+    for (uint i = 0; i < local_len; ++i) {
+        uint pos = start_pos + i;
+        uint k_base = (pos * params.num_kv_heads + kv_h) * params.head_dim;
+        float dot = 0.0;
+        for (uint d = tid; d < params.head_dim; d += 256u) {
+            dot += q_in[q_base + d] * k_in[k_base + d];
+        }
+
+        #ifdef GL_KHR_shader_subgroup_arithmetic
+        dot = subgroupAdd(dot);
+        if (subgroupElect()) {
+            s_sub_dot[gl_SubgroupID] = dot;
+        }
+        barrier();
+        if (tid < 32u) {
+            float s = (tid < gl_NumSubgroups) ? s_sub_dot[tid] : 0.0;
+            s = subgroupAdd(s);
+            if (tid == 0u) {
+                s_scores[i] = s * params.scale;
+            }
+        }
+        barrier();
+        #else
+        if (tid == 0u) {
+            s_scores[i] = dot * params.scale;
+        }
+        barrier();
+        #endif
+    }
+
+    // 2. Partial Softmax local max & sum
+    float local_max = -1e20;
+    float local_sum = 0.0;
+    if (tid == 0u) {
+        for (uint i = 0; i < local_len; ++i) {
+            if (s_scores[i] > local_max) local_max = s_scores[i];
+        }
+        for (uint i = 0; i < local_len; ++i) {
+            s_scores[i] = exp(s_scores[i] - local_max);
+            local_sum += s_scores[i];
+        }
+        uint split_offset = h * params.num_splits + split_idx;
+        m_partial[split_offset] = local_max;
+        l_partial[split_offset] = local_sum;
+    }
+    barrier();
+
+    // 3. Partial V weighted sum
+    uint out_base = (h * params.num_splits + split_idx) * params.head_dim;
+    for (uint d = tid; d < params.head_dim; d += 256u) {
+        float acc = 0.0;
+        for (uint i = 0; i < local_len; ++i) {
+            uint pos = start_pos + i;
+            uint v_base = (pos * params.num_kv_heads + kv_h) * params.head_dim;
+            acc += s_scores[i] * v_in[v_base + d];
+        }
+        v_partial[out_base + d] = acc;
+    }
+}

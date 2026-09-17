@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Params {
+    uint num_tokens;
+    uint num_q_heads;
+    uint num_k_heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint section_t;
+    uint section_h;
+    uint section_w;
+    float rope_theta;
+} params;
+
+layout(std430, binding = 0) buffer Q { float q[]; };
+layout(std430, binding = 1) buffer K { float k[]; };
+layout(std430, binding = 2) readonly buffer Pos { int positions[]; }; // [num_tokens, 3] -> (T, H, W)
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint head_idx = gl_WorkGroupID.y;
+    uint pair_idx = gl_LocalInvocationID.x;
+
+    uint total_heads = params.num_q_heads + params.num_k_heads;
+    if (t >= params.num_tokens || head_idx >= total_heads || pair_idx >= (params.rotary_dim / 2u)) return;
+
+    bool is_q = (head_idx < params.num_q_heads);
+    uint local_head = is_q ? head_idx : (head_idx - params.num_q_heads);
+
+    int pos_t = positions[t * 3u + 0u];
+    int pos_h = positions[t * 3u + 1u];
+    int pos_w = positions[t * 3u + 2u];
+
+    int pos = pos_t;
+    if (pair_idx >= params.section_t && pair_idx < (params.section_t + params.section_h)) {
+        pos = pos_h;
+    } else if (pair_idx >= (params.section_t + params.section_h)) {
+        pos = pos_w;
+    }
+
+    float freq = 1.0 / pow(params.rope_theta, (2.0 * float(pair_idx)) / float(params.rotary_dim));
+    float angle = float(pos) * freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    uint idx0 = 2u * pair_idx;
+    uint idx1 = 2u * pair_idx + 1u;
+
+    if (is_q) {
+        uint base = (t * params.num_q_heads + local_head) * params.head_dim;
+        float x0 = q[base + idx0];
+        float x1 = q[base + idx1];
+        q[base + idx0] = x0 * cos_val - x1 * sin_val;
+        q[base + idx1] = x0 * sin_val + x1 * cos_val;
+    } else {
+        uint base = (t * params.num_k_heads + local_head) * params.head_dim;
+        float x0 = k[base + idx0];
+        float x1 = k[base + idx1];
+        k[base + idx0] = x0 * cos_val - x1 * sin_val;
+        k[base + idx1] = x0 * sin_val + x1 * cos_val;
+    }
+}

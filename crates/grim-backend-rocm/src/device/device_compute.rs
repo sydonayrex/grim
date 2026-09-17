@@ -2270,16 +2270,38 @@ impl RocmDevice {
             ],
         )?;
 
-        // RDNA2 (gfx103x APU, unified/GTT memory) visibility quirk: the
-        // immediately-following dot4 GEMV launch reads `dst` on the same
-        // stream, but on gfx1036 the consumer observed stale bytes unless a
-        // host-side barrier separates the producer and consumer launches
-        // (deterministic 75.9 divergence without it). On gfx1201 / discrete GPUs,
-        // stream ordering guarantees visibility, so skip the host-side sync stall.
-        if !self.is_rdna34 {
-            self.synchronize();
+        // P1-1 (PLAN-improve-grim-perf): real dependency edge for the
+        // quantize -> dot4 GEMV producer/consumer pair, replacing the old
+        // `if !is_rdna34 { synchronize() }` arch-gated guess. The event is
+        // recorded on the quantize launch's stream; the consuming GEMV's
+        // stream waits on it before its own launch. Correct under eager AND
+        // capture (the wait becomes a DAG edge), on every arch, and removes
+        // the host-side stall entirely.
+        let ev = self.q81_quant_event();
+        if !ev.is_null() {
+            // SAFETY: ev created via hipEventCreate; handle is a live stream.
+            unsafe { crate::hipEventRecord(ev, handle) };
         }
         Ok(handle)
+    }
+
+    /// P1-1: lazily-created, per-device event used to order the
+    /// quantize_q8_1 producer against its dot4 GEMV consumer. Reused across
+    /// launches (hipEventRecord re-arms a recorded event).
+    fn q81_quant_event(&self) -> *mut c_void {
+        let mut guard = self
+            .q81_event
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let mut new_ev: *mut c_void = std::ptr::null_mut();
+            let res = unsafe { crate::hipEventCreate(&mut new_ev) };
+            if res != 0 {
+                return std::ptr::null_mut();
+            }
+            *guard = Some(new_ev);
+        }
+        guard.unwrap_or(std::ptr::null_mut())
     }
 
     /// SPEED-DOT: Q8_0 x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
@@ -2292,6 +2314,12 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // P1-1: wait for the quantize producer's event (no-op once complete).
+        let ev = self.q81_quant_event();
+        if !ev.is_null() {
+            // SAFETY: ev is a live event; active_stream is the device's stream.
+            unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
+        }
         let a_ptr = act_q81
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q80_q81_gemv: act_q81 has no device ptr".into()))?;

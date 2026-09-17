@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Input {
+    float in_data[];
+};
+layout(set = 0, binding = 1) buffer Output {
+    float out_data[];
+};
+// Scratch buffer: world_size * count, holds each rank's partials.
+layout(set = 0, binding = 2) buffer Partials {
+    float partial_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    uint rank;
+    uint world_size;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.count) return;
+
+    // Each rank writes its input into the partials slice for that rank.
+    partial_data[pc.rank * pc.count + gid] = in_data[gid];
+
+    barrier();
+
+    // After barrier, sum all ranks' partials into output.
+    // NOTE: this is a single-dispatch sum that assumes all partials are
+    // visible to the same workgroup (i.e., a single GPU or a unified-memory
+    // multi-GPU setup). True ring-allreduce across discrete GPUs requires
+    // multiple dispatches + P2P copies — this shader is the reduce step.
+    float sum = 0.0;
+    for (uint r = 0; r < pc.world_size; ++r) {
+        sum += partial_data[r * pc.count + gid];
+    }
+    out_data[gid] = sum;
+}

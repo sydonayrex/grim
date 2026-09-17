@@ -1,0 +1,117 @@
+#version 450
+
+// Fused quantize + GEMM (FP8 E4M3 activations).
+// Computes C = A_quant @ B where A is quantized to FP8 E4M3 on-the-fly
+// per-element (round-trip through fp8). Both A and B are F32 device-resident.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB { float B[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
+
+// Convert float to FP8 E4M3 byte (matching grim_quant::f32_to_fp8_e4m3).
+uint f32_to_fp8_e4m3(float val) {
+    if (isnan(val)) return 0x7Fu;
+    float abs_val = abs(val);
+    uint sign = (val < 0.0) ? 0x80u : 0x00u;
+    if (abs_val > 448.0) abs_val = 448.0;
+
+    if (abs_val < 0.001953125) {
+        uint mant = uint(round(abs_val * 512.0));
+        mant = min(mant, 7u);
+        return sign | mant;
+    }
+
+    uint u = floatBitsToUint(abs_val);
+    int e = int((u >> 23u) & 0xFFu) - 127;
+    uint m = u & 0x7FFFFFu;
+
+    int e_fp8 = e + 7;
+    if (e_fp8 >= 15) return sign | 0x7Eu;
+    if (e_fp8 <= 0) {
+        uint mant = uint(round(abs_val * 512.0));
+        mant = min(mant, 7u);
+        return sign | mant;
+    }
+
+    uint mant_bits = (m >> 20u) & 0x7u;
+    return sign | (uint(e_fp8) << 3u) | mant_bits;
+}
+
+// Convert FP8 E4M3 byte back to float (matching grim_quant::fp8_e4m3_to_f32).
+float fp8_e4m3_to_f32(uint byte_val) {
+    uint sign = (byte_val >> 7u) & 1u;
+    uint exp = (byte_val >> 3u) & 0xFu;
+    uint mant = byte_val & 0x7u;
+
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        float f = float(mant) / 512.0;
+        return sign == 1u ? -f : f;
+    } else if (exp == 15u) {
+        return sign == 1u ? -448.0 : 448.0;
+    } else {
+        float f = (1.0 + float(mant) / 8.0) * exp2(float(exp) - 7.0);
+        return sign == 1u ? -f : f;
+    }
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        // Load tile: A quantized to FP8 on-the-fly, B direct.
+        uint a_k = bk + tx;
+        if (row < M && a_k < K) {
+            float val = A[row * K + a_k];
+            uint fp8_byte = f32_to_fp8_e4m3(val);
+            s_a[ty][tx] = fp8_e4m3_to_f32(fp8_byte);
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint b_k = bk + ty;
+        if (col < N && b_k < K) {
+            s_b[ty][tx] = B[b_k * N + col];
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

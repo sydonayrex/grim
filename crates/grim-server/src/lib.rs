@@ -339,6 +339,8 @@ pub struct SamplerParams {
     /// device path no longer silently ignores it (was: penalty dropped on
     /// device, applied only on CPU fallback).
     pub repeat_penalty: Option<f32>,
+    /// P1-3 (PLAN-improve-grim-perf): minimum tokens before EOS is honored.
+    pub min_tokens: u32,
 }
 
 /// Per-request sampler params, keyed by request id.
@@ -354,6 +356,10 @@ fn register_request_sampler_params(
     body_obj: &serde_json::Map<String, serde_json::Value>,
 ) {
     let params = SamplerParams {
+        min_tokens: body_obj
+            .get("min_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
         temperature: body_obj
             .get("temperature")
             .and_then(|v| v.as_f64())
@@ -1593,6 +1599,7 @@ async fn chat_completions(
                 let state = state_clone.clone();
                 let adapter_ids = adapter_ids_clone.clone();
                 let stop_seqs = stop_sequences_clone.clone();
+                let request_sampler_params = take_request_sampler_params(session_request_id);
                 let sampler = sampler_clone.clone();
                 let parse_ctx = (
                     tools_active_clone,
@@ -1721,7 +1728,13 @@ async fn chat_completions(
                     let hit_stop = stop_seqs.iter().any(|s| emitted.contains(s));
                     // EOS check: if the model emitted the EOS token, terminate generation without including it
                     // in the output (the EOS token is a signal, not content - OpenAI convention).
-                    let hit_eos = eos_token_id_clone == Some(token_id);
+                    // P1-3 (PLAN-improve-grim-perf): honor min_tokens — EOS
+                    // is ignored until at least `min_tokens` tokens have been
+                    // generated. `step` is 0-based, so EOS is legal from
+                    // step == min_tokens onward.
+                    let min_tokens_enforced = request_sampler_params.min_tokens;
+                    let hit_eos = eos_token_id_clone == Some(token_id)
+                        && (step as u64) >= u64::from(min_tokens_enforced);
                     if hit_eos {
                         // Trim the EOS token's text from the emitted buffer
                         // so it doesn't appear in the response.
@@ -3465,6 +3478,7 @@ async fn completions(
     // T1.3 param plumbing: honor per-request temperature/top_p/top_k/seed on BOTH sampling paths -
     // the CPU sampler below and the device-side sampler (via the request registry).
     let request_params = SamplerParams {
+        min_tokens: 0,
         temperature: payload.temperature,
         top_k: payload.top_k,
         top_p: payload.top_p,

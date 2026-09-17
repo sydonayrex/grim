@@ -1,0 +1,64 @@
+#version 450
+
+// Gated Delta Network (GDN) / Delta-rule linear attention decode kernel.
+// Implements the recurrence: S_t = S_{t-1} * diag(1 - beta * k_t) + beta * v_t k_t^T
+//                         o_t = q_t^T S_t
+//
+// This is the decode path: one token at a time, state persists across invocations.
+// Each thread computes one output element by summing over all rows of the state.
+//
+// State update: S[row, col] = S_old[row, col] * (1 - beta * k[row]) + beta * v[row] * k[col]
+// Output:       out[col] = sum_row q[row] * S[row, col]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint dim;          // head dimension (d)
+    uint pad0;         // padding
+    uint pad1;         // padding
+    uint pad2;         // padding
+    uint has_rope;     // 1 if q/k have RoPE applied externally
+    float beta_scale;  // scaling factor for beta
+} params;
+
+// q: [dim] query for current token
+layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
+// k: [dim] key for current token
+layout(std430, binding = 1) readonly buffer BufK { float K[]; };
+// v: [dim] value for current token
+layout(std430, binding = 2) readonly buffer BufV { float V[]; };
+// beta: [1] gate scalar
+layout(std430, binding = 3) readonly buffer BufBeta { float Beta[]; };
+// state: [dim, dim] recurrent state S (row-major: State[row * dim + col])
+layout(std430, binding = 4) buffer BufState { float State[]; };
+// out: [dim] output
+layout(std430, binding = 5) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint d = params.dim;
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= d) return;
+
+    float beta = Beta[0] * params.beta_scale;
+
+    // Compute output[col] = sum_{row=0}^{dim-1} q[row] * S[row, col]
+    // where S[row, col] = S_old[row, col] * (1 - beta * k[row]) + beta * v[row] * k[col]
+    float acc = 0.0;
+    for (uint row = 0u; row < d; ++row) {
+        float s_old = State[row * d + col];
+        float k_row = K[row];
+        float v_row = V[row];
+        float k_col = K[col];
+
+        // Delta update
+        float s_new = s_old * (1.0 - beta * k_row) + beta * v_row * k_col;
+
+        // Write updated state back
+        State[row * d + col] = s_new;
+
+        // Accumulate output
+        acc += Q[row] * s_new;
+    }
+
+    Out[col] = acc;
+}

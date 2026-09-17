@@ -1,0 +1,58 @@
+#version 450
+
+// MLA Q/KV norm + split kernel.
+// Fused RMS-norm + split for DeepSeek-style Multi-Head Latent Attention.
+//
+// Takes raw q and kv projections, applies elementwise norm weights, then splits
+// into nope (no positional encoding) and rope (rotary-positional) components.
+//
+// q_raw -> [q_norm_w] -> q_nope[0..qk_nope_dim] + q_rope[qk_nope_dim..qk_nope_dim+qk_rope_dim]
+// kv_raw -> [kv_norm_w] -> kv_nope + kv_rope
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint qk_nope_dim;  // dimension of nope component (e.g. 128)
+    uint qk_rope_dim;  // dimension of rope component (e.g. 64)
+    uint total_dim;    // qk_nope_dim + qk_rope_dim
+    uint pad0;
+    uint pad1;
+    float eps;         // RMS norm epsilon (unused for elementwise)
+} params;
+
+// q_raw: [total_dim] raw query projection
+layout(std430, binding = 0) readonly buffer BufQR { float q_raw[]; };
+// kv_raw: [total_dim] raw kv projection
+layout(std430, binding = 1) readonly buffer BufKVR { float kv_raw[]; };
+// q_norm_w: [total_dim] elementwise norm weights for q
+layout(std430, binding = 2) readonly buffer BufQW { float q_norm_w[]; };
+// kv_norm_w: [total_dim] elementwise norm weights for kv
+layout(std430, binding = 3) readonly buffer BufKVW { float kv_norm_w[]; };
+// q_nope: [qk_nope_dim] output query nope component
+layout(std430, binding = 4) writeonly buffer BufQN { float q_nope[]; };
+// q_rope: [qk_rope_dim] output query rope component
+layout(std430, binding = 5) writeonly buffer BufQRope { float q_rope[]; };
+// kv_nope: [qk_nope_dim] output kv nope component
+layout(std430, binding = 6) writeonly buffer BufKVN { float kv_nope[]; };
+// kv_rope: [qk_rope_dim] output kv rope component
+layout(std430, binding = 7) writeonly buffer BufKVRope { float kv_rope[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = params.total_dim;
+    if (tid >= total) return;
+
+    float q_val = q_raw[tid] * q_norm_w[tid];
+    float kv_val = kv_raw[tid] * kv_norm_w[tid];
+
+    if (tid < params.qk_nope_dim) {
+        // Nope region
+        q_nope[tid] = q_val;
+        kv_nope[tid] = kv_val;
+    } else if (tid < total) {
+        // Rope region
+        uint rope_idx = tid - params.qk_nope_dim;
+        q_rope[rope_idx] = q_val;
+        kv_rope[rope_idx] = kv_val;
+    }
+}

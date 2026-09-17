@@ -1,0 +1,13 @@
+cargo:rustc-link-search=native=/opt/rocm/lib
+cargo:rustc-link-search=native=/opt/rocm/lib
+cargo:rustc-link-lib=dylib=amdhip64
+cargo:rustc-link-lib=dylib=rocblas
+cargo:rustc-link-lib=dylib=hiprtc
+cargo:rerun-if-env-changed=HIP_PATH
+cargo:rerun-if-env-changed=ROCM_PATH
+cargo:rustc-link-search=native=/opt/rocm/lib
+cargo:rustc-link-lib=dylib=rccl
+cargo:rerun-if-env-changed=RCCL_PATH
+cargo:rerun-if-env-changed=ROCM_RCCL_PATH
+cargo:rerun-if-env-changed=ROCM_PATH
+cargo:rerun-if-changed=build.rs

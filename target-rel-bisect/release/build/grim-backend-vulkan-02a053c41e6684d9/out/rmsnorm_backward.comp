@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) readonly buffer Grad { float g[]; };
+layout(std430, binding = 3) writeonly buffer Dx { float dx[]; };
+layout(std430, binding = 4) buffer Dw { float dw[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.size) return;
+
+    uint cols = params.dim;
+    uint row = id / cols;
+    uint col = id % cols;
+    uint row_start = row * cols;
+    uint row_end = min(row_start + cols, params.size);
+
+    // Phase 1: mean_sq = Σ x_i^2 / N
+    float mean_sq = 0.0;
+    for (uint c = row_start; c < row_end; ++c) {
+        float xv = x[c];
+        mean_sq += xv * xv / float(cols);
+    }
+    float rms = sqrt(mean_sq + params.eps);
+    float inv_rms = 1.0 / rms;
+
+    // Phase 2: sum_xg = Σ x_i * g_i
+    float sum_xg = 0.0;
+    for (uint c = row_start; c < row_end; ++c) {
+        sum_xg += x[c] * g[c];
+    }
+
+    // Phase 3: dx_i = w_i * (g_i * inv_rms - x_i * sum_xg * inv_rms / N)
+    float xn = x[id] * inv_rms;
+    dx[id] = w[col] * (g[id] * inv_rms - xn * sum_xg * inv_rms / float(cols));
+
+    // Phase 4: dw_i += g_i * x_i * inv_rms  (atomic scatter-add)
+    atomicAdd(dw[col], g[id] * xn);
+}

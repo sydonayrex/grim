@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_tokens;
+    uint head_dim;
+    uint num_heads;
+    uint unused0;
+    uint unused1;
+    float base;
+} params;
+
+layout(std430, binding = 0) readonly buffer K { float k[]; };
+layout(std430, binding = 1) readonly buffer OldPos { uint old_pos[]; };
+layout(std430, binding = 2) readonly buffer NewPos { uint new_pos[]; };
+layout(std430, binding = 3) writeonly buffer Out { float out_k[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint half_dim = params.head_dim / 2u;
+    uint total = params.num_tokens * params.num_heads * half_dim;
+    if (idx >= total) return;
+
+    uint pair_idx = idx % half_dim;
+    uint head_idx = (idx / half_dim) % params.num_heads;
+    uint token_idx = idx / (half_dim * params.num_heads);
+
+    uint p_old = old_pos[token_idx];
+    uint p_new = new_pos[token_idx];
+
+    float freq = 1.0 / pow(params.base, float(2u * pair_idx) / float(params.head_dim));
+
+    float val_old = float(p_old) * freq;
+    float old_cos = cos(val_old);
+    float old_sin = sin(val_old);
+
+    float val_new = float(p_new) * freq;
+    float new_cos = cos(val_new);
+    float new_sin = sin(val_new);
+
+    uint base_offset = (token_idx * params.num_heads + head_idx) * params.head_dim;
+    uint i0 = base_offset + 2u * pair_idx;
+    uint i1 = base_offset + 2u * pair_idx + 1u;
+
+    float k0_rot = k[i0];
+    float k1_rot = k[i1];
+
+    // 1. Un-rotate: inverse rotation matrix [cos, sin; -sin, cos]
+    float k0_orig = k0_rot * old_cos + k1_rot * old_sin;
+    float k1_orig = -k0_rot * old_sin + k1_rot * old_cos;
+
+    // 2. Re-rotate: forward rotation matrix [cos, -sin; sin, cos]
+    out_k[i0] = k0_orig * new_cos - k1_orig * new_sin;
+    out_k[i1] = k0_orig * new_sin + k1_orig * new_cos;
+}
