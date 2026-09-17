@@ -2223,6 +2223,11 @@ impl Engine {
         positions: &grim_tensor::Tensor,
         capture_key: &str,
     ) -> Result<StepOutcome> {
+        let _step_t0 = if std::env::var("GRIM_STEP_TRACE").is_ok() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let adapter_ids = self
             .request_adapters
             .get(&request_id)
@@ -2465,6 +2470,12 @@ impl Engine {
         self.graph_capture_logits
             .insert(capture_key.to_string(), Arc::new(logits.clone()));
         let _ = running;
+        if let Some(t0) = _step_t0 {
+            eprintln!(
+                "[grim] step trace: total {:?} (generic capture bracket)",
+                t0.elapsed()
+            );
+        }
         Ok(StepOutcome {
             logits: Some(Arc::new(logits)),
             accepted_tokens: accepted,

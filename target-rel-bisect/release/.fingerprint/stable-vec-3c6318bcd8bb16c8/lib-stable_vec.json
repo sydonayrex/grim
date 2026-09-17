@@ -1,1 +1,0 @@
-{"rustc":2467252760697041086,"features":"[]","declared_features":"[\"nightly-bench\"]","target":5665079826943722545,"profile":1783587453833569552,"path":9075849327988202219,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"release/.fingerprint/stable-vec-3c6318bcd8bb16c8/dep-lib-stable_vec","checksum":false}}],"rustflags":[],"config":9396254390672932401,"compile_kind":0}

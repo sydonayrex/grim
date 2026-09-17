@@ -4060,9 +4060,10 @@ async fn grim_chat(
         let body_stream = body.into_data_stream();
 
         let ndjson_stream = futures::stream::unfold(
-            (body_stream, String::new(), false),
-            move |(mut body_stream, mut buffer, done_sent)| {
+            (body_stream, String::new(), false, 0u64, None::<std::time::Instant>),
+            move |(mut body_stream, mut buffer, done_sent, mut eval_count, mut first_content)| {
                 let model_name = model_name.clone();
+                let gen_start = chat_start;
                 async move {
                     loop {
                         if done_sent {
@@ -4106,9 +4107,13 @@ async fn grim_chat(
                                 });
                                 let chunk_str =
                                     format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
+                                eval_count += 1;
+                                if first_content.is_none() {
+                                    first_content = Some(std::time::Instant::now());
+                                }
                                 return Some((
                                     Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
-                                    (body_stream, buffer, false),
+                                    (body_stream, buffer, false, eval_count, first_content),
                                 ));
                             }
                             continue;
@@ -4121,24 +4126,35 @@ async fn grim_chat(
                                 }
                             }
                             Some(Err(err)) => {
-                                return Some((Err(err), (body_stream, buffer, false)));
+                                return Some((Err(err), (body_stream, buffer, false, eval_count, first_content)));
                             }
                             None => {
+                                // P1-followup: real timing — eval window is
+                                // first-content -> done; prompt window is
+                                // request start -> first content.
+                                let (prompt_eval, eval_dur) = match first_content {
+                                    Some(t0) => (
+                                        (t0 - gen_start).as_nanos() as u64,
+                                        (std::time::Instant::now() - t0).as_nanos() as u64,
+                                    ),
+                                    None => (0, 0),
+                                };
                                 let final_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),
                                     "done": true,
-                                    "total_duration": 0,
+                                    "total_duration": gen_start.elapsed().as_nanos() as u64,
                                     "load_duration": 0,
-                                    "prompt_eval_count": 0,
-                                    "eval_count": 0,
-                                    "eval_duration": 0
+                                    "prompt_eval_count": 0, // true prompt token count not plumbed into this translate path
+                                    "eval_count": eval_count,
+                                    "prompt_eval_duration": prompt_eval,
+                                    "eval_duration": eval_dur
                                 });
                                 let chunk_str =
                                     format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
                                 return Some((
                                     Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
-                                    (body_stream, buffer, true),
+                                    (body_stream, buffer, true, eval_count, first_content),
                                 ));
                             }
                         }
@@ -4236,8 +4252,8 @@ async fn grim_generate(
         let body_stream = body.into_data_stream();
 
         let ndjson_stream = futures::stream::unfold(
-            (body_stream, String::new(), false),
-            move |(mut body_stream, mut buffer, done_sent)| {
+            (body_stream, String::new(), false, 0u64),
+            move |(mut body_stream, mut buffer, done_sent, mut eval_count)| {
                 let model_name = model_name.clone();
                 async move {
                     loop {
@@ -4270,9 +4286,11 @@ async fn grim_generate(
                                 });
                                 let chunk_str =
                                     format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
+                                eval_count += 1;
+                                eprintln!("[trace] generate content chunk #{eval_count}");
                                 return Some((
                                     Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
-                                    (body_stream, buffer, false),
+                                    (body_stream, buffer, false, eval_count),
                                 ));
                             }
                             continue;
@@ -4285,7 +4303,7 @@ async fn grim_generate(
                                 }
                             }
                             Some(Err(err)) => {
-                                return Some((Err(err), (body_stream, buffer, false)));
+                                return Some((Err(err), (body_stream, buffer, false, eval_count)));
                             }
                             None => {
                                 if !buffer.is_empty() {
@@ -4301,9 +4319,10 @@ async fn grim_generate(
                                         "{}\n",
                                         serde_json::to_string(&partial_chunk).unwrap()
                                     );
+                                    eval_count += 1;
                                     return Some((
                                         Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
-                                        (body_stream, buffer, false),
+                                        (body_stream, buffer, false, eval_count),
                                     ));
                                 }
                                 let elapsed = gen_start.elapsed().as_nanos() as u64;
@@ -4314,14 +4333,14 @@ async fn grim_generate(
                                     "total_duration": elapsed,
                                     "load_duration": 0,
                                     "prompt_eval_count": prompt_tokens,
-                                    "eval_count": 0,
+                                    "eval_count": eval_count,
                                     "eval_duration": elapsed
                                 });
                                 let chunk_str =
                                     format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
                                 return Some((
                                     Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
-                                    (body_stream, buffer, true),
+                                    (body_stream, buffer, true, eval_count),
                                 ));
                             }
                         }
