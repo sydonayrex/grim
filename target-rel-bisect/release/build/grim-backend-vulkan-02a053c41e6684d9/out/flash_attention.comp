@@ -1,0 +1,58 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
+layout(std430, binding = 1) readonly buffer BufK { float K[]; };
+layout(std430, binding = 2) readonly buffer BufV { float V[]; };
+layout(std430, binding = 3) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint head_dim = params.n;
+    uint seq_len = params.m;
+    uint tid = gl_GlobalInvocationID.x;
+    uint q_row = gl_WorkGroupID.y;
+
+    if (tid >= head_dim || q_row >= seq_len) return;
+
+    float scale = 1.0 / sqrt(float(head_dim));
+    float q_val = Q[q_row * head_dim + tid] * scale;
+
+    float max_prev = -1e30;
+    float sum_exp = 0.0;
+    float acc_out = 0.0;
+
+    // Tiled online softmax pass over sequence length
+    for (uint kv_pos = 0u; kv_pos <= q_row; ++kv_pos) {
+        float k_val = K[kv_pos * head_dim + tid];
+        float score = q_val * k_val;
+
+        if (score > max_prev) {
+            float alpha = exp(max_prev - score);
+            sum_exp = sum_exp * alpha + 1.0;
+            acc_out = acc_out * alpha;
+            max_prev = score;
+        } else {
+            sum_exp += exp(score - max_prev);
+        }
+
+        float v_val = V[kv_pos * head_dim + tid];
+        float p = exp(score - max_prev);
+        acc_out += p * v_val;
+    }
+
+    if (sum_exp > 0.0) {
+        Out[q_row * head_dim + tid] = acc_out / sum_exp;
+    } else {
+        Out[q_row * head_dim + tid] = 0.0;
+    }
+}

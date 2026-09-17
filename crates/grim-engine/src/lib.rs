@@ -2379,7 +2379,16 @@ impl Engine {
 
         // Capture path: run decode_one with the capture stream active.
         // All ops dispatch on the capture stream automatically.
-        rocm.begin_graph_capture(capture_key)?;
+        //
+        // P2-2 action item (PLAN-improve-grim-perf): models whose decode step
+        // is not capture-clean (e.g. Qwen3.5 dense still has per-step D2H
+        // host round-trips) make capture fail HERE — previously a hard `Err`
+        // with no fallback, killing the request. Degrade to the eager step
+        // instead; a clean capture path (LFM2) is unaffected.
+        if rocm.begin_graph_capture(capture_key).is_err() {
+            eprintln!("[grim] graph capture: begin failed for {capture_key}; eager step");
+            return self.drive_forward(model_id, request_id, input_ids, positions);
+        }
         // Scope borrows: session + model disjoint from logits cache insert below.
         let (result, accepted, running) = {
             let session = self
@@ -2400,9 +2409,15 @@ impl Engine {
             let acc = session.last_accepted_tokens();
             (out, acc, running)
         };
-        rocm.end_graph_capture(capture_key)?;
+        if rocm.end_graph_capture(capture_key).is_err() {
+            eprintln!("[grim] graph capture: end failed for {capture_key}; eager step");
+            return self.drive_forward(model_id, request_id, input_ids, positions);
+        }
         // Replay immediately to execute the captured graph.
-        rocm.replay_graph(capture_key)?;
+        if rocm.replay_graph(capture_key).is_err() {
+            eprintln!("[grim] graph capture: replay failed for {capture_key}; eager step");
+            return self.drive_forward(model_id, request_id, input_ids, positions);
+        }
         let logits = result?;
         // Cache output handle: replay rewrites the same device buffers, so
         // future replays return this Arc with fresh contents — zero transfers.

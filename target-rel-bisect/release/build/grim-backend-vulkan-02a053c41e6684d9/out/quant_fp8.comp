@@ -1,0 +1,72 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufX { float X[]; };
+layout(std430, binding = 1) writeonly buffer BufOut { uint Out[]; };
+
+// Convert float to FP8 E4M3 byte (matching CPU oracle)
+uint f32_to_fp8_e4m3(float val) {
+    if (isnan(val)) return 0x7Fu;
+    float abs_val = abs(val);
+    uint sign = (val < 0.0) ? 0x80u : 0x00u;
+    if (abs_val > 448.0) abs_val = 448.0;
+
+    if (abs_val < 0.001953125) { // 2^-9 subnormal threshold
+        uint mant = uint(round(abs_val * 512.0)); // mant / 2^-9 = mant * 512
+        mant = min(mant, 7u);
+        return sign | mant;
+    }
+
+    uint u = floatBitsToUint(abs_val);
+    int e = int((u >> 23u) & 0xFFu) - 127;
+    uint m = u & 0x7FFFFFu;
+
+    int e_fp8 = e + 7;
+    if (e_fp8 >= 15) {
+        return sign | 0x7Eu; // Max finite E4M3
+    }
+    if (e_fp8 <= 0) {
+        uint mant = uint(round(abs_val * 512.0));
+        mant = min(mant, 7u);
+        return sign | mant;
+    }
+
+    uint mant_bits = (m >> 20u) & 0x7u;
+    return sign | (uint(e_fp8) << 3u) | mant_bits;
+}
+
+void set_byte(uint byte_idx, uint val) {
+    uint word_idx = byte_idx / 4u;
+    uint shift = (byte_idx % 4u) * 8u;
+    uint mask = ~(0xFFu << shift);
+    uint new_val = (val & 0xFFu) << shift;
+    atomicAnd(Out[word_idx], mask);
+    atomicOr(Out[word_idx], new_val);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (gid == 0u) {
+        // Output format: 4-byte float scale (1.0) followed by E4M3 bytes
+        float scale = 1.0;
+        Out[0] = floatBitsToUint(scale);
+    }
+
+    barrier();
+
+    if (gid < params.size) {
+        uint fp8_byte = f32_to_fp8_e4m3(X[gid]);
+        set_byte(4u + gid, fp8_byte);
+    }
+}

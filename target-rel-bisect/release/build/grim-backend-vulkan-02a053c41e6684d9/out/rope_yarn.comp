@@ -1,0 +1,96 @@
+#version 450
+// Partial-rotary + YaRN RoPE for the Vulkan backend.
+//
+// Mirrors the CPU `Rope::forward` (grim-backend-cpu/src/device.rs) and the
+// HIP `grim_rope_yarn` numerically, but uses the split/half pair layout
+// `(i, i + rotary_half)` that Vulkan (and HF) RoPE tensors use:
+//     out[i]              = x[i]              * cos - x[i + half] * sin
+//     out[i + half]       = x[i + half]       * cos + x[i]         * sin
+// where `i` runs over `[0, rotary_half)` and `half = rotary_dim / 2`.
+//
+// The YaRN frequency ramp is recomputed per pair inside the shader (cheap
+// scalar math) so no `inv_freq` device buffer is required and the kernel
+// stays a single 3-buffer dispatch. An optional `mscale` (attention_factor)
+// is folded into cos/sin. The non-rotary tail `[rotary_dim, head_dim)` is
+// copied verbatim by a second pass over the same thread pool.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_tokens;        // S
+    uint head_dim;          // D
+    uint num_heads;         // H
+    uint rotary_dim;        // rotary_dim (<= head_dim); 0 => plain full (treated as head_dim)
+    uint has_yarn;          // 0 => plain RoPE (factor unused); 1 => apply YaRN ramp + mscale
+    float base;             // rope base theta
+    float yarn_factor;      // YaRN scaling factor
+    float yarn_orig_max;    // original_max_position_embeddings (f32)
+    float yarn_beta_fast;   // beta_fast
+    float yarn_beta_slow;   // beta_slow
+    float mscale;           // attention_factor (1.0 when has_yarn == 0)
+} params;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Pos { uint pos[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    uint rdim = params.rotary_dim == 0u ? params.head_dim : params.rotary_dim;
+    uint rotary_half = rdim / 2u;
+    uint copy_len = params.head_dim - rdim;
+
+    // Pass 1: rotate the [0, rotary_half) pairs (split/half layout).
+    uint total = params.num_tokens * params.num_heads * rotary_half;
+    if (idx < total) {
+        uint pair_idx = idx % rotary_half;
+        uint head_idx = (idx / rotary_half) % params.num_heads;
+        uint token_idx = idx / (rotary_half * params.num_heads);
+
+        uint p = pos[token_idx];
+        float freq = 1.0 / pow(params.base, float(2u * pair_idx) / float(params.head_dim));
+
+        if (params.has_yarn > 0u) {
+            float wavelength = 2.0 * 3.14159265358979323846 / freq;
+            float low  = params.yarn_orig_max / params.yarn_beta_slow;
+            float high = params.yarn_orig_max / params.yarn_beta_fast;
+            if (wavelength < high) {
+                // extrapolation region: unchanged
+            } else if (wavelength > low) {
+                freq = freq / params.yarn_factor;
+            } else {
+                float ramp = (params.yarn_orig_max / wavelength - params.yarn_beta_slow)
+                             / (params.yarn_beta_fast - params.yarn_beta_slow);
+                freq = (1.0 - ramp) * (freq / params.yarn_factor) + ramp * freq;
+            }
+        }
+
+        float val = float(p) * freq;
+        float cos_v = cos(val) * params.mscale;
+        float sin_v = sin(val) * params.mscale;
+
+        uint base_offset = (token_idx * params.num_heads + head_idx) * params.head_dim;
+        uint i0 = base_offset + pair_idx;
+        uint i1 = base_offset + pair_idx + rotary_half;
+
+        float v0 = x[i0];
+        float v1 = x[i1];
+        y[i0] = v0 * cos_v - v1 * sin_v;
+        y[i1] = v0 * sin_v + v1 * cos_v;
+        return;
+    }
+
+    // Pass 2: copy the non-rotary tail [rdim, head_dim) verbatim. Same thread
+    // pool, offset so it doesn't overlap pass 1.
+    if (copy_len > 0u) {
+        uint total2 = params.num_tokens * params.num_heads * copy_len;
+        if (idx < total2) {
+            uint ci = idx % copy_len;
+            uint head_idx = (idx / copy_len) % params.num_heads;
+            uint token_idx = idx / (copy_len * params.num_heads);
+            uint src = (token_idx * params.num_heads + head_idx) * params.head_dim + rdim + ci;
+            y[src] = x[src];
+        }
+    }
+}

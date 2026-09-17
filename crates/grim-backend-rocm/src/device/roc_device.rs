@@ -253,6 +253,8 @@ pub struct RocmDevice {
     pub(crate) rccl: Mutex<Option<Arc<crate::rccl::RcclAllReduce>>>,
     /// Upload completion event for async H2D pipeline.
     pub(crate) upload_event: Mutex<Option<*mut c_void>>,
+    /// P1-1: producer/consumer event ordering quantize_q8_1 -> dot4 GEMV.
+    pub(crate) q81_event: Mutex<Option<*mut c_void>>,
     /// SPEED-CEREMONY: true between "upload event recorded" and "compute stream
     /// fenced on it". Lets `active_stream()` skip the mutex + hipStreamWaitEvent
     /// per launch when no stream-ordered upload is in flight.
@@ -818,6 +820,7 @@ impl RocmDevice {
             )),
             rccl: Mutex::new(None),
             upload_event: Mutex::new(None),
+            q81_event: Mutex::new(None),
             upload_in_flight: AtomicBool::new(false),
             graph_capture_mgr: Mutex::new(None),
             attn_logit_softcap: std::sync::atomic::AtomicU32::new(0),
@@ -1073,21 +1076,14 @@ impl RocmDevice {
         };
         // SPEED-ROC-1: if a stream-ordered upload is in flight on the transfer stream, fence this (compute) stream on its completion event so the prefetch can overlap the prior decode-step GEMM instead of racing it.
         // `hipStreamWaitEvent` is a no-op ordering edge; it does not block the host.
-        if !stream.is_null() && self.upload_in_flight.load(Ordering::SeqCst) {
-            if let Ok(guard) = self.upload_event.lock() {
-                if let Some(ev) = *guard {
-                    if !ev.is_null() {
-                        unsafe {
-                            let _ = crate::hipStreamWaitEvent(stream, ev, 0);
-                        }
-                        // Stream ordering makes this single fence cover every
-                        // later launch enqueued on the same stream — clear the
-                        // flag so subsequent launches skip mutex + WaitEvent.
-                        self.upload_in_flight.store(false, Ordering::SeqCst);
-                    }
-                }
-            }
-        }
+        //
+        // P1-2 (PLAN-improve-grim-perf): the fence no longer *consumes* the
+        // flag. The old clear-on-first-wait let two back-to-back launches race
+        // — the first consumed the wait, the second assumed ordering that only
+        // the first had established. Now every launch waits on the latest
+        // upload event (a wait on an already-complete event is ~free), and the
+        // flag is cleared only by the next upload's own re-arm path on the
+        // upload side.
         stream
     }
 

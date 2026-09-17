@@ -1032,16 +1032,31 @@ impl Lfm2Block {
                 // derive offsets/totals on-device, so the whole step is
                 // graph-capturable. Falls back to the stock host path otherwise.
                 let decode_graph = crate::decode_graph_active(norm_x.device());
-                if decode_graph {
-                    let (q_rot_vec, arena_total, device_attn) = self.decode_attention_device(
-                        q_rot_storage,
-                        k_rot_storage,
-                        v,
+                // P0-2 (PLAN-improve-grim-perf): a device-path failure here
+                // (e.g. kv_append type mismatch) must degrade to the eager
+                // paths below, never terminate the request.
+                let decoded_graph = if decode_graph {
+                    match self.decode_attention_device(
+                        q_rot_storage.as_ref(),
+                        k_rot_storage.as_ref(),
+                        &v,
                         norm_x.device(),
                         cache,
                         kv_stride,
                         steps,
-                    )?;
+                    ) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            eprintln!(
+                                "[grim] decode_attention_device failed ({e}); eager attention fallback"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some((q_rot_vec, arena_total, device_attn)) = decoded_graph {
                     (q_rot_vec, arena_total, device_attn)
                 } else if matches!(norm_x.device(), Device::Rocm(_))
                     && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
@@ -1759,9 +1774,9 @@ impl Lfm2Block {
     #[allow(clippy::too_many_arguments)]
     fn decode_attention_device(
         &self,
-        q_rot_storage: Box<dyn grim_tensor::BackendStorage>,
-        k_rot_storage: Box<dyn grim_tensor::BackendStorage>,
-        v: Tensor,
+        q_rot_storage: &dyn grim_tensor::BackendStorage,
+        k_rot_storage: &dyn grim_tensor::BackendStorage,
+        v: &grim_tensor::Tensor,
         device: &Device,
         cache: &mut Option<Lfm2LayerCache>,
         kv_stride: usize,
@@ -1840,7 +1855,7 @@ impl Lfm2Block {
         let stream = grim_backend_rocm::launch_kv_append(
             &rocm_dev,
             k_arena.storage().as_ref(),
-            k_rot_storage.as_ref(),
+            k_rot_storage,
             past_dev.storage().as_ref(),
             kv_stride,
             steps,
@@ -1867,7 +1882,7 @@ impl Lfm2Block {
         let dummy = rocm_dev.alloc_storage(&Shape::new(vec![1]), DType::F32)?;
         let stream = grim_backend_rocm::launch_qkv_attention_dev(
             &rocm_dev,
-            q_rot_storage.as_ref(),
+            q_rot_storage,
             k_arena.storage().as_ref(),
             v_arena.storage().as_ref(),
             out_s.as_ref(),

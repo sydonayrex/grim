@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/drive/bigfast/grim/target-rel-bisect/release/build/mime_guess-1d63e5e280facae0/out/mime_types_generated.rs

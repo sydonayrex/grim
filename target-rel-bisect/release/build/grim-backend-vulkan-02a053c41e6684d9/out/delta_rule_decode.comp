@@ -1,0 +1,75 @@
+#version 450
+
+// Standard Delta Rule recurrence for DeltaNet / SolarOpen2.
+//
+// Per-head, per-token recurrence:
+//   Sk[i] = sum_j S[i,j] * k[j]
+//   delta_v[i] = beta * (v[i] - Sk[i])
+//   S[i,j] += delta_v[i] * k[j]
+//   o[i] = sum_j q[j] * S[i,j]
+//
+// Each workgroup processes one head of one token. Threads parallelize
+// over the v-dimension (d_v). The state matrix S[d_k, d_v] is
+// read-modified-written in place.
+//
+// Dispatch: (batch * num_heads) workgroups, d_v threads each.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint d_k;           // key dimension (== head_dim)
+    uint d_v;           // value dimension (== head_dim)
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    float beta;         // scalar beta (already sigmoided by model)
+} params;
+
+// q: [d_k] query
+layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
+// k: [d_k] key
+layout(std430, binding = 1) readonly buffer BufK { float K[]; };
+// v: [d_v] value
+layout(std430, binding = 2) readonly buffer BufV { float V[]; };
+// state: [d_k, d_v] recurrent state S (read-write)
+layout(std430, binding = 3) buffer BufState { float State[]; };
+// out: [d_v] output
+layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint d_k = params.d_k;
+    uint d_v = params.d_v;
+    float beta = params.beta;
+    uint i = gl_GlobalInvocationID.x;  // v-dimension index
+    uint head = gl_WorkGroupID.y;
+
+    if (i >= d_v) return;
+
+    uint state_base = head * d_k * d_v;
+    uint q_base = head * d_k;
+    uint k_base = head * d_k;
+    uint v_base = head * d_v;
+    uint out_base = head * d_v;
+
+    // Step 1: Sk[i] = sum_j S[i,j] * k[j]
+    float sk = 0.0;
+    for (uint j = 0u; j < d_k; ++j) {
+        sk += State[state_base + i * d_k + j] * K[k_base + j];
+    }
+
+    // Step 2: delta_v[i] = beta * (v[i] - Sk[i])
+    float delta_v = beta * (V[v_base + i] - sk);
+
+    // Step 3: S[i,j] += delta_v[i] * k[j]
+    for (uint j = 0u; j < d_k; ++j) {
+        State[state_base + i * d_k + j] += delta_v * K[k_base + j];
+    }
+
+    // Step 4: o[i] = sum_j q[j] * S[i,j]
+    float acc = 0.0;
+    for (uint j = 0u; j < d_k; ++j) {
+        acc += Q[q_base + j] * State[state_base + i * d_k + j];
+    }
+
+    Out[out_base + i] = acc;
+}

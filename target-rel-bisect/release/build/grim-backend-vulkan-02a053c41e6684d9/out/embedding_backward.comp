@@ -1,0 +1,28 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_tokens;
+    uint hidden_dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer TokenIds { uint tok_ids[]; };
+layout(std430, binding = 1) readonly buffer Grad { float g[]; };
+layout(std430, binding = 2) buffer Dweight { float dw[]; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = params.num_tokens * params.hidden_dim;
+    if (gid >= total) return;
+    uint token_idx = gid / params.hidden_dim;
+    uint dim_idx = gid % params.hidden_dim;
+    uint vocab_idx = tok_ids[token_idx];
+    float val = g[gid];
+    atomicAdd(dw[vocab_idx * params.hidden_dim + dim_idx], val);
+}

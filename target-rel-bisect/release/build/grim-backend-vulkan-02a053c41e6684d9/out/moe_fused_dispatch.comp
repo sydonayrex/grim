@@ -1,0 +1,103 @@
+// moe_fused_dispatch.comp
+//
+// Fused grouped Mixture-of-Experts dispatch (WI-M5) for Vulkan.
+//
+// One workgroup launch carries one (token, expert) routed pair. The host
+// pre-expands the top-k routing into a flat list of `num_pairs` (token,
+// expert, weight) triples (`router_tokens` / `router_experts` /
+// `router_weights`), so there is no device-side sort and no per-expert kernel
+// launch — the pair index `gl_GlobalInvocationID.x` maps directly to a routed
+// entry, exactly like the ROCm `grim_moe_fused_dispatch` / `grim_moe_fused_grouped`
+// P-DAFD path.
+//
+// Per pair, this computes the full SwiGLU expert contribution for one token:
+//   h_gate[h] = sum_j gate_w[e, h, j] * x[token, j]      (j over inter)
+//   h_up[h]   = sum_j up_w[e, h, j]   * x[token, j]
+//   act       = silu(h_gate) * h_up
+//   y[h]      = sum_j down_w[e, h, j] * act               (j over inter)
+//   out[token, h] += routed_scaling_factor * weight * y[h]
+//
+// A token routed to K>1 experts produces K pairs, so the weighted accumulate
+// into `out[token]` uses atomicAdd (the shared/always-on expert is added
+// separately on the host, matching `grim_nn::moe::MoeFfn::forward`).
+//
+// This is the FP32 base case (matches `grim_moe_fused_dispatch` scope);
+// quantized-weight MoE variants are a follow-up, reusing the dequant device
+// fns already shipped in the other `fused_dequant_gemm_*` kernels.
+//
+// Contract: weights are row-major per expert; `gate_w`/`up_w` are
+// [e, inter, hidden] (so `out` dim is `hidden`), `down_w` is [e, hidden, inter].
+
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256) in;
+
+// Reused 6-field Params block (keep in lockstep with push_params()):
+//   size = hidden  (output feature dim this thread iterates)
+//   dim  = inter   (contraction dim)
+//   k    = num_experts
+//   n    = batch
+//   m    = unused
+//   eps  = routed_scaling_factor
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufX   { float x[]; };       // [batch, hidden]
+layout(std430, binding = 1) readonly buffer BufGW  { float gate_w[]; };  // [num_experts, inter, hidden]
+layout(std430, binding = 2) readonly buffer BufUW  { float up_w[]; };    // [num_experts, inter, hidden]
+layout(std430, binding = 3) readonly buffer BufDW  { float down_w[]; };  // [num_experts, hidden, inter]
+layout(std430, binding = 4) readonly buffer BufTok { uint  router_tokens[]; };   // [num_pairs]
+layout(std430, binding = 5) readonly buffer BufExp { uint  router_experts[]; }; // [num_pairs]
+layout(std430, binding = 6) readonly buffer BufWt  { float router_weights[]; };  // [num_pairs]
+layout(std430, binding = 7) writeonly buffer BufO   { float o[]; };     // [batch, hidden] (atomicAdd)
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    // router_tokens.length() == num_pairs; guard against over-dispatch.
+    // Host launches exactly `num_pairs` workgroups (grid_x = num_pairs).
+    if (pair >= router_tokens.length()) return;
+
+    uint hidden = params.size;
+    uint inter  = params.dim;
+    uint tok    = router_tokens[pair];
+    uint exp_id = router_experts[pair];
+    float w     = router_weights[pair] * params.eps; // routed_scaling_factor fold
+
+    // Per-(token,expert) base offsets into the flattened weight buffers.
+    uint gw_base = exp_id * inter * hidden;
+    uint uw_base = exp_id * inter * hidden;
+    uint dw_base = exp_id * hidden * inter;
+
+    uint x_base = tok * hidden;
+
+    // Gate + up produce per-expert `inter`-dim intermediates; the contraction is
+    // over `hidden` (the activation input dim). Then the down projection maps
+    // `inter` -> `hidden` and is atomic-added into the shared token output.
+    for (uint i = 0u; i < inter; ++i) {
+        // Gate + up contraction over the `hidden` dim (input activation).
+        float g = 0.0;
+        float u = 0.0;
+        for (uint j = 0u; j < hidden; ++j) {
+            float xv = x[x_base + j];
+            g += gate_w[gw_base + i * hidden + j] * xv;
+            u += up_w[uw_base + i * hidden + j] * xv;
+        }
+        float silu_g = g / (1.0 + exp(-g));
+        float act = silu_g * u;
+
+        // Down projection: y[h] = sum_i down_w[h, i] * act[i]  (i over inter).
+        // Each (token,expert) pair adds its scaled contribution to out[token].
+        for (uint h = 0u; h < hidden; ++h) {
+            float y = down_w[dw_base + h * inter + i] * act;
+            uint out_idx = x_base + h;
+            atomicAdd(o[out_idx], w * y);
+        }
+    }
+}

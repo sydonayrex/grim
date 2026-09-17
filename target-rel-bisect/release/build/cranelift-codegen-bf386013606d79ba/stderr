@@ -1,0 +1,27 @@
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/settings.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/types.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/opcodes.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/inst_builder.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/settings-pulley.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/settings-pulley.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/settings-x86.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/numerics.isle
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_numerics.rs
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/clif_opt.isle
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/clif_lower.isle
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/assembler.isle
+Writing generated file: /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/assembler-isle-macro.rs
+Rebuilding /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_opt.rs
+Writing ISLE-generated Rust code to /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_opt.rs
+Rebuilding /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_x64.rs
+Writing ISLE-generated Rust code to /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_x64.rs
+Rebuilding /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_aarch64.rs
+Writing ISLE-generated Rust code to /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_aarch64.rs
+Rebuilding /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_s390x.rs
+Writing ISLE-generated Rust code to /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_s390x.rs
+Rebuilding /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_riscv64.rs
+Writing ISLE-generated Rust code to /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_riscv64.rs
+Rebuilding /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_pulley_shared.rs
+Writing ISLE-generated Rust code to /drive/bigfast/grim/target-rel-bisect/release/build/cranelift-codegen-bf386013606d79ba/out/isle_pulley_shared.rs
+fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).

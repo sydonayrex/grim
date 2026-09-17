@@ -1,0 +1,99 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB { uint B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
+
+uint get_byte(uint byte_idx) {
+    uint word = B_bytes[byte_idx / 4u];
+    uint shift = (byte_idx % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float unpack_f16_bytes(uint b0, uint b1) {
+    uint bits = b0 | (b1 << 8u);
+    if (bits == 0u) return 0.0;
+    uint sign = (bits >> 15u) & 1u;
+    uint exp = (bits >> 10u) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        float f = float(mant) / 1024.0 * exp2(-14.0);
+        return sign == 1u ? -f : f;
+    } else if (exp == 31u) {
+        return sign == 1u ? -1.0 / 0.0 : 1.0 / 0.0;
+    } else {
+        float f = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+        return sign == 1u ? -f : f;
+    }
+}
+
+float dequant_q8_0_element(uint block_start, uint in_sb) {
+    float d = unpack_f16_bytes(get_byte(block_start), get_byte(block_start + 1u));
+    uint raw = get_byte(block_start + 2u + in_sb);
+    int sbyte = (raw >= 128u) ? int(raw) - 256 : int(raw);
+    return d * float(sbyte);
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    uint blocks_per_row = K / 32u;
+    uint row_bytes = blocks_per_row * 34u;
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        if (row < M && (bk + tx) < K) {
+            s_a[ty][tx] = A[row * K + bk + tx];
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint k_idx = bk + ty;
+        if (col < N && k_idx < K) {
+            uint sb_idx = k_idx / 32u;
+            uint in_sb = k_idx % 32u;
+            uint block_start = col * row_bytes + sb_idx * 34u;
+            s_b[ty][tx] = dequant_q8_0_element(block_start, in_sb);
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

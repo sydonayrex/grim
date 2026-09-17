@@ -97,16 +97,17 @@ impl RocmCachingAllocator {
             *cached + cls > self.cap_bytes
         };
         if over_cap || ptr.is_null() {
-            // Use hipFreeAsync on the null stream instead of hipDeviceSynchronize + hipFree.
-            // hipFreeAsync enqueues the release after all currently submitted work on the null stream, avoiding a.
+            // P0-1 (PLAN-improve-grim-perf): a real release must be ordered
+            // after EVERY in-flight consumer, not just null-stream work. The
+            // previous `hipFreeAsync(ptr, null stream)` could unmap a page
+            // while a compute-stream kernel still read it — the "Page not
+            // present" UAF (fused Q8_0 QKV fault, GPU 1 speed test). Eviction
+            // is rare (only over cap), so a device-wide synchronize before
+            // the free costs nothing measurable and is correct for any stream.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             unsafe {
-                let res = crate::hipFreeAsync(ptr, std::ptr::null_mut());
-                if res != 0 {
-                    // hipFreeAsync not supported — fall back to sync path.
-                    let _ = crate::hipDeviceSynchronize();
-                    let _ = hipFree(ptr);
-                }
+                let _ = crate::hipDeviceSynchronize();
+                let _ = hipFree(ptr);
             }
             self.free_count.fetch_add(1, Ordering::Relaxed);
             return;

@@ -1,0 +1,2 @@
+cargo::rustc-check-cfg=cfg(embed_metallib)
+cargo:rerun-if-changed=src/kernels.msl

@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufX { float X[]; };
+layout(std430, binding = 1) readonly buffer BufDelta { float Delta[]; };
+layout(std430, binding = 2) readonly buffer BufA { float A_ssm[]; };
+layout(std430, binding = 3) readonly buffer BufB { float B_ssm[]; };
+layout(std430, binding = 4) readonly buffer BufC { float C_ssm[]; };
+layout(std430, binding = 5) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint d = params.dim;
+    uint seq_len = params.m;
+    uint d_state = params.n;
+    uint ch = gl_GlobalInvocationID.x;
+
+    if (ch >= d) return;
+
+    // State h of dimension d_state per channel
+    float h[16];
+    for (uint i = 0u; i < d_state && i < 16u; ++i) {
+        h[i] = 0.0;
+    }
+
+    for (uint t = 0u; t < seq_len; ++t) {
+        float delta_val = Delta[t * d + ch];
+        float x_val = X[t * d + ch];
+
+        float y_val = 0.0;
+
+        for (uint i = 0u; i < d_state && i < 16u; ++i) {
+            float a_val = A_ssm[ch * d_state + i];
+            float b_val = B_ssm[t * d_state + i];
+            float c_val = C_ssm[t * d_state + i];
+
+            // Discretization: dA = exp(delta * A), dB = delta * B
+            float dA = exp(delta_val * a_val);
+            float dB = delta_val * b_val;
+
+            h[i] = dA * h[i] + dB * x_val;
+            y_val += h[i] * c_val;
+        }
+
+        Out[t * d + ch] = y_val;
+    }
+}

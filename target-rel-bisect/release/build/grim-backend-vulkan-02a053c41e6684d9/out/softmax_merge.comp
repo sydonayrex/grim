@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint num_heads;
+    uint num_splits;
+    uint head_dim;
+} params;
+
+layout(std430, binding = 0) readonly buffer VPartial { float v_partial[]; };
+layout(std430, binding = 1) readonly buffer MPartial { float m_partial[]; };
+layout(std430, binding = 2) readonly buffer LPartial { float l_partial[]; };
+layout(std430, binding = 3) writeonly buffer Out { float out_buf[]; };
+
+shared float s_global_max;
+shared float s_global_sum;
+shared float s_weights[64];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (h >= params.num_heads) return;
+
+    if (tid == 0u) {
+        float m_max = -1e20;
+        for (uint s = 0; s < params.num_splits; ++s) {
+            float m = m_partial[h * params.num_splits + s];
+            if (m > m_max) m_max = m;
+        }
+        s_global_max = m_max;
+
+        float total_l = 0.0;
+        for (uint s = 0; s < params.num_splits; ++s) {
+            float m = m_partial[h * params.num_splits + s];
+            float l = l_partial[h * params.num_splits + s];
+            float w = l * exp(m - m_max);
+            s_weights[s] = w;
+            total_l += w;
+        }
+        s_global_sum = max(total_l, 1e-8);
+    }
+    barrier();
+
+    float inv_sum = 1.0 / s_global_sum;
+    uint out_base = h * params.head_dim;
+
+    for (uint d = tid; d < params.head_dim; d += 256u) {
+        float final_v = 0.0;
+        for (uint s = 0; s < params.num_splits; ++s) {
+            float v_val = v_partial[(h * params.num_splits + s) * params.head_dim + d];
+            float w = s_weights[s];
+            float m = m_partial[h * params.num_splits + s];
+            float exp_scale = exp(m - s_global_max);
+            final_v += v_val * exp_scale;
+        }
+        out_buf[out_base + d] = final_v * inv_sum;
+    }
+}

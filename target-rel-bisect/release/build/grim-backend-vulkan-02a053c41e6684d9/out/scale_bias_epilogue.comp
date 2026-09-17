@@ -1,0 +1,29 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;   // batch * out_dim
+    uint dim;    // out_dim
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) buffer OutBuf { float data[]; };
+layout(std430, binding = 1) readonly buffer A_SCALE { float a_scale[]; }; // [batch], unity-padded if absent
+layout(std430, binding = 2) readonly buffer B_SCALE { float b_scale[]; }; // [out_dim], unity-padded if absent
+layout(std430, binding = 3) readonly buffer BIAS { float bias[]; };      // [out_dim], zero-padded if absent
+
+// out[i,j] = out[i,j] * a_scale[i] * b_scale[j] + bias[j]. The host pads
+// absent a_scale/b_scale with 1.0 and absent bias with 0.0, so this is a
+// uniform multiply-add with no in-shader branching.
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.size) return;
+    uint out_dim = params.dim;
+    uint i = id / out_dim;
+    uint j = id % out_dim;
+    data[id] = data[id] * a_scale[i] * b_scale[j] + bias[j];
+}
