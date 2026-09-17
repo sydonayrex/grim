@@ -2258,6 +2258,9 @@ impl RocmDevice {
         let mut dptr = dst_ptr;
         let mut kk = k as i32;
         let mut mm = m as i32;
+        if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
+            eprintln!("[trace] quantize_q8_1 src={:#x} dst={:#x} k={k} m={m}", src_ptr as u64, dst_ptr as u64);
+        }
         let handle = self.launch_compute_kernel(
             "grim_quantize_q8_1",
             grid_dim,
@@ -2319,6 +2322,12 @@ impl RocmDevice {
         if !ev.is_null() {
             // SAFETY: ev is a live event; active_stream is the device's stream.
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
+        }
+        if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
+            eprintln!("[trace] dot4_q80_q81 act={:p} w={:p} out={:p} n={n} k={k}",
+                act_q81.device_ptr.unwrap_or(0) as *const std::ffi::c_void,
+                b_storage.device_ptr.unwrap_or(0) as *const std::ffi::c_void,
+                out_storage.device_ptr.unwrap_or(0) as *const std::ffi::c_void);
         }
         let a_ptr = act_q81
             .device_ptr

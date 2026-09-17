@@ -13,7 +13,11 @@ use crate::{check_hip, hipFree, hipMalloc};
 #[derive(Debug)]
 pub struct RocmCachingAllocator {
     /// Free-list: size class -> available device pointers (stored as `u64` so the [see: `Send + Sync`]
-    pool: Mutex<HashMap<usize, Vec<u64>>>,
+    /// P0-1: each entry carries an event recorded on the stream that was
+    /// current at free() time; a later `alloc` reusing the block waits on
+    /// that event first, so an in-flight consumer on another stream can
+    /// never race the new owner's writes.
+    pool: Mutex<HashMap<usize, Vec<PoolEntry>>>,
     /// Total bytes currently held in `pool` (not returned to the driver).
     cached_bytes: Mutex<usize>,
     /// Soft cap on `cached_bytes`. Once exceeded, freed buffers are actually [see: `hipFree`]
@@ -26,6 +30,15 @@ pub struct RocmCachingAllocator {
     /// Count of real `hipFree` calls (evictions / cap overflow). Always incremented.
     free_count: AtomicUsize,
 }
+
+/// A pooled device block plus the fence event recorded when it was freed.
+#[derive(Debug)]
+struct PoolEntry {
+    ptr: u64,
+    event: *mut c_void,
+}
+
+unsafe impl Send for PoolEntry {}
 
 impl RocmCachingAllocator {
     pub fn new(ordinal: usize, cap_bytes: usize) -> Self {
@@ -55,12 +68,23 @@ impl RocmCachingAllocator {
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             pool.get_mut(&cls).and_then(|v| v.pop())
         };
-        if let Some(ptr_u64) = reused {
-            // Buffer leaves the pool: adjust cached accounting.
+        if let Some(entry) = reused {
+            // Buffer leaves the pool: adjust cached accounting, and order the
+            // new owner's stream after whatever last used this block.
             if let Ok(mut cached) = self.cached_bytes.lock() {
                 *cached = cached.saturating_sub(cls);
             }
-            return Ok(ptr_u64 as *mut c_void);
+            if !entry.event.is_null() {
+                let stream = crate::device::roc_device::RocmDevice::shared(self.ordinal)
+                    .active_stream();
+                if !stream.is_null() {
+                    // SAFETY: event owned by this entry; stream is live.
+                    unsafe {
+                        let _ = crate::hipStreamWaitEvent(stream, entry.event, 0);
+                    }
+                }
+            }
+            return Ok(entry.ptr as *mut c_void);
         }
 
         // WI-M1: `hipMalloc` allocates in the calling thread's current device context.
@@ -112,9 +136,30 @@ impl RocmCachingAllocator {
             self.free_count.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // P0-1: fence the block against in-flight consumers. Record an event
+        // on the stream that was current at free() time — any future reuse
+        // waits on it, so a queued kernel reading this buffer can never race
+        // the new owner's writes, regardless of which stream either ran on.
+        let fence = crate::device::roc_device::RocmDevice::shared(self.ordinal)
+            .active_stream();
+        let event: *mut c_void = if fence.is_null() {
+            std::ptr::null_mut()
+        } else {
+            let mut ev: *mut c_void = std::ptr::null_mut();
+            // SAFETY: fresh event handle; stream is the device's live stream.
+            if unsafe { crate::hipEventCreate(&mut ev) } == 0 && !fence.is_null() {
+                // SAFETY: as above.
+                unsafe {
+                    let _ = crate::hipEventRecord(ev, fence);
+                }
+                ev
+            } else {
+                std::ptr::null_mut()
+            }
+        };
         {
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-            pool.entry(cls).or_default().push(ptr as u64);
+            pool.entry(cls).or_default().push(PoolEntry { ptr: ptr as u64, event });
             let mut cached = self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner());
             *cached += cls;
         }
@@ -132,7 +177,10 @@ impl RocmCachingAllocator {
         for (_cls, bufs) in pool.drain() {
             for p in bufs {
                 unsafe {
-                    let _ = hipFree(p as *mut c_void);
+                    let _ = hipFree(p.ptr as *mut c_void);
+                    if !p.event.is_null() {
+                        let _ = crate::hipEventDestroy(p.event);
+                    }
                 }
                 self.free_count.fetch_add(1, Ordering::Relaxed);
             }
