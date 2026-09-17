@@ -244,7 +244,13 @@ pub struct Engine {
     /// stays valid and replay returns a clone — no `decode_one`, no D2H.
     graph_capture_logits: HashMap<String, Arc<grim_tensor::Tensor>>,
     /// Fixed-buffer DecodeGraphs per request (twinkie-zombieland P2).
-    pub decode_graphs: HashMap<u64, grim_backend_rocm::FullDecodeGraph>,
+    /// P2-1 Layer 1 (session-continuity design): decode graphs are keyed by
+    /// MODEL, not request. The graph + KV arenas are expensive fixed resources
+    /// (alloc + capture + seed); reusing them across requests removes the
+    /// per-request ~170 ms setup that dominated warm TTFT. The seed path
+    /// re-binds the arenas to each new request's prefill state on every
+    /// miss, so cross-request reuse is position-reset-correct.
+    pub decode_graphs: HashMap<String, grim_backend_rocm::FullDecodeGraph>,
     /// P3: bucket-specialized batch decode graphs. Maps model_id → pool of
     /// per-bucket captured graphs for batch decode replay in step_batch.
     batch_graph_pools: HashMap<String, grim_backend_rocm::DecodeBucketGraphPool>,
@@ -2264,7 +2270,8 @@ impl Engine {
                 })
                 .unwrap_or(0);
 
-            if !self.decode_graphs.contains_key(&request_id) {
+            let graph_slot_key = format!("{model_id}");
+            if !self.decode_graphs.contains_key(&graph_slot_key) {
                 let max_ctx = 4096;
                 match lfm2.get_or_create_decode_graph(max_ctx, 1) {
                     Ok(mut g) => {
@@ -2310,8 +2317,8 @@ impl Engine {
                         }
                         // `current_pos` already set by the KV seed
                         // (`= valid_rows`); replays append after it.
-                        self.decode_graphs.insert(request_id, g);
-                        if let Some(g) = self.decode_graphs.get(&request_id) {
+                        self.decode_graphs.insert(graph_slot_key.clone(), g);
+                        if let Some(g) = self.decode_graphs.get(&graph_slot_key) {
                             let _ = g.replay();
                         }
                     }
@@ -2320,15 +2327,49 @@ impl Engine {
                     }
                 }
             } else {
-                let g = self.decode_graphs.get_mut(&request_id).unwrap();
+                let g = self.decode_graphs.get_mut(&graph_slot_key).unwrap();
+                // P2-1 Layer 1: the slot is reused across requests, so its
+                // arenas must be re-bound to THIS request's prefill state
+                // (same seed path as the miss branch, cheap D2D, outside any
+                // capture bracket). Without it the replay would attend over
+                // the previous request's KV rows.
+                let seed_ok: std::result::Result<(), String> = (|| {
+                    let sess = self
+                        .sessions
+                        .get(&request_id)
+                        .ok_or_else(|| "no session".to_string())?;
+                    let valid_rows = sess.current_pos() as u32;
+                    let caches = sess
+                        .model_state()
+                        .and_then(|s| {
+                            s.downcast_ref::<
+                                Vec<Option<grim_models_transformer::Lfm2LayerCache>>,
+                            >()
+                        })
+                        .ok_or_else(|| "no LFM2 caches".to_string())?;
+                    let srcs = lfm2
+                        .eager_kv_seed_sources(caches, valid_rows)
+                        .map_err(|e| format!("export: {e}"))?;
+                    let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+                    g.buffers
+                        .seed_kv_arena_from_eager(&dev, &srcs)
+                        .map_err(|e| format!("seed: {e}"))
+                })();
+                if let Err(e) = seed_ok {
+                    eprintln!(
+                        "[grim] decode-graph: slot re-seed failed for {graph_slot_key} ({e}); eager step"
+                    );
+                    self.decode_graphs.remove(&graph_slot_key);
+                    return self.drive_forward(model_id, request_id, input_ids, positions);
+                }
                 if lfm2.forward_replay(g, tid).is_err() {
-                    self.decode_graphs.remove(&request_id);
+                    self.decode_graphs.remove(&graph_slot_key);
                     return self.drive_forward(model_id, request_id, input_ids, positions);
                 }
                 g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
             }
 
-            let g = self.decode_graphs.get(&request_id).unwrap();
+            let g = self.decode_graphs.get(&graph_slot_key).unwrap();
             let logits_arc = match self.graph_capture_logits.get(capture_key) {
                 Some(cached) => cached.clone(),
                 None => {
@@ -3198,6 +3239,10 @@ impl Engine {
             let _ = session.rollback_kv_to(0);
         }
         self.sessions.remove(&id);
+        // P2-1: keep the per-model decode graph warm across requests. The old
+        // behavior removed it here, forcing the next request to pay alloc +
+        // capture + seed again (~170 ms of warm TTFT). Callers that unload a
+        // model drop the whole engine instance, which drops the graph with it.
         self.last_outcomes.remove(&id);
         self.request_rng.remove(&id);
         self.request_model_ids.remove(&id);
@@ -3205,7 +3250,6 @@ impl Engine {
         self.request_input_ids.remove(&id);
         self.prefill_progress.remove(&id);
         self.request_last_token.remove(&id);
-        self.decode_graphs.remove(&id);
         self.decode_graph_input_buffers.remove(&id);
         // Release the farm slot so the controller's load view stays honest.
         // The rank stays counted for a short cooldown (see `scythe_admission_decision`) so the NEXT admission still.

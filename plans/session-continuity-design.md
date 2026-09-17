@@ -68,3 +68,19 @@ Cost: no new transport API. Server routing change + engine slot pool.
   seed, no capture — TTFT < 50 ms on GPU 1 for the benchmark prompt.
 - Interleaved different-prompt requests produce outputs identical to fresh
   sessions (position-reset correctness test).
+
+## Implementation status (2026-09-16)
+
+Layer 1 is implemented: `decode_graphs` is keyed by `model_id`
+(`grim-engine/src/lib.rs`), the graph survives `finish_request`, and the
+slot-hit path re-binds the arenas to the current request via the existing
+`seed_kv_arena_from_eager` (fail-open to eager on seed error).
+
+Measured: correctness verified end-to-end on GPU 1 (sequential requests
+generate cleanly, no cross-request KV bleed, no faults). Caveat discovered:
+the SERVER stepping loop itself (engine `drive_*` per-step round-trip +
+sampler) costs ~0.4 s/token in server mode — it dominates everything and
+masks the slot-pool TTFT win. Next work item: profile the server stepping
+loop (likely sampler-thread handoff + per-step host sync), after which the
+slot pool's TTFT benefit becomes measurable. The CLI one-shot path already
+demonstrates the underlying decode speed (2.57 ms/tok, 389 tok/s).

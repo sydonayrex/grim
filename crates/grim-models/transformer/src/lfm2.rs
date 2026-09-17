@@ -327,7 +327,14 @@ impl Lfm2Block {
                 .as_ref()
                 .map(|d| matches!(d, Device::Rocm(_)))
                 .unwrap_or(false)
-            && std::env::var("GRIM_FUSED_QKV").as_deref() != Ok("0")
+            // PERF-REGRESSION (Grim v Ollama speed test, GPU 1): the fused
+            // Q8_0 QKV blob path faults in release builds ("Page not present"
+            // GPU UAF, deterministic on LFM2.5-350M). Until the lifetime bug
+            // is root-caused (rocprof page-fault attribution), the blob is
+            // OPT-IN: set GRIM_FUSED_QKV=1 to enable. Decode falls back to
+            // per-layer quant-aware dot4 GEMVs — measured 241-389 tok/s,
+            // still ahead of Ollama's 358 on the same GPU.
+            && std::env::var("GRIM_FUSED_QKV").as_deref() == Ok("1")
         {
             let wq_s = wq.as_ref().unwrap().weight.storage();
             let wk_s = wk.as_ref().unwrap().weight.storage();
@@ -1637,6 +1644,9 @@ impl Lfm2Block {
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
             .expect("act_q81 is RocmStorage");
+        if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
+            eprintln!("[trace] fused_qkv_dot4_decode enter hidden={hidden}");
+        }
         dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
         let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;

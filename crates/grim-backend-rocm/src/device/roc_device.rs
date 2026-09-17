@@ -1084,6 +1084,26 @@ impl RocmDevice {
         // upload event (a wait on an already-complete event is ~free), and the
         // flag is cleared only by the next upload's own re-arm path on the
         // upload side.
+        //
+        // Capture guard (added after a graph-replay page-fault repro): a
+        // wait against an event recorded OUTSIDE the open capture bracket
+        // poisons the graph — replays then page-fault. During capture the
+        // upload side must have completed before begin_capture (same
+        // contract as the seed H2D), so the fence is skipped there.
+        if !stream.is_null()
+            && !self.capture_active.load(Ordering::SeqCst)
+            && self.upload_in_flight.load(Ordering::SeqCst)
+        {
+            if let Ok(guard) = self.upload_event.lock() {
+                if let Some(ev) = *guard {
+                    if !ev.is_null() {
+                        unsafe {
+                            let _ = crate::hipStreamWaitEvent(stream, ev, 0);
+                        }
+                    }
+                }
+            }
+        }
         stream
     }
 
