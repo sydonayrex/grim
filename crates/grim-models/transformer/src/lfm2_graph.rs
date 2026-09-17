@@ -486,7 +486,6 @@ impl Lfm2Block {
         //    pool slots; no scratch allocs.
         let hidden = normed.shape().dims().last().copied().unwrap_or(0);
         let act = &buffers.act_q81_buf[layer_idx];
-        let norm_rocm = dst_downcast(normed)?;
         let batch = buffers.batch.max(1);
 
         // MXFP4 fused path (closes the decode-graph quant gap): ONE kernel
@@ -527,43 +526,6 @@ impl Lfm2Block {
                 buffers.max_ctx,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("fused mxfp4 qkv: {e}")))?;
-        } else if let Some(fused) = self
-            .wqkv_q80_fused
-            .as_ref()
-            .filter(|_| dot_fused_ok(dev, hidden) && self.head_dim != 0)
-        {
-            let m = buffers.batch.max(1);
-            dev.launch_quantize_q8_1(norm_rocm, act, m, hidden)
-                .map_err(|e| grim_core::error::Error::Backend(format!("qkv quant: {e}")))?;
-            let nkv = fused.n_k;
-            dev.launch_fused_qkv_dot4_into(
-                act,
-                &fused.storage,
-                &buffers.fused_qkv_out[layer_idx],
-                fused.n_q,
-                nkv,
-                hidden,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("fused qkv: {e}")))?;
-            let fused_out: &Storage = &buffers.fused_qkv_out[layer_idx];
-            dev.copy_slice_into(&buffers.q_buf[layer_idx], fused_out, 0, fused.n_q)
-                .map_err(grim_core::error::Error::Tensor)?;
-            dev.copy_slice_range(
-                &buffers.k_buf[layer_idx],
-                0,
-                fused_out,
-                fused.n_q,
-                fused.n_k,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-            dev.copy_slice_range(
-                &buffers.v_buf[layer_idx],
-                0,
-                fused_out,
-                fused.n_q + fused.n_k,
-                fused.n_v,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
         } else {
             linear_into(dev, normed, &wq.weight, &buffers.q_buf[layer_idx], act)?;
             linear_into(dev, normed, &wk.weight, &buffers.k_buf[layer_idx], act)?;

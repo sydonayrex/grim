@@ -47,7 +47,7 @@ Graph vs eager speedup: **4.59×**; graph + on-device sampler: 4.24×.
 
 The 350M model with temp 0.7 / top-k sampling emits EOS after ~17–38 tokens of weak text on this prompt (does not satisfy the "100–200 words" constraint; Ollama's run completes it with a proper list). Speed metrics above are unaffected — EOS suppression (`--min-tokens`) and greedy sampling were used for the sustained-rate rows.
 
-## 5. Known regression blocking Grim's default config
+## 5. Former regression — RESOLVED by removal
 
 The current release build faults (GPU memory-access fault, both tested GPUs, graph and eager alike) when the **fused Q8_0 QKV blob path** is active. Bisect evidence:
 

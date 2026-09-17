@@ -61,7 +61,6 @@ fn shortconv_block(dev: &RocmDevice, ordinal: usize, hidden: usize, l_cache: usi
         wqkv_exps: None,
         gamma_q: None,
         gamma_k: None,
-        wqkv_q80_fused: None,
         w_gate_up_q80_fused: None,
         shortconv_in_proj: Some(lin_rocm(dev, ordinal, rand_vec(3 * hidden * hidden, 1), 3 * hidden, hidden)),
         shortconv_conv: Some(tensor(
@@ -148,7 +147,6 @@ fn shortconv_device_ring_matches_host_reference() {
         wqkv_exps: None,
         gamma_q: None,
         gamma_k: None,
-        wqkv_q80_fused: None,
         w_gate_up_q80_fused: None,
         shortconv_in_proj: Some(Linear::from_tensor(
             cpu_t(rand_vec(3 * hidden * hidden, 1), Shape::new(vec![3 * hidden, hidden])),

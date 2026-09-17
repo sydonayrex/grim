@@ -66,7 +66,6 @@ fn attention_block(
         wqkv_exps: None,
         gamma_q: None,
         gamma_k: None,
-        wqkv_q80_fused: None,
         w_gate_up_q80_fused: None,
         shortconv_in_proj: None,
         shortconv_conv: None,

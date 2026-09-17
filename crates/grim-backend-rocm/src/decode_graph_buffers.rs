@@ -1026,7 +1026,7 @@ mod tests {
         // Zero-dim guard fires before any HIP alloc; no GPU needed.
         assert!(DecodeGraphBuffers::allocate(
             &crate::device::roc_device::RocmDevice::shared(0),
-            1, 64, 64, 64, 64, 256, 8, 100, 8, 0
+            1, 64, 64, 64, 64, 256, 8, 100, 8, 0, 0, 0, 0, 0
         )
         .is_err());
     }

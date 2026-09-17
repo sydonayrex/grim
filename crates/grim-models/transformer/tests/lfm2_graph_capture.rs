@@ -107,26 +107,16 @@ fn attention_block(
     let nh = n_q / hd;
     let nkv = n_kv / hd;
 
-    let (wqkv_q80_fused, w_gate_up_q80_fused) = if fused {
-        let q = test_linear_q80(dev, ordinal, n_q, hidden, 101);
-        let k = test_linear_q80(dev, ordinal, n_kv, hidden, 102);
-        let v = test_linear_q80(dev, ordinal, n_kv, hidden, 103);
+    let (_wqkv_unused, w_gate_up_q80_fused) = if fused {
         let gate = test_linear_q80(dev, ordinal, inter, hidden, 104);
         let up = test_linear_q80(dev, ordinal, inter, hidden, 105);
-        let fq = dev
-            .build_fused_qkv_q80(
-                q.weight.storage().as_ref(),
-                k.weight.storage().as_ref(),
-                v.weight.storage().as_ref(),
-            )
-            .expect("build fused Q80 QKV");
         let fgu = dev
             .build_fused_gate_up_q80(
                 gate.weight.storage().as_ref(),
                 up.weight.storage().as_ref(),
             )
             .expect("build fused Q80 gate+up");
-        (Some(fq), Some(fgu))
+        (Option::<grim_backend_rocm::FusedQkvWeights>::None, Some(fgu))
     } else {
         (None, None)
     };
@@ -143,7 +133,6 @@ fn attention_block(
         wqkv_exps: None,
         gamma_q: None,
         gamma_k: None,
-        wqkv_q80_fused,
         w_gate_up_q80_fused,
         shortconv_in_proj: None,
         shortconv_conv: None,
@@ -264,19 +253,19 @@ fn lfm2_graph_capture_replay_records_kernels() {
         "expected >=15 GEMMs (7/layer x2 + head), got {eager_gemms}"
     );
 
-    // Fused path: Q8_0 QKV and gate+up blobs.
+    // Fused path: gate+up blob (the fused QKV blob was retired — see
+    // PERF-REGRESSION note in model_loader/lfm2.rs; per-linear dot4 covers Q8_0).
     let model = tiny_lfm2(&dev, 0, 2, true);
-    assert!(
-        model.layers[0].wqkv_q80_fused.is_some(),
-        "fused Q8_0 QKV weights must be enabled for the graph path"
-    );
     assert!(
         model.layers[0].w_gate_up_q80_fused.is_some(),
         "fused Q8_0 gate+up weights must be enabled for the graph path"
     );
 
-    // Capture must enqueue fewer GEMM launches than the F32 baseline:
-    // one fused QKV dot4 replaces 3 GEMMs, one fused gate+up replaces 2.
+    // Capture must not enqueue MORE launches than the F32 baseline. The
+    // fused gate+up blob replaces 2 GEMMs with 1 quantize + 1 GEMV (net 0
+    // launches; it wins on bandwidth, not count). The fused QKV blob — the
+    // bigger win — was retired (see PERF-REGRESSION note in model_loader);
+    // per-linear dot4 covers Q8_0 decode instead.
     dev.reset_launch_count();
     graph.begin_capture().unwrap();
     model.forward_capture(&mut graph, 7).unwrap();
@@ -284,8 +273,8 @@ fn lfm2_graph_capture_replay_records_kernels() {
     assert!(graph.is_captured);
     let fused_gemms = dev.launch_count();
     assert!(
-        fused_gemms < eager_gemms,
-        "fused path should have fewer GEMMs than plain path: fused={fused_gemms}, plain={eager_gemms}"
+        fused_gemms <= eager_gemms,
+        "fused path must not exceed plain launches: fused={fused_gemms}, plain={eager_gemms}"
     );
 
     // Replay + single sync readback: finite logits, same addresses.
