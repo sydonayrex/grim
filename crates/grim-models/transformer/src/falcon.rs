@@ -6,7 +6,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, Device, Tensor};
 
 // LayerNorm
 
@@ -197,42 +197,16 @@ impl FalconBlock {
             attn_normed.clone()
         };
 
-        // 1. QKV projection. The fused column split has no device kernel, so
-        // pull once and upload only the q/k/v pieces (kernel gap).
+        // 1. QKV projection. Split into Q, K, V on device directly without host roundtrips.
         let qkv = self.fused_qkv.forward(&attn_normed)?;
-        let qkv_vec = qkv.to_vec_f32()?;
-
         let q_dim = self.num_heads * self.head_dim;
         let k_dim = self.num_kv_heads * self.head_dim;
         let v_dim = self.num_kv_heads * self.head_dim;
-        let total_qkv = q_dim + k_dim + v_dim;
 
-        let mut q_data = vec![0.0f32; seq_len * q_dim];
-        let mut k_data = vec![0.0f32; seq_len * k_dim];
-        let mut v_data = vec![0.0f32; seq_len * v_dim];
-
-        for s in 0..seq_len {
-            let row_offset = s * total_qkv;
-            q_data[s * q_dim..(s + 1) * q_dim]
-                .copy_from_slice(&qkv_vec[row_offset..row_offset + q_dim]);
-            k_data[s * k_dim..(s + 1) * k_dim]
-                .copy_from_slice(&qkv_vec[row_offset + q_dim..row_offset + q_dim + k_dim]);
-            v_data[s * v_dim..(s + 1) * v_dim]
-                .copy_from_slice(&qkv_vec[row_offset + q_dim + k_dim..row_offset + total_qkv]);
-        }
-
-        let q_rot = grim_nn::modules::move_to_device(
-            &cpu_tensor(q_data, Shape::new(vec![seq_len, q_dim])),
-            x.device(),
-        )?;
-        let k_rot = grim_nn::modules::move_to_device(
-            &cpu_tensor(k_data, Shape::new(vec![seq_len, k_dim])),
-            x.device(),
-        )?;
-        let v_tensor = grim_nn::modules::move_to_device(
-            &cpu_tensor(v_data, Shape::new(vec![seq_len, v_dim])),
-            x.device(),
-        )?;
+        let qkv_splits = grim_nn::modules::split_2d_horizontal_on_device(&qkv, &[q_dim, k_dim, v_dim])?;
+        let q_rot = qkv_splits[0].clone();
+        let k_rot = qkv_splits[1].clone();
+        let v_tensor = qkv_splits[2].clone();
 
         // Apply RoPE on-device.
         let q_rot = crate::shared_attention::rope_2d_on_device(
@@ -289,20 +263,9 @@ impl FalconBlock {
         };
         let attn_proj = self.dense.forward(&attn_tensor)?;
 
-        // 2. MLP branch (GELU — host kernel gap, pulled once, re-uploaded).
+        // 2. MLP branch (GELU on device).
         let mlp_mid = self.dense_h_to_4h.forward(&mlp_normed)?;
-        let mlp_mid_v = mlp_mid.to_vec_f32()?;
-        let gelu_v: Vec<f32> = mlp_mid_v
-            .iter()
-            .map(|&v| {
-                let c = 0.797_884_6 * (v + 0.044715 * v * v * v);
-                0.5 * v * (1.0 + c.tanh())
-            })
-            .collect();
-        let mlp_act = grim_nn::modules::move_to_device(
-            &cpu_tensor(gelu_v, mlp_mid.shape().clone()),
-            x.device(),
-        )?;
+        let mlp_act = grim_nn::modules::gelu_on_device(&mlp_mid)?;
         let mlp_proj = self.dense_4h_to_h.forward(&mlp_act)?;
 
         // 3. Parallel residual combination
@@ -436,7 +399,11 @@ impl CausalLm for Falcon {
         let kv_caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
-            .expect("Falcon::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "Falcon::forward: model_state must be Vec<Option<(Tensor, Tensor)>>".into(),
+                )
+            })?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_v, &mut kv_caches[layer_idx])?;
@@ -452,6 +419,7 @@ impl CausalLm for Falcon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_tensor::Shape;
 
     #[allow(clippy::field_reassign_with_default)]
     #[test]

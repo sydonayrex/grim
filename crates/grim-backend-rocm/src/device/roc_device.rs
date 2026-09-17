@@ -232,6 +232,7 @@ pub struct RocmDevice {
     /// Real `hipModuleLoad` call count (cache hits excluded). Item 2 acceptance.
     pub(crate) module_load_count: AtomicUsize,
     /// Total kernel + GEMM launches since the last `reset_launch_count`.
+    /// who-dat.md P2-9: uses Ordering::Relaxed on increments to avoid SeqCst memory barrier overhead on the hot launch path.
     /// Instrumentation for fusion-boundary launch-count gates (WI-F1 etc.); counts every `hipModuleLaunchKernel` and every rocBLAS GEMM enqueued.
     pub(crate) launch_counter: AtomicUsize,
     /// GPU target this device was created for, captured at construction. Used to [see: `temp_env::with_var("GRIM_GPU_TARGET", ..)`]
@@ -1094,8 +1095,8 @@ impl RocmDevice {
         // upload side must have completed before begin_capture (same
         // contract as the seed H2D), so the fence is skipped there.
         if !stream.is_null()
-            && !self.capture_active.load(Ordering::SeqCst)
-            && self.upload_in_flight.load(Ordering::SeqCst)
+            && !self.capture_active.load(Ordering::Relaxed)
+            && self.upload_in_flight.load(Ordering::Relaxed)
         {
             if let Ok(guard) = self.upload_event.lock() {
                 if let Some(ev) = *guard {

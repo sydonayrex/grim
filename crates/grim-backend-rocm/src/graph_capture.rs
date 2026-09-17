@@ -817,6 +817,15 @@ mod tests {
     }
 
     #[test]
+    fn test_graph_cache_state_tracks_hits_and_misses() {
+        let mut state = GraphCacheState::default();
+        assert_eq!((state.hits, state.misses), (0, 0));
+        state.misses = state.misses.saturating_add(1);
+        state.hits = state.hits.saturating_add(3);
+        assert_eq!((state.hits, state.misses), (3, 1));
+    }
+
+    #[test]
     fn test_decode_batch_bucket_mapping() {
         assert_eq!(DecodeBatchBucket::from_batch_size(0), None);
         assert_eq!(

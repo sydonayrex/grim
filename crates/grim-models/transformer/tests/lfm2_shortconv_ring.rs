@@ -228,3 +228,141 @@ fn shortconv_device_ring_matches_host_reference() {
         _ => panic!("expected ShortConv cache"),
     }
 }
+
+#[test]
+fn test_shortconv_prefill_then_decode_matches_reference() {
+    if !gpu_test_enabled() {
+        eprintln!("skip: set GRIM_GPU_TEST=1");
+        return;
+    }
+    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+        eprintln!("skip: no ROCm ordinal 0");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+    let hidden = 64usize;
+    let l_cache = 3usize;
+    let prefill_len = 4usize;
+    let decode_steps = 3usize;
+    let total_steps = prefill_len + decode_steps;
+    let x_data = rand_vec(total_steps * hidden, 101);
+
+    // GPU path: 1 multi-token prefill call (steps=4) followed by 3 single-token decode calls (steps=1).
+    let block_gpu = shortconv_block(&dev, 0, hidden, l_cache);
+    let mut cache_gpu: Option<Lfm2LayerCache> = None;
+    let mut out_gpu = Vec::new();
+
+    // 1. Prefill
+    let x_prefill = tensor(
+        &dev,
+        0,
+        x_data[..prefill_len * hidden].to_vec(),
+        Shape::new(vec![prefill_len, hidden]),
+    );
+    out_gpu.extend(
+        block_gpu
+            .forward(&x_prefill, &mut cache_gpu)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap(),
+    );
+
+    // 2. Decode steps
+    for t in 0..decode_steps {
+        let step = prefill_len + t;
+        let x_tok = tensor(
+            &dev,
+            0,
+            x_data[step * hidden..(step + 1) * hidden].to_vec(),
+            Shape::new(vec![1, hidden]),
+        );
+        out_gpu.extend(
+            block_gpu
+                .forward(&x_tok, &mut cache_gpu)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap(),
+        );
+    }
+
+    // CPU reference: 1 full prefill call over all total_steps tokens.
+    let block_cpu = Lfm2Block {
+        attn_norm: RmsNorm {
+            weight: cpu_t(vec![1.0f32; hidden], Shape::new(vec![hidden])),
+            eps: 1e-5,
+        },
+        wq: None,
+        wk: None,
+        wv: None,
+        wo: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        wqkv_codes: None,
+        wqkv_exps: None,
+        gamma_q: None,
+        gamma_k: None,
+        w_gate_up_q80_fused: None,
+        shortconv_in_proj: Some(Linear::from_tensor(
+            cpu_t(rand_vec(3 * hidden * hidden, 1), Shape::new(vec![3 * hidden, hidden])),
+            None,
+        )),
+        shortconv_conv: Some(cpu_t(
+            rand_vec(hidden * l_cache, 2),
+            Shape::new(vec![hidden, 1, l_cache]),
+        )),
+        shortconv_conv_vec: Some(rand_vec(hidden * l_cache, 2)),
+        shortconv_out_proj: Some(Linear::from_tensor(
+            cpu_t(rand_vec(hidden * hidden, 3), Shape::new(vec![hidden, hidden])),
+            None,
+        )),
+        ffn_norm: RmsNorm {
+            weight: cpu_t(vec![1.0f32; hidden], Shape::new(vec![hidden])),
+            eps: 1e-5,
+        },
+        ffn_gate: Linear::from_tensor(
+            cpu_t(rand_vec(hidden * hidden, 4), Shape::new(vec![hidden, hidden])),
+            None,
+        ),
+        ffn_up: Linear::from_tensor(
+            cpu_t(rand_vec(hidden * hidden, 5), Shape::new(vec![hidden, hidden])),
+            None,
+        ),
+        ffn_down: Linear::from_tensor(
+            cpu_t(rand_vec(hidden * hidden, 6), Shape::new(vec![hidden, hidden])),
+            None,
+        ),
+        ffn_gate_inp: None,
+        ffn_gate_exps: None,
+        ffn_up_exps: None,
+        ffn_down_exps: None,
+        ffn_exp_probs_b: None,
+        is_moe: false,
+        n_expert: 0,
+        n_expert_used: 1,
+        charon_cache: grim_models_transformer::shared_moe::CharonCache::new(),
+        moe_experts_cache: std::sync::OnceLock::new(),
+        num_heads: 1,
+        num_kv_heads: 1,
+        head_dim: hidden,
+        rope_theta: 10000.0,
+        eps: 1e-5,
+    };
+    let mut cache_cpu: Option<Lfm2LayerCache> = None;
+    let x_all_cpu = cpu_t(x_data, Shape::new(vec![total_steps, hidden]));
+    let out_cpu = block_cpu
+        .forward(&x_all_cpu, &mut cache_cpu)
+        .unwrap()
+        .to_vec_f32()
+        .unwrap();
+
+    assert_eq!(out_gpu.len(), out_cpu.len());
+    let max_diff = out_gpu
+        .iter()
+        .zip(out_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-3,
+        "prefill-then-decode diverged from reference: max_diff={max_diff}"
+    );
+}

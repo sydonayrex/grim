@@ -537,8 +537,16 @@ impl Engine {
         let target_itl = config.target_itl_ms as f64;
 
         // Pipeline-parallel gate. The stage layout is computable now, but block-level execution is NOT wired:
-        // a paged KV pool is single- device, so per-stage KV pools are the prerequisite.
+        // a paged KV pool is single-device, so per-stage KV pools are the prerequisite.
+        // Engine::new is infallible (returns Self), so we emit a clear diagnostic then panic.
         if config.pp_size > 1 {
+            eprintln!(
+                "[grim] ERROR: pipeline-parallel execution (GRIM_PP_SIZE={}) is not yet \
+                 wired into block execution. The paged KV pool is single-device; per-stage \
+                 KV pools are a prerequisite. Unset GRIM_PP_SIZE (or set it to 0/1) to run \
+                 single-device. See docs/serving-parity-plan.md P2.",
+                config.pp_size
+            );
             panic!(
                 "[grim-engine] INVALID config (GRIM_PP_SIZE={}): pipeline-parallel \
                  execution is not yet wired into block execution (a paged KV pool is \
@@ -2332,7 +2340,9 @@ impl Engine {
                     }
                 }
             } else {
-                let g = self.decode_graphs.get_mut(&graph_slot_key).unwrap();
+                let Some(g) = self.decode_graphs.get_mut(&graph_slot_key) else {
+                    return self.drive_forward(model_id, request_id, input_ids, positions);
+                };
                 // P2-1 Layer 1: the slot is reused across requests, so its
                 // arenas must be re-bound to THIS request's prefill state
                 // (same seed path as the miss branch, cheap D2D, outside any
@@ -2374,7 +2384,9 @@ impl Engine {
                 g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
             }
 
-            let g = self.decode_graphs.get(&graph_slot_key).unwrap();
+            let Some(g) = self.decode_graphs.get(&graph_slot_key) else {
+                return self.drive_forward(model_id, request_id, input_ids, positions);
+            };
             let logits_arc = match self.graph_capture_logits.get(capture_key) {
                 Some(cached) => cached.clone(),
                 None => {

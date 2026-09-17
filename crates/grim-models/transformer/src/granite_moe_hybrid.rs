@@ -137,6 +137,40 @@ impl GraniteMoeBlock {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _router_logits = self.gate.forward(x)?;
 
+        if x.device() != &Device::Cpu {
+            let mut acc: Option<Tensor> = if let Some(ref shared) = self.shared_expert {
+                Some(shared.forward(x)?)
+            } else {
+                None
+            };
+
+            let active_count = self.experts.len().min(self.num_experts_per_tok);
+            if active_count > 0 {
+                let weight = 1.0 / (active_count as f32);
+                for expert in &self.experts[..active_count] {
+                    let e_out = expert.forward(x)?;
+                    acc = Some(match acc {
+                        Some(a) => grim_nn::modules::axpy_on_device(&a, weight, &e_out)?,
+                        None => {
+                            let dev = grim_nn::modules::pick_device_for_tensor(&e_out);
+                            let (scaled_st, _) = dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
+                            Tensor::new(
+                                std::sync::Arc::from(scaled_st),
+                                e_out.shape().clone(),
+                                e_out.dtype(),
+                                grim_tensor::dtype::QuantProvenance::default(),
+                                e_out.device().clone(),
+                            )
+                        }
+                    });
+                }
+            }
+
+            if let Some(res) = acc {
+                return Ok(res);
+            }
+        }
+
         let mut out_vec = if let Some(ref shared) = self.shared_expert {
             shared.forward(x)?.to_vec_f32()?
         } else {
@@ -254,27 +288,16 @@ impl GraniteMoeHybridBlock {
         )?;
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
-        // Kernel gap: `res1 + m * attn_proj` / `res1 + m * moe_out` need a
-        // scalar-scale device kernel that doesn't exist yet — host math.
-        let x_vec = x.to_vec_f32()?;
-        let ap_vec = attn_proj.to_vec_f32()?;
-        let mut res1 = vec![0.0f32; x_vec.len()];
-        for i in 0..res1.len() {
-            res1[i] = x_vec[i] + self.residual_multiplier * ap_vec[i];
-        }
-        let res1_tensor = cpu_tensor(res1, x.shape().clone());
+        // Residual 1: res1 = x + residual_multiplier * attn_proj directly on-device
+        let res1_tensor = grim_nn::modules::axpy_on_device(x, self.residual_multiplier, &attn_proj)?;
 
         let normed_ffn = self.post_attention_layernorm.forward(&res1_tensor)?;
         let moe_out = self.moe.forward(&normed_ffn)?;
 
-        let r1_vec = res1_tensor.to_vec_f32()?;
-        let m_vec = moe_out.to_vec_f32()?;
-        let mut res2 = vec![0.0f32; r1_vec.len()];
-        for i in 0..res2.len() {
-            res2[i] = r1_vec[i] + self.residual_multiplier * m_vec[i];
-        }
+        // Residual 2: res2 = res1 + residual_multiplier * moe_out directly on-device
+        let res2_tensor = grim_nn::modules::axpy_on_device(&res1_tensor, self.residual_multiplier, &moe_out)?;
 
-        Ok(cpu_tensor(res2, x.shape().clone()))
+        Ok(res2_tensor)
     }
 }
 

@@ -55,6 +55,8 @@ pub mod commandr;
 pub mod configs;
 pub mod dbrx;
 pub mod deci;
+pub mod decode_graph;
+pub use decode_graph::DecodeGraphModel;
 pub mod deepseek;
 pub mod deepseek2;
 pub mod deepseek2ocr;

@@ -112,10 +112,13 @@ mod tests {
         assert!(!should_use_managed("auto", 60, 100, 1, 50));
     }
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// WI-P3: the managed fallback must be observable — note_managed_fallback
     /// bumps the counter and emits the user-facing warning exactly once.
     #[test]
     fn managed_fallback_is_observable_and_warns_once() {
+        let _guard = TEST_LOCK.lock().unwrap();
         reset_managed_fallback_instrumentation();
         assert_eq!(
             managed_fallback_count(),
@@ -144,6 +147,7 @@ mod tests {
     /// must not touch the instrumentation (no false-positive warning on normal small-model loads).
     #[test]
     fn non_managed_allocation_does_not_touch_instrumentation() {
+        let _guard = TEST_LOCK.lock().unwrap();
         reset_managed_fallback_instrumentation();
         // should_use_managed("", ...) = ordinary allocation path.
         assert!(!should_use_managed("", 1000, 2000, 1, 2000));

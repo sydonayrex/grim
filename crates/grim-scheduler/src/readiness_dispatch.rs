@@ -147,7 +147,7 @@ impl ReadinessDispatcher {
         priority: i32,
         dependencies: usize,
     ) {
-        let mut arrival = self.arrival_counter.lock().unwrap();
+        let mut arrival = self.arrival_counter.lock().unwrap_or_else(|e| e.into_inner());
         *arrival += 1;
         let epoch = *arrival;
 
@@ -161,20 +161,20 @@ impl ReadinessDispatcher {
             arrival_epoch: epoch,
         };
 
-        let mut rs = self.ready_set.lock().unwrap();
+        let mut rs = self.ready_set.lock().unwrap_or_else(|e| e.into_inner());
         rs.insert(task);
     }
 
     /// Notify that an incoming activation or predecessor operation has arrived.
     pub fn on_predecessor_completed(&self, microbatch_id: u64, kind: TaskKind) {
-        let mut rs = self.ready_set.lock().unwrap();
+        let mut rs = self.ready_set.lock().unwrap_or_else(|e| e.into_inner());
         rs.mark_dependency_satisfied(microbatch_id, kind);
     }
 
     /// Arbitrate and select the next executable task according to the priority hint.
     /// If the highest-priority kind has no ready tasks, skips to the next kind in the.
     pub fn arbitrate(&self) -> Option<MicrobatchTask> {
-        let mut rs = self.ready_set.lock().unwrap();
+        let mut rs = self.ready_set.lock().unwrap_or_else(|e| e.into_inner());
 
         for &kind in &self.hint.priority_kinds {
             if let Some(queue) = rs.ready_by_kind.get_mut(&kind) {

@@ -4389,7 +4389,7 @@ impl RocmDevice {
                 n,
                 k,
             )?;
-            self.launch_counter.fetch_add(1, Ordering::SeqCst);
+            self.launch_counter.fetch_add(1, Ordering::Relaxed);
             let compute_handle = Box::new(RocmHandle::new(Some(stream)));
             return Ok(compute_handle);
         }
@@ -4507,7 +4507,7 @@ impl RocmDevice {
                     "rocblas_gemm_strided_batched_ex failed with status {status}"
                 )));
             }
-            self.launch_counter.fetch_add(1, Ordering::SeqCst);
+            self.launch_counter.fetch_add(1, Ordering::Relaxed);
 
             // Sum up the partials along the batch dimension using the hand-written reduction kernel
             let stream = self.launch_split_k_reduction(
@@ -4547,7 +4547,7 @@ impl RocmDevice {
                 let stream = self.launch_dot2_bf16_gemv(
                     a_storage, b_storage, &out_storage, m, n, k,
                 )?;
-                self.launch_counter.fetch_add(1, Ordering::SeqCst);
+                self.launch_counter.fetch_add(1, Ordering::Relaxed);
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok(compute_handle);
             }
@@ -4588,7 +4588,7 @@ impl RocmDevice {
                         k,
                     ) {
                         Ok(_) => {
-                            self.launch_counter.fetch_add(1, Ordering::SeqCst);
+                            self.launch_counter.fetch_add(1, Ordering::Relaxed);
                             let compute_handle =
                                 Box::new(RocmHandle::new(Some(self.active_stream())));
                             return Ok(compute_handle);
@@ -4731,7 +4731,7 @@ impl RocmDevice {
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok(compute_handle);
             }
-            self.launch_counter.fetch_add(1, Ordering::SeqCst);
+            self.launch_counter.fetch_add(1, Ordering::Relaxed);
         };
 
         let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
@@ -4772,6 +4772,260 @@ impl RocmDevice {
             ],
         )?;
         Ok(())
+    }
+
+    /// Elementwise `out = silu(x)` into CALLER-PROVIDED `out` — no allocation inside.
+    pub fn silu_into(
+        &self,
+        x: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "silu_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        let mut out_ptr = dev_ptr(out)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_silu",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Elementwise `out = sigmoid(x)` into CALLER-PROVIDED `out` — no allocation inside.
+    pub fn sigmoid_into(
+        &self,
+        x: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "sigmoid_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        let mut out_ptr = dev_ptr(out)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_sigmoid",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Elementwise `out = gelu(x)` into CALLER-PROVIDED `out` — no allocation inside.
+    pub fn gelu_into(
+        &self,
+        x: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "gelu_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        let mut out_ptr = dev_ptr(out)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_gelu",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Elementwise GeLU activation returning newly allocated storage.
+    pub fn gelu(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let out = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        self.gelu_into(x, &out)?;
+        Ok(Box::new(out))
+    }
+
+    /// Elementwise GeLU-tanh gated multiplication `out = (gelu_tanh(gate)) * up` into CALLER-PROVIDED `out`.
+    pub fn gelu_tanh_mul_into(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let gate_s = as_rocm(gate)?;
+        let up_s = as_rocm(up)?;
+        if !gate_s.device_ptr_is_valid() || !up_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "gelu_tanh_mul_into: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        if gate.shape().elem_count() != total || up.shape().elem_count() != total {
+            return Err(Error::Shape(format!(
+                "gelu_tanh_mul_into: elem mismatch gate={} up={} out={total}",
+                gate.shape().elem_count(),
+                up.shape().elem_count()
+            )));
+        }
+        if !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "gelu_tanh_mul_into: out lacks a valid device pointer".into(),
+            ));
+        }
+        let mut out_ptr = dev_ptr(out)?;
+        let mut gate_ptr = dev_ptr(gate_s)?;
+        let mut up_ptr = dev_ptr(up_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_gelu_tanh_mul",
+            grid,
+            block,
+            &mut [
+                arg(&mut gate_ptr),
+                arg(&mut up_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Elementwise GeLU-tanh gated multiplication returning newly allocated storage.
+    pub fn gelu_tanh_mul(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let out = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        self.gelu_tanh_mul_into(gate, up, &out)?;
+        Ok(Box::new(out))
+    }
+
+    /// Elementwise `out = cap * tanh(x / cap)` into CALLER-PROVIDED `out`.
+    pub fn tanh_softcap_into(
+        &self,
+        x: &dyn BackendStorage,
+        cap: f32,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "tanh_softcap_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        let mut out_ptr = dev_ptr(out)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut cap_f = cap;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_tanh_softcap",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut cap_f),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// `out = a + s * b` writing into CALLER-PROVIDED `out`.
+    pub fn axpy_into(
+        &self,
+        a: &dyn BackendStorage,
+        s: f32,
+        b: &dyn BackendStorage,
+        out: &RocmStorage,
+    ) -> Result<()> {
+        let a_s = as_rocm(a)?;
+        let b_s = as_rocm(b)?;
+        if !a_s.device_ptr_is_valid() || !b_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "axpy_into: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        if a.shape().elem_count() != total || b.shape().elem_count() != total {
+            return Err(Error::Shape(format!(
+                "axpy_into: elem mismatch a={} b={} out={total}",
+                a.shape().elem_count(),
+                b.shape().elem_count()
+            )));
+        }
+        if !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "axpy_into: out lacks a valid device pointer".into(),
+            ));
+        }
+        let mut out_ptr = dev_ptr(out)?;
+        let mut a_ptr = dev_ptr(a_s)?;
+        let mut b_ptr = dev_ptr(b_s)?;
+        let mut s_f = s;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_axpy",
+            grid,
+            block,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut s_f),
+                arg(&mut b_ptr),
+                arg(&mut out_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// `out = a + s * b` returning a newly allocated storage.
+    pub fn axpy(
+        &self,
+        a: &dyn BackendStorage,
+        s: f32,
+        b: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let out = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        self.axpy_into(a, s, b, &out)?;
+        Ok(Box::new(out))
     }
 
     /// `C = A @ B^T` (SPEED-ROC-16 contract) writing into CALLER-PROVIDED
@@ -5011,6 +5265,67 @@ impl RocmDevice {
             &mut [
                 arg(&mut x_ptr),
                 arg(&mut w_ptr),
+                arg(&mut out_ptr),
+                arg(&mut row_len_i),
+                arg(&mut eps_f),
+                arg(&mut total_i),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    /// `y = (x - mean) / sqrt(var + eps) * w + b` per row (mean/variance
+    /// LayerNorm, unlike RMS norm). `bias` may be `None` (kernel receives a
+    /// NULL pointer). Writes into CALLER-PROVIDED `out`; in-place (`out`
+    /// aliases `x`) is safe: each element is read once before the write pass.
+    /// Capture-safe: pure kernel launches, no allocation, no sync.
+    pub fn layer_norm_into(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        eps: f32,
+        out: &RocmStorage,
+        out_shape: &Shape,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        use crate::device::util::dev_ptr_dyn;
+        let mut x_ptr = dev_ptr_dyn(x)?;
+        let mut w_ptr = dev_ptr_dyn(weight)?;
+        let mut b_ptr: *mut c_void = match bias {
+            Some(b) => dev_ptr_dyn(b)?,
+            None => std::ptr::null_mut(),
+        };
+        let row_len = out_shape
+            .dims()
+            .last()
+            .copied()
+            .ok_or_else(|| Error::Shape("layer_norm_into: empty out dims".into()))?;
+        let total = out_shape.elem_count();
+        if x.shape().elem_count() != total || out.shape().elem_count() != total {
+            return Err(Error::Shape(format!(
+                "layer_norm_into: elem mismatch x={} out={} shape={total}",
+                x.shape().elem_count(),
+                out.shape().elem_count()
+            )));
+        }
+        if !out.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "layer_norm_into: out lacks a valid device pointer".into(),
+            ));
+        }
+        let mut out_ptr = dev_ptr(out)?;
+        let mut row_len_i = row_len as i32;
+        let mut eps_f = eps;
+        let mut total_i = total as i32;
+        let (grid, block) = warp_rows_launch(total / row_len.max(1));
+        self.launch_compute_kernel(
+            "grim_layer_norm",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut w_ptr),
+                arg(&mut b_ptr),
                 arg(&mut out_ptr),
                 arg(&mut row_len_i),
                 arg(&mut eps_f),
@@ -5403,7 +5718,7 @@ impl RocmDevice {
                         std::ptr::null_mut(),
                     )
                 })?;
-                self.launch_counter.fetch_add(1, Ordering::SeqCst);
+                self.launch_counter.fetch_add(1, Ordering::Relaxed);
                 drop(_dev_guard);
                 return Ok(stream);
             }
@@ -5529,7 +5844,7 @@ impl RocmDevice {
                 std::ptr::null_mut(),
             )
         })?;
-        self.launch_counter.fetch_add(1, Ordering::SeqCst);
+        self.launch_counter.fetch_add(1, Ordering::Relaxed);
         Ok(stream)
     }
 

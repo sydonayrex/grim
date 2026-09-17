@@ -6,6 +6,12 @@ use grim_nn::modules::pick_device_for_storage_device;
 use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
+/// Check if fused QKV kernels are enabled (honors both `GRIM_FUSED_QKV` and legacy `GRIM_QKV_FUSED`).
+pub fn fused_qkv_enabled() -> bool {
+    std::env::var("GRIM_FUSED_QKV").as_deref() != Ok("0")
+        && std::env::var("GRIM_QKV_FUSED").as_deref() != Ok("0")
+}
+
 /// Single-token decode dot4 GEMV over fused Q8_0 weights [n_q + 2*n_kv, hidden].
 /// Produces (q, k, v) device tensors.
 pub fn fused_qkv_dot4_decode(
@@ -41,13 +47,17 @@ pub fn fused_qkv_dot4_decode(
         .as_ref()
         .as_any()
         .downcast_ref::<grim_backend_rocm::RocmStorage>()
-        .expect("norm_x is RocmStorage on fused path");
+        .ok_or_else(|| {
+            grim_core::error::Error::Backend("norm_x is RocmStorage on fused path".into())
+        })?;
     let act_rocm = act_q81
         .storage()
         .as_ref()
         .as_any()
         .downcast_ref::<grim_backend_rocm::RocmStorage>()
-        .expect("act_q81 is RocmStorage");
+        .ok_or_else(|| {
+            grim_core::error::Error::Backend("act_q81 is RocmStorage".into())
+        })?;
     dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
     let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
@@ -141,7 +151,7 @@ pub fn build_fused_qkv_q80_opt(
 ) -> Option<grim_backend_rocm::FusedQkvWeights> {
     let (wq, wk, wv) = (wq?, wk?, wv?);
     let device = wq.weight.device().clone();
-    if !matches!(&device, Device::Rocm(_)) || std::env::var("GRIM_FUSED_QKV").as_deref() == Ok("0") {
+    if !matches!(&device, Device::Rocm(_)) || !fused_qkv_enabled() {
         return None;
     }
     let is_q80 = |s: &grim_tensor::Tensor| {
@@ -190,9 +200,8 @@ pub fn fused_or_scalar_attention(
     debug_assert_eq!(v_history.len(), kv_len * kv_stride);
     let cache_offset = kv_len.saturating_sub(steps);
 
-    // GRIM_QKV_FUSED=0 forces the scalar reference path on GPU backends.
-    // Correctness escape hatch while the fused-route generation corruption (bisected to d95f21f, kernel itself verified correct.
-    if std::env::var("GRIM_QKV_FUSED").as_deref() == Ok("0") {
+    // fused_qkv_enabled() gate: forces the scalar reference path on GPU backends when disabled.
+    if !fused_qkv_enabled() {
         return scalar_attention(
             q,
             k_history,
@@ -713,7 +722,11 @@ pub fn fused_attention_tensors_softcapped(
 /// Device path: fresh arena + two D2D copies (the `block.rs::cache_append_kv` primitive pair); host fallback only.
 pub fn concat_rows_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let rows = a.shape().dims()[0] + b.shape().dims()[0];
-    let width = *a.shape().dims().last().expect("non-empty tensor");
+    let width = *a
+        .shape()
+        .dims()
+        .last()
+        .ok_or_else(|| grim_core::error::Error::Backend("non-empty tensor required for concat".into()))?;
     let out_shape = Shape::new(vec![rows, width]);
     let dev = pick_device_for_storage_device(a.device());
     if let Ok(fresh) = dev.alloc_storage(&out_shape, DType::F32) {

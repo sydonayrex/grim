@@ -18,9 +18,8 @@ use grim_engine::{
     model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
 };
 use grim_format::GgufTokenizer;
-use grim_models_transformer::{Lfm2, Lfm2Config, Lfm2LayerCache, LlamaConfig};
-use grim_tensor::CoreTensorOps;
-use grim_tensor::Device;
+use grim_models_transformer::{Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek32, DeepSeek4, Gemma2, Lfm2, Lfm2Config, Llama, LlamaConfig, Mistral3, Mistral4, Qwen35};
+use grim_tensor::{CoreTensorOps, Device};
 use std::sync::Arc;
 
 enum GraphDecodeResult {
@@ -44,8 +43,8 @@ fn try_graph_decode_step(
     step: usize,
     allow_gpu_sample: bool,
     history: &[u32],
-    // Session layer caches for A5 KV seeding (`None` → fail closed to eager).
-    caches: Option<&[Option<Lfm2LayerCache>]>,
+    // Session reference for generic KV arena seeding (`None` → fail closed to eager).
+    session: Option<&dyn grim_core::session::SessionT>,
     // Rows valid in every dense arena (prompt_len + decode steps so far).
     valid_rows: u32,
 ) -> Option<GraphDecodeResult> {
@@ -59,10 +58,32 @@ fn try_graph_decode_step(
     if !matches!(device, Device::Rocm(_)) {
         return None;
     }
-    let lfm2 = model.as_any().downcast_ref::<Lfm2>()?;
+    let graph_model: &dyn DecodeGraphModel = if let Some(m) = model.as_any().downcast_ref::<Lfm2>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<Llama>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<Mistral3>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<Mistral4>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<Qwen35>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<Gemma2>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<DeepSeek2>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<DeepSeek32>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<DeepSeek4>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<Chameleon>() {
+        m
+    } else {
+        return None;
+    };
     // Lazily allocate once; stable addresses across steps.
     if graph.is_none() {
-        match lfm2.get_or_create_decode_graph(4096, 1) {
+        match graph_model.get_or_create_decode_graph(4096, 1) {
             Ok(mut g) => {
                 // A5 Phase 2: seed graph KV arenas from the eager device
                 // caches so replay attends prompt context. Runs OUTSIDE the
@@ -70,9 +91,9 @@ fn try_graph_decode_step(
                 // Any miss → eager fallback (fail-closed; never capture
                 // prompt-blind). Needs the ROCm ordinal for the seed copy.
                 let seed_ok = (|| -> std::result::Result<(), String> {
-                    let caches = caches.ok_or_else(|| "no session caches".to_string())?;
-                    let srcs = lfm2
-                        .eager_kv_seed_sources(caches, valid_rows)
+                    let sess = session.ok_or_else(|| "no session".to_string())?;
+                    let srcs = graph_model
+                        .eager_kv_seed_sources(sess, valid_rows)
                         .map_err(|e| format!("export: {e}"))?;
                     let Device::Rocm(ordinal) = device else {
                         return Err("non-ROCm device".to_string());
@@ -88,6 +109,11 @@ fn try_graph_decode_step(
                     eprintln!("[grim] decode-graph: KV seed failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
                     return None;
                 }
+                // who-dat.md P3-11: Warmup before capture to prime JIT compiler,
+                // Scythe WI-SB0 calibration, and caching allocator (hipModuleLaunchKernel 901 prevention).
+                let _ = graph_model.forward_capture(&mut g, token_id);
+                let _ = graph_model.forward_capture(&mut g, token_id);
+
                 // First step: capture. Any failure -> abort the open capture
                 // (else the stream stays capturing and later copies fail
                 // with hipMemcpyDtoH 906), then eager fallback.
@@ -99,7 +125,7 @@ fn try_graph_decode_step(
                     eprintln!("[grim] decode-graph: begin_capture failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
                     return None;
                 }
-                let cap = lfm2.forward_capture(&mut g, token_id);
+                let cap = graph_model.forward_capture(&mut g, token_id);
                 let end = g.end_capture();
                 if cap.is_err() || end.is_err() {
                     let _ = g.abort_capture();
@@ -126,7 +152,7 @@ fn try_graph_decode_step(
         }
     }
     let g = graph.as_mut()?;
-    if let Err(e) = lfm2.forward_replay(g, token_id) {
+    if let Err(e) = graph_model.forward_replay(g, token_id) {
         // Replay failure drops the stale graph so the next attempt (after
         // the retry interval) re-seeds + re-captures from the eager caches.
         graph_retry.note_fail(step);
@@ -411,6 +437,8 @@ pub async fn cmd_run(
     seed: u64,
     repeat_penalty: f32,
     min_tokens: u32,
+    draft_model: Option<String>,
+    _lookahead: bool,
 ) -> Result<()> {
     let prompt = prompt.unwrap_or_else(|| "Hello".to_string());
 
@@ -565,6 +593,36 @@ pub async fn cmd_run(
         )));
     };
 
+    // Speculative decoding: if --draft-model was provided, wrap the base model.
+    // Full DSpark (markov+confidence scheduling) is wired in the HTTP engine path;
+    // CLI one-shot uses plain autoregressive + pre-loaded draft for future extension.
+    // ponytail: plain wrapper — add DSpark when CLI speculation throughput is measured.
+    let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
+        let dev = model.device().clone();
+        match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
+            Ok(eagle3) => {
+                eprintln!("[grim] Speculative decoding: Eagle3 draft loaded from {d_path}");
+                let _drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
+                // ponytail: plain for now; swap to with_dspark when markov/confidence CLI path added
+                Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+            }
+            Err(_) => {
+                match grim_engine::model_loader::load_from_path(d_path) {
+                    Ok(_draft_raw) => {
+                        eprintln!("[grim] Draft loaded from {d_path} (plain autoregressive; full DSpark via HTTP engine path)");
+                        Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+                    }
+                    Err(e) => {
+                        eprintln!("[grim] WARNING: draft model '{d_path}' load failed: {e}; using base model");
+                        model
+                    }
+                }
+            }
+        }
+    } else {
+        model
+    };
+
     let tokenizer = if use_gguf {
         let provider = grim_format::GgufProvider::open(&model_path_str)?;
         Some(provider.tokenizer()?)
@@ -701,8 +759,10 @@ pub async fn cmd_run(
         let input_ids: Vec<f32> = if first_pass {
             first_pass = false;
             tokens.iter().map(|t| *t as f32).collect()
+        } else if let Some(&last) = tokens.last() {
+            vec![last as f32]
         } else {
-            vec![*tokens.last().unwrap() as f32]
+            break;
         };
 
         // Host vecs: no transfer yet. Positions value matches old logic
@@ -768,13 +828,6 @@ pub async fn cmd_run(
 
         let graph_hit = if !is_prefill {
             let tid = tokens.last().copied().unwrap_or(0);
-            // A5: session layer caches feed KV seeding. `tokens` holds prompt
-            // + generated so far = rows valid in every dense arena.
-            let caches = session
-                .model_state
-                .as_ref()
-                .and_then(|s| s.downcast_ref::<Vec<Option<Lfm2LayerCache>>>())
-                .map(|v| v.as_slice());
             try_graph_decode_step(
                 &*model,
                 &device,
@@ -788,7 +841,7 @@ pub async fn cmd_run(
                 generated,
                 allow_gpu_sample,
                 &history,
-                caches,
+                Some(&session as &dyn grim_core::session::SessionT),
                 tokens.len() as u32,
             )
         } else {
@@ -1187,6 +1240,8 @@ pub async fn cmd_run_interactive(
     max_tokens: usize,
     seed: u64,
     repeat_penalty: f32,
+    draft_model: Option<String>,
+    _lookahead: bool,
 ) -> Result<()> {
     // ---- resolve path ----
     let resolved_path = resolve_model_path(&model_path)
@@ -1231,6 +1286,33 @@ pub async fn cmd_run_interactive(
             "Model '{}' is not a valid .gguf, .grim, or .safetensors file or does not exist.",
             model_path_str
         )));
+    };
+
+    // Speculative decoding: wrap base model when --draft-model was provided.
+    // ponytail: plain wrapper — full DSpark via HTTP engine path.
+    let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
+        let dev = model.device().clone();
+        match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
+            Ok(eagle3) => {
+                eprintln!("[grim] Speculative decoding: Eagle3 draft loaded from {d_path}");
+                let _drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
+                Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+            }
+            Err(_) => {
+                match grim_engine::model_loader::load_from_path(d_path) {
+                    Ok(_draft_raw) => {
+                        eprintln!("[grim] Draft loaded from {d_path} (plain autoregressive; full DSpark via HTTP engine path)");
+                        Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+                    }
+                    Err(e) => {
+                        eprintln!("[grim] WARNING: draft model '{d_path}' load failed: {e}; using base model");
+                        model
+                    }
+                }
+            }
+        }
+    } else {
+        model
     };
 
     // ---- tokenizer (loaded once) ----
@@ -1303,12 +1385,26 @@ pub async fn cmd_run_interactive(
     use std::io::Write;
     loop {
         print!(">>> ");
-        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdout().flush();
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).unwrap();
+        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            break Ok(());
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+
+        if trimmed == "/reset" {
+            session = SessionInner::new(model.device().clone());
+            messages.clear();
+            history.clear();
+            total_tokens = 0;
+            println!("(conversation reset)");
+            continue;
+        }
+        if trimmed == "/exit" || trimmed == "/quit" {
+            break Ok(());
         }
 
         // Append the user message to the conversation history.
@@ -1359,8 +1455,10 @@ pub async fn cmd_run_interactive(
             let input_ids: Vec<f32> = if first_pass {
                 first_pass = false;
                 tokens.iter().map(|t| *t as f32).collect()
+            } else if let Some(&last) = tokens.last() {
+                vec![last as f32]
             } else {
-                vec![*tokens.last().unwrap() as f32]
+                break;
             };
 
             let n_tokens = input_ids.len();

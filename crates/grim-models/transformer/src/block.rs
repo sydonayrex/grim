@@ -626,11 +626,19 @@ impl LlamaBlock {
 
         let seq_tokens = x_2d.shape().dims().first().copied().unwrap_or(0);
         let (q, k, v, k_raw) = if seq_tokens == 1 && self.wqkv_q80_fused.is_some() {
-            let fused = self.wqkv_q80_fused.as_ref().unwrap();
-            let (q_raw, k_raw, v_raw) = self.fused_qkv_dot4_decode(&x_norm, fused)?;
-            let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
-            let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
-            (q, k, v_raw, Some(k_raw))
+            if let Some(ref fused) = self.wqkv_q80_fused {
+                let (q_raw, k_raw, v_raw) = self.fused_qkv_dot4_decode(&x_norm, fused)?;
+                let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
+                let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
+                (q, k, v_raw, Some(k_raw))
+            } else {
+                let q_raw = self.wq.forward(&x_norm)?;
+                let k_raw = self.wk.forward(&x_norm)?;
+                let q = self.apply_qk_norm(&self.q_norm, &q_raw, self._cfg.local_num_heads)?;
+                let k = self.apply_qk_norm(&self.k_norm, &k_raw, self._cfg.local_num_kv_heads)?;
+                let v = self.wv.forward(&x_norm)?;
+                (q, k, v, Some(k_raw))
+            }
         } else {
             let q_raw = self.wq.forward(&x_norm)?;
             let k_raw = self.wk.forward(&x_norm)?;
@@ -765,18 +773,31 @@ impl LlamaBlock {
         // Process the full batch in one forward pass on-device (zero CPU roundtrips).
         let x_norm = self.ffn_norm.forward(&added)?;
         let (gate, up) = if seq_tokens == 1 && self.w_gate_up_q80_fused.is_some() {
-            let fused = self.w_gate_up_q80_fused.as_ref().unwrap();
-            self.fused_gate_up_dot4_decode(&x_norm, fused)?
+            if let Some(ref fused) = self.w_gate_up_q80_fused {
+                self.fused_gate_up_dot4_decode(&x_norm, fused)?
+            } else {
+                let gate = self
+                    .w_gate
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_gate missing".into()))?
+                    .forward(&x_norm)?;
+                let up = self
+                    .w_up
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_up missing".into()))?
+                    .forward(&x_norm)?;
+                (gate, up)
+            }
         } else {
             let gate = self
                 .w_gate
                 .as_ref()
-                .expect("dense FFN enabled")
+                .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_gate missing".into()))?
                 .forward(&x_norm)?;
             let up = self
                 .w_up
                 .as_ref()
-                .expect("dense FFN enabled")
+                .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_up missing".into()))?
                 .forward(&x_norm)?;
             (gate, up)
         };
@@ -798,7 +819,7 @@ impl LlamaBlock {
         let ffn_out = self
             .w_down
             .as_ref()
-            .expect("dense FFN enabled")
+            .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_down missing".into()))?
             .forward(&silu_storage)?;
 
         let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
@@ -962,13 +983,17 @@ impl LlamaBlock {
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("norm_x is RocmStorage on fused path");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("norm_x is RocmStorage on fused path".into())
+            })?;
         let act_rocm = act_q81
             .storage()
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("act_q81 is RocmStorage");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("act_q81 is RocmStorage".into())
+            })?;
         dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
         let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
@@ -1053,13 +1078,17 @@ impl LlamaBlock {
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("norm_x is RocmStorage on fused path");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("norm_x is RocmStorage on fused path".into())
+            })?;
         let act_rocm = act_q81
             .storage()
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("act_q81 is RocmStorage");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("act_q81 is RocmStorage".into())
+            })?;
         dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
         let out = dev.launch_fused_gate_up_dot4(act_rocm, &fused.storage, fused.n_gate, fused.n_up, hidden)?;
@@ -1562,9 +1591,18 @@ impl LlamaBlock {
             cache.past_dev = Some(Box::new(pos_tensor));
             cache.past_dev_seeded = Some(past_len);
         }
-        let past_dev = cache.past_dev.as_ref().unwrap();
-        let k_arena = cache.k_device.as_ref().unwrap();
-        let v_arena = cache.v_device.as_ref().unwrap();
+        let past_dev = cache
+            .past_dev
+            .as_ref()
+            .ok_or_else(|| grim_core::error::Error::Backend("cache.past_dev missing".into()))?;
+        let k_arena = cache
+            .k_device
+            .as_ref()
+            .ok_or_else(|| grim_core::error::Error::Backend("cache.k_device missing".into()))?;
+        let v_arena = cache
+            .v_device
+            .as_ref()
+            .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
 
         // Append this step's K/V at the DEVICE offset — the host past_len is
         // never baked into a kernel arg.

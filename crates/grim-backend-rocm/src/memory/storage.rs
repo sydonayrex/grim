@@ -152,7 +152,7 @@ impl RocmStorage {
                 self.bytes, need
             )));
         }
-        let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let res = unsafe {
             hipMemcpy(
@@ -186,7 +186,7 @@ impl RocmStorage {
         if stream.is_null() {
             return self.write_host_f32(host);
         }
-        let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // SAFETY: dst device mem owned by self; src host ptr valid for call.
         let res = unsafe {
@@ -223,7 +223,7 @@ impl RocmStorage {
         }
         let arith = dtype.arith;
         let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
-        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = storage.device_ptr_checked()? as *mut c_void;
 
         // WI-M1 context discipline: a synchronous `hipMemcpy` executes in the calling thread's current device context.
         // Pin the owning ordinal or a drifted thread writes the tensor onto another device's memory.
@@ -446,12 +446,7 @@ impl RocmStorage {
 
     /// Read the raw device buffer bytes back to host.
     pub fn copy_to_host(&self) -> Result<Vec<u8>> {
-        if !self.device_ptr_is_valid() {
-            return Err(Error::Backend(
-                "RocmStorage has no valid device pointer".into(),
-            ));
-        }
-        let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut raw = vec![0u8; self.bytes];
         check_hip("hipMemcpyDtoH raw bytes", unsafe {
@@ -501,12 +496,7 @@ impl BackendStorage for RocmStorage {
     }
 
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
-        if !self.device_ptr_is_valid() {
-            return Err(Error::Backend(
-                "RocmStorage has no valid device pointer".into(),
-            ));
-        }
-        let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let elem_count = self.shape.elem_count();
 
         // WI-M1 context discipline: every DtoH branch below issues a synchronous `hipMemcpy` against the calling thread's current device context.

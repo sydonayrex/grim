@@ -208,17 +208,26 @@ pub fn arena_append(
         arena.capacity_rows = new_cap;
     }
 
+    let k_arena = arena
+        .k_dev
+        .as_ref()
+        .ok_or_else(|| grim_core::error::Error::Backend("arena.k_dev missing".into()))?;
+    let v_arena = arena
+        .v_dev
+        .as_ref()
+        .ok_or_else(|| grim_core::error::Error::Backend("arena.v_dev missing".into()))?;
+
     // Append the new rows at the tail offset, no host round-trip.
     let tail_off = arena.tokens * row_elems;
     dev.copy_slice_range(
-        arena.k_dev.as_ref().unwrap().as_ref(),
+        k_arena.as_ref(),
         tail_off,
         k_new.storage().as_ref(),
         0,
         tokens_this_step * row_elems,
     )?;
     dev.copy_slice_range(
-        arena.v_dev.as_ref().unwrap().as_ref(),
+        v_arena.as_ref(),
         tail_off,
         v_new.storage().as_ref(),
         0,
@@ -226,8 +235,8 @@ pub fn arena_append(
     )?;
     arena.tokens = total;
     Ok((
-        arena.k_dev.as_ref().unwrap().clone(),
-        arena.v_dev.as_ref().unwrap().clone(),
+        k_arena.clone(),
+        v_arena.clone(),
         total,
     ))
 }

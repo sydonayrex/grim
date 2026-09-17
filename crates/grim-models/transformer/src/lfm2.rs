@@ -748,6 +748,12 @@ impl Lfm2Block {
             } else {
                 None
             };
+            if steps > 1 {
+                // If a multi-token prefill ran on host, any prior device ring in dev_state
+                // is now stale relative to the updated host state mirror. Invalidate it so
+                // subsequent decode steps re-initialize the device ring from the fresh host state.
+                *dev_state = None;
+            }
             match device_block_out {
                 Some(d) => d,
                 None => host_block_out.expect("host block_out must exist when device path skipped"),
@@ -1119,6 +1125,15 @@ impl Lfm2Block {
                     )?;
                     (Vec::new(), Some(total), Some(attn))
                 } else {
+                    // P1-5: The non-arena path does triple D2H (q, k, v) and hurts latency.
+                    // Gate behind explicit opt-in `GRIM_LFM2_ALLOW_TRIPLE_D2H=1`.
+                    if matches!(norm_x.device(), Device::Rocm(_))
+                        && std::env::var("GRIM_LFM2_ALLOW_TRIPLE_D2H").as_deref() != Ok("1")
+                    {
+                        return Err(grim_core::error::Error::Session(
+                            "LFM2 non-arena triple D2H fallback hit on ROCm device (set GRIM_LFM2_ALLOW_TRIPLE_D2H=1 to allow)".into(),
+                        ));
+                    }
                     let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
                     let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
                     let v_vec = v.to_vec_f32()?;
