@@ -77,6 +77,86 @@ pub type CaptureFn = Box<dyn FnOnce(*mut c_void) -> Result<()> + Send>;
 struct GraphCacheState {
     cache: HashMap<DecodeGraphKey, Arc<DecodeGraph>>,
     lru: Vec<DecodeGraphKey>,
+    /// who-dat.md P3-12: hit/miss counters so allocator thrash (a transient
+    /// buffer moving to a new address between steps) shows up as a falling
+    /// hit ratio instead of silently re-capturing graphs.
+    hits: u64,
+    misses: u64,
+}
+
+/// who-dat.md P3-10: decode-graph failure was previously permanent — one
+/// transient error (JIT miss, OOM blip, hipModuleLaunchKernel 901 during
+/// capture) disabled graph decode for the whole run. `GraphRetryPolicy`
+/// allows re-entering capture after `retry_interval` eager steps, up to
+/// `max_retries` times per run. Defaults are conservative; both knobs are
+/// env-overridable (`GRIM_GRAPH_MAX_RETRIES`, `GRIM_GRAPH_RETRY_INTERVAL`).
+#[derive(Debug, Clone)]
+pub struct GraphRetryPolicy {
+    failures: u32,
+    last_fail_step: Option<usize>,
+    max_retries: u32,
+    retry_interval: usize,
+}
+
+impl GraphRetryPolicy {
+    pub fn new(max_retries: u32, retry_interval: usize) -> Self {
+        Self {
+            failures: 0,
+            last_fail_step: None,
+            max_retries,
+            retry_interval,
+        }
+    }
+
+    /// Default policy: 3 retries, at least 32 eager steps apart.
+    pub fn default_policy() -> Self {
+        let max_retries = std::env::var("GRIM_GRAPH_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let retry_interval = std::env::var("GRIM_GRAPH_RETRY_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32);
+        Self::new(max_retries, retry_interval)
+    }
+
+    /// Total failures observed so far.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// Step of the most recent failure, if any.
+    pub fn last_fail_step(&self) -> Option<usize> {
+        self.last_fail_step
+    }
+
+    /// Record a capture/seed/replay failure at `step`.
+    pub fn note_fail(&mut self, step: usize) {
+        self.failures = self.failures.saturating_add(1);
+        self.last_fail_step = Some(step);
+    }
+
+    /// Whether graph decode may be (re)attempted at `step`.
+    /// Fresh runs have no failures and always attempt; after a failure the
+    /// policy requires `retry_interval` eager steps to pass and caps the
+    /// number of retries at `max_retries`.
+    pub fn should_attempt(&self, step: usize) -> bool {
+        match self.last_fail_step {
+            None => true,
+            Some(last) => {
+                self.failures <= self.max_retries
+                    && step.saturating_sub(last) >= self.retry_interval
+            }
+        }
+    }
+
+    /// Clear failure state (e.g. after a successful capture), keeping the
+    /// budget configuration.
+    pub fn note_success(&mut self) {
+        self.failures = 0;
+        self.last_fail_step = None;
+    }
 }
 
 /// Cache of captured decode-step graphs, keyed by `DecodeGraphKey`.
@@ -150,8 +230,10 @@ impl GraphCaptureManager {
                     state.lru.remove(pos);
                 }
                 state.lru.push(key);
+                state.hits = state.hits.saturating_add(1);
                 return Ok(g);
             }
+            state.misses = state.misses.saturating_add(1);
         }
 
         // Slow path: capture. Snapshot the closure before locking so we
@@ -228,7 +310,27 @@ impl GraphCaptureManager {
         }
         state.lru.push(key);
         state.cache.insert(key, g.clone());
+        let (hits, misses) = (state.hits, state.misses);
+        drop(state);
+        // who-dat.md P3-12: one line per capture showing the running hit
+        // ratio — repeated misses on a stable model mean pointer-key thrash.
+        let total = hits + misses;
+        eprintln!(
+            "[grim] graph-capture: key miss (capture #{}); hit ratio {:.1}% ({}/{})",
+            misses,
+            100.0 * hits as f64 / total.max(1) as f64,
+            hits,
+            total,
+        );
         Ok(g)
+    }
+
+    /// who-dat.md P3-12: cumulative (hits, misses) for the graph-key cache.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.state
+            .lock()
+            .map(|s| (s.hits, s.misses))
+            .unwrap_or((0, 0))
     }
 
     /// Check whether a graph is cached for `key` (without capturing).
@@ -653,6 +755,66 @@ impl Drop for HipGraphExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_graph_retry_policy_fresh_run_always_attempts() {
+        let p = GraphRetryPolicy::new(3, 32);
+        assert!(p.should_attempt(0));
+        assert!(p.should_attempt(1));
+        assert_eq!(p.failures(), 0);
+        assert_eq!(p.last_fail_step(), None);
+    }
+
+    #[test]
+    fn test_graph_retry_policy_blocks_until_interval() {
+        let mut p = GraphRetryPolicy::new(3, 32);
+        p.note_fail(10);
+        assert!(!p.should_attempt(10), "same step must not retry");
+        assert!(!p.should_attempt(41), "inside retry interval");
+        assert!(p.should_attempt(42), "retry allowed after 32 eager steps");
+    }
+
+    #[test]
+    fn test_graph_retry_policy_respects_max_retries() {
+        let mut p = GraphRetryPolicy::new(2, 8);
+        p.note_fail(0);
+        assert!(p.should_attempt(8));
+        p.note_fail(8);
+        assert!(p.should_attempt(16));
+        p.note_fail(16);
+        assert!(!p.should_attempt(24), "budget exhausted (3 failures > 2 retries)");
+        assert!(!p.should_attempt(1000));
+    }
+
+    #[test]
+    fn test_graph_retry_policy_success_resets_budget() {
+        // ponytail: reset on success — a transient blip (e.g. first-run JIT
+        // miss) must not burn the whole run's retry budget.
+        let mut p = GraphRetryPolicy::new(1, 4);
+        p.note_fail(0);
+        assert!(p.should_attempt(4));
+        p.note_success();
+        assert_eq!(p.failures(), 0);
+        assert_eq!(p.last_fail_step(), None);
+        // Behaves like a fresh run again, and the budget is restored.
+        p.note_fail(9);
+        assert!(p.should_attempt(13));
+    }
+
+    #[test]
+    fn test_graph_retry_policy_zero_retries_is_one_shot() {
+        // GRIM_GRAPH_MAX_RETRIES=0 semantics: first failure disables forever.
+        let mut p = GraphRetryPolicy::new(0, 1);
+        p.note_fail(0);
+        assert!(!p.should_attempt(1));
+        assert!(!p.should_attempt(10_000));
+    }
+
+    #[test]
+    fn test_graph_cache_stats_start_zero() {
+        let mgr = GraphCaptureManager::with_capacity(4);
+        assert_eq!(mgr.cache_stats(), (0, 0));
+    }
 
     #[test]
     fn test_decode_batch_bucket_mapping() {

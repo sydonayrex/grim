@@ -37,7 +37,7 @@ fn try_graph_decode_step(
     token_id: u32,
     vocab: usize,
     graph: &mut Option<grim_backend_rocm::FullDecodeGraph>,
-    graph_failed: &mut bool,
+    graph_retry: &mut grim_backend_rocm::graph_capture::GraphRetryPolicy,
     graph_fallback_step: &mut Option<usize>,
     sampling_params: &SamplingParams,
     seed: u64,
@@ -49,7 +49,11 @@ fn try_graph_decode_step(
     // Rows valid in every dense arena (prompt_len + decode steps so far).
     valid_rows: u32,
 ) -> Option<GraphDecodeResult> {
-    if *graph_failed || !grim_backend_rocm::decode_graph_enabled() {
+    // who-dat.md P3-10: a transient capture/replay failure no longer kills
+    // graph decode for the rest of the run — the policy re-arms after
+    // `GRIM_GRAPH_RETRY_INTERVAL` eager steps (default 32), capped by
+    // `GRIM_GRAPH_MAX_RETRIES` (default 3; 0 = old one-shot behaviour).
+    if !graph_retry.should_attempt(step) || !grim_backend_rocm::decode_graph_enabled() {
         return None;
     }
     if !matches!(device, Device::Rocm(_)) {
@@ -79,9 +83,9 @@ fn try_graph_decode_step(
                         .map_err(|e| format!("seed: {e}"))
                 })();
                 if let Err(e) = seed_ok {
-                    *graph_failed = true;
+                    graph_retry.note_fail(step);
                     *graph_fallback_step = Some(step);
-                    eprintln!("[grim] decode-graph: KV seed failed at step {step} ({e}); falling back to eager for the rest of this run");
+                    eprintln!("[grim] decode-graph: KV seed failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
                     return None;
                 }
                 // First step: capture. Any failure -> abort the open capture
@@ -90,41 +94,45 @@ fn try_graph_decode_step(
                 // B3: log on the fallback side only (never inside the capture
                 // bracket) so logging itself can't abort a capture.
                 if let Err(e) = g.begin_capture() {
-                    *graph_failed = true;
+                    graph_retry.note_fail(step);
                     *graph_fallback_step = Some(step);
-                    eprintln!("[grim] decode-graph: begin_capture failed at step {step} ({e}); falling back to eager for the rest of this run");
+                    eprintln!("[grim] decode-graph: begin_capture failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
                     return None;
                 }
                 let cap = lfm2.forward_capture(&mut g, token_id);
                 let end = g.end_capture();
                 if cap.is_err() || end.is_err() {
                     let _ = g.abort_capture();
-                    *graph_failed = true;
+                    graph_retry.note_fail(step);
                     *graph_fallback_step = Some(step);
-                    eprintln!("[grim] decode-graph: capture failed at step {step} (forward: {}, end: {}); falling back to eager for the rest of this run",
+                    eprintln!("[grim] decode-graph: capture failed at step {step} (forward: {}, end: {}); eager fallback (retry {})",
                         cap.as_ref().err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()),
-                        end.as_ref().err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()));
+                        end.as_ref().err().map(|e| e.to_string()).unwrap_or_else(|| "ok".into()),
+                        graph_retry.failures());
                     return None;
                 }
                 // Seed pos for next replay is set by the KV seed
                 // (`current_pos = valid_rows`); replays append after it.
                 *graph = Some(g);
+                graph_retry.note_success();
                 return None; // capture step ran eagerly path this token; replay from next.
             }
             Err(e) => {
-                *graph_failed = true;
+                graph_retry.note_fail(step);
                 *graph_fallback_step = Some(step);
-                eprintln!("[grim] decode-graph: graph allocation failed at step {step} ({e}); falling back to eager for the rest of this run");
+                eprintln!("[grim] decode-graph: graph allocation failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
                 return None;
             }
         }
     }
     let g = graph.as_mut()?;
     if let Err(e) = lfm2.forward_replay(g, token_id) {
-        *graph_failed = true;
+        // Replay failure drops the stale graph so the next attempt (after
+        // the retry interval) re-seeds + re-captures from the eager caches.
+        graph_retry.note_fail(step);
         *graph_fallback_step = Some(step);
         *graph = None;
-        eprintln!("[grim] decode-graph: replay failed at step {step} ({e}); falling back to eager for the rest of this run");
+        eprintln!("[grim] decode-graph: replay failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
         return None;
     }
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
@@ -678,7 +686,7 @@ pub async fn cmd_run(
     // i-was-dumb-graph.md Phase 5: full-model graph state. Allocated once,
     // reused for stable addresses. `None` + `graph_failed` = eager fallback.
     let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
-    let mut graph_failed = false;
+    let mut graph_retry = grim_backend_rocm::graph_capture::GraphRetryPolicy::default_policy();
     let mut graph_fallback_step: Option<usize> = None;
     // Owns the one prefill tensor pair so the borrow lives across the step.
     let mut decode_prefill_cache: Vec<(grim_tensor::Tensor, grim_tensor::Tensor)> = Vec::new();
@@ -773,7 +781,7 @@ pub async fn cmd_run(
                 tid,
                 vocab,
                 &mut decode_graph,
-                &mut graph_failed,
+                &mut graph_retry,
                 &mut graph_fallback_step,
                 &sampling_params,
                 seed,
@@ -929,12 +937,15 @@ pub async fn cmd_run(
     }
     // B3: operator-visible graph status (PLAN-reduce-d2h-h2d).
     if matches!(device, Device::Rocm(_)) {
-        match graph_fallback_step {
-            Some(s) => eprintln!("[grim] decode-graph: fell-back-at-step-{s} (eager for the rest of the run; see warnings above)"),
-            None if decode_graph.is_some() => {
-                eprintln!("[grim] decode-graph: active (replay path served decode steps)")
-            }
-            None => eprintln!("[grim] decode-graph: inactive (eager; capture never succeeded)"),
+        if decode_graph.is_some() {
+            eprintln!("[grim] decode-graph: active (replay path served decode steps)");
+        } else if let Some(s) = graph_fallback_step {
+            eprintln!(
+                "[grim] decode-graph: eager at end-of-run ({} failure(s), last at step {s})",
+                graph_retry.failures()
+            );
+        } else {
+            eprintln!("[grim] decode-graph: inactive (eager; capture never succeeded)");
         }
     }
     Ok(())

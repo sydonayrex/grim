@@ -3732,7 +3732,7 @@ impl RocmDevice {
         let fast_key = (self.intern_str(entry), grid.x, grid.y, None);
         let cached_func = self
             .resolved_kernel_cache
-            .lock()
+            .read()
             .ok()
             .and_then(|c| c.get(&fast_key).copied())
             .ok_or_else(|| Error::Backend(format!(
@@ -5377,7 +5377,7 @@ impl RocmDevice {
         let fast_key = (self.intern_str(entry), grid.x, grid.y, solution_index);
         let cached_func: Option<*mut c_void> = self
             .resolved_kernel_cache
-            .lock()
+            .read()
             .ok()
             .and_then(|c| c.get(&fast_key).copied());
         if let Some(func) = cached_func {
@@ -5477,7 +5477,7 @@ impl RocmDevice {
         let mut module_cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
         let (_module, func) = if let Some(cached) = module_cache.get(&cache_key) {
             let (m, f) = *cached;
-            if let Ok(mut fast) = self.resolved_kernel_cache.lock() {
+            if let Ok(mut fast) = self.resolved_kernel_cache.write() {
                 fast.insert(fast_key, f);
             }
             (m, f)
@@ -5504,7 +5504,7 @@ impl RocmDevice {
             }
             self.module_load_count.fetch_add(1, Ordering::SeqCst);
             module_cache.insert(cache_key, (module, func));
-            if let Ok(mut fast) = self.resolved_kernel_cache.lock() {
+            if let Ok(mut fast) = self.resolved_kernel_cache.write() {
                 fast.insert(fast_key, func);
             }
             (module, func)

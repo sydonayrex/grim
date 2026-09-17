@@ -221,8 +221,11 @@ pub struct RocmDevice {
     /// Resolved-function fast path for `launch_compute_kernel_with_solution`: (entry, grid_x, grid_y) -> hipFunction.
     /// Skips the per-launch kernel source regeneration + seahash + CString work for repeat launches (the.
     // SPEED-ROC-12: key entries are interned (&'static str) — the old String key heap-allocated on EVERY launch fast-path lookup.
+    /// who-dat.md P2-7: RwLock — the per-launch lookup is a read; writes only
+    /// happen the first time a kernel is resolved. Mutex serialized every
+    /// launch (~300 extra lock acquisitions per decode token).
     pub(crate) resolved_kernel_cache:
-        Mutex<HashMap<(&'static str, u32, u32, Option<i32>), *mut c_void>>,
+        RwLock<HashMap<(&'static str, u32, u32, Option<i32>), *mut c_void>>,
     /// Interner for `&'static str` autotune keys (entry / arch).
     /// Each unique string is leaked EXACTLY ONCE; repeat `get_or_tune_tiles` / `store_tune_cache` calls reuse it instead.
     pub(crate) str_interner: Mutex<std::collections::HashSet<&'static str>>,
@@ -744,7 +747,7 @@ impl RocmDevice {
             tuning: Mutex::new(crate::autotune::AutotunerConfig::default()),
 
             module_cache: Mutex::new(HashMap::new()),
-            resolved_kernel_cache: Mutex::new(HashMap::new()),
+            resolved_kernel_cache: RwLock::new(HashMap::new()),
             str_interner: Mutex::new(std::collections::HashSet::new()),
             module_load_count: AtomicUsize::new(0),
             launch_counter: AtomicUsize::new(0),
@@ -955,7 +958,7 @@ impl RocmDevice {
     pub fn kernel_max_blocks_per_cu(&self, entry: &str, block_size: u32) -> Option<i32> {
         let func = self
             .resolved_kernel_cache
-            .lock()
+            .read()
             .ok()
             .and_then(|c| c.iter().find(|(k, _)| k.0 == entry).map(|(_, &f)| f))?;
         if func.is_null() {
