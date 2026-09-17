@@ -1323,6 +1323,8 @@ async fn main() -> Result<()> {
                         seed,
                         repeat_penalty,
                         min_tokens,
+                        draft_model,
+                        lookahead,
                     )
                     .await?;
                 } else {
@@ -1341,6 +1343,8 @@ async fn main() -> Result<()> {
                         max_tokens,
                         seed,
                         repeat_penalty,
+                        draft_model,
+                        lookahead,
                     )
                     .await
                     {

@@ -537,15 +537,23 @@ impl Qwen35Block {
             let _ = v_cap_rows;
 
             if k_cap_rows >= need_rows {
+                let k_dev = cache
+                    .k_device
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("cache.k_device missing".into()))?;
+                let v_dev = cache
+                    .v_device
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
                 dev.copy_slice_range(
-                    &**cache.k_device.as_ref().unwrap(),
+                    &**k_dev,
                     cache.current_pos * self.num_kv_heads * self.head_dim,
                     k_rope.storage().as_ref(),
                     0,
                     kv_elems,
                 )?;
                 dev.copy_slice_range(
-                    &**cache.v_device.as_ref().unwrap(),
+                    &**v_dev,
                     cache.current_pos * self.num_kv_heads * self.head_dim,
                     v_dev_t.storage().as_ref(),
                     0,
@@ -595,10 +603,18 @@ impl Qwen35Block {
             }
 
             let total_kv = cache.current_pos + seq_len;
+            let k_dev = cache
+                .k_device
+                .as_ref()
+                .ok_or_else(|| grim_core::error::Error::Backend("cache.k_device missing".into()))?;
+            let v_dev = cache
+                .v_device
+                .as_ref()
+                .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
             let attn_tensor = crate::shared_attention::fused_or_scalar_attention_arena(
                 &q_all,
-                cache.k_device.as_ref().unwrap().as_ref(),
-                cache.v_device.as_ref().unwrap().as_ref(),
+                k_dev.as_ref(),
+                v_dev.as_ref(),
                 total_kv,
                 self.num_heads,
                 self.num_kv_heads,
@@ -918,7 +934,11 @@ impl CausalLm for Qwen35 {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Qwen35LayerCache>>())
-            .expect("Qwen35::forward: session.model_state must be Vec<Qwen35LayerCache>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "Qwen35::forward: session.model_state must be Vec<Qwen35LayerCache>".into(),
+                )
+            })?;
 
         for (i, block) in self.blocks.iter().enumerate() {
             if h.device() != &block.device {

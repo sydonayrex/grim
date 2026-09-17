@@ -373,7 +373,11 @@ impl CausalLm for Chameleon {
         let kv_caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
-            .expect("Chameleon::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "Chameleon::forward: model_state must be Vec<Option<(Tensor, Tensor)>>".into(),
+                )
+            })?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_v, &mut kv_caches[layer_idx])?;

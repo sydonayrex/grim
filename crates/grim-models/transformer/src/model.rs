@@ -78,7 +78,7 @@ pub struct Llama {
     pub layer_devices: Vec<Device>,
     /// WI-SB4a telemetry: actual cross-segment activation moves performed by [`Llama::decode_paged`] since model construction.
     /// The hop-bound gate drains this via [`Llama::take_boundary_moves`].
-    boundary_moves: std::sync::atomic::AtomicUsize,
+    pub(crate) boundary_moves: std::sync::atomic::AtomicUsize,
 }
 
 impl Llama {

@@ -155,6 +155,10 @@ impl GemmaBlock {
     /// Prefill-only convenience wrapper (Group B fix): delegates to the
     /// cache-aware path with a fresh cache.
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
+        if x.device() != &Device::Cpu {
+            let mut kv_cache = None;
+            return self.forward_kv(x, positions, &mut kv_cache);
+        }
         let mut cache = crate::kv_attention::RefKvCache::new();
         self.forward_cached(x, positions, &mut cache)
     }
@@ -167,6 +171,10 @@ impl GemmaBlock {
         positions: &[u32],
         cache: &mut crate::kv_attention::RefKvCache,
     ) -> Result<Tensor> {
+        if x.device() != &Device::Cpu {
+            let mut kv_cache = None;
+            return self.forward_kv(x, positions, &mut kv_cache);
+        }
         let norm_x = self.attn_norm.forward(x)?;
         let q = self.wq.forward(&norm_x)?;
         let k = self.wk.forward(&norm_x)?;
@@ -307,8 +315,8 @@ impl GemmaBlock {
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
         let up = self.ffn_up.forward(&norm_x2)?;
-        // GeGLU: gelu-tanh has no device kernel — host loop, re-uploaded once.
-        let activated = grim_nn::modules::move_to_device(&geglu(&gate, &up)?, x.device())?;
+        // GeGLU: on ROCm this runs entirely on device via `grim_gelu_tanh_mul`.
+        let activated = grim_nn::modules::gelu_tanh_mul_on_device(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
         grim_nn::modules::add_on_device(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
@@ -421,7 +429,11 @@ impl CausalLm for Gemma {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
-            .expect("Gemma::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "Gemma::forward: model_state must be Vec<Option<(Tensor, Tensor)>>".into(),
+                )
+            })?;
         if caches.len() < self.layers.len() {
             caches.resize(self.layers.len(), None);
         }

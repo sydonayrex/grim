@@ -413,7 +413,11 @@ impl CausalLm for DeepSeek {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<MlaLayerCache>>>())
-            .expect("DeepSeek::forward: model_state must be Vec<Option<MlaLayerCache>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "DeepSeek::forward: model_state must be Vec<Option<MlaLayerCache>>".into(),
+                )
+            })?;
         if caches.len() < self.layers.len() {
             caches.resize(self.layers.len(), None);
         }

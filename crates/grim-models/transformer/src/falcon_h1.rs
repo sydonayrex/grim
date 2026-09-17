@@ -292,7 +292,11 @@ impl CausalLm for FalconH1Model {
                 session
                     .model_state_mut()
                     .and_then(|s| s.downcast_mut::<Vec<FalconH1LayerCache>>())
-                    .expect("FalconH1::forward: model_state downcast after init")
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend(
+                            "FalconH1::forward: model_state downcast after init".into(),
+                        )
+                    })?
             }
         };
         let logits = self.forward_cpu(caches, &ids, &positions_vec)?;

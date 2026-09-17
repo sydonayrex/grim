@@ -303,8 +303,8 @@ impl Gpt2Block {
 
         let norm_x2 = grim_nn::modules::move_to_device(&self.ln_2.forward(&x_res1)?, x.device())?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
-        // GELU: host kernel gap, re-uploaded once.
-        let gate = grim_nn::modules::move_to_device(&gelu(&gate)?, x.device())?;
+        // GELU on device.
+        let gate = grim_nn::modules::gelu_on_device(&gate)?;
         let ffn_out = self.ffn_down.forward(&gate)?;
         grim_nn::modules::add_on_device(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
@@ -421,7 +421,11 @@ impl CausalLm for Gpt2 {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
-            .expect("Gpt2::forward: model_state must be Vec<Option<(Tensor, Tensor)>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "Gpt2::forward: model_state must be Vec<Option<(Tensor, Tensor)>>".into(),
+                )
+            })?;
         if caches.len() < self.layers.len() {
             caches.resize(self.layers.len(), None);
         }

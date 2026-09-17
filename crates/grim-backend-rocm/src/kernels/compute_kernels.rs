@@ -31,6 +31,13 @@ extern "C" __global__ void grim_add_scalar(const float* x, float s, float* out, 
     out[i] = x[i] + s;
 }
 
+// Fused AXPY: out = a + s * b (e.g. residual + residual_multiplier * branch)
+extern "C" __global__ void grim_axpy(const float* a, float s, const float* b, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = a[i] + s * b[i];
+}
+
 
 extern "C" __global__ void grim_sqrt(const float* x, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -42,6 +49,48 @@ extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = 1.0f / x[i];
+}
+
+extern "C" __global__ void grim_silu(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    out[i] = v / (1.0f + expf(-v));
+}
+
+extern "C" __global__ void grim_sigmoid(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    out[i] = 1.0f / (1.0f + expf(-v));
+}
+
+// GeLU (tanh approximation): out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+extern "C" __global__ void grim_gelu(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float x_val = x[i];
+    const float sqrt_2_over_pi = 0.7978845608028654f;
+    float tanh_in = sqrt_2_over_pi * (x_val + 0.044715f * x_val * x_val * x_val);
+    out[i] = 0.5f * x_val * (1.0f + tanhf(tanh_in));
+}
+
+// GeLU-tanh gated activation: out = (0.5 * gate * (1 + tanh(sqrt(2/pi) * (gate + 0.044715 * gate^3)))) * up
+extern "C" __global__ void grim_gelu_tanh_mul(const float* gate, const float* up, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float x_val = gate[i];
+    const float sqrt_2_over_pi = 0.7978845608028654f;
+    float tanh_in = sqrt_2_over_pi * (x_val + 0.044715f * x_val * x_val * x_val);
+    float gelu = 0.5f * x_val * (1.0f + tanhf(tanh_in));
+    out[i] = gelu * up[i];
+}
+
+// In-place or out-of-place tanh softcapping: out = cap * tanh(x / cap)
+extern "C" __global__ void grim_tanh_softcap(const float* x, float cap, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = cap * tanhf(x[i] / cap);
 }
 
 // ── GPU Reductions: sum, max, argmax (tree reduction with shared memory) ──
@@ -752,6 +801,45 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
     float rms = sqrtf(ss / (float)row_len + eps);
     for (int col = lane; col < row_len; col += 32) {
         o_row[col] = x_row[col] * w[col] / rms;
+    }
+}
+
+// Warp-per-row LayerNorm (mean/variance, unlike RMS norm); bias pointer may be NULL.
+// Used by per-head Q/K norms (Chameleon swin_norm) inside decode-graph capture.
+extern "C" __global__ void __launch_bounds__(256)
+grim_layer_norm(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b,
+                float* __restrict__ out, int row_len, float eps, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* x_row = x + (size_t)warp_id * row_len;
+    float* o_row = out + (size_t)warp_id * row_len;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    float sum = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        sum += x_row[col];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_xor_sync(shfl_mask, sum, off);
+    const float mean = sum / (float)row_len;
+
+    float var = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        float d = x_row[col] - mean;
+        var += d * d;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        var += __shfl_xor_sync(shfl_mask, var, off);
+    const float inv_std = rsqrtf(var / (float)row_len + eps);
+
+    for (int col = lane; col < row_len; col += 32) {
+        float val = (x_row[col] - mean) * inv_std * w[col];
+        if (b != (const float*)0) val += b[col];
+        o_row[col] = val;
     }
 }
 

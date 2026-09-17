@@ -80,7 +80,7 @@ impl CapabilityProfiler {
     /// Refresh the capability snapshot for every GPU. [see: `throttle_pct`, `bump_epoch()`]
     pub fn tick(&self) {
         let num_gpus = enumerate_devices().unwrap_or(0);
-        let mut state = self.inner.lock().expect("CapabilityProfiler lock poisoned");
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.last_tick = Instant::now();
 
         // Resize tracking vecs if a GPU joined (hot-plug).
@@ -111,7 +111,7 @@ impl CapabilityProfiler {
     pub fn capabilities(&self) -> Vec<GpuCapability> {
         self.inner
             .lock()
-            .expect("CapabilityProfiler lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .caps
             .clone()
     }
@@ -140,7 +140,7 @@ impl CapabilityProfiler {
     pub fn age(&self) -> Duration {
         self.inner
             .lock()
-            .expect("CapabilityProfiler lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .last_tick
             .elapsed()
     }

@@ -233,7 +233,11 @@ impl SolarOpen2Block {
 
         let attn_out = match self.layer_type {
             SolarLayerType::Gqa => {
-                let (out, _, _) = self.llama_block.as_ref().unwrap().forward_with_kv_paged(
+                let block = self
+                    .llama_block
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("solar_open2 llama_block missing".into()))?;
+                let (out, _, _) = block.forward_with_kv_paged(
                     &normed_attn,
                     positions,
                     sess,
@@ -243,13 +247,17 @@ impl SolarOpen2Block {
                 out
             }
             SolarLayerType::Kda => {
+                let delta = self
+                    .delta_net
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("solar_open2 delta_net missing".into()))?;
                 let pos_tensor = grim_backend_cpu::cpu_tensor(
                     positions.iter().map(|&p| p as f32).collect(),
                     Shape::new(vec![positions.len()]),
                 );
                 let mut dummy_sess =
-                    grim_core::session::Inner::new(self.delta_net.as_ref().unwrap().device.clone());
-                self.delta_net.as_ref().unwrap().forward(
+                    grim_core::session::Inner::new(delta.device.clone());
+                delta.forward(
                     &mut dummy_sess,
                     &normed_attn,
                     &pos_tensor,

@@ -571,7 +571,7 @@ fn sample_next_token(
                 let last_start = all.len().saturating_sub(width);
                 let last = &all[last_start..];
                 let mut idx: Vec<usize> = (0..last.len()).collect();
-                idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap());
+                idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap_or(std::cmp::Ordering::Equal));
                 eprintln!(
                     "[grim-server] step0 logits_len={} width={} top5={:?}",
                     all.len(),
@@ -1478,7 +1478,7 @@ async fn chat_completions(
     let vocab_size: usize = state
         .tokenizer
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map(|t| t.tokens.len())
         .unwrap_or(65536);
@@ -1488,7 +1488,7 @@ async fn chat_completions(
     let eos_token_id: Option<u32> = state
         .tokenizer
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|t| t.eos_token_id);
 

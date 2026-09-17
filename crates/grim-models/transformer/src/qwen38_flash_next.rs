@@ -253,6 +253,55 @@ impl Qwen38MoeBlock {
         let num_exp = self.experts.len();
         let seq_len = x.shape().elem_count() / hidden_dim;
 
+        if x.device() != &Device::Cpu && seq_len == 1 {
+            let row = &logits_vec[0..num_exp];
+            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let k = self.num_experts_per_tok.min(num_exp);
+            let topk = &indexed[..k];
+
+            let max_l = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
+            let sum_e: f32 = exps.iter().sum();
+            let weights: Vec<f32> = exps
+                .iter()
+                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
+                .collect();
+
+            let mut acc: Option<Tensor> = if let Some(ref shared) = self.shared_expert {
+                Some(shared.forward(x)?)
+            } else {
+                None
+            };
+
+            for (i, (exp_idx, _)) in topk.iter().enumerate() {
+                let w = weights[i];
+                let exp_out = self.experts[*exp_idx].forward(x)?;
+                acc = Some(match acc {
+                    Some(a) => grim_nn::modules::axpy_on_device(&a, w, &exp_out)?,
+                    None => {
+                        let dev = grim_nn::modules::pick_device_for_tensor(&exp_out);
+                        let (scaled_st, _) = dev.mul_scalar(&**exp_out.storage(), w, exp_out.shape())?;
+                        Tensor::new(
+                            std::sync::Arc::from(scaled_st),
+                            exp_out.shape().clone(),
+                            exp_out.dtype(),
+                            grim_tensor::dtype::QuantProvenance::default(),
+                            exp_out.device().clone(),
+                        )
+                    }
+                });
+            }
+
+            if let Some(out) = acc {
+                return Ok(out);
+            }
+            return Ok(x.clone());
+        }
+
         let x_vec = x.to_vec_f32()?;
         let mut out_vec = vec![0.0f32; x_vec.len()];
 
@@ -860,35 +909,51 @@ impl CausalLm for Qwen38FlashNext {
 
         let ids_f32 = input_ids.to_vec_f32()?;
         let seq_len = ids_f32.len();
-        let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
-        let mut h_vec = vec![0.0f32; seq_len * self.cfg.hidden_size];
+        let ids_u32: Vec<u32> = ids_f32.iter().map(|&v| v as u32).collect();
 
-        for (i, &tok_f) in ids_f32.iter().enumerate() {
-            let tok = tok_f as usize;
-            if tok < self.cfg.vocab_size {
-                let src_start = tok * self.cfg.hidden_size;
-                let dst_start = i * self.cfg.hidden_size;
-                if src_start + self.cfg.hidden_size <= embed_w.len() {
-                    h_vec[dst_start..dst_start + self.cfg.hidden_size]
-                        .copy_from_slice(&embed_w[src_start..src_start + self.cfg.hidden_size]);
+        let mut h = if self.device != Device::Cpu {
+            let mut h_dev = grim_nn::modules::embedding_gather_on_device(
+                &self.tok_embeddings.weight,
+                &ids_u32,
+                seq_len,
+                self.cfg.hidden_size,
+            )?;
+            if let Some(ref ngram_emb) = self.ngram_embeddings {
+                let ngram_h = ngram_emb.lookup_and_project(&ids_u32)?;
+                let ngram_h_dev = grim_nn::modules::move_to_device(&ngram_h, &self.device)?;
+                h_dev = grim_nn::modules::add_on_device(&h_dev, &ngram_h_dev)?;
+            }
+            h_dev
+        } else {
+            let embed_w = self.tok_embeddings.weight.to_vec_f32()?;
+            let mut h_vec = vec![0.0f32; seq_len * self.cfg.hidden_size];
+
+            for (i, &tok) in ids_u32.iter().enumerate() {
+                let tok = tok as usize;
+                if tok < self.cfg.vocab_size {
+                    let src_start = tok * self.cfg.hidden_size;
+                    let dst_start = i * self.cfg.hidden_size;
+                    if src_start + self.cfg.hidden_size <= embed_w.len() {
+                        h_vec[dst_start..dst_start + self.cfg.hidden_size]
+                            .copy_from_slice(&embed_w[src_start..src_start + self.cfg.hidden_size]);
+                    }
                 }
             }
-        }
 
-        // Auxiliary Position-aware / Prompt-Lookup N-gram Embedding (PLE) fusion
-        if let Some(ref ngram_emb) = self.ngram_embeddings {
-            let tokens: Vec<u32> = ids_f32.iter().map(|&v| v as u32).collect();
-            let ngram_h = ngram_emb.lookup_and_project(&tokens)?;
-            let ng_vec = ngram_h.to_vec_f32()?;
-            for i in 0..h_vec.len().min(ng_vec.len()) {
-                h_vec[i] += ng_vec[i];
+            // Auxiliary Position-aware / Prompt-Lookup N-gram Embedding (PLE) fusion
+            if let Some(ref ngram_emb) = self.ngram_embeddings {
+                let ngram_h = ngram_emb.lookup_and_project(&ids_u32)?;
+                let ng_vec = ngram_h.to_vec_f32()?;
+                for i in 0..h_vec.len().min(ng_vec.len()) {
+                    h_vec[i] += ng_vec[i];
+                }
             }
-        }
 
-        let mut h = cpu_tensor(
-            h_vec,
-            grim_tensor::Shape::new(vec![seq_len, self.cfg.hidden_size]),
-        );
+            cpu_tensor(
+                h_vec,
+                grim_tensor::Shape::new(vec![seq_len, self.cfg.hidden_size]),
+            )
+        };
 
         for layer in &self.layers {
             h = layer.forward(&h, &pos_u32)?;

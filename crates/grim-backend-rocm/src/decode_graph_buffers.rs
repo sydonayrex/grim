@@ -54,6 +54,8 @@ pub struct DecodeGraphBuffers {
     /// KV cache arenas (pre-allocated to max context)
     pub k_arena: Vec<RocmStorage>,       // [max_ctx, n_k]
     pub v_arena: Vec<RocmStorage>,       // [max_ctx, n_v]
+    /// Latent KV cache arena for MLA models (DeepSeek, Kimi): [batch * max_ctx, latent_kv_dim]
+    pub latent_kv_arena: Vec<RocmStorage>,
     /// Output projection
     pub head_input: RocmStorage,         // [batch, hidden_size]
     pub head_output: Arc<RocmStorage>,   // [batch, vocab_size]
@@ -139,6 +141,46 @@ impl DecodeGraphBuffers {
         sc_h_dim: usize,
         sc_l_cache: usize,
     ) -> Result<Self> {
+        Self::allocate_with_mla(
+            dev,
+            num_layers,
+            hidden_size,
+            n_q,
+            n_k,
+            n_v,
+            intermediate_size,
+            max_ctx,
+            vocab_size,
+            num_heads,
+            batch,
+            n_expert,
+            top_k,
+            sc_h_dim,
+            sc_l_cache,
+            0,
+        )
+    }
+
+    /// Allocate full pool on `dev`, with optional MLA latent KV arena support.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_with_mla(
+        dev: &RocmDevice,
+        num_layers: usize,
+        hidden_size: usize,
+        n_q: usize,
+        n_k: usize,
+        n_v: usize,
+        intermediate_size: usize,
+        max_ctx: usize,
+        vocab_size: usize,
+        num_heads: usize,
+        batch: usize,
+        n_expert: usize,
+        top_k: usize,
+        sc_h_dim: usize,
+        sc_l_cache: usize,
+        latent_kv_dim: usize,
+    ) -> Result<Self> {
         if num_layers == 0 || hidden_size == 0 || max_ctx == 0 || vocab_size == 0 || batch == 0 {
             return Err(Error::Backend(
                 "DecodeGraphBuffers::allocate: zero dim".into(),
@@ -175,6 +217,7 @@ impl DecodeGraphBuffers {
         let mut fused_qkv_out = Vec::with_capacity(num_layers);
         let mut k_arena = Vec::with_capacity(num_layers);
         let mut v_arena = Vec::with_capacity(num_layers);
+        let mut latent_kv_arena = Vec::with_capacity(if latent_kv_dim > 0 { num_layers } else { 0 });
         // Q8_1 staging must cover the widest activation row (hidden vs inter),
         // times one row per batch slot (P3).
         let q81_elems = hidden_size.max(intermediate_size).max(32);
@@ -292,6 +335,14 @@ impl DecodeGraphBuffers {
                 &dev.allocator,
                 dev.ordinal,
             )?);
+            if latent_kv_dim > 0 {
+                latent_kv_arena.push(RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch * max_ctx, latent_kv_dim]),
+                    dt.clone(),
+                    &dev.allocator,
+                    dev.ordinal,
+                )?);
+            }
         }
         let head_input = RocmStorage::alloc_gpu(
             &Shape::new(vec![batch, hid]),
@@ -424,6 +475,7 @@ impl DecodeGraphBuffers {
             attn_sum_buf,
             k_arena,
             v_arena,
+            latent_kv_arena,
             head_input,
             head_output,
             current_pos: 0,
@@ -587,6 +639,67 @@ impl DecodeGraphBuffers {
         self.current_pos = prefill_len;
         // Seed the device position scalar to match; the graph's bump kernel
         // increments it on each replay, so it must start at prefill_len.
+        self.write_pos_async(dev, prefill_len, stream)?;
+        dev.synchronize();
+        Ok(())
+    }
+
+    /// Prefill seeding for MLA compressed latent KV arenas (`latent_kv_arena`).
+    /// `src.k_dev` points to the `[prefill_len, latent_kv_dim]` latent tensor.
+    pub fn seed_latent_kv_arena_from_eager(
+        &mut self,
+        dev: &RocmDevice,
+        per_layer: &[Option<EagerKvSource<'_>>],
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let stream = dev.active_stream();
+        for (layer_idx, src) in per_layer.iter().enumerate() {
+            let Some(src) = src else { continue };
+            if src.prefill_len == 0 {
+                continue;
+            }
+            if layer_idx >= self.latent_kv_arena.len() {
+                return Err(Error::Backend(format!(
+                    "seed_latent_kv_arena: layer {layer_idx} >= {}",
+                    self.latent_kv_arena.len()
+                )));
+            }
+            let n_rows = src.prefill_len;
+            let n_elem: usize = (n_rows as usize) * src.kv_stride;
+            let arena_cols = self.latent_kv_arena[layer_idx].shape.dims().last().copied().unwrap_or(0);
+            if arena_cols != src.kv_stride {
+                return Err(Error::Backend(format!(
+                    "seed_latent_kv_arena: layer {layer_idx} arena width {arena_cols} != latent stride {}",
+                    src.kv_stride
+                )));
+            }
+            if n_elem > self.latent_kv_arena[layer_idx].shape.elem_count() {
+                return Err(Error::Backend(format!(
+                    "seed_latent_kv_arena: layer {layer_idx} prefill {n_elem} > arena {}",
+                    self.latent_kv_arena[layer_idx].shape.elem_count()
+                )));
+            }
+            let bytes = n_elem * std::mem::size_of::<f32>();
+            let dst_latent = self.latent_kv_arena[layer_idx]
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("seed: latent_kv_arena has no ptr".into()))?
+                as *mut c_void;
+            let src_latent = src.k_dev as *const c_void;
+            let res: crate::HipErrorT = unsafe {
+                crate::hipMemcpyAsync(
+                    dst_latent,
+                    src_latent,
+                    bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                    stream,
+                )
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!("seed_latent_kv_arena: hipMemcpyAsync failed: {res}")));
+            }
+        }
+        let prefill_len = per_layer.iter().find_map(|s| s.as_ref().map(|e| e.prefill_len)).unwrap_or(0);
+        self.current_pos = prefill_len;
         self.write_pos_async(dev, prefill_len, stream)?;
         dev.synchronize();
         Ok(())

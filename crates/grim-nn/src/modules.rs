@@ -10,7 +10,7 @@ use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, CoreTensorOps, DType, Device, Tensor};
+use grim_tensor::{BackendDevice, BackendStorage, CoreTensorOps, DType, Device, Tensor};
 
 use crate::varbuilder::WeightSource;
 
@@ -35,6 +35,76 @@ pub fn silu_mul_on_device(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         gate.dtype(),
         grim_tensor::dtype::QuantProvenance::default(),
         gate.device().clone(),
+    ))
+}
+
+/// Fused GeLU-Tanh gated multiplication `(gelu_tanh(gate)) * up` dispatched on-device without CPU roundtrips.
+pub fn gelu_tanh_mul_on_device(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "rocm-mem")]
+    if let (Device::Rocm(o_g), Device::Rocm(o_u)) = (gate.device(), up.device()) {
+        if o_g == o_u {
+            let rocm_dev = RocmDevice::try_new(*o_g)?;
+            let out_st = rocm_dev.gelu_tanh_mul(&**gate.storage(), &**up.storage(), gate.shape())?;
+            return Ok(Tensor::new(
+                Arc::from(out_st),
+                gate.shape().clone(),
+                gate.dtype(),
+                grim_tensor::dtype::QuantProvenance::default(),
+                gate.device().clone(),
+            ));
+        }
+    }
+    // Fallback: CPU approximation
+    let g = gate.to_vec_f32()?;
+    let u = up.to_vec_f32()?;
+    let mut out = vec![0.0f32; g.len()];
+    for i in 0..g.len() {
+        let x = g[i];
+        let gelu = 0.5 * x * (1.0 + (x * 0.797884 * (1.0 + 0.044715 * x * x)).tanh());
+        out[i] = gelu * u[i];
+    }
+    let dev = pick_device_for_tensor(gate);
+    let st = dev.from_cpu(&out, gate.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(st),
+        gate.shape().clone(),
+        DType::F32,
+        grim_tensor::dtype::QuantProvenance::default(),
+        gate.device().clone(),
+    ))
+}
+
+/// GeLU activation (tanh approximation) dispatched on-device without CPU roundtrips.
+pub fn gelu_on_device(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "rocm-mem")]
+    if let Device::Rocm(ordinal) = x.device() {
+        let rocm_dev = RocmDevice::try_new(*ordinal)?;
+        let out_st = rocm_dev.gelu(&**x.storage(), x.shape())?;
+        return Ok(Tensor::new(
+            Arc::from(out_st),
+            x.shape().clone(),
+            x.dtype(),
+            grim_tensor::dtype::QuantProvenance::default(),
+            x.device().clone(),
+        ));
+    }
+    // Fallback: CPU approximation
+    let v = x.to_vec_f32()?;
+    let out: Vec<f32> = v
+        .iter()
+        .map(|&val| {
+            let c = 0.797_884_6 * (val + 0.044715 * val * val * val);
+            0.5 * val * (1.0 + c.tanh())
+        })
+        .collect();
+    let dev = pick_device_for_tensor(x);
+    let st = dev.from_cpu(&out, x.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(st),
+        x.shape().clone(),
+        DType::F32,
+        grim_tensor::dtype::QuantProvenance::default(),
+        x.device().clone(),
     ))
 }
 
@@ -85,6 +155,35 @@ pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         grim_tensor::dtype::QuantProvenance::default(),
         a.device().clone(),
     ))
+}
+
+/// Elementwise `a + s * b` dispatched on-device without CPU roundtrips.
+pub fn axpy_on_device(a: &Tensor, s: f32, b: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "rocm-mem")]
+    if let (Device::Rocm(o_a), Device::Rocm(o_b)) = (a.device(), b.device()) {
+        if o_a == o_b {
+            let rocm_dev = RocmDevice::try_new(*o_a)?;
+            let out_st = rocm_dev.axpy(&**a.storage(), s, &**b.storage(), a.shape())?;
+            return Ok(Tensor::new(
+                Arc::from(out_st),
+                a.shape().clone(),
+                a.dtype(),
+                grim_tensor::dtype::QuantProvenance::default(),
+                a.device().clone(),
+            ));
+        }
+    }
+    // Fallback: scale b then add on device
+    let dev = pick_device_for_tensor(b);
+    let (scaled_b, _) = dev.mul_scalar(&**b.storage(), s, b.shape())?;
+    let b_scaled_t = Tensor::new(
+        Arc::from(scaled_b),
+        b.shape().clone(),
+        b.dtype(),
+        grim_tensor::dtype::QuantProvenance::default(),
+        b.device().clone(),
+    );
+    add_on_device(a, &b_scaled_t)
 }
 
 /// Concatenates two 2D tensors [S, Da] and [S, Db] along dimension 1 into [S, Da + Db] on device without host round-trips.
@@ -149,6 +248,61 @@ pub fn concat_2d_slices_horizontal_on_device(tensors: &[&Tensor]) -> Result<Tens
         first.provenance().clone(),
         first.device().clone(),
     ))
+}
+
+/// Splits a 2D tensor [S, sum(dims)] along dimension 1 into multiple 2D tensors [S, dims[i]] directly on device.
+pub fn split_2d_horizontal_on_device(t: &Tensor, dims: &[usize]) -> Result<Vec<Tensor>> {
+    let t_dims = t.shape().dims();
+    if t_dims.len() != 2 {
+        return Err(Error::Shape(format!(
+            "split_2d_horizontal_on_device expects a 2D tensor, got {:?}",
+            t.shape()
+        )));
+    }
+    let seq_len = t_dims[0];
+    let total_d: usize = dims.iter().sum();
+    if t_dims[1] != total_d {
+        return Err(Error::Shape(format!(
+            "split_2d_horizontal_on_device dimension mismatch: tensor has dim 1 = {}, sum(dims) = {}",
+            t_dims[1], total_d
+        )));
+    }
+
+    let dev = pick_device_for_tensor(t);
+    let mut outs: Vec<Box<dyn BackendStorage>> = Vec::with_capacity(dims.len());
+    for &d in dims {
+        outs.push(dev.alloc_storage(&Shape::new(vec![seq_len, d]), DType::F32)?);
+    }
+
+    for s in 0..seq_len {
+        let src_row = s * total_d;
+        let mut curr_offset = 0;
+        for (i, &d) in dims.iter().enumerate() {
+            dev.copy_slice_range(
+                outs[i].as_ref(),
+                s * d,
+                t.storage().as_ref(),
+                src_row + curr_offset,
+                d,
+            )?;
+            curr_offset += d;
+        }
+    }
+
+    let results = outs
+        .into_iter()
+        .zip(dims.iter())
+        .map(|(out_storage, &d)| {
+            Tensor::new(
+                Arc::from(out_storage),
+                Shape::new(vec![seq_len, d]),
+                DType::F32,
+                t.provenance().clone(),
+                t.device().clone(),
+            )
+        })
+        .collect();
+    Ok(results)
 }
 
 /// Slices the last row [1, D] of a 2D tensor [S, D] directly on device.

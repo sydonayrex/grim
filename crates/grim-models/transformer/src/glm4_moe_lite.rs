@@ -134,6 +134,41 @@ impl Glm4LiteMoeBlock {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _router_logits = self.gate.forward(x)?;
 
+        if x.device() != &Device::Cpu {
+            let mut acc: Option<Tensor> = if let Some(ref shared) = self.shared_expert {
+                Some(shared.forward(x)?)
+            } else {
+                None
+            };
+
+            let active_count = self.experts.len().min(self.num_experts_per_tok);
+            if active_count > 0 {
+                let weight = 1.0 / (active_count as f32);
+                for expert in &self.experts[..active_count] {
+                    let e_out = expert.forward(x)?;
+                    acc = Some(match acc {
+                        Some(a) => grim_nn::modules::axpy_on_device(&a, weight, &e_out)?,
+                        None => {
+                            let dev = grim_nn::modules::pick_device_for_tensor(&e_out);
+                            let (scaled_st, _) = dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
+                            Tensor::new(
+                                std::sync::Arc::from(scaled_st),
+                                e_out.shape().clone(),
+                                e_out.dtype(),
+                                grim_tensor::dtype::QuantProvenance::default(),
+                                e_out.device().clone(),
+                            )
+                        }
+                    });
+                }
+            }
+
+            if let Some(out) = acc {
+                return Ok(out);
+            }
+            return Ok(x.clone());
+        }
+
         let mut out_vec = if let Some(ref shared) = self.shared_expert {
             shared.forward(x)?.to_vec_f32()?
         } else {
