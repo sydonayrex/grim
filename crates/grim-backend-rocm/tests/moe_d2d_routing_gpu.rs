@@ -29,6 +29,13 @@ fn gpu_device() -> Option<RocmDevice> {
         .ok()
 }
 
+/// Serializes GPU tests in this binary (one device; concurrent
+/// `moe_route_topk_on_device` launches contend and give false failures
+/// under default `--test-threads=N`). See `gpu_test_lock` docs.
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    grim_backend_rocm::device::util::gpu_test_lock()
+}
+
 /// Decode a device u32 buffer's raw bytes into host `Vec<u32>` (little-endian).
 fn decode_u32(bytes: &[u8]) -> Vec<u32> {
     bytes
@@ -82,6 +89,27 @@ fn host_sqrtsoftplus_topk(logits: &[f32]) -> Vec<(usize, usize, f32)> {
     out
 }
 
+/// Host reference: top-k softmax renormalized over top-k (route_mode == 3, GLM/Qwen style `normalize_weights`).
+fn host_renorm_topk(logits: &[f32]) -> Vec<(usize, usize, f32)> {
+    let mut out = Vec::new();
+    for s in 0..SEQ {
+        let row = &logits[s * NUM_EXPERTS..(s + 1) * NUM_EXPERTS];
+        let mut idx: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+        idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let k = TOP_K.min(NUM_EXPERTS);
+        let topk = &idx[..k];
+        let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for i in 0..k {
+            let (e, _) = topk[i];
+            let w = exps[i] / (sum + 1e-12);
+            out.push((s, e, w));
+        }
+    }
+    out
+}
+
 fn compare_routing(got: &[f32], experts: &[u32], want: &[(usize, usize, f32)]) {
     for (i, &(s, e, w)) in want.iter().enumerate() {
         let g_w = got[i];
@@ -96,6 +124,7 @@ fn compare_routing(got: &[f32], experts: &[u32], want: &[(usize, usize, f32)]) {
 
 #[test]
 fn route_topk_softmax_matches_host() {
+    let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
     // Deterministic logits: [SEQ, NUM_EXPERTS].
     let mut logits = vec![0.0f32; SEQ * NUM_EXPERTS];
@@ -137,6 +166,7 @@ fn route_topk_softmax_matches_host() {
 
 #[test]
 fn route_topk_sqrtsoftplus_matches_host() {
+    let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
     let mut logits = vec![0.0f32; SEQ * NUM_EXPERTS];
     for s in 0..SEQ {
@@ -172,7 +202,45 @@ fn route_topk_sqrtsoftplus_matches_host() {
 }
 
 #[test]
+fn route_topk_renorm_matches_host() {
+    let _guard = gpu_lock();
+    let Some(dev) = gpu_device() else { return };
+    let mut logits = vec![0.0f32; SEQ * NUM_EXPERTS];
+    for s in 0..SEQ {
+        for e in 0..NUM_EXPERTS {
+            logits[s * NUM_EXPERTS + e] = ((s as f32 + 1.0) * 0.8 + (e as f32) * 1.2).cos() * 3.0;
+        }
+    }
+
+    let num_pairs = SEQ * TOP_K;
+    let l_st = dev.from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32).unwrap();
+    let l_rocm = l_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let tok_st = dev.zeros(
+        &Shape::new(vec![num_pairs]),
+        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
+    ).unwrap();
+    let exp_st = dev.zeros(
+        &Shape::new(vec![num_pairs]),
+        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
+    ).unwrap();
+    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
+    let tok_rocm = tok_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let exp_rocm = exp_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let w_rocm = w_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+
+    dev.moe_route_topk_on_device(l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, NUM_EXPERTS, TOP_K, 3)
+        .unwrap();
+    dev.synchronize();
+
+    let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
+    let weights = w_rocm.to_cpu_vec_f32().unwrap();
+    let want = host_renorm_topk(&logits);
+    compare_routing(&weights, &experts, &want);
+}
+
+#[test]
 fn device_route_topk_and_dispatch_matches_cpu_oracle() {
+    let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
 
     // Deterministic logits + expert weights (f32) for a full dispatch.

@@ -1342,10 +1342,6 @@ fn load_model_from_config(
                 n_expert,
                 n_expert_used,
                 n_ff_exp: intermediate_size,
-                expert_weights_scale: 1.0,
-                expert_gating_func: 0,
-                n_swa: 0,
-                swa_type: 0,
                 n_embd_out: 0,
                 // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (see `lfm2_mxfp4_qkv_enabled`).
                 mxfp4_qkv_attention: lfm2_mxfp4_qkv_enabled(),
@@ -3121,10 +3117,6 @@ fn load_model_with_providers(
                 n_expert,
                 n_expert_used,
                 n_ff_exp: hparams.intermediate_size,
-                expert_weights_scale: 1.0,
-                expert_gating_func: 0,
-                n_swa: 0,
-                swa_type: 0,
                 n_embd_out: 0,
                 // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (see `lfm2_mxfp4_qkv_enabled`).
                 mxfp4_qkv_attention: lfm2_mxfp4_qkv_enabled(),

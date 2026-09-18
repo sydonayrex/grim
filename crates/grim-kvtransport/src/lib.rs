@@ -9,22 +9,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use grim_core::error::{Error, Result};
-use grim_tensor::AttentionOps;
-
-pub mod activation_channel;
-pub use activation_channel::TcpActivationTransport;
-
-pub mod bitmask_index;
-pub use bitmask_index::{BitmaskChunkIndex, ChunkEntry, TierMask};
-
-pub mod pin_lease;
-pub use pin_lease::{LeaseStatus, PinLeaseMonitor, PinnedLease, SharedPinLeaseMonitor};
-
-pub mod gds_ffi;
-pub use gds_ffi::{HipFileHandle, HipFileLib};
-
-pub mod gds;
-pub use gds::GdsTier;
 
 pub type BlockId = usize;
 
@@ -35,86 +19,6 @@ pub enum CacheTier {
     NvMe,
     /// An NVMe weight-streaming layer used when weight tensors exceed VRAM/DRAM.
     NvMeWeightStream,
-}
-
-/// Applies OS-level `madvise` to the given slice/pointer range under Linux/macOS.
-pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::raw::c_void;
-        let ptr = data.as_ptr() as *mut c_void;
-        let len = std::mem::size_of_val(data);
-
-        let raw_advice = match advice {
-            grim_tensor::MemAdvice::Sequential => libc::MADV_SEQUENTIAL,
-            grim_tensor::MemAdvice::Random => libc::MADV_RANDOM,
-            grim_tensor::MemAdvice::WillNeed => libc::MADV_WILLNEED,
-            grim_tensor::MemAdvice::DontNeed => libc::MADV_DONTNEED,
-            _ => return Ok(()), // GPU advice ignored on CPU host pages
-        };
-
-        let res = unsafe { libc::madvise(ptr, len, raw_advice) };
-        if res != 0 {
-            return Err(Error::KvCache(format!(
-                "madvise failed with system error code {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::raw::c_void;
-        let ptr = data.as_ptr() as *mut c_void;
-        let len = data.len() * std::mem::size_of::<f32>();
-
-        let raw_advice = match advice {
-            grim_tensor::MemAdvice::Sequential => libc::MADV_SEQUENTIAL,
-            grim_tensor::MemAdvice::Random => libc::MADV_RANDOM,
-            grim_tensor::MemAdvice::WillNeed => libc::MADV_WILLNEED,
-            grim_tensor::MemAdvice::DontNeed => libc::MADV_DONTNEED,
-            _ => return Ok(()), // GPU advice ignored on CPU host pages
-        };
-
-        let res = unsafe { libc::madvise(ptr, len, raw_advice) };
-        if res != 0 {
-            return Err(Error::KvCache(format!(
-                "madvise failed on macOS with system error code {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
-
-    // Windows / other OS: advisory hint is a no-op
-    let _ = data;
-    let _ = advice;
-    Ok(())
-}
-
-/// Memory pinning and zero-copy transfer registration attributes for RDMA / RoCE interconnects.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RdmaPinnedRegion {
-    pub virtual_addr: u64,
-    pub length_bytes: usize,
-    pub lkey: u32,
-    pub rkey: u32,
-}
-
-impl RdmaPinnedRegion {
-    /// Create a simulated pinned memory region descriptor for zero-copy DMA writes.
-    pub fn new_pinned(virtual_addr: u64, length_bytes: usize, lkey: u32, rkey: u32) -> Self {
-        Self {
-            virtual_addr,
-            length_bytes,
-            lkey,
-            rkey,
-        }
-    }
-
-    /// Check if an offset and length fall within this registered region.
-    pub fn bounds_check(&self, offset: usize, len: usize) -> bool {
-        offset.saturating_add(len) <= self.length_bytes
-    }
 }
 
 /// Manages tiered storage of KV blocks.
@@ -360,69 +264,6 @@ impl LocalSpillManager {
     /// Gets the current storage tier of a block.
     pub fn get_tier(&self, block_id: BlockId) -> Option<CacheTier> {
         self.block_tiers.get(&block_id).copied()
-    }
-
-    /// Retargets the rotary position embedding of a cached block in Host RAM from `old_start_pos` to `new_start_pos` using CPU Re-RoPE without re-prefill.
-    /// The Re-RoPE retarget configuration is naturally seven flat positional parameters; a config struct would be.
-    #[allow(clippy::too_many_arguments)]
-    pub fn retarget_block_positions(
-        &mut self,
-        block_id: BlockId,
-        old_start_pos: usize,
-        new_start_pos: usize,
-        tokens_per_block: usize,
-        head_dim: usize,
-        num_heads: usize,
-        base_freq: f32,
-    ) -> Result<()> {
-        let (k_data, v_data) = self.retrieve(block_id)?.ok_or_else(|| {
-            Error::KvCache(format!(
-                "block {} not found in cache for retargeting",
-                block_id
-            ))
-        })?;
-
-        let expected_elems = tokens_per_block * num_heads * head_dim;
-        if k_data.len() != expected_elems {
-            return Err(Error::KvCache(format!(
-                "retarget_block_positions: block elements {} does not match expected {}",
-                k_data.len(),
-                expected_elems
-            )));
-        }
-
-        let dev = grim_backend_cpu::CpuDevice::new();
-        let k_storage = grim_backend_cpu::CpuStorage::new(
-            k_data,
-            grim_tensor::shape::Shape::new(vec![num_heads, tokens_per_block, head_dim]),
-            grim_tensor::dtype::DType::F32,
-        );
-
-        let old_positions: Vec<u32> = (0..tokens_per_block)
-            .map(|i| (old_start_pos + i) as u32)
-            .collect();
-        let new_positions: Vec<u32> = (0..tokens_per_block)
-            .map(|i| (new_start_pos + i) as u32)
-            .collect();
-
-        let cfg = grim_tensor::RopeConfig::new(head_dim, base_freq);
-
-        let (retargeted_k, _) = dev
-            .rerope(
-                &k_storage,
-                &old_positions,
-                &new_positions,
-                &cfg,
-                &grim_tensor::shape::Shape::new(vec![num_heads, tokens_per_block, head_dim]),
-            )
-            .map_err(|e| Error::KvCache(e.to_string()))?;
-
-        let new_k_vec = retargeted_k
-            .to_cpu_vec_f32()
-            .map_err(|e| Error::KvCache(e.to_string()))?;
-        self.host_ram_cache.insert(block_id, (new_k_vec, v_data));
-        self.block_tiers.insert(block_id, CacheTier::HostRam);
-        Ok(())
     }
 }
 
@@ -1150,24 +991,11 @@ pub fn start_kv_receiver_server<T>(
 where
     T: KvBlockStore + 'static,
 {
-    start_kv_receiver_server_with_prompts(listen_addr, pool, PromptChannel::new())
-}
-
-/// Like [`start_kv_receiver_server`], but prompt-token control messages ([`NetworkKvClient::send_prompt_tokens`]) are
-/// stored into the supplied [`PromptChannel`] instead of being dropped.
-pub fn start_kv_receiver_server_with_prompts<T>(
-    listen_addr: &str,
-    pool: std::sync::Arc<std::sync::Mutex<T>>,
-    prompts: PromptChannel,
-) -> Result<std::thread::JoinHandle<()>>
-where
-    T: KvBlockStore + 'static,
-{
-    let (handle, _stop) = start_kv_receiver_server_stoppable(listen_addr, pool, prompts)?;
+    let (handle, _stop) = start_kv_receiver_server_stoppable(listen_addr, pool, PromptChannel::new())?;
     Ok(handle)
 }
 
-/// Like [`start_kv_receiver_server_with_prompts`], but also returns a stop flag: setting it makes the accept loop exit within its poll interval, so
+/// Like [`start_kv_receiver_server`], but also returns a stop flag: setting it makes the accept loop exit within its poll interval, so
 /// callers that own the server's lifetime can shut it down (dropping the returned handle alone never stops the listener thread).
 pub fn start_kv_receiver_server_stoppable<T>(
     listen_addr: &str,
@@ -1616,19 +1444,6 @@ impl NvmeWeightStreamer {
             .cloned()
     }
 
-    /// Swaps the target double-buffers to update GPU memory.
-    pub fn commit_and_swap(&self, _current_layer: usize, _next_layer: usize) -> Result<()> {
-        let mut buffers = self.double_buffers.lock().unwrap();
-        // Double-buffered swap: Active buffer becomes transfer buffer and vice versa.
-        let (buf0, buf1) = &mut *buffers;
-        std::mem::swap(buf0, buf1);
-        Ok(())
-    }
-
-    /// Update the tracked transfer bandwidth usage (bytes/sec).
-    pub fn set_bandwidth_usage(&self, bytes_per_sec: f64) {
-        *self.bandwidth_usage.lock().unwrap() = bytes_per_sec;
-    }
 }
 
 /// Tiered embedding table spill manager. Wraps `NvmeWeightStreamer` around a flat embedding weight tensor
@@ -1719,29 +1534,6 @@ pub trait KvWireTransport: Send + Sync {
     fn protocol(&self) -> TransportProtocol;
     /// Transfer one KV block payload to the receiver at `addr`.
     fn send_block(&self, item: &KvBlockTransfer<'_>, addr: &str) -> Result<()>;
-}
-
-/// TCP V3 baseline: one connection, one message, one ACK.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TcpWireTransport;
-
-impl KvWireTransport for TcpWireTransport {
-    fn protocol(&self) -> TransportProtocol {
-        TransportProtocol::Tcp
-    }
-
-    fn send_block(&self, item: &KvBlockTransfer<'_>, addr: &str) -> Result<()> {
-        let msg = NetworkKvClient::encode_block_message(
-            item.block_id,
-            item.layer_idx,
-            item.k,
-            item.v,
-            item.num_tokens,
-        )?;
-        let resolved = NetworkKvClient::resolve_addr(addr);
-        let mut stream = NetworkKvClient::connect_to(&resolved, "send block")?;
-        NetworkKvClient::write_and_ack(&mut stream, &msg, item.block_id as u64, item.layer_idx)
-    }
 }
 
 /// Same-host shared-memory handoff. Payloads are the *same V3 wire bytes* the TCP path sends, published atomically (tmp
@@ -3045,7 +2837,7 @@ mod tests {
         let addr = format!("127.0.0.1:{port}");
         let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
         let prompts = PromptChannel::new();
-        let _handle = start_kv_receiver_server_with_prompts(&addr, store, prompts.clone()).unwrap();
+        let _handle = start_kv_receiver_server_stoppable(&addr, store, prompts.clone()).unwrap().0;
 
         let client = NetworkKvClient::new("127.0.0.1".to_string());
         let tokens = vec![1u32, 2, 3, u32::MAX, 0];
@@ -3075,7 +2867,7 @@ mod tests {
         let addr = format!("127.0.0.1:{port}");
         let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
         let prompts = PromptChannel::new();
-        let _handle = start_kv_receiver_server_with_prompts(&addr, store, prompts.clone()).unwrap();
+        let _handle = start_kv_receiver_server_stoppable(&addr, store, prompts.clone()).unwrap().0;
 
         let evil = KvBlockHeader {
             magic: KV_MAGIC,

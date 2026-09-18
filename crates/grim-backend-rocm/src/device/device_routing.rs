@@ -263,6 +263,50 @@ impl RocmDevice {
         Ok((out_storage, RocmHandle::new(Some(stream))))
     }
 
+    /// Fused grouped MoE dispatch for GELU-activation experts (e.g. GLM-5.2).
+    /// Calls `grim_moe_fused_grouped_gelu` with the resident expert weights and sorted routing.
+    pub fn moe_fused_grouped_dispatch_gelu_resident(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
+        let gate_r = gate_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let down_r = down_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        let stream = self.launch_charon_grouped_dispatch_entry(
+            activations,
+            gate_r.device_ptr_checked()?,
+            0,
+            down_r.device_ptr_checked()?,
+            sorted,
+            &out_storage,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
+            "grim_moe_fused_grouped_gelu",
+            None,
+            None,
+        )?;
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
     /// Device-side MoE routing (D2D): computes per-token top-k expert selection +
     /// softmax-normalized combine weights entirely on-device via `grim_moe_route_topk`.
     ///
@@ -889,6 +933,7 @@ impl RocmDevice {
             hidden,
             inter,
             num_experts,
+            expert_up_w_ptr == 0,
         )?;
 
         // Output is accumulated via atomicAdd in-kernel; zero first.
@@ -1030,6 +1075,7 @@ impl RocmDevice {
             hidden,
             inter,
             num_experts,
+            false,
         )?;
 
         check_hip("charon_grouped_fp8 hipMemset(output, 0)", unsafe {
@@ -1145,6 +1191,7 @@ impl RocmDevice {
             hidden,
             inter,
             num_experts,
+            false,
         )?;
 
         check_hip("charon_grouped_mxfp4 hipMemset(output, 0)", unsafe {
@@ -1260,6 +1307,7 @@ impl RocmDevice {
             hidden,
             inter,
             num_experts,
+            false,
         )?;
 
         check_hip("charon_grouped_mxfp8 hipMemset(output, 0)", unsafe {
@@ -1372,6 +1420,7 @@ impl RocmDevice {
             hidden,
             inter,
             num_experts,
+            false,
         )?;
 
         check_hip("charon_grouped_q80 hipMemset(output, 0)", unsafe {
@@ -2486,6 +2535,7 @@ impl RocmDevice {
             inter,
             routed_scaling_factor,
             num_experts,
+            false,
         )?;
         // SPEED-ROC-9: device-wide sync preserves the "gradients are settled
         // when this returns" contract without the D2H — the buffers stay in

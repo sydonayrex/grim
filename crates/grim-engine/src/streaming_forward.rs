@@ -678,16 +678,15 @@ impl StreamingBlockForward {
         let ffn_norm_out = block.ffn_norm.forward(&res1)?;
         let ffn_norm_id = tape.register(ffn_norm_out.clone());
 
-        let gate_base = block
-            .w_gate
-            .as_ref()
-            .expect("dense FFN")
-            .forward(&ffn_norm_out)?;
+        let gate_lin = block.w_gate.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("dense FFN step: block has no w_gate (MoE block in dense training path)".into())
+        })?;
+        let gate_base = gate_lin.forward(&ffn_norm_out)?;
         let gate_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
             let g_m = gate_base.shape().dims()[0];
             let g_k = ffn_norm_out.shape().dims()[1];
             let g_n = gate_base.shape().dims()[1];
-            let wg_id = tape.register(block.w_gate.as_ref().expect("dense FFN").weight().clone());
+            let wg_id = tape.register(gate_lin.weight().clone());
             tape.record_matmul(
                 ffn_norm_id,
                 wg_id,
@@ -716,16 +715,15 @@ impl StreamingBlockForward {
             ffn_norm_id,
         )?;
 
-        let up_base = block
-            .w_up
-            .as_ref()
-            .expect("dense FFN")
-            .forward(&ffn_norm_out)?;
+        let up_lin = block.w_up.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("dense FFN step: block has no w_up".into())
+        })?;
+        let up_base = up_lin.forward(&ffn_norm_out)?;
         let up_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
             let u_m = up_base.shape().dims()[0];
             let u_k = ffn_norm_out.shape().dims()[1];
             let u_n = up_base.shape().dims()[1];
-            let wu_id = tape.register(block.w_up.as_ref().expect("dense FFN").weight().clone());
+            let wu_id = tape.register(up_lin.weight().clone());
             tape.record_matmul(
                 ffn_norm_id,
                 wu_id,
@@ -765,16 +763,15 @@ impl StreamingBlockForward {
         );
         let silu_id = tape.register(silu_tensor.clone());
 
-        let down_base = block
-            .w_down
-            .as_ref()
-            .expect("dense FFN")
-            .forward(&silu_tensor)?;
+        let down_lin = block.w_down.as_ref().ok_or_else(|| {
+            grim_core::error::Error::Backend("dense FFN step: block has no w_down".into())
+        })?;
+        let down_base = down_lin.forward(&silu_tensor)?;
         let down_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
             let d_m = down_base.shape().dims()[0];
             let d_k = silu_tensor.shape().dims()[1];
             let d_n = down_base.shape().dims()[1];
-            let wd_id = tape.register(block.w_down.as_ref().expect("dense FFN").weight().clone());
+            let wd_id = tape.register(down_lin.weight().clone());
             tape.record_matmul(
                 silu_id,
                 wd_id,

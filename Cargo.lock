@@ -2737,6 +2737,7 @@ dependencies = [
  "grim-core",
  "grim-kvquant",
  "grim-kvtransport",
+ "grim-scheduler",
  "grim-tensor",
  "tempfile",
  "thiserror 1.0.69",

@@ -5672,12 +5672,6 @@ impl RocmDevice {
         solution_index: Option<i32>,
         shared_mem_bytes: usize,
     ) -> Result<*mut c_void> {
-        // SPEED-GRAPH: inside a segment-replay bracket the host code runs for
-        // bookkeeping only — the recorded HIP graph re-enqueues every launch
-        // in one shot, so individual launches are suppressed here.
-        if crate::device::segment_replay::SEGMENT_SUPPRESS.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(std::ptr::null_mut());
-        }
         // Fast path: a previously resolved hipFunction for this (entry, grid-shape, solution_index) launches directly - no source rebuild, no seahash, no CString, no module-cache walk.
         // Same solution_index is required because different indices map to different on-disk hsaco files (cache_key includes.
         // SPEED-CEREMONY: the env probe used to run TWICE per launch (~1-3 µs each

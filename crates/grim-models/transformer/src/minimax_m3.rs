@@ -112,6 +112,10 @@ pub struct MiniMaxM3BlockSparseMoe {
     pub gate: Linear,
     pub experts: Vec<MiniMaxM3Expert>,
     pub num_experts_per_tok: usize,
+    /// Device-resident routing scratch + resident stacked expert weights for
+    /// the D2D Charon dispatch (WI-gpu-native-moe Phase 1). Built once,
+    /// reused every decode step (no per-step H2D/D2H traffic).
+    pub charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl MiniMaxM3BlockSparseMoe {
@@ -133,12 +137,61 @@ impl MiniMaxM3BlockSparseMoe {
             gate,
             experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
-    /// Host routing stays by design: gate logits (steps×n_expert) are tiny and top-k selection is host logic.
-    /// The per-token input rows are pulled once (hoisted out of the loop - was re-downloading.
+    /// Tri-modal forward (DeepSeek2 template, WI-gpu-native-moe Phase 1):
+    /// D2D device dispatch first (no gate-logits round-trip), host path as
+    /// the documented reference fallback (CPU device or non-ROCm backend).
+    /// The host path math is unchanged — it is the parity reference.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if matches!(x.device(), Device::Rocm(_)) {
+            let logits = self.gate.forward(x)?;
+            if let Some(out) = self.forward_moe_device_d2d(x, &logits)? {
+                return Ok(out);
+            }
+        }
+        self.forward_moe_host(x)
+    }
+
+    /// Device-resident MoE (D2D): routing computed on-device from the gate
+    /// logits (route_mode 3 = softmax renormalized over top-k, matching the
+    /// host loop's `normalize_weights` semantics) and expert evaluation
+    /// launched from device-resident routing buffers. Returns `Ok(None)`
+    /// when the D2D path is unavailable; caller falls back to host routing.
+    fn forward_moe_device_d2d(&self, x: &Tensor, logits: &Tensor) -> Result<Option<Tensor>> {
+        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+        let experts: Vec<crate::shared_moe::MoeExpert> = self
+            .experts
+            .iter()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.w1.clone(),
+                up: e.w3.clone(),
+                down: e.w2.clone(),
+            })
+            .collect();
+        crate::shared_moe::fused_moe_dispatch_from_logits(
+            dev.as_ref(),
+            x,
+            logits,
+            &experts,
+            None,
+            self.num_experts_per_tok,
+            1.0,
+            3, // route_mode: renorm over top-k (matches host loop below)
+            &self.charon_cache,
+        )
+    }
+
+    /// Host routing reference path — the documented FALLBACK (CPU device, or
+    /// GPU backends missing a needed primitive). Identical math to the device
+    /// path: per-token top-k routing on the gate logits with renorm-over-
+    /// top-k combine weights, expert forward, weighted accumulation.
+    /// Host routing stays by design on this path: gate logits
+    /// (steps×n_expert) are tiny and top-k selection is host logic.
+    /// The per-token input rows are pulled once (hoisted out of the loop - was re-downloading.
+    pub fn forward_moe_host(&self, x: &Tensor) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let hidden_dim = x.shape().dims()[1];
         let logits = self.gate.forward(x)?;
@@ -413,6 +466,7 @@ impl CausalLm for MiniMaxM3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_backend_cpu::cpu_tensor;
     use grim_core::architecture::ModelArchitecture;
 
     const MINIMAX_M3_CONFIG: &str = r#"{
@@ -446,5 +500,179 @@ mod tests {
             ModelArchitecture::from_str("minimax_m3"),
             ModelArchitecture::MiniMaxM3
         );
+    }
+
+    fn det_vec(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4
+            })
+            .collect()
+    }
+
+    fn synthetic_moe(
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> (
+        MiniMaxM3BlockSparseMoe,
+        Vec<Vec<f32>>,
+        Vec<Vec<f32>>,
+        Vec<Vec<f32>>,
+        Vec<f32>,
+    ) {
+        let gate_w = det_vec(num_experts * hidden, 11);
+        let gate = Linear::from_tensor(
+            cpu_tensor(gate_w.clone(), Shape::new(vec![num_experts, hidden])),
+            None,
+        );
+        let mut experts = Vec::with_capacity(num_experts);
+        let mut w1_all = Vec::with_capacity(num_experts);
+        let mut w3_all = Vec::with_capacity(num_experts);
+        let mut w2_all = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let w1 = det_vec(inter * hidden, 100 + e as u64 * 3);
+            let w3 = det_vec(inter * hidden, 200 + e as u64 * 3);
+            let w2 = det_vec(hidden * inter, 300 + e as u64 * 3);
+            experts.push(MiniMaxM3Expert {
+                w1: Linear::from_tensor(
+                    cpu_tensor(w1.clone(), Shape::new(vec![inter, hidden])),
+                    None,
+                ),
+                w3: Linear::from_tensor(
+                    cpu_tensor(w3.clone(), Shape::new(vec![inter, hidden])),
+                    None,
+                ),
+                w2: Linear::from_tensor(
+                    cpu_tensor(w2.clone(), Shape::new(vec![hidden, inter])),
+                    None,
+                ),
+            });
+            w1_all.push(w1);
+            w3_all.push(w3);
+            w2_all.push(w2);
+        }
+        (
+            MiniMaxM3BlockSparseMoe {
+                gate,
+                experts,
+                num_experts_per_tok: top_k,
+                charon_cache: crate::shared_moe::CharonCache::new(),
+            },
+            w1_all,
+            w3_all,
+            w2_all,
+            gate_w,
+        )
+    }
+
+    /// Independent renorm-over-top-k SwiGLU oracle (mirrors the host loop's
+    /// documented semantics; written separately so the test is not a copy of
+    /// the implementation).
+    fn renorm_oracle(
+        x_data: &[f32],
+        gate_w: &[f32],
+        w1_all: &[Vec<f32>],
+        w3_all: &[Vec<f32>],
+        w2_all: &[Vec<f32>],
+        seq: usize,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; seq * hidden];
+        for s in 0..seq {
+            let xt = &x_data[s * hidden..(s + 1) * hidden];
+            // gate logits: [num_experts, hidden] @ xt
+            let mut logits = vec![0.0f32; num_experts];
+            for e in 0..num_experts {
+                for c in 0..hidden {
+                    logits[e] += gate_w[e * hidden + c] * xt[c];
+                }
+            }
+            let mut idx: Vec<usize> = (0..num_experts).collect();
+            idx.sort_by(|&a, &b| {
+                logits[b]
+                    .partial_cmp(&logits[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let k = top_k.min(num_experts);
+            let max_l = idx[..k].iter().map(|&e| logits[e]).fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = idx[..k].iter().map(|&e| (logits[e] - max_l).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (rank, &e) in idx[..k].iter().enumerate() {
+                let w = exps[rank] / (sum + 1e-12);
+                let mut act = vec![0.0f32; inter];
+                for j in 0..inter {
+                    let mut g = 0.0f32;
+                    let mut u = 0.0f32;
+                    for c in 0..hidden {
+                        g += w1_all[e][j * hidden + c] * xt[c];
+                        u += w3_all[e][j * hidden + c] * xt[c];
+                    }
+                    act[j] = g / (1.0 + (-g).exp()) * u;
+                }
+                for h in 0..hidden {
+                    let mut v = 0.0f32;
+                    for j in 0..inter {
+                        v += w2_all[e][h * inter + j] * act[j];
+                    }
+                    out[s * hidden + h] += w * v;
+                }
+            }
+        }
+        out
+    }
+
+    /// Unit (numeric): CPU `forward` (host reference path) matches the
+    /// independent renorm oracle within 1e-5 and is deterministic.
+    #[test]
+    fn minimax_m3_host_matches_renorm_oracle() {
+        let (hidden, inter, num_experts, top_k, seq) = (8, 16, 4, 2, 3);
+        let (moe, w1_all, w3_all, w2_all, gate_w) =
+            synthetic_moe(hidden, inter, num_experts, top_k);
+        let x_data = det_vec(seq * hidden, 7);
+        let x = cpu_tensor(x_data.clone(), Shape::new(vec![seq, hidden]));
+
+        let got = moe.forward(&x).unwrap().to_vec_f32().unwrap();
+        let want = renorm_oracle(
+            &x_data, &gate_w, &w1_all, &w3_all, &w2_all, seq, hidden, inter, num_experts,
+            top_k,
+        );
+        assert_eq!(got.len(), want.len());
+        let max_diff = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "minimax_m3 host vs oracle max diff {max_diff:.6} exceeds 1e-5"
+        );
+
+        // Determinism: second forward is bitwise identical.
+        let again = moe.forward(&x).unwrap().to_vec_f32().unwrap();
+        assert_eq!(got, again, "host forward must be deterministic");
+        assert!(
+            !moe.charon_cache.is_routing_engaged(),
+            "CPU path must not engage device routing"
+        );
+    }
+
+    /// Unit (edge): `top_k > num_experts` clamps without panic/NaN.
+    #[test]
+    fn minimax_m3_topk_clamp_edge() {
+        let (hidden, inter, num_experts, seq) = (8, 16, 3, 2);
+        let (moe, ..) = synthetic_moe(hidden, inter, num_experts, 8);
+        let x = cpu_tensor(det_vec(seq * hidden, 77), Shape::new(vec![seq, hidden]));
+        let out = moe.forward(&x).unwrap().to_vec_f32().unwrap();
+        assert_eq!(out.len(), seq * hidden);
+        assert!(out.iter().all(|v| v.is_finite()), "clamped output finite");
     }
 }

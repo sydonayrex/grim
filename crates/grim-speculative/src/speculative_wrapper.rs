@@ -386,16 +386,39 @@ impl SpeculativeCausalLm {
                     .unwrap()
                     .update(accepted_count, verify_len);
 
-                // Return logits for the accepted tokens. Accepted token rows start at context_len (the original input length) since
-                // target forward returned [context_len + verify_len, vocab_size] and draft positions map to target positions context_len + i.
-                let accepted_logits = self.extract_accepted_logits(
-                    &target_logits,
-                    accepted_count,
-                    vocab_size,
-                    context_len,
-                )?;
+                // ponytail ceiling: the caller contract is one next-token
+                // distribution per decode call and nothing downstream
+                // consumes multi-token emissions yet, so committing accepted
+                // draft tokens here would desync the token stream. The verify
+                // pass above therefore runs for telemetry/adaptation only:
+                // KV rolls back to `accepted_count == 0` (pure target state)
+                // and the caller gets the target's exact next-token logits —
+                // greedy output is bit-identical to the plain target. Wiring
+                // multi-token emission into the engine decode loop is the
+                // speedup follow-up.
+                if let Some(kv) = session.kv_mut() {
+                    kv.commit(0)?;
+                }
+                if context_len == 0 {
+                    return Err(Error::Session(
+                        "DSpark decode: empty input has no next-token logits row".into(),
+                    ));
+                }
+                let next_token_logits = target_logits.to_vec_f32()?;
+                let row_start = (context_len - 1) * vocab_size;
+                let row_end = row_start + vocab_size;
+                if row_end > next_token_logits.len() {
+                    return Err(Error::Session(format!(
+                        "DSpark decode: next-token row [{row_start}..{row_end}] out of bounds (len {})",
+                        next_token_logits.len()
+                    )));
+                }
+                let out = grim_backend_cpu::cpu_tensor(
+                    next_token_logits[row_start..row_end].to_vec(),
+                    grim_tensor::Shape::new(vec![1, vocab_size]),
+                );
                 session.set_last_accepted_tokens(accepted_count);
-                Ok(accepted_logits)
+                Ok(out)
             }
         }
     }

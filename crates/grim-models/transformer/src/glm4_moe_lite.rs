@@ -96,6 +96,7 @@ pub struct Glm4LiteMoeBlock {
     experts: Vec<Glm4Expert>,
     shared_expert: Option<Glm4Expert>,
     num_experts_per_tok: usize,
+    charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl Glm4LiteMoeBlock {
@@ -128,13 +129,44 @@ impl Glm4LiteMoeBlock {
             experts,
             shared_expert,
             num_experts_per_tok: cfg.num_experts_per_tok,
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _router_logits = self.gate.forward(x)?;
+        let router_logits = self.gate.forward(x)?;
 
         if x.device() != &Device::Cpu {
+            let shared_exp = self.shared_expert.as_ref().map(|s| crate::shared_moe::MoeExpert {
+                gate: s.gate_proj.clone(),
+                up: s.up_proj.clone(),
+                down: s.down_proj.clone(),
+            });
+            let moe_experts: Vec<crate::shared_moe::MoeExpert> = self
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
+                    gate: e.gate_proj.clone(),
+                    up: e.up_proj.clone(),
+                    down: e.down_proj.clone(),
+                })
+                .collect();
+
+            let dev = grim_nn::modules::pick_device_for_tensor(x);
+            if let Ok(Some(out)) = crate::shared_moe::fused_moe_dispatch_from_logits(
+                dev.as_ref(),
+                x,
+                &router_logits,
+                &moe_experts,
+                shared_exp.as_ref(),
+                self.num_experts_per_tok,
+                1.0,
+                3, // route_mode 3: softmax renormalized over top-k
+                &self.charon_cache,
+            ) {
+                return Ok(out);
+            }
+
             let mut acc: Option<Tensor> = if let Some(ref shared) = self.shared_expert {
                 Some(shared.forward(x)?)
             } else {
@@ -465,5 +497,100 @@ mod tests {
         let last_h = session.get_last_hidden_state();
         assert!(last_h.is_some());
         assert_eq!(last_h.unwrap().shape().dims(), &[2, 16]);
+    }
+}
+
+// ===========================================================================
+// Charon dispatch parity (WI-gpu-native-moe Phase 1): the D2D dispatch for
+// this model must match its own CPU host-loop path. Same device-vs-CPU
+// pattern as the qwen38 gate test.
+// =========================================================================
+
+#[cfg(test)]
+mod moe_dispatch_parity_tests {
+    use super::*;
+    use grim_backend_rocm::RocmDevice;
+    use grim_tensor::CoreTensorOps;
+
+    fn rocm_tensor(dev: &RocmDevice, data: Vec<f32>, shape: Shape) -> Tensor {
+        let storage = dev
+            .from_cpu(&data, &shape, grim_tensor::dtype::DType::F32)
+            .unwrap();
+        Tensor::new(
+            std::sync::Arc::from(storage),
+            shape,
+            grim_tensor::dtype::DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            Device::Rocm(0),
+        )
+    }
+
+    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4
+            })
+            .collect()
+    }
+
+    fn make_block(dev: Option<&RocmDevice>, hidden: usize, inter: usize, n_exp: usize) -> Glm4LiteMoeBlock {
+        let lin = |data: Vec<f32>, out: usize, inp: usize| -> Linear {
+            let t = match dev {
+                Some(d) => rocm_tensor(d, data, Shape::new(vec![out, inp])),
+                None => cpu_tensor(data, Shape::new(vec![out, inp])),
+            };
+            Linear::from_tensor(t, None)
+        };
+        let mk_expert = |e: usize| Glm4Expert {
+            gate_proj: lin(rand_vec(inter * hidden, (e as u64 + 1) * 733 + 1), inter, hidden),
+            up_proj: lin(rand_vec(inter * hidden, (e as u64 + 1) * 733 + 2), inter, hidden),
+            down_proj: lin(rand_vec(inter * hidden, (e as u64 + 1) * 733 + 3), hidden, inter),
+        };
+        Glm4LiteMoeBlock {
+            gate: lin(rand_vec(n_exp * hidden, 42), n_exp, hidden),
+            experts: (0..n_exp).map(mk_expert).collect(),
+            shared_expert: Some(mk_expert(99)),
+            num_experts_per_tok: 2,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+        }
+    }
+
+    #[test]
+    fn glm4_moe_lite_device_dispatch_matches_cpu_path() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+            return;
+        }
+        let _gpu = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = RocmDevice::shared(0);
+        let hidden = 32usize;
+        let inter = 64usize;
+        let n_exp = 8usize;
+        let seq = 3usize;
+
+        let block_gpu = make_block(Some(&dev), hidden, inter, n_exp);
+        let x_data = rand_vec(seq * hidden, 7);
+        let x = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![seq, hidden]));
+        let out_gpu = block_gpu.forward(&x).unwrap().to_vec_f32().unwrap();
+
+        let block_cpu = make_block(None, hidden, inter, n_exp);
+        let out_cpu = block_cpu
+            .forward(&cpu_tensor(x_data, Shape::new(vec![seq, hidden])))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(out_gpu.len(), out_cpu.len());
+        let max_diff = out_gpu
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "device dispatch diverged from CPU path: max_diff={max_diff}"
+        );
     }
 }

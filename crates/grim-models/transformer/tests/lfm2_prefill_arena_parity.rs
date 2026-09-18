@@ -1,8 +1,9 @@
 //! A5 (PLAN-reduce-d2h-h2d / WI-X2-PREFILL-ARENA) parity: the eager
 //! prefill-arena path (RoPE/KV device-resident, zero D2H, attention via
 //! `fused_or_scalar_attention_arena_device`) must produce the same layer
-//! output as the legacy host path (`GRIM_LFM2_KV_ARENA=0`: rope D2H, host
-//! KV mirrors, `fused_or_scalar_attention_arena`), across a multi-step
+//! output as the legacy host path (rope D2H, host KV mirrors, run on the
+//! CPU device — who-dat P1-5 removed the legacy path from ROCm), across a
+//! multi-step
 //! forward where the second call's cache_offset comes from `dev_pos`.
 //!
 //! RUN: GRIM_GPU_TEST=1 cargo test -p grim-models-transformer \
@@ -19,6 +20,7 @@ use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 
 fn gpu() -> Option<(RocmDevice, usize)> {
     if !grim_backend_rocm::gpu_test_enabled() {
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         return None;
     }
     let dev = panic::catch_unwind(|| RocmDevice::try_new(0).unwrap()).ok()?;
@@ -110,13 +112,70 @@ fn attention_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
     }
 }
 
-fn set_env(k: &str, v: Option<&str>) {
-    // SAFETY: single-threaded test; no other thread reads the env while set.
-    unsafe {
-        match v {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
+// Reference: the SAME weights built on the CPU device run the legacy host
+// path (rope D2H, host KV mirrors) — since who-dat P1-5 removed the legacy
+// path from ROCm, the CPU block is the only remaining reference for it.
+fn cpu_block() -> Lfm2Block {
+    let hidden = 32usize;
+    let hd = 8usize;
+    let nh = 2usize;
+    let nkv = 1usize;
+    let inter = 64usize;
+    let n_q = nh * hd;
+    let n_kv = nkv * hd;
+    let cpu_lin = |out: usize, inp: usize, seed: u64| -> Linear {
+        Linear {
+            weight: grim_backend_cpu::cpu_tensor(rand_vec(out * inp, seed), Shape::new(vec![out, inp])),
+            bias: None,
+            w_t: grim_backend_cpu::cpu_tensor(
+                rand_vec(out * inp, seed),
+                Shape::new(vec![out, inp]),
+            ),
+            quant_format: None,
         }
+    };
+    let cpu_norm = |n: usize| -> RmsNorm {
+        RmsNorm {
+            weight: grim_backend_cpu::cpu_tensor(vec![1.0; n], Shape::new(vec![n])),
+            eps: 1e-5,
+        }
+    };
+    Lfm2Block {
+        attn_norm: cpu_norm(hidden),
+        wq: Some(cpu_lin(n_q, hidden, 11)),
+        wk: Some(cpu_lin(n_kv, hidden, 22)),
+        wv: Some(cpu_lin(n_kv, hidden, 33)),
+        wo: Some(cpu_lin(hidden, n_q, 44)),
+        attn_q_norm: Some(cpu_norm(hd)),
+        attn_k_norm: Some(cpu_norm(hd)),
+        wqkv_codes: None,
+        wqkv_exps: None,
+        gamma_q: None,
+        gamma_k: None,
+        w_gate_up_q80_fused: None,
+        shortconv_in_proj: None,
+        shortconv_conv: None,
+        shortconv_conv_vec: None,
+        shortconv_out_proj: None,
+        ffn_norm: cpu_norm(hidden),
+        ffn_gate: cpu_lin(inter, hidden, 55),
+        ffn_up: cpu_lin(inter, hidden, 66),
+        ffn_down: cpu_lin(hidden, inter, 77),
+        ffn_gate_inp: None,
+        ffn_gate_exps: None,
+        ffn_up_exps: None,
+        ffn_down_exps: None,
+        ffn_exp_probs_b: None,
+        is_moe: false,
+        n_expert: 0,
+        n_expert_used: 0,
+        moe_experts_cache: std::sync::OnceLock::new(),
+        num_heads: nh,
+        num_kv_heads: nkv,
+        head_dim: hd,
+        rope_theta: 10000.0,
+        eps: 1e-5,
+        charon_cache: CharonCache::new(),
     }
 }
 
@@ -127,6 +186,12 @@ fn prefill_arena_matches_host_path() {
         return;
     };
     let _ = &dev;
+    // Target the arena branch: the device decode path (GRIM_DECODE_GRAPH
+    // default-on) handles single-token steps itself and would bypass it.
+    // SAFETY: test process; no concurrent reader of this env var.
+    unsafe {
+        std::env::set_var("GRIM_DECODE_GRAPH", "0");
+    }
 
     let hidden = 32usize;
     // 2-step prefill then two 1-token steps: the later calls prove the arena
@@ -136,18 +201,12 @@ fn prefill_arena_matches_host_path() {
     let mut out_host = Vec::new();
     let mut out_arena = Vec::new();
 
-    // Serialize: env vars are process-global.
-    set_env("GRIM_DECODE_GRAPH", Some("0"));
-
-    set_env("GRIM_LFM2_KV_ARENA", Some("0"));
     let mut cache_host = None;
     {
-        let block = attention_block(&dev, ordinal);
+        let block = cpu_block();
         let mut cursor = 0usize;
         for n in [2usize, 1, 1] {
-            let x = rocm_tensor(
-                &dev,
-                ordinal,
+            let x = grim_backend_cpu::cpu_tensor(
                 x_all[cursor..cursor + n * hidden].to_vec(),
                 Shape::new(vec![n, hidden]),
             );
@@ -156,7 +215,6 @@ fn prefill_arena_matches_host_path() {
         }
     }
 
-    set_env("GRIM_LFM2_KV_ARENA", None);
     let mut cache_arena = None;
     {
         let block = attention_block(&dev, ordinal);
@@ -172,7 +230,6 @@ fn prefill_arena_matches_host_path() {
             out_arena.extend(block.forward(&x, &mut cache_arena).unwrap().to_vec_f32().unwrap());
         }
     }
-    set_env("GRIM_DECODE_GRAPH", None);
 
     // Arena mode must leave the host mirrors empty and track rows in dev_pos.
     match cache_arena.as_ref() {
@@ -182,7 +239,7 @@ fn prefill_arena_matches_host_path() {
         }
         _ => panic!("expected attention cache"),
     }
-    // Host path must have mirrored 4 rows.
+    // CPU host path must have mirrored 4 rows.
     match cache_host.as_ref() {
         Some(grim_models_transformer::lfm2::Lfm2LayerCache::Attention { k, .. }) => {
             assert_eq!(k.len(), 4 * 8, "host path must mirror 4 rows of head_dim 8");

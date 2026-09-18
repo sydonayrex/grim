@@ -121,10 +121,6 @@ fn tiny_dense_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
             n_expert: 0,
             n_expert_used: 0,
             n_ff_exp: 0,
-            expert_weights_scale: 0.0,
-            expert_gating_func: 0,
-            n_swa: 0,
-            swa_type: 0,
             n_embd_out: 0,
             mxfp4_qkv_attention: false,
         },
@@ -140,6 +136,7 @@ fn tiny_dense_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
 
 fn gpu_dev() -> Option<std::sync::Arc<RocmDevice>> {
     if !gpu_test_enabled() {
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU seed test");
         return None;
     }

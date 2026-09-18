@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
-    launch_attention, launch_qkv_gemv,
+    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology,
+    decode_graph_enabled, launch_attention, launch_qkv_gemv,
 };
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
@@ -42,6 +42,16 @@ pub trait DecodeGraphModel: Send + Sync {
         session: &'a dyn grim_core::session::SessionT,
         valid_rows: u32,
     ) -> Result<Vec<Option<EagerKvSource<'a>>>>;
+
+    /// Host conv-ring snapshots for recurrent-layer seeding (default: no
+    /// conv layers). Indexed by layer; `None` for attention layers. Borrowed
+    /// from the session state — must outlive the seed H2D copy.
+    fn eager_conv_seed_rings<'a>(
+        &self,
+        _session: &'a dyn grim_core::session::SessionT,
+    ) -> Result<Vec<Option<ConvRingSeed<'a>>>> {
+        Ok(Vec::new())
+    }
 }
 
 // ─── Helpers for Graph Recording ──────────────────────────────────────────
@@ -428,6 +438,14 @@ impl DecodeGraphModel for Llama {
         let ctx = max_ctx.max(1);
         let nh = self.cfg.num_heads;
 
+        let (n_expert, top_k) = self
+            .moe_blocks
+            .iter()
+            .find_map(|mb| {
+                mb.as_ref().map(|m| (m.moe.router.num_experts, m.moe.router.top_k))
+            })
+            .unwrap_or((0, 0));
+
         let buffers = DecodeGraphBuffers::allocate(
             &dev,
             self.layers.len(),
@@ -440,8 +458,8 @@ impl DecodeGraphModel for Llama {
             vocab,
             nh,
             batch,
-            0,
-            0,
+            n_expert,
+            top_k,
             0,
             0,
         )
@@ -477,6 +495,122 @@ impl DecodeGraphModel for Llama {
         // Forward all layers
         for (i, layer) in self.layers.iter().enumerate() {
             layer.forward_graph(i, &graph.buffers, &dev)?;
+
+            if let Some(Some(moe_block)) = self.moe_blocks.get(i) {
+                let act = &graph.buffers.act_q81_buf[i];
+                let ffn_shape = graph.buffers.layer_output[i].shape().clone();
+
+                // 1. FFN norm into staging
+                dev.rms_norm_into(
+                    &graph.buffers.layer_output[i],
+                    &**moe_block.ffn_norm.weight.storage(),
+                    moe_block.ffn_norm.eps,
+                    &graph.buffers.norm_buf[i],
+                    &ffn_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                let normed: &Storage = &graph.buffers.norm_buf[i];
+
+                // 2. Router gate GEMV [batch, n_expert]
+                linear_into(
+                    &dev,
+                    normed,
+                    moe_block.moe.router.gate.weight(),
+                    &graph.buffers.moe_gate_logits[i],
+                    act,
+                )?;
+
+                // 3. Top-K routing on-device
+                let num_experts = moe_block.moe.router.num_experts;
+                let top_k = moe_block.moe.router.top_k.min(num_experts).max(1);
+                let (route_mode, bias_rocm) = match moe_block.moe.router.kind {
+                    grim_nn::moe::RouterKind::SoftmaxTopK => (0, None),
+                    grim_nn::moe::RouterKind::SoftmaxTopKRenorm => (3, None),
+                    grim_nn::moe::RouterKind::SigmoidTopKWithBias => {
+                        let b_rocm = moe_block.moe.router.correction_bias.as_ref().and_then(|b| {
+                            b.storage()
+                                .as_ref()
+                                .as_any()
+                                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        });
+                        (2, b_rocm)
+                    }
+                };
+
+                dev.moe_route_topk_on_device(
+                    &graph.buffers.moe_gate_logits[i],
+                    bias_rocm,
+                    &graph.buffers.moe_route_tokens,
+                    &graph.buffers.moe_route_experts,
+                    &graph.buffers.moe_route_weights,
+                    batch,
+                    num_experts,
+                    top_k,
+                    route_mode,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+                // 4. Resident scratch + stacked weights (cache hit after warmup)
+                let experts = (0..num_experts)
+                    .map(|e| crate::shared_moe::MoeExpert {
+                        gate: moe_block.moe.experts.gate[e].clone(),
+                        up: moe_block.moe.experts.up[e].clone(),
+                        down: moe_block.moe.experts.down[e].clone(),
+                    })
+                    .collect::<Vec<_>>();
+
+                // Global / layer charon cache: ensure resident weights
+                static CHARON_CACHES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::shared_moe::CharonCache>>>> =
+                    std::sync::OnceLock::new();
+                let caches = CHARON_CACHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                let cache = {
+                    let mut guard = caches.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.entry(i).or_insert_with(|| std::sync::Arc::new(crate::shared_moe::CharonCache::new())).clone()
+                };
+
+                let (_, _, _, gate_buf, up_buf, down_buf) =
+                    crate::shared_moe::ensure_charon_scratch(
+                        dev.ordinal(),
+                        batch,
+                        top_k,
+                        &experts,
+                        &cache,
+                    )?;
+
+                let norm_rocm = dst_downcast(normed)?;
+                dev.moe_fused_dispatch_resident_routing_into(
+                    norm_rocm,
+                    gate_buf.as_ref(),
+                    up_buf.as_ref(),
+                    down_buf.as_ref(),
+                    &graph.buffers.moe_route_tokens,
+                    &graph.buffers.moe_route_experts,
+                    &graph.buffers.moe_route_weights,
+                    batch * top_k,
+                    &graph.buffers.moe_out[i],
+                    hidden,
+                    experts[0].gate.weight.shape().dim(0).unwrap_or(0),
+                    moe_block.moe.routed_scaling_factor,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
+
+                // 5. Residual add in place
+                add_graph(
+                    &graph.buffers.layer_output[i],
+                    &graph.buffers.moe_out[i],
+                    &graph.buffers.layer_output[i],
+                    &dev,
+                )?;
+
+                // Publish to next layer or head_input
+                let n_layers = graph.buffers.layer_input.len();
+                let dst: &Storage = if i + 1 < n_layers {
+                    &graph.buffers.layer_input[i + 1]
+                } else {
+                    &graph.buffers.head_input
+                };
+                publish_into(&dev, dst, &graph.buffers.layer_output[i])?;
+            }
         }
 
         // Final norm + output head
@@ -622,52 +756,6 @@ impl DecodeGraphModel for Llama {
     }
 }
 
-// ─── DecodeGraphModel implementation for Mistral3 / Mistral4 (wrappers around Llama) ───
-
-impl DecodeGraphModel for crate::mistral3::Mistral3 {
-    fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
-        self.inner.get_or_create_decode_graph(max_ctx, batch)
-    }
-
-    fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
-        self.inner.forward_capture(graph, token_id)
-    }
-
-    fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
-        self.inner.forward_replay(graph, token_id)
-    }
-
-    fn eager_kv_seed_sources<'a>(
-        &self,
-        session: &'a dyn grim_core::session::SessionT,
-        valid_rows: u32,
-    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
-        self.inner.eager_kv_seed_sources(session, valid_rows)
-    }
-}
-
-impl DecodeGraphModel for crate::mistral4::Mistral4 {
-    fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
-        self.inner.get_or_create_decode_graph(max_ctx, batch)
-    }
-
-    fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
-        self.inner.forward_capture(graph, token_id)
-    }
-
-    fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
-        self.inner.forward_replay(graph, token_id)
-    }
-
-    fn eager_kv_seed_sources<'a>(
-        &self,
-        session: &'a dyn grim_core::session::SessionT,
-        valid_rows: u32,
-    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
-        self.inner.eager_kv_seed_sources(session, valid_rows)
-    }
-}
-
 // ─── DecodeGraphModel implementation for LFM2 ──────────────────────────────
 
 impl DecodeGraphModel for crate::lfm2::Lfm2 {
@@ -695,6 +783,62 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
                 grim_core::error::Error::Session("missing or invalid Lfm2LayerCache in session".into())
             })?;
         self.eager_kv_seed_sources(caches, valid_rows)
+    }
+
+    fn eager_conv_seed_rings<'a>(
+        &self,
+        session: &'a dyn grim_core::session::SessionT,
+    ) -> Result<Vec<Option<ConvRingSeed<'a>>>> {
+        let caches = session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Option<crate::lfm2::Lfm2LayerCache>>>())
+            .ok_or_else(|| {
+                grim_core::error::Error::Session("missing or invalid Lfm2LayerCache in session".into())
+            })?;
+        let mut out = Vec::with_capacity(self.layers.len());
+        for (layer, cache) in self.layers.iter().zip(caches.iter()) {
+            let Some(crate::lfm2::Lfm2LayerCache::ShortConv { host, .. }) = cache else {
+                out.push(None);
+                continue;
+            };
+            // in_proj outputs 3*h_dim (b, c, x); conv kernel taps l_cache with
+            // ring depth kc = l_cache - 1.
+            let out_dim = layer
+                .shortconv_in_proj
+                .as_ref()
+                .and_then(|l| l.weight.shape().dim(0).ok())
+                .ok_or_else(|| {
+                    grim_core::error::Error::Session("conv cache on layer without shortconv_in_proj".into())
+                })?;
+            if out_dim % 3 != 0 {
+                return Err(grim_core::error::Error::Session(
+                    "shortconv_in_proj out_dim not divisible by 3".into(),
+                ));
+            }
+            let h_dim = out_dim / 3;
+            let l_cache = layer
+                .shortconv_conv
+                .as_ref()
+                .and_then(|c| c.shape().dims().last().copied())
+                .ok_or_else(|| {
+                    grim_core::error::Error::Session("conv cache on layer without shortconv_conv".into())
+                })?;
+            let kc = l_cache.saturating_sub(1);
+            if host.len() != h_dim * kc {
+                return Err(grim_core::error::Error::Session(format!(
+                    "conv ring {} != h_dim*kc {}",
+                    host.len(),
+                    h_dim * kc
+                )));
+            }
+            out.push(Some(ConvRingSeed {
+                host,
+                h_dim,
+                kc,
+                _anchor: std::marker::PhantomData,
+            }));
+        }
+        Ok(out)
     }
 }
 
@@ -1887,6 +2031,101 @@ impl ChameleonBlock {
     }
 }
 
+
+// ─── Thin Llama-family wrappers: decode-graph delegation (who-dat: graph coverage) ───
+
+/// Every thin wrapper that renames a `Llama` (`pub inner: Llama`) inherits
+/// decode-graph capture/replay/seeding verbatim. Capture, replay, and KV
+/// seeding all read the inner `Llama`'s weights and the shared
+/// `LlamaLayerCache` session state, so delegation is behavior-identical.
+macro_rules! impl_llama_wrapper_graph {
+    ($($module:ident :: $name:ident),+ $(,)?) => {
+        $(
+            impl DecodeGraphModel for crate::$module::$name {
+                fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+                    self.inner.get_or_create_decode_graph(max_ctx, batch)
+                }
+                fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+                    self.inner.forward_capture(graph, token_id)
+                }
+                fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+                    self.inner.forward_replay(graph, token_id)
+                }
+                fn eager_conv_seed_rings<'a>(
+                    &self,
+                    session: &'a dyn grim_core::session::SessionT,
+                ) -> Result<Vec<Option<ConvRingSeed<'a>>>> {
+                    self.inner.eager_conv_seed_rings(session)
+                }
+                fn eager_kv_seed_sources<'a>(
+                    &self,
+                    session: &'a dyn grim_core::session::SessionT,
+                    valid_rows: u32,
+                ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
+                    self.inner.eager_kv_seed_sources(session, valid_rows)
+                }
+            }
+        )+
+    };
+}
+
+impl_llama_wrapper_graph!(
+            afmoe::AfMoe, arcee::Arcee, apertus::Apertus, chatglm::ChatGlm, arctic::Arctic,
+        codeshell::Codeshell, gemma4_assistant::Gemma4Assistant, cohere2moe::Cohere2Moe,
+        internlm2::InternLm2, lladamoe::LladaMoe, minimax_m2::MiniMaxM2, nemotron::Nemotron,
+        bailingmoe2::BailingMoe2, ernie45::Ernie45, plamo2::Plamo2, baichuan::Baichuan,
+        eurobert::Eurobert, granite::Granite, gemma_embedding::GemmaEmbedding, exaone4::Exaone4,
+        qwen3next::Qwen3Next, jais::Jais, granite_moe::GraniteMoe, cohere2::Cohere2, grok::Grok,
+        smollm3::SmolLm3, bitnet::BitNet, llama_embed::LlamaEmbed, deci::Deci, dflash::DFlash,
+        jais2::Jais2, mistral4::Mistral4, llada::Llada, bailingmoe::BailingMoe, exaone_moe::ExaoneMoe,
+        llama4::Llama4, dream::Dream, dots1::Dots1, olmo::Olmo, mistral3::Mistral3, exaone::Exaone,
+        plm::Plm, glm4::Glm4, olmoe::Olmoe, deepseek2ocr::DeepSeek2Ocr, olmo2::Olmo2,
+        hunyuan_dense::HunyuanDense, openai_moe::OpenAiMoe, plamo::Plamo, ernie4_5_moe::Ernie45Moe,
+        plamo3::Plamo3,  qwen2moe::Qwen2Moe, starcoder2::Starcoder2, qwen3::Qwen3,
+        stablelm::StableLm, qwen::Qwen, gptneox::GptNeoX, starcoder::Starcoder, glmdsa::GlmDsa,
+        maincoder::MainCoder, hunyuan_moe::HunyuanMoe, kimi_linear::KimiLinear, laguna::Laguna,
+        maple::Maple, mimo2::Mimo2, mpt::Mpt, grovemoe::GroveMoe, paddle_ocr::PaddleOcr, mellum::Mellum,
+        orion::Orion, openelm::OpenElm, seed_oss::SeedOss, pangu_embed::PanguEmbed, phi2::Phi2,
+        talkie::Talkie, nemotron_hmoe::NemotronHMoe, rnd1::Rnd1, refact::Refact, qwen3moe::Qwen3Moe,
+        xverse::Xverse, smallthinker::SmallThinker, smollm2::SmolLm2, glm4moe::Glm4Moe, step35::Step35,
+);
+
+/// Downcast an opaque model handle to whichever thin Llama wrapper it is,
+/// viewed as its decode-graph capability. One arm in the decode loop covers
+/// every wrapper above.
+pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn DecodeGraphModel> {
+    macro_rules! try_wrapper {
+        ($($module:ident :: $name:ident),+ $(,)?) => {
+            $(
+                if let Some(m) = model.downcast_ref::<crate::$module::$name>() {
+                    return Some(m);
+                }
+            )+
+        };
+    }
+    try_wrapper!(
+        afmoe::AfMoe, arcee::Arcee, apertus::Apertus, chatglm::ChatGlm, arctic::Arctic,
+        codeshell::Codeshell, gemma4_assistant::Gemma4Assistant, cohere2moe::Cohere2Moe,
+        internlm2::InternLm2, lladamoe::LladaMoe, minimax_m2::MiniMaxM2, nemotron::Nemotron,
+        bailingmoe2::BailingMoe2, ernie45::Ernie45, plamo2::Plamo2, baichuan::Baichuan,
+        eurobert::Eurobert, granite::Granite, gemma_embedding::GemmaEmbedding, exaone4::Exaone4,
+        qwen3next::Qwen3Next, jais::Jais, granite_moe::GraniteMoe, cohere2::Cohere2, grok::Grok,
+        smollm3::SmolLm3, bitnet::BitNet, llama_embed::LlamaEmbed, deci::Deci, dflash::DFlash,
+        jais2::Jais2, mistral4::Mistral4, llada::Llada, bailingmoe::BailingMoe, exaone_moe::ExaoneMoe,
+        llama4::Llama4, dream::Dream, dots1::Dots1, olmo::Olmo, mistral3::Mistral3, exaone::Exaone,
+        plm::Plm, glm4::Glm4, olmoe::Olmoe, deepseek2ocr::DeepSeek2Ocr, olmo2::Olmo2,
+        hunyuan_dense::HunyuanDense, openai_moe::OpenAiMoe, plamo::Plamo, ernie4_5_moe::Ernie45Moe,
+        plamo3::Plamo3,  qwen2moe::Qwen2Moe, starcoder2::Starcoder2, qwen3::Qwen3,
+        stablelm::StableLm, qwen::Qwen, gptneox::GptNeoX, starcoder::Starcoder, glmdsa::GlmDsa,
+        maincoder::MainCoder, hunyuan_moe::HunyuanMoe, kimi_linear::KimiLinear, laguna::Laguna,
+        maple::Maple, mimo2::Mimo2, mpt::Mpt, grovemoe::GroveMoe, paddle_ocr::PaddleOcr, mellum::Mellum,
+        orion::Orion, openelm::OpenElm, seed_oss::SeedOss, pangu_embed::PanguEmbed, phi2::Phi2,
+        talkie::Talkie, nemotron_hmoe::NemotronHMoe, rnd1::Rnd1, refact::Refact, qwen3moe::Qwen3Moe,
+        xverse::Xverse, smallthinker::SmallThinker, smollm2::SmolLm2, glm4moe::Glm4Moe, step35::Step35,
+    );
+    None
+}
+
 // ─── DecodeGraphModel implementation for Chameleon ────────────────────────
 
 fn dev_for_chameleon(m: &Chameleon) -> Result<Arc<Dev>> {
@@ -2854,10 +3093,12 @@ impl DecodeGraphModel for DeepSeek32 {
 mod tests {
     use super::*;
     use crate::block::LlamaConfigRefs;
+    use crate::moe_block::MoeBlock;
     use crate::qwen35::Qwen35Config;
     use grim_backend_rocm::RocmDevice;
     use grim_core::model::CausalLm;
     use grim_core::session::Inner as SessionInner;
+    use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
     use grim_nn::{ColumnParallelLinear, Embedding, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig};
     use grim_tensor::{ArithType, CoreTensorOps, DType, QuantProvenance, Shape, Storage, Tensor};
 
@@ -3071,6 +3312,7 @@ mod tests {
             eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
             return;
         }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         let dev = RocmDevice::shared(0);
         unsafe {
             std::env::set_var("GRIM_DECODE_GRAPH", "1");
@@ -3132,6 +3374,7 @@ mod tests {
             eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
             return;
         }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         let dev = RocmDevice::shared(0);
         unsafe {
             std::env::set_var("GRIM_DECODE_GRAPH", "1");
@@ -3172,6 +3415,7 @@ mod tests {
             eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
             return;
         }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         let dev = RocmDevice::shared(0);
         unsafe {
             std::env::set_var("GRIM_DECODE_GRAPH", "1");
@@ -3344,6 +3588,7 @@ mod tests {
             eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
             return;
         }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         let dev = RocmDevice::shared(0);
         unsafe {
             std::env::set_var("GRIM_DECODE_GRAPH", "1");
@@ -3477,6 +3722,7 @@ mod tests {
             eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
             return;
         }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         let dev = RocmDevice::shared(0);
         unsafe {
             std::env::set_var("GRIM_DECODE_GRAPH", "1");
@@ -3590,6 +3836,138 @@ mod tests {
         assert_eq!(host_logits.len(), cfg.vocab_size);
         for (i, &val) in host_logits.iter().enumerate() {
             assert!(val.is_finite(), "Chameleon logit {i} is not finite: {val}");
+        }
+    }
+
+    // ─── Thin Llama wrapper: dispatcher + capture/replay through the wrapper ───
+    #[test]
+    fn llama_wrapper_dispatch_and_graph_replay() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+            return;
+        }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = RocmDevice::shared(0);
+        let (llama, cfg) = make_test_llama(&dev, 0, false);
+
+        // Dispatcher: the wrapper resolves, the inner type does not (it is
+        // matched by name in run.rs before the wrapper arm).
+        let wrapper = crate::olmo::Olmo {
+            cfg: crate::olmo::OlmoConfig {
+                vocab_size: cfg.vocab_size,
+                hidden_size: cfg.hidden_size,
+                num_heads: cfg.num_heads,
+                num_kv_heads: cfg.num_kv_heads,
+                head_dim: cfg.head_dim,
+                num_layers: cfg.num_layers,
+                intermediate_size: cfg.intermediate_size,
+                max_seq_len: cfg.max_seq_len,
+                rope_theta: cfg.rope_theta,
+                rms_norm_eps: cfg.rms_norm_eps,
+            },
+            device: Device::Rocm(0),
+            inner: llama,
+        };
+        let any: &dyn std::any::Any = &wrapper;
+        let dg = super::llama_wrapper_graph_model(any).expect("wrapper must resolve to DecodeGraphModel");
+
+        let mut graph = dg.get_or_create_decode_graph(512, 1).expect("alloc graph");
+        let token = 9u32;
+        dg.forward_capture(&mut graph, token).expect("warmup 1");
+        dg.forward_capture(&mut graph, token).expect("warmup 2");
+        graph.begin_capture().expect("begin capture");
+        dg.forward_capture(&mut graph, token).expect("capture");
+        graph.end_capture().expect("end capture");
+        dg.forward_replay(&mut graph, token).expect("replay");
+        let _ = dev.synchronize();
+
+        let rocm_st = graph
+            .logits_device_storage()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("RocmStorage");
+        let host = rocm_st.copy_to_host().expect("copy_to_host");
+        assert!(!host.is_empty(), "no logits after replay");
+    }
+
+    #[test]
+    fn test_llama_moe_decode_graph_capture_replay() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+            return;
+        }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = RocmDevice::shared(0);
+        unsafe {
+            std::env::set_var("GRIM_DECODE_GRAPH", "1");
+        }
+
+        let (mut llama, cfg) = make_test_llama(&dev, 0, false);
+        let num_experts = 4;
+        let top_k = 2;
+        let hidden_size = cfg.hidden_size;
+        let intermediate_size = cfg.intermediate_size;
+
+        // Convert dense FFN layers to MoE layers
+        for (i, layer) in llama.layers.iter_mut().enumerate() {
+            layer.ffn_disabled = true;
+
+            let seed = (i as u64) * 1000 + 40;
+            let router_gate = test_linear(&dev, 0, num_experts, hidden_size, seed + 20);
+            let router = MoeRouter::new(router_gate, RouterKind::SoftmaxTopK, top_k, num_experts, None);
+
+            let mut egate = Vec::new();
+            let mut eup = Vec::new();
+            let mut edown = Vec::new();
+            for e in 0..num_experts {
+                let eseed = seed + 30 + (e as u64) * 10;
+                egate.push(test_linear(&dev, 0, intermediate_size, hidden_size, eseed + 1));
+                eup.push(test_linear(&dev, 0, intermediate_size, hidden_size, eseed + 2));
+                edown.push(test_linear(&dev, 0, hidden_size, intermediate_size, eseed + 3));
+            }
+            let moe_ffn = MoeFfn::new(
+                router,
+                ExpertBank::from_linears(egate, eup, edown),
+                None,
+                1.0,
+            );
+
+            llama.moe_blocks[i] = Some(MoeBlock {
+                ffn_norm: test_norm(&dev, 0, hidden_size),
+                moe: moe_ffn,
+                tp_config: layer.tp_config,
+            });
+        }
+
+        let mut graph = llama.get_or_create_decode_graph(512, 1).expect("alloc decode graph with MoE");
+        let token_id = 17u32;
+
+        // Warmup
+        llama.forward_capture(&mut graph, token_id).expect("warmup 1");
+        llama.forward_capture(&mut graph, token_id).expect("warmup 2");
+
+        // Capture
+        graph.begin_capture().expect("begin capture");
+        llama.forward_capture(&mut graph, token_id).expect("forward capture");
+        graph.end_capture().expect("end capture");
+
+        // Replay
+        llama.forward_replay(&mut graph, token_id).expect("replay token");
+        let _ = dev.synchronize();
+
+        let logits_storage = graph.logits_device_storage();
+        let rocm_st = logits_storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("RocmStorage");
+        let host_bytes = rocm_st.copy_to_host().expect("copy_to_host");
+        let host_logits: &[f32] = unsafe {
+            std::slice::from_raw_parts(host_bytes.as_ptr() as *const f32, host_bytes.len() / 4)
+        };
+
+        assert_eq!(host_logits.len(), cfg.vocab_size);
+        for (i, &val) in host_logits.iter().enumerate() {
+            assert!(val.is_finite(), "MoE decode graph logit {i} is not finite: {val}");
         }
     }
 }

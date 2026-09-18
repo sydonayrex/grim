@@ -1792,7 +1792,12 @@ async fn chat_completions(
                                     "object": "chat.completion.chunk",
                                     "model": stream_model,
                                     "choices": [{"index": 0, "delta": {"content": delta_content}, "finish_reason": "stop"}],
-                                    "adapters_active": adapter_ids.len()
+                                    "adapters_active": adapter_ids.len(),
+                                    // True sampled-token count: this chunk may bundle more
+                                    // than one token's worth of text (stop-string trimming
+                                    // collapses into one frame), so chunk-counting
+                                    // downstream undercounts.
+                                    "grim_eval_count": step + 1
                                 })
                                 .to_string();
                                 let event = axum::response::sse::Event::default()
@@ -1819,7 +1824,10 @@ async fn chat_completions(
                        "object": "chat.completion.chunk",
                        "model": stream_model,
                        "choices": [{"index": 0, "delta": {"content": token_text}}],
-                       "adapters_active": adapter_ids.len()
+                       "adapters_active": adapter_ids.len(),
+                       // True sampled-token count (downstream translators should
+                       // prefer this over counting chunks).
+                       "grim_eval_count": step + 1
                     })
                     .to_string();
                     let event = axum::response::sse::Event::default()
@@ -4278,6 +4286,16 @@ async fn grim_generate(
                                     .as_str()
                                     .unwrap_or("")
                                     .to_string();
+                                // Prefer the upstream's true sampled-token count
+                                // (grim_eval_count): a single SSE chunk can carry
+                                // multiple tokens' worth of text (e.g. the
+                                // stop-triggered terminal chunk), so counting
+                                // chunks undercounts tokens.
+                                if let Some(n) = val["grim_eval_count"].as_u64() {
+                                    eval_count = eval_count.max(n);
+                                } else {
+                                    eval_count += 1;
+                                }
                                 let ollama_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),
@@ -4286,8 +4304,7 @@ async fn grim_generate(
                                 });
                                 let chunk_str =
                                     format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
-                                eval_count += 1;
-                                eprintln!("[trace] generate content chunk #{eval_count}");
+                                eprintln!("[trace] generate content chunk, eval_count={eval_count}");
                                 return Some((
                                     Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
                                     (body_stream, buffer, false, eval_count),

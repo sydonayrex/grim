@@ -96,6 +96,7 @@ pub struct HyV3MoeBlock {
     experts: Vec<HyV3Expert>,
     shared_expert: Option<HyV3Expert>,
     num_experts_per_tok: usize,
+    charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl HyV3MoeBlock {
@@ -128,11 +129,44 @@ impl HyV3MoeBlock {
             experts,
             shared_expert,
             num_experts_per_tok: cfg.num_experts_per_tok,
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _router_logits = self.gate.forward(x)?;
+        let router_logits = self.gate.forward(x)?;
+
+        if x.device() != &Device::Cpu {
+            let shared_exp = self.shared_expert.as_ref().map(|s| crate::shared_moe::MoeExpert {
+                gate: s.gate_proj.clone(),
+                up: s.up_proj.clone(),
+                down: s.down_proj.clone(),
+            });
+            let moe_experts: Vec<crate::shared_moe::MoeExpert> = self
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
+                    gate: e.gate_proj.clone(),
+                    up: e.up_proj.clone(),
+                    down: e.down_proj.clone(),
+                })
+                .collect();
+
+            let dev = grim_nn::modules::pick_device_for_tensor(x);
+            if let Ok(Some(out)) = crate::shared_moe::fused_moe_dispatch_from_logits(
+                dev.as_ref(),
+                x,
+                &router_logits,
+                &moe_experts,
+                shared_exp.as_ref(),
+                self.num_experts_per_tok,
+                1.0,
+                3, // route_mode 3: softmax renormalized over top-k
+                &self.charon_cache,
+            ) {
+                return Ok(out);
+            }
+        }
 
         let mut out_vec = if let Some(ref shared) = self.shared_expert {
             shared.forward(x)?.to_vec_f32()?

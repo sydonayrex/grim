@@ -67,7 +67,7 @@ impl MoeBlock {
                 let b = ws.get(Shape::new(vec![spec.num_experts]), "ffn_exp_probs_b.bias")?;
                 Some(b)
             }
-            RouterKind::SoftmaxTopK => None,
+            RouterKind::SoftmaxTopK | RouterKind::SoftmaxTopKRenorm => None,
         };
 
         let router = MoeRouter::new(

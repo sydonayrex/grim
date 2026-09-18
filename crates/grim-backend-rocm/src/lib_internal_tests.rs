@@ -81,6 +81,8 @@ mod tests {
     #[test]
     fn new_infallible_constructor_does_not_panic_on_bad_ordinal() {
         // The infallible `new()` must never panic — it logs and falls back to W32
+        // HIP context init races other device work — serialize.
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(9999);
         assert_eq!(dev.wavefront_size(), WavefrontSize::W32);
     }
@@ -728,6 +730,7 @@ mod tests {
     #[test]
     fn add_produces_elementwise_sum() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let got = run_binary_op(
             env,
             &[1.0, 2.0, 3.0, 4.0],
@@ -752,6 +755,7 @@ mod tests {
     #[test]
     fn mul_produces_elementwise_product() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let got = run_binary_op(
             env,
             &[1.0, 2.0, 3.0, 4.0],
@@ -777,6 +781,7 @@ mod tests {
     fn silu_mul_matches_swiglu_formula() {
         // silu(gate) * up, with silu(x) = x / (1 + exp(-x))
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let gate = [1.0f32, -2.0, 0.0, 3.5];
         let up = [2.0f32, 4.0, 1.0, 0.5];
         let got = run_binary_op(env, &gate, &up, &[4], |d, a, b, s| d.silu_mul(a, b, s));
@@ -836,6 +841,7 @@ mod tests {
     fn rms_norm_normalizes_to_unit_when_weight_is_one() {
         // x = [3,4] over row_len 2, weight = 1, eps = 0:
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let x = [3.0f32, 4.0];
         let w = [1.0f32, 1.0];
         let got = run_rms_norm_op(env, &x, &w, &[2], 0.0);
@@ -859,6 +865,7 @@ mod tests {
     #[test]
     fn softmax_sums_to_one_per_row_and_orders_by_max() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         // Two rows: [1,2,3] and [10, 0, -5]
         let x = [1.0f32, 2.0, 3.0, 10.0, 0.0, -5.0];
         let got = run_softmax_op(env, &x, &[2, 3]);
@@ -885,6 +892,7 @@ mod tests {
     fn embedding_gathers_weight_rows_by_index() {
         // weight = [[1,2,3],[4,5,6],[7,8,9]], dim=3, vocab=3
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let weight = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let got = run_embedding_op(env, &weight, &[2, 0, 1], 3, 3);
         if let Some(out) = got {
@@ -940,6 +948,7 @@ mod tests {
     #[test]
     fn test_rocm_add_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let a = [1.5f32, -2.5, 0.0, std::f32::consts::PI];
         let b = [2.5f32, 3.5, -1.0, 1.0];
         if let Some(out) = run_binary_op(env, &a, &b, &[4], |d, x, y, s| d.add(x, y, s)) {
@@ -953,6 +962,7 @@ mod tests {
     #[test]
     fn test_rocm_mul_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let a = [2.0f32, -3.0, 0.5];
         let b = [4.0f32, 2.0, -8.0];
         if let Some(out) = run_binary_op(env, &a, &b, &[3], |d, x, y, s| d.mul(x, y, s)) {
@@ -965,6 +975,7 @@ mod tests {
     #[test]
     fn test_rocm_silu_mul_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let gate = [1.0f32, -1.0];
         let up = [2.0f32, 3.0];
         if let Some(out) = run_binary_op(env, &gate, &up, &[2], |d, g, u, s| d.silu_mul(g, u, s)) {
@@ -982,6 +993,7 @@ mod tests {
     #[test]
     fn test_rocm_rms_norm_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let x = [3.0f32, 4.0];
         let w = [1.0f32, 2.0];
         if let Some(out) = run_rms_norm_op(env, &x, &w, &[2], 1e-6) {
@@ -996,6 +1008,7 @@ mod tests {
     #[test]
     fn test_rocm_softmax_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let x = [1.0f32, 2.0, 3.0];
         if let Some(out) = run_softmax_op(env, &x, &[1, 3]) {
             let sum_exp = 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp();
@@ -1008,6 +1021,7 @@ mod tests {
     #[test]
     fn test_rocm_embedding_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let weight = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
         if let Some(out) = run_embedding_op(env, &weight, &[2, 0], 3, 2) {
             assert_eq!(out, vec![50.0, 60.0, 10.0, 20.0]);
@@ -1137,6 +1151,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(0);
         for &batch in &[1usize, 3, 5] {
             let m = 8usize;
@@ -1199,6 +1214,7 @@ mod tests {
         // Force the gemm_ex (extended-datatype) code path even for FP32 inputs by
         temp_env::with_var("GRIM_GPU_TARGET", Some("gfx90a"), || {
             let env = std::env::var(GPU_TEST_ENV).is_ok();
+            let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
             let a_dims = [4usize, 8];
             // SPEED-ROC-16: b is [N, K] = [4, 8] (old [K, N] values transposed).
             let b_dims = [4usize, 8];
@@ -1232,6 +1248,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(0);
         let a_dims = [16usize, 32];
         // SPEED-ROC-16: b is [N, K]; same element count reinterpreted (no
@@ -1265,6 +1282,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(0);
         let a_dims = [8usize, 8];
         let b_dims = [8usize, 8];
@@ -1293,6 +1311,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         // The device detects its own gfx target from the driver, so kernel [see: `GRIM_GPU_TARGET`]
         let dev = RocmDevice::new(0);
 
@@ -1402,6 +1421,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
 
         let dev = RocmDevice::new(0);
 
@@ -1505,6 +1525,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(0);
         let weight = dev
             .from_cpu(
@@ -1533,6 +1554,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(0);
         let shape = Shape::from_slice(&[3, 7, 5]);
 
@@ -1585,6 +1607,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(0);
         let shape = Shape::from_slice(&[64, 64]);
         let data: Vec<f32> = (0..shape.elem_count())
@@ -1647,6 +1670,7 @@ mod tests {
         if !env {
             return;
         }
+        let _gpu_guard = crate::device::util::gpu_test_lock();
         let dev = RocmDevice::new(0);
         // Logits-sized staging buffer (vocab ~32k floats), typical decode readback.
         let n = 32_768;
@@ -1713,6 +1737,7 @@ mod tests {
             if !env {
                 return;
             }
+            let _gpu_guard = crate::device::util::gpu_test_lock();
             let dev = RocmDevice::new(0);
 
             // Inputs are uploaded eagerly (outside the capture bracket) so the
@@ -1797,6 +1822,7 @@ mod tests {
             if !env {
                 return;
             }
+            let _gpu_guard = crate::device::util::gpu_test_lock();
             let dev = RocmDevice::new(0);
             let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
             let b: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5];
@@ -1831,6 +1857,7 @@ mod tests {
             if !env {
                 return;
             }
+            let _gpu_guard = crate::device::util::gpu_test_lock();
             let dev = RocmDevice::new(0);
             let m = 64usize;
             let k = 128usize;
@@ -2108,6 +2135,7 @@ mod tests {
         let (q, k, v) = build_inputs(0xA1, nh, nkv, hd, sl, kv_seq);
         let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
         if let Some(out) = got {
             let max = max_abs_diff(&out, &cpu);
@@ -2124,6 +2152,7 @@ mod tests {
         let (q, k, v) = build_inputs(0xB2, nh, nkv, hd, sl, kv_seq);
         let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
         if let Some(out) = got {
             let max = max_abs_diff(&out, &cpu);
@@ -2140,6 +2169,7 @@ mod tests {
         let (q, k, v) = build_inputs(0xC3, nh, nkv, hd, sl, kv_seq);
         let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
         if let Some(out) = got {
             let max = max_abs_diff(&out, &cpu);
@@ -2157,6 +2187,7 @@ mod tests {
         let (q, k, v) = build_inputs(0xD4, nh, nkv, hd, sl, kv_seq);
         let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
         if let Some(out) = got {
             let max = max_abs_diff(&out, &cpu);
@@ -2181,6 +2212,7 @@ mod tests {
         let (q, k, v) = build_inputs(0xE5, nh, nkv, hd, sl, kv_seq);
         let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
         let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let _gpu_guard = env.then(|| crate::device::util::gpu_test_lock());
         let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
         if let Some(out) = got {
             let max = max_abs_diff(&out, &cpu);

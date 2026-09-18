@@ -6,10 +6,10 @@ use grim_nn::modules::pick_device_for_storage_device;
 use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
-/// Check if fused QKV kernels are enabled (honors both `GRIM_FUSED_QKV` and legacy `GRIM_QKV_FUSED`).
+/// Check if fused QKV kernels are enabled. Canonical gate: `GRIM_FUSED_QKV=0`
+/// disables (dats-demm §4: the duplicate `GRIM_QKV_FUSED` spelling was removed).
 pub fn fused_qkv_enabled() -> bool {
     std::env::var("GRIM_FUSED_QKV").as_deref() != Ok("0")
-        && std::env::var("GRIM_QKV_FUSED").as_deref() != Ok("0")
 }
 
 /// Single-token decode dot4 GEMV over fused Q8_0 weights [n_q + 2*n_kv, hidden].
@@ -1089,6 +1089,39 @@ mod tests {
                 (x - y).abs() < 1e-6,
                 "arena/host divergence at [{i}]: {x} vs {y}"
             );
+        }
+    }
+}
+
+// Env-gate regression (dats-demm §4 dedup): the canonical kill switch is
+// `GRIM_FUSED_QKV=0`; the retired `GRIM_QKV_FUSED` spelling must no longer
+// have any effect.
+#[cfg(test)]
+mod env_gate_tests {
+    use super::fused_qkv_enabled;
+
+    #[test]
+    fn fused_qkv_gate_canonical_spelling_only() {
+        // SAFETY: the static lock serializes env mutation within this test
+        // binary; no other test reads these vars concurrently.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("GRIM_FUSED_QKV");
+            std::env::remove_var("GRIM_QKV_FUSED");
+            assert!(fused_qkv_enabled(), "default must be enabled");
+
+            std::env::set_var("GRIM_FUSED_QKV", "0");
+            assert!(!fused_qkv_enabled(), "canonical spelling must disable");
+
+            std::env::remove_var("GRIM_FUSED_QKV");
+            std::env::set_var("GRIM_QKV_FUSED", "0");
+            assert!(
+                fused_qkv_enabled(),
+                "retired GRIM_QKV_FUSED spelling must be ignored"
+            );
+
+            std::env::remove_var("GRIM_QKV_FUSED");
         }
     }
 }

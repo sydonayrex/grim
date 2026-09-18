@@ -96,6 +96,7 @@ fn shortconv_block(dev: &RocmDevice, ordinal: usize, hidden: usize, l_cache: usi
 #[test]
 fn shortconv_device_ring_matches_host_reference() {
     if !gpu_test_enabled() {
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         eprintln!("skip: set GRIM_GPU_TEST=1");
         return;
     }
@@ -232,6 +233,7 @@ fn shortconv_device_ring_matches_host_reference() {
 #[test]
 fn test_shortconv_prefill_then_decode_matches_reference() {
     if !gpu_test_enabled() {
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
         eprintln!("skip: set GRIM_GPU_TEST=1");
         return;
     }
@@ -364,5 +366,239 @@ fn test_shortconv_prefill_then_decode_matches_reference() {
     assert!(
         max_diff < 1e-3,
         "prefill-then-decode diverged from reference: max_diff={max_diff}"
+    );
+}
+
+// ===========================================================================
+// Regression (A1/S1 follow-up): the host mirror must stay fresh after device
+// decode steps even now that the GRIM_DECODE_GRAPH opt-in gate is gone.
+// `Clone for Lfm2LayerCache` copies ONLY the host ring (device ring starts
+// fresh), so a stale host mirror would silently fork state on clone.
+// =========================================================================
+
+#[test]
+fn shortconv_host_mirror_fresh_after_device_steps_clone_regression() {
+    if !gpu_test_enabled() {
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+        eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+    let hidden = 16usize;
+    let l_cache = 3usize;
+
+    let block = shortconv_block(&dev, 0, hidden, l_cache);
+    let mut cache = Some(Lfm2LayerCache::ShortConv {
+        host: vec![0.0f32; hidden * (l_cache - 1)],
+        dev: None,
+    });
+
+    // 4 device-path decode steps (steps == 1 → shortconv_step_device).
+    let mut next_input = vec![0.5f32; hidden];
+    for _t in 0..4 {
+        let x = tensor(
+            &dev,
+            0,
+            next_input.clone(),
+            Shape::new(vec![1, hidden]),
+        );
+        let y = block.forward(&x, &mut cache).unwrap();
+        next_input = y.to_vec_f32().unwrap()[..hidden].to_vec();
+    }
+
+    // The host ring must hold the last kc-1 bx rows — all non-zero (inputs
+    // and weights are non-degenerate), proving the mirror was re-synced.
+    match cache.as_ref().unwrap() {
+        Lfm2LayerCache::ShortConv { host, dev: ring } => {
+            assert!(ring.is_some(), "device ring must exist on ROCm");
+            assert!(
+                host.iter().any(|&v| v != 0.0),
+                "host mirror stale after device steps: clone would fork state"
+            );
+        }
+        _ => panic!("expected ShortConv cache"),
+    }
+
+    // Behavioral check: continuing from the clone must match continuing from
+    // the original (a stale mirror makes the clone's first step diverge).
+    let cloned = cache.as_ref().unwrap().clone();
+    let mut cache_a = Some(match cloned {
+        Lfm2LayerCache::ShortConv { host, .. } => Lfm2LayerCache::ShortConv {
+            host,
+            dev: None,
+        },
+        _ => unreachable!(),
+    });
+    let mut cache_b = cache;
+
+    let x5 = tensor(&dev, 0, next_input.clone(), Shape::new(vec![1, hidden]));
+    let y_a = block.forward(&x5, &mut cache_a).unwrap().to_vec_f32().unwrap();
+    let y_b = block.forward(&x5, &mut cache_b).unwrap().to_vec_f32().unwrap();
+    let max_diff = y_a
+        .iter()
+        .zip(y_b.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-5,
+        "cloned cache diverged from original after device steps: max_diff={max_diff}"
+    );
+}
+
+// ===========================================================================
+// Integration (A1/S1 closure): a recurrent (ShortConv) LFM2 must decode
+// IDENTICALLY through the HIP decode graph (seeded conv rings + capture +
+// replay) as through the eager path. Regression: graph `sc_state` was never
+// seeded from the eager session, so every post-prefill replay ran conv layers
+// against a zeroed ring.
+//
+// Mirrors the production sequence in run.rs `try_graph_decode_step`:
+// warmups (unseeded, discarded) -> capture (RECORDS ONLY, does not execute)
+// -> eager step for the capture token -> re-seed from session -> replay.
+// =========================================================================
+
+use grim_core::model::CausalLm;
+use grim_models_transformer::{DecodeGraphModel, Lfm2, Lfm2Config};
+use grim_nn::Embedding;
+
+fn conv_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
+    let hidden = 16usize;
+    let l_cache = 3usize;
+    let inter = 32usize;
+    let vocab = 32usize;
+    let layers = (0..n_layers)
+        .map(|l| {
+            let block = shortconv_block(dev, ordinal, hidden, l_cache);
+            Lfm2Block {
+                shortconv_in_proj: Some(lin_rocm(dev, ordinal, rand_vec(3 * hidden * hidden, (100 + l * 10 + 1) as u64), 3 * hidden, hidden)),
+                shortconv_conv: Some(tensor(dev, ordinal, rand_vec(hidden * l_cache, (100 + l * 10 + 2) as u64), Shape::new(vec![hidden, 1, l_cache]))),
+                shortconv_conv_vec: Some(rand_vec(hidden * l_cache, (100 + l * 10 + 2) as u64)),
+                shortconv_out_proj: Some(lin_rocm(dev, ordinal, rand_vec(hidden * hidden, (100 + l * 10 + 3) as u64), hidden, hidden)),
+                ffn_gate: lin_rocm(dev, ordinal, rand_vec(inter * hidden, (100 + l * 10 + 4) as u64), inter, hidden),
+                ffn_up: lin_rocm(dev, ordinal, rand_vec(inter * hidden, (100 + l * 10 + 5) as u64), inter, hidden),
+                ffn_down: lin_rocm(dev, ordinal, rand_vec(inter * hidden, (100 + l * 10 + 6) as u64), hidden, inter),
+                ..block
+            }
+        })
+        .collect();
+    Lfm2 {
+        cfg: Lfm2Config {
+            vocab_size: vocab,
+            hidden_size: hidden,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: hidden,
+            num_layers: n_layers,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            n_shortconv_l_cache: l_cache,
+            is_recr: vec![true; n_layers],
+            n_layer_dense_lead: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            n_ff_exp: 0,
+            n_embd_out: 0,
+            mxfp4_qkv_attention: false,
+        },
+        device: Device::Rocm(ordinal),
+        tok_embeddings: Embedding {
+            weight: tensor(dev, ordinal, rand_vec(vocab * hidden, 900u64), Shape::new(vec![vocab, hidden])),
+        },
+        layers,
+        norm: norm_rocm(dev, ordinal, hidden),
+        output: lin_rocm(dev, ordinal, rand_vec(vocab * hidden, 901u64), vocab, hidden),
+        dense_2_out: None,
+        dense_2_out_bias: None,
+    }
+}
+
+fn run_step(
+    dev: &RocmDevice,
+    model: &Lfm2,
+    session: &mut Box<dyn grim_core::session::SessionT>,
+    token: u32,
+) -> Vec<f32> {
+    let x = tensor(dev, 0, vec![token as f32], Shape::new(vec![1]));
+    let pos = tensor(dev, 0, vec![0.0], Shape::new(vec![1]));
+    let out = CausalLm::forward(model, session.as_mut(), &x, &pos, &[]).unwrap();
+    out.to_vec_f32().unwrap()
+}
+
+#[test]
+fn shortconv_lfm2_graph_replay_matches_eager_after_prefill() {
+    if !gpu_test_enabled() {
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+        eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+        return;
+    }
+    let dev = RocmDevice::shared(0);
+
+    // Two identical conv-only models: one decoded through the graph, one eager.
+    let model_graph = conv_lfm2(&dev, 0, 2);
+    let model_eager = conv_lfm2(&dev, 0, 2);
+
+    let prompt = [5u32, 9, 17, 3];
+    let capture_tok = 21u32;
+    let replay_toks = [7u32, 12, 30];
+
+    // ---- Graph path: eager prefill, warmups, capture, re-seed, replays ----
+    let mut sess_g = CausalLm::new_session(&model_graph);
+    for &t in &prompt {
+        let _ = run_step(&dev, &model_graph, &mut sess_g, t);
+    }
+
+    let mut graph = DecodeGraphModel::get_or_create_decode_graph(&model_graph, 16, 1).unwrap();
+    // Warmups run unseeded; the seed below discards their state writes.
+    let _ = DecodeGraphModel::forward_capture(&model_graph, &mut graph, capture_tok);
+    let _ = DecodeGraphModel::forward_capture(&model_graph, &mut graph, capture_tok);
+    graph.begin_capture().unwrap();
+    DecodeGraphModel::forward_capture(&model_graph, &mut graph, capture_tok).unwrap();
+    graph.end_capture().unwrap();
+    assert!(graph.is_captured);
+
+    // Production: the capture-step token runs EAGERLY on the session (its
+    // logits produce this step's token), then the graph is re-seeded from the
+    // session so the first replay continues exactly where the session is.
+    let _ = run_step(&dev, &model_graph, &mut sess_g, capture_tok);
+    let srcs = DecodeGraphModel::eager_kv_seed_sources(
+        &model_graph,
+        sess_g.as_ref(),
+        (prompt.len() + 1) as u32,
+    )
+    .unwrap();
+    graph.buffers.seed_kv_arena_from_eager(&dev, &srcs).unwrap();
+    let conv_seeds = DecodeGraphModel::eager_conv_seed_rings(&model_graph, sess_g.as_ref()).unwrap();
+    assert_eq!(conv_seeds.len(), 2, "per-layer conv seeds");
+    assert!(conv_seeds.iter().all(|s| s.is_some()), "conv layers must be seedable");
+    graph.buffers.seed_conv_rings(&conv_seeds).unwrap();
+
+    let mut logits_graph = Vec::new();
+    for &t in &replay_toks {
+        DecodeGraphModel::forward_replay(&model_graph, &mut graph, t).unwrap();
+        let _ = dev.synchronize();
+        logits_graph.extend(graph.read_logits_f32().unwrap());
+    }
+
+    // ---- Eager reference: identical token sequence, all eager ----
+    let mut sess_e = CausalLm::new_session(&model_eager);
+    for &t in &prompt {
+        let _ = run_step(&dev, &model_eager, &mut sess_e, t);
+    }
+    let _ = run_step(&dev, &model_eager, &mut sess_e, capture_tok);
+    let mut logits_eager = Vec::new();
+    for &t in &replay_toks {
+        logits_eager.extend(run_step(&dev, &model_eager, &mut sess_e, t));
+    }
+
+    assert_eq!(logits_graph.len(), logits_eager.len());
+    let max_diff = logits_graph
+        .iter()
+        .zip(logits_eager.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-3,
+        "graph replay diverged from eager on conv model: max_diff={max_diff}"
     );
 }

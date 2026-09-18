@@ -101,7 +101,7 @@ impl GemmaBlock {
 
         let device = wq.weight.device().clone();
         let wqkv_q80_fused = if matches!(&device, Device::Rocm(_))
-            && std::env::var("GRIM_FUSED_QKV").as_deref() != Ok("0")
+            && crate::shared_attention::fused_qkv_enabled()
         {
             let is_q80 = |s: &grim_tensor::Tensor| {
                 matches!(

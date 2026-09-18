@@ -29,6 +29,8 @@ use crate::varbuilder::WeightSource;
 #[derive(Debug, Clone)]
 pub enum RouterKind {
     SoftmaxTopK,
+    /// Softmax over top-k selections renormalized (GLM-style, route_mode 3).
+    SoftmaxTopKRenorm,
     /// Sigmoid gate logits plus a learned per-expert bias added **at selection time only**, never to the combine weights.
     /// The bias tensor itself is loaded from the checkpoint (`exp_probs_b`) and passed to `MoeRouter::new`.
     SigmoidTopKWithBias,
@@ -98,7 +100,7 @@ impl MoeRouter {
         for t in 0..batch {
             let row = &z[t * self.num_experts..(t + 1) * self.num_experts];
             let sel_scores: Vec<f32> = match &self.kind {
-                RouterKind::SoftmaxTopK => softmax(row),
+                RouterKind::SoftmaxTopK | RouterKind::SoftmaxTopKRenorm => softmax(row),
                 RouterKind::SigmoidTopKWithBias => {
                     let b = self
                         .correction_bias
@@ -117,9 +119,9 @@ impl MoeRouter {
             order.sort_by(|&a, &b| sel_scores[b].partial_cmp(&sel_scores[a]).unwrap());
             let chosen = &order[..k];
 
-            // Combine weights. * SoftmaxTopK: the softmax probabilities over the chosen logits (inherently normalized).
+            // Combine weights.
             let raw: Vec<f32> = match &self.kind {
-                RouterKind::SoftmaxTopK => {
+                RouterKind::SoftmaxTopK | RouterKind::SoftmaxTopKRenorm => {
                     let logits: Vec<f32> = chosen.iter().map(|&i| row[i]).collect();
                     softmax(&logits)
                 }
@@ -814,7 +816,7 @@ struct RocmResidentWeights {
 #[cfg(feature = "rocm-mem")]
 /// Dequantize one expert weight tensor to row-major F32 on `ordinal`.
 /// Native storages ride `to_vec_f32`.
-pub(crate) fn rocm_dequant_expert_weight(
+pub fn rocm_dequant_expert_weight(
     weight: &Tensor,
     ordinal: usize,
 ) -> Result<Vec<f32>, grim_tensor::error::Error> {
@@ -1382,8 +1384,15 @@ impl MoeFfn {
         }
         #[cfg(feature = "rocm-mem")]
         if matches!(x.device(), Device::Rocm(_)) {
-            if let Ok(out) = self.forward_rocm(x) {
-                return Ok(out);
+            match self.forward_rocm(x) {
+                Ok(out) => {
+                    return Ok(out);
+                }
+                Err(e) => {
+                    if std::env::var_os("GRIM_MOE_DIAG").is_some() {
+                        eprintln!("[moe-diag] forward_rocm fallback: {e:?}");
+                    }
+                }
             }
         }
 
@@ -2145,10 +2154,21 @@ impl MoeFfn {
                 arc
             } else {
                 let flat = rocm_dequant_expert_weight(&self.router.gate.weight, ordinal)?;
+                // Uploaded gate must keep the 2D `[num_experts, hidden]`
+                // layout: the logits matmul below expects rank >= 2 (a flat
+                // 1D buffer fails with "matmul expects inputs with rank >= 2"
+                // and silently drops the whole D2D path to the CPU fallback).
+                let gate_shape = Shape::new(vec![num_gate_rows, hidden]);
+                if flat.len() != gate_shape.elem_count() {
+                    return Err(grim_tensor::error::Error::ShapeMismatch {
+                        expected: vec![num_gate_rows, hidden],
+                        got: vec![flat.len()],
+                    });
+                }
                 let uploaded = Arc::from(CoreTensorOps::from_cpu(
                     &dev,
                     &flat,
-                    &Shape::new(vec![flat.len()]),
+                    &gate_shape,
                     DType::F32,
                 )?);
                 let mut guard = self.rocm_gate.lock().unwrap_or_else(|e| e.into_inner());
@@ -2181,6 +2201,7 @@ impl MoeFfn {
         // Route mode + optional per-expert bias (sigmoid+bias gating).
         let (route_mode, bias_rocm) = match self.router.kind {
             RouterKind::SoftmaxTopK => (0, None),
+            RouterKind::SoftmaxTopKRenorm => (3, None),
             RouterKind::SigmoidTopKWithBias => {
                 let bias_rocm = self.router.correction_bias.as_ref().and_then(|b| {
                     let bs: &dyn BackendStorage = &**b.storage();

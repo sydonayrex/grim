@@ -143,6 +143,22 @@ pub struct DemotionRecord {
 
 /// Shared pool of physical blocks, pre-allocated.
 /// The pool optionally carries: - a [`KvCompressor`] - any block whose allocation history would be.
+/// WI-HYBRID-ATTENTION-OFFLOAD Phase 1: spill-path counters. Cache-level
+/// instrumentation for demote/promote/reclaim so the offload tier is
+/// observable (plan gap 2).
+#[derive(Default, Clone, Copy)]
+pub struct SpillTelemetry {
+    /// Blocks whose contents were demoted out of GPU residency.
+    pub demoted_blocks: u64,
+    /// Blocks restored from spill back into GPU residency.
+    pub promoted_blocks: u64,
+    /// Spilled GPU pages reclaimed to satisfy an allocation after the free
+    /// list and cold eviction were exhausted (contents remain authoritative
+    /// in spill; the prefix-tree mapping is pruned so the bid cannot be
+    /// attended or promoted while reused).
+    pub reclaimed_for_alloc: u64,
+}
+
 pub struct KvBlockPool {
     blocks: Vec<KvBlock>,
     free_list: VecDeque<BlockId>,
@@ -177,6 +193,8 @@ pub struct KvBlockPool {
     spill: Option<Arc<SharedSpillManager>>,
     /// Number of bytes per block (`BLOCK_SIZE * num_heads * head_dim * 4`).
     block_bytes: usize,
+    /// WI-HYBRID: spill-path counters (demote/promote/reclaim).
+    pub spill_telemetry: SpillTelemetry,
 }
 
 impl KvBlockPool {
@@ -233,6 +251,7 @@ impl KvBlockPool {
             compressor: None,
             spill: None,
             block_bytes: block_elem * std::mem::size_of::<f32>(),
+            spill_telemetry: SpillTelemetry::default(),
         }
     }
 
@@ -267,13 +286,28 @@ impl KvBlockPool {
     }
 
     /// Attach a tiered spill manager (host-RAM and NVMe tiers).
+    /// WI-HYBRID Phase 1: spill-path counters (demote/promote/reclaim).
+    pub fn spill_telemetry(&self) -> SpillTelemetry {
+        self.spill_telemetry
+    }
+
     pub fn attach_spill(&mut self, s: Arc<SharedSpillManager>) {
         self.spill = Some(s);
+    }
+
+    /// Access attached spill manager if present.
+    pub fn spill(&self) -> Option<Arc<SharedSpillManager>> {
+        self.spill.clone()
     }
 
     /// True if a spill manager is wired in (drives demote-before-drop).
     pub fn has_spill(&self) -> bool {
         self.spill.is_some()
+    }
+
+    /// Demote a physical block directly to host/NVMe tier.
+    pub fn demote_block(&mut self, bid: BlockId) -> bool {
+        self.demote_prefix_block(bid)
     }
 
     /// True if a compressor is wired in (drives in-place compress).
@@ -286,6 +320,13 @@ impl KvBlockPool {
             // Pressure: reclaim a cold, unreferenced trie leaf before
             // declaring exhaustion.
             self.evict_cold();
+        }
+        if self.free_list.is_empty() {
+            // WI-HYBRID Phase 1: last resort — a spilled block (HostRam/NvMe)
+            // is authoritative in the spill tier, so its GPU page can serve a
+            // fresh allocation. The prefix-tree mapping is pruned (no stale
+            // attend/promote) and telemetry records the reclaim.
+            self.reclaim_spilled_coldest();
         }
         let id = self
             .free_list
@@ -383,10 +424,35 @@ impl KvBlockPool {
             return false;
         }
         if spill.demote_to_nvme(bid).is_err() {
+            self.blocks[bid].location = CacheTier::HostRam;
             return false;
         }
-        self.blocks[bid].location = CacheTier::HostRam;
+        self.blocks[bid].location = CacheTier::NvMe;
+        self.spill_telemetry.demoted_blocks += 1;
         true
+    }
+
+    /// WI-HYBRID Phase 1: return a spilled (HostRam/NvMe), unreferenced block's
+    /// GPU page to the free list. Safe because the spill tier holds the
+    /// authoritative contents and the prefix-tree mapping is pruned — the bid
+    /// can never be attended stale nor promoted onto a live owner. Used only
+    /// when the free list AND cold eviction are exhausted.
+    fn reclaim_spilled_coldest(&mut self) -> bool {
+        for bid in 0..self.blocks.len() {
+            if self.blocks[bid].location != CacheTier::Gpu
+                && !self.ref_counts.contains_key(&bid)
+            {
+                self.prefix_tree.remove(&[bid]);
+                self.blocks[bid].num_tokens = 0;
+                self.blocks[bid].received = false;
+                self.ref_counts.remove(&bid);
+                self.dirty_blocks.remove(&bid);
+                self.free_list.push_back(bid);
+                self.spill_telemetry.reclaimed_for_alloc += 1;
+                return true;
+            }
+        }
+        false
     }
 
     /// Pressure hook (Phase 2.1): demote the coldest unreferenced prefix leaf to host/NVMe, keeping it cached.
@@ -507,6 +573,7 @@ impl KvBlockPool {
                 // Mark the block as demoted so promotion can be decided later
                 // without re-querying the spill manager.
                 self.blocks[id].location = CacheTier::HostRam;
+            self.spill_telemetry.demoted_blocks += 1;
                 self.recently_zero.push_back(id);
                 // Do NOT push to free_list — the block is spilled, not available
                 // for fresh allocation. Only promote_to_gpu can reclaim it.
@@ -573,6 +640,7 @@ impl KvBlockPool {
         self.blocks[id].num_tokens = n;
         self.blocks[id].received = true;
         self.blocks[id].location = CacheTier::Gpu;
+        self.spill_telemetry.promoted_blocks += 1;
         self.dirty_blocks.remove(&id);
         Ok(Some((k, v)))
     }
@@ -658,6 +726,7 @@ impl KvBlockPool {
             }
             if demoted {
                 self.blocks[bid].location = CacheTier::HostRam;
+                self.spill_telemetry.demoted_blocks += 1;
                 self.recently_zero.push_back(bid);
                 // Do NOT push to free_list — spilled blocks are not available for
                 // fresh allocation. Only promote_to_gpu can reclaim them.
@@ -1182,6 +1251,58 @@ impl PagedKvCache {
             None
         }
     }
+
+    /// Access the underlying KvBlockPool mutex.
+    pub fn pool(&self) -> &Arc<std::sync::Mutex<KvBlockPool>> {
+        &self.pool
+    }
+
+    /// Access the logical-to-physical block table.
+    pub fn block_table_ids(&self) -> &[BlockId] {
+        &self.table.logical_to_physical
+    }
+
+    /// Check if any blocks in this sequence have been spilled to HostRam/NvMe;
+    /// if so, re-promote them into GPU residency and copy contents back to pages.
+    pub fn check_and_repromote_blocks(&mut self, _layer: usize, stride: usize) -> Result<()> {
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(spill) = pool.spill() else {
+            return Ok(());
+        };
+        let (_, host_blocks) =
+            grim_scheduler::plan_hybrid_attention_step(&self.table.logical_to_physical, &spill);
+        if host_blocks.is_empty() {
+            return Ok(());
+        }
+        let block_elems = self.page_size * stride;
+        for bid in host_blocks {
+            if let Some((k_data, v_data)) = pool.promote_to_gpu(bid)? {
+                for l in 0..self.k_pages.len() {
+                    let off = bid * block_elems;
+                    if off + block_elems <= self.k_pages[l].len()
+                        && off + block_elems <= self.v_pages[l].len()
+                    {
+                        if let (Some(lk), Some(lv)) = (pool.read_layer_keys(bid, l), pool.read_layer_values(bid, l)) {
+                            self.k_pages[l][off..off + lk.len().min(block_elems)]
+                                .copy_from_slice(&lk[..lk.len().min(block_elems)]);
+                            self.v_pages[l][off..off + lv.len().min(block_elems)]
+                                .copy_from_slice(&lv[..lv.len().min(block_elems)]);
+                        } else if l == 0 && k_data.len() >= block_elems {
+                            self.k_pages[0][off..off + block_elems]
+                                .copy_from_slice(&k_data[..block_elems]);
+                            self.v_pages[0][off..off + block_elems]
+                                .copy_from_slice(&v_data[..block_elems]);
+                        }
+                    }
+                }
+                let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+                for l in 0..self.k_pages.len() {
+                    m.dirty.insert((l, bid));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl KvCache for PagedKvCache {
@@ -1341,7 +1462,8 @@ impl KvCache for PagedKvCache {
                 self.append_slot()?;
             }
             let pos = self.layer_committed_tokens[layer];
-            let physical = *self.table.logical_to_physical.last().unwrap();
+            let block_idx = pos / self.page_size;
+            let physical = self.table.logical_to_physical[block_idx];
             let slot = physical * self.page_size + (pos % self.page_size);
             let offset = slot * stride;
             let tok_start = t * stride;
@@ -1352,8 +1474,35 @@ impl KvCache for PagedKvCache {
             self.layer_committed_tokens[layer] += 1;
 
             if let Ok(mut pool) = self.pool.lock() {
-                pool.write_layer_keys(physical, layer, &k_flat[tok_start..tok_start + stride], 1);
-                pool.write_layer_values(physical, layer, &v_flat[tok_start..tok_start + stride]);
+                let within_block = (pos % self.page_size) * stride;
+                let elem = stride;
+                let b_elem = BLOCK_SIZE * pool.num_heads * pool.head_dim;
+                if pool.blocks[physical].layer_keys.len() <= layer {
+                    pool.blocks[physical]
+                        .layer_keys
+                        .resize_with(layer + 1, || vec![0.0; b_elem]);
+                }
+                if pool.blocks[physical].layer_values.len() <= layer {
+                    pool.blocks[physical]
+                        .layer_values
+                        .resize_with(layer + 1, || vec![0.0; b_elem]);
+                }
+                let end = (within_block + elem).min(b_elem);
+                if within_block < b_elem {
+                    pool.blocks[physical].layer_keys[layer][within_block..end]
+                        .copy_from_slice(&k_flat[tok_start..tok_start + (end - within_block)]);
+                    pool.blocks[physical].layer_values[layer][within_block..end]
+                        .copy_from_slice(&v_flat[tok_start..tok_start + (end - within_block)]);
+                }
+                if layer == 0 && within_block < pool.blocks[physical].key_data.len() {
+                    let k_end = (within_block + elem).min(pool.blocks[physical].key_data.len());
+                    pool.blocks[physical].key_data[within_block..k_end]
+                        .copy_from_slice(&k_flat[tok_start..tok_start + (k_end - within_block)]);
+                    pool.blocks[physical].value_data[within_block..k_end]
+                        .copy_from_slice(&v_flat[tok_start..tok_start + (k_end - within_block)]);
+                    pool.blocks[physical].num_tokens = ((pos % self.page_size) + 1).min(BLOCK_SIZE);
+                    pool.blocks[physical].received = true;
+                }
             }
 
             // WI-perf (decode fast path): when the persistent full-layer device buffer already exists and this append is a single token (decode), push the K/V row device-to-device straight into it.
@@ -1389,6 +1538,12 @@ impl KvCache for PagedKvCache {
                 m.dirty.insert((layer, physical));
             }
         }
+
+        // WI-HYBRID-ATTENTION-OFFLOAD (Phase 1 / Phase 2a):
+        // Before attention executes on this layer's pages, verify all physical blocks
+        // in the sequence table reside in GPU tier; if any spilled, re-promote them.
+        self.check_and_repromote_blocks(layer, stride)?;
+
         Ok(())
     }
 
@@ -1630,6 +1785,138 @@ pub type KvTransportId = TransportBlockId;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===========================================================================
+    // WI-HYBRID-ATTENTION-OFFLOAD Phase 1 gates
+    // =========================================================================
+
+    fn fill_block(pool: &mut KvBlockPool, id: usize, tokens: usize) {
+        let n = pool.blocks[id].key_data.len();
+        pool.blocks[id].key_data = vec![0.25f32; n];
+        pool.blocks[id].value_data = vec![0.75f32; n];
+        pool.blocks[id].num_tokens = tokens;
+        pool.blocks[id].received = true;
+    }
+
+    fn spill_pool(capacity: usize) -> (KvBlockPool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "grim_spill_gate_{}_{}",
+            std::process::id(),
+            capacity
+        ));
+        let mgr = SharedSpillManager::new(dir.clone(), BLOCK_SIZE * 2 * 4).unwrap();
+        let mut pool = KvBlockPool::new(capacity, 2, 4);
+        pool.attach_spill(std::sync::Arc::new(mgr));
+        (pool, dir)
+    }
+
+    /// Regression (WI-HYBRID gap 3): pool exhaustion WITH a spill manager must
+    /// be rescued by reclaiming a spilled page. Before `reclaim_spilled_
+    /// coldest`, `evict_cold` demoted instead of freeing, stranding the page:
+    /// the fifth alloc errored "block pool exhausted" even though three blocks
+    /// sat safely in HostRam.
+    #[test]
+    fn spill_rescues_pool_exhaustion() {
+        let (mut pool, dir) = spill_pool(3);
+
+        // Fill the pool with three live blocks, then release two as cold
+        // prefix content (free_with_tier demotes them into the spill tier).
+        let mut ids = Vec::new();
+        for _i in 0..3 {
+            let id = pool.alloc().unwrap();
+            fill_block(&mut pool, id, 16);
+            ids.push(id);
+        }
+        let prefix_tokens: Vec<u32> = (1000..1032).collect();
+        pool.insert_prefix(&prefix_tokens, &ids[..2]);
+        pool.free_with_tier(ids[0], false).unwrap();
+        pool.free_with_tier(ids[1], false).unwrap();
+        assert_eq!(pool.spill_telemetry().demoted_blocks, 2, "free must demote");
+
+        // After the two frees the free list is EMPTY (spilled blocks are not
+        // returned to it), so the 4th and 5th allocs each reclaim one spilled
+        // page. The 6th alloc must then fail: the only remaining block is live
+        // (refcount 1) and unevictable.
+        let a = pool.alloc().unwrap();
+        let b = pool.alloc().unwrap();
+        assert_eq!(
+            pool.spill_telemetry().reclaimed_for_alloc, 2,
+            "post-exhaustion allocs must reclaim spilled pages"
+        );
+        assert_ne!(a, b);
+        let err = pool.alloc().unwrap_err();
+        assert!(
+            err.to_string().contains("exhausted"),
+            "expected genuine exhaustion, got {err}"
+        );
+
+        // Protection contract for a reclaimed bid: it cannot be ROUTED to
+        // (prefix-tree mapping pruned — a matching request recomputes) and no
+        // live sequence references it (refcount 0 was the reclaim predicate).
+        // An explicit stale-id promote_to_gpu would still read the spill
+        // tier — that is a caller error, not a pool path.
+        assert!(
+            pool.match_prefix(&[1000, 1001]).1 == 0
+                || pool.block_location(ids[0]) == CacheTier::Gpu,
+            "pruned mapping must not route to a reclaimed bid while it is reused"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// WI-HYBRID gap 2: demote/promote counters track the offload tier.
+    #[test]
+    fn spill_telemetry_counts_demote_and_promote() {
+        let (mut pool, dir) = spill_pool(4);
+        let id = pool.alloc().unwrap();
+        fill_block(&mut pool, id, 16);
+        pool.insert_prefix(&[5, 6], &[id]);
+        pool.free_with_tier(id, false).unwrap();
+        let t = pool.spill_telemetry();
+        assert!(t.demoted_blocks >= 1, "demote must be counted");
+
+        let restored = pool.promote_to_gpu(id).unwrap();
+        assert!(restored.is_some(), "promote must restore spilled contents");
+        let t = pool.spill_telemetry();
+        assert!(t.promoted_blocks >= 1, "promote must be counted");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// WI-HYBRID gap 3 (throughput gate): spill-on vs plain-free append cost.
+    /// Ignored by default — run explicitly with
+    /// `GRIM_GPU_TEST=1 cargo test -p grim-memory -- --ignored`.
+    #[test]
+    #[ignore]
+    fn spill_free_cycle_throughput_benchmark() {
+        use std::time::Instant;
+        const CYCLES: usize = 2000;
+        let (mut pool_spill, dir) = spill_pool(64);
+        let mut pool_plain = KvBlockPool::new(64, 2, 4);
+
+        let t0 = Instant::now();
+        for i in 0..CYCLES {
+            let id = pool_plain.alloc().unwrap();
+            fill_block(&mut pool_plain, id, 16);
+            pool_plain.free(id);
+            let _ = i;
+        }
+        let plain_us = t0.elapsed().as_micros();
+
+        let t1 = Instant::now();
+        for i in 0..CYCLES {
+            let id = pool_spill.alloc().unwrap();
+            fill_block(&mut pool_spill, id, 16);
+            pool_spill.insert_prefix(&[(i % 256) as u32, i as u32], &[id]);
+            pool_spill.free_with_tier(id, false).unwrap();
+        }
+        let spill_us = t1.elapsed().as_micros();
+
+        eprintln!(
+            "[spill-bench] plain free: {plain_us}µs / {CYCLES} cycles; spill demote cycle: {spill_us}µs / {CYCLES} cycles ({}x)",
+            spill_us as f64 / plain_us.max(1) as f64
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn test_kv_block_pool_telemetry_accessors() {

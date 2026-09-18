@@ -6,14 +6,8 @@
 //! 5. Offset overflow guards in read_layer_weights.
 //! 6. Zero/negative parameter validation in EmbeddingSpillManager and NvmeWeightStreamer.
 //! 7. Prompt message payload size capping.
-//! 8. Distinct tier tracking in BitmaskChunkIndex.
-//! 9. Clock monotonic safety in PinLeaseMonitor.
 
-use grim_kvtransport::{
-    CacheTier, EmbeddingSpillManager, KvBlockHeader, LocalSpillManager, NvmeWeightStreamer,
-    bitmask_index::BitmaskChunkIndex, compute_checksum, pin_lease::PinLeaseMonitor,
-};
-use std::time::Duration;
+use grim_kvtransport::{CacheTier, EmbeddingSpillManager, KvBlockHeader, LocalSpillManager, NvmeWeightStreamer, compute_checksum};
 use tempfile::tempdir;
 
 #[test]
@@ -110,52 +104,4 @@ fn test_embedding_spill_manager_zero_dim_panic() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("embed.bin");
     let _ = EmbeddingSpillManager::new(path, 4, 1024, 0);
-}
-
-#[test]
-fn test_bitmask_chunk_index_distinct_nvme_tiers() {
-    let mut index = BitmaskChunkIndex::new();
-    let hash1 = 12345u64;
-    let hash2 = 67890u64;
-
-    index.record_chunk(hash1, 1, 16, CacheTier::NvMe);
-    index.record_chunk(hash2, 2, 16, CacheTier::NvMeWeightStream);
-
-    let e1 = index.lookup(hash1).unwrap();
-    assert_eq!(e1.tier_mask.highest_tier(), Some(CacheTier::NvMe));
-    assert!(e1.tier_mask.has_tier(CacheTier::NvMe));
-    assert!(!e1.tier_mask.has_tier(CacheTier::NvMeWeightStream));
-
-    let e2 = index.lookup(hash2).unwrap();
-    assert_eq!(
-        e2.tier_mask.highest_tier(),
-        Some(CacheTier::NvMeWeightStream)
-    );
-    assert!(e2.tier_mask.has_tier(CacheTier::NvMeWeightStream));
-    assert!(!e2.tier_mask.has_tier(CacheTier::NvMe));
-
-    // Update chunk tier
-    index.update_chunk_tier(hash1, CacheTier::NvMe, CacheTier::HostRam);
-    let e1_updated = index.lookup(hash1).unwrap();
-    assert_eq!(
-        e1_updated.tier_mask.highest_tier(),
-        Some(CacheTier::HostRam)
-    );
-    assert!(!e1_updated.tier_mask.has_tier(CacheTier::NvMe));
-}
-
-#[test]
-fn test_pin_lease_monotonic_safety() {
-    let mut monitor = PinLeaseMonitor::new(Duration::from_millis(10));
-    monitor.acquire(1, CacheTier::HostRam, 1024);
-
-    // Immediate sweep without delay should not expire
-    let expired = monitor.sweep_timed_out();
-    assert!(expired.is_empty());
-    assert_eq!(monitor.active_count(), 1);
-
-    std::thread::sleep(Duration::from_millis(25));
-    let expired_after = monitor.sweep_timed_out();
-    assert_eq!(expired_after, vec![1]);
-    assert_eq!(monitor.active_count(), 0);
 }

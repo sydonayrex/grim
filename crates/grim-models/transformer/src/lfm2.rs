@@ -32,10 +32,6 @@ pub struct Lfm2Config {
     pub n_expert: usize,
     pub n_expert_used: usize,
     pub n_ff_exp: usize,
-    pub expert_weights_scale: f32,
-    pub expert_gating_func: u32,
-    pub n_swa: usize,
-    pub swa_type: u32,
     pub n_embd_out: usize,
     /// Opt-in: route attention QKV through the ROCm fused MXFP4 GEMM + QK-Norm + RoPE kernel.
     /// Off by default so the F32 reference path remains the golden behavior.
@@ -620,17 +616,16 @@ impl Lfm2Block {
             let mut device_block_out: Option<Tensor> = None;
             if steps == 1 {
                 let device = norm_x.device().clone();
-                // A1-revert (2026-09-16, measured on gfx1201/LFM2.5-350M-Q8_0):
-                // the ShortConv device step stays OPT-IN (`GRIM_DECODE_GRAPH=1`).
-                // Unifying it to default-on regressed greedy decode
-                // ("Hello! How can I assist you today" → "Hello!<|im_end|>");
-                // bisection isolated `shortconv_step_device`, NOT the RoPE
-                // seed or attention gates (both proven innocent). Re-unify
-                // only once the ShortConv device rework lands with a parity
-                // test (cf. `shortconv_decode_matches_prefill`).
-                let decode_graph = std::env::var("GRIM_DECODE_GRAPH").as_deref() == Ok("1")
-                    && matches!(device, Device::Rocm(_));
-                match self.shortconv_step_device(&proj, h_dim, l_cache, state, dev_state, &device, decode_graph) {
+                // A1 (2026-09-16) isolated a greedy-decode regression in
+                // `shortconv_step_device` and made this step opt-in. The S1
+                // device-ring rework fixed it: both parity tests in
+                // `tests/lfm2_shortconv_ring.rs` (device-vs-host step and
+                // prefill→decode) pass on gfx1201, so the device step is
+                // default-on again. HIP graph capture never routes through
+                // this eager path (lfm2_graph has its own `sc_state` ring),
+                // so the host mirror is ALWAYS re-synced here — that mirror
+                // is what keeps `Clone for Lfm2LayerCache` correct.
+                match self.shortconv_step_device(&proj, h_dim, l_cache, state, dev_state, &device, false) {
                     Ok(Some(y_t)) => {
                         let block_out_2d =
                             self.shortconv_out_proj.as_ref().unwrap().forward(&y_t)?;
@@ -756,7 +751,11 @@ impl Lfm2Block {
             }
             match device_block_out {
                 Some(d) => d,
-                None => host_block_out.expect("host block_out must exist when device path skipped"),
+                None => host_block_out.ok_or_else(|| {
+                    grim_core::error::Error::Backend(
+                        "device ShortConv path skipped but host path produced no output".into(),
+                    )
+                })?,
             }
         } else if self.is_moe {
             self.forward_moe_ffn(&norm_x)?
@@ -1023,9 +1022,11 @@ impl Lfm2Block {
                 };
                 if let Some((q_rot_vec, arena_total, device_attn)) = decoded_graph {
                     (q_rot_vec, arena_total, device_attn)
-                } else if matches!(norm_x.device(), Device::Rocm(_))
-                    && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
-                {
+                } else if matches!(norm_x.device(), Device::Rocm(_)) {
+                    // who-dat P1-5: the arena path is now the ONLY attention
+                    // path on ROCm — the `GRIM_LFM2_KV_ARENA=0` opt-out and
+                    // the triple-D2H legacy fallback were removed (any arena
+                    // failure surfaces as an error, never a silent D2H).
                     // A5 (WI-X2-PREFILL-ARENA): eager prefill/decode attention
                     // with ZERO D2H/H2D. RoPE output stays device-resident,
                     // K/V append into the device arenas D2D via copy_slice_into,
@@ -1125,13 +1126,13 @@ impl Lfm2Block {
                     )?;
                     (Vec::new(), Some(total), Some(attn))
                 } else {
-                    // P1-5: The non-arena path does triple D2H (q, k, v) and hurts latency.
-                    // Gate behind explicit opt-in `GRIM_LFM2_ALLOW_TRIPLE_D2H=1`.
-                    if matches!(norm_x.device(), Device::Rocm(_))
-                        && std::env::var("GRIM_LFM2_ALLOW_TRIPLE_D2H").as_deref() != Ok("1")
-                    {
+                    // P1-5: the legacy host path below does triple D2H
+                    // (q, k, v). It is CPU-only now — the arena branch above
+                    // is unconditional on ROCm, so reaching this guard means
+                    // an ROCm tensor took a path it never should.
+                    if matches!(norm_x.device(), Device::Rocm(_)) {
                         return Err(grim_core::error::Error::Session(
-                            "LFM2 non-arena triple D2H fallback hit on ROCm device (set GRIM_LFM2_ALLOW_TRIPLE_D2H=1 to allow)".into(),
+                            "LFM2 non-arena attention path hit on ROCm device (arena path is mandatory; report this as a bug)".into(),
                         ));
                     }
                     let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
@@ -1198,10 +1199,7 @@ impl Lfm2Block {
                                 off_elems,
                                 cnt_elems,
                             );
-                            if k_ok.is_ok()
-                                && v_ok.is_ok()
-                                && std::env::var("GRIM_LFM2_KV_ARENA").as_deref() != Ok("0")
-                            {
+                            if k_ok.is_ok() && v_ok.is_ok() {
                                 arena_total = Some(past + steps);
                             }
                         }
@@ -1605,13 +1603,17 @@ impl Lfm2Block {
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("norm_x is RocmStorage on fused path");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("fused gate_up path: norm_x is not RocmStorage".into())
+            })?;
         let act_rocm = act_q81
             .storage()
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .expect("act_q81 is RocmStorage");
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("fused gate_up path: act_q81 is not RocmStorage".into())
+            })?;
         dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
         let out = dev.launch_fused_gate_up_dot4(act_rocm, &fused.storage, fused.n_gate, fused.n_up, hidden)?;
@@ -2391,7 +2393,11 @@ impl CausalLm for Lfm2 {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<Lfm2LayerCache>>>())
-            .expect("Lfm2::forward: session.model_state must be Vec<Option<Lfm2LayerCache>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Session(
+                    "Lfm2::forward: model_state must be Vec<Option<Lfm2LayerCache>>".into(),
+                )
+            })?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i])?;
