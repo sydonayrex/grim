@@ -214,7 +214,7 @@ impl SpeculativeCausalLm {
     /// Query runtime speculative decoding telemetry snapshot.
     pub fn telemetry(&self) -> SpeculativeTelemetry {
         let (state, config) = {
-            let sched = self.scheduler.lock().unwrap();
+            let sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
             (sched.adaptation_state.clone(), sched.adaptation_config)
         };
         let should_adapt = if state.steps_observed < config.min_steps_before_trigger {
@@ -235,7 +235,7 @@ impl SpeculativeCausalLm {
             min_accept_rate: config.min_accept_rate,
             should_adapt,
             draft_depth_k: if self.strategy == Strategy::DSpark {
-                Some(self.depth_tuner.lock().unwrap().current_depth() as u64)
+                Some(self.depth_tuner.lock().unwrap_or_else(|e| e.into_inner()).current_depth() as u64)
             } else {
                 None
             },
@@ -263,7 +263,7 @@ impl SpeculativeCausalLm {
 
                 // T2-4 (closed): the draft block length K is PID-tuned online
                 // from observed acceptance — not the old hardcoded 3.
-                let draft_depth_k = self.depth_tuner.lock().unwrap().current_depth();
+                let draft_depth_k = self.depth_tuner.lock().unwrap_or_else(|e| e.into_inner()).current_depth();
                 let draft_block = draft.draft_block(session, input_ids, draft_depth_k)?;
                 if draft_block.tokens.is_empty() {
                     return self.target.forward(session, input_ids, positions, adapters);
@@ -275,7 +275,7 @@ impl SpeculativeCausalLm {
                 scored.confidence = scores;
 
                 // Phase 3: Choose verify length dynamically
-                let verify_len = self.scheduler.lock().unwrap().choose_verify_len(
+                let verify_len = self.scheduler.lock().unwrap_or_else(|e| e.into_inner()).choose_verify_len(
                     &scored,
                     live_gpu_utilization,
                     batch_pressure,
@@ -355,7 +355,7 @@ impl SpeculativeCausalLm {
 
                 // Update scheduler and check adaptation gating
                 {
-                    let mut sched = self.scheduler.lock().unwrap();
+                    let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
                     sched.record_acceptance(accepted_count, verify_len);
 
                     if sched.should_adapt_draft() {
@@ -504,7 +504,7 @@ impl SpeculativeCausalLm {
         }
 
         {
-            let mut sched = self.scheduler.lock().unwrap();
+            let mut sched = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
             sched.record_acceptance(accepted_count, verify_len);
         }
 
@@ -758,7 +758,7 @@ mod tests {
 
         // 4. Force weight update (adaptation EMA will drop below 1.5 min threshold after this step)
         let w_head_before = {
-            let w = draft.weights.lock().unwrap();
+            let w = draft.weights.lock().unwrap_or_else(|e| e.into_inner());
             w.w_head.clone()
         };
 
@@ -767,13 +767,13 @@ mod tests {
             .unwrap();
 
         // Check that the scheduler registered the step and triggered adaptation
-        let sched = spec_lm.scheduler.lock().unwrap();
+        let sched = spec_lm.scheduler.lock().unwrap_or_else(|e| e.into_inner());
         assert!(sched.adaptation_state.steps_observed >= 2);
         assert!(sched.adaptation_state.accept_rate_ema < 1.5);
 
         // Check that weights were indeed updated (nudge applied)
         let w_head_after = {
-            let w = draft.weights.lock().unwrap();
+            let w = draft.weights.lock().unwrap_or_else(|e| e.into_inner());
             w.w_head.clone()
         };
         assert_ne!(w_head_before, w_head_after);

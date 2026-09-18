@@ -2171,7 +2171,7 @@ impl App {
                 // the prompt, then run this one.
                 if let Some((_, name, arguments)) = &self.pending_tool_call {
                     let rule = permissions::rule_for_tool_call(name, arguments);
-                    let mut rules = self.permissions.lock().unwrap();
+                    let mut rules = self.permissions.lock().unwrap_or_else(|e| e.into_inner());
                     rules.add(rule.clone());
                     let summary = match &rule.command_prefix {
                         Some(prefix) => format!("{} '{}…'", rule.tool, prefix),

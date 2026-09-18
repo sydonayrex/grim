@@ -171,8 +171,7 @@ extern "C" {
         const unsigned int* __restrict__ sorted_token_ids,
         const unsigned int* __restrict__ sorted_expert_ids, const float* __restrict__ sorted_weights,
         float* __restrict__ out,
-        int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor,
-        float* stash_hg, float* stash_hu) {
+        int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor) {
         if (block_size <= 0) return;
         const int blk = blockIdx.x;
         const int base = blk * block_size;
@@ -574,14 +573,20 @@ extern "C" __global__ void grim_moe_fused_grouped_fp8(
 
 // --- #3 MXFP4 (E2M1 + E8M0) grouped kernel -------------------------------- OCP Microscaling FP4 (Jay tier): weights packed 2x E2M1 4-bit codes per byte, with one E8M0 shared-exponent byte per 32-element group.
 // Dequant inline: value = mxfp4_e2m1_to_f32(code, shared_exp) where code is the 4-bit E2M1 nibble and shared_exp.
+// NOTE (perf, WI-gpu-native-moe Phase 2): power-of-two factors go through
+// integer bit construction, never __powf — bitwise-identical results
+// (exact scalings of exact mantissas) at a fraction of the latency. The
+// only special case is shared_exp == 0 (2^-127 subnormal), spelled as a
+// compile-time constant.
 __device__ __forceinline__ float mxfp4_e2m1_to_f32(unsigned char code, unsigned char shared_exp) {
     int sign = (code >> 3) & 1;
     int exp  = (code >> 1) & 3;
     int mant = code & 1;
     float base = (exp == 0) ? (float)mant * 0.5f
-                            : (1.0f + (float)mant * 0.5f) * __powf(2.0f, (float)(exp - 1));
+                            : (float)(2 + mant) * __int_as_float((unsigned int)(exp - 2 + 127) << 23);
     float val = sign ? -base : base;
-    float scale = __powf(2.0f, (float)((int)shared_exp - 127));
+    float scale = (shared_exp == 0) ? 0x1p-127f
+                                    : __int_as_float((unsigned int)shared_exp << 23);
     return val * scale;
 }
 
@@ -654,6 +659,66 @@ extern "C" __global__ void grim_moe_fused_grouped_mxfp4(
             } else {
                 acc_prev = acc;
             }
+        }
+    }
+}
+
+// --- WI-gpu-native-moe Phase 2: sortless MXFP4 fused dispatch ----------------
+// Pair-parallel twin of `grim_moe_fused_grouped_mxfp4`: routing triples from
+// DEVICE-resident buffers; codes and shared-exponent stacks concatenated per
+// expert (no length prefixes on device — validated at stack-build time).
+// Requires (rows*cols) % 32 == 0 so every 32-group is whole; the launcher
+// and stack builder enforce this and refuse misaligned shapes loudly.
+extern "C" __global__ void grim_moe_fused_dispatch_mxfp4(
+    const float* __restrict__ activations,     // [batch, hidden]
+    const unsigned char* __restrict__ expert_gate_w, // stacked packed E2M1
+    const unsigned char* __restrict__ expert_up_w,   // stacked packed E2M1
+    const unsigned char* __restrict__ expert_down_w, // stacked packed E2M1
+    const unsigned char* __restrict__ expert_gate_e, // stacked E8M0 exps
+    const unsigned char* __restrict__ expert_up_e,   // stacked E8M0 exps
+    const unsigned char* __restrict__ expert_down_e, // stacked E8M0 exps
+    const float* __restrict__ a_scale,         // [batch] per-token act scale
+    const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+    const unsigned int* __restrict__ router_experts, // [num_pairs]
+    const float* __restrict__ router_weights,        // [num_pairs]
+    float* __restrict__ out,                     // [batch, hidden]
+    int hidden, int inter, int num_pairs,
+    float routed_scaling_factor)
+{
+    const unsigned long long pair = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= (unsigned long long)num_pairs) return;
+
+    const unsigned int tok = router_tokens[pair];
+    const unsigned int exp = router_experts[pair];
+    const float w = router_weights[pair];
+    const float as = a_scale[tok];
+
+    const float* a = activations + (unsigned long long)tok * hidden;
+    const unsigned char* gw = expert_gate_w + (unsigned long long)exp * (inter * hidden / 2);
+    const unsigned char* uw = expert_up_w   + (unsigned long long)exp * (inter * hidden / 2);
+    const unsigned char* dw = expert_down_w + (unsigned long long)exp * (hidden * inter / 2);
+    const unsigned char* ge = expert_gate_e + (unsigned long long)exp * (inter * hidden / 32);
+    const unsigned char* ue = expert_up_e   + (unsigned long long)exp * (inter * hidden / 32);
+    const unsigned char* de = expert_down_e + (unsigned long long)exp * (hidden * inter / 32);
+
+    for (int j = 0; j < inter; ++j) {
+        float g = 0.0f;
+        float u = 0.0f;
+        for (int i = 0; i < hidden; ++i) {
+            const int gidx = (j * hidden + i) / 32;
+            const int uidx = (j * hidden + i) / 32;
+            g += mxfp4_e2m1_to_f32(mxfp4_code_at(gw, j * hidden + i), ge[gidx]) * a[i];
+            u += mxfp4_e2m1_to_f32(mxfp4_code_at(uw, j * hidden + i), ue[uidx]) * a[i];
+        }
+        float silu_g = g / (1.0f + expf(-g));
+        float act = silu_g * u;
+        float scale = routed_scaling_factor * w * as * act;
+
+        for (int h = 0; h < hidden; ++h) {
+            const int didx = (h * inter + j) / 32;
+            float dv = mxfp4_e2m1_to_f32(mxfp4_code_at(dw, h * inter + j), de[didx]);
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, dv * scale);
         }
     }
 }
@@ -1255,7 +1320,82 @@ extern "C" __global__ void grim_moe_fused_grouped_w8a8_int8(
     }
 }
 
+// --- WI-gpu-native-moe Phase 2: sortless W8A8-int8 fused dispatch ---------
+// Pair-parallel twin of `grim_moe_fused_dispatch` for int8-quantized experts:
+// one thread per routed (token, expert) pair, routing triples read from
+// DEVICE-resident buffers (no host SortedRouting, no H2D upload), so the D2D
+// path (`moe_route_topk_on_device` + this kernel) never round-trips.
+// Expert stacks are the same self-describing packed blobs as
+// `grim_moe_fused_grouped_w8a8_int8` ([u64 prefix | int8 codes | f32
+// per-row scales]), concatenated per expert; strides identical.
+extern "C" __global__ void grim_moe_fused_dispatch_w8a8_int8(
+    const float* __restrict__ activations,     // [batch, hidden]
+    const unsigned char* __restrict__ expert_gate_w, // stacked packed blobs
+    const unsigned char* __restrict__ expert_up_w,   // stacked packed blobs
+    const unsigned char* __restrict__ expert_down_w, // stacked packed blobs
+    const float* __restrict__ a_scale,         // [batch] per-token act scale
+    const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+    const unsigned int* __restrict__ router_experts, // [num_pairs]
+    const float* __restrict__ router_weights,        // [num_pairs]
+    float* __restrict__ out,                     // [batch, hidden]
+    int hidden, int inter, int num_pairs,
+    float routed_scaling_factor)
+{
+    const unsigned long long pair = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= (unsigned long long)num_pairs) return;
+
+    const unsigned int tok = router_tokens[pair];
+    const unsigned int exp = router_experts[pair];
+    const float w = router_weights[pair];
+    const float as = a_scale[tok];
+
+    // Per-expert stride: 8 (u64 prefix) + (rows*cols) codes + (rows*4) scales.
+    const unsigned long long gate_stride = 8 + (unsigned long long)inter * hidden + (unsigned long long)inter * 4;
+    const unsigned long long down_stride = 8 + (unsigned long long)hidden * inter + (unsigned long long)hidden * 4;
+
+    const float* a = activations + (unsigned long long)tok * hidden;
+    const unsigned char* gw = expert_gate_w + (unsigned long long)exp * gate_stride;
+    const unsigned char* uw = expert_up_w   + (unsigned long long)exp * gate_stride;
+    const unsigned char* dw = expert_down_w + (unsigned long long)exp * down_stride;
+
+    const unsigned char* g_codes = gw + 8;
+    const float* g_scales = (const float*)(gw + 8 + (unsigned long long)inter * hidden);
+    const unsigned char* u_codes = uw + 8;
+    const float* u_scales = (const float*)(uw + 8 + (unsigned long long)inter * hidden);
+    const unsigned char* d_codes = dw + 8;
+    const float* d_scales = (const float*)(dw + 8 + (unsigned long long)hidden * inter);
+
+    // Fused gate + up GEMM with in-register SiLU combine, then down.
+    for (int j = 0; j < inter; ++j) {
+        float g = 0.0f;
+        float u = 0.0f;
+        for (int i = 0; i < hidden; ++i) {
+            g += (float)((signed char)g_codes[j * hidden + i]) * g_scales[j] * a[i];
+            u += (float)((signed char)u_codes[j * hidden + i]) * u_scales[j] * a[i];
+        }
+        float silu_g = g / (1.0f + expf(-g));
+        float act = silu_g * u;
+        float scale = routed_scaling_factor * w * as * act;
+
+        for (int h = 0; h < hidden; ++h) {
+            float dv = (float)((signed char)d_codes[h * inter + j]) * d_scales[h];
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, dv * scale);
+        }
+    }
+}
+
 // --- #8 CompressedTensors W8A8 FP8 grouped kernel --------------------------
+
+// --- #8 CompressedTensors W8A8 FP8 grouped kernel --------------------------
+// NOTE (perf, WI-gpu-native-moe Phase 2): same no-powf discipline as the
+// MXFP4 decoder above — `(8+mant) * 2^(exp-10)` is bitwise-identical to
+// `(1+mant/8) * 2^(exp-7)` (exact mantissa, exact power-of-two scaling).
+// KNOWN DIVERGENCE (not touched): exp == 0xF, mant != 7 maps to 448.0
+// here but to (1+mant/8)*256 in `grim_quant::fp8_e4m3_to_f32`. Per OCP
+// those codes are NaN — no conforming quantizer emits them — so the
+// stand-ins never execute on real checkpoints. Parity fixtures exclude
+// them (see `fp8_pack_tensor`); do NOT "fix" one side without the other.
 __device__ __forceinline__ float grim_charon_fp8_e4m3_to_f32(unsigned char val) {
     int sign = (val >> 7) & 1;
     int exp = (val >> 3) & 0x0F;
@@ -1267,9 +1407,9 @@ __device__ __forceinline__ float grim_charon_fp8_e4m3_to_f32(unsigned char val) 
     }
     float res;
     if (exp != 0) {
-        res = (1.0f + (float)mant / 8.0f) * powf(2.0f, (float)exp - 7.0f);
+        res = (float)(8 + mant) * __int_as_float((unsigned int)(exp - 10 + 127) << 23);
     } else {
-        res = (float)mant / 512.0f;
+        res = (float)mant * 0x1p-9f;
     }
     return sign ? -res : res;
 }
@@ -1323,11 +1463,13 @@ extern "C" __global__ void grim_moe_fused_grouped_w8a8_fp8(
                 float gate = 0.0f;
                 float up = 0.0f;
                 for (int i = 0; i < hidden; ++i) {
-                    float gw_f = grim_charon_fp8_e4m3_to_f32(g_codes[(unsigned long long)j * hidden + i]) * g_scale;
-                    float uw_f = grim_charon_fp8_e4m3_to_f32(u_codes[(unsigned long long)j * hidden + i]) * u_scale;
+                    float gw_f = grim_charon_fp8_e4m3_to_f32(g_codes[(unsigned long long)j * hidden + i]);
+                    float uw_f = grim_charon_fp8_e4m3_to_f32(u_codes[(unsigned long long)j * hidden + i]);
                     gate += gw_f * a[i];
                     up   += uw_f * a[i];
                 }
+                gate *= g_scale;
+                up   *= u_scale;
                 float silu_g = gate / (1.0f + expf(-gate));
                 float act = silu_g * up;
                 float dw_f = grim_charon_fp8_e4m3_to_f32(d_codes[(unsigned long long)h * inter + j]) * d_scale;
@@ -1343,6 +1485,69 @@ extern "C" __global__ void grim_moe_fused_grouped_w8a8_fp8(
             } else {
                 acc_prev = acc;
             }
+        }
+    }
+}
+
+// --- WI-gpu-native-moe Phase 2: sortless W8A8-fp8 fused dispatch ----------
+// Pair-parallel twin of `grim_moe_fused_grouped_w8a8_fp8`: routing triples
+// from DEVICE-resident buffers, expert stacks are concatenated per-expert
+// blobs ([u64 prefix | fp8-E4M3 codes | ONE f32 scale]), strides identical
+// to the grouped kernel.
+extern "C" __global__ void grim_moe_fused_dispatch_w8a8_fp8(
+    const float* __restrict__ activations,     // [batch, hidden]
+    const unsigned char* __restrict__ expert_gate_w, // stacked packed blobs
+    const unsigned char* __restrict__ expert_up_w,   // stacked packed blobs
+    const unsigned char* __restrict__ expert_down_w, // stacked packed blobs
+    const float* __restrict__ a_scale,         // [batch] per-token act scale
+    const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+    const unsigned int* __restrict__ router_experts, // [num_pairs]
+    const float* __restrict__ router_weights,        // [num_pairs]
+    float* __restrict__ out,                     // [batch, hidden]
+    int hidden, int inter, int num_pairs,
+    float routed_scaling_factor)
+{
+    const unsigned long long pair = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= (unsigned long long)num_pairs) return;
+
+    const unsigned int tok = router_tokens[pair];
+    const unsigned int exp = router_experts[pair];
+    const float w = router_weights[pair];
+    const float as = a_scale[tok];
+
+    // Per-expert stride: 8 (u64 prefix) + (rows*cols) codes + 4 (one scale).
+    const unsigned long long gate_stride = 8 + (unsigned long long)inter * hidden + 4;
+    const unsigned long long down_stride = 8 + (unsigned long long)hidden * inter + 4;
+
+    const float* a = activations + (unsigned long long)tok * hidden;
+    const unsigned char* gw = expert_gate_w + (unsigned long long)exp * gate_stride;
+    const unsigned char* uw = expert_up_w   + (unsigned long long)exp * gate_stride;
+    const unsigned char* dw = expert_down_w + (unsigned long long)exp * down_stride;
+
+    const unsigned char* g_codes = gw + 8;
+    const float g_scale = *(const float*)(gw + 8 + (unsigned long long)inter * hidden);
+    const unsigned char* u_codes = uw + 8;
+    const float u_scale = *(const float*)(uw + 8 + (unsigned long long)inter * hidden);
+    const unsigned char* d_codes = dw + 8;
+    const float d_scale = *(const float*)(dw + 8 + (unsigned long long)hidden * inter);
+
+    for (int j = 0; j < inter; ++j) {
+        float g = 0.0f;
+        float u = 0.0f;
+        for (int i = 0; i < hidden; ++i) {
+            g += grim_charon_fp8_e4m3_to_f32(g_codes[j * hidden + i]) * a[i];
+            u += grim_charon_fp8_e4m3_to_f32(u_codes[j * hidden + i]) * a[i];
+        }
+        g *= g_scale;
+        u *= u_scale;
+        float silu_g = g / (1.0f + expf(-g));
+        float act = silu_g * u;
+        float scale = routed_scaling_factor * w * as * act * d_scale;
+
+        for (int h = 0; h < hidden; ++h) {
+            float dv = grim_charon_fp8_e4m3_to_f32(d_codes[h * inter + j]);
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, dv * scale);
         }
     }
 }
@@ -1470,6 +1675,85 @@ extern "C" __global__ void grim_moe_fused_grouped_awq(
             } else {
                 acc_prev = acc;
             }
+        }
+    }
+}
+
+// --- WI-gpu-native-moe Phase 2: sortless AWQ fused dispatch ----------------
+// Pair-parallel twin of `grim_moe_fused_grouped_awq`: routing triples from
+// DEVICE-resident buffers; per-expert packed blobs with the same qw/qz/sc
+// segment offsets (passed as args, computed on host from bits/group/dims).
+extern "C" __global__ void grim_moe_fused_dispatch_awq(
+    const float* __restrict__ activations,     // [batch, hidden]
+    const unsigned char* __restrict__ expert_gate_w, // stacked packed blobs
+    const unsigned char* __restrict__ expert_up_w,   // stacked packed blobs
+    const unsigned char* __restrict__ expert_down_w, // stacked packed blobs
+    const float* __restrict__ a_scale,         // [batch] per-token act scale
+    const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+    const unsigned int* __restrict__ router_experts, // [num_pairs]
+    const float* __restrict__ router_weights,        // [num_pairs]
+    float* __restrict__ out,                     // [batch, hidden]
+    int hidden, int inter, int num_pairs,
+    int bits, int group_size,
+    long long gate_qw_off, long long gate_qz_off, long long gate_sc_off, unsigned long long gate_stride,
+    long long down_qw_off, long long down_qz_off, long long down_sc_off, unsigned long long down_stride,
+    float routed_scaling_factor)
+{
+    const unsigned long long pair = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= (unsigned long long)num_pairs) return;
+
+    const unsigned int tok = router_tokens[pair];
+    const unsigned int exp = router_experts[pair];
+    const float w = router_weights[pair];
+    const float as = a_scale[tok];
+
+    const int vpw = (bits == 4) ? 8 : (bits == 2 ? 16 : 1);
+    const int g_zero_words_per_row = (inter + vpw - 1) / vpw;
+    const int d_zero_words_per_row = (hidden + vpw - 1) / vpw;
+
+    const float* a = activations + (unsigned long long)tok * hidden;
+    const unsigned char* gw = expert_gate_w + (unsigned long long)exp * gate_stride;
+    const unsigned char* uw = expert_up_w   + (unsigned long long)exp * gate_stride;
+    const unsigned char* dw = expert_down_w + (unsigned long long)exp * down_stride;
+
+    const unsigned char* g_qw = gw + gate_qw_off;
+    const unsigned char* g_qz = gw + gate_qz_off;
+    const unsigned char* g_sc = gw + gate_sc_off;
+    const unsigned char* u_qw = uw + gate_qw_off;
+    const unsigned char* u_qz = uw + gate_qz_off;
+    const unsigned char* u_sc = uw + gate_sc_off;
+    const unsigned char* d_qw = dw + down_qw_off;
+    const unsigned char* d_qz = dw + down_qz_off;
+    const unsigned char* d_sc = dw + down_sc_off;
+
+    for (int j = 0; j < inter; ++j) {
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (int i = 0; i < hidden; ++i) {
+            int grp = i / group_size;
+            unsigned int g_code = grim_charon_awq_read_code(g_qw, i, j, inter, bits, vpw);
+            float g_zero = grim_charon_awq_read_zero(g_qz, grp, j, bits, vpw, g_zero_words_per_row);
+            unsigned short g_sch = *(const unsigned short*)(g_sc + ((long long)grp * inter + j) * 2);
+            float gw_f = ((float)g_code - g_zero) * f16_to_f32(g_sch);
+            unsigned int u_code = grim_charon_awq_read_code(u_qw, i, j, inter, bits, vpw);
+            float u_zero = grim_charon_awq_read_zero(u_qz, grp, j, bits, vpw, g_zero_words_per_row);
+            unsigned short u_sch = *(const unsigned short*)(u_sc + ((long long)grp * inter + j) * 2);
+            float uw_f = ((float)u_code - u_zero) * f16_to_f32(u_sch);
+            gate += gw_f * a[i];
+            up   += uw_f * a[i];
+        }
+        float silu_g = gate / (1.0f + expf(-gate));
+        float act = silu_g * up;
+        float scale = routed_scaling_factor * w * as * act;
+
+        for (int h = 0; h < hidden; ++h) {
+            int d_grp = j / group_size;
+            unsigned int d_code = grim_charon_awq_read_code(d_qw, j, h, hidden, bits, vpw);
+            float d_zero = grim_charon_awq_read_zero(d_qz, d_grp, h, bits, vpw, d_zero_words_per_row);
+            unsigned short d_sch = *(const unsigned short*)(d_sc + ((long long)d_grp * hidden + h) * 2);
+            float dw_f = ((float)d_code - d_zero) * f16_to_f32(d_sch);
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, dw_f * scale);
         }
     }
 }
@@ -1806,6 +2090,89 @@ extern "C" __global__ void grim_moe_fused_grouped_w8a8_int8_dot4(
         }
         atomicAdd(out + (unsigned long long)tok * hidden + h,
                   routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+// --- WI-gpu-native-moe #2: sortless W8A8-int8 DOT4 fused dispatch ---------
+// Same contract as `grim_moe_fused_dispatch_w8a8_int8` (pair-parallel,
+// device-resident routing, packed int8 blobs, per-row scales), but the
+// gate/up contraction runs on V_DOT4 (sdot4 RDNA2 / sudot4 RDNA3+, selected
+// in-device by `grim_charon_sdot4`) instead of per-element fp32 FMA:
+// activations are quantized to Q8_1 per 32-block once per thread, weights
+// are already dense int8. Per-row scales fold per 32-block exactly like the
+// grouped twin above (`gsum += gpos*da*scale`), so the two agree to fp
+// rounding. Symmetric quantization has no zero-point, so unlike the Q4_K
+// two-dot decomposition there is no sum(a) correction term.
+// Lives under the same RDNA arch guard as the grouped dot4 kernels.
+// REQUIRES hidden % 32 == 0 (launcher enforces; scalar kernel otherwise).
+extern "C" __global__ void grim_moe_fused_dispatch_w8a8_int8_dot4(
+    const float* __restrict__ activations,     // [batch, hidden]
+    const unsigned char* __restrict__ expert_gate_w, // stacked packed blobs
+    const unsigned char* __restrict__ expert_up_w,   // stacked packed blobs
+    const unsigned char* __restrict__ expert_down_w, // stacked packed blobs
+    const float* __restrict__ a_scale,         // [batch] per-token act scale
+    const unsigned int* __restrict__ router_tokens,  // [num_pairs]
+    const unsigned int* __restrict__ router_experts, // [num_pairs]
+    const float* __restrict__ router_weights,        // [num_pairs]
+    float* __restrict__ out,                     // [batch, hidden]
+    int hidden, int inter, int num_pairs,
+    float routed_scaling_factor)
+{
+    const unsigned long long pair = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= (unsigned long long)num_pairs) return;
+
+    const unsigned int tok = router_tokens[pair];
+    const unsigned int exp = router_experts[pair];
+    const float w = router_weights[pair];
+    const float as = a_scale[tok];
+
+    const unsigned long long gate_stride = 8 + (unsigned long long)inter * hidden + (unsigned long long)inter * 4;
+    const unsigned long long down_stride = 8 + (unsigned long long)hidden * inter + (unsigned long long)hidden * 4;
+
+    const float* a = activations + (unsigned long long)tok * hidden;
+    const unsigned char* gw = expert_gate_w + (unsigned long long)exp * gate_stride;
+    const unsigned char* uw = expert_up_w   + (unsigned long long)exp * gate_stride;
+    const unsigned char* dw = expert_down_w + (unsigned long long)exp * down_stride;
+
+    const signed char* g_codes = (const signed char*)(gw + 8);
+    const signed char* u_codes = (const signed char*)(uw + 8);
+    const signed char* d_codes = (const signed char*)(dw + 8);
+    const float* g_scales = (const float*)(gw + 8 + (unsigned long long)inter * hidden);
+    const float* u_scales = (const float*)(uw + 8 + (unsigned long long)inter * hidden);
+    const float* d_scales = (const float*)(dw + 8 + (unsigned long long)hidden * inter);
+
+    for (int j = 0; j < inter; ++j) {
+        float g = 0.0f;
+        float u = 0.0f;
+        for (int i0 = 0; i0 < hidden; i0 += 32) {
+            signed char ai8[32];
+            float da, dummy;
+            grim_charon_quant_q8_1_block(a + i0, ai8, &da, &dummy);
+            int gpos = 0;
+            int upos = 0;
+            #pragma unroll
+            for (int e = 0; e < 32; e += 4) {
+                const int a4 = grim_charon_pack_i8x4(ai8[e], ai8[e+1], ai8[e+2], ai8[e+3]);
+                const unsigned long long base = (unsigned long long)j * hidden + i0 + e;
+                const int g4 = grim_charon_pack_i8x4(
+                    g_codes[base], g_codes[base+1], g_codes[base+2], g_codes[base+3]);
+                const int u4 = grim_charon_pack_i8x4(
+                    u_codes[base], u_codes[base+1], u_codes[base+2], u_codes[base+3]);
+                gpos = grim_charon_sdot4(a4, g4, gpos);
+                upos = grim_charon_sdot4(a4, u4, upos);
+            }
+            g += (float)gpos * da * g_scales[j];
+            u += (float)upos * da * u_scales[j];
+        }
+        float silu_g = g / (1.0f + expf(-g));
+        float act = silu_g * u;
+        float scale = routed_scaling_factor * w * as * act;
+
+        for (int h = 0; h < hidden; ++h) {
+            float dv = (float)d_codes[(unsigned long long)h * inter + j] * d_scales[h];
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, dv * scale);
         }
     }
 }

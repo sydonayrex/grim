@@ -335,7 +335,9 @@ pub(crate) fn run_compute_shader(
             signal_semaphore_count: 0,
             p_signal_semaphores: std::ptr::null(),
         };
-        let _q_lock = QUEUE_LOCK.lock().unwrap();
+        let _q_lock = QUEUE_LOCK
+            .lock()
+            .map_err(|_| Error::Backend("Vulkan QUEUE_LOCK mutex poisoned".into()))?;
         let res = vkQueueSubmit(ctx.queue, 1, &submit_info, 0);
         if res != VK_SUCCESS {
             return Err(Error::Backend(format!("vkQueueSubmit failed: {res}")));

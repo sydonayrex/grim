@@ -550,3 +550,61 @@ fn w4a16_expert_bank_moe_forward_matches_reference() {
 fn gptq_groupint_expert_bank_moe_forward_matches_reference() {
     quant_moe_parity(build_gptq_fixture(), "GPTQ/GroupInt");
 }
+
+#[test]
+fn mxfp4_expert_bank_grouped_dispatch_engages_on_gpu() {
+    // ponytail: MXFP4 grouped dispatch verification for host-routed/LFM2 packed tensors
+    let dev = match RocmDevice::try_new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[skipped: no ROCm device: {e:?}]");
+            return;
+        }
+    };
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("[skipped: GRIM_GPU_TEST not set]");
+        return;
+    }
+
+    let _guard = grim_backend_rocm::device::util::gpu_test_lock();
+    const NUM_EXP: usize = 2;
+    const H: usize = 8;
+    const I: usize = 32;
+    const BATCH: usize = 1;
+
+    let act = vec![0.5f32; BATCH * H];
+    let gw_codes = vec![0x11u8; NUM_EXP * (I * H / 2)];
+    let uw_codes = vec![0x11u8; NUM_EXP * (I * H / 2)];
+    let dw_codes = vec![0x11u8; NUM_EXP * (H * I / 2)];
+    let ge_exps = vec![127u8; NUM_EXP * (I * H / 32)];
+    let ue_exps = vec![127u8; NUM_EXP * (I * H / 32)];
+    let de_exps = vec![127u8; NUM_EXP * (H * I / 32)];
+    let a_scale = vec![1.0f32];
+
+    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment {
+        tokens: vec![0, 0],
+        experts: vec![0, 1],
+        weights: vec![0.6, 0.4],
+    };
+
+    let res = dev.charon_grouped_dispatch_roundtrip_mxfp4(
+        &act,
+        &gw_codes,
+        &uw_codes,
+        &dw_codes,
+        &ge_exps,
+        &ue_exps,
+        &de_exps,
+        &a_scale,
+        &assignment,
+        BATCH,
+        H,
+        I,
+        1.0,
+    );
+    assert!(res.is_ok(), "MXFP4 grouped dispatch must succeed: {:?}", res);
+    let out = res.unwrap();
+    assert_eq!(out.len(), BATCH * H);
+    eprintln!("[MXFP4 grouped] dispatch completed successfully, len={}", out.len());
+}
+

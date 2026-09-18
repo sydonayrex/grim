@@ -702,23 +702,23 @@ impl LlamaBlock {
                     } else {
                         self.apply_rope_multi_head_opt(&k, positions, self._cfg.local_num_kv_heads, pos_base_ref)?
                     };
-                    // A FAILED append must skip the paged read - attending over pages missing this call's K/V silently corrupts output (the `.ok()` here used to swallow the error and read the stale pages anyway).
-                    // The classic-cache fallback is always correct.
-                    let appended = sess.append_kv_layer(layer, &k_rot, &v).is_ok();
-                    if appended {
-                        if let (Some(bt), Some((k_pages, v_pages, page_size))) =
-                            (sess.block_table(), sess.paged_kv_handles(layer))
-                        {
-                            // WI-kv: reuse the session-cached device block table (rebuilt only
-                            // when the table grows) instead of a per-layer-per-token H2D upload.
-                            let bt_gpu = sess.block_table_gpu_handle();
-                            self.paged_self_attention(
-                                &q, bt, &k_pages, &v_pages, page_size, positions, bt_gpu,
-                            )
-                            .ok()
-                        } else {
-                            None
-                        }
+                    // WI (session-continuity step 1): a FAILED append is a
+                    // hard error — with the atomic reservation in
+                    // `append_kv_layer`, failure means the pool is exhausted;
+                    // attending over pages missing this call's K/V would
+                    // silently corrupt output. The error propagates and the
+                    // request fails loudly instead.
+                    sess.append_kv_layer(layer, &k_rot, &v)?;
+                    if let (Some(bt), Some((k_pages, v_pages, page_size))) =
+                        (sess.block_table(), sess.paged_kv_handles(layer))
+                    {
+                        // WI-kv: reuse the session-cached device block table (rebuilt only
+                        // when the table grows) instead of a per-layer-per-token H2D upload.
+                        let bt_gpu = sess.block_table_gpu_handle();
+                        self.paged_self_attention(
+                            &q, bt, &k_pages, &v_pages, page_size, positions, bt_gpu,
+                        )
+                        .ok()
                     } else {
                         None
                     }
@@ -727,8 +727,35 @@ impl LlamaBlock {
                     // so the cache stays complete, then attend densely.
                     let k_rot =
                         self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
-                    let _ = sess.append_kv_layer(layer, &k_rot, &v);
-                    None
+                    // Layer 1.5: when the paged store already holds a prefix
+                    // (radix-seeded shared prefix or an earlier prefill chunk),
+                    // this chunk's queries must attend over it — the one-shot
+                    // fallback below would only see the chunk itself. The
+                    // prefix length is `current_pos`, which stays constant
+                    // across layers during this forward (the session advances
+                    // at the END of the pass); reading the paged cache's
+                    // shared len() here would leak layer 0's same-chunk
+                    // appends into layer N's "prefix" and double-count them.
+                    let committed_before = sess.current_pos();
+                    sess.append_kv_layer(layer, &k_rot, &v)?;
+                    if committed_before > 0 {
+                        let total = committed_before + seq_tokens;
+                        sess.kv_cache()
+                            .and_then(|kv| kv.gather_kv_f32(layer, total))
+                            .and_then(|(k_all, v_all)| {
+                                self.attend_chunk_with_prefix(
+                                    &q,
+                                    &k_all,
+                                    &v_all,
+                                    positions,
+                                    committed_before,
+                                    seq_tokens,
+                                )
+                                .ok()
+                            })
+                    } else {
+                        None
+                    }
                 }
             } else {
                 None
@@ -1522,6 +1549,85 @@ impl LlamaBlock {
         let attn_out = reshaped_view(&attn_out, &flat_shape)?;
         let _t3 = std::time::Instant::now();
         Ok((attn_out, false))
+    }
+
+    /// Layer 1.5: dense attention for a prefill chunk whose paged KV store
+    /// already holds a prefix (radix-seeded shared prefix or an earlier
+    /// prefill chunk). `k_all`/`v_all` are the flat post-RoPE rows for
+    /// `[prefix_len + q_len]` tokens, exactly as appended to the paged store.
+    /// Returns the 2-D `[q_len, num_heads * head_dim]` pre-`wo` output.
+    /// Causality comes from `cache_offset = prefix_len`, the same convention
+    /// `qkv_attention` uses for decoded steps.
+    fn attend_chunk_with_prefix(
+        &self,
+        q: &Tensor,
+        k_all: &[f32],
+        v_all: &[f32],
+        positions: &[u32],
+        prefix_len: usize,
+        q_len: usize,
+    ) -> Result<Tensor> {
+        let cfg = &self._cfg;
+        let q_rot = self.apply_rope_multi_head_opt(q, positions, cfg.local_num_heads, None)?;
+        let kv_len = prefix_len + q_len;
+        let kv_shape = Shape::new(vec![kv_len, cfg.local_num_kv_heads, cfg.head_dim]);
+        let out_shape = Shape::new(vec![q_len, cfg.local_num_heads, cfg.head_dim]);
+        let flat_shape = Shape::new(vec![q_len, cfg.local_num_heads * cfg.head_dim]);
+        let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+        let k_tensor = dev.from_cpu(k_all, &kv_shape, DType::F32)?;
+        let v_tensor = dev.from_cpu(v_all, &kv_shape, DType::F32)?;
+        let q_3d = relabel_3d(&q_rot, q_len, cfg.local_num_heads, cfg.head_dim)?;
+        let attn_3d = if let Some(slopes) = &self.alibi_slopes {
+            let slope_shape = Shape::new(vec![cfg.local_num_heads]);
+            let slopes_st = dev.from_cpu(slopes, &slope_shape, DType::F32)?;
+            match dev.qkv_attention_alibi(
+                q_3d.storage().as_ref(),
+                k_tensor.as_ref(),
+                v_tensor.as_ref(),
+                cfg.local_num_kv_heads,
+                kv_len,
+                prefix_len as u32,
+                cfg.sliding_window,
+                slopes_st.as_ref(),
+                &out_shape,
+            ) {
+                Ok((s, _h)) => Tensor::new(
+                    std::sync::Arc::from(s),
+                    out_shape.clone(),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    self._dev.clone(),
+                ),
+                Err(_) => {
+                    self.cpu_attention_fallback(&q_3d, k_all, v_all, prefix_len, q_len, kv_len, Some(slopes))?
+                }
+            }
+        } else {
+            match dev.qkv_attention(
+                q_3d.storage().as_ref(),
+                k_tensor.as_ref(),
+                v_tensor.as_ref(),
+                cfg.local_num_kv_heads,
+                kv_len,
+                prefix_len as u32,
+                cfg.sliding_window,
+                &out_shape,
+                None,
+                None,
+            ) {
+                Ok((s, _h)) => Tensor::new(
+                    std::sync::Arc::from(s),
+                    out_shape.clone(),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    self._dev.clone(),
+                ),
+                Err(_) => {
+                    self.cpu_attention_fallback(&q_3d, k_all, v_all, prefix_len, q_len, kv_len, None)?
+                }
+            }
+        };
+        reshaped_view(&attn_3d, &flat_shape)
     }
 
     /// Phase 1c: whole decode attention step on the device with a device-resident

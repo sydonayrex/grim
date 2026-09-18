@@ -1243,9 +1243,9 @@ async fn load_model_handler(
         }
     };
 
-    let mut engine = state.engine.lock().unwrap();
+    let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     engine.register_model(&model_name, model);
-    *state.tokenizer.lock().unwrap() = tokenizer;
+    *state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()) = tokenizer;
 
     Ok(Json(LoadModelResponse {
         success: true,
@@ -1287,13 +1287,13 @@ async fn chat_handler(
     // Load model on demand if not yet registered (runs before tokenizer
     // check so the first request works without calling /api/chat/load).
     {
-        let mut engine = state.engine.lock().unwrap();
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
 
         if !engine.loaded_models().contains(&model_name) {
             // Lazily set the tokenizer from GGUF metadata too
-            if state.tokenizer.lock().unwrap().is_none() {
+            if state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
                 if let Some(tok) = load_tokenizer_from_path(&model_str) {
-                    *state.tokenizer.lock().unwrap() = Some(tok);
+                    *state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()) = Some(tok);
                 }
             }
 
@@ -1310,7 +1310,7 @@ async fn chat_handler(
 
     // Encode prompt
     let prompt_tokens = {
-        let tok = state.tokenizer.lock().unwrap();
+        let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
         let tokenizer = tok.as_ref().ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1346,7 +1346,7 @@ async fn chat_handler(
     // The engine is a multi-request scheduler - `tick()` advances every scheduled request and outcomes are.
     {
         // Enqueue prefill under a short-lived lock.
-        let mut engine = state.engine.lock().unwrap();
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = engine.enqueue_request(grim_engine::Request {
             id: request_id,
             prompt_tokens,
@@ -1356,6 +1356,7 @@ async fn chat_handler(
             model_id: Some(model_name.clone()),
             adapter_ids: vec![],
             input_ids: None,
+            session: None,
         }) {
             eprintln!("[chat_handler] enqueue_request failed: {e}");
         }
@@ -1369,7 +1370,7 @@ async fn chat_handler(
         // The lock is released between steps, so competing chats can make progress instead of waiting.
         let token = {
             let logits = {
-                let mut engine = state.engine.lock().unwrap();
+                let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = engine.tick() {
                     eprintln!("[chat_handler] engine tick failed: {e}");
                     break;
@@ -1407,14 +1408,14 @@ async fn chat_handler(
 
     // Detach the request under a short-lived lock.
     {
-        let mut engine = state.engine.lock().unwrap();
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.finish_request(request_id);
     }
     let latency_ms = start_time.elapsed().as_millis() as u64;
 
     // Decode generated tokens
     let reply_text = {
-        let tok = state.tokenizer.lock().unwrap();
+        let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
         match tok.as_ref() {
             Some(tokenizer) => tokenizer.decode(&generated_ids),
             None => format!("<generated {} tokens>", generated_ids.len()),
@@ -1555,8 +1556,8 @@ async fn get_diagnostics(State(state): State<AppState>) -> Json<serde_json::Valu
         .map(|n| n.get())
         .unwrap_or(1);
     let (engine_models, kv_blocks) = {
-        let engine = state.engine.lock().unwrap();
-        let cap = engine.block_pool.lock().unwrap().capacity();
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).capacity();
         (engine.loaded_models(), cap)
     };
 

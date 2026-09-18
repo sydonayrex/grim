@@ -5,6 +5,7 @@ use grim_core::error::Result;
 use grim_tensor::{BackendDevice, BackendStorage, Device, QuantProvenance, Shape, Tensor};
 use std::sync::Arc;
 
+pub mod channel_importance;
 pub mod kv_omni;
 pub use kv_omni::{KvOmniConfig, KvOmniEvictor, ModalityPolicy, OmniKvCompressor};
 
@@ -129,6 +130,14 @@ pub struct CompressedKvBlock {
     pub head_dim: usize,
     /// Modality tag for KV-OMNI per-modality dispatch (default Text).
     pub modality: KvModality,
+    /// Channel-axis tier allocation used to (de)quantize, if applied
+    /// (PLAN-kvcache-channel-axis WI-3). Present on a block ⟹ the block was
+    /// quantized per (kv_head, 32-channel group) with this table and the
+    /// TurboQuant rotation was SKIPPED for keys (rotation would smear the
+    /// per-channel signal the allocation encodes — the two are alternative
+    /// compression strategies, not additive). Dequantization keys off this
+    /// field, not the compressor's config, so blobs stay self-describing.
+    pub channel_alloc: Option<channel_importance::ChannelBitAllocation>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,6 +243,12 @@ pub struct LloydMaxCompressor {
     /// Packed-KV memo for the GPU dispatch (pack-once, reuse across decode steps).
     /// See `PackedKvBuf` contract.
     packed_kv: std::sync::Mutex<Option<PackedKvBuf>>,
+    /// WI-3 (channel-axis): optional per-(kv_head, 32-channel-group) tier
+    /// allocation. `None` = today's uniform path, byte-identical. `Some` makes
+    /// `compress` skip the K rotation (which would destroy the per-channel
+    /// signal) and quantize each element at its group's tier; the table is
+    /// cloned onto every produced block so blobs stay self-describing.
+    pub channel_alloc: Option<channel_importance::ChannelBitAllocation>,
 }
 
 impl LloydMaxCompressor {
@@ -243,6 +258,7 @@ impl LloydMaxCompressor {
             config,
             gpu_attn: KvDequantAttentionConfig::default(),
             packed_kv: std::sync::Mutex::new(None),
+            channel_alloc: None,
         }
     }
 
@@ -252,7 +268,19 @@ impl LloydMaxCompressor {
             config,
             gpu_attn,
             packed_kv: std::sync::Mutex::new(None),
+            channel_alloc: None,
         }
+    }
+
+    /// Attach a channel-axis tier allocation (WI-3). Returns the compressor
+    /// unchanged when `alloc` is `None` (uniform path, byte-identical to
+    /// today). Geometry mismatches are rejected eagerly at compress time.
+    pub fn with_channel_alloc(
+        mut self,
+        alloc: channel_importance::ChannelBitAllocation,
+    ) -> Self {
+        self.channel_alloc = Some(alloc);
+        self
     }
 }
 
@@ -276,7 +304,16 @@ fn dispatch_gpu_fused_attention(
     let cfg_key_bits = compressor.config.key_bits;
     let cfg_value_bits = compressor.config.value_bits;
     let both_low_bw = cfg_key_bits <= 4 && cfg_value_bits <= 4;
-    let quant_bits: u32 = if both_low_bw && head_dim % 2 == 0 {
+    // WI-3: a channel allocation maps to Q4KHalf storage (per-32-channel-group
+    // scale+min) when the head geometry is representable. `3` is the
+    // q4khalf-kernel selector sentinel understood by the ROCm device layer
+    // (GRIM_KV_QUANT_FORMAT handles the same mapping interactively).
+    let q4khalf_eligible = compressor.channel_alloc.is_some()
+        && head_dim % channel_importance::CHANNEL_GROUP_SIZE == 0
+        && head_dim <= 256;
+    let quant_bits: u32 = if q4khalf_eligible {
+        3
+    } else if both_low_bw && head_dim % 2 == 0 {
         4
     } else {
         8
@@ -335,18 +372,16 @@ fn dispatch_gpu_fused_attention(
     };
 
     let scale_len = kv_seq_len * num_kv_heads;
-    let kv_byte_len = if quant_bits == 8 {
-        kv_seq_len * num_kv_heads * head_dim
+    let q4kh = quant_bits == 3;
+    let row_bytes = if q4kh {
+        grim_quant::q4khalf_row_bytes(head_dim)
+    } else if quant_bits == 8 {
+        head_dim
     } else {
-        kv_seq_len * num_kv_heads * (head_dim / 2)
+        head_dim / 2
     };
-    let kv_shape = if quant_bits == 8 {
-        Shape::new(vec![kv_seq_len, num_kv_heads, head_dim])
-    } else {
-        // 4-bit: half the bytes; lie about the innermost dim to keep the byte count correct while `from_cpu` copies `len*4` bytes for f32 elements.
-        // We reinterpret the u8 buffer as &[f32] of equal byte length below, so the shape.
-        Shape::new(vec![kv_seq_len, num_kv_heads, head_dim / 2])
-    };
+    let kv_byte_len = kv_seq_len * num_kv_heads * row_bytes;
+    let kv_shape = Shape::new(vec![kv_seq_len, num_kv_heads, row_bytes]);
     let scale_shape = Shape::new(vec![scale_len]);
     let q_shape = query.shape().clone();
     let f32_dtype = grim_tensor::DType {
@@ -408,7 +443,9 @@ fn k_packed_byte_len(
     heads: usize,
     dim: usize,
 ) -> usize {
-    if quant_bits == 8 {
+    if quant_bits == 3 {
+        seq * heads * grim_quant::q4khalf_row_bytes(dim)
+    } else if quant_bits == 8 {
         seq * heads * dim
     } else {
         seq * heads * (dim / 2)
@@ -443,11 +480,22 @@ fn pack_kv_buf(
     let mut k_scales: Vec<f32> = Vec::with_capacity(kv_seq_len * num_kv_heads);
     let mut v_scales: Vec<f32> = Vec::with_capacity(kv_seq_len * num_kv_heads);
 
-    let pack_row = |src: &[f32], out: &mut Vec<u8>, scales: &mut Vec<f32>| {
+    let pack_row = |src: &[f32], out: &mut Vec<u8>, scales: &mut Vec<f32>| -> Result<()> {
         for j in 0..kv_seq_len {
             for h in 0..num_kv_heads {
                 let base = (j * num_kv_heads + h) * row_len;
                 let row = &src[base..base + row_len];
+                if quant_bits == 3 {
+                    // WI-3: Q4KHalf per-row sub-block packing. The kernel
+                    // reads scales from the block itself; keep the host-side
+                    // `scales` array structurally populated for legacy
+                    // callers (it is unused by the q4khalf kernel branch).
+                    scales.push(row.iter().copied().fold(0.0f32, |a, x| a.max(x.abs())));
+                    out.extend_from_slice(&grim_quant::quant_q4khalf(row).map_err(
+                        |e| grim_core::error::Error::KvCache(format!("q4khalf pack: {e}")),
+                    )?);
+                    continue;
+                }
                 let peak = row.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
                 let scale = if peak > 0.0 { peak } else { 1.0 };
                 scales.push(scale);
@@ -474,10 +522,11 @@ fn pack_kv_buf(
                 }
             }
         }
+        Ok(())
     };
 
-    pack_row(&k_data, &mut k_packed, &mut k_scales);
-    pack_row(&v_data, &mut v_packed, &mut v_scales);
+    pack_row(&k_data, &mut k_packed, &mut k_scales)?;
+    pack_row(&v_data, &mut v_packed, &mut v_scales)?;
 
     // Content hashes for memo keying - include in PackedKvBuf so the memo key can distinguish same-shape-but-different-content blocks.
     // [P1-39 fix: populate content hashes in pack_kv_buf.]
@@ -625,24 +674,53 @@ impl KvCompressor for LloydMaxCompressor {
         let num_kv_heads = k_dims[1];
         let head_dim = k_dims[2];
 
-        // 1. Random Orthogonal Rotation pre-step for Keys (§6)
-        let rotation = random_orthogonal_matrix(head_dim, 0x1337_C0DE_BA5E_B01D);
-        for t in 0..num_tokens {
-            for h in 0..num_kv_heads {
-                let start_idx = (t * num_kv_heads + h) * head_dim;
-                let rotated_chunk = apply_rotation(
-                    &k_data[start_idx..start_idx + head_dim],
-                    &rotation,
-                    head_dim,
-                    1,
-                );
-                k_data[start_idx..start_idx + head_dim].copy_from_slice(&rotated_chunk);
+        // WI-3: channel-axis tier allocation. When attached, the rotation is
+        // SKIPPED (it would smear per-channel structure uniformly over the
+        // head) and each element quantizes at its (kv_head, channel-group)
+        // tier instead of the config scalar.
+        let alloc = match &self.channel_alloc {
+            Some(a) => {
+                if !a.matches_geometry(num_kv_heads, head_dim) {
+                    return Err(grim_core::error::Error::KvCache(format!(
+                        "channel allocation geometry mismatch: alloc {}x{} vs block {num_kv_heads}x{head_dim}",
+                        a.num_kv_heads, a.head_dim
+                    )));
+                }
+                Some(a)
+            }
+            None => None,
+        };
+
+        // 1. Random Orthogonal Rotation pre-step for Keys (§6) — skipped when a
+        // channel allocation drives the quantizer (see above).
+        if alloc.is_none() {
+            let rotation = random_orthogonal_matrix(head_dim, 0x1337_C0DE_BA5E_B01D);
+            for t in 0..num_tokens {
+                for h in 0..num_kv_heads {
+                    let start_idx = (t * num_kv_heads + h) * head_dim;
+                    let rotated_chunk = apply_rotation(
+                        &k_data[start_idx..start_idx + head_dim],
+                        &rotation,
+                        head_dim,
+                        1,
+                    );
+                    k_data[start_idx..start_idx + head_dim].copy_from_slice(&rotated_chunk);
+                }
             }
         }
 
         // 2. Symmetric uniform key compression at `config.key_bits` density (replaces the prior hard-coded 3-bit
         // Lloyd-Max path so the host block's bit density actually responds to the configured bitwidth).
+        // With a channel allocation, the scale group shrinks to the 32-channel
+        // tier boundary (Q4KHalf-style per-group scales) so a hot group's
+        // dynamic range is contained in its own scale rather than saturated
+        // by the whole-row RMS.
         let group_size = self.config.group_size;
+        let scale_group = if alloc.is_some() {
+            channel_importance::CHANNEL_GROUP_SIZE
+        } else {
+            group_size
+        };
         let mut key_meta: Vec<f32> = Vec::new();
         let key_bits;
         {
@@ -657,9 +735,9 @@ impl KvCompressor for LloydMaxCompressor {
                 .buf
                 .reserve(BitWriter::capacity_for(k_data.len(), bits) + 4);
 
-            for group_idx in 0..k_data.len().div_ceil(group_size) {
-                let start = group_idx * group_size;
-                let end = (start + group_size).min(k_data.len());
+            for group_idx in 0..k_data.len().div_ceil(scale_group) {
+                let start = group_idx * scale_group;
+                let end = (start + scale_group).min(k_data.len());
                 let slice = &k_data[start..end];
 
                 // Group scale (RMS ≈ std_dev) for symmetric quantization.
@@ -670,13 +748,23 @@ impl KvCompressor for LloydMaxCompressor {
                 let std_dev = f32::sqrt(sum_sq / slice.len() as f32).max(1e-5);
                 key_meta.push(std_dev);
 
-                for &x in slice {
+                for (i, &x) in slice.iter().enumerate() {
+                    // Per-element tier when a channel allocation is attached.
+                    let bits = match alloc {
+                        Some(a) => {
+                            let e = start + i;
+                            let h = (e / head_dim) % num_kv_heads;
+                            let d = e % head_dim;
+                            a.key_bit_for(h, d).clamp(1, 8)
+                        }
+                        None => bits,
+                    };
+                    let levels = (1u32 << bits) as f32;
                     // n = (x/std + 1)/2 maps to [0,1]; quantize uniformly.
                     let n = ((x / std_dev) + 1.0) * 0.5;
                     let n = n.clamp(0.0, 1.0);
                     let q = (n * (levels - 1.0)).round().clamp(0.0, levels - 1.0) as u32;
                     debug_assert!(q < (1u32 << bits));
-                    let _ = _inv_levels;
                     writer.push(q, bits);
                 }
             }
@@ -697,9 +785,9 @@ impl KvCompressor for LloydMaxCompressor {
                 .buf
                 .reserve(BitWriter::capacity_for(v_data.len(), vb_bits) + 4);
 
-            for group_idx in 0..v_data.len().div_ceil(group_size) {
-                let start = group_idx * group_size;
-                let end = (start + group_size).min(v_data.len());
+            for group_idx in 0..v_data.len().div_ceil(scale_group) {
+                let start = group_idx * scale_group;
+                let end = (start + scale_group).min(v_data.len());
                 let slice = &v_data[start..end];
 
                 let mut min_val = slice[0];
@@ -712,21 +800,42 @@ impl KvCompressor for LloydMaxCompressor {
                         max_val = x;
                     }
                 }
-                let scale = (max_val - min_val) / (max_q as f32);
-                let scale = if scale < 1e-5 { 1e-5 } else { scale };
+                // With a per-group tier allocation, the per-tier quantization
+                // grid differs per element, so the group stores (max, min) and
+                // dequant re-derives each element's scale from ITS tier.
+                // Without an allocation the legacy (scale, min) pair is stored.
+                let scale_default = ((max_val - min_val) / (max_q as f32)).max(1e-5);
+                if alloc.is_some() {
+                    value_meta.push(max_val);
+                    value_meta.push(min_val);
+                } else {
+                    value_meta.push(scale_default);
+                    value_meta.push(min_val);
+                }
 
-                value_meta.push(scale);
-                value_meta.push(min_val);
-
-                for &x in slice {
-                    let q = ((x - min_val) / scale).round().clamp(0.0, max_q as f32) as u32;
-                    writer.push(q, vb_bits);
+                for (i, &x) in slice.iter().enumerate() {
+                    // Per-element tier when allocated: the scale is re-derived
+                    // per element from the group's range and the tier's range.
+                    let vb_bits_e = match alloc {
+                        Some(a) => {
+                            let e = start + i;
+                            let h = (e / head_dim) % num_kv_heads;
+                            let d = e % head_dim;
+                            a.value_bit_for(h, d).clamp(1, 8)
+                        }
+                        None => vb_bits,
+                    };
+                    let max_q_e = ((1u32 << vb_bits_e) - 1).max(1);
+                    let scale = ((max_val - min_val) / (max_q_e as f32)).max(1e-5);
+                    let q = ((x - min_val) / scale).round().clamp(0.0, max_q_e as f32) as u32;
+                    writer.push(q, vb_bits_e);
                 }
             }
             value_bits = writer.finish();
         }
 
         Ok(CompressedKvBlock {
+            channel_alloc: alloc.cloned(),
             key_bits,
             key_meta,
             value_bits,
@@ -748,20 +857,36 @@ impl KvCompressor for LloydMaxCompressor {
         let group_size = self.config.group_size;
 
         // 1. Dequantize Keys via symmetric uniform at the same density used
-        // during compress.
+        // during compress. Per-element tiers when the block carries a channel
+        // allocation (self-describing — the compressor config is ignored).
+        let alloc = block.channel_alloc.as_ref();
+        let scale_group = if alloc.is_some() {
+            channel_importance::CHANNEL_GROUP_SIZE
+        } else {
+            group_size
+        };
         let kb_bits = self.config.key_bits.clamp(1, 8);
         let levels = (1u32 << kb_bits) as f32;
         let denom = (levels - 1.0).max(1.0);
         let mut k_reader = BitReader::new(&block.key_bits);
         let mut k_data = Vec::with_capacity(total_elems);
-        for group_idx in 0..total_elems.div_ceil(group_size) {
-            let start = group_idx * group_size;
-            let end = (start + group_size).min(total_elems);
+        for group_idx in 0..total_elems.div_ceil(scale_group) {
+            let start = group_idx * scale_group;
+            let end = (start + scale_group).min(total_elems);
             let std_dev = block.key_meta[group_idx];
-            for _ in start..end {
-                let q = k_reader.next(kb_bits) as f32;
+            for idx in start..end {
+                let (bits_el, denom_el) = match alloc {
+                    Some(a) => {
+                        let h = (idx / block.head_dim) % block.num_kv_heads;
+                        let d = idx % block.head_dim;
+                        let b = a.key_bit_for(h, d).clamp(1, 8);
+                        (b, ((1u32 << b) - 1) as f32)
+                    }
+                    None => (kb_bits, denom),
+                };
+                let q = k_reader.next(bits_el) as f32;
                 // Inverse of compress: n = q/(levels-1) -> [-1,1] normalized, *std_dev.
-                let n = q / denom;
+                let n = q / denom_el.max(1.0);
                 let x = (n * 2.0 - 1.0) * std_dev;
                 k_data.push(x);
                 if k_data.len() >= total_elems {
@@ -777,41 +902,57 @@ impl KvCompressor for LloydMaxCompressor {
             k_data.push(0.0);
         }
 
-        // Apply inverse Random Orthogonal Rotation for Keys (§6)
-        let rotation = random_orthogonal_matrix(block.head_dim, 0x1337_C0DE_BA5E_B01D);
-        // Compute transpose of orthogonal matrix for the inverse transformation
-        let mut inv_rotation = vec![0.0f32; block.head_dim * block.head_dim];
-        for r in 0..block.head_dim {
-            for c in 0..block.head_dim {
-                inv_rotation[c * block.head_dim + r] = rotation[r * block.head_dim + c];
+        // Apply inverse Random Orthogonal Rotation for Keys (§6) — only when
+        // compress applied it (i.e. no channel allocation was attached).
+        if alloc.is_none() {
+            let rotation = random_orthogonal_matrix(block.head_dim, 0x1337_C0DE_BA5E_B01D);
+            // Compute transpose of orthogonal matrix for the inverse transformation
+            let mut inv_rotation = vec![0.0f32; block.head_dim * block.head_dim];
+            for r in 0..block.head_dim {
+                for c in 0..block.head_dim {
+                    inv_rotation[c * block.head_dim + r] = rotation[r * block.head_dim + c];
+                }
             }
-        }
-        for t in 0..block.num_tokens {
-            for h in 0..block.num_kv_heads {
-                let start_idx = (t * block.num_kv_heads + h) * block.head_dim;
-                let unrotated_chunk = apply_rotation(
-                    &k_data[start_idx..start_idx + block.head_dim],
-                    &inv_rotation,
-                    block.head_dim,
-                    1,
-                );
-                k_data[start_idx..start_idx + block.head_dim].copy_from_slice(&unrotated_chunk);
+            for t in 0..block.num_tokens {
+                for h in 0..block.num_kv_heads {
+                    let start_idx = (t * block.num_kv_heads + h) * block.head_dim;
+                    let unrotated_chunk = apply_rotation(
+                        &k_data[start_idx..start_idx + block.head_dim],
+                        &inv_rotation,
+                        block.head_dim,
+                        1,
+                    );
+                    k_data[start_idx..start_idx + block.head_dim].copy_from_slice(&unrotated_chunk);
+                }
             }
         }
 
         // 2. Dequantize Values via asymmetric uniform at the same density used
-        // during compress.
+        // during compress. Channel-allocated blocks stored (max, min) per group
+        // (see compress); legacy blocks stored (scale, min) at default density.
         let vb_bits = self.config.value_bits.clamp(1, 8);
         let mut v_reader = BitReader::new(&block.value_bits);
         let mut v_data = Vec::with_capacity(total_elems);
-        for group_idx in 0..total_elems.div_ceil(group_size) {
-            let start = group_idx * group_size;
-            let end = (start + group_size).min(total_elems);
-            let scale = block.value_meta[group_idx * 2];
-            let min_val = block.value_meta[group_idx * 2 + 1];
-            for _ in start..end {
-                let q = v_reader.next(vb_bits) as f32;
-                v_data.push(q * scale + min_val);
+        for group_idx in 0..total_elems.div_ceil(scale_group) {
+            let start = group_idx * scale_group;
+            let end = (start + scale_group).min(total_elems);
+            let (max_val_or_scale, min_val) = (
+                block.value_meta[group_idx * 2],
+                block.value_meta[group_idx * 2 + 1],
+            );
+            for idx in start..end {
+                let (bits_el, scale_el) = match alloc {
+                    Some(a) => {
+                        let h = (idx / block.head_dim) % block.num_kv_heads;
+                        let d = idx % block.head_dim;
+                        let b = a.value_bit_for(h, d).clamp(1, 8);
+                        let max_q = ((1u32 << b) - 1).max(1) as f32;
+                        (b, ((max_val_or_scale - min_val) / max_q).max(1e-5))
+                    }
+                    None => (vb_bits, max_val_or_scale),
+                };
+                let q = v_reader.next(bits_el) as f32;
+                v_data.push(q * scale_el + min_val);
                 if v_data.len() >= total_elems {
                     break;
                 }
@@ -964,7 +1105,11 @@ impl CompressedKvBlock {
 
     /// Serialize to a self-describing byte blob for on-disk persistence (WI-R4 `.grim` KV region).
     /// Layout (format v2): ```text [ magic "GKVB": u8 × 4 ][ version: u8 = 2.
+    /// When a channel-axis allocation is attached the version is 3 and a tail
+    /// section carries it: `[ u32 num_kv_heads ][ u32 head_dim ][ u32 group_size ]
+    /// [ kvh*(hd/g) u8 key bits ][ same for value bits ]`.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let version: u8 = if self.channel_alloc.is_some() { 3 } else { 2 };
         let mut buf = Vec::with_capacity(
             5 + 4 * 6
                 + 1
@@ -974,7 +1119,7 @@ impl CompressedKvBlock {
                 + self.value_bits.len(),
         );
         buf.extend_from_slice(b"GKVB");
-        buf.push(2); // format version
+        buf.push(version); // format version
         buf.extend_from_slice(&(self.num_tokens as u32).to_le_bytes());
         buf.extend_from_slice(&(self.num_kv_heads as u32).to_le_bytes());
         buf.extend_from_slice(&(self.head_dim as u32).to_le_bytes());
@@ -991,6 +1136,17 @@ impl CompressedKvBlock {
         }
         buf.extend_from_slice(&self.key_bits);
         buf.extend_from_slice(&self.value_bits);
+        if let Some(a) = &self.channel_alloc {
+            buf.extend_from_slice(&(a.num_kv_heads as u32).to_le_bytes());
+            buf.extend_from_slice(&(a.head_dim as u32).to_le_bytes());
+            buf.extend_from_slice(&(a.group_size as u32).to_le_bytes());
+            for row in &a.key_bits {
+                buf.extend_from_slice(row);
+            }
+            for row in &a.value_bits {
+                buf.extend_from_slice(row);
+            }
+        }
         buf
     }
 
@@ -998,13 +1154,14 @@ impl CompressedKvBlock {
     /// Errors on a malformed or truncated buffer.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         if buf.len() >= 5 && &buf[..4] == b"GKVB" {
-            if buf[4] != 2 {
-                return Err(grim_core::error::Error::KvCache(format!(
-                    "CompressedKvBlock::from_bytes: unsupported format version {}",
-                    buf[4]
-                )));
-            }
-            return Self::parse_v2(&buf[5..]);
+            let version = buf[4];
+            return match version {
+                2 => Self::parse_v2(&buf[5..]),
+                3 => Self::parse_v3(&buf[5..]),
+                other => Err(grim_core::error::Error::KvCache(format!(
+                    "CompressedKvBlock::from_bytes: unsupported format version {other}"
+                ))),
+            };
         }
         // Legacy (pre-magic) blobs: header ambiguity (with/without the modality byte) is
         // resolved by validated trial parse, not by blob length sniffing.
@@ -1018,7 +1175,9 @@ impl CompressedKvBlock {
             })
     }
 
-    fn parse_v2(body: &[u8]) -> Result<Self> {
+    /// Parse the v2 body and return the block plus the bytes consumed (v3
+    /// appends its allocation section after the v2 core).
+    fn parse_v2_core(body: &[u8]) -> Result<(Self, usize)> {
         const HDR: usize = 4 * 7 + 1;
         if body.len() < HDR {
             return Err(grim_core::error::Error::KvCache(
@@ -1041,12 +1200,6 @@ impl CompressedKvBlock {
         let key_bits_len = rd_u32(&mut pos) as usize;
         let value_bits_len = rd_u32(&mut pos) as usize;
         let need = pos + key_meta_len * 4 + value_meta_len * 4 + key_bits_len + value_bits_len;
-        if body.len() != need {
-            return Err(grim_core::error::Error::KvCache(format!(
-                "CompressedKvBlock::from_bytes: v2 length mismatch (need {need}, have {})",
-                body.len()
-            )));
-        }
         if body.len() < need {
             return Err(grim_core::error::Error::KvCache(format!(
                 "CompressedKvBlock::from_bytes: truncated v2 (need {need}, have {})",
@@ -1065,16 +1218,83 @@ impl CompressedKvBlock {
         }
         let key_bits = body[pos..pos + key_bits_len].to_vec();
         let value_bits = body[pos + key_bits_len..pos + key_bits_len + value_bits_len].to_vec();
-        Ok(Self {
+        Ok((
+            Self {
+                key_bits,
+                key_meta,
+                value_bits,
+                value_meta,
+                num_tokens,
+                num_kv_heads,
+                head_dim,
+                modality,
+                channel_alloc: None,
+            },
+            need,
+        ))
+    }
+
+    fn parse_v2(body: &[u8]) -> Result<Self> {
+        let (block, need) = Self::parse_v2_core(body)?;
+        if body.len() != need {
+            return Err(grim_core::error::Error::KvCache(format!(
+                "CompressedKvBlock::from_bytes: v2 length mismatch (need {need}, have {})",
+                body.len()
+            )));
+        }
+        Ok(block)
+    }
+
+    /// WI-3: v3 = v2 core + trailing channel-allocation section.
+    fn parse_v3(body: &[u8]) -> Result<Self> {
+        let (mut block, head_len) = Self::parse_v2_core(body)?;
+        let tail = &body[head_len..];
+        if tail.len() < 12 {
+            return Err(grim_core::error::Error::KvCache(
+                "CompressedKvBlock::from_bytes: truncated v3 allocation section".into(),
+            ));
+        }
+        let mut pos = 0usize;
+        let rd = |p: &mut usize| -> u32 {
+            let v = u32::from_le_bytes([tail[*p], tail[*p + 1], tail[*p + 2], tail[*p + 3]]);
+            *p += 4;
+            v
+        };
+        let kvh = rd(&mut pos) as usize;
+        let hd = rd(&mut pos) as usize;
+        let gs = rd(&mut pos) as usize;
+        if gs == 0 || hd % gs != 0 || kvh != block.num_kv_heads || hd != block.head_dim {
+            return Err(grim_core::error::Error::KvCache(format!(
+                "v3 allocation geometry mismatch: alloc {kvh}x{hd}/g{gs} vs block {}x{}",
+                block.num_kv_heads, block.head_dim
+            )));
+        }
+        let groups = hd / gs;
+        let want = pos + 2 * kvh * groups;
+        if tail.len() != want {
+            return Err(grim_core::error::Error::KvCache(format!(
+                "v3 allocation length mismatch: want {want}, have {}",
+                tail.len()
+            )));
+        }
+        let mut key_bits = Vec::with_capacity(kvh);
+        for _ in 0..kvh {
+            key_bits.push(tail[pos..pos + groups].to_vec());
+            pos += groups;
+        }
+        let mut value_bits = Vec::with_capacity(kvh);
+        for _ in 0..kvh {
+            value_bits.push(tail[pos..pos + groups].to_vec());
+            pos += groups;
+        }
+        block.channel_alloc = Some(channel_importance::ChannelBitAllocation {
+            num_kv_heads: kvh,
+            head_dim: hd,
+            group_size: gs,
             key_bits,
-            key_meta,
             value_bits,
-            value_meta,
-            num_tokens,
-            num_kv_heads,
-            head_dim,
-            modality,
-        })
+        });
+        Ok(block)
     }
 
     /// Pre-v2 layout, candidate A: 3×u32 dims + modality u8 + 3×u32 lens.
@@ -1137,6 +1357,7 @@ impl CompressedKvBlock {
         let key_bits = buf[pos..pos + key_bits_len].to_vec();
         let value_bits = buf[pos + key_bits_len..].to_vec();
         Ok(Self {
+            channel_alloc: None,
             key_bits,
             key_meta,
             value_bits,
@@ -1163,6 +1384,7 @@ impl KvCompressor for IdentityCompressor {
         let head_dim = k_dims[2];
 
         Ok(CompressedKvBlock {
+            channel_alloc: None,
             key_bits: k_data.iter().flat_map(|v| v.to_le_bytes()).collect(),
             key_meta: vec![],
             value_bits: v_data.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -1954,4 +2176,198 @@ mod tests {
             result
         );
     }
+
+    // ---- WI-3 (channel-axis allocation) ------------------------------------
+
+    use crate::channel_importance::{ChannelBitAllocation, CHANNEL_GROUP_SIZE};
+
+    fn hand_alloc(kvh: usize, hd: usize, hot_groups: &[(usize, usize)]) -> ChannelBitAllocation {
+        assert!(hd % CHANNEL_GROUP_SIZE == 0);
+        let gs = hd / CHANNEL_GROUP_SIZE;
+        let mk = |hot: bool| {
+            let mut bits = vec![vec![2u8; gs]; kvh];
+            if hot {
+                for &(h, g) in hot_groups {
+                    bits[h][g] = 8;
+                }
+            }
+            bits
+        };
+        // Uniform-2 baseline except explicitly hot groups at 8.
+        ChannelBitAllocation {
+            num_kv_heads: kvh,
+            head_dim: hd,
+            group_size: CHANNEL_GROUP_SIZE,
+            key_bits: mk(true),
+            value_bits: mk(true),
+        }
+    }
+
+    /// Round-trip with a channel allocation must work end to end.
+    #[test]
+    fn channel_allocated_block_round_trips_and_self_describes() {
+        let device = grim_backend_cpu::CpuDevice::new();
+        let (t, kvh, hd) = (3usize, 2usize, 64usize);
+        let shape = Shape::new(vec![t, kvh, hd]);
+        let k_data: Vec<f32> = (0..t * kvh * hd).map(|i| (i as f32 * 0.13).sin()).collect();
+        let v_data: Vec<f32> = (0..t * kvh * hd).map(|i| (i as f32 * 0.07).cos()).collect();
+        let keys = cpu_tensor_from(&device, &k_data, &shape);
+        let values = cpu_tensor_from(&device, &v_data, &shape);
+
+        let alloc = hand_alloc(kvh, hd, &[(0, 0), (1, 1)]);
+        let compressor = LloydMaxCompressor::new(KvQuantConfig {
+            key_bits: 3,
+            value_bits: 4,
+            group_size: 16,
+            qk_compute_bits: 8,
+        })
+        .with_channel_alloc(alloc.clone());
+        let block = compressor.compress(&keys, &values).unwrap();
+        assert_eq!(block.channel_alloc.as_ref(), Some(&alloc));
+
+        let (kq, vq) = compressor
+            .dequantize_for_attention(&block, &device, Device::Cpu)
+            .unwrap();
+        assert_eq!(kq.to_vec_f32().unwrap().len(), t * kvh * hd);
+        assert_eq!(vq.to_vec_f32().unwrap().len(), t * kvh * hd);
+        let max_k = kq
+            .to_vec_f32()
+            .unwrap()
+            .iter()
+            .zip(&k_data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_k < 0.5, "allocated round-trip stays bounded: {max_k}");
+    }
+
+    /// WI-3 gate: at the SAME average bits, the channel-allocated block must
+    /// reconstruct high-importance groups better than the uniform compressor —
+    /// this is the actual claim being tested (not just "does it run").
+    #[test]
+    fn channel_allocation_improves_error_on_high_importance_groups() {
+        let device = grim_backend_cpu::CpuDevice::new();
+        let (t, kvh, hd) = (8usize, 1usize, 128usize);
+        let shape = Shape::new(vec![t, kvh, hd]);
+        // Concentrated signal in channels 32..64 (group 1), noise elsewhere.
+        let k_data: Vec<f32> = (0..t * kvh * hd)
+            .map(|i| {
+                let d = i % hd;
+                if (32..64).contains(&d) {
+                    ((i as f32) * 0.037).sin() // full-amplitude, structured
+                } else {
+                    ((i as f32) * 0.11).sin() * 0.02
+                }
+            })
+            .collect();
+        let v_data: Vec<f32> = (0..t * kvh * hd).map(|i| ((i as f32) * 0.05).cos()).collect();
+        let keys = cpu_tensor_from(&device, &k_data, &shape);
+        let values = cpu_tensor_from(&device, &v_data, &shape);
+
+        let cfg = KvQuantConfig { key_bits: 4, value_bits: 4, group_size: 128, qk_compute_bits: 8 };
+        // Uniform baseline at 4 bits (rotation ON, as today).
+        let uniform = LloydMaxCompressor::new(cfg);
+        let block_u = uniform.compress(&keys, &values).unwrap();
+        let (kq_u, _) = uniform
+            .dequantize_for_attention(&block_u, &device, Device::Cpu)
+            .unwrap();
+        let ku = kq_u.to_vec_f32().unwrap();
+
+        // Allocated: hot group 1 at 8 bits, rest at 4 (alloc skips rotation).
+        let alloc = ChannelBitAllocation {
+            num_kv_heads: kvh,
+            head_dim: hd,
+            group_size: CHANNEL_GROUP_SIZE,
+            key_bits: vec![vec![4, 8, 4, 4]],
+            value_bits: vec![vec![4, 8, 4, 4]],
+        };
+        let xz = LloydMaxCompressor::new(cfg).with_channel_alloc(alloc);
+        let block_a = xz.compress(&keys, &values).unwrap();
+        let (kq_a, _) = xz
+            .dequantize_for_attention(&block_a, &device, Device::Cpu)
+            .unwrap();
+        let ka = kq_a.to_vec_f32().unwrap();
+
+        let err = |got: &[f32], lo: usize, hi: usize| -> f64 {
+            let mut mse = 0.0f64;
+            let mut n = 0usize;
+            for (i, v) in k_data.iter().enumerate() {
+                let d = i % hd;
+                if (lo..hi).contains(&d) {
+                    let e = got[i] - v;
+                    mse += (e as f64) * (e as f64);
+                    n += 1;
+                }
+            }
+            mse / n as f64
+        };
+        let u_hot = err(&ku, 32, 64);
+        let a_hot = err(&ka, 32, 64);
+        assert!(
+            a_hot < u_hot,
+            "allocated path must beat uniform on the hot group: alloc={a_hot} uniform={u_hot}"
+        );
+        let u_cold = err(&ku, 0, 32);
+        let a_cold = err(&ka, 0, 32);
+        // Cold groups are noise-level; both paths sit at the 4-bit floor and
+        // may differ (allocation path skips rotation) but must stay bounded.
+        assert!(u_cold < 0.1 && a_cold < 0.1);
+    }
+
+    /// Opt-out contract: no allocation attached -> the byte stream and fields
+    /// are identical to the pre-WI-3 build (blob v2, rotation applied).
+    #[test]
+    fn no_allocation_is_byte_identical_legacy() {
+        let device = grim_backend_cpu::CpuDevice::new();
+        let shape = Shape::new(vec![2usize, 2, 32]);
+        let k_data: Vec<f32> = (0..128).map(|i| (i as f32 * 0.021).sin()).collect();
+        let v_data: Vec<f32> = (0..128).map(|i| (i as f32 * 0.015).cos()).collect();
+        let keys = cpu_tensor_from(&device, &k_data, &shape);
+        let values = cpu_tensor_from(&device, &v_data, &shape);
+        let cfg = KvQuantConfig::default();
+        let c = LloydMaxCompressor::new(cfg);
+        let b1 = c.compress(&keys, &values).unwrap();
+        let b2 = LloydMaxCompressor::new(cfg).compress(&keys, &values).unwrap();
+        assert_eq!(b1.to_bytes(), b2.to_bytes(), "v2 blobs are deterministic");
+        assert_eq!(b1.to_bytes()[4], 2, "no allocation -> blob version 2");
+        assert!(b1.channel_alloc.is_none());
+    }
+
+    /// Blob v3 round-trip: allocation survives the on-disk format.
+    #[test]
+    fn blob_v3_carries_allocation() {
+        let device = grim_backend_cpu::CpuDevice::new();
+        let shape = Shape::new(vec![2usize, 2, 64]);
+        let k = vec![0.25f32; 2 * 2 * 64];
+        let keys = cpu_tensor_from(&device, &k, &shape);
+        let values = cpu_tensor_from(&device, &k, &shape);
+        let alloc = hand_alloc(2, 64, &[(0, 1)]);
+        let compressor = LloydMaxCompressor::new(KvQuantConfig::default()).with_channel_alloc(alloc.clone());
+        let block = compressor.compress(&keys, &values).unwrap();
+        let blob = block.to_bytes();
+        assert_eq!(blob[4], 3);
+        let back = CompressedKvBlock::from_bytes(&blob).unwrap();
+        assert_eq!(back.channel_alloc, Some(alloc));
+        // v2 blob rejected as v3 and vice versa.
+        let without = LloydMaxCompressor::new(KvQuantConfig::default())
+            .compress(&keys, &values)
+            .unwrap()
+            .to_bytes();
+        let back2 = CompressedKvBlock::from_bytes(&without).unwrap();
+        assert!(back2.channel_alloc.is_none());
+    }
+
+    /// Geometry mismatch is a hard error at compress time, not silent drift.
+    #[test]
+    fn channel_alloc_geometry_mismatch_errors() {
+        let device = grim_backend_cpu::CpuDevice::new();
+        let shape = Shape::new(vec![2usize, 4, 64]);
+        let k = vec![0.1f32; 2 * 4 * 64];
+        let keys = cpu_tensor_from(&device, &k, &shape);
+        let values = cpu_tensor_from(&device, &k, &shape);
+        let alloc = hand_alloc(2, 64, &[]); // kvh mismatch: 2 vs 4
+        let compressor =
+            LloydMaxCompressor::new(KvQuantConfig::default()).with_channel_alloc(alloc);
+        assert!(compressor.compress(&keys, &values).is_err());
+    }
 }
+

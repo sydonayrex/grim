@@ -20,6 +20,10 @@ pub struct RadixNode {
     pub parent: Option<usize>,
     /// Number of sequences whose prefix traverses this node.
     pub ref_count: u32,
+    /// WI-HYBRID Layer 2: while `Some(t)` and `t > now`, eviction
+    /// (`evict_coldest_leaf`/`coldest_leaf`) skips this node — session-tagged
+    /// blocks are pinned until N seconds idle.
+    pub pinned_until: Option<Instant>,
     /// Last time this node (or a descendant) was matched/inserted.
     pub last_access: Instant,
     /// Checkpoint ID of attached recurrent/hybrid layer state at this block boundary (if any).
@@ -35,6 +39,12 @@ pub struct RadixTree {
     block_to_node: HashMap<usize, usize>,
 }
 
+impl RadixNode {
+    fn is_pinned(&self) -> bool {
+        self.pinned_until.is_some_and(|t| t > Instant::now())
+    }
+}
+
 impl RadixTree {
     /// Build an empty tree. `block_size` must match the pool's
     /// [`crate::BLOCK_SIZE`].
@@ -47,6 +57,7 @@ impl RadixTree {
             ref_count: 0,
             last_access: Instant::now(),
             recurrent_state_id: None,
+            pinned_until: None,
         };
         Self {
             nodes: vec![root],
@@ -154,6 +165,7 @@ impl RadixTree {
                 ref_count: 1,
                 last_access: Instant::now(),
                 recurrent_state_id: None,
+                pinned_until: None,
             });
             self.nodes[node].children.insert(key, child_idx);
             self.block_to_node.insert(bid, child_idx);
@@ -162,6 +174,49 @@ impl RadixTree {
         }
     }
 
+    /// Incremental registration: `blocks[..skip_blocks]` were already claimed
+    /// or registered by this request — descend through them without touching
+    /// their refcounts, then insert the tail normally. Token keys are always
+    /// computed with absolute offsets into the FULL sequence, so keys match
+    /// the whole-sequence hashing used by `match_prefix`.
+    pub fn insert_at(&mut self, tokens: &[u32], blocks: &[usize], skip_blocks: usize) {
+        let mut node = self.root;
+        let mut offset = 0;
+        for (i, &bid) in blocks.iter().enumerate() {
+            let key = Self::block_key(tokens, offset, self.block_size);
+            if i < skip_blocks {
+                if let Some(&child) = self.nodes[node].children.get(&key) {
+                    node = child;
+                    offset += self.block_size;
+                    continue;
+                }
+                // The covering claim was evicted mid-flight; fall through and
+                // recreate the node so the tail stays reachable.
+            }
+            if let Some(&child) = self.nodes[node].children.get(&key) {
+                // Shared prefix: reuse the existing node, bump refcount.
+                self.nodes[child].ref_count += 1;
+                node = child;
+                offset += self.block_size;
+                continue;
+            }
+            let child_idx = self.nodes.len();
+            self.nodes.push(RadixNode {
+                block_id: bid,
+                token_span: offset..(offset + self.block_size),
+                children: HashMap::new(),
+                parent: Some(node),
+                ref_count: 1,
+                last_access: Instant::now(),
+                recurrent_state_id: None,
+                pinned_until: None,
+            });
+            self.nodes[node].children.insert(key, child_idx);
+            self.block_to_node.insert(bid, child_idx);
+            node = child_idx;
+            offset += self.block_size;
+        }
+    }
     /// Drop one sequence's reference to `blocks`.
     /// Refcounts are decremented but nodes are NOT pruned here - an unreferenced prefix stays cached.
     pub fn remove(&mut self, blocks: &[usize]) {
@@ -173,15 +228,116 @@ impl RadixTree {
         }
     }
 
+    /// True when `bid` is still mapped by any tree node (i.e. it is cached
+    /// prefix content, referenced or not). The pool consults this in
+    /// `free_with_tier` so it never zeroes/free-lists a block the tree can
+    /// still match against.
+    pub fn contains_block(&self, bid: usize) -> bool {
+        self.block_to_node.contains_key(&bid)
+    }
+
+    /// WI-HYBRID Layer 2 retention: pin the nodes mapped to `blocks` until
+    /// `secs` seconds after NOW (idle-time pin — refreshed by the next
+    /// session-tagged turn). Unmapped bids are ignored; expired pins are
+    /// simply stale values the time comparison ignores.
+    pub fn pin_blocks(&mut self, blocks: &[usize], secs: u64) {
+        let until = Instant::now() + std::time::Duration::from_secs(secs);
+        for &bid in blocks {
+            if let Some(&idx) = self.block_to_node.get(&bid) {
+                let node = &mut self.nodes[idx];
+                node.pinned_until = Some(match node.pinned_until {
+                    Some(t) if t > until => t,
+                    _ => until,
+                });
+            }
+        }
+    }
+
+    /// Drop expired pin entries (housekeeping — expired pins are inert by
+    /// time comparison, but the map/node fields would grow without bound).
+    pub fn sweep_expired_pins(&mut self) {
+        let now = Instant::now();
+        for node in &mut self.nodes {
+            if node.pinned_until.is_some_and(|t| t <= now) {
+                node.pinned_until = None;
+            }
+        }
+    }
+
+    /// True while the node mapped to `bid` is pin-protected from LRU eviction.
+    pub fn is_pinned(&self, bid: usize) -> bool {
+        self.block_to_node
+            .get(&bid)
+            .is_some_and(|&idx| self.nodes[idx].pinned_until.is_some_and(|t| t > Instant::now()))
+    }
+
+    /// WI-HYBRID Layer 2 (admission accounting): attached, refcount-0,
+    /// unpinned nodes — all of these are reclaimable via leaf eviction plus
+    /// the cascade prune (child leaves go first, then the childless parent
+    /// is pruned and its page freed).
+    pub fn evictable_leaves(&self) -> usize {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, n)| {
+                *idx != self.root
+                    && n.ref_count == 0
+                    && !n.is_pinned()
+                    && self.block_to_node.get(&n.block_id) == Some(idx)
+            })
+            .count()
+    }
+
+    /// Drop the `n` oldest (earliest-expiring) pins, returning how many were
+    /// actually dropped. Admission uses this as the rescue when a request's
+    /// block demand can't be satisfied otherwise (spec: "pin sweep drops
+    /// oldest pins when admission can't be satisfied").
+    pub fn drop_oldest_pins(&mut self, n: usize) -> usize {
+        let now = Instant::now();
+        let mut pinned: Vec<(usize, Instant)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, node)| {
+                node.pinned_until
+                    .filter(|t| *t > now)
+                    .map(|t| (idx, t))
+            })
+            .collect();
+        pinned.sort_by_key(|(_, t)| *t);
+        let mut dropped = 0;
+        for (idx, _) in pinned.into_iter().take(n) {
+            self.nodes[idx].pinned_until = None;
+            dropped += 1;
+        }
+        dropped
+    }
+
     /// Evict the coldest childless leaf with `ref_count == 0`, returning its block id.
     /// After detaching the leaf, walks up pruning any parent that has become childless and unreferenced,.
     pub fn evict_coldest_leaf(&mut self) -> Option<usize> {
+        self.evict_coldest_chain().first().copied()
+    }
+
+    /// Detach the coldest childless, unreferenced, unpinned leaf and
+    /// cascade-prune childless unreferenced ancestors, returning EVERY
+    /// detached block id (leaf first, then pruned ancestors). The caller owns
+    /// all these pages — the pruned ancestors' mappings are gone, so their
+    /// contents are garbage and their pages must return to the free list
+    /// (the old leaf-only return stranded one parent page per eviction).
+    pub fn evict_coldest_chain(&mut self) -> Vec<usize> {
         let mut coldest: Option<(usize, Instant)> = None;
         for (idx, node) in self.nodes.iter().enumerate() {
             if idx == self.root {
                 continue;
             }
-            if !node.children.is_empty() || node.ref_count > 0 {
+            // Detached zombie from a prior eviction: the walk-up removed it
+            // from its parent and from block_to_node, but the node object
+            // stays in `nodes`. Returning it would demote/reclaim stale data.
+            if self.block_to_node.get(&node.block_id) != Some(&idx) {
+                continue;
+            }
+            if !node.children.is_empty() || node.ref_count > 0 || node.is_pinned() {
                 continue;
             }
             match coldest {
@@ -192,9 +348,12 @@ impl RadixTree {
                 _ => {}
             }
         }
-        let (idx, _) = coldest?;
-        let bid = self.nodes[idx].block_id;
-        // Walk up pruning childless, unreferenced parents.
+        let Some((idx, _)) = coldest else {
+            return Vec::new();
+        };
+        let mut detached = vec![self.nodes[idx].block_id];
+        // Walk up pruning childless, unreferenced parents — their pages are
+        // collected for the caller to free.
         let mut cur = Some(idx);
         while let Some(n) = cur {
             let (bid_n, has_children, parent) = {
@@ -212,6 +371,9 @@ impl RadixTree {
                         self.nodes[p].children.remove(&k);
                     }
                     self.block_to_node.remove(&bid_n);
+                    if n != idx {
+                        detached.push(bid_n);
+                    }
                     cur = Some(p);
                 } else {
                     cur = None;
@@ -220,7 +382,7 @@ impl RadixTree {
                 cur = None;
             }
         }
-        Some(bid)
+        detached
     }
 
     /// Number of leaf/branch nodes (excluding root) — a rough tree-size probe.
@@ -236,7 +398,13 @@ impl RadixTree {
             if idx == self.root {
                 continue;
             }
-            if !node.children.is_empty() || node.ref_count > 0 {
+            // Detached zombie from a prior eviction: the walk-up removed it
+            // from its parent and from block_to_node, but the node object
+            // stays in `nodes`. Returning it would demote/reclaim stale data.
+            if self.block_to_node.get(&node.block_id) != Some(&idx) {
+                continue;
+            }
+            if !node.children.is_empty() || node.ref_count > 0 || node.is_pinned() {
                 continue;
             }
             match coldest {
@@ -254,6 +422,70 @@ impl RadixTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===========================================================================
+    // WI-HYBRID Layer 2 (session identity): pin/retention unit tests
+    // =========================================================================
+
+    /// Two leaves; A inserted first (colder last_access). Pin A: eviction and
+    /// cold-prefix selection must skip it and return B instead.
+    #[test]
+    fn pinned_block_is_skipped_by_eviction_and_cold_prefix() {
+        let mut tree = RadixTree::new(16);
+        let tokens_a: Vec<u32> = (0..16).collect();
+        let tokens_b: Vec<u32> = (16..32).collect();
+        tree.insert(&tokens_a, &[0]);
+        tree.insert(&tokens_b, &[1]);
+        // Simulate finish_request: refcounts drop to 0, mappings survive —
+        // that is the state in which LRU eviction actually competes.
+        tree.remove(&[0]);
+        tree.remove(&[1]);
+        // Sanity: without pins the colder leaf (A, inserted first) is evicted.
+        assert_eq!(tree.coldest_leaf(), Some(0));
+
+        tree.pin_blocks(&[0], 300);
+        assert!(tree.is_pinned(0));
+        assert!(!tree.is_pinned(1));
+
+        // Eviction must skip the pinned coldest leaf and take B.
+        assert_eq!(tree.evict_coldest_leaf(), Some(1));
+        // coldest_leaf (demote_cold_prefix source) must also skip A.
+        assert_eq!(tree.coldest_leaf(), None, "A is pinned; nothing else left");
+        // A must survive: still mapped, still matchable.
+        assert!(tree.contains_block(0));
+        assert_eq!(tree.match_prefix(&tokens_a).1, 16);
+    }
+
+    /// A pin with `secs == 0` is immediately expired: the block returns to
+    /// normal LRU eligibility.
+    #[test]
+    fn expired_pin_no_longer_protects() {
+        let mut tree = RadixTree::new(16);
+        tree.insert(&(0..16).collect::<Vec<u32>>(), &[7]);
+        tree.remove(&[7]); // finish_request: refcount 0, mapping survives
+        tree.pin_blocks(&[7], 0);
+        assert!(!tree.is_pinned(7), "zero-second pin is already expired");
+        assert_eq!(tree.coldest_leaf(), Some(7));
+    }
+
+    /// Re-pinning extends protection: pin for 0 (expired), then re-pin for a
+    /// real duration — protection must come back (idle-time refresh).
+    #[test]
+    fn repin_refreshes_protection() {
+        let mut tree = RadixTree::new(16);
+        tree.insert(&(0..16).collect::<Vec<u32>>(), &[3]);
+        tree.remove(&[3]); // finish_request simulation
+        tree.pin_blocks(&[3], 0);
+        assert!(!tree.is_pinned(3));
+        tree.pin_blocks(&[3], 300);
+        assert!(tree.is_pinned(3));
+        assert_eq!(tree.coldest_leaf(), None, "re-pinned leaf must be skipped");
+        assert_eq!(
+            tree.evict_coldest_leaf(),
+            None,
+            "eviction must skip the re-pinned leaf"
+        );
+    }
 
     #[test]
     fn match_then_insert_full_prefix_is_idempotent() {

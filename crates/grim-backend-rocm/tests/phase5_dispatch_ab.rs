@@ -181,7 +181,7 @@ fn time_config(
 
 #[test]
 fn phase5_dispatch_ab_benchmark() {
-    let _lock = AB_MUTEX.lock().unwrap();
+    let _lock = AB_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TESTS=1 + GPU");
         return;

@@ -276,6 +276,7 @@ impl OmniKvCompressor {
         value_meta.extend_from_slice(&r_matrix);
 
         Ok(CompressedKvBlock {
+            channel_alloc: None,
             key_bits,
             key_meta,
             value_bits,
@@ -778,6 +779,7 @@ impl KvOmniEvictor {
         // Modality defaults to Text for the merged block; the fixed
         // text/audio/visual merge order is what split_merged_block keys off.
         CompressedKvBlock {
+            channel_alloc: None,
             key_bits,
             key_meta,
             value_bits,
@@ -838,6 +840,7 @@ impl KvOmniEvictor {
         let mut subs: Vec<CompressedKvBlock> = Vec::with_capacity(3);
         for i in 0..3 {
             subs.push(CompressedKvBlock {
+                channel_alloc: None,
                 key_bits: merged.key_bits[kb_off..kb_off + kb[i]].to_vec(),
                 key_meta: merged.key_meta[km_off..km_off + km[i]].to_vec(),
                 value_bits: merged.value_bits[vb_off..vb_off + vb[i]].to_vec(),
@@ -936,6 +939,7 @@ mod tests {
             num_kv_heads: 2,
             head_dim: 4,
             modality: KvModality::Text,
+            channel_alloc: None,
         }
     }
 

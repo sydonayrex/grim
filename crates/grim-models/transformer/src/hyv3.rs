@@ -64,10 +64,10 @@ impl ModelConfig for HyV3Config {
 
 // MoE Block
 
-struct HyV3Expert {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+pub struct HyV3Expert {
+    pub gate_proj: Linear,
+    pub up_proj: Linear,
+    pub down_proj: Linear,
 }
 
 impl HyV3Expert {
@@ -92,11 +92,11 @@ impl HyV3Expert {
 }
 
 pub struct HyV3MoeBlock {
-    gate: Linear,
-    experts: Vec<HyV3Expert>,
-    shared_expert: Option<HyV3Expert>,
-    num_experts_per_tok: usize,
-    charon_cache: crate::shared_moe::CharonCache,
+    pub gate: Linear,
+    pub experts: Vec<HyV3Expert>,
+    pub shared_expert: Option<HyV3Expert>,
+    pub num_experts_per_tok: usize,
+    pub charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl HyV3MoeBlock {

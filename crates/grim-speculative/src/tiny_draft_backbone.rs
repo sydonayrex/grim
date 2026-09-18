@@ -61,7 +61,7 @@ impl DraftBackbone for TinyDraftBackbone {
         let hidden = self.hidden;
 
         // Lock weights for the forward pass
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock().unwrap_or_else(|e| e.into_inner());
 
         // 1. Pull the context representation (a 1-D F32 tensor of size `hidden` proxying the embedding
         // of the last prompt token; real impl would embed the actual token and project to hidden).
@@ -135,7 +135,7 @@ impl DraftBackbone for TinyDraftBackbone {
     }
 
     fn estimated_footprint_bytes(&self) -> usize {
-        let weights = self.weights.lock().unwrap();
+        let weights = self.weights.lock().unwrap_or_else(|e| e.into_inner());
         // Calculate raw size of all the parameter arrays
         let params_len = weights.pos_emb.len()
             + weights.w_q.len()
@@ -155,7 +155,7 @@ impl DraftBackbone for TinyDraftBackbone {
         let verify_len = draft_tokens.len();
         let hidden_size = self.hidden;
         let vocab_size = self.vocab_size;
-        let mut weights = self.weights.lock().unwrap();
+        let mut weights = self.weights.lock().unwrap_or_else(|e| e.into_inner());
 
         let lr = 0.01f32;
         // Penultimate layer target hidden state mapping update: Adjust the linear classification head (w_head)

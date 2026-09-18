@@ -1,4 +1,5 @@
 //! Thin wrapper around `Llama` for granite_moe uses a Llama-style transformer.
+// ponytail: dense Llama wrapper alias (no expert stack). True IBM Granite MoE is `GraniteMoeHybrid` in `granite_moe_hybrid.rs`.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};

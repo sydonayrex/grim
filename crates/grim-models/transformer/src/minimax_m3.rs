@@ -450,7 +450,19 @@ impl CausalLm for MiniMaxM3 {
             self.cfg.hidden_size,
         )?;
 
-        let mut kv_caches = vec![None; self.layers.len()];
+        if session.model_state().is_none() {
+            let fresh: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
+            session.set_model_state(Box::new(fresh));
+        }
+
+        let kv_caches = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "MiniMaxM3::forward: model_state must be Vec<Option<(Tensor, Tensor)>>".into(),
+                )
+            })?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_v, &mut kv_caches[layer_idx])?;

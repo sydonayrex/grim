@@ -86,7 +86,7 @@ fn reference_q80(a: &[f32], b_packed: &[u8], m: usize, n: usize, k: usize) -> Ve
 
 #[test]
 fn wmma_quant_graph_capture_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = CAP_MUTEX.lock().unwrap();
+    let _lock = CAP_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return Ok(());

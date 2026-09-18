@@ -409,7 +409,7 @@ mod runtime_env_tests {
 
     #[test]
     fn defaults_when_no_env_or_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_grim_vars();
         // CWD is the crate dir during tests; ensure no grim.toml leak.
         let saved_cwd = std::env::current_dir().unwrap();
@@ -434,7 +434,7 @@ mod runtime_env_tests {
 
     #[test]
     fn env_vars_override_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_grim_vars();
         set_var("GRIM_HOST", "0.0.0.0");
         set_var("GRIM_PORT", "8123");
@@ -463,7 +463,7 @@ mod runtime_env_tests {
 
     #[test]
     fn malformed_env_values_fall_back_to_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_grim_vars();
         set_var("GRIM_PORT", "not-a-port");
         set_var("GRIM_CONTEXT", "-5");
@@ -481,7 +481,7 @@ mod runtime_env_tests {
 
     #[test]
     fn toml_config_is_parsed_and_env_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_grim_vars();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("grim.toml");
@@ -519,7 +519,7 @@ mod runtime_env_tests {
 
     #[test]
     fn effective_config_summary_lists_keys_and_sources() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_grim_vars();
         set_var("GRIM_BACKEND", "cuda");
         let env = RuntimeEnv::from_env();

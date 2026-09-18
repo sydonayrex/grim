@@ -83,6 +83,14 @@ fn try_graph_decode_step(
         m
     } else if let Some(m) = model.as_any().downcast_ref::<Chameleon>() {
         m
+    } else if let Some(m) = model.as_any().downcast_ref::<grim_models_transformer::MiniMaxM3>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<grim_models_transformer::Glm4MoeLite>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<grim_models_transformer::GraniteMoeHybrid>() {
+        m
+    } else if let Some(m) = model.as_any().downcast_ref::<grim_models_transformer::HyV3>() {
+        m
     } else if let Some(m) = grim_models_transformer::llama_wrapper_graph_model(model.as_any()) {
         m
     } else {

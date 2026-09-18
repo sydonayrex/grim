@@ -84,7 +84,7 @@ struct TuneEntryOwned {
 
 impl Clone for CudaAutotuner {
     fn clone(&self) -> Self {
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let new_cache = cache.clone();
         drop(cache);
         Self {
@@ -109,7 +109,7 @@ impl CudaAutotuner {
             if let Ok(data) = fs::read_to_string(&path) {
                 match serde_json::from_str::<Vec<TuneEntryOwned>>(&data) {
                     Ok(entries) => {
-                        let mut lock = self.cache.lock().unwrap();
+                        let mut lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                         for e in entries {
                             if e.caps_hash != hash {
                                 continue;
@@ -142,7 +142,7 @@ impl CudaAutotuner {
     pub fn save_cache(&self, caps: &CudaCaps) {
         let hash = caps.cache_key_hash();
         let entries: Vec<TuneEntryOwned> = {
-            let lock = self.cache.lock().unwrap();
+            let lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             lock.iter()
                 .filter(|((h, _, _, _, _), _)| *h == hash)
                 .map(|((h, m, n, k, sc), opt_cfg)| TuneEntryOwned {
@@ -192,7 +192,7 @@ impl CudaAutotuner {
 
         // Fast path: in-memory (or previously loaded-from-disk) cache hit.
         {
-            let lock = self.cache.lock().unwrap();
+            let lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cfg) = lock.get(&key).and_then(|opt| opt.as_ref()) {
                 return *cfg;
             }
@@ -276,7 +276,7 @@ impl CudaAutotuner {
 
         // Insert winner, then persist so a repeat shape on this GPU hits the on-disk cache.
         {
-            let mut lock = self.cache.lock().unwrap();
+            let mut lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             lock.insert(key, Some(winner));
         }
         self.save_cache(caps);

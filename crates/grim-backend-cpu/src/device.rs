@@ -107,6 +107,20 @@ fn dequant_packed_kv(
     let total = rows * elems_per_row;
     let mut out = vec![0.0f32; total];
 
+    // Q4KHalf (WI-3, kernel quant_format==3): self-contained per-row
+    // sub-block quantization — CPU-side mirror of the ROCm kernel branch.
+    if quant_bits == 3 {
+        let row_bytes = grim_quant::q4khalf_row_bytes(head_dim);
+        for r in 0..rows {
+            let row = bytes
+                .get(r * row_bytes..(r + 1) * row_bytes)
+                .ok_or(Error::Shape("kv_dequant_attention: q4kh row out of range".into()))?;
+            let deq = grim_quant::dequant_q4khalf(row, head_dim)?;
+            out[r * elems_per_row..r * elems_per_row + head_dim].copy_from_slice(&deq);
+        }
+        return Ok(out);
+    }
+
     if quant_bits == 8 {
         for r in 0..rows {
             let s = scale_data.get(r).copied().unwrap_or(1.0f32);

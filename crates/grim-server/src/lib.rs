@@ -141,6 +141,9 @@ impl Drop for RequestCleanupGuard {
         let _ = take_request_sampler_params(self.request_id);
         if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
             hist.remove(&self.request_id);
+            if let Ok(mut sess) = REQUEST_SESSIONS.lock() {
+                sess.remove(&self.request_id);
+            }
         }
         LIVE_CLEANUP_GUARDS.fetch_sub(1, Ordering::Relaxed);
     }
@@ -325,6 +328,12 @@ fn now_millis() -> u64 {
 /// Encapsulates the fixed-REQUEST_ID prefill-on-step-0 / decode-thereafter contract the server already relies on, plus the formerly-inline.
 static REQUEST_HISTORIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// WI-HYBRID Layer 2: client session tag per request (body `session` field or
+/// `x-grim-session` header), read at enqueue time by `sample_next_token`.
+static REQUEST_SESSIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Client-supplied sampler overrides for one request.
@@ -533,6 +542,12 @@ fn sample_next_token(
             Some(ref id) if !id.is_empty() => Some(id.clone()),
             _ => engine.loaded_models().first().cloned(),
         };
+        // WI-HYBRID Layer 2: attach the client session tag (if any) so the
+        // engine gets slot affinity + radix-block pinning.
+        let session = REQUEST_SESSIONS
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&request_id));
         let req = grim_scheduler::Request {
             id: request_id,
             prompt_tokens: prompt_tokens.len(),
@@ -542,6 +557,7 @@ fn sample_next_token(
             model_id: model_id_final,
             adapter_ids: vec![],
             input_ids: Some(prompt_tokens.to_vec()),
+            session,
         };
         let _ = engine.enqueue_request(req);
     }
@@ -951,9 +967,26 @@ fn build_constrained_sampler(
 /// §13.3 contract: no silent partial fulfillment.
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let body_obj = body.as_object().cloned().unwrap_or_default();
+
+    // WI-HYBRID Layer 2: optional session identity — `session` body field or
+    // `x-grim-session` header. No session => plain Layer 1.5 behavior.
+    let session_tag = body_obj
+        .get("session")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get("x-grim-session")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        });
+    // The tag rides the stream-task locals and is keyed by request id once
+    // the stream mints one (REQUEST_SESSIONS insert at the mint site below).
+    let session_tag_for_task = session_tag.clone();
 
     let requested_model = body_obj
         .get("model")
@@ -1049,6 +1082,9 @@ async fn chat_completions(
         "top_logprobs",
         "presence_penalty",
         "frequency_penalty",
+        // WI-HYBRID Layer 2: optional session identity (slot affinity + block
+        // pinning). Absence degrades to plain Layer 1.5 behavior.
+        "session",
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
@@ -1568,6 +1604,13 @@ async fn chat_completions(
         // CRIT-1: generate ONE request_id for the entire streaming session so sample_next_token enqueues a request on step 0 and can look up the outcome on every subsequent step.
         // The previous code created a new id per step, meaning no request existed under that.
         let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        // WI-HYBRID Layer 2: key the session tag by request id —
+        // sample_next_token attaches it to the engine Request at enqueue.
+        if let Some(sess) = &session_tag_for_task {
+            if let Ok(mut map) = REQUEST_SESSIONS.lock() {
+                map.insert(session_request_id, sess.clone());
+            }
+        }
         // T1.3: request params feed the device-side sampler for this stream.
         register_request_sampler_params(session_request_id, &body_obj);
 
@@ -2703,6 +2746,26 @@ async fn metrics_endpoint(
         return axum::response::Json(snapshot).into_response();
     }
 
+    // WI (session-continuity Layer 1.5 gate): radix hit-rate metrics — the
+    // "measure hit rate" observability, exported to Prometheus.
+    let prefix_cache = snapshot.get("prefix_cache");
+    let radix_lookups = prefix_cache
+        .and_then(|pc| pc.get("lookups"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let radix_hit_requests = prefix_cache
+        .and_then(|pc| pc.get("hit_requests"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let radix_hit_tokens = prefix_cache
+        .and_then(|pc| pc.get("hit_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let radix_hit_rate = prefix_cache
+        .and_then(|pc| pc.get("hit_rate"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
     let gpu_util = snapshot
         .get("gpu_util_pct")
         .and_then(|v| v.as_f64())
@@ -2782,6 +2845,21 @@ async fn metrics_endpoint(
              grim_response_tokens_per_second {dec_tps:.2}\n"
         ));
     }
+    prometheus_text.push_str(&format!(
+        "# HELP grim_radix_lookups_total Radix prefix-cache lookups (one per request with token ids)\n\
+         # TYPE grim_radix_lookups_total counter\n\
+         grim_radix_lookups_total {radix_lookups}\n\
+         # HELP grim_radix_hit_requests_total Requests that reused a cached radix prefix\n\
+         # TYPE grim_radix_hit_requests_total counter\n\
+         grim_radix_hit_requests_total {radix_hit_requests}\n\
+         # HELP grim_radix_hit_tokens_total Prompt tokens served from the radix prefix cache\n\
+         # TYPE grim_radix_hit_tokens_total counter\n\
+         grim_radix_hit_tokens_total {radix_hit_tokens}\n\
+         # HELP grim_radix_hit_rate Fraction of requests that hit the radix prefix cache\n\
+         # TYPE grim_radix_hit_rate gauge\n\
+         grim_radix_hit_rate {radix_hit_rate:.4}\n"
+    ));
+
     if let Some(pref_tps) = prefill_tps {
         prometheus_text.push_str(&format!(
             "# HELP grim_prefill_tokens_per_second Exponential moving average of prompt tokens prefilled per second\n\
@@ -4058,7 +4136,7 @@ async fn grim_chat(
     // F-6: wall-clock timing so the Ollama stats fields carry real
     // measurements instead of hardcoded zeros.
     let chat_start = std::time::Instant::now();
-    let response = chat_completions(State(state), Json(payload)).await;
+    let response = chat_completions(State(state), axum::http::HeaderMap::new(), Json(payload)).await;
     if !response.status().is_success() {
         return response;
     }
@@ -4228,6 +4306,7 @@ async fn grim_chat(
 /// Grim compatibility /api/generate endpoint.
 async fn grim_generate(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let model_name = req
@@ -4247,10 +4326,16 @@ async fn grim_generate(
         "messages": [{ "role": "user", "content": &prompt }],
         "stream": stream,
     });
+    // WI-HYBRID Layer 2: forward the session tag (body field or header).
+    if let Some(sess) = req.get("session").and_then(|v| v.as_str()) {
+        payload["session"] = serde_json::json!(sess);
+    } else if let Some(sess) = headers.get("x-grim-session").and_then(|v| v.to_str().ok()) {
+        payload["session"] = serde_json::json!(sess);
+    }
     translate_options(&req, &mut payload);
 
     let gen_start = std::time::Instant::now();
-    let response = chat_completions(State(state), Json(payload)).await;
+    let response = chat_completions(State(state), headers, Json(payload)).await;
     if !response.status().is_success() {
         return response;
     }
@@ -5451,7 +5536,23 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
         }
     };
 
-    serde_json::json!({
+        // WI-2: radix prefix-cache hit-rate and reuse-volume observability.
+        let (radix_lookups, radix_hit_requests, radix_hit_tokens) =
+            engine.radix_cache_telemetry();
+        let (_, _, total_tokens_pref2) =
+            (0u64, 0u64, engine.total_tokens_prefilled());
+        let prefix_reuse_ratio = if total_tokens_pref2 > 0 {
+            radix_hit_tokens as f64 / total_tokens_pref2 as f64
+        } else {
+            0.0
+        };
+        let hit_rate = if radix_lookups > 0 {
+            radix_hit_requests as f64 / radix_lookups as f64
+        } else {
+            0.0
+        };
+
+        serde_json::json!({
         "model_name": model_name,
         "tokens_per_sec": tps_json,
         "decode_tokens_per_sec": tps_json,
@@ -5499,6 +5600,15 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
             "device_attempts": qkv_attempts,
             "arena_fallbacks": qkv_fallbacks,
             "sticky_failed_configs": qkv_sticky,
+        },
+        // PLAN-radix-prefix-consume WI-2: hit-rate + reuse-volume observability.
+        "prefix_cache": {
+            "enabled": engine.radix_cache_telemetry().0 > 0 || std::env::var("GRIM_RADIX").as_deref() == Ok("on"),
+            "lookups": radix_lookups,
+            "hit_requests": radix_hit_requests,
+            "hit_tokens": radix_hit_tokens,
+            "hit_rate": hit_rate,
+            "reuse_ratio": prefix_reuse_ratio,
         },
         "models": {
             "grim": grim_models,
@@ -7129,6 +7239,120 @@ mod tests {
     use grim_format::{ChatMessage, ToolCallMsg};
     use grim_tensor::Device;
     use tower::ServiceExt;
+
+    /// WI-HYBRID Layer 2: the optional `session` field is whitelisted (no
+    /// unknown-field 400) and the request completes.
+    #[tokio::test]
+    async fn chat_completions_accepts_session_field() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        ));
+        engine.register_model("default", mock_model);
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            model_arch: std::sync::Mutex::new(None),
+            plugin_registry: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false,
+            "max_tokens": 2,
+            "session": "chat-abc-123"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "session field must be accepted, not rejected as unknown"
+        );
+    }
+
+    /// WI-HYBRID Layer 2: the `x-grim-session` header is honored the same way
+    /// (no 400), matching the field-based transport.
+    #[tokio::test]
+    async fn chat_completions_accepts_x_grim_session_header() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        ));
+        engine.register_model("default", mock_model);
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            model_arch: std::sync::Mutex::new(None),
+            plugin_registry: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false,
+            "max_tokens": 2
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("x-grim-session", "chat-abc-123")
+                    .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
     /// Integration test: grim-server endpoints wire correctly to grim-engine.
     /// Tests that chat_completions endpoint can invoke engine and return valid response.
@@ -9008,6 +9232,7 @@ mod tests {
             adapter_ids: vec![],
             max_new_tokens: 0,
             input_ids: Some(vec![0]),
+            session: None,
         };
         let _ = engine.enqueue_request(req);
         assert!(
@@ -9091,6 +9316,7 @@ mod tests {
             adapter_ids: vec![],
             max_new_tokens: 0,
             input_ids: Some(vec![0]),
+            session: None,
         };
         let _ = engine.enqueue_request(req);
 

@@ -1,4 +1,5 @@
 //! Thin wrapper around `Llama` for olmoe uses a Llama-style transformer.
+// ponytail: dense Llama wrapper alias (no expert stack). Olmoe GGUF checkpoints without expert weights load as dense Llama.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -19,6 +20,10 @@ pub struct OlmoeConfig {
     pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: Option<usize>,
+    pub routed_scaling_factor: f32,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
@@ -36,7 +41,7 @@ impl ModelConfig for OlmoeConfig {
     }
 }
 
-// Model - thin wrapper around Llama
+// Model - OLMoE sparse mixture of experts / Llama wrapper
 
 pub struct Olmoe {
     pub cfg: OlmoeConfig,
@@ -70,7 +75,27 @@ impl Olmoe {
             partial_rotary_factor: 1.0,
             yarn: None,
         };
-        let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
+
+        // If num_experts > 0, wire through MoE blocks (OLMoE: 64 experts, 8 active, top-k softmax)
+        let inner = if cfg.num_experts > 0 {
+            use grim_nn::moe::RouterKind;
+            use crate::moe_block::MoESpec;
+            let spec = MoESpec {
+                num_experts: cfg.num_experts,
+                top_k: cfg.num_experts_per_tok,
+                router_kind: RouterKind::SoftmaxTopK,
+                routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 { 1.0 } else { cfg.routed_scaling_factor },
+                has_shared_expert: false,
+                moe_intermediate_size: cfg.moe_intermediate_size,
+                shared_expert_intermediate_size: None,
+                transposed_expert_layout: false,
+            };
+            let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); cfg.num_layers];
+            Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?
+        } else {
+            Llama::load_tp(device.clone(), ws, llama_cfg, tp)?
+        };
+
         Ok(Self {
             cfg,
             device: inner.device.clone(),

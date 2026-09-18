@@ -1375,7 +1375,7 @@ impl NvmeWeightStreamer {
     pub fn prefetch_layer_async(&self, layer_id: usize) -> Result<()> {
         // Bandwidth Admission and Backpressure check: If bandwidth usage exceeds 12.0 GB/s
         // (~PCIe Gen4 x8 saturation), defer the prefetch instead of saturating the link.
-        let cur_bandwidth = *self.bandwidth_usage.lock().unwrap();
+        let cur_bandwidth = *self.bandwidth_usage.lock().unwrap_or_else(|e| e.into_inner());
         if cur_bandwidth > 12.0 * 1024.0 * 1024.0 * 1024.0 {
             return Err(Error::KvCache(
                 "PCIe transfer bandwidth limit backpressure triggered".into(),
@@ -1390,12 +1390,12 @@ impl NvmeWeightStreamer {
         // cache locks) so I/O errors fail loudly instead of leaving the cache half-mutated.
         let weights = read_layer_weights(&self.weights_path, layer_id, unit_elems, unit_bytes)?;
 
-        *self.uring_submitting.lock().unwrap() = true;
+        *self.uring_submitting.lock().unwrap_or_else(|e| e.into_inner()) = true;
 
         // Populate LRU cache.
-        let mut cache = self.host_weight_cache.lock().unwrap();
-        let mut order = self.lru_order.lock().unwrap();
-        let mut tier_map = self.unit_tier_map.lock().unwrap();
+        let mut cache = self.host_weight_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut order = self.lru_order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tier_map = self.unit_tier_map.lock().unwrap_or_else(|e| e.into_inner());
 
         if !cache.contains_key(&layer_id) {
             // Evict LRU if capacity exceeded; record the evicted unit's tier
@@ -1412,7 +1412,7 @@ impl NvmeWeightStreamer {
             tier_map.insert(layer_id, CacheTier::HostRam);
 
             // Populate double buffers (async swap preparation).
-            let mut buffers = self.double_buffers.lock().unwrap();
+            let mut buffers = self.double_buffers.lock().unwrap_or_else(|e| e.into_inner());
             buffers.1 = weights; // Load into transfer buffer
         } else {
             // Move unit to end of access order (most-recently-used).
@@ -1424,14 +1424,14 @@ impl NvmeWeightStreamer {
             tier_map.insert(layer_id, CacheTier::HostRam);
         }
 
-        *self.uring_submitting.lock().unwrap() = false;
+        *self.uring_submitting.lock().unwrap_or_else(|e| e.into_inner()) = false;
         Ok(())
     }
 
     /// Query the current storage tier of a weight unit.
     /// Returns `Some(CacheTier::HostRam)` if the unit is in the LRU cache, `Some(CacheTier::NvMeWeightStream)` if it was evicted.
     pub fn get_unit_tier(&self, unit_id: usize) -> Option<CacheTier> {
-        self.unit_tier_map.lock().unwrap().get(&unit_id).copied()
+        self.unit_tier_map.lock().unwrap_or_else(|e| e.into_inner()).get(&unit_id).copied()
     }
 
     /// Retrieve the cached weight data for a unit, if present in host RAM.
@@ -1999,7 +1999,7 @@ mod tests {
 
         // Give the receiver thread a moment to write.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let guard = store.lock().unwrap();
+        let guard = store.lock().unwrap_or_else(|e| e.into_inner());
         let stored = guard
             .blocks
             .get(&100)
@@ -2067,7 +2067,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("send_block_remote(size={size}) failed: {e}"));
 
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let guard = store.lock().unwrap();
+            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
             let stored = guard.blocks.get(&block_id).unwrap_or_else(|| {
                 panic!("block {block_id} (size={size}) must have been written");
             });
@@ -2165,7 +2165,7 @@ mod tests {
             .expect("shm send must land in the polled inbox");
 
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
             assert!(guard.block_is_received(7), "block must be stored");
             let (got_k, got_v) = guard.blocks.get(&7).expect("block present");
             assert_eq!(got_k, &k, "keys must be byte-identical");
@@ -2201,7 +2201,7 @@ mod tests {
             .send_block_remote(11, 0, &k, &v, 4, &addr)
             .expect("fallback send must succeed over TCP");
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock().unwrap_or_else(|e| e.into_inner());
         assert!(guard.block_is_received(11));
         let (got_k, got_v) = guard.blocks.get(&11).expect("block present");
         assert_eq!(got_k, &k);
@@ -2356,7 +2356,7 @@ mod tests {
         streamer
             .prefetch_layer_async(0)
             .expect("layer 0 should prefetch");
-        let cache = streamer.host_weight_cache.lock().unwrap();
+        let cache = streamer.host_weight_cache.lock().unwrap_or_else(|e| e.into_inner());
         let got = cache.get(&0).expect("layer 0 should be cached");
         assert_eq!(
             got, &layer0,
@@ -2368,7 +2368,7 @@ mod tests {
         streamer
             .prefetch_layer_async(1)
             .expect("layer 1 should prefetch");
-        let cache = streamer.host_weight_cache.lock().unwrap();
+        let cache = streamer.host_weight_cache.lock().unwrap_or_else(|e| e.into_inner());
         let got1 = cache.get(&1).expect("layer 1 should be cached");
         assert_eq!(
             got1, &layer1,
@@ -2738,7 +2738,7 @@ mod tests {
             .expect("send of NaN-bearing block must succeed");
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock().unwrap_or_else(|e| e.into_inner());
         let stored = guard.blocks.get(&901).expect("NaN block must be stored");
         for (i, (a, b)) in stored.0.iter().zip(k.iter()).enumerate() {
             assert_eq!(
@@ -2773,7 +2773,7 @@ mod tests {
             .expect("send of all-zero block must succeed");
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             guard.block_is_received(902),
             "all-zero block must count as received"
@@ -2908,7 +2908,7 @@ mod tests {
             "error should say the receiver rejected the block: {err}"
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(guard.write_count, 0, "store must receive no writes");
         assert!(
             !guard.blocks.contains_key(&903),

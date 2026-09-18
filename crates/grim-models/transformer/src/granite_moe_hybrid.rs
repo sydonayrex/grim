@@ -66,10 +66,10 @@ impl ModelConfig for GraniteMoeHybridConfig {
 
 // MoE Block
 
-struct GraniteExpert {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+pub struct GraniteExpert {
+    pub gate_proj: Linear,
+    pub up_proj: Linear,
+    pub down_proj: Linear,
 }
 
 impl GraniteExpert {
@@ -94,11 +94,11 @@ impl GraniteExpert {
 }
 
 pub struct GraniteMoeBlock {
-    gate: Linear,
-    experts: Vec<GraniteExpert>,
-    shared_expert: Option<GraniteExpert>,
-    num_experts_per_tok: usize,
-    charon_cache: crate::shared_moe::CharonCache,
+    pub gate: Linear,
+    pub experts: Vec<GraniteExpert>,
+    pub shared_expert: Option<GraniteExpert>,
+    pub num_experts_per_tok: usize,
+    pub charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl GraniteMoeBlock {

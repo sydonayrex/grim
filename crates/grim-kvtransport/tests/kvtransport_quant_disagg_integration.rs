@@ -154,7 +154,7 @@ fn test_network_kv_transport_tcp_loopback_streaming() {
 
     // The send only returns after the receiver's commit ACK.
     {
-        let store = pool.lock().unwrap();
+        let store = pool.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             store.block_is_received(2),
             "Block 2 should be marked received"

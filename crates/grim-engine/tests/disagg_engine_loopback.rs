@@ -113,7 +113,7 @@ fn test_all_zero_kv_block_marked_received() {
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     // Verify the block was received and marked — the core of Issue 1.
-    let pool = engine.block_pool.lock().unwrap();
+    let pool = engine.block_pool.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         pool.block_is_received(0),
         "all-zero KV block must be marked as received (not re-fetched)"
@@ -178,7 +178,7 @@ fn test_disagg_prefill_to_decode_loopback() {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     {
-        let pool = decode_engine.block_pool.lock().unwrap();
+        let pool = decode_engine.block_pool.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             pool.block_is_received(0),
             "decode pool block 0 must be marked received after transfer"
@@ -318,13 +318,13 @@ fn test_pure_transferred_kv_decode_without_local_prefill() {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     {
-        let pool = decode_engine.block_pool.lock().unwrap();
+        let pool = decode_engine.block_pool.lock().unwrap_or_else(|e| e.into_inner());
         assert!(pool.block_is_received(0) && pool.block_is_received(1));
     }
     // Snapshot transferred KV from the PREFILL pool — this is the ground truth
     // the decode side must attend without any local recompute.
     let transferred_l0 = {
-        let ppool = prefill_engine.block_pool.lock().unwrap();
+        let ppool = prefill_engine.block_pool.lock().unwrap_or_else(|e| e.into_inner());
         (
             ppool.read_layer_keys(0, 0).unwrap().to_vec(),
             ppool.read_layer_values(0, 0).unwrap().to_vec(),
@@ -349,7 +349,7 @@ fn test_pure_transferred_kv_decode_without_local_prefill() {
     // layer-0 pages for both transferred blocks must equal the prefill node's
     // pool storage — arrived via network, zero local recompute.
     {
-        let ppool = prefill_engine.block_pool.lock().unwrap();
+        let ppool = prefill_engine.block_pool.lock().unwrap_or_else(|e| e.into_inner());
         let dsession = decode_engine.sessions.get(&1).unwrap();
         for b in 0..2usize {
             let (dk, _dv) = dsession

@@ -20,6 +20,8 @@
     clippy::manual_ignore_case_cmp
 )]
 
+pub mod calibrate_channels;
+pub mod catalog;
 pub mod config;
 pub mod doctor;
 pub mod echo;

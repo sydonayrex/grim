@@ -68,6 +68,11 @@ pub struct Request {
     /// Actual input token IDs for the prompt. If provided,
     /// these are used instead of synthetic position indices during prefill.
     pub input_ids: Option<Vec<u32>>,
+    /// WI-HYBRID Layer 2 (session identity): optional client-supplied session
+    /// tag. Drives (a) decode-graph slot affinity and (b) block pinning so the
+    /// radix LRU doesn't reclaim the session's cached prefix between turns.
+    /// `None` degrades to exactly the Layer 1.5 behavior.
+    pub session: Option<String>,
 }
 
 /// Admission decision for an incoming request.
@@ -877,7 +882,7 @@ mod tests {
         // Oversized single request = 100 tokens -> predicted TTFT = 100ms
         let ctrl = AdmissionController::new(50, 0);
         // Force throughput estimate to 100.0 so 100 tokens = 1000ms > 50ms target
-        *ctrl.throughput_estimate.lock().unwrap() = 100.0;
+        *ctrl.throughput_estimate.lock().unwrap_or_else(|e| e.into_inner()) = 100.0;
 
         let mut sched = Scheduler::new(4096, 8, ctrl);
         sched.enqueue(Request {

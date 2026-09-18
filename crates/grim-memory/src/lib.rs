@@ -291,6 +291,48 @@ impl KvBlockPool {
         self.spill_telemetry
     }
 
+    /// WI-HYBRID Layer 2 retention: pin the radix nodes mapped to `blocks`
+    /// until `secs` seconds idle, so `evict_coldest_leaf`/`demote_cold_prefix`
+    /// /reclaim skip them under pressure from *other* traffic. Advisory only:
+    /// explicit `free`/`rollback` still reclaims pinned pages. Expired pins
+    /// are swept here so the map cannot grow without bound.
+    pub fn pin_blocks(&mut self, blocks: &[BlockId], secs: u64) {
+        self.prefix_tree.sweep_expired_pins();
+        self.prefix_tree.pin_blocks(blocks, secs);
+    }
+
+    /// True while `bid`'s radix node is pin-protected.
+    pub fn is_block_pinned(&self, bid: BlockId) -> bool {
+        self.prefix_tree.is_pinned(bid)
+    }
+
+    /// WI-HYBRID Layer 2 (admission accounting): blocks allocatable RIGHT NOW
+    /// — free list, plus cold unreferenced leaves eviction could free, plus
+    /// spilled unreferenced pages `reclaim_spilled_coldest` could return.
+    /// Pinned blocks are excluded: they are exactly what admission must not
+    /// count on.
+    pub fn allocatable_blocks(&mut self) -> usize {
+        self.prefix_tree.sweep_expired_pins();
+        let evictable = self.prefix_tree.evictable_leaves();
+        let spilled = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(bid, b)| {
+                b.location != CacheTier::Gpu
+                    && !self.ref_counts.contains_key(bid)
+                    && !self.prefix_tree.is_pinned(*bid)
+            })
+            .count();
+        self.free_list.len() + evictable + spilled
+    }
+
+    /// WI-HYBRID Layer 2 (admission rescue): drop the `n` oldest pins so a
+    /// session's demand can be satisfied. Returns how many were dropped.
+    pub fn drop_oldest_pins(&mut self, n: usize) -> usize {
+        self.prefix_tree.drop_oldest_pins(n)
+    }
+
     pub fn attach_spill(&mut self, s: Arc<SharedSpillManager>) {
         self.spill = Some(s);
     }
@@ -366,7 +408,22 @@ impl KvBlockPool {
         blocks: &[BlockId],
         layer_states: Vec<RecurrentLayerState>,
     ) {
-        self.insert_prefix(tokens, blocks);
+        self.insert_prefix_with_recurrent_state_at(tokens, blocks, layer_states, 0);
+    }
+
+    /// Layer 1.5: incremental registration. `blocks[..skip_blocks]` were
+    /// already claimed/registered by this request — only the tail is inserted,
+    /// hashing tokens at absolute offsets. Anchor checkpoint attachment uses
+    /// the full absolute token sequence.
+    pub fn insert_prefix_with_recurrent_state_at(
+        &mut self,
+        tokens: &[u32],
+        blocks: &[BlockId],
+        layer_states: Vec<RecurrentLayerState>,
+        skip_blocks: usize,
+    ) {
+        self.prefix_tree.insert_at(tokens, blocks, skip_blocks);
+        self.prefix_tree.touch(tokens);
 
         // Find semantic anchors in the prompt
         let anchors = self.anchor_registry.find_anchors(tokens);
@@ -441,6 +498,7 @@ impl KvBlockPool {
         for bid in 0..self.blocks.len() {
             if self.blocks[bid].location != CacheTier::Gpu
                 && !self.ref_counts.contains_key(&bid)
+                && !self.prefix_tree.is_pinned(bid)
             {
                 self.prefix_tree.remove(&[bid]);
                 self.blocks[bid].num_tokens = 0;
@@ -526,6 +584,8 @@ impl KvBlockPool {
             }
         }
         // Demote-before-drop: spill manager routes to host RAM + NVMe.
+        // (A tree-mapped block still demotes here — the spill tier IS the
+        // retention mechanism; the prefix-tree entry survives demotion.)
         if let Some(spill) = self.spill.as_ref() {
             let mut demoted = false;
             // 1. Compressed path: the compressor's serialized block IS the spilled bytes
@@ -579,6 +639,14 @@ impl KvBlockPool {
                 // for fresh allocation. Only promote_to_gpu can reclaim it.
             } else {
                 // Both demotion paths failed: the block must stay reclaimable.
+                // Exception: a radix-tree-mapped block is CACHED CONTENT —
+                // zeroing + free-listing it would let a later alloc reuse the
+                // same physical id while the tree still maps tokens to it,
+                // corrupting any subsequent prefix match. Keep it resident and
+                // let `evict_cold`/`demote_cold_prefix` reclaim it when cold.
+                if self.prefix_tree.contains_block(id) {
+                    return Ok(());
+                }
                 // Zero it in place and return it to the free list rather than stranding GPU.
                 self.blocks[id].num_tokens = 0;
                 self.blocks[id].received = false;
@@ -588,6 +656,11 @@ impl KvBlockPool {
                 self.free_list.push_back(id);
             }
         } else {
+            // No spill attached: a radix-tree-mapped block is CACHED CONTENT,
+            // not garbage — keep it resident (see above).
+            if self.prefix_tree.contains_block(id) {
+                return Ok(());
+            }
             // No spill attached: zero the in-place contents directly.
             self.blocks[id].num_tokens = 0;
             self.blocks[id].received = false;
@@ -686,12 +759,29 @@ impl KvBlockPool {
     /// Trie-leaf LRU eviction (Phase 1.6): reclaim the coldest childless tree leaf whose physical block is not actively referenced, freeing its contents (demote-to-host/NVMe if a spill manager is attached, otherwise in-place zero) and returning it to the free list.
     /// Returns `true` if a block was reclaimed.
     fn evict_cold(&mut self) -> bool {
-        let Some(bid) = self.prefix_tree.evict_coldest_leaf() else {
+        // WI (session-continuity step 2): detach the coldest leaf AND its
+        // cascade-pruned ancestors. The old leaf-only return stranded the
+        // ancestors' pages (detached from the tree but never freed) — one
+        // leaked page per multi-block-prefix eviction, which is what
+        // exhausted the pool in the session-pinning churn test.
+        let chain = self.prefix_tree.evict_coldest_chain();
+        let Some(&bid) = chain.first() else {
             return false;
         };
         // Never reclaim a block still attached to a live sequence.
         if self.ref_counts.get(&bid).copied().unwrap_or(0) > 0 {
             return false;
+        }
+        // Pruned ancestors: mapping gone, contents garbage — straight back
+        // to the free list (telemetry counts them as evictions too).
+        for &ancestor in chain[1..].iter() {
+            self.blocks[ancestor].num_tokens = 0;
+            self.blocks[ancestor].received = false;
+            self.blocks[ancestor].key_data.fill(0.0);
+            self.blocks[ancestor].value_data.fill(0.0);
+            self.ref_counts.remove(&ancestor);
+            self.free_list.push_back(ancestor);
+            self.spill_telemetry.demoted_blocks += 1;
         }
         if let Some(spill) = self.spill.as_ref() {
             let mut demoted = false;
@@ -783,6 +873,13 @@ impl KvBlockPool {
         self.blocks.len().saturating_sub(self.free_list.len())
     }
 
+    /// Live pool refcount of `id` (0 = unreferenced; may still be
+    /// radix-cached content — tree state is separate). Test/metrics aid for
+    /// Layer 1.5 refcount accounting.
+    pub fn block_ref_count(&self, id: BlockId) -> u32 {
+        self.ref_counts.get(&id).copied().unwrap_or(0)
+    }
+
     /// Size of a single block in bytes.
     pub fn block_bytes(&self) -> usize {
         self.block_bytes
@@ -823,8 +920,10 @@ impl KvBlockPool {
         }
     }
 
+    /// Take one reference to `id`. A first reference starts at 1 (the missing-
+    /// entry case covers radix-cached blocks being re-adopted by `seed_prefix`).
     pub fn add_ref(&mut self, id: BlockId) {
-        *self.ref_counts.entry(id).or_insert(1) += 1;
+        *self.ref_counts.entry(id).or_insert(0) += 1;
     }
 
     pub fn write_keys(&mut self, id: BlockId, keys: &[f32], num_tokens: usize) {
@@ -1094,6 +1193,15 @@ pub struct PagedKvCache {
     /// WI-kv: cached device-resident block table (`BlockTableEntry` ABI), keyed on (len, first id, last id).
     /// Skips the per-layer-per-token H2D upload of the table in the paged-attention decode path.
     gpu_block_table: std::sync::Mutex<Option<GpuBlockTableCache>>,
+    /// Layer 1.5: how many leading table blocks were seeded from the radix
+    /// tree and still need their pool bytes staged into the session pages.
+    /// Hydration is LAZY (per layer, on first append for that layer) because
+    /// the real per-token stride is only known once a model tensor arrives —
+    /// config-side geometry is wrong whenever the registered model's kv shape
+    /// differs from `EngineConfig` defaults.
+    seeded_blocks_pending: usize,
+    /// Layers whose seeded prefix blocks have already been staged into pages.
+    hydrated_layers: std::collections::HashSet<usize>,
 }
 
 /// Cached device block table + the fingerprint it was built from.
@@ -1180,6 +1288,39 @@ impl PagedKvCache {
             mirror_state: std::sync::Mutex::new(DeviceKvMirror::default()),
             gpu_block_table: std::sync::Mutex::new(None),
             gpu_paged_v: Vec::new(),
+            seeded_blocks_pending: 0,
+            hydrated_layers: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Layer 1.5: stage the seeded prefix blocks' K/V from the shared pool
+    /// into the pages of `layer` (whose buffers have just been created with
+    /// the model's real `stride`), then mark them dirty for device upload.
+    /// Idempotent per layer; a no-op when no seed is pending.
+    fn hydrate_seeded_layer_from_pool(&mut self, layer: usize, stride: usize) {
+        if self.seeded_blocks_pending == 0 || !self.hydrated_layers.insert(layer) {
+            return;
+        }
+        let block_elems = self.page_size * stride;
+        let seeded: Vec<BlockId> =
+            self.table.logical_to_physical[..self.seeded_blocks_pending].to_vec();
+        let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
+        for bid in seeded {
+            let off = bid * block_elems;
+            if let (Some(lk), Some(lv)) =
+                (pool.read_layer_keys(bid, layer), pool.read_layer_values(bid, layer))
+            {
+                let k_len = lk.len().min(block_elems);
+                let v_len = lv.len().min(block_elems);
+                if off + k_len <= self.k_pages[layer].len() {
+                    self.k_pages[layer][off..off + k_len].copy_from_slice(&lk[..k_len]);
+                }
+                if off + v_len <= self.v_pages[layer].len() {
+                    self.v_pages[layer][off..off + v_len].copy_from_slice(&lv[..v_len]);
+                }
+            }
+            m.dirty.insert((layer, bid));
         }
     }
 
@@ -1449,12 +1590,47 @@ impl KvCache for PagedKvCache {
         // actual per-token stride so the flat layout matches the kernel.
         let page_elems = self.capacity * self.page_size * stride;
         if self.k_pages.len() <= layer {
-            for _ in self.k_pages.len()..=layer {
+            // Layers created after a radix `seed_prefix` must start their write
+            // cursor at the seeded prefix length, not at 0 — otherwise the
+            // first append would overwrite the seeded prefix. `committed_tokens`
+            // at this point counts every token layer 0 already appended in this
+            // chunk (and, via `seed_prefix`, the seeded prefix), so the seed
+            // offset for a fresh layer L is `committed_tokens` for L==0 (this
+            // chunk not yet counted for it) and `committed_tokens - seq` for
+            // L>0 (layer 0 counted the chunk already).
+            for l in self.k_pages.len()..=layer {
+                let init_cursor = if l == 0 {
+                    self.committed_tokens
+                } else {
+                    self.committed_tokens.saturating_sub(seq)
+                };
                 self.k_pages.push(vec![0.0f32; page_elems]);
                 self.v_pages.push(vec![0.0f32; page_elems]);
-                self.layer_committed_tokens.push(0);
+                self.layer_committed_tokens.push(init_cursor);
             }
         }
+        // WI (session-continuity P2-1, step 1): ATOMIC block reservation.
+        // Layer 0 pre-allocates every block this append will need BEFORE any
+        // write or cursor advance. A mid-loop alloc failure (pool exhausted
+        // under pinned blocks + churn) used to abort layer 0 with
+        // committed_tokens already advanced while the table stayed short;
+        // the next layer's cursor then indexed past the table (the
+        // len-2/index-2 crash). Now an alloc failure fails the whole append
+        // up front, so layers can never desync.
+        if layer == 0 {
+            let req_blocks = (self.committed_tokens + seq).div_ceil(BLOCK_SIZE);
+            if self.table.len() < req_blocks {
+                let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+                while self.table.len() < req_blocks {
+                    let id = pool.alloc()?;
+                    self.table.push(id);
+                    self.block_table_u32.push(id as u32);
+                }
+            }
+        }
+        // Layer 1.5: lazily stage seeded prefix blocks' K/V into this layer's
+        // pages — the model's real stride is only known now, at first contact.
+        self.hydrate_seeded_layer_from_pool(layer, stride);
         for t in 0..seq {
             // Only layer 0 drives block-table growth (all layers see the same token sequence,
             // so `append_slot` must fire once per token, not once per layer per token).
@@ -1463,6 +1639,14 @@ impl KvCache for PagedKvCache {
             }
             let pos = self.layer_committed_tokens[layer];
             let block_idx = pos / self.page_size;
+            // Fail-closed: a short table here is a layer-desync bug, never a
+            // recoverable state — error out instead of panicking mid-write.
+            if block_idx >= self.table.len() {
+                return Err(grim_core::error::Error::KvCache(format!(
+                    "append_kv_layer: block_idx {block_idx} beyond table len {} (layer {layer}, pos {pos}, seq {seq}) — KV layer desync",
+                    self.table.len()
+                )));
+            }
             let physical = self.table.logical_to_physical[block_idx];
             let slot = physical * self.page_size + (pos % self.page_size);
             let offset = slot * stride;
@@ -1724,13 +1908,54 @@ impl KvCache for PagedKvCache {
         for &b in blocks {
             pool.add_ref(b);
             self.table.push(b);
+            self.block_table_u32.push(b as u32);
         }
         self.committed_tokens = self.table.len() * BLOCK_SIZE;
+        // Layers that already exist (rare on a fresh cache) resume after the seed.
+        for cursor in self.layer_committed_tokens.iter_mut() {
+            *cursor = self.committed_tokens;
+        }
+        // The pool-side K/V bytes are staged lazily on each layer's first
+        // append (`hydrate_seeded_layer_from_pool`), when the model's real
+        // per-token stride is known.
+        self.seeded_blocks_pending = blocks.len();
+    }
+
+    fn gather_kv_f32(&self, layer: usize, num_tokens: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        if num_tokens == 0 {
+            return Some((Vec::new(), Vec::new()));
+        }
+        let k_layer = self.k_pages.get(layer)?;
+        let v_layer = self.v_pages.get(layer)?;
+        if k_layer.is_empty() || v_layer.is_empty() {
+            return None;
+        }
+        let stride = k_layer.len() / (self.capacity * self.page_size);
+        if stride == 0 {
+            return None;
+        }
+        let block_elems = self.page_size * stride;
+        let n_blocks = num_tokens.div_ceil(self.page_size).min(self.table.len());
+        let mut k = Vec::with_capacity(n_blocks * block_elems);
+        let mut v = Vec::with_capacity(n_blocks * block_elems);
+        for &pid in &self.table.logical_to_physical[..n_blocks] {
+            let off = pid * block_elems;
+            let end = (off + block_elems).min(k_layer.len());
+            if off >= end {
+                return None;
+            }
+            k.extend_from_slice(&k_layer[off..end]);
+            v.extend_from_slice(&v_layer[off..end]);
+        }
+        k.truncate(num_tokens * stride);
+        v.truncate(num_tokens * stride);
+        Some((k, v))
     }
 
     fn prefix_physical_ids(&self) -> Vec<usize> {
         self.table.physical_ids().to_vec()
     }
+
 
     fn num_layers(&self) -> usize {
         self.k_pages.len()
@@ -2475,5 +2700,148 @@ mod f10_mirror_tests {
             "mirror uploads must beat naive full-layer staging (up={up})"
         );
         let _ = elems;
+    }
+
+    /// Layer 1.5 unit: `seed_prefix` must publish the seeded blocks in the
+    /// device-visible u32 block table, advance every per-layer write cursor to
+    /// the seeded length, and stage the pool's K/V bytes lazily on each
+    /// layer's first append — WITH THE MODEL'S REAL STRIDE (regression: the
+    /// engine-size (4 heads × 128 dim) config geometry must not leak into the
+    /// consumer model's (2×4) page layout). A post-seed append must land
+    /// AFTER the prefix, never overwrite it.
+    #[test]
+    fn seed_prefix_hydrates_pages_and_appends_resume_after_prefix() {
+        const LAYERS: usize = 3;
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(8, 2, 4)));
+        let tokens: Vec<u32> = (0..32u32).collect(); // exactly 2 full blocks
+
+        // Producer request A: compute the prefix through the real append path.
+        let mut a = PagedKvCache::new(pool.clone(), 2, 4, BLOCK_SIZE);
+        for layer in 0..LAYERS {
+            let k = grim_backend_cpu::cpu_tensor(
+                (0..32 * 2 * 4)
+                    .map(|i| (layer as f32) + (i as f32) * 0.001)
+                    .collect::<Vec<f32>>(),
+                Shape::new(vec![32, 2 * 4]),
+            );
+            let v = grim_backend_cpu::cpu_tensor(
+                vec![layer as f32; 32 * 2 * 4],
+                Shape::new(vec![32, 2 * 4]),
+            );
+            a.append_kv_layer(layer, &k, &v).unwrap();
+        }
+        let a_blocks = a.prefix_physical_ids();
+        assert_eq!(a_blocks.len(), 2);
+        {
+            let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+            p.insert_prefix(&tokens, &a_blocks);
+        }
+        // Request A finishes: blocks release their pool ref, the tree entry
+        // becomes a cold cached prefix (tree refcount returns to 0).
+        a.rollback_to(0).unwrap();
+        {
+            let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+            p.remove_prefix(&a_blocks);
+        }
+        drop(a);
+
+        // Request B: engine consumes the radix match. NOTE the deliberately
+        // wrong config geometry (4×128, the EngineConfig default) — the
+        // consumer's real stride (2×4) is learned at first append, and
+        // hydration must use THAT, not the config.
+        let (matched, matched_tokens, _promoted) = pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .match_prefix_promoting(&tokens);
+        assert_eq!((matched.len(), matched_tokens), (2, 32));
+
+        let mut b = PagedKvCache::new(pool.clone(), 4, 128, BLOCK_SIZE);
+        b.seed_prefix(&matched);
+
+        // Seeded table is visible to the attention path immediately.
+        let seeded_ids: Vec<usize> = b
+            .block_table()
+            .unwrap()
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
+        assert_eq!(seeded_ids, matched);
+        assert_eq!(b.len(), 32);
+        // Pool refcounts were taken for the seeded blocks.
+        {
+            let p = pool.lock().unwrap_or_else(|e| e.into_inner());
+            for &bid in &matched {
+                assert!(
+                    p.block_ref_count(bid) >= 1,
+                    "seeded block {bid} must be refcounted"
+                );
+            }
+        }
+
+        // Append the tail chunk. The first append per layer lazily stages the
+        // seeded prefix with the TENSOR's stride, then writes after it.
+        let tail = grim_backend_cpu::cpu_tensor(
+            vec![9.0f32; 16 * 2 * 4],
+            Shape::new(vec![16, 2 * 4]),
+        );
+        let tail_v = tail.clone();
+        for layer in 0..LAYERS {
+            b.append_kv_layer(layer, &tail, &tail_v).unwrap();
+        }
+        assert_eq!(b.len(), 48);
+        assert_eq!(b.table.len(), 3);
+
+        // Hydrated prefix content is present per layer with the model's real
+        // stride: producer K flat index for (token t, channel c) is t*8+c, so
+        // block 1's first element is i=128 → layer + 0.128. And the seeded
+        // block was NOT overwritten by the tail append (9.0).
+        for layer in 0..LAYERS {
+            let (k_slice, v_slice) = b.layer_block_slice(layer, matched[1]).unwrap();
+            assert_eq!(v_slice, &vec![layer as f32; BLOCK_SIZE * 2 * 4][..]);
+            assert_eq!(k_slice[0], layer as f32 + 0.128);
+            let (k0, _) = b.layer_block_slice(layer, matched[0]).unwrap();
+            assert_eq!(
+                k0[0],
+                layer as f32,
+                "layer {layer} seeded block 0 was overwritten by the tail append"
+            );
+        }
+
+        // gather_kv_f32 (the prefill-prefix attention feed) returns the
+        // producer's rows followed by the appended tail, block-table ordered.
+        let (k_all, v_all) = b.gather_kv_f32(1, 48).unwrap();
+        let stride = 2 * 4;
+        assert_eq!(k_all.len(), 48 * stride);
+        assert_eq!(k_all[0], 1.0, "layer 1, first seeded row");
+        assert_eq!(k_all[16 * stride..16 * stride + 1][0], 1.0 + 0.128);
+        assert_eq!(k_all[32 * stride], 9.0, "tail row follows the prefix");
+        assert_eq!(v_all[0], 1.0);
+        assert_eq!(v_all[47 * stride], 9.0);
+
+        // Finish: rollback returns every block (seeded + computed) to the pool.
+        b.rollback_to(0).unwrap();
+        {
+            let p = pool.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !p.ref_counts.values().any(|&c| c > 0),
+                "all blocks must be unreferenced after rollback"
+            );
+        }
+    }
+
+    /// Regression: hydration with zero matched blocks / zero layers is a no-op
+    /// that leaves the cache empty (engine calls it unconditionally after a
+    /// zero-length match on the GRIM_RADIX-disabled path).
+    #[test]
+    fn hydrate_prefix_from_pool_is_noop_when_unseeded() {
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
+        let mut cache = PagedKvCache::new(pool.clone(), 2, 4, BLOCK_SIZE);
+        // Nothing seeded: a first append behaves exactly like a fresh cache.
+        let k = grim_backend_cpu::cpu_tensor(vec![1.0f32; 16 * 2 * 4], Shape::new(vec![16, 2 * 4]));
+        let v = k.clone();
+        cache.append_kv_layer(0, &k, &v).unwrap();
+        assert_eq!(cache.len(), 16);
+        let (k_slice, _) = cache.layer_block_slice(0, cache.table.logical_to_physical[0]).unwrap();
+        assert_eq!(k_slice[0], 1.0);
     }
 }

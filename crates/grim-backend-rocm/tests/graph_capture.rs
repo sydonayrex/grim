@@ -135,7 +135,7 @@ fn run_seq(
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn eager_vs_captured_multi_op_match() -> TestResult {
-    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         return Ok(());
     };
@@ -185,7 +185,7 @@ fn eager_vs_captured_multi_op_match() -> TestResult {
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn replay_with_different_key_returns_false() -> TestResult {
-    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         return Ok(());
     };
@@ -228,7 +228,7 @@ fn replay_with_different_key_returns_false() -> TestResult {
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
 fn capture_then_replay_undercuts_eager_loop() -> TestResult {
-    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         return Ok(());
     };
@@ -272,7 +272,7 @@ fn capture_then_replay_undercuts_eager_loop() -> TestResult {
 #[test]
 fn rocm_device_implements_graph_capture_ops_trait() -> TestResult {
     use grim_tensor::GraphCaptureOps;
-    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         return Ok(());
     };

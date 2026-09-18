@@ -4839,7 +4839,7 @@ mod tests {
 
     #[test]
     fn resolve_arch_compat_spec_finds_grimplugin_in_plugins_dir() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_dir = tempfile::TempDir::new().expect("temp dir");
 
         // Write a .grimplugin JSON into the temp dir.
@@ -4903,7 +4903,7 @@ mod tests {
     /// over the plugins-dir scan when both are available.
     #[test]
     fn resolve_arch_compat_spec_prefers_inline_config_over_plugins_dir() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_dir = tempfile::TempDir::new().expect("temp dir");
 
         // Write a .grimplugin into the plugins dir with one set of values.

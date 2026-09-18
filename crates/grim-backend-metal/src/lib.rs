@@ -435,7 +435,7 @@ impl BackendStorage for MetalStorage {
                 }
                 Ok(out)
             } else if let Some(ref data) = self.data {
-                let data_guard = data.lock().unwrap();
+                let data_guard = data.lock().unwrap_or_else(|e| e.into_inner());
                 let elem_count = self.shape.elem_count();
                 let mut out = vec![0.0f32; elem_count];
                 let bytes = elem_count * dtype_byte_size(&self.dtype)?;
@@ -460,7 +460,7 @@ impl BackendStorage for MetalStorage {
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let data_guard = self.data.lock().unwrap();
+            let data_guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
             let elem_count = self.shape.elem_count();
             match self.dtype.storage {
                 DTypeStorage::KQuant(KQuantScheme::Q80) => {
@@ -627,7 +627,10 @@ impl MetalDevice {
             .inner
             .as_ref()
             .ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
-        let mut active = inner.active_command_buffer.lock().unwrap();
+        let mut active = inner
+            .active_command_buffer
+            .lock()
+            .map_err(|_| Error::Backend("Metal active_command_buffer mutex poisoned".into()))?;
         if let Some(ref buf) = *active {
             use objc2_metal::MTLCommandBufferStatus;
             if buf.status() == MTLCommandBufferStatus::NotEnqueued {
@@ -645,7 +648,10 @@ impl MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                let mut active = inner.active_command_buffer.lock().unwrap();
+                let mut active = inner
+                    .active_command_buffer
+                    .lock()
+                    .map_err(|_| Error::Backend("Metal active_command_buffer mutex poisoned".into()))?;
                 if let Some(buf) = active.take() {
                     buf.commit();
                 }
@@ -1601,7 +1607,7 @@ impl MetalDevice {
                         "fused_rmsnorm_mxfp4_gemm CPU fallback: w_packed not MetalStorage".into(),
                     )
                 })?;
-            let w_data = w_s.data.lock().unwrap();
+            let w_data = w_s.data.lock().unwrap_or_else(|e| e.into_inner());
             let w_bytes: &[u8] = w_data.as_slice();
             let codes_bytes = k.div_ceil(2);
             let exps_bytes = k / 32;
@@ -5516,7 +5522,7 @@ impl QuantOps for MetalDevice {
                 let len = m_s.shape.elem_count();
                 unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
             } else if let Some(ref d) = m_s.data {
-                d.lock().unwrap().clone()
+                d.lock().unwrap_or_else(|e| e.into_inner()).clone()
             } else {
                 vec![0u8; k * n]
             }
@@ -5526,7 +5532,7 @@ impl QuantOps for MetalDevice {
 
         #[cfg(not(target_vendor = "apple"))]
         let b_bytes = if let Some(m_s) = b_packed.as_any().downcast_ref::<MetalStorage>() {
-            m_s.data.lock().unwrap().clone()
+            m_s.data.lock().unwrap_or_else(|e| e.into_inner()).clone()
         } else {
             vec![0u8; k * n]
         };

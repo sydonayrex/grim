@@ -65,6 +65,21 @@ Spill telemetry (demoted/promoted/reclaimed counts) is exposed via
 `check_and_repromote_blocks` propagates errors instead of attending stale
 pages.
 
+### Session Identity (WI-HYBRID Layer 2, optional)
+
+| Variable | Type | Default | Used By | Description |
+|---|---|---|---|---|
+| `GRIM_SESSION_GRAPH_SLOTS` | int | `2` | `grim-engine` | Max session-scoped decode-graph slots kept warm per model (LRU eviction beyond the cap). Each slot owns full device arenas. |
+| `GRIM_SESSION_PIN_SECS` | int | `300` | `grim-engine` | Seconds a session-tagged request's KV blocks stay pinned against radix-LRU eviction since the last session-tagged turn (idle-time pin, refreshed per turn). |
+
+Transport: send an optional `"session": "<tag>"` field (or an
+`x-grim-session` header) on `/api/generate` or `/v1/chat/completions`.
+Effects: (a) decode-graph slot affinity — the session reuses its own graph
+slot and arena state; (b) the turn's KV blocks are pinned so other traffic's
+memory pressure cannot reclaim the cached prefix between turns. Omitting the
+tag degrades to plain opportunistic prefix reuse (Layer 1.5) with default
+LRU — never a correctness difference.
+
 ### Backend & Hardware Selection
 
 | Variable | Type | Default | Used By | Description |

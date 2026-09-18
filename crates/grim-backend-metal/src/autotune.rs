@@ -94,7 +94,7 @@ impl MetalAutotuner {
         if path.exists() {
             if let Ok(data) = fs::read_to_string(&path) {
                 if let Ok(entries) = serde_json::from_str::<Vec<CacheEntry>>(&data) {
-                    let mut lock = self.cache.lock().unwrap();
+                    let mut lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                     for entry in entries {
                         let sc = match entry.shape_class.as_str() {
                             "TLOLog" => ShapeClass::TLOLog,
@@ -118,7 +118,7 @@ impl MetalAutotuner {
         let _ = fs::create_dir_all(".autotune_cache");
         let path = PathBuf::from(format!(".autotune_cache/metal_{:016x}.json", hash));
 
-        let lock = self.cache.lock().unwrap();
+        let lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let entries: Vec<CacheEntry> = lock
             .iter()
             .map(
@@ -172,7 +172,7 @@ impl MetalAutotuner {
         };
 
         let caps_hash = caps.cache_key_hash();
-        let mut lock = self.cache.lock().unwrap();
+        let mut lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let key = (caps_hash, m, n, k, shape_class);
 
         if let Some((cfg, _ms)) = lock.get(&key) {

@@ -2538,6 +2538,7 @@ dependencies = [
  "grim-engine",
  "grim-format",
  "grim-garage",
+ "grim-kvquant",
  "grim-memory",
  "grim-models-mamba",
  "grim-models-transformer",
@@ -2711,7 +2712,10 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-core",
+ "grim-quant",
  "grim-tensor",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
