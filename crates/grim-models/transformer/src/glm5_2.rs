@@ -122,6 +122,8 @@ pub struct Glm52Moe {
     pub gate: Linear,
     pub experts: Vec<Glm52Expert>,
     pub num_experts_per_tok: usize,
+    /// Resident GPU weight cache for the GELU Charon dispatch path.
+    charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl Glm52Moe {
@@ -141,6 +143,7 @@ impl Glm52Moe {
             gate,
             experts,
             num_experts_per_tok: cfg.num_experts_per_tok.max(1),
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
@@ -151,40 +154,61 @@ impl Glm52Moe {
         let logits_v = logits.to_vec_f32()?;
         let num_exp = self.experts.len();
 
-        let xv = x.to_vec_f32()?;
-        let mut out = vec![0.0f32; seq_len * hidden_dim];
-
+        // Build per-token top-k routings (used by both GPU and CPU paths).
+        let mut routings: Vec<crate::shared_moe::TokenRouting> =
+            Vec::with_capacity(seq_len);
         for s in 0..seq_len {
             let row_logits = &logits_v[s * num_exp..(s + 1) * num_exp];
-            // Top-k selection
-            let mut indexed: Vec<(usize, f32)> = row_logits.iter().cloned().enumerate().collect();
+            let mut indexed: Vec<(usize, f32)> =
+                row_logits.iter().cloned().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
-
-            // Softmax over top-k
-            let max_logit = topk
-                .iter()
-                .map(|(_, l)| *l)
-                .fold(f32::NEG_INFINITY, f32::max);
+            let max_logit = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_logit).exp()).collect();
             let sum_exp: f32 = exps.iter().sum();
             let weights: Vec<f32> = exps.iter().map(|e| e / (sum_exp + 1e-12)).collect();
+            routings.push(topk.iter().zip(weights.iter()).map(|((ei, _), w)| (*ei, *w)).collect());
+        }
 
+        // GPU path: Charon GELU grouped dispatch (ROCm only).
+        if matches!(x.device(), grim_tensor::Device::Rocm(_)) {
+            let gate_refs: Vec<&grim_tensor::Tensor> =
+                self.experts.iter().map(|e| &e.dense_h_to_4h.weight).collect();
+            let down_refs: Vec<&grim_tensor::Tensor> =
+                self.experts.iter().map(|e| &e.dense_4h_to_h.weight).collect();
+            let dev = grim_backend_rocm::RocmDevice::shared(match x.device() {
+                grim_tensor::Device::Rocm(o) => *o,
+                _ => unreachable!(),
+            });
+            if let Some(out) = crate::shared_moe::gelu_charon_dispatch(
+                &*dev,
+                x,
+                &gate_refs,
+                &down_refs,
+                &routings,
+                1.0,
+                &self.charon_cache,
+            )? {
+                return Ok(out);
+            }
+        }
+
+        // CPU fallback: per-expert GELU loop.
+        let xv = x.to_vec_f32()?;
+        let mut out = vec![0.0f32; seq_len * hidden_dim];
+        for (s, routing) in routings.iter().enumerate() {
             let token_x = cpu_tensor(
                 xv[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
                 Shape::new(vec![1, hidden_dim]),
             );
-
-            for (i, (expert_idx, _)) in topk.iter().enumerate() {
-                let w = weights[i];
-                let exp_out = self.experts[*expert_idx].forward(&token_x)?;
+            for &(expert_idx, w) in routing {
+                let exp_out = self.experts[expert_idx].forward(&token_x)?;
                 let exp_out_v = exp_out.to_vec_f32()?;
                 for d in 0..hidden_dim {
                     out[s * hidden_dim + d] += w * exp_out_v[d];
                 }
             }
         }
-
         Ok(cpu_tensor(out, x.shape().clone()))
     }
 }
@@ -493,6 +517,104 @@ mod tests {
         assert_eq!(
             ModelArchitecture::from_str("glm5_2"),
             ModelArchitecture::Glm52
+        );
+    }
+}
+
+// ===========================================================================
+// GELU Charon dispatch parity (WI-gpu-native-moe Phase 3): the device grouped
+// GELU kernel (null expert_up_w, tanh-approx GELU) must match the host
+// reference loop. Regression: the launch was rejected by the null-check on
+// expert_up_w before `allow_null_up` was added to validate_grouped_inputs.
+// =========================================================================
+
+#[cfg(test)]
+mod gelu_dispatch_parity_tests {
+    use super::*;
+    use grim_backend_rocm::RocmDevice;
+    use grim_tensor::CoreTensorOps;
+
+    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4
+            })
+            .collect()
+    }
+
+    fn rocm_tensor(dev: &RocmDevice, data: Vec<f32>, shape: Shape) -> Tensor {
+        let storage = dev.from_cpu(&data, &shape, grim_tensor::dtype::DType::F32).unwrap();
+        Tensor::new(
+            std::sync::Arc::from(storage),
+            shape,
+            grim_tensor::dtype::DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            Device::Rocm(0),
+        )
+    }
+
+    fn make_moe(dev: Option<&RocmDevice>, hidden: usize, inter: usize, n_exp: usize) -> Glm52Moe {
+        let lin = |data: Vec<f32>, out: usize, inp: usize| -> Linear {
+            let t = match dev {
+                Some(d) => rocm_tensor(d, data, Shape::new(vec![out, inp])),
+                None => cpu_tensor(data, Shape::new(vec![out, inp])),
+            };
+            Linear::from_tensor(t, None)
+        };
+        let experts = (0..n_exp)
+            .map(|e| {
+                let s = (e as u64 + 1) * 613;
+                Glm52Expert {
+                    dense_h_to_4h: lin(rand_vec(inter * hidden, s + 1), inter, hidden),
+                    dense_4h_to_h: lin(rand_vec(inter * hidden, s + 2), hidden, inter),
+                }
+            })
+            .collect();
+        Glm52Moe {
+            gate: lin(rand_vec(n_exp * hidden, 42), n_exp, hidden),
+            experts,
+            num_experts_per_tok: 2,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+        }
+    }
+
+    #[test]
+    fn glm52_gelu_charon_dispatch_matches_host_reference() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+            return;
+        }
+        let _gpu = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = RocmDevice::shared(0);
+        let hidden = 32usize;
+        let inter = 64usize;
+        let n_exp = 8usize;
+        let seq = 3usize;
+
+        let block_gpu = make_moe(Some(&dev), hidden, inter, n_exp);
+        let x_data = rand_vec(seq * hidden, 7);
+        let x = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![seq, hidden]));
+        let out_gpu = block_gpu.forward(&x).unwrap().to_vec_f32().unwrap();
+
+        // Host reference: identical weights on CPU device (host loop path).
+        let block_cpu = make_moe(None, hidden, inter, n_exp);
+        let out_ref = block_cpu
+            .forward(&cpu_tensor(x_data, Shape::new(vec![seq, hidden])))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(out_gpu.len(), out_ref.len());
+        let max_diff = out_gpu
+            .iter()
+            .zip(out_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "GELU Charon dispatch diverged from host reference: max_diff={max_diff}"
         );
     }
 }

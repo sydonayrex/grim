@@ -2,7 +2,6 @@
 pub mod cache_blend;
 pub mod model_loader;
 pub mod packing;
-pub mod pipeline_engine;
 pub mod pipelines;
 pub mod rope_scaling;
 /// SCYTHE-2 WI-4 + WI-7: C²PLR controller, PlacementCache, ScytheRing.
@@ -16,12 +15,6 @@ pub mod tp_layers;
 pub mod train_packed;
 
 pub use cache_blend::{CacheBlendEngine, CachedSegment, StitchedPromptLayout};
-pub use pipeline_engine::{
-    InprocVppTransport, PipelinePlan, PipelineStageConfig, PipelineStageExecutor,
-    PipelineStageRunner, PipelinedModelCoordinator, TcpVppTransport, VirtualPipelineCoordinator,
-    VirtualPipelinePlan, VppActivationTransport, VppChannel, VppStep, VppTransfer,
-    vpp_async_schedule,
-};
 pub use pipelines::moe_prefill_pipeline::{BufferRole, MoePrefillPipeline};
 
 use std::collections::HashMap;
@@ -97,9 +90,6 @@ pub struct EngineConfig {
     pub tp_size: usize,
     /// Explicit GPU ordinals for TP (`GRIM_GPUS`, empty = all visible).
     pub tp_gpus: Vec<usize>,
-    /// Pipeline-parallel size (`GRIM_PP_SIZE`, 0/1 = off).
-    /// The stage layout (`pipeline_engine::PipelinePlan`) is computed and validated at engine startup, but block-level execution is.
-    pub pp_size: usize,
     /// WI-TOOLS-4c-i: hard cap on the total number of tool-call entries across every assistant message in a single request's `messages` array.
     /// Rejects the request with 400 once a conversation has made more tool calls than a.
     pub max_tool_calls_per_conversation: usize,
@@ -143,10 +133,6 @@ impl Default for EngineConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
-            pp_size: std::env::var("GRIM_PP_SIZE")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0),
             max_tool_calls_per_conversation: 20,
             max_messages_per_request: 200,
             disagg_router: None,
@@ -432,6 +418,31 @@ impl Engine {
             pool.attach_compressor(comp.clone());
         }
 
+        // WI-HYBRID-ATTENTION-OFFLOAD (Phase 1):
+        // Attach a SharedSpillManager when GRIM_KV_SPILL=1 (or true/on).
+        let kv_spill_enabled = std::env::var("GRIM_KV_SPILL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        if kv_spill_enabled {
+            let scratch_dir = std::env::var("GRIM_KV_SPILL_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join(format!("grim_kv_spill_{}", std::process::id())));
+            let block_elems = BLOCK_SIZE * config.num_kv_heads * config.head_dim;
+            match grim_kvtransport::SharedSpillManager::new(scratch_dir.clone(), block_elems) {
+                Ok(spill_mgr) => {
+                    log::info!(
+                        "[grim-engine] attached SharedSpillManager (scratch: {:?}, block_elems: {})",
+                        scratch_dir,
+                        block_elems
+                    );
+                    pool.attach_spill(std::sync::Arc::new(spill_mgr));
+                }
+                Err(e) => {
+                    log::warn!("[grim-engine] failed to create SharedSpillManager: {e}");
+                }
+            }
+        }
+
         // Tensor-parallel bootstrap (§c-tp-scope, WI-TP-4).
         // Design A (multi-process): one OS process per rank.
         let tp_config: Option<grim_nn::TensorParallelConfig> = if config.tp_size > 1 {
@@ -535,26 +546,6 @@ impl Engine {
         })));
         let target_ttft = config.target_ttft_ms as f64;
         let target_itl = config.target_itl_ms as f64;
-
-        // Pipeline-parallel gate. The stage layout is computable now, but block-level execution is NOT wired:
-        // a paged KV pool is single-device, so per-stage KV pools are the prerequisite.
-        // Engine::new is infallible (returns Self), so we emit a clear diagnostic then panic.
-        if config.pp_size > 1 {
-            eprintln!(
-                "[grim] ERROR: pipeline-parallel execution (GRIM_PP_SIZE={}) is not yet \
-                 wired into block execution. The paged KV pool is single-device; per-stage \
-                 KV pools are a prerequisite. Unset GRIM_PP_SIZE (or set it to 0/1) to run \
-                 single-device. See docs/serving-parity-plan.md P2.",
-                config.pp_size
-            );
-            panic!(
-                "[grim-engine] INVALID config (GRIM_PP_SIZE={}): pipeline-parallel \
-                 execution is not yet wired into block execution (a paged KV pool is \
-                 single-device, so per-stage KV pools are a prerequisite). See \
-                 docs/serving-parity-plan.md P2.",
-                config.pp_size
-            );
-        }
 
         let is_multi_gpu = tp_config
             .as_ref()
@@ -1103,6 +1094,35 @@ impl Engine {
 
     /// Register a `CausalLm` with an attached DSpark bundle (draft + Markov + confidence heads).
     /// The engine will pick DSpark speculation automatically.
+
+    /// Build a DSpark-wrapped model from a target + draft backbone, sizing the
+    /// markov/confidence heads from the target's real hyperparameters.
+    ///
+    /// dats-demm §3: this wires the previously-dead markov/confidence/scheduler
+    /// stack end-to-end — `Strategy::DSpark` in the decode loop is now
+    /// reachable from production entrypoints (CLI `--draft-model`, engine
+    /// `load_and_register_speculative`).
+    pub fn build_dspark_model(
+        model: Box<dyn CausalLm>,
+        draft: Arc<dyn DraftBackbone>,
+    ) -> Box<SpeculativeCausalLm> {
+        let vocab = model
+            .arch_hyperparams()
+            .map(|h| h.vocab_size)
+            .unwrap_or(128256);
+        // ponytail: UniformMarkovHead ignores hidden today; pass it through
+        // anyway once the head grows a projection.
+        let markov = Arc::new(grim_speculative::UniformMarkovHead::new(vocab, 8, 0xD5_A4_ED_u64));
+        let confidence = Arc::new(grim_speculative::EntropyConfidenceHead);
+        let scheduler = grim_speculative::ConfidenceScheduler::new(
+            grim_speculative::ThroughputProfile::default(),
+            grim_speculative::SpeculationConfig::default(),
+        );
+        Box::new(grim_speculative::SpeculativeCausalLm::with_dspark(
+            model, draft, markov, confidence, scheduler,
+        ))
+    }
+
     pub fn register_with_dspark(
         &mut self,
         id: &str,
@@ -1226,13 +1246,30 @@ impl Engine {
             if let Ok(eagle3) = crate::model_loader::load_eagle3_from_path(d_path, dev.clone()) {
                 self.register_eagle3_model(id, base_model, eagle3);
             } else {
-                let draft_model = crate::model_loader::load_from_path(d_path)?;
-                // Generic draft model: wrap as DraftBackbone or register speculative
+                // Generic draft file: the draft backbone is a TinyDraftBackbone
+                // sized from the BASE model's hyperparameters (the draft file's
+                // own weights are not 1:1 reusable as a backbone yet).
+                let _ = crate::model_loader::load_from_path(d_path)?;
+                let hyper = base_model.arch_hyperparams();
+                let dims = hyper
+                    .as_ref()
+                    .map(|h| (h.vocab_size, h.hidden_size))
+                    .unwrap_or((128256, 2048));
                 let drafter = Arc::new(grim_speculative::TinyDraftBackbone::new(
-                    128256, 2048, 4, 42,
+                    dims.0, dims.1, 4, 42,
                 ));
-                let _ = draft_model;
-                self.register_speculative(id, base_model, Some(drafter), None, None);
+                let modality = base_model.config().modality();
+                let wrapped = Self::build_dspark_model(base_model, drafter);
+                self.models.insert(id.to_string(), LoadedModel {
+                    model: wrapped,
+                    config: Box::new(grim_core::config::GenericModelConfig {
+                        name: id.to_string(),
+                        modality,
+                    }),
+                    device: dev,
+                    tp_config: self.tp_config(),
+                    arch_hyperparams: hyper,
+                });
             }
         } else {
             self.register_model(id, base_model);
@@ -1817,11 +1854,37 @@ impl Engine {
                                 }
                             }
                         }
-                        // F3: per-layer slices above are the single handoff channel;
-                        // the redundant pool-level transfer is removed (was sent twice).
                     }
                 }
             }
+
+            // WI-HYBRID-ATTENTION-OFFLOAD (Phase 1):
+            // Watermark policy: demote only prefix blocks beyond watermark (never the last N blocks).
+            // Default keep_tail = 4 blocks (64 tokens).
+            if let Ok(watermark_str) = std::env::var("GRIM_KV_WATERMARK_BLOCKS") {
+                if let Ok(watermark) = watermark_str.parse::<usize>() {
+                    let block_ids: Vec<usize> = self
+                        .sessions
+                        .get(&id)
+                        .and_then(|s| s.block_table())
+                        .map(|t| t.iter().map(|&b| b as usize).collect())
+                        .unwrap_or_default();
+                    if block_ids.len() > watermark {
+                        let keep_tail = std::env::var("GRIM_KV_KEEP_TAIL_BLOCKS")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(2);
+                        let demote_end = block_ids.len().saturating_sub(keep_tail);
+                        let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                        if pool.has_spill() {
+                            for &bid in &block_ids[..demote_end] {
+                                pool.demote_block(bid);
+                            }
+                        }
+                    }
+                }
+            }
+
             return Ok(chunk_len);
         }
         Ok(0)
@@ -3427,6 +3490,72 @@ mod tests {
     use grim_models_transformer::{Llama, LlamaConfig};
     use grim_tensor::Device;
 
+    /// dats-demm §3 closure: DSpark wiring end-to-end. The wrapper reports
+    /// Strategy::DSpark (previously unreachable in production) and greedy
+    /// decoding through the speculative wrapper is token-identical to the
+    /// plain target — speculation must never change greedy output.
+    #[test]
+    fn dspark_wrap_reports_strategy_and_preserves_greedy() {
+        let draft = Arc::new(grim_speculative::TinyDraftBackbone::new(256, 32, 4, 42));
+        let wrapped = Engine::build_dspark_model(small_llama(), draft);
+        assert_eq!(wrapped.strategy(), Strategy::DSpark);
+
+        let plain = small_llama();
+        let mut sess_p = plain.new_session();
+        let mut sess_d = wrapped.new_session();
+
+        let mut token: f32 = 3.0;
+        for step in 0..8 {
+            let input = grim_backend_cpu::cpu_tensor(vec![token], grim_tensor::Shape::new(vec![1]));
+            let pos = grim_backend_cpu::cpu_tensor(vec![step as f32], grim_tensor::Shape::new(vec![1]));
+            let logits_plain = CausalLm::forward(
+                &*plain,
+                sess_p.as_mut(),
+                &input,
+                &pos,
+                &[],
+            )
+            .unwrap();
+            let logits_dspark = wrapped
+                .decode_one(sess_d.as_mut(), &input, &pos, 0.0, 0, &[])
+                .unwrap();
+            let lp = logits_plain.to_vec_f32().unwrap();
+            let ld = logits_dspark.to_vec_f32().unwrap();
+            assert_eq!(lp.len(), ld.len(), "vocab mismatch at step {step}");
+            let next_p = lp
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+            let next_d = ld
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+            assert_eq!(
+                next_p, next_d,
+                "greedy divergence at step {step}: plain {next_p} vs dspark {next_d}"
+            );
+            token = next_p as f32;
+        }
+    }
+
+    /// Journey: DSpark-wrapped model registration via `register_with_dspark`
+    /// must land in the engine registry with a non-Plain strategy so the
+    /// speculative decode path (and GRIM_SPEC telemetry) engages.
+    #[test]
+    fn dspark_registration_journey() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let draft = Arc::new(grim_speculative::TinyDraftBackbone::new(256, 32, 4, 42));
+        let markov = Arc::new(grim_speculative::UniformMarkovHead::new(256, 8, 7));
+        let confidence = Arc::new(grim_speculative::EntropyConfidenceHead);
+        engine.register_with_dspark("spec-journey", small_llama(), draft, markov, confidence);
+        let loaded = engine.models.get("spec-journey").expect("registered");
+        assert_eq!(loaded.model.strategy(), Strategy::DSpark);
+    }
+
     fn small_llama() -> Box<dyn CausalLm> {
         Box::new(Llama::random(
             Device::Cpu,
@@ -4198,6 +4327,126 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_attention_offload_spill_and_repromote_parity() {
+        use grim_core::CausalLm;
+        use grim_core::session::Inner;
+        use grim_models_transformer::{Llama, LlamaConfig};
+        use grim_tensor::Device;
+
+        let cfg = LlamaConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 16,
+            num_layers: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 64,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
+        let model = Llama::random(Device::Cpu, cfg);
+
+        // Baseline (no spill manager)
+        let pool_no_spill = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
+            1024, 1, 16,
+        )));
+        let kv_no_spill = grim_memory::PagedKvCache::new(pool_no_spill, 1, 16, 16);
+        let mut session_no_spill = Inner::with_kv(model.device.clone(), Box::new(kv_no_spill));
+
+        // Spilled path (with SharedSpillManager)
+        let scratch_dir = std::env::temp_dir().join(format!("grim_spill_test_{}", std::process::id()));
+        let spill_mgr = std::sync::Arc::new(
+            grim_kvtransport::SharedSpillManager::new(scratch_dir, 16 * 1 * 16).unwrap(),
+        );
+        let pool_spill = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
+            1024, 1, 16,
+        )));
+        pool_spill.lock().unwrap().attach_spill(spill_mgr.clone());
+        let kv_spill = grim_memory::PagedKvCache::new(pool_spill.clone(), 1, 16, 16);
+        let mut session_spill = Inner::with_kv(model.device.clone(), Box::new(kv_spill));
+
+        // Step 1: multi-token prompt prefill (32 tokens = 2 blocks of 16 tokens each)
+        let tokens: Vec<f32> = (0..32).map(|i| (i % 64) as f32).collect();
+        let pos: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let tok_t = grim_backend_cpu::cpu_tensor(tokens, grim_tensor::Shape::new(vec![32]));
+        let pos_t = grim_backend_cpu::cpu_tensor(pos, grim_tensor::Shape::new(vec![32]));
+
+        let logits_no_spill = CausalLm::forward(&model, &mut session_no_spill, &tok_t, &pos_t, &[]).unwrap();
+        let logits_spill = CausalLm::forward(&model, &mut session_spill, &tok_t, &pos_t, &[]).unwrap();
+
+        assert_eq!(
+            logits_no_spill.to_vec_f32().unwrap(),
+            logits_spill.to_vec_f32().unwrap(),
+            "prefill logits must match before demote"
+        );
+
+        // Step 2: Under memory pressure / watermark, demote prefix block 0
+        let block_0 = session_spill.block_table().unwrap()[0] as usize;
+        {
+            let mut p = pool_spill.lock().unwrap();
+            let demoted = p.demote_block(block_0);
+            assert!(demoted, "block 0 demotion must succeed");
+            assert!(
+                matches!(
+                    spill_mgr.get_tier(block_0),
+                    Some(grim_kvtransport::CacheTier::HostRam) | Some(grim_kvtransport::CacheTier::NvMe)
+                ),
+                "demoted block must reside in HostRam or NvMe tier"
+            );
+        }
+
+        // Step 3: Decode token 33 at position 32.
+        // Paged attention checks plan_hybrid_attention_step -> detects block_0 in HostRam
+        // -> re-promotes to GPU before attention -> produces identical logits!
+        let mut cur_pos = 32;
+        let mut cur_tok_no_spill = 32u32;
+        let mut cur_tok_spill = 32u32;
+        for _ in 0..4 {
+            let tok_no_spill_t = grim_backend_cpu::cpu_tensor(vec![cur_tok_no_spill as f32], grim_tensor::Shape::new(vec![1]));
+            let tok_spill_t = grim_backend_cpu::cpu_tensor(vec![cur_tok_spill as f32], grim_tensor::Shape::new(vec![1]));
+            let pos_t = grim_backend_cpu::cpu_tensor(vec![cur_pos as f32], grim_tensor::Shape::new(vec![1]));
+
+            let dec_no_spill = CausalLm::forward(&model, &mut session_no_spill, &tok_no_spill_t, &pos_t, &[]).unwrap();
+            let dec_spill = CausalLm::forward(&model, &mut session_spill, &tok_spill_t, &pos_t, &[]).unwrap();
+
+            let logits_a = dec_no_spill.to_vec_f32().unwrap();
+            let logits_b = dec_spill.to_vec_f32().unwrap();
+
+            let diff: f32 = logits_a
+                .iter()
+                .zip(logits_b.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(
+                diff < 1e-4,
+                "decode logits at pos {cur_pos} after spill + re-promotion must match unspilled baseline (max diff {diff})"
+            );
+
+            // Greedy token pick (argmax)
+            let next_a = logits_a
+                .iter()
+                .enumerate()
+                .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+                .map(|(idx, _)| idx as u32)
+                .unwrap();
+            let next_b = logits_b
+                .iter()
+                .enumerate()
+                .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+                .map(|(idx, _)| idx as u32)
+                .unwrap();
+
+            assert_eq!(next_a, next_b, "greedy token parity mismatch at pos {cur_pos}");
+            cur_tok_no_spill = next_a;
+            cur_tok_spill = next_b;
+            cur_pos += 1;
+        }
+    }
+
+    #[test]
     fn test_engine_speculative_mtp_and_eagle3_registration() {
         let mut engine = Engine::new(EngineConfig::default());
         let llama = Llama::random(
@@ -4855,26 +5104,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// PP gate: requesting pp_size > 1 must hard-fail at Engine::new, not
-    /// silently run single-device execution.
-    #[test]
-    #[allow(clippy::field_reassign_with_default)]
-    #[should_panic(expected = "pipeline-parallel execution is not yet wired")]
-    fn test_engine_rejects_pipeline_parallel_size() {
-        let mut cfg = EngineConfig::default();
-        cfg.pp_size = 2;
-        let _ = Engine::new(cfg);
-    }
-
-    /// PP off (pp_size 0/1) must not trip the gate.
-    #[test]
-    fn test_engine_accepts_pipeline_parallel_off() {
-        let cfg = EngineConfig::default();
-        assert_eq!(cfg.pp_size, 0, "default EngineConfig must have pp_size off");
-        // Engine::new with pp_size 0 should NOT panic.
-        let _ = Engine::new(cfg);
     }
 
     /// R4 validation (deterministic, mock-probed): the admission gate rejects a request whose footprint exceeds the current memory envelope and admits it when the envelope is large enough.

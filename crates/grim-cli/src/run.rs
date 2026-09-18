@@ -47,6 +47,11 @@ fn try_graph_decode_step(
     session: Option<&dyn grim_core::session::SessionT>,
     // Rows valid in every dense arena (prompt_len + decode steps so far).
     valid_rows: u32,
+    // Set when the previous call captured a fresh graph: the capture bracket
+    // only RECORDS (it does not execute), so the capture-step token never
+    // entered graph state. The eager forward for that step ran in the caller
+    // afterwards — re-seed from the session once, at the first replay.
+    just_captured: &mut bool,
 ) -> Option<GraphDecodeResult> {
     // who-dat.md P3-10: a transient capture/replay failure no longer kills
     // graph decode for the rest of the run — the policy re-arms after
@@ -78,6 +83,8 @@ fn try_graph_decode_step(
         m
     } else if let Some(m) = model.as_any().downcast_ref::<Chameleon>() {
         m
+    } else if let Some(m) = grim_models_transformer::llama_wrapper_graph_model(model.as_any()) {
+        m
     } else {
         return None;
     };
@@ -85,34 +92,54 @@ fn try_graph_decode_step(
     if graph.is_none() {
         match graph_model.get_or_create_decode_graph(4096, 1) {
             Ok(mut g) => {
-                // A5 Phase 2: seed graph KV arenas from the eager device
-                // caches so replay attends prompt context. Runs OUTSIDE the
-                // capture bracket (D2D + H2D + sync are capture-poison).
-                // Any miss → eager fallback (fail-closed; never capture
-                // prompt-blind). Needs the ROCm ordinal for the seed copy.
-                let seed_ok = (|| -> std::result::Result<(), String> {
-                    let sess = session.ok_or_else(|| "no session".to_string())?;
-                    let srcs = graph_model
-                        .eager_kv_seed_sources(sess, valid_rows)
-                        .map_err(|e| format!("export: {e}"))?;
-                    let Device::Rocm(ordinal) = device else {
-                        return Err("non-ROCm device".to_string());
+                // Seed = copy prompt state (KV arenas + conv rings) from the
+                // eager session into the graph pool. Runs OUTSIDE any capture
+                // bracket (D2D + H2D + sync are capture-poison) and AFTER the
+                // warmups (their state writes are discarded by the seed).
+                macro_rules! seed_from_session {
+                    ($g:expr) => {
+                        (|| -> std::result::Result<(), String> {
+                            let sess = session.ok_or_else(|| "no session".to_string())?;
+                            let srcs = graph_model
+                                .eager_kv_seed_sources(sess, valid_rows)
+                                .map_err(|e| format!("export: {e}"))?;
+                            let Device::Rocm(ordinal) = *device else {
+                                return Err("non-ROCm device".to_string());
+                            };
+                            let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+                            $g.buffers
+                                .seed_kv_arena_from_eager(&dev, &srcs)
+                                .map_err(|e| format!("seed: {e}"))?;
+                            // Recurrent (ShortConv) layers: upload the host conv rings
+                            // so replay doesn't run them against a zeroed ring after
+                            // prefill. Fail-closed like the KV seed on any mismatch.
+                            let conv_seeds = graph_model
+                                .eager_conv_seed_rings(sess)
+                                .map_err(|e| format!("conv export: {e}"))?;
+                            if !conv_seeds.is_empty() {
+                                $g.buffers
+                                    .seed_conv_rings(&conv_seeds)
+                                    .map_err(|e| format!("conv seed: {e}"))?;
+                            }
+                            Ok(())
+                        })()
                     };
-                    let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
-                    g.buffers
-                        .seed_kv_arena_from_eager(&dev, &srcs)
-                        .map_err(|e| format!("seed: {e}"))
-                })();
-                if let Err(e) = seed_ok {
+                }
+                // who-dat.md P3-11: Warmup before capture to prime JIT compiler,
+                // Scythe WI-SB0 calibration, and caching allocator (hipModuleLaunchKernel 901 prevention).
+                // Warmups run on UNSEEDED buffers and their state writes are
+                // discarded — the seed below re-establishes prompt state
+                // afterwards, so warmup side effects (KV appends, conv-ring
+                // advances) can't desync graph state from the eager session.
+                let _ = graph_model.forward_capture(&mut g, token_id);
+                let _ = graph_model.forward_capture(&mut g, token_id);
+
+                if let Err(e) = seed_from_session!(g) {
                     graph_retry.note_fail(step);
                     *graph_fallback_step = Some(step);
                     eprintln!("[grim] decode-graph: KV seed failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
                     return None;
                 }
-                // who-dat.md P3-11: Warmup before capture to prime JIT compiler,
-                // Scythe WI-SB0 calibration, and caching allocator (hipModuleLaunchKernel 901 prevention).
-                let _ = graph_model.forward_capture(&mut g, token_id);
-                let _ = graph_model.forward_capture(&mut g, token_id);
 
                 // First step: capture. Any failure -> abort the open capture
                 // (else the stream stays capturing and later copies fail
@@ -137,8 +164,12 @@ fn try_graph_decode_step(
                         graph_retry.failures());
                     return None;
                 }
-                // Seed pos for next replay is set by the KV seed
-                // (`current_pos = valid_rows`); replays append after it.
+                // The capture bracket only RECORDS — it does not execute — so
+                // the capture-step token never entered graph state. The eager
+                // forward for this step runs in the caller after we return;
+                // `just_captured` makes the FIRST replay re-seed from the
+                // session (which then includes the capture-step token).
+                *just_captured = true;
                 *graph = Some(g);
                 graph_retry.note_success();
                 return None; // capture step ran eagerly path this token; replay from next.
@@ -152,6 +183,47 @@ fn try_graph_decode_step(
         }
     }
     let g = graph.as_mut()?;
+    // First replay after a fresh capture: the capture step's token went
+    // through the eager session (the caller ran it after we returned), but
+    // the recorded graph never applied it. Re-seed so graph state matches
+    // the session exactly before the first replay appends to it.
+    if *just_captured {
+        macro_rules! seed_from_session {
+            ($g:expr) => {
+                (|| -> std::result::Result<(), String> {
+                    let sess = session.ok_or_else(|| "no session".to_string())?;
+                    let srcs = graph_model
+                        .eager_kv_seed_sources(sess, valid_rows)
+                        .map_err(|e| format!("export: {e}"))?;
+                    let Device::Rocm(ordinal) = *device else {
+                        return Err("non-ROCm device".to_string());
+                    };
+                    let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+                    $g.buffers
+                        .seed_kv_arena_from_eager(&dev, &srcs)
+                        .map_err(|e| format!("seed: {e}"))?;
+                    let conv_seeds = graph_model
+                        .eager_conv_seed_rings(sess)
+                        .map_err(|e| format!("conv export: {e}"))?;
+                    if !conv_seeds.is_empty() {
+                        $g.buffers
+                            .seed_conv_rings(&conv_seeds)
+                            .map_err(|e| format!("conv seed: {e}"))?;
+                    }
+                    Ok(())
+                })()
+            };
+        }
+        if let Err(e) = seed_from_session!(g) {
+            graph_retry.note_fail(step);
+            *graph_fallback_step = Some(step);
+            *graph = None;
+            *just_captured = false;
+            eprintln!("[grim] decode-graph: post-capture re-seed failed at step {step} ({e}); eager fallback (retry {})", graph_retry.failures());
+            return None;
+        }
+        *just_captured = false;
+    }
     if let Err(e) = graph_model.forward_replay(g, token_id) {
         // Replay failure drops the stale graph so the next attempt (after
         // the retry interval) re-seeds + re-captures from the eager caches.
@@ -188,10 +260,10 @@ fn try_graph_decode_step(
                 stream,
             ) {
                 Ok(Some(tok)) => return Some(GraphDecodeResult::Sampled(tok)),
-                Ok(None) => {}
-                Err(_) => {
-                    // Order ambient sampler (active_stream) after the replayed
-                    // graph: one-time blocking sync (only on kernel-miss).
+                // Miss or error: anything launched after this point (ambient
+                // sampler, fallback D2H) must be ordered after the replayed
+                // graph — one blocking sync, then fall through.
+                Ok(None) | Err(_) => {
                     let _ = unsafe {
                         grim_backend_rocm::hipStreamSynchronize(stream)
                     };
@@ -203,6 +275,11 @@ fn try_graph_decode_step(
         }
     }
 
+    // who-dat P1-4: this full-vocab D2H is reached ONLY when the user forces
+    // the CPU sampler (GRIM_CPU_SAMPLER) — the GPU sampler above already
+    // applies repeat penalty on-device, so penalty-active steps never D2H.
+    // Ordering: `to_cpu_vec_f32` copies via blocking `hipMemcpy`, which is
+    // ordered after the replayed graph on every stream.
     let flat = g.read_logits_f32().ok()?;
     if flat.len() != vocab {
         return None;
@@ -744,6 +821,7 @@ pub async fn cmd_run(
     // i-was-dumb-graph.md Phase 5: full-model graph state. Allocated once,
     // reused for stable addresses. `None` + `graph_failed` = eager fallback.
     let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
+    let mut graph_just_captured = false;
     let mut graph_retry = grim_backend_rocm::graph_capture::GraphRetryPolicy::default_policy();
     let mut graph_fallback_step: Option<usize> = None;
     // Owns the one prefill tensor pair so the borrow lives across the step.
@@ -843,6 +921,7 @@ pub async fn cmd_run(
                 &history,
                 Some(&session as &dyn grim_core::session::SessionT),
                 tokens.len() as u32,
+                &mut graph_just_captured,
             )
         } else {
             None
@@ -1290,19 +1369,29 @@ pub async fn cmd_run_interactive(
 
     // Speculative decoding: wrap base model when --draft-model was provided.
     // ponytail: plain wrapper — full DSpark via HTTP engine path.
+    // DSpark speculative wrapping (see cmd_run): draft backbone + markov +
+    // entropy confidence + PID depth tuner; the old plain() ignored the draft.
     let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
         let dev = model.device().clone();
         match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
             Ok(eagle3) => {
                 eprintln!("[grim] Speculative decoding: Eagle3 draft loaded from {d_path}");
-                let _drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
-                Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+                let drafter = Arc::new(grim_speculative::Eagle3Drafter::new(eagle3));
+                grim_engine::Engine::build_dspark_model(model, drafter) as Box<dyn CausalLm>
             }
             Err(_) => {
                 match grim_engine::model_loader::load_from_path(d_path) {
                     Ok(_draft_raw) => {
-                        eprintln!("[grim] Draft loaded from {d_path} (plain autoregressive; full DSpark via HTTP engine path)");
-                        Box::new(grim_speculative::SpeculativeCausalLm::plain(model)) as Box<dyn CausalLm>
+                        eprintln!("[grim] Draft loaded from {d_path} (DSpark: tiny backbone + markov + confidence)");
+                        let dims = model
+                            .arch_hyperparams()
+                            .map(|h| (h.vocab_size, h.hidden_size))
+                            .unwrap_or((128256, 2048));
+                        let drafter = Arc::new(grim_speculative::TinyDraftBackbone::new(
+                            dims.0, dims.1, 4, 42,
+                        ));
+                        grim_engine::Engine::build_dspark_model(model, drafter)
+                            as Box<dyn CausalLm>
                     }
                     Err(e) => {
                         eprintln!("[grim] WARNING: draft model '{d_path}' load failed: {e}; using base model");

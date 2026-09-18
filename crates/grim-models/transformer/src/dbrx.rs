@@ -89,6 +89,8 @@ pub struct DbrxMoeBlock {
     router: Linear,
     experts: Vec<DbrxExpert>,
     moe_top_k: usize,
+    /// Resident weight cache for the Charon real-routing path (GRIM_DBRX_REAL_ROUTING=1).
+    charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl DbrxMoeBlock {
@@ -110,12 +112,51 @@ impl DbrxMoeBlock {
             router,
             experts,
             moe_top_k: cfg.moe_top_k,
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _router_logits = self.router.forward(x)?;
+        let router_logits = self.router.forward(x)?;
 
+        // Real top-k routing path: gated behind GRIM_DBRX_REAL_ROUTING=1.
+        // Maps w1->gate, v1->up, w2->down and calls the Charon fused dispatch
+        // with actual softmax top-k routing from `router_logits`.
+        // This is a behavior change vs the fixed-ensemble path; gate it for safety.
+        if std::env::var("GRIM_DBRX_REAL_ROUTING").as_deref() == Ok("1") {
+            if matches!(x.device(), Device::Rocm(_)) {
+                let experts: Vec<crate::shared_moe::MoeExpert> = self
+                    .experts
+                    .iter()
+                    .map(|e| crate::shared_moe::MoeExpert {
+                        gate: e.w1.clone(),
+                        up: e.v1.clone(),
+                        down: e.w2.clone(),
+                    })
+                    .collect();
+                let dev_any = x.device();
+                let ordinal = match dev_any {
+                    Device::Rocm(o) => *o,
+                    _ => unreachable!(),
+                };
+                let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+                if let Some(out) = crate::shared_moe::fused_moe_dispatch_from_logits(
+                    &*rocm_dev,
+                    x,
+                    &router_logits,
+                    &experts,
+                    None,
+                    self.moe_top_k,
+                    1.0,
+                    0, // softmax
+                    &self.charon_cache,
+                )? {
+                    return Ok(out);
+                }
+            }
+        }
+
+        // Fixed-ensemble fallback (original shipped-model semantics).
         if x.device() != &Device::Cpu {
             let mut acc: Option<Tensor> = None;
             let active_count = self.experts.len().min(self.moe_top_k);

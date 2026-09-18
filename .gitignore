@@ -28,3 +28,4 @@ rocprof_out_new/
 rocprof_trace_opt/
 rocprof_hip_out/
 /target-rel-bisect/
+plans/

@@ -56,7 +56,7 @@ pub mod configs;
 pub mod dbrx;
 pub mod deci;
 pub mod decode_graph;
-pub use decode_graph::DecodeGraphModel;
+pub use decode_graph::{llama_wrapper_graph_model, DecodeGraphModel};
 pub mod deepseek;
 pub mod deepseek2;
 pub mod deepseek2ocr;

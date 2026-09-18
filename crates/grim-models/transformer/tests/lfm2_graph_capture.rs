@@ -196,10 +196,6 @@ fn tiny_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize, fused: bool) -> 
             n_expert: 0,
             n_expert_used: 0,
             n_ff_exp: 0,
-            expert_weights_scale: 0.0,
-            expert_gating_func: 0,
-            n_swa: 0,
-            swa_type: 0,
             n_embd_out: 0,
             mxfp4_qkv_attention: false,
         },
@@ -228,6 +224,7 @@ fn lfm2_graph_capture_replay_records_kernels() {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::shared(0);
 
     // Baseline: F32 attention weights and F32 FFN weights.
@@ -312,6 +309,7 @@ fn lfm2_graph_recurrent_falls_back_eager() {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::shared(0);
     let model = tiny_lfm2(&dev, 0, 1, false);
     let graph = model.get_or_create_decode_graph(16, 1).unwrap();
@@ -456,10 +454,6 @@ fn tiny_lfm2_custom(dev: &RocmDevice, ordinal: usize, layers: Vec<Lfm2Block>) ->
             n_expert: 4,
             n_expert_used: 2,
             n_ff_exp: 16,
-            expert_weights_scale: 0.0,
-            expert_gating_func: 0,
-            n_swa: 0,
-            swa_type: 0,
             n_embd_out: 0,
             mxfp4_qkv_attention: false,
         },
@@ -510,6 +504,7 @@ fn lfm2_graph_moe_layer_captures_and_replays() {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::shared(0);
     // Two MoE layers — routing buffers shared across layers must stay
     // coherent (each layer writes then consumes within stream order).
@@ -542,6 +537,7 @@ fn lfm2_graph_moe_sublayer_matches_eager_dispatch() {
         eprintln!("skip: GPU test");
         return;
     }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::shared(0);
     let model = tiny_lfm2_custom(&dev, 0, vec![moe_block(&dev, 0)]);
     let block = &model.layers[0];
@@ -651,6 +647,7 @@ fn lfm2_graph_shortconv_layer_captures_and_replays() {
         eprintln!("skip: GPU test");
         return;
     }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::shared(0);
     // Pure-ShortConv layers (no attention) — the S2 graph path.
     let model = tiny_lfm2_custom(
@@ -681,6 +678,7 @@ fn lfm2_graph_shortconv_ring_advances_across_replays() {
         eprintln!("skip: GPU test");
         return;
     }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::shared(0);
     let model = tiny_lfm2_custom(
         &dev,
@@ -724,6 +722,7 @@ fn lfm2_graph_mxfp4_layer_captures_and_replays() {
         eprintln!("skip: GPU test");
         return;
     }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::shared(0);
     let hidden = 32usize;
     let hd = 8usize;

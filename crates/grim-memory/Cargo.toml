@@ -11,6 +11,7 @@ grim-tensor = { workspace = true }
 grim-core = { workspace = true }
 grim-kvtransport = { workspace = true }
 grim-kvquant = { workspace = true }
+grim-scheduler = { workspace = true }
 grim-backend-cpu = { workspace = true }
 thiserror = { workspace = true }
 

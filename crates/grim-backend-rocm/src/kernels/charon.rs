@@ -165,6 +165,59 @@ extern "C" {
             num_tokens, block_size, routed_scaling_factor, stash_hg, stash_hu);
     }
 
+    __global__ void grim_moe_fused_grouped_gelu(
+        const float* __restrict__ activations, const float* __restrict__ expert_gate_w,
+        const float* __restrict__ expert_up_w, const float* __restrict__ expert_down_w,
+        const unsigned int* __restrict__ sorted_token_ids,
+        const unsigned int* __restrict__ sorted_expert_ids, const float* __restrict__ sorted_weights,
+        float* __restrict__ out,
+        int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor,
+        float* stash_hg, float* stash_hu) {
+        if (block_size <= 0) return;
+        const int blk = blockIdx.x;
+        const int base = blk * block_size;
+        const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+        for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+            const unsigned int tok = sorted_token_ids[s];
+            if (tok >= (unsigned int)num_tokens) continue;
+            const unsigned int exp = sorted_expert_ids[s];
+            const float w = sorted_weights[s];
+
+            const float* a  = activations + (unsigned long long)tok * hidden;
+            const float* gw = expert_gate_w + (unsigned long long)exp * inter * hidden;
+            const float* dw = expert_down_w + (unsigned long long)exp * hidden * inter;
+
+            float acc_prev = 0.0f;
+            const bool odd_hidden = (hidden & 1) != 0;
+            for (int h = 0; h < hidden; ++h) {
+                float acc = 0.0f;
+                for (int j = 0; j < inter; ++j) {
+                    float g = 0.0f;
+                    for (int i = 0; i < hidden; ++i) {
+                        g += gw[j * hidden + i] * a[i];
+                    }
+                    // GELU tanh approximation: 0.5 * g * (1.0 + tanh(0.7978846 * (g + 0.044715 * g^3)))
+                    float g3 = g * g * g;
+                    float tanh_arg = 0.7978846f * (g + 0.044715f * g3);
+                    float act = 0.5f * g * (1.0f + tanhf(tanh_arg));
+
+                    acc += dw[h * inter + j] * act;
+                }
+                if (odd_hidden) {
+                    atomicAdd(out + (unsigned long long)tok * hidden + h,
+                              routed_scaling_factor * w * acc);
+                } else if (h & 1) {
+                    charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                       routed_scaling_factor * w * acc_prev,
+                                       routed_scaling_factor * w * acc);
+                } else {
+                    acc_prev = acc;
+                }
+            }
+        }
+    }
+
     // ──────────────────────────────────────────────────────────────────── grim_moe_route_topk - device-side MoE routing (D2D).
     // Computes per-token top-k expert selection + softmax-normalized combine weights
     // entirely on-device, writing sortless (token, expert, weight) triples into three
@@ -297,7 +350,55 @@ extern "C" {
             return;
         }
 
-        // route_mode == 0: softmax top-k (the shared MoE default).
+        // route_mode == 0: softmax top-k (global softmax denominator).
+        // route_mode == 3: softmax top-k renormalized over top-k only (GLM / shared_moe::normalize_weights).
+        if (route_mode == 3) {
+            if (tid == 0) {
+                const int k = top_k < num_experts ? top_k : num_experts;
+                int chosen[64];
+                float chosen_v[64];
+                for (int i = 0; i < k; ++i) { chosen[i] = -1; chosen_v[i] = -1e30f; }
+                for (int v = 0; v < num_experts; ++v) {
+                    const float lv = row[v];
+                    int pos = k - 1;
+                    if (lv <= chosen_v[pos] && chosen[pos] >= 0) continue;
+                    while (pos > 0 && (chosen[pos - 1] < 0 || lv > chosen_v[pos - 1])) {
+                        chosen[pos] = chosen[pos - 1];
+                        chosen_v[pos] = chosen_v[pos - 1];
+                        pos--;
+                    }
+                    chosen[pos] = v;
+                    chosen_v[pos] = lv;
+                }
+                float topk_max = -1e30f;
+                for (int i = 0; i < k; ++i) {
+                    if (chosen[i] >= 0 && chosen_v[i] > topk_max) {
+                        topk_max = chosen_v[i];
+                    }
+                }
+                float sum_exp = 0.0f;
+                for (int i = 0; i < k; ++i) {
+                    if (chosen[i] >= 0) {
+                        sum_exp += __expf(chosen_v[i] - topk_max);
+                    }
+                }
+                const float inv_sum = 1.0f / fmaxf(sum_exp, 1e-12f);
+                const long long base = (long long)tok * top_k;
+                for (int i = 0; i < top_k; ++i) {
+                    if (i < k && chosen[i] >= 0) {
+                        out_tokens[base + i]  = (unsigned int)tok;
+                        out_experts[base + i] = (unsigned int)chosen[i];
+                        out_weights[base + i] = __expf(chosen_v[i] - topk_max) * inv_sum;
+                    } else {
+                        out_tokens[base + i]  = (unsigned int)tok;
+                        out_experts[base + i] = 0u;
+                        out_weights[base + i] = 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+
         float lmax = -1e30f;
         for (int v = tid; v < num_experts; v += block) {
             if (row[v] > lmax) lmax = row[v];
@@ -1999,6 +2100,7 @@ pub(crate) fn plan_grouped_dispatch(sorted: &SortedRouting, wave_size: u32) -> C
 
 /// Validate the host-side inputs to a grouped fused dispatch *before* any device pointer is dereferenced.
 /// Pure, allocation-free, unit-testable without a GPU (G-A2).
+/// `allow_null_up` — when `true`, skip the null check on `expert_up_w` (GELU kernel passes 0).
 #[allow(dead_code)]
 pub(crate) fn validate_grouped_inputs(
     activations: *mut c_void,
@@ -2010,11 +2112,11 @@ pub(crate) fn validate_grouped_inputs(
     hidden: usize,
     inter: usize,
     num_experts: usize,
+    allow_null_up: bool,
 ) -> Result<()> {
     for (label, p) in [
         ("activations", activations),
         ("expert_gate_w", expert_gate_w),
-        ("expert_up_w", expert_up_w),
         ("expert_down_w", expert_down_w),
         ("out", out),
     ] {
@@ -2023,6 +2125,11 @@ pub(crate) fn validate_grouped_inputs(
                 "charon_grouped_dispatch: {label} is null"
             )));
         }
+    }
+    if !allow_null_up && expert_up_w.is_null() {
+        return Err(Error::Backend(
+            "charon_grouped_dispatch: expert_up_w is null".into(),
+        ));
     }
     if hidden == 0 || inter == 0 {
         return Err(Error::Backend(format!(

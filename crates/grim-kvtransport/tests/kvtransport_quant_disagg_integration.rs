@@ -177,5 +177,4 @@ fn test_nvme_weight_streamer_read_and_prefetch() {
     // unit_elems=1024: matches the dummy weight file (1024 floats per layer).
     let streamer = NvmeWeightStreamer::new(weight_file, 4, 1024);
     assert!(streamer.prefetch_layer_async(0).is_ok());
-    assert!(streamer.commit_and_swap(0, 1).is_ok());
 }

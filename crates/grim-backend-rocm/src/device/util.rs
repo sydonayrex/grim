@@ -87,6 +87,20 @@ pub fn gpu_test_enabled() -> bool {
     check("GRIM_GPU_TEST") || check("GRIM_RUN_GPU_TESTS") || check("GRIM_RUN_GPU_TEST")
 }
 
+/// Serialize tests that capture HIP graphs (or otherwise drive the whole
+/// device). Concurrent graph capture on one GPU segfaults
+/// (`hipModuleLaunchKernel` races + graph-capture mode poisoning), so every
+/// capture/replay test takes this lock first. `cargo test` runs test
+/// BINARIES sequentially, so a process-wide mutex is sufficient; threads
+/// within one binary are what need serializing.
+///
+/// Poison-recovering on purpose: a panicking GPU test must not poison the
+/// lock and fail every sibling with a lock error.
+pub fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// RAII guard that switches the calling thread to `ordinal` and restores the previous current device on drop.
 /// Probes that call `hipSetDevice` on multi-GPU boxes must use this: leaving the thread on a.
 pub struct DeviceGuard {

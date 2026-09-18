@@ -209,6 +209,8 @@ struct Qwen38MoeBlock {
     shared_expert: Option<Qwen38MoeExpert>,
     num_experts_per_tok: usize,
     routed_scaling_factor: f32,
+    /// Device routing scratch for the D2D Charon dispatch (shared_moe).
+    charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl Qwen38MoeBlock {
@@ -242,16 +244,53 @@ impl Qwen38MoeBlock {
             shared_expert,
             num_experts_per_tok: cfg.num_experts_per_tok,
             routed_scaling_factor: cfg.routed_scaling_factor,
+            charon_cache: crate::shared_moe::CharonCache::new(),
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let router_logits = self.gate.forward(x)?;
-        let logits_vec = router_logits.to_vec_f32()?;
         let dims = x.shape().dims();
         let hidden_dim = dims[dims.len() - 1];
-        let num_exp = self.experts.len();
         let seq_len = x.shape().elem_count() / hidden_dim;
+
+        // D2D path (who-dat 2.3): routing + expert dispatch on-device, no
+        // gate-logits D2H. Expert weight layout matches DeepSeek2's, so the
+        // shared dispatch contract applies. `Ok(None)` = backend/kernel
+        // unavailable → host routing below (unchanged behavior).
+        if x.device() != &Device::Cpu {
+            let experts: Vec<crate::shared_moe::MoeExpert> = self
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
+                    gate: e.gate_proj.clone(),
+                    up: e.up_proj.clone(),
+                    down: e.down_proj.clone(),
+                })
+                .collect();
+            let shared_expert = self.shared_expert.as_ref().map(|e| crate::shared_moe::MoeExpert {
+                gate: e.gate_proj.clone(),
+                up: e.up_proj.clone(),
+                down: e.down_proj.clone(),
+            });
+            let dev = grim_nn::modules::pick_device_for_tensor(x);
+            if let Some(out) = crate::shared_moe::fused_moe_dispatch_from_logits(
+                dev.as_ref(),
+                x,
+                &router_logits,
+                &experts,
+                shared_expert.as_ref(),
+                self.num_experts_per_tok,
+                self.routed_scaling_factor,
+                0, // route_mode: softmax over top-k
+                &self.charon_cache,
+            )? {
+                return Ok(out);
+            }
+        }
+
+        let logits_vec = router_logits.to_vec_f32()?;
+        let num_exp = self.experts.len();
 
         if x.device() != &Device::Cpu && seq_len == 1 {
             let row = &logits_vec[0..num_exp];
@@ -260,15 +299,14 @@ impl Qwen38MoeBlock {
             let k = self.num_experts_per_tok.min(num_exp);
             let topk = &indexed[..k];
 
-            let max_l = topk
+            // Global softmax over ALL experts (matches the device
+            // `grim_moe_route_topk` mode 0 / HF Qwen-MoE reference; the
+            // combine weights are NOT renormalized over the top-k).
+            let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
+            let weights: Vec<f32> = topk
                 .iter()
-                .map(|(_, l)| *l)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
-            let sum_e: f32 = exps.iter().sum();
-            let weights: Vec<f32> = exps
-                .iter()
-                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
+                .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
                 .collect();
 
             let mut acc: Option<Tensor> = if let Some(ref shared) = self.shared_expert {
@@ -312,15 +350,14 @@ impl Qwen38MoeBlock {
             let k = self.num_experts_per_tok.min(num_exp);
             let topk = &indexed[..k];
 
-            let max_l = topk
+            // Global softmax over ALL experts (matches the device
+            // `grim_moe_route_topk` mode 0 / HF Qwen-MoE reference; the
+            // combine weights are NOT renormalized over the top-k).
+            let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
+            let weights: Vec<f32> = topk
                 .iter()
-                .map(|(_, l)| *l)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
-            let sum_e: f32 = exps.iter().sum();
-            let weights: Vec<f32> = exps
-                .iter()
-                .map(|e| (e / (sum_e + 1e-12)) * self.routed_scaling_factor)
+                .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
                 .collect();
 
             let token_x = cpu_tensor(
@@ -1461,6 +1498,141 @@ mod tests {
         assert!(
             mean.abs() > 1e-4,
             "Real weights must produce non-trivial mean response (got {mean})"
+        );
+    }
+}
+
+// ===========================================================================
+// D2D MoE routing parity (who-dat 2.3): the Charon device dispatch
+// (`fused_moe_dispatch_from_logits`, routing + expert GEMVs fully on-device)
+// must match the host reference math. Regression gate for the qwen38 wiring.
+// =========================================================================
+
+#[cfg(test)]
+mod moe_d2d_parity_tests {
+    use super::*;
+    use grim_backend_rocm::RocmDevice;
+    use grim_tensor::CoreTensorOps;
+    type DType = grim_tensor::dtype::DType;
+
+    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4
+            })
+            .collect()
+    }
+
+    fn rocm_tensor(dev: &RocmDevice, data: Vec<f32>, shape: Shape) -> Tensor {
+        let storage = dev.from_cpu(&data, &shape, DType::F32).unwrap();
+        Tensor::new(
+            std::sync::Arc::from(storage),
+            shape,
+            DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            Device::Rocm(0),
+        )
+    }
+
+    fn make_block(dev: Option<&RocmDevice>, hidden: usize, inter: usize, n_exp: usize) -> Qwen38MoeBlock {
+        let lin = |data: Vec<f32>, out: usize, inp: usize| -> Linear {
+            let t = match dev {
+                Some(d) => rocm_tensor(d, data, Shape::new(vec![out, inp])),
+                None => cpu_tensor(data, Shape::new(vec![out, inp])),
+            };
+            Linear::from_tensor(t, None)
+        };
+        let experts = (0..n_exp)
+            .map(|e| {
+                let s = (e as u64 + 1) * 977;
+                Qwen38MoeExpert {
+                    gate_proj: lin(rand_vec(inter * hidden, s + 1), inter, hidden),
+                    up_proj: lin(rand_vec(inter * hidden, s + 2), inter, hidden),
+                    down_proj: lin(rand_vec(inter * hidden, s + 3), hidden, inter),
+                }
+            })
+            .collect();
+        Qwen38MoeBlock {
+            gate: lin(rand_vec(n_exp * hidden, 42), n_exp, hidden),
+            experts,
+            shared_expert: None,
+            num_experts_per_tok: 2,
+            routed_scaling_factor: 1.0,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+        }
+    }
+
+    fn host_reference(block: &Qwen38MoeBlock, x: &[f32], seq: usize, hidden: usize) -> Vec<f32> {
+        let logits_v = block.gate.forward(&cpu_tensor(x.to_vec(), Shape::new(vec![seq, hidden]))).unwrap().to_vec_f32().unwrap();
+        let n_exp = block.experts.len();
+        let mut out = vec![0.0f32; seq * hidden];
+        for s in 0..seq {
+            let row = &logits_v[s * n_exp..(s + 1) * n_exp];
+            let mut idx: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+            idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let topk = &idx[..block.num_experts_per_tok];
+            // Global softmax over ALL experts (matches `grim_moe_route_topk` mode 0).
+            let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
+            let token_x = &x[s * hidden..(s + 1) * hidden];
+            for (_i, (ei, l)) in topk.iter().enumerate() {
+                let w = ((l - max_l).exp() / denom) * block.routed_scaling_factor;
+                let e = &block.experts[*ei];
+                let g = e.gate_proj.forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden]))).unwrap().to_vec_f32().unwrap();
+                let u = e.up_proj.forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden]))).unwrap().to_vec_f32().unwrap();
+                let act: Vec<f32> = g.iter().zip(u.iter()).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+                let d = e.down_proj.forward(&cpu_tensor(act.clone(), Shape::new(vec![1, act.len()]))).unwrap().to_vec_f32().unwrap();
+                for (j, dv) in d.iter().enumerate() {
+                    out[s * hidden + j] += w * dv;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn qwen38_moe_device_dispatch_matches_host_reference() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+            return;
+        }
+        let dev = RocmDevice::shared(0);
+        let hidden = 32usize;
+        let inter = 64usize;
+        let n_exp = 8usize;
+        let seq = 3usize;
+
+        let block_gpu = make_block(Some(&dev), hidden, inter, n_exp);
+        let x_data = rand_vec(seq * hidden, 7);
+        let x = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![seq, hidden]));
+
+        let out_gpu = block_gpu.forward(&x).unwrap().to_vec_f32().unwrap();
+
+        // Host reference (identical weights on CPU device).
+        let block_cpu = make_block(None, hidden, inter, n_exp);
+        let out_ref = host_reference(&block_cpu, &x_data, seq, hidden);
+
+        // Reference self-check: the model's own CPU path must equal the
+        // reference math (validates the reference before judging the D2D path).
+        let out_cpu_model = block_cpu
+            .forward(&cpu_tensor(x_data.clone(), Shape::new(vec![seq, hidden])))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let d0 = out_cpu_model.iter().zip(out_ref.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(d0 < 1e-4, "reference self-check failed: cpu model vs reference max_diff={d0}");
+
+        assert_eq!(out_gpu.len(), out_ref.len());
+        let max_diff = out_gpu
+            .iter()
+            .zip(out_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "D2D MoE dispatch diverged from host reference: max_diff={max_diff}"
         );
     }
 }

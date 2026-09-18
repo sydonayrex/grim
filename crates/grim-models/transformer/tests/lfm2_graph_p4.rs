@@ -20,11 +20,10 @@ use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 /// Serializes GPU tests within this file (one device; concurrent captures
 /// contend on the graph pools and give false failures under default
 /// `--test-threads=N`).
-static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Lock the GPU for the duration of a test; returned guard releases on drop.
 fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
-    GPU_TEST_LOCK.lock().unwrap()
+    grim_backend_rocm::device::util::gpu_test_lock()
 }
 
 // ===========================================================================
@@ -169,10 +168,6 @@ fn tiny_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
             n_expert: 0,
             n_expert_used: 0,
             n_ff_exp: 0,
-            expert_weights_scale: 0.0,
-            expert_gating_func: 0,
-            n_swa: 0,
-            swa_type: 0,
             n_embd_out: 0,
             mxfp4_qkv_attention: false,
         },

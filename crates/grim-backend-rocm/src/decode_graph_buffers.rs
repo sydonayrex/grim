@@ -118,6 +118,18 @@ pub struct EagerKvSource<'a> {
     pub _anchor: std::marker::PhantomData<&'a ()>,
 }
 
+/// Prefill seeding for a recurrent (ShortConv) layer's device ring. The host
+/// mirror holds `kc` rows of `h_dim` (`host[t*h_dim + d]` = b·x from `t` steps
+/// ago); the device ring is the transposed column-major `[d, kc]` layout the
+/// `grim_short_conv1d_causal_step` kernel updates in place.
+pub struct ConvRingSeed<'a> {
+    pub host: &'a [f32],
+    pub h_dim: usize,
+    /// Ring depth (`l_cache - 1` previous b·x rows).
+    pub kc: usize,
+    pub _anchor: std::marker::PhantomData<&'a ()>,
+}
+
 impl DecodeGraphBuffers {
     /// Allocate full pool on `dev`. Fails fast on OOM -> caller falls back eager.
     /// `batch` parameterizes all per-token slots as `[batch, dim]`. `batch=1`
@@ -641,6 +653,50 @@ impl DecodeGraphBuffers {
         // increments it on each replay, so it must start at prefill_len.
         self.write_pos_async(dev, prefill_len, stream)?;
         dev.synchronize();
+        Ok(())
+    }
+
+    /// Prefill seeding for recurrent (ShortConv) layers: upload each layer's
+    /// host conv ring (transposed to the kernel's `[d, kc]` layout) into
+    /// `sc_state`. Without this the graph replays conv layers against a
+    /// ZEROED ring after any prompt prefill — greedy decode diverges from
+    /// eager. Must run OUTSIDE a capture bracket (blocking H2D).
+    /// `per_layer` is indexed by layer_idx; `None` for attention layers.
+    pub fn seed_conv_rings(
+        &mut self,
+        per_layer: &[Option<ConvRingSeed<'_>>],
+    ) -> Result<()> {
+        for (layer_idx, seed) in per_layer.iter().enumerate() {
+            let Some(s) = seed else { continue };
+            if layer_idx >= self.sc_state.len() {
+                return Err(Error::Backend(format!(
+                    "seed_conv_rings: layer {layer_idx} >= {} sc rings",
+                    self.sc_state.len()
+                )));
+            }
+            let expect = s.h_dim * s.kc;
+            if s.host.len() != expect {
+                return Err(Error::Backend(format!(
+                    "seed_conv_rings: layer {layer_idx} host ring {} != h_dim*kc {expect}",
+                    s.host.len()
+                )));
+            }
+            if self.sc_state[layer_idx].shape.elem_count() != expect {
+                return Err(Error::Backend(format!(
+                    "seed_conv_rings: layer {layer_idx} sc ring {} != {expect}",
+                    self.sc_state[layer_idx].shape.elem_count()
+                )));
+            }
+            let mut col_major = vec![0.0f32; expect];
+            for t in 0..s.kc {
+                for d in 0..s.h_dim {
+                    col_major[d * s.kc + t] = s.host[t * s.h_dim + d];
+                }
+            }
+            self.sc_state[layer_idx]
+                .write_host_f32(&col_major)
+                .map_err(|e| Error::Backend(format!("seed_conv_rings: H2D layer {layer_idx}: {e}")))?;
+        }
         Ok(())
     }
 

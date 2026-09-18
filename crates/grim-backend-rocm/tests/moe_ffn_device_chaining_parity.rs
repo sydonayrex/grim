@@ -1,11 +1,22 @@
 //! Integration test: MoeFfn::forward end-to-end device execution vs CPU reference parity
 //! and on-device output chaining verification without redundant host roundtrips.
 //!
+//! NOTE (2026-09-18, WI-gpu-native-moe): this test uses
+//! `RouterKind::SoftmaxTopKRenorm` (route_mode 3) deliberately. Device
+//! route_mode 0 is global-softmax (HF Qwen semantics) while the host
+//! `MoeRouter::route` renormalizes over top-k — for plain `SoftmaxTopK`
+//! the two sides implement DIFFERENT normalizations, so a GPU-vs-CPU
+//! comparison with `SoftmaxTopK` cannot pass and must not be "fixed" by
+//! weakening tolerance. Mode-0 numerics are covered against a global-softmax
+//! oracle in `moe_all_models_parity_gpu.rs`.
+//!
 //! VERIFIED(gpu-verify): Charon MoE verified on live hardware:
 //! 1. MoeFfn::forward GPU vs CPU oracle parity under full batch and multi-expert routing.
 //! 2. Verification that the GPU forward path stays entirely on-device (zero D2H roundtrip).
 //!
-//! Verified on: gfx1201 / gfx1200 (Dual-GPU) and gfx1036 (RDNA2) — 2026-08-29
+//! Verified on: gfx1201 (RX 9070 XT) — 2026-09-18 (after CPU-gate rank fix;
+//! prior header claim could not have held on live hardware: the D2D path
+//! bailed to CPU fallback and the residency assertion failed).
 
 use std::panic;
 use std::sync::Arc;
@@ -109,7 +120,7 @@ fn build_moe_oracle(routed_scaling_factor: f32) -> MoeFfn {
         ));
     }
     let bank = ExpertBank::from_linears(eg, eu, ed);
-    let router = MoeRouter::new(gate, RouterKind::SoftmaxTopK, TOP_K, NUM_EXPERTS, None);
+    let router = MoeRouter::new(gate, RouterKind::SoftmaxTopKRenorm, TOP_K, NUM_EXPERTS, None);
     MoeFfn::new(router, bank, None, routed_scaling_factor)
 }
 

@@ -53,6 +53,18 @@ are intentionally not part of the file contract.
 | `GRIM_PLUGINS_DIR` | String | `~/.grim/plugins` or `/var/lib/grim/plugins` | `grim-plugin` | Directory for native and WASM plugin binaries. |
 | `GRIM_HSACO_CACHE_DIR` | String | `~/.cache/hsaco` | `grim-backend-rocm` | Disk cache directory for JIT-compiled AMD HSACO kernel binaries. |
 
+### KV Spill / Hybrid Attention Offload (WI-HYBRID-ATTENTION-OFFLOAD)
+
+| Variable | Type | Default | Used By | Description |
+|---|---|---|---|---|
+| `GRIM_KV_SPILL` | bool | `off` | `grim-engine` | Opt-in: attach a `SharedSpillManager` to the paged KV pool so KV blocks demoted under pressure survive in HostRam/NvMe and can be re-promoted before attention. Demoted blocks are also reclaimable for fresh allocations (contents remain authoritative in the spill tier; prefix mappings are pruned). |
+| `GRIM_KV_SPILL_DIR` | String | per-process temp dir | `grim-engine` | Scratch directory for spilled KV block contents. |
+
+Spill telemetry (demoted/promoted/reclaimed counts) is exposed via
+`KvBlockPool::spill_telemetry()`. Promotion failures are fail-closed:
+`check_and_repromote_blocks` propagates errors instead of attending stale
+pages.
+
 ### Backend & Hardware Selection
 
 | Variable | Type | Default | Used By | Description |

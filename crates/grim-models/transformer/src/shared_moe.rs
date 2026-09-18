@@ -85,6 +85,17 @@ impl CharonCache {
         *self.resident.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.routing.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+
+    /// Engagement sentinel (WI-gpu-native-moe Phase 0.3): true once the
+    /// device-resident routing scratch has been populated by a successful
+    /// `fused_moe_dispatch_from_logits` call. Parity tests assert this to
+    /// fail loudly on silent `Ok(None)` fallback (vacuous pass guard).
+    pub fn is_routing_engaged(&self) -> bool {
+        self.routing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
 }
 
 /// Environment gate for the Charon grouped-dispatch path (Phase 3a). Set
@@ -256,7 +267,9 @@ pub fn fused_moe_dispatch(
 ///
 /// * `logits` - device-resident gate projection `[seq_len, num_experts]`.
 /// * `top_k` - experts-per-token selection width.
-/// * `route_mode` - gating transform: 0 = softmax, 1 = sqrt-softplus (DeepSeek-V4).
+/// * `route_mode` - gating transform: 0 = softmax (global denom, HF Qwen),
+///   1 = sqrt-softplus (DeepSeek-V4), 2 = sigmoid+bias (DeepSeek-V2/V3 dedup),
+///   3 = softmax renormalized over top-k only (GLM/Qwen `normalize_weights`).
 /// Returns `Ok(None)` when the path cannot run (non-ROCm, unavailable kernel, or
 /// `GRIM_MOE_CHARON=0`), so the caller falls back to the host-routing path.
 #[allow(clippy::too_many_arguments)]
@@ -612,6 +625,159 @@ fn charon_grouped_dispatch(
     shared_expert_tail(dev, out_t, x, shared_expert).map(Some)
 }
 
+/// Charon grouped dispatch for GELU-activation MoE experts (GLM-5.2 style).
+///
+/// GLM-5.2 experts have a single projection (`dense_h_to_4h`, stored as `gate`)
+/// followed by GELU and a down projection (`dense_4h_to_h`, stored as `down`).
+/// There is no `up` projection. The GELU kernel (`grim_moe_fused_grouped_gelu`)
+/// accepts `up_ptr = 0` and is pre-wired in `moe_fused_grouped_dispatch_gelu_resident`.
+///
+/// `gate_weights` — `[num_experts]` refs to expert projection weight tensors.
+/// `down_weights` — `[num_experts]` refs to expert down projection weight tensors.
+/// `routings`     — per-token (expert_idx, weight) routing result from the CPU gate.
+///
+/// Returns `Ok(None)` when the GELU path cannot run (non-ROCm, etc.) so the
+/// caller falls back to the per-expert CPU loop.
+pub fn gelu_charon_dispatch(
+    dev: &dyn BackendDevice,
+    x: &Tensor,
+    gate_weights: &[&grim_tensor::Tensor],
+    down_weights: &[&grim_tensor::Tensor],
+    routings: &[TokenRouting],
+    routed_scaling_factor: f32,
+    cache: &CharonCache,
+) -> Result<Option<Tensor>> {
+    if !charon_enabled() {
+        return Ok(None);
+    }
+    let dims = x.shape().dims();
+    if dims.len() != 2 {
+        return Ok(None);
+    }
+    let (seq_len, hidden) = (dims[0], dims[1]);
+    let num_experts = gate_weights.len();
+    if seq_len == 0 || hidden == 0 || num_experts == 0 || num_experts != down_weights.len() {
+        return Ok(None);
+    }
+    let ordinal = match x.device() {
+        Device::Rocm(o) => *o,
+        _ => return Ok(None),
+    };
+
+    // gate weight dim(0) == inter (intermediate), dim(1) == hidden.
+    let inter = gate_weights[0].shape().dim(0).unwrap_or(0);
+    if inter == 0 {
+        return Ok(None);
+    }
+
+    // Build sortless routing assignment from host-computed routings.
+    let indices: Vec<Vec<usize>> = routings
+        .iter()
+        .map(|r| r.iter().map(|(e, _)| *e).collect())
+        .collect();
+    let weights: Vec<Vec<f32>> = routings
+        .iter()
+        .map(|r| r.iter().map(|(_, w)| *w).collect())
+        .collect();
+    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
+        &indices, &weights,
+    )?;
+    if assignment.num_pairs() == 0 {
+        let out = dev.zeros(x.shape(), DType::F32)?;
+        let out_t = Tensor::new(
+            Arc::from(out),
+            x.shape().clone(),
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        return Ok(Some(out_t));
+    }
+    let sorted = grim_backend_rocm::kernels::charon::moe_align_block_size(
+        &assignment,
+        64.max(rocm_wavefront_size(ordinal)),
+        num_experts,
+    );
+
+    let rocm = Arc::new(grim_backend_rocm::RocmDevice::shared(ordinal));
+
+    // Lazily build + cache gate and down resident stacks (no up).
+    let (gate_buf, down_buf) = {
+        let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (num_experts, hidden, inter);
+        match guard.as_ref() {
+            Some(r) if r.fingerprint == key => (Arc::clone(&r.gate), Arc::clone(&r.down)),
+            _ => {
+                let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
+                let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
+                for (gw, dw) in gate_weights.iter().zip(down_weights.iter()) {
+                    let gv = match gw.device() {
+                        Device::Rocm(ord) => grim_nn::moe::rocm_dequant_expert_weight(gw, *ord)
+                            .map_err(grim_core::error::Error::Tensor)?,
+                        _ => gw.to_vec_f32()?,
+                    };
+                    gate_flat.extend_from_slice(&gv);
+                    let dv = match dw.device() {
+                        Device::Rocm(ord) => grim_nn::moe::rocm_dequant_expert_weight(dw, *ord)
+                            .map_err(grim_core::error::Error::Tensor)?,
+                        _ => dw.to_vec_f32()?,
+                    };
+                    down_flat.extend_from_slice(&dv);
+                }
+                let gate = Arc::from(rocm.from_cpu(
+                    &gate_flat,
+                    &Shape::new(vec![gate_flat.len()]),
+                    DType::F32,
+                )?);
+                // Dummy zero up buffer (kernel ignores it via up_ptr=0, but
+                // ResidentWeights.up slot must be filled).
+                let up_dummy = Arc::from(rocm.zeros(&Shape::new(vec![1]), DType::F32)?);
+                let down = Arc::from(rocm.from_cpu(
+                    &down_flat,
+                    &Shape::new(vec![down_flat.len()]),
+                    DType::F32,
+                )?);
+                *guard = Some(ResidentWeights {
+                    gate: Arc::clone(&gate),
+                    up: Arc::clone(&up_dummy),
+                    down: Arc::clone(&down),
+                    fingerprint: key,
+                });
+                (gate, down)
+            }
+        }
+    };
+
+    let x_rocm = x
+        .storage()
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_tensor::Error::Backend("x is not RocmStorage".into()))?;
+
+    let out_shape = Shape::new(vec![seq_len, hidden]);
+    let (out_storage, _handle) = rocm.moe_fused_grouped_dispatch_gelu_resident(
+        x_rocm,
+        &*gate_buf,
+        &*down_buf,
+        &sorted,
+        &out_shape,
+        hidden,
+        inter,
+        num_experts,
+        routed_scaling_factor,
+    )?;
+
+    let out_t = Tensor::new(
+        Arc::from(out_storage),
+        out_shape,
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    );
+    Ok(Some(out_t))
+}
+
 /// Wavefront size of the shared ROCm device (32 for RDNA, 64 for CDNA), with a
 /// fallback for the non-ROCm path (never reached here but keeps the call safe).
 fn rocm_wavefront_size(ordinal: usize) -> usize {
@@ -634,7 +800,13 @@ fn stack_expert_weights(
             (&mut up_flat, &e.up),
             (&mut down_flat, &e.down),
         ] {
-            let w = lin.weight.to_vec_f32()?;
+            let w = match lin.weight.device() {
+                Device::Rocm(ord) => {
+                    grim_nn::moe::rocm_dequant_expert_weight(&lin.weight, *ord)
+                        .map_err(grim_core::error::Error::Tensor)?
+                }
+                _ => lin.weight.to_vec_f32()?,
+            };
             if w.len() != lin.weight.shape().elem_count() {
                 return Err(grim_core::error::Error::Shape(format!(
                     "stack_expert_weights: expert weight len {} != elem_count {}",
@@ -808,5 +980,77 @@ mod tests {
         assert_eq!(topk[1].0, 3); // expert 3 has logit 4.0
         let sum_w: f32 = topk.iter().map(|(_, w)| *w).sum();
         assert!((sum_w - 1.0).abs() < 1e-4);
+    }
+
+    /// Unit: `normalize_weights` matches the route_mode-3 device kernel
+    /// semantics (softmax renormalized over top-k only). Guards the
+    /// Phase-1 renorm rollout's numeric contract on CPU (no GPU needed).
+    #[test]
+    fn test_normalize_weights_renorm_contract() {
+        // Top-k subset (logits 5.0, 4.0) renormalized: exp(0)/(exp(0)+exp(-1)).
+        let topk = vec![(1usize, 5.0f32), (3usize, 4.0f32)];
+        let ws = normalize_weights(&topk);
+        assert_eq!(ws.len(), 2);
+        let e0 = 1.0f32;
+        let e1 = (-1.0f32).exp();
+        let sum = e0 + e1;
+        assert!((ws[0] - e0 / (sum + 1e-12)).abs() < 1e-6);
+        assert!((ws[1] - e1 / (sum + 1e-12)).abs() < 1e-6);
+        let total: f32 = ws.iter().sum();
+        assert!((total - 1.0).abs() < 1e-6, "renorm weights must sum to 1");
+    }
+
+    /// Unit: `route_topk` output equals `normalize_weights` applied to the
+    /// raw-logit top-k (i.e. host path == route_mode 3, not global softmax).
+    /// Multi-token + edge cases (top_k == num_experts, top_k == 1).
+    #[test]
+    fn test_route_topk_matches_normalize_weights_multi_token() {
+        let logits = vec![
+            1.0, 5.0, 2.0, 4.0, // token 0
+            -3.0, 0.5, 2.5, 2.0, // token 1
+        ];
+        for top_k in [1usize, 2, 4] {
+            let routings = route_topk(&logits, 4, top_k).expect("route_topk succeeds");
+            assert_eq!(routings.len(), 2);
+            for (s, routing) in routings.iter().enumerate() {
+                assert_eq!(routing.len(), top_k.min(4));
+                // Re-derive expected top-k from raw logits.
+                let row = &logits[s * 4..(s + 1) * 4];
+                let mut indexed: Vec<(usize, f32)> =
+                    row.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let k = top_k.min(4);
+                let expected_w = normalize_weights(&indexed[..k]);
+                for (j, (idx, w)) in routing.iter().enumerate() {
+                    assert_eq!(*idx, indexed[j].0, "rank mismatch s={s} k={top_k}");
+                    assert!(
+                        (*w - expected_w[j]).abs() < 1e-6,
+                        "weight mismatch s={s} k={top_k}: {w} vs {}",
+                        expected_w[j]
+                    );
+                }
+                let total: f32 = routing.iter().map(|(_, w)| *w).sum();
+                assert!((total - 1.0).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// Unit: engagement sentinel starts disengaged and `invalidate` resets it.
+    /// (Engaged state itself is set only by the GPU D2D path; asserted in the
+    /// GPU parity tests via `is_routing_engaged`.)
+    #[test]
+    fn test_charon_cache_engagement_sentinel_lifecycle() {
+        let cache = CharonCache::new();
+        assert!(
+            !cache.is_routing_engaged(),
+            "fresh cache must not report engaged routing"
+        );
+        cache.invalidate();
+        assert!(
+            !cache.is_routing_engaged(),
+            "invalidate must leave routing disengaged"
+        );
     }
 }

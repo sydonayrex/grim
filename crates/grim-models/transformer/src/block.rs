@@ -291,8 +291,12 @@ pub(crate) fn cache_append_kv<'a>(
     let want = past_len + s_len;
     grow_kv_arena(dev, k_device, want, row_elems)?;
     grow_kv_arena(dev, v_device, want, row_elems)?;
-    let k_arena = k_device.as_ref().expect("k arena just grown");
-    let v_arena = v_device.as_ref().expect("v arena just grown");
+    let k_arena = k_device.as_ref().ok_or_else(|| {
+        grim_core::error::Error::Backend("kv arena append: k arena missing after grow".into())
+    })?;
+    let v_arena = v_device.as_ref().ok_or_else(|| {
+        grim_core::error::Error::Backend("kv arena append: v arena missing after grow".into())
+    })?;
     let offset = past_len * row_elems;
     let count = s_len * row_elems;
     dev.copy_slice_into(k_arena.as_ref(), cur_k, offset, count)?;
@@ -471,7 +475,7 @@ impl LlamaBlock {
         // On ROCm, fuse Q/K/V Q8_0 weights into one storage for single-token dot4 decode GEMV.
         let wqkv_q80_fused = if tp.world_size == 1
             && matches!(&device, Device::Rocm(_))
-            && std::env::var("GRIM_FUSED_QKV").as_deref() != Ok("0")
+            && crate::shared_attention::fused_qkv_enabled()
         {
             let wq_s = wq.weight().storage();
             let wk_s = wk.weight().storage();

@@ -179,7 +179,8 @@ impl Lfm2 {
         }
         let mut out = Vec::with_capacity(self.layers.len());
         for (layer, cache) in self.layers.iter().zip(caches.iter()) {
-            // Recurrent layers keep host conv state — never seedable.
+            // Recurrent layers carry conv state, not KV — seeded separately
+            // via `eager_conv_seed_rings` + `seed_conv_rings`.
             if layer.wq.is_none() {
                 out.push(None);
                 continue;

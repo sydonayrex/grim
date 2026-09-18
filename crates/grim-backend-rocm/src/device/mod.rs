@@ -5,6 +5,7 @@ pub(crate) mod accel_ffi;
 pub mod batch_orchestrator;
 /// SCYTHE-2 WI-2: live GPU capability profiler.
 pub mod capability_profiler;
+#[cfg(feature = "cubecl")]
 pub mod cubecl;
 pub mod device_attention;
 pub mod device_compute;
@@ -23,7 +24,6 @@ pub mod moe_hybrid_exec;
 pub mod parallel_comm;
 pub mod probe;
 pub mod rmsnorm_quant_launch;
-pub mod segment_replay;
 pub mod roc_device;
 pub mod rocblas;
 pub mod scythe_route;
