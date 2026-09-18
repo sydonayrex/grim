@@ -41,7 +41,7 @@ impl CudaCaps {
         };
 
         let fp = spec.fingerprint_string();
-        let mut cached = CACHED_FINGERPRINT.lock().unwrap();
+        let mut cached = CACHED_FINGERPRINT.lock().unwrap_or_else(|e| e.into_inner());
         let changed = cached.as_ref() != Some(&fp);
         let epoch = if changed {
             let e = CAP_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;

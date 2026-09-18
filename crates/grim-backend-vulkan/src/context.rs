@@ -272,7 +272,7 @@ static RETRY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 /// Re-initializes the global Vulkan context after a failed init.
 /// `lazy_static` caches `None` forever when the initial `VulkanContext::init` fails (e.g.
 pub fn reset_global_context() -> Result<()> {
-    let mut guard = GLOBAL_CONTEXT.lock().unwrap();
+    let mut guard = GLOBAL_CONTEXT.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         RETRY_ATTEMPTED.store(true, Ordering::SeqCst);
         *guard = VulkanContext::init().ok();
@@ -289,7 +289,7 @@ pub fn reset_global_context() -> Result<()> {
 /// Accessor for the global context that re-attempts init once when the initial `lazy_static` init failed (which would otherwise cache `None` forever).
 /// A persistent failure is not re-tried on every call thanks to `RETRY_ATTEMPTED`; callers see `None`.
 pub(crate) fn global_context() -> std::sync::MutexGuard<'static, Option<VulkanContext>> {
-    let mut guard = GLOBAL_CONTEXT.lock().unwrap();
+    let mut guard = GLOBAL_CONTEXT.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() && !RETRY_ATTEMPTED.swap(true, Ordering::SeqCst) {
         *guard = VulkanContext::init().ok();
     }

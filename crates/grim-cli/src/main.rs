@@ -26,6 +26,7 @@ use grim_core::error::Result;
 pub mod adapter;
 pub mod arch_plugin;
 pub mod bench;
+pub mod calibrate_channels;
 pub mod catalog;
 pub mod client;
 pub mod config;
@@ -648,6 +649,36 @@ enum Commands {
         /// Verbose output (show per-tensor details).
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// Calibrate KV-cache channel importance and output JSON sidecar (PLAN-kvcache-channel-axis WI-2).
+    CalibrateChannels {
+        /// Output path (a `.json` suffix is kept verbatim; otherwise
+        /// `{output}.channels.json` is written).
+        #[arg(short, long, default_value = "channel_importance.json")]
+        output: String,
+        /// Model to calibrate against (gguf/.grim/.safetensors). Absent →
+        /// synthetic deterministic corpus.
+        #[arg(long)]
+        model: Option<String>,
+        /// Prompt file (one prompt per line). Absent → built-in set.
+        #[arg(long)]
+        prompts: Option<String>,
+        /// KV head count (defaults are the typical dense-model geometry).
+        #[arg(long, default_value = "8")]
+        kv_heads: usize,
+        /// Head dimension (must be multiple of 32).
+        #[arg(long, default_value = "128")]
+        head_dim: usize,
+        /// Calibration samples (synthetic mode) or max tokens per prompt.
+        #[arg(long, default_value = "64")]
+        samples: usize,
+        /// Max tokens captured per calibration prompt (model mode).
+        #[arg(long, default_value = "512")]
+        max_tokens: usize,
+        /// Additionally emit a derived per-group tier allocation using this
+        /// (key, value) average-bits budget.
+        #[arg(long, num_args = 2, value_names = ["KEY_BITS", "VALUE_BITS"])]
+        alloc_budget: Option<Vec<f32>>,
     },
 }
 
@@ -2341,6 +2372,35 @@ async fn main() -> Result<()> {
         Commands::Verify { path, verbose: _ } => {
             if let Err(e) = verify::cmd_verify(&path) {
                 eprintln!("Verification failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::CalibrateChannels {
+            output,
+            model,
+            prompts,
+            kv_heads,
+            head_dim,
+            samples,
+            max_tokens,
+            alloc_budget,
+        } => {
+            let budgets = alloc_budget
+                .as_deref()
+                .map(|v| (v.first().copied().unwrap_or(4.0), v.get(1).copied().unwrap_or(4.0)));
+            if let Err(e) = calibrate_channels::cmd_calibrate_channels(
+                calibrate_channels::CalibrateChannelsArgs {
+                    output,
+                    model,
+                    prompts_file: prompts,
+                    kv_heads,
+                    head_dim,
+                    samples,
+                    max_tokens_per_prompt: max_tokens,
+                    alloc_budget_bits: budgets,
+                },
+            ) {
+                eprintln!("Calibration failed: {e}");
                 std::process::exit(1);
             }
         }

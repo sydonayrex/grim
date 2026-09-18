@@ -22,7 +22,7 @@ use grim_core::error::Result;
 use grim_nn::modules::silu_mul_on_device;
 use grim_nn::Linear;
 use grim_tensor::backend::BackendDevice;
-use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
+use grim_tensor::{CoreTensorOps, DType, Device, MemoryOps, Shape, Tensor};
 
 /// One expert's SwiGLU FFN as three Linear layers (gate/up projection + down
 /// projection), matching the `w1`/`w3`/`w2` naming used across the MoE models.
@@ -49,14 +49,84 @@ pub struct CharonCache {
     /// Device-resident routing scratch: (tokens, experts, weights), resized to
     /// `seq_len * top_k` on demand, keyed by `(seq_len, top_k)`.
     routing: Mutex<Option<(usize, usize, RoutingBuffers)>>,
+    /// Resident W8A8-int8 packed expert stacks (WI-gpu-native-moe Phase 2).
+    /// Built once from packed per-expert blobs, keyed like `resident`.
+    w8a8: Mutex<Option<ResidentWeights>>,
+    /// Resident W8A8-fp8 packed expert stacks (same discipline as `w8a8`).
+    w8a8fp8: Mutex<Option<ResidentWeights>>,
+    /// Resident AWQ packed expert stacks. Fingerprint tag carries
+    /// bits/group (see [`stack_tag_awq`]) so a config change rebuilds.
+    awq: Mutex<Option<ResidentWeights>>,
+    /// Resident MXFP4 codes + shared-exponent stacks (separate buffers —
+    /// the kernel takes 6 weight pointers, not 3 packed blobs).
+    mxfp4: Mutex<Option<Mxfp4Resident>>,
+    /// Which dispatch arm the last `fused_moe_dispatch_from_logits` call took.
+    /// Tests assert this to prove the NATIVE quantized arm ran (a numeric
+    /// match alone cannot distinguish it from the dequant fallback — both
+    /// compute the same math by design).
+    last_dispatch: Mutex<DispatchKind>,
+}
+
+/// Which numeric path served a `fused_moe_dispatch_from_logits` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchKind {
+    /// f32 expert stacks (native f32, or any quantized format dequantized
+    /// to f32 at stack-build time).
+    F32Dequant,
+    /// Native W8A8-int8 dispatch (`grim_moe_fused_dispatch_w8a8_int8`)
+    /// straight from packed int8 blobs.
+    W8a8Native,
+    /// V_DOT4 variant of the int8 arm (`grim_moe_fused_dispatch_w8a8_int8_
+    /// dot4`): same numeric path (int32 Q8_1 dot products), different
+    /// contraction. Recorded distinctly so tests/benches prove which ran.
+    W8a8NativeDot4,
+    /// Native W8A8-fp8 dispatch (`grim_moe_fused_dispatch_w8a8_fp8`)
+    /// straight from packed fp8 blobs.
+    W8a8Fp8Native,
+    /// Native AWQ dispatch (`grim_moe_fused_dispatch_awq`).
+    AwqNative,
+    /// Native MXFP4 dispatch (`grim_moe_fused_dispatch_mxfp4`). The f32
+    /// dequant arm cannot serve MXFP4 (no device dequant exists), so MXFP4
+    /// is native-or-error, never silent fallback.
+    Mxfp4Native,
 }
 
 struct ResidentWeights {
     gate: Arc<dyn grim_tensor::BackendStorage>,
     up: Arc<dyn grim_tensor::BackendStorage>,
     down: Arc<dyn grim_tensor::BackendStorage>,
-    fingerprint: (usize, usize, usize),
+    /// `(num_experts, hidden, inter, format_tag)`. The tag discriminates
+    /// stacked formats sharing one slot family (`0` = f32, `1` = w8a8-int8,
+    /// `2` = w8a8-fp8, `3` = awq with bits/group folded in — see
+    /// [`stack_tag_awq`]); a tag mismatch rebuilds instead of aliasing.
+    fingerprint: (usize, usize, usize, u64),
 }
+
+/// Resident MXFP4 stacks: E2M1 code bytes and E8M0 shared-exponent bytes,
+/// each concatenated per expert (gate/up/down), no length prefixes.
+struct Mxfp4Resident {
+    codes_gate: Arc<dyn grim_tensor::BackendStorage>,
+    codes_up: Arc<dyn grim_tensor::BackendStorage>,
+    codes_down: Arc<dyn grim_tensor::BackendStorage>,
+    exps_gate: Arc<dyn grim_tensor::BackendStorage>,
+    exps_up: Arc<dyn grim_tensor::BackendStorage>,
+    exps_down: Arc<dyn grim_tensor::BackendStorage>,
+    fingerprint: (usize, usize, usize, u64),
+}
+
+/// Format tag for [`ResidentWeights::fingerprint`]. AWQ folds bits/group in
+/// so heterogeneous AWQ configs never alias one stack.
+fn stack_tag_awq(bits: u8, group_size: usize) -> u64 {
+    3 | ((bits as u64) << 32) | ((group_size as u64) << 40)
+}
+
+/// Stack tags for [`ResidentWeights::fingerprint`].
+const TAG_F32: u64 = 0;
+const TAG_W8A8_INT8: u64 = 1;
+const TAG_W8A8_FP8: u64 = 2;
+/// GELU path stores a dummy up projection — it must never alias the f32
+/// stack of the same dims (which carries a real up).
+const TAG_GELU: u64 = 5;
 
 /// Device-resident routing triple: sortless (token, expert, weight) buffers.
 struct RoutingBuffers {
@@ -76,6 +146,11 @@ impl CharonCache {
         Self {
             resident: Mutex::new(None),
             routing: Mutex::new(None),
+            w8a8: Mutex::new(None),
+            w8a8fp8: Mutex::new(None),
+            awq: Mutex::new(None),
+            mxfp4: Mutex::new(None),
+            last_dispatch: Mutex::new(DispatchKind::F32Dequant),
         }
     }
 
@@ -84,6 +159,10 @@ impl CharonCache {
     pub fn invalidate(&self) {
         *self.resident.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.routing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.w8a8.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.w8a8fp8.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.awq.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.mxfp4.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Engagement sentinel (WI-gpu-native-moe Phase 0.3): true once the
@@ -95,6 +174,20 @@ impl CharonCache {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    /// Arm sentinel (WI-gpu-native-moe Phase 2): which numeric path the last
+    /// dispatch took. Quantized-engagement tests assert `W8a8Native` for
+    /// packed-int8 experts to prove the native arm ran.
+    pub fn last_dispatch_kind(&self) -> DispatchKind {
+        *self
+            .last_dispatch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn record_dispatch(&self, kind: DispatchKind) {
+        *self.last_dispatch.lock().unwrap_or_else(|e| e.into_inner()) = kind;
     }
 }
 
@@ -194,7 +287,7 @@ pub fn ensure_charon_scratch(
 
     let (gate_buf, up_buf, down_buf) = {
         let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (num_experts, hidden, inter);
+        let key = (num_experts, hidden, inter, TAG_F32);
         match guard.as_ref() {
             Some(r) if r.fingerprint == key => {
                 (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
@@ -254,6 +347,68 @@ pub fn fused_moe_dispatch(
         }
     }
     per_expert_loop(dev, x, experts, shared_expert, routings, routed_scaling_factor)
+}
+
+/// Opt-in gate for native quantized arms that trail the f32 dequant path
+/// on latency (measured gfx1201: fp8 1.8x, awq 1.7x slower at decode
+/// shapes — per-element decode under an occupancy-starved launch).
+/// `GRIM_MOE_NATIVE_FP8=1` / `GRIM_MOE_NATIVE_AWQ=1` engage them; default
+/// is the proven dequant arm. int8 (latency-neutral) and MXFP4 (no dequant
+/// alternative exists) are always on and ignore this gate.
+fn native_quant_allowed(marker: &str) -> bool {
+    let var = match marker {
+        "fp8" => "GRIM_MOE_NATIVE_FP8",
+        "awq" => "GRIM_MOE_NATIVE_AWQ",
+        _ => return false,
+    };
+    matches!(
+        std::env::var(var).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Upload per-token activation scales of 1.0 (v1 policy shared by the
+/// native quantized arms: quantization error lives in the weight codes,
+/// exactly like the dequant path, so native dispatch is accuracy-neutral
+/// vs today's path and only saves weight traffic).
+fn upload_ones_ascale(
+    rocm: &grim_backend_rocm::RocmDevice,
+    seq_len: usize,
+) -> Result<Arc<dyn grim_tensor::backend::BackendStorage>> {
+    let ones = vec![1.0f32; seq_len.max(1)];
+    Ok(Arc::from(rocm.from_cpu(
+        &ones,
+        &Shape::new(vec![ones.len()]),
+        DType::F32,
+    )?))
+}
+
+/// Downcast a resident buffer to `RocmStorage` for a kernel launch.
+fn as_rocm_storage<'a>(
+    buf: &'a Arc<dyn grim_tensor::backend::BackendStorage>,
+    label: &str,
+) -> Result<&'a grim_backend_rocm::RocmStorage> {
+    buf.as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .ok_or_else(|| grim_core::error::Error::Backend(format!("{label} not RocmStorage")))
+}
+
+/// Zero-output early return shared by the native quantized arms when
+/// `num_pairs == 0` (no routed pairs: output is zeros + shared expert).
+fn zero_moe_output(
+    dev: &dyn BackendDevice,
+    x: &Tensor,
+    shared_expert: Option<&MoeExpert>,
+) -> Result<Tensor> {
+    let out = dev.zeros(x.shape(), DType::F32)?;
+    let out_t = Tensor::new(
+        Arc::from(out),
+        x.shape().clone(),
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    );
+    shared_expert_tail(dev, out_t, x, shared_expert)
 }
 
 /// Fully device-resident (D2D) MoE dispatch: routing is computed **on-device**
@@ -392,10 +547,403 @@ pub fn fused_moe_dispatch_from_logits(
         route_mode,
     )?;
 
+    // WI-gpu-native-moe Phase 2: native W8A8-int8 arm. When every expert
+    // projection is a ROCm-resident CompressedTensorsW8A8Int8 packed blob,
+    // dispatch straight from the packed stacks (no dequant, no fallback).
+    // Anything else rides the f32 arm below (native f32, or any quantized
+    // format dequantized at stack-build time).
+    if experts_use_w8a8_native(experts) {
+        let (gate_buf, up_buf, down_buf) = {
+            let mut guard = cache.w8a8.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (num_experts, hidden, inter, TAG_W8A8_INT8);
+            match guard.as_ref() {
+                Some(r) if r.fingerprint == key => (
+                    Arc::clone(&r.gate),
+                    Arc::clone(&r.up),
+                    Arc::clone(&r.down),
+                ),
+                _ => {
+                    let (gate_flat, up_flat, down_flat) =
+                        stack_w8a8_blobs(experts, num_experts, hidden, inter)?;
+                    let pack_dtype = || DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::CompressedTensorsW8A8Int8,
+                    };
+                    let gate = Arc::from(rocm.from_cpu_bytes(
+                        &gate_flat,
+                        &Shape::new(vec![gate_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    let up = Arc::from(rocm.from_cpu_bytes(
+                        &up_flat,
+                        &Shape::new(vec![up_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    let down = Arc::from(rocm.from_cpu_bytes(
+                        &down_flat,
+                        &Shape::new(vec![down_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    *guard = Some(ResidentWeights {
+                        gate: Arc::clone(&gate),
+                        up: Arc::clone(&up),
+                        down: Arc::clone(&down),
+                        fingerprint: key,
+                    });
+                    (gate, up, down)
+                }
+            }
+        };
+
+        // Per-token activation scale. v1 policy: 1.0 (quantization error
+        // lives in the int8 codes, exactly like the dequant path — so the
+        // native arm is accuracy-neutral vs today's path and only saves
+        // weight traffic). Dynamic per-token max-scaling is a follow-up.
+        let ones = vec![1.0f32; seq_len.max(1)];
+        let ascale_buf: Arc<dyn grim_tensor::backend::BackendStorage> =
+            Arc::from(rocm.from_cpu(&ones, &Shape::new(vec![ones.len()]), DType::F32)?);
+        let ascale_rocm = ascale_buf
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| grim_tensor::Error::Backend("ascale not RocmStorage".into()))?;
+
+        cache.record_dispatch(DispatchKind::W8a8Native);
+        if num_pairs == 0 {
+            let out = dev.zeros(x.shape(), DType::F32)?;
+            let out_t = Tensor::new(
+                Arc::from(out),
+                x.shape().clone(),
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            );
+            return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+        }
+
+        let out_shape = Shape::new(vec![seq_len, hidden]);
+        // WI-gpu-native-moe #2: prefer the V_DOT4 contraction when the
+        // shape (hidden % 32) and the architecture allow it; the scalar
+        // sortless kernel is the exact-math fallback. The variant is a
+        // perf detail inside one numeric path (both recorded distinctly
+        // so tests/benches can tell them apart).
+        let use_dot4 = hidden % 32 == 0
+            && grim_backend_rocm::kernels::charon::dot4_supported(rocm.gcn_arch());
+        let (out_storage, _handle) = if use_dot4 {
+            cache.record_dispatch(DispatchKind::W8a8NativeDot4);
+            rocm.moe_fused_dispatch_resident_routing_w8a8_int8_dot4(
+                x_rocm,
+                &*gate_buf,
+                &*up_buf,
+                &*down_buf,
+                ascale_rocm,
+                tokens_rocm,
+                experts_rocm,
+                weights_rocm,
+                num_pairs,
+                &out_shape,
+                hidden,
+                inter,
+                routed_scaling_factor,
+            )?
+        } else {
+            rocm.moe_fused_dispatch_resident_routing_w8a8_int8(
+                x_rocm,
+                &*gate_buf,
+                &*up_buf,
+                &*down_buf,
+                ascale_rocm,
+                tokens_rocm,
+                experts_rocm,
+                weights_rocm,
+                num_pairs,
+                &out_shape,
+                hidden,
+                inter,
+                routed_scaling_factor,
+            )?
+        };
+
+        let out_t = Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+    }
+
+    // WI-gpu-native-moe Phase 2: native W8A8-fp8 arm (mirrors the int8 arm;
+    // per-expert blobs carry ONE f32 scale — see `w8a8_fp8_strides`).
+    // Gated by GRIM_MOE_NATIVE_FP8 (bench: 1.8x slower than dequant —
+    // per-element fp8 decode under an occupancy-starved launch).
+    if experts_use_w8a8_fp8_native(experts) && native_quant_allowed("fp8") {
+        let (gate_buf, up_buf, down_buf) = {
+            let mut guard = cache.w8a8fp8.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (num_experts, hidden, inter, TAG_W8A8_FP8);
+            match guard.as_ref() {
+                Some(r) if r.fingerprint == key => (
+                    Arc::clone(&r.gate),
+                    Arc::clone(&r.up),
+                    Arc::clone(&r.down),
+                ),
+                _ => {
+                    let (gate_flat, up_flat, down_flat) =
+                        stack_w8a8_fp8_blobs(experts, num_experts, hidden, inter)?;
+                    let pack_dtype = || DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::CompressedTensorsW8A8Fp8,
+                    };
+                    let gate = Arc::from(rocm.from_cpu_bytes(
+                        &gate_flat,
+                        &Shape::new(vec![gate_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    let up = Arc::from(rocm.from_cpu_bytes(
+                        &up_flat,
+                        &Shape::new(vec![up_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    let down = Arc::from(rocm.from_cpu_bytes(
+                        &down_flat,
+                        &Shape::new(vec![down_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    *guard = Some(ResidentWeights {
+                        gate: Arc::clone(&gate),
+                        up: Arc::clone(&up),
+                        down: Arc::clone(&down),
+                        fingerprint: key,
+                    });
+                    (gate, up, down)
+                }
+            }
+        };
+
+        let ascale_buf = upload_ones_ascale(&rocm, seq_len)?;
+        let ascale_rocm = as_rocm_storage(&ascale_buf, "ascale")?;
+
+        cache.record_dispatch(DispatchKind::W8a8Fp8Native);
+        if num_pairs == 0 {
+            return zero_moe_output(dev, x, shared_expert).map(Some);
+        }
+
+        let out_shape = Shape::new(vec![seq_len, hidden]);
+        let (out_storage, _handle) = rocm.moe_fused_dispatch_resident_routing_w8a8_fp8(
+            x_rocm,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            ascale_rocm,
+            tokens_rocm,
+            experts_rocm,
+            weights_rocm,
+            num_pairs,
+            &out_shape,
+            hidden,
+            inter,
+            routed_scaling_factor,
+        )?;
+
+        let out_t = Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+    }
+
+    // WI-gpu-native-moe Phase 2: native AWQ arm. Uniform bits/group across
+    // the whole bank is enforced by `awq_uniform_config`; heterogeneous
+    // banks fall through to the f32 dequant arm (which handles per-tensor
+    // configs). Gated by GRIM_MOE_NATIVE_AWQ (bench: 1.7x slower than
+    // dequant — per-element unpack under an occupancy-starved launch).
+    if let Some((bits, group_size)) = awq_uniform_config(experts)
+        .filter(|_| native_quant_allowed("awq"))
+    {
+        let (gate_buf, up_buf, down_buf) = {
+            let mut guard = cache.awq.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (num_experts, hidden, inter, stack_tag_awq(bits, group_size));
+            match guard.as_ref() {
+                Some(r) if r.fingerprint == key => (
+                    Arc::clone(&r.gate),
+                    Arc::clone(&r.up),
+                    Arc::clone(&r.down),
+                ),
+                _ => {
+                    let (gate_flat, up_flat, down_flat) =
+                        stack_awq_blobs(experts, num_experts, hidden, inter, bits, group_size)?;
+                    let pack_dtype = || DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::Awq(
+                            grim_tensor::dtype::AwqStorageConfig { bits, group_size },
+                        ),
+                    };
+                    let gate = Arc::from(rocm.from_cpu_bytes(
+                        &gate_flat,
+                        &Shape::new(vec![gate_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    let up = Arc::from(rocm.from_cpu_bytes(
+                        &up_flat,
+                        &Shape::new(vec![up_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    let down = Arc::from(rocm.from_cpu_bytes(
+                        &down_flat,
+                        &Shape::new(vec![down_flat.len()]),
+                        pack_dtype(),
+                    )?);
+                    *guard = Some(ResidentWeights {
+                        gate: Arc::clone(&gate),
+                        up: Arc::clone(&up),
+                        down: Arc::clone(&down),
+                        fingerprint: key,
+                    });
+                    (gate, up, down)
+                }
+            }
+        };
+
+        let ascale_buf = upload_ones_ascale(&rocm, seq_len)?;
+        let ascale_rocm = as_rocm_storage(&ascale_buf, "ascale")?;
+
+        cache.record_dispatch(DispatchKind::AwqNative);
+        if num_pairs == 0 {
+            return zero_moe_output(dev, x, shared_expert).map(Some);
+        }
+
+        let out_shape = Shape::new(vec![seq_len, hidden]);
+        let (out_storage, _handle) = rocm.moe_fused_dispatch_resident_routing_awq(
+            x_rocm,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            ascale_rocm,
+            tokens_rocm,
+            experts_rocm,
+            weights_rocm,
+            num_pairs,
+            &out_shape,
+            hidden,
+            inter,
+            bits,
+            group_size,
+            routed_scaling_factor,
+        )?;
+
+        let out_t = Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+    }
+
+    // WI-gpu-native-moe Phase 2: native MXFP4 arm. The f32 dequant arm
+    // CANNOT serve MXFP4 (no device dequant exists), so MXFP4 is
+    // native-or-error — never silent fallback, never silent zeros.
+    if experts_use_mxfp4_native(experts, hidden, inter) {
+        let (cg, cu, cd, eg, eu, ed) = {
+            let mut guard = cache.mxfp4.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (num_experts, hidden, inter, 4u64);
+            match guard.as_ref() {
+                Some(r) if r.fingerprint == key => (
+                    Arc::clone(&r.codes_gate),
+                    Arc::clone(&r.codes_up),
+                    Arc::clone(&r.codes_down),
+                    Arc::clone(&r.exps_gate),
+                    Arc::clone(&r.exps_up),
+                    Arc::clone(&r.exps_down),
+                ),
+                _ => {
+                    let (cg_v, cu_v, cd_v, eg_v, eu_v, ed_v) =
+                        stack_mxfp4(experts, num_experts, hidden, inter)?;
+                    let pack_dtype = || DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::Storage::FloatPack(
+                            grim_tensor::FloatPackScheme::MxFp4,
+                        ),
+                    };
+                    // from_cpu_bytes failures propagate as dispatch errors
+                    // (loud) — never unwrap into a panic inside serving.
+                    let build = |v: &Vec<u8>| -> Result<Arc<dyn grim_tensor::backend::BackendStorage>> {
+                        Ok(Arc::from(rocm.from_cpu_bytes(
+                            v,
+                            &Shape::new(vec![v.len()]),
+                            pack_dtype(),
+                        )?))
+                    };
+                    let cg_b = build(&cg_v)?;
+                    let cu_b = build(&cu_v)?;
+                    let cd_b = build(&cd_v)?;
+                    let eg_b = build(&eg_v)?;
+                    let eu_b = build(&eu_v)?;
+                    let ed_b = build(&ed_v)?;
+                    *guard = Some(Mxfp4Resident {
+                        codes_gate: Arc::clone(&cg_b),
+                        codes_up: Arc::clone(&cu_b),
+                        codes_down: Arc::clone(&cd_b),
+                        exps_gate: Arc::clone(&eg_b),
+                        exps_up: Arc::clone(&eu_b),
+                        exps_down: Arc::clone(&ed_b),
+                        fingerprint: key,
+                    });
+                    (cg_b, cu_b, cd_b, eg_b, eu_b, ed_b)
+                }
+            }
+        };
+
+        let ascale_buf = upload_ones_ascale(&rocm, seq_len)?;
+        let ascale_rocm = as_rocm_storage(&ascale_buf, "ascale")?;
+
+        cache.record_dispatch(DispatchKind::Mxfp4Native);
+        if num_pairs == 0 {
+            return zero_moe_output(dev, x, shared_expert).map(Some);
+        }
+
+        let out_shape = Shape::new(vec![seq_len, hidden]);
+        let (out_storage, _handle) = rocm.moe_fused_dispatch_resident_routing_mxfp4(
+            x_rocm,
+            &*cg,
+            &*cu,
+            &*cd,
+            &*eg,
+            &*eu,
+            &*ed,
+            ascale_rocm,
+            tokens_rocm,
+            experts_rocm,
+            weights_rocm,
+            num_pairs,
+            &out_shape,
+            hidden,
+            inter,
+            routed_scaling_factor,
+        )?;
+
+        let out_t = Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+    }
+
     // Resolve the resident weight stack (built once).
     let (gate_buf, up_buf, down_buf) = {
         let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (num_experts, hidden, inter);
+        let key = (num_experts, hidden, inter, TAG_F32);
         match guard.as_ref() {
             Some(r) if r.fingerprint == key => (
                 Arc::clone(&r.gate),
@@ -433,6 +981,7 @@ pub fn fused_moe_dispatch_from_logits(
 
     // 2. Sortless fused dispatch from device-resident routing (no H2D).
     if num_pairs == 0 {
+        cache.record_dispatch(DispatchKind::F32Dequant);
         let out = dev.zeros(x.shape(), DType::F32)?;
         let out_t = Tensor::new(
             Arc::from(out),
@@ -459,6 +1008,7 @@ pub fn fused_moe_dispatch_from_logits(
         inter,
         routed_scaling_factor,
     )?;
+    cache.record_dispatch(DispatchKind::F32Dequant);
 
     let out_t = Tensor::new(
         Arc::from(out_storage),
@@ -557,7 +1107,7 @@ fn charon_grouped_dispatch(
     let rocm = Arc::new(grim_backend_rocm::RocmDevice::shared(ordinal));
     let (gate_buf, up_buf, down_buf) = {
         let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (num_experts, hidden, inter);
+        let key = (num_experts, hidden, inter, TAG_F32);
         match guard.as_ref() {
             Some(r) if r.fingerprint == key => (
                 Arc::clone(&r.gate),
@@ -704,7 +1254,7 @@ pub fn gelu_charon_dispatch(
     // Lazily build + cache gate and down resident stacks (no up).
     let (gate_buf, down_buf) = {
         let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (num_experts, hidden, inter);
+        let key = (num_experts, hidden, inter, TAG_GELU);
         match guard.as_ref() {
             Some(r) if r.fingerprint == key => (Arc::clone(&r.gate), Arc::clone(&r.down)),
             _ => {
@@ -784,7 +1334,335 @@ fn rocm_wavefront_size(ordinal: usize) -> usize {
     grim_backend_rocm::RocmDevice::shared(ordinal).wavefront_size() as usize
 }
 
-/// Stack `experts[*].{gate,up,down}` into three contiguous row-major f32 vecs.
+/// W8A8-int8 packed-blob strides, in bytes: `[u64 prefix | int8 codes |
+/// f32 per-row scales]`. MUST match `grim_moe_fused_dispatch_w8a8_int8`
+/// (`gate_stride` / `down_stride`).
+fn w8a8_strides(hidden: usize, inter: usize) -> (usize, usize) {
+    (
+        8 + inter * hidden + inter * 4,
+        8 + hidden * inter + hidden * 4,
+    )
+}
+
+/// Native-arm predicate (WI-gpu-native-moe Phase 2): true only when every
+/// projection of every expert is a ROCm-resident CompressedTensorsW8A8Int8
+/// packed blob. Mixed/quantized-other formats ride the f32 dequant arm.
+fn experts_use_w8a8_native(experts: &[MoeExpert]) -> bool {
+    experts.iter().all(|e| {
+        [&e.gate, &e.up, &e.down].iter().all(|l| {
+            matches!(l.weight.device(), Device::Rocm(_))
+                && matches!(
+                    l.weight.dtype().storage,
+                    grim_tensor::Storage::CompressedTensorsW8A8Int8
+                )
+        })
+    })
+}
+
+/// Concatenate per-expert W8A8-int8 packed blobs into three contiguous
+/// device-upload-ready stacks (gate/up share `gate_stride`, down uses
+/// `down_stride`). Each blob is validated byte-exact: a short/long blob is
+/// a loader bug and must fail loudly, never silently misalign the kernel's
+/// per-expert pointer arithmetic.
+fn stack_w8a8_blobs(
+    experts: &[MoeExpert],
+    num_experts: usize,
+    hidden: usize,
+    inter: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let (gate_stride, down_stride) = w8a8_strides(hidden, inter);
+    let mut gate_flat = Vec::with_capacity(num_experts * gate_stride);
+    let mut up_flat = Vec::with_capacity(num_experts * gate_stride);
+    let mut down_flat = Vec::with_capacity(num_experts * down_stride);
+    for e in experts.iter().take(num_experts) {
+        for (dst, lin, stride) in [
+            (&mut gate_flat, &e.gate, gate_stride),
+            (&mut up_flat, &e.up, gate_stride),
+            (&mut down_flat, &e.down, down_stride),
+        ] {
+            let storage = lin
+                .weight
+                .storage()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| {
+                    grim_tensor::Error::Backend("stack_w8a8_blobs: expert not RocmStorage".into())
+                })?;
+            let bytes = storage.copy_to_host()?;
+            if bytes.len() != stride {
+                return Err(grim_core::error::Error::Shape(format!(
+                    "stack_w8a8_blobs: expert blob len {} != stride {} (hidden={hidden} inter={inter})",
+                    bytes.len(),
+                    stride,
+                )));
+            }
+            dst.extend_from_slice(&bytes);
+        }
+    }
+    Ok((gate_flat, up_flat, down_flat))
+}
+
+/// W8A8-fp8 packed-blob strides, in bytes: `[u64 prefix | fp8 codes |
+/// ONE f32 scale]`. MUST match `grim_moe_fused_dispatch_w8a8_fp8`.
+fn w8a8_fp8_strides(hidden: usize, inter: usize) -> (usize, usize) {
+    (
+        8 + inter * hidden + 4,
+        8 + hidden * inter + 4,
+    )
+}
+
+/// Native-arm predicate for W8A8-fp8 (mirrors [`experts_use_w8a8_native`]).
+fn experts_use_w8a8_fp8_native(experts: &[MoeExpert]) -> bool {
+    experts.iter().all(|e| {
+        [&e.gate, &e.up, &e.down].iter().all(|l| {
+            matches!(l.weight.device(), Device::Rocm(_))
+                && matches!(
+                    l.weight.dtype().storage,
+                    grim_tensor::Storage::CompressedTensorsW8A8Fp8
+                )
+        })
+    })
+}
+
+/// Concatenate per-expert W8A8-fp8 packed blobs (byte-exact validation,
+/// same discipline as [`stack_w8a8_blobs`]).
+fn stack_w8a8_fp8_blobs(
+    experts: &[MoeExpert],
+    num_experts: usize,
+    hidden: usize,
+    inter: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let (gate_stride, down_stride) = w8a8_fp8_strides(hidden, inter);
+    let mut gate_flat = Vec::with_capacity(num_experts * gate_stride);
+    let mut up_flat = Vec::with_capacity(num_experts * gate_stride);
+    let mut down_flat = Vec::with_capacity(num_experts * down_stride);
+    for e in experts.iter().take(num_experts) {
+        for (dst, lin, stride) in [
+            (&mut gate_flat, &e.gate, gate_stride),
+            (&mut up_flat, &e.up, gate_stride),
+            (&mut down_flat, &e.down, down_stride),
+        ] {
+            let storage = lin
+                .weight
+                .storage()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| {
+                    grim_tensor::Error::Backend(
+                        "stack_w8a8_fp8_blobs: expert not RocmStorage".into(),
+                    )
+                })?;
+            let bytes = storage.copy_to_host()?;
+            if bytes.len() != stride {
+                return Err(grim_core::error::Error::Shape(format!(
+                    "stack_w8a8_fp8_blobs: expert blob len {} != stride {} (hidden={hidden} inter={inter})",
+                    bytes.len(),
+                    stride,
+                )));
+            }
+            dst.extend_from_slice(&bytes);
+        }
+    }
+    Ok((gate_flat, up_flat, down_flat))
+}
+
+/// AWQ values-per-u32-word for a bit width. MUST match `awq_split_bank`
+/// and `grim_moe_fused_dispatch_awq` (`vpw`).
+fn awq_vpw(bits: u8) -> Option<usize> {
+    match bits {
+        4 => Some(8),
+        2 => Some(16),
+        8 => Some(1),
+        _ => None,
+    }
+}
+
+/// AWQ per-expert blob stride for a [rows=out, cols=k] projection.
+/// MUST match `awq_split_bank`'s per-expert layout AND the launcher's
+/// segment math: `[u64 qw_len | qw | u64 qz_len | qzeros | u64 sc_len |
+/// f16 scales]`.
+fn awq_blob_stride(out: usize, k: usize, bits: u8, group_size: usize) -> Option<usize> {
+    let vpw = awq_vpw(bits)?;
+    if group_size == 0 {
+        return None;
+    }
+    let qw_len = k.div_ceil(vpw) * out * 4;
+    let groups = k.div_ceil(group_size);
+    let qz_len = groups * out.div_ceil(vpw) * 4;
+    let sc_len = groups * out * 2;
+    Some(8 + qw_len + 8 + qz_len + 8 + sc_len)
+}
+
+/// Native-arm config for AWQ: `Some((bits, group_size))` only when EVERY
+/// projection of EVERY expert is ROCm-resident AWQ with IDENTICAL
+/// bits/group. Heterogeneous banks ride the f32 dequant arm (which handles
+/// per-tensor configs); silently picking one config would misdecode the rest.
+fn awq_uniform_config(experts: &[MoeExpert]) -> Option<(u8, usize)> {
+    let mut cfg: Option<(u8, usize)> = None;
+    for e in experts {
+        for l in [&e.gate, &e.up, &e.down] {
+            if !matches!(l.weight.device(), Device::Rocm(_)) {
+                return None;
+            }
+            let this = match l.weight.dtype().storage {
+                grim_tensor::Storage::Awq(c) => (c.bits, c.group_size),
+                _ => return None,
+            };
+            match cfg {
+                None => cfg = Some(this),
+                Some(c) if c == this => {}
+                _ => return None,
+            }
+        }
+    }
+    let (bits, group) = cfg?;
+    awq_vpw(bits)?;
+    if group == 0 {
+        return None;
+    }
+    Some((bits, group))
+}
+
+/// Concatenate per-expert AWQ packed blobs (byte-exact validation against
+/// [`awq_blob_stride`]).
+fn stack_awq_blobs(
+    experts: &[MoeExpert],
+    num_experts: usize,
+    hidden: usize,
+    inter: usize,
+    bits: u8,
+    group_size: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let gate_stride = awq_blob_stride(inter, hidden, bits, group_size).ok_or_else(|| {
+        grim_core::error::Error::Backend("stack_awq_blobs: bad gate layout".into())
+    })?;
+    let down_stride = awq_blob_stride(hidden, inter, bits, group_size).ok_or_else(|| {
+        grim_core::error::Error::Backend("stack_awq_blobs: bad down layout".into())
+    })?;
+    let mut gate_flat = Vec::with_capacity(num_experts * gate_stride);
+    let mut up_flat = Vec::with_capacity(num_experts * gate_stride);
+    let mut down_flat = Vec::with_capacity(num_experts * down_stride);
+    for e in experts.iter().take(num_experts) {
+        for (dst, lin, stride) in [
+            (&mut gate_flat, &e.gate, gate_stride),
+            (&mut up_flat, &e.up, gate_stride),
+            (&mut down_flat, &e.down, down_stride),
+        ] {
+            let storage = lin
+                .weight
+                .storage()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| {
+                    grim_tensor::Error::Backend("stack_awq_blobs: expert not RocmStorage".into())
+                })?;
+            let bytes = storage.copy_to_host()?;
+            if bytes.len() != stride {
+                return Err(grim_core::error::Error::Shape(format!(
+                    "stack_awq_blobs: expert blob len {} != stride {} (hidden={hidden} inter={inter} bits={bits} group={group_size})",
+                    bytes.len(),
+                    stride,
+                )));
+            }
+            dst.extend_from_slice(&bytes);
+        }
+    }
+    Ok((gate_flat, up_flat, down_flat))
+}
+
+/// Native-arm predicate for MXFP4: every projection ROCm-resident
+/// FloatPack(MxFp4) AND `(hidden*inter) % 32 == 0` (whole 32-groups —
+/// the kernel cannot address partial groups; misaligned shapes stay out
+/// rather than read OOB).
+fn experts_use_mxfp4_native(experts: &[MoeExpert], hidden: usize, inter: usize) -> bool {
+    (hidden * inter) % 32 == 0
+        && experts.iter().all(|e| {
+            [&e.gate, &e.up, &e.down].iter().all(|l| {
+                matches!(l.weight.device(), Device::Rocm(_))
+                    && matches!(
+                        l.weight.dtype().storage,
+                        grim_tensor::Storage::FloatPack(grim_tensor::FloatPackScheme::MxFp4)
+                    )
+            })
+        })
+}
+
+/// Split one framed MXFP4 per-expert blob (`[u64 clen | codes | u64 xlen |
+/// exps]`, as produced by the bank loader) into its `(codes, exps)` parts
+/// with exact length validation.
+fn split_mxfp4_blob(bytes: &[u8], rows: usize, k: usize, label: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let need_codes = rows * k / 2;
+    let need_exps = (rows * k).div_ceil(32);
+    if bytes.len() < 8 {
+        return Err(grim_core::error::Error::Shape(format!(
+            "stack_mxfp4: {label} blob truncated (len={})",
+            bytes.len()
+        )));
+    }
+    let clen = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    if clen != need_codes || bytes.len() < 8 + clen + 8 {
+        return Err(grim_core::error::Error::Shape(format!(
+            "stack_mxfp4: {label} codes len {clen} != {need_codes}"
+        )));
+    }
+    let xlen_off = 8 + clen;
+    let xlen = u64::from_le_bytes(bytes[xlen_off..xlen_off + 8].try_into().unwrap()) as usize;
+    if xlen != need_exps || bytes.len() < 8 + clen + 8 + xlen {
+        return Err(grim_core::error::Error::Shape(format!(
+            "stack_mxfp4: {label} exps len {xlen} != {need_exps}"
+        )));
+    }
+    Ok((
+        bytes[8..8 + clen].to_vec(),
+        bytes[xlen_off + 8..xlen_off + 8 + xlen].to_vec(),
+    ))
+}
+
+/// Build MXFP4 code + shared-exponent stacks (gate/up share shapes, down
+/// differs). Returns `(codes_gate, codes_up, codes_down, exps_gate,
+/// exps_up, exps_down)`.
+fn stack_mxfp4(
+    experts: &[MoeExpert],
+    num_experts: usize,
+    hidden: usize,
+    inter: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let codes_per_gate = inter * hidden / 2;
+    let exps_per_gate = (inter * hidden).div_ceil(32);
+    let codes_per_down = hidden * inter / 2;
+    let exps_per_down = (hidden * inter).div_ceil(32);
+    let mut cg = Vec::with_capacity(num_experts * codes_per_gate);
+    let mut cu = Vec::with_capacity(num_experts * codes_per_gate);
+    let mut cd = Vec::with_capacity(num_experts * codes_per_down);
+    let mut eg = Vec::with_capacity(num_experts * exps_per_gate);
+    let mut eu = Vec::with_capacity(num_experts * exps_per_gate);
+    let mut ed = Vec::with_capacity(num_experts * exps_per_down);
+    for e in experts.iter().take(num_experts) {
+        for (codes_dst, exps_dst, lin, rows, k, label) in [
+            (&mut cg, &mut eg, &e.gate, inter, hidden, "gate"),
+            (&mut cu, &mut eu, &e.up, inter, hidden, "up"),
+            (&mut cd, &mut ed, &e.down, hidden, inter, "down"),
+        ] {
+            let storage = lin
+                .weight
+                .storage()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| {
+                    grim_tensor::Error::Backend("stack_mxfp4: expert not RocmStorage".into())
+                })?;
+            let bytes = storage.copy_to_host()?;
+            let (codes, exps) = split_mxfp4_blob(&bytes, rows, k, label)?;
+            codes_dst.extend_from_slice(&codes);
+            exps_dst.extend_from_slice(&exps);
+        }
+    }
+    Ok((cg, cu, cd, eg, eu, ed))
+}
 fn stack_expert_weights(
     experts: &[MoeExpert],
     num_experts: usize,

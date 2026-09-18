@@ -109,6 +109,16 @@ pub trait KvCache: Send {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Layer 1.5: gather the first `num_tokens` tokens' K/V rows for `layer`
+    /// as flat `[n, num_kv_heads * head_dim]` host vectors, in sequence order.
+    /// Used by prefill attention when a paged session holds a radix-seeded (or
+    /// earlier-chunked) prefix the current chunk's queries must attend over.
+    /// Default `None` — caches that can't gather force the caller into the
+    /// attended-only-within-chunk fallback.
+    fn gather_kv_f32(&self, _layer: usize, _num_tokens: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
+    }
 }
 
 /// A lightweight in-memory [`KvCache`] for tests (audit gap: callers previously had to pull in the heavyweight grim-memory paged store to test against the trait).

@@ -72,6 +72,8 @@ void grim_kv_dequant_attention(
     const int row_bytes_fp16 = head_dim * 2;
     const int row_bytes_q8_0 = ((head_dim + 31) / 32) * 34;
     const int row_bytes_q4k = ((head_dim + 255) / 256) * 144;
+    const int num_sub_blocks_q4khalf = (head_dim + 31) / 32;
+    const int row_bytes_q4khalf = 4 + 2 * num_sub_blocks_q4khalf + head_dim / 2;
 
     for (int j = j_start; j < j_end; ++j) {
         float score = 0.0f;
@@ -95,7 +97,7 @@ void grim_kv_dequant_attention(
                             k_val = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            k_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            k_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     score += q[q_offset + dim] * k_val;
@@ -124,7 +126,7 @@ void grim_kv_dequant_attention(
                             delta = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            delta = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            delta = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     // Read int8 code from block body (bytes 2..34).
@@ -156,7 +158,7 @@ void grim_kv_dequant_attention(
                             d_val = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            d_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            d_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     float dmin_val;
@@ -170,7 +172,7 @@ void grim_kv_dequant_attention(
                             dmin_val = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            dmin_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            dmin_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     const unsigned char* scales = sb + 4;
@@ -190,6 +192,56 @@ void grim_kv_dequant_attention(
                     }
                     const int qs_byte = 32 * k + j_idx;
                     unsigned char q_nib = (off < 32) ? (qs[qs_byte] & 0x0F) : (qs[qs_byte] >> 4);
+                    float k_val = d_val * (float)sc * (float)q_nib - dmin_val * (float)m;
+                    score += q[q_offset + dim] * k_val;
+                }
+            }
+        } else if (quant_format == 3) {
+            // Q4KHalf (PLAN-kvcache-channel-axis WI-1): sub-block-quantized KV per row.
+            // 4 bytes: fp16 d, fp16 min. Then s scales (6-bit in u8), s mins (6-bit in u8), then head_dim/2 nibbles.
+            const int k_row_byte_offset = (j * num_kv_heads + kv_head) * row_bytes_q4khalf;
+            const unsigned char* __restrict__ k_row_bytes = k_tensor + k_row_byte_offset;
+            const unsigned short* h_ptr = (const unsigned short*)(k_row_bytes);
+            float d_val;
+            {
+                unsigned short bits = h_ptr[0];
+                unsigned exp = (bits >> 10) & 0x1F;
+                unsigned mant = bits & 0x3FF;
+                if (exp == 0) {
+                    d_val = (mant == 0) ? 0.0f : ((float)mant * 5.9604644775390625e-8f);
+                } else if (exp == 31) {
+                    d_val = ((int)bits >> 31) ? -1e30f : 1e30f;
+                } else {
+                    float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
+                    d_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
+                }
+            }
+            float dmin_val;
+            {
+                unsigned short bits = h_ptr[1];
+                unsigned exp = (bits >> 10) & 0x1F;
+                unsigned mant = bits & 0x3FF;
+                if (exp == 0) {
+                    dmin_val = (mant == 0) ? 0.0f : ((float)mant * 5.9604644775390625e-8f);
+                } else if (exp == 31) {
+                    dmin_val = ((int)bits >> 31) ? -1e30f : 1e30f;
+                } else {
+                    float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
+                    dmin_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
+                }
+            }
+            const unsigned char* scales = k_row_bytes + 4;
+            const unsigned char* mins   = scales + num_sub_blocks_q4khalf;
+            const unsigned char* qs     = mins + num_sub_blocks_q4khalf;
+            for (int dim = 0; dim < 256; ++dim) {
+                if (dim < head_dim) {
+                    const int s = dim / 32;
+                    const int off = dim % 32;
+                    const unsigned char sc = scales[s] & 63;
+                    const unsigned char m  = mins[s] & 63;
+                    const int byte_idx = (s * 32 + off) / 2;
+                    const unsigned char byte_val = qs[byte_idx];
+                    const unsigned char q_nib = ((off & 1) == 0) ? (byte_val & 0x0F) : (byte_val >> 4);
                     float k_val = d_val * (float)sc * (float)q_nib - dmin_val * (float)m;
                     score += q[q_offset + dim] * k_val;
                 }
@@ -245,7 +297,7 @@ void grim_kv_dequant_attention(
                             v_val = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            v_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            v_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_val;
@@ -273,7 +325,7 @@ void grim_kv_dequant_attention(
                             delta = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            delta = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            delta = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     const signed char* codes = (const signed char*)(block + 2);
@@ -303,7 +355,7 @@ void grim_kv_dequant_attention(
                             d_val = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            d_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            d_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     float dmin_val;
@@ -317,7 +369,7 @@ void grim_kv_dequant_attention(
                             dmin_val = ((int)bits >> 31) ? -1e30f : 1e30f;
                         } else {
                             float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-                            dmin_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+                            dmin_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
                         }
                     }
                     const unsigned char* scales = sb + 4;
@@ -337,6 +389,56 @@ void grim_kv_dequant_attention(
                     }
                     const int qs_byte = 32 * k + j_idx;
                     unsigned char q_nib = (off < 32) ? (qs[qs_byte] & 0x0F) : (qs[qs_byte] >> 4);
+                    float v_val = d_val * (float)sc * (float)q_nib - dmin_val * (float)m;
+                    out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_val;
+                }
+            }
+        } else if (quant_format == 3) {
+            // Q4KHalf V dequant: per-sub-block d * sc * q - min * m.
+            const int v_row_byte_offset = (j * num_kv_heads + kv_head) * row_bytes_q4khalf;
+            const unsigned char* __restrict__ v_row_bytes = v_tensor + v_row_byte_offset;
+            const unsigned short* h_ptr = (const unsigned short*)(v_row_bytes);
+            float d_val;
+            {
+                unsigned short bits = h_ptr[0];
+                unsigned exp = (bits >> 10) & 0x1F;
+                unsigned mant = bits & 0x3FF;
+                if (exp == 0) {
+                    d_val = (mant == 0) ? 0.0f : ((float)mant * 5.9604644775390625e-8f);
+                } else if (exp == 31) {
+                    d_val = ((int)bits >> 31) ? -1e30f : 1e30f;
+                } else {
+                    float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
+                    d_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
+                }
+            }
+            float dmin_val;
+            {
+                unsigned short bits = h_ptr[1];
+                unsigned exp = (bits >> 10) & 0x1F;
+                unsigned mant = bits & 0x3FF;
+                if (exp == 0) {
+                    dmin_val = (mant == 0) ? 0.0f : ((float)mant * 5.9604644775390625e-8f);
+                } else if (exp == 31) {
+                    dmin_val = ((int)bits >> 31) ? -1e30f : 1e30f;
+                } else {
+                    float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
+                    dmin_val = sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
+                }
+            }
+            const unsigned char* scales = v_row_bytes + 4;
+            const unsigned char* mins   = scales + num_sub_blocks_q4khalf;
+            const unsigned char* qs     = mins + num_sub_blocks_q4khalf;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                int dd = lane_id + chunk * wave_size;
+                if (dd < head_dim) {
+                    const int s = dd / 32;
+                    const int off = dd % 32;
+                    const unsigned char sc = scales[s] & 63;
+                    const unsigned char m  = mins[s] & 63;
+                    const int byte_idx = (s * 32 + off) / 2;
+                    const unsigned char byte_val = qs[byte_idx];
+                    const unsigned char q_nib = ((off & 1) == 0) ? (byte_val & 0x0F) : (byte_val >> 4);
                     float v_val = d_val * (float)sc * (float)q_nib - dmin_val * (float)m;
                     out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_val;
                 }
@@ -422,7 +524,7 @@ __device__ __forceinline__ float grim_kvrow_h2f(unsigned short bits) {
     if (exp == 0) return (mant == 0) ? 0.0f : ((float)mant * 5.9604644775390625e-8f);
     if (exp == 31) return ((int)bits >> 31) ? -1e30f : 1e30f;
     float sign = (bits >> 15) & 1 ? -1.0f : 1.0f;
-    return sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+    return sign * (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)exp - 15));
 }
 
 __device__ __forceinline__ float grim_kvrow_dequant_elem(
@@ -463,6 +565,24 @@ __device__ __forceinline__ float grim_kvrow_dequant_elem(
                                          : (qs[32 * k + (off & 31)] >> 4);
         return d_val * (float)sc * (float)q_nib - dmin_val * (float)m;
     }
+    if (quant_format == 3) {
+        // Q4KHalf: 4B fp16 header (d, min) + s scale bytes + s min bytes
+        // + plain-order nibbles (s = head_dim/32).
+        const unsigned short* h_ptr2 = (const unsigned short*)row;
+        float d2 = grim_kvrow_h2f(h_ptr2[0]);
+        float dmin2 = grim_kvrow_h2f(h_ptr2[1]);
+        const int nsub = (head_dim + 31) / 32;
+        const unsigned char* sbytes2 = row + 4;
+        const unsigned char* mbytes2 = sbytes2 + nsub;
+        const unsigned char* qs2 = mbytes2 + nsub;
+        const int sb2 = dim / 32;
+        const int off2 = dim % 32;
+        const unsigned char sc2 = sbytes2[sb2] & 63;
+        const unsigned char m2 = mbytes2[sb2] & 63;
+        const unsigned char qb = qs2[(sb2 * 32 + off2) / 2];
+        const float q_nib2 = ((off2 & 1) == 0) ? (float)(qb & 0x0F) : (float)(qb >> 4);
+        return d2 * (float)sc2 * q_nib2 - dmin2 * (float)m2;
+    }
     if (quant_bits == 8) {
         return (((float)((int)row[dim]) - 128.0f) / 127.0f) * scales[0];
     }
@@ -489,16 +609,19 @@ extern "C" __global__ void grim_kv_dequant_to_f32(
     const int row_bytes_fp16 = head_dim * 2;
     const int row_bytes_q8_0 = ((head_dim + 31) / 32) * 34;
     const int row_bytes_q4k = ((head_dim + 255) / 256) * 144;
+    const int nsub_elems = (head_dim + 31) / 32;
+    const int row_bytes_q4kh = 4 + 2 * nsub_elems + head_dim / 2;
 
     int row_off;
     if (quant_format == 0)      row_off = row * row_bytes_fp16;
     else if (quant_format == 1) row_off = row * row_bytes_q8_0;
     else if (quant_format == 2) row_off = row * row_bytes_q4k;
+    else if (quant_format == 3) row_off = row * row_bytes_q4kh;
     else if (quant_bits == 8)   row_off = row * head_dim;
     else                        row_off = (row * head_dim) / 2;
 
     float val;
-    if (quant_format == 0 || quant_format == 1 || quant_format == 2) {
+    if (quant_format == 0 || quant_format == 1 || quant_format == 2 || quant_format == 3) {
         val = grim_kvrow_dequant_elem(tensor + row_off, scales, dim, head_dim, quant_bits, quant_format);
     } else {
         // Legacy paths index the per-row scale from the flat table.
@@ -543,6 +666,22 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("dmin_val"));
         assert!(KERNEL_SOURCE.contains("sc"));
         assert!(KERNEL_SOURCE.contains("q_nib"));
+    }
+
+    #[test]
+    fn kv_dequant_attention_source_contains_q4khalf_paths() {
+        // WI-3 (Q4KHalf): main kernel K + V branches AND the split-KV
+        // FlashDecode helper must all accept quant_format == 3 using the
+        // 4+2s+hd/2 row stride.
+        let (k_sec, v_sec) = kv_sections();
+        assert!(k_sec.contains("row_bytes_q4khalf"));
+        assert!(v_sec.contains("row_bytes_q4khalf"));
+        assert!(KERNEL_SOURCE.contains("row_bytes_q4kh"));
+        // Host contract mirror: 4 + 2*s + hd/2.
+        assert!(KERNEL_SOURCE.contains("4 + 2 * num_sub_blocks_q4khalf + head_dim / 2"));
+        assert!(KERNEL_SOURCE.contains("4 + 2 * nsub_elems + head_dim / 2"));
+        // Plain-order nibbles: (s*32 + off)/2, low nibble on even offsets.
+        assert!(KERNEL_SOURCE.contains("(off2 & 1) == 0"));
     }
 
     #[test]

@@ -8,7 +8,10 @@ description = "Runtime KV cache compression for Grim — TurboQuant-style rotati
 
 [dependencies]
 grim-tensor = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 grim-core = { workspace = true }
+grim-quant = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -139,8 +139,8 @@ impl ConstrainedSampler {
         match &self.constraint {
             Constraint::JsonObject => {
                 if let Some(vocab) = &self.vocab {
-                    let fsm = self.fsm.lock().unwrap();
-                    let mut cache = self.cache.lock().unwrap();
+                    let fsm = self.fsm.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                     let mut mask = cache.mask_for(fsm.clone(), vocab).to_vec();
                     if mask.len() != vocab_size {
                         mask.resize(vocab_size, true);
@@ -151,11 +151,11 @@ impl ConstrainedSampler {
             }
             Constraint::JsonSchema(comp) => {
                 if let Some(vocab) = &self.vocab {
-                    let fsm = self.fsm.lock().unwrap();
-                    let mut cache = self.cache.lock().unwrap();
+                    let fsm = self.fsm.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                     // 1. Fast O(1) state-cached PDA mask eliminates structurally invalid tokens
                     let base_mask = cache.mask_for(fsm.clone(), vocab);
-                    let output = self.output.lock().unwrap();
+                    let output = self.output.lock().unwrap_or_else(|e| e.into_inner());
 
                     // 2. Query schema validity mask.
                     let all_valid: Arc<[bool]> = vec![true; vocab_size].into();
@@ -184,7 +184,7 @@ impl ConstrainedSampler {
     pub fn lookahead_literal(&self) -> Option<String> {
         // FSM-level singletons (JSON-object mode): forced colon, literal tails.
         {
-            let fsm = self.fsm.lock().unwrap();
+            let fsm = self.fsm.lock().unwrap_or_else(|e| e.into_inner());
             match fsm.mode {
                 crate::json_fsm::Mode::ExpectColon => return Some(": ".to_string()),
                 crate::json_fsm::Mode::LitTrue(1) => return Some("rue".to_string()),
@@ -241,7 +241,7 @@ mod tests {
 
         // Validate that the FSM starts at Root by checking the first mask
         // allows `{` but not `}`.
-        let fsm = cs.fsm.lock().unwrap();
+        let fsm = cs.fsm.lock().unwrap_or_else(|e| e.into_inner());
         let mask = fsm.valid_tokens(&vocab);
         assert!(mask[0], "token `{{` should be valid at root");
         assert!(!mask[5], "token `}}` should be invalid at root");
@@ -250,7 +250,7 @@ mod tests {
         // Simulate sampling token 0 (`{`), feed it.
         cs.feed_sampled_token_id(0);
         // Now `}` (token 5) should be valid.
-        let fsm = cs.fsm.lock().unwrap();
+        let fsm = cs.fsm.lock().unwrap_or_else(|e| e.into_inner());
         let mask = fsm.valid_tokens(&vocab);
         assert!(mask[5], "token `}}` should be valid after `{{`");
         drop(fsm);

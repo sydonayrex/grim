@@ -72,3 +72,34 @@ target_ttft_ms = 100
     assert_eq!(parsed.server.max_num_seqs, 16);
     assert_eq!(parsed.server.target_ttft_ms, Some(100));
 }
+
+#[test]
+fn test_calibrate_channels_cli_e2e() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+
+    let res = grim_cli::calibrate_channels::cmd_calibrate_channels(
+        grim_cli::calibrate_channels::CalibrateChannelsArgs {
+            output: path.to_string(),
+            model: None,
+            prompts_file: None,
+            kv_heads: 4,
+            head_dim: 128,
+            samples: 8,
+            max_tokens_per_prompt: 32,
+            alloc_budget_bits: None,
+        },
+    );
+    assert!(res.is_ok(), "cmd_calibrate_channels should succeed: {:?}", res);
+
+    let content = std::fs::read_to_string(path).unwrap();
+    let scores: grim_kvquant::channel_importance::ChannelImportanceScores =
+        serde_json::from_str(&content).unwrap();
+
+    assert_eq!(scores.num_kv_heads, 4);
+    assert_eq!(scores.head_dim, 128);
+    assert_eq!(scores.group_size, 32);
+    assert_eq!(scores.k_scores.len(), 4);
+    assert_eq!(scores.k_scores[0].len(), 4);
+    assert_eq!(scores.kv_rows, 8);
+}

@@ -118,7 +118,7 @@ mod tests {
     /// bumps the counter and emits the user-facing warning exactly once.
     #[test]
     fn managed_fallback_is_observable_and_warns_once() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_managed_fallback_instrumentation();
         assert_eq!(
             managed_fallback_count(),
@@ -147,7 +147,7 @@ mod tests {
     /// must not touch the instrumentation (no false-positive warning on normal small-model loads).
     #[test]
     fn non_managed_allocation_does_not_touch_instrumentation() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_managed_fallback_instrumentation();
         // should_use_managed("", ...) = ordinary allocation path.
         assert!(!should_use_managed("", 1000, 2000, 1, 2000));

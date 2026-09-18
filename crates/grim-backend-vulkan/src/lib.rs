@@ -578,7 +578,7 @@ impl VulkanDevice {
         // Persistent autotuner: cached (loaded-from-disk or in-memory) winner on a repeat shape
         // is reused; on a miss the winner is chosen and persisted (search_tile_config saves).
         let tile_config = {
-            let autotuner = self.autotuner.lock().unwrap();
+            let autotuner = self.autotuner.lock().unwrap_or_else(|e| e.into_inner());
             autotuner.search_tile_config(&self.caps, m, n, k, op)
         };
         let shape_class = match op {
@@ -2472,7 +2472,9 @@ impl MemoryOps for VulkanDevice {
                 signal_semaphore_count: 0,
                 p_signal_semaphores: std::ptr::null(),
             };
-            let _q_lock = QUEUE_LOCK.lock().unwrap();
+            let _q_lock = QUEUE_LOCK
+                .lock()
+                .map_err(|_| Error::Backend("Vulkan QUEUE_LOCK mutex poisoned".into()))?;
             let res = vkQueueSubmit(ctx.queue, 1, &submit_info, 0);
             if res != VK_SUCCESS {
                 return Err(Error::Backend(format!(

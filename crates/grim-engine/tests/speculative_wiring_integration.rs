@@ -90,6 +90,7 @@ fn test_engine_decode_sampling_interaction_pipeline() {
         consumed_tokens: 0,
         adapter_ids: Vec::new(),
         input_ids: Some(prompt_tokens.clone()),
+        session: None,
     };
 
     engine.enqueue_request(request).expect("enqueue request");

@@ -40,8 +40,16 @@ impl AttentionOps for RocmDevice {
         quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let quant_format =
-            crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true);
+        let quant_format = match std::env::var("GRIM_KV_QUANT_FORMAT").as_deref() {
+            Ok("q4khalf") | Ok("q4k_half") | Ok("3") => crate::fusion::KvQuantFormat::Q4KHalf,
+            Ok("q4k") | Ok("2") => crate::fusion::KvQuantFormat::Q4K,
+            Ok("q8_0") | Ok("q8") | Ok("1") => crate::fusion::KvQuantFormat::Q8_0,
+            Ok("legacy") => crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true),
+            _ => match quant_bits {
+                3 => crate::fusion::KvQuantFormat::Q4KHalf,
+                _ => crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true),
+            },
+        };
         self.kv_dequant_attention_impl(
             q,
             k_tensor,

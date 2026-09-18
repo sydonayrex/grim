@@ -19,6 +19,10 @@ use crate::deepseek2::DeepSeek2;
 use crate::deepseek32::DeepSeek32;
 use crate::deepseek4::DeepSeek4;
 use crate::gemma2::{Gemma2, Gemma2Block};
+use crate::glm4_moe_lite::Glm4MoeLite;
+use crate::granite_moe_hybrid::GraniteMoeHybrid;
+use crate::hyv3::HyV3;
+use crate::minimax_m3::MiniMaxM3;
 use crate::model::Llama;
 use crate::qwen35::{Qwen35, Qwen35Block, Qwen35LayerCache};
 
@@ -112,6 +116,18 @@ fn add_graph(
     dev: &Dev,
 ) -> Result<()> {
     dev.add_into(a, b, dst)
+        .map_err(grim_core::error::Error::Tensor)?;
+    Ok(())
+}
+
+fn axpy_graph(
+    a: &dyn grim_tensor::BackendStorage,
+    s: f32,
+    b: &dyn grim_tensor::BackendStorage,
+    dst: &grim_backend_rocm::RocmStorage,
+    dev: &Dev,
+) -> Result<()> {
+    dev.axpy_into(a, s, b, dst)
         .map_err(grim_core::error::Error::Tensor)?;
     Ok(())
 }
@@ -2124,6 +2140,1433 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         xverse::Xverse, smallthinker::SmallThinker, smollm2::SmolLm2, glm4moe::Glm4Moe, step35::Step35,
     );
     None
+}
+
+// ─── DecodeGraphModel implementation for MiniMaxM3 ────────────────────────
+
+fn dev_for_minimax_m3(m: &MiniMaxM3) -> Result<Arc<Dev>> {
+    match &m.device {
+        Device::Rocm(o) => Ok(Dev::shared(*o)),
+        _ => Err(grim_core::error::Error::Unimplemented(
+            "decode graph needs ROCm device".into(),
+        )),
+    }
+}
+
+impl DecodeGraphModel for MiniMaxM3 {
+    fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled by env".into(),
+            ));
+        }
+        let dev = dev_for_minimax_m3(self)?;
+        let stream = dev
+            .get_stream_from_pool(0)
+            .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
+
+        let hidden = self.cfg.hidden_size;
+        let n_q = self.cfg.num_attention_heads * self.cfg.head_dim;
+        let n_k = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let n_v = n_k;
+        let inter = self.cfg.intermediate_size;
+        let vocab = self.cfg.vocab_size.max(1);
+        let ctx = max_ctx.max(1);
+        let nh = self.cfg.num_attention_heads;
+
+        let buffers = DecodeGraphBuffers::allocate(
+            &dev,
+            self.layers.len(),
+            hidden,
+            n_q,
+            n_k,
+            n_v,
+            inter,
+            ctx,
+            vocab,
+            nh,
+            batch,
+            self.cfg.num_experts,
+            self.cfg.num_experts_per_tok,
+            0,
+            0,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
+        Ok(DecodeGraph::new(&dev, buffers, stream))
+    }
+
+    fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled".into(),
+            ));
+        }
+        let dev = dev_for_minimax_m3(self)?;
+        if !graph.capturing {
+            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        }
+
+        let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        let hd = self.cfg.head_dim;
+        let nh = self.cfg.num_attention_heads;
+        let nkv = self.cfg.num_key_value_heads;
+        let h_shape = Shape::new(vec![batch, hidden]);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let act = &graph.buffers.act_q81_buf[i];
+
+            // 1. Attention pre-norm
+            dev.rms_norm_into(
+                &graph.buffers.layer_input[i],
+                &**layer.input_layernorm.weight.storage(),
+                layer.input_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed: &Storage = &graph.buffers.norm_buf[i];
+
+            // 2. QKV projections
+            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
+            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
+            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+
+            // 3. RoPE
+            let steps = 1usize;
+            let rope_cfg = layer.rope.config.clone();
+            let q3 = Shape::new(vec![batch, nh * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.q_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.q_buf[i],
+                &rope_cfg,
+                &q3,
+                nh,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            let k3 = Shape::new(vec![batch, nkv * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.k_buf[i],
+                &rope_cfg,
+                &k3,
+                nkv,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            // 4. KV append & attention
+            let kv_stride = nkv * hd;
+            let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
+            let max_ctx = graph.buffers.max_ctx;
+            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.k_arena[i],
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.v_arena[i],
+                &graph.buffers.v_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+
+            grim_backend_rocm::launch_qkv_attention_dev_batch(
+                &dev,
+                &graph.buffers.q_buf[i],
+                &graph.buffers.k_arena[i],
+                &graph.buffers.v_arena[i],
+                &graph.buffers.attn_out_buf[i],
+                &graph.buffers.attn_max_buf[i],
+                &graph.buffers.attn_sum_buf[i],
+                &graph.buffers.pos_dev,
+                nh as u32,
+                nkv as u32,
+                hd as u32,
+                steps as u32,
+                steps as u32,
+                1.0 / (hd as f32).sqrt(),
+                0,
+                0.0,
+                &graph.buffers.attn_dummy,
+                0,
+                0,
+                &graph.buffers.attn_dummy,
+                0,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
+
+            grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
+                .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+
+            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
+            add_graph(&graph.buffers.layer_input[i], &graph.buffers.norm_buf[i], &graph.buffers.layer_output[i], &dev)?;
+
+            // 5. Post-attention RMSNorm -> MoE FFN
+            dev.rms_norm_into(
+                &graph.buffers.layer_output[i],
+                &**layer.post_attention_layernorm.weight.storage(),
+                layer.post_attention_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed_moe: &Storage = &graph.buffers.norm_buf[i];
+
+            // 6. MoE Gate + top-k route (mode 3 renorm)
+            linear_into(&dev, normed_moe, layer.block_sparse_moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            let num_exp = self.cfg.num_experts;
+            let top_k = self.cfg.num_experts_per_tok.min(num_exp);
+            dev.moe_route_topk_on_device(
+                &graph.buffers.moe_gate_logits[i],
+                None,
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch,
+                num_exp,
+                top_k,
+                3, // mode 3: softmax renormalized over top-k
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+            // 7. Resident grouped dispatch
+            let experts = layer.block_sparse_moe.experts.iter().map(|e| {
+                crate::shared_moe::MoeExpert {
+                    gate: e.w1.clone(),
+                    up: e.w3.clone(),
+                    down: e.w2.clone(),
+                }
+            }).collect::<Vec<_>>();
+
+            let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
+                dev.ordinal(),
+                batch,
+                top_k,
+                &experts,
+                &layer.block_sparse_moe.charon_cache,
+            )?;
+
+            let norm_rocm = dst_downcast(normed_moe)?;
+            dev.moe_fused_dispatch_resident_routing_into(
+                norm_rocm,
+                gate_buf.as_ref(),
+                up_buf.as_ref(),
+                down_buf.as_ref(),
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch * top_k,
+                &graph.buffers.moe_out[i],
+                hidden,
+                self.cfg.intermediate_size,
+                1.0,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
+
+            add_graph(&graph.buffers.layer_output[i], &graph.buffers.moe_out[i], &graph.buffers.layer_output[i], &dev)?;
+
+            let n_layers = graph.buffers.layer_input.len();
+            let dst: &Storage = if i + 1 < n_layers {
+                &graph.buffers.layer_input[i + 1]
+            } else {
+                &graph.buffers.head_input
+            };
+            dev.copy_slice_into(dst, &graph.buffers.layer_output[i], 0, batch * hidden)
+                .map_err(grim_core::error::Error::Tensor)?;
+        }
+
+        // Final RMSNorm + LM head
+        dev.rms_norm_into(
+            &graph.buffers.head_input,
+            &**self.norm.weight.storage(),
+            self.norm.eps,
+            &graph.buffers.head_input,
+            &h_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+
+        linear_into(
+            &dev,
+            &graph.buffers.head_input,
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[0],
+        )?;
+
+        Ok(())
+    }
+
+    fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !graph.is_captured {
+            return Err(grim_core::error::Error::Backend(
+                "forward_replay before capture".into(),
+            ));
+        }
+        let dev = dev_for_minimax_m3(self)?;
+        crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+
+        let pos = graph.buffers.current_pos;
+        if !graph.kv_append_node.is_null() {
+            let _ = graph.update_kv_pos_params(std::ptr::null());
+        }
+        graph
+            .buffers
+            .write_pos_async(&dev, pos, graph.stream)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        graph
+            .replay()
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        Ok(())
+    }
+
+    fn eager_kv_seed_sources<'a>(
+        &self,
+        session: &'a dyn grim_core::session::SessionT,
+        valid_rows: u32,
+    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
+        let caches = session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>>>())
+            .ok_or_else(|| {
+                grim_core::error::Error::Session(
+                    "missing or invalid MiniMaxM3 KV cache in session".into(),
+                )
+            })?;
+
+        if caches.len() != self.layers.len() {
+            return Err(grim_core::error::Error::Session(format!(
+                "eager_kv_seed_sources: {} caches != {} layers",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+
+        let mut out = Vec::with_capacity(self.layers.len());
+        for cache in caches.iter() {
+            let (k_st, v_st) = match cache {
+                Some((k, v)) => (k, v),
+                None => {
+                    if valid_rows > 0 {
+                        return Err(grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: missing layer cache".into(),
+                        ));
+                    }
+                    out.push(None);
+                    continue;
+                }
+            };
+
+            let (k_rocm, v_rocm) = match (as_rocm(k_st.storage().as_ref()), as_rocm(v_st.storage().as_ref())) {
+                (Ok(k), Ok(v)) => (k, v),
+                _ => {
+                    if valid_rows > 0 {
+                        return Err(grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: KV caches not ROCm-resident".into(),
+                        ));
+                    }
+                    out.push(None);
+                    continue;
+                }
+            };
+
+            let kv_stride = k_rocm.shape().dims().last().copied().unwrap_or(0);
+            if kv_stride == 0 {
+                if valid_rows > 0 {
+                    return Err(grim_core::error::Error::Session(
+                        "eager_kv_seed_sources: zero-width KV cache".into(),
+                    ));
+                }
+                out.push(None);
+                continue;
+            }
+
+            let (k_ptr, v_ptr) = match (k_rocm.device_ptr_u64(), v_rocm.device_ptr_u64()) {
+                (Some(k), Some(v)) if k != 0 && v != 0 => (k as *const f32, v as *const f32),
+                _ => {
+                    if valid_rows > 0 {
+                        return Err(grim_core::error::Error::Session(
+                            "eager_kv_seed_sources: KV caches have no device pointer".into(),
+                        ));
+                    }
+                    out.push(None);
+                    continue;
+                }
+            };
+
+            out.push(Some(EagerKvSource {
+                k_dev: k_ptr,
+                v_dev: v_ptr,
+                prefill_len: valid_rows,
+                kv_stride,
+                _anchor: std::marker::PhantomData,
+            }));
+        }
+
+        Ok(out)
+    }
+}
+
+// ─── DecodeGraphModel implementation for Glm4MoeLite ──────────────────────
+
+fn dev_for_glm4_moe_lite(m: &Glm4MoeLite) -> Result<Arc<Dev>> {
+    match &m.device {
+        Device::Rocm(o) => Ok(Dev::shared(*o)),
+        _ => Err(grim_core::error::Error::Unimplemented(
+            "decode graph needs ROCm device".into(),
+        )),
+    }
+}
+
+impl DecodeGraphModel for Glm4MoeLite {
+    fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled by env".into(),
+            ));
+        }
+        let dev = dev_for_glm4_moe_lite(self)?;
+        let stream = dev
+            .get_stream_from_pool(0)
+            .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
+
+        let hidden = self.cfg.hidden_size;
+        let n_q = self.cfg.num_attention_heads * self.cfg.head_dim;
+        let n_k = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let n_v = n_k;
+        let inter = self.cfg.intermediate_size;
+        let vocab = self.cfg.vocab_size.max(1);
+        let ctx = max_ctx.max(1);
+        let nh = self.cfg.num_attention_heads;
+
+        let buffers = DecodeGraphBuffers::allocate(
+            &dev,
+            self.layers.len(),
+            hidden,
+            n_q,
+            n_k,
+            n_v,
+            inter,
+            ctx,
+            vocab,
+            nh,
+            batch,
+            self.cfg.num_experts,
+            self.cfg.num_experts_per_tok,
+            0,
+            0,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
+        Ok(DecodeGraph::new(&dev, buffers, stream))
+    }
+
+    fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled".into(),
+            ));
+        }
+        let dev = dev_for_glm4_moe_lite(self)?;
+        if !graph.capturing {
+            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        }
+
+        let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        let hd = self.cfg.head_dim;
+        let nh = self.cfg.num_attention_heads;
+        let nkv = self.cfg.num_key_value_heads;
+        let h_shape = Shape::new(vec![batch, hidden]);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let act = &graph.buffers.act_q81_buf[i];
+
+            // 1. Attention pre-norm
+            dev.rms_norm_into(
+                &graph.buffers.layer_input[i],
+                &**layer.input_layernorm.weight.storage(),
+                layer.input_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed: &Storage = &graph.buffers.norm_buf[i];
+
+            // 2. QKV projections
+            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
+            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
+            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+
+            // 3. RoPE
+            let steps = 1usize;
+            let rope_cfg = layer.rope.config.clone();
+            let q3 = Shape::new(vec![batch, nh * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.q_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.q_buf[i],
+                &rope_cfg,
+                &q3,
+                nh,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            let k3 = Shape::new(vec![batch, nkv * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.k_buf[i],
+                &rope_cfg,
+                &k3,
+                nkv,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            // 4. KV append & attention
+            let kv_stride = nkv * hd;
+            let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
+            let max_ctx = graph.buffers.max_ctx;
+            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.k_arena[i],
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.v_arena[i],
+                &graph.buffers.v_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+
+            grim_backend_rocm::launch_qkv_attention_dev_batch(
+                &dev,
+                &graph.buffers.q_buf[i],
+                &graph.buffers.k_arena[i],
+                &graph.buffers.v_arena[i],
+                &graph.buffers.attn_out_buf[i],
+                &graph.buffers.attn_max_buf[i],
+                &graph.buffers.attn_sum_buf[i],
+                &graph.buffers.pos_dev,
+                nh as u32,
+                nkv as u32,
+                hd as u32,
+                steps as u32,
+                steps as u32,
+                1.0 / (hd as f32).sqrt(),
+                0,
+                0.0,
+                &graph.buffers.attn_dummy,
+                0,
+                0,
+                &graph.buffers.attn_dummy,
+                0,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
+
+            grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
+                .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+
+            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
+            add_graph(&graph.buffers.layer_input[i], &graph.buffers.norm_buf[i], &graph.buffers.layer_output[i], &dev)?;
+
+            // 5. Post-attention RMSNorm -> MoE FFN
+            dev.rms_norm_into(
+                &graph.buffers.layer_output[i],
+                &**layer.post_attention_layernorm.weight.storage(),
+                layer.post_attention_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed_moe: &Storage = &graph.buffers.norm_buf[i];
+
+            // 6. MoE Gate + top-k route (mode 3 renorm)
+            linear_into(&dev, normed_moe, layer.moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            let num_exp = self.cfg.num_experts;
+            let top_k = self.cfg.num_experts_per_tok.min(num_exp);
+            dev.moe_route_topk_on_device(
+                &graph.buffers.moe_gate_logits[i],
+                None,
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch,
+                num_exp,
+                top_k,
+                3, // mode 3: softmax renormalized over top-k
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+            // 7. Resident grouped dispatch
+            let experts = layer.moe.experts.iter().map(|e| {
+                crate::shared_moe::MoeExpert {
+                    gate: e.gate_proj.clone(),
+                    up: e.up_proj.clone(),
+                    down: e.down_proj.clone(),
+                }
+            }).collect::<Vec<_>>();
+
+            let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
+                dev.ordinal(),
+                batch,
+                top_k,
+                &experts,
+                &layer.moe.charon_cache,
+            )?;
+
+            let norm_rocm = dst_downcast(normed_moe)?;
+            dev.moe_fused_dispatch_resident_routing_into(
+                norm_rocm,
+                gate_buf.as_ref(),
+                up_buf.as_ref(),
+                down_buf.as_ref(),
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch * top_k,
+                &graph.buffers.moe_out[i],
+                hidden,
+                self.cfg.intermediate_size,
+                1.0,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
+
+            // If shared expert present, project through gate/up/down and accumulate
+            if let Some(ref shared) = layer.moe.shared_expert {
+                linear_into(&dev, normed_moe, shared.gate_proj.weight(), &graph.buffers.gate_buf[i], act)?;
+                linear_into(&dev, normed_moe, shared.up_proj.weight(), &graph.buffers.up_buf[i], act)?;
+                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
+                    .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(&dev, &graph.buffers.activated_buf[i], shared.down_proj.weight(), &graph.buffers.norm_buf[i], act)?;
+                add_graph(&graph.buffers.moe_out[i], &graph.buffers.norm_buf[i], &graph.buffers.moe_out[i], &dev)?;
+            }
+
+            add_graph(&graph.buffers.layer_output[i], &graph.buffers.moe_out[i], &graph.buffers.layer_output[i], &dev)?;
+
+            let n_layers = graph.buffers.layer_input.len();
+            let dst: &Storage = if i + 1 < n_layers {
+                &graph.buffers.layer_input[i + 1]
+            } else {
+                &graph.buffers.head_input
+            };
+            dev.copy_slice_into(dst, &graph.buffers.layer_output[i], 0, batch * hidden)
+                .map_err(grim_core::error::Error::Tensor)?;
+        }
+
+        // Final RMSNorm + LM head
+        dev.rms_norm_into(
+            &graph.buffers.head_input,
+            &**self.norm.weight.storage(),
+            self.norm.eps,
+            &graph.buffers.head_input,
+            &h_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+
+        linear_into(
+            &dev,
+            &graph.buffers.head_input,
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[0],
+        )?;
+
+        Ok(())
+    }
+
+    fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !graph.is_captured {
+            return Err(grim_core::error::Error::Backend(
+                "forward_replay before capture".into(),
+            ));
+        }
+        let dev = dev_for_glm4_moe_lite(self)?;
+        crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+
+        let pos = graph.buffers.current_pos;
+        if !graph.kv_append_node.is_null() {
+            let _ = graph.update_kv_pos_params(std::ptr::null());
+        }
+        graph
+            .buffers
+            .write_pos_async(&dev, pos, graph.stream)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        graph
+            .replay()
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        Ok(())
+    }
+
+    fn eager_kv_seed_sources<'a>(
+        &self,
+        _session: &'a dyn grim_core::session::SessionT,
+        _valid_rows: u32,
+    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
+        Ok((0..self.layers.len()).map(|_| None).collect())
+    }
+}
+
+// ─── DecodeGraphModel implementation for GraniteMoeHybrid ─────────────────
+
+fn dev_for_granite_moe_hybrid(m: &GraniteMoeHybrid) -> Result<Arc<Dev>> {
+    match &m.device {
+        Device::Rocm(o) => Ok(Dev::shared(*o)),
+        _ => Err(grim_core::error::Error::Unimplemented(
+            "decode graph needs ROCm device".into(),
+        )),
+    }
+}
+
+impl DecodeGraphModel for GraniteMoeHybrid {
+    fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled by env".into(),
+            ));
+        }
+        let dev = dev_for_granite_moe_hybrid(self)?;
+        let stream = dev
+            .get_stream_from_pool(0)
+            .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
+
+        let hidden = self.cfg.hidden_size;
+        let n_q = self.cfg.num_attention_heads * self.cfg.head_dim;
+        let n_k = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let n_v = n_k;
+        let inter = self.cfg.intermediate_size;
+        let vocab = self.cfg.vocab_size.max(1);
+        let ctx = max_ctx.max(1);
+        let nh = self.cfg.num_attention_heads;
+
+        let buffers = DecodeGraphBuffers::allocate(
+            &dev,
+            self.layers.len(),
+            hidden,
+            n_q,
+            n_k,
+            n_v,
+            inter,
+            ctx,
+            vocab,
+            nh,
+            batch,
+            self.cfg.num_local_experts,
+            self.cfg.num_experts_per_tok,
+            0,
+            0,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
+        Ok(DecodeGraph::new(&dev, buffers, stream))
+    }
+
+    fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled".into(),
+            ));
+        }
+        let dev = dev_for_granite_moe_hybrid(self)?;
+        if !graph.capturing {
+            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        }
+
+        let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        let hd = self.cfg.head_dim;
+        let nh = self.cfg.num_attention_heads;
+        let nkv = self.cfg.num_key_value_heads;
+        let h_shape = Shape::new(vec![batch, hidden]);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let act = &graph.buffers.act_q81_buf[i];
+
+            // 1. Attention pre-norm
+            dev.rms_norm_into(
+                &graph.buffers.layer_input[i],
+                &**layer.input_layernorm.weight.storage(),
+                layer.input_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed: &Storage = &graph.buffers.norm_buf[i];
+
+            // 2. QKV projections
+            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
+            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
+            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+
+            // 3. RoPE
+            let steps = 1usize;
+            let rope_cfg = layer.rope.config.clone();
+            let q3 = Shape::new(vec![batch, nh * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.q_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.q_buf[i],
+                &rope_cfg,
+                &q3,
+                nh,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            let k3 = Shape::new(vec![batch, nkv * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.k_buf[i],
+                &rope_cfg,
+                &k3,
+                nkv,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            // 4. KV append & attention
+            let kv_stride = nkv * hd;
+            let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
+            let max_ctx = graph.buffers.max_ctx;
+            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.k_arena[i],
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.v_arena[i],
+                &graph.buffers.v_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+
+            grim_backend_rocm::launch_qkv_attention_dev_batch(
+                &dev,
+                &graph.buffers.q_buf[i],
+                &graph.buffers.k_arena[i],
+                &graph.buffers.v_arena[i],
+                &graph.buffers.attn_out_buf[i],
+                &graph.buffers.attn_max_buf[i],
+                &graph.buffers.attn_sum_buf[i],
+                &graph.buffers.pos_dev,
+                nh as u32,
+                nkv as u32,
+                hd as u32,
+                steps as u32,
+                steps as u32,
+                1.0 / (hd as f32).sqrt(),
+                0,
+                0.0,
+                &graph.buffers.attn_dummy,
+                0,
+                0,
+                &graph.buffers.attn_dummy,
+                0,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
+
+            grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
+                .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+
+            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
+            // Residual 1: out = in + residual_multiplier * attn
+            axpy_graph(
+                &graph.buffers.layer_input[i],
+                layer.residual_multiplier,
+                &graph.buffers.norm_buf[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
+
+            // 5. Post-attention RMSNorm -> MoE FFN
+            dev.rms_norm_into(
+                &graph.buffers.layer_output[i],
+                &**layer.post_attention_layernorm.weight.storage(),
+                layer.post_attention_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed_moe: &Storage = &graph.buffers.norm_buf[i];
+
+            // 6. MoE Gate + top-k route (mode 3 renorm)
+            linear_into(&dev, normed_moe, layer.moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            let num_exp = self.cfg.num_local_experts;
+            let top_k = self.cfg.num_experts_per_tok.min(num_exp);
+            dev.moe_route_topk_on_device(
+                &graph.buffers.moe_gate_logits[i],
+                None,
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch,
+                num_exp,
+                top_k,
+                3, // mode 3: softmax renormalized over top-k
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+            // 7. Resident grouped dispatch
+            let experts = layer.moe.experts.iter().map(|e| {
+                crate::shared_moe::MoeExpert {
+                    gate: e.gate_proj.clone(),
+                    up: e.up_proj.clone(),
+                    down: e.down_proj.clone(),
+                }
+            }).collect::<Vec<_>>();
+
+            let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
+                dev.ordinal(),
+                batch,
+                top_k,
+                &experts,
+                &layer.moe.charon_cache,
+            )?;
+
+            let norm_rocm = dst_downcast(normed_moe)?;
+            dev.moe_fused_dispatch_resident_routing_into(
+                norm_rocm,
+                gate_buf.as_ref(),
+                up_buf.as_ref(),
+                down_buf.as_ref(),
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch * top_k,
+                &graph.buffers.moe_out[i],
+                hidden,
+                self.cfg.intermediate_size,
+                1.0,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
+
+            // If shared expert present, project through gate/up/down and accumulate
+            if let Some(ref shared) = layer.moe.shared_expert {
+                linear_into(&dev, normed_moe, shared.gate_proj.weight(), &graph.buffers.gate_buf[i], act)?;
+                linear_into(&dev, normed_moe, shared.up_proj.weight(), &graph.buffers.up_buf[i], act)?;
+                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
+                    .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(&dev, &graph.buffers.activated_buf[i], shared.down_proj.weight(), &graph.buffers.norm_buf[i], act)?;
+                add_graph(&graph.buffers.moe_out[i], &graph.buffers.norm_buf[i], &graph.buffers.moe_out[i], &dev)?;
+            }
+
+            // Residual 2: out = out + residual_multiplier * moe_out
+            axpy_graph(
+                &graph.buffers.layer_output[i],
+                layer.residual_multiplier,
+                &graph.buffers.moe_out[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
+
+            let n_layers = graph.buffers.layer_input.len();
+            let dst: &Storage = if i + 1 < n_layers {
+                &graph.buffers.layer_input[i + 1]
+            } else {
+                &graph.buffers.head_input
+            };
+            dev.copy_slice_into(dst, &graph.buffers.layer_output[i], 0, batch * hidden)
+                .map_err(grim_core::error::Error::Tensor)?;
+        }
+
+        // Final RMSNorm + LM head
+        dev.rms_norm_into(
+            &graph.buffers.head_input,
+            &**self.norm.weight.storage(),
+            self.norm.eps,
+            &graph.buffers.head_input,
+            &h_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+
+        linear_into(
+            &dev,
+            &graph.buffers.head_input,
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[0],
+        )?;
+
+        Ok(())
+    }
+
+    fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !graph.is_captured {
+            return Err(grim_core::error::Error::Backend(
+                "forward_replay before capture".into(),
+            ));
+        }
+        let dev = dev_for_granite_moe_hybrid(self)?;
+        crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+
+        let pos = graph.buffers.current_pos;
+        if !graph.kv_append_node.is_null() {
+            let _ = graph.update_kv_pos_params(std::ptr::null());
+        }
+        graph
+            .buffers
+            .write_pos_async(&dev, pos, graph.stream)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        graph
+            .replay()
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        Ok(())
+    }
+
+    fn eager_kv_seed_sources<'a>(
+        &self,
+        _session: &'a dyn grim_core::session::SessionT,
+        _valid_rows: u32,
+    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
+        Ok((0..self.layers.len()).map(|_| None).collect())
+    }
+}
+
+// ─── DecodeGraphModel implementation for HyV3 ─────────────────────────────
+
+fn dev_for_hyv3(m: &HyV3) -> Result<Arc<Dev>> {
+    match &m.device {
+        Device::Rocm(o) => Ok(Dev::shared(*o)),
+        _ => Err(grim_core::error::Error::Unimplemented(
+            "decode graph needs ROCm device".into(),
+        )),
+    }
+}
+
+impl DecodeGraphModel for HyV3 {
+    fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled by env".into(),
+            ));
+        }
+        let dev = dev_for_hyv3(self)?;
+        let stream = dev
+            .get_stream_from_pool(0)
+            .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
+
+        let hidden = self.cfg.hidden_size;
+        let n_q = self.cfg.num_attention_heads * self.cfg.head_dim;
+        let n_k = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let n_v = n_k;
+        let inter = self.cfg.intermediate_size;
+        let vocab = self.cfg.vocab_size.max(1);
+        let ctx = max_ctx.max(1);
+        let nh = self.cfg.num_attention_heads;
+
+        let buffers = DecodeGraphBuffers::allocate(
+            &dev,
+            self.layers.len(),
+            hidden,
+            n_q,
+            n_k,
+            n_v,
+            inter,
+            ctx,
+            vocab,
+            nh,
+            batch,
+            self.cfg.num_experts,
+            self.cfg.num_experts_per_tok,
+            0,
+            0,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
+        Ok(DecodeGraph::new(&dev, buffers, stream))
+    }
+
+    fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled".into(),
+            ));
+        }
+        let dev = dev_for_hyv3(self)?;
+        if !graph.capturing {
+            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+        }
+
+        let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        let hidden = self.cfg.hidden_size;
+        let batch = graph.buffers.batch.max(1);
+        dev.launch_embedding_gather_dev_idx(
+            w,
+            &graph.buffers.layer_input[0],
+            &graph.buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+
+        let hd = self.cfg.head_dim;
+        let nh = self.cfg.num_attention_heads;
+        let nkv = self.cfg.num_key_value_heads;
+        let h_shape = Shape::new(vec![batch, hidden]);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let act = &graph.buffers.act_q81_buf[i];
+
+            // 1. Attention pre-norm
+            dev.rms_norm_into(
+                &graph.buffers.layer_input[i],
+                &**layer.input_layernorm.weight.storage(),
+                layer.input_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed: &Storage = &graph.buffers.norm_buf[i];
+
+            // 2. QKV projections
+            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
+            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
+            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+
+            // 3. Per-head QK-norm
+            let qn_shape = Shape::new(vec![batch * nh, hd]);
+            dev.rms_norm_into(
+                &graph.buffers.q_buf[i],
+                &**layer.q_norm.weight.storage(),
+                layer.q_norm.eps,
+                &graph.buffers.q_buf[i],
+                &qn_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            let kn_shape = Shape::new(vec![batch * nkv, hd]);
+            dev.rms_norm_into(
+                &graph.buffers.k_buf[i],
+                &**layer.k_norm.weight.storage(),
+                layer.k_norm.eps,
+                &graph.buffers.k_buf[i],
+                &kn_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            // 4. RoPE
+            let steps = 1usize;
+            let rope_cfg = layer.rope.config.clone();
+            let q3 = Shape::new(vec![batch, nh * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.q_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.q_buf[i],
+                &rope_cfg,
+                &q3,
+                nh,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            let k3 = Shape::new(vec![batch, nkv * steps, hd]);
+            dev.rope_dev_base_into(
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                &graph.buffers.k_buf[i],
+                &rope_cfg,
+                &k3,
+                nkv,
+                steps,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            // 5. KV append & attention
+            let kv_stride = nkv * hd;
+            let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
+            let max_ctx = graph.buffers.max_ctx;
+            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
+                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.k_arena[i],
+                &graph.buffers.k_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
+
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &graph.buffers.v_arena[i],
+                &graph.buffers.v_buf[i],
+                &graph.buffers.pos_dev,
+                kv_stride,
+                steps,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+
+            grim_backend_rocm::launch_qkv_attention_dev_batch(
+                &dev,
+                &graph.buffers.q_buf[i],
+                &graph.buffers.k_arena[i],
+                &graph.buffers.v_arena[i],
+                &graph.buffers.attn_out_buf[i],
+                &graph.buffers.attn_max_buf[i],
+                &graph.buffers.attn_sum_buf[i],
+                &graph.buffers.pos_dev,
+                nh as u32,
+                nkv as u32,
+                hd as u32,
+                steps as u32,
+                steps as u32,
+                1.0 / (hd as f32).sqrt(),
+                0,
+                0.0,
+                &graph.buffers.attn_dummy,
+                0,
+                0,
+                &graph.buffers.attn_dummy,
+                0,
+                batch,
+                arena_slot_stride,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
+
+            grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
+                .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
+
+            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
+            add_graph(&graph.buffers.layer_input[i], &graph.buffers.norm_buf[i], &graph.buffers.layer_output[i], &dev)?;
+
+            // 6. Post-attention RMSNorm -> MoE FFN
+            dev.rms_norm_into(
+                &graph.buffers.layer_output[i],
+                &**layer.post_attention_layernorm.weight.storage(),
+                layer.post_attention_layernorm.eps,
+                &graph.buffers.norm_buf[i],
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            let normed_moe: &Storage = &graph.buffers.norm_buf[i];
+
+            // 7. MoE Gate + top-k route (mode 3 renorm)
+            linear_into(&dev, normed_moe, layer.moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            let num_exp = self.cfg.num_experts;
+            let top_k = self.cfg.num_experts_per_tok.min(num_exp);
+            dev.moe_route_topk_on_device(
+                &graph.buffers.moe_gate_logits[i],
+                None,
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch,
+                num_exp,
+                top_k,
+                3, // mode 3: softmax renormalized over top-k
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+            // 8. Resident grouped dispatch
+            let experts = layer.moe.experts.iter().map(|e| {
+                crate::shared_moe::MoeExpert {
+                    gate: e.gate_proj.clone(),
+                    up: e.up_proj.clone(),
+                    down: e.down_proj.clone(),
+                }
+            }).collect::<Vec<_>>();
+
+            let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
+                dev.ordinal(),
+                batch,
+                top_k,
+                &experts,
+                &layer.moe.charon_cache,
+            )?;
+
+            let norm_rocm = dst_downcast(normed_moe)?;
+            dev.moe_fused_dispatch_resident_routing_into(
+                norm_rocm,
+                gate_buf.as_ref(),
+                up_buf.as_ref(),
+                down_buf.as_ref(),
+                &graph.buffers.moe_route_tokens,
+                &graph.buffers.moe_route_experts,
+                &graph.buffers.moe_route_weights,
+                batch * top_k,
+                &graph.buffers.moe_out[i],
+                hidden,
+                self.cfg.intermediate_size,
+                1.0,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
+
+            // If shared expert present, project through gate/up/down and accumulate
+            if let Some(ref shared) = layer.moe.shared_expert {
+                linear_into(&dev, normed_moe, shared.gate_proj.weight(), &graph.buffers.gate_buf[i], act)?;
+                linear_into(&dev, normed_moe, shared.up_proj.weight(), &graph.buffers.up_buf[i], act)?;
+                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
+                    .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(&dev, &graph.buffers.activated_buf[i], shared.down_proj.weight(), &graph.buffers.norm_buf[i], act)?;
+                add_graph(&graph.buffers.moe_out[i], &graph.buffers.norm_buf[i], &graph.buffers.moe_out[i], &dev)?;
+            }
+
+            add_graph(&graph.buffers.layer_output[i], &graph.buffers.moe_out[i], &graph.buffers.layer_output[i], &dev)?;
+
+            let n_layers = graph.buffers.layer_input.len();
+            let dst: &Storage = if i + 1 < n_layers {
+                &graph.buffers.layer_input[i + 1]
+            } else {
+                &graph.buffers.head_input
+            };
+            dev.copy_slice_into(dst, &graph.buffers.layer_output[i], 0, batch * hidden)
+                .map_err(grim_core::error::Error::Tensor)?;
+        }
+
+        // Final RMSNorm + LM head
+        dev.rms_norm_into(
+            &graph.buffers.head_input,
+            &**self.norm.weight.storage(),
+            self.norm.eps,
+            &graph.buffers.head_input,
+            &h_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+
+        linear_into(
+            &dev,
+            &graph.buffers.head_input,
+            self.output.weight(),
+            &graph.buffers.head_output,
+            &graph.buffers.act_q81_buf[0],
+        )?;
+
+        Ok(())
+    }
+
+    fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !graph.is_captured {
+            return Err(grim_core::error::Error::Backend(
+                "forward_replay before capture".into(),
+            ));
+        }
+        let dev = dev_for_hyv3(self)?;
+        crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+
+        let pos = graph.buffers.current_pos;
+        if !graph.kv_append_node.is_null() {
+            let _ = graph.update_kv_pos_params(std::ptr::null());
+        }
+        graph
+            .buffers
+            .write_pos_async(&dev, pos, graph.stream)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        graph
+            .replay()
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        Ok(())
+    }
+
+    fn eager_kv_seed_sources<'a>(
+        &self,
+        _session: &'a dyn grim_core::session::SessionT,
+        _valid_rows: u32,
+    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
+        Ok((0..self.layers.len()).map(|_| None).collect())
+    }
 }
 
 // ─── DecodeGraphModel implementation for Chameleon ────────────────────────

@@ -31,6 +31,7 @@ grim-speculative = { workspace = true }
 grim-plugin = { workspace = true }
 grim-format = { workspace = true }
     grim-quant = { workspace = true }
+    grim-kvquant = { workspace = true }
     grim-nn = { workspace = true }
     grim-autograd = { workspace = true }
     grim-garage = { workspace = true }

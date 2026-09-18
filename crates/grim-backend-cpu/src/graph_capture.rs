@@ -42,21 +42,30 @@ impl CpuGraphRegistry {
 
     /// Begin capturing operations under `key`.
     pub fn begin_capture(&self, key: &str) -> Result<()> {
-        let mut active = self.capture_active.lock().unwrap();
+        let mut active = self
+            .capture_active
+            .lock()
+            .map_err(|_| Error::Backend("CpuGraphRegistry capture_active mutex poisoned".into()))?;
         if active.is_some() {
             return Err(Error::Backend(
                 "begin_graph_capture: capture session already active".into(),
             ));
         }
         *active = Some(key.to_string());
-        let mut ops = self.recording_ops.lock().unwrap();
+        let mut ops = self
+            .recording_ops
+            .lock()
+            .map_err(|_| Error::Backend("CpuGraphRegistry recording_ops mutex poisoned".into()))?;
         ops.clear();
         Ok(())
     }
 
     /// Check if a graph capture session is currently active.
     pub fn is_capturing(&self) -> bool {
-        self.capture_active.lock().unwrap().is_some()
+        self.capture_active
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 
     /// Record an operation closure into the current active graph capture session.
@@ -64,22 +73,32 @@ impl CpuGraphRegistry {
     where
         F: Fn() -> Result<()> + Send + Sync + 'static,
     {
-        let mut ops = self.recording_ops.lock().unwrap();
-        ops.push(Arc::new(op));
+        if let Ok(mut ops) = self.recording_ops.lock() {
+            ops.push(Arc::new(op));
+        }
     }
 
     /// End the graph capture session for `key` and save the recorded graph.
     pub fn end_capture(&self, key: &str) -> Result<()> {
-        let mut active = self.capture_active.lock().unwrap();
+        let mut active = self
+            .capture_active
+            .lock()
+            .map_err(|_| Error::Backend("CpuGraphRegistry capture_active mutex poisoned".into()))?;
         match active.take() {
             Some(k) if k == key => {
-                let mut ops = self.recording_ops.lock().unwrap();
+                let mut ops = self
+                    .recording_ops
+                    .lock()
+                    .map_err(|_| Error::Backend("CpuGraphRegistry recording_ops mutex poisoned".into()))?;
                 let recorded = std::mem::take(&mut *ops);
                 let graph = CpuCapturedGraph {
                     key: key.to_string(),
                     ops: recorded,
                 };
-                let mut graphs = self.graphs.lock().unwrap();
+                let mut graphs = self
+                    .graphs
+                    .lock()
+                    .map_err(|_| Error::Backend("CpuGraphRegistry graphs mutex poisoned".into()))?;
                 graphs.insert(key.to_string(), graph);
                 Ok(())
             }
@@ -91,7 +110,10 @@ impl CpuGraphRegistry {
 
     /// Replay the graph recorded under `key`. Returns `Ok(true)` if replayed, `Ok(false)` if key not found.
     pub fn replay(&self, key: &str) -> Result<bool> {
-        let graphs = self.graphs.lock().unwrap();
+        let graphs = self
+            .graphs
+            .lock()
+            .map_err(|_| Error::Backend("CpuGraphRegistry graphs mutex poisoned".into()))?;
         if let Some(graph) = graphs.get(key) {
             graph.replay()?;
             Ok(true)
@@ -102,7 +124,10 @@ impl CpuGraphRegistry {
 
     /// Check whether a graph executable is stored under `key`.
     pub fn has_captured(&self, key: &str) -> bool {
-        self.graphs.lock().unwrap().contains_key(key)
+        self.graphs
+            .lock()
+            .map(|g| g.contains_key(key))
+            .unwrap_or(false)
     }
 }
 

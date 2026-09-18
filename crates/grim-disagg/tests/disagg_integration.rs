@@ -45,7 +45,7 @@ fn test_receptor_server_write_and_read() {
         .expect("send_block_remote must succeed");
 
     // Pushes ACK on commit — the data is in the pool already.
-    let guard = shared.lock().unwrap();
+    let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
     let recv_k = guard.read_keys(block_id);
     let recv_v = guard.read_values(block_id);
     // read_keys returns the full block (BLOCK_SIZE * elem_per_token = 512),

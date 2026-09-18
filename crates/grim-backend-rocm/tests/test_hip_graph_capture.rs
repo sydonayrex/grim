@@ -41,7 +41,7 @@ fn gpu_device() -> Option<RocmDevice> {
 /// matmul -> add (bias) -> rms_norm -> mul (scaling)
 #[test]
 fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
-    let _lock = GRAPH_TEST_MUTEX.lock().unwrap();
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
         eprintln!("[test] ROCm GPU test skipped (no GPU or not enabled)");
         return Ok(());

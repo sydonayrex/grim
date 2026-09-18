@@ -64,10 +64,10 @@ impl ModelConfig for Glm4MoeLiteConfig {
 
 // MoE Block
 
-struct Glm4Expert {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+pub struct Glm4Expert {
+    pub gate_proj: Linear,
+    pub up_proj: Linear,
+    pub down_proj: Linear,
 }
 
 impl Glm4Expert {
@@ -92,11 +92,11 @@ impl Glm4Expert {
 }
 
 pub struct Glm4LiteMoeBlock {
-    gate: Linear,
-    experts: Vec<Glm4Expert>,
-    shared_expert: Option<Glm4Expert>,
-    num_experts_per_tok: usize,
-    charon_cache: crate::shared_moe::CharonCache,
+    pub gate: Linear,
+    pub experts: Vec<Glm4Expert>,
+    pub shared_expert: Option<Glm4Expert>,
+    pub num_experts_per_tok: usize,
+    pub charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl Glm4LiteMoeBlock {

@@ -295,6 +295,56 @@ impl ParallelCommunicator {
         Ok(())
     }
 
+    /// MG-5: All-reduce across a local and peer tensor with cross-device event ordering.
+    /// Orders peer device's producer stream before reduction on the local device without host barrier.
+    pub fn all_reduce_sum_peer_pair_ordered(
+        &self,
+        local_storage: &RocmStorage,
+        peer_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        peer_ordinal: usize,
+        stream_u64: u64,
+    ) -> Result<()> {
+        let my_ordinal = self.topology.local_device_ordinal();
+        let my_dev = crate::RocmDevice::try_new(my_ordinal)?;
+        let peer_dev = crate::RocmDevice::try_new(peer_ordinal)?;
+
+        // Record event on peer device stream and wait on local device stream
+        let event = crate::device::scythe_route::record_event_on(&peer_dev, std::ptr::null_mut())?;
+        crate::device::scythe_route::stream_wait_event(
+            &my_dev,
+            stream_u64 as *mut std::ffi::c_void,
+            event,
+        )?;
+        self.all_reduce_sum_peer_pair(local_storage, peer_storage, out_storage, stream_u64)
+    }
+
+    /// MG-2: Route a GEMM operation directly to a specific target device's persistent wave ring.
+    pub fn route_gemm_on_device(
+        &self,
+        target_ordinal: usize,
+        stream_u64: u64,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<u64> {
+        let stream = crate::device::scythe_route::route_gemm_to(
+            target_ordinal,
+            stream_u64 as *mut std::ffi::c_void,
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+        )?;
+        Ok(stream as u64)
+    }
+
+
     /// Gathers slices from all ranks into a concatenated destination buffer.
     /// # Contract * `dst.len() == src.len() * world_size`
     pub fn all_gather_f32(&self, src: &[f32], dst: &mut [f32]) -> Result<()> {
@@ -433,11 +483,27 @@ impl ParallelCommunicator {
                 .device_ordinals
                 .get(dst_rank)
                 .copied()
-                .unwrap_or(dst_rank) as i32;
+                .unwrap_or(dst_rank);
             if let Some(recv_ptr) = recv_dev_ptr {
+                // If P2P direct ring channel enabled and F32 aligned, use route_commfuse
+                if self.backend == CommBackendType::P2pDirect && count_bytes % 4 == 0 {
+                    if let Ok(my_dev) = crate::RocmDevice::try_new(my_ordinal as usize) {
+                        let elem_count = count_bytes / 4;
+                        if crate::device::scythe_route::route_commfuse_ptrs(
+                            &my_dev,
+                            stream_u64 as *mut std::ffi::c_void,
+                            send_ptr,
+                            Some(recv_ptr),
+                            None,
+                            elem_count,
+                        ).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                }
                 crate::rccl::p2p_memcpy_async(
                     recv_ptr as *mut std::ffi::c_void,
-                    dst_ordinal,
+                    dst_ordinal as i32,
                     send_ptr as *const std::ffi::c_void,
                     my_ordinal,
                     count_bytes,

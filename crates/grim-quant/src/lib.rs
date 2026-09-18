@@ -1907,6 +1907,134 @@ pub fn quant_q4k(data: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Quantize a KV-cache row of `data.len()` elements (any multiple of 32 up to
+/// 256) into the **Q4KHalf** layout used by `grim_kv_dequant_attention`'s
+/// `quant_format == 3` path (PLAN-kvcache-channel-axis WI-1/WI-3):
+///
+/// ```text
+/// [0..2]   fp16 d     (row-wide scale factor)
+/// [2..4]   fp16 dmin  (row-wide min factor)
+/// [4 .. 4+s]          s = len/32 per-sub-block 6-bit scale codes
+/// [4+s .. 4+2s]       s per-sub-block 6-bit min codes
+/// [4+2s ..]           nibbles, PLAIN order: byte (i/2), low nibble = even i
+/// ```
+///
+/// Byte cost per 128-element row: 76 B (vs LegacyNibble's 68 B), buying
+/// per-32-channel-group scale+min granularity. Math mirrors [`quant_q4k`];
+/// the layout is the j<4 plain-6-bit half of Q4_K's packing with the
+/// nibble-interleave-for-chunks dropped (the kernel indexes nibbles directly).
+pub fn quant_q4khalf(data: &[f32]) -> Result<Vec<u8>> {
+    if data.is_empty() || data.len() % 32 != 0 || data.len() > 256 {
+        return Err(Error::Backend(format!("quant_q4khalf: len {} must be a nonzero multiple of 32, <= 256", data.len())));
+    }
+    let s_blocks = data.len() / 32;
+    let mut out = Vec::with_capacity(4 + 2 * s_blocks + data.len() / 2);
+
+    let mut sub_d1 = [0.0f32; 8];
+    let mut sub_m1 = [0.0f32; 8];
+    let mut max_d1 = 0.0f32;
+    let mut max_m1 = 0.0f32;
+    for s in 0..s_blocks {
+        let sub = &data[s * 32..(s + 1) * 32];
+        let min_v = sub.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_v = sub.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let m1 = if min_v < 0.0 { -min_v } else { 0.0 };
+        let d1 = if min_v < 0.0 {
+            (max_v - min_v) / 15.0
+        } else {
+            max_v.max(0.0) / 15.0
+        };
+        sub_m1[s] = m1;
+        sub_d1[s] = d1;
+        max_d1 = max_d1.max(d1);
+        max_m1 = max_m1.max(m1);
+    }
+    let d = if max_d1 == 0.0 { 1.0 } else { max_d1 / 63.0 };
+    let min = if max_m1 == 0.0 { 0.0 } else { max_m1 / 63.0 };
+    out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+    out.extend_from_slice(&f32_to_f16(min).to_le_bytes());
+
+    let mut sc_u8 = [0u8; 8];
+    let mut m_u8 = [0u8; 8];
+    for s in 0..s_blocks {
+        sc_u8[s] = if d > 0.0 {
+            (sub_d1[s] / d).round().clamp(1.0, 63.0) as u8
+        } else {
+            1
+        };
+        m_u8[s] = if min > 0.0 {
+            (sub_m1[s] / min).round().clamp(0.0, 63.0) as u8
+        } else {
+            0
+        };
+    }
+    for s in 0..s_blocks {
+        out.push(sc_u8[s] & 63);
+    }
+    for s in 0..s_blocks {
+        out.push(m_u8[s] & 63);
+    }
+
+    for i in (0..data.len()).step_by(2) {
+        let q_of = |idx: usize| -> u8 {
+            let s = idx / 32;
+            let d1 = d * sc_u8[s] as f32;
+            let m1 = min * m_u8[s] as f32;
+            if d1 > 0.0 {
+                ((data[idx] + m1) / d1).round().clamp(0.0, 15.0) as u8
+            } else {
+                0
+            }
+        };
+        let lo = q_of(i);
+        let hi = if i + 1 < data.len() { q_of(i + 1) } else { 8 };
+        out.push(lo | (hi << 4));
+    }
+    Ok(out)
+}
+
+/// Q4KHalf row byte count for a given head_dim (multiple of 32, ≤ 256).
+/// Panics on invalid geometry — call-side validation happens in
+/// `quant_q4khalf` before any bytes are produced.
+pub fn q4khalf_row_bytes(head_dim: usize) -> usize {
+    debug_assert!(head_dim % 32 == 0 && head_dim > 0 && head_dim <= 256);
+    4 + 2 * (head_dim / 32) + head_dim / 2
+}
+
+/// Dequantize a Q4KHalf buffer produced by [`quant_q4khalf`]. Host-side mirror
+/// of the kernel's `quant_format == 3` branch — used as the CPU reference in
+/// parity tests.
+pub fn dequant_q4khalf(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    if num_weights == 0 || num_weights % 32 != 0 || num_weights > 256 {
+        return Err(Error::Backend(format!(
+            "dequant_q4khalf: num_weights {num_weights} must be a nonzero multiple of 32, <= 256"
+        )));
+    }
+    let s_blocks = num_weights / 32;
+    let row_bytes = 4 + 2 * s_blocks + num_weights / 2;
+    if data.len() != row_bytes {
+        return Err(Error::Backend(format!(
+            "dequant_q4khalf: want {row_bytes} bytes for {num_weights} weights ({s_blocks} sub-blocks), have {}",
+            data.len()
+        )));
+    }
+    let d = f16_to_f32(data[0], data[1]);
+    let min = f16_to_f32(data[2], data[3]);
+    let scales = &data[4..4 + s_blocks];
+    let mins = &data[4 + s_blocks..4 + 2 * s_blocks];
+    let qs = &data[4 + 2 * s_blocks..];
+    let mut out = vec![0.0f32; num_weights];
+    for i in 0..num_weights {
+        let s = i / 32;
+        let sc = (scales[s] & 63) as f32;
+        let m = (mins[s] & 63) as f32;
+        let byte = qs[i / 2];
+        let q = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+        out[i] = d * sc * (q as f32) - min * m;
+    }
+    Ok(out)
+}
+
 #[inline]
 fn pack_scale_min_k4(scales_sc: &[u8; 8], scales_m: &[u8; 8]) -> [u8; 12] {
     let mut out = [0u8; 12];
@@ -4026,6 +4154,82 @@ mod tests {
         assert_eq!(dequantized.len(), data.len());
         let mse = mean_squared_error(&data, &dequantized);
         assert!(mse < 0.5, "q4k mse too high: {mse}");
+    }
+
+    // ----- Q4KHalf (PLAN-kvcache-channel-axis WI-1/WI-3) -----
+
+    #[test]
+    fn q4khalf_byte_layout_is_pinned() {
+        // 128 elements -> 4 + 2*4 + 64 = 76 bytes (the WI-1 byte budget).
+        let data: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) / 16.0).collect();
+        let packed = quant_q4khalf(&data).unwrap();
+        assert_eq!(packed.len(), 76, "W1 byte budget: 76 B/row at head_dim 128");
+        // 96 elements -> 3 sub-blocks: 4 + 6 + 48 = 58 bytes.
+        let d96: Vec<f32> = (0..96).map(|i| (i as f32) * 0.01).collect();
+        assert_eq!(quant_q4khalf(&d96).unwrap().len(), 58);
+        // 192 -> 4 + 12 + 96 = 112.
+        let d192: Vec<f32> = (0..192).map(|i| (i as f32) * 0.01).collect();
+        assert_eq!(quant_q4khalf(&d192).unwrap().len(), 112);
+        // Bad lengths are rejected (not-zero-padded silently).
+        assert!(quant_q4khalf(&[]).is_err());
+        assert!(quant_q4khalf(&d96[..40]).is_err());
+        assert!(quant_q4khalf(&vec![0.0f32; 320]).is_err());
+    }
+
+    #[test]
+    fn q4khalf_roundtrip() {
+        let data: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.17).sin()).collect();
+        let packed = quant_q4khalf(&data).unwrap();
+        let back = dequant_q4khalf(&packed, 128).unwrap();
+        assert_eq!(back.len(), 128);
+        let mse = mean_squared_error(&data, &back);
+        assert!(mse < 0.02, "q4khalf mse too high: {mse}");
+        // Dequant rejects length mismatches.
+        assert!(dequant_q4khalf(&packed, 96).is_err());
+        assert!(dequant_q4khalf(&packed[..70], 128).is_err());
+    }
+
+    /// The point of the format: a row whose channel-groups have wildly
+    /// different dynamic ranges keeps the quiet groups intact, because each
+    /// sub-block gets its own scale+min. A whole-row 4-bit quantizer (the
+    /// LegacyNibble “one abs-max scale per row” scheme this replaces) flat-
+    /// lines the quiet groups. The claim is measured, not asserted.
+    #[test]
+    fn q4khalf_per_subblock_scales_track_a_hot_group() {
+        let mut data = vec![0.0f32; 128];
+        for (i, v) in data.iter_mut().enumerate().take(96).skip(64) {
+            *v = 3.0 + (i as f32 - 64.0) * 0.01; // sub-block 2: large magnitudes
+        }
+        for (i, v) in data.iter_mut().enumerate().take(64) {
+            *v = (i as f32 * 0.013).sin() * 1e-3 + 1e-3; // sub-blocks 0-1: 1e-3 scale
+        }
+        let packed = quant_q4khalf(&data).unwrap();
+        assert_eq!(packed.len(), 76);
+        let back = dequant_q4khalf(&packed, 128).unwrap();
+
+        // Reference: whole-row symmetric 4-bit (what Q4KHalf replaces at 68 B).
+        let peak = data.iter().copied().fold(0.0f32, f32::max);
+        let legacy_err: f32 = data
+            .iter()
+            .map(|&x| {
+                let n = ((x / peak) * 7.0 + 8.0).round().clamp(0.0, 15.0);
+                ((n - 8.0) / 7.0 * peak - x).abs()
+            })
+            .fold(0.0f32, f32::max);
+
+        let q4kh_cold_err: f32 = (0..64).map(|i| (back[i] - data[i]).abs()).fold(0.0f32, f32::max);
+        assert!(
+            q4kh_cold_err * 4.0 < legacy_err,
+            "per-group scaling must win decisively on the quiet groups: q4khalf={q4kh_cold_err} legacy={legacy_err}"
+        );
+        // Hot group: absolute error bounded by the sub-block's grid step.
+        let hot_err: f32 = (64..96)
+            .map(|i| (back[i] - data[i]).abs())
+            .fold(0.0f32, f32::max);
+        // sub-block 2 spans ~0.31 → its grid step is 0.31/15 ≈ 0.021 in the
+        // asymmetric-Q4K contribution; errors land within a few grid steps of
+        // the fp16-rounded scale representation.
+        assert!(hot_err < 0.15, "hot group bounded: {hot_err}");
     }
 
     #[test]

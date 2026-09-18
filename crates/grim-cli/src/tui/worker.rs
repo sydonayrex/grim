@@ -526,6 +526,7 @@ impl Worker {
             model_id: Some(model_id),
             adapter_ids: vec![],
             input_ids: Some(prompt_ids.clone()),
+            session: None,
         };
 
         let mut history: Vec<u32> = prompt_ids.clone();

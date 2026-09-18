@@ -286,14 +286,26 @@ pub fn route_commfuse(
     local_out: Option<u64>,
     elem_count: usize,
 ) -> Result<*mut c_void> {
+    let src_ptr = src
+        .device_ptr_u64()
+        .ok_or_else(|| Error::Backend("commfuse: src has no device ptr".into()))?;
+    route_commfuse_ptrs(device, stream, src_ptr, peer_dst, local_out, elem_count)
+}
+
+/// Route OP_COMMFUSE directly using device pointers.
+pub fn route_commfuse_ptrs(
+    device: &RocmDevice,
+    stream: *mut c_void,
+    src_ptr: u64,
+    peer_dst: Option<u64>,
+    local_out: Option<u64>,
+    elem_count: usize,
+) -> Result<*mut c_void> {
     let stream = if stream.is_null() {
         device.active_stream()
     } else {
         stream
     };
-    let src_ptr = src
-        .device_ptr_u64()
-        .ok_or_else(|| Error::Backend("commfuse: src has no device ptr".into()))?;
     let peer_val = peer_dst.unwrap_or(0);
     let local_val = local_out.unwrap_or(0);
 

@@ -1,5 +1,49 @@
 /// Non-prefix KV chunk stitching and attention recalibration.
 pub mod cache_blend;
+
+/// WI-HYBRID Layer 2: max session-scoped decode-graph slots per model.
+/// Each slot owns full device arenas; the default keeps GPU memory bounded.
+fn session_graph_slots() -> usize {
+    std::env::var("GRIM_SESSION_GRAPH_SLOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(2)
+}
+
+/// WI-HYBRID Layer 2: pick the LRU session-scoped slot to evict when
+/// `new_key` would exceed `cap` among this model's session slots. `None` = no
+/// eviction (the key already exists, or the model is under cap).
+fn session_slot_victim(
+    prefix: &str,
+    graph_keys: &[String],
+    last_use: &HashMap<String, std::time::Instant>,
+    cap: usize,
+    new_key: &str,
+) -> Option<String> {
+    let mut mine: Vec<String> = graph_keys
+        .iter()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
+    if mine.iter().any(|k| k == new_key) {
+        return None;
+    }
+    if mine.len() < cap {
+        return None;
+    }
+    mine.sort_by_key(|k| last_use.get(k).copied());
+    mine.first().cloned()
+}
+
+/// WI-HYBRID Layer 2: session block pins last this many seconds since the
+/// last session-tagged turn (idle-time pin).
+fn session_pin_secs() -> u64 {
+    std::env::var("GRIM_SESSION_PIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300)
+}
 pub mod model_loader;
 pub mod packing;
 pub mod pipelines;
@@ -221,6 +265,19 @@ pub struct Engine {
     scythe_vram_waitlist: Vec<grim_scheduler::Request>,
     /// Set GRIM_RADIX=on to enable prefix-cache reuse on prefill (WP5).
     pub radix_enabled: bool,
+    /// Layer 1.5: per-request count of leading blocks claimed from the radix
+    /// tree at first prefill (`seed_prefix`). Seeded blocks are tree-claimed
+    /// (+1 ref) at seed time, so they must NOT be re-registered when their
+    /// owner finishes prefill — registration covers only the tail.
+    pub radix_seeded_blocks: HashMap<u64, usize>,
+    /// Per-request count of leading blocks already registered into the radix
+    /// tree by this request (chunked prefill registers incrementally; only
+    /// blocks beyond this cursor are inserted on a later pass).
+    pub radix_registered_blocks: HashMap<u64, usize>,
+    /// Layer 1.5 hit-rate metrics (surfaced via `radix_cache_telemetry`).
+    pub radix_lookups: u64,
+    pub radix_hit_requests: u64,
+    pub radix_hit_tokens: u64,
     /// Persistent GPU buffers for decode-step inputs (token ID, position).
     /// Used by graph capture to enable in-place updates between replays.
     /// Maps request_id → (input_ids_gpu, positions_gpu).
@@ -237,6 +294,12 @@ pub struct Engine {
     /// re-binds the arenas to each new request's prefill state on every
     /// miss, so cross-request reuse is position-reset-correct.
     pub decode_graphs: HashMap<String, grim_backend_rocm::FullDecodeGraph>,
+    /// WI-HYBRID Layer 2: request id → session hash (clients send an optional
+    /// `session` tag; `None` = plain Layer 1.5 behavior).
+    pub request_session: HashMap<u64, u64>,
+    /// WI-HYBRID Layer 2: session-scoped graph slot key → last use, for LRU
+    /// eviction under the per-model session-slot cap.
+    pub session_slot_last_use: HashMap<String, std::time::Instant>,
     /// P3: bucket-specialized batch decode graphs. Maps model_id → pool of
     /// per-bucket captured graphs for batch decode replay in step_batch.
     batch_graph_pools: HashMap<String, grim_backend_rocm::DecodeBucketGraphPool>,
@@ -625,9 +688,16 @@ impl Engine {
             radix_enabled: std::env::var("GRIM_RADIX")
                 .map(|v| v != "0" && v != "false" && v != "off")
                 .unwrap_or(true),
+            radix_seeded_blocks: HashMap::new(),
+            radix_registered_blocks: HashMap::new(),
+            radix_lookups: 0,
+            radix_hit_requests: 0,
+            radix_hit_tokens: 0,
             decode_graph_input_buffers: HashMap::new(),
             graph_capture_logits: HashMap::new(),
             decode_graphs: HashMap::new(),
+            request_session: HashMap::new(),
+            session_slot_last_use: HashMap::new(),
             batch_graph_pools: HashMap::new(),
             batch_bucket_slots: HashMap::new(),
         }
@@ -1047,6 +1117,32 @@ impl Engine {
         } else {
             (0, 0, 0, 0)
         }
+    }
+
+    /// Layer 1.5: radix prefix-cache hit-rate telemetry —
+    /// `(prefix_lookups, requests_with_hits, reused_tokens_total)`.
+    pub fn radix_cache_telemetry(&self) -> (u64, u64, u64) {
+        (self.radix_lookups, self.radix_hit_requests, self.radix_hit_tokens)
+    }
+
+    /// Layer 1.5 gate: hybrid models (LFM2's ShortConv state, Mamba variants)
+    /// keep per-layer state that a paged-KV prefix seed cannot reconstruct —
+    /// prefix reuse for those requires recurrent checkpoints, which Layer 1.5
+    /// deliberately declines (no anchor state → no seed). Returns true when
+    /// the request's model must NOT receive a radix seed.
+    fn model_uses_hybrid_kv(&self, id: u64) -> bool {
+        self.model_for_request(id)
+            .and_then(|(mid, _)| self.models.get(&mid))
+            .map(|m| {
+                m.model
+                    .target()
+                    .as_any()
+                    .downcast_ref::<grim_models_transformer::Lfm2>()
+                    .is_some()
+            })
+            // Unknown model: do not seed — skipping the shared prefix would be
+            // a correctness risk we cannot rule out.
+            .unwrap_or(true)
     }
 
     /// Maximum context limit (max batched tokens) configured for this engine.
@@ -1708,6 +1804,7 @@ impl Engine {
     }
 
     fn drive_prefill_inner(&mut self, id: u64) -> Result<usize> {
+        eprintln!("[pin-dbg] prefill req {id} session_recorded={}", self.request_session.contains_key(&id));
         // Chunked prefill (F9 follow-on): the scheduler may carry several running copies of `id` (one per
         // pass, each with the cumulative consumed count), so take the LATEST bound, not the first copy's.
         let mut prompt_tokens = None;
@@ -1725,11 +1822,8 @@ impl Engine {
         }
         // Only the tokens the scheduler has budgeted but the engine has not yet prefilled run through the model.
         // Everything else (radix matching, KV registration, disagg handoff) still sees the full prompt below.
-        let already = self.prefill_progress.get(&id).copied().unwrap_or(0);
+        let already0 = self.prefill_progress.get(&id).copied().unwrap_or(0);
         let target = consumed_tokens.min(prompt_tokens);
-        if target <= already {
-            return Ok(0); // this pass budgeted no new prompt tokens
-        }
         // Build the full input_ids tensor: use real token IDs if provided,
         // otherwise fall back to synthetic position indices (0..prompt_tokens) for backward compatibility.
         let full_input: Vec<u32> = self
@@ -1738,28 +1832,84 @@ impl Engine {
             .cloned()
             .filter(|v| !v.is_empty() && v.len() == prompt_tokens)
             .unwrap_or_else(|| (0..prompt_tokens as u32).collect());
+        let has_real_ids = self
+            .request_input_ids
+            .get(&id)
+            .filter(|v| !v.is_empty() && v.len() == prompt_tokens)
+            .is_some();
 
-        if self.radix_enabled && !full_input.is_empty() {
-            let (matched_blocks, matched_tokens, anchor_state) = {
+        // Layer 1.5 (session-continuity design): CONSUME the radix prefix
+        // cache — it was registration-only before this and `seed_prefix` had
+        // no callers. On the FIRST prefill pass of a request with real token
+        // ids, claim matched prefix blocks (tree refcount +1), seed + hydrate
+        // the session's paged KV from the shared pool, and start the prefill
+        // cursor past the matched tokens.
+        let mut already = already0;
+        if self.radix_enabled && already0 == 0 && has_real_ids && !full_input.is_empty() {
+            let (matched_blocks, matched_tokens, promoted) = {
                 let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                pool.match_prefix_with_recurrent(&full_input)
+                // ponytail: match_prefix_promoting = match + LRU-promote in one call,
+                // so a hit doesn't simultaneously make itself eviction-eligible.
+                pool.match_prefix_promoting(&full_input)
             };
-            if !matched_blocks.is_empty() {
-                if let Some(cp) = anchor_state {
+            self.radix_lookups += 1;
+            // Seeding is only sound when (a) the model keeps all its state in
+            // the paged KV pages (hybrid models with recurrent/conv state are
+            // excluded via model_uses_hybrid_kv) and (b) at least one block
+            // remains to prefill — the first decode token's logits come from the
+            // last prefill pass. The skip is block-aligned: `matched_tokens` is
+            // a multiple of BLOCK_SIZE.
+            let skip_cap = full_input.len().saturating_sub(1);
+            let skip_tokens = {
+                let raw = matched_tokens.min(skip_cap);
+                raw - (raw % grim_memory::BLOCK_SIZE)
+            };
+            let seed_ok = skip_tokens >= grim_memory::BLOCK_SIZE
+                && !self.model_uses_hybrid_kv(id);
+            if seed_ok {
+                let seed_blocks = &matched_blocks[..skip_tokens / grim_memory::BLOCK_SIZE];
+                // Claim the matched nodes for the lifetime of this request.
+                {
+                    let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                    pool.insert_prefix(&full_input[..skip_tokens], seed_blocks);
+                }
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    // `seed_prefix` refcounts the blocks and wires the block
+                    // table; the pool's K/V bytes are staged lazily per layer
+                    // on the session's first appends, when the model's real
+                    // stride is known (the arena-bridge problem is unsolvable
+                    // at engine level because EngineConfig kv geometry may
+                    // differ from the registered model's).
+                    if let Some(kv) = session.kv_mut() {
+                        kv.seed_prefix(seed_blocks);
+                    }
+                    session.advance_pos(skip_tokens);
+                    self.prefill_progress.insert(id, skip_tokens);
+                    self.radix_seeded_blocks.insert(id, seed_blocks.len());
+                    self.radix_hit_requests += 1;
+                    self.radix_hit_tokens += skip_tokens as u64;
+                    already = skip_tokens;
                     log::info!(
-                        "[grim-engine] req {id} radix hit: {}/{} tokens with semantic recurrent checkpoint #{}",
-                        matched_tokens,
+                        "[grim-engine] req {id} radix hit+reuse: skipping {} of {} prompt tokens ({} blocks, promoted={})",
+                        skip_tokens,
                         full_input.len(),
-                        cp.id
-                    );
-                } else {
-                    log::info!(
-                        "[grim-engine] req {id} radix hit: {}/{} tokens",
-                        matched_tokens,
-                        full_input.len()
+                        seed_blocks.len(),
+                        promoted,
                     );
                 }
+            } else if matched_tokens > 0 {
+                log::info!(
+                    "[grim-engine] req {id} radix match not consumed ({}/{} tokens; skip_tokens={}, hybrid={}, promoted={})",
+                    matched_tokens,
+                    full_input.len(),
+                    skip_tokens,
+                    self.model_uses_hybrid_kv(id),
+                    promoted,
+                );
             }
+        }
+        if target <= already {
+            return Ok(0); // this pass budgeted no new prompt tokens
         }
 
         // The chunk actually prefilled this pass: tokens [already, target) with their true positions.
@@ -1784,18 +1934,30 @@ impl Engine {
             // The engine does *not* double-count.
             self.last_outcomes.insert(id, outcome);
 
-            // Radix prefix cache: register computed KV blocks and semantic state anchors
+            // Radix prefix cache: register computed KV blocks and semantic state anchors.
+            // Only blocks beyond (seeded + previously registered) are inserted —
+            // re-inserting matched/already-registered nodes would double their
+            // tree refcount and leak their eviction eligibility (Layer 1.5).
             if self.radix_enabled && !full_input.is_empty() {
+                let skip_blocks = self.radix_seeded_blocks.get(&id).copied().unwrap_or(0)
+                    + self.radix_registered_blocks.get(&id).copied().unwrap_or(0);
                 if let Some(session) = self.sessions.get(&id) {
                     if let Some(block_table) = session.block_table() {
-                        let usize_blocks: Vec<usize> =
-                            block_table.iter().map(|&b| b as usize).collect();
-                        let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-                        pool.insert_prefix_with_recurrent_state(
-                            &full_input,
-                            &usize_blocks,
-                            Vec::new(),
-                        );
+                        if block_table.len() > skip_blocks {
+                            let usize_blocks: Vec<usize> =
+                                block_table.iter().map(|&b| b as usize).collect();
+                            let registered_now = usize_blocks.len() - skip_blocks;
+                            let mut pool =
+                                self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                            pool.insert_prefix_with_recurrent_state_at(
+                                &full_input,
+                                &usize_blocks,
+                                Vec::new(),
+                                skip_blocks,
+                            );
+                            self.radix_registered_blocks
+                                .insert(id, skip_blocks + registered_now);
+                        }
                     }
                 }
             }
@@ -1882,6 +2044,29 @@ impl Engine {
                             }
                         }
                     }
+                }
+            }
+
+            // WI-HYBRID Layer 2: session-tagged requests pin their KV blocks
+            // (idle-time pin) so the radix LRU can't reclaim the cached
+            // prefix between turns under other traffic's pressure. Advisory
+            // only — rollback/free still reclaims pinned pages.
+            if self.request_session.contains_key(&id) {
+                let pin_secs = session_pin_secs();
+                let block_ids: Vec<usize> = self
+                    .sessions
+                    .get(&id)
+                    .and_then(|s| s.block_table())
+                    .map(|t| t.iter().map(|&b| b as usize).collect())
+                    .unwrap_or_default();
+                if !block_ids.is_empty() {
+                    let mut pool =
+                        self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                    pool.pin_blocks(&block_ids, pin_secs);
+                    eprintln!(
+                        "[pin-dbg] prefill pinned {block_ids:?} for {pin_secs}s; is_pinned now: {:?}",
+                        block_ids.iter().map(|&b| pool.is_block_pinned(b)).collect::<Vec<_>>()
+                    );
                 }
             }
 
@@ -2286,6 +2471,7 @@ impl Engine {
     /// All ops inside `decode_one` automatically dispatch on the capture stream
     /// (via `active_stream()` → `capture_stream` when `capture_active`), so the
     /// model code is capture-unaware.
+    #[allow(clippy::too_many_arguments)]
     fn drive_forward_graph_capture(
         &mut self,
         model_id: &str,
@@ -2311,6 +2497,12 @@ impl Engine {
             .models
             .get(model_id)
             .ok_or_else(|| Error::Config(format!("unknown model {model_id}")))?;
+
+        // WI-HYBRID Layer 2: session-scoped slot key (None when untagged).
+        let session_slot_key = self
+            .request_session
+            .get(&request_id)
+            .map(|h| format!("{model_id}#s{h}"));
 
         // Only ROCm devices support graph capture.
         let ordinal = match &loaded.device {
@@ -2346,7 +2538,9 @@ impl Engine {
                 })
                 .unwrap_or(0);
 
-            let graph_slot_key = format!("{model_id}");
+            let graph_slot_key = session_slot_key
+                .clone()
+                .unwrap_or_else(|| format!("{model_id}"));
             if !self.decode_graphs.contains_key(&graph_slot_key) {
                 let max_ctx = 4096;
                 match lfm2.get_or_create_decode_graph(max_ctx, 1) {
@@ -2827,6 +3021,30 @@ impl Engine {
         // per (effective model, power-of-2 bucket) and replay ONE captured batch
         // graph per group. Items the graph cannot serve stay in the per-item
         // loop below (adapters/eager fallbacks unaffected).
+        // WI-HYBRID Layer 2: session-slot affinity bookkeeping for every
+        // item — device-agnostic, and it runs BEFORE any graph consumption
+        // this tick so LRU eviction sees fresh recency.
+        for &(req_id, model_id, _, _) in items {
+            if let Some(h) = self.request_session.get(&req_id).copied() {
+                let key = format!("{model_id}#s{h}");
+                let prefix = format!("{model_id}#s");
+                let graph_keys: Vec<String> =
+                    self.decode_graphs.keys().cloned().collect();
+                if let Some(victim) = session_slot_victim(
+                    &prefix,
+                    &graph_keys,
+                    &self.session_slot_last_use,
+                    session_graph_slots(),
+                    &key,
+                ) {
+                    self.decode_graphs.remove(&victim);
+                    self.session_slot_last_use.remove(&victim);
+                }
+                self.session_slot_last_use
+                    .insert(key, std::time::Instant::now());
+            }
+        }
+
         let mut prebatched: HashMap<usize, StepOutcome> = HashMap::new();
         self.drive_batch_bucket_groups(items, &mut prebatched);
 
@@ -3040,6 +3258,16 @@ impl Engine {
 
     /// Allocate a session with a paged KV cache wired in and prefix caching active (§5.1).
     pub fn enqueue_request_with_kv(&mut self, request: grim_scheduler::Request) -> Result<()> {
+        // WI-HYBRID Layer 2: record the session hash (if any) so the decode
+        // loop can affinity the graph slot and prefill can pin the blocks.
+        if let Some(sess) = &request.session {
+            let model = request.model_id.as_deref().unwrap_or("");
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&model, &mut h);
+            std::hash::Hash::hash(&sess, &mut h);
+            self.request_session
+                .insert(request.id, std::hash::Hasher::finish(&h));
+        }
         // SCYTHE-2 farm mode: pin the request to a controller-chosen replica BEFORE the session exists, so its
         // KV pages are allocated on the pinned replica's device and stay there for the request's lifetime.
         let base_for_pin = request
@@ -3176,6 +3404,35 @@ impl Engine {
             }
         }
 
+        // WI-HYBRID Layer 2 (step 2): pool-level admission accounting. The
+        // device-memory certificate above knows nothing about the block pool,
+        // so a pool exhausted by pinned + live blocks could admit a request
+        // whose KV demand can never be satisfied (the append-crash scenario).
+        // Demand = one block per BLOCK_SIZE tokens of (prompt + max_tokens).
+        // If allocatable capacity falls short, drop the OLDEST pins (spec:
+        // "pin sweep drops oldest pins when admission can't be satisfied").
+        // Still short after the rescue: log and proceed — over-demand is the
+        // scheduler/scythe-waitlist's contract to queue, and the atomic
+        // append makes any true exhaustion a loud step error, never silent
+        // KV corruption.
+        let needed_blocks = request
+            .prompt_tokens
+            .saturating_add(request.max_new_tokens)
+            .div_ceil(grim_memory::BLOCK_SIZE);
+        {
+            let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+            let allocatable = pool.allocatable_blocks();
+            if allocatable < needed_blocks {
+                let dropped = pool.drop_oldest_pins(needed_blocks - allocatable);
+                log::info!(
+                    "[grim-engine] admission: pool short by {} blocks for request {} — dropped {} oldest session pins (allocatable now {})",
+                    needed_blocks.saturating_sub(pool.allocatable_blocks()),
+                    request.id,
+                    dropped,
+                    pool.allocatable_blocks()
+                );
+            }
+        }
         let mut kv = grim_memory::PagedKvCache::new(
             self.block_pool.clone(),
             self.config.num_kv_heads,
@@ -3321,6 +3578,26 @@ impl Engine {
 
     pub fn finish_request(&mut self, id: u64) {
         self.scheduler.finish(id);
+        // Layer 1.5: release this request's radix-tree claims BEFORE the KV
+        // rollback below — the tree's refcounts (+1 per seeded claim, +1 per
+        // registered chunk) balance exactly one `remove_prefix` over the full
+        // block table, after which unreferenced cached prefixes become
+        // LRU-evictable again.
+        let had_radix_claim = self.radix_seeded_blocks.contains_key(&id)
+            || self.radix_registered_blocks.contains_key(&id);
+        if self.radix_enabled && had_radix_claim {
+            let blocks: Option<Vec<usize>> = self
+                .sessions
+                .get(&id)
+                .and_then(|s| s.block_table().map(|t| t.to_vec()))
+                .map(|t| t.iter().map(|&b| b as usize).collect());
+            if let Some(blocks) = blocks {
+                let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                pool.remove_prefix(&blocks);
+            }
+        }
+        self.radix_seeded_blocks.remove(&id);
+        self.radix_registered_blocks.remove(&id);
         if let Some(session) = self.sessions.get_mut(&id) {
             let _ = session.rollback_kv_to(0);
         }
@@ -3335,6 +3612,10 @@ impl Engine {
         self.request_adapters.remove(&id);
         self.request_input_ids.remove(&id);
         self.prefill_progress.remove(&id);
+        // WI-HYBRID Layer 2: the request→session mapping dies with the
+        // request; the session-scoped slot + its LRU entry persist by design
+        // (that IS the affinity).
+        self.request_session.remove(&id);
         self.request_last_token.remove(&id);
         self.decode_graph_input_buffers.remove(&id);
         // Release the farm slot so the controller's load view stays honest.
@@ -3424,6 +3705,38 @@ pub use grim_scheduler::{AdmissionController, Request, Scheduler, SchedulerOutpu
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
+
+    /// WI-HYBRID Layer 2: LRU eviction selection for session-scoped graph
+    /// slots — picks the least-recently-used slot only when the cap is
+    /// exceeded and the key is genuinely new.
+    #[test]
+    fn session_slot_victim_lru_selection() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut last_use = HashMap::new();
+        last_use.insert("small#s1".to_string(), now - Duration::from_secs(300));
+        last_use.insert("small#s2".to_string(), now - Duration::from_secs(60));
+        let keys = vec!["small#s1".to_string(), "small#s2".to_string()];
+
+        // Under cap: no eviction.
+        assert_eq!(
+            session_slot_victim("small#", &keys, &last_use, 3, "small#s3"),
+            None
+        );
+        // Key already present: no eviction (it is a reuse, not a new slot).
+        assert_eq!(
+            session_slot_victim("small#", &keys, &last_use, 2, "small#s2"),
+            None
+        );
+        // At cap with a new key: the LRU slot (s1) is the victim.
+        assert_eq!(
+            session_slot_victim("small#", &keys, &last_use, 2, "small#s3"),
+            Some("small#s1".to_string())
+        );
+        // Unknown prefix (other model): its slots are invisible here.
+        let other = vec!["other#s9".to_string()];
+        assert_eq!(session_slot_victim("small#", &other, &last_use, 1, "small#s3"), None);
+    }
     use super::*;
 
     #[test]
@@ -4181,6 +4494,7 @@ mod tests {
             prompt_tokens,
             priority: 0,
             input_ids: Some(real_tokens.clone()),
+            session: None,
             ..Default::default()
         });
 
@@ -4364,7 +4678,7 @@ mod tests {
         let pool_spill = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
             1024, 1, 16,
         )));
-        pool_spill.lock().unwrap().attach_spill(spill_mgr.clone());
+        pool_spill.lock().unwrap_or_else(|e| e.into_inner()).attach_spill(spill_mgr.clone());
         let kv_spill = grim_memory::PagedKvCache::new(pool_spill.clone(), 1, 16, 16);
         let mut session_spill = Inner::with_kv(model.device.clone(), Box::new(kv_spill));
 
@@ -4386,7 +4700,7 @@ mod tests {
         // Step 2: Under memory pressure / watermark, demote prefix block 0
         let block_0 = session_spill.block_table().unwrap()[0] as usize;
         {
-            let mut p = pool_spill.lock().unwrap();
+            let mut p = pool_spill.lock().unwrap_or_else(|e| e.into_inner());
             let demoted = p.demote_block(block_0);
             assert!(demoted, "block 0 demotion must succeed");
             assert!(

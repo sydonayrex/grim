@@ -1,4 +1,5 @@
 //! Thin wrapper around `Llama` for glm4moe uses a Llama-style transformer.
+// ponytail: dense Llama wrapper alias (no expert stack). True GLM-4 MoE implementation is `Glm4MoeLite` in `glm4_moe_lite.rs`.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};

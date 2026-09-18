@@ -1,4 +1,5 @@
 //! Thin wrapper around `Llama` for qwen2moe uses a Llama-style transformer.
+// ponytail: dense Llama wrapper alias (no expert stack). Qwen MoE architectures with routed experts are `Qwen3Moe` (`qwen3moe.rs`) and `Qwen35Moe` (`qwen35moe.rs`).
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
@@ -19,6 +20,11 @@ pub struct Qwen2MoeConfig {
     pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: Option<usize>,
+    pub shared_expert_intermediate_size: Option<usize>,
+    pub routed_scaling_factor: f32,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
@@ -36,7 +42,7 @@ impl ModelConfig for Qwen2MoeConfig {
     }
 }
 
-// Model - thin wrapper around Llama
+// Model - Qwen2-MoE sparse mixture of experts / Llama wrapper
 
 pub struct Qwen2Moe {
     pub cfg: Qwen2MoeConfig,
@@ -74,7 +80,27 @@ impl Qwen2Moe {
             partial_rotary_factor: 1.0,
             yarn: None,
         };
-        let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
+
+        // If num_experts > 0, wire through MoE blocks (Qwen2-MoE: 60 routed experts, 4 active, optional shared expert)
+        let inner = if cfg.num_experts > 0 {
+            use grim_nn::moe::RouterKind;
+            use crate::moe_block::MoESpec;
+            let spec = MoESpec {
+                num_experts: cfg.num_experts,
+                top_k: cfg.num_experts_per_tok,
+                router_kind: RouterKind::SoftmaxTopK,
+                routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 { 1.0 } else { cfg.routed_scaling_factor },
+                has_shared_expert: cfg.shared_expert_intermediate_size.is_some(),
+                moe_intermediate_size: cfg.moe_intermediate_size,
+                shared_expert_intermediate_size: cfg.shared_expert_intermediate_size,
+                transposed_expert_layout: false,
+            };
+            let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); cfg.num_layers];
+            Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?
+        } else {
+            Llama::load_tp(device.clone(), ws, llama_cfg, tp)?
+        };
+
         Ok(Self {
             cfg,
             device: inner.device.clone(),

@@ -155,6 +155,10 @@ pub enum KvQuantFormat {
     /// Q4K super-block-quantized KV: each 256-element super-block is 144 bytes (2-byte fp16 d + 2-byte fp16 min + 12-byte packed scales + 128 bytes nibbles).
     /// Per-super-block scale embedded in block; k_scales[] unused.
     Q4K,
+    /// Q4KHalf sub-block-quantized KV (PLAN-kvcache-channel-axis WI-1):
+    /// for head_dim <= 256 (e.g. head_dim = 128: 76 bytes/row, 4 sub-blocks of 32 channels).
+    /// 4 bytes (fp16 d + fp16 min) + 2 * (head_dim/32) bytes scales/mins + (head_dim/2) bytes nibbles.
+    Q4KHalf,
     /// Legacy nibble dequant path (quant_bits == 4): 4-bit per nibble, 2 nibbles per byte,
     /// external scale from k_scales[]. Backward compat; use Q4K for the new super-block path.
     LegacyNibble,
@@ -192,18 +196,20 @@ impl KvQuantFormat {
             Self::Fp16 => 16,
             Self::Q8_0 => 8,
             Self::Q4K => 4,
+            Self::Q4KHalf => 4,
             Self::LegacyNibble => 4,
             Self::LegacyInt8 => 8,
         }
     }
 
     /// In-kernel dequant kind selector, passed as the `quant_format` arg to the kernel so it can select the right dequant formula.
-    /// 0 = Fp16, 1 = Q8_0, 2 = Q4K, -1 = legacy nibble (quant_bits ==.
+    /// 0 = Fp16, 1 = Q8_0, 2 = Q4K, 3 = Q4KHalf, -1 = legacy nibble (quant_bits ==.
     pub fn kernel_arg(&self) -> i32 {
         match self {
             Self::Fp16 => 0,
             Self::Q8_0 => 1,
             Self::Q4K => 2,
+            Self::Q4KHalf => 3,
             Self::LegacyNibble => -1,
             Self::LegacyInt8 => -2,
         }

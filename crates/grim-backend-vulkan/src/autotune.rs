@@ -55,7 +55,7 @@ pub struct VulkanAutotuner {
 
 impl std::fmt::Debug for VulkanAutotuner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.cache.lock().unwrap().len();
+        let len = self.cache.lock().unwrap_or_else(|e| e.into_inner()).len();
         f.debug_struct("VulkanAutotuner")
             .field("cache_len", &len)
             .finish()
@@ -100,7 +100,7 @@ impl VulkanAutotuner {
             if let Ok(data) = fs::read_to_string(&path) {
                 match serde_json::from_str::<Vec<TuneEntryOwned>>(&data) {
                     Ok(entries) => {
-                        let mut lock = self.cache.lock().unwrap();
+                        let mut lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                         for e in entries {
                             if e.caps_hash != hash {
                                 continue;
@@ -133,7 +133,7 @@ impl VulkanAutotuner {
     pub fn save_cache(&self, caps: &VulkanCaps) {
         let hash = caps.cache_key_hash();
         let entries: Vec<TuneEntryOwned> = {
-            let lock = self.cache.lock().unwrap();
+            let lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             lock.iter()
                 .filter(|((h, _, _, _, _), _)| *h == hash)
                 .map(|((h, m, n, k, sc), (cfg, ms))| TuneEntryOwned {
@@ -182,7 +182,7 @@ impl VulkanAutotuner {
 
         // Fast path: in-memory (or previously loaded-from-disk) cache hit.
         {
-            let lock = self.cache.lock().unwrap();
+            let lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((cfg, _ms)) = lock.get(&(caps_hash, m, n, k, shape_class)) {
                 return *cfg;
             }
@@ -270,7 +270,7 @@ impl VulkanAutotuner {
         // Insert winner, then persist so a repeat shape on this GPU hits the on-disk cache.
         let key = (caps_hash, m, n, k, shape_class);
         {
-            let mut lock = self.cache.lock().unwrap();
+            let mut lock = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             lock.insert(key, (winner, 0.010));
         }
         self.save_cache(caps);
