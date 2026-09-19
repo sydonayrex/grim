@@ -520,6 +520,8 @@ pub async fn cmd_run(
     min_tokens: u32,
     draft_model: Option<String>,
     _lookahead: bool,
+    raw: bool,
+    system: Option<String>,
 ) -> Result<()> {
     let prompt = prompt.unwrap_or_else(|| "Hello".to_string());
 
@@ -730,6 +732,21 @@ pub async fn cmd_run(
         None
     };
 
+    // Apply model-recommended sampling defaults if CLI didn't override and not in raw mode.
+    let (temperature, repeat_penalty, top_k) = if !raw {
+        if let Some((rec_temp, rec_rep, rec_k)) = tokenizer.as_ref().and_then(|t| t.default_sampling_params()) {
+            // Use recommended default if temperature was default 0.7
+            let t = if (temperature - 0.7).abs() < 1e-4 { rec_temp } else { temperature };
+            let r = if (repeat_penalty - 1.1).abs() < 1e-4 { rec_rep } else { repeat_penalty };
+            let k = if top_k == 40 { rec_k } else { top_k };
+            (t, r, k)
+        } else {
+            (temperature, repeat_penalty, top_k)
+        }
+    } else {
+        (temperature, repeat_penalty, top_k)
+    };
+
     // Create sampler based on parameters
     let sampling_params = SamplingParams {
         temperature,
@@ -745,18 +762,34 @@ pub async fn cmd_run(
     let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
         let mut ids = Vec::new();
 
-        // If the tokenizer carries a Jinja chat template, render the single-turn prompt through it for instruction-tuned models.
-        // Otherwise fall back to raw prompt + best-effort BOS.
-        let prompt_text = if tok.chat_template.is_some() {
-            // The chat template itself is responsible for inserting BOS via `{{ bos_token }}` (grim-format resolves it to the tokenizer's `<s>` string).
-            // We must NOT prepend BOS here - that would double-inject it for models like MiniCPM5.
-            let messages = vec![grim_format::ChatMessage {
+        // If raw mode is requested, pass prompt unformatted.
+        // Otherwise, render through chat template and inject default/explicit system prompt.
+        let prompt_text = if !raw && tok.chat_template.is_some() {
+            let mut messages = Vec::new();
+            if let Some(ref sys) = system {
+                messages.push(grim_format::ChatMessage {
+                    role: "system".to_string(),
+                    content: sys.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            } else if let Some(default_sys) = tok.default_system_prompt() {
+                messages.push(grim_format::ChatMessage {
+                    role: "system".to_string(),
+                    content: default_sys.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            messages.push(grim_format::ChatMessage {
                 role: "user".to_string(),
                 content: prompt.clone(),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
-            }];
+            });
             grim_format::render_messages_or_last(tok, &messages)
         } else {
             // Prepend BOS token for models that expect it (e.g. <|startoftext|> for LFM2).
@@ -1328,6 +1361,8 @@ pub async fn cmd_run_interactive(
     repeat_penalty: f32,
     draft_model: Option<String>,
     _lookahead: bool,
+    raw: bool,
+    system: Option<String>,
 ) -> Result<()> {
     // ---- resolve path ----
     let resolved_path = resolve_model_path(&model_path)
@@ -1435,6 +1470,20 @@ pub async fn cmd_run_interactive(
         None
     };
 
+    // Apply model-recommended sampling defaults if CLI didn't override and not in raw mode.
+    let (temperature, repeat_penalty, top_k) = if !raw {
+        if let Some((rec_temp, rec_rep, rec_k)) = tokenizer.as_ref().and_then(|t| t.default_sampling_params()) {
+            let t = if (temperature - 0.7).abs() < 1e-4 { rec_temp } else { temperature };
+            let r = if (repeat_penalty - 1.1).abs() < 1e-4 { rec_rep } else { repeat_penalty };
+            let k = if top_k == 40 { rec_k } else { top_k };
+            (t, r, k)
+        } else {
+            (temperature, repeat_penalty, top_k)
+        }
+    } else {
+        (temperature, repeat_penalty, top_k)
+    };
+
     // ---- sampler (created once) ----
     let sampling_params = SamplingParams {
         temperature,
@@ -1471,17 +1520,33 @@ pub async fn cmd_run_interactive(
 
     // Session and KV cache persist across turns.
     let mut session = SessionInner::new(model.device().clone());
-    // Multi-turn chat template history.
-    let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
     // Repeat-penalty history persists across turns.
     let mut history: Vec<u32> = Vec::new();
+    // Multi-turn chat template history.
+    let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
+    let mut raw_mode = raw;
+
+    // Initialize system prompt if configured or model provides a default
+    let active_sys_prompt = system.as_deref().or_else(|| {
+        tokenizer.as_ref().and_then(|t| t.default_system_prompt())
+    });
+    if let Some(sys) = active_sys_prompt {
+        messages.push(grim_format::ChatMessage {
+            role: "system".to_string(),
+            content: sys.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
     // Running token count for position offset across turns.
     let mut total_tokens: usize = 0;
 
     use std::io::Write;
     loop {
-        print!(">>> ");
-        let _ = std::io::stdout().flush();
+        print!("> ");
+        std::io::stdout().flush().unwrap();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
             break Ok(());
@@ -1494,9 +1559,23 @@ pub async fn cmd_run_interactive(
         if trimmed == "/reset" {
             session = SessionInner::new(model.device().clone());
             messages.clear();
+            if let Some(sys) = active_sys_prompt {
+                messages.push(grim_format::ChatMessage {
+                    role: "system".to_string(),
+                    content: sys.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
             history.clear();
             total_tokens = 0;
             println!("(conversation reset)");
+            continue;
+        }
+        if trimmed == "/raw" {
+            raw_mode = !raw_mode;
+            println!("(raw mode: {})", if raw_mode { "ON" } else { "OFF" });
             continue;
         }
         if trimmed == "/exit" || trimmed == "/quit" {
@@ -1514,7 +1593,7 @@ pub async fn cmd_run_interactive(
 
         let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
             let mut ids = Vec::new();
-            let prompt_text = if tok.chat_template.is_some() {
+            let prompt_text = if !raw_mode && tok.chat_template.is_some() {
                 if tok.add_bos_token {
                     if let Some(bos_id) = tok.bos_token_id {
                         ids.push(bos_id);

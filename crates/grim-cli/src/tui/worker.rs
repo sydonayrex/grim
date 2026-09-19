@@ -1040,6 +1040,7 @@ mod tests {
             add_bos_token: false,
             unk_token_id: None,
             chat_template: None,
+            architecture: None,
         }
     }
 

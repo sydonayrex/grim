@@ -25,6 +25,8 @@ pub struct GgufTokenizer {
     /// Jinja chat template extracted from GGUF `tokenizer.chat_template`, if present.
     /// Drives instruction-tuned prompt formatting in the CLI/server prompt path.
     pub chat_template: Option<String>,
+    /// Model architecture name (e.g. "lfm2", "qwen2", "llama").
+    pub architecture: Option<String>,
 }
 
 impl Default for GgufTokenizer {
@@ -41,6 +43,7 @@ impl Default for GgufTokenizer {
             add_bos_token: false,
             unk_token_id: None,
             chat_template: None,
+            architecture: None,
         }
     }
 }
@@ -193,6 +196,7 @@ impl GgufTokenizer {
             add_bos_token: false,
             unk_token_id,
             chat_template: None,
+            architecture: None,
         })
     }
 
@@ -291,6 +295,11 @@ impl GgufTokenizer {
             None
         };
 
+        let architecture = metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let byte_decoder = if model_type == "bpe" || model_type == "gpt2" {
             Some(gpt2_byte_decoder())
         } else {
@@ -309,7 +318,35 @@ impl GgufTokenizer {
             add_bos_token,
             unk_token_id,
             chat_template,
+            architecture,
         })
+    }
+
+    /// Model-aware default system prompt matching upstream / Ollama defaults.
+    pub fn default_system_prompt(&self) -> Option<&'static str> {
+        let arch = self.architecture.as_deref().unwrap_or("");
+        if arch.eq_ignore_ascii_case("lfm2")
+            || arch.eq_ignore_ascii_case("lfm")
+            || arch.contains("lfm")
+        {
+            Some("You are a helpful assistant trained by Liquid AI.")
+        } else {
+            None
+        }
+    }
+
+    /// Model-aware recommended default sampling parameters (temperature, repeat_penalty, top_k).
+    pub fn default_sampling_params(&self) -> Option<(f32, f32, u32)> {
+        let arch = self.architecture.as_deref().unwrap_or("");
+        if arch.eq_ignore_ascii_case("lfm2")
+            || arch.eq_ignore_ascii_case("lfm")
+            || arch.contains("lfm")
+        {
+            // Matches Ollama Modelfile defaults for liquidai/lfm2.5-350m:q8_0
+            Some((0.1, 1.05, 50))
+        } else {
+            None
+        }
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {

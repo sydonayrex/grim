@@ -1592,6 +1592,7 @@ mod tests {
             bpe_merges: None,
             byte_decoder: None,
             chat_template: None,
+            architecture: None,
         };
 
         let dataset = load_dataset_from_str(json, &tokenizer, 512).unwrap();
@@ -2069,6 +2070,7 @@ mod tests {
             bpe_merges: None,
             byte_decoder: None,
             chat_template: None,
+            architecture: None,
         };
 
         let paths = vec![
