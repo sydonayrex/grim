@@ -834,7 +834,7 @@ impl LlamaBlock {
         };
         let silu_storage = if seq_tokens == 1
             && matches!(x_norm.device(), Device::Rocm(_))
-            && self.w_down.as_ref().map_or(false, |w| {
+            && self.w_down.as_ref().is_some_and(|w| {
                 matches!(
                     w.weight().dtype().storage,
                     grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80)
@@ -1388,27 +1388,29 @@ impl LlamaBlock {
             && self._cfg.sliding_window.is_none()
             && crate::decode_graph_active(&self._dev)
         {
-            match self.device_graph_decode_attention(
-                &q_3d,
-                &k_3d,
-                &v_3d,
-                cache.as_mut().unwrap(),
-                row_elems,
-                &out_shape,
-            ) {
-                Ok((attn, o_done)) => {
-                    if o_done {
-                        // Phase 4b: wo already applied in the kernel epilogue.
-                        *o_fused = true;
-                        return Ok((attn, true));
+            if let Some(cache) = cache.as_mut() {
+                match self.device_graph_decode_attention(
+                    &q_3d,
+                    &k_3d,
+                    &v_3d,
+                    cache,
+                    row_elems,
+                    &out_shape,
+                ) {
+                    Ok((attn, o_done)) => {
+                        if o_done {
+                            // Phase 4b: wo already applied in the kernel epilogue.
+                            *o_fused = true;
+                            return Ok((attn, true));
+                        }
+                        let flat_shape =
+                            Shape::new(vec![q_len, cfg.local_num_heads * cfg.head_dim]);
+                        return Ok((reshaped_view(&attn, &flat_shape)?, false));
                     }
-                    let flat_shape =
-                        Shape::new(vec![q_len, cfg.local_num_heads * cfg.head_dim]);
-                    return Ok((reshaped_view(&attn, &flat_shape)?, false));
+                    // Missing backend primitives → stock path (mirrors `cache_append_kv`).
+                    Err(e) if is_unimplemented(&e) => {}
+                    Err(e) => return Err(e),
                 }
-                // Missing backend primitives → stock path (mirrors `cache_append_kv`).
-                Err(e) if is_unimplemented(&e) => {}
-                Err(e) => return Err(e),
             }
         }
 

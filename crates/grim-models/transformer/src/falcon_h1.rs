@@ -355,16 +355,16 @@ fn forward_block_cpu(
     let normed = normed.to_vec_f32()?;
 
     let normed_t = wrap(&normed, seq_len, cfg.hidden_size, device)?;
-    let (q_t, k_t, v_t) = if seq_len == 1 && b.wqkv_q80_fused.is_some() {
-        crate::shared_attention::fused_qkv_dot4_decode(
-            &normed_t,
-            b.wqkv_q80_fused.as_ref().unwrap(),
-        )?
-    } else {
+    let (q_t, k_t, v_t) = match b.wqkv_q80_fused.as_ref() {
+        Some(fused) if seq_len == 1 => {
+            crate::shared_attention::fused_qkv_dot4_decode(&normed_t, fused)?
+        }
+        _ => {
         let q_t = b.wq.forward(&normed_t)?;
         let k_t = b.wk.forward(&normed_t)?;
         let v_t = b.wv.forward(&normed_t)?;
         (q_t, k_t, v_t)
+        }
     };
 
     let attn_tensor = gqa_attn_with_cache(b, cfg, &q_t, &k_t, &v_t, positions, seq_len, cache)?;

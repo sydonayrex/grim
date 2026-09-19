@@ -45,6 +45,7 @@ fn ref_matmul(a: &[f32], b_packed: &[u8], m: usize, n: usize, k: usize, scheme: 
     c
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_case(dev: &RocmDevice, m: usize, n: usize, k: usize, scheme: KQuantScheme, format: grim_tensor::QuantFormat, pack: &dyn Fn(&[f32]) -> grim_tensor::error::Result<Vec<u8>>, deq: &dyn Fn(&[u8], usize) -> Vec<f32>) {
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
     let b_orig: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0).collect();

@@ -215,27 +215,29 @@ fn charon_enabled() -> bool {
 /// That is the exact math of the per-expert loop, cross-checked by
 /// `tests/golden_charon_moe_gpu.rs` (≤1e-3 max-abs-diff). On any other backend
 /// (or when the kernel is unavailable) it falls back to the per-expert loop.
-
+///
 /// M2 (PLAN-kernel-fusion): resolve (lazily allocate, once per shape key) the
 /// device routing scratch triple + resident stacked expert weights that the
 /// Charon grouped dispatch consumes. Used by `fused_moe_dispatch_from_logits`
 /// and by the capture-safe graph path (`Lfm2Block::moe_forward_graph`), which
 /// must hit the already-allocated buffers inside a capture bracket — callers
 /// warm up once before `begin_capture` so every later call is a cache hit.
+pub type CharonScratchBuffers = (
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+    Arc<dyn grim_tensor::BackendStorage>,
+);
+
 pub fn ensure_charon_scratch(
     ordinal: usize,
     seq_len: usize,
     top_k: usize,
     experts: &[MoeExpert],
     cache: &CharonCache,
-) -> Result<(
-    Arc<dyn grim_tensor::BackendStorage>,
-    Arc<dyn grim_tensor::BackendStorage>,
-    Arc<dyn grim_tensor::BackendStorage>,
-    Arc<dyn grim_tensor::BackendStorage>,
-    Arc<dyn grim_tensor::BackendStorage>,
-    Arc<dyn grim_tensor::BackendStorage>,
-)> {
+) -> Result<CharonScratchBuffers> {
     let rocm = Arc::new(grim_backend_rocm::RocmDevice::shared(ordinal));
     let num_experts = experts.len();
     let hidden = experts[0].gate.weight.shape().dim(1).unwrap_or(0);
@@ -425,6 +427,7 @@ fn zero_moe_output(
 /// * `route_mode` - gating transform: 0 = softmax (global denom, HF Qwen),
 ///   1 = sqrt-softplus (DeepSeek-V4), 2 = sigmoid+bias (DeepSeek-V2/V3 dedup),
 ///   3 = softmax renormalized over top-k only (GLM/Qwen `normalize_weights`).
+///
 /// Returns `Ok(None)` when the path cannot run (non-ROCm, unavailable kernel, or
 /// `GRIM_MOE_CHARON=0`), so the caller falls back to the host-routing path.
 #[allow(clippy::too_many_arguments)]
@@ -1624,12 +1627,13 @@ fn split_mxfp4_blob(bytes: &[u8], rows: usize, k: usize, label: &str) -> Result<
 /// Build MXFP4 code + shared-exponent stacks (gate/up share shapes, down
 /// differs). Returns `(codes_gate, codes_up, codes_down, exps_gate,
 /// exps_up, exps_down)`.
+type Mxfp4Stacks = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 fn stack_mxfp4(
     experts: &[MoeExpert],
     num_experts: usize,
     hidden: usize,
     inter: usize,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+) -> Result<Mxfp4Stacks> {
     let codes_per_gate = inter * hidden / 2;
     let exps_per_gate = (inter * hidden).div_ceil(32);
     let codes_per_down = hidden * inter / 2;
@@ -1728,8 +1732,7 @@ fn per_expert_loop(
 
     let out_st = dev.zeros(x.shape(), DType::F32)?;
 
-    for s in 0..seq_len {
-        let routing = &routings[s];
+    for (s, routing) in routings.iter().enumerate() {
         if routing.is_empty() {
             continue;
         }
@@ -1799,11 +1802,7 @@ fn per_expert_loop(
 /// logit, descending) with softmax-normalized combine weights (no architecture
 /// scaling applied — multiply by `routed_scaling_factor` at dispatch time).
 pub fn route_topk(logits_v: &[f32], num_experts: usize, top_k: usize) -> Result<Vec<TokenRouting>> {
-    let seq_len = if num_experts == 0 {
-        0
-    } else {
-        logits_v.len() / num_experts
-    };
+    let seq_len = logits_v.len().checked_div(num_experts).unwrap_or(0);
     let mut out = Vec::with_capacity(seq_len);
     for s in 0..seq_len {
         let row = &logits_v[s * num_experts..(s + 1) * num_experts];

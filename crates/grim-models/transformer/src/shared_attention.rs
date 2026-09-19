@@ -894,7 +894,7 @@ mod tests {
         qkv_record_sticky_failure(key);
         let (_, _, sticky_after) = qkv_arena_fallback_stats();
         assert!(
-            sticky_after >= sticky_before + 1,
+            sticky_after > sticky_before,
             "sticky count must grow at least once for a new key"
         );
     }

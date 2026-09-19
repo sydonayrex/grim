@@ -39,7 +39,8 @@ fn round_to_f16(v: f32) -> f32 {
     half::f16::from_f32(v).to_f32()
 }
 
-/// Row-major GEMM on the CPU: C[M×N] = A[M×K] · B[K×N].
+/// Row-major GEMM on the CPU for the crate matmul contract:
+/// C[M×N] = A[M×K] · B[N×K]^T (B is the natural weight layout).
 ///
 /// Both inputs are already f16-rounded (via `round_to_f16`) to match GPU storage.
 fn host_gemm_f16_rounded(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -48,7 +49,7 @@ fn host_gemm_f16_rounded(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> 
         for ni in 0..n {
             let mut acc = 0.0f32;
             for ki in 0..k {
-                acc += a[mi * k + ki] * b[ki * n + ni];
+                acc += a[mi * k + ki] * b[ni * k + ki];
             }
             out[mi * n + ni] = acc;
         }
@@ -81,7 +82,8 @@ fn run_gpu(
     n: usize,
 ) -> TestResult<Vec<f32>> {
     let a_shape = Shape::from_slice(&[m, k]);
-    let b_shape = Shape::from_slice(&[k, n]);
+    // SPEED-ROC-16 contract: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+    let b_shape = Shape::from_slice(&[n, k]);
     let out_shape = Shape::from_slice(&[m, n]);
 
     // Upload as F16; `from_cpu` converts element-wise.
@@ -137,7 +139,7 @@ fn test_wmma_gemm_cpu_gpu_parity_all_shapes() -> TestResult {
     for &(m, k, n) in SHAPES {
         for seed in 0u32..4 {
             let a = seeded_data(m * k, seed, 0.5);
-            let b = seeded_data(k * n, seed.wrapping_add(7), 0.5);
+            let b = seeded_data(n * k, seed.wrapping_add(7), 0.5);
 
             let gpu_out = run_gpu(&dev, &a, &b, m, k, n)?;
             let cpu_out = host_gemm_f16_rounded(&a, &b, m, k, n);
@@ -173,10 +175,11 @@ fn test_wmma_gemm_enable_disable_output_consistency() -> TestResult {
 
     let (m, k, n) = (16usize, 64usize, 16usize);
     let a = seeded_data(m * k, 42, 0.5);
-    let b = seeded_data(k * n, 99, 0.5);
+    let b = seeded_data(n * k, 99, 0.5);
 
     let a_shape = Shape::from_slice(&[m, k]);
-    let b_shape = Shape::from_slice(&[k, n]);
+    // SPEED-ROC-16 contract: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+    let b_shape = Shape::from_slice(&[n, k]);
     let out_shape = Shape::from_slice(&[m, n]);
 
     let a_dev = CoreTensorOps::from_cpu(&dev, &a, &a_shape, DType::F16)?;

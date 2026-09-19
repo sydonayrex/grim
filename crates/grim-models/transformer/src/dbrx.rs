@@ -123,8 +123,8 @@ impl DbrxMoeBlock {
         // Maps w1->gate, v1->up, w2->down and calls the Charon fused dispatch
         // with actual softmax top-k routing from `router_logits`.
         // This is a behavior change vs the fixed-ensemble path; gate it for safety.
-        if std::env::var("GRIM_DBRX_REAL_ROUTING").as_deref() == Ok("1") {
-            if matches!(x.device(), Device::Rocm(_)) {
+        if std::env::var("GRIM_DBRX_REAL_ROUTING").as_deref() == Ok("1")
+            && matches!(x.device(), Device::Rocm(_)) {
                 let experts: Vec<crate::shared_moe::MoeExpert> = self
                     .experts
                     .iter()
@@ -154,7 +154,6 @@ impl DbrxMoeBlock {
                     return Ok(out);
                 }
             }
-        }
 
         // Fixed-ensemble fallback (original shipped-model semantics).
         if x.device() != &Device::Cpu {

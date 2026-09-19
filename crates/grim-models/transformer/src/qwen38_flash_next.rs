@@ -460,13 +460,16 @@ impl Qwen38FlashNextBlock {
 
         // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV instead
         // of 3 separate GEMVs; the per-head RoPE closure is applied after.
-        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
-            crate::shared_attention::fused_qkv_project_raw(&normed_attn, self.wqkv_q80_fused.as_ref().unwrap())?
-        } else {
+        let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
+            Some(fused) if seq_len == 1 => {
+                crate::shared_attention::fused_qkv_project_raw(&normed_attn, fused)?
+            }
+            _ => {
             let q = self.wq.forward(&normed_attn)?;
             let k = self.wk.forward(&normed_attn)?;
             let v = self.wv.forward(&normed_attn)?;
             (q, k, v)
+            }
         };
 
         let _q_dim = self.num_heads * self.head_dim;
@@ -1577,7 +1580,7 @@ mod moe_d2d_parity_tests {
             let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
             let token_x = &x[s * hidden..(s + 1) * hidden];
-            for (_i, (ei, l)) in topk.iter().enumerate() {
+            for (ei, l) in topk.iter() {
                 let w = ((l - max_l).exp() / denom) * block.routed_scaling_factor;
                 let e = &block.experts[*ei];
                 let g = e.gate_proj.forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden]))).unwrap().to_vec_f32().unwrap();

@@ -468,14 +468,11 @@ impl Qwen35Block {
             // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
             // (pre-rope) instead of 3 separate GEMVs; the same rope_ext and
             // arena-attention path follow unchanged.
-            let (q_dev, k_dev_t, v_dev_t) =
-                if seq_len == 1 && self.wqkv_q80_fused.is_some() {
-                    let (fq, fk, fv) = crate::shared_attention::fused_qkv_project_raw(
-                        &x_normed,
-                        self.wqkv_q80_fused.as_ref().unwrap(),
-                    )?;
-                    (fq, fk, fv)
-                } else {
+            let (q_dev, k_dev_t, v_dev_t) = match self.wqkv_q80_fused.as_ref() {
+                Some(fused) if seq_len == 1 => {
+                    crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?
+                }
+                _ => {
                     let q_dev = match self.wq.as_ref() {
                         Some(wq) => exact(wq.forward(&x_normed)?, seq_len, q_dim)?,
                         None => Tensor::new(
@@ -510,6 +507,7 @@ impl Qwen35Block {
                         ),
                     };
                     (q_dev, k_dev_t, v_dev_t)
+                }
                 };
 
             let q_rope = rope_ext(&q_dev, self.num_heads)?;

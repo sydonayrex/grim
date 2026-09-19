@@ -91,11 +91,7 @@ fn try_graph_decode_step(
         m
     } else if let Some(m) = model.as_any().downcast_ref::<grim_models_transformer::HyV3>() {
         m
-    } else if let Some(m) = grim_models_transformer::llama_wrapper_graph_model(model.as_any()) {
-        m
-    } else {
-        return None;
-    };
+    } else { grim_models_transformer::llama_wrapper_graph_model(model.as_any())? };
     // Lazily allocate once; stable addresses across steps.
     if graph.is_none() {
         match graph_model.get_or_create_decode_graph(4096, 1) {
@@ -1009,11 +1005,11 @@ pub async fn cmd_run(
                     );
                     Ok(sampler.sample(&last_logits_tensor, &history)?)
                 };
-                let next_token = match device_token {
+                
+                match device_token {
                     Some(tok) => tok,
                     None => cpu_sample()?,
-                };
-                next_token
+                }
             }
         };
 
@@ -1604,7 +1600,7 @@ pub async fn cmd_run_interactive(
             };
 
             let logits =
-                CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
+                CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?;
 
             // SPEED-ROC: GPU-direct sampling on decode steps — see one-shot loop.
             // B1: penalty on-device; kernel miss degrades to CPU (never errors).

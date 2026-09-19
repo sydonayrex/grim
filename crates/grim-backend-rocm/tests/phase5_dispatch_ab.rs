@@ -95,8 +95,8 @@ fn encode_weights(fmt: Fmt, n: usize, k: usize) -> Vec<u8> {
             for c in 0..n {
                 for b in 0..sb {
                     let blk = &mut out[(c * sb + b) * 84..(c * sb + b) * 84 + 84];
-                    for i in 0..16 {
-                        blk[i] = (rand() as u8) % 16 | (((rand() as u8) % 16) << 4);
+                    for b_val in blk.iter_mut().take(16) {
+                        *b_val = ((rand() as u8) % 16) | (((rand() as u8) % 16) << 4);
                     }
                     for i in 0..64 {
                         blk[16 + i] = rand().to_bits() as u8;
@@ -115,8 +115,8 @@ fn encode_weights(fmt: Fmt, n: usize, k: usize) -> Vec<u8> {
             for c in 0..n {
                 for b in 0..sb {
                     let blk = &mut out[(c * sb + b) * 110..(c * sb + b) * 110 + 110];
-                    for i in 0..32 {
-                        blk[i] = rand().to_bits() as u8; // hmask
+                    for v in blk[..32].iter_mut() {
+                        *v = rand().to_bits() as u8; // hmask
                     }
                     for i in 0..64 {
                         blk[32 + i] = rand().to_bits() as u8; // qs

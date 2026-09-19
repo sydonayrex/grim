@@ -18,7 +18,7 @@ fn stream_bound_sampler_works_off_default_stream() {
         eprintln!("skip: set GRIM_GPU_TEST=1");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }

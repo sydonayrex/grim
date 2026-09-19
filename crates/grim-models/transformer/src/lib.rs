@@ -23,10 +23,10 @@ pub fn decode_graph_active(device: &grim_tensor::Device) -> bool {
     if !matches!(device, grim_tensor::Device::Rocm(_)) {
         return false;
     }
-    match std::env::var("GRIM_DECODE_GRAPH").as_deref() {
-        Ok("0") | Ok("false") | Ok("off") | Ok("False") | Ok("OFF") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("GRIM_DECODE_GRAPH").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("False") | Ok("OFF")
+    )
 }
 
 pub mod afmoe;

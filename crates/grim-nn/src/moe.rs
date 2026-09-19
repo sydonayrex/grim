@@ -20,6 +20,9 @@ use grim_tensor::shape::Shape;
 use grim_tensor::{BackendStorage, CoreTensorOps, Device, Tensor};
 use std::sync::Arc;
 
+/// Cached device gate-projection entry: `(num_experts, hidden, logits buffer)`.
+type RocmGateSlot = std::sync::Mutex<Option<(usize, usize, Arc<dyn BackendStorage>)>>;
+
 use crate::modules::{ExpertParallelConfig, Linear};
 use crate::varbuilder::WeightSource;
 
@@ -1244,7 +1247,7 @@ pub struct MoeFfn {
     /// uploaded once (when the checkpoint keeps the gate CPU-resident), for the
     /// D2D `forward_rocm` gate projection. Keyed by `(num_experts, hidden)`.
     #[cfg(feature = "rocm-mem")]
-    rocm_gate: std::sync::Mutex<Option<(usize, usize, Arc<dyn BackendStorage>)>>,
+    rocm_gate: RocmGateSlot,
     /// CUDA resident expert-weight cache (see [`CudaResidentWeights`]).
     #[cfg(feature = "cuda-mem")]
     cuda_weights: std::sync::Mutex<Option<CudaResidentWeights>>,

@@ -11,8 +11,9 @@ extern "C" __global__ void grim_decode_gemm_f16(
     int M, int N, int K,
     int stride_a, int stride_b, int stride_c)
 {
-    // Decode-shape F16 GEMM: C[M,N] = A[M,K] @ B[K,N], f32 accumulate, F16 out.
-    // Simple, correct, single-buffer implementation.
+    // Decode-shape F16 GEMM: C[M,N] = A[M,K] @ B[N,K]^T (SPEED-ROC-16 contract:
+    // B is the natural weight [N, K] row-major, stride_b = K), f32 accumulate,
+    // F16 out. Simple, correct, single-buffer implementation.
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = M * N;
     if (idx >= total) return;
@@ -21,11 +22,12 @@ extern "C" __global__ void grim_decode_gemm_f16(
     const int col = idx % N;
 
     const _Float16* a_row = A + row * stride_a;
+    const _Float16* b_col = B + col * stride_b;
     float acc = 0.0f;
 
     for (int k = 0; k < K; ++k) {
         float a_val = (float)a_row[k];
-        float b_val = (float)B[k * stride_b + col];
+        float b_val = (float)b_col[k];
         acc += a_val * b_val;
     }
 

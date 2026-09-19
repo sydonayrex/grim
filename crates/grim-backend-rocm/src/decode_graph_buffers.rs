@@ -1214,11 +1214,8 @@ mod tests {
             0,
         );
         // On CPU-only CI alloc fails -> fallback eager is correct behavior.
-        match st {
-            Ok(s) => {
-                assert!(launch_qkv_gemv(&s, 99999, 8).is_err());
-            }
-            Err(_) => {}
+        if let Ok(s) = st {
+            assert!(launch_qkv_gemv(&s, 99999, 8).is_err());
         }
     }
 }

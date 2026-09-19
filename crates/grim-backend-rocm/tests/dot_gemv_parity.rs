@@ -91,13 +91,18 @@ fn max_diff(want: &[f32], got: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+type Q80Pair = (
+    Box<dyn grim_tensor::BackendStorage>,
+    Box<dyn grim_tensor::BackendStorage>,
+);
+
 fn upload_q80_case(
     dev: &RocmDevice,
     a: &[f32],
     b_packed: &[u8],
     m: usize,
     k: usize,
-) -> Result<(Box<dyn grim_tensor::BackendStorage>, Box<dyn grim_tensor::BackendStorage>), Box<dyn std::error::Error>>
+) -> Result<Q80Pair, Box<dyn std::error::Error>>
 {
     let a_dev = CoreTensorOps::from_cpu(dev, a, &Shape::new(vec![m, k]), DType::F32)?;
     let q_dtype = DType {
@@ -768,7 +773,7 @@ fn rmsnorm_rope_parity() {
 
     // Reference: run on CPU / unfused math
     let mut ref_out = vec![0.0f32; total_elems];
-    for h in 0..(heads * steps) {
+    for (h, &pos_raw) in positions.iter().enumerate() {
         let base = h * head_dim;
         let mut ss = 0.0f32;
         for i in 0..head_dim {
@@ -782,7 +787,7 @@ fn rmsnorm_rope_parity() {
         }
         // apply RoPE
         let half = head_dim / 2;
-        let pos = positions[h] as f32;
+        let pos = pos_raw as f32;
         for i in 0..half {
             let freq = 1.0f32 / 10000.0f32.powf((2.0 * i as f32) / head_dim as f32);
             let val = pos * freq;
@@ -892,9 +897,7 @@ fn silu_mul_quant_q81_parity() {
         let mut fsum = 0.0f32;
         let mut ref_q = [0i8; 32];
         for j in 0..32 {
-            let mut q = (act[j] * inv_d).round() as i32;
-            if q > 127 { q = 127; }
-            if q < -127 { q = -127; }
+            let q = ((act[j] * inv_d).round() as i32).clamp(-127, 127);
             ref_q[j] = q as i8;
             fsum += q as f32;
         }
@@ -1193,7 +1196,7 @@ fn dot4_q3k_gemv_parity() {
     let mut b_bytes = vec![0u8; n * 110];
     for col in 0..n {
         let blk = &mut b_bytes[col * 110..(col + 1) * 110];
-        for i in 0..32 { blk[i] = rand().to_bits() as u8; }
+        for v in blk[..32].iter_mut() { *v = rand().to_bits() as u8; }
         for i in 0..64 { blk[32 + i] = rand().to_bits() as u8; }
         for i in 0..12 { blk[96 + i] = rand().to_bits() as u8; }
         blk[108..110].copy_from_slice(&f16_bits(0.01));
@@ -1810,10 +1813,13 @@ fn dot4_q4k_gemv_parity_on_rdna2_apu() {
 
 /// Prefer the gfx103x APU (ordinal 2); fall back to any dot4-capable device.
 fn gpu_device_rdna2() -> Option<RocmDevice> {
+    // These tests verify the gfx103x APU sdot4 path specifically (the
+    // `grim_dot4_q4k_q81_gemv` kernel's documented target). A non-gfx103x
+    // device must skip, not fall back — the kernel mis-computes there.
     for ordinal in [2usize, 0, 1] {
         if let Ok(dev) = RocmDevice::try_new(ordinal) {
             let arch = dev.gpu_target_str();
-            if arch.starts_with("gfx10") || arch.starts_with("gfx11") || arch.starts_with("gfx12") {
+            if arch.starts_with("gfx103") {
                 return Some(dev);
             }
         }

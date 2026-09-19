@@ -37,15 +37,14 @@ fn gpu_device() -> Option<RocmDevice> {
         .ok()
 }
 
-/// Computes a standard row-major float GEMM reference on the CPU.
-///
-/// Matrix dimensions are: A is [m x k], B is [k x n], and out is [m x n].
+/// CPU reference for the crate matmul contract: A is [m x k], B is the
+/// weight [n x k], and out[m x n] = A @ B^T.
 fn host_gemm_f32(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
     for mi in 0..m {
         for ni in 0..n {
             let mut acc = 0.0f32;
             for ki in 0..k {
-                acc += a[mi * k + ki] * b[ki * n + ni];
+                acc += a[mi * k + ki] * b[ni * k + ki];
             }
             out[mi * n + ni] = acc;
         }
@@ -74,7 +73,8 @@ fn run_wmma_kernel(
     n: usize,
 ) -> TestResult<Vec<f32>> {
     let a_shape = Shape::from_slice(&[m, k]);
-    let b_shape = Shape::from_slice(&[k, n]);
+    // SPEED-ROC-16 contract: `b` is the natural weight (N, K); matmul computes C = A @ B^T.
+    let b_shape = Shape::from_slice(&[n, k]);
     let out_shape = Shape::from_slice(&[m, n]);
 
     let a_dev = CoreTensorOps::from_cpu(dev, a_data, &a_shape, DType::F16)?;
@@ -99,7 +99,7 @@ fn test_wmma_gemm_infrastructure_and_correctness() -> TestResult {
 
     let (m, k, n) = (8usize, 128usize, 128usize);
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.02).sin() * 0.5).collect();
-    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.04).cos() * 0.5).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.04).cos() * 0.5).collect();
 
     // 1. Run with WMMA JIT kernel enabled
     let gpu_out = run_wmma_kernel(&dev, &a_data, &b_data, m, k, n)?;

@@ -50,6 +50,9 @@ impl ModelConfig for Lfm2Config {
     }
 }
 
+// Boxing the larger variant would change the public pattern-match shape of this
+// cache enum, so silence the size-difference lint instead.
+#[allow(clippy::large_enum_variant)]
 pub enum Lfm2LayerCache {
     /// ShortConv state: host mirror (row-major `[t, d]` layout, same as CPU path expects)
     /// plus optional device-resident ring buffer (column-major `[d, kc]` layout matching the
@@ -1357,12 +1360,15 @@ impl Lfm2Block {
         let ffn_out = if self.is_moe {
             self.forward_moe_ffn(&norm_x_ffn)?
         } else {
-            let (gate, up) = if seq_tokens == 1 && self.w_gate_up_q80_fused.is_some() {
-                self.fused_gate_up_dot4_decode(&norm_x_ffn, self.w_gate_up_q80_fused.as_ref().unwrap())?
-            } else {
+            let (gate, up) = match self.w_gate_up_q80_fused.as_ref() {
+                Some(fused) if seq_tokens == 1 => {
+                    self.fused_gate_up_dot4_decode(&norm_x_ffn, fused)?
+                }
+                _ => {
                 let gate = self.ffn_gate.forward(&norm_x_ffn)?;
                 let up = self.ffn_up.forward(&norm_x_ffn)?;
                 (gate, up)
+                }
             };
             let activated = silu_mul(&gate, &up)?;
             self.ffn_down.forward(&activated)?
@@ -1570,7 +1576,7 @@ impl Lfm2Block {
     /// `norm_x` is the single-token f32 activation `[1, hidden]`; we quantize it
     /// to q8_1 inline, run the fused GEMV writing `[1, n_q + 2·n_kv]` f32, then
     /// slice the output into (q, k, v). Returns device-resident storages.
-
+    ///
     /// Phase 4c: fused Gate+Up dot4 GEMV for single-token decode.
     fn fused_gate_up_dot4_decode(
         &self,
@@ -1659,6 +1665,7 @@ impl Lfm2Block {
     ///  - `grim_qkv_attention_dev` reads `total = *past_dev + steps` from device.
     ///  - `grim_bump_i32(past_dev, steps)` is the LAST node, incrementing the
     ///    counter so the next replay sees the updated past.
+    ///
     /// `q_rot_storage`/`k_rot_storage` are device-resident f32; `v` is the raw
     /// projection tensor. Returns the (host Q vec for the FFN path, arena_total).
     #[allow(clippy::too_many_arguments)]
@@ -1811,6 +1818,7 @@ impl Lfm2Block {
 
     /// Device-side per-token expert compute: extract the winning expert's weight block from the stacked `[E, F, H]` tensor, transpose on-device, matmul the token row, silu-gate with the up projection, then the down projection.
     /// All of it on the device; the host only sees the tiny gate-logit vector.
+    #[allow(clippy::too_many_arguments)]
     fn shortconv_step_device(
         &self,
         proj: &Tensor,

@@ -147,13 +147,16 @@ impl GptJBlock {
 
         // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV instead
         // of 3 separate GEMVs; GPT-J's full-width rope is applied after.
-        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
-            crate::shared_attention::fused_qkv_project_raw(&normed, self.wqkv_q80_fused.as_ref().unwrap())?
-        } else {
+        let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
+            Some(fused) if seq_len == 1 => {
+                crate::shared_attention::fused_qkv_project_raw(&normed, fused)?
+            }
+            _ => {
             let q = self.q_proj.forward(&normed)?;
             let k = self.k_proj.forward(&normed)?;
             let v = self.v_proj.forward(&normed)?;
             (q, k, v)
+            }
         };
 
         // GPT-J is partial-rotary (block `rope` carries rotary_dim), but this loader always rotated the

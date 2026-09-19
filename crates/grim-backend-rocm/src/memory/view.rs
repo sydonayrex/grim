@@ -251,9 +251,9 @@ mod tests {
         // Also via to_cpu_vec_f32: must decode to 100.0..164.0.
         let view_vec = view.to_cpu_vec_f32().expect("view to_cpu_vec_f32");
         assert_eq!(view_vec.len(), view_elems);
-        for i in 0..view_elems {
+        for (i, &v) in view_vec.iter().enumerate() {
             assert!(
-                (view_vec[i] - ((row_a + i) as f32)).abs() < 1e-6,
+                (v - ((row_a + i) as f32)).abs() < 1e-6,
                 "view element {}: expected {}, got {}",
                 i,
                 row_a + i,

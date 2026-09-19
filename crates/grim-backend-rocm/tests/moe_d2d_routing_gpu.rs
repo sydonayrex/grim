@@ -85,8 +85,7 @@ fn host_sqrtsoftplus_topk(logits: &[f32]) -> Vec<(usize, usize, f32)> {
         let sum: f32 = scores.iter().sum();
         let mut idx: Vec<(usize, f32)> = scores.iter().cloned().enumerate().collect();
         idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        for k in 0..TOP_K.min(NUM_EXPERTS) {
-            let (e, sc) = idx[k];
+        for &(e, sc) in idx.iter().take(TOP_K.min(NUM_EXPERTS)) {
             out.push((s, e, sc / (sum + 1e-12)));
         }
     }
@@ -332,7 +331,7 @@ fn device_route_topk_and_dispatch_matches_cpu_oracle() {
     // CPU oracle: replicate the sortless dispatch math.
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
     let weights = w_rocm.to_cpu_vec_f32().unwrap();
-    let mut oracle = vec![0.0f32; SEQ * HIDDEN];
+    let mut oracle = [0.0f32; SEQ * HIDDEN];
     for p in 0..num_pairs {
         let tok = decode_u32(&tok_rocm.copy_to_host().unwrap())[p] as usize;
         let e = experts[p] as usize;
@@ -512,7 +511,7 @@ fn device_w8a8_dispatch_matches_exact_dequant_oracle() {
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
     let weights = w_rocm.to_cpu_vec_f32().unwrap();
     let tokens = decode_u32(&tok_rocm.copy_to_host().unwrap());
-    let mut oracle = vec![0.0f32; SEQ * HIDDEN];
+    let mut oracle = [0.0f32; SEQ * HIDDEN];
     for p in 0..num_pairs {
         let tok = tokens[p] as usize;
         let e = experts[p] as usize;
@@ -560,7 +559,7 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     if a >= INF32 {
         return (sign | 0x7BFF) as u16;
     }
-    if a < 5.960464477539063e-8 {
+    if a < 5.960_464_5e-8 {
         return sign as u16;
     }
     let b = (a * 4096.0 + 0.5) as u32;
@@ -750,7 +749,7 @@ fn device_w8a8_fp8_dispatch_matches_exact_oracle() {
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
     let weights = w_rocm.to_cpu_vec_f32().unwrap();
     let tokens = decode_u32(&tok_rocm.copy_to_host().unwrap());
-    let mut oracle = vec![0.0f32; SEQ * HIDDEN];
+    let mut oracle = [0.0f32; SEQ * HIDDEN];
     for p in 0..SEQ * TOP_K {
         let tok = tokens[p] as usize;
         let e = experts[p] as usize;
@@ -912,7 +911,7 @@ fn device_awq_dispatch_matches_blob_exact_oracle() {
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
     let weights = w_rocm.to_cpu_vec_f32().unwrap();
     let tokens = decode_u32(&tok_rocm.copy_to_host().unwrap());
-    let mut oracle = vec![0.0f32; SEQ * HIDDEN];
+    let mut oracle = [0.0f32; SEQ * HIDDEN];
     for p in 0..SEQ * TOP_K {
         let tok = tokens[p] as usize;
         let e = experts[p] as usize;
@@ -1043,7 +1042,7 @@ fn device_mxfp4_dispatch_matches_exact_oracle() {
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
     let weights = w_rocm.to_cpu_vec_f32().unwrap();
     let tokens = decode_u32(&tok_rocm.copy_to_host().unwrap());
-    let mut oracle = vec![0.0f32; SEQ * HIDDEN];
+    let mut oracle = [0.0f32; SEQ * HIDDEN];
     for p in 0..SEQ * TOP_K {
         let tok = tokens[p] as usize;
         let e = experts[p] as usize;

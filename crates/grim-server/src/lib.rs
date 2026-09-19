@@ -994,9 +994,115 @@ async fn chat_completions(
         .unwrap_or("default")
         .to_string();
 
+    if let Some(resp) = ensure_model_available(&state, &requested_model) {
+        return resp;
+    }
+
+    if let Err(resp) = validate_chat_request(&state, &body_obj) {
+        return resp;
+    }
+
+    let stream_requested = body_obj
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let adapter_names = match resolve_adapters(&state, &body_obj) {
+        Ok(names) => names,
+        Err(resp) => return resp,
+    };
+
+    let sampling = match build_chat_sampling(&state, &body_obj, &requested_model) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    // Parse `messages` into typed structs (and `tools` / `tool_choice`), then
+    // render the prompt once, before the streaming / non-streaming split.
+    let (messages, tools, tool_choice, tools_active) = match parse_chat_messages(&body_obj) {
+        Ok(parsed) => parsed,
+        Err(resp) => return resp,
+    };
+
+    let prompt = match render_chat_prompt(
+        &state,
+        &messages,
+        &tools,
+        tool_choice.as_ref(),
+        tools_active,
+        sampling.max_tokens,
+    ) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let parts = ChatRequestParts {
+        body_obj,
+        session_tag: session_tag_for_task,
+        requested_model,
+        adapter_names,
+        stream_requested,
+        thinking_level: sampling.thinking_level,
+        sampler: sampling.sampler,
+        max_tokens: sampling.max_tokens,
+        stop_sequences: sampling.stop_sequences,
+        messages,
+        tools_active,
+        template_family: prompt.template_family,
+        prompt_tokens: prompt.tokens,
+        vocab_size: prompt.vocab_size,
+        eos_token_id: prompt.eos_token_id,
+    };
+
+    if parts.stream_requested {
+        stream_chat_completion(state, parts).await
+    } else {
+        non_stream_chat_completion(state, parts).await
+    }
+}
+
+/// All per-request state produced by the `chat_completions` prelude stages
+/// and consumed by the streaming / non-streaming dispatch tails.
+struct ChatRequestParts {
+    body_obj: serde_json::Map<String, serde_json::Value>,
+    session_tag: Option<String>,
+    requested_model: String,
+    adapter_names: Vec<String>,
+    stream_requested: bool,
+    thinking_level: grim_core::sampler::ThinkingLevel,
+    sampler: std::sync::Arc<dyn grim_core::sampler::Sampler>,
+    max_tokens: u64,
+    stop_sequences: Vec<String>,
+    messages: Vec<grim_format::ChatMessage>,
+    tools_active: bool,
+    template_family: Option<String>,
+    prompt_tokens: Vec<u32>,
+    vocab_size: usize,
+    eos_token_id: Option<u32>,
+}
+
+/// Sampling/length controls resolved from the request body.
+struct ChatSampling {
+    thinking_level: grim_core::sampler::ThinkingLevel,
+    sampler: std::sync::Arc<dyn grim_core::sampler::Sampler>,
+    max_tokens: u64,
+    stop_sequences: Vec<String>,
+}
+
+/// Prompt rendered from the messages and validated against the model context window.
+struct ChatPrompt {
+    tokens: Vec<u32>,
+    vocab_size: usize,
+    eos_token_id: Option<u32>,
+    template_family: Option<String>,
+}
+
+/// Stage (a): dynamic model routing / on-demand loading. Returns `Some(err)`
+/// for the 404 "model not found" response, `None` when a model is available.
+fn ensure_model_available(state: &Arc<AppState>, requested_model: &str) -> Option<Response> {
     // WI-1: Remote Provider Routing - route only names carrying a *known* remote provider scheme (e.g.
     // "ollama:cloud", "openai:gpt-4", "hf/meta-llama/...").
-    if is_remote_provider_model(&requested_model) {
+    if is_remote_provider_model(requested_model) {
         let provider_key = requested_model.split(':').next().unwrap_or("default");
         let token = grim_core::client::load_login_token(provider_key)
             .ok()
@@ -1015,14 +1121,14 @@ async fn chat_completions(
             .loaded_models()
             .contains(&requested_model.to_string())
         {
-            match load_model_for_server(&requested_model) {
+            match load_model_for_server(requested_model) {
                 Ok((model, maybe_tokenizer)) => {
                     // SCYTHE-2 farm mode when armed (see /models load path);
                     // plain registration otherwise.
-                    let farm_path = resolve_catalog_model_path(&requested_model)
+                    let farm_path = resolve_catalog_model_path(requested_model)
                         .map(|p| p.display().to_string())
                         .unwrap_or_default();
-                    engine.register_model_with_farm(&requested_model, model, &farm_path);
+                    engine.register_model_with_farm(requested_model, model, &farm_path);
                     eprintln!(
                         "[grim-server] Loaded model '{}' on demand.",
                         requested_model
@@ -1046,12 +1152,23 @@ async fn chat_completions(
                     );
                     body["error"]["model"] = serde_json::json!(requested_model);
                     body["error"]["cause"] = serde_json::json!(e.to_string());
-                    return (StatusCode::NOT_FOUND, Json(body)).into_response();
+                    return Some((StatusCode::NOT_FOUND, Json(body)).into_response());
                 }
             }
         }
     }
+    None
+}
 
+// The error is a fully-formed HTTP `Response` by design; boxing it would ripple
+// through every call site, so allow the large-Err lint here.
+#[allow(clippy::result_large_err)]
+/// Stage (a): §13.3 request validation - unknown-field whitelist, per-request
+/// message cap, and determinism-mode mismatch. Each violation is an early 400.
+fn validate_chat_request(
+    state: &Arc<AppState>,
+    body_obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), Response> {
     // §13.3 - Exhaustive whitelist of known top-level request fields.
     // Any field outside this set is an immediate 400.
     const KNOWN_FIELDS: &[&str] = &[
@@ -1088,7 +1205,7 @@ async fn chat_completions(
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json({
                     let mut body = request_error(
@@ -1109,7 +1226,7 @@ async fn chat_completions(
                     body
                 }),
             )
-                .into_response();
+                .into_response());
         }
     }
 
@@ -1120,7 +1237,7 @@ async fn chat_completions(
         let max_messages = engine.config.max_messages_per_request;
         if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
             if arr.len() > max_messages {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
                     Json({
                         let mut body = request_error(
@@ -1136,7 +1253,7 @@ async fn chat_completions(
                         body
                     }),
                 )
-                    .into_response();
+                    .into_response());
             }
         }
     }
@@ -1147,7 +1264,7 @@ async fn chat_completions(
         if det == "strict" {
             let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             if engine.config.determinism_mode == DeterminismMode::Relaxed {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
                     Json({
                         let mut body = request_error(
@@ -1160,18 +1277,22 @@ async fn chat_completions(
                         body
                     }),
                 )
-                    .into_response();
+                    .into_response());
             }
         }
     }
+    Ok(())
+}
 
-    let stream_requested = body_obj
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    // §13.3 + §4.5 — Resolve adapter names from request body.
-    // Any unrecognised name is a hard 400: fail loudly, never silently degrade.
+// The error is a fully-formed HTTP `Response` by design; boxing it would ripple
+// through every call site, so allow the large-Err lint here.
+#[allow(clippy::result_large_err)]
+/// Stage (a): §13.3 + §4.5 — resolve adapter names from the request body and
+/// validate they are all registered. Any unrecognised name is a hard 400.
+fn resolve_adapters(
+    state: &Arc<AppState>,
+    body_obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<Vec<String>, Response> {
     let mut adapter_names: Vec<String> = body_obj
         .get("adapters")
         .and_then(|v| v.as_array())
@@ -1192,7 +1313,7 @@ async fn chat_completions(
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         for name in &adapter_names {
             if engine.get_adapter_by_name(name).is_none() {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
                     Json({
                         let mut body = request_error(
@@ -1207,12 +1328,24 @@ async fn chat_completions(
                         body
                     }),
                 )
-                    .into_response();
+                    .into_response());
             }
         }
     }
+    Ok(adapter_names)
+}
 
-    // Read sampling / length controls from the whitelisted request fields.
+// The error is a fully-formed HTTP `Response` by design; boxing it would ripple
+// through every call site, so allow the large-Err lint here.
+#[allow(clippy::result_large_err)]
+/// Stage (a): read sampling / length controls from the whitelisted request
+/// fields, build the (possibly plugin-provided and response_format-constrained)
+/// sampler, and resolve `max_tokens` / `stop`.
+fn build_chat_sampling(
+    state: &Arc<AppState>,
+    body_obj: &serde_json::Map<String, serde_json::Value>,
+    requested_model: &str,
+) -> std::result::Result<ChatSampling, Response> {
     // These were already accepted by the KNOWN_FIELDS gate above; here we actually honor them instead.
     let thinking_str = body_obj
         .get("reasoning_effort")
@@ -1283,17 +1416,17 @@ async fn chat_completions(
         .as_ref()
         .map(|t| std::sync::Arc::from(t.tokens.clone()) as std::sync::Arc<[String]>);
     let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =
-        match build_constrained_sampler(sampler, &body_obj, vocab) {
+        match build_constrained_sampler(sampler, body_obj, vocab) {
             Ok(s) => s,
             Err(msg) => {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
                     Json(request_error(
                         ErrorCode::InvalidRequest,
                         format!("invalid response_format: {msg}"),
                     )),
                 )
-                    .into_response();
+                    .into_response());
             }
         };
 
@@ -1313,8 +1446,32 @@ async fn chat_completions(
         })
         .unwrap_or_default();
 
-    // Parse `messages` into typed structs and render the prompt once, before the streaming / non-streaming split.
-    // If the tokenizer carries a Jinja chat template, use it; otherwise fall back to the.
+    Ok(ChatSampling {
+        thinking_level,
+        sampler,
+        max_tokens,
+        stop_sequences,
+    })
+}
+
+/// Stage (b): parse `messages` into typed structs, apply the empty-messages /
+/// vision checks, parse `tools` / `tool_choice`, and inject the synthetic
+/// system message when tool calling is active without an existing system turn.
+#[allow(clippy::type_complexity)]
+// The error is a fully-formed HTTP `Response` by design; boxing it would ripple
+// through every call site, so allow the large-Err lint here.
+#[allow(clippy::result_large_err)]
+fn parse_chat_messages(
+    body_obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<
+    (
+        Vec<grim_format::ChatMessage>,
+        Vec<grim_format::ToolDef>,
+        Option<grim_format::ToolChoice>,
+        bool,
+    ),
+    Response,
+> {
     let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
     let mut image_parts: usize = 0;
     if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
@@ -1335,7 +1492,7 @@ async fn chat_completions(
                             }
                             Some("image_url") => images += 1,
                             other => {
-                                return (
+                                return Err((
                                     StatusCode::BAD_REQUEST,
                                     Json(request_error(
                                         ErrorCode::UnknownField,
@@ -1343,8 +1500,7 @@ async fn chat_completions(
                                             "malformed message at index {idx}: unsupported content part type {other:?} (expected text or image_url)"
                                         ),
                                     )),
-                                )
-                                    .into_response();
+                                ).into_response());
                             }
                         }
                     }
@@ -1358,20 +1514,19 @@ async fn chat_completions(
             match serde_json::from_value(normalized) {
                 Ok(msg) => messages.push(msg),
                 Err(e) => {
-                    return (
+                    return Err((
                         StatusCode::BAD_REQUEST,
                         Json(request_error(
                             ErrorCode::UnknownField,
                             &format!("malformed message at index {idx}: {e}"),
                         )),
-                    )
-                        .into_response();
+                    ).into_response());
                 }
             }
         }
     }
     if messages.is_empty() {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json({
                 let mut body = request_error(
@@ -1381,13 +1536,12 @@ async fn chat_completions(
                 body["error"]["messages"] = serde_json::json!([]);
                 body
             }),
-        )
-            .into_response();
+        ).into_response());
     }
     // Image parts are only servable by a model whose modality hint includes vision.
     // No such model is loadable in the serving path today, so this fires for every.
     if image_parts > 0 {
-        return (
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(request_error(
                 ErrorCode::InvalidRequest,
@@ -1395,8 +1549,7 @@ async fn chat_completions(
                     "request contains {image_parts} image part(s) but the loaded model has no vision encoder; pass text-only content or load a vision model"
                 ),
             )),
-        )
-            .into_response();
+        ).into_response());
     }
 
     // §WI-TOOLS-1 - Parse `tools` / `tool_choice` into the typed shapes the template renderer and output parser consume.
@@ -1435,6 +1588,22 @@ async fn chat_completions(
         messages.to_vec()
     };
 
+    Ok((messages, tools, tool_choice, tools_active))
+}
+
+// The error is a fully-formed HTTP `Response` by design; boxing it would ripple
+// through every call site, so allow the large-Err lint here.
+#[allow(clippy::result_large_err)]
+/// Stage (b)+(c): render the prompt (template / tools), tokenize (with the
+/// opt-in compression gate), and enforce the model context window.
+fn render_chat_prompt(
+    state: &Arc<AppState>,
+    messages: &[grim_format::ChatMessage],
+    tools: &[grim_format::ToolDef],
+    tool_choice: Option<&grim_format::ToolChoice>,
+    tools_active: bool,
+    max_tokens: u64,
+) -> std::result::Result<ChatPrompt, Response> {
     // `template_family` drives WI-TOOLS-4's per-family output parsing.
     // We resolve it from the loaded tokenizer's embedded chat template so the same model template.
     let (prompt_text, template_family) = {
@@ -1444,13 +1613,13 @@ async fn chat_completions(
                 let family = t.chat_template.clone();
                 let text = grim_format::render_messages_or_last_with_tools(
                     t,
-                    &messages,
-                    Some(&tools),
-                    tool_choice.as_ref(),
+                    messages,
+                    Some(tools),
+                    tool_choice,
                 );
                 (text, family)
             }
-            Some(t) => (grim_format::render_messages_or_last(t, &messages), None),
+            Some(t) => (grim_format::render_messages_or_last(t, messages), None),
             None => (
                 messages
                     .last()
@@ -1547,7 +1716,7 @@ async fn chat_completions(
     };
     let total_requested = prompt_tokens.len().saturating_add(max_tokens as usize);
     if total_requested > context_limit {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json({
                 let mut body = request_error(
@@ -1568,8 +1737,7 @@ async fn chat_completions(
                 body["error"]["total_requested"] = serde_json::json!(total_requested);
                 body
             }),
-        )
-            .into_response();
+        ).into_response());
     } else if total_requested > 1_000_000 {
         eprintln!(
             "[Server] WARNING: prompt ({} tokens) + max_tokens ({}) = {} tokens \
@@ -1581,157 +1749,300 @@ async fn chat_completions(
         );
     }
 
-    if stream_requested {
-        let state_clone = state.clone();
-        let adapter_ids: Vec<u32> = {
-            let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-            adapter_names
-                .iter()
-                .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
-                .collect()
-        };
-        let adapter_ids_clone = adapter_ids.clone();
-        let sampler_clone = sampler.clone();
-        let stop_sequences_clone = stop_sequences.clone();
-        let max_tokens_clone = max_tokens;
-        let eos_token_id_clone = eos_token_id;
+    Ok(ChatPrompt {
+        tokens: prompt_tokens,
+        vocab_size,
+        eos_token_id,
+        template_family,
+    })
+}
 
-        // WI-TOOLS-5 (streaming MVP, buffered): true incremental tool-call streaming is not achievable while parsing is still post-hoc (WI- TOOLS-4) - you cannot confidently detect a marker-delimited call is complete until you see the closing tag, which only happens at or near end-of-generation.
-        // So we buffer the full completion in `emitted` (already done for stop-sequence detection) and, once.
-        let tools_active_clone = tools_active;
-        let template_family_clone = template_family.clone();
+/// Stage (d): the streaming dispatch tail. Buffers generation into an SSE
+/// `unfold` stream with tool-call post-processing and a `[DONE]` sentinel.
+async fn stream_chat_completion(state: Arc<AppState>, parts: ChatRequestParts) -> Response {
+    let ChatRequestParts {
+        body_obj,
+        session_tag: session_tag_for_task,
+        requested_model,
+        adapter_names,
+        stream_requested: _,
+        thinking_level,
+        sampler,
+        max_tokens,
+        stop_sequences,
+        messages,
+        tools_active,
+        template_family,
+        prompt_tokens,
+        vocab_size,
+        eos_token_id,
+    } = parts;
+    let state_clone = state.clone();
+    let adapter_ids: Vec<u32> = {
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        adapter_names
+            .iter()
+            .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
+            .collect()
+    };
+    let adapter_ids_clone = adapter_ids.clone();
+    let sampler_clone = sampler.clone();
+    let stop_sequences_clone = stop_sequences.clone();
+    let max_tokens_clone = max_tokens;
+    let eos_token_id_clone = eos_token_id;
 
-        // CRIT-1: generate ONE request_id for the entire streaming session so sample_next_token enqueues a request on step 0 and can look up the outcome on every subsequent step.
-        // The previous code created a new id per step, meaning no request existed under that.
-        let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-        // WI-HYBRID Layer 2: key the session tag by request id —
-        // sample_next_token attaches it to the engine Request at enqueue.
-        if let Some(sess) = &session_tag_for_task {
-            if let Ok(mut map) = REQUEST_SESSIONS.lock() {
-                map.insert(session_request_id, sess.clone());
-            }
+    // WI-TOOLS-5 (streaming MVP, buffered): true incremental tool-call streaming is not achievable while parsing is still post-hoc (WI- TOOLS-4) - you cannot confidently detect a marker-delimited call is complete until you see the closing tag, which only happens at or near end-of-generation.
+    // So we buffer the full completion in `emitted` (already done for stop-sequence detection) and, once.
+    let tools_active_clone = tools_active;
+    let template_family_clone = template_family.clone();
+
+    // CRIT-1: generate ONE request_id for the entire streaming session so sample_next_token enqueues a request on step 0 and can look up the outcome on every subsequent step.
+    // The previous code created a new id per step, meaning no request existed under that.
+    let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    // WI-HYBRID Layer 2: key the session tag by request id —
+    // sample_next_token attaches it to the engine Request at enqueue.
+    if let Some(sess) = &session_tag_for_task {
+        if let Ok(mut map) = REQUEST_SESSIONS.lock() {
+            map.insert(session_request_id, sess.clone());
         }
-        // T1.3: request params feed the device-side sampler for this stream.
-        register_request_sampler_params(session_request_id, &body_obj);
+    }
+    // T1.3: request params feed the device-side sampler for this stream.
+    register_request_sampler_params(session_request_id, &body_obj);
 
-        // WI-CANCEL-1: register a CancellationToken so /v1/requests/:id/cancel
-        // can signal this specific stream to stop.
-        let cancel_token = register_cancel_token(session_request_id);
+    // WI-CANCEL-1: register a CancellationToken so /v1/requests/:id/cancel
+    // can signal this specific stream to stop.
+    let cancel_token = register_cancel_token(session_request_id);
 
-        // WI-CANCEL-2: RAII guard that calls finish_request on drop - fires on every exit path
-        // (max_tokens, stop-sequence, explicit cancel, client disconnect) since it's threaded through the unfold state tuple.
-        let cleanup_guard = RequestCleanupGuard::new(state.clone(), session_request_id);
+    // WI-CANCEL-2: RAII guard that calls finish_request on drop - fires on every exit path
+    // (max_tokens, stop-sequence, explicit cancel, client disconnect) since it's threaded through the unfold state tuple.
+    let cleanup_guard = RequestCleanupGuard::new(state.clone(), session_request_id);
 
-        let stream = futures::stream::unfold(
-            (
-                0u64,
-                String::new(),
-                prompt_tokens.clone(),
-                session_request_id,
-                cancel_token,
-                cleanup_guard,
-            ),
-            move |(step, mut emitted, prompt_tokens, request_id, cancel_token, cleanup_guard): (
-                u64,
-                String,
-                Vec<u32>,
-                u64,
-                CancellationToken,
-                RequestCleanupGuard,
-            )| {
-                let state = state_clone.clone();
-                let adapter_ids = adapter_ids_clone.clone();
-                let stop_seqs = stop_sequences_clone.clone();
-                let request_sampler_params = take_request_sampler_params(session_request_id);
-                let sampler = sampler_clone.clone();
-                let parse_ctx = (
-                    tools_active_clone,
-                    template_family_clone.clone(),
-                    state
-                        .model_arch
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone(),
-                );
-                let prior_messages = messages.clone();
-                let req_model = requested_model.clone();
-                let stream_model = requested_model.clone();
-                async move {
-                    // WI-CANCEL-1: check for explicit cancel before doing work.
-                    // The cancel endpoint calls cancel_token.cancel(); we poll it cooperatively each tick (matching the spec's tick-boundary.
-                    if cancel_token.is_cancelled() {
-                        let _ = cleanup_guard; // consumed; Drop fires on move-into-scope end
-                        return None;
-                    }
+    let stream = futures::stream::unfold(
+        (
+            0u64,
+            String::new(),
+            prompt_tokens.clone(),
+            session_request_id,
+            cancel_token,
+            cleanup_guard,
+        ),
+        move |(step, mut emitted, prompt_tokens, request_id, cancel_token, cleanup_guard): (
+            u64,
+            String,
+            Vec<u32>,
+            u64,
+            CancellationToken,
+            RequestCleanupGuard,
+        )| {
+            let state = state_clone.clone();
+            let adapter_ids = adapter_ids_clone.clone();
+            let stop_seqs = stop_sequences_clone.clone();
+            let request_sampler_params = take_request_sampler_params(session_request_id);
+            let sampler = sampler_clone.clone();
+            let parse_ctx = (
+                tools_active_clone,
+                template_family_clone.clone(),
+                state
+                    .model_arch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            );
+            let prior_messages = messages.clone();
+            let req_model = requested_model.clone();
+            let stream_model = requested_model.clone();
+            async move {
+                // WI-CANCEL-1: check for explicit cancel before doing work.
+                // The cancel endpoint calls cancel_token.cancel(); we poll it cooperatively each tick (matching the spec's tick-boundary.
+                if cancel_token.is_cancelled() {
+                    let _ = cleanup_guard; // consumed; Drop fires on move-into-scope end
+                    return None;
+                }
 
-                    // Honor `max_tokens` (was a hardcoded 256). Stop early if a
-                    // configured stop sequence appears in the emitted text.
-                    if step >= max_tokens_clone {
-                        // End of generation reached - attempt WI-TOOLS-4 post-hoc tool-call extraction on the buffered completion.
-                        // The result (Some terminal delta, or None to close) becomes the final unfold item; the.
-                        let (reasoning_content, clean_emitted) =
-                            if thinking_level != grim_core::sampler::ThinkingLevel::Off {
-                                split_think_content(&emitted)
-                            } else {
-                                (None, emitted.clone())
-                            };
-                        let delta = terminal_tool_delta(
-                            &parse_ctx,
-                            &clean_emitted,
-                            &prior_messages,
-                            reasoning_content.as_deref(),
-                        );
-                        return delta.map(|ev| {
-                            (
-                                ev,
-                                (
-                                    step + 1,
-                                    emitted,
-                                    prompt_tokens,
-                                    request_id,
-                                    cancel_token,
-                                    cleanup_guard,
-                                ),
-                            )
-                        });
-                    }
-
-                    let sampled = {
-                        let mut engine = match state.engine.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => poisoned.into_inner(),
+                // Honor `max_tokens` (was a hardcoded 256). Stop early if a
+                // configured stop sequence appears in the emitted text.
+                if step >= max_tokens_clone {
+                    // End of generation reached - attempt WI-TOOLS-4 post-hoc tool-call extraction on the buffered completion.
+                    // The result (Some terminal delta, or None to close) becomes the final unfold item; the.
+                    let (reasoning_content, clean_emitted) =
+                        if thinking_level != grim_core::sampler::ThinkingLevel::Off {
+                            split_think_content(&emitted)
+                        } else {
+                            (None, emitted.clone())
                         };
-                        sample_next_token(
-                            &mut engine,
-                            request_id,
-                            step,
-                            sampler.as_ref(),
-                            if step == 0 {
-                                Some(&prompt_tokens)
-                            } else {
-                                None
-                            },
-                            vocab_size,
-                            Some(req_model),
+                    let delta = terminal_tool_delta(
+                        &parse_ctx,
+                        &clean_emitted,
+                        &prior_messages,
+                        reasoning_content.as_deref(),
+                    );
+                    return delta.map(|ev| {
+                        (
+                            ev,
+                            (
+                                step + 1,
+                                emitted,
+                                prompt_tokens,
+                                request_id,
+                                cancel_token,
+                                cleanup_guard,
+                            ),
                         )
+                    });
+                }
+
+                let sampled = {
+                    let mut engine = match state.engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
                     };
-                    // WI-1: a generation failure ends the stream with a terminal OpenAI-shaped error
-                    // event; the chained `[DONE]` sentinel still fires because the task does not unwind.
-                    let token_id = match sampled {
-                        Ok(t) => t,
-                        Err(msg) => {
+                    sample_next_token(
+                        &mut engine,
+                        request_id,
+                        step,
+                        sampler.as_ref(),
+                        if step == 0 {
+                            Some(&prompt_tokens)
+                        } else {
+                            None
+                        },
+                        vocab_size,
+                        Some(req_model),
+                    )
+                };
+                // WI-1: a generation failure ends the stream with a terminal OpenAI-shaped error
+                // event; the chained `[DONE]` sentinel still fires because the task does not unwind.
+                let token_id = match sampled {
+                    Ok(t) => t,
+                    Err(msg) => {
+                        let payload = serde_json::json!({
+                            "error": {
+                                "code": "generation_failed",
+                                "message": msg,
+                            }
+                        })
+                        .to_string();
+                        let ev = axum::response::sse::Event::default()
+                            .event("error")
+                            .data(payload);
+                        return Some((
+                            Ok(ev),
+                            (
+                                max_tokens_clone,
+                                emitted,
+                                prompt_tokens,
+                                request_id,
+                                cancel_token,
+                                cleanup_guard,
+                            ),
+                        ));
+                    }
+                };
+
+                // Token pacing: opt-in inter-token delay for clients that need
+                // it. Default 0 (no artificial pacing): SSE backpressure
+                // already propagates via the write path — a fixed sleep
+                // only adds self-inflicted latency. Set
+                // GRIM_TOKEN_PACING_MS=N to pace explicitly.
+                let pacing_ms = std::env::var("GRIM_TOKEN_PACING_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if pacing_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(pacing_ms)).await;
+                }
+
+                let tokenizer = state
+                    .tokenizer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let token_text = if let Some(tok) = &tokenizer {
+                    tok.decode(&[token_id])
+                } else {
+                    format!("<tok:{token_id}>")
+                };
+                emitted.push_str(&token_text);
+                let hit_stop = stop_seqs.iter().any(|s| emitted.contains(s));
+                // EOS check: if the model emitted the EOS token, terminate generation without including it
+                // in the output (the EOS token is a signal, not content - OpenAI convention).
+                // P1-3 (PLAN-improve-grim-perf): honor min_tokens — EOS
+                // is ignored until at least `min_tokens` tokens have been
+                // generated. `step` is 0-based, so EOS is legal from
+                // step == min_tokens onward.
+                let min_tokens_enforced = request_sampler_params.min_tokens;
+                let hit_eos = eos_token_id_clone == Some(token_id)
+                    && step >= u64::from(min_tokens_enforced);
+                if hit_eos {
+                    // Trim the EOS token's text from the emitted buffer
+                    // so it doesn't appear in the response.
+                    emitted = emitted
+                        .strip_suffix(&token_text)
+                        .unwrap_or(&emitted)
+                        .to_string();
+                }
+                if hit_stop {
+                    // Trim the stop string from the buffered text used
+                    // for terminal tool-call parsing (suffix-trim is enough for parse purposes).
+                    let (trimmed, _) = trim_stop_sequences(&emitted, &stop_seqs);
+                    emitted = trimmed;
+                }
+                if hit_stop || hit_eos {
+                    // A stop sequence or EOS terminated generation early —
+                    // same end-of-stream tool-call extraction path as max_tokens.
+                    let (reasoning_content, clean_emitted) =
+                        if thinking_level != grim_core::sampler::ThinkingLevel::Off {
+                            split_think_content(&emitted)
+                        } else {
+                            (None, emitted.clone())
+                        };
+                    let delta = terminal_tool_delta(
+                        &parse_ctx,
+                        &clean_emitted,
+                        &prior_messages,
+                        reasoning_content.as_deref(),
+                    );
+                    if let Some(ev) = delta {
+                        return Some((
+                            ev,
+                            (
+                                step + 1,
+                                emitted,
+                                prompt_tokens,
+                                request_id,
+                                cancel_token,
+                                cleanup_guard,
+                            ),
+                        ));
+                    }
+                    // WI-P9: no tool call - the stop-triggering token's text must still reach the client, or stream:true silently drops the final content the non-streaming path returns.
+                    // Emit it stop-stripped (signal, not content) in the same chunk shape as every other delta,.
+                    if hit_stop && !clean_emitted.is_empty() {
+                        let (stripped, _) = strip_stop_sequences(&clean_emitted, &stop_seqs);
+                        let prior_raw_len = emitted.len() - token_text.len();
+                        let delta_content = if stripped.len() > prior_raw_len {
+                            stripped[prior_raw_len..].to_string()
+                        } else {
+                            String::new()
+                        };
+                        if !delta_content.is_empty() {
                             let payload = serde_json::json!({
-                                "error": {
-                                    "code": "generation_failed",
-                                    "message": msg,
-                                }
+                                "object": "chat.completion.chunk",
+                                "model": stream_model,
+                                "choices": [{"index": 0, "delta": {"content": delta_content}, "finish_reason": "stop"}],
+                                "adapters_active": adapter_ids.len(),
+                                // True sampled-token count: this chunk may bundle more
+                                // than one token's worth of text (stop-string trimming
+                                // collapses into one frame), so chunk-counting
+                                // downstream undercounts.
+                                "grim_eval_count": step + 1
                             })
                             .to_string();
-                            let ev = axum::response::sse::Event::default()
-                                .event("error")
+                            let event = axum::response::sse::Event::default()
+                                .event("message")
                                 .data(payload);
                             return Some((
-                                Ok(ev),
+                                Ok(event),
                                 (
                                     max_tokens_clone,
                                     emitted,
@@ -1742,376 +2053,281 @@ async fn chat_completions(
                                 ),
                             ));
                         }
-                    };
-
-                    // Token pacing: opt-in inter-token delay for clients that need
-                    // it. Default 0 (no artificial pacing): SSE backpressure
-                    // already propagates via the write path — a fixed sleep
-                    // only adds self-inflicted latency. Set
-                    // GRIM_TOKEN_PACING_MS=N to pace explicitly.
-                    let pacing_ms = std::env::var("GRIM_TOKEN_PACING_MS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    if pacing_ms > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(pacing_ms)).await;
                     }
-
-                    let tokenizer = state
-                        .tokenizer
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    let token_text = if let Some(tok) = &tokenizer {
-                        tok.decode(&[token_id])
-                    } else {
-                        format!("<tok:{token_id}>")
-                    };
-                    emitted.push_str(&token_text);
-                    let hit_stop = stop_seqs.iter().any(|s| emitted.contains(s));
-                    // EOS check: if the model emitted the EOS token, terminate generation without including it
-                    // in the output (the EOS token is a signal, not content - OpenAI convention).
-                    // P1-3 (PLAN-improve-grim-perf): honor min_tokens — EOS
-                    // is ignored until at least `min_tokens` tokens have been
-                    // generated. `step` is 0-based, so EOS is legal from
-                    // step == min_tokens onward.
-                    let min_tokens_enforced = request_sampler_params.min_tokens;
-                    let hit_eos = eos_token_id_clone == Some(token_id)
-                        && (step as u64) >= u64::from(min_tokens_enforced);
-                    if hit_eos {
-                        // Trim the EOS token's text from the emitted buffer
-                        // so it doesn't appear in the response.
-                        emitted = emitted
-                            .strip_suffix(&token_text)
-                            .unwrap_or(&emitted)
-                            .to_string();
-                    }
-                    if hit_stop {
-                        // Trim the stop string from the buffered text used
-                        // for terminal tool-call parsing (suffix-trim is enough for parse purposes).
-                        let (trimmed, _) = trim_stop_sequences(&emitted, &stop_seqs);
-                        emitted = trimmed;
-                    }
-                    if hit_stop || hit_eos {
-                        // A stop sequence or EOS terminated generation early —
-                        // same end-of-stream tool-call extraction path as max_tokens.
-                        let (reasoning_content, clean_emitted) =
-                            if thinking_level != grim_core::sampler::ThinkingLevel::Off {
-                                split_think_content(&emitted)
-                            } else {
-                                (None, emitted.clone())
-                            };
-                        let delta = terminal_tool_delta(
-                            &parse_ctx,
-                            &clean_emitted,
-                            &prior_messages,
-                            reasoning_content.as_deref(),
-                        );
-                        if let Some(ev) = delta {
-                            return Some((
-                                ev,
-                                (
-                                    step + 1,
-                                    emitted,
-                                    prompt_tokens,
-                                    request_id,
-                                    cancel_token,
-                                    cleanup_guard,
-                                ),
-                            ));
-                        }
-                        // WI-P9: no tool call - the stop-triggering token's text must still reach the client, or stream:true silently drops the final content the non-streaming path returns.
-                        // Emit it stop-stripped (signal, not content) in the same chunk shape as every other delta,.
-                        if hit_stop && !clean_emitted.is_empty() {
-                            let (stripped, _) = strip_stop_sequences(&clean_emitted, &stop_seqs);
-                            let prior_raw_len = emitted.len() - token_text.len();
-                            let delta_content = if stripped.len() > prior_raw_len {
-                                stripped[prior_raw_len..].to_string()
-                            } else {
-                                String::new()
-                            };
-                            if !delta_content.is_empty() {
-                                let payload = serde_json::json!({
-                                    "object": "chat.completion.chunk",
-                                    "model": stream_model,
-                                    "choices": [{"index": 0, "delta": {"content": delta_content}, "finish_reason": "stop"}],
-                                    "adapters_active": adapter_ids.len(),
-                                    // True sampled-token count: this chunk may bundle more
-                                    // than one token's worth of text (stop-string trimming
-                                    // collapses into one frame), so chunk-counting
-                                    // downstream undercounts.
-                                    "grim_eval_count": step + 1
-                                })
-                                .to_string();
-                                let event = axum::response::sse::Event::default()
-                                    .event("message")
-                                    .data(payload);
-                                return Some((
-                                    Ok(event),
-                                    (
-                                        max_tokens_clone,
-                                        emitted,
-                                        prompt_tokens,
-                                        request_id,
-                                        cancel_token,
-                                        cleanup_guard,
-                                    ),
-                                ));
-                            }
-                        }
-                        return None;
-                    }
-                    // WI-2: streaming chunks echo the requested model too, so
-                    // clients validating `chunk.model` see what they sent.
-                    let payload = serde_json::json!({
-                       "object": "chat.completion.chunk",
-                       "model": stream_model,
-                       "choices": [{"index": 0, "delta": {"content": token_text}}],
-                       "adapters_active": adapter_ids.len(),
-                       // True sampled-token count (downstream translators should
-                       // prefer this over counting chunks).
-                       "grim_eval_count": step + 1
-                    })
-                    .to_string();
-                    let event = axum::response::sse::Event::default()
-                        .event("message")
-                        .data(payload);
-                    let res: std::result::Result<axum::response::sse::Event, axum::Error> =
-                        Ok(event);
-                    Some((
-                        res,
-                        (
-                            step + 1,
-                            emitted,
-                            prompt_tokens,
-                            request_id,
-                            cancel_token,
-                            cleanup_guard,
-                        ),
-                    ))
+                    return None;
                 }
-            },
-        );
-        Sse::new(stream.chain(futures::stream::once(async {
-            Ok(axum::response::sse::Event::default().data("[DONE]"))
-        })))
-        .into_response()
-    } else {
-        let mut content = String::new();
-        let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-        // T1.3: request params feed the device-side sampler for this request.
-        register_request_sampler_params(request_id, &body_obj);
-        let _adapter_ids: Vec<u32> = {
-            let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-            adapter_names
-                .iter()
-                .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
-                .collect()
-        };
+                // WI-2: streaming chunks echo the requested model too, so
+                // clients validating `chunk.model` see what they sent.
+                let payload = serde_json::json!({
+                   "object": "chat.completion.chunk",
+                   "model": stream_model,
+                   "choices": [{"index": 0, "delta": {"content": token_text}}],
+                   "adapters_active": adapter_ids.len(),
+                   // True sampled-token count (downstream translators should
+                   // prefer this over counting chunks).
+                   "grim_eval_count": step + 1
+                })
+                .to_string();
+                let event = axum::response::sse::Event::default()
+                    .event("message")
+                    .data(payload);
+                let res: std::result::Result<axum::response::sse::Event, axum::Error> =
+                    Ok(event);
+                Some((
+                    res,
+                    (
+                        step + 1,
+                        emitted,
+                        prompt_tokens,
+                        request_id,
+                        cancel_token,
+                        cleanup_guard,
+                    ),
+                ))
+            }
+        },
+    );
+    Sse::new(stream.chain(futures::stream::once(async {
+        Ok(axum::response::sse::Event::default().data("[DONE]"))
+    })))
+    .into_response()
+}
 
-        let tokenizer = state
-            .tokenizer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        // Tokenize the prompt once for prefill (rendered from messages above)
-        let prompt_tokens = prompt_tokens.clone();
-        // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
-        for step in 0..max_tokens {
-            let sampled = {
+/// Stage (d): the non-streaming dispatch tail. Generates the full completion,
+/// runs tool-call guards, and builds the OpenAI-shaped response payload.
+#[allow(clippy::too_many_lines)]
+async fn non_stream_chat_completion(state: Arc<AppState>, parts: ChatRequestParts) -> Response {
+    let ChatRequestParts {
+        body_obj,
+        session_tag: _,
+        requested_model,
+        adapter_names,
+        stream_requested: _,
+        thinking_level,
+        sampler,
+        max_tokens,
+        stop_sequences,
+        messages,
+        tools_active,
+        template_family,
+        prompt_tokens,
+        vocab_size,
+        eos_token_id,
+    } = parts;
+    let mut content = String::new();
+    let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    // T1.3: request params feed the device-side sampler for this request.
+    register_request_sampler_params(request_id, &body_obj);
+    let _adapter_ids: Vec<u32> = {
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        adapter_names
+            .iter()
+            .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
+            .collect()
+    };
+
+    let tokenizer = state
+        .tokenizer
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    // Tokenize the prompt once for prefill (rendered from messages above)
+    let prompt_tokens = prompt_tokens.clone();
+    // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
+    for step in 0..max_tokens {
+        let sampled = {
+            let mut engine = match state.engine.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            sample_next_token(
+                &mut engine,
+                request_id,
+                step,
+                sampler.as_ref(),
+                if step == 0 {
+                    Some(&prompt_tokens)
+                } else {
+                    None
+                },
+                vocab_size,
+                Some(requested_model.to_string()),
+            )
+        };
+        // WI-1: propagate a clean OpenAI-shaped 500 instead of panicking
+        // inside the handler while holding the engine mutex.
+        let token_id = match sampled {
+            Ok(t) => t,
+            Err(msg) => {
                 let mut engine = match state.engine.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                sample_next_token(
-                    &mut engine,
-                    request_id,
-                    step,
-                    sampler.as_ref(),
-                    if step == 0 {
-                        Some(&prompt_tokens)
-                    } else {
-                        None
-                    },
-                    vocab_size,
-                    Some(requested_model.to_string()),
+                engine.finish_request(request_id);
+                take_request_sampler_params(request_id);
+                drop(engine);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "generation_failed",
+                            "message": msg,
+                            "type": "server_error",
+                        },
+                        "model": requested_model,
+                    })),
                 )
-            };
-            // WI-1: propagate a clean OpenAI-shaped 500 instead of panicking
-            // inside the handler while holding the engine mutex.
-            let token_id = match sampled {
-                Ok(t) => t,
-                Err(msg) => {
-                    let mut engine = match state.engine.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    engine.finish_request(request_id);
-                    take_request_sampler_params(request_id);
-                    drop(engine);
+                    .into_response();
+            }
+        };
+        let token_text = if let Some(tok) = &tokenizer {
+            tok.decode(&[token_id])
+        } else {
+            format!("<tok:{token_id}>")
+        };
+        content.push_str(&token_text);
+        // EOS check: stop generation if the model emitted the EOS token, and strip the
+        // EOS token's text from the output (it's a signal, not content - OpenAI convention).
+        if eos_token_id == Some(token_id) {
+            content = content
+                .strip_suffix(&token_text)
+                .unwrap_or(&content)
+                .to_string();
+            break;
+        }
+        if stop_sequences.iter().any(|s| content.contains(s)) {
+            break;
+        }
+    }
+
+    // Strip stop-sequence occurrences from the returned content (OpenAI convention: the stop string is a signal, not part of the output).
+    // WI-P9: uses the same occurrence-strip as the streaming path's terminal delta, so stream:true and stream:false.
+    let (content, _hit_stop) = strip_stop_sequences(&content, &stop_sequences);
+
+    // Thinking output handling: when the model emits <think> blocks, split them into reasoning_content (chain-of-thought) and clean content (the actual response).
+    // This mirrors DeepSeek-R1 / Qwen3-Thinking convention where the think preamble is surfaced separately.
+    let (reasoning_content, content) =
+        if thinking_level != grim_core::sampler::ThinkingLevel::Off {
+            split_think_content(&content)
+        } else {
+            (None, content)
+        };
+
+    {
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.finish_request(request_id);
+    }
+    take_request_sampler_params(request_id);
+
+    // WI-TOOLS-4/5/4b: when tool calling is active, run the completion through the per-family output parser.
+    // Before constructing the response, apply the WI-TOOLS-4b hard guard - if the parsed call would.
+    if tools_active {
+        let family = tool_parse::resolve_effective_tool_family(
+            template_family.as_deref().unwrap_or(""),
+            state
+                .model_arch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+        );
+        if let tool_parse::ParseOutcome {
+            calls: Some(calls), ..
+        } = tool_parse::parse_tool_calls(&content, family)
+        {
+            for c in &calls {
+                if let Some(repeat) =
+                    check_repeated_call_hard_guard(&messages, &c.name, &c.arguments)
+                {
                     return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": {
-                                "code": "generation_failed",
-                                "message": msg,
-                                "type": "server_error",
-                            },
-                            "model": requested_model,
-                        })),
+                        StatusCode::BAD_REQUEST,
+                        Json({
+                            let mut body = request_error(
+                                ErrorCode::DuplicateToolCall,
+                                format!(
+                                    "Refusing to call tool '{}' — it has already been called {} times \
+                                     with identical arguments in this conversation. This is the hard \
+                                     guard (WI-TOOLS-4b) preventing a runaway agentic loop. Adjust the \
+                                     arguments or try a different action.",
+                                    c.name, repeat
+                                ),
+                            );
+                            body["error"]["tool_name"] = c.name.clone().into();
+                            body["error"]["repeat_count"] = repeat.into();
+                            body
+                        }),
                     )
                         .into_response();
                 }
-            };
-            let token_text = if let Some(tok) = &tokenizer {
-                tok.decode(&[token_id])
-            } else {
-                format!("<tok:{token_id}>")
-            };
-            content.push_str(&token_text);
-            // EOS check: stop generation if the model emitted the EOS token, and strip the
-            // EOS token's text from the output (it's a signal, not content - OpenAI convention).
-            if eos_token_id == Some(token_id) {
-                content = content
-                    .strip_suffix(&token_text)
-                    .unwrap_or(&content)
-                    .to_string();
-                break;
             }
-            if stop_sequences.iter().any(|s| content.contains(s)) {
-                break;
-            }
-        }
-
-        // Strip stop-sequence occurrences from the returned content (OpenAI convention: the stop string is a signal, not part of the output).
-        // WI-P9: uses the same occurrence-strip as the streaming path's terminal delta, so stream:true and stream:false.
-        let (content, _hit_stop) = strip_stop_sequences(&content, &stop_sequences);
-
-        // Thinking output handling: when the model emits <think> blocks, split them into reasoning_content (chain-of-thought) and clean content (the actual response).
-        // This mirrors DeepSeek-R1 / Qwen3-Thinking convention where the think preamble is surfaced separately.
-        let (reasoning_content, content) =
-            if thinking_level != grim_core::sampler::ThinkingLevel::Off {
-                split_think_content(&content)
-            } else {
-                (None, content)
-            };
-
-        {
-            let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.finish_request(request_id);
-        }
-        take_request_sampler_params(request_id);
-
-        // WI-TOOLS-4/5/4b: when tool calling is active, run the completion through the per-family output parser.
-        // Before constructing the response, apply the WI-TOOLS-4b hard guard - if the parsed call would.
-        if tools_active {
-            let family = tool_parse::resolve_effective_tool_family(
-                template_family.as_deref().unwrap_or(""),
-                state
-                    .model_arch
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_deref(),
-            );
-            if let tool_parse::ParseOutcome {
-                calls: Some(calls), ..
-            } = tool_parse::parse_tool_calls(&content, family)
+            // WI-TOOLS-4c-i: total tool-call budget across the whole conversation.
+            // If the newly parsed calls would push the cumulative count past the engine-config cap, reject.
             {
-                for c in &calls {
-                    if let Some(repeat) =
-                        check_repeated_call_hard_guard(&messages, &c.name, &c.arguments)
-                    {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json({
-                                let mut body = request_error(
-                                    ErrorCode::DuplicateToolCall,
-                                    format!(
-                                        "Refusing to call tool '{}' — it has already been called {} times \
-                                         with identical arguments in this conversation. This is the hard \
-                                         guard (WI-TOOLS-4b) preventing a runaway agentic loop. Adjust the \
-                                         arguments or try a different action.",
-                                        c.name, repeat
-                                    ),
-                                );
-                                body["error"]["tool_name"] = c.name.clone().into();
-                                body["error"]["repeat_count"] = repeat.into();
-                                body
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-                // WI-TOOLS-4c-i: total tool-call budget across the whole conversation.
-                // If the newly parsed calls would push the cumulative count past the engine-config cap, reject.
-                {
-                    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    let max_tool_calls = engine.config.max_tool_calls_per_conversation;
-                    let total_prior = tool_parse::count_total_prior_tool_calls(&messages);
-                    let total_with_new = total_prior + calls.len();
-                    if total_with_new > max_tool_calls {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json({
-                                let mut body = request_error(
-                                    ErrorCode::TotalToolCallLimit,
-                                    format!(
-                                        "Total tool calls across this conversation ({}) would exceed \
-                                         the per-conversation budget of {}",
-                                        total_with_new, max_tool_calls
-                                    ),
-                                );
-                                body["error"]["total_tool_calls"] = total_with_new.into();
-                                body["error"]["max_tool_calls_per_conversation"] = max_tool_calls.into();
-                                body
-                            }),
-                        )
-                            .into_response();
-                    }
+                let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+                let max_tool_calls = engine.config.max_tool_calls_per_conversation;
+                let total_prior = tool_parse::count_total_prior_tool_calls(&messages);
+                let total_with_new = total_prior + calls.len();
+                if total_with_new > max_tool_calls {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json({
+                            let mut body = request_error(
+                                ErrorCode::TotalToolCallLimit,
+                                format!(
+                                    "Total tool calls across this conversation ({}) would exceed \
+                                     the per-conversation budget of {}",
+                                    total_with_new, max_tool_calls
+                                ),
+                            );
+                            body["error"]["total_tool_calls"] = total_with_new.into();
+                            body["error"]["max_tool_calls_per_conversation"] = max_tool_calls.into();
+                            body
+                        }),
+                    )
+                        .into_response();
                 }
             }
         }
-        let model_arch = state
-            .model_arch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let choice = build_choice_payload(
-            &content,
-            reasoning_content.as_deref(),
-            tools_active,
-            template_family.as_deref(),
-            model_arch.as_deref(),
-            &messages,
-        );
-        // WI-CANCEL-0: tear down engine-side request state on every exit path - non-streaming has no Drop guard, so we call finish_request directly here, on both the normal-completion and stop-sequence break paths (the loop above falls through to this point in both cases).
-        // Idempotent per the audit: retain-based queue removal and refcount-decrement rollback are no-ops if state is.
-        {
-            let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.finish_request(request_id);
-        }
-        take_request_sampler_params(request_id);
-        // WI-2: echo back exactly the model name the client requested, per OpenAI API semantics.
-        // The previous hardcoded "grim" broke any client that validates `response.model` against what it sent.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COMPLETION_COUNTER: AtomicU64 = AtomicU64::new(1);
-        let completion_id = COMPLETION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let response_id = format!("chatcmpl-{completion_id:03}");
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        Json(serde_json::json!({
-            "id": response_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": requested_model,
-            "adapters_active": adapter_names.len(),
-            "choices": [choice]
-        }))
-        .into_response()
     }
+    let model_arch = state
+        .model_arch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let choice = build_choice_payload(
+        &content,
+        reasoning_content.as_deref(),
+        tools_active,
+        template_family.as_deref(),
+        model_arch.as_deref(),
+        &messages,
+    );
+    // WI-CANCEL-0: tear down engine-side request state on every exit path - non-streaming has no Drop guard, so we call finish_request directly here, on both the normal-completion and stop-sequence break paths (the loop above falls through to this point in both cases).
+    // Idempotent per the audit: retain-based queue removal and refcount-decrement rollback are no-ops if state is.
+    {
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.finish_request(request_id);
+    }
+    take_request_sampler_params(request_id);
+    // WI-2: echo back exactly the model name the client requested, per OpenAI API semantics.
+    // The previous hardcoded "grim" broke any client that validates `response.model` against what it sent.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COMPLETION_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let completion_id = COMPLETION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let response_id = format!("chatcmpl-{completion_id:03}");
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": requested_model,
+        "adapters_active": adapter_names.len(),
+        "choices": [choice]
+    }))
+    .into_response()
 }
 
 /// §5.2.1 - pause a running request. Idempotent: if the request is already

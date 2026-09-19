@@ -171,16 +171,18 @@ impl CommandRBlock {
 
         // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
         // (quantize + fused dot4 + RoPE) instead of 3 separate GEMV + RoPE.
-        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
-            crate::shared_attention::fused_qkv_project(
-                &normed,
-                self.wqkv_q80_fused.as_ref().unwrap(),
-                &self.rope,
-                self.num_heads,
-                self.num_kv_heads,
-                positions,
-            )?
-        } else {
+        let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
+            Some(fused) if seq_len == 1 => {
+                crate::shared_attention::fused_qkv_project(
+                    &normed,
+                    fused,
+                    &self.rope,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    positions,
+                )?
+            }
+            _ => {
             let q = self.wq.forward(&normed)?;
             let k = self.wk.forward(&normed)?;
             let v = self.wv.forward(&normed)?;
@@ -194,6 +196,7 @@ impl CommandRBlock {
                 positions,
             )?;
             (q, k, v)
+            }
         };
 
         // GPU-first: fused tensor-level attention; on backends that reject the kernel call (e.g.

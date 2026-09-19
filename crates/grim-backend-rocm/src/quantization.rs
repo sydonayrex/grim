@@ -67,20 +67,12 @@ impl TileConfig {
 
     /// Number of output columns computed per thread block.
     pub fn n_per_block(self) -> u32 {
-        if self.dual_n {
-            self.n
-        } else {
-            self.n
-        }
+        self.n
     }
 
     /// Grid dimension for N given the number of output columns.
     pub fn grid_x(self, n: usize) -> u32 {
-        if self.dual_n {
-            n.div_ceil(self.n as usize) as u32
-        } else {
-            n.div_ceil(self.n as usize) as u32
-        }
+        n.div_ceil(self.n as usize) as u32
     }
 }
 

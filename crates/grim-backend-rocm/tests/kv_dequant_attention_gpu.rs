@@ -384,7 +384,7 @@ fn gpu_q4khalf_attention_matches_cpu_reference() -> TestResult {
         assert!(block.channel_alloc.is_some(), "allocation must be carried");
 
         let q_shape = Shape::new(vec![q_tokens, num_heads, head_dim]);
-        let q_storage = Arc::from(cpu.from_cpu(&q_data[..q_tokens * num_heads * head_dim].to_vec(), &q_shape, dtype.clone())?);
+        let q_storage = Arc::from(cpu.from_cpu(&q_data[..q_tokens * num_heads * head_dim], &q_shape, dtype.clone())?);
         let query = Tensor::new(
             q_storage,
             q_shape.clone(),

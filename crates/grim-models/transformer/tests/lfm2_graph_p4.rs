@@ -20,7 +20,7 @@ use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
 /// Serializes GPU tests within this file (one device; concurrent captures
 /// contend on the graph pools and give false failures under default
 /// `--test-threads=N`).
-
+///
 /// Lock the GPU for the duration of a test; returned guard releases on drop.
 fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     grim_backend_rocm::device::util::gpu_test_lock()
@@ -208,7 +208,7 @@ fn p4_1000_step_replay_stable_addresses() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU replay stress test");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
@@ -241,7 +241,7 @@ fn p4_1000_step_replay_stable_addresses() {
     let mut prev_in_ptr: Option<u64> = None;
     for step in 0..1000u32 {
         // Replay with a token that wraps at vocab size.
-        let token = (step as u32) % 32;
+        let token = step % 32;
         model.forward_replay(&mut graph, token).unwrap();
 
         // Address stability: layer_input[0] MUST NOT move for 1000 replays.
@@ -301,7 +301,7 @@ fn p4_50_step_eager_vs_graph_parity() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU parity test");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
@@ -399,7 +399,7 @@ fn p4_batch_bucket_matches_single_slot0() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU batch parity test");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
@@ -676,7 +676,7 @@ fn p4_debug_batch_row_uniformity() {
         0,
     )
     .unwrap();
-    dev.launch_f32_gemv_into(&norm_buf, &wg, &gemv_out, n, k).unwrap();
+    dev.launch_f32_gemv_into(&norm_buf, wg, &gemv_out, n, k).unwrap();
     dev.synchronize();
     let gout = gemv_out.to_cpu_vec_f32().unwrap();
     for s in 1..batch {
@@ -698,9 +698,11 @@ fn p4_debug_batch_row_uniformity() {
 // ===========================================================================
 
 /// Times 100 decode steps through the same kernels two ways:
+///
 /// 1. eager: `forward_capture` outside a capture bracket (all ops enqueued
 ///    individually, host-side, like the legacy decode path),
 /// 2. graph: one `hipGraphLaunch` per step via `forward_replay`.
+///
 /// Prints ms/token for both; asserts the graph path is not slower on the
 /// enqueue side (that is the whole point of capture).
 #[test]
@@ -709,7 +711,7 @@ fn p4_benchmark_eager_vs_graph() {
         eprintln!("skip: set GRIM_GPU_TEST=1");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }

@@ -136,6 +136,8 @@ unsafe extern "C" {
     pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipErrorT;
     pub fn hipDeviceGetAttribute(value: *mut i32, attribute: i32, device: i32) -> HipErrorT;
+    #[allow(non_snake_case)]
+    pub fn hipPointerGetAttributes(attributes: *mut HipPointerAttribute, ptr: *const std::ffi::c_void) -> HipErrorT;
     pub fn hipMemAdvise(devPtr: *const c_void, count: usize, advice: i32, device: i32)
     -> HipErrorT;
 
@@ -236,6 +238,24 @@ unsafe extern "C" {
     ) -> HipErrorT;
 }
 
+/// Mirrors HIP's `hipPointerAttribute_t` (ROCm 7.x); only the device ordinal
+/// is material to our probes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HipPointerAttribute {
+    pub memory_type: i32,
+    pub device: i32,
+    pub device_pointer: *mut std::ffi::c_void,
+    pub host_pointer: *mut std::ffi::c_void,
+    pub is_managed: i32,
+    pub allocation_flags: u32,
+}
+
+/// Blocking host-to-device or device-to-host copy of `count` bytes.
+///
+/// # Safety
+/// Must run under a device context pinned to the ordinal owning both
+/// pointers; `dst`/`src` must be valid for `count` bytes.
 #[inline]
 #[allow(non_snake_case)]
 pub unsafe fn hipMemcpy(
@@ -250,6 +270,14 @@ pub unsafe fn hipMemcpy(
     unsafe { raw_hipMemcpy(dst, src, count, kind) }
 }
 
+/// Blocks the calling thread until all previously enqueued work on the
+/// current device's streams has completed.
+/// Blocks the calling thread until all previously enqueued work on the
+/// current device's streams has completed.
+///
+/// # Safety
+/// Enqueued kernels must not dereference freed or unmapped memory; this
+/// call surfaces such faults on the host.
 #[inline]
 #[allow(non_snake_case)]
 pub unsafe fn hipDeviceSynchronize() -> HipErrorT {

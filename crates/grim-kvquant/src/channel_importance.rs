@@ -104,7 +104,7 @@ impl ChannelImportanceComputer {
 
     /// One (kv_head, channel) energy observation. Internal.
     #[inline]
-    fn acc(acc: &mut Vec<Vec<f64>>, kv_head: usize, group: usize, x: f32) {
+    fn acc(acc: &mut [Vec<f64>], kv_head: usize, group: usize, x: f32) {
         acc[kv_head][group] += (x as f64) * (x as f64);
     }
 

@@ -866,15 +866,6 @@ fn dst_downcast(
         .ok_or_else(|| grim_core::error::Error::Backend("write_embedding: need RocmStorage".into()))
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn graph_dims_sane() {
-        // Shape math must not underflow on tiny configs.
-        assert!("GRIM_DECODE_GRAPH".is_ascii());
-    }
-}
-
 
 impl Lfm2Block {
     /// S2 (PLAN-kernel-fusion): ShortConv sublayer + dense FFN tail, fully
@@ -957,10 +948,11 @@ impl Lfm2Block {
 
     /// M2 (PLAN-kernel-fusion): MoE FFN sublayer, fully enqueued.
     /// 1) ffn-norm into staging; 2) router gate GEMV into
-    /// `moe_gate_logits[l]`; 3) `grim_moe_route_topk` writes the sortless
-    /// routing triple into the graph's persistent routing buffers; 4) the
-    /// grouped-expert kernel reads resident stacked weights + the routing
-    /// triple and atomically accumulates into `moe_out[l]`; 5) residual add.
+    ///    `moe_gate_logits[l]`; 3) `grim_moe_route_topk` writes the sortless
+    ///    routing triple into the graph's persistent routing buffers; 4) the
+    ///    grouped-expert kernel reads resident stacked weights + the routing
+    ///    triple and atomically accumulates into `moe_out[l]`; 5) residual add.
+    ///
     /// All launches hit fixed pool addresses — capture-safe after one warmup
     /// pass builds the resident weight stack (an H2D at capture time would
     /// abort; the caller's warmup guarantee makes every bracket call a hit).
@@ -1045,6 +1037,15 @@ impl Lfm2Block {
             &buffers.layer_output[layer_idx],
             dev,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn graph_dims_sane() {
+        // Shape math must not underflow on tiny configs.
+        assert!("GRIM_DECODE_GRAPH".is_ascii());
     }
 }
 

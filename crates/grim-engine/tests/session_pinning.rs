@@ -92,7 +92,7 @@ fn session_tag_pins_prefix_against_idle_eviction() {
 
     // Churn the pool with unrelated traffic (fits within the pool only if eviction is not blocked).
     for i in 0..12u64 {
-        let prompt: Vec<u32> = (0..32).map(|x| (17 + i as u32 * 7 + x) as u32).collect();
+        let prompt: Vec<u32> = (0..32).map(|x| 17 + i as u32 * 7 + x).collect();
         run(&mut engine, 1000 + i, prompt, None);
     }
 
@@ -150,7 +150,7 @@ fn expired_pin_is_plain_lru() {
     }
     // Churn hard enough to force eviction of the prefix (pool holds 8 blocks).
     for i in 0..8u64 {
-        let p: Vec<u32> = (0..32).map(|x| (100 + i as u32 * 3 + x) as u32).collect();
+        let p: Vec<u32> = (0..32).map(|x| 100 + i as u32 * 3 + x).collect();
         run(&mut engine, 10 + i, p, None);
     }
     assert!(engine.tick().is_ok());

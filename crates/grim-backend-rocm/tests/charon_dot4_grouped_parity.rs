@@ -305,7 +305,7 @@ fn dot4_rejects_unaligned_shape() {
         &quant_q80(&gw),
         &quant_q80(&uw),
         &quant_q80(&dw),
-        &vec![1.0; BATCH],
+        &[1.0; BATCH],
         &assignment(),
         BATCH,
         8,  // hidden not a multiple of 32

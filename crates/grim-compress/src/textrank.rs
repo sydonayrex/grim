@@ -81,7 +81,7 @@ pub fn textrank_scores(sentences: &[String], stats: &TfIdfStats) -> Vec<f32> {
 fn build_similarity_matrix(stats: &TfIdfStats, n: usize) -> Vec<HashMap<usize, f32>> {
     let mut matrix: Vec<HashMap<usize, f32>> = vec![HashMap::new(); n];
 
-    for j in 0..n {
+    for (j, row) in matrix.iter_mut().enumerate() {
         let tf_j = match stats.tf_vector(j) {
             Some(v) => v,
             None => continue,
@@ -94,9 +94,9 @@ fn build_similarity_matrix(stats: &TfIdfStats, n: usize) -> Vec<HashMap<usize, f
                 Some(v) => v,
                 None => continue,
             };
-            let sim = cosine_similarity(&tf_j, &tf_i);
+            let sim = cosine_similarity(tf_j, tf_i);
             if sim > 1e-6 {
-                matrix[j].insert(i, sim);
+                row.insert(i, sim);
             }
         }
     }
@@ -211,7 +211,7 @@ mod tests {
 
         // All scores should be in [0, 1]
         for &s in &scores {
-            assert!(s >= 0.0 && s <= 1.0, "score {s} out of [0,1]");
+            assert!((0.0..=1.0).contains(&s), "score {s} out of [0,1]");
         }
     }
 }
