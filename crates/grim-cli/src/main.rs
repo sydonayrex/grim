@@ -209,6 +209,12 @@ enum Commands {
         /// Minimum tokens before EOS is allowed (0 = no minimum). Helps prevent premature stopping on small models.
         #[arg(long, default_value = "0")]
         min_tokens: u32,
+        /// Pass raw unformatted prompt directly to model, bypassing chat templates and default system prompts.
+        #[arg(long)]
+        raw: bool,
+        /// Explicit system prompt to override default system instructions.
+        #[arg(long)]
+        system: Option<String>,
     },
     /// Diagnostics TUI chat interface.
     Tui {
@@ -1251,6 +1257,8 @@ async fn main() -> Result<()> {
             device,
             repeat_penalty,
             min_tokens,
+            raw,
+            system,
         } => {
             if !config.is_empty() {
                 unsafe {
@@ -1356,6 +1364,8 @@ async fn main() -> Result<()> {
                         min_tokens,
                         draft_model,
                         lookahead,
+                        raw,
+                        system,
                     )
                     .await?;
                 } else {
@@ -1376,6 +1386,8 @@ async fn main() -> Result<()> {
                         repeat_penalty,
                         draft_model,
                         lookahead,
+                        raw,
+                        system,
                     )
                     .await
                     {

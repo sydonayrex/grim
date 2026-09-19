@@ -1597,20 +1597,39 @@ fn render_chat_prompt(
     // We resolve it from the loaded tokenizer's embedded chat template so the same model template.
     let (prompt_text, template_family) = {
         let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
+        let effective_messages = if !messages.iter().any(|m| m.role == "system") {
+            if let Some(default_sys) = tok.as_ref().and_then(|t| t.default_system_prompt()) {
+                let mut with_sys = Vec::with_capacity(messages.len() + 1);
+                with_sys.push(grim_format::ChatMessage {
+                    role: "system".to_string(),
+                    content: default_sys.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                with_sys.extend(messages.iter().cloned());
+                with_sys
+            } else {
+                messages.to_vec()
+            }
+        } else {
+            messages.to_vec()
+        };
+
         match tok.as_ref() {
             Some(t) if tools_active => {
                 let family = t.chat_template.clone();
                 let text = grim_format::render_messages_or_last_with_tools(
                     t,
-                    messages,
+                    &effective_messages,
                     Some(tools),
                     tool_choice,
                 );
                 (text, family)
             }
-            Some(t) => (grim_format::render_messages_or_last(t, messages), None),
+            Some(t) => (grim_format::render_messages_or_last(t, &effective_messages), None),
             None => (
-                messages
+                effective_messages
                     .last()
                     .map(|m| m.content.clone())
                     .unwrap_or_default(),
