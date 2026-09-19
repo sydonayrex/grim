@@ -7,11 +7,11 @@ pub mod batch_orchestrator;
 pub mod capability_profiler;
 #[cfg(feature = "cubecl")]
 pub mod cubecl;
-pub mod device_attention;
-pub mod device_compute;
-pub mod device_quant;
+pub mod attention;
+pub mod compute;
+pub mod quant;
 pub mod device_recurrent;
-pub mod device_routing;
+pub mod routing;
 pub mod device_serve;
 pub mod eplb;
 pub mod gemm_tuning;

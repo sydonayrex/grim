@@ -245,6 +245,7 @@ fn histogram_top_k(
 /// Zero heap allocations per token (all buffers reused from `state`).
 ///
 /// Falls back to the scalar `sample_logits` for edge cases (greedy, non-finite).
+#[allow(clippy::too_many_arguments)] // mirrors the full sampler pipeline signature
 pub fn sample_logits_with_state<F>(
     logits: &[f32],
     temperature: f32,
@@ -622,7 +623,7 @@ where
 /// Returns true if the given token is an end-of-sequence token for the provided tokenizer.
 /// Checks the model's native `eos_token_id` plus common chat-format stop tokens.
 pub fn is_eos_token(token: u32, eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> bool {
-    eos_token_id.map_or(false, |id| token == id) || stop_token_ids.contains(&token)
+    eos_token_id.is_some_and(|id| token == id) || stop_token_ids.contains(&token)
 }
 
 /// Determines whether generation should stop given the current state.

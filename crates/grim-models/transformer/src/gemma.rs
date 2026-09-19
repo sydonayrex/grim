@@ -250,16 +250,16 @@ impl GemmaBlock {
     ) -> Result<Tensor> {
         let norm_x = self.attn_norm.forward(x)?;
         let new_tokens = x.shape().dims().first().copied().unwrap_or(0);
-        let (q, k, v) = if new_tokens == 1 && self.wqkv_q80_fused.is_some() {
-            crate::shared_attention::fused_qkv_dot4_decode(
-                &norm_x,
-                self.wqkv_q80_fused.as_ref().unwrap(),
-            )?
-        } else {
+        let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
+            Some(fused) if new_tokens == 1 => {
+                crate::shared_attention::fused_qkv_dot4_decode(&norm_x, fused)?
+            }
+            _ => {
             let q = self.wq.forward(&norm_x)?;
             let k = self.wk.forward(&norm_x)?;
             let v = self.wv.forward(&norm_x)?;
             (q, k, v)
+            }
         };
         let q =
             crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;

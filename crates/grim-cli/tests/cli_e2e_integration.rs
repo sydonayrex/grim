@@ -92,9 +92,14 @@ fn test_calibrate_channels_cli_e2e() {
     );
     assert!(res.is_ok(), "cmd_calibrate_channels should succeed: {:?}", res);
 
-    let content = std::fs::read_to_string(path).unwrap();
+    // write_sidecar appends `.channels.json` when the output path lacks it and
+    // wraps the per-layer scores in a versioned envelope.
+    let sidecar = std::fs::read_to_string(format!("{path}.channels.json")).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
+    assert_eq!(doc["scope"], "kv-channel-importance");
+    assert_eq!(doc["num_layers"], 1);
     let scores: grim_kvquant::channel_importance::ChannelImportanceScores =
-        serde_json::from_str(&content).unwrap();
+        serde_json::from_value(doc["layers"][0].clone()).unwrap();
 
     assert_eq!(scores.num_kv_heads, 4);
     assert_eq!(scores.head_dim, 128);

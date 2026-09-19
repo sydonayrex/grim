@@ -100,7 +100,7 @@ fn shortconv_device_ring_matches_host_reference() {
         eprintln!("skip: set GRIM_GPU_TEST=1");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
@@ -237,7 +237,7 @@ fn test_shortconv_prefill_then_decode_matches_reference() {
         eprintln!("skip: set GRIM_GPU_TEST=1");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
@@ -576,7 +576,7 @@ fn shortconv_lfm2_graph_replay_matches_eager_after_prefill() {
     let mut logits_graph = Vec::new();
     for &t in &replay_toks {
         DecodeGraphModel::forward_replay(&model_graph, &mut graph, t).unwrap();
-        let _ = dev.synchronize();
+        dev.synchronize();
         logits_graph.extend(graph.read_logits_f32().unwrap());
     }
 

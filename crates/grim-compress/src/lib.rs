@@ -146,12 +146,8 @@ impl PromptCompressor {
         let preserve_first = PRESERVE_FIRST.min(n);
         let preserve_last = PRESERVE_LAST.min(n.saturating_sub(preserve_first));
         let mut preserved = vec![false; n];
-        for i in 0..preserve_first {
-            preserved[i] = true;
-        }
-        for i in (n - preserve_last)..n {
-            preserved[i] = true;
-        }
+        preserved[..preserve_first].fill(true);
+        preserved[(n - preserve_last)..].fill(true);
 
         // Greedy fill: pick highest-scoring non-preserved sentences until budget
         // Sentinelinel reached. Preserved sentences are added first (free).

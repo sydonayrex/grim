@@ -27,12 +27,13 @@ fn fill(rows: usize, cols: usize, seed: f32) -> Vec<f32> {
 }
 
 fn host_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    // Host oracle for the crate matmul contract: C = A[m,k] @ B[n,k]^T.
     let mut out = vec![0.0f32; m * n];
     for r in 0..m {
         for c in 0..n {
             let mut acc = 0.0f32;
             for d in 0..k {
-                acc += a[r * k + d] * b[d * n + c];
+                acc += a[r * k + d] * b[c * k + d];
             }
             out[r * n + c] = acc;
         }
@@ -46,30 +47,17 @@ fn concat_qkv_weights_layout_matches_slices() {
     let q_dim = 12;
     let k_dim = 8;
     let v_dim = 4;
-    let q_w = fill(hidden, q_dim, 0.1);
-    let k_w = fill(hidden, k_dim, 0.2);
-    let v_w = fill(hidden, v_dim, 0.3);
+    let q_w = fill(q_dim, hidden, 0.1);
+    let k_w = fill(k_dim, hidden, 0.2);
+    let v_w = fill(v_dim, hidden, 0.3);
     let fused = grim_backend_rocm::concat_qkv_weights(&q_w, &k_w, &v_w, hidden)
         .expect("concat_qkv_weights should succeed for matching row counts");
     assert_eq!(fused.len(), hidden * (q_dim + k_dim + v_dim));
-    for r in 0..hidden {
-        let row = &fused[r * (q_dim + k_dim + v_dim)..(r + 1) * (q_dim + k_dim + v_dim)];
-        assert_eq!(
-            &row[..q_dim],
-            &q_w[r * q_dim..(r + 1) * q_dim],
-            "q slice row {r}"
-        );
-        assert_eq!(
-            &row[q_dim..q_dim + k_dim],
-            &k_w[r * k_dim..(r + 1) * k_dim],
-            "k slice row {r}"
-        );
-        assert_eq!(
-            &row[q_dim + k_dim..],
-            &v_w[r * v_dim..(r + 1) * v_dim],
-            "v slice row {r}"
-        );
-    }
+    // Natural [out, hidden] weights concatenate along the out dimension:
+    // fused = q_w ++ k_w ++ v_w, so each weight's rows appear verbatim.
+    assert_eq!(&fused[..q_w.len()], &q_w[..], "q rows verbatim");
+    assert_eq!(&fused[q_w.len()..q_w.len() + k_w.len()], &k_w[..], "k rows verbatim");
+    assert_eq!(&fused[q_w.len() + k_w.len()..], &v_w[..], "v rows verbatim");
     // Mismatched row counts must be rejected, not silently truncated.
     let bad = grim_backend_rocm::concat_qkv_weights(&q_w, &k_w[..hidden * 4 + 1], &v_w, hidden);
     assert!(bad.is_err(), "mismatched k_w rows must error");
@@ -90,12 +78,13 @@ fn qkv_proj_fusion_matches_unfused() {
     let qkv_dim = q_dim + k_dim + v_dim;
 
     let x_data = fill(tokens, hidden, 0.7);
-    let q_w = fill(hidden, q_dim, 0.1);
-    let k_w = fill(hidden, k_dim, 0.2);
-    let v_w = fill(hidden, v_dim, 0.3);
+    // SPEED-ROC-16 natural-weight layout: each projection weight is [out, hidden].
+    let q_w = fill(q_dim, hidden, 0.1);
+    let k_w = fill(k_dim, hidden, 0.2);
+    let v_w = fill(v_dim, hidden, 0.3);
 
     let x_shape = Shape::from_slice(&[tokens, hidden]);
-    let w_shape = |n| Shape::from_slice(&[hidden, n]);
+    let w_shape = |n| Shape::from_slice(&[n, hidden]);
 
     let x = dev.from_cpu(&x_data, &x_shape, DType::F32).unwrap();
     let q = dev.from_cpu(&q_w, &w_shape(q_dim), DType::F32).unwrap();
@@ -193,11 +182,12 @@ fn qkv_proj_fused_uses_single_launch() {
     let qkv_dim = 3 * dim;
 
     let x_data = fill(tokens, hidden, 0.7);
-    let w = fill(hidden, qkv_dim, 0.4);
+    // SPEED-ROC-16 natural-weight layout: [out, hidden].
+    let w = fill(qkv_dim, hidden, 0.4);
     let x_shape = Shape::from_slice(&[tokens, hidden]);
     let x = dev.from_cpu(&x_data, &x_shape, DType::F32).unwrap();
     let fw = dev
-        .from_cpu(&w, &Shape::from_slice(&[hidden, qkv_dim]), DType::F32)
+        .from_cpu(&w, &Shape::from_slice(&[qkv_dim, hidden]), DType::F32)
         .unwrap();
 
     // Unfused: three separate GEMM calls on column slices of the same weight —
@@ -205,22 +195,22 @@ fn qkv_proj_fused_uses_single_launch() {
     // three separate weight tensors (the real pre-fusion call shape).
     let wq = dev
         .from_cpu(
-            &fill(hidden, dim, 0.1),
-            &Shape::from_slice(&[hidden, dim]),
+            &fill(dim, hidden, 0.1),
+            &Shape::from_slice(&[dim, hidden]),
             DType::F32,
         )
         .unwrap();
     let wk = dev
         .from_cpu(
-            &fill(hidden, dim, 0.2),
-            &Shape::from_slice(&[hidden, dim]),
+            &fill(dim, hidden, 0.2),
+            &Shape::from_slice(&[dim, hidden]),
             DType::F32,
         )
         .unwrap();
     let wv = dev
         .from_cpu(
-            &fill(hidden, dim, 0.3),
-            &Shape::from_slice(&[hidden, dim]),
+            &fill(dim, hidden, 0.3),
+            &Shape::from_slice(&[dim, hidden]),
             DType::F32,
         )
         .unwrap();

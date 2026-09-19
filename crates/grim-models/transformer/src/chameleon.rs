@@ -170,13 +170,16 @@ impl ChameleonBlock {
 
         // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV instead
         // of 3 separate GEMVs; per-head Q/K norm and RoPE follow as usual.
-        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
-            crate::shared_attention::fused_qkv_project_raw(&normed_attn, self.wqkv_q80_fused.as_ref().unwrap())?
-        } else {
+        let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
+            Some(fused) if seq_len == 1 => {
+                crate::shared_attention::fused_qkv_project_raw(&normed_attn, fused)?
+            }
+            _ => {
             let q = self.wq.forward(&normed_attn)?;
             let k = self.wk.forward(&normed_attn)?;
             let v = self.wv.forward(&normed_attn)?;
             (q, k, v)
+            }
         };
 
         // Per-head Q/K norm before RoPE (host kernel gap, re-uploaded once).

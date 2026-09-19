@@ -4778,7 +4778,7 @@ mod tests {
 
         // 3. Replay with a token
         llama.forward_replay(&mut graph, token_id).expect("replay token");
-        let _ = dev.synchronize();
+        dev.synchronize();
 
         // 4. Read back logits from graph storage
         let logits_storage = graph.logits_device_storage();
@@ -4837,7 +4837,7 @@ mod tests {
         graph.end_capture().expect("end capture");
 
         llama.forward_replay(&mut graph, token_id).expect("replay token");
-        let _ = dev.synchronize();
+        dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
         let rocm_st = logits_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().expect("RocmStorage");
@@ -4998,7 +4998,7 @@ mod tests {
         graph.end_capture().expect("end capture");
 
         qwen.forward_replay(&mut graph, token_id).expect("replay token");
-        let _ = dev.synchronize();
+        dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
         let rocm_st = logits_storage
@@ -5124,7 +5124,7 @@ mod tests {
         graph.end_capture().expect("end capture");
 
         gemma.forward_replay(&mut graph, token_id).expect("replay token");
-        let _ = dev.synchronize();
+        dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
         let rocm_st = logits_storage
@@ -5264,7 +5264,7 @@ mod tests {
         chameleon
             .forward_replay(&mut graph, token_id)
             .expect("replay token");
-        let _ = dev.synchronize();
+        dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
         let rocm_st = logits_storage
@@ -5322,7 +5322,7 @@ mod tests {
         dg.forward_capture(&mut graph, token).expect("capture");
         graph.end_capture().expect("end capture");
         dg.forward_replay(&mut graph, token).expect("replay");
-        let _ = dev.synchronize();
+        dev.synchronize();
 
         let rocm_st = graph
             .logits_device_storage()
@@ -5396,7 +5396,7 @@ mod tests {
 
         // Replay
         llama.forward_replay(&mut graph, token_id).expect("replay token");
-        let _ = dev.synchronize();
+        dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
         let rocm_st = logits_storage

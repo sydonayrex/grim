@@ -140,7 +140,7 @@ fn gpu_dev() -> Option<std::sync::Arc<RocmDevice>> {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU seed test");
         return None;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return None;
     }
@@ -194,12 +194,12 @@ fn kv_seed_moves_eager_arenas_bit_exact() {
     graph.buffers.seed_kv_arena_from_eager(&rdev, &srcs).expect("seed");
     assert_eq!(graph.buffers.current_pos, 6);
 
-    for layer in 0..2 {
-        let eager_k = match &caches[layer] {
+    for (layer, cache) in caches.iter().enumerate() {
+        let eager_k = match cache {
             Some(Lfm2LayerCache::Attention { k_dev, .. }) => k_dev.as_deref().expect("k_dev"),
             _ => panic!("layer {layer}: expected attention cache"),
         };
-        let eager_v = match &caches[layer] {
+        let eager_v = match cache {
             Some(Lfm2LayerCache::Attention { v_dev, .. }) => v_dev.as_deref().expect("v_dev"),
             _ => panic!("layer {layer}: expected attention cache"),
         };

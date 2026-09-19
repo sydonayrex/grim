@@ -161,16 +161,18 @@ impl HyV4Block {
 
         // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
         // (quantize + fused dot4 + RoPE) instead of 3 separate GEMV + RoPE.
-        let (q, k, v) = if seq_len == 1 && self.wqkv_q80_fused.is_some() {
-            crate::shared_attention::fused_qkv_project(
-                &normed_attn,
-                self.wqkv_q80_fused.as_ref().unwrap(),
-                &self.rope,
-                self.num_heads,
-                self.num_kv_heads,
-                positions,
-            )?
-        } else {
+        let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
+            Some(fused) if seq_len == 1 => {
+                crate::shared_attention::fused_qkv_project(
+                    &normed_attn,
+                    fused,
+                    &self.rope,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    positions,
+                )?
+            }
+            _ => {
             let q = self.wq.forward(&normed_attn)?;
             let k = self.wk.forward(&normed_attn)?;
             let v = self.wv.forward(&normed_attn)?;
@@ -184,6 +186,7 @@ impl HyV4Block {
                 positions,
             )?;
             (q, k, v)
+            }
         };
 
         // GPU-first; on backends that reject the kernel call fall back to the

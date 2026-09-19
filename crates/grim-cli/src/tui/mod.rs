@@ -790,33 +790,30 @@ impl App {
                 self.input_mode = InputMode::Chat;
                 self.composer.clear();
             }
-            KeyCode::Enter => {
-                if !matches.is_empty() {
+            KeyCode::Enter
+                if !matches.is_empty() => {
                     let next = (selected + 1) % matches.len();
                     let q = query.clone();
                     let m = matches.clone();
                     self.scroll_to_find_match(next, &m);
                     self.sync_find_state(q, m, next);
                 }
-            }
-            KeyCode::Char('n') if is_ctrl => {
-                if !matches.is_empty() {
+            KeyCode::Char('n') if is_ctrl
+                && !matches.is_empty() => {
                     let next = (selected + 1) % matches.len();
                     let q = query.clone();
                     let m = matches.clone();
                     self.scroll_to_find_match(next, &m);
                     self.sync_find_state(q, m, next);
                 }
-            }
-            KeyCode::Char('f') if is_ctrl => {
-                if !matches.is_empty() {
+            KeyCode::Char('f') if is_ctrl
+                && !matches.is_empty() => {
                     let next = (selected + 1) % matches.len();
                     let q = query.clone();
                     let m = matches.clone();
                     self.scroll_to_find_match(next, &m);
                     self.sync_find_state(q, m, next);
                 }
-            }
             KeyCode::Backspace => {
                 let mut q = query;
                 q.pop();

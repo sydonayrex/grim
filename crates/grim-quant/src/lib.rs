@@ -1968,12 +1968,8 @@ pub fn quant_q4khalf(data: &[f32]) -> Result<Vec<u8>> {
             0
         };
     }
-    for s in 0..s_blocks {
-        out.push(sc_u8[s] & 63);
-    }
-    for s in 0..s_blocks {
-        out.push(m_u8[s] & 63);
-    }
+    out.extend(sc_u8[..s_blocks].iter().map(|&sc| sc & 63));
+    out.extend(m_u8[..s_blocks].iter().map(|&m| m & 63));
 
     for i in (0..data.len()).step_by(2) {
         let q_of = |idx: usize| -> u8 {

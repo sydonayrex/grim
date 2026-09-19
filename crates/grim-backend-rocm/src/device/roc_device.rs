@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::device::device_quant::wmma_route_decision;
+use crate::device::quant::wmma_route_decision;
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendStorage, Shape};
@@ -333,7 +333,7 @@ impl RocmDevice {
             .bounce_staging
             .lock()
             .map_err(|_| Error::Backend("bounce_staging mutex poisoned".into()))?;
-        if staging.as_ref().map_or(true, |(cap, _)| *cap < bytes) {
+        if staging.as_ref().is_none_or(|(cap, _)| *cap < bytes) {
             *staging = Some((bytes, RocmPinnedBuffer::<u8>::alloc(bytes)?));
         }
         let staging_buf = &mut staging.as_mut().unwrap().1;
@@ -770,9 +770,13 @@ impl RocmDevice {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(16384),
+            // Graph capture/replay bakes device pointers into the captured
+            // graph. When the caching allocator recycles those buffers the
+            // replay reads/writes freed memory (wrong GEMM results, GPU page
+            // faults). Unsound as a default — require explicit opt-in.
             capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH")
-                .map(|v| v != "0" && v != "false" && v != "off")
-                .unwrap_or(true),
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             capture_stream: RwLock::new(None),
             capture_active: AtomicBool::new(false),
             captured_graphs: Mutex::new(HashMap::new()),
@@ -1062,7 +1066,6 @@ impl RocmDevice {
     }
 
     /// The stream an op should dispatch onto: the capture stream when a session is
-
     /// Public read-only access to this device's GCN target string (e.g.
     /// "gfx1201", "gfx1036") for tests and capability gating.
     pub fn gpu_target_str(&self) -> &str {

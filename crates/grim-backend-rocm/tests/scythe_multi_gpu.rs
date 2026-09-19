@@ -531,8 +531,8 @@ fn tensor_parallel_2_device_block_decode_matches_single_device() {
     let x_b = ul(&dev_b, &x_data, &[1, hidden]);
 
     // alloc_storage returns Box<dyn BackendStorage>; downcast by ref for &RocmStorage.
-    fn rs(b: &Box<dyn grim_tensor::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
-        b.as_ref().as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap()
+    fn rs(b: &dyn grim_tensor::BackendStorage) -> &grim_backend_rocm::RocmStorage {
+        b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap()
     }
     let alloc = |dev: &grim_backend_rocm::RocmDevice, h: usize, w: usize|
                  -> Box<dyn grim_tensor::BackendStorage> {
@@ -558,51 +558,51 @@ fn tensor_parallel_2_device_block_decode_matches_single_device() {
     // --- 2-device TP block ---
     let tp_out: Vec<f32> = {
         let qa = alloc(&dev_a, 1, local_q);
-        rgemm(&dev_a, rs(&x_a), rs(&wq_a), rs(&qa), 1, local_q, hidden);
+        rgemm(&dev_a, rs(&*x_a), rs(&*wq_a), rs(&*qa), 1, local_q, hidden);
         let qb = alloc(&dev_b, 1, local_q);
-        rgemm(&dev_b, rs(&x_b), rs(&wq_b), rs(&qb), 1, local_q, hidden);
+        rgemm(&dev_b, rs(&*x_b), rs(&*wq_b), rs(&*qb), 1, local_q, hidden);
 
         // O row-parallel: partial O_i = Q_i @ Wo_i^T -> [1,hidden]; allreduce sum.
         let oa = alloc(&dev_a, 1, hidden);
-        rgemm(&dev_a, rs(&qa), rs(&wo_a), rs(&oa), 1, hidden, local_q);
+        rgemm(&dev_a, rs(&*qa), rs(&*wo_a), rs(&*oa), 1, hidden, local_q);
         let ob = alloc(&dev_b, 1, hidden);
-        rgemm(&dev_b, rs(&qb), rs(&wo_b), rs(&ob), 1, hidden, local_q);
+        rgemm(&dev_b, rs(&*qb), rs(&*wo_b), rs(&*ob), 1, hidden, local_q);
         let comm = grim_backend_rocm::ParallelCommunicator::with_p2p(
             0, 2, vec![dev_a.ordinal(), dev_b.ordinal()]).unwrap();
         let o_sum = alloc(&dev_a, 1, hidden);
-        comm.all_reduce_sum_peer_pair(rs(&oa), rs(&ob), rs(&o_sum), 0).unwrap();
+        comm.all_reduce_sum_peer_pair(rs(&*oa), rs(&*ob), rs(&*o_sum), 0).unwrap();
         dev_a.synchronize(); dev_b.synchronize();
 
         // residual x = x + O (each device)
-        let x2_a = add_dev(&dev_a, hidden, rs(&x_a), rs(&o_sum));
-        let x2_b = add_dev(&dev_b, hidden, rs(&x_b), rs(&o_sum));
+        let x2_a = add_dev(&dev_a, hidden, rs(&*x_a), rs(&*o_sum));
+        let x2_b = add_dev(&dev_b, hidden, rs(&*x_b), rs(&*o_sum));
 
         // FFN gate/up column-parallel
         let ga = alloc(&dev_a, 1, local_ffn);
-        rgemm(&dev_a, rs(&x2_a), rs(&wg_a), rs(&ga), 1, local_ffn, hidden);
+        rgemm(&dev_a, rs(&*x2_a), rs(&*wg_a), rs(&*ga), 1, local_ffn, hidden);
         let ua = alloc(&dev_a, 1, local_ffn);
-        rgemm(&dev_a, rs(&x2_a), rs(&wu_a), rs(&ua), 1, local_ffn, hidden);
+        rgemm(&dev_a, rs(&*x2_a), rs(&*wu_a), rs(&*ua), 1, local_ffn, hidden);
         let gb = alloc(&dev_b, 1, local_ffn);
-        rgemm(&dev_b, rs(&x2_b), rs(&wg_b), rs(&gb), 1, local_ffn, hidden);
+        rgemm(&dev_b, rs(&*x2_b), rs(&*wg_b), rs(&*gb), 1, local_ffn, hidden);
         let ub = alloc(&dev_b, 1, local_ffn);
-        rgemm(&dev_b, rs(&x2_b), rs(&wu_b), rs(&ub), 1, local_ffn, hidden);
+        rgemm(&dev_b, rs(&*x2_b), rs(&*wu_b), rs(&*ub), 1, local_ffn, hidden);
 
-        let gu_a = silu_dev(&dev_a, local_ffn, rs(&ga), rs(&ua));
-        let gu_b = silu_dev(&dev_b, local_ffn, rs(&gb), rs(&ub));
+        let gu_a = silu_dev(&dev_a, local_ffn, rs(&*ga), rs(&*ua));
+        let gu_b = silu_dev(&dev_b, local_ffn, rs(&*gb), rs(&*ub));
 
         // down row-parallel: partial d_i = gu_i @ Wd_i^T -> [1,hidden]; allreduce -> full down.
         let da = alloc(&dev_a, 1, hidden);
-        rgemm(&dev_a, rs(&gu_a), rs(&wd_a), rs(&da), 1, hidden, local_ffn);
+        rgemm(&dev_a, rs(&*gu_a), rs(&*wd_a), rs(&*da), 1, hidden, local_ffn);
         let db = alloc(&dev_b, 1, hidden);
-        rgemm(&dev_b, rs(&gu_b), rs(&wd_b), rs(&db), 1, hidden, local_ffn);
+        rgemm(&dev_b, rs(&*gu_b), rs(&*wd_b), rs(&*db), 1, hidden, local_ffn);
         let d_sum = alloc(&dev_a, 1, hidden);
-        comm.all_reduce_sum_peer_pair(rs(&da), rs(&db), rs(&d_sum), 0).unwrap();
+        comm.all_reduce_sum_peer_pair(rs(&*da), rs(&*db), rs(&*d_sum), 0).unwrap();
         dev_a.synchronize(); dev_b.synchronize();
 
         // final residual x2 = x2 + down
-        let out_a = add_dev(&dev_a, hidden, rs(&x2_a), rs(&d_sum));
+        let out_a = add_dev(&dev_a, hidden, rs(&*x2_a), rs(&*d_sum));
         dev_a.synchronize();
-        host_f32(rs(&out_a))
+        host_f32(rs(&*out_a))
     };
 
     // --- Single-device host-CPU reference (full weights) ---

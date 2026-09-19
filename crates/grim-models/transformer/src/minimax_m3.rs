@@ -526,18 +526,20 @@ mod tests {
             .collect()
     }
 
-    fn synthetic_moe(
-        hidden: usize,
-        inter: usize,
-        num_experts: usize,
-        top_k: usize,
-    ) -> (
+    type SyntheticMoe = (
         MiniMaxM3BlockSparseMoe,
         Vec<Vec<f32>>,
         Vec<Vec<f32>>,
         Vec<Vec<f32>>,
         Vec<f32>,
-    ) {
+    );
+
+    fn synthetic_moe(
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> SyntheticMoe {
         let gate_w = det_vec(num_experts * hidden, 11);
         let gate = Linear::from_tensor(
             cpu_tensor(gate_w.clone(), Shape::new(vec![num_experts, hidden])),
@@ -586,6 +588,7 @@ mod tests {
     /// Independent renorm-over-top-k SwiGLU oracle (mirrors the host loop's
     /// documented semantics; written separately so the test is not a copy of
     /// the implementation).
+    #[allow(clippy::too_many_arguments)]
     fn renorm_oracle(
         x_data: &[f32],
         gate_w: &[f32],

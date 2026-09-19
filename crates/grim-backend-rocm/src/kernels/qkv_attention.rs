@@ -1672,7 +1672,7 @@ fn kv_rot_device_ptr(
         return r
             .device_ptr
             .map(|p| p as *mut std::ffi::c_void)
-            .ok_or_else(|| crate::Error::Backend(format!("kv_append: {label} has no device ptr").into()));
+            .ok_or_else(|| crate::Error::Backend(format!("kv_append: {label} has no device ptr")));
     }
     if let Some(v) = s.as_any().downcast_ref::<crate::memory::view::RocmStorageView>() {
         let p = v.device_ptr_u64();
@@ -1681,7 +1681,7 @@ fn kv_rot_device_ptr(
         }
     }
     Err(crate::Error::Backend(
-        format!("kv_append: {label} must be RocmStorage or RocmStorageView").into(),
+        format!("kv_append: {label} must be RocmStorage or RocmStorageView"),
     ))
 }
 

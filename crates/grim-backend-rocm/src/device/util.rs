@@ -393,3 +393,17 @@ mod util_self_tests {
         );
     }
 }
+
+/// Return the device ordinal that owns the allocation at `ptr`, queried via
+/// `hipPointerGetAttributes`. Returns -1 on error (no valid device).
+pub fn pointer_owning_device(ptr: *const std::ffi::c_void) -> i32 {
+    use crate::device::handles::hipPointerGetAttributes;
+    use std::mem::MaybeUninit;
+    let mut attr = MaybeUninit::<crate::device::handles::HipPointerAttribute>::uninit();
+    let code = unsafe { hipPointerGetAttributes(attr.as_mut_ptr(), ptr) };
+    if code == crate::hipSuccess {
+        unsafe { attr.assume_init() }.device
+    } else {
+        -1
+    }
+}

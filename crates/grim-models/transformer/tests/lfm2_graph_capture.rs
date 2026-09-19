@@ -94,6 +94,7 @@ fn test_norm(dev: &RocmDevice, ordinal: usize, dim: usize) -> RmsNorm {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attention_block(
     dev: &RocmDevice,
     ordinal: usize,
@@ -220,7 +221,7 @@ fn lfm2_graph_capture_replay_records_kernels() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
@@ -305,7 +306,7 @@ fn lfm2_graph_recurrent_falls_back_eager() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
         return;
     }
-    if RocmDevice::probe_one(0).unwrap_or(false) == false {
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
         eprintln!("skip: no ROCm ordinal 0");
         return;
     }
@@ -543,7 +544,7 @@ fn lfm2_graph_moe_sublayer_matches_eager_dispatch() {
     let block = &model.layers[0];
     let hidden = model.cfg.hidden_size;
     let top_k = block.n_expert_used.min(block.n_expert).max(1);
-    let x = rocm_tensor(&dev, 0, rand_vec(1 * hidden, 71), Shape::new(vec![1, hidden]));
+    let x = rocm_tensor(&dev, 0, rand_vec(hidden, 71), Shape::new(vec![1, hidden]));
 
     // Eager path (production MoE forward).
     let gate_inp = block.ffn_gate_inp.as_ref().unwrap();
@@ -618,7 +619,7 @@ fn lfm2_graph_moe_sublayer_matches_eager_dispatch() {
         downcast(&experts_b),
         downcast(&weights),
         top_k,
-        &out,
+        out,
         hidden,
         inter,
         1.0,
@@ -787,8 +788,8 @@ fn lfm2_graph_mxfp4_layer_captures_and_replays() {
                 row[t as usize * hidden..(t as usize + 1) * hidden].to_vec()
             }, Shape::new(vec![1, hidden]));
             let mut h = x;
-            for li in 0..plain.layers.len() {
-                h = plain.layers[li].forward(&h, &mut caches[li]).unwrap();
+            for (li, layer) in plain.layers.iter().enumerate() {
+                h = layer.forward(&h, &mut caches[li]).unwrap();
             }
             let n = plain.norm.weight.to_vec_f32().unwrap();
             let mut hv = h.to_vec_f32().unwrap();
@@ -829,8 +830,8 @@ fn lfm2_graph_mxfp4_layer_captures_and_replays() {
             Shape::new(vec![1, hidden]),
         );
         let mut h = x;
-        for li in 0..model.layers.len() {
-            h = model.layers[li].forward(&h, &mut caches[li]).unwrap();
+        for (li, layer) in model.layers.iter().enumerate() {
+            h = layer.forward(&h, &mut caches[li]).unwrap();
         }
         // Head over the final hidden state.
         let n = model.norm.weight.to_vec_f32().unwrap();

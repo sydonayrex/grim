@@ -33,9 +33,9 @@ fn q3k_wmma_inline_dequant_formula_vs_canonical() {
         ];
         let mut sc = [0i32; 16];
         let mut si = 0;
-        for j in 0..4 {
+        for &av in aux.iter() {
             for b in 0..4 {
-                let v = (aux[j] >> (8 * b)) & 0xFF;
+                let v = (av >> (8 * b)) & 0xFF;
                 sc[si] = if v < 128 { v as i32 } else { v as i32 - 256 }; si += 1;
             }
         }
