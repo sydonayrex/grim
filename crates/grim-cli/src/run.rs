@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 enum GraphDecodeResult {
     Sampled(u32),
-    Logits(grim_tensor::Tensor),
+    Logits(Box<grim_tensor::Tensor>),
 }
 
 /// i-was-dumb-graph.md Phase 5 + twinkie-zombieland P0: decode-loop graph trigger (LFM2 + ROCm only).
@@ -290,7 +290,7 @@ fn try_graph_decode_step(
     }
     let shape = grim_tensor::Shape::new(vec![1, vocab]);
     let tensor = build_tensor(&flat, &shape, device).ok()?;
-    Some(GraphDecodeResult::Logits(tensor))
+    Some(GraphDecodeResult::Logits(Box::new(tensor)))
 }
 
 /// Resolve the GPU ordinal for this TP rank's process.
@@ -858,46 +858,49 @@ pub async fn cmd_run(
         // SPEED-ROC: ROCm decode steps reuse preallocated [1]-shape tensors —
         // async in-place update, zero H2D allocs on the reuse path (old code
         // built + discarded two tensors per token). Non-Rocm: per-step build.
-        let rocm_reuse =
-            !is_prefill && matches!(device, Device::Rocm(_)) && decode_input.is_some() && decode_pos.is_some();
-        let (input_tensor, positions_tensor) =
-            if rocm_reuse {
+        let cached_tensors = if !is_prefill && matches!(device, Device::Rocm(_)) {
+            if let (Some(din), Some(dpos)) = (&decode_input, &decode_pos) {
                 // Update in place async on the active stream, ordered vs forward.
                 if let Device::Rocm(ordinal) = &device {
                     let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
-                    dev.write_f32_into_async(decode_input.as_ref().unwrap().storage().as_ref(), &input_ids)?;
-                    dev.write_f32_into_async(decode_pos.as_ref().unwrap().storage().as_ref(), &positions)?;
+                    dev.write_f32_into_async(din.storage().as_ref(), &input_ids)?;
+                    dev.write_f32_into_async(dpos.storage().as_ref(), &positions)?;
                 }
-                (
-                    decode_input.as_ref().unwrap(),
-                    decode_pos.as_ref().unwrap(),
-                )
+                Some((din, dpos))
             } else {
-                // Build tensor from selected token(s). Prefill + first decode
-                // step allocate; later ROCm steps never reach here.
-                let n_tokens = input_ids.len();
-                let shape = grim_tensor::Shape::new(vec![n_tokens]);
-                let float_tokens = input_ids;
-                let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
+                None
+            }
+        } else {
+            None
+        };
 
-                // Forward pass with proper positions tensor (CRIT-1).
-                let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
-                let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
-                if !is_prefill {
-                    decode_input = Some(input_tensor);
-                    decode_pos = Some(positions_tensor);
-                    (
-                        decode_input.as_ref().unwrap(),
-                        decode_pos.as_ref().unwrap(),
-                    )
-                } else {
-                    // Prefill temps: leak via small Vec to keep borrow simple.
-                    // One alloc on prefill only, never on decode.
-                    decode_prefill_cache.push((input_tensor, positions_tensor));
-                    let (i, p) = decode_prefill_cache.last().unwrap();
-                    (i, p)
-                }
-            };
+        let (input_tensor, positions_tensor) = if let Some((din, dpos)) = cached_tensors {
+            (din, dpos)
+        } else {
+            // Build tensor from selected token(s). Prefill + first decode
+            // step allocate; later ROCm steps never reach here.
+            let n_tokens = input_ids.len();
+            let shape = grim_tensor::Shape::new(vec![n_tokens]);
+            let float_tokens = input_ids;
+            let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
+
+            // Forward pass with proper positions tensor (CRIT-1).
+            let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
+            let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
+            if !is_prefill {
+                decode_input = Some(input_tensor);
+                decode_pos = Some(positions_tensor);
+                let din = decode_input.as_ref().expect("just set");
+                let dpos = decode_pos.as_ref().expect("just set");
+                (din, dpos)
+            } else {
+                // Prefill temps: leak via small Vec to keep borrow simple.
+                // One alloc on prefill only, never on decode.
+                decode_prefill_cache.push((input_tensor, positions_tensor));
+                let (i, p) = decode_prefill_cache.last().unwrap();
+                (i, p)
+            }
+        };
 
         let step_start = std::time::Instant::now();
         // Phase 5 trigger: LFM2 decode steps try single-launch replay first.
@@ -1571,28 +1574,28 @@ pub async fn cmd_run_interactive(
             let positions_tensor;
             let it;
             let pt;
-            if !is_prefill && decode_input.is_some() && decode_pos.is_some() {
+            if let (false, Some(din), Some(dpos)) = (is_prefill, &decode_input, &decode_pos) {
                 if let Device::Rocm(ordinal) = &device {
                     let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
                     dev.write_f32_into(
-                        decode_input.as_ref().unwrap().storage().as_ref(),
+                        din.storage().as_ref(),
                         &input_ids,
                     )?;
                     dev.write_f32_into(
-                        decode_pos.as_ref().unwrap().storage().as_ref(),
+                        dpos.storage().as_ref(),
                         &positions,
                     )?;
                 }
-                input_tensor = decode_input.as_ref().unwrap();
-                positions_tensor = decode_pos.as_ref().unwrap();
+                input_tensor = din;
+                positions_tensor = dpos;
             } else {
                 it = build_tensor(&input_ids, &shape, &device)?;
                 pt = build_tensor(&positions, &pos_shape, &device)?;
                 if !is_prefill {
                     decode_input = Some(it.clone());
                     decode_pos = Some(pt.clone());
-                    input_tensor = decode_input.as_ref().unwrap();
-                    positions_tensor = decode_pos.as_ref().unwrap();
+                    input_tensor = decode_input.as_ref().expect("just assigned");
+                    positions_tensor = decode_pos.as_ref().expect("just assigned");
                 } else {
                     input_tensor = &it;
                     positions_tensor = &pt;

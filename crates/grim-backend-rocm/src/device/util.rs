@@ -304,6 +304,23 @@ pub fn dtype_byte_size(dtype: &DType) -> usize {
     }
 }
 
+/// Return the device ordinal that owns the allocation at `ptr`, queried via
+/// `hipPointerGetAttributes`. Returns -1 on error (no valid device).
+pub fn pointer_owning_device(ptr: *const std::ffi::c_void) -> i32 {
+    use crate::device::handles::hipPointerGetAttributes;
+    use std::mem::MaybeUninit;
+    let mut attr = MaybeUninit::<crate::device::handles::HipPointerAttribute>::uninit();
+    // SAFETY: attr points to valid uninit memory for HipPointerAttribute.
+    // hipPointerGetAttributes safely accepts any pointer and returns non-success on invalid addresses.
+    let code = unsafe { hipPointerGetAttributes(attr.as_mut_ptr(), ptr) };
+    if code == crate::hipSuccess {
+        // SAFETY: hipPointerGetAttributes returned hipSuccess, indicating attr was fully populated.
+        unsafe { attr.assume_init() }.device
+    } else {
+        -1
+    }
+}
+
 #[cfg(test)]
 mod util_self_tests {
     use super::*;
@@ -391,19 +408,5 @@ mod util_self_tests {
             !opts.iter().any(|o| o.starts_with("-mwavefrontsize")),
             "CDNA (gfx90a) must leave wave size to native MFMA: {opts:?}"
         );
-    }
-}
-
-/// Return the device ordinal that owns the allocation at `ptr`, queried via
-/// `hipPointerGetAttributes`. Returns -1 on error (no valid device).
-pub fn pointer_owning_device(ptr: *const std::ffi::c_void) -> i32 {
-    use crate::device::handles::hipPointerGetAttributes;
-    use std::mem::MaybeUninit;
-    let mut attr = MaybeUninit::<crate::device::handles::HipPointerAttribute>::uninit();
-    let code = unsafe { hipPointerGetAttributes(attr.as_mut_ptr(), ptr) };
-    if code == crate::hipSuccess {
-        unsafe { attr.assume_init() }.device
-    } else {
-        -1
     }
 }

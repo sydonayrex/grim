@@ -1,0 +1,9 @@
+pub mod adapters;
+pub mod audio;
+pub mod catalog;
+pub mod completions;
+pub mod control;
+pub mod embeddings;
+pub mod health;
+pub mod models;
+pub mod tokens;
