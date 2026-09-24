@@ -1965,7 +1965,20 @@ impl MetalDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         #[cfg(target_vendor = "apple")]
         {
-            self.begin_graph_capture("flash_decode")?;
+            let ns = num_splits.max(1);
+            let shape_key = format!("flash_decode:{num_heads}:{head_dim}:{kv_seq_len}:{ns}");
+
+            // Shape-keyed graph replay (Task 5 Step 3): if a graph already
+            // exists for this (num_heads, head_dim, kv_seq_len, num_splits)
+            // signature, replay it instead of re-encoding.
+            if let Ok(()) = self.replay_graph(&shape_key) {
+                let cmd = self.get_or_create_command_buffer()?;
+                return Ok((
+                    self.zeros(&Shape::new(vec![ns, num_heads, head_dim]), DType::F32)?,
+                    Box::new(MetalHandle { command_buffer: cmd }),
+                ));
+            }
+
             if let Some(ref inner) = self.inner {
                 let q_s = q
                     .as_any()
@@ -1993,10 +2006,12 @@ impl MetalDevice {
                     .as_ref()
                     .ok_or_else(|| Error::Backend("v lacks buffer".into()))?;
 
-                let ns = num_splits.max(1);
                 let mid_out = self.zeros(&Shape::new(vec![ns, num_heads, head_dim]), DType::F32)?;
                 let mid_max = self.zeros(&Shape::new(vec![ns, num_heads]), DType::F32)?;
                 let mid_sum = self.zeros(&Shape::new(vec![ns, num_heads]), DType::F32)?;
+
+                // No replayable graph yet — record a new one under the shape key.
+                self.begin_graph_capture(&shape_key)?;
 
                 let mout_s = mid_out.as_any().downcast_ref::<MetalStorage>().unwrap();
                 let mmax_s = mid_max.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -2090,7 +2105,7 @@ impl MetalDevice {
                     }),
                 ));
             }
-            self.end_graph_capture("flash_decode")?;
+            self.end_graph_capture(&shape_key)?;
         }
 
         #[cfg(not(target_vendor = "apple"))]
