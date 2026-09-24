@@ -27,6 +27,14 @@ fn test_metal_msl_kernels_present() {
         "grim_speculative_acceptor",
         "grim_fused_dequant_gemm_q4k",
         "grim_fused_dequant_gemm_fp8",
+        // SSM / state-space model kernels (parity with Vulkan + ROCm) — Task 2
+        "grim_selective_scan",
+        "grim_selective_scan_headed",
+        "grim_delta_rule_decode",
+        "grim_gated_delta_net_decode",
+        // RWKV recurrence kernels — Task 3
+        "grim_rwkv_wkv_recurrence",
+        "grim_rwkv_channel_mix_full",
     ];
 
     for kernel in required_kernels {

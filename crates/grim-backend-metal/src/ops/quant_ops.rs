@@ -487,6 +487,355 @@ impl QuantOps for MetalDevice {
                                     command_buffer: cmd_buffer,
                                 }),
                             ));
+                        // IQ2/IQ3 fused dequant + GEMM fast-paths
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ2XXS) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq2xxs);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ2XS) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq2xs);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ2S) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq2s);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ3XXS) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq3xxs);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ3S) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq3s);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+
+                        // IQ2/IQ3 fused dequant + GEMM fast-paths
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ2XXS) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq2xxs);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void, 4, 3);
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void, 4, 5);
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ2XS) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq2xs);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void, 4, 3);
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void, 4, 5);
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ2S) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq2s);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void, 4, 3);
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void, 4, 5);
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ3XXS) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq3xxs);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void, 4, 3);
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void, 4, 5);
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+                        if let DTypeStorage::KQuant(KQuantScheme::IQ3S) = b_packed.dtype().storage {
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+                            encoder.setComputePipelineState(&ctx.pipelines.fused_dequant_gemm_iq3s);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void, 4, 3);
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void, 4, 4);
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void, 4, 5);
+                            }
+                            let threads = MTLSize::new(16, 16, 1);
+                            let groups = MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                            encoder.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                        }
+
+
                         }
                     }
                 }

@@ -4,9 +4,8 @@
 use grim_tensor::dtype::{
     DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance, Storage as DTypeStorage,
 };
-use grim_tensor::error::{ Result };
-use grim_tensor::{ BackendStorage, MemoryOps, Shape };
-
+use grim_tensor::error::Result;
+use grim_tensor::{BackendStorage, MemoryOps, Shape};
 
 #[cfg(target_vendor = "apple")]
 use objc2::rc::Retained;

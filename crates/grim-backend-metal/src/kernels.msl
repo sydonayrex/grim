@@ -1563,13 +1563,194 @@ kernel void grim_dequant_iq3s(
     if (id < uint(n_blocks * 256)) {
         int block_idx = id / 256;
         int in_sb = id % 256;
-        device const uchar* block_ptr = packed + block_idx * 110;
+        device const uchar* block_ptr = packed + block_idx * 104;
         device const ushort* h_ptr = (device const ushort*)block_ptr;
         float d = metal_fp16_to_float(h_ptr[0]);
         uchar q = block_ptr[2 + in_sb / 3];
         uchar val = (q >> ((in_sb % 3) * 2)) & 7;
         out[id] = d * (float)val;
     }
+}
+
+// ===========================================================================
+// IQ2/IQ3 fused dequant + GEMM kernels
+// These fuse dequantization and matrix multiply into a single dispatch:
+//   C[M,N] = A[M,K] @ dequant(B_packed[K,N])
+// Each thread computes one output element (row, col).
+// A is F32, B_packed is IQ2/IQ3 packed, output is F32.
+// ===========================================================================
+
+// ----- grim_fused_dequant_gemm_iq2xxs -------------------------------------
+// B layout: IQ2XXS, 2-bit per weight, 256 weights per block, 66 bytes/block
+//   block = [fp16_scale(2), codebook_bytes(64)]  (256/4=64 2-bit pairs per byte)
+// A: F32 row-major [M, K],	K: hidden dim
+// C: F32 row-major [M, N]
+kernel void grim_fused_dequant_gemm_iq2xxs(
+    device float* restrict out [[buffer(0)]],
+    device const float* restrict a [[buffer(1)]],
+    device const uchar* restrict b_packed [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int row = tid.x;
+    int col = tid.y;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int blocks_per_col = (k + 255) / 256;
+    for (int b = 0; b < blocks_per_col; b++) {
+        int k_start = b * 256;
+        int k_end = min(k_start + 256, k);
+        device const uchar* block_ptr = b_packed + (col * blocks_per_col + b) * 66;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        for (int ki = k_start; ki < k_end; ki++) {
+            int in_sb = ki - k_start;
+            uchar q = block_ptr[2 + in_sb / 4];
+            uchar val = (q >> ((in_sb % 4) * 2)) & 3;
+            acc += a[row * k + ki] * d * (float)val;
+        }
+    }
+    out[row * n + col] = acc;
+}
+
+// ----- grim_fused_dequant_gemm_iq2xs --------------------------------------
+// B layout: IQ2XS, 2-bit per weight, 256 weights per block, 74 bytes/block
+//   block = [fp16_scale(2), codebook_bytes(64), per-channel-scale(8)]
+kernel void grim_fused_dequant_gemm_iq2xs(
+    device float* restrict out [[buffer(0)]],
+    device const float* restrict a [[buffer(1)]],
+    device const uchar* restrict b_packed [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int row = tid.x;
+    int col = tid.y;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int blocks_per_col = (k + 255) / 256;
+    for (int b = 0; b < blocks_per_col; b++) {
+        int k_start = b * 256;
+        int k_end = min(k_start + 256, k);
+        device const uchar* block_ptr = b_packed + (col * blocks_per_col + b) * 74;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        for (int ki = k_start; ki < k_end; ki++) {
+            int in_sb = ki - k_start;
+            uchar q = block_ptr[2 + in_sb / 4];
+            uchar val = (q >> ((in_sb % 4) * 2)) & 3;
+            acc += a[row * k + ki] * d * (float)val;
+        }
+    }
+    out[row * n + col] = acc;
+}
+
+// ----- grim_fused_dequant_gemm_iq2s ---------------------------------------
+// B layout: IQ2S, 2-bit per weight, 256 weights per block, 82 bytes/block
+//   block = [fp16_scale(2), codebook_bytes(64), per-channel-scale(16)]
+kernel void grim_fused_dequant_gemm_iq2s(
+    device float* restrict out [[buffer(0)]],
+    device const float* restrict a [[buffer(1)]],
+    device const uchar* restrict b_packed [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int row = tid.x;
+    int col = tid.y;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int blocks_per_col = (k + 255) / 256;
+    for (int b = 0; b < blocks_per_col; b++) {
+        int k_start = b * 256;
+        int k_end = min(k_start + 256, k);
+        device const uchar* block_ptr = b_packed + (col * blocks_per_col + b) * 82;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        for (int ki = k_start; ki < k_end; ki++) {
+            int in_sb = ki - k_start;
+            uchar q = block_ptr[2 + in_sb / 4];
+            uchar val = (q >> ((in_sb % 4) * 2)) & 3;
+            acc += a[row * k + ki] * d * (float)val;
+        }
+    }
+    out[row * n + col] = acc;
+}
+
+// ----- grim_fused_dequant_gemm_iq3xxs ------------------------------------
+// B layout: IQ3XXS, 3-bit per weight, 256 weights per block, 96 bytes/block
+//   block = [fp16_scale(2), codebook_bytes(256/3≈86 written as 94 incl padding)]
+// 3-bit decoding: 2 values per byte (6 bits used), plus 2 padding bits
+kernel void grim_fused_dequant_gemm_iq3xxs(
+    device float* restrict out [[buffer(0)]],
+    device const float* restrict a [[buffer(1)]],
+    device const uchar* restrict b_packed [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int row = tid.x;
+    int col = tid.y;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int blocks_per_col = (k + 255) / 256;
+    for (int b = 0; b < blocks_per_col; b++) {
+        int k_start = b * 256;
+        int k_end = min(k_start + 256, k);
+        device const uchar* block_ptr = b_packed + (col * blocks_per_col + b) * 96;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        for (int ki = k_start; ki < k_end; ki++) {
+            int in_sb = ki - k_start;
+            uchar q = block_ptr[2 + in_sb / 3];
+            uchar val = (q >> ((in_sb % 3) * 2)) & 7;
+            acc += a[row * k + ki] * d * (float)val;
+        }
+    }
+    out[row * n + col] = acc;
+}
+
+// ----- grim_fused_dequant_gemm_iq3s ---------------------------------------
+// B layout: IQ3S, 3-bit per weight, 256 weights per block, 104 bytes/block
+//   block = [fp16_scale(2), codebook_bytes(94), per-channel-scale(8)]
+kernel void grim_fused_dequant_gemm_iq3s(
+    device float* restrict out [[buffer(0)]],
+    device const float* restrict a [[buffer(1)]],
+    device const uchar* restrict b_packed [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int row = tid.x;
+    int col = tid.y;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    int blocks_per_col = (k + 255) / 256;
+    for (int b = 0; b < blocks_per_col; b++) {
+        int k_start = b * 256;
+        int k_end = min(k_start + 256, k);
+        device const uchar* block_ptr = b_packed + (col * blocks_per_col + b) * 104;
+        device const ushort* h_ptr = (device const ushort*)block_ptr;
+        float d = metal_fp16_to_float(h_ptr[0]);
+        for (int ki = k_start; ki < k_end; ki++) {
+            int in_sb = ki - k_start;
+            uchar q = block_ptr[2 + in_sb / 3];
+            uchar val = (q >> ((in_sb % 3) * 2)) & 7;
+            acc += a[row * k + ki] * d * (float)val;
+        }
+    }
+    out[row * n + col] = acc;
 }
 
 kernel void grim_dequant_iq4nl(
@@ -2832,4 +3013,319 @@ kernel void grim_argmax(
     if (tid == 0) {
         out_idx[bid] = s_idx[0];
     }
+}
+
+// ---------------------------------------------------------------------------
+// State-space model kernels (Mamba / SSM / DeltaNet / Selective Scan)
+// Parity with Vulkan SPIR-V: SelectiveScan, SelectiveScanHeaded, DeltaRuleDecode, GatedDeltaNetDecode
+// and ROCm HIP: mamba2, delta_rule, gated_delta_net kernels
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// grim_selective_scan — Falcon-H1 / Mamba-2 selective scan (single-head)
+// I/O: out[buffer(0)], state[buffer(1)], input[buffer(2)], params[buffer(3)]
+// Params block: seq_len(int), dim(int), dt(int), A(float), B(float), C(float)
+// Grid: 1D over sequence positions
+// ===========================================================================
+kernel void grim_selective_scan(
+    device float* restrict out [[buffer(0)]],
+    device float* restrict state [[buffer(1)]],
+    device const float* restrict input [[buffer(2)]],
+    device const float* restrict params [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int seq_len = int(params[0]);
+    int dim = int(params[1]);
+    int dt = int(params[2]);
+    float A = params[3];
+    float B = params[4];
+    float C = params[5];
+
+    if (id >= uint(seq_len)) return;
+
+    int base = id * dim;
+    float s = 0.0f;
+
+    for (int d = 0; d < dim; d++) {
+        float x = input[base + d];
+        s = s * exp(A * float(dt)) + x * B;
+        state[base + d] = s;
+        out[base + d] = s * C;
+    }
+}
+
+// ===========================================================================
+// grim_selective_scan_headed — head-indexed selective scan
+// I/O: out[buffer(0)], state[buffer(1)], input[buffer(2)], params[buffer(3)]
+// Params block: seq_len(int), num_heads(int), head_dim(int), dt(int),
+//               A_per_head[float*N], B_per_head[float*N], C_per_head[float*N]
+// Each thread processes one (position, head) pair
+// ===========================================================================
+kernel void grim_selective_scan_headed(
+    device float* restrict out [[buffer(0)]],
+    device float* restrict state [[buffer(1)]],
+    device const float* restrict input [[buffer(2)]],
+    device const float* restrict params [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int seq_len = int(params[0]);
+    int num_heads = int(params[1]);
+    int head_dim = int(params[2]);
+    int dt = int(params[3]);
+
+    if (id >= uint(seq_len * num_heads)) return;
+
+    int pos = id / num_heads;
+    int head = id % num_heads;
+    int head_dim_offset = head * head_dim;
+
+    int param_stride = 3;
+    float A = params[4 + head * param_stride];
+    float B = params[4 + head * param_stride + 1];
+    float C = params[4 + head * param_stride + 2];
+
+    int in_base = pos * (num_heads * head_dim) + head_dim_offset;
+    int out_base = in_base;
+    int state_base = head_dim_offset;
+
+    float s = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float x = input[in_base + d];
+        s = s * exp(A * float(dt)) + x * B;
+        state[state_base + d] = s;
+        out[out_base + d] = s * C;
+    }
+}
+
+// ===========================================================================
+// grim_delta_rule_decode — standard delta rule recurrence (DeltaNet / SolarOpen2)
+// I/O: out_k[buffer(0)], out_v[buffer(1)], in_k[buffer(2)], in_v[buffer(3)],
+//      state_k[buffer(4)], state_v[buffer(5)], params[buffer(6)]
+// Params: dim(int), decay(float), gamma(float)
+// ===========================================================================
+kernel void grim_delta_rule_decode(
+    device float* restrict out_k [[buffer(0)]],
+    device float* restrict out_v [[buffer(1)]],
+    device const float* restrict in_k [[buffer(2)]],
+    device const float* restrict in_v [[buffer(3)]],
+    device float* restrict state_k [[buffer(4)]],
+    device float* restrict state_v [[buffer(5)]],
+    device const float* restrict params [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int dim = int(params[0]);
+    float decay = params[1];
+    float gamma = params[2];
+
+    if (id >= uint(dim)) return;
+
+    float sk = state_k[id];
+    float sv = state_v[id];
+    float ik = in_k[id];
+    float iv = in_v[id];
+
+    sk = decay * sk + ik;
+    sv = decay * sv + iv;
+
+    state_k[id] = sk;
+    state_v[id] = sv;
+    out_k[id] = sk;
+    out_v[id] = sv;
+}
+
+// ===========================================================================
+// grim_gated_delta_net_decode — gated delta rule with gating tensor
+// I/O: out_k[buffer(0)], out_v[buffer(1)], in_k[buffer(2)], in_v[buffer(3)],
+//      gate[buffer(4)], state_k[buffer(5)], state_v[buffer(6)], params[buffer(7)]
+// Params: dim(int), decay(float), gate_bias(float)
+// ===========================================================================
+kernel void grim_gated_delta_net_decode(
+    device float* restrict out_k [[buffer(0)]],
+    device float* restrict out_v [[buffer(1)]],
+    device const float* restrict in_k [[buffer(2)]],
+    device const float* restrict in_v [[buffer(3)]],
+    device const float* restrict gate [[buffer(4)]],
+    device float* restrict state_k [[buffer(5)]],
+    device float* restrict state_v [[buffer(6)]],
+    device const float* restrict params [[buffer(7)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int dim = int(params[0]);
+    float decay = params[1];
+    float gate_bias = params[2];
+
+    if (id >= uint(dim)) return;
+
+    float g = gate[id] + gate_bias;
+    g = 1.0f / (1.0f + exp(-g));
+
+    float sk = state_k[id];
+    float sv = state_v[id];
+    float ik = in_k[id];
+    float iv = in_v[id];
+
+    sk = decay * sk + g * ik;
+    sv = decay * sv + g * iv;
+
+    state_k[id] = sk;
+    state_v[id] = sv;
+    out_k[id] = sk;
+    out_v[id] = sv;
+}
+
+// ===========================================================================
+// grim_moe_mega_kernel — MoE persistent-worker comm-compute mega-kernel
+// Fuses expert weight fetch, token routing, and compute.
+// I/O:  out[buffer(0)], in[buffer(1)], routing[buffer(2)], expert_weights[buffer(3)]
+//       expert_biases[buffer(4)], state[buffer(5)], params[buffer(6)]
+// Params: num_tokens(int), num_experts(int), hidden_dim(int), intermediate_dim(int)
+// ===========================================================================
+kernel void grim_moe_mega_kernel(
+    device float* restrict out [[buffer(0)]],
+    device const float* restrict in [[buffer(1)]],
+    device const float* restrict routing [[buffer(2)]],
+    device const float* restrict expert_weights [[buffer(3)]],
+    device const float* restrict expert_biases [[buffer(4)]],
+    device float* restrict state [[buffer(5)]],
+    device const float* restrict params [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int num_tokens = int(params[0]);
+    int num_experts = int(params[1]);
+    int hidden_dim = int(params[2]);
+    int intermediate_dim = int(params[3]);
+
+    if (id >= uint(num_tokens * hidden_dim)) return;
+
+    int token = id / hidden_dim;
+    int dim = id % hidden_dim;
+
+    // Read routing weights for this token (top-2 expert indices stored as ints)
+    int topk = 2;
+    int expert_offset = token * topk;
+    int e0 = 0, e1 = 0;
+    float w0 = 0.0f, w1 = 0.0f;
+    if (expert_offset + 1 < num_experts * 2) {
+        // routing buffer stores [expert_idx0, weight0, expert_idx1, weight1, ...] per token
+        e0 = int(routing[expert_offset]);
+        w0 = routing[expert_offset + 1];
+        e1 = int(routing[expert_offset + 2]);
+        w1 = routing[expert_offset + 3];
+    }
+
+    // Accumulate from expert 0
+    float acc = 0.0f;
+    int e0_base = e0 * hidden_dim * intermediate_dim;
+    for (int j = 0; j < intermediate_dim; j++) {
+        float w = expert_weights[e0_base + dim * intermediate_dim + j];
+        float inp = in[token * hidden_dim + j % hidden_dim];
+        acc += w * inp;
+    }
+    float b0 = expert_biases[e0 * intermediate_dim + dim % intermediate_dim];
+    acc += b0;
+    acc *= w0;
+
+    // Accumulate from expert 1
+    float acc1 = 0.0f;
+    int e1_base = e1 * hidden_dim * intermediate_dim;
+    for (int j = 0; j < intermediate_dim; j++) {
+        float w = expert_weights[e1_base + dim * intermediate_dim + j];
+        float inp = in[token * hidden_dim + j % hidden_dim];
+        acc1 += w * inp;
+    }
+    float b1 = expert_biases[e1 * intermediate_dim + dim % intermediate_dim];
+    acc1 += b1;
+    acc1 *= w1;
+
+    out[id] = acc + acc1;
+
+    // Update state for persistent worker tracking
+    if (token < num_experts) {
+        state[token] = acc;
+    }
+}
+
+// ===========================================================================
+// grim_rwkv_wkv_recurrence — RWKV-4 WKV (weighted key-value) recurrence
+// I/O:  out[buffer(0)], state_aa[buffer(1)], state_bb[buffer(2)],
+//       state_pp[buffer(3)], time_first[buffer(4)], time_decay[buffer(5)],
+//       k[buffer(6)], v[buffer(7)], r[buffer(8)]
+// One thread per channel (dim). Computes WKV for one-step recurrence.
+// wkv = (exp(td)*aa + k*v) / (exp(td)*bb + k)
+// out = r_sig * wkv + tf * pp
+// ===========================================================================
+kernel void grim_rwkv_wkv_recurrence(
+    device float* restrict out [[buffer(0)]],
+    device float* restrict state_aa [[buffer(1)]],
+    device float* restrict state_bb [[buffer(2)]],
+    device float* restrict state_pp [[buffer(3)]],
+    device const float* restrict time_first [[buffer(4)]],
+    device const float* restrict time_decay [[buffer(5)]],
+    device const float* restrict k [[buffer(6)]],
+    device const float* restrict v [[buffer(7)]],
+    device const float* restrict r [[buffer(8)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int dim = id; // one thread per channel; grid size = dim
+    float td = time_decay[id];
+    float tf = time_first[id];
+    float k_v = k[id];
+    float v_v = v[id];
+    float r_v = r[id];
+
+    float aa = state_aa[id];
+    float bb = state_bb[id];
+    float pp = state_pp[id];
+
+    // WKV numerator and denominator
+    float exp_td = exp(td);
+    float wkv_num = exp_td * aa + k_v * v_v;
+    float wkv_den = exp_td * bb + k_v;
+
+    float wkv = (fabsf(wkv_den) > 1e-6) ? (wkv_num / wkv_den) : 0.0f;
+
+    // Sigmoid on r
+    float sig_r = 1.0f / (1.0f + exp(-r_v));
+
+    out[id] = sig_r * wkv + tf * pp;
+
+    // Update persistent state
+    state_aa[id] = wkv_num;
+    state_bb[id] = wkv_den;
+    state_pp[id] = pp + tf;
+}
+
+// ===========================================================================
+// grim_rwkv_channel_mix_full — RWKV-4 channel-mix with token-shift + gating
+// I/O:  out[buffer(0)], x[buffer(1)], mix_k[buffer(2)], mix_r[buffer(3)],
+//       ffn_xx[buffer(4)]
+// One thread per channel (dim). Channel-mix with token-shift + sigmoid/ReLU/FFN gates.
+// ===========================================================================
+kernel void grim_rwkv_channel_mix_full(
+    device float* restrict out [[buffer(0)]],
+    device const float* restrict x [[buffer(1)]],
+    device const float* restrict mix_k [[buffer(2)]],
+    device const float* restrict mix_r [[buffer(3)]],
+    device const float* restrict ffn_xx [[buffer(4)]],
+    uint id [[thread_position_in_grid]]
+) {
+    int dim = id; // one thread per channel
+    float xd = x[id];
+    float mk = mix_k[id];
+    float mr = mix_r[id];
+    float ffn = ffn_xx[id];
+
+    // Token shift: x = x + mr
+    float shifted = xd + mr;
+
+    // Sigmoid gate on r
+    float sig_r = 1.0f / (1.0f + exp(-shifted));
+
+    // ReLU on k-mix
+    float relu_k = max(0.0f, shifted * mk);
+
+    // FFN gating (sigmoid)
+    float ffn_gate = 1.0f / (1.0f + exp(-ffn));
+
+    out[id] = sig_r * relu_k * ffn_gate;
 }

@@ -900,6 +900,7 @@ pub trait FusionOps: CoreTensorOps + QuantOps {
         mscale: f32,
         eps: f32,
         max_seq_len: usize,
+        rope_interleaved: bool,
     ) -> Result<Box<dyn ComputeHandle>> {
         let _ = (
             x,
@@ -907,6 +908,7 @@ pub trait FusionOps: CoreTensorOps + QuantOps {
             gamma_k,
             w_codes,
             w_exps,
+            rope_interleaved,
             q_out,
             k_cache,
             v_cache,
@@ -1097,8 +1099,7 @@ pub trait AutogradOps: CoreTensorOps + ElementwiseOps {
         h_handle.synchronize()?;
 
         let delta_2d_shape = Shape::new(vec![batch, out_features]);
-        let (delta_storage, delta_handle) =
-            self.matmul(h_storage.as_ref(), b, &delta_2d_shape)?;
+        let (delta_storage, delta_handle) = self.matmul(h_storage.as_ref(), b, &delta_2d_shape)?;
         delta_handle.synchronize()?;
 
         let scale_buf_storage;
@@ -1652,7 +1653,6 @@ pub trait BackendDevice:
     fn gpu_target_str(&self) -> String {
         String::new()
     }
-
 }
 
 impl<T: CoreTensorOps + ?Sized> CoreTensorOps for std::sync::Arc<T> {
@@ -2195,6 +2195,7 @@ impl<T: FusionOps + ?Sized> FusionOps for std::sync::Arc<T> {
         mscale: f32,
         eps: f32,
         max_seq_len: usize,
+        rope_interleaved: bool,
     ) -> Result<Box<dyn ComputeHandle>> {
         (**self).fused_mxfp4_gemm_qk_norm_rope_kv(
             x,
@@ -2218,6 +2219,7 @@ impl<T: FusionOps + ?Sized> FusionOps for std::sync::Arc<T> {
             mscale,
             eps,
             max_seq_len,
+            rope_interleaved,
         )
     }
 }

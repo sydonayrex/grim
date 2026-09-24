@@ -1,13 +1,12 @@
 //! optimizer_ops ops for MetalDevice — moved verbatim from lib.rs.
 
-use grim_tensor::backend::{ ComputeHandle };
+use grim_tensor::backend::ComputeHandle;
 #[allow(unused_imports)]
 use grim_tensor::dtype::{
     DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance, Storage as DTypeStorage,
 };
-use grim_tensor::error::{ Result };
-use grim_tensor::{ BackendStorage, CoreTensorOps, OptimizerOps };
-
+use grim_tensor::error::Result;
+use grim_tensor::{BackendStorage, CoreTensorOps, OptimizerOps};
 
 #[cfg(target_vendor = "apple")]
 use objc2::rc::Retained;
