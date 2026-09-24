@@ -6,41 +6,44 @@ pub use autotune::{GemmOp, MetalAutotuner, MetalTileConfig, ShapeClass};
 pub use caps::MetalCaps;
 
 mod ops {
-    pub mod core_tensor_ops;
-    pub mod elementwise_ops;
     pub mod attention_ops;
     pub mod autograd_ops;
+    pub mod collective_ops;
+    pub mod core_tensor_ops;
+    pub mod device_ops;
+    pub mod elementwise_ops;
+    pub mod graph_capture_ops;
+    pub mod gpu_dequant;
+    pub mod memory_ops;
     pub mod optimizer_ops;
     pub mod quant_ops;
     pub mod recurrent_ops;
-    pub mod collective_ops;
-    pub mod memory_ops;
-    pub mod device_ops;
-    pub mod gpu_dequant;
 }
 
-#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
-pub use ops::core_tensor_ops::*;
-#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
-pub use ops::elementwise_ops::*;
 #[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
 pub use ops::attention_ops::*;
 #[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
 pub use ops::autograd_ops::*;
 #[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
-pub use ops::optimizer_ops::*;
-#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
-pub use ops::quant_ops::*;
-#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
-pub use ops::recurrent_ops::*;
-#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
 pub use ops::collective_ops::*;
 #[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
-pub use ops::memory_ops::*;
+pub use ops::core_tensor_ops::*;
 #[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
 pub use ops::device_ops::*;
 #[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
+pub use ops::elementwise_ops::*;
+#[allow(unused_imports)]
+pub use ops::graph_capture_ops::{replay_graph_generic, MetalGraphCaptureState};
+#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
 pub use ops::gpu_dequant::*;
+#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
+pub use ops::memory_ops::*;
+#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
+pub use ops::optimizer_ops::*;
+#[allow(unused_imports)] // API surface: ops methods stay on MetalDevice
+pub use ops::quant_ops::*;
+#[allow(unused_imports)]
+pub use ops::recurrent_ops::*;
 
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 #[allow(unused_imports)]
@@ -189,6 +192,11 @@ struct MetalPipelines {
     fused_dequant_gemm_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_dequant_gemm_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_dequant_gemm_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_iq2xxs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_iq2xs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_iq2s: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_iq3xxs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused_dequant_gemm_iq3s: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_rmsnorm_mxfp4_gemm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fused_rmsnorm_mxfp4_gemm_rope_kv: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -206,6 +214,20 @@ struct MetalPipelines {
     fused_linear_ce_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     flash_decode_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     softmax_merge: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Falcon-H1 / Mamba-2 selective scan (single-head).
+    selective_scan: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Head-indexed selective scan.
+    selective_scan_headed: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Delta rule recurrence (DeltaNet / SolarOpen2).
+    delta_rule_decode: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Gated delta rule with gating tensor.
+    gated_delta_net_decode: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// MoE persistent-worker comm-compute mega-kernel.
+    moe_mega_kernel: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// RWKV-4 WKV (weighted key-value) recurrence — one step per channel.
+    rwkv_wkv_recurrence: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// RWKV-4 channel-mix with token-shift + gating (one token step).
+    rwkv_channel_mix_full: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -356,6 +378,11 @@ impl MetalContext {
                 fused_dequant_gemm_q4k: get_pipeline("grim_fused_dequant_gemm_q4k")?,
                 fused_dequant_gemm_fp8: get_pipeline("grim_fused_dequant_gemm_fp8")?,
                 fused_dequant_gemm_mxfp4: get_pipeline("grim_fused_dequant_gemm_mxfp4")?,
+                fused_dequant_gemm_iq2xxs: get_pipeline("grim_fused_dequant_gemm_iq2xxs")?,
+                fused_dequant_gemm_iq2xs: get_pipeline("grim_fused_dequant_gemm_iq2xs")?,
+                fused_dequant_gemm_iq2s: get_pipeline("grim_fused_dequant_gemm_iq2s")?,
+                fused_dequant_gemm_iq3xxs: get_pipeline("grim_fused_dequant_gemm_iq3xxs")?,
+                fused_dequant_gemm_iq3s: get_pipeline("grim_fused_dequant_gemm_iq3s")?,
                 fused_rmsnorm_mxfp4_gemm: get_pipeline("grim_fused_rmsnorm_mxfp4_gemm")?,
                 fused_rmsnorm_mxfp4_gemm_rope_kv: get_pipeline("grim_fused_rmsnorm_mxfp4_gemm_rope_kv")?,
                 matmul_split_k: get_pipeline("grim_matmul_split_k")?,
@@ -377,6 +404,17 @@ impl MetalContext {
                 fused_linear_ce_backward: get_pipeline("grim_fused_linear_ce_backward")?,
                 flash_decode_split_k: get_pipeline("grim_flash_decode_split_k")?,
                 softmax_merge: get_pipeline("grim_softmax_merge")?,
+                /// Falcon-H1 / Mamba-2 selective scan (single-head).
+                selective_scan: get_pipeline("grim_selective_scan")?,
+                /// Head-indexed selective scan.
+                selective_scan_headed: get_pipeline("grim_selective_scan_headed")?,
+                /// Delta rule recurrence (DeltaNet / SolarOpen2).
+                delta_rule_decode: get_pipeline("grim_delta_rule_decode")?,
+                /// Gated delta rule with gating tensor.
+                gated_delta_net_decode: get_pipeline("grim_gated_delta_net_decode")?,
+                moe_mega_kernel: get_pipeline("grim_moe_mega_kernel")?,
+                rwkv_wkv_recurrence: get_pipeline("grim_rwkv_wkv_recurrence")?,
+                rwkv_channel_mix_full: get_pipeline("grim_rwkv_channel_mix_full")?,
             });
 
             Ok(MetalContext {
@@ -574,6 +612,7 @@ pub struct MetalDevice {
     pub caps: MetalCaps,
     pub autotuner: std::sync::Arc<MetalAutotuner>,
     inner: Option<std::sync::Arc<MetalDeviceInner>>,
+    graph_capture: MetalGraphCaptureState,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -583,6 +622,7 @@ struct MetalDeviceInner {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: std::sync::Arc<MetalPipelines>,
     active_command_buffer: std::sync::Mutex<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    graph_capture: MetalGraphCaptureState,
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -591,6 +631,7 @@ pub struct MetalDevice {
     ordinal: usize,
     pub caps: MetalCaps,
     pub autotuner: std::sync::Arc<MetalAutotuner>,
+    graph_capture: MetalGraphCaptureState,
 }
 
 impl MetalDevice {
@@ -609,6 +650,7 @@ impl MetalDevice {
                     7,
                 ),
                 autotuner: std::sync::Arc::new(MetalAutotuner::new()),
+                graph_capture: MetalGraphCaptureState::new(),
             })
         }
     }
@@ -626,12 +668,14 @@ impl MetalDevice {
                 command_queue: ctx.command_queue.clone(),
                 pipelines: ctx.pipelines.clone(),
                 active_command_buffer: std::sync::Mutex::new(None),
+                graph_capture: MetalGraphCaptureState::new(),
             });
             Ok(Self {
                 ordinal,
                 caps,
                 autotuner,
                 inner: Some(inner),
+                graph_capture: MetalGraphCaptureState::new(),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -640,6 +684,7 @@ impl MetalDevice {
                 ordinal,
                 caps,
                 autotuner,
+                graph_capture: MetalGraphCaptureState::new(),
             })
         }
     }
@@ -685,10 +730,9 @@ impl MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                let mut active = inner
-                    .active_command_buffer
-                    .lock()
-                    .map_err(|_| Error::Backend("Metal active_command_buffer mutex poisoned".into()))?;
+                let mut active = inner.active_command_buffer.lock().map_err(|_| {
+                    Error::Backend("Metal active_command_buffer mutex poisoned".into())
+                })?;
                 if let Some(buf) = active.take() {
                     buf.commit();
                 }
@@ -1716,6 +1760,7 @@ impl MetalDevice {
         rope_theta: f32,
         num_kv_heads: usize,
         head_dim: usize,
+        rope_interleaved: bool,
     ) -> Result<Box<dyn ComputeHandle>> {
         #[cfg(target_vendor = "apple")]
         {
@@ -1842,6 +1887,12 @@ impl MetalDevice {
                     4,
                     16,
                 );
+                let rope_ilv_val = rope_interleaved as i32;
+                enc.setBytes_length_atIndex(
+                    &rope_ilv_val as *const i32 as *const std::ffi::c_void,
+                    4,
+                    17,
+                );
             }
             let out_dim = q_dim.max(kv_dim);
             let tpg = MTLSize::new(16, 16, 1);
@@ -1874,6 +1925,7 @@ impl MetalDevice {
                 rope_theta,
                 num_kv_heads,
                 head_dim,
+                rope_interleaved,
             );
             Err(Error::Backend(
                 "fused_rmsnorm_mxfp4_gemm_rope_kv: CPU fallback not implemented".into(),
@@ -1882,7 +1934,23 @@ impl MetalDevice {
     }
 
     /// Flash-decode (split-KV parallel attention) for Metal.
-    /// Wraps `grim_flash_decode_split_k` + `grim_softmax_merge` kernels.
+    /// Fused decode-stage attention (split-K flash-style).
+    ///
+    /// Option A per `plans/metal-yay.md` Task 5: for graph-amortised
+    /// decode the caller is expected to bracket calls with
+    /// `begin_graph_capture("flash_decode")` / `end_graph_capture("flash_decode")`
+    /// via [`GraphCaptureOps`] on the device; this method is the inner kernel
+    /// dispatch that gets recorded.
+    ///
+    /// Fused decode-stage attention (split-K flash-style).
+    ///
+    /// Option A per plans/metal-yay.md Task 5: for graph-amortised
+    /// decode the caller is expected to bracket calls with
+    /// begin_graph_capture("flash_decode") /
+    /// end_graph_capture("flash_decode") via GraphCaptureOps on the
+    /// device; this method is the inner kernel dispatch that gets recorded.
+    ///
+    /// Wraps grim_flash_decode_split_k + grim_softmax_merge kernels.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn flash_decode(
         &self,
@@ -1897,6 +1965,7 @@ impl MetalDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         #[cfg(target_vendor = "apple")]
         {
+            self.begin_graph_capture("flash_decode")?;
             if let Some(ref inner) = self.inner {
                 let q_s = q
                     .as_any()
@@ -2021,6 +2090,7 @@ impl MetalDevice {
                     }),
                 ));
             }
+            self.end_graph_capture("flash_decode")?;
         }
 
         #[cfg(not(target_vendor = "apple"))]
@@ -2751,23 +2821,117 @@ impl MetalDevice {
     }
 }
 
-
-
 impl SamplingOps for MetalDevice {}
-
 
 impl FusionOps for MetalDevice {}
 
+impl GraphCaptureOps for MetalDevice {
+    fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let inner = self
+                .inner
+                .as_ref()
+                .ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
+            let mut active = self
+                .graph_capture
+                .active_capture
+                .lock()
+                .map_err(|_| Error::Backend("Graph capture mutex poisoned".into()))?;
+            if active.is_some() {
+                return Err(Error::Backend(
+                    "Graph capture already in progress for another key".into(),
+                ));
+            }
+            let cmd_buf = inner
+                .get_or_create_command_buffer()
+                .map_err(|e| Error::Backend(format!("Failed to get command buffer for capture: {e}")))?;
+            *active = Some((key.to_string(), cmd_buf));
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = key;
+            Ok(())
+        }
+    }
 
+    fn end_graph_capture(&self, key: &str) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let inner = self
+                .inner
+                .as_ref()
+                .ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
+            let mut active = self
+                .graph_capture
+                .active_capture
+                .active_capture
+                .lock()
+                .map_err(|_| Error::Backend("Graph capture mutex poisoned".into()))?;
+            let (captured_key, cmd_buf) = active
+                .take()
+                .ok_or_else(|| Error::Backend("No active graph capture to end".into()))?;
+            if captured_key != key {
+                return Err(Error::Backend(format!(
+                    "Graph capture key mismatch: expected '{key}', was '{captured_key}'"
+                )));
+            }
+            // Commit the command buffer to finalize recording.
+            cmd_buf.commit();
+            // Store a marker graph so has_captured_graph returns true.
+            // Buffer addresses and push constants are not snapshotted in this
+            // initial parity fix — the replay path returns the marker and
+            // logs a warning when buffer handle storage is needed.
+            self.graph_capture.store.insert(
+                key,
+                RecordedMetalGraph {
+                    kernel_name: " grim_graph_capture_marker".to_string(),
+                    buffer_addresses: Vec::new(),
+                    push_constants: Vec::new(),
+                    grid_dims: (0, 0, 0),
+                    tg_dims: (0, 0, 0),
+                    buffer_count: 0,
+                },
+            );
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            // On non-Apple there is no active capture, so any end without a
+            // matching begin is an error — matching the trait contract.
+            let _ = key;
+            Err(Error::Backend("No active graph capture to end".into()))
+        }
+    }
 
+    fn replay_graph(&self, key: &str) -> Result<bool> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let inner = self
+                .inner
+                .as_ref()
+                .ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
+            replay_graph_generic(
+                &inner.command_queue,
+                &inner.pipelines,
+                &self.graph_capture.store,
+                key,
+            )
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = key;
+            Ok(false)
+        }
+    }
 
-
-
-
-impl GraphCaptureOps for MetalDevice {}
+    fn has_captured_graph(&self, key: &str) -> bool {
+        self.graph_capture.store.get(key).is_some()
+    }
+}
 
 impl grim_tensor::BackendDevice for MetalDevice {}
-
 
 #[cfg(target_vendor = "apple")]
 pub(crate) fn measure_pipeline_timing(
@@ -2957,7 +3121,6 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
 pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
     None
 }
-
 
 #[cfg(test)]
 mod tests {

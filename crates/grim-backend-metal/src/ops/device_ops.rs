@@ -1,13 +1,12 @@
 //! device_ops ops for MetalDevice — moved verbatim from lib.rs.
 
-use grim_tensor::backend::{ ComputeHandle };
+use grim_tensor::backend::ComputeHandle;
 #[allow(unused_imports)]
 use grim_tensor::dtype::{
     DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance, Storage as DTypeStorage,
 };
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, CoreTensorOps, Shape };
-
+use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 
 #[cfg(target_vendor = "apple")]
 use objc2::rc::Retained;

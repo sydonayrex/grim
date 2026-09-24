@@ -299,7 +299,9 @@ impl DType {
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
             Storage::W4A4OstQuant(cfg) => {
                 let group = cfg.group_size.max(1);
-                24 + elem_count.div_ceil(2) + (elem_count.div_ceil(group)) * 2 + elem_count.div_ceil(group)
+                24 + elem_count.div_ceil(2)
+                    + (elem_count.div_ceil(group)) * 2
+                    + elem_count.div_ceil(group)
             }
             _ => elem_count * self.arith.byte_size(),
         }
