@@ -1,8 +1,93 @@
 //! Telemetry, metrics and state accessors.
 
 use crate::*;
+use std::sync::atomic::Ordering;
+
+/// D5: serializable config summary — the scalar subset of `EngineConfig`
+/// (Arc handles are reported as booleans; the snapshot must stay one JSON
+/// artifact).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigSummary {
+    pub max_batched_tokens: usize,
+    pub max_num_seqs: usize,
+    pub block_pool_capacity: usize,
+    pub determinism_mode: String,
+    pub tp_size: usize,
+    pub kv_compressor: bool,
+    pub disagg_router: bool,
+}
+
+/// D5: dispatch-fallback counters at snapshot time — the QKV shared-attention
+/// dispatch stats plus the fused quantized-matmul forward/backward stats.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FallbackCounters {
+    pub qkv_attempts: u64,
+    pub qkv_arena_fallbacks: u64,
+    pub fused_forward_attempts: usize,
+    pub fused_forward_fallbacks: usize,
+    pub fused_backward_attempts: usize,
+    pub fused_backward_fallbacks: usize,
+}
+
+/// D5: decode-graph poison state — capture opt-in plus the slot keys that
+/// currently hold a stored graph.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphState {
+    /// Decode-graph capture opt-in (`GRIM_CAPTURE_GRAPH`).
+    pub capture_enabled: bool,
+    /// Slot keys with a stored decode graph.
+    pub stored_decode_graphs: Vec<String>,
+}
+
+/// D5: one per-request debug bundle — the artifact a failing request dumps
+/// (config, fallback counters, sticky set, graph state) in one shot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineDebugSnapshot {
+    pub request_id: u64,
+    pub config: ConfigSummary,
+    pub fallback_counters: FallbackCounters,
+    pub sticky_failed_configs: usize,
+    pub graph_state: GraphState,
+}
 
 impl Engine {
+    /// D5: per-request debug bundle — one artifact a failing request can
+    /// dump to stderr (or serve over `/metrics`) that names the engine
+    /// config summary, the dispatch-fallback counters, the sticky
+    /// failed-config set size, and the decode-graph state. Serializable, so
+    /// the whole bundle renders as one machine-readable JSON line.
+    pub fn debug_snapshot(&self, request_id: u64) -> EngineDebugSnapshot {
+        let (qkv_attempts, qkv_arena_fallbacks, sticky) =
+            grim_models_transformer::shared_attention::qkv_arena_fallback_stats();
+        let fwd = &grim_backend_rocm::FUSED_FORWARD_DISPATCH_STATS;
+        let bwd = &grim_backend_rocm::FUSED_BACKWARD_DISPATCH_STATS;
+        EngineDebugSnapshot {
+            request_id,
+            config: ConfigSummary {
+                max_batched_tokens: self.config.max_batched_tokens,
+                max_num_seqs: self.config.max_num_seqs,
+                block_pool_capacity: self.config.block_pool_capacity,
+                determinism_mode: format!("{:?}", self.config.determinism_mode),
+                tp_size: self.config.tp_size,
+                kv_compressor: self.config.kv_compressor.is_some(),
+                disagg_router: self.config.disagg_router.is_some(),
+            },
+            fallback_counters: FallbackCounters {
+                qkv_attempts,
+                qkv_arena_fallbacks,
+                fused_forward_attempts: fwd.attempts.load(Ordering::Relaxed),
+                fused_forward_fallbacks: fwd.fallback_calls.load(Ordering::Relaxed),
+                fused_backward_attempts: bwd.attempts.load(Ordering::Relaxed),
+                fused_backward_fallbacks: bwd.fallback_calls.load(Ordering::Relaxed),
+            },
+            sticky_failed_configs: sticky,
+            graph_state: GraphState {
+                capture_enabled: grim_backend_rocm::RocmDevice::shared(0).graph_capture_enabled(),
+                stored_decode_graphs: self.decode_graphs.keys().cloned().collect(),
+            },
+        }
+    }
+
     /// Return live snapshot of visible GPU capabilities if profiler is active.
     pub fn capabilities(&self) -> Option<Vec<grim_tensor::backend::GpuCapability>> {
         self.capability_profiler.as_ref().map(|p| p.capabilities())
@@ -96,7 +181,11 @@ impl Engine {
     /// Layer 1.5: radix prefix-cache hit-rate telemetry —
     /// `(prefix_lookups, requests_with_hits, reused_tokens_total)`.
     pub fn radix_cache_telemetry(&self) -> (u64, u64, u64) {
-        (self.radix_lookups, self.radix_hit_requests, self.radix_hit_tokens)
+        (
+            self.radix_lookups,
+            self.radix_hit_requests,
+            self.radix_hit_tokens,
+        )
     }
 
     /// Layer 1.5 gate: hybrid models (LFM2's ShortConv state, Mamba variants)
@@ -237,5 +326,42 @@ impl Engine {
             model_id.clone()
         };
         Some((self.effective_model_id(id, &base), 0))
+    }
+}
+
+#[cfg(test)]
+mod debug_snapshot_tests {
+    use super::*;
+
+    /// D5: debug_snapshot bundles config summary, fallback counters, sticky
+    /// set size and graph state in one artifact — and the JSON round-trips,
+    /// so a failing request can dump it as one machine-readable line.
+    #[test]
+    fn debug_snapshot_bundles_request_debug_state() {
+        let engine = Engine::new(EngineConfig::default());
+        let snap = engine.debug_snapshot(42);
+        assert_eq!(snap.request_id, 42);
+        assert_eq!(
+            snap.config.max_batched_tokens,
+            EngineConfig::default().max_batched_tokens
+        );
+        // The sticky count must match the live stats at snapshot time
+        // (exact, not assumed-zero — parallel GPU tests may poison it).
+        let (_, _, sticky_now) =
+            grim_models_transformer::shared_attention::qkv_arena_fallback_stats();
+        assert_eq!(snap.sticky_failed_configs, sticky_now);
+        // Fresh engine: no decode graph stored, no counters inflated by this call.
+        assert!(snap.graph_state.stored_decode_graphs.is_empty());
+        // The bundle is machine-readable: every section survives a JSON parse.
+        let line = serde_json::to_string(&snap).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request_id"], 42);
+        assert!(v["config"]["max_batched_tokens"].is_u64());
+        assert!(v["config"]["determinism_mode"].is_string());
+        assert!(v["fallback_counters"]["qkv_attempts"].is_u64());
+        assert!(v["fallback_counters"]["fused_forward_fallbacks"].is_u64());
+        assert!(v["fallback_counters"]["fused_backward_fallbacks"].is_u64());
+        assert!(v["graph_state"]["capture_enabled"].is_boolean());
+        assert!(v["graph_state"]["stored_decode_graphs"].is_array());
     }
 }

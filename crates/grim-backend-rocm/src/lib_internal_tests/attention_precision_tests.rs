@@ -343,5 +343,4 @@ mod tests {
             assert!(max <= 5e-3, "wi1 skewed max_abs_diff {} too large", max);
         }
     }
-
 }

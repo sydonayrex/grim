@@ -1,18 +1,22 @@
 //! Core tensor computation, GEMM, elementwise, autograd, and optimizer operations for `RocmDevice`.
 //! Fused layer ops: QKV/GateUp projections, RMSNorm fusions, cross-entropy, embedding gather.
 
-use super::{FusedGateUpWeights, FusedQkvWeights};
+use super::{FusedGateUpWeights, FusedQkvGateLogits, FusedQkvWeights};
 use std::ffi::c_void;
+use std::sync::Arc;
 
-
-use grim_tensor::backend::{ ComputeHandle };
+use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, Shape };
+use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, QkvAttentionFusionConfig, QuantMode, RmsNormMatMulFusionConfig, RocmHandle, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemsetAsync, hipSuccess, warp_rows_launch };
+use crate::memory::view::RocmStorageView;
+use crate::{
+    arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemsetAsync, hipSuccess, warp_rows_launch,
+    HipDim3, QkvAttentionFusionConfig, QuantMode, RmsNormMatMulFusionConfig, RocmHandle,
+};
 
 impl RocmDevice {
     /// Graph-capturable embedding gather: `out[slot*dim + j] = weight[idx[slot]*dim + j]`.
@@ -31,8 +35,7 @@ impl RocmDevice {
         let dt = weight.dtype();
         if dt.arith != ArithType::F32 || !matches!(dt.storage, crate::DTypeStorage::Native) {
             return Err(Error::Unimplemented(
-                "embedding_gather_dev_idx: F32 native tables only (quant falls back eager)"
-                    .into(),
+                "embedding_gather_dev_idx: F32 native tables only (quant falls back eager)".into(),
             ));
         }
         let w_ptr = weight
@@ -54,7 +57,13 @@ impl RocmDevice {
             "grim_embedding",
             grid,
             block,
-            &mut [arg(&mut w), arg(&mut o), arg(&mut i), arg(&mut d), arg(&mut t)],
+            &mut [
+                arg(&mut w),
+                arg(&mut o),
+                arg(&mut i),
+                arg(&mut d),
+                arg(&mut t),
+            ],
         )
     }
 
@@ -78,9 +87,10 @@ impl RocmDevice {
         hidden: usize,
     ) -> Result<Box<dyn BackendStorage>> {
         let n_total = n_q
-            .checked_add(n_kv.checked_mul(2).ok_or_else(|| {
-                Error::Backend("launch_fused_qkv_dot4: n_kv overflow".into())
-            })?)
+            .checked_add(
+                n_kv.checked_mul(2)
+                    .ok_or_else(|| Error::Backend("launch_fused_qkv_dot4: n_kv overflow".into()))?,
+            )
             .ok_or_else(|| Error::Backend("launch_fused_qkv_dot4: n_q+n_kv overflow".into()))?;
         let out_shape = Shape::new(vec![n_total]);
         let out_storage = RocmStorage::alloc_gpu(
@@ -113,9 +123,10 @@ impl RocmDevice {
             )));
         }
         let n_total = n_q
-            .checked_add(n_kv.checked_mul(2).ok_or_else(|| {
-                Error::Backend("launch_fused_qkv_dot4: n_kv overflow".into())
-            })?)
+            .checked_add(
+                n_kv.checked_mul(2)
+                    .ok_or_else(|| Error::Backend("launch_fused_qkv_dot4: n_kv overflow".into()))?,
+            )
             .ok_or_else(|| Error::Backend("launch_fused_qkv_dot4: n_q+n_kv overflow".into()))?;
         if wqkv_q80.shape().elem_count() != n_total * hidden {
             return Err(Error::Backend(format!(
@@ -187,7 +198,6 @@ impl RocmDevice {
             return Err(Error::Backend(format!(
                 "build_fused_qkv_q80: hidden must be a non-zero multiple of 32, got {hidden}"
             )));
-
         }
         // Raw Q8_0 bytes of each weight (D2H). Each row is (hidden/32)*34 bytes.
         let q_bytes = as_rocm(wq)?.copy_to_host()?;
@@ -211,8 +221,194 @@ impl RocmDevice {
             n_q,
             n_k,
             n_v,
+            n_gb: 0,
+            n_gw: 0,
+            n_gf: 0,
             hidden,
         })
+    }
+
+    /// G4b Phase 2: quantize one f32 weight storage to Q8_0 on-device and read
+    /// back its raw Q8_0 bytes (row order preserved). Shared by the gate-blob
+    /// builder and used to concatenate gate rows with the QKV Q8_0 bytes.
+    fn gate_weight_q80_bytes(&self, w: &dyn BackendStorage) -> Result<Vec<u8>> {
+        let (quantized, handle) = self.quantize_on_device(w, grim_tensor::QuantFormat::Q8_0)?;
+        handle.synchronize()?;
+        let q_storage = quantized
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate quant: output is not RocmStorage".into()))?;
+        q_storage.copy_to_host()
+    }
+
+    /// G4b Phase 2: build the gate-augmented fused Q8_0 blob
+    /// `[Q ∥ K ∥ V ∥ Gb ∥ Gw ∥ Gf, hidden]` consumed by one fused QKV+gate GEMV.
+    ///
+    /// `wq`/`wk`/`wv` must already be Q8_0 (the teacher projections); the three
+    /// gate projections `w_gb`/`w_gw`/`w_gf` are f32 and are quantized to Q8_0
+    /// on-device here (same quant path the parity test references). Row counts
+    /// `n_gb`/`n_gw`/`n_gf` are taken from the gate weights' outer dimension so
+    /// the fused GEMV output can be sliced back into gate logits.
+    pub fn build_fused_gate_qkv_q80(
+        &self,
+        wq: &dyn BackendStorage,
+        wk: &dyn BackendStorage,
+        wv: &dyn BackendStorage,
+        w_gb: &dyn BackendStorage,
+        w_gw: &dyn BackendStorage,
+        w_gf: &dyn BackendStorage,
+    ) -> Result<FusedQkvWeights> {
+        let q80 = DType {
+            arith: ArithType::F32,
+            storage: DTypeStorage::KQuant(grim_tensor::dtype::KQuantScheme::Q80),
+        };
+        for (name, w) in [("wq", wq), ("wk", wk), ("wv", wv)] {
+            if w.dtype().storage != q80.storage {
+                return Err(Error::Backend(format!(
+                    "build_fused_gate_qkv_q80: {name} must be Q8_0, got {:?}",
+                    w.dtype().storage
+                )));
+            }
+        }
+        let q_dims = wq.shape().dims();
+        let k_dims = wk.shape().dims();
+        let v_dims = wv.shape().dims();
+        if q_dims.len() != 2 || k_dims.len() != 2 || v_dims.len() != 2 {
+            return Err(Error::Backend(
+                "build_fused_gate_qkv_q80: QKV weights must be 2D [rows, hidden]".into(),
+            ));
+        }
+        let n_q = q_dims[0];
+        let n_k = k_dims[0];
+        let n_v = v_dims[0];
+        let hidden = q_dims[1];
+        if k_dims[1] != hidden || v_dims[1] != hidden {
+            return Err(Error::Backend(format!(
+                "build_fused_gate_qkv_q80: QKV hidden dims must match (got {}/{}/{})",
+                q_dims[1], k_dims[1], v_dims[1]
+            )));
+        }
+        if hidden == 0 || hidden % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "build_fused_gate_qkv_q80: hidden must be a non-zero multiple of 32, got {hidden}"
+            )));
+        }
+        let n_gb = w_gb.shape().dims().first().copied().unwrap_or(0);
+        let n_gw = w_gw.shape().dims().first().copied().unwrap_or(0);
+        let n_gf = w_gf.shape().dims().first().copied().unwrap_or(0);
+
+        // QKV Q8_0 bytes are read back directly; gate bytes are quantized first.
+        let q_bytes = as_rocm(wq)?.copy_to_host()?;
+        let k_bytes = as_rocm(wk)?.copy_to_host()?;
+        let v_bytes = as_rocm(wv)?.copy_to_host()?;
+        let gb_bytes = self.gate_weight_q80_bytes(w_gb)?;
+        let gw_bytes = self.gate_weight_q80_bytes(w_gw)?;
+        let gf_bytes = self.gate_weight_q80_bytes(w_gf)?;
+
+        let mut fused = Vec::with_capacity(
+            q_bytes.len()
+                + k_bytes.len()
+                + v_bytes.len()
+                + gb_bytes.len()
+                + gw_bytes.len()
+                + gf_bytes.len(),
+        );
+        fused.extend_from_slice(&q_bytes);
+        fused.extend_from_slice(&k_bytes);
+        fused.extend_from_slice(&v_bytes);
+        fused.extend_from_slice(&gb_bytes);
+        fused.extend_from_slice(&gw_bytes);
+        fused.extend_from_slice(&gf_bytes);
+
+        let n_total = n_q + n_k + n_v + n_gb + n_gw + n_gf;
+        let fused_shape = Shape::new(vec![n_total, hidden]);
+        let fused_storage = RocmStorage::copy_from_host_raw_bytes(
+            &fused,
+            &fused_shape,
+            q80,
+            &self.allocator,
+            self.ordinal,
+        )?;
+        Ok(FusedQkvWeights {
+            storage: fused_storage,
+            n_q,
+            n_k,
+            n_v,
+            n_gb,
+            n_gw,
+            n_gf,
+            hidden,
+        })
+    }
+
+    /// G4b Phase 3: one fused Q8_0/Q8_1 GEMV over the gate-augmented blob,
+    /// writing `[m, n_total_with_gates]` f32 into CALLER-PROVIDED `out`. No
+    /// allocation inside — graph-capture safe. Slices of `out` are the Q/K/V and
+    /// gate-logit regions. `m` is the activation batch (tokens); the caller must
+    /// have quantized `m` rows into `act_q81` and sized `out` to `m * n_total`.
+    pub fn launch_fused_qkv_gates_dot4_into(
+        &self,
+        act_q81: &RocmStorage,
+        weights: &FusedQkvWeights,
+        out: &RocmStorage,
+        m: usize,
+    ) -> Result<*mut c_void> {
+        if weights.hidden == 0 || weights.hidden % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "launch_fused_qkv_gates: hidden must be a non-zero multiple of 32, got {}",
+                weights.hidden
+            )));
+        }
+        let n_total = weights.n_total_with_gates();
+        if out.shape().elem_count() != m * n_total {
+            return Err(Error::Backend(format!(
+                "launch_fused_qkv_gates_into: out holds {} elems, need {}",
+                out.shape().elem_count(),
+                m * n_total
+            )));
+        }
+        self.launch_dot4_q80_q81_gemv(act_q81, &weights.storage, out, m, n_total, weights.hidden)
+    }
+
+    /// G4b Phase 3: allocate an output buffer, run the fused QKV+gate GEMV, and
+    /// return zero-copy views over the three gate-logit regions plus the full
+    /// output allocation (which keeps the views alive).
+    pub fn fused_qkv_gates_dot4(
+        &self,
+        act_q81: &RocmStorage,
+        weights: &FusedQkvWeights,
+    ) -> Result<FusedQkvGateLogits> {
+        let n_total = weights.n_total_with_gates();
+        let out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![n_total]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_fused_qkv_gates_dot4_into(act_q81, weights, &out_storage, 1)?;
+        let output: Arc<dyn BackendStorage> = Arc::from(out_storage);
+        let gb = RocmStorageView::from_offset(
+            Arc::clone(&output),
+            weights.gb_offset() * 4,
+            weights.n_gb * 4,
+            Shape::new(vec![weights.n_gb]),
+        )?;
+        let gw = RocmStorageView::from_offset(
+            Arc::clone(&output),
+            weights.gw_offset() * 4,
+            weights.n_gw * 4,
+            Shape::new(vec![weights.n_gw]),
+        )?;
+        let gf = RocmStorageView::from_offset(
+            Arc::clone(&output),
+            weights.gf_offset() * 4,
+            weights.n_gf * 4,
+            Shape::new(vec![weights.n_gf]),
+        )?;
+        Ok(FusedQkvGateLogits { output, gb, gw, gf })
     }
 
     /// SPEED-DOT-FUSED (Phase 4c): build the concatenated Q8_0 weight blob
@@ -379,12 +575,7 @@ impl RocmDevice {
             "grim_silu_mul_quant_q8_1",
             grid_dim,
             block_dim,
-            &mut [
-                arg(&mut gptr),
-                arg(&mut uptr),
-                arg(&mut dptr),
-                arg(&mut kk),
-            ],
+            &mut [arg(&mut gptr), arg(&mut uptr), arg(&mut dptr), arg(&mut kk)],
         )
     }
 
@@ -535,8 +726,7 @@ impl RocmDevice {
                 Error::Backend("fused_attn_o_proj: o_proj is not RocmStorage".into())
             })?;
             let transposed = self.transpose_f32_2d(src, o_dim, num_heads * head_dim)?;
-            let transposed_s =
-                as_rocm(transposed.as_ref())?;
+            let transposed_s = as_rocm(transposed.as_ref())?;
             dev_ptr(transposed_s)?
         } else {
             dev_ptr(o_s)?
@@ -745,6 +935,7 @@ impl RocmDevice {
         mscale: f32,
         eps: f32,
         max_seq_len: usize,
+        rope_interleaved: bool,
     ) -> Result<Box<dyn ComputeHandle>> {
         let x_s = as_rocm(x)?;
         let gamma_s = as_rocm(gamma)?;
@@ -797,6 +988,7 @@ impl RocmDevice {
             mscale,
             eps,
             max_seq_len,
+            rope_interleaved,
         )?;
 
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
@@ -827,6 +1019,7 @@ impl RocmDevice {
         mscale: f32,
         eps: f32,
         max_seq_len: usize,
+        rope_interleaved: bool,
     ) -> Result<Box<dyn ComputeHandle>> {
         let x_s = as_rocm(x)?;
         let gamma_q_s = as_rocm(gamma_q)?;
@@ -862,6 +1055,7 @@ impl RocmDevice {
             mscale,
             eps,
             max_seq_len,
+            rope_interleaved,
         )?;
 
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))

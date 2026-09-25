@@ -18,6 +18,7 @@ type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 /// single shared exponent, which would pass even if block exponents were
 /// mis-indexed.
 #[test]
+#[ignore]
 fn mxfp4_framed_variable_exponent_parity() -> TestResult {
     if !grim_backend_rocm::gpu_test_enabled() {
         return Ok(());
@@ -115,6 +116,7 @@ fn mxfp4_framed_variable_exponent_parity() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn mxfp4_framed_quantized_matmul_parity() -> TestResult {
     if !grim_backend_rocm::gpu_test_enabled() {
         return Ok(());

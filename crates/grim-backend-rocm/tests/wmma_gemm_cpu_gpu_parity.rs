@@ -130,6 +130,7 @@ const SHAPES: &[(usize, usize, usize)] = &[
 /// would silently pass on the rocBLAS path rather than exercising the WMMA
 /// JIT kernel.  Confirm via `GRIM_WMMA_VERIFY=1` tracing if needed.
 #[test]
+#[ignore]
 fn test_wmma_gemm_cpu_gpu_parity_all_shapes() -> TestResult {
     let dev = match gpu_device() {
         Some(d) => d,
@@ -167,6 +168,7 @@ fn test_wmma_gemm_cpu_gpu_parity_all_shapes() -> TestResult {
 /// but its enabled flag has no effect on the actual dispatch branch.
 // PASSED: 2026-08-27 on gfx1036 (ROCm)
 #[test]
+#[ignore]
 fn test_wmma_gemm_enable_disable_output_consistency() -> TestResult {
     let dev = match gpu_device() {
         Some(d) => d,

@@ -5,15 +5,19 @@ use std::ffi::c_void;
 
 use std::sync::atomic::Ordering;
 
-use grim_tensor::backend::{ ComputeHandle };
+use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, Shape };
+use grim_tensor::{BackendStorage, Shape};
 
-use crate::device::gemm_tuning::{ lookup_gemm_config_for_shape, lookup_solution_index };
+use crate::device::gemm_tuning::{lookup_gemm_config_for_shape, lookup_solution_index};
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, ROCBLAS_GEMM_FLAGS_NONE, RocblasInt, RocblasOperation, RocmHandle, arg, arith_to_compute_dtype, arith_to_rocblas_dtype, rocblas_gemm_ex, rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success, select_gemm_algo };
+use crate::{
+    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, rocblas_gemm_ex,
+    rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success,
+    select_gemm_algo, HipDim3, RocblasInt, RocblasOperation, RocmHandle, ROCBLAS_GEMM_FLAGS_NONE,
+};
 
 impl RocmDevice {
     /// WI 2.4.4-2c — dispatch `grim_decode_gemm_f16` and return the [see: `launch_compute_kernel`, `DecodeGemmConfig::enabled`]
@@ -163,7 +167,9 @@ impl RocmDevice {
                 );
             }
             if status != rocblas_status_success {
-                return Err(Error::Backend(format!("rocblas_gemm_ex failed with code {status}")));
+                return Err(Error::Backend(format!(
+                    "rocblas_gemm_ex failed with code {status}"
+                )));
             }
         }
         Ok(stream)
@@ -263,9 +269,9 @@ impl RocmDevice {
         let b_ptr = b_col_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("wmma_gemm_b_transposed: b has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("wmma_gemm_b_transposed: out has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("wmma_gemm_b_transposed: out has no device ptr".into())
+        })?;
 
         let is_rdna4 = matches!(
             crate::quantization::gcn_arch(&self.gpu_target),
@@ -275,7 +281,14 @@ impl RocmDevice {
         // Architectural policy: Multi-wave workgroup (RDNA4) pays off when M >= 16 (reusing larger
         // activation matrices in LDS). For decode shapes (M < 16), single-wave R3 avoids barrier stalls.
         if is_rdna4 && m >= 16 {
-            return self.launch_wmma_gemm_b_transposed_rdna4(a_storage, b_col_storage, out_storage, m, n, k);
+            return self.launch_wmma_gemm_b_transposed_rdna4(
+                a_storage,
+                b_col_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
         }
 
         let is_native_wmma = matches!(
@@ -344,15 +357,15 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = a_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("wmma_gemm_b_transposed_rdna4: a has no device ptr".into()))?;
-        let b_ptr = b_col_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("wmma_gemm_b_transposed_rdna4: b has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("wmma_gemm_b_transposed_rdna4: out has no device ptr".into()))?;
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("wmma_gemm_b_transposed_rdna4: a has no device ptr".into())
+        })?;
+        let b_ptr = b_col_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("wmma_gemm_b_transposed_rdna4: b has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("wmma_gemm_b_transposed_rdna4: out has no device ptr".into())
+        })?;
 
         // 4 tiles of 16 along N = 64 elements of N per workgroup (2 waves: 64 threads).
         let grid_x = n.div_ceil(64) as u32;
@@ -543,7 +556,13 @@ impl RocmDevice {
     /// SPEED-ROC: WMMA fused-dequant Q5_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q5k(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q5k", a, b, out, m, n, k)
     }
@@ -551,7 +570,13 @@ impl RocmDevice {
     /// SPEED-ROC: WMMA fused-dequant Q2_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q2k(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q2k", a, b, out, m, n, k)
     }
@@ -559,7 +584,13 @@ impl RocmDevice {
     /// SPEED-ROC: WMMA fused-dequant Q3_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q3k(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q3k", a, b, out, m, n, k)
     }
@@ -567,7 +598,13 @@ impl RocmDevice {
     /// SPEED-ROC: WMMA fused-dequant Q6_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q6k(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q6k", a, b, out, m, n, k)
     }
@@ -575,49 +612,91 @@ impl RocmDevice {
     /// SPEED-ROC: WMMA fused-dequant IQ-family GEMM launchers (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq2xxs(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xxs", a, b, out, m, n, k)
     }
 
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq2xs(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xs", a, b, out, m, n, k)
     }
 
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq2s(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2s", a, b, out, m, n, k)
     }
 
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq3xxs(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3xxs", a, b, out, m, n, k)
     }
 
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq3s(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3s", a, b, out, m, n, k)
     }
 
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq4nl(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4nl", a, b, out, m, n, k)
     }
 
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_iq4xs(
-        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
         self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4xs", a, b, out, m, n, k)
     }
@@ -952,7 +1031,12 @@ impl RocmDevice {
                 // decode shapes take the scalar `grim_decode_gemm_f16` kernel instead.
                 if n % 16 == 0 && k % 16 == 0 {
                     let stream = self.launch_wmma_gemm_b_transposed(
-                        a_storage, b_storage, out_storage, m, n, k,
+                        a_storage,
+                        b_storage,
+                        out_storage,
+                        m,
+                        n,
+                        k,
                     )?;
                     let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                     return Ok(compute_handle);
@@ -1073,9 +1157,8 @@ impl RocmDevice {
                 && m <= 4
                 && k % 32 == 0
             {
-                let stream = self.launch_dot2_bf16_gemv(
-                    a_storage, b_storage, out_storage, m, n, k,
-                )?;
+                let stream =
+                    self.launch_dot2_bf16_gemv(a_storage, b_storage, out_storage, m, n, k)?;
                 self.launch_counter.fetch_add(1, Ordering::Relaxed);
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok(compute_handle);
@@ -1101,9 +1184,8 @@ impl RocmDevice {
             // shapes fall through to rocBLAS, which is exact.
             let tile_safe = n % 16 == 0 && k % 16 == 0;
             if is_rdna3_or_newer && tile_safe && dtype_out.arith == ArithType::F16 {
-                let stream = self.launch_wmma_gemm_b_transposed(
-                    a_storage, b_storage, out_storage, m, n, k,
-                )?;
+                let stream =
+                    self.launch_wmma_gemm_b_transposed(a_storage, b_storage, out_storage, m, n, k)?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok(compute_handle);
             }
@@ -1254,11 +1336,7 @@ impl RocmDevice {
                     && matches!(a_s.dtype().storage, crate::DTypeStorage::Native);
                 let b_is_f32 = b_s.dtype().arith == ArithType::F32
                     && matches!(b_s.dtype().storage, crate::DTypeStorage::Native);
-                if a_is_f32
-                    && b_is_f32
-                    && a_s.device_ptr_is_valid()
-                    && b_s.device_ptr_is_valid()
-                {
+                if a_is_f32 && b_is_f32 && a_s.device_ptr_is_valid() && b_s.device_ptr_is_valid() {
                     let stream = self.launch_fp32_gemv(a_s, b_s, out, m, n, k)?;
                     return Ok(Box::new(RocmHandle::new(Some(stream))));
                 }
@@ -1345,25 +1423,16 @@ impl RocmDevice {
                 }
                 let k_aligned = k - (k % 32);
                 if self.is_dot4_arch && !dot_disabled && k_aligned >= 32 {
-                    self.launch_quantize_q8_1(
-                        a.as_any()
-                            .downcast_ref::<RocmStorage>()
-                            .ok_or_else(|| {
-                                Error::Backend("linear_decode_into: a not RocmStorage".into())
-                            })?,
-                        act_q81,
-                        m,
-                        k_aligned,
-                    )?;
-                    self.launch_dot4_q80_q81_gemv(act_q81, w, out, m, n, k_aligned)?;
+                    let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                        Error::Backend("linear_decode_into: a not RocmStorage".into())
+                    })?;
+                    self.launch_dot4_q80_f32act_gemv(a_rocm, w, out, m, n, k_aligned)?;
                     Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
                 } else {
                     self.launch_wmma_fused_dequant_q8_0(
-                        a.as_any()
-                            .downcast_ref::<RocmStorage>()
-                            .ok_or_else(|| {
-                                Error::Backend("linear_decode_into: a not RocmStorage".into())
-                            })?,
+                        a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                            Error::Backend("linear_decode_into: a not RocmStorage".into())
+                        })?,
                         w,
                         out,
                         m,
@@ -1373,11 +1442,13 @@ impl RocmDevice {
                     Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
                 }
             }
-            DTypeStorage::KQuant(scheme @ (KQuantScheme::Q4K
-            | KQuantScheme::Q5K
-            | KQuantScheme::Q6K
-            | KQuantScheme::Q2K
-            | KQuantScheme::Q3K)) => {
+            DTypeStorage::KQuant(
+                scheme @ (KQuantScheme::Q4K
+                | KQuantScheme::Q5K
+                | KQuantScheme::Q6K
+                | KQuantScheme::Q2K
+                | KQuantScheme::Q3K),
+            ) => {
                 if act_q81.bytes < need_q81 {
                     return Err(Error::Backend(format!(
                         "linear_decode_into: act scratch {}B < {need_q81}B",
@@ -1389,26 +1460,15 @@ impl RocmDevice {
                         "linear_decode_into: K-quant needs dot4 arch + k%256==0 (else WMMA leg needs its own scratch)".into(),
                     ));
                 }
-                let a_s = a
-                    .as_any()
-                    .downcast_ref::<RocmStorage>()
-                    .ok_or_else(|| {
-                        Error::Backend("linear_decode_into: a not RocmStorage".into())
-                    })?;
+                let a_s = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                    Error::Backend("linear_decode_into: a not RocmStorage".into())
+                })?;
                 self.launch_quantize_q8_1(a_s, act_q81, m, k)?;
                 match scheme {
-                    KQuantScheme::Q4K => {
-                        self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?
-                    }
-                    KQuantScheme::Q5K => {
-                        self.launch_dot4_q5k_q81_gemv(act_q81, w, out, m, n, k)?
-                    }
-                    KQuantScheme::Q6K => {
-                        self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
-                    }
-                    KQuantScheme::Q2K => {
-                        self.launch_dot4_q2k_q81_gemv(act_q81, w, out, m, n, k)?
-                    }
+                    KQuantScheme::Q4K => self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?,
+                    KQuantScheme::Q5K => self.launch_dot4_q5k_q81_gemv(act_q81, w, out, m, n, k)?,
+                    KQuantScheme::Q6K => self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?,
+                    KQuantScheme::Q2K => self.launch_dot4_q2k_q81_gemv(act_q81, w, out, m, n, k)?,
                     _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
                 };
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))

@@ -1291,7 +1291,12 @@ async fn chat_handler(
 
         if !engine.loaded_models().contains(&model_name) {
             // Lazily set the tokenizer from GGUF metadata too
-            if state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            if state
+                .tokenizer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+            {
                 if let Some(tok) = load_tokenizer_from_path(&model_str) {
                     *state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()) = Some(tok);
                 }
@@ -1557,7 +1562,11 @@ async fn get_diagnostics(State(state): State<AppState>) -> Json<serde_json::Valu
         .unwrap_or(1);
     let (engine_models, kv_blocks) = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let cap = engine.block_pool.lock().unwrap_or_else(|e| e.into_inner()).capacity();
+        let cap = engine
+            .block_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .capacity();
         (engine.loaded_models(), cap)
     };
 

@@ -203,7 +203,8 @@ impl FalconBlock {
         let k_dim = self.num_kv_heads * self.head_dim;
         let v_dim = self.num_kv_heads * self.head_dim;
 
-        let qkv_splits = grim_nn::modules::split_2d_horizontal_on_device(&qkv, &[q_dim, k_dim, v_dim])?;
+        let qkv_splits =
+            grim_nn::modules::split_2d_horizontal_on_device(&qkv, &[q_dim, k_dim, v_dim])?;
         let q_rot = qkv_splits[0].clone();
         let k_rot = qkv_splits[1].clone();
         let v_tensor = qkv_splits[2].clone();

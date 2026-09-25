@@ -32,7 +32,7 @@ use grim_tensor::dtype::QuantProvenance;
 use grim_tensor::error::{Error, Result};
 
 use crate::memory::storage::dequant_cpu;
-use crate::{check_hip, hipMemcpy, DType, DTypeStorage, HipMemcpyKind, RocmStorage, Shape};
+use crate::{DType, DTypeStorage, HipMemcpyKind, RocmStorage, Shape, check_hip, hipMemcpy};
 
 /// A byte-offset view over a parent ROCm allocation. `Send + Sync` (all fields
 /// are), but **never frees** — see module docs.
@@ -66,14 +66,10 @@ impl RocmStorageView {
         shape: Shape,
     ) -> Result<Self> {
         let base = parent.device_ptr().ok_or_else(|| {
-            Error::Backend(
-                "RocmStorageView: parent has no device pointer (CPU-resident?)".into(),
-            )
+            Error::Backend("RocmStorageView: parent has no device pointer (CPU-resident?)".into())
         })?;
         if bytes == 0 {
-            return Err(Error::Backend(
-                "RocmStorageView: zero-byte view".into(),
-            ));
+            return Err(Error::Backend("RocmStorageView: zero-byte view".into()));
         }
         Ok(Self {
             device_ptr: base + byte_offset as u64,
@@ -119,17 +115,14 @@ impl RocmStorageView {
         }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut raw = vec![0u8; self.bytes];
-        check_hip(
-            "RocmStorageView copy_to_host",
-            unsafe {
-                hipMemcpy(
-                    raw.as_mut_ptr() as *mut c_void,
-                    self.device_ptr as *const c_void,
-                    self.bytes,
-                    HipMemcpyKind::DeviceToHost,
-                )
-            },
-        )?;
+        check_hip("RocmStorageView copy_to_host", unsafe {
+            hipMemcpy(
+                raw.as_mut_ptr() as *mut c_void,
+                self.device_ptr as *const c_void,
+                self.bytes,
+                HipMemcpyKind::DeviceToHost,
+            )
+        })?;
         Ok(raw)
     }
 }
@@ -246,7 +239,10 @@ mod tests {
         // (i) aliased data is bit-identical to the expected sub-range.
         let view_raw = view.copy_to_host().expect("view D2H");
         assert_eq!(view_raw.len(), view_bytes);
-        assert_eq!(&view_raw[..], &parent_bytes[byte_offset..byte_offset + view_bytes]);
+        assert_eq!(
+            &view_raw[..],
+            &parent_bytes[byte_offset..byte_offset + view_bytes]
+        );
 
         // Also via to_cpu_vec_f32: must decode to 100.0..164.0.
         let view_vec = view.to_cpu_vec_f32().expect("view to_cpu_vec_f32");

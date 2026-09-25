@@ -991,7 +991,8 @@ pub fn start_kv_receiver_server<T>(
 where
     T: KvBlockStore + 'static,
 {
-    let (handle, _stop) = start_kv_receiver_server_stoppable(listen_addr, pool, PromptChannel::new())?;
+    let (handle, _stop) =
+        start_kv_receiver_server_stoppable(listen_addr, pool, PromptChannel::new())?;
     Ok(handle)
 }
 
@@ -1375,7 +1376,10 @@ impl NvmeWeightStreamer {
     pub fn prefetch_layer_async(&self, layer_id: usize) -> Result<()> {
         // Bandwidth Admission and Backpressure check: If bandwidth usage exceeds 12.0 GB/s
         // (~PCIe Gen4 x8 saturation), defer the prefetch instead of saturating the link.
-        let cur_bandwidth = *self.bandwidth_usage.lock().unwrap_or_else(|e| e.into_inner());
+        let cur_bandwidth = *self
+            .bandwidth_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if cur_bandwidth > 12.0 * 1024.0 * 1024.0 * 1024.0 {
             return Err(Error::KvCache(
                 "PCIe transfer bandwidth limit backpressure triggered".into(),
@@ -1390,10 +1394,16 @@ impl NvmeWeightStreamer {
         // cache locks) so I/O errors fail loudly instead of leaving the cache half-mutated.
         let weights = read_layer_weights(&self.weights_path, layer_id, unit_elems, unit_bytes)?;
 
-        *self.uring_submitting.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *self
+            .uring_submitting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
 
         // Populate LRU cache.
-        let mut cache = self.host_weight_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .host_weight_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut order = self.lru_order.lock().unwrap_or_else(|e| e.into_inner());
         let mut tier_map = self.unit_tier_map.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1412,7 +1422,10 @@ impl NvmeWeightStreamer {
             tier_map.insert(layer_id, CacheTier::HostRam);
 
             // Populate double buffers (async swap preparation).
-            let mut buffers = self.double_buffers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut buffers = self
+                .double_buffers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             buffers.1 = weights; // Load into transfer buffer
         } else {
             // Move unit to end of access order (most-recently-used).
@@ -1424,14 +1437,21 @@ impl NvmeWeightStreamer {
             tier_map.insert(layer_id, CacheTier::HostRam);
         }
 
-        *self.uring_submitting.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *self
+            .uring_submitting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
         Ok(())
     }
 
     /// Query the current storage tier of a weight unit.
     /// Returns `Some(CacheTier::HostRam)` if the unit is in the LRU cache, `Some(CacheTier::NvMeWeightStream)` if it was evicted.
     pub fn get_unit_tier(&self, unit_id: usize) -> Option<CacheTier> {
-        self.unit_tier_map.lock().unwrap_or_else(|e| e.into_inner()).get(&unit_id).copied()
+        self.unit_tier_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&unit_id)
+            .copied()
     }
 
     /// Retrieve the cached weight data for a unit, if present in host RAM.
@@ -1443,7 +1463,6 @@ impl NvmeWeightStreamer {
             .get(&unit_id)
             .cloned()
     }
-
 }
 
 /// Tiered embedding table spill manager. Wraps `NvmeWeightStreamer` around a flat embedding weight tensor
@@ -2356,7 +2375,10 @@ mod tests {
         streamer
             .prefetch_layer_async(0)
             .expect("layer 0 should prefetch");
-        let cache = streamer.host_weight_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = streamer
+            .host_weight_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let got = cache.get(&0).expect("layer 0 should be cached");
         assert_eq!(
             got, &layer0,
@@ -2368,7 +2390,10 @@ mod tests {
         streamer
             .prefetch_layer_async(1)
             .expect("layer 1 should prefetch");
-        let cache = streamer.host_weight_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = streamer
+            .host_weight_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let got1 = cache.get(&1).expect("layer 1 should be cached");
         assert_eq!(
             got1, &layer1,
@@ -2837,7 +2862,9 @@ mod tests {
         let addr = format!("127.0.0.1:{port}");
         let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
         let prompts = PromptChannel::new();
-        let _handle = start_kv_receiver_server_stoppable(&addr, store, prompts.clone()).unwrap().0;
+        let _handle = start_kv_receiver_server_stoppable(&addr, store, prompts.clone())
+            .unwrap()
+            .0;
 
         let client = NetworkKvClient::new("127.0.0.1".to_string());
         let tokens = vec![1u32, 2, 3, u32::MAX, 0];
@@ -2867,7 +2894,9 @@ mod tests {
         let addr = format!("127.0.0.1:{port}");
         let store = std::sync::Arc::new(std::sync::Mutex::new(WireTestStore::new(8)));
         let prompts = PromptChannel::new();
-        let _handle = start_kv_receiver_server_stoppable(&addr, store, prompts.clone()).unwrap().0;
+        let _handle = start_kv_receiver_server_stoppable(&addr, store, prompts.clone())
+            .unwrap()
+            .0;
 
         let evil = KvBlockHeader {
             magic: KV_MAGIC,

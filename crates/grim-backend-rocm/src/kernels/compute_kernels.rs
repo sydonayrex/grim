@@ -45,6 +45,34 @@ extern "C" __global__ void grim_sqrt(const float* x, float* out, int n) {
     out[i] = sqrtf(x[i]);
 }
 
+// Broadcast a per-channel vector [dk] across heads -> [nh, dk]. Used by the
+// on-device GDL-2 gate path so the erase/write/decay gates (one dk-vector per
+// token, shared across all heads per the GDL-2 spec) reach the fused kernel's
+// [slot, dk] layout without a host round-trip.
+extern "C" __global__ void grim_broadcast_heads(const float* in, float* out, int dk, int nh) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = dk * nh;
+    if (idx >= total) return;
+    out[idx] = in[idx % dk];
+}
+
+// GQA head-repeat: expand K/V from [nkv, hd] to [nh, hd] by repeating each
+// KV head kv_group times (kv_h = h / kv_group). One launch handles both K and V.
+extern "C" __global__ void grim_head_repeat(
+    const float* k_in, const float* v_in,
+    float* k_out, float* v_out,
+    int nkv, int nh, int kv_group, int hd
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = nh * hd;
+    if (idx >= total) return;
+    int h = idx / hd;
+    int d = idx % hd;
+    int kv_h = h / kv_group;
+    k_out[idx] = k_in[kv_h * hd + d];
+    v_out[idx] = v_in[kv_h * hd + d];
+}
+
 extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -654,9 +682,10 @@ extern "C" __global__ void grim_rope_yarn(
         int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + rotary_half + i);
         float x1 = x[a_idx];
         float x2 = x[b_idx];
-        out[a_idx] = x1 * cos_val - x2 * sin_val;
-        out[b_idx] = x2 * cos_val + x1 * sin_val;
-    }
+    out[a_idx] = x1 * cos_val - x2 * sin_val;
+    out[b_idx] = x2 * cos_val + x1 * sin_val;
+}
+
     // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim.
     // We reuse the same thread pool; threads with idx in [0, b*s*(d-2*rotary_half)) handle the copy.
     int copy_start = 2 * rotary_half;
@@ -1115,6 +1144,53 @@ extern "C" __global__ void grim_split_k_reduction_bf16(
     unsigned int s = __float_as_uint(sum);
     unsigned int rounded = (s + 0x7fffu + ((s >> 16) & 1u)) >> 16;
     out[idx] = (unsigned short)rounded;
+}
+
+// PLAN-kernel-launch-reduction Phase C: fused ShortConv step. The in_proj
+// GEMV output is [batch, 3*channels] laid out b|x|c per row; this kernel reads
+// b/c/x directly from that buffer (no slice copies), computes bx = b*x in
+// registers, runs the causal conv with in-place state update, and applies the
+// c gate on the output: y = (conv(bx) . c). One launch replaces
+// (3 slice copies + mul + conv + mul).
+// GRAVE Phase 1: elementwise f32 -> f16 conversion for prefill writes into
+// the f16 KV arena (replaces the plain D2D byte copy, which would corrupt).
+extern "C" __global__ void grim_f32_to_f16(
+    const float* __restrict__ src, unsigned short* __restrict__ dst,
+    int src_off, int dst_off, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[dst_off + i] = f32_to_fp16_bits_device(src[src_off + i]);
+}
+
+extern "C" __global__ void grim_short_conv1d_fused_step(
+    const float* proj, const float* weight, float* conv_state,
+    float* y_out, int batch, int channels, int kernel_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (idx >= total) return;
+    int b = idx / channels;
+    int c = idx % channels;
+    const float* row = proj + (long long)b * 3 * channels;
+
+    float b_v = row[c];
+    float c_v = row[channels + c];
+    float x_v = row[2 * channels + c];
+    float bx = b_v * x_v;
+
+    int state_offset = (b * channels + c) * (kernel_size - 1);
+    float sum = bx * weight[c * kernel_size + (kernel_size - 1)];
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        sum += conv_state[state_offset + k] * weight[c * kernel_size + k];
+    }
+    y_out[idx] = sum * c_v;
+
+    // Shift state buffer left and insert the new bx sample.
+    for (int k = 0; k < kernel_size - 2; ++k) {
+        conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+    }
+    if (kernel_size > 1) {
+        conv_state[state_offset + kernel_size - 2] = bx;
+    }
 }
 
 extern "C" __global__ void grim_short_conv1d_causal_step(

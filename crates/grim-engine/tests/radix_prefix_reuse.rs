@@ -77,7 +77,10 @@ fn second_request_with_shared_prefix_skips_prefill_and_matches_cold_output() {
     let mut cold = fresh_engine();
     let cold_logits = run_request(&mut cold, 1, prompt_b.clone(), 3);
     let (lookups_cold, hits_cold, tokens_cold) = cold.radix_cache_telemetry();
-    assert!(hits_cold == 0 && tokens_cold == 0, "cold engine has no hits");
+    assert!(
+        hits_cold == 0 && tokens_cold == 0,
+        "cold engine has no hits"
+    );
     let _ = lookups_cold;
 
     // Warm engine: A registers the shared prefix, B must hit it.
@@ -168,7 +171,10 @@ fn finished_requests_leave_cached_prefix_reusable_and_unpinned() {
     run_request(&mut engine, 3, prompt, 2);
     engine.finish_request(3);
     let (_, hits, _) = engine.radix_cache_telemetry();
-    assert_eq!(hits, 2, "cached prefix survives unreferenced between requests");
+    assert_eq!(
+        hits, 2,
+        "cached prefix survives unreferenced between requests"
+    );
 }
 
 /// Radix seeding must not engage for a request with synthetic (absent) input

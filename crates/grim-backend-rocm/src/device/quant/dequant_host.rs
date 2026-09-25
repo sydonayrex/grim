@@ -2,15 +2,12 @@
 
 //! Host-side dequantization wrappers (device->host reads and pure-CPU mirrors).
 
-
+use grim_tensor::Shape;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ Shape };
 
-use crate::device::roc_device::{ RocmDevice };
+use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-
-
 
 impl RocmDevice {
     /// Launch the JIT compiled Q8_0 dequantization kernel.  Reads packed [see: `packed_storage`, `n_weights`, `out_storage`, `materialize()`]

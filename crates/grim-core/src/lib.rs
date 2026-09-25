@@ -15,6 +15,7 @@ pub mod paths;
 pub mod rng;
 pub mod sampler;
 pub mod session;
+pub mod telemetry;
 
 pub use architecture::{ModelArchitecture, TensorNamingRegistry, TensorRole};
 pub use catalog::{ModelEntry, list_local_models, resolve_model_path};
@@ -39,3 +40,4 @@ pub use model::{
 pub use paths::{grim_config_dir, grim_log_dir, grim_models_dir, grim_plugins_dir, home_dir};
 pub use sampler::Sampler;
 pub use session::{DeterminismMode, GraphBuilder, Session};
+pub use telemetry::{FallbackEvent, FallbackReason, emit_fallback, fallback_enabled};

@@ -344,7 +344,6 @@ impl ParallelCommunicator {
         Ok(stream as u64)
     }
 
-
     /// Gathers slices from all ranks into a concatenated destination buffer.
     /// # Contract * `dst.len() == src.len() * world_size`
     pub fn all_gather_f32(&self, src: &[f32], dst: &mut [f32]) -> Result<()> {
@@ -496,7 +495,9 @@ impl ParallelCommunicator {
                             Some(recv_ptr),
                             None,
                             elem_count,
-                        ).is_ok() {
+                        )
+                        .is_ok()
+                        {
                             return Ok(());
                         }
                     }

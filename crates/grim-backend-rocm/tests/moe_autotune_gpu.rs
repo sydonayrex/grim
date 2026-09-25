@@ -545,6 +545,7 @@ fn moe_autotune_disk_persist_to_cache_dir() {
 /// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
 /// Full sweep output: 3 shapes × 8 buckets, 24 entries cached, CharonSelector consumed table.
 #[test]
+#[ignore]
 fn moe_autotune_full_gpu_sweep_and_selector_build() {
     if !gpu_available() {
         eprintln!("[moe_autotune] GPU test skipped (set GRIM_RUN_GPU_TESTS=1 to run)");

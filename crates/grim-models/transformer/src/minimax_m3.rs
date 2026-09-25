@@ -618,8 +618,14 @@ mod tests {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             let k = top_k.min(num_experts);
-            let max_l = idx[..k].iter().map(|&e| logits[e]).fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = idx[..k].iter().map(|&e| (logits[e] - max_l).exp()).collect();
+            let max_l = idx[..k]
+                .iter()
+                .map(|&e| logits[e])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = idx[..k]
+                .iter()
+                .map(|&e| (logits[e] - max_l).exp())
+                .collect();
             let sum: f32 = exps.iter().sum();
             for (rank, &e) in idx[..k].iter().enumerate() {
                 let w = exps[rank] / (sum + 1e-12);
@@ -657,7 +663,15 @@ mod tests {
 
         let got = moe.forward(&x).unwrap().to_vec_f32().unwrap();
         let want = renorm_oracle(
-            &x_data, &gate_w, &w1_all, &w3_all, &w2_all, seq, hidden, inter, num_experts,
+            &x_data,
+            &gate_w,
+            &w1_all,
+            &w3_all,
+            &w2_all,
+            seq,
+            hidden,
+            inter,
+            num_experts,
             top_k,
         );
         assert_eq!(got.len(), want.len());

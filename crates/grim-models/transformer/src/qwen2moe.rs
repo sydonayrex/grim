@@ -83,13 +83,17 @@ impl Qwen2Moe {
 
         // If num_experts > 0, wire through MoE blocks (Qwen2-MoE: 60 routed experts, 4 active, optional shared expert)
         let inner = if cfg.num_experts > 0 {
-            use grim_nn::moe::RouterKind;
             use crate::moe_block::MoESpec;
+            use grim_nn::moe::RouterKind;
             let spec = MoESpec {
                 num_experts: cfg.num_experts,
                 top_k: cfg.num_experts_per_tok,
                 router_kind: RouterKind::SoftmaxTopK,
-                routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 { 1.0 } else { cfg.routed_scaling_factor },
+                routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 {
+                    1.0
+                } else {
+                    cfg.routed_scaling_factor
+                },
                 has_shared_expert: cfg.shared_expert_intermediate_size.is_some(),
                 moe_intermediate_size: cfg.moe_intermediate_size,
                 shared_expert_intermediate_size: cfg.shared_expert_intermediate_size,

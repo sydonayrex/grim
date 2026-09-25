@@ -1,4 +1,5 @@
 //! Thin wrapper around `Llama` for dflash uses a Llama-style transformer.
+//! Serves dense Llama; real DFlash linear attention NOT implemented — GDL ineligible.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};

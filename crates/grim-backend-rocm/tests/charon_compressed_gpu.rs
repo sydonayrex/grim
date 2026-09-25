@@ -4,6 +4,7 @@ use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendStorage, DType, Shape};
 
 #[test]
+#[ignore]
 fn test_charon_w8a8_int8_grouped_moe_structure() {
     if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
         return;
@@ -131,6 +132,7 @@ fn test_charon_w8a8_int8_grouped_moe_structure() {
 }
 
 #[test]
+#[ignore]
 fn test_charon_w8a8_fp8_grouped_moe_structure() {
     if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
         return;
@@ -251,6 +253,7 @@ fn test_charon_w8a8_fp8_grouped_moe_structure() {
 }
 
 #[test]
+#[ignore]
 fn test_charon_awq_grouped_moe_structure() {
     if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
         return;

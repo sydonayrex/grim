@@ -121,8 +121,9 @@ impl GptJBlock {
 
         // Phase 2b: build a fused Q8_0 QKV projection blob when all three
         // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
-        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&q_proj, &k_proj, &v_proj)
-            .map(std::sync::Arc::new);
+        let wqkv_q80_fused =
+            crate::shared_attention::build_fused_qkv_q80(&q_proj, &k_proj, &v_proj)
+                .map(std::sync::Arc::new);
 
         Ok(Self {
             q_proj,
@@ -152,10 +153,10 @@ impl GptJBlock {
                 crate::shared_attention::fused_qkv_project_raw(&normed, fused)?
             }
             _ => {
-            let q = self.q_proj.forward(&normed)?;
-            let k = self.k_proj.forward(&normed)?;
-            let v = self.v_proj.forward(&normed)?;
-            (q, k, v)
+                let q = self.q_proj.forward(&normed)?;
+                let k = self.k_proj.forward(&normed)?;
+                let v = self.v_proj.forward(&normed)?;
+                (q, k, v)
             }
         };
 

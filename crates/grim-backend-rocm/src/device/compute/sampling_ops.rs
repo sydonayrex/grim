@@ -1,13 +1,11 @@
 //! Core tensor computation, GEMM, elementwise, autograd, and optimizer operations for `RocmDevice`.
 //! The trait-required `impl SamplingOps for RocmDevice` block, kept whole.
 
-
-
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, ElementwiseOps, SamplingOps };
+use grim_tensor::{BackendStorage, ElementwiseOps, SamplingOps};
 
+use crate::as_rocm;
 use crate::device::roc_device::RocmDevice;
-use crate::{ as_rocm };
 
 impl SamplingOps for RocmDevice {
     /// B1 (PLAN-reduce-d2h-h2d): penalty-aware device sampling. Penalty

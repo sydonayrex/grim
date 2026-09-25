@@ -1,16 +1,14 @@
 //! Core tensor computation, GEMM, elementwise, autograd, and optimizer operations for `RocmDevice`.
 //! The trait-required `impl ElementwiseOps for RocmDevice` block, kept whole.
 
-
-
-use grim_tensor::backend::{ ComputeHandle };
-use grim_tensor::dtype::{ ArithType };
+use grim_tensor::backend::ComputeHandle;
+use grim_tensor::dtype::ArithType;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, ElementwiseOps, Shape };
+use grim_tensor::{BackendStorage, ElementwiseOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch };
+use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, RocmHandle};
 
 impl ElementwiseOps for RocmDevice {
     fn mul_scalar(

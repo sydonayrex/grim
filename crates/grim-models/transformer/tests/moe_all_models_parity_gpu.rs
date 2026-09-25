@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::RocmDevice;
-use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
 use grim_nn::Linear;
+use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendStorage, CoreTensorOps, DType, Device, Tensor};
 
@@ -34,16 +34,20 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.2
         })
         .collect()
 }
 
-
 fn o1_vec(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
-        .map(|i| ((i as f32 + 1.0) * 0.37 + seed).sin() + ((i as f32 + 1.0) * 0.11 + seed * 2.0).cos() * 0.5)
+        .map(|i| {
+            ((i as f32 + 1.0) * 0.37 + seed).sin()
+                + ((i as f32 + 1.0) * 0.11 + seed * 2.0).cos() * 0.5
+        })
         .collect()
 }
 fn rocm_tensor(dev: &RocmDevice, data: Vec<f32>, shape: Shape) -> Tensor {
@@ -82,7 +86,11 @@ fn test_moe_ffn_gpu_softmax_and_renorm_parity() {
         let kind = RouterKind::SoftmaxTopKRenorm;
         let gate_weight = o1_vec(num_experts * hidden, 1.0);
         let gate_linear_gpu = Linear::from_tensor(
-            rocm_tensor(&dev, gate_weight.clone(), Shape::new(vec![num_experts, hidden])),
+            rocm_tensor(
+                &dev,
+                gate_weight.clone(),
+                Shape::new(vec![num_experts, hidden]),
+            ),
             None,
         );
         let gate_linear_cpu = Linear::from_tensor(
@@ -151,8 +159,16 @@ fn test_moe_ffn_gpu_softmax_and_renorm_parity() {
         let x_gpu = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![batch, hidden]));
         let x_cpu = cpu_tensor(x_data, Shape::new(vec![batch, hidden]));
 
-        let out_gpu = moe_gpu.forward(&x_gpu).expect("GPU forward").to_vec_f32().unwrap();
-        let out_cpu = moe_cpu.forward(&x_cpu).expect("CPU forward").to_vec_f32().unwrap();
+        let out_gpu = moe_gpu
+            .forward(&x_gpu)
+            .expect("GPU forward")
+            .to_vec_f32()
+            .unwrap();
+        let out_cpu = moe_cpu
+            .forward(&x_cpu)
+            .expect("CPU forward")
+            .to_vec_f32()
+            .unwrap();
 
         assert_eq!(out_gpu.len(), out_cpu.len());
         let max_diff = out_gpu
@@ -176,10 +192,20 @@ fn test_moe_ffn_gpu_softmax_and_renorm_parity() {
     {
         let gate_weight = o1_vec(num_experts * hidden, 2.0);
         let gate_linear_gpu = Linear::from_tensor(
-            rocm_tensor(&dev, gate_weight.clone(), Shape::new(vec![num_experts, hidden])),
+            rocm_tensor(
+                &dev,
+                gate_weight.clone(),
+                Shape::new(vec![num_experts, hidden]),
+            ),
             None,
         );
-        let router_gpu = MoeRouter::new(gate_linear_gpu, RouterKind::SoftmaxTopK, top_k, num_experts, None);
+        let router_gpu = MoeRouter::new(
+            gate_linear_gpu,
+            RouterKind::SoftmaxTopK,
+            top_k,
+            num_experts,
+            None,
+        );
 
         let mut gate_gpu = Vec::new();
         let mut up_gpu = Vec::new();
@@ -220,7 +246,11 @@ fn test_moe_ffn_gpu_softmax_and_renorm_parity() {
 
         let x_data = o1_vec(batch * hidden, 9.0);
         let x_gpu = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![batch, hidden]));
-        let out_gpu = moe_gpu.forward(&x_gpu).expect("GPU forward").to_vec_f32().unwrap();
+        let out_gpu = moe_gpu
+            .forward(&x_gpu)
+            .expect("GPU forward")
+            .to_vec_f32()
+            .unwrap();
 
         // Global-softmax oracle from CPU gate logits.
         let x_cpu = cpu_tensor(x_data.clone(), Shape::new(vec![batch, hidden]));
@@ -235,7 +265,10 @@ fn test_moe_ffn_gpu_softmax_and_renorm_parity() {
             let row = &logits[s * num_experts..(s + 1) * num_experts];
             let mut idx: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
             idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let max_l = idx.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = idx
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = idx.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum: f32 = exps.iter().sum();
             let k = top_k.min(num_experts);
@@ -243,7 +276,10 @@ fn test_moe_ffn_gpu_softmax_and_renorm_parity() {
             weights[s] = idx[..k]
                 .iter()
                 .enumerate()
-                .map(|(j, _)| exps[idx.iter().position(|(i, _)| *i == topk_idx[s][j]).unwrap()] / (sum + 1e-12))
+                .map(|(j, _)| {
+                    exps[idx.iter().position(|(i, _)| *i == topk_idx[s][j]).unwrap()]
+                        / (sum + 1e-12)
+                })
                 .collect();
         }
         let out_cpu = swiglu_oracle(
@@ -308,23 +344,66 @@ fn test_granite_moe_block_gpu_dispatch_matches_cpu() {
         let uw = o1_vec(inter * hidden, s + 2.0);
         let dw = o1_vec(hidden * inter, s + 3.0);
 
-        g_gpu.push(Linear::from_tensor(rocm_tensor(&dev, gw.clone(), Shape::new(vec![inter, hidden])), None));
-        u_gpu.push(Linear::from_tensor(rocm_tensor(&dev, uw.clone(), Shape::new(vec![inter, hidden])), None));
-        d_gpu.push(Linear::from_tensor(rocm_tensor(&dev, dw.clone(), Shape::new(vec![hidden, inter])), None));
+        g_gpu.push(Linear::from_tensor(
+            rocm_tensor(&dev, gw.clone(), Shape::new(vec![inter, hidden])),
+            None,
+        ));
+        u_gpu.push(Linear::from_tensor(
+            rocm_tensor(&dev, uw.clone(), Shape::new(vec![inter, hidden])),
+            None,
+        ));
+        d_gpu.push(Linear::from_tensor(
+            rocm_tensor(&dev, dw.clone(), Shape::new(vec![hidden, inter])),
+            None,
+        ));
 
-        g_cpu.push(Linear::from_tensor(cpu_tensor(gw, Shape::new(vec![inter, hidden])), None));
-        u_cpu.push(Linear::from_tensor(cpu_tensor(uw, Shape::new(vec![inter, hidden])), None));
-        d_cpu.push(Linear::from_tensor(cpu_tensor(dw, Shape::new(vec![hidden, inter])), None));
+        g_cpu.push(Linear::from_tensor(
+            cpu_tensor(gw, Shape::new(vec![inter, hidden])),
+            None,
+        ));
+        u_cpu.push(Linear::from_tensor(
+            cpu_tensor(uw, Shape::new(vec![inter, hidden])),
+            None,
+        ));
+        d_cpu.push(Linear::from_tensor(
+            cpu_tensor(dw, Shape::new(vec![hidden, inter])),
+            None,
+        ));
     }
 
-    let ffn_gpu = MoeFfn::new(router_gpu, ExpertBank::from_linears(g_gpu, u_gpu, d_gpu), None, 1.0);
-    let ffn_cpu = MoeFfn::new(router_cpu, ExpertBank::from_linears(g_cpu, u_cpu, d_cpu), None, 1.0);
+    let ffn_gpu = MoeFfn::new(
+        router_gpu,
+        ExpertBank::from_linears(g_gpu, u_gpu, d_gpu),
+        None,
+        1.0,
+    );
+    let ffn_cpu = MoeFfn::new(
+        router_cpu,
+        ExpertBank::from_linears(g_cpu, u_cpu, d_cpu),
+        None,
+        1.0,
+    );
 
-    let out_gpu = ffn_gpu.forward(&x_gpu).expect("GPU forward").to_vec_f32().unwrap();
-    let out_cpu = ffn_cpu.forward(&x_cpu).expect("CPU forward").to_vec_f32().unwrap();
+    let out_gpu = ffn_gpu
+        .forward(&x_gpu)
+        .expect("GPU forward")
+        .to_vec_f32()
+        .unwrap();
+    let out_cpu = ffn_cpu
+        .forward(&x_cpu)
+        .expect("CPU forward")
+        .to_vec_f32()
+        .unwrap();
 
-    let max_diff = out_gpu.iter().zip(out_cpu.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < 2e-3, "Granite MoE dispatch parity failed: max_diff={max_diff}");
+    let max_diff = out_gpu
+        .iter()
+        .zip(out_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 2e-3,
+        "Granite MoE dispatch parity failed: max_diff={max_diff}"
+    );
 }
 
 // ── WI-gpu-native-moe Phase 0: shared_moe D2D engagement + parity ──────────
@@ -445,7 +524,11 @@ fn check_shared_moe_d2d_parity(route_mode: i32, label: &str) {
     let x_data = rand_vec(seq * hidden, 99);
     let x_gpu = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![seq, hidden]));
     let router_gpu = Linear::from_tensor(
-        rocm_tensor(&dev, router_w.clone(), Shape::new(vec![num_experts, hidden])),
+        rocm_tensor(
+            &dev,
+            router_w.clone(),
+            Shape::new(vec![num_experts, hidden]),
+        ),
         None,
     );
     let logits_gpu = router_gpu.forward(&x_gpu).unwrap();
@@ -467,7 +550,9 @@ fn check_shared_moe_d2d_parity(route_mode: i32, label: &str) {
         &cache,
     )
     .unwrap()
-    .unwrap_or_else(|| panic!("{label}: D2D dispatch returned Ok(None) — silent fallback, engagement FAILED"));
+    .unwrap_or_else(|| {
+        panic!("{label}: D2D dispatch returned Ok(None) — silent fallback, engagement FAILED")
+    });
     assert!(
         cache.is_routing_engaged(),
         "{label}: CharonCache.routing not populated after forward — engagement FAILED"
@@ -493,13 +578,19 @@ fn check_shared_moe_d2d_parity(route_mode: i32, label: &str) {
         topk_idx[s] = topk.iter().map(|(i, _)| *i).collect();
         weights[s] = if route_mode == 3 {
             // Renorm over top-k (shared_moe::normalize_weights).
-            let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum: f32 = exps.iter().sum();
             exps.iter().map(|e| e / (sum + 1e-12)).collect()
         } else {
             // Global softmax (HF Qwen): denom over ALL experts.
-            let max_l = idx.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_l = idx
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps_all: Vec<f32> = idx.iter().map(|(_, l)| (l - max_l).exp()).collect();
             let sum_all: f32 = exps_all.iter().sum();
             let w_of = |ei: usize| {
@@ -684,9 +775,21 @@ fn test_minimax_m3_decode_graph_capture_and_replay_parity() {
         let mut experts = Vec::new();
         for e in 0..cfg.num_experts {
             experts.push(MiniMaxM3Expert {
-                w1: mk_lin(cfg.hidden_size, cfg.intermediate_size, 100 + (l * 10 + e) as u64 * 3),
-                w3: mk_lin(cfg.hidden_size, cfg.intermediate_size, 200 + (l * 10 + e) as u64 * 3),
-                w2: mk_lin(cfg.intermediate_size, cfg.hidden_size, 300 + (l * 10 + e) as u64 * 3),
+                w1: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    100 + (l * 10 + e) as u64 * 3,
+                ),
+                w3: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    200 + (l * 10 + e) as u64 * 3,
+                ),
+                w2: mk_lin(
+                    cfg.intermediate_size,
+                    cfg.hidden_size,
+                    300 + (l * 10 + e) as u64 * 3,
+                ),
             });
         }
         let block = MiniMaxM3Block {
@@ -695,11 +798,19 @@ fn test_minimax_m3_decode_graph_capture_and_replay_parity() {
             wv: mk_lin(cfg.hidden_size, kv_dim, 30 + l as u64),
             wo: mk_lin(q_dim, cfg.hidden_size, 40 + l as u64),
             input_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             post_attention_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             block_sparse_moe: MiniMaxM3BlockSparseMoe {
@@ -722,34 +833,44 @@ fn test_minimax_m3_decode_graph_capture_and_replay_parity() {
         tok_embeddings: mk_lin(cfg.hidden_size, cfg.vocab_size, 999),
         layers,
         norm: RmsNorm {
-            weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: rocm_tensor(
+                &dev,
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         },
         output: mk_lin(cfg.hidden_size, cfg.vocab_size, 888),
     };
 
-    let mut graph = model.get_or_create_decode_graph(64, 1).expect("graph creation");
+    let mut graph = model
+        .get_or_create_decode_graph(64, 1)
+        .expect("graph creation");
     // Warmup before capture to prime JIT compiler, Charon cache, and weight stacks
 
     let _ = model.forward_capture(&mut graph, 5);
     dev.synchronize();
 
-
-
     graph.begin_capture().expect("begin_capture");
-    model.forward_capture(&mut graph, 5).expect("forward_capture");
+    model
+        .forward_capture(&mut graph, 5)
+        .expect("forward_capture");
     graph.end_capture().expect("end_capture");
-
-
-
 
     // Replay
     model.forward_replay(&mut graph, 5).expect("forward_replay");
     dev.synchronize();
 
-    let graph_out = graph.buffers.head_output.to_cpu_vec_f32().expect("graph out read");
+    let graph_out = graph
+        .buffers
+        .head_output
+        .to_cpu_vec_f32()
+        .expect("graph out read");
     assert_eq!(graph_out.len(), cfg.vocab_size);
-    eprintln!("[minimax_m3 graph] capture and replay succeeded, head_output[0..4]={:?}", &graph_out[..4]);
+    eprintln!(
+        "[minimax_m3 graph] capture and replay succeeded, head_output[0..4]={:?}",
+        &graph_out[..4]
+    );
 }
 
 #[test]
@@ -768,7 +889,6 @@ fn test_glm4_moe_lite_decode_graph_capture_and_replay_parity() {
         Glm4Expert, Glm4LiteMoeBlock, Glm4MoeLite, Glm4MoeLiteBlock, Glm4MoeLiteConfig,
     };
     use grim_nn::RmsNorm;
-
 
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else {
@@ -805,9 +925,21 @@ fn test_glm4_moe_lite_decode_graph_capture_and_replay_parity() {
         let mut experts = Vec::new();
         for e in 0..cfg.num_experts {
             experts.push(Glm4Expert {
-                gate_proj: mk_lin(cfg.hidden_size, cfg.intermediate_size, 100 + (l * 10 + e) as u64 * 3),
-                up_proj: mk_lin(cfg.hidden_size, cfg.intermediate_size, 200 + (l * 10 + e) as u64 * 3),
-                down_proj: mk_lin(cfg.intermediate_size, cfg.hidden_size, 300 + (l * 10 + e) as u64 * 3),
+                gate_proj: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    100 + (l * 10 + e) as u64 * 3,
+                ),
+                up_proj: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    200 + (l * 10 + e) as u64 * 3,
+                ),
+                down_proj: mk_lin(
+                    cfg.intermediate_size,
+                    cfg.hidden_size,
+                    300 + (l * 10 + e) as u64 * 3,
+                ),
             });
         }
         let shared_expert = cfg.shared_expert_intermediate_size.map(|inter| Glm4Expert {
@@ -822,11 +954,19 @@ fn test_glm4_moe_lite_decode_graph_capture_and_replay_parity() {
             wv: mk_lin(cfg.hidden_size, kv_dim, 30 + l as u64),
             wo: mk_lin(q_dim, cfg.hidden_size, 40 + l as u64),
             input_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             post_attention_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             moe: Glm4LiteMoeBlock {
@@ -850,33 +990,46 @@ fn test_glm4_moe_lite_decode_graph_capture_and_replay_parity() {
         tok_embeddings: mk_lin(cfg.hidden_size, cfg.vocab_size, 999),
         layers,
         norm: RmsNorm {
-            weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: rocm_tensor(
+                &dev,
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         },
         output: mk_lin(cfg.hidden_size, cfg.vocab_size, 888),
     };
 
-    let mut graph = model.get_or_create_decode_graph(64, 1).expect("graph creation");
+    let mut graph = model
+        .get_or_create_decode_graph(64, 1)
+        .expect("graph creation");
     // Warmup before capture to prime JIT compiler, Charon cache, and weight stacks
 
     let _ = model.forward_capture(&mut graph, 5);
     dev.synchronize();
 
-
     graph.begin_capture().expect("begin_capture");
 
-    model.forward_capture(&mut graph, 5).expect("forward_capture");
+    model
+        .forward_capture(&mut graph, 5)
+        .expect("forward_capture");
     graph.end_capture().expect("end_capture");
-
 
     // Replay
 
     model.forward_replay(&mut graph, 5).expect("forward_replay");
     dev.synchronize();
-    let graph_out = graph.buffers.head_output.to_cpu_vec_f32().expect("graph out read");
+    let graph_out = graph
+        .buffers
+        .head_output
+        .to_cpu_vec_f32()
+        .expect("graph out read");
 
     assert_eq!(graph_out.len(), cfg.vocab_size);
-    eprintln!("[glm4_moe_lite graph] capture and replay succeeded, head_output[0..4]={:?}", &graph_out[..4]);
+    eprintln!(
+        "[glm4_moe_lite graph] capture and replay succeeded, head_output[0..4]={:?}",
+        &graph_out[..4]
+    );
 }
 
 #[test]
@@ -924,9 +1077,21 @@ fn test_granite_moe_hybrid_decode_graph_capture_and_replay_parity() {
         let mut experts = Vec::new();
         for e in 0..cfg.num_local_experts {
             experts.push(GraniteExpert {
-                gate_proj: mk_lin(cfg.hidden_size, cfg.intermediate_size, 100 + (l * 10 + e) as u64 * 3),
-                up_proj: mk_lin(cfg.hidden_size, cfg.intermediate_size, 200 + (l * 10 + e) as u64 * 3),
-                down_proj: mk_lin(cfg.intermediate_size, cfg.hidden_size, 300 + (l * 10 + e) as u64 * 3),
+                gate_proj: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    100 + (l * 10 + e) as u64 * 3,
+                ),
+                up_proj: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    200 + (l * 10 + e) as u64 * 3,
+                ),
+                down_proj: mk_lin(
+                    cfg.intermediate_size,
+                    cfg.hidden_size,
+                    300 + (l * 10 + e) as u64 * 3,
+                ),
             });
         }
         let shared_expert = cfg.shared_intermediate_size.map(|inter| GraniteExpert {
@@ -941,11 +1106,19 @@ fn test_granite_moe_hybrid_decode_graph_capture_and_replay_parity() {
             wv: mk_lin(cfg.hidden_size, kv_dim, 30 + l as u64),
             wo: mk_lin(q_dim, cfg.hidden_size, 40 + l as u64),
             input_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             post_attention_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             moe: GraniteMoeBlock {
@@ -970,41 +1143,49 @@ fn test_granite_moe_hybrid_decode_graph_capture_and_replay_parity() {
         tok_embeddings: mk_lin(cfg.hidden_size, cfg.vocab_size, 999),
         layers,
         norm: RmsNorm {
-            weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: rocm_tensor(
+                &dev,
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         },
         output: mk_lin(cfg.hidden_size, cfg.vocab_size, 888),
     };
 
-    let mut graph = model.get_or_create_decode_graph(64, 1).expect("graph creation");
+    let mut graph = model
+        .get_or_create_decode_graph(64, 1)
+        .expect("graph creation");
     // Warmup before capture to prime JIT compiler, Charon cache, and weight stacks
 
     let _ = model.forward_capture(&mut graph, 5);
     dev.synchronize();
 
-
-
     graph.begin_capture().expect("begin_capture");
-    model.forward_capture(&mut graph, 5).expect("forward_capture");
+    model
+        .forward_capture(&mut graph, 5)
+        .expect("forward_capture");
     graph.end_capture().expect("end_capture");
-
-
-
 
     // Replay
     model.forward_replay(&mut graph, 5).expect("forward_replay");
     dev.synchronize();
-    let graph_out = graph.buffers.head_output.to_cpu_vec_f32().expect("graph out read");
+    let graph_out = graph
+        .buffers
+        .head_output
+        .to_cpu_vec_f32()
+        .expect("graph out read");
     assert_eq!(graph_out.len(), cfg.vocab_size);
-    eprintln!("[granite_moe_hybrid graph] capture and replay succeeded, head_output[0..4]={:?}", &graph_out[..4]);
+    eprintln!(
+        "[granite_moe_hybrid graph] capture and replay succeeded, head_output[0..4]={:?}",
+        &graph_out[..4]
+    );
 }
 
 #[test]
 fn test_hyv3_decode_graph_capture_and_replay_parity() {
     use grim_models_transformer::decode_graph::DecodeGraphModel;
-    use grim_models_transformer::hyv3::{
-        HyV3, HyV3Block, HyV3Config, HyV3Expert, HyV3MoeBlock,
-    };
+    use grim_models_transformer::hyv3::{HyV3, HyV3Block, HyV3Config, HyV3Expert, HyV3MoeBlock};
     use grim_nn::RmsNorm;
 
     let _guard = gpu_lock();
@@ -1042,9 +1223,21 @@ fn test_hyv3_decode_graph_capture_and_replay_parity() {
         let mut experts = Vec::new();
         for e in 0..cfg.num_experts {
             experts.push(HyV3Expert {
-                gate_proj: mk_lin(cfg.hidden_size, cfg.intermediate_size, 100 + (l * 10 + e) as u64 * 3),
-                up_proj: mk_lin(cfg.hidden_size, cfg.intermediate_size, 200 + (l * 10 + e) as u64 * 3),
-                down_proj: mk_lin(cfg.intermediate_size, cfg.hidden_size, 300 + (l * 10 + e) as u64 * 3),
+                gate_proj: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    100 + (l * 10 + e) as u64 * 3,
+                ),
+                up_proj: mk_lin(
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    200 + (l * 10 + e) as u64 * 3,
+                ),
+                down_proj: mk_lin(
+                    cfg.intermediate_size,
+                    cfg.hidden_size,
+                    300 + (l * 10 + e) as u64 * 3,
+                ),
             });
         }
         let shared_expert = cfg.shared_expert_intermediate_size.map(|inter| HyV3Expert {
@@ -1059,19 +1252,35 @@ fn test_hyv3_decode_graph_capture_and_replay_parity() {
             wv: mk_lin(cfg.hidden_size, kv_dim, 30 + l as u64),
             wo: mk_lin(q_dim, cfg.hidden_size, 40 + l as u64),
             q_norm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.head_dim], Shape::new(vec![cfg.head_dim])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.head_dim],
+                    Shape::new(vec![cfg.head_dim]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             k_norm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.head_dim], Shape::new(vec![cfg.head_dim])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.head_dim],
+                    Shape::new(vec![cfg.head_dim]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             input_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             post_attention_layernorm: RmsNorm {
-                weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: rocm_tensor(
+                    &dev,
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             moe: HyV3MoeBlock {
@@ -1095,32 +1304,41 @@ fn test_hyv3_decode_graph_capture_and_replay_parity() {
         tok_embeddings: mk_lin(cfg.hidden_size, cfg.vocab_size, 999),
         layers,
         norm: RmsNorm {
-            weight: rocm_tensor(&dev, vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: rocm_tensor(
+                &dev,
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         },
         output: mk_lin(cfg.hidden_size, cfg.vocab_size, 888),
     };
 
-    let mut graph = model.get_or_create_decode_graph(64, 1).expect("graph creation");
+    let mut graph = model
+        .get_or_create_decode_graph(64, 1)
+        .expect("graph creation");
     // Warmup before capture to prime JIT compiler, Charon cache, and weight stacks
 
     let _ = model.forward_capture(&mut graph, 5);
     dev.synchronize();
 
-
-
     graph.begin_capture().expect("begin_capture");
-    model.forward_capture(&mut graph, 5).expect("forward_capture");
+    model
+        .forward_capture(&mut graph, 5)
+        .expect("forward_capture");
     graph.end_capture().expect("end_capture");
-
-
-
 
     // Replay
     model.forward_replay(&mut graph, 5).expect("forward_replay");
     dev.synchronize();
-    let graph_out = graph.buffers.head_output.to_cpu_vec_f32().expect("graph out read");
+    let graph_out = graph
+        .buffers
+        .head_output
+        .to_cpu_vec_f32()
+        .expect("graph out read");
     assert_eq!(graph_out.len(), cfg.vocab_size);
-    eprintln!("[hyv3 graph] capture and replay succeeded, head_output[0..4]={:?}", &graph_out[..4]);
+    eprintln!(
+        "[hyv3 graph] capture and replay succeeded, head_output[0..4]={:?}",
+        &graph_out[..4]
+    );
 }
-

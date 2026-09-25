@@ -137,11 +137,14 @@ impl Glm4LiteMoeBlock {
         let router_logits = self.gate.forward(x)?;
 
         if x.device() != &Device::Cpu {
-            let shared_exp = self.shared_expert.as_ref().map(|s| crate::shared_moe::MoeExpert {
-                gate: s.gate_proj.clone(),
-                up: s.up_proj.clone(),
-                down: s.down_proj.clone(),
-            });
+            let shared_exp = self
+                .shared_expert
+                .as_ref()
+                .map(|s| crate::shared_moe::MoeExpert {
+                    gate: s.gate_proj.clone(),
+                    up: s.up_proj.clone(),
+                    down: s.down_proj.clone(),
+                });
             let moe_experts: Vec<crate::shared_moe::MoeExpert> = self
                 .experts
                 .iter()
@@ -182,7 +185,8 @@ impl Glm4LiteMoeBlock {
                         Some(a) => grim_nn::modules::axpy_on_device(&a, weight, &e_out)?,
                         None => {
                             let dev = grim_nn::modules::pick_device_for_tensor(&e_out);
-                            let (scaled_st, _) = dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
+                            let (scaled_st, _) =
+                                dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
                             Tensor::new(
                                 std::sync::Arc::from(scaled_st),
                                 e_out.shape().clone(),
@@ -529,13 +533,20 @@ mod moe_dispatch_parity_tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4
             })
             .collect()
     }
 
-    fn make_block(dev: Option<&RocmDevice>, hidden: usize, inter: usize, n_exp: usize) -> Glm4LiteMoeBlock {
+    fn make_block(
+        dev: Option<&RocmDevice>,
+        hidden: usize,
+        inter: usize,
+        n_exp: usize,
+    ) -> Glm4LiteMoeBlock {
         let lin = |data: Vec<f32>, out: usize, inp: usize| -> Linear {
             let t = match dev {
                 Some(d) => rocm_tensor(d, data, Shape::new(vec![out, inp])),
@@ -544,9 +555,21 @@ mod moe_dispatch_parity_tests {
             Linear::from_tensor(t, None)
         };
         let mk_expert = |e: usize| Glm4Expert {
-            gate_proj: lin(rand_vec(inter * hidden, (e as u64 + 1) * 733 + 1), inter, hidden),
-            up_proj: lin(rand_vec(inter * hidden, (e as u64 + 1) * 733 + 2), inter, hidden),
-            down_proj: lin(rand_vec(inter * hidden, (e as u64 + 1) * 733 + 3), hidden, inter),
+            gate_proj: lin(
+                rand_vec(inter * hidden, (e as u64 + 1) * 733 + 1),
+                inter,
+                hidden,
+            ),
+            up_proj: lin(
+                rand_vec(inter * hidden, (e as u64 + 1) * 733 + 2),
+                inter,
+                hidden,
+            ),
+            down_proj: lin(
+                rand_vec(inter * hidden, (e as u64 + 1) * 733 + 3),
+                hidden,
+                inter,
+            ),
         };
         Glm4LiteMoeBlock {
             gate: lin(rand_vec(n_exp * hidden, 42), n_exp, hidden),

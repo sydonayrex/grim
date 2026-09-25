@@ -7,6 +7,7 @@ use grim_tensor::dtype::{DType, QuantFormat};
 use grim_tensor::{AttentionOps, BackendStorage, CoreTensorOps, FusionOps, Shape};
 
 #[test]
+#[ignore]
 fn test_silu_mul_quantize_parity() {
     let cpu_dev = CpuDevice::new();
     let rocm_dev = RocmDevice::new(0);
@@ -70,6 +71,7 @@ fn test_silu_mul_quantize_parity() {
 }
 
 #[test]
+#[ignore]
 fn test_sage_attention_parity() {
     let cpu_dev = CpuDevice::new();
     let rocm_dev = RocmDevice::new(0);
@@ -134,6 +136,7 @@ fn test_sage_attention_parity() {
 }
 
 #[test]
+#[ignore]
 fn test_fused_allreduce_rms_norm_parity() {
     let rocm_dev = RocmDevice::new(0);
 

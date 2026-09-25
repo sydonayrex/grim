@@ -268,11 +268,14 @@ impl Qwen38MoeBlock {
                     down: e.down_proj.clone(),
                 })
                 .collect();
-            let shared_expert = self.shared_expert.as_ref().map(|e| crate::shared_moe::MoeExpert {
-                gate: e.gate_proj.clone(),
-                up: e.up_proj.clone(),
-                down: e.down_proj.clone(),
-            });
+            let shared_expert = self
+                .shared_expert
+                .as_ref()
+                .map(|e| crate::shared_moe::MoeExpert {
+                    gate: e.gate_proj.clone(),
+                    up: e.up_proj.clone(),
+                    down: e.down_proj.clone(),
+                });
             let dev = grim_nn::modules::pick_device_for_tensor(x);
             if let Some(out) = crate::shared_moe::fused_moe_dispatch_from_logits(
                 dev.as_ref(),
@@ -322,7 +325,8 @@ impl Qwen38MoeBlock {
                     Some(a) => grim_nn::modules::axpy_on_device(&a, w, &exp_out)?,
                     None => {
                         let dev = grim_nn::modules::pick_device_for_tensor(&exp_out);
-                        let (scaled_st, _) = dev.mul_scalar(&**exp_out.storage(), w, exp_out.shape())?;
+                        let (scaled_st, _) =
+                            dev.mul_scalar(&**exp_out.storage(), w, exp_out.shape())?;
                         Tensor::new(
                             std::sync::Arc::from(scaled_st),
                             exp_out.shape().clone(),
@@ -434,8 +438,8 @@ impl Qwen38FlashNextBlock {
 
         // Phase 2b: build a fused Q8_0 QKV projection blob when all three
         // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
-        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
-            .map(std::sync::Arc::new);
+        let wqkv_q80_fused =
+            crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv).map(std::sync::Arc::new);
 
         Ok(Self {
             wq,
@@ -465,10 +469,10 @@ impl Qwen38FlashNextBlock {
                 crate::shared_attention::fused_qkv_project_raw(&normed_attn, fused)?
             }
             _ => {
-            let q = self.wq.forward(&normed_attn)?;
-            let k = self.wk.forward(&normed_attn)?;
-            let v = self.wv.forward(&normed_attn)?;
-            (q, k, v)
+                let q = self.wq.forward(&normed_attn)?;
+                let k = self.wk.forward(&normed_attn)?;
+                let v = self.wv.forward(&normed_attn)?;
+                (q, k, v)
             }
         };
 
@@ -1522,7 +1526,9 @@ mod moe_d2d_parity_tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4
             })
             .collect()
@@ -1539,7 +1545,12 @@ mod moe_d2d_parity_tests {
         )
     }
 
-    fn make_block(dev: Option<&RocmDevice>, hidden: usize, inter: usize, n_exp: usize) -> Qwen38MoeBlock {
+    fn make_block(
+        dev: Option<&RocmDevice>,
+        hidden: usize,
+        inter: usize,
+        n_exp: usize,
+    ) -> Qwen38MoeBlock {
         let lin = |data: Vec<f32>, out: usize, inp: usize| -> Linear {
             let t = match dev {
                 Some(d) => rocm_tensor(d, data, Shape::new(vec![out, inp])),
@@ -1568,7 +1579,12 @@ mod moe_d2d_parity_tests {
     }
 
     fn host_reference(block: &Qwen38MoeBlock, x: &[f32], seq: usize, hidden: usize) -> Vec<f32> {
-        let logits_v = block.gate.forward(&cpu_tensor(x.to_vec(), Shape::new(vec![seq, hidden]))).unwrap().to_vec_f32().unwrap();
+        let logits_v = block
+            .gate
+            .forward(&cpu_tensor(x.to_vec(), Shape::new(vec![seq, hidden])))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         let n_exp = block.experts.len();
         let mut out = vec![0.0f32; seq * hidden];
         for s in 0..seq {
@@ -1583,10 +1599,29 @@ mod moe_d2d_parity_tests {
             for (ei, l) in topk.iter() {
                 let w = ((l - max_l).exp() / denom) * block.routed_scaling_factor;
                 let e = &block.experts[*ei];
-                let g = e.gate_proj.forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden]))).unwrap().to_vec_f32().unwrap();
-                let u = e.up_proj.forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden]))).unwrap().to_vec_f32().unwrap();
-                let act: Vec<f32> = g.iter().zip(u.iter()).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
-                let d = e.down_proj.forward(&cpu_tensor(act.clone(), Shape::new(vec![1, act.len()]))).unwrap().to_vec_f32().unwrap();
+                let g = e
+                    .gate_proj
+                    .forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden])))
+                    .unwrap()
+                    .to_vec_f32()
+                    .unwrap();
+                let u = e
+                    .up_proj
+                    .forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden])))
+                    .unwrap()
+                    .to_vec_f32()
+                    .unwrap();
+                let act: Vec<f32> = g
+                    .iter()
+                    .zip(u.iter())
+                    .map(|(a, b)| a / (1.0 + (-a).exp()) * b)
+                    .collect();
+                let d = e
+                    .down_proj
+                    .forward(&cpu_tensor(act.clone(), Shape::new(vec![1, act.len()])))
+                    .unwrap()
+                    .to_vec_f32()
+                    .unwrap();
                 for (j, dv) in d.iter().enumerate() {
                     out[s * hidden + j] += w * dv;
                 }
@@ -1624,8 +1659,15 @@ mod moe_d2d_parity_tests {
             .unwrap()
             .to_vec_f32()
             .unwrap();
-        let d0 = out_cpu_model.iter().zip(out_ref.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(d0 < 1e-4, "reference self-check failed: cpu model vs reference max_diff={d0}");
+        let d0 = out_cpu_model
+            .iter()
+            .zip(out_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d0 < 1e-4,
+            "reference self-check failed: cpu model vs reference max_diff={d0}"
+        );
 
         assert_eq!(out_gpu.len(), out_ref.len());
         let max_diff = out_gpu

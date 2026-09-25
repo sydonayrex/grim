@@ -114,7 +114,9 @@ fn dequant_packed_kv(
         for r in 0..rows {
             let row = bytes
                 .get(r * row_bytes..(r + 1) * row_bytes)
-                .ok_or(Error::Shape("kv_dequant_attention: q4kh row out of range".into()))?;
+                .ok_or(Error::Shape(
+                    "kv_dequant_attention: q4kh row out of range".into(),
+                ))?;
             let deq = grim_quant::dequant_q4khalf(row, head_dim)?;
             out[r * elems_per_row..r * elems_per_row + head_dim].copy_from_slice(&deq);
         }
@@ -769,11 +771,21 @@ impl AttentionOps for CpuDevice {
                     cos_p[i] = a.cos() * mscale;
                     sin_p[i] = a.sin() * mscale;
                 }
-                for i in 0..rotary_half {
-                    let x1 = src[base_index + 2 * i];
-                    let x2 = src[base_index + 2 * i + 1];
-                    src[base_index + 2 * i] = x1 * cos_p[i] - x2 * sin_p[i];
-                    src[base_index + 2 * i + 1] = x1 * sin_p[i] + x2 * cos_p[i];
+                if cfg.interleaved {
+                    for i in 0..rotary_half {
+                        let x1 = src[base_index + 2 * i];
+                        let x2 = src[base_index + 2 * i + 1];
+                        src[base_index + 2 * i] = x1 * cos_p[i] - x2 * sin_p[i];
+                        src[base_index + 2 * i + 1] = x1 * sin_p[i] + x2 * cos_p[i];
+                    }
+                } else {
+                    // Half-split (GPT-NeoX / llama.cpp LFM2): pairs (i, i + rotary_half).
+                    for i in 0..rotary_half {
+                        let x1 = src[base_index + i];
+                        let x2 = src[base_index + i + rotary_half];
+                        src[base_index + i] = x1 * cos_p[i] - x2 * sin_p[i];
+                        src[base_index + i + rotary_half] = x1 * sin_p[i] + x2 * cos_p[i];
+                    }
                 }
             }
         }
@@ -2177,7 +2189,14 @@ pub(crate) fn gemm_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: 
 
 /// SPEED-ROC-16: `(M,K) @ (N,K)^T → (M,N)`. out[i,j] = sum_k A[i,k] * B[j,k].
 /// M==1 reduces to a single dot-product per output column (GEMV-like).
-pub(crate) fn gemm_b_transposed(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
+pub(crate) fn gemm_b_transposed(
+    a: &[f32],
+    b: &[f32],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
     for o in out[..m * n].iter_mut() {
         *o = 0.0;
     }

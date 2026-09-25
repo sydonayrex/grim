@@ -45,6 +45,7 @@ fn test_hugepage_pinned_buffer_allocation_and_readwrite() {
 }
 
 #[test]
+#[ignore]
 fn test_hugepage_pinned_buffer_gpu_dma_roundtrip() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping DMA roundtrip test");

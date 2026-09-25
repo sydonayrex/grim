@@ -389,3 +389,65 @@ impl Engine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod scythe_farm_tests {
+    use super::*;
+
+    fn tiny_cpu_llama() -> Box<dyn grim_core::model::CausalLm> {
+        Box::new(grim_models_transformer::Llama::random(
+            grim_tensor::Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32,
+                hidden_size: 16,
+                num_heads: 2,
+                num_kv_heads: 1,
+                head_dim: 8,
+                num_layers: 1,
+                intermediate_size: 32,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+                max_seq_len: 32,
+            },
+        ))
+    }
+
+    /// M8: a failed farm replica must not shrink the farm below what the
+    /// controller routes over. A CPU primary (or single GPU) takes the
+    /// early-return leg; a ROCm primary with an unloadable path takes the
+    /// fail-loud leg — both must leave exactly the base model registered
+    /// and no dangling replica entry behind.
+    #[test]
+    fn failed_farm_replica_leaves_base_only() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_model_with_farm_inner(
+            "farm",
+            tiny_cpu_llama(),
+            "/nonexistent/model.gguf",
+            None,
+        );
+        assert!(
+            engine.models.contains_key("farm"),
+            "base model must be registered"
+        );
+        assert!(
+            !engine.scythe_replicas.contains_key("farm"),
+            "failed farm must leave no replica entry"
+        );
+        for key in engine.models.keys() {
+            assert!(
+                !key.contains("#scythe"),
+                "no partial replica may survive: {key}"
+            );
+        }
+        if let Some(ctrl) = engine.scythe_ctrl.as_ref() {
+            assert_eq!(
+                ctrl.num_gpus(),
+                1,
+                "controller must route over exactly the registered count"
+            );
+        }
+    }
+}

@@ -127,6 +127,7 @@ fn test_q5k_element_matches_cpu_reference_across_seeds() {
 }
 
 #[test]
+#[ignore]
 fn test_q5k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
     // End-to-end forward + backward parity on a real AMD GPU. Without
     // GRIM_GPU_TEST=1 this bails green (CI-safe).

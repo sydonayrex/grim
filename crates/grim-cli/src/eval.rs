@@ -104,13 +104,20 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
         let ctx = &tokens[start..start + PPL_WINDOW];
         let target = tokens[start + PPL_WINDOW];
 
-        let ids = grim_backend_cpu::cpu_tensor(
+        // BUG FIX (2026-09-24): tensors MUST be created on the model's device.
+        // The old code used grim_backend_cpu::cpu_tensor here, which created CPU
+        // tensors even when the model was on Rocm — producing garbage logits
+        // (PPL ~1.3M) because the model never saw its inputs. Use the model's
+        // own device so the harness works for both CPU and ROCm models.
+        let ids = tensor_on_device(
             ctx.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
-            grim_tensor::Shape::new(vec![1, ctx.len()]),
+            &grim_tensor::Shape::new(vec![1, ctx.len()]),
+            &model.device(),
         );
-        let positions = grim_backend_cpu::cpu_tensor(
+        let positions = tensor_on_device(
             (0..ctx.len()).map(|p| p as f32).collect::<Vec<f32>>(),
-            grim_tensor::Shape::new(vec![1, ctx.len()]),
+            &grim_tensor::Shape::new(vec![1, ctx.len()]),
+            &model.device(),
         );
 
         // Fresh session per window: each window is an independent prediction,
@@ -336,6 +343,33 @@ pub fn load_eval_dataset(
 ) -> grim_core::error::Result<Vec<Vec<u32>>> {
     let examples = crate::train::load_dataset(path, tokenizer, max_seq_len)?;
     Ok(examples.into_iter().map(|(toks, _)| toks).collect())
+}
+
+/// Create a tensor on the model's device (CPU or Rocm). The old PPL harness
+/// hardcoded cpu_tensor here, which silently produced garbage on Rocm models.
+fn tensor_on_device(
+    data: Vec<f32>,
+    shape: &grim_tensor::Shape,
+    device: &grim_tensor::Device,
+) -> grim_tensor::Tensor {
+    use std::sync::Arc;
+    use grim_tensor::CoreTensorOps;
+    let storage = match device {
+        grim_tensor::Device::Cpu => grim_backend_cpu::CpuDevice::new()
+            .from_cpu(&data, shape, grim_tensor::DType::F32)
+            .unwrap(),
+        grim_tensor::Device::Rocm(o) => grim_backend_rocm::RocmDevice::shared(*o)
+            .from_cpu(&data, shape, grim_tensor::DType::F32)
+            .unwrap(),
+        _ => panic!("unsupported device {device:?}"),
+    };
+    grim_tensor::Tensor::new(
+        Arc::from(storage),
+        shape.clone(),
+        grim_tensor::DType::F32,
+        grim_tensor::QuantProvenance::GrimNative,
+        device.clone(),
+    )
 }
 
 /// Entry point for `grim-cli eval`.

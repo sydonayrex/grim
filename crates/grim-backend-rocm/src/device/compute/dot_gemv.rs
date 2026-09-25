@@ -3,13 +3,12 @@
 
 use std::ffi::c_void;
 
-
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage };
+use grim_tensor::BackendStorage;
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, arg };
+use crate::{arg, HipDim3};
 
 impl RocmDevice {
     /// Launch grim_quantize_q8_1 activation quantizer.
@@ -67,10 +66,7 @@ impl RocmDevice {
     /// quantize_q8_1 producer against its dot4 GEMV consumer. Reused across
     /// launches (hipEventRecord re-arms a recorded event).
     fn q81_quant_event(&self) -> *mut c_void {
-        let mut guard = self
-            .q81_event
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.q81_event.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let mut new_ev: *mut c_void = std::ptr::null_mut();
             let res = unsafe { crate::hipEventCreate(&mut new_ev) };
@@ -99,10 +95,12 @@ impl RocmDevice {
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
         }
         if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
-            eprintln!("[trace] dot4_q80_q81 act={:p} w={:p} out={:p} n={n} k={k}",
+            eprintln!(
+                "[trace] dot4_q80_q81 act={:p} w={:p} out={:p} n={n} k={k}",
                 act_q81.device_ptr.unwrap_or(0) as *const std::ffi::c_void,
                 b_storage.device_ptr.unwrap_or(0) as *const std::ffi::c_void,
-                out_storage.device_ptr.unwrap_or(0) as *const std::ffi::c_void);
+                out_storage.device_ptr.unwrap_or(0) as *const std::ffi::c_void
+            );
         }
         let a_ptr = act_q81
             .device_ptr
@@ -1055,15 +1053,15 @@ impl RocmDevice {
         let src_ptr = src
             .device_ptr
             .ok_or_else(|| Error::Backend("quantize_u4_group128: src has no device ptr".into()))?;
-        let dst_codes_ptr = dst_codes
-            .device_ptr
-            .ok_or_else(|| Error::Backend("quantize_u4_group128: dst_codes has no device ptr".into()))?;
-        let dst_scales_ptr = dst_scales
-            .device_ptr
-            .ok_or_else(|| Error::Backend("quantize_u4_group128: dst_scales has no device ptr".into()))?;
-        let dst_sums_ptr = dst_sums
-            .device_ptr
-            .ok_or_else(|| Error::Backend("quantize_u4_group128: dst_sums has no device ptr".into()))?;
+        let dst_codes_ptr = dst_codes.device_ptr.ok_or_else(|| {
+            Error::Backend("quantize_u4_group128: dst_codes has no device ptr".into())
+        })?;
+        let dst_scales_ptr = dst_scales.device_ptr.ok_or_else(|| {
+            Error::Backend("quantize_u4_group128: dst_scales has no device ptr".into())
+        })?;
+        let dst_sums_ptr = dst_sums.device_ptr.ok_or_else(|| {
+            Error::Backend("quantize_u4_group128: dst_sums has no device ptr".into())
+        })?;
 
         if k % 128 != 0 {
             return Err(Error::Backend(format!(

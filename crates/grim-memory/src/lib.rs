@@ -633,7 +633,7 @@ impl KvBlockPool {
                 // Mark the block as demoted so promotion can be decided later
                 // without re-querying the spill manager.
                 self.blocks[id].location = CacheTier::HostRam;
-            self.spill_telemetry.demoted_blocks += 1;
+                self.spill_telemetry.demoted_blocks += 1;
                 self.recently_zero.push_back(id);
                 // Do NOT push to free_list — the block is spilled, not available
                 // for fresh allocation. Only promote_to_gpu can reclaim it.
@@ -1308,9 +1308,10 @@ impl PagedKvCache {
         let mut m = self.mirror_state.lock().unwrap_or_else(|e| e.into_inner());
         for bid in seeded {
             let off = bid * block_elems;
-            if let (Some(lk), Some(lv)) =
-                (pool.read_layer_keys(bid, layer), pool.read_layer_values(bid, layer))
-            {
+            if let (Some(lk), Some(lv)) = (
+                pool.read_layer_keys(bid, layer),
+                pool.read_layer_values(bid, layer),
+            ) {
                 let k_len = lk.len().min(block_elems);
                 let v_len = lv.len().min(block_elems);
                 if off + k_len <= self.k_pages[layer].len() {
@@ -1423,7 +1424,9 @@ impl PagedKvCache {
                     if off + block_elems <= self.k_pages[l].len()
                         && off + block_elems <= self.v_pages[l].len()
                     {
-                        if let (Some(lk), Some(lv)) = (pool.read_layer_keys(bid, l), pool.read_layer_values(bid, l)) {
+                        if let (Some(lk), Some(lv)) =
+                            (pool.read_layer_keys(bid, l), pool.read_layer_values(bid, l))
+                        {
                             self.k_pages[l][off..off + lk.len().min(block_elems)]
                                 .copy_from_slice(&lk[..lk.len().min(block_elems)]);
                             self.v_pages[l][off..off + lv.len().min(block_elems)]
@@ -1956,7 +1959,6 @@ impl KvCache for PagedKvCache {
         self.table.physical_ids().to_vec()
     }
 
-
     fn num_layers(&self) -> usize {
         self.k_pages.len()
     }
@@ -2065,7 +2067,8 @@ mod tests {
         let a = pool.alloc().unwrap();
         let b = pool.alloc().unwrap();
         assert_eq!(
-            pool.spill_telemetry().reclaimed_for_alloc, 2,
+            pool.spill_telemetry().reclaimed_for_alloc,
+            2,
             "post-exhaustion allocs must reclaim spilled pages"
         );
         assert_ne!(a, b);
@@ -2780,10 +2783,8 @@ mod f10_mirror_tests {
 
         // Append the tail chunk. The first append per layer lazily stages the
         // seeded prefix with the TENSOR's stride, then writes after it.
-        let tail = grim_backend_cpu::cpu_tensor(
-            vec![9.0f32; 16 * 2 * 4],
-            Shape::new(vec![16, 2 * 4]),
-        );
+        let tail =
+            grim_backend_cpu::cpu_tensor(vec![9.0f32; 16 * 2 * 4], Shape::new(vec![16, 2 * 4]));
         let tail_v = tail.clone();
         for layer in 0..LAYERS {
             b.append_kv_layer(layer, &tail, &tail_v).unwrap();
@@ -2801,8 +2802,7 @@ mod f10_mirror_tests {
             assert_eq!(k_slice[0], layer as f32 + 0.128);
             let (k0, _) = b.layer_block_slice(layer, matched[0]).unwrap();
             assert_eq!(
-                k0[0],
-                layer as f32,
+                k0[0], layer as f32,
                 "layer {layer} seeded block 0 was overwritten by the tail append"
             );
         }
@@ -2841,7 +2841,9 @@ mod f10_mirror_tests {
         let v = k.clone();
         cache.append_kv_layer(0, &k, &v).unwrap();
         assert_eq!(cache.len(), 16);
-        let (k_slice, _) = cache.layer_block_slice(0, cache.table.logical_to_physical[0]).unwrap();
+        let (k_slice, _) = cache
+            .layer_block_slice(0, cache.table.logical_to_physical[0])
+            .unwrap();
         assert_eq!(k_slice[0], 1.0);
     }
 }

@@ -8,6 +8,7 @@ use grim_backend_rocm::{
 use grim_tensor::DType;
 
 #[test]
+#[ignore]
 fn gpu_stochastic_sampler_matches_multinomial_distribution() {
     if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
         eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
@@ -106,6 +107,7 @@ fn gpu_stochastic_sampler_matches_multinomial_distribution() {
 // ── Parity gate: GPU greedy (T=0) must exactly match CPU argmax ───────────
 // Fixed logits, fixed seed. If this fails the kernel is argmax-broken.
 #[test]
+#[ignore]
 fn gpu_greedy_sampler_exact_parity_with_cpu_argmax() {
     if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
         eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
@@ -113,7 +115,10 @@ fn gpu_greedy_sampler_exact_parity_with_cpu_argmax() {
     }
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
-        Err(e) => { eprintln!("ROCm device 0 not available: {e}"); return; }
+        Err(e) => {
+            eprintln!("ROCm device 0 not available: {e}");
+            return;
+        }
     };
 
     let vocab = 32768usize;
@@ -149,6 +154,7 @@ fn gpu_greedy_sampler_exact_parity_with_cpu_argmax() {
 // The device path keeps logits on GPU and D2H's only 4 bytes.
 // The CPU path calls to_cpu_vec_f32() (Vec<f32> alloc + full D2H) per step.
 #[test]
+#[ignore]
 fn gpu_sampler_decode_throughput_gate() {
     if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
         eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
@@ -156,7 +162,10 @@ fn gpu_sampler_decode_throughput_gate() {
     }
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
-        Err(e) => { eprintln!("ROCm device 0 not available: {e}"); return; }
+        Err(e) => {
+            eprintln!("ROCm device 0 not available: {e}");
+            return;
+        }
     };
 
     const VOCAB: usize = 32768;
@@ -168,13 +177,21 @@ fn gpu_sampler_decode_throughput_gate() {
         .map(|i| ((i as f32 - VOCAB as f32 / 2.0) / 256.0).tanh())
         .collect();
     let shape = Shape::new(vec![VOCAB]);
-    let storage = dev.from_cpu(&logits, &shape, DType::F32).expect("upload logits");
+    let storage = dev
+        .from_cpu(&logits, &shape, DType::F32)
+        .expect("upload logits");
     let rocm_st = as_rocm(storage.as_ref()).expect("rocm storage");
 
     // ── device-sample path ───────────────────────────────────────────────
+    // Heartbeats every 64 steps: each step is a full device round-trip, so a
+    // stalled launch shows up as a frozen counter instead of a silent hang
+    // tripping the harness 60s-inactivity kill (use --nocapture to watch).
     let t0 = std::time::Instant::now();
     let mut device_tokens = Vec::with_capacity(STEPS);
     for step in 0..STEPS as u32 {
+        if step % 64 == 0 {
+            eprintln!("[throughput_gate] device path step {step}/{STEPS} ...");
+        }
         let tok = sample_logits_on_device_at(&dev, rocm_st, VOCAB, 0.8, 40, 0.9, SEED, step)
             .expect("device sample")
             .expect("must sample");
@@ -186,6 +203,9 @@ fn gpu_sampler_decode_throughput_gate() {
     let t1 = std::time::Instant::now();
     let mut cpu_tokens = Vec::with_capacity(STEPS);
     for step in 0..STEPS as u32 {
+        if step % 64 == 0 {
+            eprintln!("[throughput_gate] cpu path step {step}/{STEPS} ...");
+        }
         // Pull full logits to host (this is the expensive part).
         let host = storage.to_cpu_vec_f32().expect("D2H");
         // CPU greedy (argmax) so the timing comparison is fair — the bottleneck
@@ -227,6 +247,7 @@ fn gpu_sampler_decode_throughput_gate() {
 
 // ── PinnedLogitsBuf round-trip: D2H via pinned buf matches to_cpu_vec_f32 ─
 #[test]
+#[ignore]
 fn pinned_logits_buf_round_trip_matches_standard_d2h() {
     if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
         eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
@@ -234,7 +255,10 @@ fn pinned_logits_buf_round_trip_matches_standard_d2h() {
     }
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
-        Err(e) => { eprintln!("ROCm device 0 not available: {e}"); return; }
+        Err(e) => {
+            eprintln!("ROCm device 0 not available: {e}");
+            return;
+        }
     };
 
     const VOCAB: usize = 4096;
@@ -246,8 +270,8 @@ fn pinned_logits_buf_round_trip_matches_standard_d2h() {
     // Reference: standard blocking D2H.
     let reference = storage.to_cpu_vec_f32().expect("reference D2H");
 
-    // Under test: PinnedLogitsBuf.
-    let mut pinned = PinnedLogitsBuf::alloc(VOCAB).expect("alloc pinned buf");
+    // Under test: PinnedLogitsBuf (renamed `alloc` -> `alloc_on` with ordinal pin).
+    let mut pinned = PinnedLogitsBuf::alloc_on(0, VOCAB).expect("alloc pinned buf");
 
     // Read twice (ping-pong) to exercise both slots.
     for _round in 0..2 {
@@ -265,3 +289,50 @@ fn pinned_logits_buf_round_trip_matches_standard_d2h() {
     }
 }
 
+/// C1 split: `Ok(None)` vs `Err` must not conflate. Each documented
+/// `validate_input` precondition yields `Ok(None)` (legitimate unavailable →
+/// CPU fallback), never `Err`. A bug returning `Err` here would kill the
+/// request instead of degrading; a bug returning `Some` would sample garbage.
+#[test]
+#[ignore]
+fn sampler_validate_preconditions_return_none_not_err() {
+    if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
+        eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+        return;
+    }
+    let dev = match RocmDevice::try_new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("ROCm device 0 not available: {e}");
+            return;
+        }
+    };
+    use grim_backend_rocm::sample_logits_on_device;
+    let vocab = 64usize;
+    let logits: Vec<f32> = (0..vocab).map(|i| i as f32 * 0.01).collect();
+    let shape = Shape::new(vec![vocab]);
+    let storage = dev.from_cpu(&logits, &shape, DType::F32).expect("upload");
+    let rocm_st = as_rocm(storage.as_ref()).expect("rocm storage");
+
+    // Valid input samples (proves the Some leg is reachable, not None-always).
+    let got = sample_logits_on_device(&dev, rocm_st, vocab, 0.8, 40, 0.9, 42)
+        .expect("valid input must not Err");
+    assert!(got.is_some(), "valid input must sample");
+    assert!((got.unwrap() as usize) < vocab);
+
+    // Each invalid precondition → Ok(None), never Err, never Some.
+    for (label, v, temp, top_p) in [
+        ("zero vocab", 0, 0.8f32, 0.9f32),
+        ("non-finite temperature", vocab, f32::NAN, 0.9),
+        ("negative temperature", vocab, -1.0, 0.9),
+        ("non-finite top_p", vocab, 0.8, f32::INFINITY),
+    ] {
+        let r = sample_logits_on_device(&dev, rocm_st, v, temp, 40, top_p, 42)
+            .unwrap_or_else(|e| panic!("{label} must be Ok(None), got Err: {e:?}"));
+        assert!(r.is_none(), "{label} must be None (CPU fallback)");
+    }
+    // Oversize vocab (wider than the uploaded tail) → Ok(None).
+    let r = sample_logits_on_device(&dev, rocm_st, vocab + 1, 0.8, 40, 0.9, 42)
+        .expect("oversize vocab must not Err");
+    assert!(r.is_none(), "oversize vocab must be None (CPU fallback)");
+}

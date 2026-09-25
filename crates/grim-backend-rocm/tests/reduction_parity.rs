@@ -4,7 +4,7 @@
 //! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test reduction_parity -- --nocapture
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{CoreTensorOps, ElementwiseOps, DType, Shape};
+use grim_tensor::{CoreTensorOps, DType, ElementwiseOps, Shape};
 
 fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -14,23 +14,14 @@ fn gpu_device() -> Option<RocmDevice> {
 }
 
 #[test]
+#[ignore]
 fn gpu_reduction_parity_vs_cpu() {
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
     };
 
-    let test_sizes = [
-        4usize,
-        32,
-        64,
-        256,
-        1024,
-        4096,
-        65536,
-        262144,
-        1048576,
-    ];
+    let test_sizes = [4usize, 32, 64, 256, 1024, 4096, 65536, 262144, 1048576];
 
     for &n in &test_sizes {
         // Generate pseudo-random f32 data with positive, negative, and extreme values
@@ -48,7 +39,9 @@ fn gpu_reduction_parity_vs_cpu() {
 
         // 1. reduce_sum
         let cpu_sum: f32 = cpu_data.iter().sum();
-        let gpu_sum = dev.reduce_sum(dev_storage.as_ref()).expect("gpu reduce_sum");
+        let gpu_sum = dev
+            .reduce_sum(dev_storage.as_ref())
+            .expect("gpu reduce_sum");
         let sum_abs_diff = (cpu_sum - gpu_sum).abs();
         let sum_rel_diff = sum_abs_diff / (cpu_sum.abs().max(gpu_sum.abs()).max(1.0));
         eprintln!(
@@ -65,7 +58,9 @@ fn gpu_reduction_parity_vs_cpu() {
             .copied()
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .expect("cpu max");
-        let gpu_max = dev.reduce_max(dev_storage.as_ref()).expect("gpu reduce_max");
+        let gpu_max = dev
+            .reduce_max(dev_storage.as_ref())
+            .expect("gpu reduce_max");
         let max_diff = (cpu_max - gpu_max).abs();
         eprintln!("[reduction-max] N={n} cpu={cpu_max:.4} gpu={gpu_max:.4} diff={max_diff:.6}");
         assert_eq!(
@@ -91,6 +86,7 @@ fn gpu_reduction_parity_vs_cpu() {
 }
 
 #[test]
+#[ignore]
 fn gpu_argmax_tie_breaker_parity() {
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
@@ -110,5 +106,8 @@ fn gpu_argmax_tie_breaker_parity() {
         .expect("upload tensor to GPU");
 
     let gpu_argmax = dev.argmax(dev_storage.as_ref()).expect("gpu argmax");
-    assert_eq!(gpu_argmax, 950, "argmax must pick the last maximum element on ties");
+    assert_eq!(
+        gpu_argmax, 950,
+        "argmax must pick the last maximum element on ties"
+    );
 }

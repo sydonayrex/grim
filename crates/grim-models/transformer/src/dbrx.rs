@@ -124,36 +124,37 @@ impl DbrxMoeBlock {
         // with actual softmax top-k routing from `router_logits`.
         // This is a behavior change vs the fixed-ensemble path; gate it for safety.
         if std::env::var("GRIM_DBRX_REAL_ROUTING").as_deref() == Ok("1")
-            && matches!(x.device(), Device::Rocm(_)) {
-                let experts: Vec<crate::shared_moe::MoeExpert> = self
-                    .experts
-                    .iter()
-                    .map(|e| crate::shared_moe::MoeExpert {
-                        gate: e.w1.clone(),
-                        up: e.v1.clone(),
-                        down: e.w2.clone(),
-                    })
-                    .collect();
-                let dev_any = x.device();
-                let ordinal = match dev_any {
-                    Device::Rocm(o) => *o,
-                    _ => unreachable!(),
-                };
-                let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal);
-                if let Some(out) = crate::shared_moe::fused_moe_dispatch_from_logits(
-                    &*rocm_dev,
-                    x,
-                    &router_logits,
-                    &experts,
-                    None,
-                    self.moe_top_k,
-                    1.0,
-                    0, // softmax
-                    &self.charon_cache,
-                )? {
-                    return Ok(out);
-                }
+            && matches!(x.device(), Device::Rocm(_))
+        {
+            let experts: Vec<crate::shared_moe::MoeExpert> = self
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
+                    gate: e.w1.clone(),
+                    up: e.v1.clone(),
+                    down: e.w2.clone(),
+                })
+                .collect();
+            let dev_any = x.device();
+            let ordinal = match dev_any {
+                Device::Rocm(o) => *o,
+                _ => unreachable!(),
+            };
+            let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+            if let Some(out) = crate::shared_moe::fused_moe_dispatch_from_logits(
+                &*rocm_dev,
+                x,
+                &router_logits,
+                &experts,
+                None,
+                self.moe_top_k,
+                1.0,
+                0, // softmax
+                &self.charon_cache,
+            )? {
+                return Ok(out);
             }
+        }
 
         // Fixed-ensemble fallback (original shipped-model semantics).
         if x.device() != &Device::Cpu {
@@ -167,7 +168,8 @@ impl DbrxMoeBlock {
                         Some(a) => grim_nn::modules::axpy_on_device(&a, weight, &e_out)?,
                         None => {
                             let dev = grim_nn::modules::pick_device_for_tensor(&e_out);
-                            let (scaled_st, _) = dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
+                            let (scaled_st, _) =
+                                dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
                             Tensor::new(
                                 std::sync::Arc::from(scaled_st),
                                 e_out.shape().clone(),

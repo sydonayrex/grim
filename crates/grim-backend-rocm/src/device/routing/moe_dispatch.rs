@@ -4,16 +4,16 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::backend::{ BackendStorage };
-use grim_tensor::dtype::{ DType };
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::dtype::DType;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ CoreTensorOps, Shape };
+use grim_tensor::{CoreTensorOps, Shape};
 
-use crate::device::roc_device::{ RocmDevice };
 #[cfg(feature = "training")]
 use crate::device::roc_device::CharonBackwardResult;
+use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, RocmHandle, arg, check_hip, dtype_f32, hipMemsetAsync };
+use crate::{HipDim3, RocmHandle, arg, check_hip, dtype_f32, hipMemsetAsync};
 impl RocmDevice {
     /// Fused MoE dispatch helper: allocates output buffer, uploads flat expert weights,
     /// and launches `grim_moe_fused_dispatch`.
@@ -454,19 +454,27 @@ impl RocmDevice {
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8 resident_routing: gate_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8 resident_routing: gate_buf downcast failed".into())
+            })?;
         let up_r = up_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8 resident_routing: up_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8 resident_routing: up_buf downcast failed".into())
+            })?;
         let down_r = down_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8 resident_routing: down_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8 resident_routing: down_buf downcast failed".into())
+            })?;
         let ascale_r = a_scale_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8 resident_routing: a_scale_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8 resident_routing: a_scale_buf downcast failed".into())
+            })?;
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
@@ -613,27 +621,35 @@ impl RocmDevice {
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_dot4 resident_routing: gate_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_dot4 resident_routing: gate_buf downcast failed".into())
+            })?;
         let up_r = up_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_dot4 resident_routing: up_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_dot4 resident_routing: up_buf downcast failed".into())
+            })?;
         let down_r = down_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_dot4 resident_routing: down_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_dot4 resident_routing: down_buf downcast failed".into())
+            })?;
         let ascale_r = a_scale_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_dot4 resident_routing: a_scale_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_dot4 resident_routing: a_scale_buf downcast failed".into())
+            })?;
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("w8a8_dot4 resident_routing: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("w8a8_dot4 resident_routing: out has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("w8a8_dot4 resident_routing: out has no device ptr".into())
+        })?;
 
         // Zero output (atomicAdd accumulation).
         check_hip("w8a8_dot4 resident_routing hipMemset(output, 0)", unsafe {
@@ -757,27 +773,35 @@ impl RocmDevice {
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_fp8 resident_routing: gate_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_fp8 resident_routing: gate_buf downcast failed".into())
+            })?;
         let up_r = up_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_fp8 resident_routing: up_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_fp8 resident_routing: up_buf downcast failed".into())
+            })?;
         let down_r = down_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_fp8 resident_routing: down_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_fp8 resident_routing: down_buf downcast failed".into())
+            })?;
         let ascale_r = a_scale_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("w8a8_fp8 resident_routing: a_scale_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("w8a8_fp8 resident_routing: a_scale_buf downcast failed".into())
+            })?;
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("w8a8_fp8 resident_routing: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("w8a8_fp8 resident_routing: out has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("w8a8_fp8 resident_routing: out has no device ptr".into())
+        })?;
 
         // Zero output (atomicAdd accumulation).
         check_hip("w8a8_fp8 resident_routing hipMemset(output, 0)", unsafe {
@@ -917,7 +941,9 @@ impl RocmDevice {
             }
         };
         if group_size == 0 {
-            return Err(Error::Backend("awq resident_routing: group_size is 0".into()));
+            return Err(Error::Backend(
+                "awq resident_routing: group_size is 0".into(),
+            ));
         }
         // (qw_off, qz_off, sc_off, stride) for a [rows=out, cols=k] projection.
         let proj_offsets = |out: usize, k: usize| -> (i64, i64, i64, u64) {
@@ -937,7 +963,9 @@ impl RocmDevice {
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("awq resident_routing: gate_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("awq resident_routing: gate_buf downcast failed".into())
+            })?;
         let up_r = up_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -945,11 +973,15 @@ impl RocmDevice {
         let down_r = down_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("awq resident_routing: down_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("awq resident_routing: down_buf downcast failed".into())
+            })?;
         let ascale_r = a_scale_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("awq resident_routing: a_scale_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("awq resident_routing: a_scale_buf downcast failed".into())
+            })?;
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
@@ -1118,39 +1150,53 @@ impl RocmDevice {
         let gw_c = gate_codes
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: gate_codes downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mxfp4 resident_routing: gate_codes downcast failed".into())
+            })?;
         let uw_c = up_codes
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: up_codes downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mxfp4 resident_routing: up_codes downcast failed".into())
+            })?;
         let dw_c = down_codes
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: down_codes downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mxfp4 resident_routing: down_codes downcast failed".into())
+            })?;
         let gw_e = gate_exps
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: gate_exps downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mxfp4 resident_routing: gate_exps downcast failed".into())
+            })?;
         let uw_e = up_exps
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: up_exps downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mxfp4 resident_routing: up_exps downcast failed".into())
+            })?;
         let dw_e = down_exps
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: down_exps downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mxfp4 resident_routing: down_exps downcast failed".into())
+            })?;
         let ascale_r = a_scale_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: a_scale_buf downcast failed".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mxfp4 resident_routing: a_scale_buf downcast failed".into())
+            })?;
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("mxfp4 resident_routing: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mxfp4 resident_routing: out has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("mxfp4 resident_routing: out has no device ptr".into())
+        })?;
 
         // Zero output (atomicAdd accumulation).
         check_hip("mxfp4 resident_routing hipMemset(output, 0)", unsafe {
@@ -1263,10 +1309,8 @@ impl RocmDevice {
             false,
         );
         let stream = match dot4_entry {
-            Some(entry)
-                if hidden % 32 == 0 && inter % 32 == 0 =>
-            {
-                self.launch_charon_grouped_dispatch_dot4(
+            Some(entry) if hidden % 32 == 0 && inter % 32 == 0 => self
+                .launch_charon_grouped_dispatch_dot4(
                     entry,
                     activations,
                     gate_r.device_ptr_checked()?,
@@ -1278,8 +1322,7 @@ impl RocmDevice {
                     hidden,
                     inter,
                     routed_scaling_factor,
-                )?
-            }
+                )?,
             _ => self.launch_charon_grouped_dispatch_w8a8_int8(
                 activations,
                 gate_r.device_ptr_checked()?,

@@ -1,5 +1,3 @@
-//! Pinned (`hipHostMalloc`) page-locked host buffer used by the per-token [see: `hipMemcpyAsync`, `Vec`]
-
 use std::ffi::c_void;
 use std::marker::PhantomData;
 
@@ -26,6 +24,15 @@ impl<T> std::fmt::Debug for RocmPinnedBuffer<T> {
 }
 
 impl<T: Copy> RocmPinnedBuffer<T> {
+    /// Allocate `len` elements of pinned host memory with the thread's HIP
+    /// context pinned to `ordinal` — scythe2/GRAVE lesson: unpinned
+    /// `hipHostMalloc` can land on a foreign device context and page-fault on
+    /// later copies. New code must use this, not `alloc`.
+    pub fn alloc_on(ordinal: usize, len: usize) -> Result<Self> {
+        let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
+        Self::alloc(len)
+    }
+
     /// Allocate `len` elements of pinned host memory.
     pub fn alloc(len: usize) -> Result<Self> {
         if len == 0 {
@@ -134,4 +141,66 @@ impl PinnedStagingPool {
             lock.push(buffer);
         }
     }
+}
+
+thread_local! {
+    static H2D_STAGE_RING: std::cell::RefCell<Vec<(usize, StageRing)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const STAGE_RING_SLOTS: usize = 16;
+const STAGE_RING_MAX_BYTES: usize = 64 * 1024;
+
+struct StageRing {
+    slots: Vec<RocmPinnedBuffer<u8>>,
+    next: usize,
+}
+
+/// Stage `host` into the ring slot for `ordinal` and return the pinned pointer.
+/// Falls back to the input pointer for oversized uploads (caller then copies
+/// from pageable memory, as before).
+// Thread-local pinned staging ring for small per-step H2D uploads (token ids,
+// positions, scalars). Pageable-memory `hipMemcpyAsync` takes the driver's
+// slow staged path (~0.4 ms per call observed on gfx1201), which dominated
+// decode time; copying into pinned memory first avoids it entirely.
+// SAFETY: the returned pointer stays valid until this thread stages
+// `SLOTS` more times. Decode steps end with a blocking sampled-token D2H
+// (stream fully drained), and a step issues far fewer than `SLOTS` staged
+// copies, so a slot is never rewritten while its copy is in flight.
+pub fn stage_h2d_pinned<'a>(ordinal: usize, host: &'a [u8]) -> (*const u8, bool) {
+    if host.is_empty() || host.len() > STAGE_RING_MAX_BYTES {
+        return (host.as_ptr(), false);
+    }
+    H2D_STAGE_RING.with(|cell| {
+        let mut rings = cell.borrow_mut();
+        let entry = match rings.iter_mut().find(|(o, _)| *o == ordinal) {
+            Some(e) => &mut e.1,
+            None => {
+                rings.push((
+                    ordinal,
+                    StageRing {
+                        slots: Vec::new(),
+                        next: 0,
+                    },
+                ));
+                &mut rings.last_mut().unwrap().1
+            }
+        };
+        if entry.slots.len() < STAGE_RING_SLOTS {
+            // scythe2 lesson: hipHostMalloc is a raw HIP seam — pin the
+            // thread's context to the owning ordinal or the pinned pages can
+            // land on a foreign device context (page fault on later copies).
+            let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
+            match RocmPinnedBuffer::<u8>::alloc(STAGE_RING_MAX_BYTES) {
+                Ok(buf) => entry.slots.push(buf),
+                Err(_) => return (host.as_ptr(), false),
+            }
+        }
+        let idx = entry.next % entry.slots.len();
+        entry.next = entry.next.wrapping_add(1);
+        let slot = &mut entry.slots[idx];
+        let dst = slot.as_mut_slice();
+        dst[..host.len()].copy_from_slice(host);
+        (dst.as_ptr(), true)
+    })
 }

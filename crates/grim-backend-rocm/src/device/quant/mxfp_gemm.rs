@@ -4,14 +4,12 @@
 
 use std::ffi::c_void;
 
+use grim_tensor::Shape;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ Shape };
 
-use crate::device::roc_device::{ RocmDevice };
+use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, arg, dtype_f32 };
-
-
+use crate::{HipDim3, arg, dtype_f32};
 
 impl RocmDevice {
     /// Launch the JIT compiled tiled MXFP4 GEMM kernel.
@@ -399,6 +397,7 @@ impl RocmDevice {
         mscale: f32,
         eps: f32,
         max_seq_len: usize,
+        rope_interleaved: bool,
     ) -> Result<*mut c_void> {
         let x_ptr = x_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_rmsnorm_mxfp4_rope_kv: x has no device ptr".into())
@@ -444,6 +443,7 @@ impl RocmDevice {
         let mut mscale_val = mscale;
         let mut eps_val = eps;
         let mut max_seq = max_seq_len as i32;
+        let mut rope_ilv = rope_interleaved as i32;
 
         self.launch_compute_kernel_with_solution(
             "grim_fused_rmsnorm_mxfp4_gemm_rope_kv",
@@ -470,6 +470,7 @@ impl RocmDevice {
                 arg(&mut mscale_val),
                 arg(&mut eps_val),
                 arg(&mut max_seq),
+                arg(&mut rope_ilv),
             ],
             None,
             64 * std::mem::size_of::<f32>(),

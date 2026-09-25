@@ -7,7 +7,10 @@
 //! 6. Zero/negative parameter validation in EmbeddingSpillManager and NvmeWeightStreamer.
 //! 7. Prompt message payload size capping.
 
-use grim_kvtransport::{CacheTier, EmbeddingSpillManager, KvBlockHeader, LocalSpillManager, NvmeWeightStreamer, compute_checksum};
+use grim_kvtransport::{
+    CacheTier, EmbeddingSpillManager, KvBlockHeader, LocalSpillManager, NvmeWeightStreamer,
+    compute_checksum,
+};
 use tempfile::tempdir;
 
 #[test]

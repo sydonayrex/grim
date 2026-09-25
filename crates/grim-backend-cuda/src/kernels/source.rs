@@ -329,7 +329,7 @@ extern "C" __global__ void grim_argmax(const float* x, int* out, int rows, int c
     out[row] = max_idx;
 }
 
-extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out, int num_tokens, int num_heads, int head_dim, float base) {
+extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out, int num_tokens, int num_heads, int head_dim, float base, int interleaved) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_dim = head_dim / 2;
     int total = num_tokens * num_heads * half_dim;
@@ -346,8 +346,8 @@ extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out,
     float sin_v = sinf(val);
 
     int base_offset = (token_idx * num_heads + head_idx) * head_dim;
-    int i0 = base_offset + 2 * pair_idx;
-    int i1 = base_offset + 2 * pair_idx + 1;
+    int i0 = interleaved ? base_offset + 2 * pair_idx : base_offset + pair_idx;
+    int i1 = interleaved ? base_offset + 2 * pair_idx + 1 : base_offset + half_dim + pair_idx;
 
     float v0 = x[i0];
     float v1 = x[i1];
@@ -363,7 +363,7 @@ extern "C" __global__ void grim_rope_yarn(
     const unsigned int* __restrict__ positions,
     const float* __restrict__ inv_freq,
     float* __restrict__ out,
-    int b, int s, int d, int rotary_half, float mscale
+    int b, int s, int d, int rotary_half, float mscale, int interleaved
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -379,8 +379,8 @@ extern "C" __global__ void grim_rope_yarn(
         float sin_val = sinf(val) * mscale;
         float cos_val = cosf(val) * mscale;
         int base_idx = (bi * s + si) * d;
-        int a_idx = base_idx + 2 * i;
-        int b_idx = base_idx + 2 * i + 1;
+        int a_idx = interleaved ? base_idx + 2 * i : base_idx + i;
+        int b_idx = interleaved ? base_idx + 2 * i + 1 : base_idx + rotary_half + i;
         float x1 = x[a_idx];
         float x2 = x[b_idx];
         out[a_idx] = x1 * cos_val - x2 * sin_val;

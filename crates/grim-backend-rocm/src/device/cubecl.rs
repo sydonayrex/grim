@@ -124,7 +124,12 @@ pub fn add(client: &Client, a: &[f32], b: &[f32]) -> Vec<f32> {
         unsafe { ArrayArg::from_raw_parts(ah.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(bh.clone(), len) },
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 #[cube(launch)]
@@ -148,7 +153,12 @@ pub fn mul(client: &Client, a: &[f32], b: &[f32]) -> Vec<f32> {
         unsafe { ArrayArg::from_raw_parts(ah.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(bh.clone(), len) },
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 /// silu(x) = x * sigmoid(x); out = silu(x) * gate.
@@ -174,7 +184,12 @@ pub fn silu_mul(client: &Client, x: &[f32], gate: &[f32]) -> Vec<f32> {
         unsafe { ArrayArg::from_raw_parts(xh.clone(), len) },
         unsafe { ArrayArg::from_raw_parts(gh.clone(), len) },
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 // ---------------- embedding gather ----------------
@@ -210,7 +225,12 @@ pub fn embedding(client: &Client, weight: &[f32], indices: &[i32], dim: usize) -
         unsafe { ArrayArg::from_raw_parts(ih.clone(), indices.len()) },
         dim,
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 // ---------------- row reductions (dim <= 64, single wavefront) ----------------
@@ -246,7 +266,12 @@ pub fn rms_norm(client: &Client, input: &[f32], rows: usize, dim: usize) -> Vec<
         rows,
         dim,
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 #[cube(launch)]
@@ -295,7 +320,12 @@ pub fn softmax(client: &Client, input: &[f32], rows: usize, dim: usize) -> Vec<f
         rows,
         dim,
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 // ======================== Phase 3: causal GQA attention (head_dim up to 256) ======================== [see: `tid`]
@@ -443,7 +473,12 @@ pub fn qkv_attention(
         kv_seq_len,
         cache_offset,
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 // ---------------- paged QKV attention (same online softmax; paged K/V) ---------------- [see: `block_tables`]
@@ -607,7 +642,12 @@ pub fn paged_attention(
         kv_seq_len,
         cache_offset,
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 // ---------------- tree attention (same online softmax; tree-structured mask) ---------------- [see: `tree_parents`]
@@ -771,7 +811,12 @@ pub fn tree_attention(
         kv_seq_len,
         cache_offset,
     );
-    f32::from_bytes(&client.read_one(oh).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(oh)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }
 
 // ---------------- GPTQ correction (Phase 4) ----------------
@@ -829,5 +874,10 @@ pub fn gptq_correction(
         rows,
         cols,
     );
-    f32::from_bytes(&client.read_one(ah).expect("cubecl fallback: read_one failed (kernel compile/launch error)")).to_vec()
+    f32::from_bytes(
+        &client
+            .read_one(ah)
+            .expect("cubecl fallback: read_one failed (kernel compile/launch error)"),
+    )
+    .to_vec()
 }

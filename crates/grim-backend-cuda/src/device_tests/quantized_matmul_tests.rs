@@ -2,11 +2,11 @@ use super::common::*;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use grim_tensor::dtype::{
         ArithType, DType, FloatPackScheme, KQuantScheme, Storage as DTypeStorage,
     };
-    use super::*;
-    use grim_tensor::{ BackendStorage, CoreTensorOps, MemoryOps, QuantOps, Shape };
+    use grim_tensor::{BackendStorage, CoreTensorOps, MemoryOps, QuantOps, Shape};
 
     fn q8_matmul_ref(
         a: &[f32],

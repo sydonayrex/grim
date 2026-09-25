@@ -1,0 +1,20 @@
+name: HIP guard gate
+
+on:
+  pull_request:
+    paths:
+      - crates/grim-backend-rocm/src/**
+      - scripts/check-hip-guards.sh
+      - .github/workflows/hip-guard.yml
+
+permissions:
+  contents: read
+
+jobs:
+  hip-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: scripts/check-hip-guards.sh "${{ github.event.pull_request.base.sha }}"

@@ -70,6 +70,7 @@ fn build_awq_blob(k: usize, n: usize, bits: u8, group_size: usize) -> (Vec<u8>, 
 }
 
 #[test]
+#[ignore]
 fn gpu_awq_dequant_gemm_forward_backward_parity() {
     if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
         return;

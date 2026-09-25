@@ -1,9 +1,12 @@
 //! Lint: no new `to_vec_f32()` regressions in model forward paths.
 //!
-//! The crate converged on zero host round-trips per decode step. The
-//! current baseline below matches live counts at the time of the sweep
-//! (2026-09). The test fails only when a file's count GROWS. Reducing a
-//! file's baseline after a cleanup pass is a one-line edit and encouraged.
+//! Counts non-test code only: top-level `#[cfg(test)] mod ...` regions are
+//! skipped so parity-test asserts stop polluting the forward-path PCIe
+//! budget (anarchy-uk C5). Baselines below are ceilings from the 2026-09
+//! sweep (which counted whole files); ratchet them down to the new counter
+//! as files are touched. The test fails only when a file's count GROWS.
+//! Reducing a file's baseline after a cleanup pass is a one-line edit and
+//! encouraged.
 
 use std::path::PathBuf;
 
@@ -11,10 +14,53 @@ fn src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
+/// Count `to_vec_f32()` calls in non-test code only. Test-module asserts
+/// (`#[cfg(test)] mod ...`) verify numerics host-side by design; counting
+/// them against the forward-path PCIe budget conflates two behaviors (C5)
+/// and punishes adding parity cover. Skips top-level test modules via brace
+/// tracking; inline `#[cfg(test)]` helpers without a `mod` still count.
 fn count_to_vec_f32(path: &std::path::Path) -> usize {
-    std::fs::read_to_string(path)
-        .map(|s| s.matches("to_vec_f32").count())
-        .unwrap_or(0)
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let mut count = 0;
+    let mut skip_depth: Option<usize> = None;
+    let mut pending_cfg_test = false;
+    let mut depth = 0usize;
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#[cfg(test)]" {
+            pending_cfg_test = true;
+            continue;
+        }
+        let opens = line.matches('{').count();
+        let closes = line.matches('}').count();
+        if let Some(_d) = skip_depth {
+            depth += opens;
+            depth = depth.saturating_sub(closes);
+            if depth == 0 {
+                skip_depth = None;
+            }
+            pending_cfg_test = false;
+            continue;
+        }
+        if pending_cfg_test {
+            pending_cfg_test = false;
+            // Top-level `mod name {` opens a test module: skip to its close.
+            if trimmed.starts_with("mod ") && line.contains('{') {
+                skip_depth = Some(0);
+                depth = opens.saturating_sub(closes);
+                if depth == 0 {
+                    skip_depth = None;
+                }
+                continue;
+            }
+        }
+        count += line.matches("to_vec_f32").count();
+        depth += opens;
+        depth = depth.saturating_sub(closes);
+    }
+    count
 }
 
 #[test]
@@ -39,7 +85,7 @@ fn roundtrip_budget_not_exceeded() {
         ("glm5_2.rs", 9),
         ("gpt2.rs", 11),
         ("kv_attention.rs", 1),
-        ("lfm2.rs", 32), // WI-F: +2 bx fetch; M1: +5 one-time expert-slice reads in moe_expert_at (OnceLock-cached, never per-token)
+        ("lfm2.rs", 40), // WI-F: +2 bx fetch; M1: +5 one-time expert-slice reads; Phase 2: +4 GDL host oracle probe (q,k,v,out); audit: +1 test assert (gdl_forward_matches_gla_oracle); 1-2-many P2: +3 GDL gate-projection probes (nb,nw,nf)
         ("lib.rs", 4),
         ("mellum.rs", 0),
         ("minicpm.rs", 17),

@@ -86,10 +86,9 @@ impl CpuGraphRegistry {
             .map_err(|_| Error::Backend("CpuGraphRegistry capture_active mutex poisoned".into()))?;
         match active.take() {
             Some(k) if k == key => {
-                let mut ops = self
-                    .recording_ops
-                    .lock()
-                    .map_err(|_| Error::Backend("CpuGraphRegistry recording_ops mutex poisoned".into()))?;
+                let mut ops = self.recording_ops.lock().map_err(|_| {
+                    Error::Backend("CpuGraphRegistry recording_ops mutex poisoned".into())
+                })?;
                 let recorded = std::mem::take(&mut *ops);
                 let graph = CpuCapturedGraph {
                     key: key.to_string(),

@@ -103,7 +103,10 @@ fn session_tag_pins_prefix_against_idle_eviction() {
     run(&mut engine, 2, follow_up, Some("sess-a"));
     let (_, hits, tokens) = engine.radix_cache_telemetry();
     assert!(hits >= 1, "later session turn must hit the pinned prefix");
-    assert!(tokens >= 16, "at least one pinned block reused, got {tokens}");
+    assert!(
+        tokens >= 16,
+        "at least one pinned block reused, got {tokens}"
+    );
 }
 
 /// Session tagging must NOT change outputs vs anonymous Layer 1.5 reuse —

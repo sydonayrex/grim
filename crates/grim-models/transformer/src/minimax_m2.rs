@@ -1,4 +1,5 @@
 //! Thin wrapper around `Llama` for minimax_m2 uses a Llama-style transformer.
+//! Serves dense Llama; real MiniMax-M2 linear attention NOT implemented — GDL ineligible.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};

@@ -155,27 +155,39 @@ impl Glm52Moe {
         let num_exp = self.experts.len();
 
         // Build per-token top-k routings (used by both GPU and CPU paths).
-        let mut routings: Vec<crate::shared_moe::TokenRouting> =
-            Vec::with_capacity(seq_len);
+        let mut routings: Vec<crate::shared_moe::TokenRouting> = Vec::with_capacity(seq_len);
         for s in 0..seq_len {
             let row_logits = &logits_v[s * num_exp..(s + 1) * num_exp];
-            let mut indexed: Vec<(usize, f32)> =
-                row_logits.iter().cloned().enumerate().collect();
+            let mut indexed: Vec<(usize, f32)> = row_logits.iter().cloned().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let topk = &indexed[..self.num_experts_per_tok.min(num_exp)];
-            let max_logit = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+            let max_logit = topk
+                .iter()
+                .map(|(_, l)| *l)
+                .fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_logit).exp()).collect();
             let sum_exp: f32 = exps.iter().sum();
             let weights: Vec<f32> = exps.iter().map(|e| e / (sum_exp + 1e-12)).collect();
-            routings.push(topk.iter().zip(weights.iter()).map(|((ei, _), w)| (*ei, *w)).collect());
+            routings.push(
+                topk.iter()
+                    .zip(weights.iter())
+                    .map(|((ei, _), w)| (*ei, *w))
+                    .collect(),
+            );
         }
 
         // GPU path: Charon GELU grouped dispatch (ROCm only).
         if matches!(x.device(), grim_tensor::Device::Rocm(_)) {
-            let gate_refs: Vec<&grim_tensor::Tensor> =
-                self.experts.iter().map(|e| &e.dense_h_to_4h.weight).collect();
-            let down_refs: Vec<&grim_tensor::Tensor> =
-                self.experts.iter().map(|e| &e.dense_4h_to_h.weight).collect();
+            let gate_refs: Vec<&grim_tensor::Tensor> = self
+                .experts
+                .iter()
+                .map(|e| &e.dense_h_to_4h.weight)
+                .collect();
+            let down_refs: Vec<&grim_tensor::Tensor> = self
+                .experts
+                .iter()
+                .map(|e| &e.dense_4h_to_h.weight)
+                .collect();
             let dev = grim_backend_rocm::RocmDevice::shared(match x.device() {
                 grim_tensor::Device::Rocm(o) => *o,
                 _ => unreachable!(),
@@ -538,14 +550,18 @@ mod gelu_dispatch_parity_tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4
             })
             .collect()
     }
 
     fn rocm_tensor(dev: &RocmDevice, data: Vec<f32>, shape: Shape) -> Tensor {
-        let storage = dev.from_cpu(&data, &shape, grim_tensor::dtype::DType::F32).unwrap();
+        let storage = dev
+            .from_cpu(&data, &shape, grim_tensor::dtype::DType::F32)
+            .unwrap();
         Tensor::new(
             std::sync::Arc::from(storage),
             shape,

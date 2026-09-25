@@ -69,15 +69,14 @@ pub use crate::device::handles::{
     hipEventRecord, hipEventSynchronize, hipFree, hipFreeAsync, hipGetDeviceCount,
     hipGetDeviceProperties, hipGraphAddKernelNode, hipGraphCreate, hipGraphDestroy,
     hipGraphExecDestroy, hipGraphExecKernelNodeSetParams, hipGraphExtendFromGlobalStream,
-    hipGraphInstantiate, hipGraphLaunch, hipGraphUpload,
-    hipHostFree, hipHostMalloc, hipMalloc, hipMallocManaged, hipMemAdvise, hipMemGetInfo,
-    hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
-    hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSetDevice,
-    hipStreamBeginCapture, hipStreamCreate, hipStreamCreateWithFlags, hipStreamDestroy,
-    hipStreamEndCapture, hipStreamSynchronize, hipStreamWaitEvent, hipSuccess,
-    hiprtcAddNameExpression, hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram,
-    hiprtcGetCode, hiprtcGetCodeSize, hiprtcGetErrorString, hiprtcGetLoweredName,
-    hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    hipGraphInstantiate, hipGraphLaunch, hipGraphUpload, hipHostFree, hipHostMalloc, hipMalloc,
+    hipMallocManaged, hipMemAdvise, hipMemGetInfo, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync,
+    hipMemset, hipMemsetAsync, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
+    hipModuleUnload, hipSetDevice, hipStreamBeginCapture, hipStreamCreate,
+    hipStreamCreateWithFlags, hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize,
+    hipStreamWaitEvent, hipSuccess, hiprtcAddNameExpression, hiprtcCompileProgram,
+    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
+    hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
 
 pub use crate::device::rocblas::{
@@ -119,14 +118,15 @@ pub use crate::gptq_kernel::wavefront_size_for_gcn;
 pub use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE;
 pub use crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE;
 pub use crate::kernels::jit_cache::HsacoKernelCache;
+pub use crate::kernels::qkv_attention::kv_f16_enabled;
 pub use crate::kernels::source_asm::compute_kernel_source;
 
+pub use crate::device::compute::{FusedGateUpWeights, FusedQkvWeights};
 pub use crate::memory::allocator::RocmCachingAllocator;
 pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
 pub use crate::memory::storage::RocmStorage;
 pub use crate::memory::view::RocmStorageView;
-pub use crate::device::compute::{FusedGateUpWeights, FusedQkvWeights};
 
 pub use crate::device::helpers::{
     check_hip, hip_stream_synchronize, hip_stream_synchronize_after_copy, jit_compile_hsaco,
@@ -142,25 +142,24 @@ pub use crate::device::util::{
 
 // ROCmDevice itself: large struct + every impl lives in `device::roc_device`.
 // Re-exported here so existing callers can keep using `RocmDevice::new(...)` etc.
-pub use crate::device::roc_device::{
-    FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
-};
 #[cfg(feature = "training")]
 pub use crate::device::roc_device::CharonBackwardResult;
-
-pub use crate::graph_capture::{
-    DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey, GraphCaptureManager,
+pub use crate::device::roc_device::{
+    FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
 };
+
+pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
 pub use crate::decode_graph_buffers::{
     DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
-    launch_attention, launch_qkv_gemv, write_embedding_to_buffer,
-    write_embeddings_to_buffer_batch,
+    launch_attention, launch_qkv_gemv, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
 };
-pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
-pub use crate::rccl::{RcclAllReduce, RocmMultiNodeGroup};
 pub use crate::device::parallel_comm::{
     CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology,
 };
+pub use crate::graph_capture::{
+    DecodeBatchBucket, DecodeBucketGraphPool, DecodeGraph, DecodeGraphKey, GraphCaptureManager,
+};
+pub use crate::rccl::{RcclAllReduce, RocmMultiNodeGroup};
 
 pub use fusion::{
     DecodeGemmConfig, FusedDequantGemmConfig, HipKernelLaunch, KvDequantAttentionConfig,
@@ -169,10 +168,10 @@ pub use fusion::{
 };
 
 pub use kernels::qkv_attention::{
-    BlockTableEntry, KvCacheQuantFormat, launch_bump_i32, launch_bump_i32_slots,
-    launch_kv_append, launch_kv_append_batch, launch_paged_attention,
-    launch_paged_attention_quant, launch_qkv_attention_dev, launch_qkv_attention_dev_batch,
-    launch_qkv_attention_wmma, launch_tree_attention,
+    BlockTableEntry, KvCacheQuantFormat, launch_bump_i32, launch_bump_i32_slots, launch_kv_append,
+    launch_kv_append_batch, launch_paged_attention, launch_paged_attention_quant,
+    launch_qkv_attention_dev, launch_qkv_attention_dev_batch, launch_qkv_attention_wmma,
+    launch_tree_attention,
 };
 pub use kernels::tile_picker::run_install_tune;
 
@@ -202,4 +201,3 @@ mod lib_internal_tests;
 // fault (gguf_multigpu_context_plan.md). Device-gated; needs >=2 GPUs.
 #[cfg(test)]
 mod context_drift_tests;
-

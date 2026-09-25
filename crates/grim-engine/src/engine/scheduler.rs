@@ -930,10 +930,18 @@ impl Engine {
                             let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
                             g.buffers
                                 .seed_kv_arena_from_eager(&dev, &srcs)
-                                .map_err(|e| format!("seed: {e}"))
+                                .map_err(|e| format!("seed: {e}"))?;
+                            g.buffers
+                                .seed_gdl_state_from_eager(&dev, &srcs)
+                                .map_err(|e| format!("gdl seed: {e}"))
                         })();
                         if let Err(e) = seed_ok {
                             eprintln!("[grim] decode-graph: KV seed failed for request {request_id} ({e}); eager fallback");
+                            grim_core::emit_fallback(
+                                "grim-engine/scheduler",
+                                grim_core::FallbackReason::KvSeed,
+                                format!("request {request_id}: {e}"),
+                            );
                             return self.drive_forward(model_id, request_id, input_ids, positions);
                         }
                         if g.begin_capture().is_err() {
@@ -984,16 +992,29 @@ impl Engine {
                     let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
                     g.buffers
                         .seed_kv_arena_from_eager(&dev, &srcs)
-                        .map_err(|e| format!("seed: {e}"))
+                        .map_err(|e| format!("seed: {e}"))?;
+                    g.buffers
+                        .seed_gdl_state_from_eager(&dev, &srcs)
+                        .map_err(|e| format!("gdl seed: {e}"))
                 })();
                 if let Err(e) = seed_ok {
                     eprintln!(
                         "[grim] decode-graph: slot re-seed failed for {graph_slot_key} ({e}); eager step"
                     );
+                    grim_core::emit_fallback(
+                        "grim-engine/scheduler",
+                        grim_core::FallbackReason::KvReseed,
+                        format!("{graph_slot_key}: {e}"),
+                    );
                     self.decode_graphs.remove(&graph_slot_key);
                     return self.drive_forward(model_id, request_id, input_ids, positions);
                 }
                 if lfm2.forward_replay(g, tid).is_err() {
+                    grim_core::emit_fallback(
+                        "grim-engine/scheduler",
+                        grim_core::FallbackReason::GraphCaptureReplay,
+                        graph_slot_key.clone(),
+                    );
                     self.decode_graphs.remove(&graph_slot_key);
                     return self.drive_forward(model_id, request_id, input_ids, positions);
                 }
@@ -1061,6 +1082,11 @@ impl Engine {
         // instead; a clean capture path (LFM2) is unaffected.
         if rocm.begin_graph_capture(capture_key).is_err() {
             eprintln!("[grim] graph capture: begin failed for {capture_key}; eager step");
+            grim_core::emit_fallback(
+                "grim-engine/scheduler",
+                grim_core::FallbackReason::GraphCaptureBegin,
+                capture_key.to_string(),
+            );
             return self.drive_forward(model_id, request_id, input_ids, positions);
         }
         // Scope borrows: session + model disjoint from logits cache insert below.
@@ -1085,11 +1111,21 @@ impl Engine {
         };
         if rocm.end_graph_capture(capture_key).is_err() {
             eprintln!("[grim] graph capture: end failed for {capture_key}; eager step");
+            grim_core::emit_fallback(
+                "grim-engine/scheduler",
+                grim_core::FallbackReason::GraphCaptureEnd,
+                capture_key.to_string(),
+            );
             return self.drive_forward(model_id, request_id, input_ids, positions);
         }
         // Replay immediately to execute the captured graph.
         if rocm.replay_graph(capture_key).is_err() {
             eprintln!("[grim] graph capture: replay failed for {capture_key}; eager step");
+            grim_core::emit_fallback(
+                "grim-engine/scheduler",
+                grim_core::FallbackReason::GraphCaptureReplay,
+                capture_key.to_string(),
+            );
             return self.drive_forward(model_id, request_id, input_ids, positions);
         }
         let logits = result?;
@@ -1604,5 +1640,419 @@ impl Engine {
                 Slot::Staged { .. } => unreachable!("staged slot left unfilled by phase B"),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod scheduler_fallback_tests {
+    use super::*;
+
+    fn tiny_cpu_llama() -> Box<dyn grim_core::model::CausalLm> {
+        Box::new(grim_models_transformer::Llama::random(
+            grim_tensor::Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32,
+                hidden_size: 16,
+                num_heads: 2,
+                num_kv_heads: 1,
+                head_dim: 8,
+                num_layers: 1,
+                intermediate_size: 32,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                partial_rotary_factor: 1.0,
+                yarn: None,
+                max_seq_len: 32,
+            },
+        ))
+    }
+
+    fn prefilled_engine() -> Engine {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_model("small", tiny_cpu_llama());
+        engine
+            .enqueue_request(grim_scheduler::Request {
+                id: 1,
+                prompt_tokens: 2,
+                input_ids: Some(vec![3, 5]),
+                max_new_tokens: 1,
+                ..Default::default()
+            })
+            .expect("enqueue");
+        engine.tick().expect("prefill tick");
+        engine
+    }
+
+    fn decode_tensors(token: f32, pos: f32) -> (grim_tensor::Tensor, grim_tensor::Tensor) {
+        let ids = grim_backend_cpu::cpu_tensor(vec![token], grim_tensor::Shape::new(vec![1]));
+        let positions = grim_backend_cpu::cpu_tensor(vec![pos], grim_tensor::Shape::new(vec![1]));
+        (ids, positions)
+    }
+
+    /// M6: on a non-ROCm device the graph-capture path must degrade to the
+    /// eager step with identical logits and no stored graph. A fallback that
+    /// silently corrupts (or panics) instead of matching `drive_forward`
+    /// would hide here — this pins equivalence.
+    #[test]
+    fn graph_capture_falls_back_to_eager_with_identical_logits_on_cpu() {
+        let mut eager_engine = prefilled_engine();
+        let mut graph_engine = prefilled_engine();
+        let (ids, positions) = decode_tensors(7.0, 2.0);
+
+        let eager = eager_engine
+            .drive_forward("small", 1, &ids, &positions)
+            .expect("eager forward");
+        let via_capture = graph_engine
+            .drive_forward_graph_capture("small", 1, &ids, &positions, "test-key")
+            .expect("graph-capture path must fall back, not fail");
+
+        assert!(
+            graph_engine.decode_graphs.is_empty(),
+            "CPU fallback must not store a decode graph"
+        );
+        let a = eager.logits.expect("eager logits").to_vec_f32().unwrap();
+        let b = via_capture
+            .logits
+            .expect("capture logits")
+            .to_vec_f32()
+            .unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a, b, "fallback logits must equal eager logits exactly");
+    }
+}
+
+#[cfg(test)]
+mod scheduler_fallback_gpu_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn gpu_dev() -> Option<Arc<grim_backend_rocm::RocmDevice>> {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            return None;
+        }
+        grim_backend_rocm::RocmDevice::try_new(0).ok().map(Arc::new)
+    }
+
+    /// Opt into graph capture for the engine fallback legs below. The shared
+    /// device singleton snapshots the flag at first construction, so this
+    /// must run before any `shared(0)` use in the process; when another test
+    /// already built it without the flag, there is nothing honest to do but
+    /// skip (the CPU test covers the disabled branch instead).
+    /// Returns the previous value for restoration.
+    fn capture_env() -> Option<String> {
+        // SAFETY: gpu_test_lock serializes this binary's GPU tests; no other
+        // thread here mutates process env during the window.
+        unsafe {
+            let prev = std::env::var("GRIM_CAPTURE_GRAPH").ok();
+            std::env::set_var("GRIM_CAPTURE_GRAPH", "1");
+            prev
+        }
+    }
+
+    fn restore_capture_env(prev: Option<String>) {
+        // SAFETY: same serialization window as `capture_env`.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("GRIM_CAPTURE_GRAPH", v),
+                None => std::env::remove_var("GRIM_CAPTURE_GRAPH"),
+            }
+        }
+    }
+
+    fn rocm_tensor(
+        dev: &grim_backend_rocm::RocmDevice,
+        data: Vec<f32>,
+        shape: grim_tensor::Shape,
+    ) -> grim_tensor::Tensor {
+        use grim_tensor::CoreTensorOps;
+        let storage = dev
+            .from_cpu(&data, &shape, grim_tensor::DType::F32)
+            .unwrap();
+        grim_tensor::Tensor::new(
+            Arc::from(storage),
+            shape,
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::GrimNative,
+            grim_tensor::Device::Rocm(0),
+        )
+    }
+
+    fn rocm_linear(
+        dev: &grim_backend_rocm::RocmDevice,
+        rows: usize,
+        cols: usize,
+        seed: f32,
+    ) -> grim_nn::Linear {
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i + 1) as f32) * 0.37 + seed).sin() * 0.2)
+            .collect();
+        grim_nn::Linear::from_tensor(
+            rocm_tensor(dev, w, grim_tensor::Shape::new(vec![rows, cols])),
+            None,
+        )
+    }
+
+    fn rocm_norm(dev: &grim_backend_rocm::RocmDevice, dim: usize) -> grim_nn::RmsNorm {
+        grim_nn::RmsNorm::new(
+            rocm_tensor(dev, vec![1.0f32; dim], grim_tensor::Shape::new(vec![dim])),
+            1e-5,
+        )
+    }
+
+    struct MapProvider {
+        tensors: std::collections::HashMap<String, grim_tensor::provider::RawTensor>,
+    }
+
+    impl grim_tensor::TensorProvider for MapProvider {
+        fn get(
+            &self,
+            name: &str,
+        ) -> std::result::Result<grim_tensor::provider::RawTensor, grim_tensor::Error> {
+            self.tensors.get(name).cloned().ok_or_else(|| {
+                grim_tensor::Error::Backend(format!("test provider: missing tensor '{name}'"))
+            })
+        }
+
+        fn meta(
+            &self,
+            name: &str,
+        ) -> std::result::Result<grim_tensor::provider::TensorMeta, grim_tensor::Error> {
+            let raw = self.get(name)?;
+            Ok(grim_tensor::provider::TensorMeta {
+                dtype: raw.dtype,
+                provenance: raw.provenance,
+                shape: raw.shape,
+                fusion_mask: 0,
+            })
+        }
+    }
+
+    fn f32_raw(data: Vec<f32>, shape: Vec<usize>) -> grim_tensor::provider::RawTensor {
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        grim_tensor::provider::RawTensor {
+            bytes,
+            shape,
+            dtype: grim_tensor::DType::F32,
+            provenance: grim_tensor::QuantProvenance::GrimNative,
+        }
+    }
+
+    /// Minimal 1-layer Softmax LFM2 on ROCm for fallback-path tests. Dense,
+    /// non-MoE, no ShortConv, no fused packs — exercises the engine's graph
+    /// plumbing, not model quality. Built through `Lfm2Block::load` (never a
+    /// struct literal) so private fields can't break this harness.
+    fn tiny_rocm_lfm2(dev: &grim_backend_rocm::RocmDevice) -> grim_models_transformer::Lfm2 {
+        use grim_models_transformer::lfm2::{Lfm2, Lfm2AttentionMode, Lfm2Block, Lfm2Config};
+        let hidden = 32usize;
+        let (nh, nkv, hd, inter, vocab) = (2usize, 1usize, 8usize, 64usize, 32usize);
+        let synth = |rows: usize, cols: usize, seed: f32| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|i| (((i + 1) as f32) * 0.37 + seed).sin() * 0.2)
+                .collect()
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "attn_norm.weight".to_string(),
+            f32_raw(vec![1.0; hidden], vec![hidden]),
+        );
+        map.insert(
+            "attn_q.weight".to_string(),
+            f32_raw(synth(nh * hd, hidden, 11.0), vec![nh * hd, hidden]),
+        );
+        map.insert(
+            "attn_k.weight".to_string(),
+            f32_raw(synth(nkv * hd, hidden, 22.0), vec![nkv * hd, hidden]),
+        );
+        map.insert(
+            "attn_v.weight".to_string(),
+            f32_raw(synth(nkv * hd, hidden, 33.0), vec![nkv * hd, hidden]),
+        );
+        map.insert(
+            "attn_output.weight".to_string(),
+            f32_raw(synth(hidden, nh * hd, 44.0), vec![hidden, nh * hd]),
+        );
+        map.insert(
+            "attn_q_norm.weight".to_string(),
+            f32_raw(vec![1.0; hd], vec![hd]),
+        );
+        map.insert(
+            "attn_k_norm.weight".to_string(),
+            f32_raw(vec![1.0; hd], vec![hd]),
+        );
+        map.insert(
+            "ffn_norm.weight".to_string(),
+            f32_raw(vec![1.0; hidden], vec![hidden]),
+        );
+        map.insert(
+            "ffn_gate.weight".to_string(),
+            f32_raw(synth(inter, hidden, 55.0), vec![inter, hidden]),
+        );
+        map.insert(
+            "ffn_up.weight".to_string(),
+            f32_raw(synth(inter, hidden, 66.0), vec![inter, hidden]),
+        );
+        map.insert(
+            "ffn_down.weight".to_string(),
+            f32_raw(synth(hidden, inter, 77.0), vec![hidden, inter]),
+        );
+        let provider = MapProvider { tensors: map };
+        let ws = grim_nn::WeightSource::root(&provider, grim_tensor::Device::Rocm(0));
+        let cfg = Lfm2Config {
+            vocab_size: vocab,
+            hidden_size: hidden,
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            num_layers: 1,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            n_shortconv_l_cache: 0,
+            is_recr: vec![false],
+            n_layer_dense_lead: 1,
+            n_expert: 0,
+            n_expert_used: 1,
+            n_ff_exp: 0,
+            n_embd_out: hidden,
+            mxfp4_qkv_attention: false,
+            attention_mode: Lfm2AttentionMode::Softmax,
+            attention_mode_per_layer: None,
+        };
+        let block = Lfm2Block::load(&ws, &cfg, 0).expect("synthetic block load");
+        block.validate(0).expect("synthetic block coherent");
+        Lfm2 {
+            cfg,
+            device: grim_tensor::Device::Rocm(0),
+            tok_embeddings: grim_nn::Embedding {
+                weight: rocm_tensor(
+                    dev,
+                    (0..vocab * hidden)
+                        .map(|i| ((i % 13) as f32 * 0.05) - 0.3)
+                        .collect(),
+                    grim_tensor::Shape::new(vec![vocab, hidden]),
+                ),
+            },
+            layers: vec![block],
+            norm: rocm_norm(dev, hidden),
+            output: rocm_linear(dev, vocab, hidden, 88.0),
+            dense_2_out: None,
+            dense_2_out_bias: None,
+        }
+    }
+
+    /// M6 GPU leg: KV-seed failure must fall back to the eager step — Ok
+    /// with finite logits, no stored graph. The seed only Errs when
+    /// valid_rows > 0 with missing KV sources (`eager_kv_seed_sources`
+    /// fail-closed contract); a fresh session (valid_rows == 0)
+    /// legitimately no-op-seeds and captures. So this test prefills to
+    /// advance current_pos, then strips the KV state to make the seed
+    /// genuinely fail closed.
+    #[test]
+    #[ignore]
+    fn graph_capture_seed_fail_falls_back_to_eager_on_gpu() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+            return;
+        };
+        let _guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let prev_env = capture_env();
+        if !grim_backend_rocm::RocmDevice::shared(0).graph_capture_enabled() {
+            eprintln!("Skipping: shared device predates capture opt-in (CPU test covers off-branch)");
+            restore_capture_env(prev_env);
+            return;
+        }
+        let lfm2 = tiny_rocm_lfm2(&dev);
+        let n_layers = lfm2.cfg.num_layers;
+        let mut engine = Engine::new(EngineConfig::default());
+        let sess = grim_core::model::CausalLm::new_session(&lfm2);
+        engine.register_model("lfm2tiny", Box::new(lfm2));
+        engine.sessions.insert(7, sess);
+
+        // Prefill one token through the eager path so current_pos > 0.
+        let pre_ids = rocm_tensor(&dev, vec![3.0], grim_tensor::Shape::new(vec![1]));
+        let pre_pos = rocm_tensor(&dev, vec![0.0], grim_tensor::Shape::new(vec![1]));
+        engine
+            .drive_forward("lfm2tiny", 7, &pre_ids, &pre_pos)
+            .expect("prefill eager forward");
+
+        // Strip the KV state: current_pos stays > 0 but the seed sources
+        // are gone, so the decode-graph seed must fail closed to eager.
+        engine
+            .sessions
+            .get_mut(&7)
+            .expect("session 7 present after prefill")
+            .set_model_state(Box::new(vec![
+                None::<grim_models_transformer::Lfm2LayerCache>;
+                n_layers
+            ]));
+
+        let ids = rocm_tensor(&dev, vec![5.0], grim_tensor::Shape::new(vec![1]));
+        let pos = rocm_tensor(&dev, vec![1.0], grim_tensor::Shape::new(vec![1]));
+        let out = engine
+            .drive_forward_graph_capture("lfm2tiny", 7, &ids, &pos, "m6-seed-fail")
+            .expect("seed failure must fall back to eager, not fail");
+        restore_capture_env(prev_env);
+        assert!(
+            engine.decode_graphs.is_empty(),
+            "seed-fail fallback must not store a decode graph"
+        );
+        let v = out.logits.expect("logits").to_vec_f32().unwrap();
+        assert!(!v.is_empty() && v.iter().all(|x| x.is_finite()));
+    }
+
+    /// M6 GPU leg: after a real prefill, the capture path (or its eager
+    /// fallback) must stay Ok with finite logits; a stored graph must replay
+    /// Ok on the next step. Either dispatch is valid — silent corruption or
+    /// a hard error is not.
+    #[test]
+    #[ignore]
+    fn graph_capture_prefilled_path_stays_ok_on_gpu() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+            return;
+        };
+        let _guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let prev_env = capture_env();
+        if !grim_backend_rocm::RocmDevice::shared(0).graph_capture_enabled() {
+            eprintln!("Skipping: shared device predates capture opt-in (CPU test covers off-branch)");
+            restore_capture_env(prev_env);
+            return;
+        }
+        let lfm2 = tiny_rocm_lfm2(&dev);
+        let mut engine = Engine::new(EngineConfig::default());
+        let sess = grim_core::model::CausalLm::new_session(&lfm2);
+        engine.register_model("lfm2tiny", Box::new(lfm2));
+        engine.sessions.insert(7, sess);
+
+        // Prefill two tokens through the eager path to populate KV caches.
+        for (tok, pos) in [(3.0f32, 0.0f32), (5.0, 1.0)] {
+            let ids = rocm_tensor(&dev, vec![tok], grim_tensor::Shape::new(vec![1]));
+            let positions = rocm_tensor(&dev, vec![pos], grim_tensor::Shape::new(vec![1]));
+            engine
+                .drive_forward("lfm2tiny", 7, &ids, &positions)
+                .expect("prefill eager forward");
+        }
+        let ids = rocm_tensor(&dev, vec![7.0], grim_tensor::Shape::new(vec![1]));
+        let pos = rocm_tensor(&dev, vec![2.0], grim_tensor::Shape::new(vec![1]));
+        let out = engine
+            .drive_forward_graph_capture("lfm2tiny", 7, &ids, &pos, "m6-prefilled")
+            .expect("capture-or-fallback must stay Ok");
+        restore_capture_env(prev_env);
+        let v = out.logits.expect("logits").to_vec_f32().unwrap();
+        assert!(!v.is_empty() && v.iter().all(|x| x.is_finite()));
+
+        // If a graph was stored, the replay leg must also stay Ok.
+        if !engine.decode_graphs.is_empty() {
+            let ids2 = rocm_tensor(&dev, vec![9.0], grim_tensor::Shape::new(vec![1]));
+            let pos2 = rocm_tensor(&dev, vec![3.0], grim_tensor::Shape::new(vec![1]));
+            let out2 = engine
+                .drive_forward_graph_capture("lfm2tiny", 7, &ids2, &pos2, "m6-prefilled")
+                .expect("replay leg must stay Ok");
+            let v2 = out2.logits.expect("logits").to_vec_f32().unwrap();
+            assert!(!v2.is_empty() && v2.iter().all(|x| x.is_finite()));
+        }
     }
 }

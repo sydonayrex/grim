@@ -4,12 +4,14 @@ use std::ffi::c_void;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, Shape };
+use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, hipFreeAsync, linear_launch, upload_device_buffer };
-
+use crate::{
+    HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, hipFreeAsync, linear_launch,
+    upload_device_buffer,
+};
 
 impl RocmDevice {
     /// GPU-side YaRN / partial-rotary RoPE: computes `inv_freq[]` on the host, uploads it once per call, then dispatches `grim_rope_yarn` entirely on-device.
@@ -529,7 +531,9 @@ impl RocmDevice {
         let base = cfg.base;
         let x_s = as_rocm(x_storage)?;
         if !x_s.device_ptr_is_valid() {
-            return Err(Error::Backend("rmsnorm_rope: x lacks valid device ptr".into()));
+            return Err(Error::Backend(
+                "rmsnorm_rope: x lacks valid device ptr".into(),
+            ));
         }
         let out_dims = out_shape.dims();
         if out_dims.len() != 3 || out_dims[2] != dim {
@@ -618,6 +622,7 @@ impl RocmDevice {
         mscale: f32,
         eps: f32,
         max_seq_len: usize,
+        rope_interleaved: bool,
     ) -> Result<*mut c_void> {
         let gamma_q_ptr = gamma_q_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_q has no device ptr".into())
@@ -693,6 +698,7 @@ impl RocmDevice {
         let mut mscale_val = mscale;
         let mut eps_val = eps;
         let mut max_seq = max_seq_len as i32;
+        let mut rope_ilv = rope_interleaved as i32;
 
         let stream = self.launch_compute_kernel(
             "grim_qk_norm_rope",
@@ -716,6 +722,7 @@ impl RocmDevice {
                 arg(&mut mscale_val),
                 arg(&mut eps_val),
                 arg(&mut max_seq),
+                arg(&mut rope_ilv),
             ],
         )?;
 

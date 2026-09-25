@@ -339,9 +339,8 @@ pub struct LlamaBlock {
     pub(crate) ffn_disabled: bool,
     /// N2: reusable Q8_1 activation scratch for `silu_mul_quant_q81_decode`
     /// (single-token decode). Avoids a fresh VRAM allocation per decode step.
-    pub(crate) silu_q81_scratch: std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<dyn grim_tensor::BackendStorage>>>,
-    >,
+    pub(crate) silu_q81_scratch:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn grim_tensor::BackendStorage>>>>,
 }
 
 impl LlamaBlock {
@@ -493,10 +492,16 @@ impl LlamaBlock {
                 };
                 match grim_backend_rocm::RocmDevice::try_new(ordinal) {
                     Ok(rocm_dev) => {
-                        match rocm_dev.build_fused_qkv_q80(wq_s.as_ref(), wk_s.as_ref(), wv_s.as_ref()) {
+                        match rocm_dev.build_fused_qkv_q80(
+                            wq_s.as_ref(),
+                            wk_s.as_ref(),
+                            wv_s.as_ref(),
+                        ) {
                             Ok(fused) => Some(std::sync::Arc::new(fused)),
                             Err(e) => {
-                                eprintln!("[grim] fused Q8_0 QKV build failed ({e}), falling back to 3-GEMV");
+                                eprintln!(
+                                    "[grim] fused Q8_0 QKV build failed ({e}), falling back to 3-GEMV"
+                                );
                                 None
                             }
                         }
@@ -537,7 +542,9 @@ impl LlamaBlock {
                             match rocm_dev.build_fused_gate_up_q80(wg_s.as_ref(), wu_s.as_ref()) {
                                 Ok(fused) => Some(std::sync::Arc::new(fused)),
                                 Err(e) => {
-                                    eprintln!("[grim] fused Q8_0 GateUp build failed ({e}), falling back to 2-GEMV");
+                                    eprintln!(
+                                        "[grim] fused Q8_0 GateUp build failed ({e}), falling back to 2-GEMV"
+                                    );
                                     None
                                 }
                             }
@@ -668,8 +675,11 @@ impl LlamaBlock {
                                     Device::Rocm(o) => *o,
                                     _ => 0,
                                 };
-                                if let Ok(rocm_dev) = grim_backend_rocm::RocmDevice::try_new(ordinal) {
-                                    if let Ok(st) = rocm_dev.zeros(&Shape::new(vec![1]), DType::U32) {
+                                if let Ok(rocm_dev) =
+                                    grim_backend_rocm::RocmDevice::try_new(ordinal)
+                                {
+                                    if let Ok(st) = rocm_dev.zeros(&Shape::new(vec![1]), DType::U32)
+                                    {
                                         c.pos_base_dev = Some(Box::new(Tensor::new(
                                             std::sync::Arc::from(st),
                                             Shape::new(vec![1]),
@@ -688,7 +698,8 @@ impl LlamaBlock {
                                 let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal);
                                 let pos_val = positions.first().copied().unwrap_or(0);
                                 let pos_bits = f32::from_bits(pos_val);
-                                let _ = rocm_dev.write_f32_into(pos_base.storage().as_ref(), &[pos_bits]);
+                                let _ = rocm_dev
+                                    .write_f32_into(pos_base.storage().as_ref(), &[pos_bits]);
                             }
                         }
                     }
@@ -698,9 +709,19 @@ impl LlamaBlock {
                     // Append this layer's K/V into the paged store BEFORE attending so the current token is visible to the attention kernel (which reads up to `cache_offset + total_tokens`).
                     // The K stored must be POST-RoPE - the classic `LlamaLayerCache` path caches `k_rot`.
                     let k_rot = if let (Some(kn), Some(raw)) = (&self.k_norm, &k_raw) {
-                        self.apply_rmsnorm_rope_multi_head_opt(raw, kn, positions, self._cfg.local_num_kv_heads)?
+                        self.apply_rmsnorm_rope_multi_head_opt(
+                            raw,
+                            kn,
+                            positions,
+                            self._cfg.local_num_kv_heads,
+                        )?
                     } else {
-                        self.apply_rope_multi_head_opt(&k, positions, self._cfg.local_num_kv_heads, pos_base_ref)?
+                        self.apply_rope_multi_head_opt(
+                            &k,
+                            positions,
+                            self._cfg.local_num_kv_heads,
+                            pos_base_ref,
+                        )?
                     };
                     // WI (session-continuity step 1): a FAILED append is a
                     // hard error — with the atomic reservation in
@@ -768,7 +789,8 @@ impl LlamaBlock {
         let attn_out = match paged_attn_out {
             Some(out) => out,
             None => {
-                let (a, _) = self.prefilled_self_attention(&q, &k, &v, positions, cache, &mut o_fused)?;
+                let (a, _) =
+                    self.prefilled_self_attention(&q, &k, &v, positions, cache, &mut o_fused)?;
                 a
             }
         };
@@ -810,12 +832,16 @@ impl LlamaBlock {
                 let gate = self
                     .w_gate
                     .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_gate missing".into()))?
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("dense FFN w_gate missing".into())
+                    })?
                     .forward(&x_norm)?;
                 let up = self
                     .w_up
                     .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("dense FFN w_up missing".into()))?
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend("dense FFN w_up missing".into())
+                    })?
                     .forward(&x_norm)?;
                 (gate, up)
             }
@@ -1022,12 +1048,11 @@ impl LlamaBlock {
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .ok_or_else(|| {
-                grim_core::error::Error::Backend("act_q81 is RocmStorage".into())
-            })?;
+            .ok_or_else(|| grim_core::error::Error::Backend("act_q81 is RocmStorage".into()))?;
         dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
-        let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
+        let out =
+            dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
         let out_arc: std::sync::Arc<dyn grim_tensor::BackendStorage> = std::sync::Arc::from(out);
         let q_bytes = fused.n_q * 4;
         let k_bytes = fused.n_k * 4;
@@ -1117,12 +1142,16 @@ impl LlamaBlock {
             .as_ref()
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
-            .ok_or_else(|| {
-                grim_core::error::Error::Backend("act_q81 is RocmStorage".into())
-            })?;
+            .ok_or_else(|| grim_core::error::Error::Backend("act_q81 is RocmStorage".into()))?;
         dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
-        let out = dev.launch_fused_gate_up_dot4(act_rocm, &fused.storage, fused.n_gate, fused.n_up, hidden)?;
+        let out = dev.launch_fused_gate_up_dot4(
+            act_rocm,
+            &fused.storage,
+            fused.n_gate,
+            fused.n_up,
+            hidden,
+        )?;
         let out_arc: std::sync::Arc<dyn grim_tensor::BackendStorage> = std::sync::Arc::from(out);
         let gate_bytes = fused.n_gate * 4;
         let up_bytes = fused.n_up * 4;
@@ -1157,11 +1186,7 @@ impl LlamaBlock {
 
     /// SPEED-DOT-OPFUSE (Phase 4d): single-token decode fused SwiGLU + Q8_1 quantization.
     /// Emits directly a U8-typed Q8_1 pre-quantized activation for down-projection dot4 GEMV.
-    pub(crate) fn silu_mul_quant_q81_decode(
-        &self,
-        gate: &Tensor,
-        up: &Tensor,
-    ) -> Result<Tensor> {
+    pub(crate) fn silu_mul_quant_q81_decode(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         let dev = grim_backend_rocm::RocmDevice::shared(match gate.device() {
             Device::Rocm(o) => *o,
             _ => 0,
@@ -1172,7 +1197,10 @@ impl LlamaBlock {
         // N2: reuse the per-block Q8_1 scratch across decode steps instead of
         // allocating fresh VRAM every call. Grown in place if a larger shape
         // ever arrives.
-        let mut scratch = self.silu_q81_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scratch = self
+            .silu_q81_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let need_alloc = match scratch.as_ref() {
             Some(s) => s.shape().elem_count() < q81_bytes,
             None => true,
@@ -1294,7 +1322,9 @@ impl LlamaBlock {
         }
 
         if let Device::Rocm(ordinal) = x.device() {
-            if self.rope.config.is_plain() && std::env::var("GRIM_RMSNORM_ROPE").as_deref() != Ok("0") {
+            if self.rope.config.is_plain()
+                && std::env::var("GRIM_RMSNORM_ROPE").as_deref() != Ok("0")
+            {
                 let rocm_dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
                 let rope_shape = Shape::new(vec![b, s * num_heads, head_dim]);
                 let relabeled = Tensor::new(
@@ -1354,8 +1384,10 @@ impl LlamaBlock {
         let pos_base_dev = cache.as_ref().and_then(|c| c.pos_base_dev.as_deref());
 
         // Apply RoPE to Q and K on-device.
-        let q_rot = self.apply_rope_multi_head_opt(q, positions, cfg.local_num_heads, pos_base_dev)?;
-        let k_rot = self.apply_rope_multi_head_opt(k, positions, cfg.local_num_kv_heads, pos_base_dev)?;
+        let q_rot =
+            self.apply_rope_multi_head_opt(q, positions, cfg.local_num_heads, pos_base_dev)?;
+        let k_rot =
+            self.apply_rope_multi_head_opt(k, positions, cfg.local_num_kv_heads, pos_base_dev)?;
         let _t1 = std::time::Instant::now();
 
         let q_len = {
@@ -1390,12 +1422,7 @@ impl LlamaBlock {
         {
             if let Some(cache) = cache.as_mut() {
                 match self.device_graph_decode_attention(
-                    &q_3d,
-                    &k_3d,
-                    &v_3d,
-                    cache,
-                    row_elems,
-                    &out_shape,
+                    &q_3d, &k_3d, &v_3d, cache, row_elems, &out_shape,
                 ) {
                     Ok((attn, o_done)) => {
                         if o_done {
@@ -1600,9 +1627,15 @@ impl LlamaBlock {
                     grim_tensor::QuantProvenance::default(),
                     self._dev.clone(),
                 ),
-                Err(_) => {
-                    self.cpu_attention_fallback(&q_3d, k_all, v_all, prefix_len, q_len, kv_len, Some(slopes))?
-                }
+                Err(_) => self.cpu_attention_fallback(
+                    &q_3d,
+                    k_all,
+                    v_all,
+                    prefix_len,
+                    q_len,
+                    kv_len,
+                    Some(slopes),
+                )?,
             }
         } else {
             match dev.qkv_attention(
@@ -1624,9 +1657,8 @@ impl LlamaBlock {
                     grim_tensor::QuantProvenance::default(),
                     self._dev.clone(),
                 ),
-                Err(_) => {
-                    self.cpu_attention_fallback(&q_3d, k_all, v_all, prefix_len, q_len, kv_len, None)?
-                }
+                Err(_) => self
+                    .cpu_attention_fallback(&q_3d, k_all, v_all, prefix_len, q_len, kv_len, None)?,
             }
         };
         reshaped_view(&attn_3d, &flat_shape)
@@ -1651,11 +1683,7 @@ impl LlamaBlock {
     ) -> Result<(Tensor, bool)> {
         let ordinal = match self._dev {
             Device::Rocm(o) => o,
-            _ => {
-                return Err(Error::Unimplemented(
-                    "decode graph: non-ROCm device".into(),
-                ))
-            }
+            _ => return Err(Error::Unimplemented("decode graph: non-ROCm device".into())),
         };
         let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
         // All operands must be device-resident Rocm blocks.
@@ -1763,7 +1791,12 @@ impl LlamaBlock {
             let out = rocm.zeros(&Shape::new(vec![1, o_dim]), DType::F32)?;
             (out, Shape::new(vec![1, o_dim]), 1u32, o_dim as u32)
         } else {
-            (rocm.alloc_storage(out_shape, DType::F32)?, out_shape.clone(), 0u32, 0)
+            (
+                rocm.alloc_storage(out_shape, DType::F32)?,
+                out_shape.clone(),
+                0u32,
+                0,
+            )
         };
         let out_max_s = rocm.alloc_storage(&Shape::new(vec![cfg.local_num_heads]), DType::F32)?;
         let out_sum_s = rocm.alloc_storage(&Shape::new(vec![cfg.local_num_heads]), DType::F32)?;
@@ -2465,8 +2498,13 @@ mod tests {
         assert!(cache.pos_base_dev.is_none());
         assert!(cache.past_dev.is_none());
 
-        let x = make_tensor(vec![0.1; block._cfg.hidden_size], &[1, block._cfg.hidden_size]);
-        let (out, _k, _v) = block.forward_with_kv_paged(&x, &[0], None, Some(&mut cache), 0).unwrap();
+        let x = make_tensor(
+            vec![0.1; block._cfg.hidden_size],
+            &[1, block._cfg.hidden_size],
+        );
+        let (out, _k, _v) = block
+            .forward_with_kv_paged(&x, &[0], None, Some(&mut cache), 0)
+            .unwrap();
         assert_eq!(out.shape().dims(), &[1, block._cfg.hidden_size]);
     }
 
@@ -2897,9 +2935,15 @@ mod tests {
         let mut k_hist: Vec<Vec<f32>> = Vec::new();
         let mut v_hist: Vec<Vec<f32>> = Vec::new();
         for step in 0..3usize {
-            let kdat: Vec<f32> = (0..row).map(|i| ((step * 31 + i) as f32 * 0.07).sin()).collect();
-            let vdat: Vec<f32> = (0..row).map(|i| ((step * 17 + i) as f32 * 0.05).cos()).collect();
-            let qdat: Vec<f32> = (0..hq).map(|i| ((step * 13 + i) as f32 * 0.09).sin()).collect();
+            let kdat: Vec<f32> = (0..row)
+                .map(|i| ((step * 31 + i) as f32 * 0.07).sin())
+                .collect();
+            let vdat: Vec<f32> = (0..row)
+                .map(|i| ((step * 17 + i) as f32 * 0.05).cos())
+                .collect();
+            let qdat: Vec<f32> = (0..hq)
+                .map(|i| ((step * 13 + i) as f32 * 0.09).sin())
+                .collect();
             let q = up(&qdat, &Shape::new(vec![1, hq]));
             let k = up(&kdat, &Shape::new(vec![1, cfg.local_num_kv_heads, hd]));
             let v = up(&vdat, &Shape::new(vec![1, cfg.local_num_kv_heads, hd]));
@@ -2920,7 +2964,10 @@ mod tests {
                 let scores: Vec<f32> = k_hist
                     .iter()
                     .map(|kr| {
-                        (0..hd).map(|d| qdat[h * hd + d] * kr[kvh * hd + d]).sum::<f32>() * inv
+                        (0..hd)
+                            .map(|d| qdat[h * hd + d] * kr[kvh * hd + d])
+                            .sum::<f32>()
+                            * inv
                     })
                     .collect();
                 let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2939,7 +2986,10 @@ mod tests {
                 .zip(want.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(diff < 1e-4, "step {step} decode-graph attention diff={diff}");
+            assert!(
+                diff < 1e-4,
+                "step {step} decode-graph attention diff={diff}"
+            );
         }
         assert_eq!(cache.past_len, 3);
     }
@@ -2977,7 +3027,9 @@ mod tests {
         block._dev = devc.clone();
         block.wo.inner.bias = None;
         // Random wo weight [out=32, in=32] + pre-transposed w_t.
-        let wdat: Vec<f32> = (0..32 * 32).map(|i| ((i % 13) as f32 - 6.0) * 0.04).collect();
+        let wdat: Vec<f32> = (0..32 * 32)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.04)
+            .collect();
         let wtdat: Vec<f32> = (0..32 * 32)
             .map(|i| {
                 let (d, oc) = (i / 32, i % 32);
@@ -3005,7 +3057,9 @@ mod tests {
             .unwrap();
 
         eprintln!("DBG o_done={o_done} dims={:?}", out.shape().dims());
-        if !o_done { return; } // GRIM_DBG_NO_FUSE isolation run
+        if !o_done {
+            return;
+        } // GRIM_DBG_NO_FUSE isolation run
         assert_eq!(out.shape().dims(), &[1, 32]);
         let got = out.to_vec_f32().unwrap();
         eprintln!("DBG got={got:?}");
@@ -3015,7 +3069,8 @@ mod tests {
         let mut attn = vec![0f32; hq];
         for h in 0..cfg.local_num_heads {
             let scores: Vec<f32> = (0..hd)
-                .map(|d| qdat[h * hd + d] * kdat[d]).collect::<Vec<_>>();
+                .map(|d| qdat[h * hd + d] * kdat[d])
+                .collect::<Vec<_>>();
             let s = scores.iter().sum::<f32>() * inv;
             let e = s.exp();
             for d in 0..hd {
@@ -3025,12 +3080,13 @@ mod tests {
         // CPU reference check: with a single KV row the softmax weight is 1,
         // so the fused result must equal (vdat broadcast per head) @ wo^T.
         for oc in 0..32 {
-            let want: f32 = (0..32).map(|d| {
-                let a = (0..cfg.local_num_heads)
-                    .map(|_h| vdat[d % hd])
-                    .sum::<f32>() / cfg.local_num_heads as f32;
-                a * wdat[oc * 32 + d]
-            }).sum();
+            let want: f32 = (0..32)
+                .map(|d| {
+                    let a = (0..cfg.local_num_heads).map(|_h| vdat[d % hd]).sum::<f32>()
+                        / cfg.local_num_heads as f32;
+                    a * wdat[oc * 32 + d]
+                })
+                .sum();
             assert!(
                 (got[oc] - want).abs() < 1e-4,
                 "fuse_o mismatch at {oc}: got {} want {want}",
@@ -3106,5 +3162,4 @@ mod alibi_reference_tests {
             }
         }
     }
-
 }

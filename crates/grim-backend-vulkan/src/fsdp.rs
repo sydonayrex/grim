@@ -2,8 +2,8 @@
 //! `VkFsdpGroup` mirrors the structure of `grim-backend-rocm/src/fsdp.rs`: it plans parameter sharding across `world_size` ranks and delegates.
 
 use crate::collective::VkCommunicator;
-use grim_tensor::Shape;
 use grim_tensor::error::{Error, Result};
+use grim_tensor::Shape;
 
 /// Configuration for Vulkan FSDP sharding.
 #[derive(Debug, Clone)]

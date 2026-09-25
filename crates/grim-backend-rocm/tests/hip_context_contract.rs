@@ -13,7 +13,7 @@
 //!
 //! Any new bare `hipSetDevice(` anywhere else fails this test. Route it
 //! through `DeviceGuard::set` / `raw_set_device` instead so the context is
-//! restored and the `[ctx-trace]` drift watch sees the flip.
+//! restored and the `[ctxtrace]` drift watch sees the flip.
 //!
 //! Purely host-side: reads this crate's own sources from disk, no GPU needed.
 
@@ -172,10 +172,9 @@ fn peer_access_save_restore_pair_stays_balanced() {
 /// `hipStreamCreate` — executes against the CALLING THREAD's current HIP
 /// device. The rank-1 zero-logits crash existed because `matmul_op` /
 /// `matmul_with_solution` launched rocBLAS on a drifted thread. This gate
-/// enforces the audit: in `device/roc_device.rs` and `p2p_route.rs`, any
-/// function body containing one of those calls must also contain a
-/// `DeviceGuard::set` (or `raw_set_device`) before its use, unless the
-/// function is on the by-design allowlist below.
+/// enforces the audit: every source file containing one of those calls must
+/// also contain a `DeviceGuard::set` (or `raw_set_device`) before its use,
+/// unless the function is on the by-design allowlist below.
 ///
 /// Purely host-side: parses this crate's own sources; no GPU needed.
 #[test]
@@ -185,6 +184,7 @@ fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
     //   raw_set_device + restore around construction, and its inline lazy
     //   rocblas_create_handle runs inside that pinned window.
     // - fallback: RocmDevice::fallback constructor (no raw launches).
+    // - build: hsaco build path; context established by caller.
     const ALLOWED_UNGUARDED: &[&str] = &["try_new", "fallback", "build"];
 
     let audited: &[(&str, &str)] = &[
@@ -193,6 +193,42 @@ fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
             include_str!("../src/device/roc_device.rs"),
         ),
         ("p2p_route.rs", include_str!("../src/p2p_route.rs")),
+        ("fsdp.rs", include_str!("../src/fsdp.rs")),
+        ("rccl.rs", include_str!("../src/rccl.rs")),
+        (
+            "kernels/batched_lora.rs",
+            include_str!("../src/kernels/batched_lora.rs"),
+        ),
+        (
+            "kernels/device_sampler.rs",
+            include_str!("../src/kernels/device_sampler.rs"),
+        ),
+        (
+            "device/compute/fused_ops.rs",
+            include_str!("../src/device/compute/fused_ops.rs"),
+        ),
+        (
+            "device/compute/kernel_infra.rs",
+            include_str!("../src/device/compute/kernel_infra.rs"),
+        ),
+        (
+            "device/device_serve.rs",
+            include_str!("../src/device/device_serve.rs"),
+        ),
+        (
+            "decode_graph_buffers.rs",
+            include_str!("../src/decode_graph_buffers.rs"),
+        ),
+        (
+            "memory/storage.rs",
+            include_str!("../src/memory/storage.rs"),
+        ),
+        ("memory/pinned.rs", include_str!("../src/memory/pinned.rs")),
+        ("memory/view.rs", include_str!("../src/memory/view.rs")),
+        (
+            "device/helpers.rs",
+            include_str!("../src/device/helpers.rs"),
+        ),
     ];
 
     let risky = [

@@ -16,8 +16,8 @@ use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 use crate::block::LlamaBlock;
 use crate::chameleon::{Chameleon, ChameleonBlock};
 use crate::deepseek2::DeepSeek2;
-use crate::deepseek32::DeepSeek32;
 use crate::deepseek4::DeepSeek4;
+use crate::deepseek32::DeepSeek32;
 use crate::gemma2::{Gemma2, Gemma2Block};
 use crate::glm4_moe_lite::Glm4MoeLite;
 use crate::granite_moe_hybrid::GraniteMoeHybrid;
@@ -182,14 +182,8 @@ impl LlamaBlock {
             let staged: &Storage = &buffers.fused_qkv_out[layer_idx];
             dev.copy_slice_into(&buffers.q_buf[layer_idx], staged, 0, fused.n_q)
                 .map_err(grim_core::error::Error::Tensor)?;
-            dev.copy_slice_range(
-                &buffers.k_buf[layer_idx],
-                0,
-                staged,
-                fused.n_q,
-                fused.n_k,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+            dev.copy_slice_range(&buffers.k_buf[layer_idx], 0, staged, fused.n_q, fused.n_k)
+                .map_err(grim_core::error::Error::Tensor)?;
             dev.copy_slice_range(
                 &buffers.v_buf[layer_idx],
                 0,
@@ -199,9 +193,27 @@ impl LlamaBlock {
             )
             .map_err(grim_core::error::Error::Tensor)?;
         } else {
-            linear_into(dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act)?;
-            linear_into(dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act)?;
-            linear_into(dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act)?;
+            linear_into(
+                dev,
+                normed,
+                self.wq.weight(),
+                &buffers.q_buf[layer_idx],
+                act,
+            )?;
+            linear_into(
+                dev,
+                normed,
+                self.wk.weight(),
+                &buffers.k_buf[layer_idx],
+                act,
+            )?;
+            linear_into(
+                dev,
+                normed,
+                self.wv.weight(),
+                &buffers.v_buf[layer_idx],
+                act,
+            )?;
         }
 
         // 3. Optional QK-norm
@@ -383,14 +395,28 @@ impl LlamaBlock {
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
             } else {
-                let wg = self.w_gate.as_ref().ok_or_else(|| {
-                    grim_core::error::Error::Backend("missing w_gate".into())
-                })?;
-                let wu = self.w_up.as_ref().ok_or_else(|| {
-                    grim_core::error::Error::Backend("missing w_up".into())
-                })?;
-                linear_into(dev, normed_ffn, wg.weight(), &buffers.gate_buf[layer_idx], act)?;
-                linear_into(dev, normed_ffn, wu.weight(), &buffers.up_buf[layer_idx], act)?;
+                let wg = self
+                    .w_gate
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("missing w_gate".into()))?;
+                let wu = self
+                    .w_up
+                    .as_ref()
+                    .ok_or_else(|| grim_core::error::Error::Backend("missing w_up".into()))?;
+                linear_into(
+                    dev,
+                    normed_ffn,
+                    wg.weight(),
+                    &buffers.gate_buf[layer_idx],
+                    act,
+                )?;
+                linear_into(
+                    dev,
+                    normed_ffn,
+                    wu.weight(),
+                    &buffers.up_buf[layer_idx],
+                    act,
+                )?;
             }
 
             dev.silu_mul_into(
@@ -400,9 +426,10 @@ impl LlamaBlock {
             )
             .map_err(grim_core::error::Error::Tensor)?;
 
-            let wd = self.w_down.as_ref().ok_or_else(|| {
-                grim_core::error::Error::Backend("missing w_down".into())
-            })?;
+            let wd = self
+                .w_down
+                .as_ref()
+                .ok_or_else(|| grim_core::error::Error::Backend("missing w_down".into()))?;
             linear_into(
                 dev,
                 &buffers.activated_buf[layer_idx],
@@ -458,7 +485,8 @@ impl DecodeGraphModel for Llama {
             .moe_blocks
             .iter()
             .find_map(|mb| {
-                mb.as_ref().map(|m| (m.moe.router.num_experts, m.moe.router.top_k))
+                mb.as_ref()
+                    .map(|m| (m.moe.router.num_experts, m.moe.router.top_k))
             })
             .unwrap_or((0, 0));
 
@@ -492,7 +520,11 @@ impl DecodeGraphModel for Llama {
         }
         let dev = dev_for_llama(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         // Embedding gather
@@ -576,12 +608,24 @@ impl DecodeGraphModel for Llama {
                     .collect::<Vec<_>>();
 
                 // Global / layer charon cache: ensure resident weights
-                static CHARON_CACHES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::shared_moe::CharonCache>>>> =
-                    std::sync::OnceLock::new();
-                let caches = CHARON_CACHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                static CHARON_CACHES: std::sync::OnceLock<
+                    std::sync::Mutex<
+                        std::collections::HashMap<
+                            usize,
+                            std::sync::Arc<crate::shared_moe::CharonCache>,
+                        >,
+                    >,
+                > = std::sync::OnceLock::new();
+                let caches = CHARON_CACHES
+                    .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
                 let cache = {
                     let mut guard = caches.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.entry(i).or_insert_with(|| std::sync::Arc::new(crate::shared_moe::CharonCache::new())).clone()
+                    guard
+                        .entry(i)
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(crate::shared_moe::CharonCache::new())
+                        })
+                        .clone()
                 };
 
                 let (_, _, _, gate_buf, up_buf, down_buf) =
@@ -683,7 +727,9 @@ impl DecodeGraphModel for Llama {
             .model_state()
             .and_then(|s| s.downcast_ref::<Vec<Option<crate::block::LlamaLayerCache>>>())
             .ok_or_else(|| {
-                grim_core::error::Error::Session("missing or invalid LlamaLayerCache in session".into())
+                grim_core::error::Error::Session(
+                    "missing or invalid LlamaLayerCache in session".into(),
+                )
             })?;
 
         if caches.len() != self.layers.len() {
@@ -764,6 +810,7 @@ impl DecodeGraphModel for Llama {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -796,7 +843,9 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
             .model_state()
             .and_then(|s| s.downcast_ref::<Vec<Option<crate::lfm2::Lfm2LayerCache>>>())
             .ok_or_else(|| {
-                grim_core::error::Error::Session("missing or invalid Lfm2LayerCache in session".into())
+                grim_core::error::Error::Session(
+                    "missing or invalid Lfm2LayerCache in session".into(),
+                )
             })?;
         self.eager_kv_seed_sources(caches, valid_rows)
     }
@@ -809,7 +858,9 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
             .model_state()
             .and_then(|s| s.downcast_ref::<Vec<Option<crate::lfm2::Lfm2LayerCache>>>())
             .ok_or_else(|| {
-                grim_core::error::Error::Session("missing or invalid Lfm2LayerCache in session".into())
+                grim_core::error::Error::Session(
+                    "missing or invalid Lfm2LayerCache in session".into(),
+                )
             })?;
         let mut out = Vec::with_capacity(self.layers.len());
         for (layer, cache) in self.layers.iter().zip(caches.iter()) {
@@ -824,7 +875,9 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
                 .as_ref()
                 .and_then(|l| l.weight.shape().dim(0).ok())
                 .ok_or_else(|| {
-                    grim_core::error::Error::Session("conv cache on layer without shortconv_in_proj".into())
+                    grim_core::error::Error::Session(
+                        "conv cache on layer without shortconv_in_proj".into(),
+                    )
                 })?;
             if out_dim % 3 != 0 {
                 return Err(grim_core::error::Error::Session(
@@ -837,7 +890,9 @@ impl DecodeGraphModel for crate::lfm2::Lfm2 {
                 .as_ref()
                 .and_then(|c| c.shape().dims().last().copied())
                 .ok_or_else(|| {
-                    grim_core::error::Error::Session("conv cache on layer without shortconv_conv".into())
+                    grim_core::error::Error::Session(
+                        "conv cache on layer without shortconv_conv".into(),
+                    )
                 })?;
             let kc = l_cache.saturating_sub(1);
             if host.len() != h_dim * kc {
@@ -907,7 +962,9 @@ impl Qwen35Block {
                 let norm_rocm = dst_downcast(normed)?;
                 let m = buffers.batch.max(1);
                 dev.launch_quantize_q8_1(norm_rocm, act, m, self.hidden_size)
-                    .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 qkv quant: {e}")))?;
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("qwen35 qkv quant: {e}"))
+                    })?;
                 dev.launch_fused_qkv_dot4_into(
                     act,
                     &fused.storage,
@@ -921,14 +978,8 @@ impl Qwen35Block {
                 let staged: &Storage = &buffers.fused_qkv_out[layer_idx];
                 dev.copy_slice_into(&buffers.q_buf[layer_idx], staged, 0, fused.n_q)
                     .map_err(grim_core::error::Error::Tensor)?;
-                dev.copy_slice_range(
-                    &buffers.k_buf[layer_idx],
-                    0,
-                    staged,
-                    fused.n_q,
-                    fused.n_k,
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
+                dev.copy_slice_range(&buffers.k_buf[layer_idx], 0, staged, fused.n_q, fused.n_k)
+                    .map_err(grim_core::error::Error::Tensor)?;
                 dev.copy_slice_range(
                     &buffers.v_buf[layer_idx],
                     0,
@@ -1082,7 +1133,13 @@ impl Qwen35Block {
         } else {
             // Recurrent / ShortConv / SSM path
             if let Some(ref qkv_lin) = self.attn_qkv {
-                linear_into(dev, normed, qkv_lin.weight(), &buffers.q_buf[layer_idx], act)?;
+                linear_into(
+                    dev,
+                    normed,
+                    qkv_lin.weight(),
+                    &buffers.q_buf[layer_idx],
+                    act,
+                )?;
 
                 // If conv weight is present and we have allocated sc_state, run causal conv step
                 if let Some(ref conv_t) = self.ssm_conv1d {
@@ -1094,7 +1151,9 @@ impl Qwen35Block {
                             &buffers.sc_state[layer_idx],
                             &buffers.attn_out_buf[layer_idx],
                         )
-                        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
+                        .map_err(|e| {
+                            grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}"))
+                        })?;
                         // SiLU in-place on attn_out_buf
                         dev.silu_into(
                             &buffers.attn_out_buf[layer_idx],
@@ -1102,18 +1161,12 @@ impl Qwen35Block {
                         )
                         .map_err(grim_core::error::Error::Tensor)?;
                     } else {
-                        dev.silu_into(
-                            &buffers.q_buf[layer_idx],
-                            &buffers.attn_out_buf[layer_idx],
-                        )
-                        .map_err(grim_core::error::Error::Tensor)?;
+                        dev.silu_into(&buffers.q_buf[layer_idx], &buffers.attn_out_buf[layer_idx])
+                            .map_err(grim_core::error::Error::Tensor)?;
                     }
                 } else {
-                    dev.silu_into(
-                        &buffers.q_buf[layer_idx],
-                        &buffers.attn_out_buf[layer_idx],
-                    )
-                    .map_err(grim_core::error::Error::Tensor)?;
+                    dev.silu_into(&buffers.q_buf[layer_idx], &buffers.attn_out_buf[layer_idx])
+                        .map_err(grim_core::error::Error::Tensor)?;
                 }
             } else {
                 return Err(grim_core::error::Error::Backend(
@@ -1123,12 +1176,15 @@ impl Qwen35Block {
 
             // Optional attn_gate (sigmoid gate)
             if let Some(ref gate_lin) = self.attn_gate {
-                linear_into(dev, normed, gate_lin.weight(), &buffers.gate_buf[layer_idx], act)?;
-                dev.sigmoid_into(
+                linear_into(
+                    dev,
+                    normed,
+                    gate_lin.weight(),
                     &buffers.gate_buf[layer_idx],
-                    &buffers.gate_buf[layer_idx],
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
+                    act,
+                )?;
+                dev.sigmoid_into(&buffers.gate_buf[layer_idx], &buffers.gate_buf[layer_idx])
+                    .map_err(grim_core::error::Error::Tensor)?;
                 dev.mul_into(
                     &buffers.attn_out_buf[layer_idx],
                     &buffers.gate_buf[layer_idx],
@@ -1170,8 +1226,20 @@ impl Qwen35Block {
         .map_err(grim_core::error::Error::Tensor)?;
         let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
 
-        linear_into(dev, normed_ffn, self.ffn_gate.weight(), &buffers.gate_buf[layer_idx], act)?;
-        linear_into(dev, normed_ffn, self.ffn_up.weight(), &buffers.up_buf[layer_idx], act)?;
+        linear_into(
+            dev,
+            normed_ffn,
+            self.ffn_gate.weight(),
+            &buffers.gate_buf[layer_idx],
+            act,
+        )?;
+        linear_into(
+            dev,
+            normed_ffn,
+            self.ffn_up.weight(),
+            &buffers.up_buf[layer_idx],
+            act,
+        )?;
 
         dev.silu_mul_into(
             &buffers.gate_buf[layer_idx],
@@ -1263,7 +1331,11 @@ impl DecodeGraphModel for Qwen35 {
         }
         let dev = dev_for_qwen35(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         // Embedding gather
@@ -1338,7 +1410,9 @@ impl DecodeGraphModel for Qwen35 {
             .model_state()
             .and_then(|s| s.downcast_ref::<Vec<Qwen35LayerCache>>())
             .ok_or_else(|| {
-                grim_core::error::Error::Session("missing or invalid Qwen35LayerCache in session".into())
+                grim_core::error::Error::Session(
+                    "missing or invalid Qwen35LayerCache in session".into(),
+                )
             })?;
 
         if caches.len() != self.blocks.len() {
@@ -1412,6 +1486,7 @@ impl DecodeGraphModel for Qwen35 {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -1455,9 +1530,27 @@ impl Gemma2Block {
         let normed: &Storage = &buffers.norm_buf[layer_idx];
 
         // 2. QKV projections
-        linear_into(dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act)?;
-        linear_into(dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act)?;
-        linear_into(dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act)?;
+        linear_into(
+            dev,
+            normed,
+            self.wq.weight(),
+            &buffers.q_buf[layer_idx],
+            act,
+        )?;
+        linear_into(
+            dev,
+            normed,
+            self.wk.weight(),
+            &buffers.k_buf[layer_idx],
+            act,
+        )?;
+        linear_into(
+            dev,
+            normed,
+            self.wv.weight(),
+            &buffers.v_buf[layer_idx],
+            act,
+        )?;
 
         // 3. RoPE in-place using device position base (`pos_dev`)
         let hd = self.head_dim;
@@ -1595,8 +1688,20 @@ impl Gemma2Block {
         let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
 
         // 10. Gemma2 MLP: gate_proj, up_proj, gelu_tanh_mul_into, down_proj
-        linear_into(dev, normed_ffn, self.mlp.gate_proj.weight(), &buffers.gate_buf[layer_idx], act)?;
-        linear_into(dev, normed_ffn, self.mlp.up_proj.weight(), &buffers.up_buf[layer_idx], act)?;
+        linear_into(
+            dev,
+            normed_ffn,
+            self.mlp.gate_proj.weight(),
+            &buffers.gate_buf[layer_idx],
+            act,
+        )?;
+        linear_into(
+            dev,
+            normed_ffn,
+            self.mlp.up_proj.weight(),
+            &buffers.up_buf[layer_idx],
+            act,
+        )?;
 
         dev.gelu_tanh_mul_into(
             &buffers.gate_buf[layer_idx],
@@ -1696,7 +1801,11 @@ impl DecodeGraphModel for Gemma2 {
         }
         let dev = dev_for_gemma2(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         // Embedding gather
@@ -1738,12 +1847,8 @@ impl DecodeGraphModel for Gemma2 {
 
         // Optional final logit softcapping inside device graph
         if let Some(cap) = self.cfg.final_logit_softcapping {
-            dev.tanh_softcap_into(
-                &*graph.buffers.head_output,
-                cap,
-                &graph.buffers.head_output,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+            dev.tanh_softcap_into(&*graph.buffers.head_output, cap, &graph.buffers.head_output)
+                .map_err(grim_core::error::Error::Tensor)?;
         }
 
         Ok(())
@@ -1823,7 +1928,9 @@ impl ChameleonBlock {
             let norm_rocm = dst_downcast(normed)?;
             let m = batch;
             dev.launch_quantize_q8_1(norm_rocm, act, m, fused.hidden)
-                .map_err(|e| grim_core::error::Error::Backend(format!("chameleon qkv quant: {e}")))?;
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!("chameleon qkv quant: {e}"))
+                })?;
             dev.launch_fused_qkv_dot4_into(
                 act,
                 &fused.storage,
@@ -1848,19 +1955,34 @@ impl ChameleonBlock {
             )
             .map_err(grim_core::error::Error::Tensor)?;
         } else {
-            linear_into(dev, normed, self.wq.weight(), &buffers.q_buf[layer_idx], act)?;
-            linear_into(dev, normed, self.wk.weight(), &buffers.k_buf[layer_idx], act)?;
-            linear_into(dev, normed, self.wv.weight(), &buffers.v_buf[layer_idx], act)?;
+            linear_into(
+                dev,
+                normed,
+                self.wq.weight(),
+                &buffers.q_buf[layer_idx],
+                act,
+            )?;
+            linear_into(
+                dev,
+                normed,
+                self.wk.weight(),
+                &buffers.k_buf[layer_idx],
+                act,
+            )?;
+            linear_into(
+                dev,
+                normed,
+                self.wv.weight(),
+                &buffers.v_buf[layer_idx],
+                act,
+            )?;
         }
 
         // 3. Per-head Q/K LayerNorm (swin_norm) — mean/variance, NOT RMS.
         // Eager applies these over [seq*heads, head_dim]; seq == 1 in decode.
         if let Some(qn) = &self.q_norm {
             let qn_shape = Shape::new(vec![batch * nh, hd]);
-            let qn_bias = qn
-                .bias
-                .as_ref()
-                .map(|b| b.storage().as_ref() as &Storage);
+            let qn_bias = qn.bias.as_ref().map(|b| b.storage().as_ref() as &Storage);
             dev.layer_norm_into(
                 &buffers.q_buf[layer_idx],
                 &**qn.weight.storage(),
@@ -1873,10 +1995,7 @@ impl ChameleonBlock {
         }
         if let Some(kn) = &self.k_norm {
             let kn_shape = Shape::new(vec![batch * nkv, hd]);
-            let kn_bias = kn
-                .bias
-                .as_ref()
-                .map(|b| b.storage().as_ref() as &Storage);
+            let kn_bias = kn.bias.as_ref().map(|b| b.storage().as_ref() as &Storage);
             dev.layer_norm_into(
                 &buffers.k_buf[layer_idx],
                 &**kn.weight.storage(),
@@ -2009,8 +2128,20 @@ impl ChameleonBlock {
         .map_err(grim_core::error::Error::Tensor)?;
         let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
 
-        linear_into(dev, normed_ffn, self.w_gate.weight(), &buffers.gate_buf[layer_idx], act)?;
-        linear_into(dev, normed_ffn, self.w_up.weight(), &buffers.up_buf[layer_idx], act)?;
+        linear_into(
+            dev,
+            normed_ffn,
+            self.w_gate.weight(),
+            &buffers.gate_buf[layer_idx],
+            act,
+        )?;
+        linear_into(
+            dev,
+            normed_ffn,
+            self.w_up.weight(),
+            &buffers.up_buf[layer_idx],
+            act,
+        )?;
 
         dev.silu_mul_into(
             &buffers.gate_buf[layer_idx],
@@ -2046,7 +2177,6 @@ impl ChameleonBlock {
         Ok(())
     }
 }
-
 
 // ─── Thin Llama-family wrappers: decode-graph delegation (who-dat: graph coverage) ───
 
@@ -2086,24 +2216,90 @@ macro_rules! impl_llama_wrapper_graph {
 }
 
 impl_llama_wrapper_graph!(
-            afmoe::AfMoe, arcee::Arcee, apertus::Apertus, chatglm::ChatGlm, arctic::Arctic,
-        codeshell::Codeshell, gemma4_assistant::Gemma4Assistant, cohere2moe::Cohere2Moe,
-        internlm2::InternLm2, lladamoe::LladaMoe, minimax_m2::MiniMaxM2, nemotron::Nemotron,
-        bailingmoe2::BailingMoe2, ernie45::Ernie45, plamo2::Plamo2, baichuan::Baichuan,
-        eurobert::Eurobert, granite::Granite, gemma_embedding::GemmaEmbedding, exaone4::Exaone4,
-        qwen3next::Qwen3Next, jais::Jais, granite_moe::GraniteMoe, cohere2::Cohere2, grok::Grok,
-        smollm3::SmolLm3, bitnet::BitNet, llama_embed::LlamaEmbed, deci::Deci, dflash::DFlash,
-        jais2::Jais2, mistral4::Mistral4, llada::Llada, bailingmoe::BailingMoe, exaone_moe::ExaoneMoe,
-        llama4::Llama4, dream::Dream, dots1::Dots1, olmo::Olmo, mistral3::Mistral3, exaone::Exaone,
-        plm::Plm, glm4::Glm4, olmoe::Olmoe, deepseek2ocr::DeepSeek2Ocr, olmo2::Olmo2,
-        hunyuan_dense::HunyuanDense, openai_moe::OpenAiMoe, plamo::Plamo, ernie4_5_moe::Ernie45Moe,
-        plamo3::Plamo3,  qwen2moe::Qwen2Moe, starcoder2::Starcoder2, qwen3::Qwen3,
-        stablelm::StableLm, qwen::Qwen, gptneox::GptNeoX, starcoder::Starcoder, glmdsa::GlmDsa,
-        maincoder::MainCoder, hunyuan_moe::HunyuanMoe, kimi_linear::KimiLinear, laguna::Laguna,
-        maple::Maple, mimo2::Mimo2, mpt::Mpt, grovemoe::GroveMoe, paddle_ocr::PaddleOcr, mellum::Mellum,
-        orion::Orion, openelm::OpenElm, seed_oss::SeedOss, pangu_embed::PanguEmbed, phi2::Phi2,
-        talkie::Talkie, nemotron_hmoe::NemotronHMoe, rnd1::Rnd1, refact::Refact, qwen3moe::Qwen3Moe,
-        xverse::Xverse, smallthinker::SmallThinker, smollm2::SmolLm2, glm4moe::Glm4Moe, step35::Step35,
+    afmoe::AfMoe,
+    arcee::Arcee,
+    apertus::Apertus,
+    chatglm::ChatGlm,
+    arctic::Arctic,
+    codeshell::Codeshell,
+    gemma4_assistant::Gemma4Assistant,
+    cohere2moe::Cohere2Moe,
+    internlm2::InternLm2,
+    lladamoe::LladaMoe,
+    minimax_m2::MiniMaxM2,
+    nemotron::Nemotron,
+    bailingmoe2::BailingMoe2,
+    ernie45::Ernie45,
+    plamo2::Plamo2,
+    baichuan::Baichuan,
+    eurobert::Eurobert,
+    granite::Granite,
+    gemma_embedding::GemmaEmbedding,
+    exaone4::Exaone4,
+    qwen3next::Qwen3Next,
+    jais::Jais,
+    granite_moe::GraniteMoe,
+    cohere2::Cohere2,
+    grok::Grok,
+    smollm3::SmolLm3,
+    bitnet::BitNet,
+    llama_embed::LlamaEmbed,
+    deci::Deci,
+    dflash::DFlash,
+    jais2::Jais2,
+    mistral4::Mistral4,
+    llada::Llada,
+    bailingmoe::BailingMoe,
+    exaone_moe::ExaoneMoe,
+    llama4::Llama4,
+    dream::Dream,
+    dots1::Dots1,
+    olmo::Olmo,
+    mistral3::Mistral3,
+    exaone::Exaone,
+    plm::Plm,
+    glm4::Glm4,
+    olmoe::Olmoe,
+    deepseek2ocr::DeepSeek2Ocr,
+    olmo2::Olmo2,
+    hunyuan_dense::HunyuanDense,
+    openai_moe::OpenAiMoe,
+    plamo::Plamo,
+    ernie4_5_moe::Ernie45Moe,
+    plamo3::Plamo3,
+    qwen2moe::Qwen2Moe,
+    starcoder2::Starcoder2,
+    qwen3::Qwen3,
+    stablelm::StableLm,
+    qwen::Qwen,
+    gptneox::GptNeoX,
+    starcoder::Starcoder,
+    glmdsa::GlmDsa,
+    maincoder::MainCoder,
+    hunyuan_moe::HunyuanMoe,
+    kimi_linear::KimiLinear,
+    laguna::Laguna,
+    maple::Maple,
+    mimo2::Mimo2,
+    mpt::Mpt,
+    grovemoe::GroveMoe,
+    paddle_ocr::PaddleOcr,
+    mellum::Mellum,
+    orion::Orion,
+    openelm::OpenElm,
+    seed_oss::SeedOss,
+    pangu_embed::PanguEmbed,
+    phi2::Phi2,
+    talkie::Talkie,
+    nemotron_hmoe::NemotronHMoe,
+    rnd1::Rnd1,
+    refact::Refact,
+    qwen3moe::Qwen3Moe,
+    xverse::Xverse,
+    smallthinker::SmallThinker,
+    smollm2::SmolLm2,
+    glm4moe::Glm4Moe,
+    step35::Step35,
 );
 
 /// Downcast an opaque model handle to whichever thin Llama wrapper it is,
@@ -2120,24 +2316,90 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         };
     }
     try_wrapper!(
-        afmoe::AfMoe, arcee::Arcee, apertus::Apertus, chatglm::ChatGlm, arctic::Arctic,
-        codeshell::Codeshell, gemma4_assistant::Gemma4Assistant, cohere2moe::Cohere2Moe,
-        internlm2::InternLm2, lladamoe::LladaMoe, minimax_m2::MiniMaxM2, nemotron::Nemotron,
-        bailingmoe2::BailingMoe2, ernie45::Ernie45, plamo2::Plamo2, baichuan::Baichuan,
-        eurobert::Eurobert, granite::Granite, gemma_embedding::GemmaEmbedding, exaone4::Exaone4,
-        qwen3next::Qwen3Next, jais::Jais, granite_moe::GraniteMoe, cohere2::Cohere2, grok::Grok,
-        smollm3::SmolLm3, bitnet::BitNet, llama_embed::LlamaEmbed, deci::Deci, dflash::DFlash,
-        jais2::Jais2, mistral4::Mistral4, llada::Llada, bailingmoe::BailingMoe, exaone_moe::ExaoneMoe,
-        llama4::Llama4, dream::Dream, dots1::Dots1, olmo::Olmo, mistral3::Mistral3, exaone::Exaone,
-        plm::Plm, glm4::Glm4, olmoe::Olmoe, deepseek2ocr::DeepSeek2Ocr, olmo2::Olmo2,
-        hunyuan_dense::HunyuanDense, openai_moe::OpenAiMoe, plamo::Plamo, ernie4_5_moe::Ernie45Moe,
-        plamo3::Plamo3,  qwen2moe::Qwen2Moe, starcoder2::Starcoder2, qwen3::Qwen3,
-        stablelm::StableLm, qwen::Qwen, gptneox::GptNeoX, starcoder::Starcoder, glmdsa::GlmDsa,
-        maincoder::MainCoder, hunyuan_moe::HunyuanMoe, kimi_linear::KimiLinear, laguna::Laguna,
-        maple::Maple, mimo2::Mimo2, mpt::Mpt, grovemoe::GroveMoe, paddle_ocr::PaddleOcr, mellum::Mellum,
-        orion::Orion, openelm::OpenElm, seed_oss::SeedOss, pangu_embed::PanguEmbed, phi2::Phi2,
-        talkie::Talkie, nemotron_hmoe::NemotronHMoe, rnd1::Rnd1, refact::Refact, qwen3moe::Qwen3Moe,
-        xverse::Xverse, smallthinker::SmallThinker, smollm2::SmolLm2, glm4moe::Glm4Moe, step35::Step35,
+        afmoe::AfMoe,
+        arcee::Arcee,
+        apertus::Apertus,
+        chatglm::ChatGlm,
+        arctic::Arctic,
+        codeshell::Codeshell,
+        gemma4_assistant::Gemma4Assistant,
+        cohere2moe::Cohere2Moe,
+        internlm2::InternLm2,
+        lladamoe::LladaMoe,
+        minimax_m2::MiniMaxM2,
+        nemotron::Nemotron,
+        bailingmoe2::BailingMoe2,
+        ernie45::Ernie45,
+        plamo2::Plamo2,
+        baichuan::Baichuan,
+        eurobert::Eurobert,
+        granite::Granite,
+        gemma_embedding::GemmaEmbedding,
+        exaone4::Exaone4,
+        qwen3next::Qwen3Next,
+        jais::Jais,
+        granite_moe::GraniteMoe,
+        cohere2::Cohere2,
+        grok::Grok,
+        smollm3::SmolLm3,
+        bitnet::BitNet,
+        llama_embed::LlamaEmbed,
+        deci::Deci,
+        dflash::DFlash,
+        jais2::Jais2,
+        mistral4::Mistral4,
+        llada::Llada,
+        bailingmoe::BailingMoe,
+        exaone_moe::ExaoneMoe,
+        llama4::Llama4,
+        dream::Dream,
+        dots1::Dots1,
+        olmo::Olmo,
+        mistral3::Mistral3,
+        exaone::Exaone,
+        plm::Plm,
+        glm4::Glm4,
+        olmoe::Olmoe,
+        deepseek2ocr::DeepSeek2Ocr,
+        olmo2::Olmo2,
+        hunyuan_dense::HunyuanDense,
+        openai_moe::OpenAiMoe,
+        plamo::Plamo,
+        ernie4_5_moe::Ernie45Moe,
+        plamo3::Plamo3,
+        qwen2moe::Qwen2Moe,
+        starcoder2::Starcoder2,
+        qwen3::Qwen3,
+        stablelm::StableLm,
+        qwen::Qwen,
+        gptneox::GptNeoX,
+        starcoder::Starcoder,
+        glmdsa::GlmDsa,
+        maincoder::MainCoder,
+        hunyuan_moe::HunyuanMoe,
+        kimi_linear::KimiLinear,
+        laguna::Laguna,
+        maple::Maple,
+        mimo2::Mimo2,
+        mpt::Mpt,
+        grovemoe::GroveMoe,
+        paddle_ocr::PaddleOcr,
+        mellum::Mellum,
+        orion::Orion,
+        openelm::OpenElm,
+        seed_oss::SeedOss,
+        pangu_embed::PanguEmbed,
+        phi2::Phi2,
+        talkie::Talkie,
+        nemotron_hmoe::NemotronHMoe,
+        rnd1::Rnd1,
+        refact::Refact,
+        qwen3moe::Qwen3Moe,
+        xverse::Xverse,
+        smallthinker::SmallThinker,
+        smollm2::SmolLm2,
+        glm4moe::Glm4Moe,
+        step35::Step35,
     );
     None
 }
@@ -2204,7 +2466,11 @@ impl DecodeGraphModel for MiniMaxM3 {
         }
         let dev = dev_for_minimax_m3(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
@@ -2239,9 +2505,27 @@ impl DecodeGraphModel for MiniMaxM3 {
             let normed: &Storage = &graph.buffers.norm_buf[i];
 
             // 2. QKV projections
-            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
-            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
-            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wq.weight(),
+                &graph.buffers.q_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wk.weight(),
+                &graph.buffers.k_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wv.weight(),
+                &graph.buffers.v_buf[i],
+                act,
+            )?;
 
             // 3. RoPE
             let steps = 1usize;
@@ -2274,10 +2558,18 @@ impl DecodeGraphModel for MiniMaxM3 {
             let kv_stride = nkv * hd;
             let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
             let max_ctx = graph.buffers.max_ctx;
-            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_qkv_gemv(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
             grim_backend_rocm::launch_kv_append_batch(
                 &dev,
@@ -2333,8 +2625,19 @@ impl DecodeGraphModel for MiniMaxM3 {
             grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
-            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
-            add_graph(&graph.buffers.layer_input[i], &graph.buffers.norm_buf[i], &graph.buffers.layer_output[i], &dev)?;
+            linear_into(
+                &dev,
+                &graph.buffers.attn_out_buf[i],
+                layer.wo.weight(),
+                &graph.buffers.norm_buf[i],
+                act,
+            )?;
+            add_graph(
+                &graph.buffers.layer_input[i],
+                &graph.buffers.norm_buf[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
 
             // 5. Post-attention RMSNorm -> MoE FFN
             dev.rms_norm_into(
@@ -2348,7 +2651,13 @@ impl DecodeGraphModel for MiniMaxM3 {
             let normed_moe: &Storage = &graph.buffers.norm_buf[i];
 
             // 6. MoE Gate + top-k route (mode 3 renorm)
-            linear_into(&dev, normed_moe, layer.block_sparse_moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            linear_into(
+                &dev,
+                normed_moe,
+                layer.block_sparse_moe.gate.weight(),
+                &graph.buffers.moe_gate_logits[i],
+                act,
+            )?;
             let num_exp = self.cfg.num_experts;
             let top_k = self.cfg.num_experts_per_tok.min(num_exp);
             dev.moe_route_topk_on_device(
@@ -2365,13 +2674,16 @@ impl DecodeGraphModel for MiniMaxM3 {
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
             // 7. Resident grouped dispatch
-            let experts = layer.block_sparse_moe.experts.iter().map(|e| {
-                crate::shared_moe::MoeExpert {
+            let experts = layer
+                .block_sparse_moe
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
                     gate: e.w1.clone(),
                     up: e.w3.clone(),
                     down: e.w2.clone(),
-                }
-            }).collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
 
             let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
                 dev.ordinal(),
@@ -2398,7 +2710,12 @@ impl DecodeGraphModel for MiniMaxM3 {
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
 
-            add_graph(&graph.buffers.layer_output[i], &graph.buffers.moe_out[i], &graph.buffers.layer_output[i], &dev)?;
+            add_graph(
+                &graph.buffers.layer_output[i],
+                &graph.buffers.moe_out[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
 
             let n_layers = graph.buffers.layer_input.len();
             let dst: &Storage = if i + 1 < n_layers {
@@ -2461,7 +2778,9 @@ impl DecodeGraphModel for MiniMaxM3 {
     ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
         let caches = session
             .model_state()
-            .and_then(|s| s.downcast_ref::<Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>>>())
+            .and_then(|s| {
+                s.downcast_ref::<Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>>>()
+            })
             .ok_or_else(|| {
                 grim_core::error::Error::Session(
                     "missing or invalid MiniMaxM3 KV cache in session".into(),
@@ -2491,7 +2810,10 @@ impl DecodeGraphModel for MiniMaxM3 {
                 }
             };
 
-            let (k_rocm, v_rocm) = match (as_rocm(k_st.storage().as_ref()), as_rocm(v_st.storage().as_ref())) {
+            let (k_rocm, v_rocm) = match (
+                as_rocm(k_st.storage().as_ref()),
+                as_rocm(v_st.storage().as_ref()),
+            ) {
                 (Ok(k), Ok(v)) => (k, v),
                 _ => {
                     if valid_rows > 0 {
@@ -2533,6 +2855,7 @@ impl DecodeGraphModel for MiniMaxM3 {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -2603,7 +2926,11 @@ impl DecodeGraphModel for Glm4MoeLite {
         }
         let dev = dev_for_glm4_moe_lite(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
@@ -2638,9 +2965,27 @@ impl DecodeGraphModel for Glm4MoeLite {
             let normed: &Storage = &graph.buffers.norm_buf[i];
 
             // 2. QKV projections
-            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
-            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
-            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wq.weight(),
+                &graph.buffers.q_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wk.weight(),
+                &graph.buffers.k_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wv.weight(),
+                &graph.buffers.v_buf[i],
+                act,
+            )?;
 
             // 3. RoPE
             let steps = 1usize;
@@ -2673,10 +3018,18 @@ impl DecodeGraphModel for Glm4MoeLite {
             let kv_stride = nkv * hd;
             let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
             let max_ctx = graph.buffers.max_ctx;
-            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_qkv_gemv(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
             grim_backend_rocm::launch_kv_append_batch(
                 &dev,
@@ -2732,8 +3085,19 @@ impl DecodeGraphModel for Glm4MoeLite {
             grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
-            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
-            add_graph(&graph.buffers.layer_input[i], &graph.buffers.norm_buf[i], &graph.buffers.layer_output[i], &dev)?;
+            linear_into(
+                &dev,
+                &graph.buffers.attn_out_buf[i],
+                layer.wo.weight(),
+                &graph.buffers.norm_buf[i],
+                act,
+            )?;
+            add_graph(
+                &graph.buffers.layer_input[i],
+                &graph.buffers.norm_buf[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
 
             // 5. Post-attention RMSNorm -> MoE FFN
             dev.rms_norm_into(
@@ -2747,7 +3111,13 @@ impl DecodeGraphModel for Glm4MoeLite {
             let normed_moe: &Storage = &graph.buffers.norm_buf[i];
 
             // 6. MoE Gate + top-k route (mode 3 renorm)
-            linear_into(&dev, normed_moe, layer.moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            linear_into(
+                &dev,
+                normed_moe,
+                layer.moe.gate.weight(),
+                &graph.buffers.moe_gate_logits[i],
+                act,
+            )?;
             let num_exp = self.cfg.num_experts;
             let top_k = self.cfg.num_experts_per_tok.min(num_exp);
             dev.moe_route_topk_on_device(
@@ -2764,13 +3134,16 @@ impl DecodeGraphModel for Glm4MoeLite {
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
             // 7. Resident grouped dispatch
-            let experts = layer.moe.experts.iter().map(|e| {
-                crate::shared_moe::MoeExpert {
+            let experts = layer
+                .moe
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
                     gate: e.gate_proj.clone(),
                     up: e.up_proj.clone(),
                     down: e.down_proj.clone(),
-                }
-            }).collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
 
             let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
                 dev.ordinal(),
@@ -2799,15 +3172,47 @@ impl DecodeGraphModel for Glm4MoeLite {
 
             // If shared expert present, project through gate/up/down and accumulate
             if let Some(ref shared) = layer.moe.shared_expert {
-                linear_into(&dev, normed_moe, shared.gate_proj.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, normed_moe, shared.up_proj.weight(), &graph.buffers.up_buf[i], act)?;
-                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
-                    .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(&dev, &graph.buffers.activated_buf[i], shared.down_proj.weight(), &graph.buffers.norm_buf[i], act)?;
-                add_graph(&graph.buffers.moe_out[i], &graph.buffers.norm_buf[i], &graph.buffers.moe_out[i], &dev)?;
+                linear_into(
+                    &dev,
+                    normed_moe,
+                    shared.gate_proj.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    normed_moe,
+                    shared.up_proj.weight(),
+                    &graph.buffers.up_buf[i],
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    &graph.buffers.gate_buf[i],
+                    &graph.buffers.up_buf[i],
+                    &graph.buffers.activated_buf[i],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.activated_buf[i],
+                    shared.down_proj.weight(),
+                    &graph.buffers.norm_buf[i],
+                    act,
+                )?;
+                add_graph(
+                    &graph.buffers.moe_out[i],
+                    &graph.buffers.norm_buf[i],
+                    &graph.buffers.moe_out[i],
+                    &dev,
+                )?;
             }
 
-            add_graph(&graph.buffers.layer_output[i], &graph.buffers.moe_out[i], &graph.buffers.layer_output[i], &dev)?;
+            add_graph(
+                &graph.buffers.layer_output[i],
+                &graph.buffers.moe_out[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
 
             let n_layers = graph.buffers.layer_input.len();
             let dst: &Storage = if i + 1 < n_layers {
@@ -2934,7 +3339,11 @@ impl DecodeGraphModel for GraniteMoeHybrid {
         }
         let dev = dev_for_granite_moe_hybrid(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
@@ -2969,9 +3378,27 @@ impl DecodeGraphModel for GraniteMoeHybrid {
             let normed: &Storage = &graph.buffers.norm_buf[i];
 
             // 2. QKV projections
-            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
-            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
-            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wq.weight(),
+                &graph.buffers.q_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wk.weight(),
+                &graph.buffers.k_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wv.weight(),
+                &graph.buffers.v_buf[i],
+                act,
+            )?;
 
             // 3. RoPE
             let steps = 1usize;
@@ -3004,10 +3431,18 @@ impl DecodeGraphModel for GraniteMoeHybrid {
             let kv_stride = nkv * hd;
             let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
             let max_ctx = graph.buffers.max_ctx;
-            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_qkv_gemv(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
             grim_backend_rocm::launch_kv_append_batch(
                 &dev,
@@ -3063,7 +3498,13 @@ impl DecodeGraphModel for GraniteMoeHybrid {
             grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
-            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
+            linear_into(
+                &dev,
+                &graph.buffers.attn_out_buf[i],
+                layer.wo.weight(),
+                &graph.buffers.norm_buf[i],
+                act,
+            )?;
             // Residual 1: out = in + residual_multiplier * attn
             axpy_graph(
                 &graph.buffers.layer_input[i],
@@ -3085,7 +3526,13 @@ impl DecodeGraphModel for GraniteMoeHybrid {
             let normed_moe: &Storage = &graph.buffers.norm_buf[i];
 
             // 6. MoE Gate + top-k route (mode 3 renorm)
-            linear_into(&dev, normed_moe, layer.moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            linear_into(
+                &dev,
+                normed_moe,
+                layer.moe.gate.weight(),
+                &graph.buffers.moe_gate_logits[i],
+                act,
+            )?;
             let num_exp = self.cfg.num_local_experts;
             let top_k = self.cfg.num_experts_per_tok.min(num_exp);
             dev.moe_route_topk_on_device(
@@ -3102,13 +3549,16 @@ impl DecodeGraphModel for GraniteMoeHybrid {
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
             // 7. Resident grouped dispatch
-            let experts = layer.moe.experts.iter().map(|e| {
-                crate::shared_moe::MoeExpert {
+            let experts = layer
+                .moe
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
                     gate: e.gate_proj.clone(),
                     up: e.up_proj.clone(),
                     down: e.down_proj.clone(),
-                }
-            }).collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
 
             let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
                 dev.ordinal(),
@@ -3137,12 +3587,39 @@ impl DecodeGraphModel for GraniteMoeHybrid {
 
             // If shared expert present, project through gate/up/down and accumulate
             if let Some(ref shared) = layer.moe.shared_expert {
-                linear_into(&dev, normed_moe, shared.gate_proj.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, normed_moe, shared.up_proj.weight(), &graph.buffers.up_buf[i], act)?;
-                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
-                    .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(&dev, &graph.buffers.activated_buf[i], shared.down_proj.weight(), &graph.buffers.norm_buf[i], act)?;
-                add_graph(&graph.buffers.moe_out[i], &graph.buffers.norm_buf[i], &graph.buffers.moe_out[i], &dev)?;
+                linear_into(
+                    &dev,
+                    normed_moe,
+                    shared.gate_proj.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    normed_moe,
+                    shared.up_proj.weight(),
+                    &graph.buffers.up_buf[i],
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    &graph.buffers.gate_buf[i],
+                    &graph.buffers.up_buf[i],
+                    &graph.buffers.activated_buf[i],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.activated_buf[i],
+                    shared.down_proj.weight(),
+                    &graph.buffers.norm_buf[i],
+                    act,
+                )?;
+                add_graph(
+                    &graph.buffers.moe_out[i],
+                    &graph.buffers.norm_buf[i],
+                    &graph.buffers.moe_out[i],
+                    &dev,
+                )?;
             }
 
             // Residual 2: out = out + residual_multiplier * moe_out
@@ -3279,7 +3756,11 @@ impl DecodeGraphModel for HyV3 {
         }
         let dev = dev_for_hyv3(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         let w = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
@@ -3314,9 +3795,27 @@ impl DecodeGraphModel for HyV3 {
             let normed: &Storage = &graph.buffers.norm_buf[i];
 
             // 2. QKV projections
-            linear_into(&dev, normed, layer.wq.weight(), &graph.buffers.q_buf[i], act)?;
-            linear_into(&dev, normed, layer.wk.weight(), &graph.buffers.k_buf[i], act)?;
-            linear_into(&dev, normed, layer.wv.weight(), &graph.buffers.v_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wq.weight(),
+                &graph.buffers.q_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wk.weight(),
+                &graph.buffers.k_buf[i],
+                act,
+            )?;
+            linear_into(
+                &dev,
+                normed,
+                layer.wv.weight(),
+                &graph.buffers.v_buf[i],
+                act,
+            )?;
 
             // 3. Per-head QK-norm
             let qn_shape = Shape::new(vec![batch * nh, hd]);
@@ -3370,10 +3869,18 @@ impl DecodeGraphModel for HyV3 {
             let kv_stride = nkv * hd;
             let arena_slot_stride = graph.buffers.max_ctx * kv_stride;
             let max_ctx = graph.buffers.max_ctx;
-            launch_qkv_gemv(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-            launch_attention(&graph.buffers.k_arena[i], graph.buffers.current_pos, max_ctx)
-                .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_qkv_gemv(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+            launch_attention(
+                &graph.buffers.k_arena[i],
+                graph.buffers.current_pos,
+                max_ctx,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
             grim_backend_rocm::launch_kv_append_batch(
                 &dev,
@@ -3429,8 +3936,19 @@ impl DecodeGraphModel for HyV3 {
             grim_backend_rocm::launch_bump_i32_slots(&dev, &graph.buffers.pos_dev, steps, batch)
                 .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
-            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.wo.weight(), &graph.buffers.norm_buf[i], act)?;
-            add_graph(&graph.buffers.layer_input[i], &graph.buffers.norm_buf[i], &graph.buffers.layer_output[i], &dev)?;
+            linear_into(
+                &dev,
+                &graph.buffers.attn_out_buf[i],
+                layer.wo.weight(),
+                &graph.buffers.norm_buf[i],
+                act,
+            )?;
+            add_graph(
+                &graph.buffers.layer_input[i],
+                &graph.buffers.norm_buf[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
 
             // 6. Post-attention RMSNorm -> MoE FFN
             dev.rms_norm_into(
@@ -3444,7 +3962,13 @@ impl DecodeGraphModel for HyV3 {
             let normed_moe: &Storage = &graph.buffers.norm_buf[i];
 
             // 7. MoE Gate + top-k route (mode 3 renorm)
-            linear_into(&dev, normed_moe, layer.moe.gate.weight(), &graph.buffers.moe_gate_logits[i], act)?;
+            linear_into(
+                &dev,
+                normed_moe,
+                layer.moe.gate.weight(),
+                &graph.buffers.moe_gate_logits[i],
+                act,
+            )?;
             let num_exp = self.cfg.num_experts;
             let top_k = self.cfg.num_experts_per_tok.min(num_exp);
             dev.moe_route_topk_on_device(
@@ -3461,13 +3985,16 @@ impl DecodeGraphModel for HyV3 {
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
             // 8. Resident grouped dispatch
-            let experts = layer.moe.experts.iter().map(|e| {
-                crate::shared_moe::MoeExpert {
+            let experts = layer
+                .moe
+                .experts
+                .iter()
+                .map(|e| crate::shared_moe::MoeExpert {
                     gate: e.gate_proj.clone(),
                     up: e.up_proj.clone(),
                     down: e.down_proj.clone(),
-                }
-            }).collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
 
             let (_, _, _, gate_buf, up_buf, down_buf) = crate::shared_moe::ensure_charon_scratch(
                 dev.ordinal(),
@@ -3496,15 +4023,47 @@ impl DecodeGraphModel for HyV3 {
 
             // If shared expert present, project through gate/up/down and accumulate
             if let Some(ref shared) = layer.moe.shared_expert {
-                linear_into(&dev, normed_moe, shared.gate_proj.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, normed_moe, shared.up_proj.weight(), &graph.buffers.up_buf[i], act)?;
-                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
-                    .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(&dev, &graph.buffers.activated_buf[i], shared.down_proj.weight(), &graph.buffers.norm_buf[i], act)?;
-                add_graph(&graph.buffers.moe_out[i], &graph.buffers.norm_buf[i], &graph.buffers.moe_out[i], &dev)?;
+                linear_into(
+                    &dev,
+                    normed_moe,
+                    shared.gate_proj.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    normed_moe,
+                    shared.up_proj.weight(),
+                    &graph.buffers.up_buf[i],
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    &graph.buffers.gate_buf[i],
+                    &graph.buffers.up_buf[i],
+                    &graph.buffers.activated_buf[i],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.activated_buf[i],
+                    shared.down_proj.weight(),
+                    &graph.buffers.norm_buf[i],
+                    act,
+                )?;
+                add_graph(
+                    &graph.buffers.moe_out[i],
+                    &graph.buffers.norm_buf[i],
+                    &graph.buffers.moe_out[i],
+                    &dev,
+                )?;
             }
 
-            add_graph(&graph.buffers.layer_output[i], &graph.buffers.moe_out[i], &graph.buffers.layer_output[i], &dev)?;
+            add_graph(
+                &graph.buffers.layer_output[i],
+                &graph.buffers.moe_out[i],
+                &graph.buffers.layer_output[i],
+                &dev,
+            )?;
 
             let n_layers = graph.buffers.layer_input.len();
             let dst: &Storage = if i + 1 < n_layers {
@@ -3631,7 +4190,11 @@ impl DecodeGraphModel for Chameleon {
         }
         let dev = dev_for_chameleon(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         // Embedding gather
@@ -3705,7 +4268,9 @@ impl DecodeGraphModel for Chameleon {
         // Chameleon eager forward stores full-history (k, v) tensors per layer.
         let caches = session
             .model_state()
-            .and_then(|s| s.downcast_ref::<Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>>>())
+            .and_then(|s| {
+                s.downcast_ref::<Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>>>()
+            })
             .ok_or_else(|| {
                 grim_core::error::Error::Session(
                     "missing or invalid Chameleon KV cache in session".into(),
@@ -3735,7 +4300,10 @@ impl DecodeGraphModel for Chameleon {
                 }
             };
 
-            let (k_rocm, v_rocm) = match (as_rocm(k_st.storage().as_ref()), as_rocm(v_st.storage().as_ref())) {
+            let (k_rocm, v_rocm) = match (
+                as_rocm(k_st.storage().as_ref()),
+                as_rocm(v_st.storage().as_ref()),
+            ) {
                 (Ok(k), Ok(v)) => (k, v),
                 _ => {
                     if valid_rows > 0 {
@@ -3777,6 +4345,7 @@ impl DecodeGraphModel for Chameleon {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -3849,7 +4418,11 @@ impl DecodeGraphModel for DeepSeek4 {
         }
         let dev = dev_for_deepseek4(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         // Embedding gather
@@ -3891,14 +4464,38 @@ impl DecodeGraphModel for DeepSeek4 {
 
             // Project Q: norm_buf -> q_buf
             if let (Some(qa), Some(qb)) = (&layer.self_attn.q_a_proj, &layer.self_attn.q_b_proj) {
-                linear_into(&dev, normed_attn, qa.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, &graph.buffers.gate_buf[i], qb.weight(), &graph.buffers.q_buf[i], act)?;
+                linear_into(
+                    &dev,
+                    normed_attn,
+                    qa.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.gate_buf[i],
+                    qb.weight(),
+                    &graph.buffers.q_buf[i],
+                    act,
+                )?;
             } else if let Some(ref q_direct) = layer.self_attn.q_proj_direct {
-                linear_into(&dev, normed_attn, q_direct.weight(), &graph.buffers.q_buf[i], act)?;
+                linear_into(
+                    &dev,
+                    normed_attn,
+                    q_direct.weight(),
+                    &graph.buffers.q_buf[i],
+                    act,
+                )?;
             }
 
             // Project KV: norm_buf -> gate_up_buf (staged latent)
-            linear_into(&dev, normed_attn, layer.self_attn.kv_a_proj.weight(), &graph.buffers.gate_up_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed_attn,
+                layer.self_attn.kv_a_proj.weight(),
+                &graph.buffers.gate_up_buf[i],
+                act,
+            )?;
 
             // Append to latent_kv_arena
             let latent_row = rank + rope_d;
@@ -3938,7 +4535,13 @@ impl DecodeGraphModel for DeepSeek4 {
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
 
             // Project Attention Out: attn_out_buf -> norm_buf
-            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.self_attn.o_proj.weight(), &graph.buffers.norm_buf[i], act)?;
+            linear_into(
+                &dev,
+                &graph.buffers.attn_out_buf[i],
+                layer.self_attn.o_proj.weight(),
+                &graph.buffers.norm_buf[i],
+                act,
+            )?;
 
             // Residual 1: layer_input + attn_out -> layer_output
             add_graph(
@@ -3960,11 +4563,33 @@ impl DecodeGraphModel for DeepSeek4 {
 
             let normed_ffn: &Storage = &graph.buffers.norm_buf[i];
             if let Some(ref mlp) = layer.mlp {
-                linear_into(&dev, normed_ffn, mlp.w1.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, normed_ffn, mlp.w3.weight(), &graph.buffers.up_buf[i], act)?;
-                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
-                    .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(&dev, &graph.buffers.activated_buf[i], mlp.w2.weight(), &graph.buffers.norm_buf[i], act)?;
+                linear_into(
+                    &dev,
+                    normed_ffn,
+                    mlp.w1.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    normed_ffn,
+                    mlp.w3.weight(),
+                    &graph.buffers.up_buf[i],
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    &graph.buffers.gate_buf[i],
+                    &graph.buffers.up_buf[i],
+                    &graph.buffers.activated_buf[i],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.activated_buf[i],
+                    mlp.w2.weight(),
+                    &graph.buffers.norm_buf[i],
+                    act,
+                )?;
             }
 
             // Residual 2: layer_output + ffn_out -> layer_output
@@ -4099,7 +4724,11 @@ impl DecodeGraphModel for DeepSeek2 {
         }
         let dev = dev_for_deepseek2(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         // Embedding gather
@@ -4140,10 +4769,22 @@ impl DecodeGraphModel for DeepSeek2 {
             let nh = layer.self_attn.num_heads;
 
             // Project Q: norm_buf -> q_buf
-            linear_into(&dev, normed_attn, layer.self_attn.q_proj.weight(), &graph.buffers.q_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed_attn,
+                layer.self_attn.q_proj.weight(),
+                &graph.buffers.q_buf[i],
+                act,
+            )?;
 
             // Project KV: norm_buf -> gate_up_buf (staged latent)
-            linear_into(&dev, normed_attn, layer.self_attn.kv_a_proj.weight(), &graph.buffers.gate_up_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed_attn,
+                layer.self_attn.kv_a_proj.weight(),
+                &graph.buffers.gate_up_buf[i],
+                act,
+            )?;
 
             // Append to latent_kv_arena
             let latent_row = rank + rope_d;
@@ -4183,7 +4824,13 @@ impl DecodeGraphModel for DeepSeek2 {
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
 
             // Project Attention Out: attn_out_buf -> norm_buf
-            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.self_attn.o_proj.weight(), &graph.buffers.norm_buf[i], act)?;
+            linear_into(
+                &dev,
+                &graph.buffers.attn_out_buf[i],
+                layer.self_attn.o_proj.weight(),
+                &graph.buffers.norm_buf[i],
+                act,
+            )?;
 
             // Residual 1: layer_input + attn_out -> layer_output
             add_graph(
@@ -4205,11 +4852,33 @@ impl DecodeGraphModel for DeepSeek2 {
 
             let normed_ffn: &Storage = &graph.buffers.norm_buf[i];
             if let Some(ref mlp) = layer.mlp {
-                linear_into(&dev, normed_ffn, mlp.w1.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, normed_ffn, mlp.w3.weight(), &graph.buffers.up_buf[i], act)?;
-                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
-                    .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(&dev, &graph.buffers.activated_buf[i], mlp.w2.weight(), &graph.buffers.norm_buf[i], act)?;
+                linear_into(
+                    &dev,
+                    normed_ffn,
+                    mlp.w1.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    normed_ffn,
+                    mlp.w3.weight(),
+                    &graph.buffers.up_buf[i],
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    &graph.buffers.gate_buf[i],
+                    &graph.buffers.up_buf[i],
+                    &graph.buffers.activated_buf[i],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.activated_buf[i],
+                    mlp.w2.weight(),
+                    &graph.buffers.norm_buf[i],
+                    act,
+                )?;
             }
 
             // Residual 2: layer_output + ffn_out -> layer_output
@@ -4344,7 +5013,11 @@ impl DecodeGraphModel for DeepSeek32 {
         }
         let dev = dev_for_deepseek32(self)?;
         if !graph.capturing {
-            crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
         }
 
         // Embedding gather
@@ -4386,14 +5059,38 @@ impl DecodeGraphModel for DeepSeek32 {
 
             // Project Q: norm_buf -> q_buf
             if let (Some(qa), Some(qb)) = (&layer.self_attn.q_a_proj, &layer.self_attn.q_b_proj) {
-                linear_into(&dev, normed_attn, qa.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, &graph.buffers.gate_buf[i], qb.weight(), &graph.buffers.q_buf[i], act)?;
+                linear_into(
+                    &dev,
+                    normed_attn,
+                    qa.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.gate_buf[i],
+                    qb.weight(),
+                    &graph.buffers.q_buf[i],
+                    act,
+                )?;
             } else if let Some(ref q_direct) = layer.self_attn.q_proj_direct {
-                linear_into(&dev, normed_attn, q_direct.weight(), &graph.buffers.q_buf[i], act)?;
+                linear_into(
+                    &dev,
+                    normed_attn,
+                    q_direct.weight(),
+                    &graph.buffers.q_buf[i],
+                    act,
+                )?;
             }
 
             // Project KV: norm_buf -> gate_up_buf (staged latent)
-            linear_into(&dev, normed_attn, layer.self_attn.kv_a_proj.weight(), &graph.buffers.gate_up_buf[i], act)?;
+            linear_into(
+                &dev,
+                normed_attn,
+                layer.self_attn.kv_a_proj.weight(),
+                &graph.buffers.gate_up_buf[i],
+                act,
+            )?;
 
             // Append to latent_kv_arena
             let latent_row = rank + rope_d;
@@ -4433,7 +5130,13 @@ impl DecodeGraphModel for DeepSeek32 {
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
 
             // Project Attention Out: attn_out_buf -> norm_buf
-            linear_into(&dev, &graph.buffers.attn_out_buf[i], layer.self_attn.o_proj.weight(), &graph.buffers.norm_buf[i], act)?;
+            linear_into(
+                &dev,
+                &graph.buffers.attn_out_buf[i],
+                layer.self_attn.o_proj.weight(),
+                &graph.buffers.norm_buf[i],
+                act,
+            )?;
 
             // Residual 1: layer_input + attn_out -> layer_output
             add_graph(
@@ -4455,11 +5158,33 @@ impl DecodeGraphModel for DeepSeek32 {
 
             let normed_ffn: &Storage = &graph.buffers.norm_buf[i];
             if let Some(ref mlp) = layer.mlp {
-                linear_into(&dev, normed_ffn, mlp.w1.weight(), &graph.buffers.gate_buf[i], act)?;
-                linear_into(&dev, normed_ffn, mlp.w3.weight(), &graph.buffers.up_buf[i], act)?;
-                dev.silu_mul_into(&graph.buffers.gate_buf[i], &graph.buffers.up_buf[i], &graph.buffers.activated_buf[i])
-                    .map_err(grim_core::error::Error::Tensor)?;
-                linear_into(&dev, &graph.buffers.activated_buf[i], mlp.w2.weight(), &graph.buffers.norm_buf[i], act)?;
+                linear_into(
+                    &dev,
+                    normed_ffn,
+                    mlp.w1.weight(),
+                    &graph.buffers.gate_buf[i],
+                    act,
+                )?;
+                linear_into(
+                    &dev,
+                    normed_ffn,
+                    mlp.w3.weight(),
+                    &graph.buffers.up_buf[i],
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    &graph.buffers.gate_buf[i],
+                    &graph.buffers.up_buf[i],
+                    &graph.buffers.activated_buf[i],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    &graph.buffers.activated_buf[i],
+                    mlp.w2.weight(),
+                    &graph.buffers.norm_buf[i],
+                    act,
+                )?;
             }
 
             // Residual 2: layer_output + ffn_out -> layer_output
@@ -4542,7 +5267,10 @@ mod tests {
     use grim_core::model::CausalLm;
     use grim_core::session::Inner as SessionInner;
     use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
-    use grim_nn::{ColumnParallelLinear, Embedding, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig};
+    use grim_nn::{
+        ColumnParallelLinear, Embedding, Linear, RmsNorm, Rope, RowParallelLinear,
+        TensorParallelConfig,
+    };
     use grim_tensor::{ArithType, CoreTensorOps, DType, QuantProvenance, Shape, Storage, Tensor};
 
     fn rocm_tensor(dev: &RocmDevice, ordinal: usize, data: Vec<f32>, shape: Shape) -> Tensor {
@@ -4560,13 +5288,21 @@ mod tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.2
             })
             .collect()
     }
 
-    fn test_linear(dev: &RocmDevice, ordinal: usize, out_dim: usize, in_dim: usize, seed: u64) -> Linear {
+    fn test_linear(
+        dev: &RocmDevice,
+        ordinal: usize,
+        out_dim: usize,
+        in_dim: usize,
+        seed: u64,
+    ) -> Linear {
         let w = rocm_tensor(
             dev,
             ordinal,
@@ -4619,7 +5355,11 @@ mod tests {
         }
     }
 
-    fn make_test_llama(dev: &RocmDevice, ordinal: usize, q80: bool) -> (Llama, crate::model::LlamaConfig) {
+    fn make_test_llama(
+        dev: &RocmDevice,
+        ordinal: usize,
+        q80: bool,
+    ) -> (Llama, crate::model::LlamaConfig) {
         let vocab_size = 64;
         let hidden_size = 64;
         let intermediate_size = 128;
@@ -4687,15 +5427,21 @@ mod tests {
             let w_down = mk_lin(hidden_size, intermediate_size, seed + 7);
 
             let (wqkv_q80_fused, w_gate_up_q80_fused) = if q80 {
-                let fqkv = dev.build_fused_qkv_q80(
-                    wq.weight.storage().as_ref(),
-                    wk.weight.storage().as_ref(),
-                    wv.weight.storage().as_ref(),
-                ).ok().map(Arc::new);
-                let fgu = dev.build_fused_gate_up_q80(
-                    w_gate.weight.storage().as_ref(),
-                    w_up.weight.storage().as_ref(),
-                ).ok().map(Arc::new);
+                let fqkv = dev
+                    .build_fused_qkv_q80(
+                        wq.weight.storage().as_ref(),
+                        wk.weight.storage().as_ref(),
+                        wv.weight.storage().as_ref(),
+                    )
+                    .ok()
+                    .map(Arc::new);
+                let fgu = dev
+                    .build_fused_gate_up_q80(
+                        w_gate.weight.storage().as_ref(),
+                        w_up.weight.storage().as_ref(),
+                    )
+                    .ok()
+                    .map(Arc::new);
                 (fqkv, fgu)
             } else {
                 (None, None)
@@ -4764,25 +5510,38 @@ mod tests {
         let (llama, cfg) = make_test_llama(&dev, 0, false);
 
         // 1. Allocate decode graph buffers
-        let mut graph = llama.get_or_create_decode_graph(512, 1).expect("alloc graph");
+        let mut graph = llama
+            .get_or_create_decode_graph(512, 1)
+            .expect("alloc graph");
 
         // Warmup before capture (JIT + allocator)
         let token_id = 5u32;
-        llama.forward_capture(&mut graph, token_id).expect("warmup 1");
-        llama.forward_capture(&mut graph, token_id).expect("warmup 2");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 1");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 2");
 
         // 2. Capture a step
         graph.begin_capture().expect("begin capture");
-        llama.forward_capture(&mut graph, token_id).expect("forward capture");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("forward capture");
         graph.end_capture().expect("end capture");
 
         // 3. Replay with a token
-        llama.forward_replay(&mut graph, token_id).expect("replay token");
+        llama
+            .forward_replay(&mut graph, token_id)
+            .expect("replay token");
         dev.synchronize();
 
         // 4. Read back logits from graph storage
         let logits_storage = graph.logits_device_storage();
-        let rocm_st = logits_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().expect("RocmStorage");
+        let rocm_st = logits_storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("RocmStorage");
         let host_bytes = rocm_st.copy_to_host().expect("copy_to_host");
         let host_logits: &[f32] = unsafe {
             std::slice::from_raw_parts(host_bytes.as_ptr() as *const f32, host_bytes.len() / 4)
@@ -4800,14 +5559,22 @@ mod tests {
         let pos_tensor = rocm_tensor(&dev, 0, vec![0.0f32, 1.0, 2.0], Shape::new(vec![3]));
         let _ = llama.forward(&mut session, &prompt_tensor, &pos_tensor, &[]);
 
-        let seed_sources = llama.eager_kv_seed_sources(&session, 3).expect("eager_kv_seed_sources");
+        let seed_sources = llama
+            .eager_kv_seed_sources(&session, 3)
+            .expect("eager_kv_seed_sources");
         assert_eq!(seed_sources.len(), cfg.num_layers);
         for (i, src) in seed_sources.iter().enumerate() {
-            assert!(src.is_some(), "layer {i} should have valid eager KV seed source");
+            assert!(
+                src.is_some(),
+                "layer {i} should have valid eager KV seed source"
+            );
         }
 
         // Seed into graph buffers
-        graph.buffers.seed_kv_arena_from_eager(&dev, &seed_sources).expect("seed_kv_arena_from_eager");
+        graph
+            .buffers
+            .seed_kv_arena_from_eager(&dev, &seed_sources)
+            .expect("seed_kv_arena_from_eager");
         assert_eq!(graph.buffers.current_pos, 3);
     }
 
@@ -4825,22 +5592,35 @@ mod tests {
 
         let (llama, cfg) = make_test_llama(&dev, 0, true);
 
-        let mut graph = llama.get_or_create_decode_graph(512, 1).expect("alloc graph");
+        let mut graph = llama
+            .get_or_create_decode_graph(512, 1)
+            .expect("alloc graph");
 
         let token_id = 7u32;
         // Warmup before capture
-        llama.forward_capture(&mut graph, token_id).expect("warmup 1");
-        llama.forward_capture(&mut graph, token_id).expect("warmup 2");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 1");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 2");
 
         graph.begin_capture().expect("begin capture");
-        llama.forward_capture(&mut graph, token_id).expect("forward capture");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("forward capture");
         graph.end_capture().expect("end capture");
 
-        llama.forward_replay(&mut graph, token_id).expect("replay token");
+        llama
+            .forward_replay(&mut graph, token_id)
+            .expect("replay token");
         dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
-        let rocm_st = logits_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().expect("RocmStorage");
+        let rocm_st = logits_storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .expect("RocmStorage");
         let host_bytes = rocm_st.copy_to_host().expect("copy_to_host");
         let host_logits: &[f32] = unsafe {
             std::slice::from_raw_parts(host_bytes.as_ptr() as *const f32, host_bytes.len() / 4)
@@ -4919,7 +5699,11 @@ mod tests {
             } else {
                 let conv_shape = Shape::new(vec![q_dim, cfg.ssm_d_conv]);
                 let conv_storage = dev
-                    .from_cpu(&vec![0.25f32; q_dim * cfg.ssm_d_conv], &conv_shape, DType::F32)
+                    .from_cpu(
+                        &vec![0.25f32; q_dim * cfg.ssm_d_conv],
+                        &conv_shape,
+                        DType::F32,
+                    )
                     .unwrap();
                 let conv_t = Tensor::new(
                     Arc::from(conv_storage),
@@ -4978,26 +5762,30 @@ mod tests {
         let qwen = Qwen35 {
             cfg: cfg.clone(),
             device: Device::Rocm(0),
-            tok_embeddings: Embedding {
-                weight: embed,
-            },
+            tok_embeddings: Embedding { weight: embed },
             blocks,
             output_norm: test_norm(&dev, 0, hidden_size),
             output: test_linear(&dev, 0, vocab_size, hidden_size, 999),
         };
 
-        let mut graph = qwen.get_or_create_decode_graph(512, 1).expect("alloc graph");
+        let mut graph = qwen
+            .get_or_create_decode_graph(512, 1)
+            .expect("alloc graph");
 
         let token_id = 11u32;
         // Warmup before capture
-        qwen.forward_capture(&mut graph, token_id).expect("warmup 1");
-        qwen.forward_capture(&mut graph, token_id).expect("warmup 2");
+        qwen.forward_capture(&mut graph, token_id)
+            .expect("warmup 1");
+        qwen.forward_capture(&mut graph, token_id)
+            .expect("warmup 2");
 
         graph.begin_capture().expect("begin capture");
-        qwen.forward_capture(&mut graph, token_id).expect("forward capture");
+        qwen.forward_capture(&mut graph, token_id)
+            .expect("forward capture");
         graph.end_capture().expect("end capture");
 
-        qwen.forward_replay(&mut graph, token_id).expect("replay token");
+        qwen.forward_replay(&mut graph, token_id)
+            .expect("replay token");
         dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
@@ -5017,7 +5805,9 @@ mod tests {
 
         // Test eager_kv_seed_sources with a session
         let session = qwen.new_session();
-        let seed_sources = qwen.eager_kv_seed_sources(session.as_ref(), 0).expect("seed sources");
+        let seed_sources = qwen
+            .eager_kv_seed_sources(session.as_ref(), 0)
+            .expect("seed sources");
         assert_eq!(seed_sources.len(), num_layers);
         // Layer 0 is recurrent -> None
         assert!(seed_sources[0].is_none());
@@ -5112,18 +5902,28 @@ mod tests {
             output: test_linear(&dev, 0, vocab_size, hidden_size, 999),
         };
 
-        let mut graph = gemma.get_or_create_decode_graph(512, 1).expect("alloc graph");
+        let mut graph = gemma
+            .get_or_create_decode_graph(512, 1)
+            .expect("alloc graph");
 
         let token_id = 9u32;
         // Warmup before capture
-        gemma.forward_capture(&mut graph, token_id).expect("warmup 1");
-        gemma.forward_capture(&mut graph, token_id).expect("warmup 2");
+        gemma
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 1");
+        gemma
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 2");
 
         graph.begin_capture().expect("begin capture");
-        gemma.forward_capture(&mut graph, token_id).expect("forward capture");
+        gemma
+            .forward_capture(&mut graph, token_id)
+            .expect("forward capture");
         graph.end_capture().expect("end capture");
 
-        gemma.forward_replay(&mut graph, token_id).expect("replay token");
+        gemma
+            .forward_replay(&mut graph, token_id)
+            .expect("replay token");
         dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
@@ -5312,7 +6112,8 @@ mod tests {
             inner: llama,
         };
         let any: &dyn std::any::Any = &wrapper;
-        let dg = super::llama_wrapper_graph_model(any).expect("wrapper must resolve to DecodeGraphModel");
+        let dg = super::llama_wrapper_graph_model(any)
+            .expect("wrapper must resolve to DecodeGraphModel");
 
         let mut graph = dg.get_or_create_decode_graph(512, 1).expect("alloc graph");
         let token = 9u32;
@@ -5357,16 +6158,40 @@ mod tests {
 
             let seed = (i as u64) * 1000 + 40;
             let router_gate = test_linear(&dev, 0, num_experts, hidden_size, seed + 20);
-            let router = MoeRouter::new(router_gate, RouterKind::SoftmaxTopK, top_k, num_experts, None);
+            let router = MoeRouter::new(
+                router_gate,
+                RouterKind::SoftmaxTopK,
+                top_k,
+                num_experts,
+                None,
+            );
 
             let mut egate = Vec::new();
             let mut eup = Vec::new();
             let mut edown = Vec::new();
             for e in 0..num_experts {
                 let eseed = seed + 30 + (e as u64) * 10;
-                egate.push(test_linear(&dev, 0, intermediate_size, hidden_size, eseed + 1));
-                eup.push(test_linear(&dev, 0, intermediate_size, hidden_size, eseed + 2));
-                edown.push(test_linear(&dev, 0, hidden_size, intermediate_size, eseed + 3));
+                egate.push(test_linear(
+                    &dev,
+                    0,
+                    intermediate_size,
+                    hidden_size,
+                    eseed + 1,
+                ));
+                eup.push(test_linear(
+                    &dev,
+                    0,
+                    intermediate_size,
+                    hidden_size,
+                    eseed + 2,
+                ));
+                edown.push(test_linear(
+                    &dev,
+                    0,
+                    hidden_size,
+                    intermediate_size,
+                    eseed + 3,
+                ));
             }
             let moe_ffn = MoeFfn::new(
                 router,
@@ -5382,20 +6207,30 @@ mod tests {
             });
         }
 
-        let mut graph = llama.get_or_create_decode_graph(512, 1).expect("alloc decode graph with MoE");
+        let mut graph = llama
+            .get_or_create_decode_graph(512, 1)
+            .expect("alloc decode graph with MoE");
         let token_id = 17u32;
 
         // Warmup
-        llama.forward_capture(&mut graph, token_id).expect("warmup 1");
-        llama.forward_capture(&mut graph, token_id).expect("warmup 2");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 1");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("warmup 2");
 
         // Capture
         graph.begin_capture().expect("begin capture");
-        llama.forward_capture(&mut graph, token_id).expect("forward capture");
+        llama
+            .forward_capture(&mut graph, token_id)
+            .expect("forward capture");
         graph.end_capture().expect("end capture");
 
         // Replay
-        llama.forward_replay(&mut graph, token_id).expect("replay token");
+        llama
+            .forward_replay(&mut graph, token_id)
+            .expect("replay token");
         dev.synchronize();
 
         let logits_storage = graph.logits_device_storage();
@@ -5410,7 +6245,10 @@ mod tests {
 
         assert_eq!(host_logits.len(), cfg.vocab_size);
         for (i, &val) in host_logits.iter().enumerate() {
-            assert!(val.is_finite(), "MoE decode graph logit {i} is not finite: {val}");
+            assert!(
+                val.is_finite(),
+                "MoE decode graph logit {i} is not finite: {val}"
+            );
         }
     }
 }

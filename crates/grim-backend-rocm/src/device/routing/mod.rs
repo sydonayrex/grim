@@ -9,7 +9,7 @@ use grim_tensor::backend::{BackendStorage, ComputeHandle};
 use grim_tensor::error::Result;
 
 use crate::device::roc_device::RocmDevice;
-use crate::{ arg, as_rocm, dev_ptr, RocmHandle };
+use crate::{RocmHandle, arg, as_rocm, dev_ptr};
 
 mod charon_fused;
 mod charon_grouped_dispatch;
@@ -25,17 +25,28 @@ pub use charon_roundtrip::*;
 #[allow(unused_imports)]
 pub use moe_dispatch::*;
 
-impl RocmDevice {/// Compute dynamic Expert Parallel Load Balancing (EPLB) greedy LPT placement.
+impl RocmDevice {
+    /// Compute dynamic Expert Parallel Load Balancing (EPLB) greedy LPT placement.
     pub fn eplb_balance_experts(
-        &self, expert_frequencies: &[f32], num_ranks: usize, replication_slots: usize, ) -> crate::device::eplb::EplbPackingPlan {
+        &self,
+        expert_frequencies: &[f32],
+        num_ranks: usize,
+        replication_slots: usize,
+    ) -> crate::device::eplb::EplbPackingPlan {
         crate::device::eplb::EplbRouter::balance_experts(
-            expert_frequencies, num_ranks, replication_slots, )
+            expert_frequencies,
+            num_ranks,
+            replication_slots,
+        )
     }
 
     /// Plan continuous batch reordering into [Decode : Extend : Prefill] partitions.
     pub fn reorder_batch(
-        &self, sequences: &[crate::device::batch_orchestrator::SequenceMeta], ) -> crate::device::batch_orchestrator::ReorderedBatch {
-        crate::device::batch_orchestrator::BatchReorderer::plan(sequences)}
+        &self,
+        sequences: &[crate::device::batch_orchestrator::SequenceMeta],
+    ) -> crate::device::batch_orchestrator::ReorderedBatch {
+        crate::device::batch_orchestrator::BatchReorderer::plan(sequences)
+    }
 
     /// Launch one bounded Scythe persistent worker.
     /// The worker is intentionally launched as a single 128-thread block: the callable Charon device function.
@@ -161,7 +172,11 @@ mod routing_dispatch_selection_tests {
                 .map(|i| ((i % 11) as f32 - 5.0) * 0.07 * salt)
                 .collect()
         };
-        (mk(HIDDEN * INTER, 1.0), mk(HIDDEN * INTER, 1.3), mk(INTER * HIDDEN, 0.8))
+        (
+            mk(HIDDEN * INTER, 1.0),
+            mk(HIDDEN * INTER, 1.3),
+            mk(INTER * HIDDEN, 0.8),
+        )
     }
 
     fn assert_finite_shape(out: Vec<f32>, what: &str) {
@@ -354,8 +369,8 @@ mod routing_dispatch_selection_tests {
                 BATCH,
                 HIDDEN,
                 INTER,
-                7,    // scalar IQK q4k format (golden-tested in golden_charon_moe_gpu)
-                144,  // q4k block bytes
+                7,   // scalar IQK q4k format (golden-tested in golden_charon_moe_gpu)
+                144, // q4k block bytes
                 RSF,
             )
             .expect("iqk q4k grouped roundtrip");
@@ -440,7 +455,7 @@ mod routing_dispatch_selection_tests {
     #[test]
     fn grouped_dispatch_dot4_q80_reachable() {
         let Some(dev) = gpu_device() else { return };
-        use crate::kernels::charon::{dot4_entry_for, CharonDot4Quant};
+        use crate::kernels::charon::{CharonDot4Quant, dot4_entry_for};
         let (gw, uw, dw) = weights_f32();
         let out = dev
             .charon_grouped_dispatch_roundtrip_dot4(
@@ -465,7 +480,7 @@ mod routing_dispatch_selection_tests {
     #[test]
     fn grouped_dispatch_dot4_rejects_unaligned_hidden() {
         let Some(dev) = gpu_device() else { return };
-        use crate::kernels::charon::{dot4_entry_for, CharonDot4Quant};
+        use crate::kernels::charon::{CharonDot4Quant, dot4_entry_for};
         let (gw, uw, dw) = weights_f32();
         let err = dev.charon_grouped_dispatch_roundtrip_dot4(
             dot4_entry_for(CharonDot4Quant::Q8_0, dev.gcn_arch(), false)
@@ -485,6 +500,3 @@ mod routing_dispatch_selection_tests {
         assert!(err.is_err(), "unaligned hidden must be rejected");
     }
 }
-
-
-

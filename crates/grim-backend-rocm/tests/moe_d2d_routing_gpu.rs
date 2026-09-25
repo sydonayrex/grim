@@ -33,6 +33,18 @@ fn gpu_device() -> Option<RocmDevice> {
         .ok()
 }
 
+/// P1 parity must never turn a missing GPU into a green result. The test is
+/// ignored on CPU CI and the ROCm runner enables it explicitly.
+fn required_gpu_device() -> RocmDevice {
+    assert!(
+        grim_backend_rocm::gpu_test_enabled(),
+        "P1 D2D parity requires GRIM_RUN_GPU_TESTS=1"
+    );
+    panic::catch_unwind(|| RocmDevice::try_new(0))
+        .expect("P1 D2D parity requires a usable ROCm device")
+        .expect("P1 D2D parity could not create RocmDevice(0)")
+}
+
 /// Serializes GPU tests in this binary (one device; concurrent
 /// `moe_route_topk_on_device` launches contend and give false failures
 /// under default `--test-threads=N`). See `gpu_test_lock` docs.
@@ -55,11 +67,11 @@ fn host_softmax_topk(logits: &[f32]) -> Vec<(usize, usize, f32)> {
         let row = &logits[s * NUM_EXPERTS..(s + 1) * NUM_EXPERTS];
         let mut idx: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
         idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let max_l = idx.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = idx
+        let max_l = idx
             .iter()
-            .map(|(_, l)| (l - max_l).exp())
-            .collect();
+            .map(|(_, l)| *l)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = idx.iter().map(|(_, l)| (l - max_l).exp()).collect();
         let sum: f32 = exps.iter().sum();
         for k in 0..TOP_K.min(NUM_EXPERTS) {
             let (e, _) = idx[k];
@@ -101,7 +113,10 @@ fn host_renorm_topk(logits: &[f32]) -> Vec<(usize, usize, f32)> {
         idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let k = TOP_K.min(NUM_EXPERTS);
         let topk = &idx[..k];
-        let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+        let max_l = topk
+            .iter()
+            .map(|(_, l)| *l)
+            .fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
         let sum: f32 = exps.iter().sum();
         for i in 0..k {
@@ -126,6 +141,7 @@ fn compare_routing(got: &[f32], experts: &[u32], want: &[(usize, usize, f32)]) {
 }
 
 #[test]
+#[ignore]
 fn route_topk_softmax_matches_host() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -133,32 +149,63 @@ fn route_topk_softmax_matches_host() {
     let mut logits = vec![0.0f32; SEQ * NUM_EXPERTS];
     for s in 0..SEQ {
         for e in 0..NUM_EXPERTS {
-            logits[s * NUM_EXPERTS + e] = ((s as f32 + 1.0) * 0.7 + (e as f32 + 1.0) * 1.3).sin() * 3.0
-                + (e as f32) * 0.2;
+            logits[s * NUM_EXPERTS + e] =
+                ((s as f32 + 1.0) * 0.7 + (e as f32 + 1.0) * 1.3).sin() * 3.0 + (e as f32) * 0.2;
         }
     }
 
     let num_pairs = SEQ * TOP_K;
-    let l_st = dev.from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32).unwrap();
+    let l_st = dev
+        .from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32)
+        .unwrap();
     let l_rocm = l_st
         .as_any()
         .downcast_ref::<grim_backend_rocm::RocmStorage>()
         .unwrap();
-    let tok_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let exp_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
-    let tok_rocm = tok_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-
-    dev.moe_route_topk_on_device(l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, NUM_EXPERTS, TOP_K, 0)
+    let tok_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
         .unwrap();
+    let exp_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+
+    dev.moe_route_topk_on_device(
+        l_rocm,
+        None,
+        tok_rocm,
+        exp_rocm,
+        w_rocm,
+        SEQ,
+        NUM_EXPERTS,
+        TOP_K,
+        0,
+    )
+    .unwrap();
     dev.synchronize();
 
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
@@ -168,6 +215,7 @@ fn route_topk_softmax_matches_host() {
 }
 
 #[test]
+#[ignore]
 fn route_topk_sqrtsoftplus_matches_host() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -179,23 +227,57 @@ fn route_topk_sqrtsoftplus_matches_host() {
     }
 
     let num_pairs = SEQ * TOP_K;
-    let l_st = dev.from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32).unwrap();
-    let l_rocm = l_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let tok_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let exp_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
-    let tok_rocm = tok_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-
-    dev.moe_route_topk_on_device(l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, NUM_EXPERTS, TOP_K, 1)
+    let l_st = dev
+        .from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32)
         .unwrap();
+    let l_rocm = l_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let tok_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+    let exp_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+
+    dev.moe_route_topk_on_device(
+        l_rocm,
+        None,
+        tok_rocm,
+        exp_rocm,
+        w_rocm,
+        SEQ,
+        NUM_EXPERTS,
+        TOP_K,
+        1,
+    )
+    .unwrap();
     dev.synchronize();
 
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
@@ -205,6 +287,7 @@ fn route_topk_sqrtsoftplus_matches_host() {
 }
 
 #[test]
+#[ignore]
 fn route_topk_renorm_matches_host() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -216,23 +299,57 @@ fn route_topk_renorm_matches_host() {
     }
 
     let num_pairs = SEQ * TOP_K;
-    let l_st = dev.from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32).unwrap();
-    let l_rocm = l_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let tok_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let exp_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
-    let tok_rocm = tok_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-
-    dev.moe_route_topk_on_device(l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, NUM_EXPERTS, TOP_K, 3)
+    let l_st = dev
+        .from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32)
         .unwrap();
+    let l_rocm = l_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let tok_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+    let exp_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+
+    dev.moe_route_topk_on_device(
+        l_rocm,
+        None,
+        tok_rocm,
+        exp_rocm,
+        w_rocm,
+        SEQ,
+        NUM_EXPERTS,
+        TOP_K,
+        3,
+    )
+    .unwrap();
     dev.synchronize();
 
     let experts = decode_u32(&exp_rocm.copy_to_host().unwrap());
@@ -242,9 +359,10 @@ fn route_topk_renorm_matches_host() {
 }
 
 #[test]
+#[ignore = "GPU-only P1 D2D-vs-host parity; run with GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --test moe_d2d_routing_gpu -- --ignored device_route_topk_and_dispatch_matches_cpu_oracle"]
 fn device_route_topk_and_dispatch_matches_cpu_oracle() {
     let _guard = gpu_lock();
-    let Some(dev) = gpu_device() else { return };
+    let dev = required_gpu_device();
 
     // Deterministic logits + expert weights (f32) for a full dispatch.
     let mut logits = vec![0.0f32; SEQ * NUM_EXPERTS];
@@ -261,7 +379,8 @@ fn device_route_topk_and_dispatch_matches_cpu_oracle() {
     for e in 0..NUM_EXPERTS {
         for j in 0..INTER {
             for i in 0..HIDDEN {
-                let v = ((e + 1) as f32 * 0.3 + (j as f32 + 1.0) * 0.1 + (i as f32 + 1.0) * 0.05).sin();
+                let v =
+                    ((e + 1) as f32 * 0.3 + (j as f32 + 1.0) * 0.1 + (i as f32 + 1.0) * 0.05).sin();
                 gate_flat[e * INTER * HIDDEN + j * HIDDEN + i] = v;
                 up_flat[e * INTER * HIDDEN + j * HIDDEN + i] = v * 0.7;
             }
@@ -282,46 +401,81 @@ fn device_route_topk_and_dispatch_matches_cpu_oracle() {
         }
     }
 
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let l_st = dev.from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32).unwrap();
-    let l_rocm = l_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let gate_buf = dev.from_cpu(&gate_flat, &Shape::new(vec![gate_flat.len()]), DType::F32).unwrap();
-    let up_buf = dev.from_cpu(&up_flat, &Shape::new(vec![up_flat.len()]), DType::F32).unwrap();
-    let down_buf = dev.from_cpu(&down_flat, &Shape::new(vec![down_flat.len()]), DType::F32).unwrap();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let l_st = dev
+        .from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32)
+        .unwrap();
+    let l_rocm = l_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let gate_buf = dev
+        .from_cpu(&gate_flat, &Shape::new(vec![gate_flat.len()]), DType::F32)
+        .unwrap();
+    let up_buf = dev
+        .from_cpu(&up_flat, &Shape::new(vec![up_flat.len()]), DType::F32)
+        .unwrap();
+    let down_buf = dev
+        .from_cpu(&down_flat, &Shape::new(vec![down_flat.len()]), DType::F32)
+        .unwrap();
 
     let num_pairs = SEQ * TOP_K;
-    let tok_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let exp_st = dev.zeros(
-        &Shape::new(vec![num_pairs]),
-        DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native },
-    ).unwrap();
-    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
-    let tok_rocm = tok_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-
-    dev.moe_route_topk_on_device(l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, NUM_EXPERTS, TOP_K, 0)
+    let tok_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
         .unwrap();
+    let exp_st = dev
+        .zeros(
+            &Shape::new(vec![num_pairs]),
+            DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap();
+    let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+
+    dev.moe_route_topk_on_device(
+        l_rocm,
+        None,
+        tok_rocm,
+        exp_rocm,
+        w_rocm,
+        SEQ,
+        NUM_EXPERTS,
+        TOP_K,
+        0,
+    )
+    .unwrap();
 
     let out_shape = Shape::new(vec![SEQ, HIDDEN]);
     let (out_storage, _h) = dev
         .moe_fused_dispatch_resident_routing(
-            act_rocm,
-            &*gate_buf,
-            &*up_buf,
-            &*down_buf,
-            tok_rocm,
-            exp_rocm,
-            w_rocm,
-            num_pairs,
-            &out_shape,
-            HIDDEN,
-            INTER,
-            1.0,
+            act_rocm, &*gate_buf, &*up_buf, &*down_buf, tok_rocm, exp_rocm, w_rocm, num_pairs,
+            &out_shape, HIDDEN, INTER, 1.0,
         )
         .unwrap();
     dev.synchronize();
@@ -356,7 +510,7 @@ fn device_route_topk_and_dispatch_matches_cpu_oracle() {
 
     for (i, (g, o)) in got.iter().zip(oracle.iter()).enumerate() {
         assert!(
-            (g - o).abs() < 1e-3,
+            (g - o).abs() < 1e-4,
             "dispatch mismatch at {i}: device {g}, cpu {o}"
         );
     }
@@ -372,7 +526,11 @@ fn w8a8_int8_quantize_rowmajor(w: &mut [f32], rows: usize, k: usize) -> (Vec<u8>
     let mut scales = vec![0.0f32; rows];
     for r in 0..rows {
         let max_abs = (0..k).map(|c| w[r * k + c].abs()).fold(0.0f32, f32::max);
-        let scale = if max_abs == 0.0 { 1e-12 } else { max_abs / 127.0 };
+        let scale = if max_abs == 0.0 {
+            1e-12
+        } else {
+            max_abs / 127.0
+        };
         scales[r] = scale;
         for c in 0..k {
             let q = ((w[r * k + c] / scale).round() as i32).clamp(-128, 127);
@@ -398,6 +556,7 @@ fn w8a8_pack_blob(codes: &[u8], scales: &[f32]) -> Vec<u8> {
 /// per-token `a_scale` is ones (quant error lives in the codes, exactly
 /// like the dequant path — see `shared_moe` v1 policy).
 #[test]
+#[ignore]
 fn device_w8a8_dispatch_matches_exact_dequant_oracle() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -436,21 +595,12 @@ fn device_w8a8_dispatch_matches_exact_dequant_oracle() {
     for e in 0..NUM_EXPERTS {
         let gs = e * INTER * HIDDEN;
         let ds = e * HIDDEN * INTER;
-        let (gc, gs_sc) = w8a8_int8_quantize_rowmajor(
-            &mut gate_w[gs..gs + INTER * HIDDEN],
-            INTER,
-            HIDDEN,
-        );
-        let (uc, us_sc) = w8a8_int8_quantize_rowmajor(
-            &mut up_w[gs..gs + INTER * HIDDEN],
-            INTER,
-            HIDDEN,
-        );
-        let (dc, ds_sc) = w8a8_int8_quantize_rowmajor(
-            &mut down_w[ds..ds + HIDDEN * INTER],
-            HIDDEN,
-            INTER,
-        );
+        let (gc, gs_sc) =
+            w8a8_int8_quantize_rowmajor(&mut gate_w[gs..gs + INTER * HIDDEN], INTER, HIDDEN);
+        let (uc, us_sc) =
+            w8a8_int8_quantize_rowmajor(&mut up_w[gs..gs + INTER * HIDDEN], INTER, HIDDEN);
+        let (dc, ds_sc) =
+            w8a8_int8_quantize_rowmajor(&mut down_w[ds..ds + HIDDEN * INTER], HIDDEN, INTER);
         gate_stack.extend_from_slice(&w8a8_pack_blob(&gc, &gs_sc));
         up_stack.extend_from_slice(&w8a8_pack_blob(&uc, &us_sc));
         down_stack.extend_from_slice(&w8a8_pack_blob(&dc, &ds_sc));
@@ -458,33 +608,85 @@ fn device_w8a8_dispatch_matches_exact_dequant_oracle() {
     // gate_w/up_w/down_w are now exact-dequant references (rewritten in place).
 
     let pack_shape = |len: usize| Shape::new(vec![len]);
-    let gate_buf = MemoryOps::from_cpu_bytes(&dev, &gate_stack, &pack_shape(gate_stack.len()), pack_dtype())
-        .unwrap();
+    let gate_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &gate_stack,
+        &pack_shape(gate_stack.len()),
+        pack_dtype(),
+    )
+    .unwrap();
     let up_buf =
-        MemoryOps::from_cpu_bytes(&dev, &up_stack, &pack_shape(up_stack.len()), pack_dtype()).unwrap();
-    let down_buf = MemoryOps::from_cpu_bytes(&dev, &down_stack, &pack_shape(down_stack.len()), pack_dtype())
-        .unwrap();
+        MemoryOps::from_cpu_bytes(&dev, &up_stack, &pack_shape(up_stack.len()), pack_dtype())
+            .unwrap();
+    let down_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &down_stack,
+        &pack_shape(down_stack.len()),
+        pack_dtype(),
+    )
+    .unwrap();
 
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let l_st = dev.from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32).unwrap();
-    let l_rocm = l_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let l_st = dev
+        .from_cpu(&logits, &Shape::new(vec![SEQ, NUM_EXPERTS]), DType::F32)
+        .unwrap();
+    let l_rocm = l_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let num_pairs = SEQ * TOP_K;
-    let u32_dtype = || DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native };
-    let tok_st = dev.zeros(&Shape::new(vec![num_pairs]), u32_dtype()).unwrap();
-    let exp_st = dev.zeros(&Shape::new(vec![num_pairs]), u32_dtype()).unwrap();
+    let u32_dtype = || DType {
+        arith: grim_tensor::ArithType::U32,
+        storage: Storage::Native,
+    };
+    let tok_st = dev
+        .zeros(&Shape::new(vec![num_pairs]), u32_dtype())
+        .unwrap();
+    let exp_st = dev
+        .zeros(&Shape::new(vec![num_pairs]), u32_dtype())
+        .unwrap();
     let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
-    let tok_rocm = tok_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-
-    dev.moe_route_topk_on_device(l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, NUM_EXPERTS, TOP_K, 0)
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
         .unwrap();
 
+    dev.moe_route_topk_on_device(
+        l_rocm,
+        None,
+        tok_rocm,
+        exp_rocm,
+        w_rocm,
+        SEQ,
+        NUM_EXPERTS,
+        TOP_K,
+        0,
+    )
+    .unwrap();
+
     let ascale = vec![1.0f32; SEQ];
-    let ascale_st = dev.from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32).unwrap();
-    let ascale_rocm = ascale_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let ascale_st = dev
+        .from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32)
+        .unwrap();
+    let ascale_rocm = ascale_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let out_shape = Shape::new(vec![SEQ, HIDDEN]);
     let (out_storage, _h) = dev
@@ -605,7 +807,11 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 /// finite stand-ins — a real quantizer never emits them either.
 fn fp8_pack_tensor(w: &mut [f32]) -> (Vec<u8>, f32) {
     let max_abs = w.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    let scale = if max_abs == 0.0 { 1e-12 } else { max_abs / 240.0 };
+    let scale = if max_abs == 0.0 {
+        1e-12
+    } else {
+        max_abs / 240.0
+    };
     let mut codes = vec![0u8; w.len()];
     for (i, v) in w.iter_mut().enumerate() {
         let target = *v / scale;
@@ -648,18 +854,43 @@ fn route_on_device(
     Box<dyn grim_tensor::backend::BackendStorage>,
 ) {
     let num_pairs = seq * top_k;
-    let u32d = || DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native };
-    let l_st = dev.from_cpu(logits, &Shape::new(vec![seq, num_experts]), DType::F32).unwrap();
+    let u32d = || DType {
+        arith: grim_tensor::ArithType::U32,
+        storage: Storage::Native,
+    };
+    let l_st = dev
+        .from_cpu(logits, &Shape::new(vec![seq, num_experts]), DType::F32)
+        .unwrap();
     let tok = dev.zeros(&Shape::new(vec![num_pairs]), u32d()).unwrap();
     let exp = dev.zeros(&Shape::new(vec![num_pairs]), u32d()).unwrap();
     let wth = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
     {
-        let l_rocm = l_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let tok_rocm = tok.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let exp_rocm = exp.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let w_rocm = wth.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+        let l_rocm = l_st
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let tok_rocm = tok
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let exp_rocm = exp
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let w_rocm = wth
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
         dev.moe_route_topk_on_device(
-            l_rocm, None, tok_rocm, exp_rocm, w_rocm, seq, num_experts, top_k, mode,
+            l_rocm,
+            None,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            seq,
+            num_experts,
+            top_k,
+            mode,
         )
         .unwrap();
     }
@@ -668,6 +899,7 @@ fn route_on_device(
 
 /// Native W8A8-fp8 D2D dispatch vs exact fp8-dequant CPU oracle.
 #[test]
+#[ignore]
 fn device_w8a8_fp8_dispatch_matches_exact_oracle() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -721,26 +953,74 @@ fn device_w8a8_fp8_dispatch_matches_exact_oracle() {
         down_stack.extend_from_slice(&fp8_pack_blob(&dc, dsc));
     }
 
-    let gate_buf = MemoryOps::from_cpu_bytes(&dev, &gate_stack, &Shape::new(vec![gate_stack.len()]), pack_dtype()).unwrap();
-    let up_buf = MemoryOps::from_cpu_bytes(&dev, &up_stack, &Shape::new(vec![up_stack.len()]), pack_dtype()).unwrap();
-    let down_buf = MemoryOps::from_cpu_bytes(&dev, &down_stack, &Shape::new(vec![down_stack.len()]), pack_dtype()).unwrap();
+    let gate_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &gate_stack,
+        &Shape::new(vec![gate_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
+    let up_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &up_stack,
+        &Shape::new(vec![up_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
+    let down_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &down_stack,
+        &Shape::new(vec![down_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
 
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let (tok_b, exp_b, w_b) = route_on_device(&dev, &logits, SEQ, NUM_EXPERTS, TOP_K, 0);
-    let tok_rocm = tok_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let tok_rocm = tok_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let ascale = vec![1.0f32; SEQ];
-    let ascale_st = dev.from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32).unwrap();
-    let ascale_rocm = ascale_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let ascale_st = dev
+        .from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32)
+        .unwrap();
+    let ascale_rocm = ascale_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let out_shape = Shape::new(vec![SEQ, HIDDEN]);
     let (out_storage, _h) = dev
         .moe_fused_dispatch_resident_routing_w8a8_fp8(
-            act_rocm, &*gate_buf, &*up_buf, &*down_buf, ascale_rocm,
-            tok_rocm, exp_rocm, w_rocm, SEQ * TOP_K, &out_shape, HIDDEN, INTER, 1.0,
+            act_rocm,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            SEQ * TOP_K,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            1.0,
         )
         .unwrap();
     dev.synchronize();
@@ -771,9 +1051,16 @@ fn device_w8a8_fp8_dispatch_matches_exact_oracle() {
         }
     }
 
-    let max_diff = got.iter().zip(oracle.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff = got
+        .iter()
+        .zip(oracle.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("w8a8_fp8 D2D vs exact oracle max_diff={max_diff:.2e}");
-    assert!(max_diff < 1e-3, "w8a8_fp8 dispatch mismatch: {max_diff:.6} exceeds 1e-3");
+    assert!(
+        max_diff < 1e-3,
+        "w8a8_fp8 dispatch mismatch: {max_diff:.6} exceeds 1e-3"
+    );
 }
 
 /// AWQ 4-bit exact fixture: per-group (zero=8, scale=max/7) with f16 scales;
@@ -799,7 +1086,8 @@ fn awq4_pack_rows(w: &mut [f32], rows: usize, k: usize, group_size: usize) -> Ve
                 // Clamp in float domain BEFORE int conversion: an unbounded
                 // ratio saturates `as i32` to i32::MAX and the `+ 8` then
                 // overflows (debug panic). Bounded here, clamped again after.
-                let q = ((w[r * k + c] / fsc).round().clamp(-8.0, 7.0) as i32 + 8).clamp(0, 15) as u32;
+                let q =
+                    ((w[r * k + c] / fsc).round().clamp(-8.0, 7.0) as i32 + 8).clamp(0, 15) as u32;
                 let wi = (c / VPW) * rows + r;
                 qw[wi] |= q << ((c % VPW) * BITS);
                 w[r * k + c] = (q as f32 - 8.0) * fsc;
@@ -834,6 +1122,7 @@ fn awq4_pack_rows(w: &mut [f32], rows: usize, k: usize, group_size: usize) -> Ve
 /// Native AWQ D2D dispatch vs blob-exact CPU oracle (the oracle decodes the
 /// packed blobs with the same (code-zero)*f16(scale) math as the kernel).
 #[test]
+#[ignore]
 fn device_awq_dispatch_matches_blob_exact_oracle() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -880,29 +1169,81 @@ fn device_awq_dispatch_matches_blob_exact_oracle() {
 
     let awq_dtype = || DType {
         arith: grim_tensor::ArithType::F32,
-        storage: Storage::Awq(grim_tensor::dtype::AwqStorageConfig { bits: BITS, group_size: GROUP }),
+        storage: Storage::Awq(grim_tensor::dtype::AwqStorageConfig {
+            bits: BITS,
+            group_size: GROUP,
+        }),
     };
-    let gate_buf = MemoryOps::from_cpu_bytes(&dev, &gate_stack, &Shape::new(vec![gate_stack.len()]), awq_dtype()).unwrap();
-    let up_buf = MemoryOps::from_cpu_bytes(&dev, &up_stack, &Shape::new(vec![up_stack.len()]), awq_dtype()).unwrap();
-    let down_buf = MemoryOps::from_cpu_bytes(&dev, &down_stack, &Shape::new(vec![down_stack.len()]), awq_dtype()).unwrap();
+    let gate_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &gate_stack,
+        &Shape::new(vec![gate_stack.len()]),
+        awq_dtype(),
+    )
+    .unwrap();
+    let up_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &up_stack,
+        &Shape::new(vec![up_stack.len()]),
+        awq_dtype(),
+    )
+    .unwrap();
+    let down_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &down_stack,
+        &Shape::new(vec![down_stack.len()]),
+        awq_dtype(),
+    )
+    .unwrap();
 
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let (tok_b, exp_b, w_b) = route_on_device(&dev, &logits, SEQ, NUM_EXPERTS, TOP_K, 0);
-    let tok_rocm = tok_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let tok_rocm = tok_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let ascale = vec![1.0f32; SEQ];
-    let ascale_st = dev.from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32).unwrap();
-    let ascale_rocm = ascale_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let ascale_st = dev
+        .from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32)
+        .unwrap();
+    let ascale_rocm = ascale_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let out_shape = Shape::new(vec![SEQ, HIDDEN]);
     let (out_storage, _h) = dev
         .moe_fused_dispatch_resident_routing_awq(
-            act_rocm, &*gate_buf, &*up_buf, &*down_buf, ascale_rocm,
-            tok_rocm, exp_rocm, w_rocm, SEQ * TOP_K, &out_shape,
-            HIDDEN, INTER, BITS, GROUP, 1.0,
+            act_rocm,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            SEQ * TOP_K,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            BITS,
+            GROUP,
+            1.0,
         )
         .unwrap();
     dev.synchronize();
@@ -933,9 +1274,16 @@ fn device_awq_dispatch_matches_blob_exact_oracle() {
         }
     }
 
-    let max_diff = got.iter().zip(oracle.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff = got
+        .iter()
+        .zip(oracle.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("awq D2D vs blob-exact oracle max_diff={max_diff:.2e}");
-    assert!(max_diff < 1e-3, "awq dispatch mismatch: {max_diff:.6} exceeds 1e-3");
+    assert!(
+        max_diff < 1e-3,
+        "awq dispatch mismatch: {max_diff:.6} exceeds 1e-3"
+    );
 }
 
 /// Exact MXFP4 quantize: shared exp 127 (scale 1.0) per 32-group, nearest of
@@ -968,6 +1316,7 @@ fn mxfp4_pack_tensor(w: &mut [f32]) -> (Vec<u8>, Vec<u8>) {
 
 /// Native MXFP4 D2D dispatch vs exact-dequant CPU oracle.
 #[test]
+#[ignore]
 fn device_mxfp4_dispatch_matches_exact_oracle() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -1014,26 +1363,64 @@ fn device_mxfp4_dispatch_matches_exact_oracle() {
     let up_stack = |v: &[u8]| {
         MemoryOps::from_cpu_bytes(&dev, v, &Shape::new(vec![v.len()]), mxfp4_dtype()).unwrap()
     };
-    let (gate_c, up_c, down_c, gate_e, up_e, down_e) =
-        (up_stack(&cg), up_stack(&cu), up_stack(&cd), up_stack(&eg), up_stack(&eu), up_stack(&ed));
+    let (gate_c, up_c, down_c, gate_e, up_e, down_e) = (
+        up_stack(&cg),
+        up_stack(&cu),
+        up_stack(&cd),
+        up_stack(&eg),
+        up_stack(&eu),
+        up_stack(&ed),
+    );
 
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let (tok_b, exp_b, w_b) = route_on_device(&dev, &logits, SEQ, NUM_EXPERTS, TOP_K, 0);
-    let tok_rocm = tok_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let tok_rocm = tok_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let ascale = vec![1.0f32; SEQ];
-    let ascale_st = dev.from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32).unwrap();
-    let ascale_rocm = ascale_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let ascale_st = dev
+        .from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32)
+        .unwrap();
+    let ascale_rocm = ascale_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let out_shape = Shape::new(vec![SEQ, HIDDEN]);
     let (out_storage, _h) = dev
         .moe_fused_dispatch_resident_routing_mxfp4(
-            act_rocm, &*gate_c, &*up_c, &*down_c, &*gate_e, &*up_e, &*down_e,
-            ascale_rocm, tok_rocm, exp_rocm, w_rocm, SEQ * TOP_K,
-            &out_shape, HIDDEN, INTER, 1.0,
+            act_rocm,
+            &*gate_c,
+            &*up_c,
+            &*down_c,
+            &*gate_e,
+            &*up_e,
+            &*down_e,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            SEQ * TOP_K,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            1.0,
         )
         .unwrap();
     dev.synchronize();
@@ -1064,9 +1451,16 @@ fn device_mxfp4_dispatch_matches_exact_oracle() {
         }
     }
 
-    let max_diff = got.iter().zip(oracle.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff = got
+        .iter()
+        .zip(oracle.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("mxfp4 D2D vs exact oracle max_diff={max_diff:.2e}");
-    assert!(max_diff < 1e-3, "mxfp4 dispatch mismatch: {max_diff:.6} exceeds 1e-3");
+    assert!(
+        max_diff < 1e-3,
+        "mxfp4 dispatch mismatch: {max_diff:.6} exceeds 1e-3"
+    );
 }
 
 /// Native W8A8-int8 DOT4 dispatch vs exact-dequant CPU oracle.
@@ -1074,6 +1468,7 @@ fn device_mxfp4_dispatch_matches_exact_oracle() {
 /// stay on the scalar kernel (asserted by the launcher's loud refusal —
 /// covered implicitly: this test's dims satisfy it).
 #[test]
+#[ignore]
 fn device_w8a8_dot4_dispatch_matches_exact_oracle() {
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else { return };
@@ -1123,26 +1518,74 @@ fn device_w8a8_dot4_dispatch_matches_exact_oracle() {
         up_stack.extend_from_slice(&w8a8_pack_blob(&uc, &usc));
         down_stack.extend_from_slice(&w8a8_pack_blob(&dc, &dsc));
     }
-    let gate_buf = MemoryOps::from_cpu_bytes(&dev, &gate_stack, &Shape::new(vec![gate_stack.len()]), pack_dtype()).unwrap();
-    let up_buf = MemoryOps::from_cpu_bytes(&dev, &up_stack, &Shape::new(vec![up_stack.len()]), pack_dtype()).unwrap();
-    let down_buf = MemoryOps::from_cpu_bytes(&dev, &down_stack, &Shape::new(vec![down_stack.len()]), pack_dtype()).unwrap();
+    let gate_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &gate_stack,
+        &Shape::new(vec![gate_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
+    let up_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &up_stack,
+        &Shape::new(vec![up_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
+    let down_buf = MemoryOps::from_cpu_bytes(
+        &dev,
+        &down_stack,
+        &Shape::new(vec![down_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
 
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, H]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, H]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let (tok_b, exp_b, w_b) = route_on_device(&dev, &logits, SEQ, E, TOPK, 0);
-    let tok_rocm = tok_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let tok_rocm = tok_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let ascale = vec![1.0f32; SEQ];
-    let ascale_st = dev.from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32).unwrap();
-    let ascale_rocm = ascale_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let ascale_st = dev
+        .from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32)
+        .unwrap();
+    let ascale_rocm = ascale_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let out_shape = Shape::new(vec![SEQ, H]);
     let (out_storage, _h) = dev
         .moe_fused_dispatch_resident_routing_w8a8_int8_dot4(
-            act_rocm, &*gate_buf, &*up_buf, &*down_buf, ascale_rocm,
-            tok_rocm, exp_rocm, w_rocm, SEQ * TOPK, &out_shape, H, I, 1.0,
+            act_rocm,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            SEQ * TOPK,
+            &out_shape,
+            H,
+            I,
+            1.0,
         )
         .unwrap();
     dev.synchronize();
@@ -1173,7 +1616,11 @@ fn device_w8a8_dot4_dispatch_matches_exact_oracle() {
         }
     }
 
-    let max_diff = got.iter().zip(oracle.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff = got
+        .iter()
+        .zip(oracle.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("w8a8_dot4 D2D vs exact oracle max_diff={max_diff:.2e}");
     // NOTE: tolerance here is the Q8_1 ACTIVATION-quantization noise floor,
     // not kernel slop — the dot4 contraction quantizes activations to int8
@@ -1181,7 +1628,10 @@ fn device_w8a8_dot4_dispatch_matches_exact_oracle() {
     // them float. Measured 1.24e-2 at O(1) magnitudes. Implementation bugs
     // are caught by the grouped-twin cross-check below (same quantization
     // on both sides), which must agree tightly.
-    assert!(max_diff < 5e-2, "w8a8_dot4 dispatch blew past quantization noise: {max_diff:.6}");
+    assert!(
+        max_diff < 5e-2,
+        "w8a8_dot4 dispatch blew past quantization noise: {max_diff:.6}"
+    );
 
     // Cross-check: sortless-dot4 vs grouped-dot4 (host-sorted routing).
     // Both quantize the same 32-blocks identically; only summation order
@@ -1197,8 +1647,17 @@ fn device_w8a8_dot4_dispatch_matches_exact_oracle() {
     let sorted = moe_align_block_size(&assignment, 64, E);
     let (grouped_out, _h2) = dev
         .moe_fused_grouped_dispatch_w8a8_int8(
-            act_rocm, &*gate_buf, &*up_buf, &*down_buf, ascale_rocm,
-            &sorted, &out_shape, H, I, E, 1.0,
+            act_rocm,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            ascale_rocm,
+            &sorted,
+            &out_shape,
+            H,
+            I,
+            E,
+            1.0,
         )
         .unwrap();
     dev.synchronize();
@@ -1247,16 +1706,38 @@ fn w8a8_head_to_head_vs_dequant_decode_shape() {
     let mut down_stack = Vec::new();
     for e in 0..EXPERTS {
         for (stack, base, rows, k, src) in [
-            (&mut gate_stack, e * INTER * HIDDEN, INTER, HIDDEN, &mut gate_f32),
-            (&mut up_stack, e * INTER * HIDDEN, INTER, HIDDEN, &mut up_f32),
-            (&mut down_stack, e * HIDDEN * INTER, HIDDEN, INTER, &mut down_f32),
+            (
+                &mut gate_stack,
+                e * INTER * HIDDEN,
+                INTER,
+                HIDDEN,
+                &mut gate_f32,
+            ),
+            (
+                &mut up_stack,
+                e * INTER * HIDDEN,
+                INTER,
+                HIDDEN,
+                &mut up_f32,
+            ),
+            (
+                &mut down_stack,
+                e * HIDDEN * INTER,
+                HIDDEN,
+                INTER,
+                &mut down_f32,
+            ),
         ] {
             let slab = &mut src[base..base + rows * k];
             let mut codes = vec![0u8; rows * k];
             let mut scales = vec![0.0f32; rows];
             for r in 0..rows {
                 let max_abs = (0..k).map(|c| slab[r * k + c].abs()).fold(0.0f32, f32::max);
-                let sc = if max_abs == 0.0 { 1e-12 } else { max_abs / 127.0 };
+                let sc = if max_abs == 0.0 {
+                    1e-12
+                } else {
+                    max_abs / 127.0
+                };
                 scales[r] = sc;
                 for c in 0..k {
                     let q = ((slab[r * k + c] / sc).round() as i32).clamp(-128, 127);
@@ -1276,11 +1757,32 @@ fn w8a8_head_to_head_vs_dequant_decode_shape() {
         arith: grim_tensor::ArithType::F32,
         storage: Storage::CompressedTensorsW8A8Int8,
     };
-    let w8_gate = MemoryOps::from_cpu_bytes(&dev, &gate_stack, &Shape::new(vec![gate_stack.len()]), pack_dtype()).unwrap();
-    let w8_up = MemoryOps::from_cpu_bytes(&dev, &up_stack, &Shape::new(vec![up_stack.len()]), pack_dtype()).unwrap();
-    let w8_down = MemoryOps::from_cpu_bytes(&dev, &down_stack, &Shape::new(vec![down_stack.len()]), pack_dtype()).unwrap();
+    let w8_gate = MemoryOps::from_cpu_bytes(
+        &dev,
+        &gate_stack,
+        &Shape::new(vec![gate_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
+    let w8_up = MemoryOps::from_cpu_bytes(
+        &dev,
+        &up_stack,
+        &Shape::new(vec![up_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
+    let w8_down = MemoryOps::from_cpu_bytes(
+        &dev,
+        &down_stack,
+        &Shape::new(vec![down_stack.len()]),
+        pack_dtype(),
+    )
+    .unwrap();
     // gate_f32/up_f32/down_f32 now hold exact-dequant values: stack f32 twin.
-    let f32_of = |v: &[f32]| dev.from_cpu(v, &Shape::new(vec![v.len()]), DType::F32).unwrap();
+    let f32_of = |v: &[f32]| {
+        dev.from_cpu(v, &Shape::new(vec![v.len()]), DType::F32)
+            .unwrap()
+    };
     let f_gate = f32_of(&gate_f32);
     let f_up = f32_of(&up_f32);
     let f_down = f32_of(&down_f32);
@@ -1294,25 +1796,54 @@ fn w8a8_head_to_head_vs_dequant_decode_shape() {
     let act: Vec<f32> = (0..SEQ * HIDDEN)
         .map(|i| ((i as f32 + 1.0) * 0.2).cos())
         .collect();
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let l_st = dev.from_cpu(&logits, &Shape::new(vec![SEQ, EXPERTS]), DType::F32).unwrap();
-    let l_rocm = l_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let l_st = dev
+        .from_cpu(&logits, &Shape::new(vec![SEQ, EXPERTS]), DType::F32)
+        .unwrap();
+    let l_rocm = l_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
 
     let num_pairs = SEQ * TOPK;
-    let u32d = || DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native };
+    let u32d = || DType {
+        arith: grim_tensor::ArithType::U32,
+        storage: Storage::Native,
+    };
     let tok_st = dev.zeros(&Shape::new(vec![num_pairs]), u32d()).unwrap();
     let exp_st = dev.zeros(&Shape::new(vec![num_pairs]), u32d()).unwrap();
     let w_st = dev.zeros(&Shape::new(vec![num_pairs]), DType::F32).unwrap();
-    let tok_rocm = tok_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    dev.moe_route_topk_on_device(l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, EXPERTS, TOPK, 0)
+    let tok_rocm = tok_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
         .unwrap();
+    let exp_rocm = exp_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    dev.moe_route_topk_on_device(
+        l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, EXPERTS, TOPK, 0,
+    )
+    .unwrap();
 
     let ascale = vec![1.0f32; SEQ];
-    let ascale_st = dev.from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32).unwrap();
-    let ascale_rocm = ascale_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let ascale_st = dev
+        .from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32)
+        .unwrap();
+    let ascale_rocm = ascale_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let out_shape = Shape::new(vec![SEQ, HIDDEN]);
 
     // Warmup (JIT + caches), then timed iters with device sync.
@@ -1323,17 +1854,26 @@ fn w8a8_head_to_head_vs_dequant_decode_shape() {
             if native {
                 let _ = dev
                     .moe_fused_dispatch_resident_routing_w8a8_int8(
-                        act_rocm, &*w8_gate, &*w8_up, &*w8_down, ascale_rocm,
-                        tok_rocm, exp_rocm, w_rocm, num_pairs, &out_shape,
-                        HIDDEN, INTER, 1.0,
+                        act_rocm,
+                        &*w8_gate,
+                        &*w8_up,
+                        &*w8_down,
+                        ascale_rocm,
+                        tok_rocm,
+                        exp_rocm,
+                        w_rocm,
+                        num_pairs,
+                        &out_shape,
+                        HIDDEN,
+                        INTER,
+                        1.0,
                     )
                     .unwrap();
             } else {
                 let _ = dev
                     .moe_fused_dispatch_resident_routing(
-                        act_rocm, &*f_gate, &*f_up, &*f_down,
-                        tok_rocm, exp_rocm, w_rocm, num_pairs, &out_shape,
-                        HIDDEN, INTER, 1.0,
+                        act_rocm, &*f_gate, &*f_up, &*f_down, tok_rocm, exp_rocm, w_rocm,
+                        num_pairs, &out_shape, HIDDEN, INTER, 1.0,
                     )
                     .unwrap();
             }
@@ -1465,11 +2005,20 @@ fn quant_natives_head_to_head() {
         m4ed.extend_from_slice(&de4);
     }
 
-    let pack_i8 = || DType { arith: grim_tensor::ArithType::F32, storage: Storage::CompressedTensorsW8A8Int8 };
-    let pack_f8 = || DType { arith: grim_tensor::ArithType::F32, storage: Storage::CompressedTensorsW8A8Fp8 };
+    let pack_i8 = || DType {
+        arith: grim_tensor::ArithType::F32,
+        storage: Storage::CompressedTensorsW8A8Int8,
+    };
+    let pack_f8 = || DType {
+        arith: grim_tensor::ArithType::F32,
+        storage: Storage::CompressedTensorsW8A8Fp8,
+    };
     let pack_aq = || DType {
         arith: grim_tensor::ArithType::F32,
-        storage: Storage::Awq(grim_tensor::dtype::AwqStorageConfig { bits: 4, group_size: 8 }),
+        storage: Storage::Awq(grim_tensor::dtype::AwqStorageConfig {
+            bits: 4,
+            group_size: 8,
+        }),
     };
     let pack_m4 = || DType {
         arith: grim_tensor::ArithType::F32,
@@ -1478,30 +2027,74 @@ fn quant_natives_head_to_head() {
     let up_b = |v: &[u8], dt: DType| {
         MemoryOps::from_cpu_bytes(&dev, v, &Shape::new(vec![v.len()]), dt).unwrap()
     };
-    let (bi8g, bi8u, bi8d) = (up_b(&i8g, pack_i8()), up_b(&i8u, pack_i8()), up_b(&i8d, pack_i8()));
-    let (bf8g, bf8u, bf8d) = (up_b(&f8g, pack_f8()), up_b(&f8u, pack_f8()), up_b(&f8d, pack_f8()));
-    let (baqg, baqu, baqd) = (up_b(&aqg, pack_aq()), up_b(&aqu, pack_aq()), up_b(&aqd, pack_aq()));
-    let (bm4cg, bm4cu, bm4cd) = (up_b(&m4cg, pack_m4()), up_b(&m4cu, pack_m4()), up_b(&m4cd, pack_m4()));
-    let (bm4eg, bm4eu, bm4ed) = (up_b(&m4eg, pack_m4()), up_b(&m4eu, pack_m4()), up_b(&m4ed, pack_m4()));
+    let (bi8g, bi8u, bi8d) = (
+        up_b(&i8g, pack_i8()),
+        up_b(&i8u, pack_i8()),
+        up_b(&i8d, pack_i8()),
+    );
+    let (bf8g, bf8u, bf8d) = (
+        up_b(&f8g, pack_f8()),
+        up_b(&f8u, pack_f8()),
+        up_b(&f8d, pack_f8()),
+    );
+    let (baqg, baqu, baqd) = (
+        up_b(&aqg, pack_aq()),
+        up_b(&aqu, pack_aq()),
+        up_b(&aqd, pack_aq()),
+    );
+    let (bm4cg, bm4cu, bm4cd) = (
+        up_b(&m4cg, pack_m4()),
+        up_b(&m4cu, pack_m4()),
+        up_b(&m4cd, pack_m4()),
+    );
+    let (bm4eg, bm4eu, bm4ed) = (
+        up_b(&m4eg, pack_m4()),
+        up_b(&m4eu, pack_m4()),
+        up_b(&m4ed, pack_m4()),
+    );
     // f32-dequant twin stacks (exact values already in gate_f/up_f/down_f? No:
     // per-format rewrites touched only copies. Build f32 stacks from gate_f
     // as-is (unquantized) — bench compares traffic, not numerics.
-    let f32_of = |v: &[f32]| dev.from_cpu(v, &Shape::new(vec![v.len()]), DType::F32).unwrap();
+    let f32_of = |v: &[f32]| {
+        dev.from_cpu(v, &Shape::new(vec![v.len()]), DType::F32)
+            .unwrap()
+    };
     let (ffg, ffu, ffd) = (f32_of(&gate_f), f32_of(&up_f), f32_of(&down_f));
 
     let logits: Vec<f32> = (0..SEQ * EXPERTS)
         .map(|i| ((i as f32 + 1.0) * 0.6).sin() * 2.5)
         .collect();
-    let act: Vec<f32> = (0..SEQ * HIDDEN).map(|i| ((i as f32 + 1.0) * 0.2).cos()).collect();
-    let act_st = dev.from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32).unwrap();
-    let act_rocm = act_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let act: Vec<f32> = (0..SEQ * HIDDEN)
+        .map(|i| ((i as f32 + 1.0) * 0.2).cos())
+        .collect();
+    let act_st = dev
+        .from_cpu(&act, &Shape::new(vec![SEQ, HIDDEN]), DType::F32)
+        .unwrap();
+    let act_rocm = act_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let (tok_b, exp_b, w_b) = route_on_device(&dev, &logits, SEQ, EXPERTS, TOPK, 0);
-    let tok_rocm = tok_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let exp_rocm = exp_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-    let w_rocm = w_b.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let tok_rocm = tok_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let exp_rocm = exp_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let w_rocm = w_b
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let ascale = vec![1.0f32; SEQ];
-    let ascale_st = dev.from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32).unwrap();
-    let ascale_rocm = ascale_st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+    let ascale_st = dev
+        .from_cpu(&ascale, &Shape::new(vec![SEQ]), DType::F32)
+        .unwrap();
+    let ascale_rocm = ascale_st
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
     let out_shape = Shape::new(vec![SEQ, HIDDEN]);
     let num_pairs = SEQ * TOPK;
 
@@ -1517,49 +2110,125 @@ fn quant_natives_head_to_head() {
     };
     let t_f32 = time_it(&mut || {
         dev.moe_fused_dispatch_resident_routing(
-            act_rocm, &*ffg, &*ffu, &*ffd, tok_rocm, exp_rocm, w_rocm,
-            num_pairs, &out_shape, HIDDEN, INTER, 1.0,
+            act_rocm, &*ffg, &*ffu, &*ffd, tok_rocm, exp_rocm, w_rocm, num_pairs, &out_shape,
+            HIDDEN, INTER, 1.0,
         )
         .unwrap();
     });
     let t_i8 = time_it(&mut || {
         dev.moe_fused_dispatch_resident_routing_w8a8_int8(
-            act_rocm, &*bi8g, &*bi8u, &*bi8d, ascale_rocm, tok_rocm, exp_rocm, w_rocm,
-            num_pairs, &out_shape, HIDDEN, INTER, 1.0,
+            act_rocm,
+            &*bi8g,
+            &*bi8u,
+            &*bi8d,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            num_pairs,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            1.0,
         )
         .unwrap();
     });
     let t_f8 = time_it(&mut || {
         dev.moe_fused_dispatch_resident_routing_w8a8_fp8(
-            act_rocm, &*bf8g, &*bf8u, &*bf8d, ascale_rocm, tok_rocm, exp_rocm, w_rocm,
-            num_pairs, &out_shape, HIDDEN, INTER, 1.0,
+            act_rocm,
+            &*bf8g,
+            &*bf8u,
+            &*bf8d,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            num_pairs,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            1.0,
         )
         .unwrap();
     });
     let t_awq = time_it(&mut || {
         dev.moe_fused_dispatch_resident_routing_awq(
-            act_rocm, &*baqg, &*baqu, &*baqd, ascale_rocm, tok_rocm, exp_rocm, w_rocm,
-            num_pairs, &out_shape, HIDDEN, INTER, 4, 8, 1.0,
+            act_rocm,
+            &*baqg,
+            &*baqu,
+            &*baqd,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            num_pairs,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            4,
+            8,
+            1.0,
         )
         .unwrap();
     });
     let t_mx = time_it(&mut || {
         dev.moe_fused_dispatch_resident_routing_mxfp4(
-            act_rocm, &*bm4cg, &*bm4cu, &*bm4cd, &*bm4eg, &*bm4eu, &*bm4ed,
-            ascale_rocm, tok_rocm, exp_rocm, w_rocm, num_pairs, &out_shape,
-            HIDDEN, INTER, 1.0,
+            act_rocm,
+            &*bm4cg,
+            &*bm4cu,
+            &*bm4cd,
+            &*bm4eg,
+            &*bm4eu,
+            &*bm4ed,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            num_pairs,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            1.0,
         )
         .unwrap();
     });
     let t_dot4 = time_it(&mut || {
         dev.moe_fused_dispatch_resident_routing_w8a8_int8_dot4(
-            act_rocm, &*bi8g, &*bi8u, &*bi8d, ascale_rocm,
-            tok_rocm, exp_rocm, w_rocm, num_pairs, &out_shape,
-            HIDDEN, INTER, 1.0,
+            act_rocm,
+            &*bi8g,
+            &*bi8u,
+            &*bi8d,
+            ascale_rocm,
+            tok_rocm,
+            exp_rocm,
+            w_rocm,
+            num_pairs,
+            &out_shape,
+            HIDDEN,
+            INTER,
+            1.0,
         )
         .unwrap();
     });
     eprintln!(
         "[bench] h={HIDDEN} i={INTER} e={EXPERTS} topk={TOPK} seq={SEQ} best-of-{ITERS} (ms): f32={t_f32:.2} int8={t_i8:.2} fp8={t_f8:.2} awq={t_awq:.2} mxfp4={t_mx:.2} int8_dot4={t_dot4:.2}"
+    );
+}
+
+/// W1 split: presence probe contract, CPU-runnable (NOT ignored). Routing
+/// tests below prove numerics on hardware; this test proves the helper that
+/// gates them — without the env gate it must yield None, never panic, so a
+/// missing GPU can never turn into a green routing result.
+#[test]
+fn gpu_device_helper_returns_none_without_env_gate() {
+    let _guard = gpu_lock();
+    for v in ["GRIM_GPU_TEST", "GRIM_RUN_GPU_TESTS", "GRIM_RUN_GPU_TEST"] {
+        // SAFETY: gpu_lock serializes this binary's tests; no other thread
+        // here touches the env during the mutation window.
+        unsafe { std::env::remove_var(v) };
+    }
+    assert!(
+        gpu_device().is_none(),
+        "no env gate => no device probe, never a panic"
     );
 }

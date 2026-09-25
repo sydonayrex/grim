@@ -134,8 +134,8 @@ impl HyV4Block {
 
         // Phase 2b: build a fused Q8_0 QKV projection blob when all three
         // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
-        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
-            .map(std::sync::Arc::new);
+        let wqkv_q80_fused =
+            crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv).map(std::sync::Arc::new);
 
         Ok(Self {
             wq,
@@ -162,30 +162,32 @@ impl HyV4Block {
         // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
         // (quantize + fused dot4 + RoPE) instead of 3 separate GEMV + RoPE.
         let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
-            Some(fused) if seq_len == 1 => {
-                crate::shared_attention::fused_qkv_project(
-                    &normed_attn,
-                    fused,
-                    &self.rope,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    positions,
-                )?
-            }
-            _ => {
-            let q = self.wq.forward(&normed_attn)?;
-            let k = self.wk.forward(&normed_attn)?;
-            let v = self.wv.forward(&normed_attn)?;
-
-            let q =
-                crate::shared_attention::rope_2d_on_device(&self.rope, &q, self.num_heads, positions)?;
-            let k = crate::shared_attention::rope_2d_on_device(
+            Some(fused) if seq_len == 1 => crate::shared_attention::fused_qkv_project(
+                &normed_attn,
+                fused,
                 &self.rope,
-                &k,
+                self.num_heads,
                 self.num_kv_heads,
                 positions,
-            )?;
-            (q, k, v)
+            )?,
+            _ => {
+                let q = self.wq.forward(&normed_attn)?;
+                let k = self.wk.forward(&normed_attn)?;
+                let v = self.wv.forward(&normed_attn)?;
+
+                let q = crate::shared_attention::rope_2d_on_device(
+                    &self.rope,
+                    &q,
+                    self.num_heads,
+                    positions,
+                )?;
+                let k = crate::shared_attention::rope_2d_on_device(
+                    &self.rope,
+                    &k,
+                    self.num_kv_heads,
+                    positions,
+                )?;
+                (q, k, v)
             }
         };
 

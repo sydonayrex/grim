@@ -630,11 +630,14 @@ impl DeepSeek4Moe {
                 down: e.w2.clone(),
             })
             .collect();
-        let shared_expert = self.shared_experts.as_ref().map(|e| crate::shared_moe::MoeExpert {
-            gate: e.w1.clone(),
-            up: e.w3.clone(),
-            down: e.w2.clone(),
-        });
+        let shared_expert = self
+            .shared_experts
+            .as_ref()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.w1.clone(),
+                up: e.w3.clone(),
+                down: e.w2.clone(),
+            });
 
         crate::shared_moe::fused_moe_dispatch_from_logits(
             dev.as_ref(),
@@ -697,11 +700,14 @@ impl DeepSeek4Moe {
                 down: e.w2.clone(),
             })
             .collect();
-        let shared_expert = self.shared_experts.as_ref().map(|e| crate::shared_moe::MoeExpert {
-            gate: e.w1.clone(),
-            up: e.w3.clone(),
-            down: e.w2.clone(),
-        });
+        let shared_expert = self
+            .shared_experts
+            .as_ref()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.w1.clone(),
+                up: e.w3.clone(),
+                down: e.w2.clone(),
+            });
 
         if dev.zeros(&Shape::new(vec![1]), DType::F32).is_err() {
             return Ok(None);

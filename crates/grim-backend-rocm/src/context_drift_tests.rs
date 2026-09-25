@@ -182,9 +182,7 @@ fn raw_bytes_upload_lands_on_intended_ordinal_under_drifted_context() {
         // drifted device, so the probe reports device != 0. This is host-side,
         // touches no large buffers, and is exact on the first try (no VRAM
         // accounting, no D2H).
-        let payload_bytes: Vec<u8> = (0..PAYLOAD_BYTES as u32)
-            .map(|i| (i % 251) as u8)
-            .collect();
+        let payload_bytes: Vec<u8> = (0..PAYLOAD_BYTES as u32).map(|i| (i % 251) as u8).collect();
 
         let storage = RocmStorage::copy_from_host_raw_bytes(
             &payload_bytes,
@@ -200,7 +198,9 @@ fn raw_bytes_upload_lands_on_intended_ordinal_under_drifted_context() {
             "storage metadata must claim the intended ordinal"
         );
 
-        let ptr = storage.device_ptr.expect("raw-bytes alloc has a device ptr");
+        let ptr = storage
+            .device_ptr
+            .expect("raw-bytes alloc has a device ptr");
         let owning = crate::device::util::pointer_owning_device(ptr as *const std::ffi::c_void);
         assert_eq!(
             owning, 0,

@@ -75,8 +75,8 @@ impl RocmCachingAllocator {
                 *cached = cached.saturating_sub(cls);
             }
             if !entry.event.is_null() {
-                let stream = crate::device::roc_device::RocmDevice::shared(self.ordinal)
-                    .active_stream();
+                let stream =
+                    crate::device::roc_device::RocmDevice::shared(self.ordinal).active_stream();
                 if !stream.is_null() {
                     // SAFETY: event owned by this entry; stream is live.
                     unsafe {
@@ -140,8 +140,7 @@ impl RocmCachingAllocator {
         // on the stream that was current at free() time — any future reuse
         // waits on it, so a queued kernel reading this buffer can never race
         // the new owner's writes, regardless of which stream either ran on.
-        let fence = crate::device::roc_device::RocmDevice::shared(self.ordinal)
-            .active_stream();
+        let fence = crate::device::roc_device::RocmDevice::shared(self.ordinal).active_stream();
         let event: *mut c_void = if fence.is_null() {
             std::ptr::null_mut()
         } else {
@@ -159,7 +158,10 @@ impl RocmCachingAllocator {
         };
         {
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-            pool.entry(cls).or_default().push(PoolEntry { ptr: ptr as u64, event });
+            pool.entry(cls).or_default().push(PoolEntry {
+                ptr: ptr as u64,
+                event,
+            });
             let mut cached = self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner());
             *cached += cls;
         }

@@ -114,8 +114,8 @@ fn channel_for(device: &RocmDevice) -> Result<Arc<Mutex<RingChannel>>> {
         tail: scalar(0)?,
         head,
         stop: scalar(0)?,
-        staging: RocmPinnedBuffer::alloc(64)?,
-        head_cell: RocmPinnedBuffer::alloc(4)?,
+        staging: RocmPinnedBuffer::alloc_on(device.ordinal(), 64)?,
+        head_cell: RocmPinnedBuffer::alloc_on(device.ordinal(), 4)?,
         slots_dev,
         head_dev,
         next_head: 0,
@@ -253,7 +253,11 @@ pub fn channel_for_ordinal(ordinal: usize) -> Result<Arc<Mutex<RingChannel>>> {
 pub fn peer_link_type(src_ordinal: usize, dst_ordinal: usize) -> Option<LinkType> {
     let map = channels().lock().unwrap_or_else(|e| e.into_inner());
     let chan = map.get(&src_ordinal)?;
-    chan.lock().unwrap_or_else(|e| e.into_inner()).peer_links.get(&dst_ordinal).copied()
+    chan.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peer_links
+        .get(&dst_ordinal)
+        .copied()
 }
 
 /// MG-2: route one GEMM through a specific device's ring channel.

@@ -10,8 +10,8 @@ use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, Shape};
 
 use crate::context::global_context;
 use crate::ffi::*;
-use crate::kernel::{VulkanKernel, push_params, run_compute_shader, spirv_for};
-use crate::{VulkanDevice, VulkanStorage, f32_to_bf16_to_f32};
+use crate::kernel::{push_params, run_compute_shader, spirv_for, VulkanKernel};
+use crate::{f32_to_bf16_to_f32, VulkanDevice, VulkanStorage};
 
 impl CoreTensorOps for VulkanDevice {
     /// Tier A: delegate to the existing rms_norm kernel.

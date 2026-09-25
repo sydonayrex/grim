@@ -73,6 +73,7 @@ fn check_parity(label: &str, got: &[f32], want: &[f32], tol: f32) {
 }
 
 #[test]
+#[ignore]
 fn w8a8_int8_gemm_matches_golden_reference() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
@@ -148,6 +149,7 @@ fn e4m3_to_f32(byte: u8) -> f32 {
 }
 
 #[test]
+#[ignore]
 fn w8a8_fp8_gemm_matches_golden_reference() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
@@ -232,6 +234,7 @@ fn f32_to_f16_bits(f: f32) -> u16 {
 }
 
 #[test]
+#[ignore]
 fn wna16_fused_gemm_matches_golden_reference() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,

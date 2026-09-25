@@ -412,12 +412,14 @@ impl MemoryOps for RocmDevice {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // Accept both RocmStorage and RocmStorageView via the trait — views carry
         // a byte offset in their device_ptr, so the D2D copy lands correctly.
-        let dst_ptr_base = dst.device_ptr().ok_or_else(|| {
-            Error::Backend("copy_slice_range: dst lacks a device pointer".into())
-        })? as *mut c_void;
-        let src_ptr_base = src.device_ptr().ok_or_else(|| {
-            Error::Backend("copy_slice_range: src lacks a device pointer".into())
-        })? as *mut c_void;
+        let dst_ptr_base = dst
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("copy_slice_range: dst lacks a device pointer".into()))?
+            as *mut c_void;
+        let src_ptr_base = src
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("copy_slice_range: src lacks a device pointer".into()))?
+            as *mut c_void;
         if dst.device_ordinal() != src.device_ordinal() {
             return Err(Error::Backend(format!(
                 "copy_slice_range: cross-device D2D (dst ordinal {}, src ordinal {}) — \
@@ -438,9 +440,16 @@ impl MemoryOps for RocmDevice {
                 src.shape().elem_count()
             )));
         }
-        let bytes = count * std::mem::size_of::<f32>();
-        let dst_ptr = unsafe { dst_ptr_base.add(dst_elem_offset * std::mem::size_of::<f32>()) };
-        let src_ptr = unsafe { (src_ptr_base as *const c_void).add(src_elem_offset * std::mem::size_of::<f32>()) };
+        // GRAVE Phase 1: element size follows the storage dtype — the f16 KV
+        // arena has 2-byte elements; the old f32 hardcode copied 2x the bytes
+        // and D2D-failed (or overread) on f16 arenas.
+        let elem_size = match dst.dtype().arith {
+            grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => 2usize,
+            _ => 4usize,
+        };
+        let bytes = count * elem_size;
+        let dst_ptr = unsafe { dst_ptr_base.add(dst_elem_offset * elem_size) };
+        let src_ptr = unsafe { (src_ptr_base as *const c_void).add(src_elem_offset * elem_size) };
         check_hip("copy_slice_range: hipMemcpyAsync D2D", unsafe {
             hipMemcpyAsync(
                 dst_ptr,

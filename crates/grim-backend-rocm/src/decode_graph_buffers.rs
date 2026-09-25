@@ -12,15 +12,17 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use grim_tensor::BackendStorage;
+
+use crate::DTypeStorage;
+use crate::HipMemcpyKind;
 use crate::device::roc_device::RocmDevice;
 use crate::device::util::dtype_f32;
 use crate::memory::storage::RocmStorage;
-use crate::DTypeStorage;
 use crate::{
     Shape, check_hip, hipGraphDestroy, hipGraphExecDestroy, hipGraphExecKernelNodeSetParams,
     hipGraphInstantiate, hipMemcpyAsync, hipStreamBeginCapture, hipStreamEndCapture,
 };
-use crate::HipMemcpyKind;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, DType};
 
@@ -31,34 +33,34 @@ use grim_tensor::{ArithType, DType};
 #[derive(Debug)]
 pub struct DecodeGraphBuffers {
     /// Per-layer buffers (indexed by layer_idx)
-    pub layer_input: Vec<RocmStorage>,   // [batch, hidden_size]
-    pub layer_output: Vec<RocmStorage>,  // [batch, hidden_size]
+    pub layer_input: Vec<RocmStorage>, // [batch, hidden_size]
+    pub layer_output: Vec<RocmStorage>, // [batch, hidden_size]
     /// Attention-specific
-    pub q_buf: Vec<RocmStorage>,         // [batch, n_q]
-    pub k_buf: Vec<RocmStorage>,         // [batch, n_k]
-    pub v_buf: Vec<RocmStorage>,         // [batch, n_v]
-    pub attn_out_buf: Vec<RocmStorage>,  // [batch, n_q]
+    pub q_buf: Vec<RocmStorage>, // [batch, n_q]
+    pub k_buf: Vec<RocmStorage>,        // [batch, n_k]
+    pub v_buf: Vec<RocmStorage>,        // [batch, n_v]
+    pub attn_out_buf: Vec<RocmStorage>, // [batch, n_q]
     /// FFN-specific
-    pub gate_up_buf: Vec<RocmStorage>,   // [batch, 2*intermediate_size] (reserved: fused gate+up path)
+    pub gate_up_buf: Vec<RocmStorage>, // [batch, 2*intermediate_size] (reserved: fused gate+up path)
     pub gate_buf: Vec<RocmStorage>,      // [batch, intermediate_size]
     pub up_buf: Vec<RocmStorage>,        // [batch, intermediate_size]
     pub activated_buf: Vec<RocmStorage>, // [batch, intermediate_size]
     /// Per-layer [batch, hidden] staging for norm outputs and GEMM results that
     /// feed a residual add. Sequentially reused within a layer (stream order
     /// preserves dependencies); never live across layers.
-    pub norm_buf: Vec<RocmStorage>,      // [batch, hidden_size]
+    pub norm_buf: Vec<RocmStorage>, // [batch, hidden_size]
     /// Online-softmax partials for `launch_qkv_attention_dev`, kept in-pool
     /// so capture allocates nothing.
-    pub attn_max_buf: Vec<RocmStorage>,  // [num_heads]
+    pub attn_max_buf: Vec<RocmStorage>, // [num_heads]
     pub attn_sum_buf: Vec<RocmStorage>,  // [num_heads]
     /// KV cache arenas (pre-allocated to max context)
-    pub k_arena: Vec<RocmStorage>,       // [max_ctx, n_k]
+    pub k_arena: Vec<RocmStorage>, // [max_ctx, n_k]
     pub v_arena: Vec<RocmStorage>,       // [max_ctx, n_v]
     /// Latent KV cache arena for MLA models (DeepSeek, Kimi): [batch * max_ctx, latent_kv_dim]
     pub latent_kv_arena: Vec<RocmStorage>,
     /// Output projection
-    pub head_input: RocmStorage,         // [batch, hidden_size]
-    pub head_output: Arc<RocmStorage>,   // [batch, vocab_size]
+    pub head_input: RocmStorage, // [batch, hidden_size]
+    pub head_output: Arc<RocmStorage>, // [batch, vocab_size]
     /// Host-side position mirror. Device scalar lives in `pos_dev`;
     /// kernels read pos from device so graph stays capturable.
     pub current_pos: u32,
@@ -69,21 +71,21 @@ pub struct DecodeGraphBuffers {
     /// the model has no MoE layers. Routing triple is shared across layers —
     /// each layer writes then consumes it in stream order within its bracket.
     pub moe_gate_logits: Vec<RocmStorage>, // [batch, n_expert] per layer
-    pub moe_out: Vec<RocmStorage>,         // [batch, hidden] per layer
-    pub moe_route_tokens: RocmStorage,     // [batch*top_k] u32
-    pub moe_route_experts: RocmStorage,    // [batch*top_k] u32
-    pub moe_route_weights: RocmStorage,    // [batch*top_k] f32
+    pub moe_out: Vec<RocmStorage>,      // [batch, hidden] per layer
+    pub moe_route_tokens: RocmStorage,  // [batch*top_k] u32
+    pub moe_route_experts: RocmStorage, // [batch*top_k] u32
+    pub moe_route_weights: RocmStorage, // [batch*top_k] f32
     /// S2: ShortConv staging. Empty vecs when the model has no ShortConv
     /// layers. `sc_state[l]` is the device-resident ring `[h_dim*(kc)]`
     /// (column-major [d, kc], the HIP kernel's in-place layout).
     pub sc_proj_buf: Vec<RocmStorage>, // [batch, 3*h_dim]
-    pub sc_b: Vec<RocmStorage>,        // [batch*h_dim]
+    pub sc_b: Vec<RocmStorage>,         // [batch*h_dim]
     pub sc_c: Vec<RocmStorage>,
     pub sc_x: Vec<RocmStorage>,
     pub sc_bx: Vec<RocmStorage>,
     pub sc_sum: Vec<RocmStorage>,
-    pub sc_y: Vec<RocmStorage>,        // [batch, h_dim]
-    pub sc_state: Vec<RocmStorage>,    // [h_dim*(l_cache-1)] per layer
+    pub sc_y: Vec<RocmStorage>,     // [batch, h_dim]
+    pub sc_state: Vec<RocmStorage>, // [h_dim*(l_cache-1)] per layer
     /// Shared read-only dummy ([1], zeros) for unused attention inputs
     /// (o_proj weights with fuse_o=0, alibi slopes with has_alibi=0).
     pub attn_dummy: RocmStorage,
@@ -98,8 +100,45 @@ pub struct DecodeGraphBuffers {
     /// Per-layer fused-QKV output staging ([n_q + 2*n_kv] F32); the three
     /// Q/K/V slices are D2D-copied into `q/k/v_buf`.
     pub fused_qkv_out: Vec<RocmStorage>,
+    /// GRAVE Phase 4: per-layer GDN-2 buffers (`None` for softmax layers).
+    /// Filled by [`DecodeGraphBuffers::allocate_gdl_layer`] — never inside
+    /// capture (the Taylor-default H2D uploads + sync live there).
+    pub gdl: Vec<Option<GdlLayerBuffers>>,
     pub num_layers: usize,
     pub max_ctx: usize,
+    pub batch: usize,
+}
+
+/// GRAVE Phase 4 — per-layer GDN-2 device state + gate buffers.
+///
+/// One entry per LFM2 layer (`None` for non-GDL layers). The recurrent state
+/// `[batch, heads, dk, dv]` replaces the ~800 MB K/V arenas at 32K with
+/// 16 KB/layer; the gate buffers carry the Taylor-Calibrated operating
+/// point until distillation writes learned gates (sidecar → re-upload).
+#[derive(Debug)]
+pub struct GdlLayerBuffers {
+    /// Recurrent state `[batch*heads*dk*dv]` f32, zeros at alloc.
+    pub state: RocmStorage,
+    /// Decay α per key channel `[batch*heads*dk]` (init `2^(−1/dk)`).
+    pub alpha: RocmStorage,
+    /// Erase gate b `[batch*heads*dk]` (init 0.5 = σ(0)).
+    pub b_gate: RocmStorage,
+    /// Write gate w `[batch*heads*dv]` (init 0.5 = σ(0)).
+    pub w_gate: RocmStorage,
+    /// Gated-norm weight γ `[batch*heads*dv]` (init 1.0; learned later).
+    pub norm_w: RocmStorage,
+    /// Output-gate scalars `[batch*heads]` (init 0.0 → σ = 0.5, neutral).
+    pub out_gate: RocmStorage,
+    /// Expanded K buffer `[batch, nh*hd]` for GQA (None when nh == nkv).
+    /// The GEMV writes compact `[nkv, hd]` into `k_buf`; this buffer receives
+    /// the head-repeat expansion the GDL kernel consumes.
+    pub k_exp_buf: Option<RocmStorage>,
+    /// Expanded V buffer `[batch, nh*hd]` for GQA (None when nh == nkv).
+    pub v_exp_buf: Option<RocmStorage>,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub dk: usize,
+    pub dv: usize,
     pub batch: usize,
 }
 
@@ -114,6 +153,9 @@ pub struct EagerKvSource<'a> {
     pub prefill_len: u32,
     /// Elements per row (`num_kv_heads × head_dim`).
     pub kv_stride: usize,
+    /// GDL recurrent state pointer (set for GDL layers, None for dense).
+    /// Points to `[batch*heads*dk*dv]` f32 device buffer.
+    pub gdl_state: Option<*const f32>,
     /// Borrow anchor so the pointers can't outlive the session caches.
     pub _anchor: std::marker::PhantomData<&'a ()>,
 }
@@ -229,7 +271,8 @@ impl DecodeGraphBuffers {
         let mut fused_qkv_out = Vec::with_capacity(num_layers);
         let mut k_arena = Vec::with_capacity(num_layers);
         let mut v_arena = Vec::with_capacity(num_layers);
-        let mut latent_kv_arena = Vec::with_capacity(if latent_kv_dim > 0 { num_layers } else { 0 });
+        let mut latent_kv_arena =
+            Vec::with_capacity(if latent_kv_dim > 0 { num_layers } else { 0 });
         // Q8_1 staging must cover the widest activation row (hidden vs inter),
         // times one row per batch slot (P3).
         let q81_elems = hidden_size.max(intermediate_size).max(32);
@@ -335,15 +378,25 @@ impl DecodeGraphBuffers {
                 &dev.allocator,
                 dev.ordinal,
             )?);
+            // GRAVE Phase 1: KV arena element dtype follows GRIM_F16_KV so
+            // the kv_append/attention kernels' f16 flag matches the storage.
+            let kv_dt = if crate::kernels::qkv_attention::kv_f16_enabled() {
+                DType {
+                    arith: ArithType::F16,
+                    storage: grim_tensor::Storage::Native,
+                }
+            } else {
+                dt.clone()
+            };
             k_arena.push(RocmStorage::alloc_gpu(
                 &Shape::new(vec![batch * max_ctx, nkk]),
-                dt.clone(),
+                kv_dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
             )?);
             v_arena.push(RocmStorage::alloc_gpu(
                 &Shape::new(vec![batch * max_ctx, nvk]),
-                dt.clone(),
+                kv_dt,
                 &dev.allocator,
                 dev.ordinal,
             )?);
@@ -389,17 +442,17 @@ impl DecodeGraphBuffers {
             dev.ordinal,
         )?;
         let push_all = |dev: &RocmDevice,
-                            dt: &DType,
-                            moe_gate_logits: &mut Vec<RocmStorage>,
-                            moe_out: &mut Vec<RocmStorage>,
-                            sc_proj_buf: &mut Vec<RocmStorage>,
-                            sc_b: &mut Vec<RocmStorage>,
-                            sc_c: &mut Vec<RocmStorage>,
-                            sc_x: &mut Vec<RocmStorage>,
-                            sc_bx: &mut Vec<RocmStorage>,
-                            sc_sum: &mut Vec<RocmStorage>,
-                            sc_y: &mut Vec<RocmStorage>,
-                            sc_state: &mut Vec<RocmStorage>|
+                        dt: &DType,
+                        moe_gate_logits: &mut Vec<RocmStorage>,
+                        moe_out: &mut Vec<RocmStorage>,
+                        sc_proj_buf: &mut Vec<RocmStorage>,
+                        sc_b: &mut Vec<RocmStorage>,
+                        sc_c: &mut Vec<RocmStorage>,
+                        sc_x: &mut Vec<RocmStorage>,
+                        sc_bx: &mut Vec<RocmStorage>,
+                        sc_sum: &mut Vec<RocmStorage>,
+                        sc_y: &mut Vec<RocmStorage>,
+                        sc_state: &mut Vec<RocmStorage>|
          -> Result<()> {
             for _ in 0..num_layers {
                 if moe_layers {
@@ -419,21 +472,53 @@ impl DecodeGraphBuffers {
                 if sc_layers {
                     let kc = sc_l_cache - 1;
                     sc_proj_buf.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![batch, 3 * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![batch, 3 * sc_h_dim]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                     sc_b.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![batch * sc_h_dim]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                     sc_c.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![batch * sc_h_dim]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                     sc_x.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![batch * sc_h_dim]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                     sc_bx.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![batch * sc_h_dim]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                     sc_sum.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![batch * sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![batch * sc_h_dim]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                     sc_y.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![batch, sc_h_dim]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![batch, sc_h_dim]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                     sc_state.push(RocmStorage::alloc_gpu(
-                        &Shape::new(vec![sc_h_dim * kc]), dt.clone(), &dev.allocator, dev.ordinal)?);
+                        &Shape::new(vec![sc_h_dim * kc]),
+                        dt.clone(),
+                        &dev.allocator,
+                        dev.ordinal,
+                    )?);
                 }
             }
             Ok(())
@@ -459,15 +544,40 @@ impl DecodeGraphBuffers {
                 storage: grim_tensor::Storage::Native,
             };
             (
-                RocmStorage::alloc_gpu(&Shape::new(vec![np]), udt.clone(), &dev.allocator, dev.ordinal)?,
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![np]),
+                    udt.clone(),
+                    &dev.allocator,
+                    dev.ordinal,
+                )?,
                 RocmStorage::alloc_gpu(&Shape::new(vec![np]), udt, &dev.allocator, dev.ordinal)?,
-                RocmStorage::alloc_gpu(&Shape::new(vec![np]), dt.clone(), &dev.allocator, dev.ordinal)?,
+                RocmStorage::alloc_gpu(
+                    &Shape::new(vec![np]),
+                    dt.clone(),
+                    &dev.allocator,
+                    dev.ordinal,
+                )?,
             )
         } else {
             // Unused dummy [1] f32 zeros keeps the fields non-null.
-            let d = RocmStorage::alloc_gpu(&Shape::new(vec![1]), dt.clone(), &dev.allocator, dev.ordinal)?;
-            let d2 = RocmStorage::alloc_gpu(&Shape::new(vec![1]), dt.clone(), &dev.allocator, dev.ordinal)?;
-            let d3 = RocmStorage::alloc_gpu(&Shape::new(vec![1]), dt.clone(), &dev.allocator, dev.ordinal)?;
+            let d = RocmStorage::alloc_gpu(
+                &Shape::new(vec![1]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?;
+            let d2 = RocmStorage::alloc_gpu(
+                &Shape::new(vec![1]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?;
+            let d3 = RocmStorage::alloc_gpu(
+                &Shape::new(vec![1]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?;
             (d, d2, d3)
         };
 
@@ -496,6 +606,7 @@ impl DecodeGraphBuffers {
             attn_dummy,
             act_q81_buf,
             fused_qkv_out,
+            gdl: (0..num_layers).map(|_| None).collect(),
             moe_gate_logits,
             moe_out,
             moe_route_tokens,
@@ -513,6 +624,125 @@ impl DecodeGraphBuffers {
             max_ctx,
             batch,
         })
+    }
+
+    /// GRAVE Phase 4: allocate one layer's GDN-2 device buffers with the
+    /// Taylor-Calibrated operating point (decay `2^(−1/dk)`, erase/write 0.5,
+    /// norm weight 1.0, output gate 0.0). MUST run outside capture: performs
+    /// H2D uploads + a synchronize (same contract as the seed methods).
+    /// Learned gates from distillation re-upload through this path later
+    /// (sidecar → host vecs → same H2D; no struct change).
+    pub fn allocate_gdl_layer(
+        &mut self,
+        dev: &RocmDevice,
+        layer_idx: usize,
+        batch: usize,
+        heads: usize,
+        kv_heads: usize,
+        dk: usize,
+        dv: usize,
+    ) -> Result<()> {
+        if layer_idx >= self.gdl.len() {
+            return Err(Error::Backend(format!(
+                "allocate_gdl_layer: layer {layer_idx} >= {}",
+                self.gdl.len()
+            )));
+        }
+        if batch == 0 || heads == 0 || kv_heads == 0 || dk == 0 || dv == 0 {
+            return Err(Error::Backend("allocate_gdl_layer: zero dim".into()));
+        }
+        if heads % kv_heads != 0 {
+            return Err(Error::Backend(format!(
+                "allocate_gdl_layer: heads ({heads}) must be a multiple of kv_heads ({kv_heads})"
+            )));
+        }
+        if dk != 64 || dv != 64 {
+            return Err(Error::Backend(format!(
+                "allocate_gdl_layer: LDS fast path needs dk==dv==64, got {dk}x{dv}"
+            )));
+        }
+        let dt = dtype_f32();
+        let n_qk = batch * heads * dk;
+        let n_v = batch * heads * dv;
+        let n_g = batch * heads;
+        let decay = (-2.0f64.ln() / dk as f64).exp() as f32;
+        let upload =
+            |dev: &RocmDevice, vals: Vec<f32>, shape: grim_tensor::Shape| -> Result<RocmStorage> {
+                let st = RocmStorage::alloc_gpu(&shape, dt.clone(), &dev.allocator, dev.ordinal)?;
+                let dst = st
+                    .device_ptr_u64()
+                    .ok_or_else(|| Error::Backend("allocate_gdl_layer: no ptr".into()))?
+                    as *mut c_void;
+                let bytes = vals.len() * 4;
+                let host_bytes =
+                    unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, bytes) };
+                let (src_ptr, _pinned) =
+                    crate::memory::pinned::stage_h2d_pinned(dev.ordinal, host_bytes);
+                let stream = dev.active_stream();
+                let res: crate::HipErrorT = unsafe {
+                    crate::hipMemcpyAsync(
+                        dst,
+                        src_ptr as *const c_void,
+                        bytes,
+                        HipMemcpyKind::HostToDevice,
+                        stream,
+                    )
+                };
+                if res != crate::hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "allocate_gdl_layer: H2D upload failed: {res}"
+                    )));
+                }
+                Ok(st)
+            };
+        let state = upload(
+            dev,
+            vec![0.0f32; n_qk * dv],
+            grim_tensor::Shape::new(vec![batch * heads * dk * dv]),
+        )?;
+        let alpha = upload(dev, vec![decay; n_qk], grim_tensor::Shape::new(vec![n_qk]))?;
+        let b_gate = upload(dev, vec![0.5f32; n_qk], grim_tensor::Shape::new(vec![n_qk]))?;
+        let w_gate = upload(dev, vec![0.5f32; n_v], grim_tensor::Shape::new(vec![n_v]))?;
+        let norm_w = upload(dev, vec![1.0f32; n_v], grim_tensor::Shape::new(vec![n_v]))?;
+        let out_gate = upload(dev, vec![0.0f32; n_g], grim_tensor::Shape::new(vec![n_g]))?;
+
+        // GQA: allocate expanded [nh, hd] K/V buffers when nh != nkv.
+        // These receive the head-repeat expansion of the compact [nkv, hd]
+        // GEMV output before the fused GDL kernel launch.
+        let (k_exp_buf, v_exp_buf) = if heads != kv_heads {
+            let n_exp = batch * heads * dk;
+            let k_exp = upload(
+                dev,
+                vec![0.0f32; n_exp],
+                grim_tensor::Shape::new(vec![n_exp]),
+            )?;
+            let v_exp = upload(
+                dev,
+                vec![0.0f32; n_exp],
+                grim_tensor::Shape::new(vec![n_exp]),
+            )?;
+            (Some(k_exp), Some(v_exp))
+        } else {
+            (None, None)
+        };
+
+        dev.synchronize();
+        self.gdl[layer_idx] = Some(GdlLayerBuffers {
+            state,
+            alpha,
+            b_gate,
+            w_gate,
+            norm_w,
+            out_gate,
+            k_exp_buf,
+            v_exp_buf,
+            heads,
+            kv_heads,
+            dk,
+            dv,
+            batch,
+        });
+        Ok(())
     }
 
     /// Async H2D of `pos` into `pos_dev` on `stream` — broadcast to every
@@ -592,8 +822,18 @@ impl DecodeGraphBuffers {
             let n_rows = src.prefill_len;
             let n_elem: usize = (n_rows as usize) * src.kv_stride;
             // K arena row width must match the eager cache stride.
-            let arena_k_cols = self.k_arena[layer_idx].shape.dims().last().copied().unwrap_or(0);
-            let arena_v_cols = self.v_arena[layer_idx].shape.dims().last().copied().unwrap_or(0);
+            let arena_k_cols = self.k_arena[layer_idx]
+                .shape
+                .dims()
+                .last()
+                .copied()
+                .unwrap_or(0);
+            let arena_v_cols = self.v_arena[layer_idx]
+                .shape
+                .dims()
+                .last()
+                .copied()
+                .unwrap_or(0);
             if arena_k_cols != src.kv_stride || arena_v_cols != src.kv_stride {
                 return Err(Error::Backend(format!(
                     "seed_kv_arena: layer {layer_idx} arena width k={arena_k_cols} v={arena_v_cols} != kv_stride {}",
@@ -609,7 +849,14 @@ impl DecodeGraphBuffers {
             // SAFETY: src.k_dev/src.v_dev are device mem owned by the session
             // caches (valid for the generation); dst is the graph arena. D2D
             // copy on the active stream, ordered vs later launches.
-            let bytes = n_elem * std::mem::size_of::<f32>();
+            // GRAVE Phase 1: element size follows the arena dtype (f16 KV
+            // arena halves the bytes; the old hardcode read past the source).
+            let elem_size = if crate::kernels::qkv_attention::kv_f16_enabled() {
+                2usize
+            } else {
+                4usize
+            };
+            let bytes = n_elem * elem_size;
             let dst_k = self.k_arena[layer_idx]
                 .device_ptr_u64()
                 .ok_or_else(|| Error::Backend("seed: k_arena has no ptr".into()))?
@@ -621,37 +868,80 @@ impl DecodeGraphBuffers {
             let src_k = src.k_dev as *const c_void;
             let src_v = src.v_dev as *const c_void;
             let res: crate::HipErrorT = unsafe {
-                crate::hipMemcpyAsync(
-                    dst_k,
-                    src_k,
-                    bytes,
-                    HipMemcpyKind::DeviceToDevice,
-                    stream,
-                )
+                crate::hipMemcpyAsync(dst_k, src_k, bytes, HipMemcpyKind::DeviceToDevice, stream)
             };
             if res != crate::hipSuccess {
-                return Err(Error::Backend(format!("seed_kv_arena: hipMemcpyAsync K failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "seed_kv_arena: hipMemcpyAsync K failed: {res}"
+                )));
             }
             let res: crate::HipErrorT = unsafe {
-                crate::hipMemcpyAsync(
-                    dst_v,
-                    src_v,
-                    bytes,
-                    HipMemcpyKind::DeviceToDevice,
-                    stream,
-                )
+                crate::hipMemcpyAsync(dst_v, src_v, bytes, HipMemcpyKind::DeviceToDevice, stream)
             };
             if res != crate::hipSuccess {
-                return Err(Error::Backend(format!("seed_kv_arena: hipMemcpyAsync V failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "seed_kv_arena: hipMemcpyAsync V failed: {res}"
+                )));
             }
         }
         // Set the append position to the end of the seeded prefill so the first
         // decode step appends at the right offset and attends over the prompt.
-        let prefill_len = per_layer.iter().find_map(|s| s.as_ref().map(|e| e.prefill_len)).unwrap_or(0);
+        let prefill_len = per_layer
+            .iter()
+            .find_map(|s| s.as_ref().map(|e| e.prefill_len))
+            .unwrap_or(0);
         self.current_pos = prefill_len;
         // Seed the device position scalar to match; the graph's bump kernel
         // increments it on each replay, so it must start at prefill_len.
         self.write_pos_async(dev, prefill_len, stream)?;
+        dev.synchronize();
+        Ok(())
+    }
+
+    /// GDL state seeding: D2D copy each layer's eager recurrent `dev_state`
+    /// into the graph's `gdl.state` buffer. Without this the graph replays
+    /// GDL layers against a zeroed state after any prompt prefill — decode
+    /// diverges from eager. Must run OUTSIDE a capture bracket (blocking H2D).
+    /// `per_layer` is indexed by layer_idx; `None` for non-GDL layers.
+    pub fn seed_gdl_state_from_eager(
+        &mut self,
+        dev: &RocmDevice,
+        per_layer: &[Option<EagerKvSource<'_>>],
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let stream = dev.active_stream();
+        for (layer_idx, src) in per_layer.iter().enumerate() {
+            let Some(src) = src else { continue };
+            let Some(state_ptr) = src.gdl_state else {
+                continue;
+            };
+            let Some(gdl) = self.gdl.get(layer_idx).and_then(|o| o.as_ref()) else {
+                return Err(Error::Backend(format!(
+                    "seed_gdl_state: layer {layer_idx} has no GDL buffers"
+                )));
+            };
+            let n_elem = gdl.state.shape().elem_count();
+            if n_elem == 0 {
+                return Err(Error::Backend(format!(
+                    "seed_gdl_state: layer {layer_idx} GDL state buffer is empty"
+                )));
+            }
+            let bytes = n_elem * 4; // f32
+            let dst = gdl
+                .state
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("seed_gdl_state: no dst ptr".into()))?
+                as *mut c_void;
+            let src_ptr = state_ptr as *const c_void;
+            let res: crate::HipErrorT = unsafe {
+                crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!(
+                    "seed_gdl_state: hipMemcpyAsync failed: {res}"
+                )));
+            }
+        }
         dev.synchronize();
         Ok(())
     }
@@ -662,10 +952,7 @@ impl DecodeGraphBuffers {
     /// ZEROED ring after any prompt prefill — greedy decode diverges from
     /// eager. Must run OUTSIDE a capture bracket (blocking H2D).
     /// `per_layer` is indexed by layer_idx; `None` for attention layers.
-    pub fn seed_conv_rings(
-        &mut self,
-        per_layer: &[Option<ConvRingSeed<'_>>],
-    ) -> Result<()> {
+    pub fn seed_conv_rings(&mut self, per_layer: &[Option<ConvRingSeed<'_>>]) -> Result<()> {
         for (layer_idx, seed) in per_layer.iter().enumerate() {
             let Some(s) = seed else { continue };
             if layer_idx >= self.sc_state.len() {
@@ -695,7 +982,9 @@ impl DecodeGraphBuffers {
             }
             self.sc_state[layer_idx]
                 .write_host_f32(&col_major)
-                .map_err(|e| Error::Backend(format!("seed_conv_rings: H2D layer {layer_idx}: {e}")))?;
+                .map_err(|e| {
+                    Error::Backend(format!("seed_conv_rings: H2D layer {layer_idx}: {e}"))
+                })?;
         }
         Ok(())
     }
@@ -722,7 +1011,12 @@ impl DecodeGraphBuffers {
             }
             let n_rows = src.prefill_len;
             let n_elem: usize = (n_rows as usize) * src.kv_stride;
-            let arena_cols = self.latent_kv_arena[layer_idx].shape.dims().last().copied().unwrap_or(0);
+            let arena_cols = self.latent_kv_arena[layer_idx]
+                .shape
+                .dims()
+                .last()
+                .copied()
+                .unwrap_or(0);
             if arena_cols != src.kv_stride {
                 return Err(Error::Backend(format!(
                     "seed_latent_kv_arena: layer {layer_idx} arena width {arena_cols} != latent stride {}",
@@ -751,10 +1045,15 @@ impl DecodeGraphBuffers {
                 )
             };
             if res != crate::hipSuccess {
-                return Err(Error::Backend(format!("seed_latent_kv_arena: hipMemcpyAsync failed: {res}")));
+                return Err(Error::Backend(format!(
+                    "seed_latent_kv_arena: hipMemcpyAsync failed: {res}"
+                )));
             }
         }
-        let prefill_len = per_layer.iter().find_map(|s| s.as_ref().map(|e| e.prefill_len)).unwrap_or(0);
+        let prefill_len = per_layer
+            .iter()
+            .find_map(|s| s.as_ref().map(|e| e.prefill_len))
+            .unwrap_or(0);
         self.current_pos = prefill_len;
         self.write_pos_async(dev, prefill_len, stream)?;
         dev.synchronize();
@@ -777,12 +1076,18 @@ impl DecodeGraphBuffers {
         let mut buf = vals.to_vec();
         buf.resize(self.batch.max(1), 0);
         let bytes = 4 * self.batch.max(1);
-        // SAFETY: dst is device mem owned by pos_dev (4*batch bytes); host buf
-        // has exactly that many valid bytes.
+        // Stage through pinned memory (see memory::pinned::stage_h2d_pinned):
+        // pageable H2D copies take the driver's slow staged path and dominated
+        // per-token decode time.
+        let host_bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, bytes) };
+        let (src_ptr, _pinned) = crate::memory::pinned::stage_h2d_pinned(dev.ordinal, host_bytes);
+        // SAFETY: dst is device mem owned by pos_dev (4*batch bytes); src is
+        // the pinned stage (or the original buf on fallback) with exactly
+        // `bytes` valid bytes, valid per stage_h2d_pinned's safety contract.
         let res: crate::HipErrorT = unsafe {
             hipMemcpyAsync(
                 dst,
-                buf.as_ptr() as *const c_void,
+                src_ptr as *const c_void,
                 bytes,
                 HipMemcpyKind::HostToDevice,
                 stream,
@@ -863,7 +1168,10 @@ impl DecodeGraph {
             vocab_size,
             num_heads,
             batch,
-            0, 0, 0, 0, // no MoE / ShortConv layers in this simplified constructor
+            0,
+            0,
+            0,
+            0, // no MoE / ShortConv layers in this simplified constructor
         )?;
         Ok(Self::new(dev, buffers, stream))
     }
@@ -913,9 +1221,7 @@ impl DecodeGraph {
         let res: crate::HipErrorT = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
         if res != crate::hipSuccess {
             self.capturing = false;
-            return Err(Error::Backend(format!(
-                "hipStreamEndCapture failed: {res}"
-            )));
+            return Err(Error::Backend(format!("hipStreamEndCapture failed: {res}")));
         }
         let mut exec: *mut c_void = std::ptr::null_mut();
         // SAFETY: graph just captured, exec out-ptr valid.
@@ -972,9 +1278,8 @@ impl DecodeGraph {
         }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // SAFETY: exec + node from capture; params point to valid node struct.
-        let res: crate::HipErrorT = unsafe {
-            hipGraphExecKernelNodeSetParams(self.exec, self.kv_append_node, node_params)
-        };
+        let res: crate::HipErrorT =
+            unsafe { hipGraphExecKernelNodeSetParams(self.exec, self.kv_append_node, node_params) };
         if res != crate::hipSuccess {
             return Err(Error::Backend(format!(
                 "hipGraphExecKernelNodeSetParams failed: {res}"
@@ -1064,11 +1369,7 @@ pub fn decode_graph_enabled() -> bool {
 /// Spec §Phase 6 helpers. GEMM stays in rocBLAS (Rule 0); these validate
 /// stable-address topology for capture. Real KV/attention launches live in
 /// `kernels::qkv_attention` (`launch_kv_append`, `launch_qkv_attention_dev`).
-pub fn launch_qkv_gemv(
-    k_arena: &RocmStorage,
-    pos: u32,
-    max_ctx: usize,
-) -> Result<()> {
+pub fn launch_qkv_gemv(k_arena: &RocmStorage, pos: u32, max_ctx: usize) -> Result<()> {
     let ptr = k_arena
         .device_ptr_u64()
         .ok_or_else(|| Error::Backend("launch_qkv_gemv: k_arena has no device ptr".into()))?;
@@ -1092,11 +1393,7 @@ pub fn launch_attention(k_arena: &RocmStorage, pos: u32, max_ctx: usize) -> Resu
 /// Thin wrapper so `lfm2_graph` + `run.rs` share one call site.
 /// Ordered vs later launches on the active stream — no host sync.
 /// Convention: `(dev, dst, token_id)` — matches `write_embeddings_to_buffer_batch`.
-pub fn write_embedding_to_buffer(
-    dev: &RocmDevice,
-    dst: &RocmStorage,
-    token_id: u32,
-) -> Result<()> {
+pub fn write_embedding_to_buffer(dev: &RocmDevice, dst: &RocmStorage, token_id: u32) -> Result<()> {
     let bits = f32::from_bits(token_id);
     dev.write_f32_into_async(dst, &[bits])
 }
@@ -1118,7 +1415,7 @@ pub fn write_embeddings_to_buffer_batch(
         _ => {
             return Err(Error::Backend(format!(
                 "write_embeddings_to_buffer_batch: expected [batch, hidden] buffer, got {dims:?}"
-            )))
+            )));
         }
     };
     if token_ids.len() > batch {
@@ -1193,19 +1490,35 @@ mod tests {
     #[test]
     fn decode_graph_buffers_allocate_rejects_zero_batch() {
         // Zero-dim guard fires before any HIP alloc; no GPU needed.
-        assert!(DecodeGraphBuffers::allocate(
-            &crate::device::roc_device::RocmDevice::shared(0),
-            1, 64, 64, 64, 64, 256, 8, 100, 8, 0, 0, 0, 0, 0
-        )
-        .is_err());
+        assert!(
+            DecodeGraphBuffers::allocate(
+                &crate::device::roc_device::RocmDevice::shared(0),
+                1,
+                64,
+                64,
+                64,
+                64,
+                256,
+                8,
+                100,
+                8,
+                0,
+                0,
+                0,
+                0,
+                0
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn launch_qkv_gemv_rejects_oob_pos() {
         // No GPU needed: null-ptr path errors before any HIP call.
-        let alloc = std::sync::Arc::new(
-            crate::memory::allocator::RocmCachingAllocator::new(0, 1 << 20),
-        );
+        let alloc = std::sync::Arc::new(crate::memory::allocator::RocmCachingAllocator::new(
+            0,
+            1 << 20,
+        ));
         let st = RocmStorage::alloc_gpu_with_bytes(
             &Shape::new(vec![8, 8]),
             dtype_f32(),

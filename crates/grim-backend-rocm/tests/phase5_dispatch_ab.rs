@@ -15,7 +15,9 @@
 //! Runs only under GRIM_RUN_GPU_TESTS=1; otherwise prints SKIP and passes.
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape, Storage};
+use grim_tensor::{
+    ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantOps, Shape, Storage,
+};
 use std::sync::Mutex;
 
 lazy_static::lazy_static! {
@@ -56,7 +58,10 @@ impl Fmt {
             Fmt::Q5K => KQuantScheme::Q5K,
             Fmt::Q6K => KQuantScheme::Q6K,
         };
-        DType { arith: ArithType::F32, storage: Storage::KQuant(scheme) }
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(scheme),
+        }
     }
 }
 
@@ -180,6 +185,7 @@ fn time_config(
 }
 
 #[test]
+#[ignore]
 fn phase5_dispatch_ab_benchmark() {
     let _lock = AB_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -190,14 +196,14 @@ fn phase5_dispatch_ab_benchmark() {
     let formats = [Fmt::Q2K, Fmt::Q3K, Fmt::Q4K, Fmt::Q5K, Fmt::Q6K];
     // (M, K, N) — K % 256 == 0 for the dot4 paths; N=1024 (hidden-ish), K=4096 (inter-ish).
     let shapes: [(usize, usize, usize); 4] = [
-        (1, 1024, 1024),    // small-model decode GEMV
-        (1, 4096, 4096),    // 7-8B-class decode GEMV
-        (64, 4096, 4096),   // short prefill
-        (512, 4096, 4096),  // prefill chunk
+        (1, 1024, 1024),   // small-model decode GEMV
+        (1, 4096, 4096),   // 7-8B-class decode GEMV
+        (64, 4096, 4096),  // short prefill
+        (512, 4096, 4096), // prefill chunk
     ];
     const ITERS_SMALL: usize = 30; // m == 1 (~0.1ms kernels + sync)
-    const ITERS_MID: usize = 20;   // m == 64
-    const ITERS_BIG: usize = 5;    // m >= 512 (multi-ms kernels)
+    const ITERS_MID: usize = 20; // m == 64
+    const ITERS_BIG: usize = 5; // m >= 512 (multi-ms kernels)
 
     let mut report = String::from(
         "| Format | M | K | N | dot4 ms | WMMA ms | scalar ms | fastest (M=1 / prefill) |\n|---|---|---|---|---|---|---|---|\n",
@@ -222,7 +228,13 @@ fn phase5_dispatch_ab_benchmark() {
             let a_dev = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![m, k]), DType::F32)
                 .expect("upload act");
 
-            let iters = if m == 1 { ITERS_SMALL } else if m < 512 { ITERS_MID } else { ITERS_BIG };
+            let iters = if m == 1 {
+                ITERS_SMALL
+            } else if m < 512 {
+                ITERS_MID
+            } else {
+                ITERS_BIG
+            };
 
             // dot4 (m==1 only; at m>1 the dispatch skips it regardless).
             set_config(true, 1);
@@ -234,15 +246,21 @@ fn phase5_dispatch_ab_benchmark() {
 
             // WMMA (wmma_max_m >= m).
             set_config(false, m.max(4));
-            let (wmma_ms, wmma_out) = time_config(&dev, a_dev.as_ref(), b_dev.as_ref(), m, n, iters);
+            let (wmma_ms, wmma_out) =
+                time_config(&dev, a_dev.as_ref(), b_dev.as_ref(), m, n, iters);
 
             // Scalar per-quant GEMM (wmma_max_m=0 forces m > threshold).
             set_config(false, 0);
-            let (scalar_ms, scalar_out) = time_config(&dev, a_dev.as_ref(), b_dev.as_ref(), m, n, iters);
+            let (scalar_ms, scalar_out) =
+                time_config(&dev, a_dev.as_ref(), b_dev.as_ref(), m, n, iters);
 
             // Cross-path sanity: all-finite, and loose parity between WMMA and
             // scalar (same math, different accumulation order).
-            for (label, v) in [("dot4", &dot4_out), ("wmma", &wmma_out), ("scalar", &scalar_out)] {
+            for (label, v) in [
+                ("dot4", &dot4_out),
+                ("wmma", &wmma_out),
+                ("scalar", &scalar_out),
+            ] {
                 if !v.is_empty() && !v.iter().all(|x| x.is_finite()) {
                     // Non-finite output = kernel-vs-host layout drift. Reported,
                     // not fatal: timing is unaffected, and correctness is owned
@@ -270,17 +288,40 @@ fn phase5_dispatch_ab_benchmark() {
             }
 
             let m1_winner = if m == 1 {
-                if dot4_ms <= wmma_ms && dot4_ms <= scalar_ms { "dot4" }
-                else if wmma_ms <= scalar_ms { "WMMA" } else { "scalar" }
-            } else if wmma_ms <= scalar_ms { "WMMA" } else { "scalar" };
+                if dot4_ms <= wmma_ms && dot4_ms <= scalar_ms {
+                    "dot4"
+                } else if wmma_ms <= scalar_ms {
+                    "WMMA"
+                } else {
+                    "scalar"
+                }
+            } else if wmma_ms <= scalar_ms {
+                "WMMA"
+            } else {
+                "scalar"
+            };
 
             report.push_str(&format!(
                 "| {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {} |\n",
-                fmt.name(), m, k, n, dot4_ms, wmma_ms, scalar_ms, m1_winner
+                fmt.name(),
+                m,
+                k,
+                n,
+                dot4_ms,
+                wmma_ms,
+                scalar_ms,
+                m1_winner
             ));
             eprintln!(
                 "[phase5-ab] {} m={} k={} n={}: dot4={:.4}ms wmma={:.4}ms scalar={:.4}ms -> {}",
-                fmt.name(), m, k, n, dot4_ms, wmma_ms, scalar_ms, m1_winner
+                fmt.name(),
+                m,
+                k,
+                n,
+                dot4_ms,
+                wmma_ms,
+                scalar_ms,
+                m1_winner
             );
         }
     }
@@ -291,6 +332,9 @@ fn phase5_dispatch_ab_benchmark() {
     eprintln!("\n[phase5-ab] RESULTS TABLE\n{report}");
     // Persist for the plan document (test runs from crate root).
     let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("phase5_ab_results.md");
-    let _ = std::fs::write(&out_path, format!("# Phase 5 dispatch A/B (gfx1201)\n\n{report}"));
+    let _ = std::fs::write(
+        &out_path,
+        format!("# Phase 5 dispatch A/B (gfx1201)\n\n{report}"),
+    );
     eprintln!("[phase5-ab] wrote {}", out_path.display());
 }

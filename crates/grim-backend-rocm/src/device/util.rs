@@ -169,16 +169,39 @@ fn alloc_trace_enabled() -> bool {
 
 /// Emit one `[ctx-trace]` line plus a forced backtrace when `target` is a context switch worth naming: the legacy TEMP-DIAG case (anything parking on ordinal 2) and - new in WI-M2 - any switch to a non-zero device while the prefill latch is up.
 /// The thread id is recorded next to `prev` so cross-thread flips are obvious in the.
-fn emit_ctx_trace(site: &str, target: i32, prev: i32) {
-    let latch_up = prefill_in_flight();
+/// D1: pure decision + message format for `[ctx-trace]` lines, split out so
+/// tests can pin the exact smoking-gun contract without capturing stderr or
+/// mutating process env (`trace_on` stands in for `GRIM_ALLOC_TRACE`).
+fn ctx_trace_line(
+    site: &str,
+    target: i32,
+    prev: i32,
+    latch_up: bool,
+    trace_on: bool,
+) -> Option<String> {
     if target != 2 && !(latch_up && target != 0) {
-        return;
+        return None;
     }
-    if !alloc_trace_enabled() {
-        return;
+    if !trace_on {
+        return None;
     }
+    Some(format!(
+        "[ctx-trace] {site} set({target}) prev={prev} prefill_latch={latch_up}"
+    ))
+}
+
+fn emit_ctx_trace(site: &str, target: i32, prev: i32) {
+    let Some(line) = ctx_trace_line(
+        site,
+        target,
+        prev,
+        prefill_in_flight(),
+        alloc_trace_enabled(),
+    ) else {
+        return;
+    };
     eprintln!(
-        "[ctx-trace] {site} set({target}) prev={prev} tid={:?} prefill_latch={latch_up}",
+        "{line} tid={:?}",
         std::thread::current().id()
     );
     eprintln!("{}", std::backtrace::Backtrace::force_capture());
@@ -408,5 +431,30 @@ mod util_self_tests {
             !opts.iter().any(|o| o.starts_with("-mwavefrontsize")),
             "CDNA (gfx90a) must leave wave size to native MFMA: {opts:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ctx_trace_tests {
+    use super::ctx_trace_line;
+
+    /// D1: pin the smoking-gun contract — which switches emit `[ctx-trace]`
+    /// and the exact line format. The legacy TEMP-DIAG case (ordinal 2)
+    /// always fires; otherwise only under the prefill latch on non-zero
+    /// targets; never without the trace flag. No stderr capture, no env
+    /// mutation, no GPU needed.
+    #[test]
+    fn ctx_trace_line_decision_matrix() {
+        // Ordinal 2 always fires when tracing is on.
+        let line = ctx_trace_line("DeviceGuard", 2, 0, false, true).expect("ordinal 2 fires");
+        assert!(line.starts_with("[ctx-trace] DeviceGuard set(2) prev=0"));
+        assert!(line.ends_with("prefill_latch=false"));
+        // Latch + non-zero target fires.
+        assert!(ctx_trace_line("DeviceGuard", 1, 0, true, true).is_some());
+        // Ordinary switches stay silent.
+        assert!(ctx_trace_line("DeviceGuard", 0, 0, false, true).is_none());
+        assert!(ctx_trace_line("DeviceGuard", 1, 0, false, true).is_none());
+        // Flag off silences everything, including ordinal 2.
+        assert!(ctx_trace_line("DeviceGuard", 2, 0, true, false).is_none());
     }
 }

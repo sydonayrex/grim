@@ -157,6 +157,7 @@ fn link_decision_pcie_overflow_threshold_saturates() -> TestResult {
 // =========================================================================
 
 #[test]
+#[ignore]
 fn host_staging_buffer_round_trips_a_short_byte_record() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -189,6 +190,7 @@ fn host_staging_buffer_round_trips_a_short_byte_record() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn host_staging_buffer_zero_size_returns_err() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -203,6 +205,7 @@ fn host_staging_buffer_zero_size_returns_err() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn host_staging_buffer_drop_returns_the_pinned_block() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -216,6 +219,7 @@ fn host_staging_buffer_drop_returns_the_pinned_block() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn host_staging_buffer_rejects_overflow() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -242,6 +246,7 @@ fn host_staging_buffer_rejects_overflow() -> TestResult {
 // =========================================================================
 
 #[test]
+#[ignore]
 fn staging_for_routes_is_none_when_peer_direct() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -256,6 +261,7 @@ fn staging_for_routes_is_none_when_peer_direct() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn staging_for_routes_is_some_when_host_bounce() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {

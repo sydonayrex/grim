@@ -147,7 +147,10 @@ impl ReadinessDispatcher {
         priority: i32,
         dependencies: usize,
     ) {
-        let mut arrival = self.arrival_counter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut arrival = self
+            .arrival_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *arrival += 1;
         let epoch = *arrival;
 

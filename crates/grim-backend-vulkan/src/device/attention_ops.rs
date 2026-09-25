@@ -11,7 +11,7 @@ use grim_tensor::{ArithType, AttentionOps, BackendStorage, CoreTensorOps, Shape}
 use crate::context::global_context;
 use crate::ffi::*;
 use crate::kernel::{
-    VulkanKernel, push_params, run_compute_shader, run_compute_shader_kernel, spirv_for,
+    push_params, run_compute_shader, run_compute_shader_kernel, spirv_for, VulkanKernel,
 };
 use crate::{VulkanDevice, VulkanHandle, VulkanStorage};
 

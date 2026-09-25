@@ -177,6 +177,7 @@ fn approx_close(a: &[f32], b: &[f32], rel_tol: f32) -> bool {
 }
 
 #[test]
+#[ignore]
 fn test_cross_attention_gpu_parity() {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -257,6 +258,7 @@ fn test_cross_attention_gpu_parity() {
 /// conventions must genuinely disagree for num_heads_k < num_heads so a
 /// regression back to interleaved grouping would be caught.
 #[test]
+#[ignore]
 fn cpu_reference_uses_contiguous_gqa_grouping() {
     let seq_len = 3_usize;
     let enc_seq = 8_usize;

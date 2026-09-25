@@ -2,10 +2,10 @@ use super::common::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::memory::storage::CudaStorage;
-    use grim_tensor::dtype::{ DType };
     use super::*;
-    use grim_tensor::{ CoreTensorOps, Shape };
+    use crate::memory::storage::CudaStorage;
+    use grim_tensor::dtype::DType;
+    use grim_tensor::{CoreTensorOps, Shape};
 
     #[test]
     fn test_cuda_moe_fused_dispatch_parity() {

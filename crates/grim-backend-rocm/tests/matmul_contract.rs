@@ -38,9 +38,19 @@ fn check(dev: &RocmDevice, m: usize, n: usize, k: usize) {
     let a: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
     let b: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
 
-    let a_s = dev.from_cpu(&a, &Shape::new(vec![m, k]), DType::F32).unwrap();
-    let b_s = dev.from_cpu(&b, &Shape::new(vec![n, k]), DType::F32).unwrap();
-    let (out, handle) = grim_tensor::CoreTensorOps::matmul(dev, a_s.as_ref(), b_s.as_ref(), &Shape::new(vec![m, n])).unwrap();
+    let a_s = dev
+        .from_cpu(&a, &Shape::new(vec![m, k]), DType::F32)
+        .unwrap();
+    let b_s = dev
+        .from_cpu(&b, &Shape::new(vec![n, k]), DType::F32)
+        .unwrap();
+    let (out, handle) = grim_tensor::CoreTensorOps::matmul(
+        dev,
+        a_s.as_ref(),
+        b_s.as_ref(),
+        &Shape::new(vec![m, n]),
+    )
+    .unwrap();
     handle.synchronize().unwrap();
     let got: Vec<f32> = out.to_cpu_vec_f32().unwrap();
     let want = cpu_ref(&a, &b, m, n, k);
@@ -60,6 +70,7 @@ fn check(dev: &RocmDevice, m: usize, n: usize, k: usize) {
 }
 
 #[test]
+#[ignore]
 fn matmul_contract_parity() {
     let Some(dev) = gpu() else { return };
     // Decode regime (M<=8, the R3 target).

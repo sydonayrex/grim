@@ -1627,7 +1627,10 @@ fn render_chat_prompt(
                 );
                 (text, family)
             }
-            Some(t) => (grim_format::render_messages_or_last(t, &effective_messages), None),
+            Some(t) => (
+                grim_format::render_messages_or_last(t, &effective_messages),
+                None,
+            ),
             None => (
                 effective_messages
                     .last()

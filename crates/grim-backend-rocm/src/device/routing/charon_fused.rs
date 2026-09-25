@@ -6,13 +6,11 @@ use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
-use crate::device::roc_device::{ RocmDevice };
 #[cfg(feature = "training")]
 use crate::device::roc_device::CharonBackwardResult;
+use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{
-    HipDim3, arg, check_hip, hipFreeAsync, hipMemsetAsync, upload_device_buffer,
-};
+use crate::{HipDim3, arg, check_hip, hipFreeAsync, hipMemsetAsync, upload_device_buffer};
 
 impl RocmDevice {
     /// `tests/golden_charon_moe_gpu.rs` ($\le 10^{-3}$ max-abs-diff).

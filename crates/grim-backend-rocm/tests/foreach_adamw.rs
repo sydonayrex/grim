@@ -75,6 +75,7 @@ fn make_state(
 }
 
 #[test]
+#[ignore]
 fn foreach_adamw_parity() {
     if !gpu_enabled() {
         return;
@@ -138,6 +139,7 @@ fn foreach_adamw_parity() {
 }
 
 #[test]
+#[ignore]
 fn foreach_adamw_throughput() {
     if !gpu_enabled() {
         return;

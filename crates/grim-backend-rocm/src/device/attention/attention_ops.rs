@@ -1,14 +1,15 @@
 //! The `impl AttentionOps for RocmDevice` trait-required block, kept whole.
 
-
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{AttentionOps, BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, QkvAttentionFusionConfig, QuantMode, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, hipFreeAsync, linear_launch, upload_device_buffer };
-
+use crate::{
+    HipDim3, QkvAttentionFusionConfig, QuantMode, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32,
+    hipFreeAsync, linear_launch, upload_device_buffer,
+};
 
 impl AttentionOps for RocmDevice {
     /// SageAttention dispatch. The GPU entry existed without trait wiring, so callers always hit the
@@ -42,7 +43,9 @@ impl AttentionOps for RocmDevice {
             Ok("q4khalf") | Ok("q4k_half") | Ok("3") => crate::fusion::KvQuantFormat::Q4KHalf,
             Ok("q4k") | Ok("2") => crate::fusion::KvQuantFormat::Q4K,
             Ok("q8_0") | Ok("q8") | Ok("1") => crate::fusion::KvQuantFormat::Q8_0,
-            Ok("legacy") => crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true),
+            Ok("legacy") => {
+                crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true)
+            }
             _ => match quant_bits {
                 3 => crate::fusion::KvQuantFormat::Q4KHalf,
                 _ => crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true),

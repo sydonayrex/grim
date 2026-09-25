@@ -60,7 +60,9 @@ impl Engine {
         if kv_spill_enabled {
             let scratch_dir = std::env::var("GRIM_KV_SPILL_DIR")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::env::temp_dir().join(format!("grim_kv_spill_{}", std::process::id())));
+                .unwrap_or_else(|_| {
+                    std::env::temp_dir().join(format!("grim_kv_spill_{}", std::process::id()))
+                });
             let block_elems = BLOCK_SIZE * config.num_kv_heads * config.head_dim;
             match grim_kvtransport::SharedSpillManager::new(scratch_dir.clone(), block_elems) {
                 Ok(spill_mgr) => {

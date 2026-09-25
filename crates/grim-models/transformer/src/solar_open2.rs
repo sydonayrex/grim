@@ -173,6 +173,7 @@ impl SolarOpen2Block {
                         chunk_size: 64,
                         rms_norm_eps: 1e-5,
                         max_seq_len: cfg.max_seq_len,
+                        gdl_opt_in: false,
                     },
                 )?;
                 (None, Some(dnet))
@@ -233,10 +234,9 @@ impl SolarOpen2Block {
 
         let attn_out = match self.layer_type {
             SolarLayerType::Gqa => {
-                let block = self
-                    .llama_block
-                    .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("solar_open2 llama_block missing".into()))?;
+                let block = self.llama_block.as_ref().ok_or_else(|| {
+                    grim_core::error::Error::Backend("solar_open2 llama_block missing".into())
+                })?;
                 let (out, _, _) = block.forward_with_kv_paged(
                     &normed_attn,
                     positions,
@@ -247,22 +247,15 @@ impl SolarOpen2Block {
                 out
             }
             SolarLayerType::Kda => {
-                let delta = self
-                    .delta_net
-                    .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("solar_open2 delta_net missing".into()))?;
+                let delta = self.delta_net.as_ref().ok_or_else(|| {
+                    grim_core::error::Error::Backend("solar_open2 delta_net missing".into())
+                })?;
                 let pos_tensor = grim_backend_cpu::cpu_tensor(
                     positions.iter().map(|&p| p as f32).collect(),
                     Shape::new(vec![positions.len()]),
                 );
-                let mut dummy_sess =
-                    grim_core::session::Inner::new(delta.device.clone());
-                delta.forward(
-                    &mut dummy_sess,
-                    &normed_attn,
-                    &pos_tensor,
-                    &[],
-                )?
+                let mut dummy_sess = grim_core::session::Inner::new(delta.device.clone());
+                delta.forward(&mut dummy_sess, &normed_attn, &pos_tensor, &[])?
             }
         };
 

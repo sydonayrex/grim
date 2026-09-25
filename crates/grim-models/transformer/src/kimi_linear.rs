@@ -1,4 +1,5 @@
 //! Thin wrapper around `Llama` for kimi_linear uses a Llama-style transformer.
+//! Serves dense Llama; real Kimi linear attention NOT implemented — GDL ineligible (softmax).
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};

@@ -6,14 +6,104 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Embedding, Linear, RmsNorm, add_tensors, broadcast_bias};
+use grim_nn::{add_tensors, broadcast_bias, Embedding, Linear, RmsNorm};
 use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
-use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Shape, Tensor};
+use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
+// ---------------------------------------------------------------------------
+// G3b feature-matching capture: arm a (layer, kind) slot, run one forward,
+// take the rows. Only one capture may be armed at a time; `take` disarms.
+// This is the Rust-only replacement for python-style forward hooks — the
+// per-layer trainer needs each GDL block's input (post-norm) and the
+// attention branch's output (pre-residual) from both the softmax teacher and
+// the GDL student without touching serving behavior.
+// ---------------------------------------------------------------------------
+
+static CAPTURE_LAYER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+// 0 = disarmed, 1 = block input (post-norm), 2 = attention output (pre-residual).
+static CAPTURE_KIND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CAPTURE_BUF: std::sync::Mutex<Vec<Vec<f32>>> = std::sync::Mutex::new(Vec::new());
+
+/// Arm capture of `norm_x` rows at `layer` on the next forward pass.
+pub fn grave_capture_block_in(layer: usize) {
+    CAPTURE_LAYER.store(layer, std::sync::atomic::Ordering::SeqCst);
+    CAPTURE_KIND.store(1, std::sync::atomic::Ordering::SeqCst);
+    CAPTURE_BUF.lock().unwrap().clear();
+}
+
+/// Arm capture of the attention branch's output rows at `layer`.
+pub fn grave_capture_block_out(layer: usize) {
+    CAPTURE_LAYER.store(layer, std::sync::atomic::Ordering::SeqCst);
+    CAPTURE_KIND.store(2, std::sync::atomic::Ordering::SeqCst);
+    CAPTURE_BUF.lock().unwrap().clear();
+}
+
+/// Take captured rows ([T][hidden]) and disarm. Empty if never armed/fired.
+pub fn grave_capture_take() -> Vec<Vec<f32>> {
+    CAPTURE_KIND.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mut buf = CAPTURE_BUF.lock().unwrap();
+    std::mem::take(&mut *buf)
+}
+
+fn grave_capture_record(layer_idx: usize, what: &Tensor) {
+    if CAPTURE_LAYER.load(std::sync::atomic::Ordering::SeqCst) != layer_idx {
+        return;
+    }
+    let Ok(data) = what.to_vec_f32() else { return };
+    let hidden = what.shape().dims().last().copied().unwrap_or(0);
+    if hidden == 0 {
+        return;
+    }
+    let mut buf = CAPTURE_BUF.lock().unwrap();
+    for r in 0..data.len() / hidden {
+        buf.push(data[r * hidden..(r + 1) * hidden].to_vec());
+    }
+}
 
 /// Max KV-cache rows pre-allocated on the ROCm device for the fused MXFP4 QKV path.
-const LFM2_FUSED_KV_CACHE_LEN: usize = 4096;
+/// KV arena capacity, overridable for long-context baselines (GRAVE plan
+/// Phase 0): `GRIM_KV_CACHE_LEN=<positions>` (default 4096). Read once.
+fn kv_cache_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| {
+        std::env::var("GRIM_KV_CACHE_LEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &usize| v >= 1024)
+            .unwrap_or(4096)
+    })
+}
+
+/// GRAVE Phase 1: KV arena element dtype — f16 halves attention bytes
+/// (`GRIM_F16_KV=1`). Must match the dtype used at every arena allocation
+/// site AND the flag the launchers pass to the kernels.
+fn rocm_of(t: &Tensor) -> &grim_backend_rocm::RocmStorage {
+    t.storage()
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .expect("KV arena must be RocmStorage")
+}
+
+fn kv_arena_dtype() -> DType {
+    if grim_backend_rocm::kv_f16_enabled() {
+        DType {
+            arith: ArithType::F16,
+            storage: Storage::Native,
+        }
+    } else {
+        DType::F32
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lfm2AttentionMode {
+    #[default]
+    Softmax,
+    Gdl,
+}
 
 #[derive(Debug, Clone)]
 pub struct Lfm2Config {
@@ -36,6 +126,22 @@ pub struct Lfm2Config {
     /// Opt-in: route attention QKV through the ROCm fused MXFP4 GEMM + QK-Norm + RoPE kernel.
     /// Off by default so the F32 reference path remains the golden behavior.
     pub mxfp4_qkv_attention: bool,
+    /// Attention mode for non-recurrent layers (Softmax by default, Gdl for GRAVE linear attention).
+    pub attention_mode: Lfm2AttentionMode,
+    /// Optional per-layer override of `attention_mode` (index = layer ordinal).
+    /// Required for the hybrid fallback (e.g. keep 2 softmax layers for
+    /// retrieval while the rest run Gdl). `None` = uniform scalar everywhere.
+    pub attention_mode_per_layer: Option<Vec<Lfm2AttentionMode>>,
+}
+
+impl Lfm2Config {
+    /// Resolved attention mode for one layer: per-layer override wins over the scalar.
+    pub fn attention_mode_at(&self, layer_idx: usize) -> Lfm2AttentionMode {
+        match &self.attention_mode_per_layer {
+            Some(v) if layer_idx < v.len() => v[layer_idx],
+            _ => self.attention_mode,
+        }
+    }
 }
 
 impl ModelConfig for Lfm2Config {
@@ -99,6 +205,15 @@ pub enum Lfm2LayerCache {
         /// Host-side mirror of device past counter (avoids D2H read per token).
         dev_pos: usize,
     },
+    /// GRAVE Gated DeltaNet-2 recurrent state: [num_heads * head_dim * head_dim] f32.
+    Gdl {
+        state: Vec<f32>,
+        /// Device-resident recurrent state `[heads, dk, dv]` f32 (ROCm only).
+        /// Allocated once on the first ROCm step and updated in place by the
+        /// fused kernel — the eager GPU path then needs zero host readbacks.
+        /// None until first use; the host `state` serves the CPU path.
+        dev_state: Option<Box<dyn grim_tensor::BackendStorage>>,
+    },
 }
 
 impl Clone for Lfm2LayerCache {
@@ -111,7 +226,14 @@ impl Clone for Lfm2LayerCache {
                 dev: None,
             },
             Self::Attention {
-                k, v, k_dev, v_dev, pos_base_dev, past_dev, dev_pos, ..
+                k,
+                v,
+                k_dev,
+                v_dev,
+                pos_base_dev,
+                past_dev,
+                dev_pos,
+                ..
             } => Self::Attention {
                 k: k.clone(),
                 v: v.clone(),
@@ -134,6 +256,10 @@ impl Clone for Lfm2LayerCache {
                 graph_residual: None,
                 dev_pos: *dev_pos,
             },
+            Self::Gdl { state, .. } => Self::Gdl {
+                state: state.clone(),
+                dev_state: None,
+            },
         }
     }
 }
@@ -155,12 +281,7 @@ impl Lfm2LayerCache {
     /// this test pins the host-side concatenation contract (row ordering and
     /// total byte count) independently of the device.
     #[cfg(test)]
-    fn verify_qkv_blob_layout(
-        q_bytes: &[u8],
-        k_bytes: &[u8],
-        v_bytes: &[u8],
-        row_bytes: usize,
-    ) {
+    fn verify_qkv_blob_layout(q_bytes: &[u8], k_bytes: &[u8], v_bytes: &[u8], row_bytes: usize) {
         let n_q = q_bytes.len() / row_bytes;
         let n_k = k_bytes.len() / row_bytes;
         let n_v = v_bytes.len() / row_bytes;
@@ -207,6 +328,12 @@ pub struct Lfm2Block {
     pub shortconv_conv: Option<Tensor>,
     pub shortconv_conv_vec: Option<Vec<f32>>,
     pub shortconv_out_proj: Option<Linear>,
+    /// GRAVE GdlGate injection point (per-token, per-channel gate projections,
+    /// shared across heads): erase B [hidden->dk], write W_w [hidden->dv],
+    /// decay-modulation W_f [hidden->dk]. None = static scalar gates.
+    pub gdl_b_proj: Option<Linear>,
+    pub gdl_w_proj: Option<Linear>,
+    pub gdl_f_proj: Option<Linear>,
     pub ffn_norm: RmsNorm,
     pub ffn_gate: Linear,
     pub ffn_up: Linear,
@@ -217,6 +344,8 @@ pub struct Lfm2Block {
     pub ffn_down_exps: Option<Tensor>,
     pub ffn_exp_probs_b: Option<Tensor>,
     pub is_moe: bool,
+    /// Layer index (for per-layer debug dumps).
+    pub index: usize,
     pub n_expert: usize,
     /// M1: real top-k routing width (was hardcoded top-1 before M0 made MoE reachable).
     pub n_expert_used: usize,
@@ -231,9 +360,288 @@ pub struct Lfm2Block {
     pub head_dim: usize,
     pub rope_theta: f32,
     pub eps: f32,
+    pub attention_mode: Lfm2AttentionMode,
+    /// GRAVE per-layer gate operating point `[decay, erase, write]`
+    /// (Taylor-Calibrated init; distillation writes learned values here).
+    /// Read by `forward_gdl`; ignored by the softmax path.
+    pub gdl_gates: [f64; 3],
+    /// G4b Phase 3: cached gate-augmented fused Q8_0 blob (`Q∥K∥V∥Gb∥Gw∥Gf`)
+    /// plus the three gate-projection bias vectors the fused GEMV omits (the
+    /// blob yields `W@x`; biases are added on-device before sigmoid). Built once
+    /// when per-token gate projections are installed on a ROCm device with
+    /// Q8_0 teacher QKV weights; `None` otherwise (host path handles those).
+    pub gdl_fused_qkv_gates: Option<GdlFusedQkvGates>,
+}
+
+/// G4b Phase 3 payload cached on an `Lfm2Block`: the fused Q8_0 QKV+gate blob
+/// and the three gate-projection bias vectors (device-resident f32, `[dk]`/`[dv]`).
+/// Lets the eager device path issue ONE fused GEMV/layer instead of three QKV
+/// GEMVs + three gate GEMVs. `None` until the builder succeeds at projection
+/// install time.
+pub struct GdlFusedQkvGates {
+    pub weights: grim_backend_rocm::FusedQkvWeights,
+    pub(crate) bias_b: RocmStorageBuf,
+    pub(crate) bias_w: RocmStorageBuf,
+    pub(crate) bias_f: RocmStorageBuf,
+    pub(crate) dk: usize,
+    pub(crate) dv: usize,
+}
+
+/// Owning handle over a device f32 buffer used to add a gate-projection bias.
+/// Clones the projection bias tensor's storage `Arc` (cheap) and downcasts to
+/// `&RocmStorage` on use, so it can be stored in the block across forwards.
+pub(crate) struct RocmStorageBuf {
+    storage: std::sync::Arc<dyn grim_tensor::BackendStorage>,
+}
+
+impl RocmStorageBuf {
+    pub(crate) fn from_tensor(bias: &grim_tensor::Tensor) -> Result<Self> {
+        Ok(Self {
+            storage: bias.storage().clone(),
+        })
+    }
+    pub(crate) fn as_rocm(&self) -> Result<&grim_backend_rocm::RocmStorage> {
+        self.storage
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("gdl gate bias not on ROCm device".into())
+            })
+    }
+}
+
+/// Transpose a 2D f32 tensor on its own device (Linear's `w_t` mirror).
+fn transpose_last_two_2d(t: &grim_tensor::Tensor) -> Result<grim_tensor::Tensor> {
+    let dims = t.shape().dims();
+    if dims.len() != 2 {
+        return Err(grim_core::error::Error::Shape(
+            "gate projection weight must be 2D".into(),
+        ));
+    }
+    let (rows, cols) = (dims[0], dims[1]);
+    let data = t.to_vec_f32()?;
+    let mut transposed = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            transposed[c * rows + r] = data[r * cols + c];
+        }
+    }
+    let dev = grim_nn::modules::pick_device_for_tensor(t);
+    let shape = grim_tensor::Shape::new(vec![cols, rows]);
+    let storage = dev.from_cpu(&transposed, &shape, grim_tensor::dtype::DType::F32)?;
+    Ok(grim_tensor::Tensor::new(
+        std::sync::Arc::from(storage),
+        shape,
+        grim_tensor::dtype::DType::F32,
+        t.provenance().clone(),
+        t.device().clone(),
+    ))
 }
 
 impl Lfm2Block {
+    /// G3b: install per-token per-channel gate projections from sidecar
+    /// payload (host weight rows `[out][in]` + `[out]` bias). Tensors land on
+    /// the same device as this block's `attn_norm` weight. Also
+    /// bias-calibrated: pass `calibrate` = the layer's trained scalar triple
+    /// `[decay, erase, write]` to shift biases so sigmoid(W·0 + b) reproduces
+    /// the scalars exactly when the weights are zero (constant-init
+    /// equivalence); `None` keeps the payload's own biases.
+    pub fn set_gate_projections_from_host(
+        &mut self,
+        lp: &crate::gla::LayerGateProjections,
+        calibrate: Option<[f64; 3]>,
+    ) -> Result<()> {
+        let reference = &self.attn_norm.weight;
+        let dev = grim_nn::modules::pick_device_for_tensor(reference);
+        let mk_linear =
+            |w_rows: &[Vec<f32>], bias_host: &[f32], bias_shift: f32| -> Result<Linear> {
+                let out_dim = w_rows.len();
+                let in_dim = w_rows.first().map(|r| r.len()).unwrap_or(0);
+                let mut flat = Vec::with_capacity(out_dim * in_dim);
+                for row in w_rows {
+                    if row.len() != in_dim {
+                        return Err(grim_core::error::Error::Shape(
+                            "gate projection rows must be rectangular".into(),
+                        ));
+                    }
+                    flat.extend_from_slice(row);
+                }
+                let shape = grim_tensor::Shape::new(vec![out_dim, in_dim]);
+                let storage = dev.from_cpu(&flat, &shape, grim_tensor::dtype::DType::F32)?;
+                let weight = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(storage),
+                    shape,
+                    grim_tensor::dtype::DType::F32,
+                    reference.provenance().clone(),
+                    reference.device().clone(),
+                );
+                let bias_host: Vec<f32> = bias_host.iter().map(|&b| b + bias_shift).collect();
+                let bias_shape = grim_tensor::Shape::new(vec![out_dim]);
+                let bias_storage =
+                    dev.from_cpu(&bias_host, &bias_shape, grim_tensor::dtype::DType::F32)?;
+                let bias = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(bias_storage),
+                    bias_shape,
+                    grim_tensor::dtype::DType::F32,
+                    reference.provenance().clone(),
+                    reference.device().clone(),
+                );
+                let w_t = transpose_last_two_2d(&weight)?;
+                Ok(Linear {
+                    weight,
+                    bias: Some(bias),
+                    w_t,
+                    quant_format: None,
+                })
+            };
+        let lnit = |p: f64| ((p / (1.0 - p)).ln()) as f32;
+        let (sb, sw, sf) = match calibrate {
+            Some([decay, erase, write]) => (
+                lnit(erase.clamp(1e-4, 1.0 - 1e-4)),
+                lnit(write.clamp(1e-4, 1.0 - 1e-4)),
+                lnit(decay.clamp(1e-4, 1.0 - 1e-4)),
+            ),
+            None => (0.0, 0.0, 0.0),
+        };
+        self.gdl_b_proj = Some(mk_linear(&lp.b_weight, &lp.b_bias, sb)?);
+        self.gdl_w_proj = Some(mk_linear(&lp.w_weight, &lp.w_bias, sw)?);
+        self.gdl_f_proj = Some(mk_linear(&lp.f_weight, &lp.f_bias, sf)?);
+        // G4b Phase 3: if the teacher QKV weights are Q8_0 on ROCm, build the
+        // gate-augmented fused blob once so the eager device path can issue ONE
+        // fused GEMV/layer. Leaves the field None otherwise (host path covers it).
+        self.gdl_fused_qkv_gates = self.build_gdl_fused_qkv_gates().ok().flatten();
+        Ok(())
+    }
+
+    /// G4b Phase 3: assemble the gate-augmented fused Q8_0 blob
+    /// `Q∥K∥V∥Gb∥Gw∥Gf` from the installed gate projections and the teacher QKV
+    /// weights, plus the three gate bias vectors the fused GEMV omits. Returns
+    /// `Ok(None)` when the block can't use the fused device path (non-ROCm,
+    /// non-Q8_0 QKV, or missing projections) so callers fall back to the host
+    /// loop. Only valid after `set_gate_projections_from_host` has run.
+    fn build_gdl_fused_qkv_gates(&self) -> Result<Option<GdlFusedQkvGates>> {
+        let (bp, wp, fp) = match (&self.gdl_b_proj, &self.gdl_w_proj, &self.gdl_f_proj) {
+            (Some(b), Some(w), Some(f)) => (b, w, f),
+            _ => {
+                eprintln!(
+                    "[gdl-fused-build] layer {} skip: gate projections incomplete (b={}, w={}, f={})",
+                    self.index,
+                    self.gdl_b_proj.is_some(),
+                    self.gdl_w_proj.is_some(),
+                    self.gdl_f_proj.is_some(),
+                );
+                return Ok(None);
+            }
+        };
+        let (wq, wk, wv) = match (&self.wq, &self.wk, &self.wv) {
+            (Some(q), Some(k), Some(v)) => (q, k, v),
+            _ => {
+                eprintln!(
+                    "[gdl-fused-build] layer {} skip: teacher QKV incomplete (wq={}, wk={}, wv={})",
+                    self.index,
+                    self.wq.is_some(),
+                    self.wk.is_some(),
+                    self.wv.is_some(),
+                );
+                return Ok(None);
+            }
+        };
+        let is_q80 = |s: &grim_tensor::Tensor| {
+            matches!(
+                s.dtype().storage,
+                grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+            )
+        };
+        let q80_q = is_q80(&wq.weight);
+        let q80_k = is_q80(&wk.weight);
+        let q80_v = is_q80(&wv.weight);
+        if !q80_q || !q80_k || !q80_v {
+            eprintln!(
+                "[gdl-fused-build] skip: wq.dtype={:?} wk.dtype={:?} wv.dtype={:?} (need Q8_0)",
+                wq.weight.dtype().storage,
+                wk.weight.dtype().storage,
+                wv.weight.dtype().storage,
+            );
+            return Ok(None);
+        }
+        let ordinal = match wq.weight.device() {
+            grim_tensor::Device::Rocm(o) => *o as i32,
+            _ => {
+                eprintln!("[gdl-fused-build] skip: QKV not on ROCm");
+                return Ok(None);
+            }
+        };
+        let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal as usize);
+        let weights = rocm_dev.build_fused_gate_qkv_q80(
+            wq.weight.storage().as_ref(),
+            wk.weight.storage().as_ref(),
+            wv.weight.storage().as_ref(),
+            bp.weight.storage().as_ref(),
+            wp.weight.storage().as_ref(),
+            fp.weight.storage().as_ref(),
+        )?;
+        let bias_b =
+            RocmStorageBuf::from_tensor(bp.bias.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Config("gdl_b_proj bias missing".into())
+            })?)?;
+        let bias_w =
+            RocmStorageBuf::from_tensor(wp.bias.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Config("gdl_w_proj bias missing".into())
+            })?)?;
+        let bias_f =
+            RocmStorageBuf::from_tensor(fp.bias.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Config("gdl_f_proj bias missing".into())
+            })?)?;
+        Ok(Some(GdlFusedQkvGates {
+            weights,
+            bias_b,
+            bias_w,
+            bias_f,
+            dk: self.head_dim,
+            dv: self.head_dim,
+        }))
+    }
+
+    /// G3b: read the installed gate projections back to host rows
+    /// ([out][in] weights + [out] biases), for sidecar round-tripping.
+    /// None if any of the three projections is absent.
+    pub fn gate_projections_to_host(&self) -> Option<crate::gla::LayerGateProjections> {
+        let (bp, wp, fp) = (
+            self.gdl_b_proj.as_ref()?,
+            self.gdl_w_proj.as_ref()?,
+            self.gdl_f_proj.as_ref()?,
+        );
+        let read = |lin: &Linear| -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+            let data = lin.weight.to_vec_f32()?;
+            let dims = lin.weight.shape().dims();
+            let (out_dim, in_dim) = (dims[0], dims[1]);
+            let w: Vec<Vec<f32>> = (0..out_dim)
+                .map(|r| data[r * in_dim..(r + 1) * in_dim].to_vec())
+                .collect();
+            let b = match &lin.bias {
+                Some(t) => t.to_vec_f32()?,
+                None => {
+                    return Err(grim_core::error::Error::Shape(
+                        "gate projection bias missing".into(),
+                    ));
+                }
+            };
+            Ok((w, b))
+        };
+        let (b_weight, b_bias) = read(bp).ok()?;
+        let (w_weight, w_bias) = read(wp).ok()?;
+        let (f_weight, f_bias) = read(fp).ok()?;
+        Some(crate::gla::LayerGateProjections {
+            b_weight,
+            b_bias,
+            w_weight,
+            w_bias,
+            f_weight,
+            f_bias,
+        })
+    }
+
     pub fn load(
         ws: &grim_nn::WeightSource<'_>,
         cfg: &Lfm2Config,
@@ -475,7 +883,9 @@ impl Lfm2Block {
                         ) {
                             Ok(fused) => Some(fused),
                             Err(e) => {
-                                eprintln!("[grim] layer {layer_idx}: fused Q8_0 GateUp build failed ({e}), falling back to 2-GEMV");
+                                eprintln!(
+                                    "[grim] layer {layer_idx}: fused Q8_0 GateUp build failed ({e}), falling back to 2-GEMV"
+                                );
                                 None
                             }
                         }
@@ -490,6 +900,7 @@ impl Lfm2Block {
         };
 
         Ok(Self {
+            index: layer_idx,
             attn_norm,
             wq,
             wk,
@@ -517,7 +928,11 @@ impl Lfm2Block {
             ffn_exp_probs_b,
             is_moe,
             n_expert: if is_moe { cfg.n_expert } else { 0 },
-            n_expert_used: if is_moe { cfg.n_expert_used.clamp(1, cfg.n_expert.max(1)) } else { 1 },
+            n_expert_used: if is_moe {
+                cfg.n_expert_used.clamp(1, cfg.n_expert.max(1))
+            } else {
+                1
+            },
             charon_cache: crate::shared_moe::CharonCache::new(),
             moe_experts_cache: std::sync::OnceLock::new(),
             num_heads: cfg.num_heads,
@@ -525,6 +940,12 @@ impl Lfm2Block {
             head_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
             eps: cfg.rms_norm_eps,
+            attention_mode: cfg.attention_mode_at(layer_idx),
+            gdl_gates: crate::gla::gdl_gate_defaults(cfg.head_dim),
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
         })
     }
 
@@ -543,6 +964,19 @@ impl Lfm2Block {
                 ("shortconv_conv", self.shortconv_conv.is_some()),
                 ("shortconv_conv_vec", self.shortconv_conv_vec.is_some()),
                 ("shortconv_out_proj", self.shortconv_out_proj.is_some()),
+            ];
+            for (name, present) in required {
+                if !present {
+                    return Err(ctx(name));
+                }
+            }
+        } else if self.attention_mode == Lfm2AttentionMode::Gdl {
+            // GRAVE Gated DeltaNet-2 linear attention: requires wq, wk, wv, wo projections.
+            let required = [
+                ("wq", self.wq.is_some()),
+                ("wk", self.wk.is_some()),
+                ("wv", self.wv.is_some()),
+                ("wo", self.wo.is_some()),
             ];
             for (name, present) in required {
                 if !present {
@@ -628,7 +1062,9 @@ impl Lfm2Block {
                 // this eager path (lfm2_graph has its own `sc_state` ring),
                 // so the host mirror is ALWAYS re-synced here — that mirror
                 // is what keeps `Clone for Lfm2LayerCache` correct.
-                match self.shortconv_step_device(&proj, h_dim, l_cache, state, dev_state, &device, false) {
+                match self
+                    .shortconv_step_device(&proj, h_dim, l_cache, state, dev_state, &device, false)
+                {
                     Ok(Some(y_t)) => {
                         let block_out_2d =
                             self.shortconv_out_proj.as_ref().unwrap().forward(&y_t)?;
@@ -697,9 +1133,9 @@ impl Lfm2Block {
                             sum += conv_kernel_vec[w_base + k] * state[k * h_dim + d];
                         }
                         y_out[step * h_dim + d] = c[d] * sum;
-                        }
+                    }
 
-                        if l_cache > 1 {
+                    if l_cache > 1 {
                         state.copy_within(h_dim.., 0);
                         state[(l_cache - 2) * h_dim..].copy_from_slice(&bx);
                     }
@@ -762,7 +1198,15 @@ impl Lfm2Block {
             }
         } else if self.is_moe {
             self.forward_moe_ffn(&norm_x)?
+        } else if self.attention_mode == Lfm2AttentionMode::Gdl {
+            if CAPTURE_KIND.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                grave_capture_record(self.index, &norm_x);
+            }
+            self.forward_gdl(&norm_x, cache)?
         } else {
+            if CAPTURE_KIND.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                grave_capture_record(self.index, &norm_x);
+            }
             let steps = norm_x.shape().dims()[0];
             let hidden = norm_x.shape().dims().last().copied().unwrap();
             let kv_stride = self.num_kv_heads * self.head_dim;
@@ -773,7 +1217,11 @@ impl Lfm2Block {
             // Both the fused MXFP4 path and the F32 reference produce identical layouts so the attention.
             // `device_attn_out` is Some when the Item 3 device path computed the
             // attention entirely on device — the caller skips the host dispatch.
-            let (q_rot_vec, arena_total, device_attn_out): (Vec<f32>, Option<usize>, Option<Tensor>) = if use_fused {
+            let (q_rot_vec, arena_total, device_attn_out): (
+                Vec<f32>,
+                Option<usize>,
+                Option<Tensor>,
+            ) = if use_fused {
                 // The fused kernel appended the new K/V rows directly into
                 // the device arenas — attention can stay arena-resident.
                 let past = match cache {
@@ -834,7 +1282,10 @@ impl Lfm2Block {
                     }
                     _ => 0,
                 };
-                let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
+                let mut rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
+                // LFM2/LFM2.5 use NeoX-style half-split rotary pairs (llama.cpp
+                // LLM_ROPE_TYPE_NEOX), NOT the GPT-J interleaved default.
+                rope_cfg.interleaved = false;
 
                 // Item 3: lazily allocate + seed the past counter (device u32)
                 // BEFORE RoPE so the decode-graph path can alias pos_base_dev to
@@ -888,7 +1339,12 @@ impl Lfm2Block {
                         // Seed with the current past count.
                         let pos_bits = f32::from_bits(cache_offset as u32);
                         rocm_dev.write_f32_into(pos_tensor.storage().as_ref(), &[pos_bits])?;
-                        if let Lfm2LayerCache::Attention { pos_base_dev, past_dev, .. } = cache.as_mut().unwrap() {
+                        if let Lfm2LayerCache::Attention {
+                            pos_base_dev,
+                            past_dev,
+                            ..
+                        } = cache.as_mut().unwrap()
+                        {
                             // Both point to the SAME storage Arc — writes via
                             // one are visible to the other (true aliasing).
                             *pos_base_dev = Some(Box::new(pos_tensor.clone()));
@@ -920,8 +1376,7 @@ impl Lfm2Block {
                         Device::Rocm(o) => *o,
                         _ => 0,
                     };
-                    let rocm_dev =
-                        grim_backend_rocm::RocmDevice::shared(ordinal);
+                    let rocm_dev = grim_backend_rocm::RocmDevice::shared(ordinal);
                     // Lazily allocate the 1-element device position buffer, then
                     // overwrite it in place each token (one 4-byte H2D write).
                     let pos_base_dev_mut = match cache.as_mut().unwrap() {
@@ -1017,6 +1472,11 @@ impl Lfm2Block {
                             eprintln!(
                                 "[grim] decode_attention_device failed ({e}); eager attention fallback"
                             );
+                            grim_core::emit_fallback(
+                                "grim-models-transformer/lfm2",
+                                grim_core::FallbackReason::FusedQkvAttention,
+                                format!("{e}"),
+                            );
                             None
                         }
                     }
@@ -1070,39 +1530,96 @@ impl Lfm2Block {
                         }
                     };
                     match cache.as_mut().unwrap() {
-                        Lfm2LayerCache::Attention { dev_pos, k_dev, v_dev, .. } => {
+                        Lfm2LayerCache::Attention {
+                            dev_pos,
+                            k_dev,
+                            v_dev,
+                            ..
+                        } => {
                             if k_dev.is_none() {
-                                let shape =
-                                    Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+                                let shape = Shape::new(vec![kv_cache_len(), kv_stride]);
                                 *k_dev = Some(Box::new(Tensor::new(
-                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape.clone(),
                                     DType::F32,
                                     QuantProvenance::GrimNative,
                                     norm_x.device().clone(),
                                 )));
                                 *v_dev = Some(Box::new(Tensor::new(
-                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape,
                                     DType::F32,
                                     QuantProvenance::GrimNative,
                                     norm_x.device().clone(),
                                 )));
                             }
+                            // GRAVE task 0.3: grow the arena when decode would
+                            // run past capacity. The old code copied past the
+                            // allocation and GPU page-faulted at long contexts.
+                            let cap_rows = kv_cache_len();
+                            if total > cap_rows {
+                                let new_cap = cap_rows.saturating_mul(2).max(total);
+                                let grow = |slot: &mut Option<Box<Tensor>>| -> Result<()> {
+                                    let old = slot.as_ref().unwrap();
+                                    let new_shape = Shape::new(vec![new_cap, kv_stride]);
+                                    let new_storage = dev.zeros(&new_shape, kv_arena_dtype())?;
+                                    let new_tensor = Tensor::new(
+                                        Arc::from(new_storage),
+                                        new_shape.clone(),
+                                        DType::F32,
+                                        QuantProvenance::GrimNative,
+                                        norm_x.device().clone(),
+                                    );
+                                    dev.copy_slice_range(
+                                        new_tensor.storage().as_ref(),
+                                        0,
+                                        old.storage().as_ref(),
+                                        0,
+                                        past * kv_stride,
+                                    )?;
+                                    *slot = Some(Box::new(new_tensor));
+                                    Ok(())
+                                };
+                                grow(k_dev)?;
+                                grow(v_dev)?;
+                            }
                             let off_elems = past * kv_stride;
                             let cnt_elems = steps * kv_stride;
-                            dev.copy_slice_into(
-                                k_dev.as_ref().unwrap().storage().as_ref(),
-                                k_rot_storage.as_ref(),
-                                off_elems,
-                                cnt_elems,
-                            )?;
-                            dev.copy_slice_into(
-                                v_dev.as_ref().unwrap().storage().as_ref(),
-                                v.storage().as_ref(),
-                                off_elems,
-                                cnt_elems,
-                            )?;
+                            if grim_backend_rocm::kv_f16_enabled() {
+                                // f16 arena: convert f32 K/V rows on store.
+                                let rocm_dev =
+                                    grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+                                        Device::Rocm(o) => *o,
+                                        _ => 0,
+                                    });
+                                rocm_dev.convert_f32_to_f16_into(
+                                    k_rot_storage.as_ref(),
+                                    0,
+                                    rocm_of(k_dev.as_ref().unwrap()),
+                                    off_elems,
+                                    cnt_elems,
+                                )?;
+                                rocm_dev.convert_f32_to_f16_into(
+                                    v.storage().as_ref(),
+                                    0,
+                                    rocm_of(v_dev.as_ref().unwrap()),
+                                    off_elems,
+                                    cnt_elems,
+                                )?;
+                            } else {
+                                dev.copy_slice_into(
+                                    k_dev.as_ref().unwrap().storage().as_ref(),
+                                    k_rot_storage.as_ref(),
+                                    off_elems,
+                                    cnt_elems,
+                                )?;
+                                dev.copy_slice_into(
+                                    v_dev.as_ref().unwrap().storage().as_ref(),
+                                    v.storage().as_ref(),
+                                    off_elems,
+                                    cnt_elems,
+                                )?;
+                            }
                             *dev_pos = total;
                         }
                         _ => {
@@ -1167,21 +1684,23 @@ impl Lfm2Block {
                     let mut arena_total: Option<usize> = None;
                     let v_storage = v.storage();
                     match cache.as_mut().unwrap() {
-                        Lfm2LayerCache::Attention { k, v, k_dev, v_dev, .. } => {
+                        Lfm2LayerCache::Attention {
+                            k, v, k_dev, v_dev, ..
+                        } => {
                             let past = k.len() / kv_stride;
                             k.extend_from_slice(&k_rot_vec);
                             v.extend_from_slice(&v_vec);
                             if k_dev.is_none() {
-                                let shape = Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+                                let shape = Shape::new(vec![kv_cache_len(), kv_stride]);
                                 *k_dev = Some(Box::new(Tensor::new(
-                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape.clone(),
                                     DType::F32,
                                     QuantProvenance::GrimNative,
                                     norm_x.device().clone(),
                                 )));
                                 *v_dev = Some(Box::new(Tensor::new(
-                                    Arc::from(dev.zeros(&shape, DType::F32)?),
+                                    Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape,
                                     DType::F32,
                                     QuantProvenance::GrimNative,
@@ -1288,6 +1807,10 @@ impl Lfm2Block {
             };
             self.wo.as_ref().unwrap().forward(&attn_tensor)?
         };
+        // G3b feature-matching: attention output, pre-residual.
+        if CAPTURE_KIND.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+            grave_capture_record(self.index, &block_out);
+        }
 
         let x_added_shape = x.shape().clone();
         // F1 (PLAN-kernel-fusion): fuse residual add + FFN RMSNorm into one
@@ -1314,9 +1837,8 @@ impl Lfm2Block {
             }
         };
         let (x_added, norm_x_ffn) = match x.device() {
-            Device::Rocm(ordinal) if contiguous(x)
-                && contiguous(&block_out)
-                && contiguous(&self.ffn_norm.weight) =>
+            Device::Rocm(ordinal)
+                if contiguous(x) && contiguous(&block_out) && contiguous(&self.ffn_norm.weight) =>
             {
                 let rocm_dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
                 match rocm_dev.fused_add_rms_norm(
@@ -1365,9 +1887,9 @@ impl Lfm2Block {
                     self.fused_gate_up_dot4_decode(&norm_x_ffn, fused)?
                 }
                 _ => {
-                let gate = self.ffn_gate.forward(&norm_x_ffn)?;
-                let up = self.ffn_up.forward(&norm_x_ffn)?;
-                (gate, up)
+                    let gate = self.ffn_gate.forward(&norm_x_ffn)?;
+                    let up = self.ffn_up.forward(&norm_x_ffn)?;
+                    (gate, up)
                 }
             };
             let activated = silu_mul(&gate, &up)?;
@@ -1391,7 +1913,7 @@ impl Lfm2Block {
         let n_q = self.num_heads * self.head_dim;
         let n_k = self.num_kv_heads * self.head_dim;
         let n_v = self.num_kv_heads * self.head_dim;
-        let mut max_seq = LFM2_FUSED_KV_CACHE_LEN;
+        let mut max_seq = kv_cache_len();
 
         let cache_offset = match cache {
             Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / n_k,
@@ -1428,13 +1950,13 @@ impl Lfm2Block {
                 ));
             }
         };
-        // The fused-KV scratch starts at `LFM2_FUSED_KV_CACHE_LEN` positions but the model's context window is far larger; sessions whose sequence runs past the current capacity grow it (doubling) instead of reading past the allocation.
+        // The fused-KV scratch starts at `kv_cache_len()` positions but the model's context window is far larger; sessions whose sequence runs past the current capacity grow it (doubling) instead of reading past the allocation.
         // K and V always share one capacity.
         let needed = cache_offset + steps;
         {
             let cur = k_dev.as_ref().map(|t| t.shape().dims()[0]).unwrap_or(0);
             if cur < needed {
-                let new_cap = needed.max(LFM2_FUSED_KV_CACHE_LEN * 2);
+                let new_cap = needed.max(kv_cache_len() * 2);
                 let grow = |slot: &mut Option<Box<Tensor>>, row_len: usize| -> Result<()> {
                     let old_data = slot.as_ref().map(|t| t.to_vec_f32()).transpose()?;
                     let mut data = vec![0f32; new_cap * row_len];
@@ -1510,6 +2032,7 @@ impl Lfm2Block {
             1.0,
             self.eps,
             max_seq,
+            false,
         )?;
         // No explicit synchronize: the storages sync lazily on first host read (WI-Host-1
         // rationale); an eager sync here would stall the pipeline every decode step.
@@ -1592,10 +2115,13 @@ impl Lfm2Block {
         let n_blocks = hidden / 32;
         let q81_bytes = n_blocks * 36 * m;
         let act_q81 = Tensor::new(
-            Arc::from(dev.zeros(&Shape::new(vec![q81_bytes]), DType {
-                arith: ArithType::U8,
-                storage: grim_tensor::Storage::Native,
-            })?),
+            Arc::from(dev.zeros(
+                &Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: grim_tensor::Storage::Native,
+                },
+            )?),
             Shape::new(vec![q81_bytes]),
             DType {
                 arith: ArithType::U8,
@@ -1610,7 +2136,9 @@ impl Lfm2Block {
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
             .ok_or_else(|| {
-                grim_core::error::Error::Backend("fused gate_up path: norm_x is not RocmStorage".into())
+                grim_core::error::Error::Backend(
+                    "fused gate_up path: norm_x is not RocmStorage".into(),
+                )
             })?;
         let act_rocm = act_q81
             .storage()
@@ -1618,11 +2146,19 @@ impl Lfm2Block {
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
             .ok_or_else(|| {
-                grim_core::error::Error::Backend("fused gate_up path: act_q81 is not RocmStorage".into())
+                grim_core::error::Error::Backend(
+                    "fused gate_up path: act_q81 is not RocmStorage".into(),
+                )
             })?;
         dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
-        let out = dev.launch_fused_gate_up_dot4(act_rocm, &fused.storage, fused.n_gate, fused.n_up, hidden)?;
+        let out = dev.launch_fused_gate_up_dot4(
+            act_rocm,
+            &fused.storage,
+            fused.n_gate,
+            fused.n_up,
+            hidden,
+        )?;
         let out_arc: Arc<dyn grim_tensor::BackendStorage> = Arc::from(out);
         let gate_bytes = fused.n_gate * 4;
         let up_bytes = fused.n_up * 4;
@@ -1704,9 +2240,15 @@ impl Lfm2Block {
                 dev_pos: 0,
             });
         }
-        // Single mutable borrow: pull past_dev, k_dev, v_dev out together.
-        let (past_dev, k_dev, v_dev) = match cache.as_mut().unwrap() {
-            Lfm2LayerCache::Attention { past_dev, k_dev, v_dev, .. } => (past_dev, k_dev, v_dev),
+        // Single mutable borrow: pull past_dev, k_dev, v_dev, dev_pos out together.
+        let (past_dev, k_dev, v_dev, dev_pos) = match cache.as_mut().unwrap() {
+            Lfm2LayerCache::Attention {
+                past_dev,
+                k_dev,
+                v_dev,
+                dev_pos,
+                ..
+            } => (past_dev, k_dev, v_dev, dev_pos),
             _ => {
                 return Err(grim_core::error::Error::Session(
                     "Mismatched Attention layer cache".into(),
@@ -1726,18 +2268,53 @@ impl Lfm2Block {
         }
         let past_dev = past_dev.as_ref().unwrap();
 
+        // GRAVE task 0.3: grow the device arenas BEFORE the append when decode
+        // would run past capacity — `grim_kv_append` writes at `*past_dev` and
+        // cannot bounds-check. The old code page-faulted at long contexts.
+        let cap_rows = k_dev
+            .as_ref()
+            .map(|a| a.shape().dims()[0])
+            .unwrap_or_else(kv_cache_len);
+        if *dev_pos + steps > cap_rows {
+            let new_cap = (cap_rows.saturating_mul(2)).max(*dev_pos + steps);
+            let grow = |slot: &mut Option<Box<Tensor>>| -> Result<()> {
+                let old = slot.as_ref().unwrap();
+                let old_rows = old.shape().dims()[0];
+                let new_shape = Shape::new(vec![new_cap, kv_stride]);
+                let new_storage = rocm_dev.zeros(&new_shape, kv_arena_dtype())?;
+                let new_tensor = Tensor::new(
+                    Arc::from(new_storage),
+                    new_shape.clone(),
+                    DType::F32,
+                    QuantProvenance::GrimNative,
+                    device.clone(),
+                );
+                rocm_dev.copy_slice_range(
+                    new_tensor.storage().as_ref(),
+                    0,
+                    old.storage().as_ref(),
+                    0,
+                    old_rows * kv_stride,
+                )?;
+                *slot = Some(Box::new(new_tensor));
+                Ok(())
+            };
+            grow(k_dev)?;
+            grow(v_dev)?;
+        }
+
         // Allocate / reuse device KV arenas.
         if k_dev.is_none() {
-            let shape = Shape::new(vec![LFM2_FUSED_KV_CACHE_LEN, kv_stride]);
+            let shape = Shape::new(vec![kv_cache_len(), kv_stride]);
             *k_dev = Some(Box::new(Tensor::new(
-                Arc::from(rocm_dev.zeros(&shape, DType::F32)?),
+                Arc::from(rocm_dev.zeros(&shape, kv_arena_dtype())?),
                 shape.clone(),
                 DType::F32,
                 QuantProvenance::GrimNative,
                 device.clone(),
             )));
             *v_dev = Some(Box::new(Tensor::new(
-                Arc::from(rocm_dev.zeros(&shape, DType::F32)?),
+                Arc::from(rocm_dev.zeros(&shape, kv_arena_dtype())?),
                 shape,
                 DType::F32,
                 QuantProvenance::GrimNative,
@@ -1767,6 +2344,7 @@ impl Lfm2Block {
             steps,
         )?;
         let _ = stream;
+        *dev_pos += steps;
 
         // Online-softmax attention reading total = *past_dev + steps from device.
         let out_shape = Shape::new(vec![steps, self.num_heads * self.head_dim]);
@@ -1802,7 +2380,8 @@ impl Lfm2Block {
         )?;
         let _ = stream;
         // Bump the counter LAST so the next replay appends at the new offset.
-        let stream = grim_backend_rocm::launch_bump_i32(&rocm_dev, past_dev.storage().as_ref(), steps)?;
+        let stream =
+            grim_backend_rocm::launch_bump_i32(&rocm_dev, past_dev.storage().as_ref(), steps)?;
         let _ = stream;
 
         // Wrap the device attention output as a Tensor for the caller.
@@ -1856,11 +2435,13 @@ impl Lfm2Block {
                         st_cm[d * kc + t] = state[t * h_dim + d];
                     }
                 }
-                *dev_state = Some(dev.from_cpu(&st_cm, &Shape::new(vec![kc * h_dim]), DType::F32)?);
+                *dev_state =
+                    Some(dev.from_cpu(&st_cm, &Shape::new(vec![kc * h_dim]), DType::F32)?);
             }
             // Non-ROCm: legacy per-call upload from the host mirror.
             let state_st;
-            let state_ref: &dyn grim_tensor::BackendStorage = if let Some(ring) = dev_state.as_ref() {
+            let state_ref: &dyn grim_tensor::BackendStorage = if let Some(ring) = dev_state.as_ref()
+            {
                 ring.as_ref()
             } else {
                 let mut st_cm = vec![0.0f32; kc * h_dim];
@@ -1925,7 +2506,6 @@ impl Lfm2Block {
         }
     }
 
-
     /// Slice the per-expert `[n_ff, hidden]` weight out of the stacked
     /// `[n_expert, n_ff, hidden]` tensor, as a device-resident `Linear`.
     /// One-time cost per expert (load-time weights, cached by caller via the
@@ -1944,15 +2524,11 @@ impl Lfm2Block {
             // stacked source stays resident (needed by Charon later); each
             // expert Linear gets its own `[f, h]` device tensor once.
             let dev = grim_nn::modules::pick_device_for_storage_device(t.device());
-            let st = dev.alloc_storage(&Shape::new(vec![f, h]), DType::F32).ok()?;
-            dev.copy_slice_range(
-                st.as_ref(),
-                0,
-                t.storage().as_ref(),
-                e * f * h,
-                f * h,
-            )
-            .ok()?;
+            let st = dev
+                .alloc_storage(&Shape::new(vec![f, h]), DType::F32)
+                .ok()?;
+            dev.copy_slice_range(st.as_ref(), 0, t.storage().as_ref(), e * f * h, f * h)
+                .ok()?;
             Some(Linear::from_tensor(
                 Tensor::new(
                     Arc::from(st),
@@ -1972,11 +2548,13 @@ impl Lfm2Block {
     }
 
     pub fn moe_experts(&self) -> Option<&Vec<crate::shared_moe::MoeExpert>> {
-        self.moe_experts_cache.get_or_init(|| {
-            (0..self.n_expert.max(1))
-                .map(|e| self.moe_expert_at(e))
-                .collect::<Option<Vec<_>>>()
-        }).as_ref()
+        self.moe_experts_cache
+            .get_or_init(|| {
+                (0..self.n_expert.max(1))
+                    .map(|e| self.moe_expert_at(e))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .as_ref()
     }
 
     /// M1 (PLAN-kernel-fusion): top-k MoE via `shared_moe`. Device-resident
@@ -2063,7 +2641,11 @@ impl Lfm2Block {
                         let row = &probs[s * n_expert..(s + 1) * n_expert];
                         let k = self.n_expert_used.min(n_expert).max(1);
                         let mut idx: Vec<usize> = (0..n_expert).collect();
-                        idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+                        idx.sort_by(|&a, &b| {
+                            row[b]
+                                .partial_cmp(&row[a])
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
                         idx[..k].iter().map(|&e| (e, row[e])).collect()
                     })
                     .collect();
@@ -2176,6 +2758,722 @@ impl Lfm2Block {
         }
 
         device_tensor(out, Shape::new(vec![steps, hidden]), x.device())
+    }
+
+    /// GRAVE Phase 2: Gated DeltaNet-2 linear attention forward for non-recurrent layers.
+    ///
+    /// Computes tokenwise GDN-2 recurrence in f32 host math, preserving constant state memory
+    /// in `Lfm2LayerCache::Gdl`. Projections (wq, wk, wv, wo) are inherited from teacher.
+    /// Decoupled erase/write gates and decay are initialized via Taylor-Calibrate defaults.
+    ///
+    /// Harness override: `GRIM_GRAVE_GATES="d,e,w;..."` (one triple per layer
+    /// index) replaces this block's `gdl_gates` for the call. Returns `None`
+    /// when unset/unparseable (caller falls back to the block triple).
+    fn grave_gate_override(layer_idx: usize) -> Option<[f64; 3]> {
+        let raw = std::env::var("GRIM_GRAVE_GATES").ok()?;
+        let triple = raw.split(';').nth(layer_idx)?;
+        let mut it = triple.split(',');
+        let d: f64 = it.next()?.trim().parse().ok()?;
+        let e: f64 = it.next()?.trim().parse().ok()?;
+        let w: f64 = it.next()?.trim().parse().ok()?;
+        if !(0.0 < d && d <= 1.0) || !(0.0 <= e && e <= 1.0) || !(0.0 <= w && w <= 1.0) {
+            return None;
+        }
+        Some([d, e, w])
+    }
+
+    /// G4b Phase 3: per-token gate vectors now come from the gate-augmented
+    /// fused blob in `forward_gdl_device_fused` (ROCm, Q8_0 teacher QKV) or the
+    /// host loop below (any device). The old per-step 3-GEMV helpers were
+    /// superseded by the single fused GEMV.
+    ///
+    /// Layout returned: `[steps, nh, dk]` f32 contiguous (replicated across the
+    /// head axis), matching the fused kernel's `b_gate[h*dk + i]` indexing for
+    /// batch-1. Computed on the host — for the decode hot path (steps = 1) this
+    /// is 3 × (dk FMA + sigmoid) ≈ 3·64·1024 flops, trivial against the fused
+    /// recurrent update.
+
+    /// GRAVE Phase 4: device-resident GDN-2 forward — zero host readbacks.
+    ///
+    /// Same math as the host loop below: per-token fused launches
+    /// (`grim_gla_state_update_output`, one launch per token for all heads)
+    /// with the recurrent state kept in `cache.dev_state` (allocated once).
+    /// Per-step Q/K/V slices and the assembled output move D2D only.
+    /// Gate vectors (~1 KB each) upload once per call — negligible.
+    /// `Unimplemented` → caller falls back to the host loop (never a wrong
+    /// launch: GQA and non-64 dims stay on CPU until their kernels land).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gdl_device(
+        &self,
+        norm_x: &Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        cache: &mut Option<Lfm2LayerCache>,
+        gates: [f64; 3],
+    ) -> Result<Tensor> {
+        use grim_backend_rocm::device::compute::gla_launchers::GlaLaunchArgs;
+        use grim_backend_rocm::device::util::DeviceGuard;
+        use grim_tensor::MemoryOps;
+
+        // P1-3 / G4a: raw HIP ops below bind to the owning device — pin the
+        // context (the matmul/gate-readback path touches device memory).
+        let _dev_guard = DeviceGuard::set(match norm_x.device() {
+            Device::Rocm(o) => *o as i32,
+            _ => 0,
+        });
+
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            eprintln!("[gdl] device-resident fused path active (zero host readbacks)");
+        });
+
+        let ordinal = match norm_x.device() {
+            Device::Rocm(o) => *o,
+            _ => {
+                return Err(grim_core::error::Error::Unimplemented(
+                    "forward_gdl_device: non-ROCm tensor".into(),
+                ));
+            }
+        };
+        let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        if hd != 64 || nh % nkv != 0 {
+            return Err(grim_core::error::Error::Unimplemented(
+                "forward_gdl_device: needs dk==dv==64 and nh % nkv == 0".into(),
+            ));
+        }
+        let steps = norm_x.shape().dims()[0];
+        let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+        let f32dt = DType::F32;
+
+        // Recurrent state: take ownership for the call, restore after.
+        let state_box: Box<dyn BackendStorage> = match cache.as_mut() {
+            Some(Lfm2LayerCache::Gdl { dev_state, .. }) => match dev_state.take() {
+                Some(s) => s,
+                None => dev.zeros(&Shape::new(vec![nh * 64 * 64]), f32dt.clone())?,
+            },
+            _ => {
+                let z = dev.zeros(&Shape::new(vec![nh * 64 * 64]), f32dt.clone())?;
+                *cache = Some(Lfm2LayerCache::Gdl {
+                    state: vec![0.0f32; nh * 64 * 64],
+                    dev_state: None,
+                });
+                z
+            }
+        };
+
+        // Gate vectors. Two regimes:
+        //   STATIC (projections absent): the original scalar triple broadcast to a
+        //       uniform per-channel vector, uploaded once, reused every step.
+        //   PER-TOKEN (G3b projections present): the three gate projections are
+        //       driven by this step's norm_x, producing per-channel erase/write/
+        //       decay vectors (GDL-2 spec, shared across heads). Computed per
+        //       step — the decode hot path (steps = 1) makes this three tiny
+        //       matmuls + a sigmoid, negligible vs the fused update.
+        // This device path serves only the static scalar triple (reached solely
+        // with no gate projections); per-token gates take the fused path.
+        // Static scalar gates (no projections): broadcast triple to uniform
+        // per-channel vectors, reused every step.
+        let static_gates = (
+            device_tensor(
+                vec![gates[0] as f32; nh * 64],
+                Shape::new(vec![nh * 64]),
+                norm_x.device(),
+            )?,
+            device_tensor(
+                vec![gates[1] as f32; nh * 64],
+                Shape::new(vec![nh * 64]),
+                norm_x.device(),
+            )?,
+            device_tensor(
+                vec![gates[2] as f32; nh * 64],
+                Shape::new(vec![nh * 64]),
+                norm_x.device(),
+            )?,
+        );
+        let norm_t = device_tensor(
+            vec![1.0f32; nh * 64],
+            Shape::new(vec![nh * 64]),
+            norm_x.device(),
+        )?;
+        let gate_t = device_tensor(vec![0.0f32; nh], Shape::new(vec![nh]), norm_x.device())?;
+        let norm_s = grim_backend_rocm::as_rocm(norm_t.storage().as_ref())?;
+        let gate_s = grim_backend_rocm::as_rocm(gate_t.storage().as_ref())?;
+        let state_s = grim_backend_rocm::as_rocm(state_box.as_ref())?;
+
+        // Per-step staging (owned locals; D2D slices, no readbacks).
+        let stage = |n: usize| -> Result<Box<dyn BackendStorage>> {
+            dev.zeros(&Shape::new(vec![n]), f32dt.clone())
+                .map_err(grim_core::error::Error::Tensor)
+        };
+        let q1 = stage(nh * 64)?;
+        let k1 = stage(nkv * 64)?;
+        let v1 = stage(nkv * 64)?;
+        let k1_exp = stage(nh * 64)?;
+        let v1_exp = stage(nh * 64)?;
+        let o1 = stage(nh * 64)?;
+        // NOTE: out_all MUST be allocated with the 2-D shape [steps, nh*64],
+        // not the flattened 1-D shape. The matmul reads the storage's shape,
+        // and a 1-D storage wrapped in a 2-D tensor reports rank 1 to the
+        // matmul, which then rejects it with "rank >= 2".
+        let out_all = dev
+            .zeros(&Shape::new(vec![steps, nh * 64]), f32dt.clone())
+            .map_err(grim_core::error::Error::Tensor)?;
+        let q_src = grim_backend_rocm::as_rocm(q.storage().as_ref())?;
+        let k_src = grim_backend_rocm::as_rocm(k.storage().as_ref())?;
+        let v_src = grim_backend_rocm::as_rocm(v.storage().as_ref())?;
+        let k1_exp_s = grim_backend_rocm::as_rocm(k1_exp.as_ref())?;
+        let v1_exp_s = grim_backend_rocm::as_rocm(v1_exp.as_ref())?;
+        let kv_group = nh / nkv;
+
+        for s in 0..steps {
+            // This device path only serves the static scalar triple (it is
+            // reached solely when there are no gate projections); per-token
+            // gates take the fused path in `forward_gdl_device_fused`.
+            let (alpha_t, b_t, w_t): (Tensor, Tensor, Tensor) = (
+                static_gates.0.clone(),
+                static_gates.1.clone(),
+                static_gates.2.clone(),
+            );
+            let alpha_s = grim_backend_rocm::as_rocm(alpha_t.storage().as_ref())?;
+            let b_s = grim_backend_rocm::as_rocm(b_t.storage().as_ref())?;
+            let w_s = grim_backend_rocm::as_rocm(w_t.storage().as_ref())?;
+            dev.copy_slice_range(q1.as_ref(), 0, q_src, s * nh * 64, nh * 64)?;
+            dev.copy_slice_range(k1.as_ref(), 0, k_src, s * nkv * 64, nkv * 64)?;
+            dev.copy_slice_range(v1.as_ref(), 0, v_src, s * nkv * 64, nkv * 64)?;
+
+            if nkv != nh {
+                dev.head_repeat(
+                    k1.as_ref(),
+                    v1.as_ref(),
+                    k1_exp_s,
+                    v1_exp_s,
+                    nkv,
+                    nh,
+                    kv_group,
+                    64,
+                )?;
+            }
+
+            let (k_launch, v_launch): (&dyn grim_tensor::BackendStorage, &dyn grim_tensor::BackendStorage) =
+                if nkv != nh {
+                    (k1_exp.as_ref(), v1_exp.as_ref())
+                } else {
+                    (k1.as_ref(), v1.as_ref())
+                };
+            dev.launch_gla_state_update_output_into(&GlaLaunchArgs {
+                q: grim_backend_rocm::as_rocm(q1.as_ref())?,
+                k: grim_backend_rocm::as_rocm(k_launch)?,
+                v: grim_backend_rocm::as_rocm(v_launch)?,
+                alpha: alpha_s,
+                b_gate: b_s,
+                w_gate: w_s,
+                norm_w: norm_s,
+                out_gate: gate_s,
+                state: state_s,
+                out: grim_backend_rocm::as_rocm(o1.as_ref())?,
+                heads: nh,
+                batch: 1,
+                dk: 64,
+                dv: 64,
+                eps: self.eps,
+            })
+            .map_err(|e| grim_core::error::Error::Backend(format!("forward_gdl_device: {e}")))?;
+            dev.copy_slice_range(out_all.as_ref(), s * nh * 64, o1.as_ref(), 0, nh * 64)?;
+        }
+
+        // Restore state ownership to the cache.
+        if let Some(Lfm2LayerCache::Gdl {
+            dev_state: slot, ..
+        }) = cache.as_mut()
+        {
+            *slot = Some(state_box);
+        }
+        let out_tensor = Tensor::new(
+            std::sync::Arc::from(out_all),
+            Shape::new(vec![steps, nh * 64]),
+            f32dt,
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        self.wo
+            .as_ref()
+            .unwrap()
+            .forward(&out_tensor)
+            .map_err(grim_core::error::Error::Tensor)
+    }
+
+    /// G4b Phase 3: device-resident GDN-2 forward over the GATE-AUGMENTED fused
+    /// blob. ONE fused QKV+gate GEMV produces Q, K, V and the three gate logits
+    /// per step; each gate logit slice is biased → sigmoided → broadcast on
+    /// device, then the existing fused GDL kernel runs. Net: 1 GEMV/layer + 3
+    /// tiny sigmoid/broadcasts, down from 1 GEMV + 3 gate GEMVs.
+    ///
+    /// Reachable only when `gdl_fused_qkv_gates` is `Some` (ROCm, Q8_0 teacher
+    /// QKV, trained gate projections installed). Static-gate blocks and
+    /// non-fusable blocks take `forward_gdl_device`/`forward_gdl` instead.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gdl_device_fused(
+        &self,
+        norm_x: &Tensor,
+        fused: &GdlFusedQkvGates,
+        cache: &mut Option<Lfm2LayerCache>,
+    ) -> Result<Tensor> {
+        use grim_backend_rocm::device::compute::gla_launchers::GlaLaunchArgs;
+        use grim_backend_rocm::device::util::DeviceGuard;
+        use grim_tensor::MemoryOps;
+
+        let _dev_guard = DeviceGuard::set(match norm_x.device() {
+            Device::Rocm(o) => *o as i32,
+            _ => 0,
+        });
+
+        let ordinal = match norm_x.device() {
+            Device::Rocm(o) => *o,
+            _ => {
+                return Err(grim_core::error::Error::Unimplemented(
+                    "forward_gdl_device_fused: non-ROCm tensor".into(),
+                ));
+            }
+        };
+        let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        if hd != 64 || nh % nkv != 0 {
+            return Err(grim_core::error::Error::Unimplemented(
+                "forward_gdl_device_fused: needs dk==dv==64 and nh % nkv == 0".into(),
+            ));
+        }
+        let steps = norm_x.shape().dims()[0];
+        let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+        let f32dt = DType::F32;
+
+        // Recurrent state: take ownership for the call, restore after (mirror
+        // forward_gdl_device exactly).
+        let state_box: Box<dyn BackendStorage> = match cache.as_mut() {
+            Some(Lfm2LayerCache::Gdl { dev_state, .. }) => match dev_state.take() {
+                Some(s) => s,
+                None => dev.zeros(&Shape::new(vec![nh * 64 * 64]), f32dt.clone())?,
+            },
+            _ => {
+                let z = dev.zeros(&Shape::new(vec![nh * 64 * 64]), f32dt.clone())?;
+                *cache = Some(Lfm2LayerCache::Gdl {
+                    state: vec![0.0f32; nh * 64 * 64],
+                    dev_state: None,
+                });
+                z
+            }
+        };
+
+        // Upload-once buffers the fused GDL kernel consumes.
+        let norm_t = device_tensor(
+            vec![1.0f32; nh * 64],
+            Shape::new(vec![nh * 64]),
+            norm_x.device(),
+        )?;
+        let gate_t = device_tensor(vec![0.0f32; nh], Shape::new(vec![nh]), norm_x.device())?;
+        let norm_s = grim_backend_rocm::as_rocm(norm_t.storage().as_ref())?;
+        let gate_s = grim_backend_rocm::as_rocm(gate_t.storage().as_ref())?;
+        let state_s = grim_backend_rocm::as_rocm(state_box.as_ref())?;
+
+        // Build the q8_1 activation once and run the single fused QKV+gate GEMV.
+        let hidden = fused.weights.hidden;
+        let n_blocks = hidden / 32;
+        let q81_elems = n_blocks * 36 * steps.max(1);
+        let act_q81 = Tensor::new(
+            Arc::from(dev.zeros(
+                &Shape::new(vec![q81_elems]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: grim_tensor::Storage::Native,
+                },
+            )?),
+            Shape::new(vec![q81_elems]),
+            DType {
+                arith: ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let x_rocm = norm_x
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "forward_gdl_device_fused: norm_x is not RocmStorage".into(),
+                )
+            })?;
+        let act_rocm = act_q81
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "forward_gdl_device_fused: act_q81 is not RocmStorage".into(),
+                )
+            })?;
+        dev.launch_quantize_q8_1(x_rocm, act_rocm, steps, hidden)?;
+        let fused_elems = fused.weights.n_total_with_gates();
+
+        // Staging helper: allocate an owned device f32 buffer of `n` elements.
+        let stage = |n: usize| -> Result<Box<dyn BackendStorage>> {
+            dev.zeros(&Shape::new(vec![n]), f32dt.clone())
+                .map_err(grim_core::error::Error::Tensor)
+        };
+        let fused_out = stage(steps * fused_elems)?;
+        let fused_rocm = grim_backend_rocm::as_rocm(fused_out.as_ref())?;
+        dev.launch_fused_qkv_gates_dot4_into(act_rocm, &fused.weights, fused_rocm, steps)?;
+
+        // Staging for per-step Q/K/V slices and GDL output. For GQA, k1/v1
+        // hold the compact [nkv, 64] slices; k1_exp/v1_exp hold the expanded
+        // [nh, 64] versions the GDL kernel consumes.
+        let q1 = stage(nh * 64)?;
+        let k1 = stage(nkv * 64)?;
+        let v1 = stage(nkv * 64)?;
+        let k1_exp = stage(nh * 64)?;
+        let v1_exp = stage(nh * 64)?;
+        let o1 = stage(nh * 64)?;
+        // NOTE: out_all MUST be allocated with the 2-D shape [steps, nh*64],
+        // not the flattened 1-D shape. The matmul reads the storage's shape,
+        // and a 1-D storage wrapped in a 2-D tensor reports rank 1 to the
+        // matmul, which then rejects it with "rank >= 2".
+        let out_all = dev
+            .zeros(&Shape::new(vec![steps, nh * 64]), f32dt.clone())
+            .map_err(grim_core::error::Error::Tensor)?;
+
+        // Per-step gate scratch: a [dk]/[dv] logit staging buffer plus a
+        // [nh,dk]/[nh,dv] broadcast target, reused across steps. Downcast to
+        // `&RocmStorage` once up front (the elementwise/broadcast APIs require it
+        // for the destination) and reuse the handles across steps.
+        let logit_b = stage(fused.dk)?;
+        let logit_w = stage(fused.dv)?;
+        let logit_f = stage(fused.dk)?;
+        let gates_b = stage(nh * fused.dk)?;
+        let gates_w = stage(nh * fused.dv)?;
+        let gates_f = stage(nh * fused.dk)?;
+        let logit_b_s = grim_backend_rocm::as_rocm(logit_b.as_ref())?;
+        let logit_w_s = grim_backend_rocm::as_rocm(logit_w.as_ref())?;
+        let logit_f_s = grim_backend_rocm::as_rocm(logit_f.as_ref())?;
+        let gates_b_s = grim_backend_rocm::as_rocm(gates_b.as_ref())?;
+        let gates_w_s = grim_backend_rocm::as_rocm(gates_w.as_ref())?;
+        let gates_f_s = grim_backend_rocm::as_rocm(gates_f.as_ref())?;
+
+        let gb_off = fused.weights.gb_offset();
+        let gw_off = fused.weights.gw_offset();
+        let gf_off = fused.weights.gf_offset();
+        let n_gb = fused.weights.n_gb;
+        let n_gw = fused.weights.n_gw;
+        let n_gf = fused.weights.n_gf;
+        let bias_b = fused.bias_b.as_rocm()?;
+        let bias_w = fused.bias_w.as_rocm()?;
+        let bias_f = fused.bias_f.as_rocm()?;
+
+        let n_q = fused.weights.n_q;
+        let n_k = fused.weights.n_k;
+        let n_v = fused.weights.n_v;
+        let kv_group = nh / nkv;
+        let k1_exp_s = grim_backend_rocm::as_rocm(k1_exp.as_ref())?;
+        let v1_exp_s = grim_backend_rocm::as_rocm(v1_exp.as_ref())?;
+
+        for s in 0..steps {
+            // Slice this step's Q/K/V out of the fused GEMV output. QKV occupies
+            // the leading `n_total` elements; the gate regions follow at their
+            // fused offsets. For GQA (nh != nkv), K and V are expanded from
+            // nkv to nh via head-repeat: each KV head is shared by kv_group
+            // adjacent query heads (kv_h = h / kv_group).
+            let row = s * fused_elems;
+            dev.copy_slice_range(q1.as_ref(), 0, fused_rocm, row, n_q)?;
+            dev.copy_slice_range(k1.as_ref(), 0, fused_rocm, row + n_q, n_k)?;
+            dev.copy_slice_range(v1.as_ref(), 0, fused_rocm, row + n_q + n_k, n_v)?;
+
+            if nkv != nh {
+                dev.head_repeat(
+                    k1.as_ref(),
+                    v1.as_ref(),
+                    k1_exp_s,
+                    v1_exp_s,
+                    nkv,
+                    nh,
+                    kv_group,
+                    64,
+                )?;
+            }
+
+            // Erase gate (B): slice logits, add bias, sigmoid, broadcast.
+            dev.copy_slice_range(logit_b.as_ref(), 0, fused_rocm, row + gb_off, n_gb)?;
+            let _hb = dev.add_into(logit_b_s, bias_b, logit_b_s)?;
+            dev.sigmoid_into(logit_b_s, logit_b_s)?;
+            dev.broadcast_heads(logit_b_s, gates_b_s, fused.dk, nh)?;
+
+            // Write gate (W).
+            dev.copy_slice_range(logit_w.as_ref(), 0, fused_rocm, row + gw_off, n_gw)?;
+            let _hw = dev.add_into(logit_w_s, bias_w, logit_w_s)?;
+            dev.sigmoid_into(logit_w_s, logit_w_s)?;
+            dev.broadcast_heads(logit_w_s, gates_w_s, fused.dv, nh)?;
+
+            // Decay gate (F).
+            dev.copy_slice_range(logit_f.as_ref(), 0, fused_rocm, row + gf_off, n_gf)?;
+            let _hf = dev.add_into(logit_f_s, bias_f, logit_f_s)?;
+            dev.sigmoid_into(logit_f_s, logit_f_s)?;
+            dev.broadcast_heads(logit_f_s, gates_f_s, fused.dk, nh)?;
+
+            let (k_launch, v_launch): (&dyn grim_tensor::BackendStorage, &dyn grim_tensor::BackendStorage) =
+                if nkv != nh {
+                    (k1_exp.as_ref(), v1_exp.as_ref())
+                } else {
+                    (k1.as_ref(), v1.as_ref())
+                };
+            dev.launch_gla_state_update_output_into(&GlaLaunchArgs {
+                q: grim_backend_rocm::as_rocm(q1.as_ref())?,
+                k: grim_backend_rocm::as_rocm(k_launch)?,
+                v: grim_backend_rocm::as_rocm(v_launch)?,
+                alpha: gates_f_s,
+                b_gate: gates_b_s,
+                w_gate: gates_w_s,
+                norm_w: norm_s,
+                out_gate: gate_s,
+                state: state_s,
+                out: grim_backend_rocm::as_rocm(o1.as_ref())?,
+                heads: nh,
+                batch: 1,
+                dk: 64,
+                dv: 64,
+                eps: self.eps,
+            })
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("forward_gdl_device_fused: {e}"))
+            })?;
+            dev.copy_slice_range(out_all.as_ref(), s * nh * 64, o1.as_ref(), 0, nh * 64)?;
+        }
+
+        // Restore state ownership to the cache.
+        if let Some(Lfm2LayerCache::Gdl {
+            dev_state: slot, ..
+        }) = cache.as_mut()
+        {
+            *slot = Some(state_box);
+        }
+        let out_tensor = Tensor::new(
+            Arc::from(out_all),
+            Shape::new(vec![steps, nh * 64]),
+            f32dt,
+            grim_tensor::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        self.wo
+            .as_ref()
+            .unwrap()
+            .forward(&out_tensor)
+            .map_err(grim_core::error::Error::Tensor)
+    }
+
+    fn forward_gdl(&self, norm_x: &Tensor, cache: &mut Option<Lfm2LayerCache>) -> Result<Tensor> {
+        let _hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
+        let steps = norm_x.shape().dims()[0];
+        let num_heads = self.num_heads;
+        let num_kv_heads = self.num_kv_heads;
+        let head_dim = self.head_dim;
+        let kv_group = num_heads / num_kv_heads.max(1);
+
+        // 1b. Gate operating point first: the device paths below need it, and
+        // branching BEFORE the readbacks is the whole point (zero D2H).
+        // (Comment block preserved at the host loop where the values land.)
+        let gates = Self::grave_gate_override(self.index).unwrap_or(self.gdl_gates);
+
+        let has_projections =
+            self.gdl_b_proj.is_some() || self.gdl_w_proj.is_some() || self.gdl_f_proj.is_some();
+        let on_rocm = matches!(norm_x.device(), Device::Rocm(_));
+
+        // G4b Phase 3 — fused eager path. With trained gate projections present
+        // AND a usable gate-augmented fused blob (ROCm + Q8_0 teacher QKV), one
+        // fused QKV+gate GEMV produces Q, K, V and the three gate logits; gates
+        // are biased → sigmoided → broadcast on device, then the fused GDL
+        // kernel runs. This supersedes the old per-step 3-gate-GEMV host path.
+        if has_projections && on_rocm {
+            if let Some(fused) = self.gdl_fused_qkv_gates.as_ref() {
+                match self.forward_gdl_device_fused(norm_x, fused, cache) {
+                    Ok(t) => return Ok(t),
+                    Err(grim_core::error::Error::Unimplemented(msg)) => {
+                        eprintln!(
+                            "[gdl-fused] layer {} fused path unimplemented: {} (falling back to host loop)",
+                            self.index, msg
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            // No usable blob (non-Q8_0 QKV, build failed): fall through to the
+            // host loop, which handles projections correctly on any device.
+        }
+
+        // 1. Projections via teacher weights (only reached by the static device
+        // path and the host loop; the fused path above never needs these).
+        let q = self.wq.as_ref().unwrap().forward(norm_x)?;
+        let k = self.wk.as_ref().unwrap().forward(norm_x)?;
+        let v = self.wv.as_ref().unwrap().forward(norm_x)?;
+
+        // Static scalar gates (no projections): the original device-resident
+        // path on ROCm, zero host readbacks.
+        if !has_projections && on_rocm {
+            match self.forward_gdl_device(norm_x, &q, &k, &v, cache, gates) {
+                Ok(t) => return Ok(t),
+                Err(grim_core::error::Error::Unimplemented(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let q_vec = q.to_vec_f32()?;
+        let k_vec = k.to_vec_f32()?;
+        let v_vec = v.to_vec_f32()?;
+
+        // 2. Ensure GDL cache exists
+        let total_state_size = num_heads * head_dim * head_dim;
+        if cache.is_none() {
+            *cache = Some(Lfm2LayerCache::Gdl {
+                state: vec![0.0f32; total_state_size],
+                dev_state: None,
+            });
+        }
+        let state_slice = match cache.as_mut().unwrap() {
+            Lfm2LayerCache::Gdl { state, .. } => {
+                if state.len() != total_state_size {
+                    state.resize(total_state_size, 0.0f32);
+                }
+                state.as_mut_slice()
+            }
+            _ => {
+                return Err(grim_core::error::Error::Session(
+                    "Mismatched Gdl layer cache".into(),
+                ));
+            }
+        };
+
+        // 3. Gate operating point: per-layer learned triple (see 1b above
+        // for the Taylor-Calibrate derivation and the harness override).
+        // Values were resolved before the device branch; reuse them here.
+        let decay_val = gates[0];
+        let erase_val = gates[1];
+        let write_val = gates[2];
+
+        // GRAVE Phase 3b.5: per-token gate rows from the GdlGate projections
+        // (per-channel, per-token gates — the mechanism the 18-scalar plateau
+        // lacked). None = static scalar triple (proven path, unchanged).
+        let gate_rows: Option<(Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> =
+            match (&self.gdl_b_proj, &self.gdl_w_proj, &self.gdl_f_proj) {
+                (Some(bp), Some(wp), Some(fp)) => {
+                    let nb = bp.forward(norm_x)?; // [steps, dk] erase logits
+                    let nw = wp.forward(norm_x)?; // [steps, dv] write logits
+                    let nf = fp.forward(norm_x)?; // [steps, dk] decay logits
+                    let nb_v = nb.to_vec_f32()?;
+                    let nw_v = nw.to_vec_f32()?;
+                    let nf_v = nf.to_vec_f32()?;
+                    let dk = head_dim;
+                    let dv = head_dim;
+                    let mut rows_b = Vec::with_capacity(steps);
+                    let mut rows_w = Vec::with_capacity(steps);
+                    let mut rows_f = Vec::with_capacity(steps);
+                    for s in 0..steps {
+                        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+                        let mut rb = vec![0.5f32; dk];
+                        let mut rw = vec![0.5f32; dv];
+                        let mut rf = vec![(-2.0f64.ln() / dk as f64) as f32; dk];
+                        for i in 0..dk {
+                            rb[i] = sigmoid(nb_v[s * dk + i]);
+                            rf[i] = sigmoid(nf_v[s * dk + i]);
+                        }
+                        for j in 0..dv {
+                            rw[j] = sigmoid(nw_v[s * dv + j]);
+                        }
+                        rows_b.push(rb);
+                        rows_w.push(rw);
+                        rows_f.push(rf);
+                    }
+                    Some((rows_b, rows_w, rows_f))
+                }
+                _ => None,
+            };
+
+        let mut out_tokens = vec![0.0f32; steps * num_heads * head_dim];
+
+        // 4. Sequential step over tokens
+        for s in 0..steps {
+            let q_s = &q_vec[s * num_heads * head_dim..(s + 1) * num_heads * head_dim];
+            let k_s = &k_vec[s * num_kv_heads * head_dim..(s + 1) * num_kv_heads * head_dim];
+            let v_s = &v_vec[s * num_kv_heads * head_dim..(s + 1) * num_kv_heads * head_dim];
+
+            // GRAVE Phase 3b.5: per-token gates when projections present;
+            // the static triple otherwise (identical math both ways).
+            let (erase_vec, write_vec, decay_vec): (Vec<f32>, Vec<f32>, Vec<f32>) = match &gate_rows
+            {
+                Some((rb, rw, rf)) => (rb[s].clone(), rw[s].clone(), rf[s].clone()),
+                None => (
+                    vec![erase_val as f32; head_dim],
+                    vec![write_val as f32; head_dim],
+                    vec![decay_val as f32; head_dim],
+                ),
+            };
+
+            for h in 0..num_heads {
+                let kv_h = h / kv_group;
+                let q_head = &q_s[h * head_dim..(h + 1) * head_dim];
+                let k_head = &k_s[kv_h * head_dim..(kv_h + 1) * head_dim];
+                let v_head = &v_s[kv_h * head_dim..(kv_h + 1) * head_dim];
+
+                // L2 normalization of key & query per GDN-2 spec (arXiv 2605.22791 §3.5)
+                let mut k_sq = 0.0f64;
+                let mut q_sq = 0.0f64;
+                for d in 0..head_dim {
+                    k_sq += (k_head[d] as f64) * (k_head[d] as f64);
+                    q_sq += (q_head[d] as f64) * (q_head[d] as f64);
+                }
+                let k_norm = k_sq.sqrt().max(1e-12);
+                let q_norm = q_sq.sqrt().max(1e-12);
+
+                let head_state =
+                    &mut state_slice[h * head_dim * head_dim..(h + 1) * head_dim * head_dim];
+
+                // Recurrence: S ∈ [head_dim, head_dim]
+                // 1. Decay first: S̃_t = D_t S_{t-1}  (D_t = diag(per-channel decay))
+                // 2. Read: r_t = S̃_t^T (b_t ⊙ k_t)
+                let mut r = vec![0.0f64; head_dim];
+                for i in 0..head_dim {
+                    let e_i = erase_vec[i] as f64 * (k_head[i] as f64 / k_norm);
+                    let a_i = decay_vec[i] as f64;
+                    for j in 0..head_dim {
+                        let idx = i * head_dim + j;
+                        let s_decayed = a_i * (head_state[idx] as f64);
+                        head_state[idx] = s_decayed as f32;
+                        r[j] += e_i * s_decayed;
+                    }
+                }
+
+                // 3. Write & Engrave: S_t = S̃_t + k_t (w_t ⊙ v_t - r_t)^T
+                // 4. Output: o_t = S_t^T q_t
+                let out_h = &mut out_tokens[s * num_heads * head_dim + h * head_dim
+                    ..s * num_heads * head_dim + (h + 1) * head_dim];
+                for i in 0..head_dim {
+                    let k_i = k_head[i] as f64 / k_norm;
+                    let q_i = q_head[i] as f64 / q_norm;
+                    for j in 0..head_dim {
+                        let delta = write_vec[j] as f64 * (v_head[j] as f64) - r[j];
+                        let idx = i * head_dim + j;
+                        let s_new = (head_state[idx] as f64) + k_i * delta;
+                        head_state[idx] = s_new as f32;
+                        out_h[j] += (q_i * s_new) as f32;
+                    }
+                }
+            }
+        }
+
+        let attn_tensor = device_tensor(
+            out_tokens,
+            Shape::new(vec![steps, num_heads * head_dim]),
+            norm_x.device(),
+        )?;
+        let out = self.wo.as_ref().unwrap().forward(&attn_tensor)?;
+        Ok(out)
     }
 }
 
@@ -2328,7 +3626,21 @@ impl Lfm2 {
             Ok(n) => n,
             Err(_) => RmsNorm::load(&ws.pp("output_norm"), cfg.hidden_size, cfg.rms_norm_eps)?,
         };
-        let output = Linear::from_tensor(tok_embeddings.weight.clone(), None);
+        // PLAN-decode-throughput-restore Fix 2: keep the head's Q8_0 bytes
+        // packed — Linear::forward dispatches to fused_quant_gemm (67 MB read
+        // per decode token instead of the 268 MB f32 gather table). Falls back
+        // to the f32 table when the raw tensor isn't quantized (safetensors).
+        let output = if std::env::var("GRIM_LFM2_F32_HEAD").as_deref() == Ok("1") {
+            Linear::from_tensor(tok_embeddings.weight.clone(), None)
+        } else {
+            match ws
+                .pp("token_embd")
+                .get([cfg.vocab_size, cfg.hidden_size], "weight")
+            {
+                Ok(raw) if raw.dtype().is_quantized() => Linear::from_tensor(raw, None),
+                _ => Linear::from_tensor(tok_embeddings.weight.clone(), None),
+            }
+        };
         let device = tok_embeddings.weight.device().clone();
 
         let (dense_2_out, dense_2_out_bias) = if cfg.n_embd_out > 0 {
@@ -2503,6 +3815,296 @@ fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
 #[cfg(test)]
 mod audit_tests {
+
+    /// G3b gate (never delete): zero-weight, bias-calibrated gate
+    /// projections must reproduce the static scalar triple EXACTLY through
+    /// forward_gdl (sigmoid(W.x + b) == scalar when W = 0 and b =
+    /// logit(scalar)). This is the invariant that lets a grave-2 sidecar
+    /// start G3b training from the trained grave-1 operating point with no
+    /// behavior change.
+    #[test]
+    fn gdl_constant_init_projections_match_static_gates() {
+        let (hidden, heads, kv_heads, head_dim) = (8usize, 2usize, 2usize, 4usize);
+        let eps = 1e-5f32;
+        let steps = 3usize;
+        let gates = [0.93f64, 0.5, 0.6]; // decay, erase, write
+
+        let rand = |n: usize, seed: u64| -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((s >> 33) as f32 / (u32::MAX as f32)) - 0.5
+                })
+                .collect()
+        };
+        let lin = |out: usize, inn: usize, seed: u64| -> Linear {
+            Linear::from_tensor(
+                cpu_tensor(
+                    rand(out * inn, seed),
+                    grim_tensor::Shape::new(vec![out, inn]),
+                ),
+                None,
+            )
+        };
+        let build_block = || Lfm2Block {
+            index: 0,
+            attn_norm: RmsNorm {
+                weight: cpu_tensor(vec![1.0f32; hidden], grim_tensor::Shape::new(vec![hidden])),
+                eps,
+            },
+            wq: Some(lin(hidden, hidden, 1)),
+            wk: Some(lin(hidden, hidden, 2)),
+            wv: Some(lin(hidden, hidden, 3)),
+            wo: Some(lin(hidden, hidden, 4)),
+            attn_q_norm: None,
+            attn_k_norm: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            w_gate_up_q80_fused: None,
+            shortconv_in_proj: None,
+            shortconv_conv: None,
+            shortconv_conv_vec: None,
+            shortconv_out_proj: None,
+            ffn_norm: RmsNorm {
+                weight: cpu_tensor(vec![1.0f32; hidden], grim_tensor::Shape::new(vec![hidden])),
+                eps,
+            },
+            ffn_gate: lin(4, hidden, 5),
+            ffn_up: lin(4, hidden, 6),
+            ffn_down: lin(hidden, 4, 7),
+            ffn_gate_inp: None,
+            ffn_gate_exps: None,
+            ffn_up_exps: None,
+            ffn_down_exps: None,
+            ffn_exp_probs_b: None,
+            is_moe: false,
+            n_expert: 0,
+            n_expert_used: 1,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            eps,
+            attention_mode: Lfm2AttentionMode::Gdl,
+            gdl_gates: gates,
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
+        };
+
+        let x = rand(steps * hidden, 9);
+        let x_t = cpu_tensor(x.clone(), grim_tensor::Shape::new(vec![steps, hidden]));
+
+        // Static scalar gates.
+        let nx = build_block().attn_norm.forward(&x_t).unwrap();
+        let mut cache_a: Option<Lfm2LayerCache> = None;
+        let out_static = build_block()
+            .forward_gdl(&nx, &mut cache_a)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        // Projections: zero weights, biases left at zero here — calibration
+        // shifts biases by logit(scalar), so pass calibrate = gates.
+        let zeros2 = |r: usize, c: usize| vec![vec![0.0f32; c]; r];
+        let lp = crate::gla::LayerGateProjections {
+            b_weight: zeros2(head_dim, hidden),
+            b_bias: vec![0.0f32; head_dim],
+            w_weight: zeros2(head_dim, hidden),
+            w_bias: vec![0.0f32; head_dim],
+            f_weight: zeros2(head_dim, hidden),
+            f_bias: vec![0.0f32; head_dim],
+        };
+        let mut block = build_block();
+        block
+            .set_gate_projections_from_host(&lp, Some(gates))
+            .unwrap();
+        assert!(block.gdl_b_proj.is_some());
+        let mut cache_b: Option<Lfm2LayerCache> = None;
+        let out_proj = block
+            .forward_gdl(&nx, &mut cache_b)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(out_static.len(), out_proj.len());
+        let max_diff = out_static
+            .iter()
+            .zip(&out_proj)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "constant-init projections diverge from static gates: {max_diff}"
+        );
+    }
+
+    #[test]
+    fn gdl_forward_matches_gla_oracle() {
+        // GRAVE Phase 2 verification (stage-isolated): forward_gdl output
+        // (norm -> projections -> per-head GDN-2 recurrence -> wo) must equal
+        // the gla.rs f64 oracle driven with the same projections and gates.
+        let (hidden, heads, kv_heads, head_dim) = (8usize, 2usize, 2usize, 4usize);
+        let eps = 1e-5f32;
+        let steps = 3usize;
+        let gates = [0.93f64, 0.5, 0.6]; // decay, erase, write
+
+        let rand = |n: usize, seed: u64| -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((s >> 33) as f32 / (u32::MAX as f32)) - 0.5
+                })
+                .collect()
+        };
+        let lin = |out: usize, inn: usize, seed: u64| -> Linear {
+            Linear::from_tensor(
+                cpu_tensor(
+                    rand(out * inn, seed),
+                    grim_tensor::Shape::new(vec![out, inn]),
+                ),
+                None,
+            )
+        };
+        let matmul = |a: &[f32], w: &[f32], rows: usize, inn: usize, out: usize| -> Vec<f32> {
+            (0..rows)
+                .flat_map(|r| {
+                    (0..out).map(move |o| {
+                        (0..inn)
+                            .map(|i| a[r * inn + i] * w[o * inn + i])
+                            .sum::<f32>()
+                    })
+                })
+                .collect()
+        };
+
+        let norm = RmsNorm {
+            weight: cpu_tensor(vec![1.0f32; hidden], grim_tensor::Shape::new(vec![hidden])),
+            eps,
+        };
+        let block = Lfm2Block {
+            index: 0,
+            attn_norm: norm.clone(),
+            wq: Some(lin(hidden, hidden, 1)),
+            wk: Some(lin(hidden, hidden, 2)),
+            wv: Some(lin(hidden, hidden, 3)),
+            wo: Some(lin(hidden, hidden, 4)),
+            attn_q_norm: None,
+            attn_k_norm: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            w_gate_up_q80_fused: None,
+            shortconv_in_proj: None,
+            shortconv_conv: None,
+            shortconv_conv_vec: None,
+            shortconv_out_proj: None,
+            ffn_norm: norm.clone(),
+            ffn_gate: lin(4, hidden, 5),
+            ffn_up: lin(4, hidden, 6),
+            ffn_down: lin(hidden, 4, 7),
+            ffn_gate_inp: None,
+            ffn_gate_exps: None,
+            ffn_up_exps: None,
+            ffn_down_exps: None,
+            ffn_exp_probs_b: None,
+            is_moe: false,
+            n_expert: 0,
+            n_expert_used: 1,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            eps,
+            attention_mode: Lfm2AttentionMode::Gdl,
+            gdl_gates: gates,
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
+        };
+
+        // Actual stage output: norm -> forward_gdl (includes the wo projection).
+        let x = rand(steps * hidden, 9);
+        let x_t = cpu_tensor(x.clone(), grim_tensor::Shape::new(vec![steps, hidden]));
+        let mut cache: Option<Lfm2LayerCache> = None;
+        let nx_block = block.attn_norm.forward(&x_t).unwrap();
+        let got = block
+            .forward_gdl(&nx_block, &mut cache)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        // Expected: identical stages with the recurrence delegated to the
+        // gla.rs f64 oracle (gdn2_step), gates from the block's triple.
+        // States persist across rows (GDN-2 recurrence); resetting per token
+        // would model a different function than forward_gdl's cache.
+        let mut states: Vec<Vec<Vec<f64>>> = vec![vec![vec![0.0f64; head_dim]; head_dim]; heads];
+        let mut want = Vec::with_capacity(steps * hidden);
+        for row in 0..steps {
+            let inp: Vec<f32> = x[row * hidden..(row + 1) * hidden].to_vec();
+            let ss: f32 = inp.iter().map(|v| v * v).sum();
+            let nx: Vec<f32> = inp
+                .iter()
+                .map(|&v| v / ((ss / hidden as f32 + eps).sqrt()))
+                .collect();
+            let q = matmul(&nx, &rand(hidden * hidden, 1), 1, hidden, hidden);
+            let k = matmul(&nx, &rand(hidden * hidden, 2), 1, hidden, hidden);
+            let v = matmul(&nx, &rand(hidden * hidden, 3), 1, hidden, hidden);
+            let mut attn = vec![0.0f32; hidden];
+            for h in 0..heads {
+                let qo = h * head_dim;
+                let kvo = (h / (heads / kv_heads)) * head_dim;
+                let q_h = &q[qo..qo + head_dim];
+                let k_h = &k[kvo..kvo + head_dim];
+                let v_h = &v[kvo..kvo + head_dim];
+                let kn: f32 = k_h.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+                let qn: f32 = q_h.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+                let k_hat: Vec<f32> = k_h.iter().map(|&v| v / kn).collect();
+                let q_hat: Vec<f32> = q_h.iter().map(|&v| v / qn).collect();
+                let alpha = vec![gates[0]; head_dim];
+                let b = vec![gates[1]; head_dim];
+                let w = vec![gates[2]; head_dim];
+                let o = crate::gla::gdn2_step(
+                    &mut states[h],
+                    &q_hat.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                    &k_hat.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                    &v_h.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                    &alpha,
+                    &b,
+                    &w,
+                );
+                for (j, ov) in o.iter().enumerate() {
+                    attn[h * head_dim + j] += *ov as f32;
+                }
+            }
+            let proj = matmul(&attn, &rand(hidden * hidden, 4), 1, hidden, hidden);
+            want.extend_from_slice(&proj);
+        }
+
+        assert_eq!(want.len(), got.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 5e-4 + w.abs() * 1e-3,
+                "stage mismatch at {i}: got {g} vs want {w}"
+            );
+        }
+    }
+
     use super::*;
 
     /// Audit gate (M11): an incoherent block variant must be NAMED by
@@ -2520,6 +4122,7 @@ mod audit_tests {
         );
         // Full-attention block with wq/wk/wv but NO wo / QK norms.
         let block = Lfm2Block {
+            index: 3,
             attn_norm: norm.clone(),
             wq: Some(lin.clone()),
             wk: Some(lin.clone()),
@@ -2555,6 +4158,12 @@ mod audit_tests {
             head_dim: 8,
             rope_theta: 10_000.0,
             eps,
+            attention_mode: Lfm2AttentionMode::Softmax,
+            gdl_gates: crate::gla::gdl_gate_defaults(64),
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
         };
         let err = block.validate(3).expect_err("incoherent block must fail");
         let msg = err.to_string();
@@ -2565,6 +4174,7 @@ mod audit_tests {
 
         // ShortConv variant missing its kernel.
         let mut conv_block = Lfm2Block {
+            index: 3,
             attn_norm: norm,
             wq: None,
             wk: None,
@@ -2576,7 +4186,7 @@ mod audit_tests {
             wqkv_exps: None,
             gamma_q: None,
             gamma_k: None,
-                w_gate_up_q80_fused: None,
+            w_gate_up_q80_fused: None,
             ffn_norm: RmsNorm {
                 weight: grim_backend_cpu::cpu_tensor(
                     vec![1.0f32; 8],
@@ -2621,6 +4231,12 @@ mod audit_tests {
             head_dim: 8,
             rope_theta: 10_000.0,
             eps,
+            attention_mode: Lfm2AttentionMode::Softmax,
+            gdl_gates: crate::gla::gdl_gate_defaults(64),
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
         };
         let err = conv_block
             .validate(5)
@@ -2643,6 +4259,181 @@ mod audit_tests {
             conv_block.validate(5).is_ok(),
             "coherent ShortConv block must pass"
         );
+    }
+
+    /// G4b gate (never delete): validates the Phase 3 fused eager path's gate
+    /// handling against the plan's two audit points — (1) the sliced gate logits
+    /// from the gate-augmented fused blob equal `W_g @ norm_x`, and (2) the
+    /// on-device bias→sigmoid→broadcast epilogue equals the CPU reference
+    /// `sigmoid(W_g @ x + b)` replicated across heads. Replaces the old per-step
+    /// `gate_buffers_step` audit, which the fused eager path supersedes.
+    /// GPU-gated: the fused blob is only built on a ROCm device.
+    #[test]
+    #[ignore = "GPU-only G4b Phase 3 parity; run with GRIM_RUN_GPU_TESTS=1 cargo test -p grim-models-transformer --lib -- --ignored g4_fused_gate_slice_parity"]
+    fn g4_fused_gate_slice_parity() {
+        use grim_tensor::MemoryOps;
+        if !grim_backend_rocm::gpu_test_enabled() {
+            eprintln!("skipping: GPU test gate off");
+            return;
+        }
+        let _guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = grim_backend_rocm::RocmDevice::try_new(0).expect("RocmDevice::try_new(0)");
+
+        // Same activation/gate weights the Phase 2 parity test uses, so the two
+        // tests cover the blob end-to-end. QKV is throwaway.
+        let hidden = 128usize;
+        let dk = 16usize;
+        let heads = 16usize;
+
+        let mut seed = 0x42u64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32 / u32::MAX as f32 - 0.5) * 0.5
+        };
+        let gb_values: Vec<f32> = (0..dk * hidden).map(|_| rand()).collect();
+        let gw_values: Vec<f32> = (0..dk * hidden).map(|_| rand()).collect();
+        let gf_values: Vec<f32> = (0..dk * hidden).map(|_| rand()).collect();
+        let qkv_values: Vec<f32> = (0..3 * dk * hidden).map(|_| rand()).collect();
+        let bb: Vec<f32> = (0..dk).map(|_| rand()).collect();
+        let wb: Vec<f32> = (0..dk).map(|_| rand()).collect();
+        let fb: Vec<f32> = (0..dk).map(|_| rand()).collect();
+        let activation: Vec<f32> = (0..hidden).map(|_| rand()).collect();
+
+        let upload_f32 = |v: &[f32], shape: Shape| -> Box<dyn grim_tensor::BackendStorage> {
+            dev.from_cpu(v, &shape, grim_tensor::DType::F32)
+                .expect("upload f32")
+        };
+        // Quantize an already-uploaded f32 storage to Q8_0 on device.
+        let to_q80 = |s: &dyn grim_tensor::BackendStorage,
+                      _elems: usize|
+         -> Box<dyn grim_tensor::BackendStorage> {
+            let (q, handle) = dev
+                .quantize_on_device(s, grim_tensor::QuantFormat::Q8_0)
+                .expect("quantize to Q8_0");
+            handle.synchronize().expect("synchronize quantize");
+            q
+        };
+
+        // Build the fused blob directly (no Lfm2Block needed). Teacher QKV must
+        // be Q8_0; gate weights are f32 (the builder quantizes them internally).
+        let qkv_elems = 3 * dk * hidden;
+        let wq_s = to_q80(
+            upload_f32(&qkv_values, Shape::new(vec![3 * dk, hidden])).as_ref(),
+            qkv_elems,
+        );
+        let wk_s = to_q80(
+            upload_f32(&qkv_values, Shape::new(vec![3 * dk, hidden])).as_ref(),
+            qkv_elems,
+        );
+        let wv_s = to_q80(
+            upload_f32(&qkv_values, Shape::new(vec![3 * dk, hidden])).as_ref(),
+            qkv_elems,
+        );
+        let wgb_s = upload_f32(&gb_values, Shape::new(vec![dk, hidden]));
+        let wgw_s = upload_f32(&gw_values, Shape::new(vec![dk, hidden]));
+        let wgf_s = upload_f32(&gf_values, Shape::new(vec![dk, hidden]));
+        let blob = dev
+            .build_fused_gate_qkv_q80(
+                wq_s.as_ref(),
+                wk_s.as_ref(),
+                wv_s.as_ref(),
+                wgb_s.as_ref(),
+                wgw_s.as_ref(),
+                wgf_s.as_ref(),
+            )
+            .expect("build fused QKV+gate blob");
+
+        // Single-step fused GEMV.
+        let n_blocks = hidden / 32;
+        let q81_bytes = n_blocks * 36;
+        let act = upload_f32(&activation, Shape::new(vec![1, hidden]));
+        let q81 = dev
+            .zeros(
+                &Shape::new(vec![q81_bytes]),
+                grim_tensor::DType {
+                    arith: grim_tensor::ArithType::U8,
+                    storage: grim_tensor::Storage::Native,
+                },
+            )
+            .expect("alloc q81");
+        let act_r = grim_backend_rocm::as_rocm(act.as_ref()).unwrap();
+        let q81_r = grim_backend_rocm::as_rocm(q81.as_ref()).unwrap();
+        dev.launch_quantize_q8_1(act_r, q81_r, 1, hidden)
+            .expect("quantize activation");
+        let logits = dev
+            .fused_qkv_gates_dot4(q81_r, &blob)
+            .expect("fused QKV+gate GEMV");
+        dev.synchronize();
+
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // Audit point 1: gate-logit slice == W_g @ x (Q8_0 quantization floor).
+        let ref_matmul = |w: &[f32]| -> Vec<f32> {
+            (0..dk)
+                .map(|i| {
+                    let mut acc = 0.0f32;
+                    for (j, &xj) in activation.iter().enumerate() {
+                        acc += xj * w[i * hidden + j];
+                    }
+                    acc
+                })
+                .collect()
+        };
+        let slice_ok = |name: &str, slice: &[f32], w: &[f32]| {
+            let expected = ref_matmul(w);
+            let worst = max_diff(slice, &expected);
+            assert!(
+                worst <= 1e-2,
+                "{name}: gate-logit slice diverges from W@x (Q8_0 floor): worst {worst:.3e}"
+            );
+        };
+        slice_ok("gb", &logits.gb.to_cpu_vec_f32().unwrap(), &gb_values);
+        slice_ok("gw", &logits.gw.to_cpu_vec_f32().unwrap(), &gw_values);
+        slice_ok("gf", &logits.gf.to_cpu_vec_f32().unwrap(), &gf_values);
+
+        // Audit point 2: on-device bias→sigmoid→broadcast == CPU reference,
+        // i.e. sigmoid(W@x + b) replicated across all heads.
+        let logit_buf = dev
+            .zeros(&Shape::new(vec![dk]), grim_tensor::DType::F32)
+            .unwrap();
+        let gates_buf = dev
+            .zeros(&Shape::new(vec![heads, dk]), grim_tensor::DType::F32)
+            .unwrap();
+        let logit_buf_r = grim_backend_rocm::as_rocm(logit_buf.as_ref()).unwrap();
+        let gates_buf_r = grim_backend_rocm::as_rocm(gates_buf.as_ref()).unwrap();
+        let epilogue_ok = |name: &str, slice: &[f32], bias: &[f32]| {
+            let pre: Vec<f32> = slice.iter().zip(bias).map(|(l, b)| l + b).collect();
+            let pre_buf = dev
+                .from_cpu(&pre, &Shape::new(vec![dk]), grim_tensor::DType::F32)
+                .expect("upload pre-sigmoid logits");
+            let pre_buf_r = grim_backend_rocm::as_rocm(pre_buf.as_ref()).unwrap();
+            dev.copy_slice_range(logit_buf_r, 0, pre_buf_r, 0, dk)
+                .expect("copy pre-sigmoid logits");
+            dev.sigmoid_into(logit_buf_r, logit_buf_r).unwrap();
+            dev.broadcast_heads(logit_buf_r, gates_buf_r, dk, heads)
+                .unwrap();
+            dev.synchronize();
+            let got = gates_buf.to_cpu_vec_f32().unwrap();
+            let sig: Vec<f32> = pre.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
+            let mut expected = Vec::with_capacity(heads * dk);
+            for _ in 0..heads {
+                expected.extend_from_slice(&sig);
+            }
+            let worst = max_diff(&got, &expected);
+            assert!(
+                worst < 1e-5,
+                "{name}: broadcast epilogue diverges: worst {worst:.3e}"
+            );
+        };
+        epilogue_ok("gb", &logits.gb.to_cpu_vec_f32().unwrap(), &bb);
+        epilogue_ok("gw", &logits.gw.to_cpu_vec_f32().unwrap(), &wb);
+        epilogue_ok("gf", &logits.gf.to_cpu_vec_f32().unwrap(), &fb);
+        println!("[OK] G4b fused gate-slice parity matches projections");
     }
 }
 
@@ -2687,6 +4478,7 @@ mod shortconv_numeric_reference_tests {
         let steps = 3usize;
         let unit = unit_norm();
         let block = Lfm2Block {
+            index: 0,
             attn_norm: unit.clone(),
             wq: None,
             wk: None,
@@ -2725,6 +4517,12 @@ mod shortconv_numeric_reference_tests {
             head_dim: hidden,
             rope_theta: 10000.0,
             eps: 1e-5,
+            attention_mode: Lfm2AttentionMode::Softmax,
+            gdl_gates: crate::gla::gdl_gate_defaults(64),
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
         };
 
         // 3-token input; run forward once over the whole sequence.
@@ -2915,6 +4713,7 @@ mod shortconv_device_decode_tests {
         };
 
         let block = Lfm2Block {
+            index: 0,
             attn_norm: unit(),
             wq: None,
             wk: None,
@@ -2953,6 +4752,12 @@ mod shortconv_device_decode_tests {
             head_dim: hidden,
             rope_theta: 10000.0,
             eps: 1e-5,
+            attention_mode: Lfm2AttentionMode::Softmax,
+            gdl_gates: crate::gla::gdl_gate_defaults(64),
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
         };
 
         let x_data: Vec<f32> = vec![
@@ -2992,7 +4797,6 @@ mod shortconv_device_decode_tests {
     }
 }
 
-
 // M1: MoE top-k routing through shared_moe.
 #[cfg(test)]
 mod moe_top_k_tests {
@@ -3003,7 +4807,9 @@ mod moe_top_k_tests {
         let mut s = seed;
         let w: Vec<f32> = (0..out_dim * in_dim)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (((s >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.3
             })
             .collect();
@@ -3038,6 +4844,7 @@ mod moe_top_k_tests {
         }
 
         let block = Lfm2Block {
+            index: 0,
             attn_norm: RmsNorm {
                 weight: grim_backend_cpu::cpu_tensor(vec![1f32; h], Shape::new(vec![h])),
                 eps: 1e-5,
@@ -3065,9 +4872,18 @@ mod moe_top_k_tests {
             ffn_up: lin(8, n_ff, h),
             ffn_down: lin(9, h, n_ff),
             ffn_gate_inp: Some(lin(10, n_e, h)),
-            ffn_gate_exps: Some(grim_backend_cpu::cpu_tensor(gw.clone(), Shape::new(vec![n_e, n_ff, h]))),
-            ffn_up_exps: Some(grim_backend_cpu::cpu_tensor(up.clone(), Shape::new(vec![n_e, n_ff, h]))),
-            ffn_down_exps: Some(grim_backend_cpu::cpu_tensor(dn.clone(), Shape::new(vec![n_e, n_ff, h]))),
+            ffn_gate_exps: Some(grim_backend_cpu::cpu_tensor(
+                gw.clone(),
+                Shape::new(vec![n_e, n_ff, h]),
+            )),
+            ffn_up_exps: Some(grim_backend_cpu::cpu_tensor(
+                up.clone(),
+                Shape::new(vec![n_e, n_ff, h]),
+            )),
+            ffn_down_exps: Some(grim_backend_cpu::cpu_tensor(
+                dn.clone(),
+                Shape::new(vec![n_e, n_ff, h]),
+            )),
             ffn_exp_probs_b: None,
             is_moe: true,
             n_expert: n_e,
@@ -3079,6 +4895,12 @@ mod moe_top_k_tests {
             head_dim: h,
             rope_theta: 10000.0,
             eps: 1e-5,
+            attention_mode: Lfm2AttentionMode::Softmax,
+            gdl_gates: crate::gla::gdl_gate_defaults(64),
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
         };
 
         let x = grim_backend_cpu::cpu_tensor(
@@ -3091,11 +4913,20 @@ mod moe_top_k_tests {
         assert!(out_v.iter().all(|v| v.is_finite()));
 
         // Explicit top-k oracle: gate probs → top-2 → softmax → sum p*expert.
-        let logits = block.ffn_gate_inp.as_ref().unwrap().forward(&x).unwrap().to_vec_f32().unwrap();
+        let logits = block
+            .ffn_gate_inp
+            .as_ref()
+            .unwrap()
+            .forward(&x)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut probs: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
         let sum: f32 = probs.iter().sum();
-        for p in &mut probs { *p /= sum; }
+        for p in &mut probs {
+            *p /= sum;
+        }
         let mut idx: Vec<usize> = (0..n_e).collect();
         idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
         let (e0, e1) = (idx[0], idx[1]);
@@ -3141,7 +4972,9 @@ mod moe_top_k_tests {
         };
         let o0 = down_of(&act(e0), e0);
         let o1 = down_of(&act(e1), e1);
-        let want: Vec<f32> = (0..h).map(|d| (probs[e0] * o0[d] + probs[e1] * o1[d]) / norm).collect();
+        let want: Vec<f32> = (0..h)
+            .map(|d| (probs[e0] * o0[d] + probs[e1] * o1[d]) / norm)
+            .collect();
         for d in 0..h {
             let rel = ((out_v[d] - want[d]) / want[d].abs().max(1e-30)).abs();
             assert!(
@@ -3152,5 +4985,108 @@ mod moe_top_k_tests {
             );
         }
         assert!(out_v.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn gdl_forward_matches_finite_recurrence() {
+        let h = 8usize;
+        let num_heads = 2usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 4usize;
+        let steps = 3usize;
+
+        let unit = RmsNorm {
+            weight: grim_backend_cpu::cpu_tensor(vec![1f32; h], Shape::new(vec![h])),
+            eps: 1e-5,
+        };
+        let lin = |seed: u64, out_dim: usize, in_dim: usize| -> Linear {
+            let mut s = seed;
+            let w: Vec<f32> = (0..out_dim * in_dim)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((s >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.1
+                })
+                .collect();
+            Linear::from_tensor(
+                grim_backend_cpu::cpu_tensor(w, Shape::new(vec![out_dim, in_dim])),
+                None,
+            )
+        };
+
+        let block = Lfm2Block {
+            index: 0,
+            attn_norm: unit.clone(),
+            wq: Some(lin(1, num_heads * head_dim, h)),
+            wk: Some(lin(2, num_kv_heads * head_dim, h)),
+            wv: Some(lin(3, num_kv_heads * head_dim, h)),
+            wo: Some(lin(4, h, num_heads * head_dim)),
+            attn_q_norm: None,
+            attn_k_norm: None,
+            wqkv_codes: None,
+            wqkv_exps: None,
+            gamma_q: None,
+            gamma_k: None,
+            w_gate_up_q80_fused: None,
+            shortconv_in_proj: None,
+            shortconv_conv: None,
+            shortconv_conv_vec: None,
+            shortconv_out_proj: None,
+            ffn_norm: unit.clone(),
+            ffn_gate: lin(5, h, h),
+            ffn_up: lin(6, h, h),
+            ffn_down: lin(7, h, h),
+            ffn_gate_inp: None,
+            ffn_gate_exps: None,
+            ffn_up_exps: None,
+            ffn_down_exps: None,
+            ffn_exp_probs_b: None,
+            is_moe: false,
+            n_expert: 0,
+            n_expert_used: 1,
+            charon_cache: crate::shared_moe::CharonCache::new(),
+            moe_experts_cache: std::sync::OnceLock::new(),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            attention_mode: Lfm2AttentionMode::Gdl,
+            gdl_gates: crate::gla::gdl_gate_defaults(64),
+            gdl_b_proj: None,
+            gdl_w_proj: None,
+            gdl_f_proj: None,
+            gdl_fused_qkv_gates: None,
+        };
+
+        assert!(
+            block.validate(0).is_ok(),
+            "GDL block with wq, wk, wv, wo must validate"
+        );
+
+        let x = grim_backend_cpu::cpu_tensor(
+            vec![
+                0.1, -0.2, 0.3, 0.4, -0.1, 0.2, 0.5, -0.3, 0.2, 0.1, -0.4, 0.3, 0.0, -0.2, 0.1,
+                0.4, -0.3, 0.5, 0.2, -0.1, 0.4, 0.1, -0.2, 0.3,
+            ],
+            Shape::new(vec![steps, h]),
+        );
+        let mut cache = None;
+        let out = block
+            .forward(&x, &mut cache)
+            .expect("gdl forward must succeed");
+        let out_vec = out.to_vec_f32().unwrap();
+        assert_eq!(out_vec.len(), steps * h);
+        assert!(out_vec.iter().all(|v| v.is_finite()));
+
+        // Cache must now be Gdl variant with exact dimension
+        match &cache {
+            Some(Lfm2LayerCache::Gdl { state, .. }) => {
+                assert_eq!(state.len(), num_heads * head_dim * head_dim);
+                assert!(state.iter().all(|v| v.is_finite()));
+            }
+            _ => panic!("Cache after GDL forward must be Lfm2LayerCache::Gdl"),
+        }
     }
 }

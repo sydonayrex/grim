@@ -14,10 +14,7 @@ use crate::device::roc_device::{
     FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
 };
 use crate::memory::storage::RocmStorage;
-use crate::{ RocmHandle, arg, dtype_f32 };
-
-
-
+use crate::{RocmHandle, arg, dtype_f32};
 
 mod dequant_fp_quants;
 mod dequant_host;
@@ -53,6 +50,16 @@ impl QuantOps for RocmDevice {
     ) -> Result<Box<dyn BackendStorage>> {
         let (out, _handle) = self.quantize_on_device(x, format)?;
         Ok(out)
+    }
+
+    fn fused_quant_gemm(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        format: grim_tensor::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.quantized_matmul(a, b, &[], format, out_shape)
     }
 
     fn quantized_matmul(
@@ -152,25 +159,31 @@ impl QuantOps for RocmDevice {
                     let a_prequant = a_storage.dtype().arith == ArithType::U8;
                     if a_prequant {
                         drop(buf_guard);
-                        self.launch_dot4_q4k_q81_gemv(
-                            a_storage, b_storage, &out_storage, m, n, k,
-                        )?;
+                        self.launch_dot4_q4k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
                         let act_q81 = buf_guard.as_ref().unwrap();
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
-                        self.launch_dot4_q4k_q81_gemv(
-                            act_q81, b_storage, &out_storage, m, n, k,
-                        )?;
+                        self.launch_dot4_q4k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34
-                    && wmma_quant_tile_ok(wave32, m, n, k, 256)
-                {
+                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 256) {
                     self.launch_wmma_fused_dequant_q4k(
-                        a_storage, b_storage, &out_storage, m, n, k,
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
                     )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    self.launch_fused_dequant_gemm_q4k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 }
             }
             DTypeStorage::KQuant(KQuantScheme::Q5K) => {
@@ -212,23 +225,31 @@ impl QuantOps for RocmDevice {
                     let a_prequant = a_storage.dtype().arith == ArithType::U8;
                     if a_prequant {
                         drop(buf_guard);
-                        self.launch_dot4_q5k_q81_gemv(
-                            a_storage, b_storage, &out_storage, m, n, k,
-                        )?;
+                        self.launch_dot4_q5k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
                         let act_q81 = buf_guard.as_ref().unwrap();
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
-                        self.launch_dot4_q5k_q81_gemv(
-                            act_q81, b_storage, &out_storage, m, n, k,
-                        )?;
+                        self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34
-                    && wmma_quant_tile_ok(wave32, m, n, k, 16)
-                {
-                    self.launch_wmma_fused_dequant_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                    self.launch_wmma_fused_dequant_q5k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    self.launch_fused_dequant_gemm_q5k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 }
             }
             DTypeStorage::KQuant(KQuantScheme::Q6K) => {
@@ -270,23 +291,31 @@ impl QuantOps for RocmDevice {
                     let a_prequant = a_storage.dtype().arith == ArithType::U8;
                     if a_prequant {
                         drop(buf_guard);
-                        self.launch_dot4_q6k_q81_gemv(
-                            a_storage, b_storage, &out_storage, m, n, k,
-                        )?;
+                        self.launch_dot4_q6k_q81_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
                         let act_q81 = buf_guard.as_ref().unwrap();
                         let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                         fence_act_quant(self, q_stream);
-                        self.launch_dot4_q6k_q81_gemv(
-                            act_q81, b_storage, &out_storage, m, n, k,
-                        )?;
+                        self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34
-                    && wmma_quant_tile_ok(wave32, m, n, k, 16)
-                {
-                    self.launch_wmma_fused_dequant_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                    self.launch_wmma_fused_dequant_q6k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    self.launch_fused_dequant_gemm_q6k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 }
             }
             DTypeStorage::KQuant(KQuantScheme::Q2K) => {
@@ -319,8 +348,12 @@ impl QuantOps for RocmDevice {
                     if need_alloc {
                         *buf_guard = Some(RocmStorage::alloc_gpu(
                             &shape,
-                            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
-                            &self.allocator, self.ordinal,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
                         )?);
                     }
                     let a_prequant = a_storage.dtype().arith == ArithType::U8;
@@ -333,12 +366,24 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34
-                    && wmma_quant_tile_ok(wave32, m, n, k, 16)
-                {
-                    self.launch_wmma_fused_dequant_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                    self.launch_wmma_fused_dequant_q2k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    self.launch_fused_dequant_gemm_q2k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 }
             }
             DTypeStorage::KQuant(KQuantScheme::Q3K) => {
@@ -369,8 +414,12 @@ impl QuantOps for RocmDevice {
                     if need_alloc {
                         *buf_guard = Some(RocmStorage::alloc_gpu(
                             &shape,
-                            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
-                            &self.allocator, self.ordinal,
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
                         )?);
                     }
                     let a_prequant = a_storage.dtype().arith == ArithType::U8;
@@ -383,59 +432,106 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34
-                    && wmma_quant_tile_ok(wave32, m, n, k, 16)
-                {
-                    self.launch_wmma_fused_dequant_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                    self.launch_wmma_fused_dequant_q3k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else {
-                    self.launch_fused_dequant_gemm_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    self.launch_fused_dequant_gemm_q3k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 }
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => {
                 self.launch_iq_wmma_fallback(
-                    a_storage, b_storage, &out_storage, m, n, k,
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
                     Self::launch_wmma_fused_dequant_iq2xxs,
                     Self::launch_fused_dequant_gemm_iq2xxs,
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2XS) => {
                 self.launch_iq_wmma_fallback(
-                    a_storage, b_storage, &out_storage, m, n, k,
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
                     Self::launch_wmma_fused_dequant_iq2xs,
                     Self::launch_fused_dequant_gemm_iq2xs,
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ2S) => {
                 self.launch_iq_wmma_fallback(
-                    a_storage, b_storage, &out_storage, m, n, k,
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
                     Self::launch_wmma_fused_dequant_iq2s,
                     Self::launch_fused_dequant_gemm_iq2s,
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ3XXS) => {
                 self.launch_iq_wmma_fallback(
-                    a_storage, b_storage, &out_storage, m, n, k,
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
                     Self::launch_wmma_fused_dequant_iq3xxs,
                     Self::launch_fused_dequant_gemm_iq3xxs,
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ3S) => {
                 self.launch_iq_wmma_fallback(
-                    a_storage, b_storage, &out_storage, m, n, k,
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
                     Self::launch_wmma_fused_dequant_iq3s,
                     Self::launch_fused_dequant_gemm_iq3s,
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
                 self.launch_iq_wmma_fallback(
-                    a_storage, b_storage, &out_storage, m, n, k,
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
                     Self::launch_wmma_fused_dequant_iq4nl,
                     Self::launch_fused_dequant_gemm_iq4nl,
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ4XS) => {
                 self.launch_iq_wmma_fallback(
-                    a_storage, b_storage, &out_storage, m, n, k,
+                    a_storage,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
                     Self::launch_wmma_fused_dequant_iq4xs,
                     Self::launch_fused_dequant_gemm_iq4xs,
                 )?;
@@ -476,7 +572,11 @@ impl QuantOps for RocmDevice {
                             ),
                         )
                     });
-                    if !dot_disabled && !Self::is_fp16_activation(a_storage) {
+                    let dot4_max_m: usize = std::env::var("GRIM_PREFILL_DOT4_M_MAX")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(64);
+                    if !dot_disabled && m <= dot4_max_m && !Self::is_fp16_activation(a_storage) {
                         // N4: K80 fallback — round K down to a 32-multiple. A
                         // tightly-packed Q8_0 buffer stores only K/32 full
                         // blocks, so the missing tail weight is zero by
@@ -485,7 +585,8 @@ impl QuantOps for RocmDevice {
                         if k_aligned >= 32 && !(use_legacy_dot2 && m == 1) {
                             let q81_bytes = (k_aligned / 32) * 36 * m;
                             let shape = Shape::new(vec![q81_bytes]);
-                            let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                            let mut buf_guard =
+                                self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                             let need_alloc = match buf_guard.as_ref() {
                                 Some(s) => s.bytes < q81_bytes,
                                 None => true,
@@ -505,14 +606,24 @@ impl QuantOps for RocmDevice {
                             if a_prequant {
                                 drop(buf_guard);
                                 self.launch_dot4_q80_q81_gemv(
-                                    a_storage, b_storage, &out_storage, m, n, k_aligned,
+                                    a_storage,
+                                    b_storage,
+                                    &out_storage,
+                                    m,
+                                    n,
+                                    k_aligned,
                                 )?;
                             } else {
-                                let act_q81 = buf_guard.as_ref().unwrap();
-                                let q_stream = self.launch_quantize_q8_1(a_storage, act_q81, m, k_aligned)?;
-                        fence_act_quant(self, q_stream);
-                                self.launch_dot4_q80_q81_gemv(
-                                    act_q81, b_storage, &out_storage, m, n, k_aligned,
+                                // Task 7 (Plan 3): Small-batch prefill & decode direct f32act dot4 GEMV.
+                                // Directly quantizes in registers and computes GEMV without standalone quantize launch.
+                                drop(buf_guard);
+                                self.launch_dot4_q80_f32act_gemv(
+                                    a_storage,
+                                    b_storage,
+                                    &out_storage,
+                                    m,
+                                    n,
+                                    k_aligned,
                                 )?;
                             }
                         } else if use_legacy_dot2 && m == 1 && k % 32 == 0 {
@@ -526,15 +637,14 @@ impl QuantOps for RocmDevice {
                                 self.ordinal,
                             )?;
                             let _ = self.quantize_fp16(a_storage, &act_f16)?;
-                            self.launch_dot2_q80_gemv(
-                                &act_f16, b_storage, &out_storage, n, k,
-                            )?;
+                            self.launch_dot2_q80_gemv(&act_f16, b_storage, &out_storage, n, k)?;
                             drop(act_f16);
                         } else {
                             // Q8_1 format: 36 bytes per 32-element block
                             let q81_bytes = (k / 32) * 36 * m;
                             let shape = Shape::new(vec![q81_bytes]);
-                            let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
+                            let mut buf_guard =
+                                self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
                             let need_alloc = match buf_guard.as_ref() {
                                 Some(s) => s.bytes < q81_bytes,
                                 None => true,
@@ -554,19 +664,27 @@ impl QuantOps for RocmDevice {
                             // already-packed q8_1 buffer (produced by the fused
                             // grim_rmsnorm_quant_i8 in the model layer) — skip
                             // the quantize launch entirely.
-                            let a_prequant =
-                                a_storage.dtype().arith == ArithType::U8;
+                            let a_prequant = a_storage.dtype().arith == ArithType::U8;
                             if a_prequant {
                                 drop(buf_guard);
                                 self.launch_dot4_q80_q81_gemv(
-                                    a_storage, b_storage, &out_storage, m, n, k,
+                                    a_storage,
+                                    b_storage,
+                                    &out_storage,
+                                    m,
+                                    n,
+                                    k,
                                 )?;
                             } else {
                                 let act_q81 = buf_guard.as_ref().unwrap();
-                                let _ =
-                                    self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
+                                let _ = self.launch_quantize_q8_1(a_storage, act_q81, m, k)?;
                                 self.launch_dot4_q80_q81_gemv(
-                                    act_q81, b_storage, &out_storage, m, n, k,
+                                    act_q81,
+                                    b_storage,
+                                    &out_storage,
+                                    m,
+                                    n,
+                                    k,
                                 )?;
                             }
                         }
@@ -575,11 +693,14 @@ impl QuantOps for RocmDevice {
                     // memory, use the FP16-input kernel to halve A-read bandwidth.
                     else if Self::is_fp16_activation(a_storage) {
                         self.launch_wmma_fused_dequant_q8_0_fp16(
-                            a_storage, b_storage, &out_storage, m, n, k,
+                            a_storage,
+                            b_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
                         )?;
-                    } else if std::env::var("GRIM_FP16_ACT").as_deref()
-                        == Ok("1")
-                    {
+                    } else if std::env::var("GRIM_FP16_ACT").as_deref() == Ok("1") {
                         // Env-gated pre-quantize path: convert FP32 activations
                         // to FP16 on-device, then run the FP16-input WMMA
                         // kernel.  Proves the bandwidth-saving dispatch without
@@ -603,8 +724,7 @@ impl QuantOps for RocmDevice {
                         // round-trip matches the original activation within
                         // FP16 tolerance.  This exercises dequantize_fp16 and
                         // pins the quantize/dequantize kernel contract.
-                        if std::env::var("GRIM_FP16_VERIFY").as_deref() == Ok("1")
-                        {
+                        if std::env::var("GRIM_FP16_VERIFY").as_deref() == Ok("1") {
                             let n_el = a_storage.shape().elem_count();
                             let verify_buf = RocmStorage::alloc_gpu(
                                 a_storage.shape(),
@@ -619,8 +739,7 @@ impl QuantOps for RocmDevice {
                             drop(verify_buf);
                             let mut max_diff = 0.0f32;
                             for i in 0..n_el {
-                                max_diff =
-                                    max_diff.max((original[i] - roundtrip[i]).abs());
+                                max_diff = max_diff.max((original[i] - roundtrip[i]).abs());
                             }
                             if max_diff > 1e-3_f32 {
                                 return Err(Error::Backend(format!(
@@ -632,18 +751,35 @@ impl QuantOps for RocmDevice {
                             }
                         }
                         self.launch_wmma_fused_dequant_q8_0_fp16(
-                            &fp16_buf, b_storage, &out_storage, m, n, k,
+                            &fp16_buf,
+                            b_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
                         )?;
                         // fp16_buf dropped after the GEMM launch is enqueued;
                         // single-stream ordering keeps it live long enough.
                         drop(fp16_buf);
                     } else {
                         self.launch_wmma_fused_dequant_q8_0(
-                            a_storage, b_storage, &out_storage, m, n, k,
+                            a_storage,
+                            b_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
                         )?;
                     }
                 } else {
-                    self.launch_fused_dequant_gemm_q8_0(a_storage, b_storage, &out_storage, m, n, k)?;
+                    self.launch_fused_dequant_gemm_q8_0(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 }
             }
             DTypeStorage::Block(BlockDtype::Fp8)
@@ -658,14 +794,7 @@ impl QuantOps for RocmDevice {
                     Ok("0" | "false" | "off")
                 );
                 if is_rdna34 && m == 1 && !dot_disabled && k % 32 == 0 {
-                    self.launch_dot4_fp8_gemv(
-                        a_storage,
-                        b_storage,
-                        &out_storage,
-                        m,
-                        n,
-                        k,
-                    )?;
+                    self.launch_dot4_fp8_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                 }
                 // gfx1200+ uses MFMA for FP8 throughput; other architectures use scalar.
                 else if self.gpu_target.starts_with("gfx12") {
@@ -806,6 +935,11 @@ impl QuantOps for RocmDevice {
                     FUSED_FORWARD_DISPATCH_STATS
                         .fallback_calls
                         .fetch_add(1, Ordering::Relaxed);
+                    grim_core::emit_fallback(
+                        "grim-backend-rocm/quant_matmul",
+                        grim_core::FallbackReason::FusedQuantGemmDisabled,
+                        format!("forward m={m} n={n} k={k}"),
+                    );
                     return self.matmul(a, b_packed, out_shape);
                 }
                 let out_f32 =
@@ -1390,6 +1524,11 @@ impl QuantOps for RocmDevice {
                     FUSED_BACKWARD_DISPATCH_STATS
                         .fallback_calls
                         .fetch_add(1, Ordering::Relaxed);
+                    grim_core::emit_fallback(
+                        "grim-backend-rocm/quant_matmul",
+                        grim_core::FallbackReason::FusedQuantGemmDisabled,
+                        format!("backward m={m} n={n} k={k}"),
+                    );
                     return self.matmul(dy, b_packed, out_shape);
                 }
                 self.launch_fused_dequant_backward_gemm_f16(
@@ -1467,7 +1606,9 @@ impl QuantOps for RocmDevice {
                     sc_off,
                 )?;
             }
-            DTypeStorage::W4A16(_) | DTypeStorage::EmbeddingWNA16Int | DTypeStorage::W4A4OstQuant(_) => {
+            DTypeStorage::W4A16(_)
+            | DTypeStorage::EmbeddingWNA16Int
+            | DTypeStorage::W4A4OstQuant(_) => {
                 // Weight-only (W4A16), embedding (EmbeddingWNA16Int), and W4A4 (W4A4OstQuant) formats are
                 // inference-only: no weight-gradient kernel exists. Fail loudly.
                 return Err(Error::Backend(
@@ -1548,7 +1689,6 @@ impl QuantOps for RocmDevice {
     }
 }
 
-
 /// WMMA tiled-quant dispatch gate (RDNA3/4, wave32 only).
 /// The tiled kernels use 128-thread (4x wave32) blocks with cross-wave LDS
 /// sharing, which is only correct when every output tile is whole:
@@ -1562,7 +1702,9 @@ impl QuantOps for RocmDevice {
 /// buffer before the quantize kernel's writes land. Record an event on the
 /// quantize stream and make the compute stream wait on it.
 fn fence_act_quant(dev: &RocmDevice, quantize_stream: *mut c_void) {
-    use crate::device::handles::{hipEventCreate, hipEventDestroy, hipEventRecord, hipStreamWaitEvent, hipSuccess};
+    use crate::device::handles::{
+        hipEventCreate, hipEventDestroy, hipEventRecord, hipStreamWaitEvent, hipSuccess,
+    };
     use std::ptr::null_mut;
     let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
     unsafe {

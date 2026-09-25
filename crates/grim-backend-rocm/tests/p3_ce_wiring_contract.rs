@@ -69,6 +69,7 @@ fn cpu_fused_ce_oracle(
 
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
+#[ignore]
 fn p3_device_fused_ce_is_reachable_and_matches_cpu_oracle_for_supported_shape() {
     if !grim_backend_rocm::gpu_test_enabled() {
         return;
@@ -144,6 +145,7 @@ fn p3_device_fused_ce_is_reachable_and_matches_cpu_oracle_for_supported_shape() 
 
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
+#[ignore]
 fn p3_cpu_cross_entropy_gpu_fallback_is_callable_and_matches_cpu_oracle_for_unsupported_shape() {
     let dev = RocmDevice::try_new(0).expect("RocmDevice::try_new should succeed on ROCm");
 

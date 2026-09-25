@@ -508,7 +508,7 @@ impl Qwen35Block {
                     };
                     (q_dev, k_dev_t, v_dev_t)
                 }
-                };
+            };
 
             let q_rope = rope_ext(&q_dev, self.num_heads)?;
             let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
@@ -535,14 +535,12 @@ impl Qwen35Block {
             let _ = v_cap_rows;
 
             if k_cap_rows >= need_rows {
-                let k_dev = cache
-                    .k_device
-                    .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("cache.k_device missing".into()))?;
-                let v_dev = cache
-                    .v_device
-                    .as_ref()
-                    .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
+                let k_dev = cache.k_device.as_ref().ok_or_else(|| {
+                    grim_core::error::Error::Backend("cache.k_device missing".into())
+                })?;
+                let v_dev = cache.v_device.as_ref().ok_or_else(|| {
+                    grim_core::error::Error::Backend("cache.v_device missing".into())
+                })?;
                 dev.copy_slice_range(
                     &**k_dev,
                     cache.current_pos * self.num_kv_heads * self.head_dim,

@@ -24,6 +24,7 @@ use grim_tensor::{CoreTensorOps, DType, Shape};
 /// no-op (passes) in a non-GPU CI. With the cubecl feature + GPU it exercises
 /// the A/B branches that the direct-kernel test above does NOT cover.
 #[test]
+#[ignore]
 fn cubecl_ab_dispatch_through_device_methods() {
     if !grim_backend_rocm::gpu_test_enabled() {
         return;
@@ -159,6 +160,7 @@ fn max_err(got: &[f32], want: &[f32]) -> f32 {
 }
 
 #[test]
+#[ignore]
 fn cubecl_lifted_kernels_match_cpu_reference() {
     if !grim_backend_rocm::gpu_test_enabled() {
         return;

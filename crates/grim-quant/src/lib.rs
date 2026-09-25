@@ -59,9 +59,9 @@ pub fn dequant_ostquant_w4a4(
     let out_features = *shape.first().ok_or_else(|| {
         Error::Backend("dequant_ostquant_w4a4: shape missing out_features".into())
     })?;
-    let in_features = *shape.get(1).ok_or_else(|| {
-        Error::Backend("dequant_ostquant_w4a4: shape missing in_features".into())
-    })?;
+    let in_features = *shape
+        .get(1)
+        .ok_or_else(|| Error::Backend("dequant_ostquant_w4a4: shape missing in_features".into()))?;
 
     let n_groups = in_features.div_ceil(group_size);
     let words_per_col = in_features / 8;
@@ -72,7 +72,9 @@ pub fn dequant_ostquant_w4a4(
             let sc_offset = (row * n_groups + g) * 2;
             let zr_offset = row * n_groups + g;
             if sc_offset + 2 > scales.len() || zr_offset >= zeros.len() {
-                return Err(Error::Backend("dequant_ostquant_w4a4: scales/zeros buffer out of bounds".into()));
+                return Err(Error::Backend(
+                    "dequant_ostquant_w4a4: scales/zeros buffer out of bounds".into(),
+                ));
             }
             let sc_bits = u16::from_le_bytes([scales[sc_offset], scales[sc_offset + 1]]);
             let sc = f32::from_bits((sc_bits as u32) << 16);
@@ -82,7 +84,9 @@ pub fn dequant_ostquant_w4a4(
             for w in 0..words_in_grp {
                 let qw_offset = (row * words_per_col + g * words_in_grp + w) * 4;
                 if qw_offset + 4 > qweight.len() {
-                    return Err(Error::Backend("dequant_ostquant_w4a4: qweight buffer out of bounds".into()));
+                    return Err(Error::Backend(
+                        "dequant_ostquant_w4a4: qweight buffer out of bounds".into(),
+                    ));
                 }
                 let word = u32::from_le_bytes([
                     qweight[qw_offset],
@@ -1925,7 +1929,10 @@ pub fn quant_q4k(data: &[f32]) -> Result<Vec<u8>> {
 /// nibble-interleave-for-chunks dropped (the kernel indexes nibbles directly).
 pub fn quant_q4khalf(data: &[f32]) -> Result<Vec<u8>> {
     if data.is_empty() || data.len() % 32 != 0 || data.len() > 256 {
-        return Err(Error::Backend(format!("quant_q4khalf: len {} must be a nonzero multiple of 32, <= 256", data.len())));
+        return Err(Error::Backend(format!(
+            "quant_q4khalf: len {} must be a nonzero multiple of 32, <= 256",
+            data.len()
+        )));
     }
     let s_blocks = data.len() / 32;
     let mut out = Vec::with_capacity(4 + 2 * s_blocks + data.len() / 2);
@@ -4213,7 +4220,9 @@ mod tests {
             })
             .fold(0.0f32, f32::max);
 
-        let q4kh_cold_err: f32 = (0..64).map(|i| (back[i] - data[i]).abs()).fold(0.0f32, f32::max);
+        let q4kh_cold_err: f32 = (0..64)
+            .map(|i| (back[i] - data[i]).abs())
+            .fold(0.0f32, f32::max);
         assert!(
             q4kh_cold_err * 4.0 < legacy_err,
             "per-group scaling must win decisively on the quiet groups: q4khalf={q4kh_cold_err} legacy={legacy_err}"
@@ -4285,7 +4294,9 @@ mod tests {
     fn quant_mxfp4_matrix_repack_of_native_is_lossless() {
         let k = 96usize; // multiple of 32, > 1 superblock per row
         let rows = 3usize;
-        let seed_data: Vec<f32> = (0..rows * k).map(|i| ((i % 23) as f32 - 11.0) * 0.4).collect();
+        let seed_data: Vec<f32> = (0..rows * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.4)
+            .collect();
         let (codes0, exps0) = quant_mxfp4_matrix(&seed_data, rows, k);
 
         // Decode exactly like the kernels do: nibble order (even=low, odd=high),

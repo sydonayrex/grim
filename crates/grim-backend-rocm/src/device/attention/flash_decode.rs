@@ -3,13 +3,12 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+use grim_tensor::Shape;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ Shape };
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, arg, dev_ptr, dtype_f32, hipStreamSynchronize, hipSuccess };
-
+use crate::{HipDim3, arg, dev_ptr, dtype_f32, hipStreamSynchronize, hipSuccess};
 
 impl RocmDevice {
     /// Launch FlashDecoding (Split-KV Parallel Attention) across sequence chunks + merge reduction.
@@ -202,11 +201,7 @@ impl RocmDevice {
                 return parsed;
             }
         }
-        if self.is_rdna34 {
-            256
-        } else {
-            512
-        }
+        if self.is_rdna34 { 256 } else { 512 }
     }
 
     /// Split-KV count for FlashDecoding: consult the autotuner (persisted in `.autotune_cache/{gpu_target}.json`) keyed by `(num_heads, head_dim, kv_len)`; on miss return the static heuristic.

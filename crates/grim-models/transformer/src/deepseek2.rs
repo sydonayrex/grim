@@ -564,11 +564,14 @@ impl DeepSeek2Moe {
                 down: e.w2.clone(),
             })
             .collect();
-        let shared_expert = self.shared_experts.as_ref().map(|e| crate::shared_moe::MoeExpert {
-            gate: e.w1.clone(),
-            up: e.w3.clone(),
-            down: e.w2.clone(),
-        });
+        let shared_expert = self
+            .shared_experts
+            .as_ref()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.w1.clone(),
+                up: e.w3.clone(),
+                down: e.w2.clone(),
+            });
 
         crate::shared_moe::fused_moe_dispatch_from_logits(
             dev.as_ref(),
@@ -595,7 +598,8 @@ impl DeepSeek2Moe {
         let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
 
         // Compute per-token top-k routing (indices + normalized combine weights).
-        let routings = crate::shared_moe::route_topk(logits_v, self.experts.len(), self.num_experts_per_tok)?;
+        let routings =
+            crate::shared_moe::route_topk(logits_v, self.experts.len(), self.num_experts_per_tok)?;
 
         // Map per-expert FFN weights into the shared MoE expert shape.
         let experts: Vec<crate::shared_moe::MoeExpert> = self
@@ -607,11 +611,14 @@ impl DeepSeek2Moe {
                 down: e.w2.clone(),
             })
             .collect();
-        let shared_expert = self.shared_experts.as_ref().map(|e| crate::shared_moe::MoeExpert {
-            gate: e.w1.clone(),
-            up: e.w3.clone(),
-            down: e.w2.clone(),
-        });
+        let shared_expert = self
+            .shared_experts
+            .as_ref()
+            .map(|e| crate::shared_moe::MoeExpert {
+                gate: e.w1.clone(),
+                up: e.w3.clone(),
+                down: e.w2.clone(),
+            });
 
         // Fall back to the host path if the backend lacks a needed primitive.
         if dev.zeros(&Shape::new(vec![1]), DType::F32).is_err() {

@@ -19,6 +19,15 @@ pub struct DoctorReport {
     pub warnings: Vec<String>,
 }
 
+/// M13: exit-code contract for `grim doctor`, called by `main`.
+/// Healthy → 0; `Ok(false)` (errors present) or `Err` → 1.
+pub fn doctor_exit_code<E>(result: std::result::Result<bool, E>) -> i32 {
+    match result {
+        Ok(true) => 0,
+        _ => 1,
+    }
+}
+
 pub fn run_doctor(
     addr: &str,
     service_name: &str,
@@ -265,6 +274,85 @@ fn check_health_endpoint(report: &mut DoctorReport, addr: &str) {
     }
 }
 
+/// D4: classification of the engine `/metrics` hardware block. Pure so the
+/// fake-server test can pin every arm without spawning curl.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MetricsGpuVerdict {
+    /// `rocm_gpu_count > 0` — engine claim corroborated.
+    Rocm(i64),
+    /// `rocm_gpu_count <= 0` (or the field is missing) — engine claims a GPU
+    /// backend but reports none.
+    CpuFallback(i64),
+    /// Body was not valid JSON.
+    Unparseable,
+}
+
+/// D4: parse a `/metrics` JSON body into a GPU-backend verdict.
+pub fn metrics_gpu_verdict(body: &str) -> MetricsGpuVerdict {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(json) => {
+            let gpu_count = json
+                .get("hardware")
+                .and_then(|h| h.get("rocm_gpu_count"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            if gpu_count > 0 {
+                MetricsGpuVerdict::Rocm(gpu_count)
+            } else {
+                MetricsGpuVerdict::CpuFallback(gpu_count)
+            }
+        }
+        Err(_) => MetricsGpuVerdict::Unparseable,
+    }
+}
+
+/// D4: probe the engine `/metrics` endpoint for the real GPU backend.
+/// URL overridable with `GRIM_DOCTOR_METRICS_URL` (fake-server tests).
+fn check_metrics_endpoint(report: &mut DoctorReport) {
+    let url = std::env::var("GRIM_DOCTOR_METRICS_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434/metrics".to_string());
+    let output = std::process::Command::new("curl").args(["-sf", &url]).output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let body = String::from_utf8_lossy(&o.stdout);
+            match metrics_gpu_verdict(&body) {
+                MetricsGpuVerdict::Rocm(gpu_count) => {
+                    report.gpu_backend_actual = Some(format!("rocm ({} devices)", gpu_count));
+                    println!(
+                        "[OK]  Engine reports {} ROCm device(s) in /metrics — GPU backend active.",
+                        gpu_count
+                    );
+                }
+                MetricsGpuVerdict::CpuFallback(gpu_count) => {
+                    report.gpu_backend_actual =
+                        Some(format!("cpu ({} devices in /metrics)", gpu_count));
+                    // D4: an engine claiming a GPU backend while reporting
+                    // zero devices is a truth failure, not a soft warning —
+                    // the doctor must exit nonzero on it.
+                    report.errors.push(
+                        "Engine /metrics reports 0 GPUs while a GPU backend is configured — CPU fallback active"
+                            .into(),
+                    );
+                    eprintln!(
+                        "[ERROR] /metrics reports {} GPU count — CPU fallback active.",
+                        gpu_count
+                    );
+                }
+                MetricsGpuVerdict::Unparseable => {
+                    eprintln!("[WARN] Could not parse /metrics JSON response.");
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "[INFO] /metrics endpoint not reachable — skipping in-process GPU backend check."
+            );
+            report.gpu_backend_actual = Some("unknown (metrics endpoint unreachable)".into());
+        }
+    }
+}
+
 fn check_gpu_backend(report: &mut DoctorReport) {
     // Query system ROCm path and version
     match grim_backend_rocm::probe_system_rocm() {
@@ -341,50 +429,7 @@ fn check_gpu_backend(report: &mut DoctorReport) {
             }
 
             // Check /metrics for actual GPU usage, not CPU fallback.
-            let output = std::process::Command::new("curl")
-                .args(["-sf", "http://127.0.0.1:11434/metrics"])
-                .output();
-
-            match output {
-                Ok(o) if o.status.success() => {
-                    let body = String::from_utf8_lossy(&o.stdout);
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                        let gpu_count = json
-                            .get("hardware")
-                            .and_then(|h| h.get("rocm_gpu_count"))
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(-1);
-                        if gpu_count > 0 {
-                            report.gpu_backend_actual =
-                                Some(format!("rocm ({} devices)", gpu_count));
-                            println!(
-                                "[OK]  Engine reports {} ROCm device(s) in /metrics — GPU backend active.",
-                                gpu_count
-                            );
-                        } else {
-                            report.gpu_backend_actual =
-                                Some(format!("cpu ({} devices in /metrics)", gpu_count));
-                            report.warnings.push(
-                                "GPU backend appears to report 0 devices — possible CPU fallback"
-                                    .into(),
-                            );
-                            eprintln!(
-                                "[WARN] /metrics reports {} GPU count — may indicate CPU fallback.",
-                                gpu_count
-                            );
-                        }
-                    } else {
-                        eprintln!("[WARN] Could not parse /metrics JSON response.");
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "[INFO] /metrics endpoint not reachable — skipping in-process GPU backend check."
-                    );
-                    report.gpu_backend_actual =
-                        Some("unknown (metrics endpoint unreachable)".into());
-                }
-            }
+            check_metrics_endpoint(report);
         }
         Ok(devices) if devices.is_empty() => {
             report.gpu_detected = Some(false);
@@ -792,5 +837,88 @@ mod tests {
     fn dirs_next_cache_returns_path_or_fallback() {
         let path = dirs_next_cache();
         assert!(path.is_some() || std::env::var("HOME").is_err());
+    }
+
+    /// M13: exit-code contract — healthy → 0, `Ok(false)` or `Err` → 1.
+    /// `main` calls `doctor_exit_code` instead of inline matching so the
+    /// mapping is pinned here, not just observed in a subprocess.
+    #[test]
+    fn doctor_exit_code_contract() {
+        assert_eq!(super::doctor_exit_code::<String>(Ok(true)), 0);
+        assert_eq!(super::doctor_exit_code::<String>(Ok(false)), 1);
+        assert_eq!(
+            super::doctor_exit_code::<String>(Err("boom".to_string())),
+            1
+        );
+    }
+
+    /// D4: every `/metrics` verdict arm is pinned — count > 0 corroborates
+    /// the engine claim, count <= 0 (and a missing field) is a CPU-fallback
+    /// truth failure, and non-JSON bodies are unparseable.
+    #[test]
+    fn metrics_gpu_verdict_arms_pinned() {
+        assert_eq!(
+            metrics_gpu_verdict("{\"hardware\":{\"rocm_gpu_count\":2}}"),
+            MetricsGpuVerdict::Rocm(2)
+        );
+        assert_eq!(
+            metrics_gpu_verdict("{\"hardware\":{\"rocm_gpu_count\":0}}"),
+            MetricsGpuVerdict::CpuFallback(0)
+        );
+        // Missing field → unwrap_or(-1) → truth failure.
+        assert_eq!(
+            metrics_gpu_verdict("{\"hardware\":{}}"),
+            MetricsGpuVerdict::CpuFallback(-1)
+        );
+        assert_eq!(metrics_gpu_verdict("not json at all"), MetricsGpuVerdict::Unparseable);
+    }
+
+    /// D4: fake `/metrics` server reporting `rocm_gpu_count: 0` — the truth
+    /// failure must fire in the report and the doctor exit contract must be
+    /// nonzero for it. This is the leg the doctor never had: an engine that
+    /// claims a GPU backend but serves 0 devices is failed, not warned.
+    #[test]
+    fn metrics_endpoint_zero_gpu_report_is_truth_failure() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one curl request");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = "{\"hardware\":{\"rocm_gpu_count\":0}}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+        // SAFETY: test-only env override; no other test in this binary reads
+        // GRIM_DOCTOR_METRICS_URL, so the set/remove window is private.
+        unsafe {
+            std::env::set_var("GRIM_DOCTOR_METRICS_URL", format!("http://{addr}/metrics"));
+        }
+        let mut report = DoctorReport::default();
+        check_metrics_endpoint(&mut report);
+        unsafe {
+            std::env::remove_var("GRIM_DOCTOR_METRICS_URL");
+        }
+        server.join().expect("fake server thread finishes");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("0 GPUs")),
+            "GPU-count-0 must be a truth failure, got {:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.gpu_backend_actual.as_deref(),
+            Some("cpu (0 devices in /metrics)")
+        );
+        // The truth failure must fail the doctor: errors non-empty →
+        // run_doctor returns Ok(false) → doctor_exit_code 1 (nonzero).
+        assert_eq!(super::doctor_exit_code::<String>(Ok(false)), 1);
     }
 }

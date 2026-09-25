@@ -149,7 +149,7 @@ pub fn copy_route(
             crate::rccl::p2p_memcpy_async(dst_ptr, dst_device, src_ptr, src_device, len, stream)?;
         }
         RouteLink::HostBounce => {
-            let staging = take_staging(stream, len)?;
+            let staging = take_staging(stream, len, src_device)?;
             // P1-3: plain `hipMemcpyAsync` executes against the calling thread's CURRENT device, but each leg dereferences a pointer owned by a specific device: the D2H leg reads `src_ptr` (src_device), the H2D leg writes `dst_ptr` (dst_device).
             // Pin each leg to its pointer's owner or the leg silently no-ops / faults on.
             {
@@ -184,6 +184,10 @@ pub fn copy_route(
 /// Cached pinned staging buffer, reused across host-bounce copies on one stream.
 /// `None` until the first bounce; grown when a larger transfer arrives.
 struct StagingCache {
+    /// Source ordinal the pinned buffer was allocated under — pinned host
+    /// memory is context-bound on this stack (scythe2/GRAVE fault class), so
+    /// a bounce routed from a different source must not reuse the buffer.
+    ordinal: i32,
     stream: *mut c_void,
     buf: HostStagingBuffer,
 }
@@ -209,13 +213,13 @@ impl StagingGuard<'_> {
 
 /// Obtain staging memory for a bounce on `stream`: the cached buffer when the stream matches
 /// and capacity suffices, a regrown replacement when a bigger same-stream transfer arrives, otherwise a one-shot allocation.
-fn take_staging(stream: *mut c_void, len: usize) -> Result<StagingGuard<'static>> {
+fn take_staging(stream: *mut c_void, len: usize, ordinal: i32) -> Result<StagingGuard<'static>> {
     let mut guard = STAGING_CACHE
         .lock()
         .map_err(|_| Error::Backend("staging cache mutex poisoned".into()))?;
     let reuse_cached = guard
         .as_ref()
-        .is_some_and(|c| c.stream == stream && c.buf.size() >= len);
+        .is_some_and(|c| c.stream == stream && c.ordinal == ordinal && c.buf.size() >= len);
     if reuse_cached {
         // SAFETY: the lock is held for the whole lease, so the buffer cannot be
         // swapped out or freed underneath us; same-stream reuse is additionally queue-ordered by `stream` itself.
@@ -229,15 +233,28 @@ fn take_staging(stream: *mut c_void, len: usize) -> Result<StagingGuard<'static>
             ptr,
         });
     }
-    let fresh = HostStagingBuffer::new(len)?;
+    // GRAVE/task-0.3 device-guard discipline: hipHostMalloc is a raw seam —
+    // pin the allocating context to the bounce's source device (scythe2
+    // lesson: unpinned pinned-memory allocs land on a foreign context and
+    // page-fault on the later D2H/H2D legs).
+    let fresh = {
+        let _alloc_guard = crate::device::util::DeviceGuard::set(ordinal);
+        HostStagingBuffer::new(len)?
+    };
     let ptr = fresh.as_device_ptr();
-    let same_stream_grow = guard
-        .as_ref()
-        .is_some_and(|c| c.stream == stream && c.buf.size() < len);
-    if same_stream_grow || guard.is_none() {
-        // First use, or a larger transfer on the same stream: (re)seed the
-        // cache so subsequent bounces reuse this allocation.
-        *guard = Some(StagingCache { stream, buf: fresh });
+    let same_ordinal = guard.as_ref().is_some_and(|c| c.ordinal == ordinal);
+    let same_stream_grow = same_ordinal
+        && guard
+            .as_ref()
+            .is_some_and(|c| c.stream == stream && c.buf.size() < len);
+    if same_stream_grow || guard.is_none() || !same_ordinal {
+        // First use, or a larger transfer / different source ordinal: (re)seed
+        // the cache so subsequent bounces reuse this allocation.
+        *guard = Some(StagingCache {
+            ordinal,
+            stream,
+            buf: fresh,
+        });
         Ok(StagingGuard {
             _lock: guard,
             _one_shot: None,

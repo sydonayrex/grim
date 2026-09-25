@@ -433,9 +433,7 @@ impl DecodeBucketGraphPool {
 
     /// Check if a graph executable is captured and instantiated for a bucket.
     pub fn contains_bucket(&self, bucket: DecodeBatchBucket) -> bool {
-        self.graphs
-            .get(&bucket)
-            .is_some_and(|g| g.is_captured)
+        self.graphs.get(&bucket).is_some_and(|g| g.is_captured)
     }
 
     /// Allocate a batch-sized decode graph (buffers + stream, not yet captured)
@@ -515,11 +513,7 @@ impl DecodeBucketGraphPool {
     /// The recorded graph binds the exact device pointers of the bucket's
     /// buffers at capture time; replay with different token IDs rewrites only
     /// input slots, never the topology.
-    pub fn capture_batch_graph<F>(
-        &mut self,
-        bucket: DecodeBatchBucket,
-        model_fn: F,
-    ) -> Result<()>
+    pub fn capture_batch_graph<F>(&mut self, bucket: DecodeBatchBucket, model_fn: F) -> Result<()>
     where
         F: FnOnce(&mut crate::decode_graph_buffers::DecodeGraph) -> Result<()>,
     {
@@ -547,9 +541,10 @@ impl DecodeBucketGraphPool {
         dev: &RocmDevice,
         token_ids: &[u32],
     ) -> Result<&crate::RocmStorage> {
-        let graph = self.graphs.get_mut(&bucket).ok_or_else(|| {
-            Error::Backend(format!("No captured graph for bucket {bucket:?}"))
-        })?;
+        let graph = self
+            .graphs
+            .get_mut(&bucket)
+            .ok_or_else(|| Error::Backend(format!("No captured graph for bucket {bucket:?}")))?;
         if token_ids.len() != bucket.batch_size() {
             return Err(Error::Backend(format!(
                 "replay_batch: token_ids len {} != bucket batch_size {}",
@@ -581,9 +576,10 @@ impl DecodeBucketGraphPool {
         token_ids: &[u32],
         positions: &[u32],
     ) -> Result<&crate::memory::storage::RocmStorage> {
-        let graph = self.graphs.get_mut(&bucket).ok_or_else(|| {
-            Error::Backend(format!("No captured graph for bucket {bucket:?}"))
-        })?;
+        let graph = self
+            .graphs
+            .get_mut(&bucket)
+            .ok_or_else(|| Error::Backend(format!("No captured graph for bucket {bucket:?}")))?;
         if token_ids.len() != bucket.batch_size() || positions.len() != bucket.batch_size() {
             return Err(Error::Backend(format!(
                 "replay_batch_with_pos: token_ids {} / positions {} != batch {}",
@@ -782,7 +778,10 @@ mod tests {
         p.note_fail(8);
         assert!(p.should_attempt(16));
         p.note_fail(16);
-        assert!(!p.should_attempt(24), "budget exhausted (3 failures > 2 retries)");
+        assert!(
+            !p.should_attempt(24),
+            "budget exhausted (3 failures > 2 retries)"
+        );
         assert!(!p.should_attempt(1000));
     }
 

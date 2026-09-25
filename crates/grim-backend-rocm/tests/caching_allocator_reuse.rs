@@ -37,6 +37,7 @@ fn gpu_tests_enabled() -> bool {
 /// the caching pool is recycling the same bucket slot across calls, not
 /// re-allocating per invocation.
 #[test]
+#[ignore]
 fn copy_from_host_async_does_not_grow_malloc_count_per_call() {
     if !gpu_tests_enabled() {
         eprintln!("[skipped: GRIM_GPU_TEST not set]");

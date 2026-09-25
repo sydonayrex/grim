@@ -234,3 +234,39 @@ impl Engine {
         self.adapters.keys().copied().max().unwrap_or(0) + 1
     }
 }
+
+#[cfg(test)]
+mod adapter_lifecycle_tests {
+    use super::*;
+    use crate::EngineConfig;
+
+    fn test_handle(id: u32) -> AdapterHandle {
+        AdapterHandle {
+            id,
+            a: grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1, 1])),
+            b: grim_backend_cpu::cpu_tensor(vec![1.0], grim_tensor::Shape::new(vec![1, 1])),
+            alpha: 1.0,
+        }
+    }
+
+    /// Dropped ids must not resolve (no stale alias); re-registration serves
+    /// the new handle; `next_adapter_id` never reuses a live-or-higher id.
+    #[test]
+    fn drop_frees_id_without_stale_alias() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_adapter("base", "first", test_handle(7));
+        assert!(engine.resolve_adapters(&[7]).is_some());
+        assert!(engine.drop_adapter(7));
+        assert!(
+            engine.resolve_adapters(&[7]).is_none(),
+            "dropped id must not resolve"
+        );
+        assert!(!engine.drop_adapter(7), "double drop must report false");
+        engine.register_adapter("base", "second", test_handle(7));
+        let resolved = engine.resolve_adapters(&[7]).expect("re-registered");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, 7);
+        assert_eq!(engine.get_adapter_by_name("second").unwrap().handle.id, 7);
+        assert!(engine.get_adapter_by_name("first").is_none());
+    }
+}

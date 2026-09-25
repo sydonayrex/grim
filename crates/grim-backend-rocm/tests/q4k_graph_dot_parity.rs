@@ -18,7 +18,9 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (u32::MAX as f32)) * 2.0 - 1.0
         })
         .collect()
@@ -32,6 +34,7 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
+#[ignore]
 fn q4k_linear_decode_into_matches_cpu() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,

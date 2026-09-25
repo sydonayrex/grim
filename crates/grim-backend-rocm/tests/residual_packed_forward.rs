@@ -7,6 +7,11 @@ use grim_backend_rocm::{FUSED_FORWARD_DISPATCH_STATS, RocmDevice};
 use grim_tensor::dtype::{ArithType, DType, QuantProvenance, Storage};
 use grim_tensor::{CoreTensorOps, MemoryOps, QuantOps, Shape};
 
+/// Both tests reset/observe the same process-global dispatch stats, so they
+/// must not run concurrently (parallel test threads made the backup2 stat
+/// observable mid-reset once JIT timing shifted).
+static STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn pack_bpw2(codes: [u8; 4]) -> u8 {
     (codes[0] << 6) | (codes[1] << 4) | (codes[2] << 2) | codes[3]
 }
@@ -17,6 +22,7 @@ fn residual_packed_forward_passes_backup2_and_merges_it() {
     if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
+    let _stats_guard = STATS_LOCK.lock().unwrap();
     let devices = match RocmDevice::probe() {
         Ok(devices) if !devices.is_empty() => devices,
         _ => return,
@@ -123,6 +129,7 @@ fn residual_packed_forward_applies_outlier_correction_in_fused_path() {
     if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
+    let _stats_guard = STATS_LOCK.lock().unwrap();
     let devices = match RocmDevice::probe() {
         Ok(devices) if !devices.is_empty() => devices,
         _ => return,

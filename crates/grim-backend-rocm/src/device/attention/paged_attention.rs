@@ -4,12 +4,11 @@ use std::ffi::c_void;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, Shape };
+use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32 };
-
+use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32};
 
 impl RocmDevice {
     /// Launch Extend Attention Chunk kernel across context slice [chunk_start, chunk_end).

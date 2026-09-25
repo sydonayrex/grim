@@ -140,7 +140,13 @@ impl ChannelImportanceComputer {
     /// (GQA-mapped: q head h maps to kv head `h * num_kv_heads / num_q_heads`).
     /// `k` is the same layout as `update_kv`. Call with the paired q/k of the
     /// same tokens.
-    pub fn update_q_variance(&mut self, q: &[f32], k: &[f32], rows: usize, num_q_heads: usize) -> Result<(), String> {
+    pub fn update_q_variance(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        rows: usize,
+        num_q_heads: usize,
+    ) -> Result<(), String> {
         let Some(k_qvar) = self.k_qvar.as_mut() else {
             return Err("computer was built with_q = false".into());
         };
@@ -419,8 +425,12 @@ mod tests {
     fn importance_is_deterministic_and_normalizes() {
         let mut c = mk_computer(2, 128, false);
         let rows = 64usize;
-        let k: Vec<f32> = (0..rows * 2 * 128).map(|i| ((i % 37) as f32 - 18.0) * 0.013).collect();
-        let v: Vec<f32> = (0..rows * 2 * 128).map(|i| ((i % 23) as f32 - 11.0) * 0.007).collect();
+        let k: Vec<f32> = (0..rows * 2 * 128)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.013)
+            .collect();
+        let v: Vec<f32> = (0..rows * 2 * 128)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.007)
+            .collect();
         c.update_kv(&k, &v, rows).unwrap();
         // Same data again must double the energies but leave normalized scores equal.
         c.update_kv(&k, &v, rows).unwrap();
@@ -447,8 +457,7 @@ mod tests {
         }
         c.update_kv(&k, &v, rows).unwrap();
         let s = c.finish();
-        let top = s
-            .k_scores[0]
+        let top = s.k_scores[0]
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
@@ -522,10 +531,7 @@ mod tests {
     #[test]
     fn allocator_respects_budget_and_prefers_important_groups() {
         // 2 heads × 4 groups. Head 0: group 1 dominates. Head 1: group 3.
-        let scores = [
-            vec![0.1f32, 0.7, 0.1, 0.1],
-            vec![0.1, 0.1, 0.1, 0.7],
-        ];
+        let scores = [vec![0.1f32, 0.7, 0.1, 0.1], vec![0.1, 0.1, 0.1, 0.7]];
         // Budget: average 5 bits/elem over 8 (head,group) cells, floor 4.
         // Floor cost 32; upgrades 4→8 cost 4 each → exactly two upgrades land,
         // on the two dominant groups.

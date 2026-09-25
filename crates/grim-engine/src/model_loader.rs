@@ -24,12 +24,13 @@ use grim_models_transformer::{
     Glm52Config, Gpt2, Gpt2Config, GptJ, GptJConfig, GptOss, GptOssConfig, GraniteMoeHybrid,
     GraniteMoeHybridConfig, HunyuanVl, HunyuanVlConfig, HunyuanVlVisionConfig, HyV3, HyV3Config,
     HyV4, HyV4Config, InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig,
-    KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, LongCatFlash,
-    LongCatFlashConfig, Mellum, MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3,
-    MiniMaxM3Config, Phi2, PhiConfig, Qwen, Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe,
-    Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe,
-    Qwen35MoeConfig, Qwen38FlashNext, Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config,
-    SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
+    KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2AttentionMode, Lfm2Config, Llama,
+    LlamaConfig, LongCatFlash, LongCatFlashConfig, Mellum, MellumConfig, MiniCpmConfig,
+    MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig, Qwen, Qwen2Vl, Qwen2VlConfig,
+    Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig,
+    Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext, Qwen38FlashNextConfig,
+    QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
+    WavTokenizerDec, WavTokenizerDecConfig,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -51,6 +52,87 @@ pub(crate) fn lfm2_mxfp4_qkv_enabled() -> bool {
     std::env::var("GRIM_LFM2_MXFP4_QKV")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
         .unwrap_or(true)
+}
+
+/// GRAVE Phase 2: detect GDL linear attention mode via env or checkpoint metadata.
+/// GRAVE checkpoint-driven mode: `lfm2grave` checkpoints force GDL mode;
+/// plain `lfm2` honors the env (`GRIM_LFM2_ATTENTION_MODE`/`GRIM_GRAVE`).
+pub(crate) fn lfm2_attention_mode_for_arch(arch_str: &str) -> Lfm2AttentionMode {
+    if arch_str.eq_ignore_ascii_case("lfm2grave") {
+        Lfm2AttentionMode::Gdl
+    } else {
+        lfm2_attention_mode_from_env()
+    }
+}
+
+pub(crate) fn lfm2_attention_mode_from_env() -> Lfm2AttentionMode {
+    if matches!(
+        std::env::var("GRIM_LFM2_ATTENTION_MODE").as_deref(),
+        Ok("gdl" | "GDL" | "grave" | "GRAVE")
+    ) || matches!(
+        std::env::var("GRIM_GRAVE").as_deref(),
+        Ok("1" | "true" | "TRUE")
+    ) {
+        Lfm2AttentionMode::Gdl
+    } else {
+        Lfm2AttentionMode::Softmax
+    }
+}
+
+/// Parse an optional per-layer attention-mode list (GRAVE hybrid fallback)
+/// from `GRIM_LFM2_ATTENTION_MODE_LAYERS`. Two accepted spellings:
+///   - dense:  `gdl,gdl,softmax,gdl`  (exactly `num_layers` entries)
+///   - sparse: `gdl@2,5,8,10,12,14`   (mode @ layer ordinals)
+///
+/// Returns `None` when unset/empty (scalar broadcast applies). Malformed or
+/// wrong-length lists are errors — fail closed, never a silent partial
+/// conversion. Checkpoint-driven per-layer lists slot in here later: the
+/// parser is the single extension point both loader arms share.
+pub(crate) fn lfm2_attention_mode_per_layer(
+    num_layers: usize,
+) -> std::result::Result<Option<Vec<Lfm2AttentionMode>>, String> {
+    let raw = match std::env::var("GRIM_LFM2_ATTENTION_MODE_LAYERS") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Ok(None),
+    };
+    let raw = raw.trim();
+    let parse_mode = |s: &str| match s.trim().to_ascii_lowercase().as_str() {
+        "gdl" | "grave" => Some(Lfm2AttentionMode::Gdl),
+        "softmax" | "sm" => Some(Lfm2AttentionMode::Softmax),
+        _ => None,
+    };
+    if let Some((mode_part, idx_part)) = raw.split_once('@') {
+        let mode = parse_mode(mode_part).ok_or_else(|| {
+            format!("GRIM_LFM2_ATTENTION_MODE_LAYERS: unknown mode {mode_part:?} in sparse form")
+        })?;
+        let mut v = vec![Lfm2AttentionMode::Softmax; num_layers];
+        for tok in idx_part.split(',') {
+            let idx: usize = tok.trim().parse().map_err(|_| {
+                format!("GRIM_LFM2_ATTENTION_MODE_LAYERS: bad layer ordinal {tok:?}")
+            })?;
+            if idx >= num_layers {
+                return Err(format!(
+                    "GRIM_LFM2_ATTENTION_MODE_LAYERS: layer {idx} out of range (0..{num_layers})"
+                ));
+            }
+            v[idx] = mode;
+        }
+        Ok(Some(v))
+    } else {
+        let items: Vec<_> = raw.split(',').map(parse_mode).collect();
+        if items.iter().any(Option::is_none) {
+            return Err(format!(
+                "GRIM_LFM2_ATTENTION_MODE_LAYERS: unknown mode in {raw:?}"
+            ));
+        }
+        if items.len() != num_layers {
+            return Err(format!(
+                "GRIM_LFM2_ATTENTION_MODE_LAYERS: {} entries vs {num_layers} layers",
+                items.len()
+            ));
+        }
+        Ok(Some(items.into_iter().map(Option::unwrap).collect()))
+    }
 }
 
 /// M0 (PLAN-kernel-fusion): LFM2 MoE loader wiring. `(n_expert,
@@ -263,10 +345,6 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
         if let Some(u) = v.as_u32() {
             dbg_eprintln!("[meta-get-u32] {key} = {u} (u32)");
             return Some(u);
-        }
-        if let Some(arr) = v.as_array() {
-            dbg_eprintln!("[meta-get-u32] {key} = {} (array.len)", arr.len());
-            return Some(arr.len() as u32);
         }
         if let Some(s) = v.as_str() {
             if let Ok(u) = s.parse::<u32>() {
@@ -1310,9 +1388,10 @@ fn load_model_from_config(
             // M0: wire MoE fields from HF config; derive first-MoE layer from
             // checkpoint tensor presence (expert weights = ffn_gate_exps).
             let n_expert = config.num_local_experts.or(config.num_experts).unwrap_or(0);
-            let n_expert_used = config
-                .num_experts_per_tok
-                .unwrap_or(if n_expert > 0 { 2 } else { 1 });
+            let n_expert_used =
+                config
+                    .num_experts_per_tok
+                    .unwrap_or(if n_expert > 0 { 2 } else { 1 });
             let first_moe = if n_expert > 0 {
                 (0..num_layers).find(|i| {
                     ws.pp("blk")
@@ -1337,7 +1416,7 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 n_shortconv_l_cache,
-                is_recr,
+                is_recr: is_recr.clone(),
                 n_layer_dense_lead,
                 n_expert,
                 n_expert_used,
@@ -1345,9 +1424,104 @@ fn load_model_from_config(
                 n_embd_out: 0,
                 // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (see `lfm2_mxfp4_qkv_enabled`).
                 mxfp4_qkv_attention: lfm2_mxfp4_qkv_enabled(),
+                // GRAVE: `lfm2grave` checkpoints force GDL mode (checkpoint-driven,
+                // not env-driven per plan §Phase 5); plain lfm2 honors the env.
+                attention_mode: lfm2_attention_mode_for_arch(&arch_str),
+                // Per-layer hybrid list (env-parsed now; checkpoint metadata
+                // plugs into lfm2_attention_mode_per_layer later).
+                attention_mode_per_layer: lfm2_attention_mode_per_layer(num_layers)
+                    .map_err(Error::Config)?,
             };
 
-            let m = Lfm2::load_tp(&ws, cfg, tp)?;
+            // Snapshot for the sidecar validation below (cfg moves into load).
+            let gdl_layers: Vec<usize> = (0..cfg.num_layers).filter(|&i| !is_recr[i]).collect();
+            let sc_head_dim = cfg.head_dim;
+            let mut m = Lfm2::load_tp(&ws, cfg, tp)?;
+
+            // GRAVE Phase 3 loop closure: consume a trained gate sidecar
+            // (`GRIM_GRAVE_SIDECAR=<path>`, GDL mode) so distilled gate params
+            // flow into inference. Fail-closed: a set-but-unreadable sidecar
+            // is an error, not silent softmax.
+            if m.cfg.attention_mode == grim_models_transformer::Lfm2AttentionMode::Gdl {
+                if let Ok(sidecar_path) = std::env::var("GRIM_GRAVE_SIDECAR") {
+                    let sc = grim_models_transformer::gla::GraveSidecar::load(
+                        std::path::Path::new(&sidecar_path),
+                    )
+                    .map_err(|e| Error::Config(format!("GRAVE sidecar {sidecar_path}: {e}")))?;
+                    if sc.layers != gdl_layers.len() {
+                        return Err(Error::Config(format!(
+                            "GRAVE sidecar: {} gate triples vs {} GDL layers",
+                            sc.layers,
+                            gdl_layers.len()
+                        )));
+                    }
+                    if sc.head_dim != sc_head_dim {
+                        return Err(Error::Config(format!(
+                            "GRAVE sidecar: head_dim {} != {}",
+                            sc.head_dim, sc_head_dim
+                        )));
+                    }
+                    if sc.format != "grave-1" && sc.format != "grave-2" {
+                        return Err(Error::Config(format!(
+                            "GRAVE sidecar: unsupported format {:?}",
+                            sc.format
+                        )));
+                    }
+                    let proj = match &sc.layer_projections {
+                        Some(p) if p.len() == gdl_layers.len() => Some(p),
+                        Some(p) => {
+                            return Err(Error::Config(format!(
+                                "GRAVE sidecar: {} projection layers vs {} GDL layers",
+                                p.len(),
+                                gdl_layers.len()
+                            )));
+                        }
+                        None if sc.format == "grave-2" => {
+                            return Err(Error::Config(
+                                "GRAVE sidecar: grave-2 format without layer_projections".into(),
+                            ));
+                        }
+                        None => None,
+                    };
+                    let hidden_size = m.cfg.hidden_size;
+                    for (ordinal, &li) in gdl_layers.iter().enumerate() {
+                        m.layers[li].gdl_gates = sc.layer_gates[ordinal];
+                        if let Some(proj) = proj {
+                            let lp = &proj[ordinal];
+                            let dim_ok = |w: &[Vec<f32>], b: &[f32]| {
+                                b.len() == 64
+                                    && w.len() == 64
+                                    && w.first().is_some_and(|r| r.len() == hidden_size)
+                            };
+                            if !(dim_ok(&lp.b_weight, &lp.b_bias)
+                                && dim_ok(&lp.w_weight, &lp.w_bias)
+                                && dim_ok(&lp.f_weight, &lp.f_bias))
+                            {
+                                return Err(Error::Config(format!(
+                                    "GRAVE sidecar: projection dims mismatch on GDL layer {li}                                      (expect 64x{hidden_size} weights, 64 biases)"
+                                )));
+                            }
+                            m.layers[li]
+                                .set_gate_projections_from_host(lp, None)
+                                .map_err(|e| {
+                                    Error::Config(format!(
+                                        "GRAVE sidecar projections (layer {li}): {e}"
+                                    ))
+                                })?;
+                        }
+                    }
+                    eprintln!(
+                        "[grim] GRAVE sidecar applied: {} layer gate triples{} from {sidecar_path}",
+                        sc.layers,
+                        if proj.is_some() {
+                            " + G3b projections"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba => {
@@ -1566,6 +1740,7 @@ fn load_model_from_config(
                 chunk_size: 64,
                 rms_norm_eps,
                 max_seq_len,
+                gdl_opt_in: false,
             };
             log::info!(
                 "[grim] Loading DeltaNetBase model with config: {:?}",
@@ -3086,9 +3261,10 @@ fn load_model_with_providers(
             // M0: wire MoE fields from GGUF hparams; derive first-MoE layer
             // from checkpoint tensor presence (same technique as is_recr).
             let n_expert = hparams.expert_count.unwrap_or(0);
-            let n_expert_used = hparams
-                .expert_used_count
-                .unwrap_or(if n_expert > 0 { 2 } else { 1 });
+            let n_expert_used =
+                hparams
+                    .expert_used_count
+                    .unwrap_or(if n_expert > 0 { 2 } else { 1 });
             let first_moe = if n_expert > 0 {
                 (0..hparams.num_layers).find(|i| {
                     ws.pp("blk")
@@ -3120,8 +3296,103 @@ fn load_model_with_providers(
                 n_embd_out: 0,
                 // WI-X6: MXFP4 QKV attention is default-on for LFM2 family (see `lfm2_mxfp4_qkv_enabled`).
                 mxfp4_qkv_attention: lfm2_mxfp4_qkv_enabled(),
+                // GRAVE: `lfm2grave` checkpoints force GDL mode (checkpoint-driven,
+                // not env-driven per plan §Phase 5); plain lfm2 honors the env.
+                attention_mode: lfm2_attention_mode_for_arch(arch_str),
+                // Per-layer hybrid list (env-parsed now; checkpoint metadata
+                // plugs into lfm2_attention_mode_per_layer later).
+                attention_mode_per_layer: lfm2_attention_mode_per_layer(hparams.num_layers)
+                    .map_err(Error::Config)?,
             };
-            let m = Lfm2::load_tp(&ws, cfg, tp)?;
+
+            // GRAVE Phase 3 loop closure (live dispatch — plan §Phase 3.6):
+            // consume a trained gate sidecar (`GRIM_GRAVE_SIDECAR=<path>`,
+            // GDL mode) so distilled gate params flow into inference.
+            // Fail-closed: a set-but-unreadable sidecar is an error, not
+            // silent softmax.
+            let gdl_layers: Vec<usize> = (0..cfg.num_layers).filter(|&i| !is_recr[i]).collect();
+            let sc_head_dim = cfg.head_dim;
+            let mut m = Lfm2::load_tp(&ws, cfg, tp)?;
+            if m.cfg.attention_mode == grim_models_transformer::Lfm2AttentionMode::Gdl {
+                if let Ok(sidecar_path) = std::env::var("GRIM_GRAVE_SIDECAR") {
+                    let sc = grim_models_transformer::gla::GraveSidecar::load(
+                        std::path::Path::new(&sidecar_path),
+                    )
+                    .map_err(|e| Error::Config(format!("GRAVE sidecar {sidecar_path}: {e}")))?;
+                    if sc.layers != gdl_layers.len() {
+                        return Err(Error::Config(format!(
+                            "GRAVE sidecar: {} gate triples vs {} GDL layers",
+                            sc.layers,
+                            gdl_layers.len()
+                        )));
+                    }
+                    if sc.head_dim != sc_head_dim {
+                        return Err(Error::Config(format!(
+                            "GRAVE sidecar: head_dim {} != {}",
+                            sc.head_dim, sc_head_dim
+                        )));
+                    }
+                    if sc.format != "grave-1" && sc.format != "grave-2" {
+                        return Err(Error::Config(format!(
+                            "GRAVE sidecar: unsupported format {:?}",
+                            sc.format
+                        )));
+                    }
+                    let proj = match &sc.layer_projections {
+                        Some(p) if p.len() == gdl_layers.len() => Some(p),
+                        Some(p) => {
+                            return Err(Error::Config(format!(
+                                "GRAVE sidecar: {} projection layers vs {} GDL layers",
+                                p.len(),
+                                gdl_layers.len()
+                            )));
+                        }
+                        None if sc.format == "grave-2" => {
+                            return Err(Error::Config(
+                                "GRAVE sidecar: grave-2 format without layer_projections".into(),
+                            ));
+                        }
+                        None => None,
+                    };
+                    let hidden_size = m.cfg.hidden_size;
+                    for (ordinal, &li) in gdl_layers.iter().enumerate() {
+                        m.layers[li].gdl_gates = sc.layer_gates[ordinal];
+                        if let Some(proj) = proj {
+                            let lp = &proj[ordinal];
+                            let dim_ok = |w: &[Vec<f32>], b: &[f32]| {
+                                b.len() == 64
+                                    && w.len() == 64
+                                    && w.first().is_some_and(|r| r.len() == hidden_size)
+                            };
+                            if !(dim_ok(&lp.b_weight, &lp.b_bias)
+                                && dim_ok(&lp.w_weight, &lp.w_bias)
+                                && dim_ok(&lp.f_weight, &lp.f_bias))
+                            {
+                                return Err(Error::Config(format!(
+                                    "GRAVE sidecar: projection dims mismatch on GDL layer {li}                                      (expect 64x{hidden_size} weights, 64 biases)"
+                                )));
+                            }
+                            m.layers[li]
+                                .set_gate_projections_from_host(lp, None)
+                                .map_err(|e| {
+                                    Error::Config(format!(
+                                        "GRAVE sidecar projections (layer {li}): {e}"
+                                    ))
+                                })?;
+                        }
+                    }
+                    eprintln!(
+                        "[grim] GRAVE sidecar applied: {} layer gate triples{} from {sidecar_path}",
+                        sc.layers,
+                        if proj.is_some() {
+                            " + G3b projections"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba => {
@@ -3741,6 +4012,7 @@ fn load_model_with_providers(
                 chunk_size: 64,
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
+                gdl_opt_in: false,
             };
             log::info!(
                 "[grim] Loading DeltaNetBase model with config: {:?}",
@@ -4605,11 +4877,69 @@ mod tests {
         }
         with_var(None, || assert!(lfm2_mxfp4_qkv_enabled()));
         for v in ["0", "false", "off", "False", "OFF", "FALSE"] {
-            with_var(Some(v), || assert!(!lfm2_mxfp4_qkv_enabled(), "{v} must disable"));
+            with_var(Some(v), || {
+                assert!(!lfm2_mxfp4_qkv_enabled(), "{v} must disable")
+            });
         }
         for v in ["1", "true", "on", ""] {
-            with_var(Some(v), || assert!(lfm2_mxfp4_qkv_enabled(), "{v} must keep enabled"));
+            with_var(Some(v), || {
+                assert!(lfm2_mxfp4_qkv_enabled(), "{v} must keep enabled")
+            });
         }
+    }
+
+    /// Per-layer attention-mode list parsing (GRAVE hybrid fallback):
+    /// unset → None, dense and sparse forms parse, malformed input fails
+    /// closed instead of broadcasting a partial conversion.
+    #[test]
+    fn lfm2_attention_mode_per_layer_parsing() {
+        use grim_models_transformer::Lfm2AttentionMode as M;
+        fn with_var(v: Option<&str>, f: impl FnOnce()) {
+            let prev = std::env::var("GRIM_LFM2_ATTENTION_MODE_LAYERS").ok();
+            unsafe {
+                match v {
+                    Some(s) => std::env::set_var("GRIM_LFM2_ATTENTION_MODE_LAYERS", s),
+                    None => std::env::remove_var("GRIM_LFM2_ATTENTION_MODE_LAYERS"),
+                }
+            }
+            f();
+            unsafe {
+                match prev {
+                    Some(s) => std::env::set_var("GRIM_LFM2_ATTENTION_MODE_LAYERS", s),
+                    None => std::env::remove_var("GRIM_LFM2_ATTENTION_MODE_LAYERS"),
+                }
+            }
+        }
+        with_var(None, || {
+            assert!(lfm2_attention_mode_per_layer(16).unwrap().is_none())
+        });
+        with_var(Some(""), || {
+            assert!(lfm2_attention_mode_per_layer(16).unwrap().is_none())
+        });
+        // Sparse form over LFM2.5 GDL layers [2,5,8,10,12,14].
+        with_var(Some("gdl@2,5,8,10,12,14"), || {
+            let v = lfm2_attention_mode_per_layer(16).unwrap().unwrap();
+            assert_eq!(v.len(), 16);
+            assert_eq!(v[2], M::Gdl);
+            assert_eq!(v[5], M::Gdl);
+            assert_eq!(v[0], M::Softmax);
+            assert_eq!(v[15], M::Softmax);
+        });
+        // Dense form, exact length.
+        with_var(Some("gdl,softmax,gdl"), || {
+            let v = lfm2_attention_mode_per_layer(3).unwrap().unwrap();
+            assert_eq!(v, vec![M::Gdl, M::Softmax, M::Gdl]);
+        });
+        // Fail closed: wrong length, unknown mode, out-of-range ordinal.
+        with_var(Some("gdl,gdl"), || {
+            assert!(lfm2_attention_mode_per_layer(16).is_err())
+        });
+        with_var(Some("banana@0"), || {
+            assert!(lfm2_attention_mode_per_layer(16).is_err())
+        });
+        with_var(Some("gdl@16"), || {
+            assert!(lfm2_attention_mode_per_layer(16).is_err())
+        });
     }
 
     /// M0 (PLAN-kernel-fusion): MoE field wiring. `is_moe = layer_idx >=

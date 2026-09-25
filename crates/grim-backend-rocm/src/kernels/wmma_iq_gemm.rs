@@ -453,11 +453,11 @@ mod self_tests {
     /// All 7 IQ-family kernel entries must be JIT-discoverable.
     #[test]
     fn source_contains_all_iq_kernel_entries() {
-        for fmt in ["iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq4nl", "iq4xs"] {
+        for fmt in [
+            "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq4nl", "iq4xs",
+        ] {
             assert!(
-                KERNEL_SOURCE.contains(&format!(
-                    "grim_wmma_fused_dequant_{fmt}"
-                )),
+                KERNEL_SOURCE.contains(&format!("grim_wmma_fused_dequant_{fmt}")),
                 "missing WMMA IQ kernel entry for {fmt}"
             );
         }

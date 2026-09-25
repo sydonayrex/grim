@@ -279,4 +279,3 @@ fn map_gguf_dtype_to_storage_bf16_preserves_bf16() {
     assert_eq!(mapped.arith, ArithType::BF16);
     assert!(matches!(mapped.storage, Storage::Native));
 }
-

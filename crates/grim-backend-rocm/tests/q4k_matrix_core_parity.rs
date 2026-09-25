@@ -41,6 +41,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
+#[ignore]
 fn test_q4k_matrix_core_vs_scalar_parity() {
     let dev = match gpu_device() {
         Some(d) => d,

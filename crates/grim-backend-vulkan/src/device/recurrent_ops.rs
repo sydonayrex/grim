@@ -7,7 +7,7 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, CoreTensorOps, RecurrentOps, Shape};
 
 use crate::context::global_context;
-use crate::kernel::{VulkanKernel, push_params, run_compute_shader_kernel};
+use crate::kernel::{push_params, run_compute_shader_kernel, VulkanKernel};
 use crate::{VulkanDevice, VulkanHandle, VulkanStorage};
 
 impl RecurrentOps for VulkanDevice {

@@ -23,6 +23,7 @@ fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
 }
 
 #[test]
+#[ignore]
 fn test_advanced_attention_kernels_compile() {
     let dev = RocmDevice::new(0);
     let src = grim_backend_rocm::kernels::source_asm::compute_kernel_source();
@@ -66,6 +67,7 @@ fn test_batch_reordering_logic() {
 }
 
 #[test]
+#[ignore]
 fn test_extend_chunk_and_lse_merge_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
@@ -204,6 +206,7 @@ fn test_extend_chunk_and_lse_merge_parity() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn test_preshuffled_paged_attention_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());

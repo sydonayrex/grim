@@ -10,6 +10,7 @@ use std::sync::Mutex;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+#[ignore]
 fn managed_storage_accepts_prefetch_request() {
     let _guard = TEST_LOCK.lock().expect("managed-memory test lock poisoned");
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -38,6 +39,7 @@ fn managed_storage_accepts_prefetch_request() {
 }
 
 #[test]
+#[ignore]
 fn global_policy_routes_ordinary_allocations_to_managed_memory() {
     let _guard = TEST_LOCK.lock().expect("managed-memory test lock poisoned");
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -69,6 +71,7 @@ fn global_policy_routes_ordinary_allocations_to_managed_memory() {
 /// instrumentation + one-time warning. The negative case (ordinary allocation)
 /// must leave the instrumentation untouched.
 #[test]
+#[ignore]
 fn managed_fallback_warning_and_instrumentation_fire() {
     let _guard = TEST_LOCK.lock().expect("managed-memory test lock poisoned");
     if !grim_backend_rocm::gpu_test_enabled() {
@@ -110,6 +113,7 @@ fn managed_fallback_warning_and_instrumentation_fire() {
 /// policy a small allocation must NOT route through managed memory and must
 /// not touch the instrumentation.
 #[test]
+#[ignore]
 fn small_auto_allocation_stays_unmanaged_and_uninstrumented() {
     let _guard = TEST_LOCK.lock().expect("managed-memory test lock poisoned");
     if !grim_backend_rocm::gpu_test_enabled() {

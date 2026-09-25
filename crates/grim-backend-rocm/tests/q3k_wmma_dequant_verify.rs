@@ -36,7 +36,8 @@ fn q3k_wmma_inline_dequant_formula_vs_canonical() {
         for &av in aux.iter() {
             for b in 0..4 {
                 let v = (av >> (8 * b)) & 0xFF;
-                sc[si] = if v < 128 { v as i32 } else { v as i32 - 256 }; si += 1;
+                sc[si] = if v < 128 { v as i32 } else { v as i32 - 256 };
+                si += 1;
             }
         }
         let qs = &block[32..96];
@@ -51,7 +52,11 @@ fn q3k_wmma_inline_dequant_formula_vs_canonical() {
                 let sc_idx = (half << 3) + (sub << 1) + (p >> 4);
                 let shift = sub << 1;
                 let q_code = ((qs[(half << 5) + p]) >> shift) & 3;
-                let hm = if (hmask[p] as u32 & (1u32 << (half * 4 + sub))) != 0 { 0 } else { 4 };
+                let hm = if (hmask[p] as u32 & (1u32 << (half * 4 + sub))) != 0 {
+                    0
+                } else {
+                    4
+                };
                 let val = d * (sc[sc_idx] as f32 - 32.0) * (q_code as f32 - hm as f32);
                 worst = worst.max((val - canon[idx]).abs());
             }

@@ -7,11 +7,15 @@ use std::sync::atomic::Ordering;
 
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, Shape };
+use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, HipMemcpyKind, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemcpyAsync, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipStreamSynchronize, hipSuccess, jit_compile_hsaco };
+use crate::{
+    arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemcpyAsync, hipModuleGetFunction,
+    hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipStreamSynchronize, hipSuccess,
+    jit_compile_hsaco, HipDim3, HipMemcpyKind,
+};
 
 impl RocmDevice {
     /// H2: GPU tree reduction for sum.
@@ -34,8 +38,14 @@ impl RocmDevice {
         let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
 
         // Ensure preallocated buffers are large enough
-        let mut part_guard = self.reduce_partials_buf.write().unwrap_or_else(|e| e.into_inner());
-        if part_guard.as_ref().is_none_or(|b| b.shape().elem_count() < grid_blocks as usize) {
+        let mut part_guard = self
+            .reduce_partials_buf
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if part_guard
+            .as_ref()
+            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
+        {
             *part_guard = Some(RocmStorage::alloc_gpu(
                 &Shape::new(vec![MAX_BLOCKS as usize]),
                 dtype_f32(),
@@ -46,7 +56,10 @@ impl RocmDevice {
         let partials_buf = part_guard.as_ref().unwrap();
         let partials_ptr = dev_ptr(partials_buf)?;
 
-        let mut out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        let mut out_guard = self
+            .reduce_out_buf
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if out_guard.is_none() {
             *out_guard = Some(RocmStorage::alloc_gpu(
                 &Shape::new(vec![16usize]),
@@ -66,11 +79,7 @@ impl RocmDevice {
             "grim_reduce_sum_stage1",
             HipDim3::new(grid_blocks, 1, 1),
             HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [
-                arg(&mut x_p),
-                arg(&mut part_p),
-                arg(&mut n_i),
-            ],
+            &mut [arg(&mut x_p), arg(&mut part_p), arg(&mut n_i)],
         )?;
 
         // Launch stage 2
@@ -80,11 +89,7 @@ impl RocmDevice {
             "grim_reduce_sum_stage2",
             HipDim3::new(1, 1, 1),
             HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [
-                arg(&mut part_p),
-                arg(&mut out_p),
-                arg(&mut num_part),
-            ],
+            &mut [arg(&mut part_p), arg(&mut out_p), arg(&mut num_part)],
         )?;
 
         // D2H copy only 4 bytes of result
@@ -122,8 +127,14 @@ impl RocmDevice {
         const MAX_BLOCKS: u32 = 1024;
         let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
 
-        let mut part_guard = self.reduce_partials_buf.write().unwrap_or_else(|e| e.into_inner());
-        if part_guard.as_ref().is_none_or(|b| b.shape().elem_count() < grid_blocks as usize) {
+        let mut part_guard = self
+            .reduce_partials_buf
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if part_guard
+            .as_ref()
+            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
+        {
             *part_guard = Some(RocmStorage::alloc_gpu(
                 &Shape::new(vec![MAX_BLOCKS as usize]),
                 dtype_f32(),
@@ -134,7 +145,10 @@ impl RocmDevice {
         let partials_buf = part_guard.as_ref().unwrap();
         let partials_ptr = dev_ptr(partials_buf)?;
 
-        let mut out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        let mut out_guard = self
+            .reduce_out_buf
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if out_guard.is_none() {
             *out_guard = Some(RocmStorage::alloc_gpu(
                 &Shape::new(vec![16usize]),
@@ -153,11 +167,7 @@ impl RocmDevice {
             "grim_reduce_max_stage1",
             HipDim3::new(grid_blocks, 1, 1),
             HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [
-                arg(&mut x_p),
-                arg(&mut part_p),
-                arg(&mut n_i),
-            ],
+            &mut [arg(&mut x_p), arg(&mut part_p), arg(&mut n_i)],
         )?;
 
         let mut out_p = out_ptr;
@@ -166,11 +176,7 @@ impl RocmDevice {
             "grim_reduce_max_stage2",
             HipDim3::new(1, 1, 1),
             HipDim3::new(BLOCK_SIZE, 1, 1),
-            &mut [
-                arg(&mut part_p),
-                arg(&mut out_p),
-                arg(&mut num_part),
-            ],
+            &mut [arg(&mut part_p), arg(&mut out_p), arg(&mut num_part)],
         )?;
 
         let mut res: f32 = 0.0f32;
@@ -207,8 +213,14 @@ impl RocmDevice {
         const MAX_BLOCKS: u32 = 1024;
         let grid_blocks = ((n as u32).div_ceil(BLOCK_SIZE)).clamp(1, MAX_BLOCKS);
 
-        let mut part_guard = self.reduce_partials_buf.write().unwrap_or_else(|e| e.into_inner());
-        if part_guard.as_ref().is_none_or(|b| b.shape().elem_count() < grid_blocks as usize) {
+        let mut part_guard = self
+            .reduce_partials_buf
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if part_guard
+            .as_ref()
+            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
+        {
             *part_guard = Some(RocmStorage::alloc_gpu(
                 &Shape::new(vec![MAX_BLOCKS as usize]),
                 dtype_f32(),
@@ -219,8 +231,14 @@ impl RocmDevice {
         let partials_buf = part_guard.as_ref().unwrap();
         let partial_vals_ptr = dev_ptr(partials_buf)?;
 
-        let mut idxs_guard = self.reduce_argmax_idxs_buf.lock().unwrap_or_else(|e| e.into_inner());
-        if idxs_guard.as_ref().is_none_or(|b| b.shape().elem_count() < grid_blocks as usize) {
+        let mut idxs_guard = self
+            .reduce_argmax_idxs_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if idxs_guard
+            .as_ref()
+            .is_none_or(|b| b.shape().elem_count() < grid_blocks as usize)
+        {
             *idxs_guard = Some(RocmStorage::alloc_gpu(
                 &Shape::new(vec![MAX_BLOCKS as usize]),
                 DType {
@@ -234,7 +252,10 @@ impl RocmDevice {
         let idxs_buf = idxs_guard.as_ref().unwrap();
         let partial_idxs_ptr = dev_ptr(idxs_buf)?;
 
-        let mut out_guard = self.reduce_out_buf.write().unwrap_or_else(|e| e.into_inner());
+        let mut out_guard = self
+            .reduce_out_buf
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if out_guard.is_none() {
             *out_guard = Some(RocmStorage::alloc_gpu(
                 &Shape::new(vec![16usize]),
@@ -286,9 +307,7 @@ impl RocmDevice {
                 stream,
             )
         })?;
-        check_hip("gpu_argmax sync", unsafe {
-            hipStreamSynchronize(stream)
-        })?;
+        check_hip("gpu_argmax sync", unsafe { hipStreamSynchronize(stream) })?;
 
         Ok(res)
     }
@@ -301,12 +320,12 @@ impl RocmDevice {
         src: &RocmStorage,
         dst: &RocmStorage,
     ) -> Result<*mut c_void> {
-        let src_ptr = src.device_ptr.ok_or_else(|| {
-            Error::Backend("quantize_fp16: src has no device ptr".into())
-        })?;
-        let dst_ptr = dst.device_ptr.ok_or_else(|| {
-            Error::Backend("quantize_fp16: dst has no device ptr".into())
-        })?;
+        let src_ptr = src
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_fp16: src has no device ptr".into()))?;
+        let dst_ptr = dst
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quantize_fp16: dst has no device ptr".into()))?;
         let n = src.shape().elem_count();
         const BLOCK_SIZE: usize = 256;
         let grid_x = (n.div_ceil(BLOCK_SIZE)) as u32;
@@ -329,12 +348,12 @@ impl RocmDevice {
         src: &RocmStorage,
         dst: &RocmStorage,
     ) -> Result<*mut c_void> {
-        let src_ptr = src.device_ptr.ok_or_else(|| {
-            Error::Backend("dequantize_fp16: src has no device ptr".into())
-        })?;
-        let dst_ptr = dst.device_ptr.ok_or_else(|| {
-            Error::Backend("dequantize_fp16: dst has no device ptr".into())
-        })?;
+        let src_ptr = src
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequantize_fp16: src has no device ptr".into()))?;
+        let dst_ptr = dst
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequantize_fp16: dst has no device ptr".into()))?;
         let n = src.shape().elem_count();
         const BLOCK_SIZE: usize = 256;
         let grid_x = (n.div_ceil(BLOCK_SIZE)) as u32;
@@ -398,8 +417,17 @@ impl RocmDevice {
         let args_ptr = args.as_mut_ptr();
         check_hip("hipModuleLaunchKernel (stream)", unsafe {
             hipModuleLaunchKernel(
-                cached_func, grid.x, grid.y, grid.z, block.x, block.y, block.z,
-                shared_mem_bytes as u32, stream, args_ptr, std::ptr::null_mut(),
+                cached_func,
+                grid.x,
+                grid.y,
+                grid.z,
+                block.x,
+                block.y,
+                block.z,
+                shared_mem_bytes as u32,
+                stream,
+                args_ptr,
+                std::ptr::null_mut(),
             )
         })?;
         Ok(stream)

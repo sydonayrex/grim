@@ -317,6 +317,55 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// PLAN-kernel-launch-reduction Phase C: fused ShortConv step over the
+    /// in_proj output `[batch, 3*channels]` (b|x|c per row). Computes
+    /// bx = b*x, the causal conv with in-place state update, and the c gate:
+    /// `y_out = conv(bx) * c`. One launch replaces (3 slice copies + mul +
+    /// conv + mul). Graph-capture safe.
+    pub fn short_conv1d_fused_step_into(
+        &self,
+        proj: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        conv_state: &dyn BackendStorage,
+        y_out: &RocmStorage,
+        batch: usize,
+        channels: usize,
+        kernel_size: usize,
+    ) -> Result<()> {
+        let p_s = as_rocm(proj)?;
+        let w_s = as_rocm(weight)?;
+        let st_s = as_rocm(conv_state)?;
+        if !p_s.device_ptr_is_valid() || !w_s.device_ptr_is_valid() || !st_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "short_conv1d_fused_into: inputs lack valid device ptr".into(),
+            ));
+        }
+        let mut proj_ptr = dev_ptr(p_s)?;
+        let mut w_ptr = dev_ptr(w_s)?;
+        let mut st_ptr = dev_ptr(st_s)?;
+        let mut y_ptr = dev_ptr(y_out)?;
+        let mut batch_i = batch as i32;
+        let mut channels_i = channels as i32;
+        let mut k_size = kernel_size as i32;
+        let total = batch * channels;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_short_conv1d_fused_step",
+            grid,
+            block,
+            &mut [
+                arg(&mut proj_ptr),
+                arg(&mut w_ptr),
+                arg(&mut st_ptr),
+                arg(&mut y_ptr),
+                arg(&mut batch_i),
+                arg(&mut channels_i),
+                arg(&mut k_size),
+            ],
+        )?;
+        Ok(())
+    }
+
     // ─── Phase 2: Selective Scan ──────────────────────────────────
 
     /// Launch the JIT compiled Mamba selective scan kernel (Wave64,

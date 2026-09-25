@@ -76,10 +76,13 @@ impl TfIdfStats {
         if tf.is_empty() {
             return 0.0;
         }
-        let sum: f32 = tf.iter().map(|(term, &freq)| {
-            let idf = self.idf.get(term).copied().unwrap_or(0.0);
-            freq * idf
-        }).sum();
+        let sum: f32 = tf
+            .iter()
+            .map(|(term, &freq)| {
+                let idf = self.idf.get(term).copied().unwrap_or(0.0);
+                freq * idf
+            })
+            .sum();
         sum / tf.len() as f32
     }
 

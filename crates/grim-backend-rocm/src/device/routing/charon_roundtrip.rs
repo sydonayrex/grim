@@ -4,16 +4,16 @@
 
 // (import removed: unused after split)
 
-use grim_tensor::backend::{ BackendStorage };
-use grim_tensor::dtype::{ DType };
-use grim_tensor::error::{ Result };
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::dtype::DType;
+use grim_tensor::error::Result;
 use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
-use crate::device::roc_device::{ RocmDevice };
 #[cfg(feature = "training")]
 use crate::device::roc_device::CharonBackwardResult;
+use crate::device::roc_device::RocmDevice;
 // (import removed: unused after split)
-use crate::{ as_rocm, dev_ptr };
+use crate::{as_rocm, dev_ptr};
 impl RocmDevice {
     /// Device launcher for the FP32 Charon MoE backward kernel (`grim_moe_fused_grouped_backward`).
     /// Mirrors `launch_charon_grouped_dispatch`: validates inputs, zero-initialises the four atomicAdd output buffers, plans the grouped grid/block from.
@@ -288,8 +288,14 @@ impl RocmDevice {
             (None, None)
         };
 
-        let shg_s = shg_storage.as_ref().map(|s| as_rocm(s.as_ref())).transpose()?;
-        let shu_s = shu_storage.as_ref().map(|s| as_rocm(s.as_ref())).transpose()?;
+        let shg_s = shg_storage
+            .as_ref()
+            .map(|s| as_rocm(s.as_ref()))
+            .transpose()?;
+        let shu_s = shu_storage
+            .as_ref()
+            .map(|s| as_rocm(s.as_ref()))
+            .transpose()?;
 
         self.launch_charon_grouped_backward(
             act_s,
@@ -490,8 +496,22 @@ impl RocmDevice {
 
         // Warmup
         let _ = self.launch_charon_grouped_backward(
-            act_s, gw_ptr, uw_ptr, dw_ptr, dy_s, dgw_s, duw_s, ddw_s, dx_s,
-            &sorted, None, None, hidden, inter, routed_scaling_factor, num_experts,
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            dy_s,
+            dgw_s,
+            duw_s,
+            ddw_s,
+            dx_s,
+            &sorted,
+            None,
+            None,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
         )?;
         self.synchronize();
 
@@ -499,8 +519,22 @@ impl RocmDevice {
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             let _ = self.launch_charon_grouped_backward(
-                act_s, gw_ptr, uw_ptr, dw_ptr, dy_s, dgw_s, duw_s, ddw_s, dx_s,
-                &sorted, None, None, hidden, inter, routed_scaling_factor, num_experts,
+                act_s,
+                gw_ptr,
+                uw_ptr,
+                dw_ptr,
+                dy_s,
+                dgw_s,
+                duw_s,
+                ddw_s,
+                dx_s,
+                &sorted,
+                None,
+                None,
+                hidden,
+                inter,
+                routed_scaling_factor,
+                num_experts,
             )?;
         }
         self.synchronize();
@@ -515,16 +549,40 @@ impl RocmDevice {
             MemoryOps::alloc_storage(self, &fwd_out_shape, DType::F32)?;
         let fwd_out_s = as_rocm(fwd_out_storage.as_ref())?;
         self.launch_charon_grouped_dispatch_entry(
-            act_s, gw_ptr, uw_ptr, dw_ptr, &sorted, fwd_out_s,
-            hidden, inter, routed_scaling_factor, num_experts,
-            "grim_moe_fused_grouped", Some(shg_s), Some(shu_s),
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            &sorted,
+            fwd_out_s,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
+            "grim_moe_fused_grouped",
+            Some(shg_s),
+            Some(shu_s),
         )?;
         self.synchronize();
         let t1 = std::time::Instant::now();
         for _ in 0..iters {
             let _ = self.launch_charon_grouped_backward(
-                act_s, gw_ptr, uw_ptr, dw_ptr, dy_s, dgw_s, duw_s, ddw_s, dx_s,
-                &sorted, Some(shg_s), Some(shu_s), hidden, inter, routed_scaling_factor, num_experts,
+                act_s,
+                gw_ptr,
+                uw_ptr,
+                dw_ptr,
+                dy_s,
+                dgw_s,
+                duw_s,
+                ddw_s,
+                dx_s,
+                &sorted,
+                Some(shg_s),
+                Some(shu_s),
+                hidden,
+                inter,
+                routed_scaling_factor,
+                num_experts,
             )?;
         }
         self.synchronize();

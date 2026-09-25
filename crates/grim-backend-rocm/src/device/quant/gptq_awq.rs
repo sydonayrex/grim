@@ -6,14 +6,12 @@ use std::ffi::c_void;
 
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, CoreTensorOps, Shape };
+use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 
-use crate::device::roc_device::{ RocmDevice };
+use crate::device::roc_device::RocmDevice;
 use crate::memory::pinned::RocmPinnedBuffer;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, HipMemcpyKind, arg, check_hip, hipMemcpyAsync, hipStreamSynchronize };
-
-
+use crate::{HipDim3, HipMemcpyKind, arg, check_hip, hipMemcpyAsync, hipStreamSynchronize};
 
 impl RocmDevice {
     pub(crate) fn launch_dequant_wna16(
@@ -620,7 +618,7 @@ impl RocmDevice {
         let qw_len = n * words_per_col * 4;
         let n_groups = k.div_ceil(group_size);
         let sc_len = n * n_groups * 2; // bf16
-        let zr_len = n * n_groups;     // u8
+        let zr_len = n * n_groups; // u8
 
         // Layout: [u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros]
         let sc_data = 8 + qw_len + 8;
@@ -670,7 +668,10 @@ impl RocmDevice {
         let scales_bytes = scales_elems * std::mem::size_of::<f32>();
         let sums_bytes = sums_elems * std::mem::size_of::<i32>();
 
-        let mut codes_guard = self.act_u4_codes_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let mut codes_guard = self
+            .act_u4_codes_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let need_codes = match codes_guard.as_ref() {
             Some(s) => s.bytes < codes_bytes,
             None => true,
@@ -687,7 +688,10 @@ impl RocmDevice {
             )?);
         }
 
-        let mut scales_guard = self.act_u4_scales_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scales_guard = self
+            .act_u4_scales_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let need_scales = match scales_guard.as_ref() {
             Some(s) => s.bytes < scales_bytes,
             None => true,
@@ -704,7 +708,10 @@ impl RocmDevice {
             )?);
         }
 
-        let mut sums_guard = self.act_u4_sums_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sums_guard = self
+            .act_u4_sums_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let need_sums = match sums_guard.as_ref() {
             Some(s) => s.bytes < sums_bytes,
             None => true,
@@ -726,14 +733,7 @@ impl RocmDevice {
         let act_sums = sums_guard.as_ref().unwrap();
 
         // Quantize activations to u4 groups
-        self.launch_quantize_u4_group128(
-            a_storage,
-            act_codes,
-            act_scales,
-            act_sums,
-            m,
-            k,
-        )?;
+        self.launch_quantize_u4_group128(a_storage, act_codes, act_scales, act_sums, m, k)?;
 
         // Pointers into blob
         let a_codes_ptr = act_codes.device_ptr.unwrap();
@@ -873,7 +873,10 @@ impl RocmDevice {
         let scales_bytes = scales_elems * std::mem::size_of::<f32>();
         let sums_bytes = sums_elems * std::mem::size_of::<i32>();
 
-        let mut codes_guard = self.act_u4_codes_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let mut codes_guard = self
+            .act_u4_codes_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let need_codes = match codes_guard.as_ref() {
             Some(s) => s.bytes < codes_bytes,
             None => true,
@@ -890,7 +893,10 @@ impl RocmDevice {
             )?);
         }
 
-        let mut scales_guard = self.act_u4_scales_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scales_guard = self
+            .act_u4_scales_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let need_scales = match scales_guard.as_ref() {
             Some(s) => s.bytes < scales_bytes,
             None => true,
@@ -907,7 +913,10 @@ impl RocmDevice {
             )?);
         }
 
-        let mut sums_guard = self.act_u4_sums_buf.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sums_guard = self
+            .act_u4_sums_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let need_sums = match sums_guard.as_ref() {
             Some(s) => s.bytes < sums_bytes,
             None => true,
@@ -929,14 +938,7 @@ impl RocmDevice {
         let act_sums = sums_guard.as_ref().unwrap();
 
         // Quantize activations to u4 groups
-        self.launch_quantize_u4_group128(
-            a_storage,
-            act_codes,
-            act_scales,
-            act_sums,
-            m,
-            k,
-        )?;
+        self.launch_quantize_u4_group128(a_storage, act_codes, act_scales, act_sums, m, k)?;
 
         // Launch sudot8 W4A4 GEMV
         self.launch_dot8_w4a4_gemv(
@@ -956,8 +958,8 @@ impl RocmDevice {
     /// Read the WNA16 blob header ([u32 n_bit][u32 num_blocks]) via pinned D2H.
     pub(crate) fn wna16_read_header(blob: &RocmStorage, ordinal: usize) -> Result<[u8; 8]> {
         let dev = RocmDevice::try_new(ordinal)?;
-        let mut pinned = RocmPinnedBuffer::<u8>::alloc(8)?;
         let _g = crate::device::util::DeviceGuard::set(ordinal as i32);
+        let mut pinned = RocmPinnedBuffer::<u8>::alloc_on(ordinal, 8)?;
         let ptr = blob
             .device_ptr
             .ok_or_else(|| Error::Backend("wna16 header: no device ptr".into()))?;
