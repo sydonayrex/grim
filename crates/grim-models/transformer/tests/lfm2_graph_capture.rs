@@ -295,6 +295,63 @@ fn tiny_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize, fused: bool) -> 
     }
 }
 
+fn tiny_lfm2_q80_down(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
+    let mut model = tiny_lfm2(dev, ordinal, n_layers, false);
+    for (layer_idx, layer) in model.layers.iter_mut().enumerate() {
+        layer.ffn_down = test_linear_q80(dev, ordinal, 32, 64, 177 + layer_idx as u64);
+    }
+    model
+}
+
+#[test]
+fn lfm2_graph_q81_down_add_matches_eager() {
+    if !grim_backend_rocm::device::util::gpu_test_enabled() {
+        eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+        return;
+    }
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
+        eprintln!("skip: no ROCm ordinal 0");
+        return;
+    }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+    temp_env::with_var("GRIM_DOT4_ADD_PREQUANT", Some("1"), || {
+        let dev = RocmDevice::shared(0);
+        let model = tiny_lfm2_q80_down(&dev, 0, 2);
+        let tokens = vec![1u32, 5, 9, 13];
+        let replay = capture_replay_logits(&model, &tokens).expect("Q8.1 down graph replay");
+
+        let mut session = model.new_session();
+        let input = rocm_tensor(
+            &dev,
+            0,
+            tokens.iter().map(|&t| t as f32).collect(),
+            Shape::new(vec![tokens.len()]),
+        );
+        let positions = rocm_tensor(
+            &dev,
+            0,
+            (0..tokens.len()).map(|p| p as f32).collect(),
+            Shape::new(vec![tokens.len()]),
+        );
+        let eager = model
+            .forward(session.as_mut(), &input, &positions, &[])
+            .expect("Q8.1 down eager forward");
+        let eager = eager.to_vec_f32().unwrap();
+        let vocab = model.cfg.vocab_size;
+        for (step, graph_logits) in replay.iter().enumerate() {
+            let start = step * vocab;
+            let mut max_rel = 0.0f32;
+            for (got, want) in graph_logits.iter().zip(&eager[start..start + vocab]) {
+                max_rel = max_rel.max((got - want).abs() / (want.abs() + 1e-3));
+            }
+            assert!(
+                max_rel < 5e-2,
+                "Q8.1 down graph/eager step {step} diverged: max rel={max_rel:.6}"
+            );
+        }
+    });
+}
+
 #[test]
 fn lfm2_f16_kv_tensor_metadata_matches_storage() {
     if !grim_backend_rocm::device::util::gpu_test_enabled() {

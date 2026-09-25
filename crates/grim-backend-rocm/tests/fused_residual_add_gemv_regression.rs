@@ -350,6 +350,91 @@ fn fused_residual_add_gemv_tile8_matches_split() {
 
 #[test]
 #[ignore]
+fn prequantized_down_add_matches_f32act_and_aliases() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    if !dev.supports_dot4() {
+        eprintln!("skipping: device does not support dot4");
+        return;
+    }
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let k = 1024usize;
+    let n = 2048usize;
+    let m = 1usize;
+    let x = rand_f32(k, 801);
+    let res_data = rand_f32(n, 802);
+    let a = f32_tensor(&dev, &x, &Shape::new(vec![m, k]));
+    let w = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 803), n, k), n, k);
+    let residual = f32_tensor(&dev, &res_data, &Shape::new(vec![n]));
+    let q81_bytes = (k / 32) * 36;
+    let q81 = f32_tensor(&dev, &vec![0.0f32; q81_bytes], &Shape::new(vec![q81_bytes]));
+    dev.launch_quantize_q8_1(rocm(&a), rocm(&q81), m, k)
+        .unwrap();
+
+    let gemv_out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    dev.launch_dot4_q80_f32act_gemv(rocm(&a), rocm(&w), rocm(&gemv_out), m, n, k)
+        .unwrap();
+    let gemv_vec = gemv_out.to_cpu_vec_f32().unwrap();
+    let want_res: Vec<f32> = gemv_vec
+        .iter()
+        .zip(res_data.iter())
+        .map(|(g, r)| g + r)
+        .collect();
+
+    let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    dev.launch_dot4_q80_q81_add_gemv(
+        rocm(&q81),
+        rocm(&w),
+        Some(rocm(&residual)),
+        rocm(&out),
+        m,
+        n,
+        k,
+    )
+    .unwrap();
+    let got = out.to_cpu_vec_f32().unwrap();
+    for (i, (got, want)) in got.iter().zip(&want_res).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "prequant distinct[{i}]: got={got} vs want={want}"
+        );
+    }
+
+    let in_place = f32_tensor(&dev, &res_data, &Shape::new(vec![n]));
+    dev.launch_dot4_q80_q81_add_gemv(
+        rocm(&q81),
+        rocm(&w),
+        Some(rocm(&in_place)),
+        rocm(&in_place),
+        m,
+        n,
+        k,
+    )
+    .unwrap();
+    let got_in_place = in_place.to_cpu_vec_f32().unwrap();
+    for (i, (got, want)) in got_in_place.iter().zip(&want_res).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "prequant in-place[{i}]: got={got} vs want={want}"
+        );
+    }
+
+    let out_none = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    dev.launch_dot4_q80_q81_add_gemv(rocm(&q81), rocm(&w), None, rocm(&out_none), m, n, k)
+        .unwrap();
+    let got_none = out_none.to_cpu_vec_f32().unwrap();
+    for (i, (got, want)) in got_none.iter().zip(&gemv_vec).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "prequant none[{i}]: got={got} vs want={want}"
+        );
+    }
+}
+
+#[test]
+#[ignore]
 fn dot4_add_microbench_compares_default_and_tiles() {
     let Some(dev) = gpu_device() else {
         eprintln!("skipping: GPU test gate off");
@@ -420,5 +505,116 @@ fn dot4_add_microbench_compares_default_and_tiles() {
     temp_env::with_var("GRIM_DOT4_TILE8", None::<&str>, || {
         temp_env::with_var("GRIM_DOT4_TILE16", Some("1"), || run("tile16"));
     });
+    assert!(out.to_cpu_vec_f32().unwrap().iter().all(|v| v.is_finite()));
+}
+
+#[test]
+#[ignore]
+fn dot4_add_prequant_microbench_compares_default() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    if !dev.supports_dot4() {
+        eprintln!("skipping: device does not support dot4");
+        return;
+    }
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let k = 4608usize;
+    let n = 1024usize;
+    let layers = 16usize;
+    let iters = 8usize;
+    let activation = f32_tensor(&dev, &rand_f32(k, 901), &Shape::new(vec![1, k]));
+    let residual = f32_tensor(&dev, &rand_f32(n, 902), &Shape::new(vec![n]));
+    let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    let q81 = f32_tensor(
+        &dev,
+        &vec![0.0f32; (k / 32) * 36],
+        &Shape::new(vec![(k / 32) * 36]),
+    );
+    let weights: Vec<_> = (0..layers)
+        .map(|layer| upload_q80(&dev, &pack_q80(&rand_f32(n * k, 903 + layer), n, k), n, k))
+        .collect();
+
+    let run_default = || {
+        for layer in 0..layers {
+            dev.launch_dot4_q80_f32act_add_gemv(
+                rocm(&activation),
+                rocm(&weights[layer]),
+                Some(rocm(&residual)),
+                rocm(&out),
+                1,
+                n,
+                k,
+            )
+            .unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            for layer in 0..layers {
+                dev.launch_dot4_q80_f32act_add_gemv(
+                    rocm(&activation),
+                    rocm(&weights[layer]),
+                    Some(rocm(&residual)),
+                    rocm(&out),
+                    1,
+                    n,
+                    k,
+                )
+                .unwrap();
+            }
+        }
+        dev.synchronize();
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+    let run_prequant = || {
+        for layer in 0..layers {
+            dev.launch_quantize_q8_1(rocm(&activation), rocm(&q81), 1, k)
+                .unwrap();
+            dev.launch_dot4_q80_q81_add_gemv(
+                rocm(&q81),
+                rocm(&weights[layer]),
+                Some(rocm(&residual)),
+                rocm(&out),
+                1,
+                n,
+                k,
+            )
+            .unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            for layer in 0..layers {
+                dev.launch_quantize_q8_1(rocm(&activation), rocm(&q81), 1, k)
+                    .unwrap();
+                dev.launch_dot4_q80_q81_add_gemv(
+                    rocm(&q81),
+                    rocm(&weights[layer]),
+                    Some(rocm(&residual)),
+                    rocm(&out),
+                    1,
+                    n,
+                    k,
+                )
+                .unwrap();
+            }
+        }
+        dev.synchronize();
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let default_ms = run_default();
+    let prequant_ms = run_prequant();
+    let calls = (layers * iters) as f64;
+    let weight_bytes = calls * n as f64 * (k as f64 / 32.0) * 34.0;
+    eprintln!(
+        "[dot4-add-prequant] shape=1x{k}x{n} layers={layers} default_us={:.3} prequant_us={:.3} default_GBps={:.2} prequant_GBps={:.2}",
+        default_ms * 1000.0 / calls,
+        prequant_ms * 1000.0 / calls,
+        weight_bytes / (default_ms * 1.0e6),
+        weight_bytes / (prequant_ms * 1.0e6),
+    );
     assert!(out.to_cpu_vec_f32().unwrap().iter().all(|v| v.is_finite()));
 }
