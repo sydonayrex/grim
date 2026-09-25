@@ -575,7 +575,12 @@ fn upload_packed_rows(
     )?;
     // Byte-counted: `copy_slice_range` would derive a 4-byte element width from
     // the storage dtype and copy 4x the payload, overrunning the page.
+    // The page buffer's owning ordinal, for diagnosing ownership mismatches.
+    let dst_ord = dst.device_ordinal();
     dev.copy_bytes_into(dst, byte_offset, staging.as_ref(), 0, bytes.len())
+        .map_err(|e| {
+            grim_tensor::Error::Backend(format!("{e} (dst_ordinal={dst_ord})"))
+        })
 }
 
 pub fn fused_or_scalar_attention_paged_quant(
@@ -670,9 +675,26 @@ pub fn fused_or_scalar_attention_paged_quant(
     .map_err(|e| grim_core::error::Error::Backend(format!("v page append: {e}")))?;
 
     // Identity block table: one page per token, so logical page == physical page.
-    let block_table_host: Vec<f32> = (0..n_after).map(|i| i as f32).collect();
+    //
+    // The kernel reads this as `BlockTableEntry*`, NOT as f32: each entry is two
+    // u32 words (block_id, page_size), so the table needs an 8-byte stride per
+    // page. Uploading `[0.0, 1.0, 2.0, ...]` as f32 makes page 1 read f32[2]
+    // and decode 1.0f32's bit pattern (1065353216) as a block_id, which then
+    // computes an astronomical `elem_offset` and faults the GPU. The parity test
+    // passes because it builds the table as real (block_id, page_size) pairs.
+    let mut block_table_words: Vec<u32> = Vec::with_capacity(n_after * 2);
+    for i in 0..n_after {
+        block_table_words.push(i as u32); // block_id: identity mapping
+        block_table_words.push(1); // page_size: one token per page
+    }
+    let table_f32: &[f32] = unsafe {
+        std::slice::from_raw_parts(
+            block_table_words.as_ptr() as *const f32,
+            block_table_words.len(),
+        )
+    };
     let table = dev
-        .from_cpu(&block_table_host, &Shape::new(vec![1, n_after, 1]), DType::F32)
+        .from_cpu(table_f32, &Shape::new(vec![1, n_after, 2]), DType::F32)
         .map_err(|e| grim_core::error::Error::Backend(format!("block table upload: {e}")))?;
 
     cache.current_pos = n_after;
