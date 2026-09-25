@@ -296,6 +296,38 @@ fn tiny_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize, fused: bool) -> 
 }
 
 #[test]
+fn lfm2_f16_kv_tensor_metadata_matches_storage() {
+    if !grim_backend_rocm::device::util::gpu_test_enabled() {
+        eprintln!("skip: set GRIM_GPU_TEST=1 for GPU F16 KV test");
+        return;
+    }
+    if !RocmDevice::probe_one(0).unwrap_or(false) {
+        eprintln!("skip: no ROCm ordinal 0");
+        return;
+    }
+    let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+    temp_env::with_vars(
+        [("GRIM_F16_KV", Some("1")), ("GRIM_DECODE_GRAPH", Some("0"))],
+        || {
+            let dev = RocmDevice::shared(0);
+            let model = tiny_lfm2(&dev, 0, 1, false);
+            let x = rocm_tensor(&dev, 0, rand_vec(32, 123), Shape::new(vec![1, 32]));
+            let mut cache = None;
+            model.layers[0]
+                .forward(&x, &mut cache)
+                .expect("F16 KV forward");
+            let Some(Lfm2LayerCache::Attention { k_dev, v_dev, .. }) = cache else {
+                panic!("F16 KV forward must create attention cache");
+            };
+            let k = k_dev.as_deref().expect("K arena");
+            let v = v_dev.as_deref().expect("V arena");
+            assert_eq!(k.dtype().arith, grim_tensor::ArithType::F16);
+            assert_eq!(v.dtype().arith, grim_tensor::ArithType::F16);
+        },
+    );
+}
+
+#[test]
 fn lfm2_graph_capture_replay_records_kernels() {
     if !grim_backend_rocm::device::util::gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
