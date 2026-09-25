@@ -1,8 +1,8 @@
 //! Vulkan context: device initialization, queue management, pipeline setup.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use grim_tensor::error::{Error, Result};
 
@@ -20,6 +20,8 @@ pub(crate) struct VulkanContext {
     pub(crate) vendor_id: u32,
     pub(crate) device_id: u32,
     pub(crate) driver_version: u32,
+    /// FP8 capability flag (Task 1 / plan Lapse E). Real detection wired through probe_from_device.
+    pub(crate) supports_fp8: bool,
 }
 
 unsafe impl Send for VulkanContext {}
@@ -236,6 +238,7 @@ impl VulkanContext {
             vendor_id: props.vendor_id,
             device_id: props.device_id,
             driver_version: props.driver_version,
+            supports_fp8: false,
         })
     }
 }
