@@ -1,7 +1,9 @@
 //! Core tensor computation, GEMM, elementwise, autograd, and optimizer operations for `RocmDevice`.
 //! Fused layer ops: QKV/GateUp projections, RMSNorm fusions, cross-entropy, embedding gather.
 
-use super::{FusedGateUpWeights, FusedQkvGateLogits, FusedQkvWeights};
+use super::{
+    FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvGateLogits, FusedQkvWeights,
+};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -463,6 +465,7 @@ impl RocmDevice {
         let u_src = as_rocm(w_up)?.device_ptr_checked()? as *const std::ffi::c_void;
         let g_bytes = as_rocm(w_gate)?.bytes;
         let u_bytes = as_rocm(w_up)?.bytes;
+        let _device_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         unsafe {
             check_hip(
                 "build_fused_gate_up_q80: D2D gate",
@@ -489,6 +492,116 @@ impl RocmDevice {
             n_up,
             hidden,
         })
+    }
+
+    /// Build a concatenated Q4_K Gate+Up blob for a local tensor-parallel shard.
+    /// The blob preserves Q4_K bytes and is consumed by the existing
+    /// fused-dequant/WMMA path; it does not use the architecture-incompatible
+    /// RDNA3/RDNA4 dot4 Q4_K kernel.
+    pub fn build_fused_gate_up_q4k(
+        &self,
+        w_gate: &dyn BackendStorage,
+        w_up: &dyn BackendStorage,
+    ) -> Result<FusedGateUpQ4KWeights> {
+        let q4k = DTypeStorage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K);
+        for (name, w) in [("w_gate", w_gate), ("w_up", w_up)] {
+            if w.dtype().storage != q4k {
+                return Err(Error::Backend(format!(
+                    "build_fused_gate_up_q4k: {name} must be Q4_K, got {:?}",
+                    w.dtype().storage
+                )));
+            }
+        }
+        let g_dims = w_gate.shape().dims();
+        let u_dims = w_up.shape().dims();
+        if g_dims.len() != 2 || u_dims.len() != 2 {
+            return Err(Error::Backend(
+                "build_fused_gate_up_q4k: weights must be 2D [rows, hidden]".into(),
+            ));
+        }
+        let n_gate = g_dims[0];
+        let n_up = u_dims[0];
+        let hidden = g_dims[1];
+        if hidden == 0 || hidden % 256 != 0 || hidden != u_dims[1] {
+            return Err(Error::Backend(format!(
+                "build_fused_gate_up_q4k: hidden must be equal and 256-aligned, got gate={} up={}",
+                hidden,
+                u_dims[1]
+            )));
+        }
+        let n_total = n_gate.checked_add(n_up).ok_or_else(|| {
+            Error::Backend("build_fused_gate_up_q4k: n_gate+n_up overflow".into())
+        })?;
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: q4k,
+        };
+        let fused_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![n_total, hidden]),
+            dtype,
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let dst = fused_storage.device_ptr_checked()? as *mut std::ffi::c_void;
+        let gate = as_rocm(w_gate)?;
+        let up = as_rocm(w_up)?;
+        let gate_src = gate.device_ptr_checked()? as *const std::ffi::c_void;
+        let up_src = up.device_ptr_checked()? as *const std::ffi::c_void;
+        let _device_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        unsafe {
+            check_hip(
+                "build_fused_gate_up_q4k: D2D gate",
+                crate::device::handles::hipMemcpy(
+                    dst,
+                    gate_src,
+                    gate.bytes,
+                    crate::device::handles::HipMemcpyKind::DeviceToDevice,
+                ),
+            )?;
+            check_hip(
+                "build_fused_gate_up_q4k: D2D up",
+                crate::device::handles::hipMemcpy(
+                    dst.add(gate.bytes),
+                    up_src,
+                    up.bytes,
+                    crate::device::handles::HipMemcpyKind::DeviceToDevice,
+                ),
+            )?;
+        }
+        Ok(FusedGateUpQ4KWeights {
+            storage: fused_storage,
+            n_gate,
+            n_up,
+            hidden,
+        })
+    }
+
+    /// Execute a Q4_K fused Gate/Up projection through the safe fused-dequant
+    /// WMMA path. The returned storage is shaped `[1, n_gate + n_up]`.
+    pub fn launch_fused_gate_up_q4k(
+        &self,
+        act_f32: &RocmStorage,
+        fused: &FusedGateUpQ4KWeights,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let n_total = fused.n_total();
+        let out = RocmStorage::alloc_gpu(
+            &Shape::new(vec![1, n_total]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_wmma_fused_dequant_q4k(
+            act_f32,
+            &fused.storage,
+            &out,
+            1,
+            n_total,
+            fused.hidden,
+        )?;
+        Ok(Box::new(out))
     }
 
     /// SPEED-DOT-FUSED (Phase 4c): fuse FFN gate+up projections into ONE dot4 GEMV.

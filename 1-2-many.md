@@ -280,9 +280,49 @@ A model-agnostic baseline seam is now available before every checkpoint is prese
   are parity/ownership results, not real-model tok/s claims. The baseline
   manifest command from P0.5 will report these checkpoints as `pending` until
   their files arrive.
-- Next candidates remain Dots-3 Note and Command-R. Do not mark P1.3b complete
-  until each has its own parity, launch-budget, and real-model raw benchmark.
+- **Dots-3 Note** (`dots3_note`): dense GQA/SwiGLU model. The GateUp fusion is wired
+  with the same `GRIM_FUSED_FFN` / Q8_0 / single-token guard.
+- **Command-R** (`commandr`): dense parallel-attention/MLP model. The fused
+  projection uses the existing normalized `input_layernorm` result; both
+  residual additions and the MLP activation remain unchanged.
+- Added and passed device-gated split-versus-fused parity regressions:
+  `dots3_note_fused_gateup_parity` and `commandr_fused_gateup_parity`.
+- These two models are parity-green, but their real Q8_0 checkpoints are not
+  locally available. P1.3b remains open for 4-combination quant matrices,
+  launch-budget checks, and raw real-model benchmarks once checkpoints arrive.
+### P1.3c — Qwen Q4_K target and dual-GPU audit (Status: PARITY GREEN, REAL MODEL BLOCKED)
 
+- `models/Qwen3.8-27B-Q4_K_M.gguf` reports `general.architecture=qwen35` and
+  `general.name=Qwen3.8-27B`. It is a 65-layer Qwen3.5/3.8 hybrid with
+  full-attention plus SSM layers, not the dense Qwen3.8 Flash-Next/MoE path.
+  The checkpoint metadata says `vocab_size=32000`, while
+  `token_embd.weight` is `[248320, 5120]`; the loader records a shape mismatch
+  and continues. This must be resolved before a real-model correctness or
+  throughput claim.
+- The installed Q4_K dot4 kernel is explicitly not valid on RDNA3/RDNA4 because
+  its scale shuffle is architecture-specific. The new Q4_K candidate therefore
+  uses a device-owned fused Gate/Up blob and the existing safe
+  fused-dequant/WMMA path, gated by `GRIM_Q4K_FUSED_GATEUP=1`. It does not
+  enable the known-invalid RDNA4 dot4 Q4_K route.
+- Added `FusedGateUpQ4KWeights`, a Q4_K D2D-concatenation builder, a safe
+  fused-dequant/WMMA launcher, and Qwen35 per-shard integration. Added
+  `DeviceGuard` around raw fused-weight D2D seams so concatenation is pinned
+  to the shard's ordinal.
+- GPU-1 backend parity test
+  `qwen_q4k_fused_gateup_matches_separate_q4k_projections` passes against
+  separate Q4_K projections.
+- Real Qwen benchmark blocker: the two-rank loader now correctly assigns each
+  rank to one ordinal, but RCCL initialization still fails with status 1. Both
+  ranks then fall back to partial-output row-parallel behavior, host-dequantize
+  `1,271,398,400` Q4_K elements in about `3.67 s`, and hit a managed-memory/OOM
+  failure while loading layers. The single-GPU diagnostic fails earlier with
+  `hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. No Qwen tok/s
+  result is recorded.
+- Required next step: fix the qwen35 vocabulary/tensor contract, make RCCL
+  initialization/communicator ownership valid for two processes, and keep the
+  16 GB Q4_K checkpoint device-resident rather than host-dequantizing a
+  multi-billion-element shard. Re-run default and `GRIM_Q4K_FUSED_GATEUP=1`
+  only after the default path completes.
 ### P2 — GDL where needed (Status: PARTIALLY IMPLEMENTED)
 
 **P2.1 `solar_open2.rs` + `delta_net_base.rs` → GDN-2 (EligibleKdaMigration).**
@@ -440,7 +480,9 @@ MoE extras: `moe_all_models_parity_gpu.rs`, `moe_special_cases_gpu.rs` must pass
 - [ ] P1.2: RoPE-dev-base for all bespoke decode paths; `GRIM_ROPE_DEV_BASE=0` fallback proven.
 - [x] P1.3a: LFM2 Q8_0 gfx1200 residual/GateUp fusion promoted; coalesced residual stores, 11-test graph parity, 468-test ROCm unit suite, clean-process 350+ tok/s gate, and `GRIM_FUSED_RESIDUAL_GATEUP=0` rollback switch verified.
 - [x] P1.3b-first: EXAONE 4.5, Hunyuan V4, and Gemma dense Q8_0 GateUp paths pass GPU split/fused parity; Gemma GeGLU now accepts fused output views.
-- [ ] P1.3b-rest: migrate Dots-3 Note and Command-R, then run per-file 4-combo quant matrices, launch budgets, and real-model raw benchmarks.
+- [x] P1.3b-rest-parity: Dots-3 Note and Command-R fused GateUp paths pass GPU split/fused parity.
+- [x] P1.3c-code: Qwen Q4_K fused-dequant/WMMA GateUp candidate and ordinal-guarded D2D construction pass backend parity.
+- [ ] P1.3c-bench: fix Qwen35 vocabulary metadata, RCCL communicator ownership, and host-dequant/OOM behavior, then run dual-GPU default versus `GRIM_Q4K_FUSED_GATEUP=1` raw benchmarks.
 - [x] P0.5: model baseline harness discovers available/pending checkpoints, executes fixed prefill baselines through the normal loader, and reports JSON; small LFM2 Q4 executions and pending-manifest behavior verified.
 - [x] Promotion review: default is limited to `gfx1200`; cold-cache startup is recorded separately from warm tok/s; deterministic and stochastic output parity passed after excluding the calibration diagnostic.
 - [ ] P1.4: Charon for the 6 host-MoE files; `moe_*_parity_gpu` green.

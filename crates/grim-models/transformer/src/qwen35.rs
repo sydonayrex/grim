@@ -9,7 +9,9 @@ use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig
 use grim_core::session::{Inner, SessionT};
 use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_device};
 use grim_nn::{TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use grim_tensor::{
+    ArithType, CoreTensorOps, DType, Device, QuantProvenance, Shape, Storage, Tensor,
+};
 
 // Config
 
@@ -185,6 +187,10 @@ pub struct Qwen35Block {
     /// three projections are present AND row-exact (no TP padding); issues
     /// 1 dot4 GEMV instead of 3 on single-token decode.
     pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
+    /// Concatenated Q4_K Gate+Up weights for the local tensor-parallel shard.
+    /// This uses the safe Q4_K fused-dequant/WMMA path, not the RDNA4-incompatible
+    /// dot4 Q4_K kernel.
+    pub w_gate_up_q4k_fused: Option<std::sync::Arc<grim_backend_rocm::FusedGateUpQ4KWeights>>,
 }
 
 impl Qwen35Block {
@@ -339,6 +345,32 @@ impl Qwen35Block {
             tp,
         )?;
 
+        let w_gate_up_q4k_fused = if matches!(&device, Device::Rocm(_))
+            && matches!(
+                std::env::var("GRIM_Q4K_FUSED_GATEUP").as_deref(),
+                Ok("1" | "true" | "on" | "yes")
+            )
+            && matches!(ffn_gate.weight().dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K))
+            && matches!(ffn_up.weight().dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K))
+        {
+            let ordinal = match &device {
+                Device::Rocm(ordinal) => *ordinal,
+                _ => 0,
+            };
+            grim_backend_rocm::RocmDevice::try_new(ordinal)
+                .ok()
+                .and_then(|dev| {
+                    dev.build_fused_gate_up_q4k(
+                        ffn_gate.weight().storage().as_ref(),
+                        ffn_up.weight().storage().as_ref(),
+                    )
+                    .ok()
+                })
+                .map(std::sync::Arc::new)
+        } else {
+            None
+        };
+
         // Phase 2b: fused Q8_0 QKV blob — only when all three projections are
         // present AND row-exact (some TP shards pad rows to a minimum width;
         // the stock path cuts them via `exact()` but the fused GEMV cannot).
@@ -396,7 +428,50 @@ impl Qwen35Block {
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
             wqkv_q80_fused,
+            w_gate_up_q4k_fused,
         })
+    }
+
+    fn fused_gate_up_q4k_decode(
+        &self,
+        norm_x: &Tensor,
+        fused: &grim_backend_rocm::FusedGateUpQ4KWeights,
+    ) -> Result<(Tensor, Tensor)> {
+        let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+            Device::Rocm(ordinal) => *ordinal,
+            _ => 0,
+        });
+        let act = grim_backend_rocm::as_rocm(norm_x.storage().as_ref())?;
+        let out = dev.launch_fused_gate_up_q4k(act, fused)?;
+        let out_arc: Arc<dyn grim_tensor::BackendStorage> = Arc::from(out);
+        let gate_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            0,
+            fused.n_gate * 4,
+            Shape::new(vec![1, fused.n_gate]),
+        )?;
+        let up_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc,
+            fused.n_gate * 4,
+            fused.n_up * 4,
+            Shape::new(vec![1, fused.n_up]),
+        )?;
+        Ok((
+            Tensor::new(
+                Arc::from(gate_view),
+                Shape::new(vec![1, fused.n_gate]),
+                DType::F32,
+                QuantProvenance::GrimNative,
+                norm_x.device().clone(),
+            ),
+            Tensor::new(
+                Arc::from(up_view),
+                Shape::new(vec![1, fused.n_up]),
+                DType::F32,
+                QuantProvenance::GrimNative,
+                norm_x.device().clone(),
+            ),
+        ))
     }
 
     pub fn forward(
@@ -749,8 +824,10 @@ impl Qwen35Block {
         let h_normed = self.post_attention_norm.forward(&h)?;
 
         // 4. SwiGLU FFN
-        let gate = self.ffn_gate.forward(&h_normed)?;
-        let up = self.ffn_up.forward(&h_normed)?;
+        let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
+            Some(fused) if seq_len == 1 => self.fused_gate_up_q4k_decode(&h_normed, fused)?,
+            _ => (self.ffn_gate.forward(&h_normed)?, self.ffn_up.forward(&h_normed)?),
+        };
         let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&act)?;
 
@@ -1115,6 +1192,7 @@ mod tests {
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
             wqkv_q80_fused: None,
+            w_gate_up_q4k_fused: None,
         };
 
         let x = cpu_tensor(
