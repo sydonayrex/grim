@@ -642,6 +642,127 @@ extern "C" __global__ void grim_dot4_gate_up_silu_q80_f32act_gemv_256(
     }
 }
 
+// Graph fusion: residual add + RMSNorm + Q8_0 Gate/Up GEMV + SiLU.
+// This keeps the residual stream in the graph workspace while avoiding the
+// separate add_rms_norm and norm-to-f32act passes used by the split path.
+extern "C" __global__ void grim_dot4_add_rms_norm_gate_up_silu_q80_gemv(
+    const float* __restrict__ base,
+    const float* __restrict__ attn,
+    const float* __restrict__ gamma,
+    float eps,
+    const unsigned char* __restrict__ Wg,
+    const unsigned char* __restrict__ Wu,
+    float* __restrict__ residual_out,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const float* base_row = base + (long long)row * K;
+    const float* attn_row = attn + (long long)row * K;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+
+    float ss = 0.0f;
+    for (int col = lane; col < K; col += 32) {
+        float v = base_row[col] + attn_row[col];
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_xor(ss, off);
+    }
+    const float rms = sqrtf(ss / (float)K + eps);
+    if (col_base == 0 && lane == 0) {
+        for (int col = 0; col < K; col++) {
+            residual_out[(long long)row * K + col] = base_row[col] + attn_row[col];
+        }
+    }
+
+    const unsigned char* g_col[4];
+    const unsigned char* u_col[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        g_col[j] = (j < active_cols)
+            ? Wg + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+            : nullptr;
+        u_col[j] = (j < active_cols)
+            ? Wu + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+            : nullptr;
+    }
+
+    float gacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float uacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const int base_offset = blk * GRIM_Q8_0_BLOCK_SIZE;
+        float nrm[GRIM_Q8_0_BLOCK_SIZE];
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            nrm[e] = (base_row[base_offset + e] + attn_row[base_offset + e])
+                * gamma[base_offset + e] / rms;
+            amax = fmaxf(amax, __builtin_fabsf(nrm[e]));
+        }
+        float d = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        d = fmaxf(d, 1e-12f);
+        const float d_a = (float)(_Float16)d;
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(nrm[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(nrm[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(nrm[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(nrm[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0)
+                | ((int)((unsigned char)q1) << 8)
+                | ((int)((unsigned char)q2) << 16)
+                | ((int)((unsigned char)q3) << 24);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* g_blk = g_col[j] + blk * GRIM_Q8_0_BYTES;
+            const unsigned char* u_blk = u_col[j] + blk * GRIM_Q8_0_BYTES;
+            const float d_g = fp16_to_float_device(((const unsigned short*)g_blk)[0]);
+            const float d_u = fp16_to_float_device(((const unsigned short*)u_blk)[0]);
+            const signed char* g_codes = (const signed char*)(g_blk + 2);
+            const signed char* u_codes = (const signed char*)(u_blk + 2);
+            int iacc_g = 0;
+            int iacc_u = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int g4;
+                int u4;
+                __builtin_memcpy(&g4, g_codes + p * 4, 4);
+                __builtin_memcpy(&u4, u_codes + p * 4, 4);
+                iacc_g = grim_sdot4(a4_reg[p], g4, iacc_g);
+                iacc_u = grim_sdot4(a4_reg[p], u4, iacc_u);
+            }
+            gacc[j] += (float)iacc_g * d_a * d_g;
+            uacc[j] += (float)iacc_u * d_a * d_u;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            gacc[j] += __shfl_xor(gacc[j], off);
+            uacc[j] += __shfl_xor(uacc[j], off);
+        }
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            float g = gacc[j];
+            float u = uacc[j];
+            C[(long long)row * N + col_base + j] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
 // Phase D.2: Fused activation quantize + GEMV + optional residual add epilogue.
 // Takes f32 activation input directly, quantizes per-block in registers,
 // computes dot4 GEMV projection, and writes (residual ? residual[...] : 0.0f) + facc[j] directly to C.
