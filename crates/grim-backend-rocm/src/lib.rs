@@ -125,7 +125,9 @@ pub use crate::kernels::jit_cache::HsacoKernelCache;
 pub use crate::kernels::qkv_attention::kv_f16_enabled;
 pub use crate::kernels::source_asm::compute_kernel_source;
 
-pub use crate::device::compute::{FusedGateUpWeights, FusedQkvWeights};
+pub use crate::device::compute::{
+    FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvWeights,
+};
 pub use crate::memory::allocator::RocmCachingAllocator;
 pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;

@@ -216,6 +216,7 @@ impl Qwen35Block {
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
             wqkv_q80_fused: None,
+            w_gate_up_q4k_fused: None,
         })
     }
 }

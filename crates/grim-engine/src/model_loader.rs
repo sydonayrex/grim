@@ -933,6 +933,17 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35 => {
+            let tp_active = TensorParallelConfig::from_env()
+                .map(|tp| tp.world_size > 1)
+                .unwrap_or(false);
+            let devices = if tp_active {
+                // Each TP process owns one ordinal. Loading every layer onto
+                // the full ordinal list makes the first cross-rank collective
+                // wait on a peer operation that this process never enqueues.
+                vec![device.clone()]
+            } else {
+                resolve_discrete_rocm_devices(&device)
+            };
             let qwen35_cfg = Qwen35Config {
                 vocab_size,
                 hidden_size,
@@ -950,7 +961,7 @@ fn load_model_from_config(
                 ssm_d_conv: 4,
                 ssm_dt_rank: 48,
                 ssm_n_group: 16,
-                devices: resolve_discrete_rocm_devices(&device),
+                devices,
             };
             log::info!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
             let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, tp)?;
@@ -2722,6 +2733,14 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35 => {
+            let tp_active = TensorParallelConfig::from_env()
+                .map(|tp| tp.world_size > 1)
+                .unwrap_or(false);
+            let qwen_devices = if tp_active {
+                vec![device.clone()]
+            } else {
+                resolve_discrete_rocm_devices(&device)
+            };
             let qwen35_cfg = Qwen35Config {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -2774,7 +2793,7 @@ fn load_model_with_providers(
                 ssm_d_conv: hparams.ssm_d_conv.unwrap_or(4),
                 ssm_dt_rank: hparams.ssm_dt_rank.unwrap_or(48),
                 ssm_n_group: hparams.ssm_n_group.unwrap_or(16),
-                devices: resolve_discrete_rocm_devices(&device),
+                devices: qwen_devices,
             };
             log::info!(
                 "[grim] Loading Qwen3.5/3.8 model with config: {:?}",

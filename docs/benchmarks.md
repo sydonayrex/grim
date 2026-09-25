@@ -258,3 +258,27 @@ Validation performed on GPU 1:
 
 These are prefill forward baselines for model preparation, not decode tok/s and
 not comparable to the 350 tok/s decode promotion gate.
+
+---
+
+## 11. Qwen3.8 Q4_K Dual-GPU Target Audit
+
+The available `Qwen3.8-27B-Q4_K_M.gguf` identifies itself as `qwen35`, not the
+dense Qwen3.8 Flash-Next architecture. It is a 65-layer hybrid with full
+attention and SSM layers. Its metadata reports a 32K vocabulary while
+`token_embd.weight` has 248,320 rows, so the loader reports a shape mismatch.
+
+The installed Q4_K dot4 kernel is not valid on RDNA3/RDNA4 because its scale
+shuffle is architecture-specific. A safe Q4_K candidate now concatenates the
+local tensor-parallel Gate/Up weights and uses the existing fused-dequant/WMMA
+path behind `GRIM_Q4K_FUSED_GATEUP=1`. The backend parity test passes on GPU 1:
+`qwen_q4k_fused_gateup_matches_separate_q4k_projections`.
+
+The real dual-GPU baseline is not yet measurable. The rank-ordinal loader
+fix assigns each rank to its own ordinal, but RCCL initialization still fails
+with status 1. Both ranks then fall back to partial-output row-parallel
+behavior, host-dequantize `1,271,398,400` Q4_K elements in about `3.67 s`, and
+hit managed-memory/OOM while loading layers. The one-GPU diagnostic still fails
+`hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. No Qwen tok/s
+result or promotion is recorded until the loader vocabulary contract, RCCL
+ownership, and device-resident Q4_K loading are fixed.

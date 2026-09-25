@@ -5810,6 +5810,7 @@ mod tests {
                 hidden_size,
                 intermediate_size,
                 wqkv_q80_fused: None,
+                w_gate_up_q4k_fused: None,
             };
             blocks.push(block);
         }
