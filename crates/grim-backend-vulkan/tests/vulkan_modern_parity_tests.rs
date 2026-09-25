@@ -3,7 +3,7 @@ use grim_backend_vulkan::{VulkanKernel, binding_count, spirv_for};
 
 #[test]
 fn test_vulkan_caps_modern_probes() {
-    let caps = VulkanCaps::probe_default("AMD Radeon RX 7900 XTX".into(), 0x1002, 0x7448, 2);
+    let caps = VulkanCaps::probe_default("AMD Radeon RX 7900 XTX".into(), 0x1002, 0x7448, 2, false);
     assert!(caps.supports_subgroup_arithmetic);
     assert_eq!(caps.subgroup_size, 32);
     assert!(caps.supports_timeline_semaphores);

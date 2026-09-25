@@ -37,6 +37,7 @@ impl VulkanCaps {
         vendor_id: u32,
         device_id: u32,
         driver_version: u32,
+        supports_fp8: bool,
     ) -> Self {
         // AMD RDNA 3+ (gfx1100+, 0x1002) and NVIDIA Pascal+ (0x10de):
         // These support native FP32 atomic add on SSBOs via GL_EXT_shader_atomic_float / OpAtomicFAdd.
@@ -55,7 +56,7 @@ impl VulkanCaps {
             max_workgroup_size: [1024, 1024, 64],
             supports_fp16: true,
             supports_bf16: true,
-            supports_fp8: false,
+            supports_fp8,
             supports_fp32_atomic_add,
             supports_subgroup_arithmetic: true,
             subgroup_size,

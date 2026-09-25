@@ -35,8 +35,8 @@ pub use grim_tensor::{
 };
 
 // Re-exported from submodules for use within trait impls.
-pub(crate) use context::QUEUE_LOCK;
 pub(crate) use context::global_context;
+pub(crate) use context::QUEUE_LOCK;
 use ffi::*;
 pub(crate) use kernel::{push_params, run_compute_shader, run_compute_shader_kernel};
 
@@ -76,10 +76,17 @@ impl VulkanDevice {
                     ctx.vendor_id,
                     ctx.device_id,
                     ctx.driver_version,
+                    ctx.supports_fp8,
                 ),
                 None => {
                     // Last-resort fallback only — no live context to query.
-                    VulkanCaps::probe_default("Vulkan Compute Device".into(), 0x1002, 0x744c, 1)
+                    VulkanCaps::probe_default(
+                        "Vulkan Compute Device".into(),
+                        0x1002,
+                        0x744c,
+                        1,
+                        false,
+                    )
                 }
             }
         };
@@ -2502,6 +2509,9 @@ impl GraphCaptureOps for VulkanDevice {
         VK_GRAPH_CACHE.end(key)
     }
 
+    /// Hardening note (Task 4 / plan Lapse G): replay must use cached pipeline from SPIR-V hash (not re-compile each time).
+    /// Per skill grim-grave-gld-gqa: graph-capture-safety requires `_into` variants, zero allocation inside replay (`CAPTURE_POISON` if allocates).
+    /// Per skill ponytail-minimalism: cache by hash, don't rebuild pipeline per replay.
     fn replay_graph(&self, key: &str) -> Result<bool> {
         VK_GRAPH_CACHE.replay(key)
     }
@@ -2762,7 +2772,7 @@ mod tests {
     #[test]
     fn test_vulkan_autotuner_and_spirv() {
         let autotuner = VulkanAutotuner::new();
-        let caps = VulkanCaps::probe_default("Vulkan Test Device".into(), 0x1002, 0x744c, 1);
+        let caps = VulkanCaps::probe_default("Vulkan Test Device".into(), 0x1002, 0x744c, 1, false);
         let config = autotuner.search_tile_config(&caps, 128, 128, 64, None);
 
         assert_eq!(config.block_m, 32);
