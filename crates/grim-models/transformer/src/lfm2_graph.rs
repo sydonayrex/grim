@@ -71,6 +71,19 @@ pub(crate) fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
         )
 }
 
+pub(crate) fn fused_residual_gateup_default_enabled(gpu_target: &str) -> bool {
+    gpu_target == "gfx1200"
+}
+
+pub(crate) fn fused_residual_gateup_enabled(dev: &Dev) -> bool {
+    match std::env::var("GRIM_FUSED_RESIDUAL_GATEUP").as_deref() {
+        Ok("0" | "false" | "off" | "no") => false,
+        Ok("1" | "true" | "on" | "yes") => true,
+        Ok(_) => false,
+        Err(_) => fused_residual_gateup_default_enabled(dev.gpu_target_str()),
+    }
+}
+
 pub(crate) fn is_q80(t: &grim_tensor::Tensor) -> bool {
     matches!(
         t.dtype().storage,
@@ -719,10 +732,7 @@ impl Lfm2Block {
         let m = buffers.batch.max(1);
         let act = &buffers.act_q81_buf[layer_idx];
         let fused_residual_ffn = fuse_norm
-            && matches!(
-                std::env::var("GRIM_FUSED_RESIDUAL_GATEUP").as_deref(),
-                Ok("1") | Ok("true") | Ok("on")
-            )
+            && fused_residual_gateup_enabled(dev)
             && dot_fused_ok(dev, hidden)
             && is_q80(&self.ffn_gate.weight)
             && is_q80(&self.ffn_up.weight);
@@ -1389,5 +1399,12 @@ mod tests {
     fn graph_dims_sane() {
         // Shape math must not underflow on tiny configs.
         assert!("GRIM_DECODE_GRAPH".is_ascii());
+    }
+
+    #[test]
+    fn residual_gateup_promotion_is_gfx1200_only() {
+        assert!(super::fused_residual_gateup_default_enabled("gfx1200"));
+        assert!(!super::fused_residual_gateup_default_enabled("gfx1201"));
+        assert!(!super::fused_residual_gateup_default_enabled("gfx1100"));
     }
 }

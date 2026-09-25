@@ -205,3 +205,22 @@ fused, with identical generated output. The fused graph suite passed `11/11`
 with `GRIM_FUSED_RESIDUAL_GATEUP=1`, and the serialized ROCm backend unit
 suite passed `468/468`. The candidate now crosses the 350 tok/s criterion on
 GPU 1 while remaining opt-in pending a clean-process parity/promotion review.
+
+---
+
+## 9. Clean-Process Promotion Review
+
+The promotion review cleared all generated HSACO/JIT caches and ran
+`cargo clean` before rebuilding the release CLI. Default and fused runs then
+used separate empty cache directories in separate processes.
+
+The first cold-cache fused process measured 347 tok/s. Warm fresh-process
+fused runs measured 356, 355, and 352 tok/s; warm default runs measured 328,
+329, and 328 tok/s. Deterministic greedy output and the stochastic 195-token
+response matched after excluding the hardware calibration diagnostic line.
+
+The fused graph suite passed `11/11`. The promotion gate now enables the
+coalesced residual/GateUp path by default only for `gfx1200`; other targets
+retain the split path. `GRIM_FUSED_RESIDUAL_GATEUP=0` is the kill switch.
+Final promoted-default warm runs measured 357, 354, and 357 tok/s, while the
+kill-switch run measured 324 tok/s in the same review session.
