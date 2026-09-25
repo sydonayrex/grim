@@ -175,3 +175,33 @@ residual fusion, while HIP kernel launches fell from 1,180 to 1,132. The
 fused kernel `grim_dot4_add_rms_norm_gate_up_silu_q80_gemv` ran 3,120 times.
 Residual/GateUp is therefore the best current candidate, but it remains about
 2% below the 350 tok/s target and is not promoted.
+
+---
+
+## 8. Fused-Kernel Coalescing — GPU 1 Target Crossing
+
+The fused residual/GateUp kernel originally serialized the residual row
+through lane 0. The retained optimization distributes those stores across all
+32 lanes:
+
+```text
+for (col = lane; col < K; col += 32)
+```
+
+The RMS reduction, Q8_0 activation quantization, dot4 accumulation, and SiLU
+arithmetic are unchanged. The eight-output tile and fast-SiLU experiments were
+measured but removed because they were slower or unsafe to generalize.
+
+The final raw GPU-1 release results, with the same 195-token protocol and no
+profiler, were:
+
+| Path | tok/s |
+|---|---:|
+| Paired default | 328, 330, 330 |
+| Coalesced residual/GateUp | **353, 354, 353** |
+
+The final paired confirmation measured 329 tok/s default versus 354 tok/s
+fused, with identical generated output. The fused graph suite passed `11/11`
+with `GRIM_FUSED_RESIDUAL_GATEUP=1`, and the serialized ROCm backend unit
+suite passed `468/468`. The candidate now crosses the 350 tok/s criterion on
+GPU 1 while remaining opt-in pending a clean-process parity/promotion review.

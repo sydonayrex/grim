@@ -676,8 +676,8 @@ extern "C" __global__ void grim_dot4_add_rms_norm_gate_up_silu_q80_gemv(
         ss += __shfl_xor(ss, off);
     }
     const float rms = sqrtf(ss / (float)K + eps);
-    if (col_base == 0 && lane == 0) {
-        for (int col = 0; col < K; col++) {
+    if (col_base == 0) {
+        for (int col = lane; col < K; col += 32) {
             residual_out[(long long)row * K + col] = base_row[col] + attn_row[col];
         }
     }
