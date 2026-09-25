@@ -7,7 +7,7 @@
 //! Gated: GRIM_GPU_TEST=1 + ROCm device.
 
 use grim_backend_rocm::RocmStorage;
-use grim_backend_rocm::{RocmDevice, as_rocm, gpu_test_enabled};
+use grim_backend_rocm::{as_rocm, gpu_test_enabled, RocmDevice};
 use grim_tensor::{ArithType, CoreTensorOps, DType, MemoryOps, Shape, Storage};
 
 fn gpu_device() -> Option<RocmDevice> {
@@ -292,4 +292,65 @@ fn fused_gate_up_silu_256_matches_split() {
             );
         }
     });
+}
+
+#[test]
+#[ignore]
+fn dot4_gate_up_microbench_uses_real_arguments() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let k = 1024usize;
+    let n = 4608usize;
+    let iters = 64usize;
+    let a = f32_tensor(&dev, &rand_f32(k, 41), &Shape::new(vec![1, k]));
+    let wg = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 42), n, k), n, k);
+    let wu = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 43), n, k), n, k);
+    let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    let act = f32_tensor(
+        &dev,
+        &vec![0.0f32; (k / 32) * 36],
+        &Shape::new(vec![(k / 32) * 36]),
+    );
+
+    dev.fused_gate_up_silu_dot4_into(
+        a.as_ref(),
+        rocm(&wg),
+        rocm(&wu),
+        rocm(&out),
+        n,
+        k,
+        rocm(&act),
+    )
+    .unwrap();
+    dev.synchronize();
+
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        dev.fused_gate_up_silu_dot4_into(
+            a.as_ref(),
+            rocm(&wg),
+            rocm(&wu),
+            rocm(&out),
+            n,
+            k,
+            rocm(&act),
+        )
+        .unwrap();
+    }
+    dev.synchronize();
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let bytes = 2.0 * n as f64 * (k as f64 / 32.0) * 34.0;
+    let gbps = bytes / (elapsed_ms * 1.0e6) * iters as f64;
+    eprintln!(
+        "[dot4-gateup-microbench] shape=1x{k}x{n} iters={iters} total_ms={elapsed_ms:.3} per_iter_us={:.3} weight_GBps={:.2}",
+        elapsed_ms * 1000.0 / iters as f64,
+        gbps
+    );
+    assert!(
+        out.to_cpu_vec_f32().unwrap().iter().all(|v| v.is_finite()),
+        "microbench output must remain finite"
+    );
 }
