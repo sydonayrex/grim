@@ -287,6 +287,17 @@ impl GraphCaptureManager {
                 inst_res
             )));
         }
+        let upload_res: HipErrorT = unsafe { crate::hipGraphUpload(exec, stream) };
+        if upload_res != hipSuccess {
+            unsafe {
+                let _ = hipGraphExecDestroy(exec);
+                let _ = hipGraphDestroy(graph);
+            }
+            return Err(Error::Backend(format!(
+                "hipGraphUpload failed: {}",
+                upload_res
+            )));
+        }
 
         // DecodeGraph holds raw HIP graph handles; access is serialized by the cache mutex,
         // so the Arc is deliberately shared despite the non-Send handle types.
