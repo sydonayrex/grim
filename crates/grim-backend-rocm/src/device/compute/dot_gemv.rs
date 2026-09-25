@@ -307,6 +307,54 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// One-wave 16-output tile experiment for residual-add Q8_0 GEMV.
+    pub fn launch_dot4_q80_f32act_add_gemv_tile16(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        residual: Option<&RocmStorage>,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_q80_f32act_add_tile16: K must be 32-aligned (k={k})"
+            )));
+        }
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_tile16: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_tile16: weight has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_tile16: out has no device ptr".into())
+        })?;
+        let residual_ptr = residual.and_then(|r| r.device_ptr).unwrap_or(0);
+        let grid_dim = HipDim3::new((n as u32).div_ceil(16), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut bptr, mut resptr, mut optr) = (a_ptr, b_ptr, residual_ptr, out_ptr);
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_f32act_add_gemv_tile16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut resptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Phase D.2: Fused activation quantize + dot4 Q8_0 GEMV with optional residual add epilogue directly from f32 activations.
     /// When residual is Some, computes C = residual + A * B. Supports in-place addition when residual is out_storage.
     pub fn launch_dot4_q80_f32act_add_gemv(
@@ -319,6 +367,20 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        if matches!(
+            std::env::var("GRIM_DOT4_TILE16").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        ) {
+            return self.launch_dot4_q80_f32act_add_gemv_tile16(
+                act_f32,
+                b_storage,
+                residual,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
         let a_ptr = act_f32
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: act_f32 has no device ptr".into()))?;
