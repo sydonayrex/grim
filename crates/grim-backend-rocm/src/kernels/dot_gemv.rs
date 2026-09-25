@@ -842,6 +842,83 @@ extern "C" __global__ void grim_dot4_q80_f32act_add_gemv_tile16(
     }
 }
 
+// One-wave 8-output activation-reuse experiment: quantize each activation
+// block once for eight output columns. This is deliberately opt-in because
+// the extra accumulators reduce the number of independent output groups.
+extern "C" __global__ void grim_dot4_q80_f32act_add_gemv_tile8(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q80,
+    const float* __restrict__ residual,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int tile_base = blockIdx.x * 8;
+    const int row = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= M || tile_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const int ncols = (tile_base + 8 <= N) ? 8 : (N - tile_base);
+    const float* a_row = act_f32 + (long long)row * K;
+    float facc[8] = {0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+        }
+        const float d = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        const float d_a = (float)(_Float16)d;
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0)
+                | ((int)((unsigned char)q1) << 8)
+                | ((int)((unsigned char)q2) << 16)
+                | ((int)((unsigned char)q3) << 24);
+        }
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (j >= ncols) break;
+            const unsigned char* b_blk = B_q80
+                + (long long)(tile_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                + blk * GRIM_Q8_0_BYTES;
+            const float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4;
+                __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        if (j >= ncols) break;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc[j] += __shfl_xor(facc[j], off);
+        }
+    }
+    if (lane == 0) {
+        for (int j = 0; j < ncols; j++) {
+            const long long out_idx = (long long)row * N + tile_base + j;
+            const float res = (residual != nullptr) ? residual[out_idx] : 0.0f;
+            C[out_idx] = res + facc[j];
+        }
+    }
+}
+
 // Phase D.2: Fused activation quantize + GEMV + optional residual add epilogue.
 // Takes f32 activation input directly, quantizes per-block in registers,
 // computes dot4 GEMV projection, and writes (residual ? residual[...] : 0.0f) + facc[j] directly to C.
@@ -2390,6 +2467,14 @@ mod tests {
         assert!(
             KERNEL_SOURCE.contains("grim_dot4_q80_f32act_add_gemv_tile16"),
             "missing one-wave 16-output residual GEMV experiment"
+        );
+    }
+
+    #[test]
+    fn source_contains_8_output_add_tile_experiment() {
+        assert!(
+            KERNEL_SOURCE.contains("grim_dot4_q80_f32act_add_gemv_tile8"),
+            "missing one-wave 8-output residual GEMV experiment"
         );
     }
 

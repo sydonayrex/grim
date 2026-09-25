@@ -7,7 +7,7 @@
 //! Gated: canonical `gpu_test_enabled()`.
 
 use grim_backend_rocm::RocmStorage;
-use grim_backend_rocm::{RocmDevice, as_rocm, gpu_test_enabled};
+use grim_backend_rocm::{as_rocm, gpu_test_enabled, RocmDevice};
 use grim_tensor::{ArithType, CoreTensorOps, DType, MemoryOps, Shape, Storage};
 
 fn gpu_device() -> Option<RocmDevice> {
@@ -188,7 +188,11 @@ fn fused_residual_add_gemv_matches_gemv_plus_add() {
     dev.launch_dot4_q80_f32act_gemv(rocm(&a), rocm(&w), rocm(&gemv_out), m, n, k)
         .unwrap();
     let gemv_vec = gemv_out.to_cpu_vec_f32().unwrap();
-    let want_res: Vec<f32> = gemv_vec.iter().zip(res_data.iter()).map(|(g, r)| g + r).collect();
+    let want_res: Vec<f32> = gemv_vec
+        .iter()
+        .zip(res_data.iter())
+        .map(|(g, r)| g + r)
+        .collect();
 
     // Test 1: Distinct output buffer
     let out_distinct = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
@@ -205,10 +209,7 @@ fn fused_residual_add_gemv_matches_gemv_plus_add() {
 
     let got_distinct = out_distinct.to_cpu_vec_f32().unwrap();
     for (i, (g, w)) in got_distinct.iter().zip(want_res.iter()).enumerate() {
-        assert!(
-            (g - w).abs() <= 1e-4,
-            "distinct[{i}]: got={g} vs want={w}"
-        );
+        assert!((g - w).abs() <= 1e-4, "distinct[{i}]: got={g} vs want={w}");
     }
 
     // Test 2: In-place aliasing (C == residual)
@@ -226,31 +227,17 @@ fn fused_residual_add_gemv_matches_gemv_plus_add() {
 
     let got_inplace = in_place.to_cpu_vec_f32().unwrap();
     for (i, (g, w)) in got_inplace.iter().zip(want_res.iter()).enumerate() {
-        assert!(
-            (g - w).abs() <= 1e-4,
-            "inplace[{i}]: got={g} vs want={w}"
-        );
+        assert!((g - w).abs() <= 1e-4, "inplace[{i}]: got={g} vs want={w}");
     }
 
     // Test 3: None residual matches standalone GEMV
     let out_none = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
-    dev.launch_dot4_q80_f32act_add_gemv(
-        rocm(&a),
-        rocm(&w),
-        None,
-        rocm(&out_none),
-        m,
-        n,
-        k,
-    )
-    .unwrap();
+    dev.launch_dot4_q80_f32act_add_gemv(rocm(&a), rocm(&w), None, rocm(&out_none), m, n, k)
+        .unwrap();
 
     let got_none = out_none.to_cpu_vec_f32().unwrap();
     for (i, (g, w)) in got_none.iter().zip(gemv_vec.iter()).enumerate() {
-        assert!(
-            (g - w).abs() <= 1e-5,
-            "none_res[{i}]: got={g} vs gemv={w}"
-        );
+        assert!((g - w).abs() <= 1e-5, "none_res[{i}]: got={g} vs gemv={w}");
     }
 }
 
@@ -299,14 +286,71 @@ fn fused_residual_add_gemv_tile16_matches_split() {
         .unwrap();
         let got = out.to_cpu_vec_f32().unwrap();
         for (i, (got, want)) in got.iter().zip(&want).enumerate() {
-            assert!((got - want).abs() < 1e-4, "tile16[{i}]: got={got} vs want={want}");
+            assert!(
+                (got - want).abs() < 1e-4,
+                "tile16[{i}]: got={got} vs want={want}"
+            );
         }
     });
 }
 
 #[test]
 #[ignore]
-fn dot4_add_microbench_compares_default_and_tile16() {
+fn fused_residual_add_gemv_tile8_matches_split() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    if !dev.supports_dot4() {
+        eprintln!("skipping: device does not support dot4");
+        return;
+    }
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    temp_env::with_var("GRIM_DOT4_TILE8", Some("1"), || {
+        let k = 1024usize;
+        let n = 2048usize;
+        let m = 1usize;
+        let x = rand_f32(k, 701);
+        let res_data = rand_f32(n, 702);
+        let a = f32_tensor(&dev, &x, &Shape::new(vec![m, k]));
+        let w = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 703), n, k), n, k);
+        let residual = f32_tensor(&dev, &res_data, &Shape::new(vec![n]));
+
+        let gemv_out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+        dev.launch_dot4_q80_f32act_gemv(rocm(&a), rocm(&w), rocm(&gemv_out), m, n, k)
+            .unwrap();
+        let want: Vec<f32> = gemv_out
+            .to_cpu_vec_f32()
+            .unwrap()
+            .iter()
+            .zip(res_data.iter())
+            .map(|(g, r)| g + r)
+            .collect();
+
+        let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+        dev.launch_dot4_q80_f32act_add_gemv(
+            rocm(&a),
+            rocm(&w),
+            Some(rocm(&residual)),
+            rocm(&out),
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+        let got = out.to_cpu_vec_f32().unwrap();
+        for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "tile8[{i}]: got={got} vs want={want}"
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore]
+fn dot4_add_microbench_compares_default_and_tiles() {
     let Some(dev) = gpu_device() else {
         eprintln!("skipping: GPU test gate off");
         return;
@@ -324,14 +368,7 @@ fn dot4_add_microbench_compares_default_and_tile16() {
     let residual = f32_tensor(&dev, &rand_f32(n, 602), &Shape::new(vec![n]));
     let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
     let weights: Vec<_> = (0..layers)
-        .map(|layer| {
-            upload_q80(
-                &dev,
-                &pack_q80(&rand_f32(n * k, 603 + layer), n, k),
-                n,
-                k,
-            )
-        })
+        .map(|layer| upload_q80(&dev, &pack_q80(&rand_f32(n * k, 603 + layer), n, k), n, k))
         .collect();
 
     let run = |label: &str| {
@@ -374,7 +411,14 @@ fn dot4_add_microbench_compares_default_and_tile16() {
         );
     };
 
-    temp_env::with_var("GRIM_DOT4_TILE16", None::<&str>, || run("default"));
-    temp_env::with_var("GRIM_DOT4_TILE16", Some("1"), || run("tile16"));
+    temp_env::with_var("GRIM_DOT4_TILE8", None::<&str>, || {
+        temp_env::with_var("GRIM_DOT4_TILE16", None::<&str>, || run("default"));
+        temp_env::with_var("GRIM_DOT4_TILE16", None::<&str>, || {
+            temp_env::with_var("GRIM_DOT4_TILE8", Some("1"), || run("tile8"));
+        });
+    });
+    temp_env::with_var("GRIM_DOT4_TILE8", None::<&str>, || {
+        temp_env::with_var("GRIM_DOT4_TILE16", Some("1"), || run("tile16"));
+    });
     assert!(out.to_cpu_vec_f32().unwrap().iter().all(|v| v.is_finite()));
 }
