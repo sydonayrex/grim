@@ -1196,8 +1196,6 @@ impl Lfm2Block {
                     )
                 })?,
             }
-        } else if self.is_moe {
-            self.forward_moe_ffn(&norm_x)?
         } else if self.attention_mode == Lfm2AttentionMode::Gdl {
             if CAPTURE_KIND.load(std::sync::atomic::Ordering::SeqCst) == 1 {
                 grave_capture_record(self.index, &norm_x);
