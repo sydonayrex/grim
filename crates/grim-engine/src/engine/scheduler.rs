@@ -1,6 +1,7 @@
 //! Scheduler loops: prefill/decode drives, graph capture, bucket groups, step.
 
 use crate::*;
+use grim_models_transformer::DecodeGraphModel;
 
 impl Engine {
     /// Run one engine iteration. For each scheduled prefill or decode request,
@@ -933,7 +934,16 @@ impl Engine {
                                 .map_err(|e| format!("seed: {e}"))?;
                             g.buffers
                                 .seed_gdl_state_from_eager(&dev, &srcs)
-                                .map_err(|e| format!("gdl seed: {e}"))
+                                .map_err(|e| format!("gdl seed: {e}"))?;
+                            let conv_seeds = lfm2
+                                .eager_conv_seed_rings(sess.as_ref())
+                                .map_err(|e| format!("conv export: {e}"))?;
+                            if !conv_seeds.is_empty() {
+                                g.buffers
+                                    .seed_conv_rings(&conv_seeds)
+                                    .map_err(|e| format!("conv seed: {e}"))?;
+                            }
+                            Ok(())
                         })();
                         if let Err(e) = seed_ok {
                             eprintln!("[grim] decode-graph: KV seed failed for request {request_id} ({e}); eager fallback");
@@ -955,8 +965,29 @@ impl Engine {
                         // `current_pos` already set by the KV seed
                         // (`= valid_rows`); replays append after it.
                         self.decode_graphs.insert(graph_slot_key.clone(), g);
-                        if let Some(g) = self.decode_graphs.get(&graph_slot_key) {
-                            let _ = g.replay();
+                        let graph_pos = self
+                            .sessions
+                            .get(&request_id)
+                            .map(|s| s.current_pos() as u32)
+                            .unwrap_or(0);
+                        if let Some(g) = self.decode_graphs.get_mut(&graph_slot_key) {
+                            let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+                            g.buffers
+                                .write_pos_async(&rocm, graph_pos, g.stream)
+                                .map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "graph position seed failed: {e}"
+                                    ))
+                                })?;
+                            g.buffers
+                                .token_ids_dev
+                                .write_host_f32_async(&[f32::from_bits(tid)], g.stream)
+                                .map_err(|e| {
+                                    grim_core::error::Error::Backend(format!(
+                                        "graph token seed failed: {e}"
+                                    ))
+                                })?;
+                            g.replay()?;
                         }
                     }
                     Err(_) => {
@@ -995,7 +1026,16 @@ impl Engine {
                         .map_err(|e| format!("seed: {e}"))?;
                     g.buffers
                         .seed_gdl_state_from_eager(&dev, &srcs)
-                        .map_err(|e| format!("gdl seed: {e}"))
+                        .map_err(|e| format!("gdl seed: {e}"))?;
+                    let conv_seeds = lfm2
+                        .eager_conv_seed_rings(sess.as_ref())
+                        .map_err(|e| format!("conv export: {e}"))?;
+                    if !conv_seeds.is_empty() {
+                        g.buffers
+                            .seed_conv_rings(&conv_seeds)
+                            .map_err(|e| format!("conv seed: {e}"))?;
+                    }
+                    Ok(())
                 })();
                 if let Err(e) = seed_ok {
                     eprintln!(
@@ -2054,5 +2094,103 @@ mod scheduler_fallback_gpu_tests {
             let v2 = out2.logits.expect("logits").to_vec_f32().unwrap();
             assert!(!v2.is_empty() && v2.iter().all(|x| x.is_finite()));
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn graph_capture_seeds_shortconv_state_before_replay() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+            return;
+        };
+        let _guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let prev_env = capture_env();
+        if !grim_backend_rocm::RocmDevice::shared(0).graph_capture_enabled() {
+            eprintln!("Skipping: shared device predates capture opt-in");
+            restore_capture_env(prev_env);
+            return;
+        }
+
+        let mut lfm2 = tiny_rocm_lfm2(&dev);
+        let hidden = lfm2.cfg.hidden_size;
+        let l_cache = 3usize;
+        lfm2.cfg.n_shortconv_l_cache = l_cache;
+        lfm2.cfg.is_recr[0] = true;
+        let block = &mut lfm2.layers[0];
+        block.wq = None;
+        block.wk = None;
+        block.wv = None;
+        block.wo = None;
+        block.attn_q_norm = None;
+        block.attn_k_norm = None;
+        block.shortconv_in_proj = Some(rocm_linear(&dev, 3 * hidden, hidden, 301.0));
+        let conv_data: Vec<f32> = (0..hidden * l_cache)
+            .map(|i| ((i % 7) as f32 * 0.03) - 0.1)
+            .collect();
+        block.shortconv_conv_vec = Some(conv_data.clone());
+        block.shortconv_conv = Some(rocm_tensor(
+            &dev,
+            conv_data,
+            grim_tensor::Shape::new(vec![hidden, l_cache]),
+        ));
+        block.shortconv_out_proj = Some(rocm_linear(&dev, hidden, hidden, 302.0));
+
+        let mut eager_session = grim_core::model::CausalLm::new_session(&lfm2);
+        let prefill = [(3.0f32, 0.0f32), (5.0, 1.0)];
+        for (token, pos) in prefill {
+            let ids = rocm_tensor(&dev, vec![token], grim_tensor::Shape::new(vec![1]));
+            let positions = rocm_tensor(&dev, vec![pos], grim_tensor::Shape::new(vec![1]));
+            grim_core::model::CausalLm::forward(&lfm2, eager_session.as_mut(), &ids, &positions, &[])
+                .expect("eager shortconv prefill");
+        }
+        let eager_ids = rocm_tensor(&dev, vec![7.0], grim_tensor::Shape::new(vec![1]));
+        let eager_pos = rocm_tensor(&dev, vec![2.0], grim_tensor::Shape::new(vec![1]));
+        let eager_logits = grim_core::model::CausalLm::forward(
+            &lfm2,
+            eager_session.as_mut(),
+            &eager_ids,
+            &eager_pos,
+            &[],
+        )
+        .expect("eager shortconv decode")
+        .to_vec_f32()
+        .expect("eager shortconv logits");
+
+        let mut engine = Engine::new(EngineConfig::default());
+        let session = grim_core::model::CausalLm::new_session(&lfm2);
+        engine.register_model("lfm2shortconv", Box::new(lfm2));
+        engine.sessions.insert(7, session);
+        for (token, pos) in prefill {
+            let ids = rocm_tensor(&dev, vec![token], grim_tensor::Shape::new(vec![1]));
+            let positions = rocm_tensor(&dev, vec![pos], grim_tensor::Shape::new(vec![1]));
+            engine
+                .drive_forward("lfm2shortconv", 7, &ids, &positions)
+                .expect("scheduler shortconv prefill");
+        }
+        let ids = rocm_tensor(&dev, vec![7.0], grim_tensor::Shape::new(vec![1]));
+        let pos = rocm_tensor(&dev, vec![2.0], grim_tensor::Shape::new(vec![1]));
+        let graph_out = engine
+            .drive_forward_graph_capture("lfm2shortconv", 7, &ids, &pos, "shortconv-seed")
+            .expect("scheduler graph capture");
+        restore_capture_env(prev_env);
+
+        assert!(
+            !engine.decode_graphs.is_empty(),
+            "ShortConv graph must be stored after successful capture"
+        );
+        let graph_logits = graph_out
+            .logits
+            .expect("graph logits")
+            .to_vec_f32()
+            .expect("graph shortconv logits");
+        let mut worst = 0.0f32;
+        for (index, (eager, graph)) in eager_logits.iter().zip(&graph_logits).enumerate() {
+            worst = worst.max((eager - graph).abs());
+            assert!(
+                (eager - graph).abs() < 5e-2,
+                "ShortConv seed mismatch at {index}: eager={eager}, graph={graph}"
+            );
+        }
+        eprintln!("[scheduler-shortconv-seed] max abs diff = {worst:.6}");
     }
 }
