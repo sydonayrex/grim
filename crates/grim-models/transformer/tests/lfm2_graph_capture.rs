@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::RocmStorage;
+use grim_core::model::CausalLm;
 use grim_models_transformer::lfm2::{Lfm2, Lfm2Block, Lfm2Config, Lfm2LayerCache};
 use grim_models_transformer::lfm2_graph::write_embedding_to_buffer;
 use grim_models_transformer::shared_moe::CharonCache;
@@ -997,13 +998,13 @@ fn g4_graph_gqa_matches_eager() {
         &dev,
         0,
         prefill_tokens.iter().map(|&t| t as f32).collect(),
-        Shape::vec![prefill_tokens.len()],
+        Shape::new(vec![prefill_tokens.len()]),
     );
     let pos = rocm_tensor(
         &dev,
         0,
         vec![0.0f32; prefill_tokens.len()],
-        Shape::vec![prefill_tokens.len()],
+        Shape::new(vec![prefill_tokens.len()]),
     );
     model
         .forward(session.as_mut(), &input, &pos, &[])
@@ -1036,24 +1037,22 @@ fn g4_graph_gqa_matches_eager() {
         &dev,
         0,
         all_tokens.iter().map(|&t| t as f32).collect(),
-        Shape::vec![all_tokens.len()],
+        Shape::new(vec![all_tokens.len()]),
     );
     let eager_pos = rocm_tensor(
         &dev,
         0,
         vec![0.0f32; all_tokens.len()],
-        Shape::vec![all_tokens.len()],
+        Shape::new(vec![all_tokens.len()]),
     );
     let eager_out = model
         .forward(eager_session.as_mut(), &eager_input, &eager_pos, &[])
         .expect("eager forward");
     let eager_logits = eager_out.to_vec_f32().unwrap();
     // Last token's logits (decode step output).
-    let hidden = 128usize;
     let vocab = 32usize;
-    let last_logits: Vec<f32> = eager_logits
-        [(all_tokens.len() - 1) * vocab..all_tokens.len() * vocab]
-        .to_vec();
+    let last_logits: Vec<f32> =
+        eager_logits[(all_tokens.len() - 1) * vocab..all_tokens.len() * vocab].to_vec();
 
     // Compare graph vs eager (tolerance for fp accumulation order).
     let mut max_diff = 0.0f32;
@@ -1091,7 +1090,11 @@ fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
     // Token sequence: 4 prefill + 3 decode.
     let prefill_tokens: Vec<u32> = vec![1, 5, 9, 13];
     let decode_tokens: Vec<u32> = vec![17, 21, 25];
-    let all_tokens: Vec<u32> = prefill_tokens.iter().chain(&decode_tokens).copied().collect();
+    let all_tokens: Vec<u32> = prefill_tokens
+        .iter()
+        .chain(&decode_tokens)
+        .copied()
+        .collect();
 
     // --- Path 1: fully eager (no graph at all) ---
     let mut eager_session = model.new_session();
@@ -1099,13 +1102,13 @@ fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
         &dev,
         0,
         all_tokens.iter().map(|&t| t as f32).collect(),
-        Shape::vec![all_tokens.len()],
+        Shape::new(vec![all_tokens.len()]),
     );
     let eager_pos = rocm_tensor(
         &dev,
         0,
         vec![0.0f32; all_tokens.len()],
-        Shape::vec![all_tokens.len()],
+        Shape::new(vec![all_tokens.len()]),
     );
     let eager_out = model
         .forward(eager_session.as_mut(), &eager_input, &eager_pos, &[])
@@ -1118,13 +1121,13 @@ fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
         &dev,
         0,
         prefill_tokens.iter().map(|&t| t as f32).collect(),
-        Shape::vec![prefill_tokens.len()],
+        Shape::new(vec![prefill_tokens.len()]),
     );
     let prefill_pos = rocm_tensor(
         &dev,
         0,
         vec![0.0f32; prefill_tokens.len()],
-        Shape::vec![prefill_tokens.len()],
+        Shape::new(vec![prefill_tokens.len()]),
     );
     model
         .forward(session.as_mut(), &prefill_input, &prefill_pos, &[])
@@ -1159,7 +1162,7 @@ fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
     graph.begin_capture().unwrap();
     model.forward_capture(&mut graph, decode_tokens[0]).unwrap();
     graph.end_capture().unwrap();
-    assert!(graph.is_capture());
+    assert!(graph.is_captured);
 
     // Replay decode steps.
     let mut graph_logits_all: Vec<f32> = Vec::new();
@@ -1175,13 +1178,13 @@ fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
                 &dev,
                 0,
                 first_tokens.iter().map(|&t| t as f32).collect(),
-                Shape::vec![first_tokens.len()],
+                Shape::new(vec![first_tokens.len()]),
             );
             let first_pos = rocm_tensor(
                 &dev,
                 0,
                 vec![0.0f32; first_tokens.len()],
-                Shape::vec![first_tokens.len()],
+                Shape::new(vec![first_tokens.len()]),
             );
             let mut first_session = model.new_session();
             let first_out = model
@@ -1190,8 +1193,7 @@ fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
             let first_eager = first_out.to_vec_f32().unwrap();
             let vocab = 32usize;
             let first_eager_last: Vec<f32> =
-                first_eager[(first_tokens.len() - 1) * vocab..first_tokens.len() * vocab]
-                    .to_vec();
+                first_eager[(first_tokens.len() - 1) * vocab..first_tokens.len() * vocab].to_vec();
             let mut max_diff = 0.0f32;
             for (a, b) in logits.iter().zip(&first_eager_last) {
                 let diff = (a - b).abs() / (b.abs() + 1e-3);
@@ -1209,7 +1211,7 @@ fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
     // Compare all decode steps against fully eager.
     let vocab = 32usize;
     let mut max_diff = 0.0f32;
-    for (i, &token) in decode_tokens.iter().enumerate() {
+    for (i, &_token) in decode_tokens.iter().enumerate() {
         let eager_start = (prefill_tokens.len() + i) * vocab;
         let eager_end = eager_start + vocab;
         let eager_slice = &eager_logits[eager_start..eager_end];
