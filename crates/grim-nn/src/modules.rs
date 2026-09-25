@@ -1251,8 +1251,12 @@ impl Embedding {
                 // Native (F32/BF16/F16) embedding: already on-device, pass through.
                 return Ok(Self { weight: t });
             }
-            // Quantized embedding (e.g. GGUF token_embd Q8_0 on ROCm): `ws.get` keeps the packed bytes
-            // resident on-device, so dequantizing via `to_vec_f32()` + re-upload would be a DtoH→H2D round trip.
+            // Packed Q4_K embedding on devices supporting on-the-fly dequant gather:
+            // keep the table packed in VRAM (715 MB instead of 5.09 GB for Qwen).
+            if matches!(t.dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)) {
+                return Ok(Self { weight: t });
+            }
+            // Other quantized embeddings: dequantize to f32.
             return Ok(Self {
                 weight: ws.get_f32([vocab, dim], "weight")?,
             });
@@ -1272,6 +1276,9 @@ impl Embedding {
 
         // Case 1: Row-major layout [actual_vocab, dim] where s1 == dim.
         if s1 == dim {
+            if matches!(raw_tensor.dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)) {
+                return Ok(Self { weight: raw_tensor });
+            }
             return Ok(Self {
                 weight: dequantize_for_gather(raw_tensor)?,
             });
@@ -1318,10 +1325,21 @@ impl Embedding {
     pub fn forward(&self, indices: &[u32], seq_len: usize, dim: usize) -> Result<Tensor> {
         let dev = pick_device_for_tensor(&self.weight);
         let out_shape = Shape::new(vec![seq_len, dim]);
-        let (s, h) =
-            CoreTensorOps::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
+        let (s, h) = if matches!(
+            self.weight.dtype().storage,
+            Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+        ) {
+            CoreTensorOps::embedding_q4k(
+                &*dev,
+                self.weight.storage().as_ref(),
+                indices,
+                &out_shape,
+                dim,
+            )?
+        } else {
+            CoreTensorOps::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?
+        };
         // WI-Host-1 #3: dropped `h.synchronize()?` here.
-        // Same lazy-sync rationale as `Linear::forward` (see the matmul-sync comment there): the stall is redundant because.
         let _ = h;
         Ok(Tensor::new(
             Arc::from(s),
