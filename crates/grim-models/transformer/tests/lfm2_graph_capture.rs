@@ -583,6 +583,10 @@ fn shortconv_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
     let inter = 64usize;
     let l_cache = 3usize;
     let mut b = attention_block(dev, ordinal, hidden, nh * hd, nkv * hd, hd, inter, false);
+    b.wq = None;
+    b.wk = None;
+    b.wv = None;
+    b.wo = None;
     b.shortconv_in_proj = Some(test_linear(dev, ordinal, 3 * hidden, hidden, 401));
     b.shortconv_conv = Some(rocm_tensor(
         dev,
@@ -865,14 +869,16 @@ fn lfm2_graph_shortconv_ring_advances_across_replays() {
         model.forward_capture(&mut graph, t).unwrap();
     }
     graph.begin_capture().unwrap();
-    model.forward_capture(&mut graph, 42).unwrap();
+    model.forward_capture(&mut graph, 7).unwrap();
     graph.end_capture().unwrap();
 
-    model.forward_replay(&mut graph, 42).unwrap();
+    model.forward_replay(&mut graph, 7).unwrap();
     graph.buffers.current_pos += 1;
+    dev.synchronize();
     let first = graph.read_logits_f32().unwrap();
-    model.forward_replay(&mut graph, 42).unwrap();
+    model.forward_replay(&mut graph, 7).unwrap();
     graph.buffers.current_pos += 1;
+    dev.synchronize();
     let second = graph.read_logits_f32().unwrap();
     let max_delta = first
         .iter()
