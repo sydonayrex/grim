@@ -369,6 +369,13 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
     }
 }
 
+fn qwen35_layer_split_enabled() -> bool {
+    matches!(
+        std::env::var("GRIM_QWEN_LAYER_SPLIT").as_deref(),
+        Ok("1" | "true" | "on" | "yes")
+    )
+}
+
 /// Load a model from a GGUF file.
 pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
     let provider = GgufProvider::open(path)?;
@@ -933,9 +940,11 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35 => {
-            let tp_active = TensorParallelConfig::from_env()
-                .map(|tp| tp.world_size > 1)
-                .unwrap_or(false);
+            let layer_split = qwen35_layer_split_enabled();
+            let tp_active = !layer_split
+                && TensorParallelConfig::from_env()
+                    .map(|tp| tp.world_size > 1)
+                    .unwrap_or(false);
             let devices = if tp_active {
                 // Each TP process owns one ordinal. Loading every layer onto
                 // the full ordinal list makes the first cross-rank collective
@@ -943,6 +952,11 @@ fn load_model_from_config(
                 vec![device.clone()]
             } else {
                 resolve_discrete_rocm_devices(&device)
+            };
+            let qwen_tp = if layer_split {
+                TensorParallelConfig::default()
+            } else {
+                tp
             };
             let qwen35_cfg = Qwen35Config {
                 vocab_size,
@@ -964,7 +978,7 @@ fn load_model_from_config(
                 devices,
             };
             log::info!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
-            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, tp)?;
+            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, qwen_tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
@@ -2733,13 +2747,20 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35 => {
-            let tp_active = TensorParallelConfig::from_env()
-                .map(|tp| tp.world_size > 1)
-                .unwrap_or(false);
+            let layer_split = qwen35_layer_split_enabled();
+            let tp_active = !layer_split
+                && TensorParallelConfig::from_env()
+                    .map(|tp| tp.world_size > 1)
+                    .unwrap_or(false);
             let qwen_devices = if tp_active {
                 vec![device.clone()]
             } else {
                 resolve_discrete_rocm_devices(&device)
+            };
+            let qwen_tp = if layer_split {
+                TensorParallelConfig::default()
+            } else {
+                tp
             };
             let qwen35_cfg = Qwen35Config {
                 vocab_size: hparams.vocab_size,
@@ -2799,7 +2820,7 @@ fn load_model_with_providers(
                 "[grim] Loading Qwen3.5/3.8 model with config: {:?}",
                 qwen35_cfg
             );
-            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, tp)?;
+            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, qwen_tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
