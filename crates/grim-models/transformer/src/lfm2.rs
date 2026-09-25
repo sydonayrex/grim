@@ -98,6 +98,16 @@ fn kv_arena_dtype() -> DType {
     }
 }
 
+pub(crate) fn validate_native_mxfp4_kv_compatibility(native_mxfp4: bool) -> Result<()> {
+    if native_mxfp4 && grim_backend_rocm::kv_f16_enabled() {
+        return Err(grim_core::error::Error::Backend(
+            "GRIM_F16_KV=1 is incompatible with native MXFP4 QKV; use F32 KV or disable the fused MXFP4 path"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Lfm2AttentionMode {
     #[default]
@@ -706,6 +716,7 @@ impl Lfm2Block {
             })
             .unwrap_or(false)
         });
+        validate_native_mxfp4_kv_compatibility(weights_native_mxfp4)?;
         let (wqkv_codes, wqkv_exps, gamma_q, gamma_k) = if !is_recurrent
             && cfg.mxfp4_qkv_attention
             && weights_native_mxfp4
@@ -1539,14 +1550,14 @@ impl Lfm2Block {
                                 *k_dev = Some(Box::new(Tensor::new(
                                     Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape.clone(),
-                                    DType::F32,
+                                    kv_arena_dtype(),
                                     QuantProvenance::GrimNative,
                                     norm_x.device().clone(),
                                 )));
                                 *v_dev = Some(Box::new(Tensor::new(
                                     Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape,
-                                    DType::F32,
+                                    kv_arena_dtype(),
                                     QuantProvenance::GrimNative,
                                     norm_x.device().clone(),
                                 )));
@@ -1564,7 +1575,7 @@ impl Lfm2Block {
                                     let new_tensor = Tensor::new(
                                         Arc::from(new_storage),
                                         new_shape.clone(),
-                                        DType::F32,
+                                        kv_arena_dtype(),
                                         QuantProvenance::GrimNative,
                                         norm_x.device().clone(),
                                     );
@@ -1693,14 +1704,14 @@ impl Lfm2Block {
                                 *k_dev = Some(Box::new(Tensor::new(
                                     Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape.clone(),
-                                    DType::F32,
+                                    kv_arena_dtype(),
                                     QuantProvenance::GrimNative,
                                     norm_x.device().clone(),
                                 )));
                                 *v_dev = Some(Box::new(Tensor::new(
                                     Arc::from(dev.zeros(&shape, kv_arena_dtype())?),
                                     shape,
-                                    DType::F32,
+                                    kv_arena_dtype(),
                                     QuantProvenance::GrimNative,
                                     norm_x.device().clone(),
                                 )));
@@ -1906,6 +1917,7 @@ impl Lfm2Block {
         steps: usize,
         hidden: usize,
     ) -> Result<Vec<f32>> {
+        validate_native_mxfp4_kv_compatibility(self.wqkv_codes.is_some())?;
         let dev_arc = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
         let dev = dev_arc.as_ref();
         let n_q = self.num_heads * self.head_dim;
@@ -2283,7 +2295,7 @@ impl Lfm2Block {
                 let new_tensor = Tensor::new(
                     Arc::from(new_storage),
                     new_shape.clone(),
-                    DType::F32,
+                    kv_arena_dtype(),
                     QuantProvenance::GrimNative,
                     device.clone(),
                 );
@@ -2307,14 +2319,14 @@ impl Lfm2Block {
             *k_dev = Some(Box::new(Tensor::new(
                 Arc::from(rocm_dev.zeros(&shape, kv_arena_dtype())?),
                 shape.clone(),
-                DType::F32,
+                kv_arena_dtype(),
                 QuantProvenance::GrimNative,
                 device.clone(),
             )));
             *v_dev = Some(Box::new(Tensor::new(
                 Arc::from(rocm_dev.zeros(&shape, kv_arena_dtype())?),
                 shape,
-                DType::F32,
+                kv_arena_dtype(),
                 QuantProvenance::GrimNative,
                 device.clone(),
             )));
@@ -3813,6 +3825,14 @@ fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 
 #[cfg(test)]
 mod audit_tests {
+
+    #[test]
+    fn native_mxfp4_rejects_f16_kv() {
+        temp_env::with_var("GRIM_F16_KV", Some("1"), || {
+            assert!(validate_native_mxfp4_kv_compatibility(true).is_err());
+            assert!(validate_native_mxfp4_kv_compatibility(false).is_ok());
+        });
+    }
 
     /// G3b gate (never delete): zero-weight, bias-calibrated gate
     /// projections must reproduce the static scalar triple EXACTLY through

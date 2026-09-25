@@ -102,6 +102,9 @@ impl Lfm2 {
             ));
         }
         let dev = dev_for(self)?;
+        crate::lfm2::validate_native_mxfp4_kv_compatibility(
+            self.layers.iter().any(|layer| layer.wqkv_codes.is_some()),
+        )?;
         // G1 (PLAN-kernel-fusion): the graph runs on pool slot 0, which today
         // coincides with the device's default stream. Post-replay sampling
         // now uses `sample_logits_on_device_with_penalty_at_stream` bound to
