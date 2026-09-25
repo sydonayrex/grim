@@ -207,11 +207,68 @@ fn calibrate_capability(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32)> {
             return Some(*found);
         }
     }
+    // PLAN 4 W2: cross-process disk cache before paying for the benchmark.
+    if let Some(found) = read_disk_calibration(gcn, clock_bucket) {
+        if let Ok(mut slot) = cache.lock() {
+            slot.insert(key, found);
+        }
+        return Some(found);
+    }
     let measured = measure_device_throughput(ordinal, gcn)?;
     if let Ok(mut slot) = cache.lock() {
-        slot.insert(key, measured);
+        slot.insert(key.clone(), measured);
     }
+    write_disk_calibration(gcn, clock_bucket, measured);
     Some(measured)
+}
+
+/// Disk backing for the WI-SB0 calibration (PLAN 4 W2): the micro-benchmark
+/// costs ~20 ms of Tensile GEMMs per process. Cache
+/// `(gcn, clock_bucket, toolchain) -> (fp16, fp8, bw)` in one small file per
+/// key next to the HSACO cache; all failures fall through to measuring.
+/// `GRIM_DISABLE_CALIBRATION` (checked by the caller) skips everything.
+fn disk_calibration_path(gcn: &str, clock_bucket: u32) -> std::path::PathBuf {
+    let mut dir = std::env::var("GRIM_HSACO_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let mut d = std::env::temp_dir();
+            d.push("grim_hsaco_cache");
+            d
+        });
+    let _ = std::fs::create_dir_all(&dir);
+    dir.push(format!(
+        "calib_{gcn}_{clock_bucket}_{}.txt",
+        crate::device::jit_cache::toolchain_fingerprint()
+    ));
+    dir
+}
+
+fn read_disk_calibration(gcn: &str, clock_bucket: u32) -> Option<(f32, f32, f32)> {
+    let text = std::fs::read_to_string(disk_calibration_path(gcn, clock_bucket)).ok()?;
+    let mut it = text.split_whitespace();
+    let v: Option<Vec<f32>> = it.by_ref().take(3).map(|s| s.parse().ok()).collect();
+    match v {
+        Some(v) if v.len() == 3 && v.iter().all(|x| x.is_finite() && *x > 0.0) => {
+            Some((v[0], v[1], v[2]))
+        }
+        _ => None,
+    }
+}
+
+fn write_disk_calibration(gcn: &str, clock_bucket: u32, measured: (f32, f32, f32)) {
+    let path = disk_calibration_path(gcn, clock_bucket);
+    let tmp = path.with_extension(format!(
+        "tmp_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let content = format!("{} {} {}\n", measured.0, measured.1, measured.2);
+    if std::fs::write(&tmp, content).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Current core clock of `ordinal` in MHz, or `None` when the attribute

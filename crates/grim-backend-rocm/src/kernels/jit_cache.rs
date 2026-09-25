@@ -75,9 +75,22 @@ impl HsacoKernelCache {
         if !cache_dir.exists() {
             let _ = fs::create_dir_all(&cache_dir);
         }
+        // Drop crash leftovers from interrupted compiles so the dir does not
+        // accumulate orphaned `.tmp_*` blobs across runs.
+        if let Ok(rd) = fs::read_dir(&cache_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(".tmp_") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
 
-        // NOTE: we deliberately do NOT pre-populate `entries` from on-disk .hsaco files.
-        // The lowered (possibly mangled) kernel name is computed at JIT-compile time and stored in-memory here;.
+        // NOTE: `entries` starts empty on purpose for the in-memory fast path,
+        // but `get_cached_kernel` below ALSO consults the on-disk `.hsaco` +
+        // `.lowered` sidecars, so second processes hit the cache without
+        // recompiling. The lowered (possibly mangled) kernel name is persisted
+        // in the sidecar at cache time for exactly this reason.
         let entries_lock = RwLock::new(HashMap::new());
 
         Self {
@@ -94,6 +107,44 @@ impl HsacoKernelCache {
             }
         }
         None
+    }
+
+    /// Cross-process lookup: reconstruct the exact on-disk filename from
+    /// `(key, current toolchain, source_hash)` and, on a hit, validate the
+    /// sidecar and populate the in-memory map. Returns `None` (→ caller
+    /// recompiles) when the toolchain rotated, the source changed, or the
+    /// sidecar is missing — never a stale binary.
+    pub fn get_cached_kernel_hashed(
+        &self,
+        key: &str,
+        source_hash: u64,
+    ) -> Option<(PathBuf, String)> {
+        if let Some(hit) = self.get_cached_kernel(key) {
+            return Some(hit);
+        }
+        let stem = format!(
+            "{}_{}_{:016x}",
+            key,
+            crate::device::jit_cache::toolchain_fingerprint(),
+            source_hash
+        );
+        let cache_path = self.cache_dir.join(format!("{stem}.hsaco"));
+        let sidecar = self.cache_dir.join(format!("{stem}.lowered"));
+        let bytes = fs::read(&cache_path).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let lowered = fs::read_to_string(&sidecar).ok()?;
+        let lowered = lowered.trim().to_string();
+        if lowered.is_empty() {
+            return None;
+        }
+        let modified = fs::metadata(&cache_path).and_then(|m| m.modified()).ok()?;
+        self.entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), (cache_path.clone(), modified, lowered.clone()));
+        Some((cache_path, lowered))
     }
 
     pub fn cache_kernel(
@@ -130,6 +181,23 @@ impl HsacoKernelCache {
         // This matters after a failed or stale compile: a successful HIPRTC result must not be.
         fs::rename(&tmp_path, &cache_path)?;
 
+        // Persist the lowered entry name alongside the code object so later
+        // processes can use the cache without recompiling to discover it.
+        // A crash between the two writes leaves an hsaco without a sidecar,
+        // which lookups treat as a miss (self-healing recompile).
+        let sidecar_tmp = self.cache_dir.join(format!(
+            ".tmp_lowered_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        if fs::write(&sidecar_tmp, lowered_name).is_ok() {
+            let sidecar = cache_path.with_extension("lowered");
+            let _ = fs::rename(&sidecar_tmp, &sidecar);
+        }
+
         let metadata = fs::metadata(&cache_path)?;
         let modified = metadata.modified()?;
         self.entries
@@ -150,6 +218,7 @@ impl HsacoKernelCache {
             .unwrap_or_else(|e| e.into_inner())
             .remove(key)
         {
+            let _ = fs::remove_file(path.with_extension("lowered"));
             let _ = fs::remove_file(path);
         }
     }
@@ -286,5 +355,64 @@ mod tests {
     fn hsaco_kernel_cache_covers_empty_get() {
         let cache = HsacoKernelCache::new();
         assert!(cache.get_cached_kernel("nonexistent").is_none());
+    }
+
+    #[test]
+    fn hsaco_kernel_cache_hashed_lookup_hits_disk_across_instances() {
+        // Simulate two processes sharing one cache dir: the writer drops
+        // (its in-memory map dies with it); a fresh reader with an empty map
+        // must still hit via the on-disk sidecar. This is the W1 cold-start
+        // contract — without it every process recompiles every kernel.
+        let dir = std::env::temp_dir().join(format!(
+            "grim_hsaco_xproc_{}",
+            std::process::id()
+        ));
+        let prev = std::env::var("GRIM_HSACO_CACHE_DIR").ok();
+        unsafe {
+            std::env::set_var("GRIM_HSACO_CACHE_DIR", &dir);
+        }
+        let key = "xproc_test_kernel";
+        let src = "kernel void xproc_test() {}";
+        let hash = seahash::hash(src.as_bytes());
+        {
+            let writer = HsacoKernelCache::new();
+            writer
+                .cache_kernel(key, src, b"xproc bytes", "xproc_test")
+                .unwrap();
+            assert!(writer.get_cached_kernel_hashed(key, hash).is_some());
+        }
+        {
+            let reader = HsacoKernelCache::new();
+            assert!(
+                reader.get_cached_kernel(key).is_none(),
+                "memory map must start empty (fresh process)"
+            );
+            let got = reader.get_cached_kernel_hashed(key, hash);
+            assert!(
+                got.is_some(),
+                "disk sidecar lookup must hit across instances"
+            );
+            assert_eq!(got.unwrap().1, "xproc_test");
+        }
+        {
+            // Stale-source safety: a different source hash must miss even
+            // when a file exists for the key.
+            let reader = HsacoKernelCache::new();
+            assert!(
+                reader
+                    .get_cached_kernel_hashed(key, hash.wrapping_add(1))
+                    .is_none(),
+                "wrong source hash must miss"
+            );
+        }
+        match prev {
+            Some(v) => unsafe {
+                std::env::set_var("GRIM_HSACO_CACHE_DIR", v);
+            },
+            None => unsafe {
+                std::env::remove_var("GRIM_HSACO_CACHE_DIR");
+            },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

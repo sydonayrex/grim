@@ -571,7 +571,9 @@ impl RocmDevice {
             format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash)
         };
 
-        if let Some((cached_path, cached_lowered)) = self.hsaco_cache.get_cached_kernel(&cache_key)
+        if let Some((cached_path, cached_lowered)) = self
+            .hsaco_cache
+            .get_cached_kernel_hashed(&cache_key, hash)
         {
             if std::env::var_os("GRIM_RING_DIAG").is_some() {
                 eprintln!(
@@ -943,7 +945,8 @@ impl RocmDevice {
                 base_key
             };
             let (path, lowered_name) = if let Some((cached_path, cached_lowered)) =
-                self.hsaco_cache.get_cached_kernel(&cache_key)
+                self.hsaco_cache
+                    .get_cached_kernel_hashed(&cache_key, hash)
             {
                 (cached_path, cached_lowered)
             } else {
