@@ -282,3 +282,10 @@ hit managed-memory/OOM while loading layers. The one-GPU diagnostic still fails
 `hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. No Qwen tok/s
 result or promotion is recorded until the loader vocabulary contract, RCCL
 ownership, and device-resident Q4_K loading are fixed.
+
+For comparison, Ollama 0.32.13 is installed locally but its source tree is
+not present. The available llama.cpp backend used by Ollama defaults to
+`LLAMA_SPLIT_MODE_LAYER` with `n_gpu_layers`/`tensor_split`, keeps Q4_K tensors
+packed in device buffer types, and auto-fits GPU layers/context to VRAM. This
+is the placement contract GRIM should adopt for the 16 GB Qwen checkpoint
+before attempting another dual-GPU benchmark.
