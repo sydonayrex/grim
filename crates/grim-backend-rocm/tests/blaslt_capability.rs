@@ -260,3 +260,99 @@ fn gpu_blaslt_prefill_matmul_matches_cpu() {
         .fold(0.0f32, f32::max);
     assert!(max_abs < 1e-3, "BLASLt parity max abs error {max_abs}");
 }
+
+#[test]
+#[ignore]
+fn gpu_blaslt_dispatch_matmul_matches_cpu_and_reuses_scratch() {
+    if !gpu_test_enabled() || !RocmDevice::probe_one(0).unwrap_or(false) {
+        return;
+    }
+    if !probe_blaslt().available() {
+        return;
+    }
+
+    let previous = std::env::var("GRIM_BLASLT_PREFILL").ok();
+    unsafe { std::env::set_var("GRIM_BLASLT_PREFILL", "1") };
+
+    let dev = RocmDevice::shared(0);
+    let (m, n, k) = (32usize, 256usize, 256usize);
+    let make_input = |seed: usize, rows: usize, cols: usize| -> Vec<f32> {
+        (0..rows * cols)
+            .map(|i| (((i * 17 + seed * 13) % 37) as f32 - 18.0) / 100.0)
+            .collect()
+    };
+    let a1_data = make_input(1, m, k);
+    let b1_data = make_input(2, n, k);
+    let a2_data = make_input(3, m, k);
+    let b2_data = make_input(4, n, k);
+    let a1 = CoreTensorOps::from_cpu(&dev, &a1_data, &Shape::new(vec![m, k]), DType::F32)
+        .expect("upload A1");
+    let b1 = CoreTensorOps::from_cpu(&dev, &b1_data, &Shape::new(vec![n, k]), DType::F32)
+        .expect("upload B1");
+    let a2 = CoreTensorOps::from_cpu(&dev, &a2_data, &Shape::new(vec![m, k]), DType::F32)
+        .expect("upload A2");
+    let b2 = CoreTensorOps::from_cpu(&dev, &b2_data, &Shape::new(vec![n, k]), DType::F32)
+        .expect("upload B2");
+    let out1 = CoreTensorOps::from_cpu(
+        &dev,
+        &vec![0.0f32; m * n],
+        &Shape::new(vec![m, n]),
+        DType::F32,
+    )
+    .expect("allocate output 1");
+    let out2 = CoreTensorOps::from_cpu(
+        &dev,
+        &vec![0.0f32; m * n],
+        &Shape::new(vec![m, n]),
+        DType::F32,
+    )
+    .expect("allocate output 2");
+
+    // Do not synchronize the first handle. The second call must wait on the
+    // persistent completion event before reusing the same A/D scratch.
+    dev.matmul_op_into(
+        a1.as_ref(),
+        b1.as_ref(),
+        as_rocm(out1.as_ref()).unwrap(),
+        grim_backend_rocm::autotune::GemmOp::Other,
+    )
+    .expect("BLASLt dispatch 1");
+    let second = dev
+        .matmul_op_into(
+            a2.as_ref(),
+            b2.as_ref(),
+            as_rocm(out2.as_ref()).unwrap(),
+            grim_backend_rocm::autotune::GemmOp::Other,
+        )
+        .expect("BLASLt dispatch 2");
+    second.synchronize().expect("synchronize second dispatch");
+
+    let got1 = out1.to_cpu_vec_f32().expect("read output 1");
+    let got2 = out2.to_cpu_vec_f32().expect("read output 2");
+    let reference = |a: &[f32], b: &[f32]| -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                c[row * n + col] = (0..k).map(|idx| a[row * k + idx] * b[col * k + idx]).sum();
+            }
+        }
+        c
+    };
+    let want1 = reference(&a1_data, &b1_data);
+    let want2 = reference(&a2_data, &b2_data);
+    let max_error = |got: &[f32], want: &[f32]| {
+        got.iter()
+            .zip(want)
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let error1 = max_error(&got1, &want1);
+    let error2 = max_error(&got2, &want2);
+
+    match previous {
+        Some(value) => unsafe { std::env::set_var("GRIM_BLASLT_PREFILL", value) },
+        None => unsafe { std::env::remove_var("GRIM_BLASLT_PREFILL") },
+    }
+    assert!(error1 < 1e-3, "first dispatch max abs error {error1}");
+    assert!(error2 < 1e-3, "reused dispatch max abs error {error2}");
+}

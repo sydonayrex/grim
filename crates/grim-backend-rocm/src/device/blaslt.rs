@@ -379,6 +379,18 @@ pub fn matmul_col_major_f32(
     result
 }
 
+/// Return whether the explicit model-prefill experiment is enabled.
+///
+/// This is intentionally opt-in. The default LFM2/Q8 decode path remains on
+/// its measured dot4/rocBLAS routes; only native-F32 multi-token matmuls can
+/// enter the BLASLt candidate below.
+pub fn blaslt_prefill_enabled() -> bool {
+    matches!(
+        std::env::var("GRIM_BLASLT_PREFILL").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Return whether a shape is eligible for a future measured BLASLt experiment.
 ///
 /// Decode and quantized shapes deliberately remain on the measured dot4 path.
