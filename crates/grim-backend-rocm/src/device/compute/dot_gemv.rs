@@ -135,6 +135,69 @@ impl RocmDevice {
         )
     }
 
+    /// Down-projection activation-reuse experiment: consume a Q8.1 activation
+    /// row and fuse the residual epilogue into the Q8.0 dot4 launch.
+    pub fn launch_dot4_q80_q81_add_gemv(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        residual: Option<&RocmStorage>,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_q80_q81_add_gemv: K must be 32-aligned (k={k})"
+            )));
+        }
+        let ev = self.q81_quant_event();
+        if !ev.is_null() {
+            // SAFETY: ev is a live event; the active stream is graph-capture safe.
+            unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
+        }
+        let a_ptr = act_q81.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_q81_add_gemv: act_q81 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_add_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_q81_add_gemv: out has no device ptr".into()))?;
+        let res_ptr = match residual {
+            Some(r) => r.device_ptr.ok_or_else(|| {
+                Error::Backend("dot4_q80_q81_add_gemv: residual has no device ptr".into())
+            })?,
+            None => 0,
+        };
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut resptr = res_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_q81_add_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut resptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// PLAN 2: Fused activation quantize + dot4 Q8_0 GEMV directly from f32 activations.
     pub fn launch_dot4_q80_f32act_gemv(
         &self,

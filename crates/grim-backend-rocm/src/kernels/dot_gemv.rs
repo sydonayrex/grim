@@ -1372,6 +1372,73 @@ extern "C" __global__ void grim_dot4_q80_q81_gemv(
     }
 }
 
+// Down-projection activation-reuse experiment: consume a prequantized Q8.1
+// activation row and add the residual in the same Wave32 dot4 launch. This
+// trades the default one-launch F32 quantize+dot4 path for two stable graph
+// nodes, so it is opt-in and must be measured end-to-end.
+extern "C" __global__ void grim_dot4_q80_q81_add_gemv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q80,
+    const float* __restrict__ residual,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q_blocks * GRIM_Q8_1_BYTES;
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+            ? B_q80 + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+            : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const unsigned char* a_blk = a_row + blk * GRIM_Q8_1_BYTES;
+        const float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        const signed char* a_codes = (const signed char*)(a_blk + 4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            const float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e += 4) {
+                int a4;
+                int b4;
+                __builtin_memcpy(&a4, a_codes + e, 4);
+                __builtin_memcpy(&b4, b_codes + e, 4);
+                iacc = grim_sdot4(a4, b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            facc[j] += __shfl_xor(facc[j], off);
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            const long long out_idx = (long long)row * N + col_base + j;
+            const float res = (residual != nullptr) ? residual[out_idx] : 0.0f;
+            C[out_idx] = res + facc[j];
+        }
+    }
+}
+
 __device__ __forceinline__ unsigned grim_pk_f16(float lo, float hi) {
     _Float16 a = (_Float16)lo;
     _Float16 b = (_Float16)hi;
@@ -2435,6 +2502,14 @@ mod tests {
         assert!(
             KERNEL_SOURCE.contains("grim_quantize_q8_1"),
             "missing Q8_1 activation quantizer"
+        );
+    }
+
+    #[test]
+    fn source_contains_q81_residual_add_experiment() {
+        assert!(
+            KERNEL_SOURCE.contains("grim_dot4_q80_q81_add_gemv"),
+            "missing Q8.1 down-projection residual-add experiment"
         );
     }
 

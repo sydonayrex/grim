@@ -10,12 +10,12 @@
 //! on host today, which poisons capture. Caller falls back eager for those
 //! stacks (spec §Fallback). Same for MoE blocks (host top-1 routing).
 
-use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
-    launch_attention, launch_qkv_gemv, write_embeddings_to_buffer_batch,
+    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
+    write_embeddings_to_buffer_batch, DecodeGraph, DecodeGraphBuffers, EagerKvSource,
 };
+use grim_backend_rocm::RocmStorage;
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 
@@ -213,8 +213,7 @@ impl Lfm2 {
                 } else {
                     let state_ptr = match cache {
                         Some(Lfm2LayerCache::Gdl {
-                            dev_state: Some(s),
-                            ..
+                            dev_state: Some(s), ..
                         }) => grim_backend_rocm::as_rocm(s.as_ref())
                             .ok()
                             .and_then(|rocm_s| rocm_s.device_ptr_u64())
@@ -427,8 +426,7 @@ impl Lfm2 {
         // (e.g. GRIM_LFM2_F32_HEAD=1 f32 table).
         let h_shape = buffers.head_input.shape().clone();
         let hidden = self.cfg.hidden_size;
-        let norm_fused_head =
-            dot_fused_ok(dev, hidden) && is_q80(&self.output.weight);
+        let norm_fused_head = dot_fused_ok(dev, hidden) && is_q80(&self.output.weight);
         if norm_fused_head {
             let n_vocab = self.output.weight.shape().dim(0).unwrap_or(0);
             let m = h_shape.dims().iter().product::<usize>() / hidden.max(1);
@@ -442,9 +440,7 @@ impl Lfm2 {
                 n_vocab,
                 hidden,
             )
-            .map_err(|e| {
-                grim_core::error::Error::Backend(format!("fused norm head: {e}"))
-            })?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused norm head: {e}")))?;
             return Ok(());
         }
         dev.rms_norm_into(
@@ -555,8 +551,7 @@ impl Lfm2Block {
             .last()
             .copied()
             .unwrap_or(0);
-        let mxfp4_fused_qkv =
-            self.wqkv_codes.is_some() && self.wqkv_exps.is_some();
+        let mxfp4_fused_qkv = self.wqkv_codes.is_some() && self.wqkv_exps.is_some();
         let norm_fused_qkv = !mxfp4_fused_qkv
             && dot_fused_ok(dev, hidden)
             && is_q80(&wq.weight)
@@ -745,9 +740,7 @@ impl Lfm2Block {
                 self.ffn_gate.weight.shape().dim(0).unwrap_or(0),
                 hidden,
             )
-            .map_err(|e| {
-                grim_core::error::Error::Backend(format!("fused residual+gateup: {e}"))
-            })?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused residual+gateup: {e}")))?;
         } else {
             if fuse_norm {
                 // PLAN-decode-throughput-restore Fix 3: ONE grim_add_rms_norm
@@ -790,9 +783,7 @@ impl Lfm2Block {
                     hidden,
                     act,
                 )
-                .map_err(|e| {
-                    grim_core::error::Error::Backend(format!("fused gateup silu: {e}"))
-                })?;
+                .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup silu: {e}")))?;
             } else if let Some(fused) = self
                 .w_gate_up_q80_fused
                 .as_ref()
@@ -847,20 +838,44 @@ impl Lfm2Block {
         // then residual add in place (per-element independent, safe).
         // Phase D.2: If down weight is Q8_0 and dot4 is supported, fuse down-projection
         // GEMV directly with the residual add from layer_output into residual_dst.
-        let ffn_k = buffers.activated_buf[layer_idx].shape().dims().last().copied().unwrap_or(0);
+        let ffn_k = buffers.activated_buf[layer_idx]
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(0);
         let ffn_n = self.ffn_down.weight.shape().dim(0).unwrap_or(0);
         let m = buffers.batch.max(1);
         if dot_fused_ok(dev, ffn_k) && is_q80(&self.ffn_down.weight) {
-            dev.launch_dot4_q80_f32act_add_gemv(
-                &buffers.activated_buf[layer_idx],
-                rocm_storage(&self.ffn_down.weight)?,
-                Some(&buffers.layer_output[layer_idx]),
-                residual_dst,
-                m,
-                ffn_n,
-                ffn_k,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+            let prequant_down = matches!(
+                std::env::var("GRIM_DOT4_ADD_PREQUANT").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            );
+            if prequant_down {
+                dev.launch_quantize_q8_1(&buffers.activated_buf[layer_idx], act, m, ffn_k)
+                    .map_err(|e| grim_core::error::Error::Backend(format!("down prequant: {e}")))?;
+                dev.launch_dot4_q80_q81_add_gemv(
+                    act,
+                    rocm_storage(&self.ffn_down.weight)?,
+                    Some(&buffers.layer_output[layer_idx]),
+                    residual_dst,
+                    m,
+                    ffn_n,
+                    ffn_k,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("prequant down+add: {e}")))?;
+            } else {
+                dev.launch_dot4_q80_f32act_add_gemv(
+                    &buffers.activated_buf[layer_idx],
+                    rocm_storage(&self.ffn_down.weight)?,
+                    Some(&buffers.layer_output[layer_idx]),
+                    residual_dst,
+                    m,
+                    ffn_n,
+                    ffn_k,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+            }
         } else {
             linear_into(
                 dev,
@@ -1191,8 +1206,7 @@ impl Lfm2Block {
         //    PLAN 4 Task 3: norm-fused in_proj — the standalone norm is
         //    skipped when the norm-fused dot4 path is taken (Q8_0 weights,
         //    dot4 arch, kill-switches honored via dot_fused_ok).
-        let norm_fused_in_proj =
-            dot_fused_ok(dev, hidden) && is_q80(&in_proj.weight);
+        let norm_fused_in_proj = dot_fused_ok(dev, hidden) && is_q80(&in_proj.weight);
         if !norm_fused_in_proj {
             dev.rms_norm_into(
                 &buffers.layer_input[layer_idx],
@@ -1216,9 +1230,7 @@ impl Lfm2Block {
                 n_in,
                 hidden,
             )
-            .map_err(|e| {
-                grim_core::error::Error::Backend(format!("fused norm in_proj: {e}"))
-            })?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused norm in_proj: {e}")))?;
         } else {
             linear_into(
                 dev,
