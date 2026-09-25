@@ -137,3 +137,41 @@ The `rocprofv3` launch census explains the cost. Both runs used 193
 are launch guidance only and were not used to report throughput. A future
 promotion candidate must preserve quantized arithmetic semantics or use a
 native-F32 model; expanding Q8 weights to F32 is not sufficient.
+
+---
+
+## 7. GPU 1 Experiment Matrix
+
+GPU 1 was an idle AMD Radeon RX 9060 XT. The release CLI was rebuilt from the
+current tree, then every case was run with `ROCR_VISIBLE_DEVICES=1`, the same
+raw LFM2.5-350M-Q8_0 prompt, seed 42, temperature 0.7, top-p 0.9, top-k 40,
+and a forced 195-token decode window. Throughput was measured without a
+profiler.
+
+| Experiment | tok/s |
+|---|---:|
+| Paired default | 326–334 |
+| Fused QKV | 333 |
+| F16 KV | 333 |
+| Eight-wave dot4 | 127 |
+| Dot4 prequant | 328 |
+| Residual/GateUp fusion | **341–343** |
+| Sampler block 512 | 319 |
+| Sampler block 256 | 309 |
+| Generic GEMM control | 94 |
+| Dot4 tile16 | 284 |
+| Dot4 tile8 | 314 |
+| Down/Q8.1 add-prequant | 322 |
+| Native-F32 BLASLt flag on Q8 model | 331 |
+
+The residual/GateUp candidate was repeated three times: default `327, 332,
+329` tok/s versus candidate `343, 342, 341` tok/s. Its response matched the
+paired default. Combinations did not close the gap: residual + F16 KV `343`,
+residual + fused QKV `340`, residual + both `342`, residual + dot4 prequant
+`343`, and residual + add-prequant `334` tok/s.
+
+`rocprofv3` launch guidance showed 193 graph launches for both default and
+residual fusion, while HIP kernel launches fell from 1,180 to 1,132. The
+fused kernel `grim_dot4_add_rms_norm_gate_up_silu_q80_gemv` ran 3,120 times.
+Residual/GateUp is therefore the best current candidate, but it remains about
+2% below the 350 tok/s target and is not promoted.
