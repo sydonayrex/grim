@@ -9,7 +9,10 @@ use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, warp_rows_launch, RocmHandle};
+use crate::device::util::dev_ptr_dyn;
+use crate::{
+    arg, as_rocm, dev_ptr, dtype_f32, linear_launch, warp_rows_launch, RocmHandle,
+};
 
 impl RocmDevice {
     /// S2 (PLAN-kernel-fusion): elementwise `out = a * b` into
@@ -278,13 +281,8 @@ impl RocmDevice {
         up: &dyn BackendStorage,
         out: &RocmStorage,
     ) -> Result<()> {
-        let gate_s = as_rocm(gate)?;
-        let up_s = as_rocm(up)?;
-        if !gate_s.device_ptr_is_valid() || !up_s.device_ptr_is_valid() {
-            return Err(Error::Backend(
-                "gelu_tanh_mul_into: inputs lack a valid device pointer".into(),
-            ));
-        }
+        let mut gate_ptr = dev_ptr_dyn(gate)?;
+        let mut up_ptr = dev_ptr_dyn(up)?;
         let total = out.shape().elem_count();
         if gate.shape().elem_count() != total || up.shape().elem_count() != total {
             return Err(Error::Shape(format!(
@@ -299,8 +297,6 @@ impl RocmDevice {
             ));
         }
         let mut out_ptr = dev_ptr(out)?;
-        let mut gate_ptr = dev_ptr(gate_s)?;
-        let mut up_ptr = dev_ptr(up_s)?;
         let mut n = total as i32;
         let (grid, block) = linear_launch(total);
         self.launch_compute_kernel(
