@@ -74,6 +74,13 @@ fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
         )
 }
 
+pub(crate) fn is_q80(t: &grim_tensor::Tensor) -> bool {
+    matches!(
+        t.dtype().storage,
+        grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+    )
+}
+
 fn dev_for(lfm: &Lfm2) -> Result<std::sync::Arc<Dev>> {
     match &lfm.device {
         Device::Rocm(o) => Ok(Dev::shared(*o)),
@@ -381,7 +388,32 @@ impl Lfm2 {
     fn output_forward_graph(&self, buffers: &DecodeGraphBuffers, dev: &Dev) -> Result<()> {
         // Final norm (in-place: kernel reduces each row before storing) +
         // output projection. Both enqueued, zero scratch.
+        // PLAN 4 Task 3: norm-fused head — when the output weight rides the
+        // Q8_0 dot4 path, the standalone norm is skipped and the prologue
+        // runs inside the GEMV. Falls back to norm + linear_into otherwise
+        // (e.g. GRIM_LFM2_F32_HEAD=1 f32 table).
         let h_shape = buffers.head_input.shape().clone();
+        let hidden = self.cfg.hidden_size;
+        let norm_fused_head =
+            dot_fused_ok(dev, hidden) && is_q80(&self.output.weight);
+        if norm_fused_head {
+            let n_vocab = self.output.weight.shape().dim(0).unwrap_or(0);
+            let m = h_shape.dims().iter().product::<usize>() / hidden.max(1);
+            dev.launch_dot4_q80_norm_f32act_gemv_into(
+                &buffers.head_input,
+                rocm_storage(&self.norm.weight)?,
+                self.norm.eps,
+                rocm_storage(&self.output.weight)?,
+                &buffers.head_output,
+                m.max(1),
+                n_vocab,
+                hidden,
+            )
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("fused norm head: {e}"))
+            })?;
+            return Ok(());
+        }
         dev.rms_norm_into(
             &buffers.head_input,
             &**self.norm.weight.storage(),
@@ -418,6 +450,10 @@ impl Lfm2Block {
     ) -> Result<()> {
         check_layer_topology(buffers, layer_idx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+        // Dense blocks fuse the sublayer residual-add with the FFN norm into
+        // ONE kernel (grim_add_rms_norm). MoE keeps the split path (its
+        // grouped-dispatch output lands in moe_out, not norm_buf).
+        let fuse_norm = !self.is_moe;
         if !self.is_attention() {
             // S2 (PLAN-kernel-fusion): ShortConv layers capture via the device
             // ring (`sc_state`) + staging buffers. Only a recurrent block with
@@ -456,6 +492,7 @@ impl Lfm2Block {
         layer_idx: usize,
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
+        fuse_norm: bool,
     ) -> Result<()> {
         let wq = self.wq.as_ref().ok_or_else(|| {
             grim_core::error::Error::Backend("attn_forward_graph: missing wq".into())
@@ -470,22 +507,41 @@ impl Lfm2Block {
             grim_core::error::Error::Backend("attn_forward_graph: missing wo".into())
         })?;
 
-        // 1. Attention norm into the per-layer staging slot.
-        dev.rms_norm_into(
-            &buffers.layer_input[layer_idx],
-            &**self.attn_norm.weight.storage(),
-            self.attn_norm.eps,
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_input[layer_idx].shape().clone(),
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        // 1. Attention norm into the per-layer staging slot — SKIPPED when
+        // the norm-fused QKV path below is taken (PLAN 4: the norm prologue
+        // runs inside the GEMV kernel, bit-identical).
+        // MXFP4 / plain / dot-fallback paths still need it staged.
+        let hidden = buffers.layer_input[layer_idx]
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let mxfp4_fused_qkv =
+            self.wqkv_codes.is_some() && self.wqkv_exps.is_some();
+        let norm_fused_qkv = !mxfp4_fused_qkv
+            && dot_fused_ok(dev, hidden)
+            && is_q80(&wq.weight)
+            && is_q80(&wk.weight)
+            && is_q80(&wv.weight)
+            && (self.num_heads * self.head_dim) % 4 == 0
+            && (self.num_kv_heads * self.head_dim) % 4 == 0;
+        if !norm_fused_qkv {
+            dev.rms_norm_into(
+                &buffers.layer_input[layer_idx],
+                &**self.attn_norm.weight.storage(),
+                self.attn_norm.eps,
+                &buffers.norm_buf[layer_idx],
+                &buffers.layer_input[layer_idx].shape().clone(),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
 
         // 2. QKV projections. Fused path (Q8_0 blob present): ONE dot4 GEMV
         //    into fused staging + 3 slice copies (4 launches vs 3 GEMMs).
         //    Plain path: quant-aware GEMV per projection. Both write fixed
         //    pool slots; no scratch allocs.
-        let hidden = normed.shape().dims().last().copied().unwrap_or(0);
         let act = &buffers.act_q81_buf[layer_idx];
         let batch = buffers.batch.max(1);
 
@@ -547,12 +603,16 @@ impl Lfm2Block {
             &buffers.norm_buf[layer_idx],
             &buffers.act_q81_buf[layer_idx],
         )?;
-        add_graph(
-            &buffers.layer_input[layer_idx],
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_output[layer_idx],
-            dev,
-        )?;
+        if !fuse_norm {
+            add_graph(
+                &buffers.layer_input[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                &buffers.layer_output[layer_idx],
+                dev,
+            )?;
+        }
+        // fuse_norm: the residual-add + FFN-norm pair is issued by
+        // ffn_forward_graph as one grim_add_rms_norm launch.
         Ok(())
     }
 
@@ -563,20 +623,39 @@ impl Lfm2Block {
         layer_idx: usize,
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
+        residual_dst: &RocmStorage,
+        fuse_norm: bool,
     ) -> Result<()> {
         check_layer_topology(buffers, layer_idx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        // Norm the attention residual (layer_output currently holds it) into
-        // the staging slot; every GEMM below then writes a fixed pool slot.
         let ffn_shape = buffers.layer_output[layer_idx].shape().clone();
-        dev.rms_norm_into(
-            &buffers.layer_output[layer_idx],
-            &**self.ffn_norm.weight.storage(),
-            self.ffn_norm.eps,
-            &buffers.norm_buf[layer_idx],
-            &ffn_shape,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        if fuse_norm {
+            // PLAN-decode-throughput-restore Fix 3: ONE grim_add_rms_norm
+            // launch replaces the (residual-add + ffn-norm) pair. norm_out
+            // aliases the residual input (norm_buf) — safe: the kernel reads
+            // the residual only in pass 1 and only reads the sum in pass 2.
+            dev.fused_add_rms_norm_into(
+                &buffers.layer_input[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                &**self.ffn_norm.weight.storage(),
+                self.ffn_norm.eps,
+                &buffers.layer_output[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                &ffn_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        } else {
+            // Norm the attention residual (layer_output currently holds it) into
+            // the staging slot; every GEMM below then writes a fixed pool slot.
+            dev.rms_norm_into(
+                &buffers.layer_output[layer_idx],
+                &**self.ffn_norm.weight.storage(),
+                self.ffn_norm.eps,
+                &buffers.norm_buf[layer_idx],
+                &ffn_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
         let act = &buffers.act_q81_buf[layer_idx];
         let hidden = normed.shape().dims().last().copied().unwrap_or(0);
@@ -584,7 +663,24 @@ impl Lfm2Block {
         // then slice halves into gate/up bufs. Works for any batch size —
         // the quantize kernel quantizes [batch, hidden] and the fused GEMV
         // writes to [batch, n_gate+n_up]. m = buffers.batch (not 1).
-        if let Some(fused) = self
+        // PLAN-kernel-launch-reduction Phase A: ONE launch does gate GEMV +
+        // up GEMV + SiLU (replaces 2 GEMV + 2 quantize + silu_mul, or the
+        // blob path's GEMV + 2 slice copies + silu_mul).
+        let fused_ffn = dot_fused_ok(dev, hidden)
+            && is_q80(&self.ffn_gate.weight)
+            && is_q80(&self.ffn_up.weight);
+        if fused_ffn {
+            dev.fused_gate_up_silu_dot4_into(
+                normed,
+                rocm_storage(&self.ffn_gate.weight)?,
+                rocm_storage(&self.ffn_up.weight)?,
+                &buffers.activated_buf[layer_idx],
+                self.ffn_gate.weight.shape().dim(0).unwrap_or(0),
+                hidden,
+                act,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup silu: {e}")))?;
+        } else if let Some(fused) = self
             .w_gate_up_q80_fused
             .as_ref()
             .filter(|_| dot_fused_ok(dev, hidden))
@@ -614,30 +710,62 @@ impl Lfm2Block {
             )
             .map_err(grim_core::error::Error::Tensor)?;
         } else {
-            linear_into(dev, normed, &self.ffn_gate.weight, &buffers.gate_buf[layer_idx], act)?;
-            linear_into(dev, normed, &self.ffn_up.weight, &buffers.up_buf[layer_idx], act)?;
+            linear_into(
+                dev,
+                normed,
+                &self.ffn_gate.weight,
+                &buffers.gate_buf[layer_idx],
+                act,
+            )?;
+            linear_into(
+                dev,
+                normed,
+                &self.ffn_up.weight,
+                &buffers.up_buf[layer_idx],
+                act,
+            )?;
         }
-        dev.silu_mul_into(
-            &buffers.gate_buf[layer_idx],
-            &buffers.up_buf[layer_idx],
-            &buffers.activated_buf[layer_idx],
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        if !fused_ffn {
+            dev.silu_mul_into(
+                &buffers.gate_buf[layer_idx],
+                &buffers.up_buf[layer_idx],
+                &buffers.activated_buf[layer_idx],
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        }
         // Down projection into staging (norm_buf free: gate/up consumed it),
         // then residual add in place (per-element independent, safe).
-        linear_into(
-            dev,
-            &buffers.activated_buf[layer_idx],
-            &self.ffn_down.weight,
-            &buffers.norm_buf[layer_idx],
-            act,
-        )?;
-        add_graph(
-            &buffers.layer_output[layer_idx],
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_output[layer_idx],
-            dev,
-        )?;
+        // Phase D.2: If down weight is Q8_0 and dot4 is supported, fuse down-projection
+        // GEMV directly with the residual add from layer_output into residual_dst.
+        let ffn_k = buffers.activated_buf[layer_idx].shape().dims().last().copied().unwrap_or(0);
+        let ffn_n = self.ffn_down.weight.shape().dim(0).unwrap_or(0);
+        let m = buffers.batch.max(1);
+        if dot_fused_ok(dev, ffn_k) && is_q80(&self.ffn_down.weight) {
+            dev.launch_dot4_q80_f32act_add_gemv(
+                &buffers.activated_buf[layer_idx],
+                rocm_storage(&self.ffn_down.weight)?,
+                Some(&buffers.layer_output[layer_idx]),
+                residual_dst,
+                m,
+                ffn_n,
+                ffn_k,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused down+add: {e}")))?;
+        } else {
+            linear_into(
+                dev,
+                &buffers.activated_buf[layer_idx],
+                &self.ffn_down.weight,
+                &buffers.norm_buf[layer_idx],
+                act,
+            )?;
+            add_graph(
+                &buffers.layer_output[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                residual_dst,
+                dev,
+            )?;
+        }
         Ok(())
     }
 
@@ -674,86 +802,143 @@ impl Lfm2Block {
             // MXFP4 fused branch: QK-norm + RoPE + K/V append already done
             // inside the single fused kernel — skip to attention + bump.
         } else {
-        // QK-norm IN PLACE (row-wise over [batch * heads, hd] slots; flat
-        // counts match [batch, n]). Safe: each row is normalized independently.
-        if let (Some(qn), Some(kn)) = (self.attn_q_norm.as_ref(), self.attn_k_norm.as_ref()) {
-            let qn_shape = Shape::new(vec![batch * nh, hd]);
-            dev.rms_norm_into(
-                &buffers.q_buf[layer_idx],
-                &**qn.weight.storage(),
-                qn.eps,
-                &buffers.q_buf[layer_idx],
-                &qn_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-            let kn_shape = Shape::new(vec![batch * nkv, hd]);
-            dev.rms_norm_into(
-                &buffers.k_buf[layer_idx],
-                &**kn.weight.storage(),
-                kn.eps,
-                &buffers.k_buf[layer_idx],
-                &kn_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-        }
+            // RoPE IN PLACE with the device position base (no host positions
+            // vector, no output alloc). Safe: each thread loads its pair before
+            // storing it; pairs are disjoint across threads.
+            // P3: shape is [steps, nh, hd] where steps==batch — each batch item
+            // is one query position sharing the same base position.
+            let mut rope_cfg = RopeConfig::new(hd, self.rope_theta);
+            // LFM2/LFM2.5: NeoX half-split pairing, not GPT-J interleaved.
+            rope_cfg.interleaved = false;
+            let q3 = Shape::new(vec![batch, nh * steps, hd]);
+            let k3 = Shape::new(vec![batch, nkv * steps, hd]);
 
-        // RoPE IN PLACE with the device position base (no host positions
-        // vector, no output alloc). Safe: each thread loads its pair before
-        // storing it; pairs are disjoint across threads.
-        // P3: shape is [steps, nh, hd] where steps==batch — each batch item
-        // is one query position sharing the same base position.
-        let rope_cfg = RopeConfig::new(hd, self.rope_theta);
-        let q3 = Shape::new(vec![batch, nh * steps, hd]);
-        dev.rope_dev_base_into(
-            &buffers.q_buf[layer_idx],
-            &buffers.pos_dev,
-            &buffers.q_buf[layer_idx],
-            &rope_cfg,
-            &q3,
-            nh,
-            steps,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
-        let k3 = Shape::new(vec![batch, nkv * steps, hd]);
-        dev.rope_dev_base_into(
-            &buffers.k_buf[layer_idx],
-            &buffers.pos_dev,
-            &buffers.k_buf[layer_idx],
-            &rope_cfg,
-            &k3,
-            nkv,
-            steps,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+            // PLAN-decode-throughput-restore: fuse the QK-norm into the RoPE
+            // launch (one grim_qk_rope_dev_base per tensor replaces the
+            // rms_norm_into + rope_dev_base_into pair). Requires head_dim 64 so a
+            // warp covers exactly one head row for the RMS reduce; the kernel
+            // applies norm BEFORE rotation, matching llama.cpp's qk-norm-then-rope.
+            let fused_qk_rope = hd == 64
+                && self
+                    .attn_q_norm
+                    .as_ref()
+                    .zip(self.attn_k_norm.as_ref())
+                    .is_some();
+            if fused_qk_rope {
+                let qn = self.attn_q_norm.as_ref().unwrap();
+                let kn = self.attn_k_norm.as_ref().unwrap();
+                dev.qk_rope_dev_base_into(
+                    &buffers.q_buf[layer_idx],
+                    &buffers.pos_dev,
+                    &**qn.weight.storage(),
+                    qn.eps,
+                    &buffers.q_buf[layer_idx],
+                    &rope_cfg,
+                    &q3,
+                    nh,
+                    steps,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                // PLAN 4 Task 4: rope+append fusion for K/V — replaces this
+                // qk_rope(k) call plus both kv_append calls below with one
+                // launch. Q rope stays separate (no append); bump stays after
+                // attention (reads pre-bump total_dev).
+                dev.qk_rope_append_kv_into(
+                    &buffers.k_buf[layer_idx],
+                    &buffers.pos_dev,
+                    &**kn.weight.storage(),
+                    kn.eps,
+                    &buffers.v_buf[layer_idx],
+                    &buffers.k_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    &buffers.v_arena[layer_idx],
+                    &rope_cfg,
+                    &k3,
+                    nkv,
+                    steps,
+                    kv_stride,
+                    arena_slot_stride,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            } else {
+                // QK-norm IN PLACE (row-wise over [batch * heads, hd] slots; flat
+                // counts match [batch, n]). Safe: each row is normalized independently.
+                if let (Some(qn), Some(kn)) = (self.attn_q_norm.as_ref(), self.attn_k_norm.as_ref())
+                {
+                    let qn_shape = Shape::new(vec![batch * nh, hd]);
+                    dev.rms_norm_into(
+                        &buffers.q_buf[layer_idx],
+                        &**qn.weight.storage(),
+                        qn.eps,
+                        &buffers.q_buf[layer_idx],
+                        &qn_shape,
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                    let kn_shape = Shape::new(vec![batch * nkv, hd]);
+                    dev.rms_norm_into(
+                        &buffers.k_buf[layer_idx],
+                        &**kn.weight.storage(),
+                        kn.eps,
+                        &buffers.k_buf[layer_idx],
+                        &kn_shape,
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                }
+                dev.rope_dev_base_into(
+                    &buffers.q_buf[layer_idx],
+                    &buffers.pos_dev,
+                    &buffers.q_buf[layer_idx],
+                    &rope_cfg,
+                    &q3,
+                    nh,
+                    steps,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                dev.rope_dev_base_into(
+                    &buffers.k_buf[layer_idx],
+                    &buffers.pos_dev,
+                    &buffers.k_buf[layer_idx],
+                    &rope_cfg,
+                    &k3,
+                    nkv,
+                    steps,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
 
-        // Append rotated rows at the on-device offset; validate topology too.
-        let max_ctx = buffers.max_ctx;
-        launch_qkv_gemv(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        launch_attention(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
-            .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
-        grim_backend_rocm::launch_kv_append_batch(
-            dev,
-            &buffers.k_arena[layer_idx],
-            &buffers.k_buf[layer_idx],
-            &buffers.pos_dev,
-            kv_stride,
-            steps,
-            batch,
-            arena_slot_stride,
-        )
-        .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
-        grim_backend_rocm::launch_kv_append_batch(
-            dev,
-            &buffers.v_arena[layer_idx],
-            &buffers.v_buf[layer_idx],
-            &buffers.pos_dev,
-            kv_stride,
-            steps,
-            batch,
-            arena_slot_stride,
-        )
-        .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+            // Append rotated rows at the on-device offset; validate topology too.
+            // PLAN 4 Task 4: skipped when the fused rope+append path above
+            // ran (it appended K and V inline); the split path still needs
+            // both appends.
+            let max_ctx = buffers.max_ctx;
+            if !fused_qk_rope {
+                launch_qkv_gemv(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
+                    .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+                launch_attention(&buffers.k_arena[layer_idx], buffers.current_pos, max_ctx)
+                    .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
+                grim_backend_rocm::launch_kv_append_batch(
+                    dev,
+                    &buffers.k_arena[layer_idx],
+                    &buffers.k_buf[layer_idx],
+                    &buffers.pos_dev,
+                    kv_stride,
+                    steps,
+                    batch,
+                    arena_slot_stride,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
+                grim_backend_rocm::launch_kv_append_batch(
+                    dev,
+                    &buffers.v_arena[layer_idx],
+                    &buffers.v_buf[layer_idx],
+                    &buffers.pos_dev,
+                    kv_stride,
+                    steps,
+                    batch,
+                    arena_slot_stride,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
+            }
         }
 
         // Attention writes DIRECTLY into pool slots: output, online-softmax
@@ -890,44 +1075,71 @@ impl Lfm2Block {
         let out_proj = self.shortconv_out_proj.as_ref().ok_or_else(|| {
             grim_core::error::Error::Backend("shortconv_forward_graph: missing out_proj".into())
         })?;
-        let hidden = buffers.layer_input[layer_idx].shape().dims().last().copied().unwrap_or(0);
+        let hidden = buffers.layer_input[layer_idx]
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(0);
         let act = &buffers.act_q81_buf[layer_idx];
 
         // 1. attn-norm the residual into the staging slot, then the fused
         //    in-projection GEMV [batch, 3*h_dim] (b∥x∥c per row).
-        dev.rms_norm_into(
-            &buffers.layer_input[layer_idx],
-            &**self.attn_norm.weight.storage(),
-            self.attn_norm.eps,
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_input[layer_idx].shape().clone(),
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        //    PLAN 4 Task 3: norm-fused in_proj — the standalone norm is
+        //    skipped when the norm-fused dot4 path is taken (Q8_0 weights,
+        //    dot4 arch, kill-switches honored via dot_fused_ok).
+        let norm_fused_in_proj =
+            dot_fused_ok(dev, hidden) && is_q80(&in_proj.weight);
+        if !norm_fused_in_proj {
+            dev.rms_norm_into(
+                &buffers.layer_input[layer_idx],
+                &**self.attn_norm.weight.storage(),
+                self.attn_norm.eps,
+                &buffers.norm_buf[layer_idx],
+                &buffers.layer_input[layer_idx].shape().clone(),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+        }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
-        linear_into(dev, normed, &in_proj.weight, &buffers.sc_proj_buf[layer_idx], act)?;
+        if norm_fused_in_proj {
+            let n_in = in_proj.weight.shape().dim(0).unwrap_or(0);
+            dev.launch_dot4_q80_norm_f32act_gemv_into(
+                &buffers.layer_input[layer_idx],
+                rocm_storage(&self.attn_norm.weight)?,
+                self.attn_norm.eps,
+                rocm_storage(&in_proj.weight)?,
+                &buffers.sc_proj_buf[layer_idx],
+                buffers.batch.max(1),
+                n_in,
+                hidden,
+            )
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("fused norm in_proj: {e}"))
+            })?;
+        } else {
+            linear_into(
+                dev,
+                normed,
+                &in_proj.weight,
+                &buffers.sc_proj_buf[layer_idx],
+                act,
+            )?;
+        }
 
-        // 2. Split b∥x∥c (row 0; decode graph runs batch=1 — see doc).
-        dev.copy_slice_range(&buffers.sc_b[layer_idx], 0, &buffers.sc_proj_buf[layer_idx], 0, hidden)
-            .map_err(grim_core::error::Error::Tensor)?;
-        dev.copy_slice_range(&buffers.sc_c[layer_idx], 0, &buffers.sc_proj_buf[layer_idx], hidden, hidden)
-            .map_err(grim_core::error::Error::Tensor)?;
-        dev.copy_slice_range(&buffers.sc_x[layer_idx], 0, &buffers.sc_proj_buf[layer_idx], 2 * hidden, hidden)
-            .map_err(grim_core::error::Error::Tensor)?;
-
-        // 3. bx = b ⊙ x; causal conv step (updates the ring IN PLACE);
-        //    y = sum ⊙ c.
-        dev.mul_into(&buffers.sc_b[layer_idx], &buffers.sc_x[layer_idx], &buffers.sc_bx[layer_idx])
-            .map_err(|e| grim_core::error::Error::Backend(format!("sc mul bx: {e}")))?;
-        dev.short_conv1d_causal_step_into(
-            &buffers.sc_bx[layer_idx],
+        // 2+3. PLAN-kernel-launch-reduction Phase C: ONE fused launch reads
+        //      b∥x∥c straight from the in_proj output, computes bx = b*x,
+        //      runs the causal conv with in-place state update, and applies
+        //      the c gate — replacing (3 slice copies + mul + conv + mul).
+        dev.short_conv1d_fused_step_into(
+            &buffers.sc_proj_buf[layer_idx],
             conv.storage().as_ref(),
-            None,
             &buffers.sc_state[layer_idx],
-            &buffers.sc_sum[layer_idx],
+            &buffers.sc_y[layer_idx],
+            buffers.batch.max(1),
+            hidden,
+            3, // l_cache
         )
-        .map_err(|e| grim_core::error::Error::Backend(format!("sc conv: {e}")))?;
-        dev.mul_into(&buffers.sc_sum[layer_idx], &buffers.sc_c[layer_idx], &buffers.sc_y[layer_idx])
-            .map_err(|e| grim_core::error::Error::Backend(format!("sc mul c: {e}")))?;
+        .map_err(|e| grim_core::error::Error::Backend(format!("sc fused conv: {e}")))?;
 
         // 4. Out projection into staging, then residual add in place
         //    (layer_output currently holds the pre-block residual).
@@ -938,6 +1150,10 @@ impl Lfm2Block {
             &buffers.norm_buf[layer_idx],
             act,
         )?;
+        if !self.is_moe {
+            // fuse_norm: residual-add + FFN-norm fused in ffn_forward_graph.
+            return Ok(());
+        }
         add_graph(
             &buffers.layer_input[layer_idx],
             &buffers.norm_buf[layer_idx],
@@ -961,11 +1177,17 @@ impl Lfm2Block {
         layer_idx: usize,
         buffers: &DecodeGraphBuffers,
         dev: &Dev,
+        residual_dst: &RocmStorage,
     ) -> Result<()> {
         let gate_inp = self.ffn_gate_inp.as_ref().ok_or_else(|| {
             grim_core::error::Error::Backend("moe_forward_graph: missing router gate".into())
         })?;
-        let hidden = buffers.layer_input[layer_idx].shape().dims().last().copied().unwrap_or(0);
+        let hidden = buffers.layer_input[layer_idx]
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(0);
         let batch = buffers.batch.max(1);
         let top_k = self.n_expert_used.min(self.n_expert).max(1);
         let act = &buffers.act_q81_buf[layer_idx];
@@ -1030,11 +1252,11 @@ impl Lfm2Block {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("moe dispatch: {e}")))?;
 
-        // 5. Residual add in place.
+        // 5. Residual add -> next block's input slot (Fix 3: no publish copy).
         add_graph(
             &buffers.layer_output[layer_idx],
             &buffers.moe_out[layer_idx],
-            &buffers.layer_output[layer_idx],
+            residual_dst,
             dev,
         )
     }

@@ -19,6 +19,48 @@ extern "C" {
         return sign ? -res : res;
     }
 
+    __device__ inline unsigned short f32_to_fp16_bits_device(float f) {
+        // Round-to-nearest-even f32 -> f16 bit pattern. Subnormal results
+        // (|f| < 6e-5) flush to zero — fine for KV-cache values.
+        unsigned int x = __builtin_bit_cast(unsigned int, f);
+        unsigned int sign = (x >> 16) & 0x8000u;
+        unsigned int mant = x & 0x7fffffu;
+        int exp = (int)((x >> 23) & 0xffu);
+        if (exp == 255) {
+            // inf / nan -> inf / canonical nan
+            return (unsigned short)(sign | 0x7c00u | (mant ? 0x0200u : 0u));
+        }
+        int e = exp - 127 + 15;
+        if (e >= 31) return (unsigned short)(sign | 0x7c00u); // overflow -> inf
+        if (e <= 0) return (unsigned short)sign;              // flush subnormals
+        unsigned int mant16 = mant >> 13;
+        unsigned int rem = mant & 0x1fffu;
+        if (rem > 0x1000u || (rem == 0x1000u && (mant16 & 1u))) mant16 += 1u;
+        if (mant16 == 0x800u) {
+            mant16 = 0u;
+            e += 1;
+            if (e >= 31) return (unsigned short)(sign | 0x7c00u);
+        }
+        return (unsigned short)(sign | ((unsigned int)e << 10) | mant16);
+    }
+
+    __device__ inline float fp16_bits_to_float_device(unsigned short h) {
+        // Bit-twiddle f16 -> f32 (no powf — this sits in the attention hot
+        // loop). Subnormals flush to zero, matching the encoder.
+        unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
+        unsigned int exp = ((unsigned int)h >> 10) & 0x1fu;
+        unsigned int mant = (unsigned int)h & 0x3ffu;
+        unsigned int bits;
+        if (exp == 0) {
+            bits = sign; // subnormal -> zero (encoder flushes too)
+        } else if (exp == 31) {
+            bits = sign | 0x7f800000u | (mant << 13);
+        } else {
+            bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+        }
+        return __builtin_bit_cast(float, bits);
+    }
+
     __device__ inline float fp8_e4m3_to_float_hip(unsigned char val) {
         int sign = (val >> 7) & 1;
         int exp = (val >> 3) & 0x0F;

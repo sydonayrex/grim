@@ -23,6 +23,591 @@ __device__ __forceinline__ int grim_sdot4(int a, int b, int c) {
 #define GRIM_Q8_0_BLOCK_SIZE 32
 #define GRIM_Q8_0_BYTES      34
 
+// PLAN-kernel-launch-reduction Phase B: QKV GEMV — one launch covers the three
+// projections (each col-base 4-group lies wholly inside one section, since the
+// launcher requires Nq % 4 == 0 and Nkv % 4 == 0). Same math as
+// grim_dot4_q80_q81_gemv, with the section picked per 4-col group.
+extern "C" __global__ void grim_dot4_qkv_q80_gemv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ Wq,
+    const unsigned char* __restrict__ Wk,
+    const unsigned char* __restrict__ Wv,
+    float* __restrict__ Q,
+    float* __restrict__ Ko,
+    float* __restrict__ V,
+    int M, int Nq, int Nkv, int KD)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    const int n_total  = Nq + 2 * Nkv;
+    if (row >= M || col_base >= n_total) return;
+
+    const int n_q_blocks = KD / GRIM_Q8_0_BLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* B;
+    float* C;
+    int N;
+    int local_base;
+    if (col_base < Nq) {
+        B = Wq; C = Q; N = Nq; local_base = col_base;
+    } else if (col_base < Nq + Nkv) {
+        B = Wk; C = Ko; N = Nkv; local_base = col_base - Nq;
+    } else {
+        B = Wv; C = V; N = Nkv; local_base = col_base - Nq - Nkv;
+    }
+
+    const unsigned char* b_col[4];
+    const int active_cols = (local_base + 4 <= N) ? 4 : (N - local_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B + (long long)(local_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const unsigned char* a_blk = a_row + blk * GRIM_Q8_1_BYTES;
+        float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        const signed char* a_codes = (const signed char*)(a_blk + 4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e += 4) {
+                int a4; __builtin_memcpy(&a4, a_codes + e, 4);
+                int b4; __builtin_memcpy(&b4, b_codes + e, 4);
+                iacc = grim_sdot4(a4, b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + local_base + j] = facc[j];
+        }
+    }
+}
+
+// Phase D.2: Fused activation quantize + QKV GEMV.
+// Reads f32 activation input directly, quantizes per-block in registers,
+// computes Q, K, V dot4 projections in one launch without separate quantize kernel.
+extern "C" __global__ void grim_dot4_qkv_q80_f32act_gemv(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ Wq,
+    const unsigned char* __restrict__ Wk,
+    const unsigned char* __restrict__ Wv,
+    float* __restrict__ Q,
+    float* __restrict__ Ko,
+    float* __restrict__ V,
+    int M, int Nq, int Nkv, int KD)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    const int n_total  = Nq + 2 * Nkv;
+    if (row >= M || col_base >= n_total) return;
+
+    const int n_q_blocks = KD / GRIM_Q8_0_BLOCK_SIZE;
+    const float* a_row = act_f32 + (long long)row * KD;
+
+    const unsigned char* B;
+    float* C;
+    int N;
+    int local_base;
+    if (col_base < Nq) {
+        B = Wq; C = Q; N = Nq; local_base = col_base;
+    } else if (col_base < Nq + Nkv) {
+        B = Wk; C = Ko; N = Nkv; local_base = col_base - Nq;
+    } else {
+        B = Wv; C = V; N = Nkv; local_base = col_base - Nq - Nkv;
+    }
+
+    const unsigned char* b_col[4];
+    const int active_cols = (local_base + 4 <= N) ? 4 : (N - local_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B + (long long)(local_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        float d_a = (float)hd;
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + local_base + j] = facc[j];
+        }
+    }
+}
+
+// PLAN 4 (DukeNukem): norm-fused QKV — rms_norm prologue + per-block
+// activation quantize + QKV dot4 GEMV in one launch. The prologue replays
+// grim_rms_norm's exact traversal (col = lane; col < KD; col += 32) and
+// formula (sqrtf(ss/KD + eps), out = x*w/rms) so results are bit-identical
+// to separate norm + f32act launches; the redundant per-block sumsq reads
+// one L2-resident 4KB row and is dwarfed by the eliminated launch.
+extern "C" __global__ void grim_dot4_qkv_q80_norm_f32act_gemv(
+    const float* __restrict__ res,
+    const float* __restrict__ gamma,
+    float eps,
+    const unsigned char* __restrict__ Wq,
+    const unsigned char* __restrict__ Wk,
+    const unsigned char* __restrict__ Wv,
+    float* __restrict__ Q,
+    float* __restrict__ Ko,
+    float* __restrict__ V,
+    int M, int Nq, int Nkv, int KD)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    const int n_total  = Nq + 2 * Nkv;
+    if (row >= M || col_base >= n_total) return;
+
+    const int n_q_blocks = KD / GRIM_Q8_0_BLOCK_SIZE;
+    const float* r_row = res + (long long)row * KD;
+
+    const unsigned char* B;
+    float* C;
+    int N;
+    int local_base;
+    if (col_base < Nq) {
+        B = Wq; C = Q; N = Nq; local_base = col_base;
+    } else if (col_base < Nq + Nkv) {
+        B = Wk; C = Ko; N = Nkv; local_base = col_base - Nq;
+    } else {
+        B = Wv; C = V; N = Nkv; local_base = col_base - Nq - Nkv;
+    }
+
+    const unsigned char* b_col[4];
+    const int active_cols = (local_base + 4 <= N) ? 4 : (N - local_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B + (long long)(local_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    // Prologue: row sumsq with grim_rms_norm-identical traversal and formula.
+    float ss = 0.0f;
+    for (int col = lane; col < KD; col += 32) {
+        float v = r_row[col];
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor(ss, off);
+    float rms = sqrtf(ss / (float)KD + eps);
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        // Norm on the fly (grim_rms_norm-identical: x*w/rms), then quantize
+        // exactly like the f32act body (fp max is order-exact, fp16 scale
+        // round-trip, roundf codes).
+        float nrm[GRIM_Q8_0_BLOCK_SIZE];
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            nrm[e] = r_row[(long long)blk * GRIM_Q8_0_BLOCK_SIZE + e]
+                   * gamma[(long long)blk * GRIM_Q8_0_BLOCK_SIZE + e] / rms;
+        }
+
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(nrm[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        float d_a = (float)hd;
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(nrm[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(nrm[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(nrm[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(nrm[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + local_base + j] = facc[j];
+        }
+    }
+}
+// ONE launch replaces (gate GEMV, up GEMV, silu_mul). Each 4-col group does
+// two independent dot4 passes (gate blob row, up blob row) over the same
+// quantized activation, then writes silu(g) * u. No cross-col reduction.
+extern "C" __global__ void grim_dot4_gate_up_silu_q80_gemv(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ Wg,
+    const unsigned char* __restrict__ Wu,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* g_col[4];
+    const unsigned char* u_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        g_col[j] = (j < active_cols)
+                 ? Wg + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+        u_col[j] = (j < active_cols)
+                 ? Wu + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    float gacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float uacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const unsigned char* a_blk = a_row + blk * GRIM_Q8_1_BYTES;
+        float d_a = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+        const signed char* a_codes = (const signed char*)(a_blk + 4);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            int iacc_g = 0;
+            int iacc_u = 0;
+            {
+                const unsigned char* b_blk = g_col[j] + blk * GRIM_Q8_0_BYTES;
+                float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const signed char* b_codes = (const signed char*)(b_blk + 2);
+                #pragma unroll
+                for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e += 4) {
+                    int a4; __builtin_memcpy(&a4, a_codes + e, 4);
+                    int b4; __builtin_memcpy(&b4, b_codes + e, 4);
+                    iacc_g = grim_sdot4(a4, b4, iacc_g);
+                }
+                gacc[j] += (float)iacc_g * d_a * d_b;
+            }
+            {
+                const unsigned char* b_blk = u_col[j] + blk * GRIM_Q8_0_BYTES;
+                float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const signed char* b_codes = (const signed char*)(b_blk + 2);
+                #pragma unroll
+                for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e += 4) {
+                    int a4; __builtin_memcpy(&a4, a_codes + e, 4);
+                    int b4; __builtin_memcpy(&b4, b_codes + e, 4);
+                    iacc_u = grim_sdot4(a4, b4, iacc_u);
+                }
+                uacc[j] += (float)iacc_u * d_a * d_b;
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            gacc[j] += __shfl_xor(gacc[j], off);
+            uacc[j] += __shfl_xor(uacc[j], off);
+        }
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            float g = gacc[j];
+            float u = uacc[j];
+            C[(long long)row * N + col_base + j] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
+// Phase D.2: Fused activation quantize + gate/up GEMV + SiLU epilogue.
+// Takes f32 activation input directly, quantizes per-block in registers,
+// computes gate & up dot4 projections and writes silu(g)*u directly to C.
+extern "C" __global__ void grim_dot4_gate_up_silu_q80_f32act_gemv(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ Wg,
+    const unsigned char* __restrict__ Wu,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const float* a_row = act_f32 + (long long)row * K;
+
+    const unsigned char* g_col[4];
+    const unsigned char* u_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        g_col[j] = (j < active_cols)
+                 ? Wg + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+        u_col[j] = (j < active_cols)
+                 ? Wu + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    float gacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float uacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        float d_a = (float)hd;
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            int iacc_g = 0;
+            int iacc_u = 0;
+            {
+                const unsigned char* b_blk = g_col[j] + blk * GRIM_Q8_0_BYTES;
+                float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const signed char* b_codes = (const signed char*)(b_blk + 2);
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                    iacc_g = grim_sdot4(a4_reg[p], b4, iacc_g);
+                }
+                gacc[j] += (float)iacc_g * d_a * d_b;
+            }
+            {
+                const unsigned char* b_blk = u_col[j] + blk * GRIM_Q8_0_BYTES;
+                float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+                const signed char* b_codes = (const signed char*)(b_blk + 2);
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                    iacc_u = grim_sdot4(a4_reg[p], b4, iacc_u);
+                }
+                uacc[j] += (float)iacc_u * d_a * d_b;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            gacc[j] += __shfl_xor(gacc[j], off);
+            uacc[j] += __shfl_xor(uacc[j], off);
+        }
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            float g = gacc[j];
+            float u = uacc[j];
+            C[(long long)row * N + col_base + j] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
+// Phase D.2: Fused activation quantize + GEMV + optional residual add epilogue.
+// Takes f32 activation input directly, quantizes per-block in registers,
+// computes dot4 GEMV projection, and writes (residual ? residual[...] : 0.0f) + facc[j] directly to C.
+// When residual == nullptr, acts as standard fused GEMV.
+// Supports C == residual for safe in-place addition.
+extern "C" __global__ void grim_dot4_q80_f32act_add_gemv(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q80,
+    const float* __restrict__ residual,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const float* a_row = act_f32 + (long long)row * K;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q80 + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        float d_a = (float)hd;
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            long long out_idx = (long long)row * N + col_base + j;
+            float res = (residual != nullptr) ? residual[out_idx] : 0.0f;
+            C[out_idx] = res + facc[j];
+        }
+    }
+}
+
 extern "C" __global__ void grim_quantize_q8_1(
     const float* __restrict__ src,
     unsigned char* __restrict__ dst,
@@ -120,6 +705,203 @@ extern "C" __global__ void grim_fp32_gemv(
         #pragma unroll
         for (int j = 0; j < active_cols; j++) {
             out[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+// PLAN 2 (Phase D launch reduction): Fused activation quantize + dot4 GEMV.
+// Cooperatively quantizes 32-element blocks of act_f32 into LDS, then computes
+// dot4 against Q8_0 weights with zero separate quantize launch.
+extern "C" __global__ void grim_dot4_q80_f32act_gemv(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ B_q80,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const float* a_row = act_f32 + (long long)row * K;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q80 + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+
+        // 1. Quantize lane's 32-element block into local registers
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        float d_a = (float)hd;
+
+        // Pack 32 signed chars into 8 int32s in registers
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4;
+                __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
+// PLAN 4 (DukeNukem) Task 3: generic norm-fused single-projection GEMV.
+// rms_norm prologue (grim_rms_norm-identical traversal + formula) + per-block
+// quantize + dot4 GEMV in one launch. Feeds shortconv in_proj, lm_head, and
+// any Q8_0 dot4 projection whose input is rms-normed. Bit-identical to
+// separate norm + f32act launches.
+extern "C" __global__ void grim_dot4_q80_norm_f32act_gemv(
+    const float* __restrict__ res,
+    const float* __restrict__ gamma,
+    float eps,
+    const unsigned char* __restrict__ B_q80,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const float* r_row = res + (long long)row * K;
+
+    const unsigned char* b_col[4];
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q80 + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+                 : nullptr;
+    }
+
+    // Prologue: row sumsq with grim_rms_norm-identical traversal and formula.
+    float ss = 0.0f;
+    for (int col = lane; col < K; col += 32) {
+        float v = r_row[col];
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor(ss, off);
+    float rms = sqrtf(ss / (float)K + eps);
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_q_blocks; blk += 32) {
+        float nrm[GRIM_Q8_0_BLOCK_SIZE];
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            nrm[e] = r_row[(long long)blk * GRIM_Q8_0_BLOCK_SIZE + e]
+                   * gamma[(long long)blk * GRIM_Q8_0_BLOCK_SIZE + e] / rms;
+        }
+
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < GRIM_Q8_0_BLOCK_SIZE; e++) {
+            amax = fmaxf(amax, __builtin_fabsf(nrm[e]));
+        }
+
+        const float d     = amax / 127.0f;
+        const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+        _Float16 hd = (_Float16)d;
+        float d_a = (float)hd;
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(nrm[p * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(nrm[p * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(nrm[p * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(nrm[p * 4 + 3] * inv_d);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q8_0_BYTES;
+            float d_b = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const signed char* b_codes = (const signed char*)(b_blk + 2);
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4; __builtin_memcpy(&b4, b_codes + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * d_b;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
         }
     }
 }

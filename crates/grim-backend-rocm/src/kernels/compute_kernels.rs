@@ -488,6 +488,52 @@ extern "C" __global__ void grim_rope_dev_base(const float* x, const unsigned int
     out[b_idx] = x2 * cos_val + x1 * sin_val;
 }
 
+// PLAN-decode-throughput-restore: fused QK-norm + device-base RoPE. Same math
+// as grim_rope_dev_base, but applies the per-head RMS QK-norm (gamma + eps)
+// BEFORE the rotation, in the same pass: each warp covers exactly one head row
+// (half == 32 == warpSize), so the row's sum of squares is a warp shuffle
+// reduce. Reads its own pair before any write — safe in place.
+extern "C" __global__ void grim_qk_rope_dev_base(const float* x, const unsigned int* pos_base,
+                                                 const float* gamma,
+                                                 float* out,
+                                                 int b, int s, int d, int half, float base,
+                                                 int interleaved, int num_heads, float eps) {
+    int total = b * s * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int bi = idx / (s * half);
+    int rem = idx - bi * (s * half);
+    int si = rem / half;
+    int i = rem - si * half;
+    int step_idx = (num_heads > 0) ? (si / num_heads) : si;
+    float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
+    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
+    float val = pos * freq;
+    float sin_val = sinf(val);
+    float cos_val = cosf(val);
+    int base_idx = (bi * s + si) * d;
+    int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+    int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
+    float x1 = x[a_idx];
+    float x2 = x[b_idx];
+
+    // Per-head RMS scale: warp reduce over the row's pairs. Requires
+    // half == warpSize (32) so each warp is exactly one head row and every
+    // lane is active; the launcher rejects other configs.
+    float ss = x1 * x1 + x2 * x2;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(0xffffffffffffffffULL, ss, off);
+    float inv_rms = rsqrtf(ss / (float)d + eps);
+    x1 *= gamma[a_idx - base_idx];
+    x2 *= gamma[b_idx - base_idx];
+    x1 *= inv_rms;
+    x2 *= inv_rms;
+
+    out[a_idx] = x1 * cos_val - x2 * sin_val;
+    out[b_idx] = x2 * cos_val + x1 * sin_val;
+}
+
 // SPEED-DOT-OPFUSE (Phase 4a): fused RMSNorm + RoPE for Q/K paths.
 // Normalizes x with per-channel weights + eps, then applies RoPE rotation in the same kernel.
 // Avoids materializing the intermediate normalized tensor in HBM.
@@ -625,6 +671,80 @@ extern "C" __global__ void grim_rope_yarn(
             int src_idx = (bi * s + si) * d + copy_start + ci;
             out[src_idx] = x[src_idx];
         }
+    }
+}
+
+// PLAN 4 Task 4: QK-rope + KV-append fusion for the K/V pair. Rotates K rows
+// (QK-norm + NeoX RoPE, bit-identical to grim_qk_rope_dev_base) and appends
+// the rotated K rows AND the raw V rows to their arenas at pos_dev
+// (bit-identical to two grim_kv_append launches: same offsets, same f16
+// conversion). Thread mapping is pair-identical to qk_rope so the norm
+// shuffle reduction is order-exact; all arena writes are order-independent
+// (one writer per address). Q rope stays separate (no append); bump stays
+// after attention (which reads pre-bump total_dev).
+extern "C" __global__ void grim_qk_rope_append_kv(
+    const float* k, const unsigned int* pos_base, const float* gamma_k,
+    const float* v,
+    float* k_out, float* k_arena, float* v_arena,
+    int b, int s, int d, int half, float base, int interleaved,
+    int nkv_heads, float eps,
+    int kv_stride, int steps, int arena_slot_stride, int f16) {
+    int total = b * s * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int bi = idx / (s * half);
+    int rem = idx - bi * (s * half);
+    int si = rem / half;
+    int i = rem - si * half;
+    int step_idx = si / nkv_heads;
+    float pos = (float)(pos_base[bi] + (unsigned int)step_idx);
+    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
+    float val = pos * freq;
+    float sin_val = sinf(val);
+    float cos_val = cosf(val);
+    int base_idx = (bi * s + si) * d;
+    int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+    int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + half + i);
+    float x1 = k[a_idx];
+    float x2 = k[b_idx];
+
+    // Per-head RMS scale: identical mapping and order to qk_rope.
+    float ss = x1 * x1 + x2 * x2;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(0xffffffffffffffffULL, ss, off);
+    float inv_rms = rsqrtf(ss / (float)d + eps);
+    x1 *= gamma_k[a_idx - base_idx];
+    x2 *= gamma_k[b_idx - base_idx];
+    x1 *= inv_rms;
+    x2 *= inv_rms;
+
+    float r1 = x1 * cos_val - x2 * sin_val;
+    float r2 = x2 * cos_val + x1 * sin_val;
+    k_out[a_idx] = r1;
+    k_out[b_idx] = r2;
+
+    // Append rotated K pair + raw V pair at the on-device offset, replicating
+    // grim_kv_append addressing (off = slot*slot_stride + past*stride + local).
+    // si rows are (step,kv_head) pairs: local = si*hd + e = step*kv_stride +
+    // khi*hd + e, so the head term must be added explicitly.
+    int past = (int)pos_base[bi];
+    int khi = si - step_idx * nkv_heads;
+    long long row_off = (long long)bi * arena_slot_stride + (long long)(past + step_idx) * kv_stride + (long long)khi * d;
+    int e1 = a_idx - base_idx;
+    int e2 = b_idx - base_idx;
+    if (f16) {
+        unsigned short* a16 = (unsigned short*)k_arena;
+        unsigned short* v16 = (unsigned short*)v_arena;
+        a16[row_off + e1] = f32_to_fp16_bits_device(r1);
+        a16[row_off + e2] = f32_to_fp16_bits_device(r2);
+        v16[row_off + e1] = f32_to_fp16_bits_device(v[a_idx]);
+        v16[row_off + e2] = f32_to_fp16_bits_device(v[b_idx]);
+    } else {
+        k_arena[row_off + e1] = r1;
+        k_arena[row_off + e2] = r2;
+        v_arena[row_off + e1] = v[a_idx];
+        v_arena[row_off + e2] = v[b_idx];
     }
 }
 

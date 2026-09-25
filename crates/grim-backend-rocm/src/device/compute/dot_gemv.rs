@@ -35,18 +35,17 @@ impl RocmDevice {
         let mut kk = k as i32;
         let mut mm = m as i32;
         if std::env::var("GRIM_TRACE_FUSED_QKV").is_ok() {
-            eprintln!("[trace] quantize_q8_1 src={:#x} dst={:#x} k={k} m={m}", { src_ptr }, { dst_ptr });
+            eprintln!(
+                "[trace] quantize_q8_1 src={:#x} dst={:#x} k={k} m={m}",
+                { src_ptr },
+                { dst_ptr }
+            );
         }
         let handle = self.launch_compute_kernel(
             "grim_quantize_q8_1",
             grid_dim,
             block_dim,
-            &mut [
-                arg(&mut sptr),
-                arg(&mut dptr),
-                arg(&mut kk),
-                arg(&mut mm),
-            ],
+            &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut kk), arg(&mut mm)],
         )?;
 
         // P1-1 (PLAN-improve-grim-perf): real dependency edge for the
@@ -84,7 +83,7 @@ impl RocmDevice {
     }
 
     /// SPEED-DOT: Q8_0 x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
-    pub(crate) fn launch_dot4_q80_q81_gemv(
+    pub fn launch_dot4_q80_q81_gemv(
         &self,
         act_q81: &RocmStorage,
         b_storage: &RocmStorage,
@@ -138,6 +137,594 @@ impl RocmDevice {
         )
     }
 
+    /// PLAN 2: Fused activation quantize + dot4 Q8_0 GEMV directly from f32 activations.
+    pub fn launch_dot4_q80_f32act_gemv(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_f32
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv: act_f32 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// PLAN 4 Task 3: norm-fused single-projection dot4 GEMV directly from
+    /// the residual stream. Bit-identical to separate rms_norm_into +
+    /// f32act launches. Graph-capture safe (caller-owned buffers only).
+    pub fn launch_dot4_q80_norm_f32act_gemv_into(
+        &self,
+        res: &RocmStorage,
+        gamma: &RocmStorage,
+        eps: f32,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_q80_norm_f32act: K must be 32-aligned (k={k})"
+            )));
+        }
+        let res_ptr = res
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_norm_f32act: res has no device ptr".into()))?;
+        let gamma_ptr = gamma
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_norm_f32act: gamma has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_norm_f32act: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_norm_f32act: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut resptr, mut gammaptr, mut epsv) = (res_ptr, gamma_ptr, eps);
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_norm_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut resptr),
+                arg(&mut gammaptr),
+                arg(&mut epsv),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Phase D.2: Fused activation quantize + dot4 Q8_0 GEMV with optional residual add epilogue directly from f32 activations.
+    /// When residual is Some, computes C = residual + A * B. Supports in-place addition when residual is out_storage.
+    pub fn launch_dot4_q80_f32act_add_gemv(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        residual: Option<&RocmStorage>,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = act_f32
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: act_f32 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: out has no device ptr".into()))?;
+        let res_ptr = match residual {
+            Some(r) => r
+                .device_ptr
+                .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: residual has no device ptr".into()))?,
+            None => 0,
+        };
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut resptr = res_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_f32act_add_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut resptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Phase D.2 wrapper: fused activation quantize + QKV dot4 GEMV in a single kernel.
+    /// Takes f32 activation input directly, bypassing standalone launch_quantize_q8_1.
+    pub fn fused_qkv_dot4_into(
+        &self,
+        a: &dyn BackendStorage,
+        wq: &RocmStorage,
+        wk: &RocmStorage,
+        wv: &RocmStorage,
+        q_out: &RocmStorage,
+        k_out: &RocmStorage,
+        v_out: &RocmStorage,
+        n_q: usize,
+        n_kv: usize,
+        k: usize,
+        act_q81: &RocmStorage,
+    ) -> Result<()> {
+        let a_rocm = a
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("fused_qkv_dot4_into: a not RocmStorage".into()))?;
+        let m = a.shape().elem_count() / k.max(1);
+        let dot_fused_ok = k != 0
+            && k % 32 == 0
+            && self.supports_dot4()
+            && !matches!(
+                std::env::var("GRIM_DOT_GEMV").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+        if dot_fused_ok {
+            self.launch_dot4_qkv_q80_f32act_gemv_into(
+                a_rocm, wq, wk, wv, q_out, k_out, v_out, m, n_q, n_kv, k,
+            )
+        } else {
+            self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
+            self.launch_dot4_qkv_q80_gemv_into(
+                act_q81, wq, wk, wv, q_out, k_out, v_out, m, n_q, n_kv, k,
+            )
+        }
+    }
+
+    /// Phase D.2: one dot4 GEMV launch covering the three QKV projections directly from f32 activation.
+    pub fn launch_dot4_qkv_q80_f32act_gemv_into(
+        &self,
+        act_f32: &RocmStorage,
+        wq: &RocmStorage,
+        wk: &RocmStorage,
+        wv: &RocmStorage,
+        q_out: &RocmStorage,
+        k_out: &RocmStorage,
+        v_out: &RocmStorage,
+        m: usize,
+        n_q: usize,
+        n_kv: usize,
+        k: usize,
+    ) -> Result<()> {
+        if n_q % 4 != 0 || n_kv % 4 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_qkv_f32act: sections must be 4-aligned (n_q={n_q}, n_kv={n_kv})"
+            )));
+        }
+        let a_ptr = act_f32
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_f32act: act_f32 has no device ptr".into()))?;
+        let wq_ptr = wq
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_f32act: wq has no device ptr".into()))?;
+        let wk_ptr = wk
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_f32act: wk has no device ptr".into()))?;
+        let wv_ptr = wv
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_f32act: wv has no device ptr".into()))?;
+        let q_ptr = q_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_f32act: q out has no device ptr".into()))?;
+        let k_ptr = k_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_f32act: k out has no device ptr".into()))?;
+        let v_ptr = v_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_f32act: v out has no device ptr".into()))?;
+        let grid_x = ((n_q + 2 * n_kv) as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut wqptr, mut wkptr, mut wvptr) = (a_ptr, wq_ptr, wk_ptr, wv_ptr);
+        let (mut qptr, mut kptr, mut vptr) = (q_ptr, k_ptr, v_ptr);
+        let mut mm = m as i32;
+        let mut nq = n_q as i32;
+        let mut nkv = n_kv as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_qkv_q80_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wqptr),
+                arg(&mut wkptr),
+                arg(&mut wvptr),
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut mm),
+                arg(&mut nq),
+                arg(&mut nkv),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// PLAN 4 (DukeNukem): norm-fused QKV — rms_norm prologue + quantize +
+    /// QKV dot4 GEMV in one launch. Bit-identical to separate rms_norm_into
+    /// + f32act launches (same traversal, formula, quantizer). Graph-capture
+    /// safe (caller-owned buffers, no H2D/sync/alloc).
+    pub fn launch_dot4_qkv_q80_norm_f32act_gemv_into(
+        &self,
+        res: &RocmStorage,
+        gamma: &RocmStorage,
+        eps: f32,
+        wq: &RocmStorage,
+        wk: &RocmStorage,
+        wv: &RocmStorage,
+        q_out: &RocmStorage,
+        k_out: &RocmStorage,
+        v_out: &RocmStorage,
+        m: usize,
+        n_q: usize,
+        n_kv: usize,
+        k: usize,
+    ) -> Result<()> {
+        if n_q % 4 != 0 || n_kv % 4 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_qkv_norm_f32act: sections must be 4-aligned (n_q={n_q}, n_kv={n_kv})"
+            )));
+        }
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_qkv_norm_f32act: KD must be 32-aligned (k={k})"
+            )));
+        }
+        let res_ptr = res
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: res has no device ptr".into()))?;
+        let gamma_ptr = gamma
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: gamma has no device ptr".into()))?;
+        let wq_ptr = wq
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: wq has no device ptr".into()))?;
+        let wk_ptr = wk
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: wk has no device ptr".into()))?;
+        let wv_ptr = wv
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: wv has no device ptr".into()))?;
+        let q_ptr = q_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: q out has no device ptr".into()))?;
+        let k_ptr = k_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: k out has no device ptr".into()))?;
+        let v_ptr = v_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: v out has no device ptr".into()))?;
+        let grid_x = ((n_q + 2 * n_kv) as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut resptr, mut gammaptr, mut epsv) = (res_ptr, gamma_ptr, eps);
+        let (mut wqptr, mut wkptr, mut wvptr) = (wq_ptr, wk_ptr, wv_ptr);
+        let (mut qptr, mut kptr, mut vptr) = (q_ptr, k_ptr, v_ptr);
+        let mut mm = m as i32;
+        let mut nq = n_q as i32;
+        let mut nkv = n_kv as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_qkv_q80_norm_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut resptr),
+                arg(&mut gammaptr),
+                arg(&mut epsv),
+                arg(&mut wqptr),
+                arg(&mut wkptr),
+                arg(&mut wvptr),
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut mm),
+                arg(&mut nq),
+                arg(&mut nkv),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// PLAN 4 wrapper: norm-fused QKV dot4 directly from the residual stream.
+    /// Caller skips the standalone `rms_norm_into`; predicates mirror
+    /// `fused_qkv_dot4_into` so kill-switches (`GRIM_DOT_GEMV`, arch,
+    /// alignment, Q80 weights) keep working — verified at the call site.
+    pub fn fused_qkv_dot4_norm_into(
+        &self,
+        res: &RocmStorage,
+        gamma: &RocmStorage,
+        eps: f32,
+        wq: &RocmStorage,
+        wk: &RocmStorage,
+        wv: &RocmStorage,
+        q_out: &RocmStorage,
+        k_out: &RocmStorage,
+        v_out: &RocmStorage,
+        n_q: usize,
+        n_kv: usize,
+        k: usize,
+    ) -> Result<()> {
+        self.launch_dot4_qkv_q80_norm_f32act_gemv_into(
+            res,
+            gamma,
+            eps,
+            wq,
+            wk,
+            wv,
+            q_out,
+            k_out,
+            v_out,
+            res.shape().elem_count() / k.max(1),
+            n_q,
+            n_kv,
+            k,
+        )
+    }
+
+    /// Phase D.2 wrapper: fused activation quantize + gate/up GEMV with SiLU epilogue directly from f32 activations.
+    /// Takes f32 activation input directly, bypassing standalone launch_quantize_q8_1.
+    pub fn fused_gate_up_silu_dot4_into(
+        &self,
+        a: &dyn BackendStorage,
+        wg: &RocmStorage,
+        wu: &RocmStorage,
+        out: &RocmStorage,
+        n: usize,
+        k: usize,
+        act_q81: &RocmStorage,
+    ) -> Result<()> {
+        let a_rocm = a
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("fused_gate_up_silu: a not RocmStorage".into()))?;
+        let m = a.shape().elem_count() / k.max(1);
+        let dot_fused_ok = k != 0
+            && k % 32 == 0
+            && self.supports_dot4()
+            && !matches!(
+                std::env::var("GRIM_DOT_GEMV").as_deref(),
+                Ok("0" | "false" | "off")
+            );
+        if dot_fused_ok {
+            self.launch_dot4_gate_up_silu_q80_f32act_gemv_into(a_rocm, wg, wu, out, m, n, k)
+        } else {
+            self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
+            self.launch_dot4_gate_up_silu_q80_gemv_into(act_q81, wg, wu, out, m, n, k)
+        }
+    }
+
+    /// Phase D.2: fused activation quantize + gate/up GEMV + SiLU directly from f32 activation.
+    pub fn launch_dot4_gate_up_silu_q80_f32act_gemv_into(
+        &self,
+        act_f32: &RocmStorage,
+        wg: &RocmStorage,
+        wu: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let a_ptr = act_f32
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: act_f32 has no device ptr".into()))?;
+        let wg_ptr = wg
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: wg has no device ptr".into()))?;
+        let wu_ptr = wu
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: wu has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut wgptr, mut wuptr, mut optr) = (a_ptr, wg_ptr, wu_ptr, out_ptr);
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_gate_up_silu_q80_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wgptr),
+                arg(&mut wuptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// PLAN-kernel-launch-reduction Phase B: one dot4 GEMV launch covering the
+    /// three QKV projections. Sections must be 4-aligned so no 4-col group
+    /// spans two weight blobs. Graph-capture safe (caller-owned outputs).
+    pub fn launch_dot4_qkv_q80_gemv_into(
+        &self,
+        act_q81: &RocmStorage,
+        wq: &RocmStorage,
+        wk: &RocmStorage,
+        wv: &RocmStorage,
+        q_out: &RocmStorage,
+        k_out: &RocmStorage,
+        v_out: &RocmStorage,
+        m: usize,
+        n_q: usize,
+        n_kv: usize,
+        k: usize,
+    ) -> Result<()> {
+        if n_q % 4 != 0 || n_kv % 4 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_qkv: sections must be 4-aligned (n_q={n_q}, n_kv={n_kv})"
+            )));
+        }
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv: act_q81 has no device ptr".into()))?;
+        let wq_ptr = wq
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv: wq has no device ptr".into()))?;
+        let wk_ptr = wk
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv: wk has no device ptr".into()))?;
+        let wv_ptr = wv
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv: wv has no device ptr".into()))?;
+        let q_ptr = q_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv: q out has no device ptr".into()))?;
+        let k_ptr = k_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv: k out has no device ptr".into()))?;
+        let v_ptr = v_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_qkv: v out has no device ptr".into()))?;
+        let grid_x = ((n_q + 2 * n_kv) as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut wqptr, mut wkptr, mut wvptr) = (a_ptr, wq_ptr, wk_ptr, wv_ptr);
+        let (mut qptr, mut kptr, mut vptr) = (q_ptr, k_ptr, v_ptr);
+        let mut mm = m as i32;
+        let mut nq = n_q as i32;
+        let mut nkv = n_kv as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_qkv_q80_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wqptr),
+                arg(&mut wkptr),
+                arg(&mut wvptr),
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut mm),
+                arg(&mut nq),
+                arg(&mut nkv),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// PLAN-kernel-launch-reduction Phase A: fused gate+up GEMV + SiLU —
+    /// one launch replaces (gate GEMV, up GEMV, silu_mul). Graph-capture safe.
+    pub fn launch_dot4_gate_up_silu_q80_gemv_into(
+        &self,
+        act_q81: &RocmStorage,
+        wg: &RocmStorage,
+        wu: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let a_ptr = act_q81
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu: act_q81 has no device ptr".into()))?;
+        let wg_ptr = wg
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu: wg has no device ptr".into()))?;
+        let wu_ptr = wu
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu: wu has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut wgptr, mut wuptr, mut optr) = (a_ptr, wg_ptr, wu_ptr, out_ptr);
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_gate_up_silu_q80_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wgptr),
+                arg(&mut wuptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Phase 4.5c: FP8 E4M3 GEMV via V_DOT4_F32_FP8_FP8 (RDNA4 dot11-insts).
     /// A is f32 [M,K] (quantized to E4M3 in-kernel), B is E4M3 column-major [N,K].
     pub(crate) fn launch_dot4_fp8_gemv(
@@ -184,42 +771,88 @@ impl RocmDevice {
 
     /// Phase 4.5f: Q2_K x Q8_1 GEMV via sudot4 + two-dot decomposition (RDNA3/4).
     pub(crate) fn launch_dot4_q2k_q81_gemv(
-        &self, act_q81: &RocmStorage, b_storage: &RocmStorage,
-        out_storage: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = act_q81.device_ptr
+        let a_ptr = act_q81
+            .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q2k_q81_gemv: act_q81 has no device ptr".into()))?;
-        let b_ptr = b_storage.device_ptr
+        let b_ptr = b_storage
+            .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q2k_q81_gemv: b has no device ptr".into()))?;
-        let out_ptr = out_storage.device_ptr
+        let out_ptr = out_storage
+            .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q2k_q81_gemv: out has no device ptr".into()))?;
         let grid_x = (n as u32).div_ceil(4);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
-        let mut aptr = a_ptr; let mut bptr = b_ptr; let mut optr = out_ptr;
-        let mut mm = m as i32; let mut nn = n as i32; let mut kk = k as i32;
-        self.launch_compute_kernel("grim_dot4_q2k_q81_gemv", grid_dim, block_dim,
-            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut mm), arg(&mut nn), arg(&mut kk)])
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q2k_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
 
     /// Phase 4.5f: Q3_K x Q8_1 GEMV via sudot4 + two-dot + sign correction (RDNA3/4).
     pub(crate) fn launch_dot4_q3k_q81_gemv(
-        &self, act_q81: &RocmStorage, b_storage: &RocmStorage,
-        out_storage: &RocmStorage, m: usize, n: usize, k: usize,
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = act_q81.device_ptr
+        let a_ptr = act_q81
+            .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: act_q81 has no device ptr".into()))?;
-        let b_ptr = b_storage.device_ptr
+        let b_ptr = b_storage
+            .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: b has no device ptr".into()))?;
-        let out_ptr = out_storage.device_ptr
+        let out_ptr = out_storage
+            .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q3k_q81_gemv: out has no device ptr".into()))?;
         let grid_x = (n as u32).div_ceil(4);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
-        let mut aptr = a_ptr; let mut bptr = b_ptr; let mut optr = out_ptr;
-        let mut mm = m as i32; let mut nn = n as i32; let mut kk = k as i32;
-        self.launch_compute_kernel("grim_dot4_q3k_q81_gemv", grid_dim, block_dim,
-            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut mm), arg(&mut nn), arg(&mut kk)])
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q3k_q81_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
 
     /// SPEED-DOT: Q4_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
