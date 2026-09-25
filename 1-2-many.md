@@ -318,11 +318,19 @@ A model-agnostic baseline seam is now available before every checkpoint is prese
   failure while loading layers. The single-GPU diagnostic fails earlier with
   `hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. No Qwen tok/s
   result is recorded.
-- Required next step: fix the qwen35 vocabulary/tensor contract, make RCCL
-  initialization/communicator ownership valid for two processes, and keep the
-  16 GB Q4_K checkpoint device-resident rather than host-dequantizing a
-  multi-billion-element shard. Re-run default and `GRIM_Q4K_FUSED_GATEUP=1`
-  only after the default path completes.
+- Ollama 0.32.13 is installed locally, but its source tree is not present. The
+  available Ollama backend reference is the local `llama.cpp` checkout, which
+  shows three material differences from the GRIM failure:
+  1. default multi-GPU placement is `LLAMA_SPLIT_MODE_LAYER` with
+     `n_gpu_layers`/`tensor_split`, not RCCL row-parallel collectives;
+  2. Q4_K tensors remain packed and are assigned backend buffer types rather
+     than host-dequantized into multi-gigabyte F32 shards;
+  3. `common_fit_params` reduces GPU layers/context to fit available VRAM
+     instead of relying on managed-memory fallback.
+- The GRIM port should adopt the same placement policy for this checkpoint
+  before attempting a real Q4 speedup: keep the Q4_K weights packed, place
+  layers by available VRAM, and do not enable RCCL row-parallelism unless a
+  working multi-process communicator exists.
 ### P2 — GDL where needed (Status: PARTIALLY IMPLEMENTED)
 
 **P2.1 `solar_open2.rs` + `delta_net_base.rs` → GDN-2 (EligibleKdaMigration).**
