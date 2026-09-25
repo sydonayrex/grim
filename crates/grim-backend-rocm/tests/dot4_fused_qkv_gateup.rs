@@ -365,7 +365,7 @@ fn dot4_gate_up_microbench_uses_real_arguments() {
     }
     dev.synchronize();
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let bytes = layers as f64 * 2.0 * n as f64 * (k as f64 / 32.0) * 34.0;
+    let bytes = (layers * iters) as f64 * 2.0 * n as f64 * (k as f64 / 32.0) * 34.0;
     let calls = (layers * iters) as f64;
     let gbps = bytes / (elapsed_ms * 1.0e6);
     eprintln!(
