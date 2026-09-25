@@ -316,8 +316,11 @@ A model-agnostic baseline seam is now available before every checkpoint is prese
   ranks then fall back to partial-output row-parallel behavior, host-dequantize
   `1,271,398,400` Q4_K elements in about `3.67 s`, and hit a managed-memory/OOM
   failure while loading layers. The single-GPU diagnostic fails earlier with
-  `hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. No Qwen tok/s
-  result is recorded.
+  `hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. A new
+  `GRIM_QWEN_LAYER_SPLIT=1` mode now follows Ollama's layer-split placement and
+  keeps weights packed, but the real run still fails with `hipModuleLoad` 209
+  for `grim_fused_dequant_gemm_q4k` on `gfx1201`. No Qwen tok/s result is
+  recorded.
 - Ollama 0.32.13 is installed locally, but its source tree is not present. The
   available Ollama backend reference is the local `llama.cpp` checkout, which
   shows three material differences from the GRIM failure:
@@ -327,10 +330,11 @@ A model-agnostic baseline seam is now available before every checkpoint is prese
      than host-dequantized into multi-gigabyte F32 shards;
   3. `common_fit_params` reduces GPU layers/context to fit available VRAM
      instead of relying on managed-memory fallback.
-- The GRIM port should adopt the same placement policy for this checkpoint
-  before attempting a real Q4 speedup: keep the Q4_K weights packed, place
-  layers by available VRAM, and do not enable RCCL row-parallelism unless a
-  working multi-process communicator exists.
+- LFM2 Q8_0 does not need a new forced-upload rule: `WeightSource::materialize`
+  already keeps KQuant/FloatPack bytes packed and device-resident on ROCm, and
+  `Linear::forward` dispatches those tensors through `quantized_matmul`. The Qwen
+  failure is specific to the layer-split/Q4 scalar-kernel path, not a general LFM
+  upload regression.
 ### P2 — GDL where needed (Status: PARTIALLY IMPLEMENTED)
 
 **P2.1 `solar_open2.rs` + `delta_net_base.rs` → GDN-2 (EligibleKdaMigration).**

@@ -279,9 +279,11 @@ fix assigns each rank to its own ordinal, but RCCL initialization still fails
 with status 1. Both ranks then fall back to partial-output row-parallel
 behavior, host-dequantize `1,271,398,400` Q4_K elements in about `3.67 s`, and
 hit managed-memory/OOM while loading layers. The one-GPU diagnostic still fails
-`hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. No Qwen tok/s
-result or promotion is recorded until the loader vocabulary contract, RCCL
-ownership, and device-resident Q4_K loading are fixed.
+`hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. A new
+`GRIM_QWEN_LAYER_SPLIT=1` mode follows Ollama's layer-split placement and keeps
+weights packed, but the real run still fails with `hipModuleLoad` 209 for
+`grim_fused_dequant_gemm_q4k` on `gfx1201`. No Qwen tok/s result or promotion
+is recorded.
 
 For comparison, Ollama 0.32.13 is installed locally but its source tree is
 not present. The available llama.cpp backend used by Ollama defaults to
@@ -289,3 +291,9 @@ not present. The available llama.cpp backend used by Ollama defaults to
 packed in device buffer types, and auto-fits GPU layers/context to VRAM. This
 is the placement contract GRIM should adopt for the 16 GB Qwen checkpoint
 before attempting another dual-GPU benchmark.
+
+LFM2 Q8_0 does not need a forced-upload change: GRIM's `WeightSource` already
+keeps KQuant/FloatPack bytes packed and device-resident on ROCm, and
+`Linear::forward` dispatches them through `quantized_matmul`. The Qwen failure
+is specific to the layer-split/Q4 scalar-kernel path, not a general LFM upload
+regression.
