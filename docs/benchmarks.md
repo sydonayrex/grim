@@ -263,34 +263,102 @@ not comparable to the 350 tok/s decode promotion gate.
 
 ## 11. Qwen3.8 Q4_K Dual-GPU Target Audit
 
-The available `Qwen3.8-27B-Q4_K_M.gguf` identifies itself as `qwen35`, not the
-dense Qwen3.8 Flash-Next architecture. It is a 65-layer hybrid with full
-attention and SSM layers. Its metadata reports a 32K vocabulary while
-`token_embd.weight` has 248,320 rows, so the loader reports a shape mismatch.
+**No Qwen tok/s is recorded.** The 27B load now clears every previous blocker,
+but generation has not completed under measurement, so nothing here is a
+promotion. Commits: `10e57867` (six root-cause fixes), `69099316` (KV-quant
+parity gates).
 
-The installed Q4_K dot4 kernel is not valid on RDNA3/RDNA4 because its scale
-shuffle is architecture-specific. A safe Q4_K candidate now concatenates the
-local tensor-parallel Gate/Up weights and uses the existing fused-dequant/WMMA
-path behind `GRIM_Q4K_FUSED_GATEUP=1`. The backend parity test passes on GPU 1:
-`qwen_q4k_fused_gateup_matches_separate_q4k_projections`.
+### Architecture, from GGUF metadata
 
-The real dual-GPU baseline is not yet measurable. The rank-ordinal loader
-fix assigns each rank to its own ordinal, but RCCL initialization still fails
-with status 1. Both ranks then fall back to partial-output row-parallel
-behavior, host-dequantize `1,271,398,400` Q4_K elements in about `3.67 s`, and
-hit managed-memory/OOM while loading layers. The one-GPU diagnostic still fails
-`hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. A new
-`GRIM_QWEN_LAYER_SPLIT=1` mode follows Ollama's layer-split placement and keeps
-weights packed, but the real run still fails with `hipModuleLoad` 209 for
-`grim_fused_dequant_gemm_q4k` on `gfx1201`. No Qwen tok/s result or promotion
-is recorded.
+`general.architecture=qwen35`, `general.name=Qwen3.8-27B`, 65 blocks,
+`embedding_length=5120`, 24 query / 4 KV heads, SSM `state_size=128`,
+`inner_size=6144`, `conv_kernel=4`, `time_step_rank=48`, `group_count=16`. A
+65-layer Qwen3.5/3.8 hybrid with full attention every 4th layer — not the dense
+Qwen3.8 Flash-Next/MoE path. Tokenizer is gpt2 BPE, `pre=qwen35`, 248,320 tokens
+and 247,587 merges, `bos=248044` / `eos=248046` / `padding=248055`. The chat
+template has vision/image and video branches.
 
-For comparison, Ollama 0.32.13 is installed locally but its source tree is
-not present. The available llama.cpp backend used by Ollama defaults to
-`LLAMA_SPLIT_MODE_LAYER` with `n_gpu_layers`/`tensor_split`, keeps Q4_K tensors
-packed in device buffer types, and auto-fits GPU layers/context to VRAM. This
-is the placement contract GRIM should adopt for the 16 GB Qwen checkpoint
-before attempting another dual-GPU benchmark.
+The file carries **no `tokenizer.ggml.vocab_size` and no `qwen35.vocab_size`**.
+The 32,000 that appeared in earlier logs was the `unwrap_or(32000)` default, not
+stale metadata: the vocabulary only exists as the `tokenizer.ggml.tokens` array
+length, which a scalar `get_u32` lookup can never resolve.
+
+### KV arena sizing (why context, not weights, is the constraint)
+
+The decode graph pre-allocates one arena per full-attention layer at full
+context, before any weight is placed. With 4 KV heads × 256 head_dim, f32, K+V,
+across the 17 full-attention layers:
+
+| context | KV arenas | + 15.2 GB Q4_K weights | fits 34 GB? |
+|---|---|---|---|
+| 32,768 | 4.6 GB | 19.8 GB | yes |
+| 65,536 | 9.1 GB | 24.3 GB | yes |
+| 98,304 | 13.7 GB | 28.9 GB | yes |
+| 131,072 | 18.3 GB | 33.5 GB | borderline |
+| 228,000 | 31.8 GB | 47.0 GB | **no** |
+
+Measured peak VRAM during a 228k load reached 17.07 of 17.10 GB on card 0 while
+card 1 sat at ~12.7 GB, and a 557,056-byte decode-graph scratch buffer fell back
+to HIP managed memory. The managed allocation was a *symptom* of oversubscription,
+not the cause.
+
+### Verified fixes
+
+| Defect | Evidence |
+|---|---|
+| `vocab_size` fell through to `unwrap_or(32000)` | loader now reports `vocab=248320`; encodes token IDs > 248,000 |
+| shape errors swallowed by `.or_else(\|_\|)` | `fallback_on_missing` propagates `ShapeMismatch`; 3 unit tests |
+| `hipModuleLoad` 209 | standalone HIP probe: same `gfx1201` object → status 0 on device 0, 209 on device 1. Root cause was process-wide `HSA_OVERRIDE_GFX_VERSION=10.3.0` set by probing the **Ryzen 9800X3D iGPU (card 2, `gfx1036`)**. RDNA4 removed from the override table |
+| `GRIM_CONTEXT` ignored on GGUF | 232192 → 32768; KV reservation 32.3 GB → 4.6 GB |
+| static round-robin layer placement | headroom-based planner; reserves KV before assigning layers |
+| KV arena stride 256 vs 1024 | 3-D eager arena read via `dims().last()`; now multiplies trailing dims |
+
+Test results at commit `10e57867` / `69099316`:
+
+```
+grim-core            70 passed; 0 failed
+qwen35 (unit)         8 passed; 0 failed
+paged KV int8         max err 0.0018  (gate 0.15)  PASS
+paged KV FP8 E4M3     max err 0.0223  (gate 0.25)  PASS
+multi-GPU context     2 passed; 0 failed
+```
+
+### KV quantization
+
+`launch_paged_attention_quant` inlines `dequant_kv_element` for Int8, W4A16,
+FP8 E4M3/E5M2, FP4 E2M1, and MXFP4/MXFP8. Int8 and FP8 E4M3 are verified on
+hardware against an f64 host reference. FP8 E4M3 is the intended RDNA4 default:
+same 1 byte/element as int8, but floating-point dynamic range, which matters for
+K where a per-tensor int8 scale flattens outlier channels. Note the paged KV read
+is a gather, not a matmul, so it uses the software decode either way — FP8's win
+here is accuracy-per-byte, not speed.
+
+Both formats must be uploaded with `from_cpu_bytes`: `dequant_kv_element` indexes
+the page pointer **bytewise**, so widening int8 values into f32 slots misaligns
+every read by 4x. That was a real failure caught by the parity test.
+
+**Nutcracker is decoded, but not in the paged KV kernel.** The format (E2M1
+codes with a per-16 E8M0 block scale whose low 2 bits are stolen as a
+special-value selector — RaZeR-style, taking the selector from exponent range
+since E8M0 has no sign bit) already has a working dequant path in the weight
+pipeline: `launch_dequant_nutcracker`, `dequantize_nutcracker_host`,
+`launch_nutcracker_gemv`, and `launch_nutcracker_gemm_tiled`, plus
+`QuantMode::NutFp4Emulated` capability reporting. What is missing is the KV
+side: the paged attention kernel's `quant_format == 4` is plain FP4_E2M1, which
+ignores the stolen selector, so pointing Nutcracker KV at that code would decode
+the block scales wrong. It needs a new format code and a reader that calls the
+existing `nutcracker_to_float_hip`.
+
+### Still open
+
+- Qwen35 decode is not routed onto the paged quantized path, so no KV memory
+  saving is realized yet.
+- The f32↔f16 KV cast was implemented and **reverted**: it compiled, but the
+  `RocmDevice` override was never dispatched from the integration test, so the
+  conversion is unverified. Deferred.
+- Packed KQuant KV is deliberately absent from the dense decode-graph arena; that
+  arena's consumer is the non-quantized attention kernel, which reads rows raw.
+
 
 LFM2 Q8_0 does not need a forced-upload change: GRIM's `WeightSource` already
 keeps KQuant/FloatPack bytes packed and device-resident on ROCm, and

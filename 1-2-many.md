@@ -290,37 +290,97 @@ A model-agnostic baseline seam is now available before every checkpoint is prese
 - These two models are parity-green, but their real Q8_0 checkpoints are not
   locally available. P1.3b remains open for 4-combination quant matrices,
   launch-budget checks, and raw real-model benchmarks once checkpoints arrive.
-### P1.3c — Qwen Q4_K target and dual-GPU audit (Status: PARITY GREEN, REAL MODEL BLOCKED)
+### P1.3c — Qwen Q4_K target and dual-GPU audit (Status: 6 ROOT CAUSES FIXED, NO tok/s YET)
 
-- `models/Qwen3.8-27B-Q4_K_M.gguf` reports `general.architecture=qwen35` and
-  `general.name=Qwen3.8-27B`. It is a 65-layer Qwen3.5/3.8 hybrid with
-  full-attention plus SSM layers, not the dense Qwen3.8 Flash-Next/MoE path.
-  The checkpoint metadata says `vocab_size=32000`, while
-  `token_embd.weight` is `[248320, 5120]`; the loader records a shape mismatch
-  and continues. This must be resolved before a real-model correctness or
-  throughput claim.
-- The installed Q4_K dot4 kernel is explicitly not valid on RDNA3/RDNA4 because
-  its scale shuffle is architecture-specific. The new Q4_K candidate therefore
-  uses a device-owned fused Gate/Up blob and the existing safe
-  fused-dequant/WMMA path, gated by `GRIM_Q4K_FUSED_GATEUP=1`. It does not
-  enable the known-invalid RDNA4 dot4 Q4_K route.
-- Added `FusedGateUpQ4KWeights`, a Q4_K D2D-concatenation builder, a safe
-  fused-dequant/WMMA launcher, and Qwen35 per-shard integration. Added
-  `DeviceGuard` around raw fused-weight D2D seams so concatenation is pinned
-  to the shard's ordinal.
-- GPU-1 backend parity test
-  `qwen_q4k_fused_gateup_matches_separate_q4k_projections` passes against
-  separate Q4_K projections.
-- Real Qwen benchmark blocker: the two-rank loader now correctly assigns each
-  rank to one ordinal, but RCCL initialization still fails with status 1. Both
-  ranks then fall back to partial-output row-parallel behavior, host-dequantize
-  `1,271,398,400` Q4_K elements in about `3.67 s`, and hit a managed-memory/OOM
-  failure while loading layers. The single-GPU diagnostic fails earlier with
-  `hipModuleLoad` status 209 for `grim_embedding` on `gfx1201`. A new
-  `GRIM_QWEN_LAYER_SPLIT=1` mode now follows Ollama's layer-split placement and
-  keeps weights packed, but the real run still fails with `hipModuleLoad` 209
-  for `grim_fused_dequant_gemm_q4k` on `gfx1201`. No Qwen tok/s result is
-  recorded.
+Six independent defects blocked the real 27B load. All are fixed and committed
+in `10e57867`; the KV-quantization parity gates are in `69099316`. The model now
+loads, tokenizes, and begins generating, but **no Qwen tok/s has been measured
+and no rocprof kernel trace has been captured** — see `docs/benchmarks.md`.
+
+**Architecture, confirmed from GGUF metadata** (not inferred from the filename):
+
+- `general.architecture=qwen35`, `general.name=Qwen3.8-27B`,
+  `general.base_model.0.name=Qwen3.8 27B`, quantized by Unsloth.
+- 65 blocks, `embedding_length=5120`, 24 query heads / 4 KV heads, and SSM
+  parameters (`state_size=128`, `inner_size=6144`, `conv_kernel=4`,
+  `time_step_rank=48`, `group_count=16`). It is a 65-layer Qwen3.5/3.8 hybrid with
+  full attention every 4th layer, **not** the dense Qwen3.8 Flash-Next/MoE path.
+  The chat template carries vision/image and video branches, so this checkpoint
+  is multimodal-capable despite the Q4_K text tensor set.
+- Tokenizer is `tokenizer.ggml.model=gpt2` BPE, `pre=qwen35`, with
+  `bos=248044`, `eos=248046`, `padding=248055`, 247,587 merges, and 248,320
+  token entries. **There is no `tokenizer.ggml.vocab_size` and no
+  `qwen35.vocab_size` key in the file at all.**
+
+**Root cause 1 — `vocab_size` fell through to a hardcoded default.** GGUF stores
+the vocabulary as the `tokenizer.ggml.tokens` *array*, so a `get_u32` lookup on
+it can never resolve. Every scalar key in the chain missed and resolution landed
+on `unwrap_or(32000)`, making `token_embd.weight` `[248320, 5120]` mismatch an
+expected `[32000, 5120]`. Added `MetadataLookup::get_array_len` and reordered
+the chain to arch-key → `tokens` array length → `llama.vocab_size` → legacy
+tokenizer key. Verified: the loader now reports `vocab=248320` and encodes
+token IDs above 248,000, which the old 32000 config could not represent.
+
+**Root cause 2 — shape errors were swallowed, not fatal.** The name-prefix
+fallbacks used `.or_else(|_| ...)`, which cannot distinguish "this prefix is
+absent, try the next" from "present but the wrong shape", so a `ShapeMismatch`
+was discarded and the run continued on a corrupt model. `fallback_on_missing`
+now retries only on a not-found backend error and propagates `ShapeMismatch`.
+
+**Root cause 3 — `hipModuleLoad` 209 was APU-iGPU pollution, not a bad cache.**
+The HSACO cache was exonerated: a standalone HIP program loads the same `gfx1201`
+code object with status 0 on device 0 and 209 on device 1, and the object
+genuinely contains `amdgcn-amd-amdhsa--gfx1201`. The real cause was
+`HSA_OVERRIDE_GFX_VERSION`, which is process-wide: RDNA4 was in the override
+table, and probing the third device — the **Ryzen 9800X3D iGPU (card 2,
+`gfx1036`)** — set it to `10.3.0`, after which both RDNA4 devices misreported and
+rejected their own code objects. Dropped the `gfx12` arm and anchored the
+override to ordinal 0. A multi-GPU context-coherence test now also pins the
+`DeviceGuard` fast path against `raw_set_device`.
+
+**Root cause 4 — `GRIM_CONTEXT` was ignored on the GGUF path.** The clamp existed
+only in the safetensors branch, so a GGUF load planned KV arenas for the
+checkpoint's advertised context. Clamping the shared `hparams` at extraction
+covers all 58 architecture sites. Verified end-to-end: `232192 → 32768`, and KV
+reservation fell from 32.3 GB to 4.6 GB.
+
+**Root cause 5 — layer placement was index arithmetic.** `devices[i * len /
+layers]` ignores per-layer size and free VRAM; it drove card 0 to 99.9% while
+card 1 sat near half full. Replaced with `plan_layer_devices`, which sizes each
+block from checkpoint metadata (`WeightSource::prefix_bytes`) and gives it to the
+device with the most headroom, **after** reserving each device's KV share. The
+planner now fails loudly instead of silently spilling.
+
+**Root cause 6 — KV arena stride mismatch aborted graph capture.** The eager
+Qwen35 KV arena is 3-D `[rows, num_kv_heads, head_dim]`, but the seed path read
+`dims().last()` and got `head_dim` (256) instead of the row stride (1024). Now
+multiplies the trailing dims.
+
+- The installed Q4_K dot4 kernel remains excluded: it is not valid on
+  RDNA3/RDNA4 because its scale shuffle is architecture-specific. The Q4_K
+  candidate keeps using `FusedGateUpQ4KWeights` plus the safe fused-dequant/WMMA
+  path behind `GRIM_Q4K_FUSED_GATEUP=1`. GPU-1 parity test
+  `qwen_q4k_fused_gateup_matches_separate_q4k_projections` passes.
+- **Context sizing.** The decode graph pre-allocates one arena per
+  full-attention layer at full context, so context — not weights — is the
+  dominant consumer: at 228k the f32 arenas alone want 31.8 GB
+  (`228000 × 4 heads × 256 dim × 4 bytes × 2 × 17 layers`) against 34 GB of VRAM.
+  `fit_context_to_vram` + `GRIM_CONTEXT_GROW_TO=1` shrink the window to what VRAM
+  holds; 32k/64k fit with real headroom, 228k cannot.
+- **KV quantization.** `launch_paged_attention_quant` with inlined
+  `dequant_kv_element` is verified on hardware for **int8** (max err 0.0018) and
+  **FP8 E4M3** (max err 0.0223) against an f64 reference. FP8 is the intended
+  RDNA4 default: same 1 byte/element as int8, but floating-point dynamic range,
+  which matters for K where a per-tensor int8 scale flattens outlier channels.
+  Nutcracker (E2M1 + E8M0 per-16 block scale with 2 bits stolen as a
+  special-value selector) already decodes in the weight path —
+  `launch_dequant_nutcracker`, `launch_nutcracker_gemv`/`_gemm_tiled`,
+  `QuantMode::NutFp4Emulated` — but its KV side is missing: the paged kernel's
+  `quant_format == 4` is plain FP4_E2M1, which ignores the stolen selector.
+- **Still open:** Qwen35 decode is not yet routed onto the paged quantized path,
+  so no KV memory saving is realized and no tok/s exists. The f32↔f16 KV cast was
+  attempted and **reverted** — it compiled but its ROCm override was never
+  dispatched from the integration test, so the conversion is unverified. Deferred.
 - Ollama 0.32.13 is installed locally, but its source tree is not present. The
   available Ollama backend reference is the local `llama.cpp` checkout, which
   shows three material differences from the GRIM failure:
@@ -330,11 +390,14 @@ A model-agnostic baseline seam is now available before every checkpoint is prese
      than host-dequantized into multi-gigabyte F32 shards;
   3. `common_fit_params` reduces GPU layers/context to fit available VRAM
      instead of relying on managed-memory fallback.
+- Items 1 and 3 are now mirrored in GRIM: `GRIM_QWEN_LAYER_SPLIT=1` for
+  layer-split placement, and `GRIM_CONTEXT_GROW_TO=1` for context fitting. Item 2
+  already held via `FusedGateUpQ4KWeights`.
 - LFM2 Q8_0 does not need a new forced-upload rule: `WeightSource::materialize`
   already keeps KQuant/FloatPack bytes packed and device-resident on ROCm, and
   `Linear::forward` dispatches those tensors through `quantized_matmul`. The Qwen
-  failure is specific to the layer-split/Q4 scalar-kernel path, not a general LFM
-  upload regression.
+  failures above were placement/context/dtype defects, not a general LFM upload
+  regression.
 ### P2 — GDL where needed (Status: PARTIALLY IMPLEMENTED)
 
 **P2.1 `solar_open2.rs` + `delta_net_base.rs` → GDN-2 (EligibleKdaMigration).**
