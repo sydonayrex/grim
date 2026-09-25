@@ -425,3 +425,130 @@ fn fp8_e4m3_quant_paged_attention_matches_f32_reference() {
         got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0f64, f64::max)
     );
 }
+
+/// Nutcracker quantized paged attention must track the f32 reference.
+///
+/// Nutcracker is E2M1 codes plus a per-16 block scale carried *inline* in the
+/// buffer, whose low 2 bits are stolen as a special-value selector. It is the
+/// only variant that ignores the caller's per-tensor `k_scale`/`v_scale` — the
+/// scale travels in the data — so the launch passes 1.0 to make that explicit.
+///
+/// At 4.5 bits/element this is the format that would actually let a long
+/// context fit, which is why it needs the same gate as int8 and FP8.
+///
+/// The host side uses the real `grim_quant::quant_nutcracker`, so this measures
+/// the device decoder against the production encoder rather than a mirror of it.
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn nutcracker_quant_paged_attention_matches_f32_reference() {
+    let Some(dev) = gpu_device() else { return };
+
+    let q_shape = Shape::new(vec![BATCH as usize, NUM_HEADS as usize, HEAD_DIM as usize]);
+
+    let q_cpu: Vec<f32> = (0..(BATCH * NUM_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.1).sin())
+        .collect();
+    let k_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.15).cos())
+        .collect();
+    let v_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.2).sin())
+        .collect();
+
+    let entries = [
+        BlockTableEntry { block_id: 0, page_size: 4 },
+        BlockTableEntry { block_id: 1, page_size: 4 },
+    ];
+    let mut k_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
+    let mut v_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
+    for b in 0..MAX_BLOCKS as usize {
+        let entry = entries[b];
+        for t in 0..entry.page_size as usize {
+            let j = b * PAGE_SIZE as usize + t;
+            if j >= KV_SEQ_LEN as usize {
+                break;
+            }
+            let physical_token = entry.block_id as usize * PAGE_SIZE as usize + t;
+            let n = NUM_KV_HEADS as usize * HEAD_DIM as usize;
+            let src = physical_token * n;
+            let dst = j * n;
+            k_flat[dst..dst + n].copy_from_slice(&k_cpu[src..src + n]);
+            v_flat[dst..dst + n].copy_from_slice(&v_cpu[src..src + n]);
+        }
+    }
+
+    // Production encoder: 9 bytes per 16 values.
+    let k_packed = grim_quant::quant_nutcracker(&k_cpu).expect("quantize K");
+    let v_packed = grim_quant::quant_nutcracker(&v_cpu).expect("quantize V");
+    assert_eq!(k_packed.len(), k_cpu.len() / 16 * 9, "9 bytes per 16 values");
+
+    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+    let table = block_table(&dev);
+    let mut out = dev.zeros(&q_shape, DType::F32).unwrap();
+
+    // Raw byte upload: the decoder indexes the page pointer bytewise.
+    let kq = dev
+        .from_cpu_bytes(&k_packed, &Shape::new(vec![k_packed.len()]), DType::F32)
+        .unwrap();
+    let vq = dev
+        .from_cpu_bytes(&v_packed, &Shape::new(vec![v_packed.len()]), DType::F32)
+        .unwrap();
+
+    launch_paged_attention_quant(
+        &dev,
+        q_storage.as_ref(),
+        table.as_ref(),
+        kq.as_ref(),
+        vq.as_ref(),
+        out.as_mut(),
+        BATCH,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        MAX_BLOCKS,
+        PAGE_SIZE,
+        KV_SEQ_LEN,
+        CACHE_OFFSET,
+        0i32,
+        KvCacheQuantFormat::NutFp4,
+        1.0, // ignored: Nutcracker carries its scale inline
+        0.0,
+        1.0, // ignored
+        0.0,
+    )
+    .expect("nutcracker quant paged attention");
+    let got = out.to_cpu_vec_f32().unwrap();
+
+    let want = reference_attention(
+        &q_cpu,
+        &k_flat,
+        &v_flat,
+        NUM_HEADS as usize,
+        NUM_KV_HEADS as usize,
+        HEAD_DIM as usize,
+        KV_SEQ_LEN as usize,
+    );
+
+    // 4-bit codes on a coarse E2M1 grid, so the gate is far looser than int8 or
+    // FP8. It must still catch O(1) breakage: wrong block indexing, ignoring the
+    // inline scale, or misreading the stolen selector.
+    let tol = 1.0;
+    for h in 0..NUM_HEADS as usize {
+        for d in 0..HEAD_DIM as usize {
+            let i = h * HEAD_DIM as usize + d;
+            let err = (got[i] as f64 - want[i]).abs();
+            assert!(
+                err < tol,
+                "nutcracker paged path disagrees at head {h} dim {d}: \
+                 got {} want {} (err {err})",
+                got[i],
+                want[i]
+            );
+        }
+    }
+    eprintln!(
+        "[quant-paged] nutcracker KV matches f32 reference within {tol} \
+         (max err {:.4})",
+        got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0f64, f64::max)
+    );
+}
