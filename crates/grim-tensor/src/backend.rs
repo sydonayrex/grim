@@ -1635,6 +1635,27 @@ pub trait MemoryOps {
         ))
     }
 
+    /// Device-to-device copy of `count` **BYTES** starting at `dst_byte_offset`
+    /// in `dst` from `src_byte_offset` in `src`.
+    ///
+    /// [`Self::copy_slice_range`] counts elements and derives the byte width from
+    /// the storage dtype, which is wrong for packed data: a quantized KV page
+    /// holds raw bytes whose element width is a fraction of one byte, so an
+    /// element-indexed copy would move the wrong number of bytes entirely.
+    /// Packed KV appends must use this instead.
+    fn copy_bytes_into(
+        &self,
+        _dst: &dyn BackendStorage,
+        _dst_byte_offset: usize,
+        _src: &dyn BackendStorage,
+        _src_byte_offset: usize,
+        _count: usize,
+    ) -> Result<()> {
+        Err(crate::error::Error::Unimplemented(
+            "copy_bytes_into not implemented on this backend".into(),
+        ))
+    }
+
     /// Device-to-device copy of `count` contiguous F32 elements starting at flat element `src_elem_offset` within `src`, into `dst` starting at flat element `dst_elem_offset`.
     /// The two-offset form is the per-expert extraction primitive: expert weight blocks are contiguous rows of.
     fn copy_slice_range(

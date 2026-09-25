@@ -568,11 +568,14 @@ fn upload_packed_rows(
     if bytes.is_empty() {
         return Ok(());
     }
-    let staging = dev.from_cpu_bytes(bytes, &Shape::new(vec![bytes.len()]), DType::F32)?;
-    // `copy_slice_range` counts elements; for a byte buffer of F32-typed storage
-    // one element is one byte of the packed payload, so the byte offset and
-    // length pass through unchanged.
-    dev.copy_slice_range(dst, byte_offset, staging.as_ref(), 0, bytes.len())
+    let staging = dev.from_cpu_bytes(
+        bytes,
+        &Shape::new(vec![bytes.len()]),
+        DType { arith: grim_tensor::ArithType::U8, storage: grim_tensor::Storage::Native },
+    )?;
+    // Byte-counted: `copy_slice_range` would derive a 4-byte element width from
+    // the storage dtype and copy 4x the payload, overrunning the page.
+    dev.copy_bytes_into(dst, byte_offset, staging.as_ref(), 0, bytes.len())
 }
 
 pub fn fused_or_scalar_attention_paged_quant(
@@ -613,13 +616,16 @@ pub fn fused_or_scalar_attention_paged_quant(
         .unwrap_or(0);
     if have < needed {
         let new_cap = (needed * 2).max(needed + 64);
+        // U8-typed: the page holds raw packed bytes, and byte-offset arithmetic
+        // in `copy_slice_range` is only correct when one element is one byte.
         let shape = Shape::new(vec![new_cap]);
-        let k_new_buf = dev.alloc_storage(&shape, DType::F32)?;
-        let v_new_buf = dev.alloc_storage(&shape, DType::F32)?;
+        let byte_dt = DType { arith: grim_tensor::ArithType::U8, storage: grim_tensor::Storage::Native };
+        let k_new_buf = dev.alloc_storage(&shape, byte_dt.clone())?;
+        let v_new_buf = dev.alloc_storage(&shape, byte_dt)?;
         let k_prev = cache.k_pages.take();
         let v_prev = cache.v_pages.take();
         if let Some(old) = k_prev.as_ref() {
-            dev.copy_slice_range(
+            dev.copy_bytes_into(
                 k_new_buf.as_ref(),
                 0,
                 old.as_ref(),
@@ -628,7 +634,7 @@ pub fn fused_or_scalar_attention_paged_quant(
             )?;
         }
         if let Some(old) = v_prev.as_ref() {
-            dev.copy_slice_range(
+            dev.copy_bytes_into(
                 v_new_buf.as_ref(),
                 0,
                 old.as_ref(),
