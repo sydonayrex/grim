@@ -276,3 +276,152 @@ fn int8_quant_paged_attention_matches_f32_reference() {
             .fold(0.0f64, f64::max)
     );
 }
+
+/// Host-side E4M3 encoder matching the device `dequant_kv_element(quant_format = 2)`
+/// bit layout: sign(1) | exp(4) | mant(3), with a per-tensor `scale` applied on
+/// decode.
+///
+/// Deliberately mirrors the kernel rather than using a library encoder, so the
+/// parity test measures the kernel's own round trip. `exp == 15 && mant == 7` is
+/// the kernel's zero/NaN special case; values are clamped so the encoder cannot
+/// produce it for finite inputs.
+fn quantize_e4m3(src: &[f32]) -> (Vec<u8>, f32) {
+    // Per-tensor scale so max|src| lands just inside the representable range.
+    // The kernel's largest normal E4M3 value is (1 + 7/8) * 2^7 = 240.
+    let amax = src.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    let scale = if amax > 0.0 { amax / 240.0 } else { 1.0 };
+    let mut out = Vec::with_capacity(src.len());
+    for &x in src {
+        let v = (x / scale).clamp(-240.0, 240.0);
+        let neg = v < 0.0;
+        let a = v.abs();
+        let (exp, mant) = if a < 0.015625 {
+            // Subnormal region: exponent field 0, linear mantissa.
+            (0u8, ((a / (0.015625 / 8.0)).round() as u8).min(7))
+        } else {
+            let e = a.log2().floor() as i32;
+            let e = e.clamp(-6, 7) as u8;
+            let m = ((a / 2f32.powi(e as i32) - 1.0) * 8.0).round() as u8;
+            (e + 7, m.min(7))
+        };
+        let byte = ((neg as u8) << 7) | (exp << 3) | mant;
+        out.push(byte);
+    }
+    (out, scale)
+}
+
+/// FP8 E4M3 quantized paged attention must track the f32 reference.
+///
+/// FP8 is the intended default for RDNA4 (`gfx1200`/`gfx1201` are classified as
+/// FP8-capable in `capability_profiler`), where it matches int8's 1 byte/element
+/// but keeps floating-point dynamic range — which matters for K, whose
+/// per-channel outliers are exactly what flattens under a per-tensor int8 scale.
+#[test]
+#[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
+fn fp8_e4m3_quant_paged_attention_matches_f32_reference() {
+    let Some(dev) = gpu_device() else { return };
+
+    let q_shape = Shape::new(vec![BATCH as usize, NUM_HEADS as usize, HEAD_DIM as usize]);
+
+    let q_cpu: Vec<f32> = (0..(BATCH * NUM_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.1).sin())
+        .collect();
+    let k_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.15).cos())
+        .collect();
+    let v_cpu: Vec<f32> = (0..(MAX_BLOCKS * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM) as usize)
+        .map(|x| ((x as f32) * 0.2).sin())
+        .collect();
+
+    // Same page flattening as the int8 test, via each block's physical id.
+    let entries = [
+        BlockTableEntry { block_id: 0, page_size: 4 },
+        BlockTableEntry { block_id: 1, page_size: 4 },
+    ];
+    let mut k_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
+    let mut v_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
+    for b in 0..MAX_BLOCKS as usize {
+        let entry = entries[b];
+        for t in 0..entry.page_size as usize {
+            let j = b * PAGE_SIZE as usize + t;
+            if j >= KV_SEQ_LEN as usize {
+                break;
+            }
+            let physical_token = entry.block_id as usize * PAGE_SIZE as usize + t;
+            let n = NUM_KV_HEADS as usize * HEAD_DIM as usize;
+            let src = physical_token * n;
+            let dst = j * n;
+            k_flat[dst..dst + n].copy_from_slice(&k_cpu[src..src + n]);
+            v_flat[dst..dst + n].copy_from_slice(&v_cpu[src..src + n]);
+        }
+    }
+
+    let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
+    let table = block_table(&dev);
+    let mut out = dev.zeros(&q_shape, DType::F32).unwrap();
+
+    let (k_bytes, k_scale) = quantize_e4m3(&k_cpu);
+    let (v_bytes, v_scale) = quantize_e4m3(&v_cpu);
+    // Raw byte upload: the kernel indexes the page pointer bytewise.
+    let byte_shape = Shape::new(vec![k_bytes.len()]);
+    let kq = dev.from_cpu_bytes(&k_bytes, &byte_shape, DType::F32).unwrap();
+    let vq = dev.from_cpu_bytes(&v_bytes, &byte_shape, DType::F32).unwrap();
+
+    launch_paged_attention_quant(
+        &dev,
+        q_storage.as_ref(),
+        table.as_ref(),
+        kq.as_ref(),
+        vq.as_ref(),
+        out.as_mut(),
+        BATCH,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        MAX_BLOCKS,
+        PAGE_SIZE,
+        KV_SEQ_LEN,
+        CACHE_OFFSET,
+        0i32,
+        KvCacheQuantFormat::Fp8E4M3,
+        k_scale,
+        0.0,
+        v_scale,
+        0.0,
+    )
+    .expect("fp8 e4m3 quant paged attention");
+    let got = out.to_cpu_vec_f32().unwrap();
+
+    let want = reference_attention(
+        &q_cpu,
+        &k_flat,
+        &v_flat,
+        NUM_HEADS as usize,
+        NUM_KV_HEADS as usize,
+        HEAD_DIM as usize,
+        KV_SEQ_LEN as usize,
+    );
+
+    // 3 mantissa bits is coarser than int8's 7, so the gate is looser than the
+    // int8 case. It still catches O(1) breakage: bad page indexing, a misapplied
+    // scale, or a transposed head map.
+    let tol = 0.25;
+    for h in 0..NUM_HEADS as usize {
+        for d in 0..HEAD_DIM as usize {
+            let i = h * HEAD_DIM as usize + d;
+            let err = (got[i] as f64 - want[i]).abs();
+            assert!(
+                err < tol,
+                "fp8 e4m3 paged path disagrees at head {h} dim {d}: \
+                 got {} want {} (err {err})",
+                got[i],
+                want[i]
+            );
+        }
+    }
+    eprintln!(
+        "[quant-paged] fp8 e4m3 KV matches f32 reference within {tol} \
+         (max err {:.4})",
+        got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0f64, f64::max)
+    );
+}
