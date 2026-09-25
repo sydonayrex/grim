@@ -47,6 +47,7 @@ Perf optimizations lfm2.rs uses **beyond** GDL (the actual "1-to-many" payload f
 8. **Charon grouped MoE dispatch**: `charon_cache: CharonCache`, lazy `moe_experts_cache: OnceLock`, `forward_moe_ffn` (`:2174`); one grouped kernel instead of per-expert launches.
 9. **Unified decode-graph gate**: `decode_graph_active()` (`lib.rs:22-30`) — the RoPE-seed, attention, and block gates agree; ShortConv gate deliberately separate (opt-in; default-on regressed gfx1201 greedy decode 2026-09-16).
 10. **Fail-soft discipline**: device-path failure → eager fallback with `eprintln!` (e.g. `decode_attention_device` P0-2 guard); `Unimplemented` = "backend lacks kernel, host fallback OK"; any other error propagates.
+11. **Promoted gfx1200 residual/GateUp fusion**: `grim_dot4_add_rms_norm_gate_up_silu_q80_gemv` now coalesces residual-row stores across all 32 lanes. The path is automatic only for `gfx1200`; `gfx1201` and other targets retain the split path. `GRIM_FUSED_RESIDUAL_GATEUP=0` is the explicit rollback switch. GPU-1 warm raw measurements are 354–357 tok/s versus 328–329 tok/s for the split default.
 
 ### 1.2 Audit findings: all transformer model files vs the gold standard
 
@@ -198,6 +199,30 @@ Targets: all dense FFNs where gate+up are Q80 (check `is_q80` on both; build `Fu
 `RocmDevice::build_fused_gate_up_q80`); skip MoE experts (Charon owns those).
 How: add `w_gate_up_q80_fused` field per block; build at load (log + fall back on failure, never error);
 decode calls the single-dot4 path; prefill keeps the two-GEMV reference for parity.
+
+**P1.3 promotion update (GPU-1 / gfx1200):** The LFM2 Q8_0 decode path is now promoted for
+`gfx1200` after a clean-process review. The promoted kernel is
+`grim_dot4_add_rms_norm_gate_up_silu_q80_gemv`; its residual store is distributed
+across 32 lanes. The default split path remains available through
+`GRIM_FUSED_RESIDUAL_GATEUP=0`. `gfx1201` and other targets must not inherit
+this promotion without their own measurement.
+
+Clean-process evidence:
+
+- `cargo clean` removed 5.9 GiB and HSACO/JIT caches were cleared.
+- First cold-cache fused process: `347 tok/s`.
+- Warm fresh-process fused runs: `356, 355, 352 tok/s`.
+- Warm default runs: `328, 329, 328 tok/s`.
+- Promoted default warm runs: `357, 354, 357 tok/s`.
+- Kill-switch run: `324 tok/s`.
+- Fused graph suite: `11 passed`; ROCm backend units: `468 passed`.
+- Deterministic greedy and stochastic model output matched after excluding the
+  hardware calibration diagnostic line.
+- `rocprofv3` launch guidance: `193` graph launches for both paths and HIP
+  kernel launches reduced from `1,180` to `1,132`.
+
+**P1.3 remaining scope:** Complete the same measured rollout for the remaining
+Class-B dense FFNs; do not infer promotion from the LFM2/gfx1200 result.
 
 **P1.4 Charon D2D MoE standardization** (pattern: `qwen38_flash_next.rs:212-277` / `kimi_k3.rs:463-532`).
 Targets (bespoke MoE without Charon): `bailingmoe3.rs`, `gpt_oss.rs`, `qwen3moe.rs`, `qwen35moe.rs`,
@@ -369,7 +394,9 @@ MoE extras: `moe_all_models_parity_gpu.rs`, `moe_special_cases_gpu.rs` must pass
 - [x] P0: `gdl_eligibility` + classification test; fetch-budget lint extended; perf-gate assertions on.
 - [ ] P1.1: arenas for the 16 `arena=0` files; per-file parity + budget-drop proven (standardizing on `AttentionDispatcher`).
 - [ ] P1.2: RoPE-dev-base for all bespoke decode paths; `GRIM_ROPE_DEV_BASE=0` fallback proven.
-- [ ] P1.3: fused GateUp where Q80; 4-combo quant matrix green.
+- [x] P1.3a: LFM2 Q8_0 gfx1200 residual/GateUp fusion promoted; coalesced residual stores, 11-test graph parity, 468-test ROCm unit suite, clean-process 350+ tok/s gate, and `GRIM_FUSED_RESIDUAL_GATEUP=0` rollback switch verified.
+- [ ] P1.3b: extend fused GateUp to remaining Class-B dense Q80 models; 4-combo quant matrix and per-file budget/parity evidence green.
+- [x] Promotion review: default is limited to `gfx1200`; cold-cache startup is recorded separately from warm tok/s; deterministic and stochastic output parity passed after excluding the calibration diagnostic.
 - [ ] P1.4: Charon for the 6 host-MoE files; `moe_*_parity_gpu` green.
 - [ ] P1.5: graph capture for block.rs-first cohort; replay bit-identical.
 - [ ] P2.1: Solar KDA + DeltaNet GDL opt-in + oracle test + sidecar; default-off; legacy path bit-identical (DeltaNet config/gate hooks done; Solar wiring pending).
