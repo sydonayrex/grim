@@ -90,6 +90,19 @@ pub struct Qwen35LayerCache {
     pub k_device: Option<Box<dyn grim_tensor::BackendStorage>>,
     #[doc(hidden)]
     pub v_device: Option<Box<dyn grim_tensor::BackendStorage>>,
+    /// Quantized paged KV cache, used when `GRIM_KV_QUANT` selects a packed
+    /// format. `k_pages`/`v_pages` hold packed sub-blocks; `block_table` maps
+    /// logical page index -> physical page id for the paged attention kernel.
+    ///
+    /// These are mutually exclusive with `k_device`/`v_device`: the dense f32
+    /// arena and the paged packed arena are different representations, and the
+    /// decode path picks one per layer via `kv_quant_format()`.
+    #[doc(hidden)]
+    pub k_pages: Option<Box<dyn grim_tensor::BackendStorage>>,
+    #[doc(hidden)]
+    pub v_pages: Option<Box<dyn grim_tensor::BackendStorage>>,
+    #[doc(hidden)]
+    pub block_table: Option<Box<dyn grim_tensor::BackendStorage>>,
 }
 
 // `BackendStorage` doesn't implement Debug — hand-roll one that prints the
@@ -104,6 +117,7 @@ impl std::fmt::Debug for Qwen35LayerCache {
             .field("current_pos", &self.current_pos)
             .field("k_device", &self.k_device.is_some())
             .field("v_device", &self.v_device.is_some())
+            .field("k_pages", &self.k_pages.is_some())
             .finish()
     }
 }
@@ -120,6 +134,9 @@ impl Clone for Qwen35LayerCache {
             current_pos: self.current_pos,
             k_device: None,
             v_device: None,
+            k_pages: None,
+            v_pages: None,
+            block_table: None,
         }
     }
 }
@@ -139,6 +156,9 @@ impl Qwen35LayerCache {
             current_pos: 0,
             k_device: None,
             v_device: None,
+            k_pages: None,
+            v_pages: None,
+            block_table: None,
         }
     }
 }
@@ -596,6 +616,25 @@ impl Qwen35Block {
             // Per-step Q crosses to host for the arena attention entry
             // point; K/V history never leaves the device.
             let q_all = q_rope.to_vec_f32()?;
+
+            // Quantized paged KV: when GRIM_KV_QUANT selects a packed format,
+            // the f32 rows produced above are quantized on the host, uploaded
+            // into paged buffers, and read back through the quant paged kernel.
+            // The dense f32 arena below is the default and is left untouched.
+            if let Some(fmt) = kv_quant_format() {
+                return crate::shared_attention::fused_or_scalar_attention_paged_quant(
+                    &q_all,
+                    k_dev_t.storage().as_ref(),
+                    v_dev_t.storage().as_ref(),
+                    cache,
+                    fmt,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    seq_len,
+                    &device,
+                );
+            }
 
             // Append to the device arena via copy_slice_range (device-side).
             // K/V history stays on the GPU — never round-trips to host.
@@ -1057,6 +1096,99 @@ impl CausalLm for Qwen35 {
 
 // Helpers
 
+/// Quantize a host K/V row block into the packed layout the paged kernel reads.
+///
+/// Returns `(packed_bytes, per_tensor_scale)`. The scale is meaningful only for
+/// formats that do not carry their own (int8, FP8); Nutcracker and NVFP4 embed
+/// a per-16 block scale in the buffer and ignore it.
+pub(crate) fn quantize_kv_block(
+    data: &[f32],
+    fmt: grim_tensor::PagedKvQuantFormat,
+) -> grim_core::error::Result<(Vec<u8>, f32)> {
+    use grim_tensor::PagedKvQuantFormat as F;
+    match fmt {
+        F::Int8 => {
+            // Symmetric per-tensor int8: scale = max|x| / 127.
+            let amax = data.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let bytes: Vec<u8> = data
+                .iter()
+                .map(|&x| (x / scale).round().clamp(-127.0, 127.0) as i8 as u8)
+                .collect();
+            Ok((bytes, scale))
+        }
+        F::Fp8E4M3 => {
+            let bytes = grim_quant::quant_fp8(data).map_err(|e| {
+                grim_core::error::Error::Backend(format!("quant_fp8 failed: {e}"))
+            })?;
+            Ok((bytes, 1.0))
+        }
+        F::NutFp4 => {
+            let bytes = grim_quant::quant_nutcracker(data).map_err(|e| {
+                grim_core::error::Error::Backend(format!("quant_nutcracker failed: {e}"))
+            })?;
+            Ok((bytes, 1.0))
+        }
+        other => Err(grim_core::error::Error::Backend(format!(
+            "kv_quant_format: {other:?} has no host packer wired for Qwen35 KV"
+        ))),
+    }
+}
+
+/// Tokens per Nutcracker/NVFP4 sub-block, and its byte width (1 scale + 8 codes).
+/// Used to document the packed layout; sizing itself goes through
+/// `packed_kv_bytes` so the two cannot drift.
+#[allow(dead_code)]
+const NUT_SUB_BLOCK: usize = 16;
+#[allow(dead_code)]
+const NUT_SUB_BLOCK_BYTES: usize = 9;
+
+/// KV quantization format selected by `GRIM_KV_QUANT`.
+///
+/// Only formats the paged attention kernel can actually decode are offered, and
+/// the value is the `KvCacheQuantFormat` discriminant so it maps 1:1 onto
+/// `dequant_kv_element`. `None` keeps the dense f32 arena.
+///
+/// `GRIM_KV_QUANT=f16` is deliberately rejected here: the f16 arena is a
+/// different representation with its own reader, and the f32<->f16 cast is
+/// currently unverified, so silently honoring it would reintroduce the exact
+/// reinterpretation bug the paged path is designed to avoid.
+fn kv_quant_format() -> Option<grim_tensor::PagedKvQuantFormat> {
+    match std::env::var("GRIM_KV_QUANT").as_deref() {
+        Ok("int8" | "q8_0" | "q8") => Some(grim_tensor::PagedKvQuantFormat::Int8),
+        Ok("fp8" | "fp8_e4m3") => Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3),
+        Ok("nutcracker" | "nutfp4" | "nut_fp4") => Some(grim_tensor::PagedKvQuantFormat::NutFp4),
+        Ok(other) => {
+            // Fail loud rather than silently falling back to f32: a user who
+            // asked for quantized KV and got a 32 GB arena would otherwise see
+            // an OOM with no indication the setting was ignored.
+            eprintln!(
+                "[qwen35] GRIM_KV_QUANT={other:?} is not a supported paged KV format \
+                 (int8 | fp8 | nutcracker); using the dense f32 arena"
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Bytes needed to hold `n_values` quantized KV entries.
+pub(crate) fn packed_kv_bytes(n_values: usize, fmt: grim_tensor::PagedKvQuantFormat) -> usize {
+    use grim_tensor::PagedKvQuantFormat as F;
+    match fmt {
+        F::Int8 => n_values,
+        F::Fp8E4M3 | F::Fp8E5M2 => n_values,
+        // Sub-blocked formats: the scale lives inside the group, so a partial
+        // group still costs a full group's scale byte. `div_ceil` on the group
+        // count, not on the total, is what keeps this correct for a KV length
+        // that is not a multiple of the group size.
+        F::NutFp4 | F::NvFp4 => n_values.div_ceil(NUT_SUB_BLOCK) * NUT_SUB_BLOCK_BYTES,
+        F::Fp4E2M1 | F::Int4 => n_values.div_ceil(2),
+        F::MxFp4 => n_values.div_ceil(32) * 17,
+        F::MxFp8 => n_values.div_ceil(32) * 33,
+    }
+}
+
 /// Fraction of a device's free VRAM the loader is allowed to plan against.
 ///
 /// The remainder absorbs activations, the KV cache, the decode graph's
@@ -1392,6 +1524,73 @@ mod tests {
         let (_targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
         assert!(remaining.iter().all(|&r| r <= 500), "budgets must not wrap");
         let _ = unplaced;
+    }
+
+    /// `GRIM_KV_QUANT` must select the packed formats the paged kernel can
+    /// actually decode, and must NOT silently fall back to the dense f32 arena
+    /// for a value it does not recognize — a user who asked for quantized KV and
+    /// got a 32 GB arena would otherwise see an unexplained OOM.
+    #[test]
+    fn kv_quant_format_selects_only_supported_packed_formats() {
+        for (val, expect) in [
+            ("int8", Some(grim_tensor::PagedKvQuantFormat::Int8)),
+            ("fp8", Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3)),
+            ("nutcracker", Some(grim_tensor::PagedKvQuantFormat::NutFp4)),
+        ] {
+            unsafe { std::env::set_var("GRIM_KV_QUANT", val) };
+            assert_eq!(kv_quant_format(), expect, "GRIM_KV_QUANT={val}");
+            unsafe { std::env::remove_var("GRIM_KV_QUANT") };
+        }
+        // f16 is deliberately rejected: the dense arena's f16 reader is a
+        // different representation, and the f32<->f16 cast is unverified.
+        unsafe { std::env::set_var("GRIM_KV_QUANT", "f16") };
+        assert_eq!(kv_quant_format(), None, "f16 must not select a paged format");
+        unsafe { std::env::set_var("GRIM_KV_QUANT", "bogus") };
+        assert_eq!(kv_quant_format(), None, "unknown value must not select a format");
+        unsafe { std::env::remove_var("GRIM_KV_QUANT") };
+    }
+
+    /// Packed sizing must match the real host encoders byte for byte, or the
+    /// page append would write at the wrong offset and silently corrupt history.
+    #[test]
+    fn packed_kv_bytes_matches_host_encoder_output() {
+        use grim_tensor::PagedKvQuantFormat as F;
+        let n = 256usize;
+
+        // int8 and FP8 are 1 byte per value.
+        assert_eq!(super::packed_kv_bytes(n, F::Int8), n);
+        assert_eq!(super::packed_kv_bytes(n, F::Fp8E4M3), n);
+
+        // Nutcracker is 9 bytes per 16 values, rounding the GROUP count up so a
+        // length that is not a multiple of 16 still reserves its trailing scale.
+        assert_eq!(super::packed_kv_bytes(n, F::NutFp4), (n + 15) / 16 * 9);
+        // A non-multiple must round up, never truncate: 250 values = 16 groups.
+        assert_eq!(super::packed_kv_bytes(250, F::NutFp4), 16 * 9);
+        let data: Vec<f32> = (0..n).map(|i| i as f32 * 0.01 - 1.0).collect();
+        let packed = grim_quant::quant_nutcracker(&data).expect("quant_nutcracker");
+        assert_eq!(
+            packed.len(),
+            super::packed_kv_bytes(n, F::NutFp4),
+            "packed_kv_bytes must agree with the production Nutcracker encoder"
+        );
+    }
+
+    /// A host round trip through the real packer must decode back to the input
+    /// within the format's expected error, proving the packer and the sizing
+    /// agree about layout (9 bytes, 1 scale + 8 codes).
+    #[test]
+    fn nutcracker_packer_round_trips_through_host_dequant() {
+        let data: Vec<f32> = (0..64).map(|i| (i as f32) * 0.05 - 1.5).collect();
+        let packed = grim_quant::quant_nutcracker(&data).expect("quant_nutcracker");
+        assert_eq!(packed.len(), 64 / 16 * 9);
+        let back = grim_quant::dequant_nutcracker(&packed, 64).expect("dequant_nutcracker");
+        assert_eq!(back.len(), 64);
+        for (a, b) in data.iter().zip(&back) {
+            assert!(
+                (a - b).abs() < 0.2,
+                "Nutcracker round trip drifted too far: {a} -> {b}"
+            );
+        }
     }
 
     #[allow(clippy::field_reassign_with_default)]

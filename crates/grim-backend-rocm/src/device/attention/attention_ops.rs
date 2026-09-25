@@ -831,6 +831,57 @@ impl AttentionOps for RocmDevice {
     }
 
     /// SCYTHE-2 WI-5: Paged attention override. [see: `crate::launch_paged_attention`, `grim_qkv_attention_paged`]
+    /// Paged attention over a quantized KV cache.
+    ///
+    /// Delegates to `RocmDevice::qkv_attention_paged_quant`, which routes to the
+    /// `grim_qkv_attention_paged_quant` kernel: its inlined `dequant_kv_element`
+    /// is what makes a packed page readable, so the unquantized
+    /// `qkv_attention_paged` kernel must not be used here.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_paged_quant(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+        quant_format: grim_tensor::PagedKvQuantFormat,
+        k_scale: f32,
+        v_scale: f32,
+    ) -> grim_tensor::error::Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn grim_tensor::backend::ComputeHandle>,
+    )> {
+        // Map the neutral enum onto the ROCm-side one; the discriminants are
+        // identical, so this is a cast rather than a translation.
+        let fmt: crate::kernels::qkv_attention::KvCacheQuantFormat = quant_format.into();
+        self.qkv_attention_paged_quant(
+            q,
+            block_tables,
+            k_pages,
+            v_pages,
+            out_shape,
+            num_kv_heads,
+            max_blocks,
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            fmt,
+            k_scale,
+            v_scale,
+        )
+        .map_err(|e| match e {
+            crate::Error::Shape(m) => grim_tensor::error::Error::Shape(m),
+            crate::Error::Backend(m) => grim_tensor::error::Error::Backend(m),
+            other => grim_tensor::error::Error::Backend(other.to_string()),
+        })
+    }
+
     fn qkv_attention_paged(
         &self,
         q: &dyn BackendStorage,
