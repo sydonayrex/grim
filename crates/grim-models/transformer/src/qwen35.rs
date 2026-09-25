@@ -350,9 +350,14 @@ impl Qwen35Block {
                 std::env::var("GRIM_Q4K_FUSED_GATEUP").as_deref(),
                 Ok("1" | "true" | "on" | "yes")
             )
-            && matches!(ffn_gate.weight().dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K))
-            && matches!(ffn_up.weight().dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K))
-        {
+            && matches!(
+                ffn_gate.weight().dtype().storage,
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+            )
+            && matches!(
+                ffn_up.weight().dtype().storage,
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+            ) {
             let ordinal = match &device {
                 Device::Rocm(ordinal) => *ordinal,
                 _ => 0,
@@ -826,7 +831,10 @@ impl Qwen35Block {
         // 4. SwiGLU FFN
         let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
             Some(fused) if seq_len == 1 => self.fused_gate_up_q4k_decode(&h_normed, fused)?,
-            _ => (self.ffn_gate.forward(&h_normed)?, self.ffn_up.forward(&h_normed)?),
+            _ => (
+                self.ffn_gate.forward(&h_normed)?,
+                self.ffn_up.forward(&h_normed)?,
+            ),
         };
         let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&act)?;
@@ -880,18 +888,29 @@ impl Qwen35 {
             cfg.vocab_size,
             cfg.hidden_size,
         )
-        .or_else(|_| {
-            Embedding::load(
-                &ws.with_device(first_device).pp("tok_embeddings"),
-                cfg.vocab_size,
-                cfg.hidden_size,
-            )
+        .or_else(|e| {
+            fallback_on_missing(e, || {
+                Embedding::load(
+                    &ws.with_device(first_device).pp("tok_embeddings"),
+                    cfg.vocab_size,
+                    cfg.hidden_size,
+                )
+            })
         })?;
+
+        let layer_devices = plan_layer_devices(
+            ws,
+            &available_devices,
+            cfg.num_layers,
+            cfg.max_seq_len,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.full_attention_interval,
+        );
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let layer_device =
-                available_devices[i * available_devices.len() / cfg.num_layers].clone();
+            let layer_device = layer_devices[i].clone();
             if i % 10 == 0 || i + 1 == cfg.num_layers {
                 eprintln!(
                     "[grim] Loading layer {}/{} on {}...",
@@ -910,12 +929,14 @@ impl Qwen35 {
             cfg.hidden_size,
             cfg.rms_norm_eps,
         )
-        .or_else(|_| {
-            RmsNorm::load(
-                &ws.with_device(last_device.clone()).pp("norm"),
-                cfg.hidden_size,
-                cfg.rms_norm_eps,
-            )
+        .or_else(|e| {
+            fallback_on_missing(e, || {
+                RmsNorm::load(
+                    &ws.with_device(last_device.clone()).pp("norm"),
+                    cfg.hidden_size,
+                    cfg.rms_norm_eps,
+                )
+            })
         })?;
 
         let output = Linear::load_column_parallel(
@@ -925,13 +946,15 @@ impl Qwen35 {
             false,
             tp,
         )
-        .or_else(|_| {
-            Linear::load(
-                &ws.with_device(last_device).pp("output"),
-                cfg.hidden_size,
-                cfg.vocab_size,
-                false,
-            )
+        .or_else(|e| {
+            fallback_on_missing(e, || {
+                Linear::load(
+                    &ws.with_device(last_device).pp("output"),
+                    cfg.hidden_size,
+                    cfg.vocab_size,
+                    false,
+                )
+            })
         })?;
 
         Ok(Self {
@@ -1034,6 +1057,192 @@ impl CausalLm for Qwen35 {
 
 // Helpers
 
+/// Fraction of a device's free VRAM the loader is allowed to plan against.
+///
+/// The remainder absorbs activations, the KV cache, the decode graph's
+/// scratch buffers, and fragmentation. Planning to 100% of free VRAM is what
+/// pushes the allocator into HIP managed (host-backed) memory, which then
+/// thrashes under oversubscription.
+const VRAM_PLAN_FRACTION: f64 = 0.90;
+
+/// Assign each transformer block to a device by measured capacity.
+///
+/// The previous placement was index arithmetic —
+/// `devices[i * devices.len() / num_layers]` — which is a static round-robin
+/// that ignores both per-layer weight size and how much VRAM each device
+/// actually has. On a mixed pair (9070 XT + 9060 XT, 17 GB each) loading the
+/// 27B Q4_K checkpoint it drove device 0 to 99.9% of VRAM while device 1 sat
+/// near half full, which forced the managed-memory fallback and then failed
+/// the first kernel module load.
+///
+/// This reserves each device's share of the decode-graph KV arenas, then walks
+/// the layers in order giving each one to the device with the most remaining
+/// headroom, so a large early layer cannot monopolize one card. Falls back to
+/// the old round-robin whenever capacity cannot be queried (a CPU device, or a
+/// backend without `hipMemGetInfo`), keeping the old behavior as the
+/// conservative default.
+#[allow(clippy::too_many_arguments)]
+fn plan_layer_devices(
+    ws: &WeightSource<'_>,
+    devices: &[Device],
+    num_layers: usize,
+    ctx: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    interval: usize,
+) -> Vec<Device> {
+    // Single-device or unknown layout: nothing to plan.
+    if devices.len() <= 1 {
+        return vec![devices[0].clone(); num_layers];
+    }
+
+    let round_robin = |i: usize| devices[i * devices.len() / num_layers.max(1)].clone();
+
+    // Reserve the decode-graph KV arenas BEFORE handing out weight budget.
+    //
+    // The arenas are allocated at full context for every full-attention layer:
+    // `ctx * num_kv_heads * head_dim * 4 bytes` for K and again for V. For this
+    // 27B Q4_K model at a 228k context that is ~1.87 GB per attention layer
+    // across 17 such layers = ~31.8 GB, which alone exceeds the 34 GB the pair
+    // has. Planning weights against the *whole* free budget therefore drives
+    // both cards to ~99% and leaves the arenas nowhere to go, which is what
+    // pushed the run into HIP managed memory. Reserving first lets weights and
+    // KV share the budget honestly, and makes an oversized context visible as a
+    // warning rather than a silent spill.
+    let kv_bytes_per_attn_layer = |ctx: usize| -> u64 {
+        (ctx as u64)
+            .saturating_mul(kv_heads as u64)
+            .saturating_mul(head_dim as u64)
+            .saturating_mul(4) // f32
+            .saturating_mul(2) // K and V
+    };
+    let num_attn_layers = (0..num_layers).filter(|i| i % interval.max(1) == 0).count();
+    let kv_total = kv_bytes_per_attn_layer(ctx.max(1)).saturating_mul(num_attn_layers as u64);
+    if kv_total > 0 {
+        eprintln!(
+            "[qwen35] reserving KV arenas: ctx={ctx}, kv_heads={kv_heads}, \
+             head_dim={head_dim}, attn_layers={num_attn_layers} \
+             -> {:.1} GB total",
+            kv_total as f64 / 1e9
+        );
+    }
+
+    // Remaining plannable bytes per device, or None when VRAM is unknowable.
+    let kv_share = (kv_total as f64 / devices.len() as f64) as u64;
+    let per_device: Vec<Option<u64>> = devices
+        .iter()
+        .map(|d| match d {
+            Device::Rocm(ord) => {
+                let (free, total) = grim_backend_rocm::vram_info(*ord);
+                // A device reporting 0 total is not queryable; treat the whole
+                // set as unplannable rather than guessing.
+                if total == 0 {
+                    return None;
+                }
+                let budget = ((free as f64) * VRAM_PLAN_FRACTION) as u64;
+                Some(budget.saturating_sub(kv_share.min(budget)))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let all_known = per_device.iter().all(Option::is_some);
+    let Some(mut remaining): Option<Vec<u64>> =
+        all_known.then(|| per_device.into_iter().map(|v| v.unwrap_or(0)).collect())
+    else {
+        eprintln!(
+            "[qwen35] VRAM capacity unavailable; using static layer round-robin \
+             across {} devices",
+            devices.len()
+        );
+        return (0..num_layers).map(round_robin).collect();
+    };
+
+    let mut assignment = Vec::with_capacity(num_layers);
+    // Size each block from checkpoint metadata before committing it.
+    let layer_bytes: Vec<u64> = (0..num_layers)
+        .map(|i| ws.pp("blk").pp(&i.to_string()).prefix_bytes())
+        .collect();
+    let (targets, unplaced) = assign_by_headroom(&layer_bytes, &mut remaining);
+    for t in targets {
+        assignment.push(devices[t].clone());
+    }
+
+    if unplaced > 0 {
+        // Do NOT fail here: managed memory is slow but correct, and the loader
+        // already warns when it engages. Surface it loudly and continue.
+        eprintln!(
+            "[qwen35] WARNING: {unplaced}/{num_layers} layers exceed aggregate \
+             plannable VRAM across {} devices; those will fall back to HIP \
+             managed memory, which degrades throughput under oversubscription",
+            devices.len()
+        );
+    }
+    let mut per_device: Vec<(String, usize)> = Vec::new();
+    for d in &assignment {
+        let key = d.to_string();
+        match per_device.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, count)) => *count += 1,
+            None => per_device.push((key, 1)),
+        }
+    }
+    eprintln!(
+        "[qwen35] capacity-aware placement: {}",
+        per_device
+            .iter()
+            .map(|(k, c)| format!("{k}={c} layers"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assignment
+}
+
+/// Greedy first-fit-decreasing-free placement: each layer goes to the device
+/// with the most remaining headroom, and `remaining` is decremented in place.
+///
+/// Returns the chosen device index per layer plus the count of layers that did
+/// not fit anywhere (those are placed on device 0 and will fall back to managed
+/// memory). Pure function so placement can be unit-tested without a GPU.
+fn assign_by_headroom(layer_bytes: &[u64], remaining: &mut [u64]) -> (Vec<usize>, usize) {
+    let mut targets = Vec::with_capacity(layer_bytes.len());
+    let mut unplaced = 0usize;
+    for &bytes in layer_bytes {
+        let max_remaining = remaining.iter().copied().max().unwrap_or(0);
+        let target = if bytes <= max_remaining {
+            remaining
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, rem)| **rem)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        } else {
+            unplaced += 1;
+            0
+        };
+        remaining[target] = remaining[target].saturating_sub(bytes);
+        targets.push(target);
+    }
+    (targets, unplaced)
+}
+
+/// Retry a load under an alternate tensor-name prefix ONLY when the first
+/// attempt failed because the tensor is absent.
+///
+/// The loader tries several naming conventions (`output_norm` vs `norm`,
+/// `token_embd` vs `tok_embeddings`). A blanket `.or_else(|_| ...)` cannot tell
+/// "this prefix does not exist, try the next one" apart from "the tensor exists
+/// but has the wrong shape", so the second case was silently discarded and the
+/// run continued with a corrupt model. A `ShapeMismatch` here is a hard error.
+fn fallback_on_missing<T, F>(err: grim_tensor::Error, alt: F) -> grim_tensor::Result<T>
+where
+    F: FnOnce() -> grim_tensor::Result<T>,
+{
+    match err {
+        grim_tensor::Error::Backend(msg) if msg.contains("not found") => alt(),
+        other => Err(other),
+    }
+}
+
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {
     if device == &Device::Cpu {
         Ok(cpu_tensor(data, shape))
@@ -1086,6 +1295,104 @@ pub(crate) fn apply_rope_neox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing tensor is the one case where trying the alternate name prefix
+    /// is correct, so the fallback must run.
+    #[test]
+    fn fallback_on_missing_retries_when_tensor_absent() {
+        let got = fallback_on_missing(
+            grim_tensor::Error::Backend("tensor 'blk.0.norm.weight' not found in GGUF file".into()),
+            || Ok::<u8, grim_tensor::Error>(7),
+        );
+        assert_eq!(got.expect("absent tensor should retry"), 7);
+    }
+
+    /// Regression for the Qwen3.8 vocab bug: a ShapeMismatch used to be
+    /// swallowed by a blanket `.or_else(|_| ...)`, so a 248320-row
+    /// `token_embd.weight` was accepted under a bogus 32000 config and the run
+    /// continued against a corrupt model. It must surface instead.
+    #[test]
+    fn fallback_on_missing_propagates_shape_mismatch() {
+        let err = fallback_on_missing(
+            grim_tensor::Error::ShapeMismatch {
+                expected: vec![32000, 5120],
+                got: vec![248320, 5120],
+            },
+            || -> grim_tensor::Result<u8> { panic!("fallback must not run for a shape mismatch") },
+        );
+        match err {
+            Err(grim_tensor::Error::ShapeMismatch { expected, got }) => {
+                assert_eq!(expected, vec![32000, 5120]);
+                assert_eq!(got, vec![248320, 5120]);
+            }
+            other => panic!("expected ShapeMismatch to propagate, got {other:?}"),
+        }
+    }
+
+    /// A backend failure that is not "not found" is also a real error and must
+    /// not trigger a silent retry under a different prefix.
+    #[test]
+    fn fallback_on_missing_propagates_other_backend_errors() {
+        let err = fallback_on_missing(
+            grim_tensor::Error::Backend("corrupt q4_k block".into()),
+            || -> grim_tensor::Result<u8> { panic!("must not retry") },
+        );
+        assert!(matches!(err, Err(grim_tensor::Error::Backend(_))));
+    }
+
+    /// Even layers of equal size must land on both devices rather than piling
+    /// onto one. The old static round-robin split 40/25 for 65 layers over two
+    /// devices, which combined with a 248320-row vocab drove device 0 to 99.9%
+    /// of VRAM.
+    #[test]
+    fn placement_spreads_equal_layers_across_devices() {
+        let layers = vec![100u64; 8];
+        let mut remaining = vec![1000u64, 1000];
+        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        assert_eq!(unplaced, 0);
+        let on0 = targets.iter().filter(|&&t| t == 0).count();
+        let on1 = targets.iter().filter(|&&t| t == 1).count();
+        assert_eq!(on0, 4, "equal layers should split evenly");
+        assert_eq!(on1, 4);
+    }
+
+    /// A layer too large for the roomiest device is reported as unplaced and
+    /// sent to device 0, so the loader can warn instead of silently thrashing.
+    #[test]
+    fn placement_flags_layers_that_exceed_all_headroom() {
+        let layers = vec![100u64, 5000u64, 100u64];
+        let mut remaining = vec![300u64, 300];
+        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        assert_eq!(unplaced, 1, "the 5000-byte layer fits nowhere");
+        assert_eq!(targets[1], 0, "unplaced layers fall back to device 0");
+    }
+
+    /// Unequal devices: the bigger card should absorb proportionally more work
+    /// instead of the 50/50 static split.
+    #[test]
+    fn placement_favors_the_device_with_more_headroom() {
+        let layers = vec![100u64; 6];
+        // Device 1 has 3x the room; it should take strictly more layers.
+        let mut remaining = vec![500u64, 1500];
+        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        assert_eq!(unplaced, 0);
+        let on0 = targets.iter().filter(|&&t| t == 0).count();
+        let on1 = targets.iter().filter(|&&t| t == 1).count();
+        assert!(
+            on1 > on0,
+            "expected the roomier device to take more, got {on1} vs {on0}"
+        );
+    }
+
+    /// No device may be driven negative; remaining headroom saturates at zero.
+    #[test]
+    fn placement_never_underflows_budget() {
+        let layers = vec![400u64; 4];
+        let mut remaining = vec![500u64, 10];
+        let (_targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        assert!(remaining.iter().all(|&r| r <= 500), "budgets must not wrap");
+        let _ = unplaced;
+    }
 
     #[allow(clippy::field_reassign_with_default)]
     #[test]

@@ -67,7 +67,7 @@ impl From<&RocmDevice> for HardwareSpec {
         // Constructing a fresh CapabilityProfiler::new() probes ALL GPUs and leaves the calling thread's HIP context parked.
         let cap = crate::device::capability_profiler::measure_capability(ordinal);
         let (bandwidth, peak_flops) = (
-            cap.hbm_bandwidth_gbps as f64,
+            cap.dram_bandwidth_gbps as f64,
             (cap.tflops_fp16 as f64) * 1e12,
         );
 

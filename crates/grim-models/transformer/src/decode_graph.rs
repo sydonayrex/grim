@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv, ConvRingSeed,
-    DecodeGraph, DecodeGraphBuffers, EagerKvSource,
+    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology,
+    decode_graph_enabled, launch_attention, launch_qkv_gemv,
 };
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
@@ -16,8 +16,8 @@ use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 use crate::block::LlamaBlock;
 use crate::chameleon::{Chameleon, ChameleonBlock};
 use crate::deepseek2::DeepSeek2;
-use crate::deepseek32::DeepSeek32;
 use crate::deepseek4::DeepSeek4;
+use crate::deepseek32::DeepSeek32;
 use crate::gemma2::{Gemma2, Gemma2Block};
 use crate::glm4_moe_lite::Glm4MoeLite;
 use crate::granite_moe_hybrid::GraniteMoeHybrid;
@@ -1457,7 +1457,12 @@ impl DecodeGraphModel for Qwen35 {
                 }
             };
 
-            let kv_stride = k_rocm.shape().dims().last().copied().unwrap_or(0);
+            // The eager Qwen35 KV arena is 3-D `[rows, num_kv_heads, head_dim]`,
+            // while the decode-graph arena it seeds is 2-D `[rows, nkv*hd]`. Taking
+            // `dims().last()` reports `head_dim` (256) rather than the row stride
+            // (1024), which aborted graph capture with an arena-width mismatch. The
+            // row stride is the product of every dim after the row dim.
+            let kv_stride: usize = k_rocm.shape().dims().iter().skip(1).product();
             if kv_stride == 0 {
                 if valid_rows > 0 {
                     return Err(grim_core::error::Error::Session(
@@ -2291,7 +2296,6 @@ impl_llama_wrapper_graph!(
     pangu_embed::PanguEmbed,
     phi2::Phi2,
     talkie::Talkie,
-    nemotron_hmoe::NemotronHMoe,
     rnd1::Rnd1,
     refact::Refact,
     qwen3moe::Qwen3Moe,
@@ -2391,7 +2395,6 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         pangu_embed::PanguEmbed,
         phi2::Phi2,
         talkie::Talkie,
-        nemotron_hmoe::NemotronHMoe,
         rnd1::Rnd1,
         refact::Refact,
         qwen3moe::Qwen3Moe,

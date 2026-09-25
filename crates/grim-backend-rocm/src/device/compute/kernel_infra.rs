@@ -1007,10 +1007,22 @@ impl RocmDevice {
             let mut module: *mut c_void = std::ptr::null_mut();
             let load_res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
             if load_res != hipSuccess {
+                // Report the real HIP context, not just our cached ordinal: a
+                // mismatch here means the thread was not actually on `self.ordinal`,
+                // which is how a `gfx1201` object gets loaded on `gfx1200` (status 209).
+                let mut ctx_dev: i32 = -1;
+                unsafe {
+                    let _ = crate::device::handles::hipGetDevice(&mut ctx_dev);
+                }
+                let ctx_arch = crate::device::util::detect_gpu_arch(ctx_dev);
+                let hsa_override = std::env::var("HSA_OVERRIDE_GFX_VERSION").ok();
                 return Err(Error::Backend(format!(
-                    "hipModuleLoad failed: {load_res} (entry={entry}, path={}, gpu_target={})",
+                    "hipModuleLoad failed: {load_res} (entry={entry}, path={}, \
+                     gpu_target={}, self.ordinal={}, ctx_device={ctx_dev}, \
+                     ctx_arch={ctx_arch}, hsa_override={hsa_override:?})",
                     path.display(),
-                    self.gpu_target
+                    self.gpu_target,
+                    self.ordinal
                 )));
             }
             let mut func: *mut c_void = std::ptr::null_mut();

@@ -141,10 +141,11 @@ pub use crate::device::helpers::{
 pub use crate::device::probe::{probe_host_gpu, probe_system_rocm, probe_xnack};
 
 pub use crate::device::util::{
-    ROCM_COMPUTE_BLOCK, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size, dtype_f32,
-    gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch, prefill_in_flight,
+    ROCM_COMPUTE_BLOCK, DeviceGuard, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size,
+    dtype_f32, gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch, prefill_in_flight,
     raw_set_device, set_prefill_in_flight, warp_rows_launch,
 };
+pub use crate::peer_access::enumerate_devices;
 
 // ROCmDevice itself: large struct + every impl lives in `device::roc_device`.
 // Re-exported here so existing callers can keep using `RocmDevice::new(...)` etc.

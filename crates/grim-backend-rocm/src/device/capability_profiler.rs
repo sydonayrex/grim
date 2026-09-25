@@ -166,7 +166,7 @@ pub(crate) fn measure_capability(ordinal: usize) -> GpuCapability {
 
     // Prefer a measured result when the optional calibration backend is available;
     // the static row is deliberately retained for GPU-less/ROCm installations and calibration failures.
-    let (tflops_fp16, tflops_fp8, hbm_gbps) = calibrate_capability(ordinal, &host_cap.gcn)
+    let (tflops_fp16, tflops_fp8, dram_gbps) = calibrate_capability(ordinal, &host_cap.gcn)
         .unwrap_or_else(|| arch_tflops_table(&host_cap.gcn));
 
     // Throttle percentage via HIP attribute.
@@ -181,7 +181,7 @@ pub(crate) fn measure_capability(ordinal: usize) -> GpuCapability {
     GpuCapability {
         tflops_fp16: effective_tflops,
         tflops_fp8,
-        hbm_bandwidth_gbps: hbm_gbps,
+        dram_bandwidth_gbps: dram_gbps,
         vram_free_bytes,
         throttle_pct,
         ordinal,
@@ -478,13 +478,13 @@ fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32
         return None;
     }
 
-    let hbm_gbps = if copy_ms.is_empty() {
+    let dram_gbps = if copy_ms.is_empty() {
         return None;
     } else {
         let copy_median = median(&copy_ms[1..])?;
         2.0 * COPY_BYTES as f32 / (copy_median * 1e-3) / 1e9
     };
-    if !(hbm_gbps > 0.0 && hbm_gbps < 100_000.0) {
+    if !(dram_gbps > 0.0 && dram_gbps < 100_000.0) {
         return None;
     }
 
@@ -499,9 +499,9 @@ fn measure_device_throughput(ordinal: usize, gcn: &str) -> Option<(f32, f32, f32
 
     eprintln!(
         "[scythe2] WI-SB0 calibrated GPU {ordinal} ({gcn}): \
-         fp16 {tflops_fp16:.1} TFLOPS, bw {hbm_gbps:.0} GB/s (measured)"
+         fp16 {tflops_fp16:.1} TFLOPS, bw {dram_gbps:.0} GB/s (measured)"
     );
-    Some((tflops_fp16, tflops_fp8, hbm_gbps))
+    Some((tflops_fp16, tflops_fp8, dram_gbps))
 }
 
 /// Architecture TFLOPS table — offline values per GCN arch string. [see: `2604.10187`, `throttle_pct`]
@@ -723,14 +723,14 @@ mod tests {
                 cap.ordinal
             );
             assert!(
-                cap.hbm_bandwidth_gbps > 0.0,
+                cap.dram_bandwidth_gbps > 0.0,
                 "GPU {} calibrated to zero bandwidth",
                 cap.ordinal
             );
         }
         // Asymmetric pair: distinct silicon must measure apart in BOTH fields.
         if caps.len() >= 2 && caps[0].tflops_fp16 != caps[1].tflops_fp16 {
-            assert_ne!(caps[0].hbm_bandwidth_gbps, caps[1].hbm_bandwidth_gbps);
+            assert_ne!(caps[0].dram_bandwidth_gbps, caps[1].dram_bandwidth_gbps);
         }
     }
 
