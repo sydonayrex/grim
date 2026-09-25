@@ -451,6 +451,22 @@ extern "C" __global__ void grim_transpose_2d_f32(const float* __restrict__ in,
     out[j * a + i] = in[i * b + j];
 }
 
+// Convert a column-major [rows, cols] matrix to row-major [rows, cols].
+// The candidate uses this after BLASLt's canonical column-major output.
+extern "C" __global__ void grim_col_major_to_row_major_f32(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int rows,
+    int cols,
+    int ld) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx >= total) return;
+    int row = idx / cols;
+    int col = idx - row * cols;
+    out[idx] = in[(long long)col * ld + row];
+}
+
 extern "C" __global__ void grim_rope(const float* x, const unsigned int* positions,
                                      float* out,
                                      int b, int s, int d, int half, float base,

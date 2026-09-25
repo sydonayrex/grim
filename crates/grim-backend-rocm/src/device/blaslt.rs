@@ -8,6 +8,10 @@ use std::ffi::c_void;
 
 use libloading::Library;
 
+use crate::device::roc_device::RocmDevice;
+use crate::memory::storage::RocmStorage;
+use crate::{arg, linear_launch};
+
 /// Result of probing the optional BLASLt runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlasLtProbe {
@@ -127,6 +131,252 @@ unsafe fn probe_loaded_library(
         }
         Ok(version)
     }
+}
+
+type MatrixLayoutCreateFn = unsafe extern "C" fn(*mut *mut c_void, i32, u64, u64, i64) -> i32;
+type MatrixLayoutDestroyFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type MatmulDescCreateFn = unsafe extern "C" fn(*mut *mut c_void, i32, i32) -> i32;
+type MatmulDescDestroyFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type MatmulDescSetAttributeFn = unsafe extern "C" fn(*mut c_void, i32, *const c_void, usize) -> i32;
+type MatmulFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *const c_void,
+    *mut c_void,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *const c_void,
+    *mut c_void,
+    usize,
+    *mut c_void,
+) -> i32;
+
+struct MatmulApi {
+    _library: Library,
+    create: CreateFn,
+    destroy: DestroyFn,
+    layout_create: MatrixLayoutCreateFn,
+    layout_destroy: MatrixLayoutDestroyFn,
+    desc_create: MatmulDescCreateFn,
+    desc_destroy: MatmulDescDestroyFn,
+    desc_set_attribute: MatmulDescSetAttributeFn,
+    matmul: MatmulFn,
+}
+
+impl MatmulApi {
+    unsafe fn open() -> Result<Self, String> {
+        let mut load_errors = Vec::new();
+        for library_name in ["libhipblaslt.so", "libhipblaslt.so.1", "librocblaslt.so"] {
+            let library = match unsafe { Library::new(library_name) } {
+                Ok(library) => library,
+                Err(error) => {
+                    load_errors.push(format!("{library_name}: {error}"));
+                    continue;
+                }
+            };
+            let result = (|| unsafe {
+                Ok(Self {
+                    create: *library
+                        .get::<CreateFn>(b"hipblasLtCreate\0")
+                        .map_err(|error| error.to_string())?,
+                    destroy: *library
+                        .get::<DestroyFn>(b"hipblasLtDestroy\0")
+                        .map_err(|error| error.to_string())?,
+                    layout_create: *library
+                        .get::<MatrixLayoutCreateFn>(b"hipblasLtMatrixLayoutCreate\0")
+                        .map_err(|error| error.to_string())?,
+                    layout_destroy: *library
+                        .get::<MatrixLayoutDestroyFn>(b"hipblasLtMatrixLayoutDestroy\0")
+                        .map_err(|error| error.to_string())?,
+                    desc_create: *library
+                        .get::<MatmulDescCreateFn>(b"hipblasLtMatmulDescCreate\0")
+                        .map_err(|error| error.to_string())?,
+                    desc_destroy: *library
+                        .get::<MatmulDescDestroyFn>(b"hipblasLtMatmulDescDestroy\0")
+                        .map_err(|error| error.to_string())?,
+                    desc_set_attribute: *library
+                        .get::<MatmulDescSetAttributeFn>(b"hipblasLtMatmulDescSetAttribute\0")
+                        .map_err(|error| error.to_string())?,
+                    matmul: *library
+                        .get::<MatmulFn>(b"hipblasLtMatmul\0")
+                        .map_err(|error| error.to_string())?,
+                    _library: library,
+                })
+            })();
+            if result.is_ok() {
+                return result;
+            }
+            if let Err(error) = result {
+                load_errors.push(format!("{library_name}: {error}"));
+            }
+        }
+        Err(load_errors.join("; "))
+    }
+
+    unsafe fn set_desc_transpose(
+        &self,
+        desc: *mut c_void,
+        attribute: i32,
+        operation: i32,
+    ) -> Result<(), String> {
+        let status = unsafe {
+            (self.desc_set_attribute)(
+                desc,
+                attribute,
+                &operation as *const i32 as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "hipblasLtMatmulDescSetAttribute(transpose) failed: {status}"
+            ))
+        }
+    }
+}
+
+/// Copy a column-major `[rows, cols]` matrix into a row-major destination.
+pub fn launch_col_major_to_row_major(
+    dev: &RocmDevice,
+    src: &RocmStorage,
+    dst: &RocmStorage,
+    rows: usize,
+    cols: usize,
+    ld: usize,
+) -> Result<(), String> {
+    let mut src_ptr = src
+        .device_ptr_checked()
+        .map_err(|error| error.to_string())? as *mut c_void;
+    let mut dst_ptr = dst
+        .device_ptr_checked()
+        .map_err(|error| error.to_string())? as *mut c_void;
+    let total = rows
+        .checked_mul(cols)
+        .ok_or_else(|| "col-major output size overflow".to_string())?;
+    let (grid, block) = linear_launch(total);
+    let mut rows_i = rows as i32;
+    let mut cols_i = cols as i32;
+    let mut ld_i = ld as i32;
+    dev.launch_compute_kernel(
+        "grim_col_major_to_row_major_f32",
+        grid,
+        block,
+        &mut [
+            arg(&mut src_ptr),
+            arg(&mut dst_ptr),
+            arg(&mut rows_i),
+            arg(&mut cols_i),
+            arg(&mut ld_i),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Execute a real canonical column-major FP32 `C = A @ B` through hipBLASLt.
+///
+/// All three buffers use canonical column-major physical layout. The caller
+/// stages row-major model tensors into this layout before the call.
+pub fn matmul_col_major_f32(
+    stream: *mut c_void,
+    a: *const c_void,
+    b: *const c_void,
+    d: *mut c_void,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), String> {
+    if stream.is_null() || a.is_null() || b.is_null() || d.is_null() {
+        return Err("matmul_row_major_f32 received a null pointer".into());
+    }
+    if m == 0 || n == 0 || k == 0 {
+        return Err("matmul_row_major_f32 received an empty shape".into());
+    }
+    let api = unsafe { MatmulApi::open()? };
+    let mut handle: *mut c_void = std::ptr::null_mut();
+    let mut desc: *mut c_void = std::ptr::null_mut();
+    let mut a_layout: *mut c_void = std::ptr::null_mut();
+    let mut b_layout: *mut c_void = std::ptr::null_mut();
+    let mut d_layout: *mut c_void = std::ptr::null_mut();
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let result = unsafe {
+        let create_status = (api.create)(&mut handle);
+        if create_status != 0 || handle.is_null() {
+            return Err(format!("hipblasLtCreate failed: {create_status}"));
+        }
+        let desc_status = (api.desc_create)(&mut desc, 2, 0); // COMPUTE_32F, F32 scale
+        if desc_status != 0 || desc.is_null() {
+            let _ = (api.destroy)(handle);
+            return Err(format!("hipblasLtMatmulDescCreate failed: {desc_status}"));
+        }
+        if let Err(error) = api.set_desc_transpose(desc, 0, 111) {
+            let _ = (api.desc_destroy)(desc);
+            let _ = (api.destroy)(handle);
+            return Err(error);
+        }
+        if let Err(error) = api.set_desc_transpose(desc, 1, 111) {
+            let _ = (api.desc_destroy)(desc);
+            let _ = (api.destroy)(handle);
+            return Err(error);
+        }
+        let a_status = (api.layout_create)(&mut a_layout, 0, m as u64, k as u64, m as i64);
+        let b_status = (api.layout_create)(&mut b_layout, 0, k as u64, n as u64, k as i64);
+        let d_status = (api.layout_create)(&mut d_layout, 0, m as u64, n as u64, m as i64);
+        if a_status != 0 || b_status != 0 || d_status != 0 {
+            if !a_layout.is_null() {
+                let _ = (api.layout_destroy)(a_layout);
+            }
+            if !b_layout.is_null() {
+                let _ = (api.layout_destroy)(b_layout);
+            }
+            if !d_layout.is_null() {
+                let _ = (api.layout_destroy)(d_layout);
+            }
+            let _ = (api.desc_destroy)(desc);
+            let _ = (api.destroy)(handle);
+            return Err(format!(
+                "hipblasLtMatrixLayoutCreate failed: A={a_status} B={b_status} D={d_status}"
+            ));
+        }
+        let matmul_status = (api.matmul)(
+            handle,
+            desc,
+            &alpha as *const f32 as *const c_void,
+            a,
+            a_layout,
+            b,
+            b_layout,
+            &beta as *const f32 as *const c_void,
+            d as *const c_void,
+            d_layout,
+            d,
+            d_layout,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+            stream,
+        );
+        let _ = (api.layout_destroy)(a_layout);
+        let _ = (api.layout_destroy)(b_layout);
+        let _ = (api.layout_destroy)(d_layout);
+        let _ = (api.desc_destroy)(desc);
+        let _ = (api.destroy)(handle);
+        if matmul_status == 0 {
+            Ok(())
+        } else {
+            Err(format!("hipblasLtMatmul failed: {matmul_status}"))
+        }
+    };
+    result
 }
 
 /// Return whether a shape is eligible for a future measured BLASLt experiment.
