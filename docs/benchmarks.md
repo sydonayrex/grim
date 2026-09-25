@@ -98,3 +98,42 @@ This document compiles the benchmark results evaluating the three candidate exec
      ```bash
      GRIM_GPU_TEST=1 cargo run --release --features gpu-test-shims --example bakeoff_decode_gemm -p grim-backend-rocm
      ```
+
+---
+
+## 6. BLASLt Prefill Promotion Gate — Q8 Candidate Rejection
+
+The native-F32 BLASLt prefill integration is opt-in and remains separate from
+this decode benchmark. To measure a real model prefill candidate on GPU 0, a
+temporary Q8_0 candidate was tested with:
+
+```bash
+GRIM_BLASLT_PREFILL=1 GRIM_BLASLT_QUANT_PREFILL=1 \\
+  grim-cli run models/LFM2.5-350M-Q8_0.gguf \\
+  "What are the top 5 Greek thought experiments?" --raw --device rocm \\
+  --min-tokens 195 --max-tokens 195 --temperature 0.7 --top-p 0.9 \\
+  --top-k 40 --seed 42
+```
+
+The candidate dequantized Q8_0 weights to F32, retained the expanded weights
+on device, and used the canonical BLASLt prefill route. Raw no-profiler
+measurements on `gfx1201` were:
+
+| Path | Samples (tok/s) |
+|---|---:|
+| Default Q8_0 | 297, 301, 300 |
+| Q8_0 → F32 → BLASLt | 301, 300, 302 |
+
+The candidate did not reach the `350 tok/s` promotion criterion. More
+importantly, both stochastic 195-token output and deterministic greedy output
+diverged from the default model. The temporary production route was therefore
+removed under the plan's parity-rejection rule; it must not be enabled as a
+fallback.
+
+The `rocprofv3` launch census explains the cost. Both runs used 193
+`hipGraphLaunch` calls, but the candidate increased HIP kernel launches from
+1,180 to 1,366 by adding 93 each of `grim_dequant_q8_0`,
+`grim_transpose_2d_f32`, and `grim_col_major_to_row_major_f32`. These counts
+are launch guidance only and were not used to report throughput. A future
+promotion candidate must preserve quantized arithmetic semantics or use a
+native-F32 model; expanding Q8 weights to F32 is not sufficient.
