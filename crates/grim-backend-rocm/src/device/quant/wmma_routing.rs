@@ -409,6 +409,9 @@ impl grim_format::convert::GpuDequant for RocmDevice {
             Storage::FloatPack(FloatPackScheme::NvFp4) => {
                 Ok(Some(self.dequantize_nvfp4_host(bytes, elem_count)?))
             }
+            Storage::FloatPack(FloatPackScheme::NutFp4) => {
+                Ok(Some(self.dequantize_nutcracker_host(bytes, elem_count)?))
+            }
             Storage::Block(BlockDtype::Fp8 | BlockDtype::Fp8Block16) => {
                 Ok(Some(self.dequantize_fp8_host(bytes, elem_count)?))
             }

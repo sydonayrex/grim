@@ -230,7 +230,7 @@ mod tests {
 
         let nvfp4_dtype = DType {
             arith: ArithType::U8,
-            storage: DTypeStorage::FloatPack(FloatPackScheme::NvFp4),
+            storage: DTypeStorage::FloatPack(FloatPackScheme::NutFp4),
         };
 
         let a_storage = dev.from_cpu(&a_data, &shape_a, DType::F32).unwrap();

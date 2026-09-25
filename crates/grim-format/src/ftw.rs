@@ -15,7 +15,7 @@ pub enum FtwQuantFormat {
     /// MXFP4 (Microscaling FP4). Banks: `["gate_up_blocks", "gate_up_scales", "down_blocks", "down_scales"]`.
     MxFp4,
     /// NVFP4 (Nvidia FP4). Banks: `["gate_up_packed", "gate_up_scale", "down_packed", "down_scale"]`.
-    NvFp4,
+    NutFp4,
     /// GGUF Q4_0 block quantization. Banks: `["gate_up", "down"]`.
     Q4_0,
 }
@@ -32,7 +32,7 @@ impl FtwQuantFormat {
                 "down_blocks",
                 "down_scales",
             ],
-            Self::NvFp4 => &[
+            Self::NutFp4 => &[
                 "gate_up_packed",
                 "gate_up_scale",
                 "down_packed",
@@ -88,7 +88,7 @@ impl FtwHeader {
                 let num_blocks_down = hidden_dim.div_ceil(128) * inter_dim.div_ceil(128);
                 bank_row_bytes.insert("down_scale".to_string(), num_blocks_down * 2);
             }
-            FtwQuantFormat::MxFp4 | FtwQuantFormat::NvFp4 => {
+            FtwQuantFormat::MxFp4 | FtwQuantFormat::NutFp4 => {
                 // 4-bit packed weights: 0.5 bytes per element
                 bank_row_bytes.insert(
                     quant_format.bank_names()[0].to_string(),
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_ftw_bank_schemas() {
-        let fmt = FtwQuantFormat::NvFp4;
+        let fmt = FtwQuantFormat::NutFp4;
         assert_eq!(fmt.bank_names().len(), 4);
         assert_eq!(fmt.bank_names()[0], "gate_up_packed");
     }

@@ -1,206 +1,289 @@
-//! Mutation-resistant golden tests for `dequant_nvfp4` and
-//! `reframe_nvfp4_to_mxfp4`.
+//! Golden tests for the two 9-bytes-per-16 formats: `dequant_nvfp4` (E4M3
+//! block scale, zero code is a real zero) and `dequant_nutcracker`
+//! (`[exp:6|sel:2]` block scale, zero code emits the block's special value).
 //!
-//! `nvfp4_roundtrip.rs` does not exercise either function despite its name —
-//! it round-trips `quant_fp4_block16`/`dequant_fp4_block16`, an unrelated
-//! Jay-tier codec. This file constructs NVFP4 byte buffers **by hand**,
-//! computes expected dequant values from the OCP E2M1 spec **independently**
-//! (not by calling any of grim's own `f32_to_mxfp4_e2m1` / `quant_*`
-//! functions, so an encode/decode bug can't cancel itself out), and asserts
-//! exact expected values — following the convention in `golden_dequant.rs`.
+//! Both formats share a byte layout but not a decode, which is precisely why
+//! these tests build buffers by hand against an independent oracle rather than
+//! round-tripping through the packers. The failure this guards against is
+//! real: grim previously decoded GGUF type-78 (true NVFP4) with an E8M0 scale.
+//! Because E4M3 and E8M0 are both exactly 1 byte per 16 elements, every length
+//! and allocation check passed and only the values were wrong.
 //!
-//! # OCP E2M1 codebook (derived from spec, 1 sign / 2 exp / 1 mantissa bit)
-//! code -> |value|: 0->0.0, 1->0.5, 2->1.0, 3->1.5, 4->2.0, 5->3.0, 6->4.0, 7->6.0
-//! (exp==0 is subnormal: value = mantissa * 0.5; exp!=0: (1 + mantissa*0.5) * 2^(exp-1))
-//! Sign bit (code bit 3) negates. Final value is codebook value * 2^(e8m0_byte - 127).
-//!
-//! # NVFP4 packing (per grim's `dequant_nvfp4` doc comment)
-//! Per 256-value super-block (144 bytes): 16 sub-blocks of 16 values each.
-//! Per sub-block: 1 byte E8M0 shared exponent, then 8 bytes of packed E2M1
-//! codes (2 per byte, low nibble = even index, high nibble = odd index).
+//! Independent oracles, not derived from the implementation:
+//!   E2M1  = { 0, .5, 1, 1.5, 2, 3, 4, 6 } with sign-magnitude, bias 1
+//!   E4M3  = OCP: bias 7, 3 mantissa bits, exp 0xF/mant 7 is NaN, max 448
+//!   E8M0  = 2^(byte - 127)
+//!   Nutcracker scale byte = [ exp:6 | sel:2 ], scale = 2^(exp - 31)
 
-use grim_quant::{dequant_mxfp4, dequant_nvfp4, reframe_nvfp4_to_mxfp4};
-
-/// f32 comparison: bit-exact treated as exact, otherwise tight absolute
-/// tolerance (values here are small hand-picked powers of two, so no
-/// legitimate rounding should ever require a loose bound).
 fn assert_close(got: f32, want: f32, ctx: &str) {
-    let diff = (got - want).abs();
-    assert!(diff < 1e-4, "{ctx}: got {got}, want {want} (diff {diff})");
+    let tol = 1e-5 * want.abs().max(1.0);
+    assert!(
+        (got - want).abs() <= tol,
+        "{ctx}: got {got}, want {want} (tol {tol})"
+    );
 }
 
-/// Independent oracle for the OCP E2M1 codebook, transcribed directly from
-/// the spec — must NOT call grim's `mxfp4_e2m1_to_f32`.
+/// OCP E2M1 codebook, decoded independently of the implementation.
 fn oracle_e2m1(code: u8) -> f32 {
-    let sign = (code >> 3) & 1 != 0;
-    let exp = (code >> 1) & 3;
-    let mant = (code & 1) as f32;
-    let base = if exp == 0 {
-        mant * 0.5
-    } else {
-        (1.0 + mant * 0.5) * 2f32.powi(exp as i32 - 1)
-    };
-    if sign { -base } else { base }
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let sign = if code & 0x8 != 0 { -1.0 } else { 1.0 };
+    sign * MAG[(code & 0x7) as usize]
 }
 
-/// Independent oracle for E8M0 shared-exponent scale.
+/// E8M0: a bare unsigned power of two.
 fn oracle_e8m0_scale(byte: u8) -> f32 {
-    2f32.powi(byte as i32 - 127)
+    2.0f32.powi(byte as i32 - 127)
 }
 
-fn oracle_nvfp4_value(code: u8, exp_byte: u8) -> f32 {
-    oracle_e2m1(code) * oracle_e8m0_scale(exp_byte)
+/// OCP E4M3 ("FN") -> f32, written from the spec rather than ported.
+///
+/// The FN variant has **no infinities**: `exp == 0xF` is a normal binade
+/// spanning [256, 448], and only `0x7F` / `0xFF` (mant == 7) are NaN. So
+/// `0x78` is 256, not 448 — clamping the whole binade to 448 would be the
+/// E4M3FN "all-ones-is-max" mistake.
+fn oracle_e4m3_scale(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = ((b >> 3) & 0x0F) as i32;
+    let mant = (b & 0x07) as f32;
+    if exp == 0x0F {
+        return if (b & 0x07) == 0x07 {
+            f32::NAN
+        } else {
+            sign * (1.0 + mant / 8.0) * 256.0
+        };
+    }
+    if exp == 0 {
+        sign * (mant / 8.0) * 2.0f32.powi(-6)
+    } else {
+        sign * (1.0 + mant / 8.0) * 2.0f32.powi(exp - 7)
+    }
 }
 
-/// Hand-pack one 16-value NVFP4 sub-block: 1 exponent byte + 8 code bytes
-/// (2 nibbles per byte, low nibble first).
-fn pack_subblock(exp_byte: u8, codes16: &[u8; 16]) -> Vec<u8> {
-    let mut out = vec![exp_byte];
-    for pair in codes16.chunks(2) {
-        out.push(pair[0] | (pair[1] << 4));
+fn oracle_nutcracker_value(code: u8, scale_byte: u8) -> f32 {
+    let sel = scale_byte & 0x3;
+    let scale = 2.0f32.powi((scale_byte >> 2) as i32 - 31);
+    if code & 0x7 == 0 {
+        let mag = if sel & 0x1 != 0 { 2.5 } else { 5.0 };
+        return if sel & 0x2 != 0 { -mag } else { mag } * scale;
+    }
+    oracle_e2m1(code) * scale
+}
+
+/// Pack one 16-value sub-block: scale byte then 8 code bytes (low nibble = even).
+fn pack_subblock(scale_byte: u8, codes: &[u8; 16]) -> Vec<u8> {
+    let mut out = vec![scale_byte];
+    for pair in codes.chunks(2) {
+        out.push((pair[0] & 0x0F) | ((pair[1] & 0x0F) << 4));
     }
     out
 }
 
-// ===========================================================================
-// dequant_nvfp4 — direct path. This is the function that actually ships
-// (toolkit ingestion routes ModelOpt NVFP4 tensors through it via
-// grim-format's `toolkit_to_storage`), so it gets the most scrutiny.
-// ===========================================================================
+use grim_quant::{dequant_nutcracker, dequant_nvfp4};
+
+fn all_codes() -> [u8; 16] {
+    let mut c = [0u8; 16];
+    for (i, slot) in c.iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    c
+}
+
+// ── Nutcracker ────────────────────────────────────────────────────────────
 
 #[test]
-fn dequant_nvfp4_single_subblock_uniform_scale() {
-    // Sub-block 0: exponent byte 127 (scale = 2^0 = 1.0), codes = [2,2,...]
-    // (E2M1 code 2 -> codebook value 1.0), so every value should decode to
-    // exactly 1.0. Remaining 15 sub-blocks of the super-block are all-zero
-    // (exp=127, code=0) to keep the fixture legible.
-    let mut data = pack_subblock(127, &[2u8; 16]);
-    for _ in 0..15 {
-        data.extend(pack_subblock(127, &[0u8; 16]));
-    }
-    assert_eq!(data.len(), 144);
-
-    let out = dequant_nvfp4(&data, 256).expect("nvfp4 dequant");
-    assert_eq!(out.len(), 256);
-    for (i, &v) in out.iter().take(16).enumerate() {
-        assert_close(v, 1.0, &format!("nvfp4 sub-block 0 elem {i}"));
-    }
-    for (i, &v) in out.iter().skip(16).enumerate() {
-        assert_close(v, 0.0, &format!("nvfp4 zero-block elem {i}"));
+fn nutcracker_decodes_a_uniform_scale_subblock() {
+    // exp = 31 -> scale 1.0, sel 0 -> special +5.0.
+    let scale_byte = (31u8 << 2) | 0;
+    let data = pack_subblock(scale_byte, &all_codes());
+    let out = dequant_nutcracker(&data, 16).expect("nutcracker dequant");
+    for (i, &code) in all_codes().iter().enumerate() {
+        assert_close(
+            out[i],
+            oracle_nutcracker_value(code, scale_byte),
+            &format!("code {code}"),
+        );
     }
 }
 
 #[test]
-fn dequant_nvfp4_distinguishes_per_subblock_exponents() {
-    // Sub-block 0: exp=127 (scale 1.0), code=2 (codebook 1.0) -> values 1.0
-    // Sub-block 1: exp=128 (scale 2.0), code=2 (codebook 1.0) -> values 2.0
-    // These two sub-blocks fall in the SAME 32-element MXFP4 group, which is
-    // exactly the boundary `reframe_nvfp4_to_mxfp4` mishandles below — this
-    // test confirms the direct dequant path keeps them distinct.
-    let mut data = pack_subblock(127, &[2u8; 16]);
-    data.extend(pack_subblock(128, &[2u8; 16]));
-    for _ in 0..14 {
-        data.extend(pack_subblock(127, &[0u8; 16]));
-    }
-    assert_eq!(data.len(), 144);
-
-    let out = dequant_nvfp4(&data, 256).expect("nvfp4 dequant");
-    for (i, &v) in out.iter().take(16).enumerate() {
-        assert_close(v, 1.0, &format!("nvfp4 sub-block 0 (elem {i})"));
-    }
-    for (i, &v) in out.iter().skip(16).take(16).enumerate() {
-        assert_close(v, 2.0, &format!("nvfp4 sub-block 1 (elem {i})"));
+fn nutcracker_distinguishes_per_subblock_exponents() {
+    let codes = all_codes();
+    let mut data = pack_subblock(30u8 << 2, &codes);
+    data.extend(pack_subblock(32u8 << 2, &codes));
+    let out = dequant_nutcracker(&data, 32).expect("nutcracker dequant");
+    for (i, &code) in codes.iter().enumerate() {
+        assert_close(
+            out[i],
+            oracle_nutcracker_value(code, 30u8.wrapping_shl(2)),
+            "sub-block 0",
+        );
+        assert_close(
+            out[16 + i],
+            oracle_nutcracker_value(code, 32u8.wrapping_shl(2)),
+            "sub-block 1",
+        );
     }
 }
 
 #[test]
-fn dequant_nvfp4_matches_independent_oracle_random_fixture() {
-    // Deterministic pseudo-random fixture (fixed LCG, not `rand`, to avoid a
-    // new dev-dependency) covering all 16 sub-blocks with varied exponents
-    // and codes, compared against the from-spec oracle rather than any of
-    // grim's own encode functions.
-    let mut state: u32 = 0x1234_5678;
+fn nutcracker_matches_independent_oracle_random_fixture() {
+    // LCG so the fixture is deterministic and reviewable.
+    let mut seed: u32 = 0x2545_F491;
     let mut next = || {
-        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        state
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
     };
-
+    let codes: Vec<u8> = (0..256).map(|_| (next() & 0x0F) as u8).collect();
     let mut data = Vec::with_capacity(144);
-    let mut oracle = Vec::with_capacity(256);
+    let mut want = Vec::with_capacity(256);
+    for blk in 0..16 {
+        let scale_byte = (next() & 0xFF) as u8;
+        let c: [u8; 16] = codes[blk * 16..blk * 16 + 16].try_into().unwrap();
+        data.extend(pack_subblock(scale_byte, &c));
+        for &code in &c {
+            want.push(oracle_nutcracker_value(code, scale_byte));
+        }
+    }
+    let out = dequant_nutcracker(&data, 256).expect("nutcracker dequant");
+    for (i, (&g, &w)) in out.iter().zip(want.iter()).enumerate() {
+        assert_close(g, w, &format!("random fixture elem {i}"));
+    }
+}
+
+#[test]
+fn nutcracker_round_trips_through_the_packer() {
+    let data: Vec<f32> = (0..512)
+        .map(|i| (i as f32 / 511.0) * 9.0 - 4.5 + 0.2 * ((i % 5) as f32 - 2.0))
+        .collect();
+    let packed = grim_quant::quant_nutcracker(&data).expect("pack");
+    let out = dequant_nutcracker(&packed, data.len()).expect("dequant");
+    // Every value must be finite and within one E2M1 grid step of the original.
+    let mut worst = 0.0f32;
+    for (a, b) in data.iter().zip(out.iter()) {
+        assert!(b.is_finite(), "non-finite reconstruction");
+        worst = worst.max((a - b).abs());
+    }
+    assert!(
+        worst < 0.6,
+        "worst absolute error {worst} exceeds one grid step"
+    );
+}
+
+// ── NVFP4 (the real format) ───────────────────────────────────────────────
+
+#[test]
+fn nvfp4_decodes_e4m3_scales() {
+    // E4M3 0x38 = 1.0, 0x3C = 1.5, 0x40 = 2.0.
+    for (byte, want) in [(0x38u8, 1.0f32), (0x3C, 1.5), (0x40, 2.0)] {
+        let data = pack_subblock(byte, &all_codes());
+        let out = dequant_nvfp4(&data, 16).expect("nvfp4 dequant");
+        for (i, &code) in all_codes().iter().enumerate() {
+            assert_close(
+                out[i],
+                oracle_e2m1(code) * want,
+                &format!("E4M3 {byte:#04x} code {code}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn nvfp4_keeps_a_real_zero() {
+    // The load-bearing difference from Nutcracker.
+    let data = pack_subblock(0x38, &all_codes());
+    let out = dequant_nvfp4(&data, 16).expect("nvfp4 dequant");
+    assert_eq!(out[0], 0.0, "code 0x0 must decode to zero");
+    assert_eq!(out[8], 0.0, "code 0x8 must decode to zero");
+    assert!(!out.iter().any(|v| *v == 5.0), "NVFP4 has no special value");
+}
+
+#[test]
+fn nvfp4_never_misreads_its_scale_as_e8m0() {
+    // The regression that motivated a correct NVFP4: an E4M3 scale byte read
+    // as E8M0 collapses the whole block to ~0 while every length check passes.
+    let data = pack_subblock(0x3C, &all_codes()); // 1.5 in E4M3
+    let out = dequant_nvfp4(&data, 16).expect("nvfp4 dequant");
+    // 2^(0x3C - 127) is ~6.8e-21, so a correct decode (~1.5 * the E2M1
+    // magnitude) exceeds the E8M0 misread by ~20 orders of magnitude.
+    let e8m0_misread = oracle_e8m0_scale(0x3C);
+    for (i, &code) in all_codes().iter().enumerate() {
+        let mag = oracle_e2m1(code);
+        let want = mag * 1.5;
+        assert_close(out[i], want, &format!("code {code}"));
+        if mag != 0.0 {
+            // The misread is ~20 orders of magnitude below the correct value.
+            // Compare absolute magnitudes so negative codes work too.
+            let misread = mag * e8m0_misread;
+            assert!(
+                out[i].abs() / misread.abs() > 1e15,
+                "code {code}: got {}, E8M0 misread would be {misread:e} (ratio {})",
+                out[i],
+                out[i].abs() / misread.abs()
+            );
+        }
+    }
+}
+
+#[test]
+fn nvfp4_and_nutcracker_disagree_on_the_same_buffer() {
+    // Guards the scheme mix-up: same bytes, different values.
+    let data = pack_subblock(
+        0x38,
+        &[
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x00,
+        ],
+    );
+    let nv = dequant_nvfp4(&data, 16).expect("nvfp4");
+    let nu = dequant_nutcracker(&data, 16).expect("nutcracker");
+    assert_ne!(nv, nu, "the two decoders must not coincide");
+    assert_eq!(nv[0], 0.5, "NVFP4 code 0x1 is +0.5");
+    // 0x38 as Nutcracker = exp 14, sel 0 -> 2^(14-31).
+    assert_close(nu[0], 0.5 * 2.0f32.powi(14 - 31), "nutcracker code 0x1");
+}
+
+#[test]
+fn nvfp4_matches_independent_oracle_random_fixture() {
+    let mut seed: u32 = 0x9E37_79B9;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
+    };
+    let mut data = Vec::with_capacity(144);
+    let mut want = Vec::with_capacity(256);
     for _ in 0..16 {
-        let exp_byte = (100 + (next() % 51)) as u8; // 100..=150
-        let mut codes = [0u8; 16];
-        for c in codes.iter_mut() {
-            *c = (next() % 16) as u8;
+        let scale_byte = (next() & 0xFF) as u8;
+        let codes: [u8; 16] = std::array::from_fn(|_| (next() & 0x0F) as u8);
+        // Skip the two E4M3 NaN encodings (0x7F/0xFF): their sub-block scale is
+        // undefined, so a buffer containing one is malformed, not a fixture.
+        if matches!(scale_byte, 0x7F | 0xFF) {
+            continue;
         }
-        data.extend(pack_subblock(exp_byte, &codes));
-        for &c in &codes {
-            oracle.push(oracle_nvfp4_value(c, exp_byte));
+        data.extend(pack_subblock(scale_byte, &codes));
+        let s = oracle_e4m3_scale(scale_byte);
+        for &code in &codes {
+            want.push(oracle_e2m1(code) * s);
         }
     }
-    assert_eq!(data.len(), 144);
-    assert_eq!(oracle.len(), 256);
-
-    let out = dequant_nvfp4(&data, 256).expect("nvfp4 dequant");
-    for (i, (&got, &want)) in out.iter().zip(oracle.iter()).enumerate() {
-        assert_close(got, want, &format!("nvfp4 random fixture elem {i}"));
+    let n = want.len();
+    assert!(n > 0 && n % 16 == 0, "fixture built {n} elements");
+    let out = dequant_nvfp4(&data, n).expect("nvfp4 dequant");
+    for (i, (&g, &w)) in out.iter().zip(want.iter()).enumerate() {
+        assert_close(g, w, &format!("random fixture elem {i}"));
     }
 }
 
-// ===========================================================================
-// reframe_nvfp4_to_mxfp4 — the GPU-kernel bridge. This function maps two
-// 16-element NVFP4 sub-blocks onto one 32-element MXFP4 group. That mapping
-// is only lossless when both sub-blocks share the same E8M0 exponent. When
-// they differ, the function must return an error rather than silently
-// dropping one exponent (which would produce a 2x scaling error).
-// ===========================================================================
-
 #[test]
-fn reframe_nvfp4_to_mxfp4_rejects_mismatched_exponents() {
-    // Sub-block 0: exp=127 (scale 1.0), code=2 -> true value 1.0
-    // Sub-block 1: exp=128 (scale 2.0), code=2 -> true value 2.0
-    // Adjacent sub-blocks have different exponents, so lossless reframing to
-    // MXFP4's 32-element groups is impossible. The function must error.
-    let mut data = pack_subblock(127, &[2u8; 16]);
-    data.extend(pack_subblock(128, &[2u8; 16]));
-    for _ in 0..14 {
-        data.extend(pack_subblock(127, &[0u8; 16]));
-    }
-    assert_eq!(data.len(), 144);
-
-    let result = reframe_nvfp4_to_mxfp4(&data, 256);
-    assert!(
-        result.is_err(),
-        "reframe_nvfp4_to_mxfp4 must return Err when adjacent sub-blocks have \
-         different E8M0 exponents, got Ok"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("different E8M0 exponents"),
-        "error message should mention mismatched exponents, got: {err_msg}"
-    );
+fn both_decoders_reject_truncated_buffers() {
+    assert!(dequant_nvfp4(&[0u8; 8], 16).is_err());
+    assert!(dequant_nutcracker(&[0u8; 8], 16).is_err());
 }
 
 #[test]
-fn reframe_nvfp4_to_mxfp4_succeeds_when_exponents_match() {
-    // All sub-blocks share the same exponent (127 = scale 1.0), so the
-    // reframing is lossless. Verify the reframed buffer decodes correctly
-    // through dequant_mxfp4.
-    let mut data = Vec::with_capacity(144);
-    for sb in 0..16 {
-        let code = (sb % 8) as u8; // varied codes, same exponent
-        data.extend(pack_subblock(127, &[code; 16]));
-    }
-    assert_eq!(data.len(), 144);
-
-    let reframed = reframe_nvfp4_to_mxfp4(&data, 256).expect("reframe should succeed");
-    let out = dequant_mxfp4(&reframed, 256).expect("mxfp4 dequant");
-
-    for (sb, chunk) in out.chunks(16).enumerate() {
-        let code = (sb % 8) as u8;
-        let expected = oracle_nvfp4_value(code, 127);
-        for (i, &v) in chunk.iter().enumerate() {
-            assert_close(v, expected, &format!("sub-block {sb} elem {i}"));
-        }
-    }
+fn both_decoders_handle_empty_and_partial() {
+    assert!(dequant_nvfp4(&[], 0).unwrap().is_empty());
+    assert!(dequant_nutcracker(&[], 0).unwrap().is_empty());
+    let data = pack_subblock(0x38, &all_codes());
+    assert_eq!(dequant_nvfp4(&data, 10).unwrap().len(), 10);
+    assert_eq!(dequant_nutcracker(&data, 10).unwrap().len(), 10);
 }

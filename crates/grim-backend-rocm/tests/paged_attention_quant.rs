@@ -532,7 +532,12 @@ fn nutcracker_quant_paged_attention_matches_f32_reference() {
     // 4-bit codes on a coarse E2M1 grid, so the gate is far looser than int8 or
     // FP8. It must still catch O(1) breakage: wrong block indexing, ignoring the
     // inline scale, or misreading the stolen selector.
-    let tol = 1.0;
+    //
+    // Calibrated against measured max error on the reference data: the correct
+    // path lands at ~0.08. Removing the special-value branch degrades it to
+    // ~0.25, so 0.15 discriminates a correct selector decode from a broken one.
+    // The previous 1.0 passed both.
+    let tol = 0.15;
     for h in 0..NUM_HEADS as usize {
         for d in 0..HEAD_DIM as usize {
             let i = h * HEAD_DIM as usize + d;

@@ -332,6 +332,38 @@ impl RocmDevice {
     }
 
     /// Standalone NVFP4 dequant: decompress NVFP4 codes + interleaved scales to F32.
+    pub(crate) fn launch_dequant_nutcracker(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_weights: usize,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant_nutcracker: packed has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant_nutcracker: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_weights as u64).div_ceil(BLOCK_SIZE as u64))
+            .try_into()
+            .map_err(|_| Error::Backend("dequant_nutcracker: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_w = n_weights as i32;
+        self.launch_compute_kernel(
+            "grim_dequant_nutcracker",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut packed), arg(&mut out), arg(&mut n_w)],
+        )
+    }
+
+    /// Standalone NVFP4 dequant: E2M1 codes + interleaved **E4M3** block
+    /// scales to F32. Same 9-bytes-per-16 layout as Nutcracker, different
+    /// scale decode.
     pub(crate) fn launch_dequant_nvfp4(
         &self,
         packed_storage: &RocmStorage,

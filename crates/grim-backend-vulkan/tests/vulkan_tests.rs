@@ -24,7 +24,7 @@ fn test_all_vulkan_spirv_blobs_compiled_and_non_empty() {
         VulkanKernel::Rope,
         VulkanKernel::FusedDequantGemmQ4K,
         VulkanKernel::FusedDequantGemmQ80,
-        VulkanKernel::FusedDequantGemmNvFp4,
+        VulkanKernel::FusedDequantGemmNutcracker,
         VulkanKernel::FusedDequantGemmW8A8Fp8,
         VulkanKernel::FusedDequantGemmW8A8Int8,
         VulkanKernel::KvDequantAttention,
@@ -234,7 +234,7 @@ fn test_vulkan_fused_dequant_gemm_nvfp4_parity() {
     use grim_tensor::dtype::FloatPackScheme;
     let nvfp4_dtype = DType {
         arith: ArithType::U8,
-        storage: Storage::FloatPack(FloatPackScheme::NvFp4),
+        storage: Storage::FloatPack(FloatPackScheme::NutFp4),
     };
 
     let a_storage = dev.from_cpu(&a_data, &shape_a, DType::F32).unwrap();
@@ -253,13 +253,13 @@ fn test_vulkan_fused_dequant_gemm_nvfp4_parity() {
     let gpu_result = out_storage.to_cpu_vec_f32().unwrap();
     assert_eq!(gpu_result.len(), m * n);
 
-    // Compute expected result using CPU dequant_nvfp4
+    // Compute expected result using CPU dequant_nutcracker
     // Note: each column has 32 weights, packed in 18 bytes.
     let mut b_dequant = vec![0.0f32; k * n];
     let col_bytes = (k / 16) * 9;
     for col in 0..n {
         let col_slice = &b_bytes[col * col_bytes..(col + 1) * col_bytes];
-        let deq_col = grim_quant::dequant_nvfp4(col_slice, k).unwrap();
+        let deq_col = grim_quant::dequant_nutcracker(col_slice, k).unwrap();
         for r in 0..k {
             b_dequant[r * n + col] = deq_col[r];
         }

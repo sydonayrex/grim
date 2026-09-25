@@ -691,6 +691,18 @@ impl CudaDevice {
         self.launch_fused_quant_gemm("grim_nvfp4_gemm", a_ptr, b_ptr, out_ptr, m, n, k)
     }
 
+    pub(crate) fn launch_nutcracker_gemm(
+        &self,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        self.launch_fused_quant_gemm("grim_nutcracker_gemm", a_ptr, b_ptr, out_ptr, m, n, k)
+    }
+
     pub(crate) fn launch_w8a8_fp8_gemm(
         &self,
         a_ptr: *const c_void,
@@ -1096,6 +1108,15 @@ impl QuantOps for CudaDevice {
                     let handle = self.launch_nvfp4_gemm(a_ptr, b_ptr, out_ptr, m, n, k)?;
                     return Ok((Box::new(out_storage), handle));
                 }
+                Storage::FloatPack(FloatPackScheme::NutFp4) => {
+                    let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+                    let a_ptr = Self::dev_ptr_or_err("quantized_matfp4) a", a_s)?;
+                    let b_ptr = Self::dev_ptr_or_err("quantized_matfp4) b", b_s)?;
+                    let out_ptr =
+                        Self::dev_ptr_or_err("quantized_matfp4) out", &out_storage)?;
+                    let handle = self.launch_nutcracker_gemm(a_ptr, b_ptr, out_ptr, m, n, k)?;
+                    return Ok((Box::new(out_storage), handle));
+                }
                 Storage::CompressedTensorsW8A8Fp8 => {
                     let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
                     let a_ptr = Self::dev_ptr_or_err("quantized_matmul(w8a8_fp8) a", a_s)?;
@@ -1347,6 +1368,13 @@ impl QuantOps for CudaDevice {
                                 Error::Backend(format!("quantized_matmul NVFP4 dequant: {e}"))
                             })?
                         }
+                        Storage::FloatPack(FloatPackScheme::NutFp4) => {
+                            grim_quant::dequant_nutcracker(&b_bytes, k * n).map_err(|e| {
+                                Error::Backend(format!(
+                                    "quantized_matmul Nutcracker dequant: {e}"
+                                ))
+                            })?
+                        }
                         Storage::CompressedTensorsW8A8Fp8 => {
                             let scale_len =
                                 u64::from_le_bytes(b_bytes[..8].try_into().unwrap()) as usize;
@@ -1589,7 +1617,7 @@ impl QuantOps for CudaDevice {
             grim_tensor::QuantFormat::Iq4Nl => "grim_fused_quant_gemm_iq4nl",
             grim_tensor::QuantFormat::Iq4Xs => "grim_fused_quant_gemm_iq4xs",
             grim_tensor::QuantFormat::Fp4 => "grim_fused_quant_gemm_mxfp4",
-            grim_tensor::QuantFormat::Fp4Block16 => "grim_fused_quant_gemm_nvfp4",
+            grim_tensor::QuantFormat::Fp4Block16 => "grim_fused_quant_gemm_nutcracker",
             grim_tensor::QuantFormat::Fp8 => {
                 // T1 caps gate: without native FP8 (compute < 8.9), don't select the fp8 shader.
                 if !self

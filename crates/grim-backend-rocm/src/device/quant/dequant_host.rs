@@ -293,7 +293,36 @@ impl RocmDevice {
         self.split_dequant_mxfp(bytes, elem_count, "mxfp8")
     }
 
-    /// Dequantize NVFP4 interleaved packed bytes (1 E8M0 scale byte + 8 codes per 16 weights) to f32.
+    /// Dequantize Nutcracker interleaved packed bytes (1 `[exp:6|sel:2]` scale byte
+    /// + 8 E2M1 code bytes per 16 values) to f32.
+    pub fn dequantize_nutcracker_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = RocmStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![bytes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_dequant_nutcracker(&packed, &out_storage, elem_count)?;
+        let mut values = self.read_to_host_async(&out_storage)?;
+        values.truncate(elem_count);
+        Ok(values)
+    }
+
+    /// Dequantize NVFP4 interleaved packed bytes (1 **E4M3** scale byte + 8 E2M1
+    /// code bytes per 16 values) to f32, on device.
     pub fn dequantize_nvfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
         let packed = RocmStorage::copy_from_host_raw_bytes(
             bytes,

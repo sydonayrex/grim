@@ -94,6 +94,7 @@ pub(crate) fn cuda_dequant_quantized_storage(
             FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(b_bytes, elem_count),
             FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(b_bytes, elem_count),
             FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(b_bytes, elem_count),
+            FloatPackScheme::NutFp4 => grim_quant::dequant_nutcracker(b_bytes, elem_count),
         },
         DTypeStorage::Block(bd) => match bd {
             BlockDtype::Fp4 | BlockDtype::Fp4Block16 => {

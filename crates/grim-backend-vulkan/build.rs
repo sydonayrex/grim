@@ -105,8 +105,8 @@ fn kernels() -> Vec<(&'static str, String)> {
             load_kernel("fused_dequant_gemm_mxfp4"),
         ),
         (
-            "fused_dequant_gemm_nvfp4",
-            load_kernel("fused_dequant_gemm_nvfp4"),
+            "fused_dequant_gemm_nutcracker",
+            load_kernel("fused_dequant_gemm_nutcracker"),
         ),
         (
             "fused_dequant_gemm_w8a8_fp8",
@@ -270,7 +270,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq2s.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_fp8_e4m3.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_mxfp4.comp");
-    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_nvfp4.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_nutcracker.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_w8a8_fp8.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_w8a8_int8.comp");
     println!("cargo:rerun-if-changed=kernels/kv_dequant_attention.comp");
