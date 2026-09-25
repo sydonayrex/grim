@@ -79,6 +79,9 @@ pub use crate::device::handles::{
     hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
 
+pub use crate::device::blaslt::{
+    BlasLtProbe, BlasLtSelection, probe_blaslt, select_blaslt_candidate,
+};
 pub use crate::device::rocblas::{
     ROCBLAS_GEMM_FLAGS_NONE,
     RocblasHandle,
