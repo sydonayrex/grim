@@ -173,6 +173,63 @@ impl std::fmt::Debug for CharonForwardStash {
     }
 }
 
+/// Device-owned staging buffers for the opt-in BLASLt prefill path.
+///
+/// `a_col` stores a transposed row-major activation matrix in the physical
+/// layout of a column-major `[m, k]` BLASLt A operand. `d_col` stores the
+/// column-major BLASLt result until the row-major conversion kernel is done.
+/// The event is recorded after the conversion; a later call waits on it
+/// before reusing either buffer, including when a caller dispatches on a
+/// different stream. Keeping these buffers in `RocmDevice` prevents an
+/// allocator-backed `RocmStorage` from being dropped while its async work is
+/// still reading or writing it.
+#[derive(Debug)]
+pub(crate) struct BlasLtScratch {
+    pub(crate) a_col: RocmStorage,
+    pub(crate) d_col: RocmStorage,
+    pub(crate) completion: *mut c_void,
+    pub(crate) in_flight: bool,
+    pub(crate) stream: *mut c_void,
+}
+
+impl BlasLtScratch {
+    pub(crate) fn new(
+        dev: &RocmDevice,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> grim_tensor::error::Result<Self> {
+        let _ctx = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let a_col = RocmStorage::alloc_gpu(
+            &Shape::new(vec![k, m]),
+            dtype_f32(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let d_col = RocmStorage::alloc_gpu(
+            &Shape::new(vec![m, n]),
+            dtype_f32(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let mut completion = std::ptr::null_mut();
+        check_hip("hipEventCreate(BLASLt scratch)", unsafe {
+            crate::hipEventCreate(&mut completion)
+        })?;
+        Ok(Self {
+            a_col,
+            d_col,
+            completion,
+            in_flight: false,
+            stream: std::ptr::null_mut(),
+        })
+    }
+
+    pub(crate) fn fits(&self, m: usize, n: usize, k: usize) -> bool {
+        self.a_col.shape().dims() == [k, m] && self.d_col.shape().dims() == [m, n]
+    }
+}
+
 #[derive(Debug)]
 pub struct RocmDevice {
     pub(crate) ordinal: usize,
@@ -205,6 +262,9 @@ pub struct RocmDevice {
     /// Allocated once per distinct size and reused, avoiding a per-call
     /// `hipHostMalloc`/`hipHostFree` pair on the hot cross-device path.
     pub(crate) bounce_staging: Mutex<Option<(usize, RocmPinnedBuffer<u8>)>>,
+    /// Persistent BLASLt prefill staging. The completion event fences reuse
+    /// across streams; the buffers remain owned by the device until shutdown.
+    pub(crate) blaslt_scratch: Mutex<Option<BlasLtScratch>>,
     /// Pinned host buffers backing in-flight stream-ordered H2D copies.
     /// A `hipMemcpyAsync` reads these pages on the copy engine *after* the CPU returns, so the.
     pub(crate) retained_pins: Mutex<Vec<RocmPinnedBuffer<f32>>>,
@@ -741,6 +801,7 @@ impl RocmDevice {
             hsaco_cache: HsacoKernelCache::new(),
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
             bounce_staging: Mutex::new(None),
+            blaslt_scratch: Mutex::new(None),
             retained_pins: Mutex::new(Vec::new()),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             autotuner: Mutex::new(autotuner),
@@ -1857,6 +1918,54 @@ impl RocmDevice {
         Ok(Box::new(storage))
     }
 
+    /// Launch a device-side 2D transpose into caller-owned storage.
+    ///
+    /// The destination is deliberately not allocated here. Callers that queue
+    /// multiple dependent operations can therefore keep one storage owner
+    /// alive until the final consumer has been enqueued.
+    pub(crate) fn transpose_f32_2d_into(
+        &self,
+        src: &RocmStorage,
+        dst: &RocmStorage,
+        a: usize,
+        b: usize,
+    ) -> Result<()> {
+        let total = a
+            .checked_mul(b)
+            .ok_or_else(|| Error::Backend("transpose_f32_2d: a*b overflow".into()))?;
+        if src.shape().elem_count() != total || dst.shape().elem_count() != total {
+            return Err(Error::Shape(format!(
+                "transpose_f32_2d: expected {total} elements, got src={} dst={}",
+                src.shape().elem_count(),
+                dst.shape().elem_count()
+            )));
+        }
+        if src.bytes() < total * std::mem::size_of::<f32>()
+            || dst.bytes() < total * std::mem::size_of::<f32>()
+        {
+            return Err(Error::Backend(
+                "transpose_f32_2d: source or destination is smaller than the f32 tile".into(),
+            ));
+        }
+        let mut in_ptr = dev_ptr(src)?;
+        let mut out_ptr = dev_ptr(dst)?;
+        let (grid, block) = linear_launch(total);
+        let mut a_i = a as i32;
+        let mut b_i = b as i32;
+        self.launch_compute_kernel(
+            "grim_transpose_2d_f32",
+            grid,
+            block,
+            &mut [
+                arg(&mut in_ptr),
+                arg(&mut out_ptr),
+                arg(&mut a_i),
+                arg(&mut b_i),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// In-memory D2D transpose of a contiguous `[a, b]` f32 tensor into a fresh `[b, a]` device buffer via `grim_transpose_2d_f32`.
     /// This replaces the DtoH + transpose + H2D round trip that the host fallback performs.
     pub fn transpose_f32_2d(
@@ -1872,28 +1981,9 @@ impl RocmDevice {
         let out_shape = Shape::new(vec![b, a]);
         let storage =
             RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        let mut in_ptr = dev_ptr(src_s)?;
-        let mut out_ptr = dev_ptr(&storage)?;
-        let total = a
-            .checked_mul(b)
-            .ok_or_else(|| Error::Backend("transpose_f32_2d: a*b overflow".into()))?;
-        let (grid, block) = linear_launch(total);
-        let mut a_i = a as i32;
-        let mut b_i = b as i32;
-        let stream = self.launch_compute_kernel(
-            "grim_transpose_2d_f32",
-            grid,
-            block,
-            &mut [
-                arg(&mut in_ptr),
-                arg(&mut out_ptr),
-                arg(&mut a_i),
-                arg(&mut b_i),
-            ],
-        )?;
+        self.transpose_f32_2d_into(src_s, &storage, a, b)?;
         // SPEED-ROC-2: no trailing sync — src/dst are both allocator-owned
         // device buffers ordered on the same stream as every consumer.
-        let _ = stream;
         Ok(Box::new(storage))
     }
 
@@ -2002,6 +2092,18 @@ impl Drop for RocmDevice {
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         unsafe {
             let _ = hipDeviceSynchronize();
+        }
+        // BLASLt scratch is device-owned and may still be referenced by the
+        // just-completed stream. Destroy its completion event before returning
+        // its allocator-backed storage to the pool.
+        if let Ok(mut guard) = self.blaslt_scratch.lock() {
+            if let Some(scratch) = guard.take() {
+                if !scratch.completion.is_null() {
+                    unsafe {
+                        let _ = crate::hipEventDestroy(scratch.completion);
+                    }
+                }
+            }
         }
         // Return all pooled buffers to the driver before the allocator Arc is dropped,
         self.allocator.empty_cache();

@@ -4,6 +4,7 @@
 use std::ffi::c_void;
 
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
@@ -14,7 +15,7 @@ use crate::device::gemm_tuning::{lookup_gemm_config_for_shape, lookup_solution_i
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, rocblas_gemm_ex,
+    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, rocblas_gemm_ex,
     rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success,
     select_gemm_algo, HipDim3, RocblasInt, RocblasOperation, RocmHandle, ROCBLAS_GEMM_FLAGS_NONE,
 };
@@ -839,6 +840,102 @@ impl RocmDevice {
         Ok((Box::new(out_storage), handle))
     }
 
+    /// Launch the opt-in native-F32 BLASLt prefill candidate.
+    ///
+    /// Model tensors use `A:[M,K]` and `B:[N,K]` row-major storage and the
+    /// dispatcher contract is `C = A @ B^T`. The physical layout is handled
+    /// without a host round trip: transposing `A` into a device-owned `[K,M]`
+    /// row-major buffer makes its bytes canonical column-major `[M,K]`, while
+    /// the existing `[N,K]` row-major bytes are already canonical column-major
+    /// `[K,N]` for `B`. The result is staged in a device-owned canonical
+    /// buffer and converted back into the caller's row-major output.
+    fn launch_blaslt_prefill_into(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let stream = self.active_stream();
+        if stream.is_null() {
+            return Err(Error::Backend(
+                "BLASLt prefill requires a non-null active stream".into(),
+            ));
+        }
+        let mut scratch_guard = self
+            .blaslt_scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(scratch) = scratch_guard.as_ref() {
+            if scratch.in_flight && scratch.stream != stream {
+                check_hip("hipStreamWaitEvent(BLASLt scratch)", unsafe {
+                    crate::hipStreamWaitEvent(stream, scratch.completion, 0)
+                })?;
+            }
+        }
+        let needs_new = scratch_guard
+            .as_ref()
+            .map(|scratch| !scratch.fits(m, n, k))
+            .unwrap_or(true);
+        if needs_new {
+            *scratch_guard = Some(crate::device::roc_device::BlasLtScratch::new(
+                self, m, n, k,
+            )?);
+        }
+
+        let launch_result = (|| {
+            let scratch = scratch_guard
+                .as_ref()
+                .ok_or_else(|| Error::Backend("BLASLt scratch disappeared".into()))?;
+            self.transpose_f32_2d_into(a_storage, &scratch.a_col, m, k)?;
+            let a_ptr = scratch.a_col.device_ptr_checked()? as *const c_void;
+            let b_ptr = b_storage.device_ptr_checked()? as *const c_void;
+            let d_ptr = scratch.d_col.device_ptr_checked()? as *mut c_void;
+            crate::device::blaslt::matmul_col_major_f32(stream, a_ptr, b_ptr, d_ptr, m, n, k)
+                .map_err(Error::Backend)?;
+            crate::device::blaslt::launch_col_major_to_row_major(
+                self,
+                &scratch.d_col,
+                out_storage,
+                m,
+                n,
+                m,
+            )
+            .map_err(Error::Backend)?;
+            Ok::<(), Error>(())
+        })();
+
+        if let Err(error) = launch_result {
+            // A failed BLASLt call may still have queued work. Drain before
+            // allowing the persistent scratch to be reused or dropped.
+            self.synchronize();
+            if let Some(scratch) = scratch_guard.as_mut() {
+                scratch.in_flight = false;
+            }
+            return Err(error);
+        }
+
+        let scratch = scratch_guard
+            .as_mut()
+            .ok_or_else(|| Error::Backend("BLASLt scratch disappeared after launch".into()))?;
+        if let Err(error) = check_hip("hipEventRecord(BLASLt scratch)", unsafe {
+            crate::hipEventRecord(scratch.completion, stream)
+        }) {
+            self.synchronize();
+            scratch.in_flight = false;
+            return Err(error);
+        }
+        scratch.in_flight = true;
+        scratch.stream = stream;
+        drop(scratch_guard);
+        // The two staging/conversion kernels increment the generic counter;
+        // account for the external BLASLt GEMM itself as one GEMM launch.
+        self.launch_counter.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new(RocmHandle::new(Some(stream))))
+    }
+
     /// `C = A @ B^T` writing into CALLER-PROVIDED `out` — no allocation inside.
     /// Required for HIP graph capture (stable pointers across replays); same
     /// dispatch as [`Self::matmul_op`] (scythe route, split-K, dot paths,
@@ -918,6 +1015,42 @@ impl RocmDevice {
             ));
         }
         let out_storage: &RocmStorage = out;
+
+        // Opt-in native-F32 prefill experiment. The gate is deliberately
+        // outside the default path: Q8/Q4 model weights and all decode shapes
+        // continue through their measured dot4/rocBLAS dispatchers.
+        let native_f32 = |storage: &RocmStorage| {
+            storage.dtype.arith == ArithType::F32
+                && matches!(storage.dtype.storage, DTypeStorage::Native)
+                && storage.device_ptr_is_valid()
+        };
+        if crate::device::blaslt::blaslt_prefill_enabled()
+            && self.active_capture_stream().is_none()
+            && native_f32(a_storage)
+            && native_f32(b_storage)
+            && native_f32(out_storage)
+            && dtype_out.arith == ArithType::F32
+        {
+            static PROBE: OnceLock<crate::device::blaslt::BlasLtProbe> = OnceLock::new();
+            let probe = PROBE.get_or_init(crate::device::blaslt::probe_blaslt);
+            if matches!(
+                crate::device::blaslt::select_blaslt_candidate(&probe, m, n, k, true),
+                crate::device::blaslt::BlasLtSelection::Eligible
+            ) {
+                return self.launch_blaslt_prefill_into(
+                    a_storage,
+                    b_storage,
+                    out_storage,
+                    m,
+                    n,
+                    k,
+                );
+            }
+            eprintln!(
+                "[blaslt-prefill] candidate not eligible for {m}x{n}x{k}: {}",
+                probe.describe()
+            );
+        }
 
         // WI-SB6 production routing: GRIM_SCYTHE_RING=1 rides F32 GEMMs (the dense-layer op of every decode step) through the ScytheRing persistent dispatch wave instead of the rocBLAS direct path.
         // Benchmark-gated, never default - see device::scythe_route.

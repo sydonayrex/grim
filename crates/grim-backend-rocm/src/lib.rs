@@ -80,8 +80,8 @@ pub use crate::device::handles::{
 };
 
 pub use crate::device::blaslt::{
-    launch_col_major_to_row_major, matmul_col_major_f32, probe_blaslt, select_blaslt_candidate,
-    BlasLtProbe, BlasLtSelection,
+    blaslt_prefill_enabled, launch_col_major_to_row_major, matmul_col_major_f32, probe_blaslt,
+    select_blaslt_candidate, BlasLtProbe, BlasLtSelection,
 };
 pub use crate::device::rocblas::{
     ROCBLAS_GEMM_FLAGS_NONE,
