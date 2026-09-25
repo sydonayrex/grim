@@ -548,7 +548,17 @@ impl RocmDevice {
                 Ok("0" | "false" | "off")
             );
         if dot_fused_ok {
-            self.launch_dot4_gate_up_silu_q80_f32act_gemv_into(a_rocm, wg, wu, out, m, n, k)
+            let use_256 = matches!(
+                std::env::var("GRIM_DOT4_256").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            );
+            if use_256 {
+                self.launch_dot4_gate_up_silu_q80_f32act_gemv_256_into(
+                    a_rocm, wg, wu, out, m, n, k,
+                )
+            } else {
+                self.launch_dot4_gate_up_silu_q80_f32act_gemv_into(a_rocm, wg, wu, out, m, n, k)
+            }
         } else {
             self.launch_quantize_q8_1(a_rocm, act_q81, m, k)?;
             self.launch_dot4_gate_up_silu_q80_gemv_into(act_q81, wg, wu, out, m, n, k)
@@ -587,6 +597,53 @@ impl RocmDevice {
         let mut kk = k as i32;
         self.launch_compute_kernel(
             "grim_dot4_gate_up_silu_q80_f32act_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut wgptr),
+                arg(&mut wuptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Eight-wave RDNA4 experiment: 256 threads per workgroup with a
+    /// cross-wave LDS reduction. Opt-in through `GRIM_DOT4_256=1`.
+    pub fn launch_dot4_gate_up_silu_q80_f32act_gemv_256_into(
+        &self,
+        act_f32: &RocmStorage,
+        wg: &RocmStorage,
+        wu: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_256: act_f32 has no device ptr".into())
+        })?;
+        let wg_ptr = wg.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_256: gate has no device ptr".into())
+        })?;
+        let wu_ptr = wu.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_256: up has no device ptr".into())
+        })?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_256: out has no device ptr".into())
+        })?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let (mut aptr, mut wgptr, mut wuptr, mut optr) = (a_ptr, wg_ptr, wu_ptr, out_ptr);
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_gate_up_silu_q80_f32act_gemv_256",
             grid_dim,
             block_dim,
             &mut [
