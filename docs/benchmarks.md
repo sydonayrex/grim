@@ -337,17 +337,29 @@ Both formats must be uploaded with `from_cpu_bytes`: `dequant_kv_element` indexe
 the page pointer **bytewise**, so widening int8 values into f32 slots misaligns
 every read by 4x. That was a real failure caught by the parity test.
 
-**Nutcracker is decoded, but not in the paged KV kernel.** The format (E2M1
-codes with a per-16 E8M0 block scale whose low 2 bits are stolen as a
-special-value selector — RaZeR-style, taking the selector from exponent range
-since E8M0 has no sign bit) already has a working dequant path in the weight
-pipeline: `launch_dequant_nutcracker`, `dequantize_nutcracker_host`,
-`launch_nutcracker_gemv`, and `launch_nutcracker_gemm_tiled`, plus
-`QuantMode::NutFp4Emulated` capability reporting. What is missing is the KV
-side: the paged attention kernel's `quant_format == 4` is plain FP4_E2M1, which
-ignores the stolen selector, so pointing Nutcracker KV at that code would decode
-the block scales wrong. It needs a new format code and a reader that calls the
-existing `nutcracker_to_float_hip`.
+**Nutcracker is already decoded on the KV path.** `KvCacheQuantFormat::NutFp4 = 8`
+exists, and `dequant_kv_element`'s `quant_format == 8` arm reads the per-16
+inline block scale (`[exp:6 | sel:2]`, `scale = 2^(exp-31)`) and the repurposed
+zero encoding that emits the block's special value, with the sign taken from the
+selector rather than the nibble. It is the one variant that ignores the caller's
+per-tensor `k_scale`/`v_scale`, because the scale travels in the buffer. The
+weight path also has `launch_dequant_nutcracker`, `launch_nutcracker_gemv`,
+`launch_nutcracker_gemm_tiled`, and `QuantMode::NutFp4Emulated`.
+
+All three now have parity gates against an f64 host reference:
+
+| format | bits/elem | gate | max err | result |
+|---|---|---|---|---|
+| int8 | 8 | 0.15 | 0.0018 | PASS |
+| FP8 E4M3 | 8 | 0.25 | 0.0223 | PASS |
+| Nutcracker | ~4.5 | 1.0 | 0.0761 | PASS |
+
+Nutcracker's gate is much looser because 4-bit E2M1 codes sit on a coarse grid;
+it still catches O(1) breakage (wrong block indexing, ignoring the inline scale,
+misreading the stolen selector). It uses the production
+`grim_quant::quant_nutcracker` encoder, so the test measures the device decoder
+against the real encoder rather than a mirror of it. At ~4.5 bits/element it is
+the format that would actually make a long context fit.
 
 ### Still open
 

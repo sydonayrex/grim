@@ -372,11 +372,12 @@ multiplies the trailing dims.
   **FP8 E4M3** (max err 0.0223) against an f64 reference. FP8 is the intended
   RDNA4 default: same 1 byte/element as int8, but floating-point dynamic range,
   which matters for K where a per-tensor int8 scale flattens outlier channels.
-  Nutcracker (E2M1 + E8M0 per-16 block scale with 2 bits stolen as a
-  special-value selector) already decodes in the weight path —
-  `launch_dequant_nutcracker`, `launch_nutcracker_gemv`/`_gemm_tiled`,
-  `QuantMode::NutFp4Emulated` — but its KV side is missing: the paged kernel's
-  `quant_format == 4` is plain FP4_E2M1, which ignores the stolen selector.
+  Nutcracker is already decoded on the KV path: `KvCacheQuantFormat::NutFp4 = 8`
+  with a `quant_format == 8` arm in `dequant_kv_element` that reads the per-16
+  inline scale and the stolen 2-bit special-value selector (and deliberately
+  ignores the caller's per-tensor scale). At 4.5 bits/element it is the format
+  that would make a long context actually fit. It has no parity test yet — the
+  next gate.
 - **Still open:** Qwen35 decode is not yet routed onto the paged quantized path,
   so no KV memory saving is realized and no tok/s exists. The f32↔f16 KV cast was
   attempted and **reverted** — it compiled but its ROCm override was never
