@@ -270,6 +270,15 @@ use crate::device::util::DeviceGuard;
 /// `GRIM_SAMPLER_BLOCK` in [`DEVICE_SAMPLER_KERNEL_SOURCE`]).
 const SAMPLER_BLOCK: u32 = 1024;
 
+fn sampler_block_size() -> u32 {
+    match std::env::var("GRIM_SAMPLER_BLOCK").as_deref() {
+        Ok("256") => 256,
+        Ok("512") => 512,
+        _ => SAMPLER_BLOCK,
+    }
+}
+
+
 /// Largest vocabulary accepted by the device sampler.
 /// Beyond this the LDS / register budget of the single-block design degrades and callers should.
 pub const MAX_DEVICE_SAMPLER_VOCAB: usize = 1 << 18; // 262144
@@ -317,6 +326,7 @@ fn sample_impl(
     // Pin the thread to the owning device for the launch + D2H copy so the
     // async copy lands in the right HIP context on multi-GPU boxes.
     let _dev_guard = DeviceGuard::set(device.ordinal as i32);
+    let sampler_block = sampler_block_size();
 
     // G1: when the caller knows the producer stream (post-graph-replay
     // sampling), launch + readback on THAT stream — ambient `active_stream()`
@@ -328,7 +338,7 @@ fn sample_impl(
         let r = device.launch_compute_kernel_on_stream(
             "grim_sample_logits_stochastic",
             HipDim3::new(1, 1, 1),
-            HipDim3::new(SAMPLER_BLOCK, 1, 1),
+            HipDim3::new(sampler_block, 1, 1),
             &mut [
                 arg(&mut logits_arg),
                 arg(&mut out_arg),
@@ -349,7 +359,7 @@ fn sample_impl(
                 device.launch_compute_kernel_on_stream(
                     "grim_sample_logits_stochastic",
                     HipDim3::new(1, 1, 1),
-                    HipDim3::new(SAMPLER_BLOCK, 1, 1),
+                    HipDim3::new(sampler_block, 1, 1),
                     &mut [
                         arg(&mut logits_arg),
                         arg(&mut out_arg),
@@ -372,7 +382,7 @@ fn sample_impl(
         device.launch_compute_kernel(
             "grim_sample_logits_stochastic",
             HipDim3::new(1, 1, 1),
-            HipDim3::new(SAMPLER_BLOCK, 1, 1),
+            HipDim3::new(sampler_block, 1, 1),
             &mut [
                 arg(&mut logits_arg),
                 arg(&mut out_arg),
@@ -689,6 +699,7 @@ fn warmup_kernel(device: &RocmDevice, kind: WarmupKind) -> Result<()> {
             )?;
         }
         WarmupKind::Sampler => {
+            let sampler_block = sampler_block_size();
             let out = RocmStorage::alloc_gpu(
                 &Shape::new(vec![1]),
                 DType {
@@ -710,7 +721,7 @@ fn warmup_kernel(device: &RocmDevice, kind: WarmupKind) -> Result<()> {
             device.launch_compute_kernel(
                 "grim_sample_logits_stochastic",
                 HipDim3::new(1, 1, 1),
-                HipDim3::new(SAMPLER_BLOCK, 1, 1),
+                HipDim3::new(sampler_block, 1, 1),
                 &mut [
                     arg(&mut lp),
                     arg(&mut op),
@@ -978,5 +989,23 @@ impl PinnedLogitsBuf {
         })?;
 
         Ok(&self.bufs[slot].as_slice()[..vocab])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampler_block_size;
+
+    #[test]
+    fn sampler_block_size_honors_opt_in_values() {
+        temp_env::with_var("GRIM_SAMPLER_BLOCK", Some("256"), || {
+            assert_eq!(sampler_block_size(), 256);
+        });
+        temp_env::with_var("GRIM_SAMPLER_BLOCK", Some("512"), || {
+            assert_eq!(sampler_block_size(), 512);
+        });
+        temp_env::with_var("GRIM_SAMPLER_BLOCK", None::<&str>, || {
+            assert_eq!(sampler_block_size(), 1024);
+        });
     }
 }
