@@ -188,7 +188,7 @@ pub enum QuantMode {
     /// Rook: MXFP4 E2M1 emulated (dequant in LDS to BF16, WMMA BF16 GEMM). Safe RDNA2+.
     MxFp4Emulated,
     /// NVFP4 E2M1 emulated (dequant in LDS to F32/BF16 with Wave cooperative reduction). Safe RDNA2+.
-    NvFp4Emulated,
+    NutFp4Emulated,
     /// Jackdaw: MXFP8 E4M3 emulated (dequant in LDS to BF16, WMMA BF16 GEMM). Safe RDNA2+.
     MxFp8Emulated,
     /// W8A8 SmoothQuant-style int8 GEMM - activations quantized per-token, weights quantized per-channel.
@@ -234,7 +234,7 @@ pub struct QuantCapability {
     /// concrete arches that actually differ. `None` == no native FP8.
     fp8: Fp8NativeFormat,
     mxfp4_emulated: bool,
-    nvfp4_emulated: bool,
+    nutcracker_emulated: bool,
     mxfp8_emulated: bool,
     /// Int8 MFMA for W8A8 SmoothQuant (CDNA2+: `mfma_i32_32x32x16_i8`).
     int8_w8a8: bool,
@@ -248,7 +248,7 @@ impl QuantCapability {
             QuantMode::Bf16 => self.bf16,
             QuantMode::Fp8Native => self.fp8.is_native(),
             QuantMode::MxFp4Emulated => self.mxfp4_emulated,
-            QuantMode::NvFp4Emulated => self.nvfp4_emulated,
+            QuantMode::NutFp4Emulated => self.nutcracker_emulated,
             QuantMode::MxFp8Emulated => self.mxfp8_emulated,
             QuantMode::Int8W8A8 => self.int8_w8a8,
         }
@@ -265,13 +265,13 @@ impl fmt::Display for QuantCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} nvfp4_emulated={} mxfp8_emulated={} int8_w8a8={}",
+            "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} nutcracker_emulated={} mxfp8_emulated={} int8_w8a8={}",
             self.fp32,
             self.f16,
             self.bf16,
             self.fp8,
             self.mxfp4_emulated,
-            self.nvfp4_emulated,
+            self.nutcracker_emulated,
             self.mxfp8_emulated,
             self.int8_w8a8
         )
@@ -287,7 +287,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: true,
             fp8: Fp8NativeFormat::OcpFn,
             mxfp4_emulated: true,
-            nvfp4_emulated: true,
+            nutcracker_emulated: true,
             mxfp8_emulated: true,
             int8_w8a8: true,
         },
@@ -297,7 +297,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: true,
             fp8: Fp8NativeFormat::Fnuz,
             mxfp4_emulated: true,
-            nvfp4_emulated: true,
+            nutcracker_emulated: true,
             mxfp8_emulated: true,
             int8_w8a8: true,
         },
@@ -307,7 +307,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: true,
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: true,
-            nvfp4_emulated: true,
+            nutcracker_emulated: true,
             mxfp8_emulated: true,
             int8_w8a8: true,
         },
@@ -317,7 +317,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: false,
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: false,
-            nvfp4_emulated: false,
+            nutcracker_emulated: false,
             mxfp8_emulated: false,
             int8_w8a8: true,
         },
@@ -327,7 +327,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             bf16: false,
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: false,
-            nvfp4_emulated: false,
+            nutcracker_emulated: false,
             mxfp8_emulated: false,
             int8_w8a8: false,
         },
@@ -351,7 +351,7 @@ pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
                 QuantMode::Fp32
             }
         }
-        QuantMode::MxFp4Emulated | QuantMode::NvFp4Emulated | QuantMode::MxFp8Emulated => {
+        QuantMode::MxFp4Emulated | QuantMode::NutFp4Emulated | QuantMode::MxFp8Emulated => {
             if caps.bf16 {
                 requested
             } else {
@@ -593,7 +593,7 @@ mod self_tests {
     }
 
     #[test]
-    fn test_quant_capability_nvfp4_emulated() {
+    fn test_quant_capability_nutcracker_emulated() {
         for arch in [
             GcnArch::RDNA2,
             GcnArch::RDNA3,
@@ -603,13 +603,13 @@ mod self_tests {
             GcnArch::UDNA,
         ] {
             let cap = arch_capability(arch);
-            assert!(cap.nvfp4_emulated, "{arch:?} should support NvFp4Emulated");
-            assert!(cap.supports(QuantMode::NvFp4Emulated));
+            assert!(cap.nutcracker_emulated, "{arch:?} should support NutFp4Emulated");
+            assert!(cap.supports(QuantMode::NutFp4Emulated));
         }
 
         let rna1 = arch_capability(GcnArch::RDNA1);
-        assert!(!rna1.nvfp4_emulated);
-        assert!(!rna1.supports(QuantMode::NvFp4Emulated));
+        assert!(!rna1.nutcracker_emulated);
+        assert!(!rna1.supports(QuantMode::NutFp4Emulated));
     }
 
     #[test]

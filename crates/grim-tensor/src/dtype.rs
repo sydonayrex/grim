@@ -150,8 +150,20 @@ pub enum FloatPackScheme {
     /// MXFP8: 8-bit float with shared E8M0 scale per 32 elements.
     /// Packed as length-prefixed codes and exponents.
     MxFp8,
-    /// NVFP4: NVIDIA 4-bit float (E2M1) with interleaved scales per 16-element sub-block.
+    /// NVFP4: NVIDIA Blackwell 4-bit float — E2M1 elements with an **E4M3**
+    /// block scale per 16 elements. GGUF type 78.
+    ///
+    /// Interleaved 9 bytes per 16 values: 1 E4M3 scale byte + 8 code bytes.
     NvFp4,
+    /// Nutcracker: grim's internal 4-bit float — E2M1 elements with a per-16
+    /// block scale byte reinterpreted as `[exp:6 | sel:2]`, where the low 2 bits
+    /// are a special-value selector and the repurposed E2M1 zero code emits
+    /// that value. RaZeR (arXiv:2501.04052) adapted to an E8M0-shaped byte.
+    ///
+    /// **Byte-identical layout to [`Self::NvFp4`], different decode.** The two
+    /// schemes must never share a tag: feeding NVFP4 data to the Nutcracker
+    /// decoder (or vice versa) fails silently, not loudly.
+    NutFp4,
 }
 
 /// Target quantization format for device-side `quantize` path.
@@ -287,8 +299,12 @@ impl DType {
                 FloatPackScheme::Fp8 => elem_count,
                 FloatPackScheme::MxFp4 => elem_count.div_ceil(2) + (elem_count.div_ceil(32)),
                 FloatPackScheme::MxFp8 => elem_count + (elem_count.div_ceil(32)),
-                // NVFP4: 1 byte E8M0 scale per 16-elem sub-block + 0.5 byte per weight.
-                FloatPackScheme::NvFp4 => elem_count.div_ceil(2) + elem_count.div_ceil(16),
+                // NVFP4 and Nutcracker: 1 scale byte per 16-elem sub-block +
+                // 0.5 byte per weight. Same size either way — which is exactly
+                // why the old E8M0-for-E4M3 scale bug was silent.
+                FloatPackScheme::NvFp4 | FloatPackScheme::NutFp4 => {
+                    elem_count.div_ceil(2) + elem_count.div_ceil(16)
+                }
             },
             Storage::Block(b) => match b {
                 BlockDtype::Fp4 | BlockDtype::Nf4 => elem_count.div_ceil(2),

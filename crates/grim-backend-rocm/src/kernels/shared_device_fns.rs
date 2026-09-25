@@ -94,6 +94,57 @@ extern "C" {
         return base_val * scale;
     }
 
+    // ── Nutcracker ────────────────────────────────────────────────────────
+    // E2M1 + E8M0 block scale where the scale byte's low bits are stolen as a
+    // special-value selector, and the redundant E2M1 zero code is repurposed
+    // to emit that value. Same idea as RaZeR (arXiv:2501.04052), but RaZeR
+    // steals the *sign* bit of an E4M3 scale. Grim packs E8M0, which has no
+    // sign bit and no mantissa, so the selector is taken out of exponent range
+    // instead — the same argument the paper makes for E3M3 weight scales: LLM
+    // weight block scales are narrow enough to not need 8 exponent bits.
+    //
+    // Byte layout is identical to NvFp4: 1 scale byte + 8 packed code bytes
+    // per 16 values (9 bytes per sub-block), so this drops into the existing
+    // unpack path with no repacking.
+    //
+    //   scale byte = [ exp : 6 | sel : 2 ]   scale = 2^(exp - 31)
+    //   code & 0x7 == 0 (the +/-0 encodings) -> special value, sign from sel
+    //
+    // Consequence: Nutcracker cannot represent an exact zero. A quantizer must
+    // map near-zero to +/-0.5 (code 0x1 / 0x9), the smallest non-zero code.
+    #define NUTCRACKER_SEL_BITS 2
+    #define NUTCRACKER_SEL_MASK 0x3
+    #define NUTCRACKER_SCALE_BIAS 31
+
+    // Two +/- pairs, ordered so the selector's high bit carries the sign and
+    // the low bit selects the magnitude:
+    // 0 -> +5.0, 1 -> +2.5, 2 -> -5.0, 3 -> -2.5.
+    // 5.0 is the midpoint of the E2M1 codebook's widest gap (4 -> 6); 2.5
+    // bridges the next widest (2 -> 3). Both are exact multiples of 0.5, so
+    // decoded values stay on the FP4 grid and the MAC stays low-precision.
+    __device__ inline float nutcracker_special_value_hip(int sel) {
+        float mag = (sel & 0x1) ? 2.5f : 5.0f;
+        return (sel & 0x2) ? -mag : mag;
+    }
+
+    __device__ inline float nutcracker_to_float_hip(unsigned char code, unsigned char scale_byte) {
+        int sel = scale_byte & NUTCRACKER_SEL_MASK;
+        float scale = powf(2.0f, (float)(scale_byte >> NUTCRACKER_SEL_BITS) - (float)NUTCRACKER_SCALE_BIAS);
+        if ((code & 0x7) == 0) {
+            return nutcracker_special_value_hip(sel) * scale;
+        }
+        int exp = (code >> 1) & 3;
+        int mant = code & 1;
+        float base_val;
+        if (exp == 0) {
+            base_val = (float)mant * 0.5f;
+        } else {
+            base_val = (1.0f + (float)mant * 0.5f) * powf(2.0f, (float)exp - 1.0f);
+        }
+        if (code & 0x8) base_val = -base_val;
+        return base_val * scale;
+    }
+
     __device__ inline float dequant_q4k_element(const unsigned char* block_ptr, int in_sb) {
         const unsigned short* h_ptr = (const unsigned short*)block_ptr;
         float d = fp16_to_float_device(h_ptr[0]);

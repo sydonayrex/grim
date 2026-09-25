@@ -68,8 +68,8 @@ impl QuantOps for VulkanDevice {
                 Storage::FloatPack(FloatPackScheme::MxFp4) => {
                     Some(VulkanKernel::FusedDequantGemmMxFp4)
                 }
-                Storage::FloatPack(FloatPackScheme::NvFp4) => {
-                    Some(VulkanKernel::FusedDequantGemmNvFp4)
+                Storage::FloatPack(FloatPackScheme::NutFp4) => {
+                    Some(VulkanKernel::FusedDequantGemmNutcracker)
                 }
                 Storage::CompressedTensorsW8A8Fp8 => Some(VulkanKernel::FusedDequantGemmW8A8Fp8),
                 Storage::CompressedTensorsW8A8Int8 => Some(VulkanKernel::FusedDequantGemmW8A8Int8),
@@ -160,6 +160,7 @@ impl QuantOps for VulkanDevice {
                     FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(&b_bytes_cpu, k * n)?,
                     FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(&b_bytes_cpu, k * n)?,
                     FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(&b_bytes_cpu, k * n)?,
+                    FloatPackScheme::NutFp4 => grim_quant::dequant_nutcracker(&b_bytes_cpu, k * n)?,
                 })
             }
             Storage::Block(dtype) => {

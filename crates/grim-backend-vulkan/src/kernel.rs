@@ -451,7 +451,7 @@ pub enum VulkanKernel {
     FusedDequantGemmIQ2S,
     FusedDequantGemmFp8E4M3,
     FusedDequantGemmMxFp4,
-    FusedDequantGemmNvFp4,
+    FusedDequantGemmNutcracker,
     FusedDequantGemmW8A8Fp8,
     FusedDequantGemmW8A8Int8,
     KvDequantAttention,
@@ -573,7 +573,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::FusedDequantGemmIQ2S => SPIRV_FUSED_DEQUANT_GEMM_IQ2S,
         VulkanKernel::FusedDequantGemmFp8E4M3 => SPIRV_FUSED_DEQUANT_GEMM_FP8_E4M3,
         VulkanKernel::FusedDequantGemmMxFp4 => SPIRV_FUSED_DEQUANT_GEMM_MXFP4,
-        VulkanKernel::FusedDequantGemmNvFp4 => SPIRV_FUSED_DEQUANT_GEMM_NVFP4,
+        VulkanKernel::FusedDequantGemmNutcracker => SPIRV_FUSED_DEQUANT_GEMM_NUTCRACKER,
         VulkanKernel::FusedDequantGemmW8A8Fp8 => SPIRV_FUSED_DEQUANT_GEMM_W8A8_FP8,
         VulkanKernel::FusedDequantGemmW8A8Int8 => SPIRV_FUSED_DEQUANT_GEMM_W8A8_INT8,
         VulkanKernel::KvDequantAttention => SPIRV_KV_DEQUANT_ATTENTION,
@@ -653,7 +653,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedDequantGemmIQ2S
         | VulkanKernel::FusedDequantGemmFp8E4M3
         | VulkanKernel::FusedDequantGemmMxFp4
-        | VulkanKernel::FusedDequantGemmNvFp4
+        | VulkanKernel::FusedDequantGemmNutcracker
         | VulkanKernel::FusedDequantGemmW8A8Fp8
         | VulkanKernel::FusedDequantGemmW8A8Int8
         | VulkanKernel::FusedQuantGemmQ80

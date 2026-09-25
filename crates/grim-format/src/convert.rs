@@ -373,6 +373,9 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
             grim_tensor::dtype::FloatPackScheme::NvFp4 => {
                 grim_quant::dequant_nvfp4(&raw.bytes, elem_count)
             }
+            grim_tensor::dtype::FloatPackScheme::NutFp4 => {
+                grim_quant::dequant_nutcracker(&raw.bytes, elem_count)
+            }
         },
         grim_tensor::dtype::Storage::GroupInt(cfg) => {
             dequant_group_int_bytes(&raw.bytes, &raw.shape, cfg.bits as u32, cfg.group_size)
@@ -1389,7 +1392,7 @@ pub fn toolkit_to_storage(_producer: ToolkitProducer, qfmt: ToolkitQuantFormat) 
         ToolkitQuantFormat::QuarkFP8 => Some(Storage::CompressedTensorsW8A8Fp8),
         ToolkitQuantFormat::ModelOptFP8 => Some(Storage::CompressedTensorsW8A8Fp8),
         ToolkitQuantFormat::ModelOptNVFP4 => {
-            // NVFP4 uses NVIDIA's native packing → NvFp4 FloatPack.
+            // ModelOpt emits real NVFP4: E2M1 + an E4M3 block scale per 16.
             Some(Storage::FloatPack(FloatPackScheme::NvFp4))
         }
     }
@@ -1445,8 +1448,8 @@ pub fn reframe_toolkit_bytes(
             Ok(out)
         }
         ToolkitQuantFormat::ModelOptNVFP4 => {
-            // NVFP4 native packing already matches FloatPackScheme::NvFp4.
-            // Pass through — dequant_nvfp4 understands the interleaved layout.
+            // NVFP4 native packing is already 9 bytes per 16 values, which is
+            // what FloatPackScheme::NvFp4 expects. Pass through.
             Ok(bytes.to_vec())
         }
         ToolkitQuantFormat::FbgemmFP8 => {
@@ -1642,7 +1645,7 @@ mod toolkit_tests {
     }
 
     /// Independent OCP E2M1 codebook oracle - transcribed from spec, NOT calling grim's own `mxfp4_e2m1_to_f32`.
-    /// Used to verify that the toolkit-to-storage pipeline produces bytes that `dequant_nvfp4` decodes to the correct.
+    /// Used to verify that the toolkit-to-storage pipeline produces bytes that `dequant_nutcracker` decodes to the correct.
     fn oracle_e2m1(code: u8) -> f32 {
         let sign = (code >> 3) & 1 != 0;
         let exp = (code >> 1) & 3;
@@ -1655,53 +1658,59 @@ mod toolkit_tests {
         if sign { -base } else { base }
     }
 
+    /// The regression that motivated splitting NvFp4 from NutFp4: ModelOpt
+    /// produces real NVFP4 (E4M3 block scale), and grim used to decode that
+    /// byte as E8M0 — which passed every length check and produced ~0.
     #[test]
     #[allow(clippy::same_item_push)]
     fn test_nvfp4_toolkit_storage_produces_correct_dequant() {
-        // Build a 32-weight NVFP4 buffer by hand: 2 sub-blocks of 16.
-        // Sub-block 0: exp=127 (scale 1.0), code=2 (codebook 1.0) → 1.0 Sub-block 1: exp=128 (scale 2.0),.
+        // 32 weights, 2 sub-blocks of 16. E4M3 scale bytes:
+        //   0x38 = 1.0, 0x40 = 2.0
         let mut nvfp4 = Vec::with_capacity(18);
-        // Sub-block 0: scale byte + 8 packed code bytes
-        nvfp4.push(127); // E8M0 scale
+        nvfp4.push(0x38); // E4M3 scale 1.0
         for _ in 0..8 {
             nvfp4.push(0x22); // two code-2 nibbles per byte
         }
-        // Sub-block 1
-        nvfp4.push(128); // E8M0 scale = 128 → 2^1 = 2.0
+        nvfp4.push(0x40); // E4M3 scale 2.0
         for _ in 0..8 {
             nvfp4.push(0x44); // two code-4 nibbles per byte
         }
 
-        // Route through the toolkit adapter (as SafetensorsProvider would).
         let storage =
             toolkit_to_storage(ToolkitProducer::ModelOpt, ToolkitQuantFormat::ModelOptNVFP4)
                 .unwrap();
-        let reframe_bytes =
-            reframe_toolkit_bytes(ToolkitQuantFormat::ModelOptNVFP4, &nvfp4, 32).unwrap();
+        let bytes = reframe_toolkit_bytes(ToolkitQuantFormat::ModelOptNVFP4, &nvfp4, 32).unwrap();
 
-        // Verify the storage variant is NvFp4.
         assert_eq!(
             storage,
-            grim_tensor::dtype::Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::NvFp4)
+            grim_tensor::dtype::Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::NvFp4),
+            "ModelOpt NVFP4 must map to NvFp4, not NutFp4"
         );
 
-        // Dequantize and verify against the independent oracle.
-        let f32_out = grim_quant::dequant_nvfp4(&reframe_bytes, 32).unwrap();
+        let f32_out = grim_quant::dequant_nvfp4(&bytes, 32).unwrap();
         assert_eq!(f32_out.len(), 32);
-
         for (i, &v) in f32_out.iter().take(16).enumerate() {
-            let expected = oracle_e2m1(2) * 2f32.powi(0); // code 2 * scale 1.0 = 1.0
+            let expected = oracle_e2m1(2) * 1.0; // code 2 * 1.0 = 1.0
             assert!(
                 (v - expected).abs() < 1e-6,
                 "sub-block 0 elem {i}: expected {expected}, got {v}"
             );
         }
         for (i, &v) in f32_out.iter().skip(16).enumerate() {
-            let expected = oracle_e2m1(4) * 2f32.powi(1); // code 4 * scale 2.0 = 4.0
+            let expected = oracle_e2m1(4) * 2.0; // code 4 * 2.0 = 4.0
             assert!(
                 (v - expected).abs() < 1e-6,
                 "sub-block 1 elem {i}: expected {expected}, got {v}"
             );
         }
+    }
+
+    /// The E8M0 misread must be detectable: 0x38 as E8M0 is 2^-71.
+    #[test]
+    fn test_nvfp4_scale_is_not_e8m0() {
+        let e8m0 = 2f32.powi(0x38 as i32 - 127);
+        assert!(e8m0 < 1e-20, "0x38 as E8M0 is {e8m0:e}");
+        let e4m3 = grim_quant::fp8_e4m3_to_f32(0x38);
+        assert!((e4m3 - 1.0).abs() < 1e-6, "0x38 as E4M3 is {e4m3}");
     }
 }

@@ -230,11 +230,13 @@ mod source_asm_self_tests {
     #[test]
     fn kernel_source_has_no_duplicate_device_fn_definitions() {
         let src = compute_kernel_source();
-        // These four symbols are defined in shared_device_fns::KERNEL_SOURCE only.
+        // These symbols are defined in shared_device_fns::KERNEL_SOURCE only.
         let shared_syms = [
             "float fp16_to_float_device(",
             "float fp8_e4m3_to_float_hip(",
             "float mxfp4_to_float_hip(",
+            "float nutcracker_to_float_hip(",
+            "float nutcracker_special_value_hip(",
             "float dequant_q4k_element(",
         ];
         for sym in &shared_syms {
@@ -245,5 +247,26 @@ mod source_asm_self_tests {
                 count, sym
             );
         }
+    }
+
+    /// Nutcracker steals 2 bits of the block-scale byte for its selector, so the
+    /// bias and selector mask must match the Rust reference exactly.
+    #[test]
+    fn nutcracker_scale_constants_match_rust_reference() {
+        let src = compute_kernel_source();
+        assert!(
+            src.contains("#define NUTCRACKER_SEL_BITS 2"),
+            "kernel selector width drifted from grim-quant::NUTCRACKER_SEL_BITS"
+        );
+        assert!(
+            src.contains("#define NUTCRACKER_SCALE_BIAS 31"),
+            "kernel scale bias drifted from grim_quant::NUTCRACKER_SCALE_BIAS"
+        );
+        // The repurposed code test must key on the zero encodings only, never on
+        // the sign bit — the selector owns the sign for a special value.
+        assert!(
+            src.contains("if ((code & 0x7) == 0)"),
+            "special-value branch must test (code & 0x7) == 0"
+        );
     }
 }

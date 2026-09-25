@@ -23,6 +23,31 @@ __device__ __forceinline__ float mxfp4_block_scale(unsigned char shared_exp) {
     return exp2f((float)(int)shared_exp - 127.0f);
 }
 
+// NVFP4: 9 bytes per 16 values, scale byte is E4M3, zero code is a real zero.
+__device__ __forceinline__ float nvfp4_block_scale(unsigned char e4m3) {
+    return fp8_e4m3_to_float_hip(e4m3);
+}
+
+__device__ __forceinline__ float nvfp4_decode_code(unsigned char code, float scale) {
+    return mxfp4_to_float_hip(code, 127) * scale;
+}
+
+// Nutcracker: same 9-byte layout, scale byte is [exp:6 | sel:2]; the low 2
+// bits select a special value that the repurposed zero code emits.
+__device__ __forceinline__ float nutcracker_block_scale(unsigned char scale_byte, int* sel_out) {
+    int sel = scale_byte & 0x3;
+    *sel_out = sel;
+    return exp2f((float)(int)(scale_byte >> 2) - 31.0f);
+}
+
+__device__ __forceinline__ float nutcracker_decode_code(unsigned char code, float scale, int sel) {
+    if ((code & 0x7) == 0) {
+        float mag = (sel & 0x1) ? 2.5f : 5.0f;
+        return ((sel & 0x2) ? -mag : mag) * scale;
+    }
+    return mxfp4_to_float_hip(code, 127) * scale;
+}
+
 // Accumulate one 32-element MXFP4 micro-block into `acc`, vectorizing the code stream as one uint4 (16 B) and the activation stream as float4s.
 // `a_row` points at A[row*K + block_k*32] (as float4*); `gamma4` optionally points at gamma[block_k*32] (as float4*).
 __device__ __forceinline__ float mxfp4_dot_block(
@@ -554,10 +579,10 @@ grim_mxfp4_backward_gemm(
     }
 }
 
-// 5. Fused NVFP4 GEMV with LDS caching and cooperative Wave reduction (M=1..4)
-// Layout per 16 weights: 9 bytes (1 byte E8M0 scale + 8 bytes 4-bit codes).
+// 5. Fused Nutcracker GEMV with LDS caching and cooperative Wave reduction (M=1..4)
+// Layout per 16 weights: 9 bytes (1 byte [exp:6|sel:2] scale + 8 bytes 4-bit codes).
 __global__ void __launch_bounds__(256)
-grim_nvfp4_gemv(
+grim_nutcracker_gemv(
     const float* __restrict__ A,                // [M, K]
     const unsigned char* __restrict__ B_packed, // [N, (K/16)*9]
     float* __restrict__ C,                      // [M, N]
@@ -582,15 +607,15 @@ grim_nvfp4_gemv(
     // Grid-stride over 16-element sub-blocks
     for (int b = tid; b < blocks_per_col; b += blockDim.x) {
         const unsigned char* blk = b_col + (size_t)b * 9;
-        float scale = mxfp4_block_scale(blk[0]);
+        int sel; float scale = nutcracker_block_scale(blk[0], &sel);
         const unsigned char* codes = blk + 1;
         const float* a_ptr = a_row + b * 16;
 
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             unsigned char c_byte = codes[i];
-            float w0 = MXFP4_E2M1_LUT[c_byte & 0x0F] * scale;
-            float w1 = MXFP4_E2M1_LUT[(c_byte >> 4) & 0x0F] * scale;
+            float w0 = nutcracker_decode_code(c_byte & 0x0F, scale, sel);
+            float w1 = nutcracker_decode_code((c_byte >> 4) & 0x0F, scale, sel);
             acc += a_ptr[i * 2 + 0] * w0;
             acc += a_ptr[i * 2 + 1] * w1;
         }
@@ -623,7 +648,113 @@ grim_nvfp4_gemv(
     }
 }
 
-// 6. Tiled NVFP4 GEMM (M > 4 batch GEMM)
+// 6. Tiled Nutcracker GEMM (M > 4 batch GEMM)
+__global__ void __launch_bounds__(256)
+grim_nutcracker_gemm_tiled(
+    const float* __restrict__ A,                // [M, K]
+    const unsigned char* __restrict__ B_packed, // [N, (K/16)*9]
+    float* __restrict__ C,                      // [M, N]
+    int M,
+    int N,
+    int K
+) {
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    const int blocks_per_col = K / 16;
+    const size_t col_bytes_stride = (size_t)blocks_per_col * 9;
+    const unsigned char* b_col = B_packed + (size_t)col * col_bytes_stride;
+    const float* a_row = A + (size_t)row * K;
+
+    float acc = 0.0f;
+    for (int b = 0; b < blocks_per_col; ++b) {
+        const unsigned char* blk = b_col + (size_t)b * 9;
+        int sel; float scale = nutcracker_block_scale(blk[0], &sel);
+        const unsigned char* codes = blk + 1;
+        const float* a_ptr = a_row + b * 16;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned char c_byte = codes[i];
+            float w0 = nutcracker_decode_code(c_byte & 0x0F, scale, sel);
+            float w1 = nutcracker_decode_code((c_byte >> 4) & 0x0F, scale, sel);
+            acc += a_ptr[i * 2 + 0] * w0 + a_ptr[i * 2 + 1] * w1;
+        }
+    }
+
+    C[(size_t)row * N + col] = acc;
+}
+// 7. Fused NVFP4 GEMV with LDS caching and cooperative Wave reduction (M=1..4)
+// Layout per 16 weights: 9 bytes (1 byte E4M3 scale + 8 bytes 4-bit codes).
+__global__ void __launch_bounds__(256)
+grim_nvfp4_gemv(
+    const float* __restrict__ A,                // [M, K]
+    const unsigned char* __restrict__ B_packed, // [N, (K/16)*9]
+    float* __restrict__ C,                      // [M, N]
+    int M,
+    int N,
+    int K
+) {
+    // 1 CTA handles one (row, col) output dot-product or 1 col with 256 threads cooperating.
+    const int col = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= M || col >= N) return;
+
+    __shared__ float s_red[256];
+    const int tid = threadIdx.x;
+    const int blocks_per_col = K / 16;
+    const size_t col_bytes_stride = (size_t)blocks_per_col * 9;
+    const unsigned char* b_col = B_packed + (size_t)col * col_bytes_stride;
+    const float* a_row = A + (size_t)row * K;
+
+    float acc = 0.0f;
+
+    // Grid-stride over 16-element sub-blocks
+    for (int b = tid; b < blocks_per_col; b += blockDim.x) {
+        const unsigned char* blk = b_col + (size_t)b * 9;
+        float scale = nvfp4_block_scale(blk[0]);
+        const unsigned char* codes = blk + 1;
+        const float* a_ptr = a_row + b * 16;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned char c_byte = codes[i];
+            float w0 = nvfp4_decode_code(c_byte & 0x0F, scale);
+            float w1 = nvfp4_decode_code((c_byte >> 4) & 0x0F, scale);
+            acc += a_ptr[i * 2 + 0] * w0;
+            acc += a_ptr[i * 2 + 1] * w1;
+        }
+    }
+
+    // Cooperative reduction using RDNA Wave shuffle (Wave32 or Wave64)
+    #pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        acc += __shfl_down(acc, offset, warpSize);
+    }
+
+    const int lane = tid % warpSize;
+    const int wid = tid / warpSize;
+    if (lane == 0) {
+        s_red[wid] = acc;
+    }
+    __syncthreads();
+
+    // Final inter-wave reduction in LDS by first wave
+    if (wid == 0) {
+        int num_warps = blockDim.x / warpSize;
+        float wave_sum = (lane < num_warps) ? s_red[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+            wave_sum += __shfl_down(wave_sum, offset, warpSize);
+        }
+        if (lane == 0) {
+            C[(size_t)row * N + col] = wave_sum;
+        }
+    }
+}
+
+// 8. Tiled NVFP4 GEMM (M > 4 batch GEMM)
 __global__ void __launch_bounds__(256)
 grim_nvfp4_gemm_tiled(
     const float* __restrict__ A,                // [M, K]
@@ -645,15 +776,15 @@ grim_nvfp4_gemm_tiled(
     float acc = 0.0f;
     for (int b = 0; b < blocks_per_col; ++b) {
         const unsigned char* blk = b_col + (size_t)b * 9;
-        float scale = mxfp4_block_scale(blk[0]);
+        float scale = nvfp4_block_scale(blk[0]);
         const unsigned char* codes = blk + 1;
         const float* a_ptr = a_row + b * 16;
 
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             unsigned char c_byte = codes[i];
-            float w0 = MXFP4_E2M1_LUT[c_byte & 0x0F] * scale;
-            float w1 = MXFP4_E2M1_LUT[(c_byte >> 4) & 0x0F] * scale;
+            float w0 = nvfp4_decode_code(c_byte & 0x0F, scale);
+            float w1 = nvfp4_decode_code((c_byte >> 4) & 0x0F, scale);
             acc += a_ptr[i * 2 + 0] * w0 + a_ptr[i * 2 + 1] * w1;
         }
     }
@@ -674,8 +805,12 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_fused_rmsnorm_mxfp4_gemm"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_gemm_tiled"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_backward_gemm"));
+        assert!(KERNEL_SOURCE.contains("grim_nutcracker_gemv"));
+        assert!(KERNEL_SOURCE.contains("grim_nutcracker_gemm_tiled"));
         assert!(KERNEL_SOURCE.contains("grim_nvfp4_gemv"));
         assert!(KERNEL_SOURCE.contains("grim_nvfp4_gemm_tiled"));
+        assert!(KERNEL_SOURCE.contains("nvfp4_block_scale"));
+        assert!(KERNEL_SOURCE.contains("nutcracker_block_scale"));
         assert!(KERNEL_SOURCE.contains("mxfp4_decode_fast"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_gemm_splitk"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_splitk_reduce"));

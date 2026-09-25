@@ -26,6 +26,15 @@ pub enum WeightFormat {
     Jackdaw,
     /// Magpie: MXFP8 block-16. Alias for Fp8Block16. ~8 bpw. RDNA2+.
     Magpie,
+    /// Nutcracker: FP4 E2M1 with a per-16 block scale whose low 2 bits select
+    /// an extra quantization value. 4.5 bpw. RDNA2+.
+    ///
+    /// Each 16-value block carries one adaptive extra level, chosen per block to
+    /// minimise that block's squared error — RaZeR (arXiv:2501.04052) adapted to
+    /// an E8M0-shaped scale byte. 4.5 bpw, same as Crow, but with a finer
+    /// effective grid inside each block. Costs an exact zero, which the
+    /// packer maps to the block's special value.
+    Nutcracker,
 }
 
 impl WeightFormat {
@@ -39,6 +48,9 @@ impl WeightFormat {
             WeightFormat::Jay => 4.1,
             WeightFormat::Jackdaw => 8.0,
             WeightFormat::Magpie => 8.0,
+            // 9 bytes per 16 values = 4.5 bits/weight, identical to Crow's
+            // Q4_K super-block and to NVFP4's byte layout.
+            WeightFormat::Nutcracker => 4.5,
         }
     }
 
@@ -50,6 +62,8 @@ impl WeightFormat {
             WeightFormat::Raven => QuantModeHint::Fp8Native,
             WeightFormat::Rook => QuantModeHint::MxFp4Emulated,
             WeightFormat::Jackdaw => QuantModeHint::MxFp8Emulated,
+            // 4-bit element path: dequant in LDS to BF16, WMMA GEMM.
+            WeightFormat::Nutcracker => QuantModeHint::MxFp4Emulated,
             // Storage-only aliases — no runtime dispatch gate.
             WeightFormat::Crow | WeightFormat::Jay | WeightFormat::Magpie => {
                 return None;
@@ -92,6 +106,7 @@ impl FromStr for WeightFormat {
             "jay" | "Jay" => Ok(WeightFormat::Jay),
             "jackdaw" | "Jackdaw" => Ok(WeightFormat::Jackdaw),
             "magpie" | "Magpie" => Ok(WeightFormat::Magpie),
+            "nutcracker" | "Nutcracker" | "nut_fp4" | "NutFp4" => Ok(WeightFormat::Nutcracker),
             _ => Err(ParseWeightFormatError { raw: s.to_string() }),
         }
     }

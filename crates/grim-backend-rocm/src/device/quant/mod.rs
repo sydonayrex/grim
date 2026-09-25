@@ -928,6 +928,13 @@ impl QuantOps for RocmDevice {
                     self.launch_nvfp4_gemm_tiled(a_storage, b_storage, &out_storage, m, n, k)?;
                 }
             }
+            DTypeStorage::FloatPack(FloatPackScheme::NutFp4) => {
+                if m <= 4 {
+                    self.launch_nutcracker_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_nutcracker_gemm_tiled(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
+            }
             DTypeStorage::ResidualPacked(cfg) => {
                 // Generic variable-bitwidth packed + residual layout (WI-C / WI-T8): [see: `grim_fused_dequant_gemm_f16`, `enabled`]
                 // Lock-free enabled check via AtomicBool shadow. [see: `fused_dequant_gemm_enabled`, `set_fused_dequant_gemm_enabled`]

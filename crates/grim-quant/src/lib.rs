@@ -1356,148 +1356,6 @@ pub fn dequant_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Dequantize NVFP4 (NVIDIA Blackwell 4-bit float, E2M1 codebook) bytes to f32.
-/// Uses the same OCP E2M1 codebook as MXFP4 (`mxfp4_e2m1_to_f32`) but NVIDIA's native packing convention: per-16-element.
-pub fn dequant_nvfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
-    if num_values == 0 {
-        return Ok(Vec::new());
-    }
-    const SUB_BLOCK: usize = 16; // weights per sub-block
-    const CODES_PER_SUB: usize = 8; // 16 weights / 2 per byte
-    const SUB_BLOCK_BYTES: usize = 1 + CODES_PER_SUB; // 1 scale + 8 code bytes = 9
-
-    // NVFP4 data is a sequence of sub-blocks. The number of sub-blocks is determined by the
-    // weight count, not by full 256-weight super-blocks - real tensors may have any number of weights.
-    let num_sub_blocks = num_values.div_ceil(SUB_BLOCK);
-    let expected_bytes = num_sub_blocks * SUB_BLOCK_BYTES;
-    if data.len() < expected_bytes {
-        return Err(Error::Backend(format!(
-            "NVFP4: expected {expected_bytes} bytes for {num_values} weights \
-             ({num_sub_blocks} sub-blocks), got {}",
-            data.len()
-        )));
-    }
-
-    let mut out = Vec::with_capacity(num_values);
-    let mut pos = 0usize;
-    for _ in 0..num_sub_blocks {
-        let shared_exp = data[pos];
-        pos += 1;
-        let codes = &data[pos..pos + CODES_PER_SUB];
-        pos += CODES_PER_SUB;
-
-        // Last sub-block may be partial if num_values isn't a multiple of 16.
-        let out_start = out.len();
-        let out_end = (out_start + SUB_BLOCK).min(num_values);
-        for i in out_start..out_end {
-            let local = i - out_start;
-            let code_byte = codes[local / 2];
-            let code = if local % 2 == 0 {
-                code_byte & 0x0F
-            } else {
-                (code_byte >> 4) & 0x0F
-            };
-            out.push(mxfp4_e2m1_to_f32(code, shared_exp));
-        }
-    }
-    while out.len() < num_values {
-        out.push(0.0);
-    }
-    Ok(out)
-}
-
-/// Reframe NVFP4 native packing into the length-prefixed `[codes][exps]` framing consumed by `dequant_mxfp4` (ROCm/CUDA kernel input).
-/// NVFP4 packs per-16-element sub-blocks interleaved (scale + 8 code bytes).
-pub fn reframe_nvfp4_to_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<u8>> {
-    if num_values == 0 {
-        return Ok(Vec::new());
-    }
-    const SUB_BLOCK: usize = 16;
-    const CODES_PER_SUB: usize = 8;
-    const SUB_BLOCK_BYTES: usize = 1 + CODES_PER_SUB; // 9
-
-    let num_sub_blocks = num_values.div_ceil(SUB_BLOCK);
-    let codes_len = num_values.div_ceil(2);
-    let num_groups = num_values.div_ceil(32);
-    let exps_len = num_groups;
-
-    // Validate input has enough bytes for all sub-blocks.
-    let expected_bytes = num_sub_blocks * SUB_BLOCK_BYTES;
-    if data.len() < expected_bytes {
-        return Err(Error::Backend(format!(
-            "reframe_nvfp4_to_mxfp4: expected {expected_bytes} bytes for \
-             {num_values} weights ({num_sub_blocks} sub-blocks), got {}",
-            data.len()
-        )));
-    }
-
-    // First pass: collect per-sub-block exponents and verify losslessness.
-    // Each pair of adjacent sub-blocks maps to one MXFP4 group.
-    let mut sub_exps = Vec::with_capacity(num_sub_blocks);
-    let mut pos = 0usize;
-    for _ in 0..num_sub_blocks {
-        sub_exps.push(data[pos]);
-        pos += SUB_BLOCK_BYTES;
-    }
-    for pair in sub_exps.chunks(2) {
-        let first = pair[0];
-        let second = pair.get(1).copied().unwrap_or(first);
-        if first != second {
-            return Err(Error::Backend(format!(
-                "reframe_nvfp4_to_mxfp4: adjacent NVFP4 sub-blocks have \
-                 different E8M0 exponents ({first} vs {second}); cannot \
-                 losslessly reframe to MXFP4's 32-element groups. Fall back \
-                 to dequant_nvfp4 for exact per-16-element dequantization."
-            )));
-        }
-    }
-
-    // Second pass: pack codes and exponents (now known to be lossless).
-    let mut codes = vec![0u8; codes_len];
-    let mut exps = vec![0u8; exps_len];
-
-    pos = 0;
-    for sb in 0..num_sub_blocks {
-        let shared_exp = data[pos];
-        pos += 1;
-        let sb_codes = &data[pos..pos + CODES_PER_SUB];
-        pos += CODES_PER_SUB;
-
-        let sb_start = sb * SUB_BLOCK;
-        let sb_end = (sb_start + SUB_BLOCK).min(num_values);
-
-        for i in sb_start..sb_end {
-            let local = i - sb_start;
-            let src_byte = sb_codes[local / 2];
-            let nibble = if local % 2 == 0 {
-                src_byte & 0x0F
-            } else {
-                (src_byte >> 4) & 0x0F
-            };
-            let dst_byte_idx = i / 2;
-            if i % 2 == 0 {
-                codes[dst_byte_idx] = (codes[dst_byte_idx] & 0xF0) | nibble;
-            } else {
-                codes[dst_byte_idx] = (codes[dst_byte_idx] & 0x0F) | (nibble << 4);
-            }
-        }
-
-        // Both sub-blocks in each pair share the same exponent (verified above),
-        // so assigning from either is correct.
-        let mx_group = sb / 2;
-        if mx_group < exps_len && sb % 2 == 0 {
-            exps[mx_group] = shared_exp;
-        }
-    }
-
-    let mut out = Vec::with_capacity(16 + codes.len() + exps.len());
-    out.extend_from_slice(&(codes.len() as u64).to_le_bytes());
-    out.extend_from_slice(&codes);
-    out.extend_from_slice(&(exps.len() as u64).to_le_bytes());
-    out.extend_from_slice(&exps);
-    Ok(out)
-}
-
 /// Dequantize MXFP8 (OCP Microscaling, Magpie tier) single-buffer bytes to f32.
 /// # Layout Length-prefixed segments (same framing as the GPTQ group-int fix): - `[u64 LE]` codes_len.
 pub fn dequant_mxfp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
@@ -1748,11 +1606,14 @@ pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     let mant = (byte & 0x07) as i32;
 
     if exp == 0xF {
+        // OCP E4M3 ("FN") reserves ONLY mant == 7 as NaN. mant 0..6 are normal
+        // numbers in [256, 448] = (1 + mant/8) * 2^(15 - 7).
+        //
+        // This previously returned 256 for all of mant 0..6, which silently
+        // collapsed the top binade: 0x7E (448) decoded as 256.
         if mant == 7 {
             return f32::NAN;
         }
-        // exp == 15, mant in 0..6 are normal numbers in [256, 448]:
-        // (1 + mant/8) * 2^(15 - 7) = (1 + mant/8) * 256.
         let val = (1.0f32 + (mant as f32) / 8.0) * 256.0f32;
         return if sign != 0 { -val } else { val };
     }
@@ -2428,6 +2289,716 @@ pub fn mxfp4_e2m1_to_f32(code: u8, shared_exp: u8) -> f32 {
     let signed_val = if sign { -base_val } else { base_val };
     let scale = (2.0f32).powi(shared_exp as i32 - 127);
     signed_val * scale
+}
+
+// ── NVFP4 (the real thing) ────────────────────────────────────────────────
+//
+// GGUF type 78 / NVIDIA Blackwell NVFP4: E2M1 elements with an **E4M3** block
+// scale per 16 elements, plus an optional per-tensor FP32 scale.
+//
+// Grim previously decoded this type with an E8M0 scale, which is a different
+// format. Because E4M3 and E8M0 are both exactly 1 byte per 16 elements the
+// buffer length, allocation and bounds checks all still passed, so the bug was
+// silent: a real type-78 tensor with E4M3 scale 0x3C (= 1.5) was read as
+// 2^(0x3C - 127) = 6.8e-21, collapsing every weight in the block to ~0.
+//
+// The 9-bytes-per-16 layout is unchanged from Nutcracker; only the scale-byte
+// decode differs.
+
+/// Split an NVFP4 E4M3 block-scale byte into its float value.
+pub fn nvfp4_e4m3_scale(scale_byte: u8) -> f32 {
+    fp8_e4m3_to_f32(scale_byte)
+}
+
+/// Convert an NVFP4 E2M1 code + E4M3 block-scale byte to f32.
+///
+/// Unlike [`nutcracker_e2m1_to_f32`], code `0x0`/`0x8` decode to a true zero —
+/// NVFP4 has no repurposed code.
+pub fn nvfp4_e2m1_to_f32(code: u8, scale_byte: u8) -> f32 {
+    let base = mxfp4_e2m1_to_f32(code, 127);
+    base * nvfp4_e4m3_scale(scale_byte)
+}
+
+/// Dequantize a packed NVFP4 buffer (9 bytes per 16 values: 1 E4M3 scale byte
+/// + 8 packed E2M1 code bytes) to f32.
+pub fn dequant_nvfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    const SUB_BLOCK: usize = 16;
+    const CODES_PER_SUB: usize = 8;
+    const SUB_BLOCK_BYTES: usize = 1 + CODES_PER_SUB; // 9
+
+    let num_sub_blocks = num_values.div_ceil(SUB_BLOCK);
+    let expected_bytes = num_sub_blocks * SUB_BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "NVFP4: expected {expected_bytes} bytes for {num_values} values \
+             ({num_sub_blocks} sub-blocks), got {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_values);
+    let mut pos = 0usize;
+    for _ in 0..num_sub_blocks {
+        let scale_byte = data[pos];
+        pos += 1;
+        let codes = &data[pos..pos + CODES_PER_SUB];
+        pos += CODES_PER_SUB;
+
+        let out_start = out.len();
+        let out_end = (out_start + SUB_BLOCK).min(num_values);
+        for i in out_start..out_end {
+            let local = i - out_start;
+            let code_byte = codes[local / 2];
+            let code = if local % 2 == 0 {
+                code_byte & 0x0F
+            } else {
+                (code_byte >> 4) & 0x0F
+            };
+            out.push(nvfp4_e2m1_to_f32(code, scale_byte));
+        }
+    }
+    while out.len() < num_values {
+        out.push(0.0);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod nvfp4_tests {
+    use super::*;
+
+    /// E4M3 0x38 is 1.0 (exp=7, mant=0). This is the value the old E8M0 path
+    /// misread as 2^(0x38 - 127) = 2^-71.
+    const UNIT_E4M3: u8 = 0x38;
+
+    #[test]
+    fn e4m3_unit_scale_decodes_to_one() {
+        assert_eq!(nvfp4_e4m3_scale(UNIT_E4M3), 1.0);
+    }
+
+    #[test]
+    fn zero_codes_are_a_real_zero_in_nvfp4() {
+        // The critical difference from Nutcracker: NVFP4 keeps the zero.
+        assert_eq!(nvfp4_e2m1_to_f32(0x0, UNIT_E4M3), 0.0);
+        assert_eq!(nvfp4_e2m1_to_f32(0x8, UNIT_E4M3), 0.0);
+        // And no special value appears anywhere in the codebook.
+        let grid: Vec<f32> = (0u8..16).map(|c| nvfp4_e2m1_to_f32(c, UNIT_E4M3)).collect();
+        for v in &grid {
+            let expected = mxfp4_e2m1_to_f32(
+                (0u8..16)
+                    .find(|&c| mxfp4_e2m1_to_f32(c, 127) == *v)
+                    .unwrap(),
+                127,
+            );
+            assert_eq!(*v, expected);
+        }
+    }
+
+    /// The regression that motivated a correct NVFP4: an E4M3 scale byte must
+    /// not be interpreted as E8M0. Byte 0x3C is 1.5 in E4M3.
+    #[test]
+    fn e4m3_scale_is_not_misread_as_e8m0() {
+        let e4m3 = nvfp4_e4m3_scale(0x3C);
+        let wrong_e8m0 = (2.0f32).powi(0x3C as i32 - 127);
+        assert_eq!(e4m3, 1.5, "0x3C must decode as 1.5 in E4M3");
+        assert!(
+            e4m3 > wrong_e8m0 * 1e18,
+            "E8M0 misread gives {wrong_e8m0:e}, E4M3 gives {e4m3}"
+        );
+    }
+
+    #[test]
+    fn nvfp4_and_nutcracker_share_a_layout_but_not_a_decode() {
+        // Same 9 bytes, different scale semantics — this is why they must stay
+        // distinct schemes with distinct tags.
+        let mut buf = vec![UNIT_E4M3; 9];
+        for (i, b) in buf[1..].iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0x11 } else { 0x11 };
+        }
+        let nv = dequant_nvfp4(&buf, 16).unwrap();
+        let nu = dequant_nutcracker(&buf, 16).unwrap();
+        // Nutcracker reads 0x38 as [exp:6|sel:2] = exp 14, sel 0 -> 2^(14-31).
+        assert_eq!(nv[0], 0.5, "code 0x1 is +0.5 under NVFP4");
+        assert_ne!(nu[0], nv[0], "the two schemes must not coincide");
+    }
+
+    #[test]
+    fn dequant_nvfp4_rejects_a_short_buffer() {
+        let err = dequant_nvfp4(&[0u8; 8], 16).unwrap_err();
+        assert!(format!("{err}").contains("expected 9 bytes"), "got {err}");
+    }
+}
+
+// ── Nutcracker ───────────────────────────────────────────────────────────
+//
+// Internal 4-bit float format: E2M1 codes + a 1-byte per-16 block scale, in
+// the same 9-bytes-per-16-values layout as NVFP4. The scale byte's low bits
+// are stolen as a special-value selector and the redundant E2M1 zero code is
+// repurposed to emit that value, so each block carries one extra quantization
+// level chosen to minimise that block's error.
+//
+// This is the RaZeR idea (arXiv:2501.04052) adapted to grim's actual scale
+// format. RaZeR steals the sign bit of an E4M3 block scale; Nutcracker is
+// defined directly on the E8M0-shaped byte grim already packed, so the
+// selector comes out of exponent range instead. RaZeR's own Table 1 shows the
+// same trade is free for LLM weight block scales (E3M3 scores identically to
+// E4M3), which is what makes stealing exponent bits defensible here.
+//
+// Wire format (per 16 values, 9 bytes — byte-identical to NvFp4):
+//   byte 0      : [ exp : 6 | sel : 2 ]   scale = 2^(exp - 31)
+//   bytes 1..=8 : 16 E2M1 codes, low nibble = even index
+//   code & 0x7 == 0 (the +/-0 encodings) decodes to the block's special value
+//   with the sign taken from `sel` bit 1, not from the code's sign bit.
+//
+// Consequence: Nutcracker cannot represent an exact zero. A quantizer must map
+// near-zero to +/-0.5 (code 0x1 / 0x9), the smallest non-zero code.
+
+/// Number of low bits stolen from the E8M0 block-scale byte as the selector.
+pub const NUTCRACKER_SEL_BITS: u8 = 2;
+/// Mask over the stolen selector bits.
+pub const NUTCRACKER_SEL_MASK: u8 = (1u8 << NUTCRACKER_SEL_BITS) - 1;
+/// Bias of the remaining `8 - NUTCRACKER_SEL_BITS` exponent field.
+///
+/// 6 exponent bits span `2^-31 ..= 2^32`, far wider than an LLM weight block
+/// scale needs.
+pub const NUTCRACKER_SCALE_BIAS: i32 = 31;
+
+/// Values per sub-block, and the sub-block byte count (1 scale + 8 code bytes).
+pub const NUTCRACKER_SUB_BLOCK: usize = 16;
+/// Bytes per sub-block: 1 scale byte + 8 packed code bytes.
+pub const NUTCRACKER_SUB_BLOCK_BYTES: usize = 9;
+
+/// The special value a block has selected, in unscaled (pre-`scale`) units.
+///
+/// Two +/- pairs, ordered so the selector's high bit carries the sign and the
+/// low bit selects the magnitude: `0 -> +5.0`, `1 -> +2.5`, `2 -> -5.0`,
+/// `3 -> -2.5`.
+///
+/// 5.0 is the midpoint of the E2M1 codebook's widest gap (4 -> 6); 2.5
+/// bridges the next widest (2 -> 3). Both are exact multiples of 0.5, so
+/// decoded values stay on the FP4 grid and the MAC stays low-precision.
+pub fn nutcracker_special_value(sel: u8) -> f32 {
+    let mag = if sel & 0x1 != 0 { 2.5 } else { 5.0 };
+    if sel & 0x2 != 0 { -mag } else { mag }
+}
+
+/// Split a Nutcracker block-scale byte into `(selector, scale)`.
+pub fn nutcracker_split_scale(scale_byte: u8) -> (u8, f32) {
+    let sel = scale_byte & NUTCRACKER_SEL_MASK;
+    let exp = scale_byte >> NUTCRACKER_SEL_BITS;
+    (sel, (2.0f32).powi(exp as i32 - NUTCRACKER_SCALE_BIAS))
+}
+
+/// Pack a Nutcracker block-scale byte from its 6-bit exponent and a selector.
+///
+/// The exponent is the Nutcracker field, not a raw E8M0 byte: the equivalent
+/// E8M0 value that would produce the same scale is `exp + 96`, since
+/// `2^(exp - 31) == 2^((exp + 96) - 127)`.
+pub fn nutcracker_pack_scale(exp: u8, sel: u8) -> u8 {
+    debug_assert!(
+        exp < (1u8 << (8 - NUTCRACKER_SEL_BITS)),
+        "Nutcracker exponent {exp} exceeds the 6-bit field"
+    );
+    (exp << NUTCRACKER_SEL_BITS) | (sel & NUTCRACKER_SEL_MASK)
+}
+
+/// Convert a Nutcracker E2M1 code + block-scale byte to f32.
+///
+/// Mirrors `nutcracker_to_float_hip` in
+/// `crates/grim-backend-rocm/src/kernels/shared_device_fns.rs`.
+pub fn nutcracker_e2m1_to_f32(code: u8, scale_byte: u8) -> f32 {
+    let (sel, scale) = nutcracker_split_scale(scale_byte);
+    if code & 0x7 == 0 {
+        return nutcracker_special_value(sel) * scale;
+    }
+    let exp = (code >> 1) & 3;
+    let mant = code & 1;
+    let base_val = if exp == 0 {
+        mant as f32 * 0.5
+    } else {
+        (1.0 + mant as f32 * 0.5) * (2.0f32).powi(exp as i32 - 1)
+    };
+    let signed_val = if code & 0x8 != 0 { -base_val } else { base_val };
+    signed_val * scale
+}
+
+/// Dequantize a packed Nutcracker buffer (9 bytes per 16 values) to f32.
+///
+/// Byte-compatible with [`dequant_nutcracker`], so a Nutcracker buffer can be fed to
+/// the NvFp4 unpack and only the leaf decode differs.
+pub fn dequant_nutcracker(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    let codes_per_sub = NUTCRACKER_SUB_BLOCK / 2;
+    let num_sub_blocks = num_values.div_ceil(NUTCRACKER_SUB_BLOCK);
+    let expected_bytes = num_sub_blocks * NUTCRACKER_SUB_BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "Nutcracker: expected {expected_bytes} bytes for {num_values} values \
+             ({num_sub_blocks} sub-blocks), got {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_values);
+    let mut pos = 0usize;
+    for _ in 0..num_sub_blocks {
+        let scale_byte = data[pos];
+        pos += 1;
+        let codes = &data[pos..pos + codes_per_sub];
+        pos += codes_per_sub;
+
+        // Last sub-block may be partial if num_values isn't a multiple of 16.
+        let out_start = out.len();
+        let out_end = (out_start + NUTCRACKER_SUB_BLOCK).min(num_values);
+        for i in out_start..out_end {
+            let local = i - out_start;
+            let code_byte = codes[local / 2];
+            let code = if local % 2 == 0 {
+                code_byte & 0x0F
+            } else {
+                (code_byte >> 4) & 0x0F
+            };
+            out.push(nutcracker_e2m1_to_f32(code, scale_byte));
+        }
+    }
+    while out.len() < num_values {
+        out.push(0.0);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod nutcracker_tests {
+    use super::*;
+
+    /// Scale byte whose decoded scale is exactly 1.0: exp = 31 -> 2^(31-31).
+    /// MXFP4 reaches scale 1.0 at shared_exp = 127, so this pairs with
+    /// `mxfp4_e2m1_to_f32(code, 127)` for equivalence checks.
+    const UNIT_SCALE_BYTE: u8 = (NUTCRACKER_SCALE_BIAS as u8) << NUTCRACKER_SEL_BITS;
+
+    #[test]
+    fn special_value_table_is_the_documented_four() {
+        assert_eq!(nutcracker_special_value(0), 5.0);
+        assert_eq!(nutcracker_special_value(1), 2.5);
+        assert_eq!(nutcracker_special_value(2), -5.0);
+        assert_eq!(nutcracker_special_value(3), -2.5);
+        // Every special value sits on the 0.5 grid, so the MAC stays low-precision.
+        for sel in 0..4u8 {
+            let v = nutcracker_special_value(sel);
+            assert_eq!(
+                v * 2.0,
+                (v * 2.0).round(),
+                "sel {sel} not a multiple of 0.5"
+            );
+        }
+    }
+
+    #[test]
+    fn non_special_codes_match_mxfp4_exactly() {
+        // Nutcracker must be a strict superset of MXFP4: the 14 codes that are
+        // not the redundant zero must decode bit-identically.
+        for code in 0u8..16 {
+            if code & 0x7 == 0 {
+                continue; // the two zero encodings are repurposed
+            }
+            let nut = nutcracker_e2m1_to_f32(code, UNIT_SCALE_BYTE);
+            let mx = mxfp4_e2m1_to_f32(code, 127);
+            assert_eq!(nut, mx, "code {code:#04x} diverged from MXFP4");
+        }
+    }
+
+    #[test]
+    fn both_zero_encodings_decode_to_the_block_special_value() {
+        // 0x0 and 0x8 are the +/-0 codes. Nutcracker repurposes both; the sign
+        // comes from the selector, so the code's own sign bit is ignored.
+        for sel in 0..4u8 {
+            let byte = UNIT_SCALE_BYTE | sel;
+            let expected = nutcracker_special_value(sel);
+            assert_eq!(nutcracker_e2m1_to_f32(0x0, byte), expected);
+            assert_eq!(
+                nutcracker_e2m1_to_f32(0x8, byte),
+                expected,
+                "code sign must not apply"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_actually_varies_the_special_value() {
+        let vals: Vec<f32> = (0..4u8)
+            .map(|sel| nutcracker_e2m1_to_f32(0x0, UNIT_SCALE_BYTE | sel))
+            .collect();
+        assert_eq!(vals, vec![5.0, 2.5, -5.0, -2.5]);
+        // Four distinct magnitudes-with-sign: two +/- pairs, no duplicates.
+        for i in 0..vals.len() {
+            for j in (i + 1)..vals.len() {
+                assert_ne!(vals[i], vals[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn scale_byte_split_and_pack_round_trip() {
+        for sel in 0..4u8 {
+            for exp in [0u8, 1, 17, 31, 62, 63] {
+                let byte = nutcracker_pack_scale(exp, sel);
+                let (got_sel, got_scale) = nutcracker_split_scale(byte);
+                assert_eq!(got_sel, sel);
+                assert_eq!(got_scale, (2.0f32).powi(exp as i32 - NUTCRACKER_SCALE_BIAS));
+            }
+        }
+    }
+
+    #[test]
+    fn stolen_bits_cost_enough_exponent_range() {
+        // The whole argument for stealing exponent bits is that 6 bits still
+        // covers everything a weight block scale needs.
+        let (min, max) = (nutcracker_split_scale(0).1, nutcracker_split_scale(0xFF).1);
+        assert_eq!(min, 2.0f32.powi(-NUTCRACKER_SCALE_BIAS));
+        assert_eq!(max, 2.0f32.powi(63 - NUTCRACKER_SCALE_BIAS));
+        // Full E8M0 range for comparison: 2^-127 .. 2^128.
+        assert!(
+            min < 2.0f32.powi(-20),
+            "range must reach small weight blocks"
+        );
+        assert!(
+            max > 2.0f32.powi(10),
+            "range must reach large weight blocks"
+        );
+    }
+
+    #[test]
+    fn decode_is_the_e2m1_codebook_with_zero_replaced() {
+        // Full grid at scale 1.0 with selector 0. The 14 ordinary codes keep
+        // their MXFP4 values; both zero encodings (0x0 and 0x8) now yield +5.0,
+        // which is the whole point of the format.
+        let mut got: Vec<f32> = (0u8..16)
+            .map(|c| nutcracker_e2m1_to_f32(c, UNIT_SCALE_BYTE | 0))
+            .collect();
+        got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            got,
+            vec![
+                -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 5.0,
+                6.0
+            ]
+        );
+        // No zero survives — the documented cost of the format.
+        assert!(!got.iter().any(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn every_selector_produces_a_usable_codebook() {
+        for sel in 0..4u8 {
+            let mut got: Vec<f32> = (0u8..16)
+                .map(|c| nutcracker_e2m1_to_f32(c, UNIT_SCALE_BYTE | sel))
+                .collect();
+            got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(got.len(), 16);
+            // 15 distinct magnitudes: the 14 ordinary codes plus the one the
+            // selector supplies (both zero codes land on it).
+            let distinct: std::collections::BTreeSet<u32> =
+                got.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(distinct.len(), 15, "sel {sel} collapsed a level");
+        }
+    }
+
+    #[test]
+    fn dequant_nutcracker_matches_per_element_decode() {
+        // One sub-block: scale byte selects -5.0, codes cover the whole 4-bit range.
+        let codes: Vec<u8> = (0u8..16).collect();
+        let mut packed = vec![UNIT_SCALE_BYTE | 0];
+        for pair in codes.chunks(2) {
+            packed.push((pair[0] & 0x0F) | ((pair[1] & 0x0F) << 4));
+        }
+        assert_eq!(packed.len(), NUTCRACKER_SUB_BLOCK_BYTES);
+
+        let out = dequant_nutcracker(&packed, 16).unwrap();
+        for (i, &code) in codes.iter().enumerate() {
+            assert_eq!(out[i], nutcracker_e2m1_to_f32(code, packed[0]), "index {i}");
+        }
+    }
+
+    #[test]
+    fn dequant_nutcracker_handles_a_partial_trailing_sub_block() {
+        let mut packed = vec![UNIT_SCALE_BYTE | 1];
+        packed.extend_from_slice(&[0x21, 0x43, 0x65, 0x87, 0xA9, 0xBC, 0xDE, 0xF0]);
+        let out = dequant_nutcracker(&packed, 10).unwrap();
+        assert_eq!(out.len(), 10);
+        // 10 values fit in the 8 code bytes (2 per byte).
+        for i in 0..10 {
+            let code_byte = packed[1 + i / 2];
+            let code = if i % 2 == 0 {
+                code_byte & 0x0F
+            } else {
+                code_byte >> 4
+            };
+            assert_eq!(out[i], nutcracker_e2m1_to_f32(code, packed[0]));
+        }
+    }
+
+    #[test]
+    fn dequant_nutcracker_rejects_a_short_buffer() {
+        // 32 values need 2 sub-blocks = 18 bytes.
+        let err = dequant_nutcracker(&[0u8; 17], 32).unwrap_err();
+        assert!(format!("{err}").contains("expected 18 bytes"), "got {err}");
+    }
+
+    #[test]
+    fn dequant_nutcracker_handles_zero_values() {
+        assert!(dequant_nutcracker(&[], 0).unwrap().is_empty());
+    }
+
+    // ── packer ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn packer_emits_the_documented_wire_size() {
+        for n in [1usize, 15, 16, 17, 32, 100] {
+            let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 0.5).collect();
+            let packed = quant_nutcracker(&data).unwrap();
+            let expected = n.div_ceil(NUTCRACKER_SUB_BLOCK) * NUTCRACKER_SUB_BLOCK_BYTES;
+            assert_eq!(packed.len(), expected, "n = {n}");
+        }
+        assert!(quant_nutcracker(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn packer_round_trips_through_the_packer_decoder() {
+        // Values spread across the E2M1 range so blocks actually exercise the
+        // codebook and the special value.
+        let data: Vec<f32> = (0..256)
+            .map(|i| {
+                let t = i as f32 / 255.0;
+                (t * 12.0 - 6.0) * (1.0 + 0.1 * ((i % 7) as f32 - 3.0))
+            })
+            .collect();
+        let packed = quant_nutcracker(&data).unwrap();
+        let recovered = dequant_nutcracker(&packed, data.len()).unwrap();
+        assert_eq!(recovered.len(), data.len());
+
+        // RMS error is the meaningful bound. Per-element relative error is
+        // unbounded by design: a block's max pins the shared exponent, so a
+        // value near that max can sit up to one exponent step above the E2M1
+        // grid ceiling (e.g. 7.56 -> 6.0 when the block max is 7.56).
+        let mut se = 0.0f32;
+        for (a, b) in data.iter().zip(recovered.iter()) {
+            se += (a - b) * (a - b);
+        }
+        let rmse = (se / data.len() as f32).sqrt();
+        let rms = (data.iter().map(|v| v * v).sum::<f32>() / data.len() as f32).sqrt();
+        let nrmse = rmse / rms;
+        // E2M1's worst adjacent-level gap is 4->6, so a 4-bit grid with one
+        // extra level lands well under 10% NRMSE on smooth data.
+        assert!(nrmse < 0.10, "NRMSE {nrmse:.4} exceeds 10%");
+    }
+
+    #[test]
+    fn packer_beats_the_bare_e2m1_grid() {
+        // The whole claim of the format is that the per-block selector reduces
+        // error versus plain per-16 E2M1 with no special value. Compare against
+        // a manual baseline that never uses the zero code as a real value.
+        let data: Vec<f32> = (0..512)
+            .map(|i| {
+                let t = i as f32 / 511.0;
+                (t * 10.0 - 5.0) + 0.37 * ((i % 11) as f32 - 5.0)
+            })
+            .collect();
+
+        let packed = quant_nutcracker(&data).unwrap();
+        let rec = dequant_nutcracker(&packed, data.len()).unwrap();
+        let nut_err: f32 = data
+            .iter()
+            .zip(rec.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+
+        // Baseline: same exponent choice, but the special value is disabled by
+        // mapping every zero code onto the smallest magnitude instead.
+        let mut base_err = 0.0f32;
+        for block in data.chunks(NUTCRACKER_SUB_BLOCK) {
+            let max_abs = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let exp: u8 = if max_abs == 0.0 {
+                NUTCRACKER_SCALE_BIAS as u8
+            } else {
+                let raw = (max_abs / 6.0).log2() + NUTCRACKER_SCALE_BIAS as f32;
+                (raw.ceil() as i32).clamp(0, 63) as u8
+            };
+            let scale = (2.0f32).powi(exp as i32 - NUTCRACKER_SCALE_BIAS);
+            for &v in block {
+                let mut best = 0.0f32; // zero maps to real zero here
+                let mut best_d = (v - 0.0).abs();
+                for c in 1u8..16 {
+                    let val = mxfp4_e2m1_to_f32(c, 127) * scale;
+                    let d = (v - val).abs();
+                    if d < best_d {
+                        best_d = d;
+                        best = val;
+                    }
+                }
+                base_err += (v - best) * (v - best);
+            }
+        }
+        assert!(
+            nut_err < base_err,
+            "Nutcracker SSE {nut_err} should beat the bare E2M1 baseline {base_err}"
+        );
+    }
+
+    #[test]
+    fn packer_selector_actually_reduces_error() {
+        // A correct sweep picks sel 0 (+5.0) for blocks whose unscaled values
+        // cluster in the 4..6 gap, because 5.0 splits the widest E2M1 gap.
+        let data: Vec<f32> = (0..64).map(|i| 4.0 + (i as f32) * 0.031).collect();
+        let packed = quant_nutcracker(&data).unwrap();
+        let sel = packed[0] & NUTCRACKER_SEL_MASK;
+        assert_eq!(sel, 0, "gap-spanning block should select +5.0");
+
+        // And it must beat the same block quantized with the other selectors.
+        let err_for = |s: u8| -> f32 {
+            let byte = nutcracker_pack_scale(31, s);
+            let scale = 1.0f32;
+            data.iter()
+                .map(|v| {
+                    let c = nutcracker_nearest_code(*v / scale, s);
+                    let r = nutcracker_e2m1_to_f32(c, byte);
+                    (v - r) * (v - r)
+                })
+                .sum()
+        };
+        for s in 1..4u8 {
+            assert!(
+                err_for(sel) <= err_for(s),
+                "sel {sel} SSE {} should be <= sel {s} SSE {}",
+                err_for(sel),
+                err_for(s)
+            );
+        }
+    }
+
+    #[test]
+    fn packer_selector_varies_across_different_block_shapes() {
+        // The exponent choice normalizes each block's max to 6.0, so blocks are
+        // distinguished by where their mass sits *below* that, not by raw
+        // magnitude. Two shapes that pick differently:
+        //
+        //   - mass low (0.3..1.6 unscaled, one outlier pinning the exponent):
+        //     the 1.5..2.0 gap is the widest reachable, so +2.5 (sel 1) wins.
+        //   - mass in the top gap (4.3..6.0 unscaled): the 4..6 gap dominates,
+        //     so +5.0 (sel 0) wins.
+        let low: Vec<f32> = {
+            let mut v: Vec<f32> = (0..15).map(|i| 0.1 + (i as f32) * 0.1).collect();
+            v.push(2.0);
+            v
+        };
+        let high: Vec<f32> = (0..16).map(|i| 4.2 + (i as f32) * 0.11).collect();
+
+        let l = quant_nutcracker(&low).unwrap();
+        let h = quant_nutcracker(&high).unwrap();
+        let ls = l[0] & NUTCRACKER_SEL_MASK;
+        let hs = h[0] & NUTCRACKER_SEL_MASK;
+        assert_eq!(ls, 1, "bottom-heavy block should select the +2.5 special");
+        assert_eq!(hs, 0, "top-gap block should select the +5.0 special");
+        assert_ne!(ls, hs, "distinct block shapes must be able to differ");
+    }
+}
+
+/// Quantize `data` to Nutcracker (E2M1 + `[exp:6|sel:2]` per-16 block scale).
+///
+/// Returns the packed buffer: 9 bytes per 16 values, no global-scale header.
+/// This is the packer counterpart to [`dequant_nutcracker`] and matches
+/// `FloatPackScheme::NutFp4` byte-for-byte.
+///
+/// Per 16-value block:
+/// 1. Pick the shared exponent so the block's largest magnitude lands near the
+///    top of the E2M1 range (6.0), which is what the exponent field is for.
+/// 2. Sweep all 4 selectors and keep the one minimising the block's squared
+///    reconstruction error. The selected value is then available to every
+///    zero code in the block, giving the block one extra effective level.
+///
+/// Note the format cannot represent an exact zero (see [`dequant_nutcracker`]),
+/// so a value that quantizes to zero lands on the block's special value.
+pub fn quant_nutcracker(data: &[f32]) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let num_blocks = data.len().div_ceil(NUTCRACKER_SUB_BLOCK);
+    let mut out = Vec::with_capacity(num_blocks * NUTCRACKER_SUB_BLOCK_BYTES);
+
+    for block in data.chunks(NUTCRACKER_SUB_BLOCK) {
+        // Choose the exponent so the block's largest magnitude fits just inside
+        // the top of the E2M1 grid (6.0).
+        //
+        // `ceil`, not `round`/`floor`: we need scale >= max/6, so the exponent
+        // must round *up* out of log2 space. Rounding either other way lets
+        // max/scale exceed 6.0 and clips the block's largest value (a max of
+        // exactly 2.0 floors to scale 0.25 -> 8.0 unscaled, a 25% clip).
+        let max_abs = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let exp: u8 = if max_abs == 0.0 {
+            NUTCRACKER_SCALE_BIAS as u8
+        } else {
+            let raw = (max_abs / 6.0).log2() + NUTCRACKER_SCALE_BIAS as f32;
+            let max_exp = (1i32 << (8 - NUTCRACKER_SEL_BITS)) - 1;
+            (raw.ceil() as i32).clamp(0, max_exp) as u8
+        };
+        let scale = (2.0f32).powi(exp as i32 - NUTCRACKER_SCALE_BIAS);
+
+        // Sweep the 4 selectors; keep the lowest squared error.
+        let mut best_sel = 0u8;
+        let mut best_err = f32::MAX;
+        let mut best_codes = [0u8; NUTCRACKER_SUB_BLOCK];
+        for sel in 0..(1u8 << NUTCRACKER_SEL_BITS) {
+            let mut codes = [0u8; NUTCRACKER_SUB_BLOCK];
+            let mut err = 0.0f32;
+            for (i, &v) in block.iter().enumerate() {
+                let code = nutcracker_nearest_code(v / scale, sel);
+                codes[i] = code;
+                let recon = nutcracker_e2m1_to_f32(code, nutcracker_pack_scale(exp, sel));
+                let d = v - recon;
+                err += d * d;
+            }
+            if err < best_err {
+                best_err = err;
+                best_sel = sel;
+                best_codes = codes;
+            }
+        }
+
+        out.push(nutcracker_pack_scale(exp, best_sel));
+        // 8 code bytes, low nibble = even index.
+        for pair in 0..(NUTCRACKER_SUB_BLOCK / 2) {
+            out.push((best_codes[pair * 2] & 0x0F) | ((best_codes[pair * 2 + 1] & 0x0F) << 4));
+        }
+    }
+    Ok(out)
+}
+
+/// Nearest Nutcracker code for an unscaled value, given the block's selector.
+///
+/// Codes `0x0` and `0x8` both decode to the block's special value — the sign
+/// comes from the selector, not from the code — so `0x0` is seeded as the
+/// initial candidate and `0x8` is skipped as a redundant duplicate. Ties break
+/// toward the lower code, which is why the seeded candidate must be `0x0`.
+fn nutcracker_nearest_code(v: f32, sel: u8) -> u8 {
+    let special = nutcracker_special_value(sel);
+    let mut best_code = 0u8;
+    let mut best_diff = (v - special).abs();
+    // Decode the plain codes at scale 1.0 (exp == bias) so `v`, which is
+    // already divided by the block scale, is comparable directly.
+    let unit = nutcracker_pack_scale(NUTCRACKER_SCALE_BIAS as u8, sel);
+    for code in 1u8..16 {
+        let val = nutcracker_e2m1_to_f32(code, unit);
+        let diff = (v - val).abs();
+        if diff < best_diff {
+            best_diff = diff;
+            best_code = code;
+        }
+    }
+    best_code
 }
 
 /// Convert f32 to MXFP4 E2M1 4-bit code with a given shared E8M0 exponent.

@@ -31,6 +31,8 @@ pub fn codec_quant_mode(format: WeightFormat) -> Option<QuantMode> {
         WeightFormat::Raven => QuantMode::Fp8Native,
         WeightFormat::Rook => QuantMode::MxFp4Emulated,
         WeightFormat::Jackdaw => QuantMode::MxFp8Emulated,
+        // 4-bit element path: dequant in LDS to BF16, WMMA GEMM.
+        WeightFormat::Nutcracker => QuantMode::MxFp4Emulated,
         // Storage-only aliases — no runtime dispatch gate.
         WeightFormat::Crow | WeightFormat::Jay | WeightFormat::Magpie => {
             return None;
@@ -108,5 +110,28 @@ mod tests {
             check_support(WeightFormat::Raven, GcnArch::RDNA4),
             CompatResult::NativeSupport
         ));
+    }
+
+    #[test]
+    fn test_nutcracker_is_native_on_all_4bit_arches() {
+        // Nutcracker is a 4-bit emulated codec like Rook/Jay, so it must be
+        // natively supported everywhere those are — no RDNA4-only gate.
+        for arch in [GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::RDNA4] {
+            assert!(
+                matches!(
+                    check_support(WeightFormat::Nutcracker, arch),
+                    CompatResult::NativeSupport
+                ),
+                "Nutcracker should be native on {arch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nutcracker_dispatches_to_the_4bit_emulated_path() {
+        assert_eq!(
+            codec_quant_mode(WeightFormat::Nutcracker),
+            Some(QuantMode::MxFp4Emulated)
+        );
     }
 }
