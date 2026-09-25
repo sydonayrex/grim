@@ -203,3 +203,54 @@ fn fused_gate_up_silu_matches_split() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn fused_gate_up_silu_256_matches_split() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    temp_env::with_var("GRIM_DOT4_256", Some("1"), || {
+        let k = 1024usize;
+        let n = 4608usize;
+        let x = rand_f32(k, 15);
+        let a = f32_tensor(&dev, &x, &Shape::new(vec![1, k]));
+        let wg = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 16), n, k), n, k);
+        let wu = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 17), n, k), n, k);
+
+        let g_ref = gemv_ref(&dev, &a, &wg, n, k);
+        let u_ref = gemv_ref(&dev, &a, &wu, n, k);
+        let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+        let act = f32_tensor(
+            &dev,
+            &vec![0.0f32; (k / 32) * 9],
+            &Shape::new(vec![(k / 32) * 36]),
+        );
+        dev.fused_gate_up_silu_dot4_into(
+            a.as_ref(),
+            rocm(&wg),
+            rocm(&wu),
+            rocm(&out),
+            n,
+            k,
+            rocm(&act),
+        )
+        .unwrap();
+
+        for (i, (got, (g, u))) in out
+            .to_cpu_vec_f32()
+            .unwrap()
+            .iter()
+            .zip(g_ref.iter().zip(&u_ref))
+            .enumerate()
+        {
+            let want = silu(*g) * u;
+            assert!(
+                (got - want).abs() <= 1e-3 + want.abs() * 1e-4,
+                "256-wave out[{i}]: {got} vs {want}"
+            );
+        }
+    });
+}

@@ -519,6 +519,129 @@ extern "C" __global__ void grim_dot4_gate_up_silu_q80_f32act_gemv(
     }
 }
 
+// Ollama-inspired RDNA4 experiment: eight Wave32 groups per workgroup.
+// The K loop is partitioned across waves, then four output accumulators are
+// reduced through LDS. This is opt-in via GRIM_DOT4_256=1; the existing
+// one-wave path remains the production control until measured on gfx1200/1201.
+extern "C" __global__ void grim_dot4_gate_up_silu_q80_f32act_gemv_256(
+    const float* __restrict__ act_f32,
+    const unsigned char* __restrict__ Wg,
+    const unsigned char* __restrict__ Wu,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int wave     = threadIdx.x / 32;
+    const int lane     = threadIdx.x % 32;
+    const int group    = lane / 8;
+    const int sub_lane = lane % 8;
+    const int n_waves  = blockDim.x / 32;
+    const int n_q_blocks = K / GRIM_Q8_0_BLOCK_SIZE;
+    const int blocks_per_wave = (n_q_blocks + n_waves - 1) / n_waves;
+    if (row >= M || col_base >= N) return;
+
+    const float* a_row = act_f32 + (long long)row * K;
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+
+    const unsigned char* g_col[4];
+    const unsigned char* u_col[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        g_col[j] = (j < active_cols)
+            ? Wg + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+            : nullptr;
+        u_col[j] = (j < active_cols)
+            ? Wu + (long long)(col_base + j) * n_q_blocks * GRIM_Q8_0_BYTES
+            : nullptr;
+    }
+
+    float gacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float uacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int b = 0; b < blocks_per_wave; b++) {
+        const int blk = wave * blocks_per_wave + b;
+        const bool active = group < blocks_per_wave && blk < n_q_blocks;
+        float block_g[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float block_u[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float d_a = 0.0f;
+        int a4_reg = 0;
+        if (active) {
+            const float* blk_src = a_row + (long long)blk * GRIM_Q8_0_BLOCK_SIZE;
+            float amax = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                amax = fmaxf(amax, __builtin_fabsf(blk_src[sub_lane * 4 + e]));
+            }
+            #pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                amax = fmaxf(amax, __shfl_xor(amax, off));
+            }
+            const float d = amax / 127.0f;
+            const float inv_d = (amax > 1e-9f) ? (127.0f / amax) : 0.0f;
+            d_a = (float)(_Float16)d;
+            signed char q0 = (signed char)__builtin_roundf(blk_src[sub_lane * 4 + 0] * inv_d);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[sub_lane * 4 + 1] * inv_d);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[sub_lane * 4 + 2] * inv_d);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[sub_lane * 4 + 3] * inv_d);
+            a4_reg = (int)((unsigned char)q0)
+                | ((int)((unsigned char)q1) << 8)
+                | ((int)((unsigned char)q2) << 16)
+                | ((int)((unsigned char)q3) << 24);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            if (active) {
+                const unsigned char* g_blk = g_col[j] + blk * GRIM_Q8_0_BYTES;
+                const unsigned char* u_blk = u_col[j] + blk * GRIM_Q8_0_BYTES;
+                float d_g = fp16_to_float_device(((const unsigned short*)g_blk)[0]);
+                float d_u = fp16_to_float_device(((const unsigned short*)u_blk)[0]);
+                int g4;
+                int u4;
+                __builtin_memcpy(&g4, (const signed char*)(g_blk + 2) + sub_lane * 4, 4);
+                __builtin_memcpy(&u4, (const signed char*)(u_blk + 2) + sub_lane * 4, 4);
+                block_g[j] += (float)grim_sdot4(a4_reg, g4, 0) * d_a * d_g;
+                block_u[j] += (float)grim_sdot4(a4_reg, u4, 0) * d_a * d_u;
+            }
+        }
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                block_g[j] += __shfl_xor(block_g[j], off);
+                block_u[j] += __shfl_xor(block_u[j], off);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            gacc[j] += block_g[j];
+            uacc[j] += block_u[j];
+        }
+    }
+
+    __shared__ float s_g[8][4];
+    __shared__ float s_u[8][4];
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            s_g[wave][j] = gacc[j];
+            s_u[wave][j] = uacc[j];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int j = 0; j < active_cols; j++) {
+            float g = 0.0f;
+            float u = 0.0f;
+            for (int w = 0; w < 8; w++) {
+                g += s_g[w][j];
+                u += s_u[w][j];
+            }
+            C[(long long)row * N + col_base + j] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
 // Phase D.2: Fused activation quantize + GEMV + optional residual add epilogue.
 // Takes f32 activation input directly, quantizes per-block in registers,
 // computes dot4 GEMV projection, and writes (residual ? residual[...] : 0.0f) + facc[j] directly to C.
@@ -2051,6 +2174,14 @@ mod tests {
         assert!(
             KERNEL_SOURCE.contains("grim_dot2_q80_gemv"),
             "legacy dot2 GEMV retained for A/B testing"
+        );
+    }
+
+    #[test]
+    fn source_contains_256_thread_gate_up_experiment() {
+        assert!(
+            KERNEL_SOURCE.contains("grim_dot4_gate_up_silu_q80_f32act_gemv_256"),
+            "missing 256-thread eight-wave gate/up experiment"
         );
     }
 
