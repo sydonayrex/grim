@@ -411,7 +411,11 @@ pub fn kv_bytes_per_token(
     bytes_per_element: usize,
 ) -> u64 {
     let interval = interval.max(1);
-    let attn_layers = (0..num_layers).filter(|i| i % interval == 0).count();
+    // Matches the Qwen3.5 model's own rule: full attention is every
+    // `interval`-th layer counting from ONE, i.e. (i + 1) % interval == 0.
+    // Counting from zero over-counts by one (17 vs 16 for 65 layers at
+    // interval 4) and silently over-reserves KV.
+    let attn_layers = (0..num_layers).filter(|i| (i + 1) % interval == 0).count();
     (kv_heads as u64)
         .saturating_mul(head_dim as u64)
         .saturating_mul(2) // K and V
@@ -710,10 +714,27 @@ mod kv_fit_tests {
     const QWEN_INTERVAL: usize = 4;
     const F32: usize = 4;
 
+    /// Full attention is every `interval`-th layer counting from ONE, matching
+    /// `Qwen35Block`: (i + 1) % interval == 0. Counting from zero would give 17
+    /// attention layers for 65 layers at interval 4 instead of 16, and
+    /// over-reserve KV by a whole layer.
+    #[test]
+    fn attention_layer_count_matches_model_predicate() {
+        let (layers, interval) = (65usize, 4usize);
+        let counted = kv_bytes_per_token(4, 256, layers, interval, 4)
+            / (4 * 256 * 2 * 4);
+        let expected = (0..layers).filter(|i| (i + 1) % interval == 0).count();
+        assert_eq!(expected, 16, "65 layers at interval 4 has 16 attention layers");
+        assert_eq!(
+            counted as usize, expected,
+            "kv_bytes_per_token must count the same attention layers the model does"
+        );
+    }
+
     #[test]
     fn kv_bytes_per_token_matches_hand_computed_geometry() {
-        // 17 full-attention layers x 4 heads x 256 dim x 2 (K and V) x 4 bytes.
-        let expected = 17 * 4 * 256 * 2 * 4;
+        // 16 full-attention layers x 4 heads x 256 dim x 2 (K and V) x 4 bytes.
+        let expected = 16 * 4 * 256 * 2 * 4;
         assert_eq!(
             kv_bytes_per_token(QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32),
             expected as u64
@@ -721,12 +742,12 @@ mod kv_fit_tests {
     }
 
     /// Only full-attention layers cost per-token KV. With interval 4 over 65
-    /// layers that is 17, not 65.
+    /// layers that is 16, not 65.
     #[test]
     fn recurrent_layers_do_not_consume_kv_budget() {
         let per_token = kv_bytes_per_token(QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32);
         // A single attention layer would be 4*256*2*4 = 8192 bytes/token.
-        assert_eq!(per_token, 17 * 8192);
+        assert_eq!(per_token, 16 * 8192);
     }
 
     /// The regression this exists for: at 228k the f32 arenas need ~32 GB,

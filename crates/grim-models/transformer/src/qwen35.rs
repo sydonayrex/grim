@@ -1253,7 +1253,14 @@ fn plan_layer_devices(
             .saturating_mul(4) // f32
             .saturating_mul(2) // K and V
     };
-    let num_attn_layers = (0..num_layers).filter(|i| i % interval.max(1) == 0).count();
+    // Must match `Qwen35Block`'s own predicate exactly: full attention is every
+    // `interval`-th layer counting from ONE, i.e. (i + 1) % interval == 0, not
+    // i % interval == 0. Using a different predicate here over-reserved one
+    // layer of KV (17 vs 16) and, more importantly, duplicated a rule that must
+    // not be able to drift from the model it is sizing.
+    let num_attn_layers = (0..num_layers)
+        .filter(|i| (i + 1) % interval.max(1) == 0)
+        .count();
     let kv_total = kv_bytes_per_attn_layer(ctx.max(1)).saturating_mul(num_attn_layers as u64);
     if kv_total > 0 {
         eprintln!(
