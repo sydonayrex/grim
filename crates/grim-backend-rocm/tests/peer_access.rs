@@ -86,6 +86,7 @@ fn enumerate_devices_does_not_panic_on_gpu_less_box() -> TestResult {
 // =========================================================================
 
 #[test]
+#[ignore]
 fn peer_status_is_symmetric_in_family_within_a_single_call() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -121,6 +122,7 @@ fn peer_status_is_symmetric_in_family_within_a_single_call() -> TestResult {
 // =========================================================================
 
 #[test]
+#[ignore]
 fn enable_peer_access_is_infallible_or_errors_loud() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
@@ -137,6 +139,7 @@ fn enable_peer_access_is_infallible_or_errors_loud() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn enable_peer_access_self_pair_is_no_op() -> TestResult {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {

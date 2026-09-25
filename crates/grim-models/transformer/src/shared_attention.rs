@@ -55,9 +55,7 @@ pub fn fused_qkv_dot4_decode(
         .as_ref()
         .as_any()
         .downcast_ref::<grim_backend_rocm::RocmStorage>()
-        .ok_or_else(|| {
-            grim_core::error::Error::Backend("act_q81 is RocmStorage".into())
-        })?;
+        .ok_or_else(|| grim_core::error::Error::Backend("act_q81 is RocmStorage".into()))?;
     dev.launch_quantize_q8_1(x_rocm, act_rocm, m, hidden)?;
 
     let out = dev.launch_fused_qkv_dot4(act_rocm, &fused.storage, fused.n_q, fused.n_k, hidden)?;
@@ -334,8 +332,9 @@ pub fn fused_or_scalar_attention_arena_device(
 /// the doomed dispatch and goes straight to the host fallback. Process
 /// lifetime only — never persisted — so a fixed kernel in a new binary gets
 /// a fresh attempt.
-static QKV_STICKY_FAILURES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, usize, usize)>>> =
-    std::sync::OnceLock::new();
+static QKV_STICKY_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(usize, usize, usize)>>,
+> = std::sync::OnceLock::new();
 /// Device `qkv_attention` attempts (arena path).
 static QKV_DEVICE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Times the arena path fell back to full-arena D2H + host attention.
@@ -355,8 +354,15 @@ fn qkv_record_sticky_failure(key: (usize, usize, usize)) {
         .lock()
     {
         if s.insert(key) {
-            eprintln!("[grim] qkv_attention: device kernel failed for config (heads={}, kv_heads={}, head_dim={}); sticking to host fallback for this config (process lifetime only)",
-                key.0, key.1, key.2);
+            eprintln!(
+                "[grim] qkv_attention: device kernel failed for config (heads={}, kv_heads={}, head_dim={}); sticking to host fallback for this config (process lifetime only)",
+                key.0, key.1, key.2
+            );
+            grim_core::emit_fallback(
+                "grim-models-transformer/shared_attention",
+                grim_core::FallbackReason::QkvStickyConfig,
+                format!("heads={} kv_heads={} head_dim={}", key.0, key.1, key.2),
+            );
         }
     }
 }
@@ -436,6 +442,11 @@ pub fn fused_or_scalar_attention_arena(
     {
         use std::sync::atomic::Ordering;
         QKV_ARENA_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        grim_core::emit_fallback(
+            "grim-models-transformer/shared_attention",
+            grim_core::FallbackReason::QkvArenaDevice,
+            format!("kv_len={kv_len} heads={num_heads}"),
+        );
     }
     let kv_stride = num_kv_heads * head_dim;
     let k_hist = k_arena.to_cpu_vec_f32()?;
@@ -722,11 +733,9 @@ pub fn fused_attention_tensors_softcapped(
 /// Device path: fresh arena + two D2D copies (the `block.rs::cache_append_kv` primitive pair); host fallback only.
 pub fn concat_rows_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let rows = a.shape().dims()[0] + b.shape().dims()[0];
-    let width = *a
-        .shape()
-        .dims()
-        .last()
-        .ok_or_else(|| grim_core::error::Error::Backend("non-empty tensor required for concat".into()))?;
+    let width = *a.shape().dims().last().ok_or_else(|| {
+        grim_core::error::Error::Backend("non-empty tensor required for concat".into())
+    })?;
     let out_shape = Shape::new(vec![rows, width]);
     let dev = pick_device_for_storage_device(a.device());
     if let Ok(fresh) = dev.alloc_storage(&out_shape, DType::F32) {
@@ -896,6 +905,63 @@ mod tests {
         assert!(
             sticky_after > sticky_before,
             "sticky count must grow at least once for a new key"
+        );
+    }
+
+    /// P2: native arena attention must not silently fall back during decode.
+    /// GPU CI runs ignored tests with `GRIM_RUN_GPU_TESTS=1`.
+    #[test]
+    #[ignore = "GPU-only P2 fallback budget; run with GRIM_RUN_GPU_TESTS=1 cargo test -p grim-models-transformer --lib -- --ignored qkv_arena_fallback_rate_stays_within_budget"]
+    fn qkv_arena_fallback_rate_stays_within_budget() {
+        const DECODE_STEPS: u64 = 1_000;
+        const MAX_FALLBACKS_PER_1K: u64 = 0;
+        assert!(
+            grim_backend_rocm::gpu_test_enabled(),
+            "P2 fallback budget requires GRIM_RUN_GPU_TESTS=1"
+        );
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = grim_backend_rocm::RocmDevice::try_new(0)
+            .expect("P2 fallback budget requires a usable ROCm device");
+        let device = Device::Rocm(0);
+        let num_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 8;
+        let kv_len = 4;
+        let kv_stride = num_kv_heads * head_dim;
+        let shape = Shape::new(vec![kv_len, kv_stride]);
+        let k = vec![0.125; kv_len * kv_stride];
+        let v = vec![0.25; kv_len * kv_stride];
+        let k_arena = dev.from_cpu(&k, &shape, DType::F32).expect("k arena");
+        let v_arena = dev.from_cpu(&v, &shape, DType::F32).expect("v arena");
+        let q = vec![0.5; num_heads * head_dim];
+        let (attempts_before, fallbacks_before, _) = qkv_arena_fallback_stats();
+
+        for _ in 0..DECODE_STEPS {
+            fused_or_scalar_attention_arena(
+                &q,
+                k_arena.as_ref(),
+                v_arena.as_ref(),
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                None,
+                &device,
+            )
+            .expect("native arena attention");
+        }
+
+        let (attempts_after, fallbacks_after, _) = qkv_arena_fallback_stats();
+        assert_eq!(
+            attempts_after - attempts_before,
+            DECODE_STEPS,
+            "every decode step must attempt native arena attention"
+        );
+        assert!(
+            fallbacks_after - fallbacks_before <= MAX_FALLBACKS_PER_1K,
+            "arena attention fell back {} times per {DECODE_STEPS} decode steps",
+            fallbacks_after - fallbacks_before,
         );
     }
 
@@ -1123,5 +1189,165 @@ mod env_gate_tests {
 
             std::env::remove_var("GRIM_QKV_FUSED");
         }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_gpu_tests {
+    use super::{fused_or_scalar_attention_arena, qkv_arena_fallback_stats};
+
+    /// C5 split + telemetry budget: on ROCm the arena path must count exactly
+    /// one device attempt per call alongside correct numerics. A numeric-only
+    /// assertion cannot tell "device served" from "silently fell back every
+    /// token" — the counters can. Distinctive dims (3,1,16) avoid sticky
+    /// collisions with other tests sharing this process.
+    #[test]
+    #[ignore]
+    fn arena_device_attempt_counted_with_correct_numerics_on_gpu() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+            return;
+        }
+        let dev = match grim_backend_rocm::RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("ROCm device 0 not available: {e}");
+                return;
+            }
+        };
+        let _guard = grim_backend_rocm::device::util::gpu_test_lock();
+        use grim_tensor::CoreTensorOps;
+        let (nh, nkv, hd, kv_len, steps) = (3usize, 1usize, 16usize, 4usize, 2usize);
+        let q: Vec<f32> = (0..steps * nh * hd)
+            .map(|i| ((i % 13) as f32 * 0.07) - 0.4)
+            .collect();
+        let k: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| ((i % 11) as f32 * 0.05) - 0.2)
+            .collect();
+        let v: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| ((i % 7) as f32 * 0.09) - 0.3)
+            .collect();
+        let k_shape = grim_tensor::Shape::new(vec![kv_len, nkv * hd]);
+        let k_arena = dev.from_cpu(&k, &k_shape, grim_tensor::DType::F32).unwrap();
+        let v_arena = dev.from_cpu(&v, &k_shape, grim_tensor::DType::F32).unwrap();
+        let device = grim_tensor::Device::Rocm(0);
+
+        let (a0, f0, _) = qkv_arena_fallback_stats();
+        let out = fused_or_scalar_attention_arena(
+            &q,
+            k_arena.as_ref(),
+            v_arena.as_ref(),
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            steps,
+            None,
+            &device,
+        )
+        .expect("arena attention must stay Ok on GPU");
+        let (a1, f1, _) = qkv_arena_fallback_stats();
+        assert_eq!(a1, a0 + 1, "exactly one device attempt per call");
+        assert!(
+            f1 == f0 || f1 == f0 + 1,
+            "at most one fallback per call (device served or sticky-recorded once)"
+        );
+        let out_v = out.to_vec_f32().unwrap();
+        assert_eq!(out_v.len(), steps * nh * hd);
+        assert!(out_v.iter().all(|x| x.is_finite()), "outputs finite");
+        // Reference: the file's own scalar oracle over the same rows (exact
+        // kernel semantics — scale, causal limits, GQA grouping — by
+        // construction, instead of a hand-rolled copy that can drift).
+        let dev_host = super::pick_device_for_storage_device(&device);
+        let expected = super::scalar_attention(
+            &q,
+            &k,
+            &v,
+            nh,
+            nkv,
+            hd,
+            steps,
+            kv_len,
+            kv_len - steps,
+            None,
+            1.0 / (hd as f32).sqrt(),
+            None,
+            &dev_host,
+            &device,
+        )
+        .expect("scalar oracle")
+        .to_vec_f32()
+        .unwrap();
+        for (i, (g, r)) in out_v.iter().zip(&expected).enumerate() {
+            assert!(
+                (g - r).abs() < 1e-3,
+                "idx {i}: device {g} vs host reference {r}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_budget_tests {
+    use super::{fused_or_scalar_attention_arena, qkv_arena_fallback_stats};
+
+    /// Telemetry budget: a supported config must serve every call on-device —
+    /// zero fallbacks across repeated calls. A fallback burns a full-arena
+    /// D2H per token; the budget pins that this config never pays it. Uses
+    /// the same known-served dims as the C5 test.
+    #[test]
+    #[ignore]
+    fn supported_config_has_zero_fallbacks_across_calls() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
+            return;
+        }
+        let dev = match grim_backend_rocm::RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("ROCm device 0 not available: {e}");
+                return;
+            }
+        };
+        let _guard = grim_backend_rocm::device::util::gpu_test_lock();
+        use grim_tensor::CoreTensorOps;
+        let (nh, nkv, hd, kv_len, steps) = (3usize, 1usize, 16usize, 4usize, 2usize);
+        let q: Vec<f32> = (0..steps * nh * hd)
+            .map(|i| ((i % 13) as f32 * 0.07) - 0.4)
+            .collect();
+        let k: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| ((i % 11) as f32 * 0.05) - 0.2)
+            .collect();
+        let v: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| ((i % 7) as f32 * 0.09) - 0.3)
+            .collect();
+        let k_shape = grim_tensor::Shape::new(vec![kv_len, nkv * hd]);
+        let k_arena = dev.from_cpu(&k, &k_shape, grim_tensor::DType::F32).unwrap();
+        let v_arena = dev.from_cpu(&v, &k_shape, grim_tensor::DType::F32).unwrap();
+        let device = grim_tensor::Device::Rocm(0);
+
+        const CALLS: u64 = 8;
+        let (a0, f0, _) = qkv_arena_fallback_stats();
+        for _ in 0..CALLS {
+            fused_or_scalar_attention_arena(
+                &q,
+                k_arena.as_ref(),
+                v_arena.as_ref(),
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                steps,
+                None,
+                &device,
+            )
+            .expect("arena attention must stay Ok");
+        }
+        let (a1, f1, _) = qkv_arena_fallback_stats();
+        assert_eq!(a1 - a0, CALLS, "every call must attempt device");
+        assert_eq!(
+            f1, f0,
+            "supported config must never fall back (budget: 0 fallbacks)"
+        );
     }
 }

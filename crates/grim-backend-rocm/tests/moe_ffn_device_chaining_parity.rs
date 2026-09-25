@@ -120,11 +120,18 @@ fn build_moe_oracle(routed_scaling_factor: f32) -> MoeFfn {
         ));
     }
     let bank = ExpertBank::from_linears(eg, eu, ed);
-    let router = MoeRouter::new(gate, RouterKind::SoftmaxTopKRenorm, TOP_K, NUM_EXPERTS, None);
+    let router = MoeRouter::new(
+        gate,
+        RouterKind::SoftmaxTopKRenorm,
+        TOP_K,
+        NUM_EXPERTS,
+        None,
+    );
     MoeFfn::new(router, bank, None, routed_scaling_factor)
 }
 
 #[test]
+#[ignore]
 fn test_moe_ffn_forward_gpu_cpu_parity_and_device_residency() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping device parity test");

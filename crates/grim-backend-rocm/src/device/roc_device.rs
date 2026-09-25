@@ -334,6 +334,7 @@ impl RocmDevice {
             .lock()
             .map_err(|_| Error::Backend("bounce_staging mutex poisoned".into()))?;
         if staging.as_ref().is_none_or(|(cap, _)| *cap < bytes) {
+            let _alloc_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             *staging = Some((bytes, RocmPinnedBuffer::<u8>::alloc(bytes)?));
         }
         let staging_buf = &mut staging.as_mut().unwrap().1;
@@ -1402,10 +1403,7 @@ impl RocmDevice {
     /// Returns `Err` if no graph has been captured for `key`. The replay is
     /// asynchronous on the capture stream — callers must synchronize before
     /// reading the output.
-    pub fn replay_decode_step(
-        &self,
-        key: crate::graph_capture::DecodeGraphKey,
-    ) -> Result<()> {
+    pub fn replay_decode_step(&self, key: crate::graph_capture::DecodeGraphKey) -> Result<()> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mgr = self
             .graph_capture_mgr
@@ -1418,10 +1416,7 @@ impl RocmDevice {
     }
 
     /// Check whether a full decode-step graph is cached for `key`.
-    pub fn has_decode_step_graph(
-        &self,
-        key: crate::graph_capture::DecodeGraphKey,
-    ) -> bool {
+    pub fn has_decode_step_graph(&self, key: crate::graph_capture::DecodeGraphKey) -> bool {
         let mgr = self
             .graph_capture_mgr
             .lock()

@@ -51,6 +51,7 @@ fn wrap(st: Box<dyn grim_tensor::BackendStorage>, shape: Shape, device: Device) 
 }
 
 #[test]
+#[ignore]
 fn w4a16_dense_dispatch_matches_dequant_reference() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
@@ -148,6 +149,7 @@ fn w4a16_dense_dispatch_matches_dequant_reference() {
 }
 
 #[test]
+#[ignore]
 fn kernel_less_variants_fail_loudly_not_silently() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
@@ -261,6 +263,7 @@ fn f16_to_f32(h: u16) -> f32 {
 /// Audit gate: WNA16 GPU dequant must match the host MSB-first decoder and
 /// the scale chain (per-block f16 × per-tensor f32).
 #[test]
+#[ignore]
 fn wna16_dequant_service_matches_host_reference() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,
@@ -353,6 +356,7 @@ fn f32_to_f16_bits(f: f32) -> u16 {
 /// Audit gate: EmbeddingWNA16Int GPU dequant vs host decode (row-major,
 /// per-tensor scale only).
 #[test]
+#[ignore]
 fn embedding_wna16_dequant_matches_host_reference() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,

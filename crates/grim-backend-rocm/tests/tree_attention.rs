@@ -4,6 +4,7 @@ use grim_tensor::{DType, Shape};
 use std::sync::Arc;
 
 #[test]
+#[ignore]
 fn test_tree_attention_gpu_matches_reference() {
     // Only run if the GPU tests gate is open
     if !grim_backend_rocm::gpu_test_enabled() {

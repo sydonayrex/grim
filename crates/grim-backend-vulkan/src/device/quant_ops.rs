@@ -10,10 +10,10 @@ use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, QuantOps, Shape};
 
 use crate::context::global_context;
 use crate::kernel::{
-    VulkanKernel, push_params, push_params_backward, run_compute_shader, run_compute_shader_kernel,
-    spirv_for,
+    push_params, push_params_backward, run_compute_shader, run_compute_shader_kernel, spirv_for,
+    VulkanKernel,
 };
-use crate::{VulkanDevice, VulkanHandle, VulkanStorage, extract_raw_bytes};
+use crate::{extract_raw_bytes, VulkanDevice, VulkanHandle, VulkanStorage};
 use grim_tensor::MemoryOps;
 
 impl QuantOps for VulkanDevice {

@@ -431,7 +431,6 @@ enum ScytheAdmission {
     Bypass,
 }
 
-
 /// Re-export key types at the grim-engine crate root.
 pub use grim_memory::PagedKvCache;
 pub use grim_scheduler::{AdmissionController, Request, Scheduler, SchedulerOutput};
@@ -469,7 +468,10 @@ mod tests {
         );
         // Unknown prefix (other model): its slots are invisible here.
         let other = vec!["other#s9".to_string()];
-        assert_eq!(session_slot_victim("small#", &other, &last_use, 1, "small#s3"), None);
+        assert_eq!(
+            session_slot_victim("small#", &other, &last_use, 1, "small#s3"),
+            None
+        );
     }
     use super::*;
 
@@ -554,15 +556,10 @@ mod tests {
         let mut token: f32 = 3.0;
         for step in 0..8 {
             let input = grim_backend_cpu::cpu_tensor(vec![token], grim_tensor::Shape::new(vec![1]));
-            let pos = grim_backend_cpu::cpu_tensor(vec![step as f32], grim_tensor::Shape::new(vec![1]));
-            let logits_plain = CausalLm::forward(
-                &*plain,
-                sess_p.as_mut(),
-                &input,
-                &pos,
-                &[],
-            )
-            .unwrap();
+            let pos =
+                grim_backend_cpu::cpu_tensor(vec![step as f32], grim_tensor::Shape::new(vec![1]));
+            let logits_plain =
+                CausalLm::forward(&*plain, sess_p.as_mut(), &input, &pos, &[]).unwrap();
             let logits_dspark = wrapped
                 .decode_one(sess_d.as_mut(), &input, &pos, 0.0, 0, &[])
                 .unwrap();
@@ -1398,21 +1395,25 @@ mod tests {
         let model = Llama::random(Device::Cpu, cfg);
 
         // Baseline (no spill manager)
-        let pool_no_spill = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
-            1024, 1, 16,
-        )));
+        let pool_no_spill = std::sync::Arc::new(std::sync::Mutex::new(
+            grim_memory::KvBlockPool::new(1024, 1, 16),
+        ));
         let kv_no_spill = grim_memory::PagedKvCache::new(pool_no_spill, 1, 16, 16);
         let mut session_no_spill = Inner::with_kv(model.device.clone(), Box::new(kv_no_spill));
 
         // Spilled path (with SharedSpillManager)
-        let scratch_dir = std::env::temp_dir().join(format!("grim_spill_test_{}", std::process::id()));
+        let scratch_dir =
+            std::env::temp_dir().join(format!("grim_spill_test_{}", std::process::id()));
         let spill_mgr = std::sync::Arc::new(
             grim_kvtransport::SharedSpillManager::new(scratch_dir, 16 * 16).unwrap(),
         );
         let pool_spill = std::sync::Arc::new(std::sync::Mutex::new(grim_memory::KvBlockPool::new(
             1024, 1, 16,
         )));
-        pool_spill.lock().unwrap_or_else(|e| e.into_inner()).attach_spill(spill_mgr.clone());
+        pool_spill
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_spill(spill_mgr.clone());
         let kv_spill = grim_memory::PagedKvCache::new(pool_spill.clone(), 1, 16, 16);
         let mut session_spill = Inner::with_kv(model.device.clone(), Box::new(kv_spill));
 
@@ -1422,8 +1423,10 @@ mod tests {
         let tok_t = grim_backend_cpu::cpu_tensor(tokens, grim_tensor::Shape::new(vec![32]));
         let pos_t = grim_backend_cpu::cpu_tensor(pos, grim_tensor::Shape::new(vec![32]));
 
-        let logits_no_spill = CausalLm::forward(&model, &mut session_no_spill, &tok_t, &pos_t, &[]).unwrap();
-        let logits_spill = CausalLm::forward(&model, &mut session_spill, &tok_t, &pos_t, &[]).unwrap();
+        let logits_no_spill =
+            CausalLm::forward(&model, &mut session_no_spill, &tok_t, &pos_t, &[]).unwrap();
+        let logits_spill =
+            CausalLm::forward(&model, &mut session_spill, &tok_t, &pos_t, &[]).unwrap();
 
         assert_eq!(
             logits_no_spill.to_vec_f32().unwrap(),
@@ -1440,7 +1443,8 @@ mod tests {
             assert!(
                 matches!(
                     spill_mgr.get_tier(block_0),
-                    Some(grim_kvtransport::CacheTier::HostRam) | Some(grim_kvtransport::CacheTier::NvMe)
+                    Some(grim_kvtransport::CacheTier::HostRam)
+                        | Some(grim_kvtransport::CacheTier::NvMe)
                 ),
                 "demoted block must reside in HostRam or NvMe tier"
             );
@@ -1452,12 +1456,24 @@ mod tests {
         let mut cur_tok_no_spill = 32u32;
         let mut cur_tok_spill = 32u32;
         for (cur_pos, _) in (32u32..).zip(0..4) {
-            let tok_no_spill_t = grim_backend_cpu::cpu_tensor(vec![cur_tok_no_spill as f32], grim_tensor::Shape::new(vec![1]));
-            let tok_spill_t = grim_backend_cpu::cpu_tensor(vec![cur_tok_spill as f32], grim_tensor::Shape::new(vec![1]));
-            let pos_t = grim_backend_cpu::cpu_tensor(vec![cur_pos as f32], grim_tensor::Shape::new(vec![1]));
+            let tok_no_spill_t = grim_backend_cpu::cpu_tensor(
+                vec![cur_tok_no_spill as f32],
+                grim_tensor::Shape::new(vec![1]),
+            );
+            let tok_spill_t = grim_backend_cpu::cpu_tensor(
+                vec![cur_tok_spill as f32],
+                grim_tensor::Shape::new(vec![1]),
+            );
+            let pos_t = grim_backend_cpu::cpu_tensor(
+                vec![cur_pos as f32],
+                grim_tensor::Shape::new(vec![1]),
+            );
 
-            let dec_no_spill = CausalLm::forward(&model, &mut session_no_spill, &tok_no_spill_t, &pos_t, &[]).unwrap();
-            let dec_spill = CausalLm::forward(&model, &mut session_spill, &tok_spill_t, &pos_t, &[]).unwrap();
+            let dec_no_spill =
+                CausalLm::forward(&model, &mut session_no_spill, &tok_no_spill_t, &pos_t, &[])
+                    .unwrap();
+            let dec_spill =
+                CausalLm::forward(&model, &mut session_spill, &tok_spill_t, &pos_t, &[]).unwrap();
 
             let logits_a = dec_no_spill.to_vec_f32().unwrap();
             let logits_b = dec_spill.to_vec_f32().unwrap();
@@ -1486,7 +1502,10 @@ mod tests {
                 .map(|(idx, _)| idx as u32)
                 .unwrap();
 
-            assert_eq!(next_a, next_b, "greedy token parity mismatch at pos {cur_pos}");
+            assert_eq!(
+                next_a, next_b,
+                "greedy token parity mismatch at pos {cur_pos}"
+            );
             cur_tok_no_spill = next_a;
             cur_tok_spill = next_b;
         }

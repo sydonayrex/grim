@@ -1,4 +1,4 @@
-//! A5 Phase 2 (WI-X2-PREFILL-ARENA): `eager_kv_seed_sources` + 
+//! A5 Phase 2 (WI-X2-PREFILL-ARENA): `eager_kv_seed_sources` +
 //! `seed_kv_arena_from_eager` move the eager device KV arenas into the graph
 //! arenas bit-exactly, and fail closed when arenas are missing.
 //!
@@ -30,19 +30,40 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.2
         })
         .collect()
 }
 
-fn test_linear(dev: &RocmDevice, ordinal: usize, out_dim: usize, in_dim: usize, seed: u64) -> Linear {
-    let w = rocm_tensor(dev, ordinal, rand_vec(out_dim * in_dim, seed), Shape::new(vec![out_dim, in_dim]));
-    Linear { weight: w.clone(), bias: None, w_t: w, quant_format: None }
+fn test_linear(
+    dev: &RocmDevice,
+    ordinal: usize,
+    out_dim: usize,
+    in_dim: usize,
+    seed: u64,
+) -> Linear {
+    let w = rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(out_dim * in_dim, seed),
+        Shape::new(vec![out_dim, in_dim]),
+    );
+    Linear {
+        weight: w.clone(),
+        bias: None,
+        w_t: w,
+        quant_format: None,
+    }
 }
 
 fn test_norm(dev: &RocmDevice, ordinal: usize, dim: usize) -> RmsNorm {
-    RmsNorm { weight: rocm_tensor(dev, ordinal, vec![1.0f32; dim], Shape::new(vec![dim])), eps: 1e-5 }
+    RmsNorm {
+        weight: rocm_tensor(dev, ordinal, vec![1.0f32; dim], Shape::new(vec![dim])),
+        eps: 1e-5,
+    }
 }
 
 fn attention_block(
@@ -55,6 +76,7 @@ fn attention_block(
     inter: usize,
 ) -> Lfm2Block {
     Lfm2Block {
+        index: 0,
         attn_norm: test_norm(dev, ordinal, hidden),
         wq: Some(test_linear(dev, ordinal, n_q, hidden, 11)),
         wk: Some(test_linear(dev, ordinal, n_kv, hidden, 22)),
@@ -90,20 +112,34 @@ fn attention_block(
         head_dim: hd,
         rope_theta: 10000.0,
         eps: 1e-5,
+        attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
     }
 }
 
-fn tiny_dense_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
-    let hidden = 32usize;
-    let hd = 8usize;
-    let nh = 2usize;
+fn tiny_gdl_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
+    let hidden = 64usize;
+    let hd = 64usize;
+    let nh = 1usize;
     let nkv = 1usize;
     let inter = 64usize;
     let vocab = 32usize;
-    let layers = (0..n_layers)
+    let mut layers: Vec<Lfm2Block> = (0..n_layers)
         .map(|_| attention_block(dev, ordinal, hidden, nh * hd, nkv * hd, hd, inter))
         .collect();
-    let tok_w = rocm_tensor(dev, ordinal, rand_vec(vocab * hidden, 99), Shape::new(vec![vocab, hidden]));
+    for layer in layers.iter_mut() {
+        layer.attention_mode = grim_models_transformer::lfm2::Lfm2AttentionMode::Gdl;
+    }
+    let tok_w = rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(vocab * hidden, 99),
+        Shape::new(vec![vocab, hidden]),
+    );
     Lfm2 {
         cfg: Lfm2Config {
             vocab_size: vocab,
@@ -123,12 +159,76 @@ fn tiny_dense_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
             n_ff_exp: 0,
             n_embd_out: 0,
             mxfp4_qkv_attention: false,
+            attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Gdl,
+            attention_mode_per_layer: None,
         },
         device: Device::Rocm(ordinal),
-        tok_embeddings: Embedding { weight: tok_w.clone() },
+        tok_embeddings: Embedding {
+            weight: tok_w.clone(),
+        },
         layers,
         norm: test_norm(dev, ordinal, hidden),
-        output: Linear { weight: tok_w.clone(), bias: None, w_t: tok_w, quant_format: None },
+        output: Linear {
+            weight: tok_w.clone(),
+            bias: None,
+            w_t: tok_w,
+            quant_format: None,
+        },
+        dense_2_out: None,
+        dense_2_out_bias: None,
+    }
+}
+
+fn tiny_dense_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
+    let hidden = 32usize;
+    let hd = 8usize;
+    let nh = 2usize;
+    let nkv = 1usize;
+    let inter = 64usize;
+    let vocab = 32usize;
+    let layers = (0..n_layers)
+        .map(|_| attention_block(dev, ordinal, hidden, nh * hd, nkv * hd, hd, inter))
+        .collect();
+    let tok_w = rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(vocab * hidden, 99),
+        Shape::new(vec![vocab, hidden]),
+    );
+    Lfm2 {
+        cfg: Lfm2Config {
+            vocab_size: vocab,
+            hidden_size: hidden,
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            num_layers: n_layers,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            n_shortconv_l_cache: 0,
+            is_recr: vec![false; n_layers],
+            n_layer_dense_lead: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            n_ff_exp: 0,
+            n_embd_out: 0,
+            mxfp4_qkv_attention: false,
+            attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+            attention_mode_per_layer: None,
+        },
+        device: Device::Rocm(ordinal),
+        tok_embeddings: Embedding {
+            weight: tok_w.clone(),
+        },
+        layers,
+        norm: test_norm(dev, ordinal, hidden),
+        output: Linear {
+            weight: tok_w.clone(),
+            bias: None,
+            w_t: tok_w,
+            quant_format: None,
+        },
         dense_2_out: None,
         dense_2_out_bias: None,
     }
@@ -161,8 +261,15 @@ fn kv_seed_moves_eager_arenas_bit_exact() {
         prompt.iter().map(|&t| t as f32).collect(),
         Shape::new(vec![prompt.len()]),
     );
-    let pos = rocm_tensor(&dev, 0, vec![0.0f32; prompt.len()], Shape::new(vec![prompt.len()]));
-    model.forward(session.as_mut(), &input, &pos, &[]).expect("prefill");
+    let pos = rocm_tensor(
+        &dev,
+        0,
+        vec![0.0f32; prompt.len()],
+        Shape::new(vec![prompt.len()]),
+    );
+    model
+        .forward(session.as_mut(), &input, &pos, &[])
+        .expect("prefill");
 
     let caches = session
         .model_state()
@@ -172,7 +279,9 @@ fn kv_seed_moves_eager_arenas_bit_exact() {
 
     // Export + fail-closed cases (no GPU needed for the error paths, but the
     // happy path below needs arenas present).
-    let srcs = model.eager_kv_seed_sources(caches, prompt.len() as u32).expect("export");
+    let srcs = model
+        .eager_kv_seed_sources(caches, prompt.len() as u32)
+        .expect("export");
     assert_eq!(srcs.len(), 2);
     assert!(srcs.iter().all(|s| s.is_some()), "dense layers must export");
     assert_eq!(srcs[0].as_ref().unwrap().kv_stride, 8); // nkv(1) * hd(8)
@@ -182,16 +291,140 @@ fn kv_seed_moves_eager_arenas_bit_exact() {
     let fresh: Vec<Option<Lfm2LayerCache>> = vec![None, None];
     assert!(model.eager_kv_seed_sources(&fresh, 6).is_err());
     // Zero rows is a no-op export.
-    let empty = model.eager_kv_seed_sources(&fresh, 0).expect("empty export");
+    let empty = model
+        .eager_kv_seed_sources(&fresh, 0)
+        .expect("empty export");
     assert!(empty.iter().all(|s| s.is_none()));
     // Length mismatch fails closed.
     assert!(model.eager_kv_seed_sources(&fresh[..1], 6).is_err());
+}
+
+#[test]
+#[ignore = "GPU-only GDL seed fail-closed; run with GRIM_GPU_TEST=1 cargo test -p grim-models-transformer --test lfm2_seed_parity -- --ignored"]
+fn eager_kv_seed_sources_fails_closed_for_gdl_with_state() {
+    let Some(dev) = gpu_dev() else { return };
+    let model = tiny_gdl_lfm2(&dev, 0, 2);
+    let mut session = model.new_session();
+
+    // 4-token prefill through the real forward (populates GDL dev_state).
+    let prompt: Vec<u32> = vec![1, 5, 9, 13];
+    let input = rocm_tensor(
+        &dev,
+        0,
+        prompt.iter().map(|&t| t as f32).collect(),
+        Shape::new(vec![prompt.len()]),
+    );
+    let pos = rocm_tensor(
+        &dev,
+        0,
+        vec![0.0f32; prompt.len()],
+        Shape::new(vec![prompt.len()]),
+    );
+    model
+        .forward(session.as_mut(), &input, &pos, &[])
+        .expect("prefill");
+
+    let caches = session
+        .model_state()
+        .and_then(|s| s.downcast_ref::<Vec<Option<Lfm2LayerCache>>>())
+        .expect("session caches");
+    assert_eq!(caches.len(), 2);
+    // Both layers are GDL — both should have dev_state populated.
+    assert!(matches!(
+        caches[0],
+        Some(Lfm2LayerCache::Gdl {
+            dev_state: Some(_),
+            ..
+        })
+    ));
+    assert!(matches!(
+        caches[1],
+        Some(Lfm2LayerCache::Gdl {
+            dev_state: Some(_),
+            ..
+        })
+    ));
+
+    // With valid_rows > 0 and live GDL state, seeding returns the GDL state
+    // pointer (Task 3: eager→graph seeding, supersedes Task 1's fail-closed).
+    let result = model
+        .eager_kv_seed_sources(caches, prompt.len() as u32)
+        .expect("eager_kv_seed_sources must succeed for GDL layers with state");
+    assert_eq!(result.len(), 2);
+    // Both layers are GDL with live dev_state — both should carry a pointer.
+    assert!(
+        result[0].as_ref().unwrap().gdl_state.is_some(),
+        "GDL layer 0 must export a state pointer"
+    );
+    assert!(
+        result[1].as_ref().unwrap().gdl_state.is_some(),
+        "GDL layer 1 must export a state pointer"
+    );
+
+    // With valid_rows == 0, it's a no-op export (returns Ok with None entries).
+    let empty = model
+        .eager_kv_seed_sources(caches, 0)
+        .expect("zero-row export");
+    assert_eq!(empty.len(), 2);
+    assert!(empty.iter().all(|s| s.is_none()));
+
+    // All-recurrent model (no GDL layers) with valid_rows > 0 still works.
+    let dense_model = tiny_dense_lfm2(&dev, 0, 2);
+    let mut dense_session = dense_model.new_session();
+    dense_model
+        .forward(dense_session.as_mut(), &input, &pos, &[])
+        .expect("dense prefill");
+    let dense_caches = dense_session
+        .model_state()
+        .and_then(|s| s.downcast_ref::<Vec<Option<Lfm2LayerCache>>>())
+        .expect("dense caches");
+    let dense_srcs = dense_model
+        .eager_kv_seed_sources(dense_caches, prompt.len() as u32)
+        .expect("dense export");
+    assert_eq!(dense_srcs.len(), 2);
+    assert!(dense_srcs.iter().all(|s| s.is_some()));
+}
+
+#[test]
+fn kv_seed_moves_eager_arenas_bit_exact_part2() {
+    let Some(dev) = gpu_dev() else { return };
+    let model = tiny_dense_lfm2(&dev, 0, 2);
+    let mut session = model.new_session();
+    let prompt: Vec<u32> = vec![1, 5, 9, 13, 17, 21];
+    let input = rocm_tensor(
+        &dev,
+        0,
+        prompt.iter().map(|&t| t as f32).collect(),
+        Shape::new(vec![prompt.len()]),
+    );
+    let pos = rocm_tensor(
+        &dev,
+        0,
+        vec![0.0f32; prompt.len()],
+        Shape::new(vec![prompt.len()]),
+    );
+    model
+        .forward(session.as_mut(), &input, &pos, &[])
+        .expect("prefill");
+
+    let caches = session
+        .model_state()
+        .and_then(|s| s.downcast_ref::<Vec<Option<Lfm2LayerCache>>>())
+        .expect("session caches");
+    let srcs = model
+        .eager_kv_seed_sources(caches, prompt.len() as u32)
+        .expect("export");
 
     // Seed a fresh graph pool and compare rows bit-exactly vs eager arenas.
-    let mut graph = model.get_or_create_decode_graph(64, 1).expect("graph alloc");
+    let mut graph = model
+        .get_or_create_decode_graph(64, 1)
+        .expect("graph alloc");
     let ordinal = 0usize;
     let rdev = RocmDevice::shared(ordinal);
-    graph.buffers.seed_kv_arena_from_eager(&rdev, &srcs).expect("seed");
+    graph
+        .buffers
+        .seed_kv_arena_from_eager(&rdev, &srcs)
+        .expect("seed");
     assert_eq!(graph.buffers.current_pos, 6);
 
     for (layer, cache) in caches.iter().enumerate() {
@@ -207,11 +440,18 @@ fn kv_seed_moves_eager_arenas_bit_exact() {
         let n = 6 * stride;
         let ek: Vec<f32> = eager_k.storage().to_cpu_vec_f32().expect("eager k read");
         let ev: Vec<f32> = eager_v.storage().to_cpu_vec_f32().expect("eager v read");
-        let sk: Vec<f32> = graph.buffers.k_arena[layer].to_cpu_vec_f32().expect("seeded k read");
-        let sv: Vec<f32> = graph.buffers.v_arena[layer].to_cpu_vec_f32().expect("seeded v read");
+        let sk: Vec<f32> = graph.buffers.k_arena[layer]
+            .to_cpu_vec_f32()
+            .expect("seeded k read");
+        let sv: Vec<f32> = graph.buffers.v_arena[layer]
+            .to_cpu_vec_f32()
+            .expect("seeded v read");
         assert_eq!(&ek[..n], &sk[..n], "layer {layer}: seeded K != eager K");
         assert_eq!(&ev[..n], &sv[..n], "layer {layer}: seeded V != eager V");
         // Seeded rows must be non-trivial (guards vacuous all-zero pass).
-        assert!(ek[..n].iter().any(|&x| x != 0.0), "layer {layer}: eager K all zero?");
+        assert!(
+            ek[..n].iter().any(|&x| x != 0.0),
+            "layer {layer}: eager K all zero?"
+        );
     }
 }

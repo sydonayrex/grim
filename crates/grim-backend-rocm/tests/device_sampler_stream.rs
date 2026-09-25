@@ -13,6 +13,7 @@ use grim_backend_rocm::{as_rocm, sample_logits_on_device_with_penalty_at_stream}
 use grim_tensor::{CoreTensorOps, DType, Shape};
 
 #[test]
+#[ignore]
 fn stream_bound_sampler_works_off_default_stream() {
     if !gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1");

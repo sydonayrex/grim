@@ -235,5 +235,4 @@ mod tests {
         assert_eq!(new_shape[0], 128);
         assert_eq!(new_shape[1], orig_cols);
     }
-
 }

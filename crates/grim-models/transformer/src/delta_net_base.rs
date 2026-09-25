@@ -24,6 +24,34 @@ pub struct DeltaNetBaseConfig {
     pub chunk_size: usize,
     pub rms_norm_eps: f32,
     pub max_seq_len: usize,
+    /// 1-2-many P2: opt-in GDL (Gated DeltaNet-2) for KDA legs. Default off;
+    /// legacy delta path stays bit-identical until distillation lands.
+    #[serde(default)]
+    pub gdl_opt_in: bool,
+}
+
+impl DeltaNetBaseConfig {
+    /// True only when config opts in AND env allows. Fail-closed by default.
+    pub fn use_gdl(&self) -> bool {
+        self.gdl_opt_in && Self::gdl_env_allowed()
+    }
+
+    fn gdl_env_allowed() -> bool {
+        matches!(
+            std::env::var("GRIM_DELTANET_GDL").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    }
+
+    /// Per-layer gate operating point for the GDL path.
+    pub fn gdl_gates(&self) -> [f64; 3] {
+        crate::gla::gdl_gate_defaults(self.head_dim)
+    }
+
+    /// Fused GDL kernel serves only the LDS path today.
+    pub fn gdl_fused_eligible(&self) -> bool {
+        self.head_dim == 64
+    }
 }
 
 impl Default for DeltaNetBaseConfig {
@@ -38,6 +66,7 @@ impl Default for DeltaNetBaseConfig {
             chunk_size: 64,
             rms_norm_eps: 1e-5,
             max_seq_len: 8192,
+            gdl_opt_in: false,
         }
     }
 }
@@ -414,6 +443,34 @@ mod tests {
         assert_eq!(cfg.hidden_size, 2048);
         assert_eq!(cfg.chunk_size, 64);
     }
+
+    /// 1-2-many P2: GDL opt-in is fail-closed. Default config never takes the
+    /// GDL path, even when the env flag is set.
+    #[test]
+    fn gdl_opt_in_fail_closed_by_default() {
+        let cfg = DeltaNetBaseConfig::default();
+        assert!(!cfg.gdl_opt_in);
+        temp_env::with_var("GRIM_DELTANET_GDL", Some("1"), || {
+            assert!(!cfg.use_gdl(), "default config must stay legacy");
+        });
+        let mut opted = DeltaNetBaseConfig::default();
+        opted.gdl_opt_in = true;
+        temp_env::with_var("GRIM_DELTANET_GDL", Some("1"), || {
+            assert!(opted.use_gdl());
+        });
+        temp_env::with_var("GRIM_DELTANET_GDL", None::<&str>, || {
+            assert!(!opted.use_gdl(), "env off must force legacy");
+        });
+    }
+
+    #[test]
+    fn gdl_fused_needs_head_dim_64() {
+        let mut cfg = DeltaNetBaseConfig::default();
+        cfg.head_dim = 64;
+        assert!(cfg.gdl_fused_eligible());
+        cfg.head_dim = 128;
+        assert!(!cfg.gdl_fused_eligible());
+    }
 }
 
 // Numeric reference + session-state gates (audit follow-up).
@@ -518,6 +575,7 @@ mod delta_numeric_reference_tests {
             chunk_size: 64,
             rms_norm_eps: 1e-5,
             max_seq_len: 256,
+            gdl_opt_in: false,
         };
         let unit_norm = RmsNorm {
             weight: cpu_tensor(vec![1.0; 4], Shape::new(vec![4])),

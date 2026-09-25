@@ -1,7 +1,8 @@
 //! Thin wrapper around `Llama` for lfm2moe uses a Llama-style transformer.
+//! Serves dense Llama; MoE+GDL hybrid needs router-gate co-design (follow-up) — GDL ineligible.
 
 use grim_core::error::Result;
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::TensorParallelConfig;
 use grim_tensor::{ArithType, Device, Tensor};
@@ -45,7 +46,11 @@ pub struct Lfm2Moe {
 }
 
 impl Lfm2Moe {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Lfm2MoeConfig) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: Lfm2MoeConfig,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
@@ -66,12 +71,16 @@ impl Lfm2Moe {
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
-        
+
             partial_rotary_factor: 1.0,
             yarn: None,
         };
         let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
-        Ok(Self { cfg, device: inner.device.clone(), inner })
+        Ok(Self {
+            cfg,
+            device: inner.device.clone(),
+            inner,
+        })
     }
 }
 

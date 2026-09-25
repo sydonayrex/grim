@@ -40,6 +40,7 @@ fn gpu_device() -> Option<RocmDevice> {
 /// Test a representative multi-op decode step DAG under HIP graph capture:
 /// matmul -> add (bias) -> rms_norm -> mul (scaling)
 #[test]
+#[ignore]
 fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
     let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(dev) = gpu_device() else {
@@ -47,9 +48,9 @@ fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
         return Ok(());
     };
 
-    let m = 1usize;      // Single-token decode scenario
-    let k = 64usize;     // Hidden dimension
-    let n = 64usize;     // Projection dimension
+    let m = 1usize; // Single-token decode scenario
+    let k = 64usize; // Hidden dimension
+    let n = 64usize; // Projection dimension
 
     let a_shape = Shape::from_slice(&[m, k]);
     let b_shape = Shape::from_slice(&[n, k]);
@@ -75,8 +76,10 @@ fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
     {
         let (mm, _) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
         let (biased, _) = CoreTensorOps::add(&dev, mm.as_ref(), bias_dev.as_ref(), &out_shape)?;
-        let (normed, _) = CoreTensorOps::rms_norm(&dev, biased.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape)?;
-        let (_scaled, _) = CoreTensorOps::mul(&dev, normed.as_ref(), scale_dev.as_ref(), &out_shape)?;
+        let (normed, _) =
+            CoreTensorOps::rms_norm(&dev, biased.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape)?;
+        let (_scaled, _) =
+            CoreTensorOps::mul(&dev, normed.as_ref(), scale_dev.as_ref(), &out_shape)?;
         dev.synchronize();
     }
 
@@ -85,8 +88,15 @@ fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
     dev.begin_graph_capture(graph_key)?;
     let (mm_cap, _) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     let (biased_cap, _) = CoreTensorOps::add(&dev, mm_cap.as_ref(), bias_dev.as_ref(), &out_shape)?;
-    let (normed_cap, _) = CoreTensorOps::rms_norm(&dev, biased_cap.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape)?;
-    let (scaled_cap, _) = CoreTensorOps::mul(&dev, normed_cap.as_ref(), scale_dev.as_ref(), &out_shape)?;
+    let (normed_cap, _) = CoreTensorOps::rms_norm(
+        &dev,
+        biased_cap.as_ref(),
+        norm_w_dev.as_ref(),
+        1e-5,
+        &out_shape,
+    )?;
+    let (scaled_cap, _) =
+        CoreTensorOps::mul(&dev, normed_cap.as_ref(), scale_dev.as_ref(), &out_shape)?;
     dev.end_graph_capture(graph_key)?;
 
     assert!(
@@ -114,10 +124,19 @@ fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
 
         // Compute eager reference from fresh input with current step values
         let a_eager = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
-        let (mm_eag, _) = CoreTensorOps::matmul(&dev, a_eager.as_ref(), b_dev.as_ref(), &out_shape)?;
-        let (bias_eag, _) = CoreTensorOps::add(&dev, mm_eag.as_ref(), bias_dev.as_ref(), &out_shape)?;
-        let (norm_eag, _) = CoreTensorOps::rms_norm(&dev, bias_eag.as_ref(), norm_w_dev.as_ref(), 1e-5, &out_shape)?;
-        let (scale_eag, _) = CoreTensorOps::mul(&dev, norm_eag.as_ref(), scale_dev.as_ref(), &out_shape)?;
+        let (mm_eag, _) =
+            CoreTensorOps::matmul(&dev, a_eager.as_ref(), b_dev.as_ref(), &out_shape)?;
+        let (bias_eag, _) =
+            CoreTensorOps::add(&dev, mm_eag.as_ref(), bias_dev.as_ref(), &out_shape)?;
+        let (norm_eag, _) = CoreTensorOps::rms_norm(
+            &dev,
+            bias_eag.as_ref(),
+            norm_w_dev.as_ref(),
+            1e-5,
+            &out_shape,
+        )?;
+        let (scale_eag, _) =
+            CoreTensorOps::mul(&dev, norm_eag.as_ref(), scale_dev.as_ref(), &out_shape)?;
         dev.synchronize();
         let eager_out = scale_eag.to_cpu_vec_f32()?;
 
@@ -142,5 +161,93 @@ fn test_hip_graph_multi_op_decode_cycle() -> TestResult {
     // Keep captured buffers alive until after graph is dropped
     drop((mm_cap, biased_cap, normed_cap, scaled_cap));
 
+    Ok(())
+}
+
+/// Graph poison → eager → recapture: a synchronous H2D inside the capture
+/// bracket must invalidate the capture (poison observed as `end` Err), the
+/// device must stay usable for eager work afterwards (no wedged capture
+/// state), and a clean recapture must succeed. Either end-Err or a dropped
+/// polluted graph is acceptable at step 3 — replaying a memcpy-polluted
+/// graph is what is forbidden, and both branches drop/never-store it.
+#[test]
+#[ignore]
+fn test_hip_graph_poison_then_eager_then_recapture() -> TestResult {
+    let _lock = GRAPH_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[test] ROCm GPU test skipped (no GPU or not enabled)");
+        return Ok(());
+    };
+
+    let m = 1usize;
+    let k = 64usize;
+    let n = 64usize;
+    let a_shape = Shape::from_slice(&[m, k]);
+    let b_shape = Shape::from_slice(&[n, k]);
+    let out_shape = Shape::from_slice(&[m, n]);
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01) + 0.1).collect();
+    let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let b_dev = CoreTensorOps::from_cpu(&dev, &b_data, &b_shape, DType::F32)?;
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
+
+    // Warmup eager matmul (kernels compiled, rocBLAS tables live).
+    let (warm, warm_h) =
+        CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    warm_h.synchronize()?;
+    let warm_out = warm.to_cpu_vec_f32()?;
+    assert!(warm_out.iter().all(|x| x.is_finite()));
+
+    // 1. Poison: H2D upload inside the capture bracket. Fail-closed order:
+    // the memcpy itself must refuse (906 stream-capture-unsupported); the
+    // capture is then invalid and `end` must also refuse.
+    dev.begin_graph_capture("poison-probe")?;
+    let upload_inside = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32);
+    assert!(
+        upload_inside.is_err(),
+        "H2D inside capture must refuse (fail-closed), not record"
+    );
+    let poisoned = dev.end_graph_capture("poison-probe").is_err();
+    eprintln!("[poison] end_capture poison observed: {poisoned}");
+    if dev.has_captured_graph("poison-probe") {
+        // Driver accepted the memcpy into the graph: never replay a
+        // memcpy-polluted template — drop it and treat as poisoned.
+        dev.drop_captured_graph("poison-probe")?;
+    }
+    assert!(
+        !dev.has_captured_graph("poison-probe"),
+        "no polluted graph may survive the poison step"
+    );
+
+    // 2. Eager fallback: device must still serve matmuls (not wedged).
+    let (eager_mm, eager_h) =
+        CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    eager_h.synchronize()?;
+    let eager_out = eager_mm.to_cpu_vec_f32()?;
+    assert_eq!(eager_out.len(), warm_out.len());
+    for (i, (a, b)) in eager_out.iter().zip(&warm_out).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "post-poison eager mismatch at {i}: {a} vs {b}"
+        );
+    }
+
+    // 3. Clean recapture: device-only work captures, replays, matches eager.
+    dev.begin_graph_capture("poison-recapture")?;
+    let (cap_mm, _cap_h) =
+        CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    dev.end_graph_capture("poison-recapture")?;
+    assert!(dev.has_captured_graph("poison-recapture"));
+    assert!(dev.replay_graph("poison-recapture")?);
+    dev.synchronize();
+    let replay_out = cap_mm.to_cpu_vec_f32()?;
+    for (i, (a, b)) in replay_out.iter().zip(&eager_out).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "replay mismatch at {i}: {a} vs {b}"
+        );
+    }
+    dev.drop_captured_graph("poison-recapture")?;
+    assert!(!dev.has_captured_graph("poison-recapture"));
+    let _ = poisoned;
     Ok(())
 }

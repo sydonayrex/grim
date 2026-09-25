@@ -278,8 +278,8 @@ fn gpu_kv_dequant_decode_uses_split_kv_flashdecode() -> TestResult {
         for (kt, score) in scores.iter_mut().enumerate() {
             let mut dot = 0.0f32;
             for d in 0..head_dim {
-                dot += q_data[h * head_dim + d]
-                    * ref_k[(kt * num_kv_heads + kv_head) * head_dim + d];
+                dot +=
+                    q_data[h * head_dim + d] * ref_k[(kt * num_kv_heads + kv_head) * head_dim + d];
             }
             let s = dot * scale;
             *score = s;
@@ -354,7 +354,10 @@ fn gpu_q4khalf_attention_matches_cpu_reference() -> TestResult {
         };
         let k_data = synth(11, cache_tokens * num_kv_heads * head_dim);
         let v_data = synth(12, cache_tokens * num_kv_heads * head_dim);
-        let q_data = synth(13, num_heads * head_dim * 2 /* 2 query tokens when prefill */);
+        let q_data = synth(
+            13,
+            num_heads * head_dim * 2, /* 2 query tokens when prefill */
+        );
         let q_tokens = if cache_tokens >= 8 { 1usize } else { 2usize };
 
         let cpu = CpuDevice::new();
@@ -376,7 +379,11 @@ fn gpu_q4khalf_attention_matches_cpu_reference() -> TestResult {
         );
 
         let gpu_compressor = LloydMaxCompressor::with_gpu_attn(
-            KvQuantConfig { key_bits: 4, value_bits: 4, ..Default::default() },
+            KvQuantConfig {
+                key_bits: 4,
+                value_bits: 4,
+                ..Default::default()
+            },
             KvDequantAttentionConfig { enabled: true },
         )
         .with_channel_alloc(alloc.clone());
@@ -384,7 +391,11 @@ fn gpu_q4khalf_attention_matches_cpu_reference() -> TestResult {
         assert!(block.channel_alloc.is_some(), "allocation must be carried");
 
         let q_shape = Shape::new(vec![q_tokens, num_heads, head_dim]);
-        let q_storage = Arc::from(cpu.from_cpu(&q_data[..q_tokens * num_heads * head_dim], &q_shape, dtype.clone())?);
+        let q_storage = Arc::from(cpu.from_cpu(
+            &q_data[..q_tokens * num_heads * head_dim],
+            &q_shape,
+            dtype.clone(),
+        )?);
         let query = Tensor::new(
             q_storage,
             q_shape.clone(),
@@ -441,10 +452,15 @@ fn gpu_q4khalf_attention_matches_cpu_reference() -> TestResult {
                             * ref_k[(kt * num_kv_heads + kvh) * head_dim + d];
                     }
                     *s = dot * scale;
-                    if *s > mx { mx = *s }
+                    if *s > mx {
+                        mx = *s
+                    }
                 }
                 let mut sum = 0.0f32;
-                for s in scores.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
                 for d in 0..head_dim {
                     let mut acc = 0.0f32;
                     for (kt, s) in scores.iter().enumerate() {
@@ -486,24 +502,37 @@ fn gpu_q4khalf_raw_pinpoint() -> TestResult {
     let mut k_rows: Vec<Vec<f32>> = Vec::new();
     let mut k_packed = Vec::new();
     for r in 0..rows {
-        let row: Vec<f32> = (0..head_dim).map(|i| ((r * head_dim + i) as f32 * 0.021).sin() * 0.4).collect();
+        let row: Vec<f32> = (0..head_dim)
+            .map(|i| ((r * head_dim + i) as f32 * 0.021).sin() * 0.4)
+            .collect();
         k_packed.extend_from_slice(&grim_quant::quant_q4khalf(&row)?);
         k_rows.push(row);
     }
     let mut v_rows: Vec<Vec<f32>> = Vec::new();
     let mut v_packed = Vec::new();
     for r in 0..rows {
-        let row: Vec<f32> = (0..head_dim).map(|i| ((r * head_dim + i) as f32 * 0.017).cos() * 0.3).collect();
+        let row: Vec<f32> = (0..head_dim)
+            .map(|i| ((r * head_dim + i) as f32 * 0.017).cos() * 0.3)
+            .collect();
         v_packed.extend_from_slice(&grim_quant::quant_q4khalf(&row)?);
         v_rows.push(row);
     }
 
-    let q_data: Vec<f32> = (0..num_heads * head_dim).map(|i| (i as f32 * 0.019).sin() * 0.5).collect();
+    let q_data: Vec<f32> = (0..num_heads * head_dim)
+        .map(|i| (i as f32 * 0.019).sin() * 0.5)
+        .collect();
 
     let q_shape = Shape::new(vec![1usize, num_heads, head_dim]);
-    let row_shape = Shape::new(vec![kv_seq_len, num_kv_heads, grim_quant::q4khalf_row_bytes(head_dim)]);
+    let row_shape = Shape::new(vec![
+        kv_seq_len,
+        num_kv_heads,
+        grim_quant::q4khalf_row_bytes(head_dim),
+    ]);
     let scale_shape = Shape::new(vec![rows]);
-    let u8_dtype = DType { arith: ArithType::U8, storage: grim_tensor::Storage::Native };
+    let u8_dtype = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
 
     let gpu_dev2: &dyn grim_tensor::BackendDevice = &dev;
     let q_st = gpu_dev2.from_cpu(&q_data, &q_shape, dtype.clone())?;
@@ -514,19 +543,33 @@ fn gpu_q4khalf_raw_pinpoint() -> TestResult {
 
     let gpu_dev: &dyn grim_tensor::BackendDevice = &dev;
     let (out_st, handle) = gpu_dev.kv_dequant_attention(
-        q_st.as_ref(), k_st.as_ref(), ks_st.as_ref(), v_st.as_ref(), vs_st.as_ref(),
-        num_kv_heads, kv_seq_len, (kv_seq_len - 1) as u32, 3, &q_shape,
+        q_st.as_ref(),
+        k_st.as_ref(),
+        ks_st.as_ref(),
+        v_st.as_ref(),
+        vs_st.as_ref(),
+        num_kv_heads,
+        kv_seq_len,
+        (kv_seq_len - 1) as u32,
+        3,
+        &q_shape,
     )?;
     handle.synchronize()?;
 
     // Dequantize each row back on host to build the float attention reference.
     let row_bytes = grim_quant::q4khalf_row_bytes(head_dim);
-    let k_deq: Vec<f32> = (0..rows).flat_map(|r| {
-        grim_quant::dequant_q4khalf(&k_packed[r*row_bytes..(r+1)*row_bytes], head_dim).unwrap()
-    }).collect();
-    let v_deq: Vec<f32> = (0..rows).flat_map(|r| {
-        grim_quant::dequant_q4khalf(&v_packed[r*row_bytes..(r+1)*row_bytes], head_dim).unwrap()
-    }).collect();
+    let k_deq: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            grim_quant::dequant_q4khalf(&k_packed[r * row_bytes..(r + 1) * row_bytes], head_dim)
+                .unwrap()
+        })
+        .collect();
+    let v_deq: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            grim_quant::dequant_q4khalf(&v_packed[r * row_bytes..(r + 1) * row_bytes], head_dim)
+                .unwrap()
+        })
+        .collect();
 
     let q_per_kv = num_heads / num_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -540,10 +583,15 @@ fn gpu_q4khalf_raw_pinpoint() -> TestResult {
                 dot += q_data[h * head_dim + d] * k_deq[(kt * num_kv_heads + kvh) * head_dim + d];
             }
             *s = dot * scale;
-            if *s > mx { mx = *s }
+            if *s > mx {
+                mx = *s
+            }
         }
         let mut sum = 0.0f32;
-        for s in scores.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
+        for s in scores.iter_mut() {
+            *s = (*s - mx).exp();
+            sum += *s;
+        }
 
         let out = out_st.to_cpu_vec_f32()?;
         for d in 0..head_dim {

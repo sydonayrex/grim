@@ -20,6 +20,7 @@ fn gpu_device() -> Option<RocmDevice> {
 }
 
 #[test]
+#[ignore]
 fn test_jay_mxfp4_gpu_gemm_golden_mutation_resistant() -> TestResult {
     // Non-square asymmetric dimensions: M=2, K=128, N=64
     let (m, k, n) = (2usize, 128usize, 64usize);

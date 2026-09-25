@@ -2,10 +2,10 @@ use super::common::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::device::cuda_device::CudaDevice;
-    use grim_tensor::dtype::{ DType };
     use super::*;
-    use grim_tensor::{ CoreTensorOps, ElementwiseOps, Shape };
+    use crate::device::cuda_device::CudaDevice;
+    use grim_tensor::dtype::DType;
+    use grim_tensor::{CoreTensorOps, ElementwiseOps, Shape};
 
     #[test]
     fn test_cuda_device_probe() {

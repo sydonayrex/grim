@@ -5,7 +5,7 @@
 pub const DEVICE_SAMPLER_KERNEL_SOURCE: &str = r#"
 // WI-X3: GPU Stochastic Logits Sampler (temperature + top-k + top-p + Gumbel) Grid: (1, 1)   - one block samples one token from one logits row.
 // Block: (256, 1) - threads stride across the vocab; all reductions are block-wide tree reductions.
-#define GRIM_SAMPLER_BLOCK 256
+#define GRIM_SAMPLER_BLOCK 1024
 
 __device__ unsigned int grim_sampler_hash(unsigned int x) {
     // splitmix32-style finalizer: full avalanche per call, so each
@@ -108,7 +108,8 @@ extern "C" __global__ void grim_sample_logits_stochastic(
     if (top_k > 0 && top_k < vocab_size) {
         float lo = s_min;
         float hi = s_max;
-        for (int it = 0; it < 24; ++it) {
+        #pragma unroll 1
+        for (int it = 0; it < 8; ++it) {
             const float mid = 0.5f * (lo + hi);
             if (!(mid > lo) || !(mid < hi)) break; // float resolution exhausted
             float cnt = 0.0f;
@@ -163,7 +164,8 @@ extern "C" __global__ void grim_sample_logits_stochastic(
             // mass(hi) < top_p (starts at p_max = inv_z for hi = s_max).
             float lo = s_min;
             float hi = s_max;
-            for (int it = 0; it < 24; ++it) {
+            #pragma unroll 1
+            for (int it = 0; it < 8; ++it) {
                 const float mid = 0.5f * (lo + hi);
                 if (!(mid > lo) || !(mid < hi)) break;
                 float m = 0.0f;
@@ -266,7 +268,7 @@ use crate::device::util::DeviceGuard;
 
 /// Block size the kernel is compiled/launched with (must match
 /// `GRIM_SAMPLER_BLOCK` in [`DEVICE_SAMPLER_KERNEL_SOURCE`]).
-const SAMPLER_BLOCK: u32 = 256;
+const SAMPLER_BLOCK: u32 = 1024;
 
 /// Largest vocabulary accepted by the device sampler.
 /// Beyond this the LDS / register budget of the single-block design degrades and callers should.
@@ -541,7 +543,9 @@ pub fn sample_logits_on_device_with_penalty_at(
         if !uniq.is_empty() {
             // Miss → Err → caller CPU-fallback. Warn once (per process) so a
             // broken pre-pass can never silently degrade every token.
-            if let Err(e) = apply_repeat_penalty_on_device(device, ptr, vocab, &uniq, repeat_penalty) {
+            if let Err(e) =
+                apply_repeat_penalty_on_device(device, ptr, vocab, &uniq, repeat_penalty)
+            {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static WARNED: AtomicBool = AtomicBool::new(false);
                 if !WARNED.swap(true, Ordering::Relaxed) {
@@ -675,7 +679,13 @@ fn warmup_kernel(device: &RocmDevice, kind: WarmupKind) -> Result<()> {
                 "grim_repeat_penalty_apply",
                 HipDim3::new(1, 1, 1),
                 HipDim3::new(SAMPLER_BLOCK, 1, 1),
-                &mut [arg(&mut lp), arg(&mut ip), arg(&mut len_i), arg(&mut v_i), arg(&mut p)],
+                &mut [
+                    arg(&mut lp),
+                    arg(&mut ip),
+                    arg(&mut len_i),
+                    arg(&mut v_i),
+                    arg(&mut p),
+                ],
             )?;
         }
         WarmupKind::Sampler => {
@@ -835,7 +845,12 @@ pub fn sample_logits_on_device_with_penalty_at_stream(
         }
         if !uniq.is_empty() {
             apply_repeat_penalty_on_device_stream(
-                device, ptr, vocab, &uniq, repeat_penalty, stream,
+                device,
+                ptr,
+                vocab,
+                &uniq,
+                repeat_penalty,
+                stream,
             )?;
         }
     }
@@ -892,7 +907,9 @@ pub struct PinnedLogitsBuf {
 
 impl PinnedLogitsBuf {
     /// Allocate two pinned host buffers each capable of holding `max_vocab` f32 elements.
-    pub fn alloc(max_vocab: usize) -> Result<Self> {
+    /// Pinned to `ordinal` (scythe2/GRAVE: hipHostMalloc is a raw seam).
+    pub fn alloc_on(ordinal: usize, max_vocab: usize) -> Result<Self> {
+        let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
         Ok(Self {
             bufs: [
                 RocmPinnedBuffer::alloc(max_vocab)?,
@@ -934,13 +951,11 @@ impl PinnedLogitsBuf {
         // Offset into the tail: the engine's logit table can be wider than vocab.
         let tail_offset = logits.bytes() - needed_bytes;
         let src_ptr = {
-            let base = logits
-                .device_ptr_u64()
-                .ok_or_else(|| {
-                    grim_tensor::error::Error::Backend(
-                        "PinnedLogitsBuf::read: logits has no device ptr".into(),
-                    )
-                })?;
+            let base = logits.device_ptr_u64().ok_or_else(|| {
+                grim_tensor::error::Error::Backend(
+                    "PinnedLogitsBuf::read: logits has no device ptr".into(),
+                )
+            })?;
             (base + tail_offset as u64) as *const c_void
         };
         let dst_ptr = self.bufs[slot].as_mut_ptr() as *mut c_void;
@@ -950,7 +965,13 @@ impl PinnedLogitsBuf {
         let stream = device.active_stream();
 
         check_hip("PinnedLogitsBuf hipMemcpyAsync D2H", unsafe {
-            hipMemcpyAsync(dst_ptr, src_ptr, needed_bytes, HipMemcpyKind::DeviceToHost, stream)
+            hipMemcpyAsync(
+                dst_ptr,
+                src_ptr,
+                needed_bytes,
+                HipMemcpyKind::DeviceToHost,
+                stream,
+            )
         })?;
         check_hip("PinnedLogitsBuf hipStreamSynchronize", unsafe {
             hipStreamSynchronize(stream)
@@ -959,4 +980,3 @@ impl PinnedLogitsBuf {
         Ok(&self.bufs[slot].as_slice()[..vocab])
     }
 }
-

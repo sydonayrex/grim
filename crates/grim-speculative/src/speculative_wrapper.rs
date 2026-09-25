@@ -211,6 +211,10 @@ impl SpeculativeCausalLm {
         &*self.target
     }
 
+    pub fn inner_target(&self) -> &dyn CausalLm {
+        &*self.target
+    }
+
     /// Query runtime speculative decoding telemetry snapshot.
     pub fn telemetry(&self) -> SpeculativeTelemetry {
         let (state, config) = {
@@ -235,7 +239,12 @@ impl SpeculativeCausalLm {
             min_accept_rate: config.min_accept_rate,
             should_adapt,
             draft_depth_k: if self.strategy == Strategy::DSpark {
-                Some(self.depth_tuner.lock().unwrap_or_else(|e| e.into_inner()).current_depth() as u64)
+                Some(
+                    self.depth_tuner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .current_depth() as u64,
+                )
             } else {
                 None
             },
@@ -263,7 +272,11 @@ impl SpeculativeCausalLm {
 
                 // T2-4 (closed): the draft block length K is PID-tuned online
                 // from observed acceptance — not the old hardcoded 3.
-                let draft_depth_k = self.depth_tuner.lock().unwrap_or_else(|e| e.into_inner()).current_depth();
+                let draft_depth_k = self
+                    .depth_tuner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .current_depth();
                 let draft_block = draft.draft_block(session, input_ids, draft_depth_k)?;
                 if draft_block.tokens.is_empty() {
                     return self.target.forward(session, input_ids, positions, adapters);
@@ -275,11 +288,11 @@ impl SpeculativeCausalLm {
                 scored.confidence = scores;
 
                 // Phase 3: Choose verify length dynamically
-                let verify_len = self.scheduler.lock().unwrap_or_else(|e| e.into_inner()).choose_verify_len(
-                    &scored,
-                    live_gpu_utilization,
-                    batch_pressure,
-                );
+                let verify_len = self
+                    .scheduler
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .choose_verify_len(&scored, live_gpu_utilization, batch_pressure);
                 let verify_len = verify_len.min(scored.tokens.len());
 
                 if verify_len == 0 {
@@ -928,5 +941,98 @@ mod tests {
                 < 0.1,
             "EMA acceptance must reflect the rejections"
         );
+    }
+
+    struct EmptyDraft {
+        vocab: usize,
+    }
+
+    impl crate::draft_backbone::DraftBackbone for EmptyDraft {
+        fn draft_block(
+            &self,
+            _session: &mut dyn SessionT,
+            _context: &Tensor,
+            _block_len: usize,
+        ) -> Result<crate::draft_backbone::DraftBlock> {
+            Ok(crate::draft_backbone::DraftBlock {
+                tokens: Vec::new(),
+                base_logits: grim_backend_cpu::cpu_tensor(
+                    vec![0.0f32; self.vocab],
+                    Shape::new(vec![1, self.vocab]),
+                ),
+                confidence: Vec::new(),
+            })
+        }
+
+        fn estimated_footprint_bytes(&self) -> usize {
+            0
+        }
+
+        fn update_weights(
+            &self,
+            _target_hidden_states: &[f32],
+            _draft_tokens: &[u32],
+            _accepted_mask: &[bool],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// M10: an empty draft block must fall back to the plain target forward
+    /// with identical logits. A DSpark path that unconditionally accepts (or
+    /// fabricates) drafts would silently diverge here.
+    #[test]
+    fn test_empty_draft_falls_back_to_plain_target_forward() {
+        let cfg = grim_models_transformer::LlamaConfig {
+            vocab_size: 100,
+            hidden_size: 16,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 8,
+            intermediate_size: 32,
+            num_layers: 2,
+            rope_theta: 10000.0,
+            max_seq_len: 2048,
+            rms_norm_eps: 1e-5,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
+        let target = Box::new(MockCausalLm {
+            cfg: cfg.clone(),
+            device: Device::Cpu,
+        });
+        let draft = Arc::new(EmptyDraft { vocab: 100 });
+        let markov = Arc::new(crate::uniform_markov_head::UniformMarkovHead::new(
+            100, 5, 42,
+        ));
+        let confidence = Arc::new(crate::entropy_confidence_head::EntropyConfidenceHead);
+        let scheduler =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
+        let spec_lm =
+            SpeculativeCausalLm::with_dspark(target, draft, markov, confidence, scheduler);
+
+        let mut session = spec_lm.new_session();
+        let input_ids = grim_backend_cpu::cpu_tensor(vec![1f32], Shape::new(vec![1]));
+        let positions = grim_backend_cpu::cpu_tensor(vec![0f32], Shape::new(vec![1]));
+        let got = spec_lm
+            .decode_one(session.as_mut(), &input_ids, &positions, 0.0, 0, &[])
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        // Plain target forward on a fresh session: MockCausalLm emits
+        // constant 0.1 logits for [seq, vocab].
+        let plain = SpeculativeCausalLm::plain(Box::new(MockCausalLm {
+            cfg,
+            device: Device::Cpu,
+        }));
+        let mut plain_session = plain.new_session();
+        let want = plain
+            .decode_one(plain_session.as_mut(), &input_ids, &positions, 0.0, 0, &[])
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        assert_eq!(got, want, "empty draft must equal plain forward exactly");
     }
 }

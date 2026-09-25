@@ -11,11 +11,11 @@
 //! stacks (spec §Fallback). Same for MoE blocks (host top-1 routing).
 
 use grim_backend_rocm::RocmStorage;
+use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
     DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
     launch_attention, launch_qkv_gemv, write_embeddings_to_buffer_batch,
 };
-use grim_backend_rocm::as_rocm;
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 
@@ -23,10 +23,7 @@ use crate::lfm2::{Lfm2, Lfm2Block, Lfm2LayerCache};
 
 /// Spec §Phase 6 dims derived from config. `max_ctx` caps KV arenas.
 #[allow(clippy::type_complexity)]
-fn graph_dims(
-    lfm: &Lfm2,
-    max_ctx: usize,
-) -> (usize, usize, usize, usize, usize, usize, usize) {
+fn graph_dims(lfm: &Lfm2, max_ctx: usize) -> (usize, usize, usize, usize, usize, usize, usize) {
     let hidden = lfm.cfg.hidden_size;
     let n_q = lfm.cfg.num_heads * lfm.cfg.head_dim;
     let n_k = lfm.cfg.num_kv_heads * lfm.cfg.head_dim;
@@ -40,14 +37,14 @@ type Dev = grim_backend_rocm::RocmDevice;
 type Storage = dyn grim_tensor::BackendStorage;
 
 /// Downcast a weight tensor to its ROCm storage (graph path is ROCm-only).
-fn rocm_storage(t: &grim_tensor::Tensor) -> Result<&RocmStorage> {
+pub(crate) fn rocm_storage(t: &grim_tensor::Tensor) -> Result<&RocmStorage> {
     dst_downcast(t.storage().as_ref())
 }
 
 /// Quant-capable GEMV into a fixed pool slot. Mirrors eager `Linear` decode
 /// dispatch (F32 rocBLAS/GEMV, Q80/Q4K-K quant dot paths) via the backend
 /// [`Dev::linear_decode_into`]; unsupported dtypes fall back eager.
-fn linear_into(
+pub(crate) fn linear_into(
     dev: &Dev,
     a: &Storage,
     w: &grim_tensor::Tensor,
@@ -64,7 +61,7 @@ fn linear_into(
 /// Pure host-side predicate: may this layer use the sudot4 fused path?
 /// Mirrors the launchers' own validation (hidden%32, dot4 arch, opt-out flag)
 /// so the branch is decided with zero enqueues — no mid-capture fallback.
-fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
+pub(crate) fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
     hidden != 0
         && hidden % 32 == 0
         && dev.supports_dot4()
@@ -92,23 +89,13 @@ fn dev_for(lfm: &Lfm2) -> Result<std::sync::Arc<Dev>> {
 
 /// D2D publish of a finished layer output into the next layer's input slot
 /// (or `head_input`). One honest graph node per boundary; no host traffic.
-fn publish_into(dev: &Dev, dst: &Storage, src: &Storage) -> Result<()> {
-    let n = dst.shape().elem_count();
-    dev.copy_slice_into(dst, src, 0, n)
-        .map_err(grim_core::error::Error::Tensor)
-}
-
 impl Lfm2 {
     /// Spec §Phase 5: `model.get_or_create_decode_graph()`.
     /// Allocates fixed pool once; caller keeps it across steps for stable addrs.
     /// `batch` parameterizes all per-step slots as `[batch, dim]`. `batch=1`
     /// preserves the original single-token shape.
     /// `Err` -> caller falls back eager (spec §Fallback). Honors both env gates.
-    pub fn get_or_create_decode_graph(
-        &self,
-        max_ctx: usize,
-        batch: usize,
-    ) -> Result<DecodeGraph> {
+    pub fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
@@ -126,7 +113,7 @@ impl Lfm2 {
             .get_stream_from_pool(0)
             .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
         let (hidden, n_q, n_k, inter, vocab, ctx, nh) = graph_dims(self, max_ctx);
-        let buffers = DecodeGraphBuffers::allocate(
+        let mut buffers = DecodeGraphBuffers::allocate(
             &dev,
             self.layers.len(),
             hidden,
@@ -153,6 +140,26 @@ impl Lfm2 {
             },
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+        // GRAVE Phase 4: GDL layers get recurrent-state buffers (Taylor
+        // defaults uploaded here, outside capture). Non-GDL layers stay None.
+        // A failed GDL alloc fails the whole graph → eager fallback (spec).
+        for (idx, layer) in self.layers.iter().enumerate() {
+            if layer.attention_mode == crate::lfm2::Lfm2AttentionMode::Gdl && layer.wq.is_some() {
+                buffers
+                    .allocate_gdl_layer(
+                        &dev,
+                        idx,
+                        batch.max(1),
+                        layer.num_heads,
+                        layer.num_kv_heads,
+                        layer.head_dim,
+                        layer.head_dim,
+                    )
+                    .map_err(|e| {
+                        grim_core::error::Error::Backend(format!("graph GDL alloc: {e}"))
+                    })?;
+            }
+        }
         Ok(DecodeGraph::new(&dev, buffers, stream))
     }
 
@@ -186,10 +193,41 @@ impl Lfm2 {
         }
         let mut out = Vec::with_capacity(self.layers.len());
         for (layer, cache) in self.layers.iter().zip(caches.iter()) {
-            // Recurrent layers carry conv state, not KV — seeded separately
-            // via `eager_conv_seed_rings` + `seed_conv_rings`.
+            // Recurrent (ShortConv) layers genuinely have nothing to seed.
             if layer.wq.is_none() {
                 out.push(None);
+                continue;
+            }
+            // GDL layers carry recurrent state (dev_state), not KV arenas.
+            // Return the state pointer so the caller can seed it into the
+            // graph's GDL state buffer before the first replay.
+            if layer.attention_mode == crate::lfm2::Lfm2AttentionMode::Gdl {
+                // Zero rows = no-op export (nothing to seed). With rows, return
+                // the GDL state pointer so the caller can D2D-copy it into the
+                // graph's GDL state buffer before the first replay.
+                if valid_rows == 0 {
+                    out.push(None);
+                } else {
+                    let state_ptr = match cache {
+                        Some(Lfm2LayerCache::Gdl {
+                            dev_state: Some(s),
+                            ..
+                        }) => grim_backend_rocm::as_rocm(s.as_ref())
+                            .ok()
+                            .and_then(|rocm_s| rocm_s.device_ptr_u64())
+                            .map(|p| p as *const f32)
+                            .filter(|p| *p != std::ptr::null()),
+                        _ => None,
+                    };
+                    out.push(Some(EagerKvSource {
+                        k_dev: std::ptr::null(),
+                        v_dev: std::ptr::null(),
+                        prefill_len: 0,
+                        kv_stride: 0,
+                        gdl_state: state_ptr,
+                        _anchor: std::marker::PhantomData,
+                    }));
+                }
                 continue;
             }
             let (k_dev, v_dev) = match cache {
@@ -197,8 +235,7 @@ impl Lfm2 {
                 _ => {
                     if valid_rows > 0 {
                         return Err(grim_core::error::Error::Session(
-                            "eager_kv_seed_sources: dense layer missing attention cache"
-                                .into(),
+                            "eager_kv_seed_sources: dense layer missing attention cache".into(),
                         ));
                     }
                     out.push(None);
@@ -210,26 +247,26 @@ impl Lfm2 {
                 _ => {
                     if valid_rows > 0 {
                         return Err(grim_core::error::Error::Session(
-                            "eager_kv_seed_sources: dense layer missing device KV arenas"
-                                .into(),
+                            "eager_kv_seed_sources: dense layer missing device KV arenas".into(),
                         ));
                     }
                     out.push(None);
                     continue;
                 }
             };
-            let (k_rocm, v_rocm) = match (as_rocm(k.storage().as_ref()), as_rocm(v.storage().as_ref())) {
-                (Ok(k), Ok(v)) => (k, v),
-                _ => {
-                    if valid_rows > 0 {
-                        return Err(grim_core::error::Error::Session(
-                            "eager_kv_seed_sources: KV arenas not ROCm-resident".into(),
-                        ));
+            let (k_rocm, v_rocm) =
+                match (as_rocm(k.storage().as_ref()), as_rocm(v.storage().as_ref())) {
+                    (Ok(k), Ok(v)) => (k, v),
+                    _ => {
+                        if valid_rows > 0 {
+                            return Err(grim_core::error::Error::Session(
+                                "eager_kv_seed_sources: KV arenas not ROCm-resident".into(),
+                            ));
+                        }
+                        out.push(None);
+                        continue;
                     }
-                    out.push(None);
-                    continue;
-                }
-            };
+                };
             let kv_stride = k_rocm.shape().dims().last().copied().unwrap_or(0);
             if kv_stride == 0 {
                 if valid_rows > 0 {
@@ -257,6 +294,7 @@ impl Lfm2 {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
         }
@@ -284,11 +322,7 @@ impl Lfm2 {
 
     /// Spec §Phase 3 capture path (P3 batch). Records a whole batch into the
     /// graph in one pass. `token_ids` must have length == `graph.buffers.batch`.
-    pub fn forward_capture_batch(
-        &self,
-        graph: &mut DecodeGraph,
-        token_ids: &[u32],
-    ) -> Result<()> {
+    pub fn forward_capture_batch(&self, graph: &mut DecodeGraph, token_ids: &[u32]) -> Result<()> {
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled".into(),
@@ -352,11 +386,7 @@ impl Lfm2 {
     /// Spec §Phase 3 replay path (P3 batch). Writes `batch` token IDs via
     /// async H2D, then replays in one launch. Caller bumps `pos_dev` by
     /// `graph.buffers.batch` after replay.
-    pub fn forward_replay_batch(
-        &self,
-        graph: &mut DecodeGraph,
-        token_ids: &[u32],
-    ) -> Result<()> {
+    pub fn forward_replay_batch(&self, graph: &mut DecodeGraph, token_ids: &[u32]) -> Result<()> {
         if !graph.is_captured {
             return Err(grim_core::error::Error::Backend(
                 "forward_replay_batch before capture".into(),
@@ -464,24 +494,29 @@ impl Lfm2Block {
                 ));
             }
             self.shortconv_forward_graph(layer_idx, buffers, dev)?;
+        } else if crate::gla_graph::is_gdl_layer(self) {
+            // GRAVE Phase 4: fused GDN-2 branch (one launch replaces
+            // kv_append + attention + norm). Unimplemented → eager fallback.
+            crate::gla_graph::gdl_forward_graph(self, layer_idx, buffers, dev, fuse_norm)?;
         } else {
-            self.attn_forward_graph(layer_idx, buffers, dev)?;
+            self.attn_forward_graph(layer_idx, buffers, dev, fuse_norm)?;
         }
-        if self.is_moe {
-            // M2 (PLAN-kernel-fusion): MoE FFN sublayer — device routing +
-            // resident-weight grouped dispatch, all enqueued (capture-safe).
-            self.moe_forward_graph(layer_idx, buffers, dev)?;
-        } else {
-            self.ffn_forward_graph(layer_idx, buffers, dev)?;
-        }
-        // Publish block output for the next layer (one D2D node).
+        // PLAN-decode-throughput-restore Fix 3: the FFN residual add writes
+        // the block result DIRECTLY into the next block's input slot (or
+        // head_input), eliminating the per-block publish D2D copy.
         let n_layers = buffers.layer_input.len();
-        let dst: &Storage = if layer_idx + 1 < n_layers {
+        let residual_dst: &RocmStorage = if layer_idx + 1 < n_layers {
             &buffers.layer_input[layer_idx + 1]
         } else {
             &buffers.head_input
         };
-        publish_into(dev, dst, &buffers.layer_output[layer_idx])?;
+        if self.is_moe {
+            // M2 (PLAN-kernel-fusion): MoE FFN sublayer — device routing +
+            // resident-weight grouped dispatch, all enqueued (capture-safe).
+            self.moe_forward_graph(layer_idx, buffers, dev, residual_dst)?;
+        } else {
+            self.ffn_forward_graph(layer_idx, buffers, dev, residual_dst, fuse_norm)?;
+        }
         Ok(())
     }
 
@@ -581,8 +616,56 @@ impl Lfm2Block {
                 1.0, // mscale
                 self.eps,
                 buffers.max_ctx,
+                false, // rope_interleaved: LFM2 uses NeoX half-split
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("fused mxfp4 qkv: {e}")))?;
+        } else if norm_fused_qkv {
+            // PLAN 4: norm-fused QKV — rms_norm prologue + quantize + dot4 in
+            // ONE launch, straight from the residual stream. The standalone
+            // norm above was skipped; predicates match the old dot-fused
+            // branch exactly, so kill-switches and fallbacks are preserved.
+            let n_q = self.num_heads * self.head_dim;
+            let n_kv = self.num_kv_heads * self.head_dim;
+            dev.fused_qkv_dot4_norm_into(
+                &buffers.layer_input[layer_idx],
+                rocm_storage(&self.attn_norm.weight)?,
+                self.attn_norm.eps,
+                rocm_storage(&wq.weight)?,
+                rocm_storage(&wk.weight)?,
+                rocm_storage(&wv.weight)?,
+                &buffers.q_buf[layer_idx],
+                &buffers.k_buf[layer_idx],
+                &buffers.v_buf[layer_idx],
+                n_q,
+                n_kv,
+                hidden,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused norm qkv dot4: {e}")))?;
+        } else if dot_fused_ok(dev, hidden)
+            && is_q80(&wq.weight)
+            && is_q80(&wk.weight)
+            && is_q80(&wv.weight)
+            && (self.num_heads * self.head_dim) % 4 == 0
+            && (self.num_kv_heads * self.head_dim) % 4 == 0
+        {
+            // PLAN-kernel-launch-reduction Phase B: ONE dot4 GEMV launch covers
+            // the three projections (replaces 3 GEMV + 3 quantize launches).
+            let n_q = self.num_heads * self.head_dim;
+            let n_kv = self.num_kv_heads * self.head_dim;
+            dev.fused_qkv_dot4_into(
+                normed,
+                rocm_storage(&wq.weight)?,
+                rocm_storage(&wk.weight)?,
+                rocm_storage(&wv.weight)?,
+                &buffers.q_buf[layer_idx],
+                &buffers.k_buf[layer_idx],
+                &buffers.v_buf[layer_idx],
+                n_q,
+                n_kv,
+                hidden,
+                act,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("fused qkv dot4: {e}")))?;
         } else {
             linear_into(dev, normed, &wq.weight, &buffers.q_buf[layer_idx], act)?;
             linear_into(dev, normed, &wk.weight, &buffers.k_buf[layer_idx], act)?;
@@ -1034,23 +1117,16 @@ pub fn write_embedding_to_buffer(
 
 /// P3: async H2D of a batch of token ids into the fixed layer-0 input buffer.
 /// Thin wrapper that converts the backend error type.
-pub fn write_batch_embeddings(
-    dev: &Dev,
-    dst: &RocmStorage,
-    token_ids: &[u32],
-) -> Result<()> {
+pub fn write_batch_embeddings(dev: &Dev, dst: &RocmStorage, token_ids: &[u32]) -> Result<()> {
     grim_backend_rocm::decode_graph_buffers::write_embeddings_to_buffer_batch(dev, dst, token_ids)
         .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))
 }
 
-fn dst_downcast(
-    dst: &dyn grim_tensor::BackendStorage,
-) -> Result<&grim_backend_rocm::RocmStorage> {
+fn dst_downcast(dst: &dyn grim_tensor::BackendStorage) -> Result<&grim_backend_rocm::RocmStorage> {
     dst.as_any()
         .downcast_ref::<grim_backend_rocm::RocmStorage>()
         .ok_or_else(|| grim_core::error::Error::Backend("write_embedding: need RocmStorage".into()))
 }
-
 
 impl Lfm2Block {
     /// S2 (PLAN-kernel-fusion): ShortConv sublayer + dense FFN tail, fully
@@ -1204,7 +1280,13 @@ impl Lfm2Block {
         let normed: &Storage = &buffers.norm_buf[layer_idx];
 
         // 2. Router gate GEMV [batch, n_expert].
-        linear_into(dev, normed, &gate_inp.weight, &buffers.moe_gate_logits[layer_idx], act)?;
+        linear_into(
+            dev,
+            normed,
+            &gate_inp.weight,
+            &buffers.moe_gate_logits[layer_idx],
+            act,
+        )?;
 
         // 3. Resident scratch + stacked weights (cache hit after warmup).
         let experts = self.moe_experts().ok_or_else(|| {
@@ -1270,4 +1352,3 @@ mod tests {
         assert!("GRIM_DECODE_GRAPH".is_ascii());
     }
 }
-

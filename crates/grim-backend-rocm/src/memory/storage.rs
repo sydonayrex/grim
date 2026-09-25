@@ -188,16 +188,26 @@ impl RocmStorage {
         }
         let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let _ctx = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        // SAFETY: dst device mem owned by self; src host ptr valid for call.
+        // Stage through pinned memory: pageable `hipMemcpyAsync` takes the
+        // driver's slow staged path (~0.4 ms/call on gfx1201), which dominated
+        // per-token decode time. Ring reuse is safe: decode steps end with a
+        // blocking D2H (stream drained) and issue few staged copies per step.
+        let host_bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, need) };
+        let (src_ptr, pinned) = crate::memory::pinned::stage_h2d_pinned(self.ordinal, host_bytes);
+        let _keep = host_bytes; // pageable fallback source (same as host.as_ptr())
+        // SAFETY: dst device mem owned by self; src is pinned stage (or the
+        // original host slice for oversized/failed-stage fallback), valid for
+        // the enqueue per `stage_h2d_pinned`'s safety contract.
         let res = unsafe {
             hipMemcpyAsync(
                 dev_ptr_void,
-                host.as_ptr() as *const c_void,
+                src_ptr as *const c_void,
                 need,
                 HipMemcpyKind::HostToDevice,
                 stream,
             )
         };
+        let _ = pinned;
         if res != hipSuccess {
             return Err(Error::Backend(format!(
                 "write_host_f32_async: hipMemcpyAsync failed {}",

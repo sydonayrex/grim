@@ -31,18 +31,15 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.2
         })
         .collect()
 }
 
-fn rocm_tensor(
-    dev: &RocmDevice,
-    ordinal: usize,
-    data: Vec<f32>,
-    shape: Shape,
-) -> Tensor {
+fn rocm_tensor(dev: &RocmDevice, ordinal: usize, data: Vec<f32>, shape: Shape) -> Tensor {
     let storage = dev.from_cpu(&data, &shape, DType::F32).unwrap();
     Tensor::new(
         Arc::from(storage),
@@ -53,9 +50,25 @@ fn rocm_tensor(
     )
 }
 
-fn test_linear(dev: &RocmDevice, ordinal: usize, out_dim: usize, in_dim: usize, seed: u64) -> Linear {
-    let w = rocm_tensor(dev, ordinal, rand_vec(out_dim * in_dim, seed), Shape::new(vec![out_dim, in_dim]));
-    Linear { weight: w.clone(), bias: None, w_t: w, quant_format: None }
+fn test_linear(
+    dev: &RocmDevice,
+    ordinal: usize,
+    out_dim: usize,
+    in_dim: usize,
+    seed: u64,
+) -> Linear {
+    let w = rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(out_dim * in_dim, seed),
+        Shape::new(vec![out_dim, in_dim]),
+    );
+    Linear {
+        weight: w.clone(),
+        bias: None,
+        w_t: w,
+        quant_format: None,
+    }
 }
 
 fn test_norm(dev: &RocmDevice, ordinal: usize, n: usize) -> RmsNorm {
@@ -74,6 +87,7 @@ fn attention_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
     let n_q = nh * hd;
     let n_kv = nkv * hd;
     Lfm2Block {
+        index: 0,
         attn_norm: test_norm(dev, ordinal, hidden),
         wq: Some(test_linear(dev, ordinal, n_q, hidden, 11)),
         wk: Some(test_linear(dev, ordinal, n_kv, hidden, 22)),
@@ -109,6 +123,12 @@ fn attention_block(dev: &RocmDevice, ordinal: usize) -> Lfm2Block {
         rope_theta: 10000.0,
         eps: 1e-5,
         charon_cache: CharonCache::new(),
+        attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
     }
 }
 
@@ -125,7 +145,10 @@ fn cpu_block() -> Lfm2Block {
     let n_kv = nkv * hd;
     let cpu_lin = |out: usize, inp: usize, seed: u64| -> Linear {
         Linear {
-            weight: grim_backend_cpu::cpu_tensor(rand_vec(out * inp, seed), Shape::new(vec![out, inp])),
+            weight: grim_backend_cpu::cpu_tensor(
+                rand_vec(out * inp, seed),
+                Shape::new(vec![out, inp]),
+            ),
             bias: None,
             w_t: grim_backend_cpu::cpu_tensor(
                 rand_vec(out * inp, seed),
@@ -141,6 +164,7 @@ fn cpu_block() -> Lfm2Block {
         }
     };
     Lfm2Block {
+        index: 0,
         attn_norm: cpu_norm(hidden),
         wq: Some(cpu_lin(n_q, hidden, 11)),
         wk: Some(cpu_lin(n_kv, hidden, 22)),
@@ -176,6 +200,12 @@ fn cpu_block() -> Lfm2Block {
         rope_theta: 10000.0,
         eps: 1e-5,
         charon_cache: CharonCache::new(),
+        attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
     }
 }
 
@@ -211,7 +241,13 @@ fn prefill_arena_matches_host_path() {
                 Shape::new(vec![n, hidden]),
             );
             cursor += n * hidden;
-            out_host.extend(block.forward(&x, &mut cache_host).unwrap().to_vec_f32().unwrap());
+            out_host.extend(
+                block
+                    .forward(&x, &mut cache_host)
+                    .unwrap()
+                    .to_vec_f32()
+                    .unwrap(),
+            );
         }
     }
 
@@ -227,7 +263,13 @@ fn prefill_arena_matches_host_path() {
                 Shape::new(vec![n, hidden]),
             );
             cursor += n * hidden;
-            out_arena.extend(block.forward(&x, &mut cache_arena).unwrap().to_vec_f32().unwrap());
+            out_arena.extend(
+                block
+                    .forward(&x, &mut cache_arena)
+                    .unwrap()
+                    .to_vec_f32()
+                    .unwrap(),
+            );
         }
     }
 
@@ -235,7 +277,10 @@ fn prefill_arena_matches_host_path() {
     match cache_arena.as_ref() {
         Some(grim_models_transformer::lfm2::Lfm2LayerCache::Attention { k, dev_pos, .. }) => {
             assert!(k.is_empty(), "arena path must not extend the host K mirror");
-            assert_eq!(*dev_pos, 4, "dev_pos must track 4 arena rows after 2+1+1 steps");
+            assert_eq!(
+                *dev_pos, 4,
+                "dev_pos must track 4 arena rows after 2+1+1 steps"
+            );
         }
         _ => panic!("expected attention cache"),
     }

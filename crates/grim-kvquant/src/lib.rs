@@ -275,10 +275,7 @@ impl LloydMaxCompressor {
     /// Attach a channel-axis tier allocation (WI-3). Returns the compressor
     /// unchanged when `alloc` is `None` (uniform path, byte-identical to
     /// today). Geometry mismatches are rejected eagerly at compress time.
-    pub fn with_channel_alloc(
-        mut self,
-        alloc: channel_importance::ChannelBitAllocation,
-    ) -> Self {
+    pub fn with_channel_alloc(mut self, alloc: channel_importance::ChannelBitAllocation) -> Self {
         self.channel_alloc = Some(alloc);
         self
     }
@@ -491,9 +488,9 @@ fn pack_kv_buf(
                     // `scales` array structurally populated for legacy
                     // callers (it is unused by the q4khalf kernel branch).
                     scales.push(row.iter().copied().fold(0.0f32, |a, x| a.max(x.abs())));
-                    out.extend_from_slice(&grim_quant::quant_q4khalf(row).map_err(
-                        |e| grim_core::error::Error::KvCache(format!("q4khalf pack: {e}")),
-                    )?);
+                    out.extend_from_slice(&grim_quant::quant_q4khalf(row).map_err(|e| {
+                        grim_core::error::Error::KvCache(format!("q4khalf pack: {e}"))
+                    })?);
                     continue;
                 }
                 let peak = row.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
@@ -2179,7 +2176,7 @@ mod tests {
 
     // ---- WI-3 (channel-axis allocation) ------------------------------------
 
-    use crate::channel_importance::{ChannelBitAllocation, CHANNEL_GROUP_SIZE};
+    use crate::channel_importance::{CHANNEL_GROUP_SIZE, ChannelBitAllocation};
 
     fn hand_alloc(kvh: usize, hd: usize, hot_groups: &[(usize, usize)]) -> ChannelBitAllocation {
         assert!(hd % CHANNEL_GROUP_SIZE == 0);
@@ -2259,11 +2256,18 @@ mod tests {
                 }
             })
             .collect();
-        let v_data: Vec<f32> = (0..t * kvh * hd).map(|i| ((i as f32) * 0.05).cos()).collect();
+        let v_data: Vec<f32> = (0..t * kvh * hd)
+            .map(|i| ((i as f32) * 0.05).cos())
+            .collect();
         let keys = cpu_tensor_from(&device, &k_data, &shape);
         let values = cpu_tensor_from(&device, &v_data, &shape);
 
-        let cfg = KvQuantConfig { key_bits: 4, value_bits: 4, group_size: 128, qk_compute_bits: 8 };
+        let cfg = KvQuantConfig {
+            key_bits: 4,
+            value_bits: 4,
+            group_size: 128,
+            qk_compute_bits: 8,
+        };
         // Uniform baseline at 4 bits (rotation ON, as today).
         let uniform = LloydMaxCompressor::new(cfg);
         let block_u = uniform.compress(&keys, &values).unwrap();
@@ -2326,7 +2330,9 @@ mod tests {
         let cfg = KvQuantConfig::default();
         let c = LloydMaxCompressor::new(cfg);
         let b1 = c.compress(&keys, &values).unwrap();
-        let b2 = LloydMaxCompressor::new(cfg).compress(&keys, &values).unwrap();
+        let b2 = LloydMaxCompressor::new(cfg)
+            .compress(&keys, &values)
+            .unwrap();
         assert_eq!(b1.to_bytes(), b2.to_bytes(), "v2 blobs are deterministic");
         assert_eq!(b1.to_bytes()[4], 2, "no allocation -> blob version 2");
         assert!(b1.channel_alloc.is_none());
@@ -2341,7 +2347,8 @@ mod tests {
         let keys = cpu_tensor_from(&device, &k, &shape);
         let values = cpu_tensor_from(&device, &k, &shape);
         let alloc = hand_alloc(2, 64, &[(0, 1)]);
-        let compressor = LloydMaxCompressor::new(KvQuantConfig::default()).with_channel_alloc(alloc.clone());
+        let compressor =
+            LloydMaxCompressor::new(KvQuantConfig::default()).with_channel_alloc(alloc.clone());
         let block = compressor.compress(&keys, &values).unwrap();
         let blob = block.to_bytes();
         assert_eq!(blob[4], 3);
@@ -2370,4 +2377,3 @@ mod tests {
         assert!(compressor.compress(&keys, &values).is_err());
     }
 }
-

@@ -17,12 +17,12 @@
 //! always preserved (boundary signals matter most).
 
 pub mod sentence;
-pub mod tfidf;
 pub mod textrank;
+pub mod tfidf;
 
 use sentence::segment_sentences;
-use tfidf::TfIdfStats;
 use textrank::textrank_scores;
+use tfidf::TfIdfStats;
 
 /// Default token budget — matches the paper's ~512 target.
 pub const DEFAULT_TOKEN_BUDGET: usize = 512;
@@ -215,9 +215,11 @@ fn position_weight(i: usize, n: usize, depth: f32) -> f32 {
 
 /// Max-normalize a slice of scores to [0, 1]. All-equal → all 0.5.
 fn normalize(scores: &[f32]) -> Vec<f32> {
-    let (min, max) = scores.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &s| {
-        (lo.min(s), hi.max(s))
-    });
+    let (min, max) = scores
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &s| {
+            (lo.min(s), hi.max(s))
+        });
     let range = max - min;
     if range < 1e-9 {
         vec![0.5; scores.len()]
@@ -277,7 +279,13 @@ mod tests {
     fn test_compress_respects_budget() {
         // Generate a long repetitive text
         let sentences: Vec<String> = (0..50)
-            .map(|i| format!("Sentence number {} contains unique content about topic {}.", i, i * 7))
+            .map(|i| {
+                format!(
+                    "Sentence number {} contains unique content about topic {}.",
+                    i,
+                    i * 7
+                )
+            })
             .collect();
         let text = sentences.join(" ");
         let original_tokens = approx_token_count(&text);

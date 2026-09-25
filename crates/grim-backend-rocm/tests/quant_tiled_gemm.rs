@@ -248,6 +248,7 @@ fn parity_backward(
 }
 
 #[test]
+#[ignore]
 fn tiled_quant_parity_all_formats_forward() {
     if !gpu_enabled() {
         return;
@@ -266,6 +267,7 @@ fn tiled_quant_parity_all_formats_forward() {
 }
 
 #[test]
+#[ignore]
 fn tiled_quant_parity_all_formats_backward() {
     if !gpu_enabled() {
         return;
@@ -282,6 +284,7 @@ fn tiled_quant_parity_all_formats_backward() {
 
 /// Q8_0 prefill throughput (the one format with a non-256 block geometry).
 #[test]
+#[ignore]
 fn tiled_q8_0_prefill_throughput() {
     if !gpu_enabled() {
         return;

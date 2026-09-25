@@ -432,8 +432,12 @@ mod tests {
         assert_eq!(cfg.num_experts_per_tok, 8);
     }
 
-    /// Parity gate for the MoeFfn migration: the layer must reproduce the original per-token host algorithm (softmax top-k routing, weighted expert
-    /// sum scaled by routed_scaling_factor, shared expert added unconditionally) - that algorithm is what the fused Charon kernel matches bit-for-bit on ROCm.
+    /// Parity gate for the MoeFfn migration (host-vs-host reference only):
+    /// the layer must reproduce the original per-token host algorithm
+    /// (softmax top-k routing, weighted expert sum scaled by
+    /// routed_scaling_factor, shared expert added unconditionally).
+    /// D2D-kernel equivalence is proven separately on GPU by
+    /// `moe_d2d_equivalence_gpu` + `moe_all_models_parity_gpu`, not here.
     #[test]
     fn test_qwen35moe_layer_matches_host_reference() {
         let hidden = 4usize;

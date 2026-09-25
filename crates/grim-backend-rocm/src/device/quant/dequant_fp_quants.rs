@@ -4,15 +4,13 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::dtype::{ ArithType };
+use grim_tensor::dtype::ArithType;
 use grim_tensor::error::{Error, Result};
 
 use crate::device::gemm_tuning::lookup_solution_index;
-use crate::device::roc_device::{ RocmDevice };
+use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, arg };
-
-
+use crate::{HipDim3, arg};
 
 impl RocmDevice {
     /// Launch the JIT compiled fused dequantization GEMM kernel for [see: `b_storage`, `Storage::ResidualPacked`]

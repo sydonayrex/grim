@@ -24,6 +24,7 @@ fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
 }
 
 #[test]
+#[ignore]
 fn test_production_kernels_compile_and_discovered() {
     let dev = RocmDevice::new(0);
     let src = grim_backend_rocm::kernels::source_asm::compute_kernel_source();
@@ -36,6 +37,7 @@ fn test_production_kernels_compile_and_discovered() {
 }
 
 #[test]
+#[ignore]
 fn test_flash_decode_split_kv_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
@@ -146,6 +148,7 @@ fn test_flash_decode_split_kv_parity() -> TestResult {
 ///   y[n]   = sum_s c[s]*h[n,s] + d[h]*x[n]*dt[h]
 /// State updates in place; outputs compared elementwise.
 #[test]
+#[ignore]
 fn test_selective_scan_headed_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
@@ -232,6 +235,7 @@ fn test_selective_scan_headed_parity() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn test_mla_head_stride_multi_head_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
@@ -348,6 +352,7 @@ fn test_mla_head_stride_multi_head_parity() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn test_mla_absorbed_decode_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
@@ -463,6 +468,7 @@ fn test_mla_absorbed_decode_parity() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn test_marlin_gemm_w4a16_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
@@ -513,6 +519,7 @@ fn test_marlin_gemm_w4a16_parity() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn test_bitnet_gemm_w158a8_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());

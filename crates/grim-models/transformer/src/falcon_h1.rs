@@ -207,8 +207,8 @@ fn load_block(ws: &WeightSource<'_>, cfg: &FalconH1Config) -> Result<FalconH1Blo
 
     let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
-    let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
-        .map(std::sync::Arc::new);
+    let wqkv_q80_fused =
+        crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv).map(std::sync::Arc::new);
 
     let ssm_in = Linear::load(&ws.pp("ssm_in"), cfg.hidden_size, cfg.ssm_in_dim(), false)?;
     let ssm_out = Linear::load(&ws.pp("ssm_out"), cfg.ssm_d_inner, cfg.hidden_size, false)?;
@@ -360,10 +360,10 @@ fn forward_block_cpu(
             crate::shared_attention::fused_qkv_dot4_decode(&normed_t, fused)?
         }
         _ => {
-        let q_t = b.wq.forward(&normed_t)?;
-        let k_t = b.wk.forward(&normed_t)?;
-        let v_t = b.wv.forward(&normed_t)?;
-        (q_t, k_t, v_t)
+            let q_t = b.wq.forward(&normed_t)?;
+            let k_t = b.wk.forward(&normed_t)?;
+            let v_t = b.wv.forward(&normed_t)?;
+            (q_t, k_t, v_t)
         }
     };
 

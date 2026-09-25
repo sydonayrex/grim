@@ -163,11 +163,7 @@ impl SamplerState {
 /// begin (tokens are sorted descending by logit within the result).
 ///
 /// This matches the approach in llama.cpp's `llama_token_data_array_partial_sort`.
-fn histogram_top_k(
-    logits: &[f32],
-    idx_buf: &mut [usize],
-    k: usize,
-) -> usize {
+fn histogram_top_k(logits: &[f32], idx_buf: &mut [usize], k: usize) -> usize {
     const NBUCKETS: usize = 128;
     const BUCKET_LOW: f32 = -10.0;
     const BUCKET_HIGH: f32 = 10.0;
@@ -223,7 +219,9 @@ fn histogram_top_k(
     }
     // Sort the tokens within bucket ib by descending logit.
     idx_buf[bucket_start..pos].sort_by(|&a, &b| {
-        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Return the start index of the top-k region.
@@ -883,11 +881,15 @@ mod tests {
         let mut state = SamplerState::with_capacity(logits.len());
         let mut dominant = 0usize;
         for _ in 0..1000 {
-            if sample_logits_with_state(&logits, 1.0, 0.95, 0, 1.0, &[], &mut rng, &mut state) == 1 {
+            if sample_logits_with_state(&logits, 1.0, 0.95, 0, 1.0, &[], &mut rng, &mut state) == 1
+            {
                 dominant += 1;
             }
         }
-        assert!(dominant > 990, "dominant token should win ~always, got {dominant}");
+        assert!(
+            dominant > 990,
+            "dominant token should win ~always, got {dominant}"
+        );
     }
 
     #[test]
@@ -924,7 +926,10 @@ mod tests {
         for _ in 0..500 {
             let tok =
                 sample_logits_with_state(&logits, 1.0, 1.0, 2, 1.0, &[], &mut rng, &mut state);
-            assert!(tok == 1 || tok == 4, "top_k=2 should only select tokens 1 or 4, got {tok}");
+            assert!(
+                tok == 1 || tok == 4,
+                "top_k=2 should only select tokens 1 or 4, got {tok}"
+            );
         }
     }
 }

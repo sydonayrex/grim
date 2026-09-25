@@ -825,6 +825,15 @@ pub fn rocm_dequant_expert_weight(
 ) -> Result<Vec<f32>, grim_tensor::error::Error> {
     let dev = RocmDevice::try_new(ordinal)?;
     let dims = weight.shape().dims();
+    // M4: rank check before indexing — a 1D gate weight used to panic here
+    // (index OOB), killing the request instead of degrading to host.
+    if dims.len() != 2 {
+        return Err(grim_tensor::error::Error::Shape(format!(
+            "rocm_dequant_expert_weight expects 2-D [rows, cols], got rank {} {:?}",
+            dims.len(),
+            dims
+        )));
+    }
     let (n_rows, k_dim) = (dims[0], dims[1]);
     let out_box = match weight.dtype().storage {
         Storage::W4A16(w4) => {
@@ -1392,6 +1401,11 @@ impl MoeFfn {
                     return Ok(out);
                 }
                 Err(e) => {
+                    grim_core::emit_fallback(
+                        "grim-nn/moe",
+                        grim_core::FallbackReason::MoeDeviceDispatch,
+                        format!("{e:?}"),
+                    );
                     if std::env::var_os("GRIM_MOE_DIAG").is_some() {
                         eprintln!("[moe-diag] forward_rocm fallback: {e:?}");
                     }
@@ -2145,13 +2159,13 @@ impl MoeFfn {
             let key = (num_gate_rows, hidden);
             let cached = {
                 let guard = self.rocm_gate.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .as_ref()
-                    .and_then(|(r, h, arc)| if *r == key.0 && *h == key.1 {
+                guard.as_ref().and_then(|(r, h, arc)| {
+                    if *r == key.0 && *h == key.1 {
                         Some(Arc::clone(arc))
                     } else {
                         None
-                    })
+                    }
+                })
             };
             if let Some(arc) = cached {
                 arc
@@ -2192,8 +2206,7 @@ impl MoeFfn {
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
             .ok_or_else(|| grim_tensor::error::Error::Backend("x is not RocmStorage".into()))?;
         let logits_shape = Shape::new(vec![batch, num_experts]);
-        let (logits_storage, _h) =
-            dev.matmul(x_rocm_early, gate_rocm, &logits_shape)?;
+        let (logits_storage, _h) = dev.matmul(x_rocm_early, gate_rocm, &logits_shape)?;
         let logits_rocm = logits_storage
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
@@ -3005,6 +3018,22 @@ mod tests {
         assert!((w[0][1] - (1.0 - expected0)).abs() < 1e-5);
     }
 
+    /// C4 split: host `route()` treats `SoftmaxTopK` and `SoftmaxTopKRenorm`
+    /// identically (shared match arm) — the global-softmax vs renorm-over-
+    /// top-k distinction (device route_mode 0 vs 3) lives ONLY in device
+    /// dispatch, proven by `moe_all_models_parity_gpu`. Pin the host
+    /// conflation here so a future divergence fails loudly instead of
+    /// silently changing which arm the host reference describes.
+    #[test]
+    fn renorm_kind_routes_identically_to_softmax_on_host() {
+        let a = build_synthetic(RouterKind::SoftmaxTopK, None, None);
+        let b = build_synthetic(RouterKind::SoftmaxTopKRenorm, None, None);
+        let (idx_a, w_a) = a.router.route(&token()).unwrap();
+        let (idx_b, w_b) = b.router.route(&token()).unwrap();
+        assert_eq!(idx_a, idx_b, "host selection identical across kinds");
+        assert_eq!(w_a, w_b, "host weights identical across kinds");
+    }
+
     #[test]
     fn sigmoid_bias_changes_selection_only_at_rank_time() {
         // Without bias: softmax([3,0.1,2,-1]) top2 = {0,2}.
@@ -3704,5 +3733,72 @@ mod tests {
             w[i * cols + i] = 1.0;
         }
         Linear::from_tensor(cpu_tensor(w, Shape::new(vec![rows, cols])), None)
+    }
+}
+
+#[cfg(test)]
+mod gate_rank_tests {
+    use super::{ExpertBank, Linear, MoeFfn, MoeRouter, RocmDevice, RouterKind};
+    use grim_backend_cpu::cpu_tensor;
+    use grim_tensor::shape::Shape;
+    use grim_tensor::{CoreTensorOps, Device, Tensor};
+    use std::sync::Arc;
+
+    /// M4: a 1D gate weight must refuse loudly in `forward_rocm`
+    /// (ShapeMismatch on the gate layout), while `forward()` still degrades
+    /// to the host reference. Silent acceptance would dispatch against a
+    /// misinterpreted `[num_experts, hidden]` layout.
+    #[test]
+    fn flat_gate_weight_refuses_loudly_in_forward_rocm() {
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("[SKIP] requires GPU");
+                return;
+            }
+        };
+        let hidden = 4usize;
+        let gate_1d = Linear::from_tensor(cpu_tensor(vec![0.1f32; 8], Shape::new(vec![8])), None);
+        let router = MoeRouter::new(gate_1d, RouterKind::SoftmaxTopK, 1, 2, None);
+        let one =
+            |v: f32| Linear::from_tensor(cpu_tensor(vec![v; 16], Shape::new(vec![4, 4])), None);
+        let bank = ExpertBank::from_linears(vec![one(0.1)], vec![one(0.2)], vec![one(0.3)]);
+        let moe = MoeFfn::new(router, bank, None, 1.0);
+        let storage = dev
+            .from_cpu(
+                &[1.0f32, 0.0, 0.0, 0.0],
+                &Shape::new(vec![1, hidden]),
+                grim_tensor::dtype::DType::F32,
+            )
+            .unwrap();
+        let x_rocm = Tensor::new(
+            Arc::from(storage),
+            Shape::new(vec![1, hidden]),
+            grim_tensor::dtype::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            Device::Rocm(0),
+        );
+        let err = moe
+            .forward_rocm(&x_rocm)
+            .expect_err("1D gate must refuse loudly");
+        assert!(
+            matches!(
+                err,
+                grim_tensor::error::Error::Shape { .. }
+                    | grim_tensor::error::Error::ShapeMismatch { .. }
+            ),
+            "expected loud shape refusal, got: {err:?}"
+        );
+        // A 1D gate is invalid on every path (host matmul needs 2-D too),
+        // so the public path must also Err — loudly, without panicking.
+        // Before the rank guard this test died with index-OOB inside
+        // `forward_rocm`; now both paths return typed errors.
+        let err_all = moe
+            .forward(&x_rocm)
+            .expect_err("1D gate invalid everywhere");
+        assert!(
+            !format!("{err_all:?}").is_empty(),
+            "error must carry a message"
+        );
     }
 }

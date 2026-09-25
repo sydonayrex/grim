@@ -2,6 +2,16 @@
 
 extern crate alloc;
 
+/// GRAVE Phase 1: store the LFM2-family KV arena in f16 (2 bytes/element)
+/// instead of f32 — halves attention bytes. Read at BOTH the arena allocation
+/// sites and the kernel launchers so the flag stays consistent. LFM2-family
+/// only; other models' arenas are unaffected while the default is off.
+pub fn kv_f16_enabled() -> bool {
+    std::env::var("GRIM_F16_KV")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
 /// HIP source for `grim_qkv_attention`. [see: `COMPUTE_KERNEL_SOURCE`, `lib.rs::RocmDevice::qkv_attention`, `j`, `__shared__`]
 pub const KERNEL_SOURCE: &str = r#"
 // HIPRTC compiles this unit standalone: provide the infinity constant the
@@ -914,7 +924,8 @@ extern "C" __global__ void grim_kv_append(
     int kv_stride,
     int steps,
     int batch,
-    int arena_slot_stride
+    int arena_slot_stride,
+    int f16
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int per_slot = steps * kv_stride;
@@ -923,7 +934,15 @@ extern "C" __global__ void grim_kv_append(
     const int slot = (batch > 1) ? (tid / per_slot) : 0;
     const int local = tid - slot * per_slot;
     const int past = past_dev[slot];
-    k_arena[slot * arena_slot_stride + past * kv_stride + local] = k_rot[tid];
+    long long off = (long long)slot * arena_slot_stride + past * kv_stride + local;
+    if (f16) {
+        // GRAVE Phase 1: arena holds f16 (2-byte) elements at the same
+        // element offsets; convert on store.
+        unsigned short* a16 = (unsigned short*)k_arena;
+        a16[off] = f32_to_fp16_bits_device(k_rot[tid]);
+    } else {
+        k_arena[off] = k_rot[tid];
+    }
 }
 
 // Item 3 — device-total attention variant. Identical math to `grim_qkv_attention`
@@ -955,7 +974,8 @@ extern "C" __global__ void grim_qkv_attention_dev(
     const float* __restrict__ alibi_slopes,
     int has_alibi,
     int batch,
-    int arena_slot_stride
+    int arena_slot_stride,
+    int kv_f16
 ) {
     // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
     // P3: blockIdx.z is the batch slot — every slot has its own arena region
@@ -1004,6 +1024,8 @@ extern "C" __global__ void grim_qkv_attention_dev(
     float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
+    const unsigned short* k_head16 = (const unsigned short*)k_tensor;
+    const unsigned short* v_head16 = (const unsigned short*)v_tensor;
     const float* __restrict__ k_head = &k_tensor[slot * arena_slot_stride + kv_head * head_dim];
     const float* __restrict__ v_head = &v_tensor[slot * arena_slot_stride + kv_head * head_dim];
     const int kv_stride = num_kv_heads * head_dim;
@@ -1020,7 +1042,10 @@ extern "C" __global__ void grim_qkv_attention_dev(
         for (int c = 0; c < 4; ++c) {
             int idx = d + c * wave_size;
             if (idx < head_dim) {
-                score += q_reg[c] * k_head[kv_idx * kv_stride + idx];
+                float kvv = kv_f16
+                    ? fp16_bits_to_float_device(k_head16[(long long)(slot * arena_slot_stride + kv_head * head_dim) + kv_idx * kv_stride + idx])
+                    : k_head[kv_idx * kv_stride + idx];
+                score += q_reg[c] * kvv;
             }
         }
         // Wave-uniform total score (every lane holds the sum).
@@ -1039,8 +1064,12 @@ extern "C" __global__ void grim_qkv_attention_dev(
             running_sum = running_sum * scale_a + scale_b;
             for (int c = 0; c < 4; ++c) {
                 int idx = d + c * wave_size;
-                if (idx < head_dim)
-                    out_acc[c] = out_acc[c] * scale_a + scale_b * v_head[kv_idx * kv_stride + idx];
+                if (idx < head_dim) {
+                    float vv = kv_f16
+                        ? fp16_bits_to_float_device(v_head16[(long long)(slot * arena_slot_stride + kv_head * head_dim) + kv_idx * kv_stride + idx])
+                        : v_head[kv_idx * kv_stride + idx];
+                    out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+                }
             }
             running_max = mw;
         }
@@ -1668,21 +1697,47 @@ fn kv_rot_device_ptr(
     s: &dyn BackendStorage,
     label: &str,
 ) -> std::result::Result<*mut std::ffi::c_void, crate::Error> {
-    if let Some(r) = s.as_any().downcast_ref::<crate::memory::storage::RocmStorage>() {
+    if let Some(r) = s
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+    {
         return r
             .device_ptr
             .map(|p| p as *mut std::ffi::c_void)
             .ok_or_else(|| crate::Error::Backend(format!("kv_append: {label} has no device ptr")));
     }
-    if let Some(v) = s.as_any().downcast_ref::<crate::memory::view::RocmStorageView>() {
+    if let Some(v) = s
+        .as_any()
+        .downcast_ref::<crate::memory::view::RocmStorageView>()
+    {
         let p = v.device_ptr_u64();
         if p != 0 {
             return Ok(p as *mut std::ffi::c_void);
         }
     }
-    Err(crate::Error::Backend(
-        format!("kv_append: {label} must be RocmStorage or RocmStorageView"),
-    ))
+    Err(crate::Error::Backend(format!(
+        "kv_append: {label} must be RocmStorage or RocmStorageView"
+    )))
+}
+
+/// M3: KV-arena dtype must match the live `GRIM_F16_KV` flag. A stale F32
+/// arena read as F16 (or vice versa) silently reinterprets bits — Err here
+/// routes callers to the host fallback instead of garbage.
+fn check_kv_arena_dtype(arena: &dyn BackendStorage, what: &str) -> Result<(), crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    let s = arena
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{what}: K/V arena must be RocmStorage")))?;
+    let want_f16 = kv_f16_enabled();
+    let is_f16 = s.dtype.arith == grim_tensor::dtype::ArithType::F16;
+    if is_f16 != want_f16 {
+        return Err(crate::Error::Backend(format!(
+            "{what}: arena dtype {:?} does not match GRIM_F16_KV={want_f16}",
+            s.dtype.arith,
+        )));
+    }
+    Ok(())
 }
 
 pub fn launch_kv_append(
@@ -1693,6 +1748,7 @@ pub fn launch_kv_append(
     kv_stride: usize,
     steps: usize,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
+    check_kv_arena_dtype(k_arena, "kv_append")?;
     let total = steps * kv_stride;
     let arena_s = k_arena
         .as_any()
@@ -1712,6 +1768,7 @@ pub fn launch_kv_append(
     let mut stride_i = kv_stride as i32;
     let mut steps_i = steps as i32;
     let (grid, block) = crate::device::util::linear_launch(total);
+    let mut f16_flag = kv_f16_enabled() as i32;
     // Legacy single-sequence path: batch=1 (slot always 0 in the kernel).
     dev.launch_compute_kernel(
         "grim_kv_append",
@@ -1725,6 +1782,7 @@ pub fn launch_kv_append(
             arg(&mut steps_i),
             arg(&mut 1i32),
             arg(&mut 0i32),
+            arg(&mut f16_flag),
         ],
     )
 }
@@ -1743,27 +1801,33 @@ pub fn launch_kv_append_batch(
     batch: usize,
     arena_slot_stride: usize,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
+    check_kv_arena_dtype(k_arena, "kv_append_batch")?;
     let arena_s = k_arena
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_arena must be RocmStorage".into()))?;
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_batch: k_arena must be RocmStorage".into())
+        })?;
     let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_batch")?;
     let past_s = past_dev
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend("kv_append_batch: past_dev must be RocmStorage".into()))?;
-    let mut arena_ptr = arena_s
-        .device_ptr
-        .ok_or_else(|| crate::Error::Backend("kv_append_batch: k_arena has no device ptr".into()))?;
-    let mut past_ptr = past_s
-        .device_ptr
-        .ok_or_else(|| crate::Error::Backend("kv_append_batch: past_dev has no device ptr".into()))?;
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_batch: past_dev must be RocmStorage".into())
+        })?;
+    let mut arena_ptr = arena_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_append_batch: k_arena has no device ptr".into())
+    })?;
+    let mut past_ptr = past_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_append_batch: past_dev has no device ptr".into())
+    })?;
     let mut stride_i = kv_stride as i32;
     let mut steps_i = steps as i32;
     let mut batch_i = batch.max(1) as i32;
     let mut slot_stride_i = arena_slot_stride as i32;
     let total = batch.max(1) * steps * kv_stride;
     let (grid, block) = crate::device::util::linear_launch(total);
+    let mut f16_flag = kv_f16_enabled() as i32;
     dev.launch_compute_kernel(
         "grim_kv_append",
         grid,
@@ -1776,6 +1840,7 @@ pub fn launch_kv_append_batch(
             arg(&mut steps_i),
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
+            arg(&mut f16_flag),
         ],
     )
 }
@@ -1807,10 +1872,29 @@ pub fn launch_qkv_attention_dev(
     has_alibi: u32,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
     launch_qkv_attention_dev_batch(
-        dev, q, k_tensor, v_tensor, out, out_max, out_sum, total_dev,
-        num_heads, num_kv_heads, head_dim, seq_len, steps, inv_sqrt_d,
-        window_lo, softcap, o_proj_w, o_dim, fuse_o, alibi_slopes, has_alibi,
-        1, 0,
+        dev,
+        q,
+        k_tensor,
+        v_tensor,
+        out,
+        out_max,
+        out_sum,
+        total_dev,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        steps,
+        inv_sqrt_d,
+        window_lo,
+        softcap,
+        o_proj_w,
+        o_dim,
+        fuse_o,
+        alibi_slopes,
+        has_alibi,
+        1,
+        0,
     )
 }
 
@@ -1855,6 +1939,8 @@ pub fn launch_qkv_attention_dev_batch(
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
         .ok_or_else(|| crate::Error::Backend(format!("{}: q must be RocmStorage", KERNEL)))?;
+    check_kv_arena_dtype(k_tensor, "grim_qkv_attention_dev")?;
+    check_kv_arena_dtype(v_tensor, "grim_qkv_attention_dev")?;
     let k_s = k_tensor
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -1878,22 +1964,42 @@ pub fn launch_qkv_attention_dev_batch(
     let total_s = total_dev
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend(format!("{}: total_dev must be RocmStorage", KERNEL)))?;
+        .ok_or_else(|| {
+            crate::Error::Backend(format!("{}: total_dev must be RocmStorage", KERNEL))
+        })?;
     let oproj_s = o_proj_w
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend(format!("{}: o_proj_w must be RocmStorage", KERNEL)))?;
+        .ok_or_else(|| {
+            crate::Error::Backend(format!("{}: o_proj_w must be RocmStorage", KERNEL))
+        })?;
     let alibi_s = alibi_slopes
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
-        .ok_or_else(|| crate::Error::Backend(format!("{}: alibi_slopes must be RocmStorage", KERNEL)))?;
-    let mut q_ptr = q_s.device_ptr.ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
-    let mut k_ptr = k_s.device_ptr.ok_or_else(|| crate::Error::Backend("k has no ptr".into()))?;
-    let mut v_ptr = v_s.device_ptr.ok_or_else(|| crate::Error::Backend("v has no ptr".into()))?;
-    let mut o_ptr = out_s.device_ptr.ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
-    let mut om_ptr = om_s.device_ptr.ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
-    let mut os_ptr = os_s.device_ptr.ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
-    let mut tot_ptr = total_s.device_ptr.ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+        .ok_or_else(|| {
+            crate::Error::Backend(format!("{}: alibi_slopes must be RocmStorage", KERNEL))
+        })?;
+    let mut q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = k_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k has no ptr".into()))?;
+    let mut v_ptr = v_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v has no ptr".into()))?;
+    let mut o_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
     let mut nh = num_heads as i32;
     let mut nkv = num_kv_heads as i32;
     let mut hd = head_dim as i32;
@@ -1904,11 +2010,16 @@ pub fn launch_qkv_attention_dev_batch(
     let mut sc = softcap;
     let mut od = o_dim as i32;
     let mut fo = fuse_o as i32;
-    let mut asl = alibi_s.device_ptr.ok_or_else(|| crate::Error::Backend("alibi has no ptr".into()))?;
+    let mut asl = alibi_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("alibi has no ptr".into()))?;
     let mut ha = has_alibi as i32;
-    let mut opptr = oproj_s.device_ptr.ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let mut opptr = oproj_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
     let mut batch_i = batch.max(1) as i32;
     let mut slot_stride_i = arena_slot_stride as i32;
+    let mut f16_flag = kv_f16_enabled() as i32;
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
     dev.launch_compute_kernel(
@@ -1938,120 +2049,123 @@ pub fn launch_qkv_attention_dev_batch(
             arg(&mut ha),
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
+            arg(&mut f16_flag),
         ],
     )
 }
 
 /// Item 3 launcher: `grim_bump_i32`. Increments `*past_dev += steps`. Single
-    /// thread; the mutable `past_dev` pointer is a graph input so each replay bumps
-    /// the live counter.
-    pub fn launch_bump_i32(
-        dev: &crate::RocmDevice,
-        past_dev: &dyn BackendStorage,
-        steps: usize,
-    ) -> Result<*mut std::ffi::c_void, crate::Error> {
-        launch_bump_i32_slots(dev, past_dev, steps, 1)
-    }
+/// thread; the mutable `past_dev` pointer is a graph input so each replay bumps
+/// the live counter.
+pub fn launch_bump_i32(
+    dev: &crate::RocmDevice,
+    past_dev: &dyn BackendStorage,
+    steps: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    launch_bump_i32_slots(dev, past_dev, steps, 1)
+}
 
-    /// P3: bump one i32 per batch slot. Grid (batch,1,1), thread b bumps
-    /// `past_dev[b] += steps`. batch=1 matches the legacy single-thread kernel.
-    pub fn launch_bump_i32_slots(
-        dev: &crate::RocmDevice,
-        past_dev: &dyn BackendStorage,
-        steps: usize,
-        batch: usize,
-    ) -> Result<*mut std::ffi::c_void, crate::Error> {
-        let past_s = past_dev
-            .as_any()
-            .downcast_ref::<crate::memory::storage::RocmStorage>()
-            .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev must be RocmStorage".into()))?;
-        let mut past_ptr = past_s
-            .device_ptr
-            .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev has no device ptr".into()))?;
-        let mut steps_i = steps as i32;
-        let b = batch.max(1) as u32;
-        dev.launch_compute_kernel(
-            "grim_bump_i32",
-            crate::HipDim3::new(b, 1, 1),
-            crate::HipDim3::new(1, 1, 1),
-            &mut [arg(&mut past_ptr), arg(&mut steps_i)],
-        )
-    }
+/// P3: bump one i32 per batch slot. Grid (batch,1,1), thread b bumps
+/// `past_dev[b] += steps`. batch=1 matches the legacy single-thread kernel.
+pub fn launch_bump_i32_slots(
+    dev: &crate::RocmDevice,
+    past_dev: &dyn BackendStorage,
+    steps: usize,
+    batch: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev must be RocmStorage".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("bump_i32: past_dev has no device ptr".into()))?;
+    let mut steps_i = steps as i32;
+    let b = batch.max(1) as u32;
+    dev.launch_compute_kernel(
+        "grim_bump_i32",
+        crate::HipDim3::new(b, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [arg(&mut past_ptr), arg(&mut steps_i)],
+    )
+}
 
-    /// ScytheRing head publish — fully on-device (no pinned staging, no H2D).
-    /// Writes a single u32 head counter to head_dev. Launched as grid
-    /// (1,1,1)/block (1,1,1): thread 0 writes the value. HIP-graph capturable.
-    /// `head_dev_ptr` is the raw device address of the head scalar.
-    pub fn launch_scythe_publish_head(
-        dev: &crate::RocmDevice,
-        head_dev_ptr: u64,
-        head_value: u32,
-    ) -> Result<*mut std::ffi::c_void, crate::Error> {
-        let mut hp = head_dev_ptr;
-        let mut hv = head_value;
-        let handle = dev.launch_compute_kernel(
-            "grim_scythe_publish_head",
-            crate::HipDim3::new(1, 1, 1),
-            crate::HipDim3::new(1, 1, 1),
-            &mut [arg(&mut hp), arg(&mut hv)],
-        )?;
-        crate::device::helpers::check_hip("scythe_publish_head: sync", unsafe {
-            crate::hipStreamSynchronize(dev.active_stream())
+/// ScytheRing head publish — fully on-device (no pinned staging, no H2D).
+/// Writes a single u32 head counter to head_dev. Launched as grid
+/// (1,1,1)/block (1,1,1): thread 0 writes the value. HIP-graph capturable.
+/// `head_dev_ptr` is the raw device address of the head scalar.
+pub fn launch_scythe_publish_head(
+    dev: &crate::RocmDevice,
+    head_dev_ptr: u64,
+    head_value: u32,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let mut hp = head_dev_ptr;
+    let mut hv = head_value;
+    let handle = dev.launch_compute_kernel(
+        "grim_scythe_publish_head",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [arg(&mut hp), arg(&mut hv)],
+    )?;
+    crate::device::helpers::check_hip("scythe_publish_head: sync", unsafe {
+        crate::hipStreamSynchronize(dev.active_stream())
+    })?;
+    Ok(handle)
+}
+
+/// ScytheRing descriptor write — fully on-device (no host pack, no H2D).
+/// Writes one 64-byte task descriptor into ring slot `slot_idx`. Launched as
+/// grid (1,1,1)/block (1,1,1): thread 0 packs the fields. This is HIP-graph
+/// capturable, unlike the legacy pinned-staging + H2D path.
+pub fn launch_scythe_write_slot(
+    dev: &crate::RocmDevice,
+    slots_base: &dyn BackendStorage,
+    slot_idx: usize,
+    opcode: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    input_ptr: u64,
+    weight_ptr: u64,
+    output_ptr: u64,
+    peer_ptr: u64,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    let slots_s = slots_base
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("scythe_write_slot: slots must be RocmStorage".into())
         })?;
-        Ok(handle)
-    }
-
-    /// ScytheRing descriptor write — fully on-device (no host pack, no H2D).
-    /// Writes one 64-byte task descriptor into ring slot `slot_idx`. Launched as
-    /// grid (1,1,1)/block (1,1,1): thread 0 packs the fields. This is HIP-graph
-    /// capturable, unlike the legacy pinned-staging + H2D path.
-    pub fn launch_scythe_write_slot(
-        dev: &crate::RocmDevice,
-        slots_base: &dyn BackendStorage,
-        slot_idx: usize,
-        opcode: u32,
-        m: u32,
-        n: u32,
-        k: u32,
-        input_ptr: u64,
-        weight_ptr: u64,
-        output_ptr: u64,
-        peer_ptr: u64,
-    ) -> Result<*mut std::ffi::c_void, crate::Error> {
-        let slots_s = slots_base
-            .as_any()
-            .downcast_ref::<crate::memory::storage::RocmStorage>()
-            .ok_or_else(|| crate::Error::Backend("scythe_write_slot: slots must be RocmStorage".into()))?;
-        let mut base_ptr = slots_s
-            .device_ptr
-            .ok_or_else(|| crate::Error::Backend("scythe_write_slot: slots have no device ptr".into()))?;
-        let mut slot = slot_idx as u32;
-        let mut op = opcode;
-        let mut mi = m;
-        let mut nn = n;
-        let mut kk = k;
-        let mut inp = input_ptr;
-        let mut wep = weight_ptr;
-        let mut outp = output_ptr;
-        let mut pep = peer_ptr;
-        dev.launch_compute_kernel(
-            "grim_scythe_write_slot",
-            crate::HipDim3::new(1, 1, 1),
-            crate::HipDim3::new(1, 1, 1),
-            &mut [
-                arg(&mut base_ptr),
-                arg(&mut slot),
-                arg(&mut op),
-                arg(&mut mi),
-                arg(&mut nn),
-                arg(&mut kk),
-                arg(&mut inp),
-                arg(&mut wep),
-                arg(&mut outp),
-                arg(&mut pep),
-            ],
-        )
-    }
+    let mut base_ptr = slots_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("scythe_write_slot: slots have no device ptr".into())
+    })?;
+    let mut slot = slot_idx as u32;
+    let mut op = opcode;
+    let mut mi = m;
+    let mut nn = n;
+    let mut kk = k;
+    let mut inp = input_ptr;
+    let mut wep = weight_ptr;
+    let mut outp = output_ptr;
+    let mut pep = peer_ptr;
+    dev.launch_compute_kernel(
+        "grim_scythe_write_slot",
+        crate::HipDim3::new(1, 1, 1),
+        crate::HipDim3::new(1, 1, 1),
+        &mut [
+            arg(&mut base_ptr),
+            arg(&mut slot),
+            arg(&mut op),
+            arg(&mut mi),
+            arg(&mut nn),
+            arg(&mut kk),
+            arg(&mut inp),
+            arg(&mut wep),
+            arg(&mut outp),
+            arg(&mut pep),
+        ],
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -2474,11 +2588,16 @@ mod tests {
 
             // Device path: grim_kv_append reads past from device memory.
             let arena_dev = vec![0.0f32; arena_rows * kv_stride];
-            let arena_storage =
-                dev.from_cpu(&arena_dev, &Shape::new(vec![arena_rows * kv_stride]), DType::F32)
-                    .unwrap();
-            let rot_storage =
-                dev.from_cpu(&k_rot, &Shape::new(vec![steps * kv_stride]), DType::F32).unwrap();
+            let arena_storage = dev
+                .from_cpu(
+                    &arena_dev,
+                    &Shape::new(vec![arena_rows * kv_stride]),
+                    DType::F32,
+                )
+                .unwrap();
+            let rot_storage = dev
+                .from_cpu(&k_rot, &Shape::new(vec![steps * kv_stride]), DType::F32)
+                .unwrap();
             let past_val = past as u32;
             let past_dev = MemoryOps::from_cpu_bytes(
                 &dev,
@@ -2595,8 +2714,12 @@ mod tests {
 
             // Device path: grim_qkv_attention_dev reads total = *past_dev + steps.
             let out_st = dev.alloc_storage(&out_shape, DType::F32).unwrap();
-            let out_max = dev.alloc_storage(&Shape::new(vec![num_heads]), DType::F32).unwrap();
-            let out_sum = dev.alloc_storage(&Shape::new(vec![num_heads]), DType::F32).unwrap();
+            let out_max = dev
+                .alloc_storage(&Shape::new(vec![num_heads]), DType::F32)
+                .unwrap();
+            let out_sum = dev
+                .alloc_storage(&Shape::new(vec![num_heads]), DType::F32)
+                .unwrap();
             let dummy = dev.alloc_storage(&Shape::new(vec![1]), DType::F32).unwrap();
             let past_val = past as u32;
             let past_dev_st = MemoryOps::from_cpu_bytes(
@@ -2646,5 +2769,54 @@ mod tests {
                 "qkv_attention_dev diverges at past={past}: max_diff={diff}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod kv_arena_dtype_tests {
+    use super::check_kv_arena_dtype;
+    use grim_tensor::dtype::{ArithType, Storage};
+    use grim_tensor::{CoreTensorOps, DType, Shape};
+
+    fn gpu_dev() -> Option<crate::RocmDevice> {
+        crate::RocmDevice::try_new(0).ok()
+    }
+
+    /// M3: arena dtype must match the live `GRIM_F16_KV` flag (off by default
+    /// here — no env mutation, so no races with parallel tests assuming the
+    /// default). F32 arena passes; F16 arena must Err loudly instead of being
+    /// silently reinterpreted by the kernel. The mirrored case (flag on, F32
+    /// arena) shares the same `!=` branch.
+    #[test]
+    fn kv_arena_dtype_mismatch_is_loud_not_silent() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        assert!(
+            !super::kv_f16_enabled(),
+            "test assumes default GRIM_F16_KV off; run without the flag"
+        );
+        let shape = Shape::new(vec![4, 64]);
+        let data = vec![0.5f32; 4 * 64];
+        let f32_arena = dev.from_cpu(&data, &shape, DType::F32).unwrap();
+        check_kv_arena_dtype(f32_arena.as_ref(), "m3-test")
+            .expect("F32 arena with flag off must pass");
+        let f16_arena = dev
+            .from_cpu(
+                &data,
+                &shape,
+                DType {
+                    arith: ArithType::F16,
+                    storage: Storage::Native,
+                },
+            )
+            .unwrap();
+        let err = check_kv_arena_dtype(f16_arena.as_ref(), "m3-test")
+            .expect_err("F16 arena with flag off must Err loudly");
+        assert!(
+            format!("{err:?}").contains("does not match"),
+            "unexpected error shape: {err:?}"
+        );
     }
 }

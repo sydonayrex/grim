@@ -3,11 +3,11 @@
 //! Benchmarks `grim_decode_gemm_f16` vs `rocBLAS` (`rocblas_gemm_ex`)
 //! across served decode shapes: M in {1, 2, 4, 8} and typical projection dimensions (N, K).
 
-use std::time::Instant;
 use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::decode_test_shim;
 use grim_tensor::backend::{BackendStorage, MemoryOps};
 use grim_tensor::{DType, Shape};
+use std::time::Instant;
 
 const TEST_SHAPES: &[(usize, usize, usize, &str)] = &[
     // (M, N, K, description)
@@ -18,17 +18,14 @@ const TEST_SHAPES: &[(usize, usize, usize, &str)] = &[
     (1, 8192, 8192, "70B Q/K/V/O"),
     (1, 28672, 8192, "70B Gate/Up"),
     (1, 8192, 28672, "70B Down"),
-
     // Batch 2
     (2, 4096, 4096, "M=2 Q/K/V/O"),
     (2, 14336, 4096, "M=2 Gate/Up"),
     (2, 4096, 14336, "M=2 Down"),
-
     // Batch 4
     (4, 4096, 4096, "M=4 Q/K/V/O"),
     (4, 14336, 4096, "M=4 Gate/Up"),
     (4, 4096, 14336, "M=4 Down"),
-
     // Batch 8
     (8, 4096, 4096, "M=8 Q/K/V/O"),
     (8, 14336, 4096, "M=8 Gate/Up"),
@@ -54,10 +51,18 @@ fn main() {
         }
     };
 
-    println!("# Decode GEMM Kernel Bake-off (Device: {}, Arch: {})", ordinal, dev.gcn_arch());
+    println!(
+        "# Decode GEMM Kernel Bake-off (Device: {}, Arch: {})",
+        ordinal,
+        dev.gcn_arch()
+    );
     println!("Warmup: {} iters, Timed: {} iters\n", WARMUP, iters);
-    println!("| M | N | K | Shape Note | Decode (µs) | rocBLAS (µs) | WMMA-T R3 (µs) | WMMA-T R4 (µs) | rocBLAS BW | R3 BW | R4 BW | R3 Parity | R4 Parity |");
-    println!("|---|---|---|------------|-------------|--------------|----------------|----------------|------------|-------|-------|-----------|-----------|");
+    println!(
+        "| M | N | K | Shape Note | Decode (µs) | rocBLAS (µs) | WMMA-T R3 (µs) | WMMA-T R4 (µs) | rocBLAS BW | R3 BW | R4 BW | R3 Parity | R4 Parity |"
+    );
+    println!(
+        "|---|---|---|------------|-------------|--------------|----------------|----------------|------------|-------|-------|-----------|-----------|"
+    );
 
     for &(m, n, k, desc) in TEST_SHAPES {
         let a_f32: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 * 0.05) - 0.3).collect();
@@ -71,37 +76,91 @@ fn main() {
             }
         }
 
-        let a_f16_bytes: Vec<u8> = a_f32.iter().flat_map(|&f| half::f16::from_f32(f).to_le_bytes()).collect();
-        let b_f16_bytes: Vec<u8> = b_f32.iter().flat_map(|&f| half::f16::from_f32(f).to_le_bytes()).collect();
-        let b_col_f16_bytes: Vec<u8> = b_col_f32.iter().flat_map(|&f| half::f16::from_f32(f).to_le_bytes()).collect();
+        let a_f16_bytes: Vec<u8> = a_f32
+            .iter()
+            .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+            .collect();
+        let b_f16_bytes: Vec<u8> = b_f32
+            .iter()
+            .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+            .collect();
+        let b_col_f16_bytes: Vec<u8> = b_col_f32
+            .iter()
+            .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+            .collect();
 
         let shape_a = Shape::from_slice(&[m, k]);
         let shape_b = Shape::from_slice(&[k, n]);
         let shape_b_col = Shape::from_slice(&[n, k]);
         let shape_c = Shape::from_slice(&[m, n]);
 
-        let a_box = dev.from_cpu_bytes(&a_f16_bytes, &shape_a, DType::F16).expect("alloc a");
-        let b_box = dev.from_cpu_bytes(&b_f16_bytes, &shape_b, DType::F16).expect("alloc b");
-        let b_col_box = dev.from_cpu_bytes(&b_col_f16_bytes, &shape_b_col, DType::F16).expect("alloc b_col");
-        let out_decode_box = dev.alloc_storage(&shape_c, DType::F16).expect("alloc out decode");
-        let out_rocblas_box = dev.alloc_storage(&shape_c, DType::F16).expect("alloc out rocblas");
-        let out_wmma_t_box = dev.alloc_storage(&shape_c, DType::F16).expect("alloc out wmma_t");
-        let out_wmma_r4_box = dev.alloc_storage(&shape_c, DType::F16).expect("alloc out wmma_r4");
+        let a_box = dev
+            .from_cpu_bytes(&a_f16_bytes, &shape_a, DType::F16)
+            .expect("alloc a");
+        let b_box = dev
+            .from_cpu_bytes(&b_f16_bytes, &shape_b, DType::F16)
+            .expect("alloc b");
+        let b_col_box = dev
+            .from_cpu_bytes(&b_col_f16_bytes, &shape_b_col, DType::F16)
+            .expect("alloc b_col");
+        let out_decode_box = dev
+            .alloc_storage(&shape_c, DType::F16)
+            .expect("alloc out decode");
+        let out_rocblas_box = dev
+            .alloc_storage(&shape_c, DType::F16)
+            .expect("alloc out rocblas");
+        let out_wmma_t_box = dev
+            .alloc_storage(&shape_c, DType::F16)
+            .expect("alloc out wmma_t");
+        let out_wmma_r4_box = dev
+            .alloc_storage(&shape_c, DType::F16)
+            .expect("alloc out wmma_r4");
 
-        let a = a_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let b = b_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let b_col = b_col_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let out_decode = out_decode_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let out_rocblas = out_rocblas_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let out_wmma_t = out_wmma_t_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
-        let out_wmma_r4 = out_wmma_r4_box.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+        let a = a_box
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let b = b_box
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let b_col = b_col_box
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let out_decode = out_decode_box
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let out_rocblas = out_rocblas_box
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let out_wmma_t = out_wmma_t_box
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
+        let out_wmma_r4 = out_wmma_r4_box
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap();
 
         // 1. Warmup
         for _ in 0..WARMUP {
             decode_test_shim::launch_decode_gemm_f16(&dev, a, b, out_decode, m, n, k).unwrap();
             decode_test_shim::launch_rocblas_gemm_f16(&dev, a, b, out_rocblas, m, n, k).unwrap();
-            decode_test_shim::launch_wmma_gemm_b_transposed(&dev, a, b_col, out_wmma_t, m, n, k).unwrap();
-            decode_test_shim::launch_wmma_gemm_b_transposed_rdna4(&dev, a, b_col, out_wmma_r4, m, n, k).unwrap();
+            decode_test_shim::launch_wmma_gemm_b_transposed(&dev, a, b_col, out_wmma_t, m, n, k)
+                .unwrap();
+            decode_test_shim::launch_wmma_gemm_b_transposed_rdna4(
+                &dev,
+                a,
+                b_col,
+                out_wmma_r4,
+                m,
+                n,
+                k,
+            )
+            .unwrap();
         }
         dev.synchronize();
 
@@ -141,7 +200,8 @@ fn main() {
         // 4. Benchmark WMMA-T (RDNA3 single-wave 16x32)
         let t0 = Instant::now();
         for _ in 0..iters {
-            decode_test_shim::launch_wmma_gemm_b_transposed(&dev, a, b_col, out_wmma_t, m, n, k).unwrap();
+            decode_test_shim::launch_wmma_gemm_b_transposed(&dev, a, b_col, out_wmma_t, m, n, k)
+                .unwrap();
         }
         dev.synchronize();
         let wmma_t_us = t0.elapsed().as_secs_f64() / iters as f64 * 1e6;
@@ -149,7 +209,16 @@ fn main() {
         // 5. Benchmark WMMA-T (RDNA4 multi-wave 16x64)
         let t0 = Instant::now();
         for _ in 0..iters {
-            decode_test_shim::launch_wmma_gemm_b_transposed_rdna4(&dev, a, b_col, out_wmma_r4, m, n, k).unwrap();
+            decode_test_shim::launch_wmma_gemm_b_transposed_rdna4(
+                &dev,
+                a,
+                b_col,
+                out_wmma_r4,
+                m,
+                n,
+                k,
+            )
+            .unwrap();
         }
         dev.synchronize();
         let wmma_r4_us = t0.elapsed().as_secs_f64() / iters as f64 * 1e6;
@@ -161,7 +230,19 @@ fn main() {
 
         println!(
             "| {} | {:>5} | {:>5} | {:<18} | {:>10.1} | {:>10.1} | {:>14.1} | {:>14.1} | {:>10.1} | {:>5.1} | {:>5.1} | {:>9.2e} | {:>9.2e} |",
-            m, n, k, desc, decode_us, rocblas_us, wmma_t_us, wmma_r4_us, rocblas_bw, wmma_t_bw, wmma_r4_bw, max_diff_wmma_t, max_diff_wmma_r4
+            m,
+            n,
+            k,
+            desc,
+            decode_us,
+            rocblas_us,
+            wmma_t_us,
+            wmma_r4_us,
+            rocblas_bw,
+            wmma_t_bw,
+            wmma_r4_bw,
+            max_diff_wmma_t,
+            max_diff_wmma_r4
         );
     }
 }

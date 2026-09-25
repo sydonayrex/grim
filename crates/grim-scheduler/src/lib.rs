@@ -107,7 +107,10 @@ impl AdmissionController {
 
     pub fn predict_ttft(&self, prompt_tokens: usize, batch_token_backlog: usize) -> Duration {
         let total = batch_token_backlog + prompt_tokens;
-        let rate = *self.throughput_estimate.lock().unwrap_or_else(|e| e.into_inner());
+        let rate = *self
+            .throughput_estimate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         Duration::from_secs_f64(total as f64 / rate.max(1.0))
     }
 
@@ -132,7 +135,10 @@ impl AdmissionController {
         let predicted = self.predict_ttft(request.prompt_tokens, backlog.total);
 
         // ITL (Inter-Token Latency) check (§5.2): verify expected decode latency does not exceed target limit
-        let rate = *self.throughput_estimate.lock().unwrap_or_else(|e| e.into_inner());
+        let rate = *self
+            .throughput_estimate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let expected_itl_ms = if rate > 0.0 {
             (1000.0 / rate) as u64
         } else {
@@ -163,7 +169,10 @@ impl AdmissionController {
             return;
         }
         const EMA_ALPHA: f64 = 0.3;
-        let mut est = self.throughput_estimate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut est = self
+            .throughput_estimate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !est.is_finite() || *est <= 0.0 {
             *est = measured_tps;
         } else {
@@ -172,7 +181,10 @@ impl AdmissionController {
     }
 
     pub fn throughput_estimate(&self) -> f64 {
-        *self.throughput_estimate.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .throughput_estimate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -882,7 +894,10 @@ mod tests {
         // Oversized single request = 100 tokens -> predicted TTFT = 100ms
         let ctrl = AdmissionController::new(50, 0);
         // Force throughput estimate to 100.0 so 100 tokens = 1000ms > 50ms target
-        *ctrl.throughput_estimate.lock().unwrap_or_else(|e| e.into_inner()) = 100.0;
+        *ctrl
+            .throughput_estimate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 100.0;
 
         let mut sched = Scheduler::new(4096, 8, ctrl);
         sched.enqueue(Request {

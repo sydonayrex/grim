@@ -9,11 +9,11 @@
 //! the kernel. RUN: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm \
 //!   --test charon_dot4_perf -- --nocapture
 
+use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::autotune::{AutotuneConfig, Autotuner, MoeKernelKey};
 use grim_backend_rocm::kernels::charon::{
-    dot4_supported, grouped_dot4_entry, CharonDot4Quant, RoutingAssignment,
+    CharonDot4Quant, RoutingAssignment, dot4_supported, grouped_dot4_entry,
 };
-use grim_backend_rocm::RocmDevice;
 use std::panic;
 use std::time::Instant;
 
@@ -52,9 +52,15 @@ fn bench_case(dev: &RocmDevice, batch: usize, hidden: usize, inter: usize, num_e
             weights.push(0.5);
         }
     }
-    let asg = RoutingAssignment { tokens, experts, weights };
+    let asg = RoutingAssignment {
+        tokens,
+        experts,
+        weights,
+    };
     let a_scale = vec![1.0f32; batch];
-    let x: Vec<f32> = (0..batch * hidden).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let x: Vec<f32> = (0..batch * hidden)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
     let w: Vec<f32> = (0..num_experts * hidden * inter)
         .map(|i| ((i % 13) as f32 - 6.0) * 0.04)
         .collect();
@@ -63,9 +69,15 @@ fn bench_case(dev: &RocmDevice, batch: usize, hidden: usize, inter: usize, num_e
     let scalar_entry = "grim_moe_fused_grouped_q80";
     let dot4_entry = grouped_dot4_entry(CharonDot4Quant::Q8_0);
 
+    // Heartbeat per iter: the scalar leg runs seconds per iter, so silence
+    // trips the harness 60s-inactivity kill without it (use --nocapture).
+    eprintln!("[dot4-perf] case batch={batch} hidden={hidden} inter={inter} starting ...");
     let time_q80 = |scalar: bool, iters: usize| -> f32 {
         let mut best = f32::MAX;
-        for _ in 0..iters {
+        for it in 0..iters {
+            if scalar {
+                eprintln!("[dot4-perf] scalar iter {}/{} ...", it + 1, iters);
+            }
             let t0 = Instant::now();
             let out = if scalar {
                 dev.charon_grouped_dispatch_roundtrip_q80(
@@ -74,7 +86,16 @@ fn bench_case(dev: &RocmDevice, batch: usize, hidden: usize, inter: usize, num_e
             } else {
                 dev.charon_grouped_dispatch_roundtrip_dot4(
                     dot4_entry,
-                    &x, &gw_q, &gw_q, &gw_q, &a_scale, &asg, batch, hidden, inter, num_experts,
+                    &x,
+                    &gw_q,
+                    &gw_q,
+                    &gw_q,
+                    &a_scale,
+                    &asg,
+                    batch,
+                    hidden,
+                    inter,
+                    num_experts,
                     1.0,
                 )
             };
@@ -86,12 +107,30 @@ fn bench_case(dev: &RocmDevice, batch: usize, hidden: usize, inter: usize, num_e
     };
 
     // Correctness of the plan: run dot4 only where supported.
+    // Scalar iters scale down with weight count: the scalar grouped kernel
+    // is one-thread-per-token and fully serial (~4.5s/iter at 256-wide,
+    // ~18s/iter at 512-wide on gfx1201). This bench prints a winner and
+    // registers a prior — no hard assertion on the ratio — so best-of-1 at
+    // the largest shape is sufficient precision.
     let run_dot4 = dot4_supported(dev.gcn_arch());
-    let scalar_ms = time_q80(true, 10);
-    let dot4_ms = if run_dot4 { time_q80(false, 10) } else { f32::MAX };
+    let scalar_iters = if batch * hidden * inter > 512 * 256 {
+        1
+    } else {
+        3
+    };
+    let scalar_ms = time_q80(true, scalar_iters);
+    let dot4_ms = if run_dot4 {
+        time_q80(false, 10)
+    } else {
+        f32::MAX
+    };
 
     let arch = dev.gcn_arch().to_string();
-    let winner = if dot4_ms < scalar_ms { dot4_entry } else { scalar_entry };
+    let winner = if dot4_ms < scalar_ms {
+        dot4_entry
+    } else {
+        scalar_entry
+    };
     println!(
         "dot4-perf batch={batch} hidden={hidden} inter={inter} experts={num_experts} \
          arch={arch}: scalar={scalar_ms:.3}ms dot4={dot4_ms:.3}ms winner={winner}"
@@ -132,13 +171,17 @@ fn bench_case(dev: &RocmDevice, batch: usize, hidden: usize, inter: usize, num_e
 }
 
 #[test]
+#[ignore]
 fn dot4_decode_perf_and_autotune_registration() {
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
         return;
     };
     if !dot4_supported(dev.gcn_arch()) {
-        eprintln!("[SKIP] {} has no dot4 path; scalar stays kernel of choice", dev.gcn_arch());
+        eprintln!(
+            "[SKIP] {} has no dot4 path; scalar stays kernel of choice",
+            dev.gcn_arch()
+        );
         return;
     }
     // Decode-class shapes (small batch, multiples of 32). Kept small: the

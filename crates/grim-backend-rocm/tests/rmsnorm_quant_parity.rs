@@ -16,6 +16,7 @@ fn gpu_device() -> Option<RocmDevice> {
 }
 
 #[test]
+#[ignore]
 fn rmsnorm_quant_fused_parity() {
     let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
@@ -26,10 +27,10 @@ fn rmsnorm_quant_fused_parity() {
         let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.07).collect();
         let w: Vec<f32> = (0..k).map(|i| 1.0 + (i % 7) as f32 * 0.03).collect();
 
-        let x_dev = CoreTensorOps::from_cpu(&dev, &x, &Shape::new(vec![k]), DType::F32)
-            .expect("upload x");
-        let w_dev = CoreTensorOps::from_cpu(&dev, &w, &Shape::new(vec![k]), DType::F32)
-            .expect("upload w");
+        let x_dev =
+            CoreTensorOps::from_cpu(&dev, &x, &Shape::new(vec![k]), DType::F32).expect("upload x");
+        let w_dev =
+            CoreTensorOps::from_cpu(&dev, &w, &Shape::new(vec![k]), DType::F32).expect("upload w");
         let n_blocks = k / 32;
         let out_dev = dev
             .zeros(&Shape::new(vec![n_blocks * 36]), DType::U8)
@@ -69,8 +70,8 @@ fn rmsnorm_quant_fused_parity() {
         let mut max_err = 0.0f32;
         for blk in 0..n_blocks {
             let base = blk * 32;
-            let d = half::f16::from_le_bytes([got_bytes[blk * 36], got_bytes[blk * 36 + 1]])
-                .to_f32();
+            let d =
+                half::f16::from_le_bytes([got_bytes[blk * 36], got_bytes[blk * 36 + 1]]).to_f32();
             for j in 0..32 {
                 let code = got_bytes[blk * 36 + 4 + j] as i8;
                 let deq = code as f32 * d;

@@ -77,7 +77,7 @@ impl MoePrefillPipeline {
     }
 
     /// Advance the pipeline after completing computation for `current_compute_layer`.
-    /// # Contract Swaps buffer roles and returns `Some(next_layer_to_prefetch)` if more layers remain, or `None` when.
+    /// # Contract Swaps buffer roles and returns `Some(next_layer_to_prefetch)` if more layers remain, or `None` when the pipeline is drained (all layers computed, nothing left to prefetch).
     pub fn step_and_swap(&mut self) -> Result<Option<usize>> {
         if self.current_compute_layer >= self.total_layers {
             return Ok(None);
@@ -190,7 +190,56 @@ mod tests {
         let primed = pipeline.prime().unwrap();
         assert_eq!(primed, vec![0]);
 
+        // Single-buffer fallback must still visit every layer exactly once:
+        // on-demand transfer of 1, 2, 3, then drained.
         let next = pipeline.step_and_swap().unwrap();
         assert_eq!(next, Some(1));
+        let next = pipeline.step_and_swap().unwrap();
+        assert_eq!(next, Some(2));
+        let next = pipeline.step_and_swap().unwrap();
+        assert_eq!(next, Some(3));
+        let next = pipeline.step_and_swap().unwrap();
+        assert_eq!(next, None);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_equivalence_tests {
+    use super::*;
+
+    /// M9 equality leg: single-buffer fallback and double-buffered plans must
+    /// compute the identical layer sequence (every layer exactly once, in
+    /// order) through the real consumer path `execute_pipelined`. The
+    /// pipeline is index logic — plan equivalence across modes, not kernel
+    /// logits, is the meaningful equality. A mode that skipped or reordered
+    /// a layer would silently corrupt prefill.
+    #[test]
+    fn single_and_double_buffer_visit_identical_compute_order() {
+        fn compute_order(double_buffered: bool) -> Vec<usize> {
+            let total_layers = 5;
+            let layer_bytes = 100_000_000;
+            let vram = if double_buffered {
+                250_000_000
+            } else {
+                150_000_000
+            };
+            let mut pipe = MoePrefillPipeline::new(total_layers, 8, layer_bytes, vram);
+            assert_eq!(pipe.double_buffering_enabled, double_buffered);
+            let mut order = Vec::new();
+            pipe.execute_pipelined(
+                |layer, _buf| {
+                    order.push(layer);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            order
+        }
+
+        let single = compute_order(false);
+        let double = compute_order(true);
+        assert_eq!(single, vec![0, 1, 2, 3, 4]);
+        assert_eq!(double, single, "modes must compute identical layer order");
     }
 }

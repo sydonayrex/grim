@@ -78,13 +78,17 @@ impl Olmoe {
 
         // If num_experts > 0, wire through MoE blocks (OLMoE: 64 experts, 8 active, top-k softmax)
         let inner = if cfg.num_experts > 0 {
-            use grim_nn::moe::RouterKind;
             use crate::moe_block::MoESpec;
+            use grim_nn::moe::RouterKind;
             let spec = MoESpec {
                 num_experts: cfg.num_experts,
                 top_k: cfg.num_experts_per_tok,
                 router_kind: RouterKind::SoftmaxTopK,
-                routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 { 1.0 } else { cfg.routed_scaling_factor },
+                routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 {
+                    1.0
+                } else {
+                    cfg.routed_scaling_factor
+                },
                 has_shared_expert: false,
                 moe_intermediate_size: cfg.moe_intermediate_size,
                 shared_expert_intermediate_size: None,

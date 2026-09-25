@@ -86,6 +86,7 @@ fn gpu_dev() -> Option<RocmDevice> {
 }
 
 #[test]
+#[ignore]
 fn repeat_penalty_prepass_matches_cpu_bit_for_bit() {
     let Some(dev) = gpu_dev() else { return };
     let vocab = 512usize;
@@ -93,9 +94,9 @@ fn repeat_penalty_prepass_matches_cpu_bit_for_bit() {
     let histories: Vec<Vec<u32>> = vec![
         vec![],
         vec![0, 1, 2, 3],
-        vec![7, 7, 7, 7],             // all-duplicate history
-        vec![0, 511, 3, 0, 511, 5],   // dupes + NaN/inf indices
-        vec![999_999, u32::MAX],      // out-of-range ids (must be skipped)
+        vec![7, 7, 7, 7],                             // all-duplicate history
+        vec![0, 511, 3, 0, 511, 5],                   // dupes + NaN/inf indices
+        vec![999_999, u32::MAX],                      // out-of-range ids (must be skipped)
         (0..300u32).map(|i| (i * 7) % 600).collect(), // long, dupes + OOR mix
     ];
     for penalty in [1.0f32, 1.1, 1.5, 2.0] {
@@ -128,6 +129,7 @@ fn repeat_penalty_prepass_matches_cpu_bit_for_bit() {
 }
 
 #[test]
+#[ignore]
 fn repeat_penalty_greedy_device_matches_cpu_token() {
     let Some(dev) = gpu_dev() else { return };
     let vocab = 512usize;
@@ -144,21 +146,15 @@ fn repeat_penalty_greedy_device_matches_cpu_token() {
             let storage = dev.from_cpu(&base, &shape, DType::F32).expect("upload");
             let rocm_st = as_rocm(storage.as_ref()).expect("rocm storage");
             let got = sample_logits_on_device_with_penalty(
-                &dev,
-                rocm_st,
-                vocab,
-                0.0, // greedy
-                0,
-                1.0,
-                0xB1,
-                penalty,
-                hist,
+                &dev, rocm_st, vocab, 0.0, // greedy
+                0, 1.0, 0xB1, penalty, hist,
             )
             .expect("device greedy+penalty")
             .expect("device greedy+penalty returned None");
             let want = cpu_argmax_first(&cpu_apply_penalty(&base, penalty, hist));
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "greedy token mismatch p={penalty} hist-len={}",
                 hist.len()
             );

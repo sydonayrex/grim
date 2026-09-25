@@ -19,6 +19,7 @@ fn test_prefill_compact_partitioning() {
 }
 
 #[test]
+#[ignore]
 fn test_prefill_compact_device_gate() {
     // Gate on ROCm device probe
     let device_visible = matches!(

@@ -100,39 +100,38 @@ impl GemmaBlock {
         let rope = Rope::new(cfg.head_dim, 10000.0); // Gemma typically uses 10000
 
         let device = wq.weight.device().clone();
-        let wqkv_q80_fused = if matches!(&device, Device::Rocm(_))
-            && crate::shared_attention::fused_qkv_enabled()
-        {
-            let is_q80 = |s: &grim_tensor::Tensor| {
-                matches!(
-                    s.dtype().storage,
-                    grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
-                )
-            };
-            if is_q80(&wq.weight) && is_q80(&wk.weight) && is_q80(&wv.weight) {
-                let ordinal = match &device {
-                    Device::Rocm(o) => *o,
-                    _ => 0,
+        let wqkv_q80_fused =
+            if matches!(&device, Device::Rocm(_)) && crate::shared_attention::fused_qkv_enabled() {
+                let is_q80 = |s: &grim_tensor::Tensor| {
+                    matches!(
+                        s.dtype().storage,
+                        grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+                    )
                 };
-                match grim_backend_rocm::RocmDevice::try_new(ordinal) {
-                    Ok(rocm_dev) => {
-                        match rocm_dev.build_fused_qkv_q80(
-                            wq.weight.storage().as_ref(),
-                            wk.weight.storage().as_ref(),
-                            wv.weight.storage().as_ref(),
-                        ) {
-                            Ok(fused) => Some(std::sync::Arc::new(fused)),
-                            Err(_) => None,
+                if is_q80(&wq.weight) && is_q80(&wk.weight) && is_q80(&wv.weight) {
+                    let ordinal = match &device {
+                        Device::Rocm(o) => *o,
+                        _ => 0,
+                    };
+                    match grim_backend_rocm::RocmDevice::try_new(ordinal) {
+                        Ok(rocm_dev) => {
+                            match rocm_dev.build_fused_qkv_q80(
+                                wq.weight.storage().as_ref(),
+                                wk.weight.storage().as_ref(),
+                                wv.weight.storage().as_ref(),
+                            ) {
+                                Ok(fused) => Some(std::sync::Arc::new(fused)),
+                                Err(_) => None,
+                            }
                         }
+                        Err(_) => None,
                     }
-                    Err(_) => None,
+                } else {
+                    None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         Ok(Self {
             attn_norm,
@@ -255,10 +254,10 @@ impl GemmaBlock {
                 crate::shared_attention::fused_qkv_dot4_decode(&norm_x, fused)?
             }
             _ => {
-            let q = self.wq.forward(&norm_x)?;
-            let k = self.wk.forward(&norm_x)?;
-            let v = self.wv.forward(&norm_x)?;
-            (q, k, v)
+                let q = self.wq.forward(&norm_x)?;
+                let k = self.wk.forward(&norm_x)?;
+                let v = self.wv.forward(&norm_x)?;
+                (q, k, v)
             }
         };
         let q =

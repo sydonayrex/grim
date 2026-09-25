@@ -266,9 +266,11 @@ impl RadixTree {
 
     /// True while the node mapped to `bid` is pin-protected from LRU eviction.
     pub fn is_pinned(&self, bid: usize) -> bool {
-        self.block_to_node
-            .get(&bid)
-            .is_some_and(|&idx| self.nodes[idx].pinned_until.is_some_and(|t| t > Instant::now()))
+        self.block_to_node.get(&bid).is_some_and(|&idx| {
+            self.nodes[idx]
+                .pinned_until
+                .is_some_and(|t| t > Instant::now())
+        })
     }
 
     /// WI-HYBRID Layer 2 (admission accounting): attached, refcount-0,
@@ -298,11 +300,7 @@ impl RadixTree {
             .nodes
             .iter()
             .enumerate()
-            .filter_map(|(idx, node)| {
-                node.pinned_until
-                    .filter(|t| *t > now)
-                    .map(|t| (idx, t))
-            })
+            .filter_map(|(idx, node)| node.pinned_until.filter(|t| *t > now).map(|t| (idx, t)))
             .collect();
         pinned.sort_by_key(|(_, t)| *t);
         let mut dropped = 0;

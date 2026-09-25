@@ -31,14 +31,25 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) % 2000) as f32 - 1000.0) / 1000.0 * 0.4
         })
         .collect()
 }
 
-fn lin_rocm(dev: &RocmDevice, ordinal: usize, w: Vec<f32>, out_dim: usize, in_dim: usize) -> Linear {
-    Linear::from_tensor(tensor(dev, ordinal, w, Shape::new(vec![out_dim, in_dim])), None)
+fn lin_rocm(
+    dev: &RocmDevice,
+    ordinal: usize,
+    w: Vec<f32>,
+    out_dim: usize,
+    in_dim: usize,
+) -> Linear {
+    Linear::from_tensor(
+        tensor(dev, ordinal, w, Shape::new(vec![out_dim, in_dim])),
+        None,
+    )
 }
 
 fn norm_rocm(dev: &RocmDevice, ordinal: usize, dim: usize) -> RmsNorm {
@@ -50,6 +61,7 @@ fn norm_rocm(dev: &RocmDevice, ordinal: usize, dim: usize) -> RmsNorm {
 
 fn shortconv_block(dev: &RocmDevice, ordinal: usize, hidden: usize, l_cache: usize) -> Lfm2Block {
     Lfm2Block {
+        index: 0,
         attn_norm: norm_rocm(dev, ordinal, hidden),
         wq: None,
         wk: None,
@@ -62,7 +74,13 @@ fn shortconv_block(dev: &RocmDevice, ordinal: usize, hidden: usize, l_cache: usi
         gamma_q: None,
         gamma_k: None,
         w_gate_up_q80_fused: None,
-        shortconv_in_proj: Some(lin_rocm(dev, ordinal, rand_vec(3 * hidden * hidden, 1), 3 * hidden, hidden)),
+        shortconv_in_proj: Some(lin_rocm(
+            dev,
+            ordinal,
+            rand_vec(3 * hidden * hidden, 1),
+            3 * hidden,
+            hidden,
+        )),
         shortconv_conv: Some(tensor(
             dev,
             ordinal,
@@ -70,7 +88,13 @@ fn shortconv_block(dev: &RocmDevice, ordinal: usize, hidden: usize, l_cache: usi
             Shape::new(vec![hidden, 1, l_cache]),
         )),
         shortconv_conv_vec: Some(rand_vec(hidden * l_cache, 2)),
-        shortconv_out_proj: Some(lin_rocm(dev, ordinal, rand_vec(hidden * hidden, 3), hidden, hidden)),
+        shortconv_out_proj: Some(lin_rocm(
+            dev,
+            ordinal,
+            rand_vec(hidden * hidden, 3),
+            hidden,
+            hidden,
+        )),
         ffn_norm: norm_rocm(dev, ordinal, hidden),
         ffn_gate: lin_rocm(dev, ordinal, rand_vec(hidden * hidden, 4), hidden, hidden),
         ffn_up: lin_rocm(dev, ordinal, rand_vec(hidden * hidden, 5), hidden, hidden),
@@ -90,6 +114,12 @@ fn shortconv_block(dev: &RocmDevice, ordinal: usize, hidden: usize, l_cache: usi
         head_dim: hidden,
         rope_theta: 10000.0,
         eps: 1e-5,
+        attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
     }
 }
 
@@ -134,6 +164,7 @@ fn shortconv_device_ring_matches_host_reference() {
     // ShortConv reference math = `full_ref` in
     // `shortconv_decode_matches_prefill` (host loop from block weights).
     let block_cpu = Lfm2Block {
+        index: 0,
         attn_norm: RmsNorm {
             weight: cpu_t(vec![1.0f32; hidden], Shape::new(vec![hidden])),
             eps: 1e-5,
@@ -150,7 +181,10 @@ fn shortconv_device_ring_matches_host_reference() {
         gamma_k: None,
         w_gate_up_q80_fused: None,
         shortconv_in_proj: Some(Linear::from_tensor(
-            cpu_t(rand_vec(3 * hidden * hidden, 1), Shape::new(vec![3 * hidden, hidden])),
+            cpu_t(
+                rand_vec(3 * hidden * hidden, 1),
+                Shape::new(vec![3 * hidden, hidden]),
+            ),
             None,
         )),
         shortconv_conv: Some(cpu_t(
@@ -159,7 +193,10 @@ fn shortconv_device_ring_matches_host_reference() {
         )),
         shortconv_conv_vec: Some(rand_vec(hidden * l_cache, 2)),
         shortconv_out_proj: Some(Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 3), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 3),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         )),
         ffn_norm: RmsNorm {
@@ -167,15 +204,24 @@ fn shortconv_device_ring_matches_host_reference() {
             eps: 1e-5,
         },
         ffn_gate: Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 4), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 4),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         ),
         ffn_up: Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 5), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 5),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         ),
         ffn_down: Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 6), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 6),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         ),
         ffn_gate_inp: None,
@@ -193,6 +239,12 @@ fn shortconv_device_ring_matches_host_reference() {
         head_dim: hidden,
         rope_theta: 10000.0,
         eps: 1e-5,
+        attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
     };
     let mut cache_cpu: Option<Lfm2LayerCache> = None;
     let mut out_cpu = Vec::new();
@@ -289,6 +341,7 @@ fn test_shortconv_prefill_then_decode_matches_reference() {
 
     // CPU reference: 1 full prefill call over all total_steps tokens.
     let block_cpu = Lfm2Block {
+        index: 0,
         attn_norm: RmsNorm {
             weight: cpu_t(vec![1.0f32; hidden], Shape::new(vec![hidden])),
             eps: 1e-5,
@@ -305,7 +358,10 @@ fn test_shortconv_prefill_then_decode_matches_reference() {
         gamma_k: None,
         w_gate_up_q80_fused: None,
         shortconv_in_proj: Some(Linear::from_tensor(
-            cpu_t(rand_vec(3 * hidden * hidden, 1), Shape::new(vec![3 * hidden, hidden])),
+            cpu_t(
+                rand_vec(3 * hidden * hidden, 1),
+                Shape::new(vec![3 * hidden, hidden]),
+            ),
             None,
         )),
         shortconv_conv: Some(cpu_t(
@@ -314,7 +370,10 @@ fn test_shortconv_prefill_then_decode_matches_reference() {
         )),
         shortconv_conv_vec: Some(rand_vec(hidden * l_cache, 2)),
         shortconv_out_proj: Some(Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 3), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 3),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         )),
         ffn_norm: RmsNorm {
@@ -322,15 +381,24 @@ fn test_shortconv_prefill_then_decode_matches_reference() {
             eps: 1e-5,
         },
         ffn_gate: Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 4), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 4),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         ),
         ffn_up: Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 5), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 5),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         ),
         ffn_down: Linear::from_tensor(
-            cpu_t(rand_vec(hidden * hidden, 6), Shape::new(vec![hidden, hidden])),
+            cpu_t(
+                rand_vec(hidden * hidden, 6),
+                Shape::new(vec![hidden, hidden]),
+            ),
             None,
         ),
         ffn_gate_inp: None,
@@ -348,6 +416,12 @@ fn test_shortconv_prefill_then_decode_matches_reference() {
         head_dim: hidden,
         rope_theta: 10000.0,
         eps: 1e-5,
+        attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
     };
     let mut cache_cpu: Option<Lfm2LayerCache> = None;
     let x_all_cpu = cpu_t(x_data, Shape::new(vec![total_steps, hidden]));
@@ -396,12 +470,7 @@ fn shortconv_host_mirror_fresh_after_device_steps_clone_regression() {
     // 4 device-path decode steps (steps == 1 → shortconv_step_device).
     let mut next_input = vec![0.5f32; hidden];
     for _t in 0..4 {
-        let x = tensor(
-            &dev,
-            0,
-            next_input.clone(),
-            Shape::new(vec![1, hidden]),
-        );
+        let x = tensor(&dev, 0, next_input.clone(), Shape::new(vec![1, hidden]));
         let y = block.forward(&x, &mut cache).unwrap();
         next_input = y.to_vec_f32().unwrap()[..hidden].to_vec();
     }
@@ -423,17 +492,22 @@ fn shortconv_host_mirror_fresh_after_device_steps_clone_regression() {
     // the original (a stale mirror makes the clone's first step diverge).
     let cloned = cache.as_ref().unwrap().clone();
     let mut cache_a = Some(match cloned {
-        Lfm2LayerCache::ShortConv { host, .. } => Lfm2LayerCache::ShortConv {
-            host,
-            dev: None,
-        },
+        Lfm2LayerCache::ShortConv { host, .. } => Lfm2LayerCache::ShortConv { host, dev: None },
         _ => unreachable!(),
     });
     let mut cache_b = cache;
 
     let x5 = tensor(&dev, 0, next_input.clone(), Shape::new(vec![1, hidden]));
-    let y_a = block.forward(&x5, &mut cache_a).unwrap().to_vec_f32().unwrap();
-    let y_b = block.forward(&x5, &mut cache_b).unwrap().to_vec_f32().unwrap();
+    let y_a = block
+        .forward(&x5, &mut cache_a)
+        .unwrap()
+        .to_vec_f32()
+        .unwrap();
+    let y_b = block
+        .forward(&x5, &mut cache_b)
+        .unwrap()
+        .to_vec_f32()
+        .unwrap();
     let max_diff = y_a
         .iter()
         .zip(y_b.iter())
@@ -470,13 +544,49 @@ fn conv_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
         .map(|l| {
             let block = shortconv_block(dev, ordinal, hidden, l_cache);
             Lfm2Block {
-                shortconv_in_proj: Some(lin_rocm(dev, ordinal, rand_vec(3 * hidden * hidden, (100 + l * 10 + 1) as u64), 3 * hidden, hidden)),
-                shortconv_conv: Some(tensor(dev, ordinal, rand_vec(hidden * l_cache, (100 + l * 10 + 2) as u64), Shape::new(vec![hidden, 1, l_cache]))),
+                index: 0,
+                shortconv_in_proj: Some(lin_rocm(
+                    dev,
+                    ordinal,
+                    rand_vec(3 * hidden * hidden, (100 + l * 10 + 1) as u64),
+                    3 * hidden,
+                    hidden,
+                )),
+                shortconv_conv: Some(tensor(
+                    dev,
+                    ordinal,
+                    rand_vec(hidden * l_cache, (100 + l * 10 + 2) as u64),
+                    Shape::new(vec![hidden, 1, l_cache]),
+                )),
                 shortconv_conv_vec: Some(rand_vec(hidden * l_cache, (100 + l * 10 + 2) as u64)),
-                shortconv_out_proj: Some(lin_rocm(dev, ordinal, rand_vec(hidden * hidden, (100 + l * 10 + 3) as u64), hidden, hidden)),
-                ffn_gate: lin_rocm(dev, ordinal, rand_vec(inter * hidden, (100 + l * 10 + 4) as u64), inter, hidden),
-                ffn_up: lin_rocm(dev, ordinal, rand_vec(inter * hidden, (100 + l * 10 + 5) as u64), inter, hidden),
-                ffn_down: lin_rocm(dev, ordinal, rand_vec(inter * hidden, (100 + l * 10 + 6) as u64), hidden, inter),
+                shortconv_out_proj: Some(lin_rocm(
+                    dev,
+                    ordinal,
+                    rand_vec(hidden * hidden, (100 + l * 10 + 3) as u64),
+                    hidden,
+                    hidden,
+                )),
+                ffn_gate: lin_rocm(
+                    dev,
+                    ordinal,
+                    rand_vec(inter * hidden, (100 + l * 10 + 4) as u64),
+                    inter,
+                    hidden,
+                ),
+                ffn_up: lin_rocm(
+                    dev,
+                    ordinal,
+                    rand_vec(inter * hidden, (100 + l * 10 + 5) as u64),
+                    inter,
+                    hidden,
+                ),
+                ffn_down: lin_rocm(
+                    dev,
+                    ordinal,
+                    rand_vec(inter * hidden, (100 + l * 10 + 6) as u64),
+                    hidden,
+                    inter,
+                ),
                 ..block
             }
         })
@@ -500,14 +610,27 @@ fn conv_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
             n_ff_exp: 0,
             n_embd_out: 0,
             mxfp4_qkv_attention: false,
+            attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+            attention_mode_per_layer: None,
         },
         device: Device::Rocm(ordinal),
         tok_embeddings: Embedding {
-            weight: tensor(dev, ordinal, rand_vec(vocab * hidden, 900u64), Shape::new(vec![vocab, hidden])),
+            weight: tensor(
+                dev,
+                ordinal,
+                rand_vec(vocab * hidden, 900u64),
+                Shape::new(vec![vocab, hidden]),
+            ),
         },
         layers,
         norm: norm_rocm(dev, ordinal, hidden),
-        output: lin_rocm(dev, ordinal, rand_vec(vocab * hidden, 901u64), vocab, hidden),
+        output: lin_rocm(
+            dev,
+            ordinal,
+            rand_vec(vocab * hidden, 901u64),
+            vocab,
+            hidden,
+        ),
         dense_2_out: None,
         dense_2_out_bias: None,
     }
@@ -568,9 +691,13 @@ fn shortconv_lfm2_graph_replay_matches_eager_after_prefill() {
     )
     .unwrap();
     graph.buffers.seed_kv_arena_from_eager(&dev, &srcs).unwrap();
-    let conv_seeds = DecodeGraphModel::eager_conv_seed_rings(&model_graph, sess_g.as_ref()).unwrap();
+    let conv_seeds =
+        DecodeGraphModel::eager_conv_seed_rings(&model_graph, sess_g.as_ref()).unwrap();
     assert_eq!(conv_seeds.len(), 2, "per-layer conv seeds");
-    assert!(conv_seeds.iter().all(|s| s.is_some()), "conv layers must be seedable");
+    assert!(
+        conv_seeds.iter().all(|s| s.is_some()),
+        "conv layers must be seedable"
+    );
     graph.buffers.seed_conv_rings(&conv_seeds).unwrap();
 
     let mut logits_graph = Vec::new();

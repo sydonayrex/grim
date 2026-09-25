@@ -68,18 +68,15 @@ const GOLDEN_TOKENS: [u32; 12] = [
 // against both the Item 1 fused-QKV path and the Item 2 device-base-RoPE path,
 // so a forward/sampler mutant that shifts the distribution fails even with a
 // refreshed golden.
-const GOLDEN_TOKENS_GPU: [u32; 12] = [
-    7, 2, 535, 509, 519, 767, 1268, 1463, 1463, 1463, 1463, 1463,
-];
+const GOLDEN_TOKENS_GPU: [u32; 12] = [7, 2, 535, 509, 519, 767, 1268, 1463, 1463, 1463, 1463, 1463];
 
 // RDNA2 APU (gfx1036) golden: scalar Q8_0 GEMM path (dot4 GEMV is RDNA3/4
 // only). First 7 tokens identical to the gfx12 golden; the tail diverges on
 // legitimate cross-arch f32 accumulation-order noise flipping greedy
 // near-ties. Validated: fused-QKV and stock paths agree token-for-token on
 // this arch (fused_qkv_decode_parity_with_stock_path).
-const GOLDEN_TOKENS_GFX1036: [u32; 12] = [
-    7, 2, 535, 509, 519, 767, 1268, 519, 519, 511, 32572, 511,
-];
+const GOLDEN_TOKENS_GFX1036: [u32; 12] =
+    [7, 2, 535, 509, 519, 767, 1268, 519, 519, 511, 32572, 511];
 
 /// Prompt and expected GGUF metadata for the sleipnir model. These values are
 /// documented in `docs/architecture-coverage-gap.md` (layers=16, hidden=1024,
@@ -452,7 +449,11 @@ fn fused_qkv_decode_parity_with_stock_path() {
         fused, stock,
         "fused QKV decode diverged from stock 3-GEMV decode (forward mutant?)"
     );
-    eprintln!("[fused-qkv-parity] stock==fused over {} tokens: {:?}", stock.len(), stock);
+    eprintln!(
+        "[fused-qkv-parity] stock==fused over {} tokens: {:?}",
+        stock.len(),
+        stock
+    );
 }
 
 // ===========================================================================

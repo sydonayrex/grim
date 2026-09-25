@@ -2,16 +2,14 @@
 
 pub mod accel_features;
 pub(crate) mod accel_ffi;
+pub mod attention;
 pub mod batch_orchestrator;
 /// SCYTHE-2 WI-2: live GPU capability profiler.
 pub mod capability_profiler;
+pub mod compute;
 #[cfg(feature = "cubecl")]
 pub mod cubecl;
-pub mod attention;
-pub mod compute;
-pub mod quant;
 pub mod device_recurrent;
-pub mod routing;
 pub mod device_serve;
 pub mod eplb;
 pub mod gemm_tuning;
@@ -23,9 +21,11 @@ pub mod layout;
 pub mod moe_hybrid_exec;
 pub mod parallel_comm;
 pub mod probe;
+pub mod quant;
 pub mod rmsnorm_quant_launch;
 pub mod roc_device;
 pub mod rocblas;
+pub mod routing;
 pub mod scythe_route;
 pub mod util;
 
@@ -451,7 +451,3 @@ pub mod decode_test_shim {
         dev.launch_rocblas_gemm_f16(a, b, out, m, n, k)
     }
 }
-
-
-
-

@@ -31,6 +31,8 @@ pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod cp;
+pub mod distill;
+pub mod distill_fm;
 pub mod doctor;
 pub mod echo;
 pub mod eval;
@@ -380,6 +382,56 @@ enum Commands {
         /// Port if evaluating against a running server (for gsm8k).
         #[arg(short, long, default_value_t = 11434)]
         port: u16,
+    },
+    /// Distill a GDN-2 GRAVE student from a softmax teacher (Phase 3).
+    Distill {
+        /// Teacher GGUF path (softmax, frozen). Empty + --smoke-only runs the
+        /// loss/sidecar smoke loop with no model.
+        #[arg(short, long, default_value = "")]
+        teacher: String,
+        /// Trained-gate sidecar to seed continuation runs from (GRAVE).
+        #[arg(long, default_value = "")]
+        init_sidecar: String,
+        /// Output *.grave.json sidecar path.
+        #[arg(short, long, default_value = "student.grave.json")]
+        output: String,
+        /// Distill temperature (plan: T=2).
+        #[arg(long, default_value_t = 2.0)]
+        temp: f64,
+        /// Run smoke loop + sidecar round-trip only (no corpus run).
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        smoke_only: bool,
+        /// Training corpus text file (full run).
+        #[arg(long, default_value = "docs/eval/corpus-grave-train-v1.txt")]
+        corpus: String,
+        /// Tokens per teacher-forced window (full run).
+        #[arg(long, default_value_t = 256)]
+        window_len: usize,
+        /// Max corpus windows per run (demo scale; budget streams the rest).
+        #[arg(long, default_value_t = 2)]
+        max_windows: usize,
+        /// Coordinate-descent steps over gate triples (full run).
+        #[arg(long, default_value_t = 2)]
+        opt_steps: usize,
+        /// Token budget (plan: 3B; demo corpus exhausts first, visibly).
+        #[arg(long, default_value_t = 3_000_000_000u64)]
+        token_budget: u64,
+        /// Coordinate-descent learning rate on gate triples.
+        #[arg(long, default_value_t = 0.01)]
+        lr: f64,
+        /// ROCm device ordinal (default 1: distill GPU; GPU 0 stays free).
+        #[arg(long, default_value_t = 1)]
+        device_ordinal: usize,
+        /// G3b: train gate PROJECTIONS (B/W_w/W_f) via SPSA instead of the
+        /// scalar-gate finite-difference descent. Seeds zero-weight,
+        /// bias-calibrated projections from the current gate triples.
+        #[arg(long, default_value_t = false)]
+        proj_spsa: bool,
+        /// G3b: per-layer feature-matching trainer (analytic gradients;
+        /// supersedes --proj-spsa, which is noise-dominated at this
+        /// dimensionality). Mutually exclusive with --proj-spsa.
+        #[arg(long, default_value_t = false)]
+        proj_feature_match: bool,
     },
     /// Launch the Grim Garage telemetry and fine-tuning dashboard web service.
     Garage {
@@ -1347,11 +1399,11 @@ async fn main() -> Result<()> {
                         })?;
                     model_path.to_string_lossy().into_owned()
                 };
-                if let Some(p) = prompt {
+                if prompt.is_some() || std::env::var("GRIM_SCORE_FILE").is_ok() {
                     println!("[grim run] Running prompt on: {}", resolved);
                     run::cmd_run(
                         resolved,
-                        Some(p),
+                        prompt,
                         false,
                         address,
                         &plugins,
@@ -1504,6 +1556,43 @@ async fn main() -> Result<()> {
             port,
         } => {
             eval::cmd_eval(model, task, output, port).await?;
+        }
+        Commands::Distill {
+            teacher,
+            init_sidecar,
+            output,
+            lr,
+            temp,
+            smoke_only,
+            corpus,
+            window_len,
+            max_windows,
+            opt_steps,
+            token_budget,
+            device_ordinal,
+            proj_spsa,
+            proj_feature_match,
+        } => {
+            let cfg = distill::DistillConfig {
+                init_sidecar,
+                teacher,
+                corpus,
+                output,
+                window_len,
+                max_windows,
+                opt_steps,
+                lr,
+                temp,
+                token_budget,
+                device_ordinal,
+                smoke_only,
+                proj_spsa,
+                proj_feature_match,
+            };
+            if let Err(e) = distill::cmd_distill(&cfg) {
+                eprintln!("[grim distill] error: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::Tune { device, output_dir } => {
             if let Err(e) = tune::cmd_tune(device, output_dir) {
@@ -2052,16 +2141,13 @@ async fn main() -> Result<()> {
                 &config_path,
                 model.as_deref(),
             );
-            match healthy {
-                Ok(ok) => {
-                    if !ok {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Doctor check failed: {e}");
-                    std::process::exit(1);
-                }
+            match &healthy {
+                Err(e) => eprintln!("Doctor check failed: {e}"),
+                _ => {}
+            }
+            let code = doctor::doctor_exit_code(healthy);
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         Commands::Convert {
@@ -2397,9 +2483,12 @@ async fn main() -> Result<()> {
             max_tokens,
             alloc_budget,
         } => {
-            let budgets = alloc_budget
-                .as_deref()
-                .map(|v| (v.first().copied().unwrap_or(4.0), v.get(1).copied().unwrap_or(4.0)));
+            let budgets = alloc_budget.as_deref().map(|v| {
+                (
+                    v.first().copied().unwrap_or(4.0),
+                    v.get(1).copied().unwrap_or(4.0),
+                )
+            });
             if let Err(e) = calibrate_channels::cmd_calibrate_channels(
                 calibrate_channels::CalibrateChannelsArgs {
                     output,

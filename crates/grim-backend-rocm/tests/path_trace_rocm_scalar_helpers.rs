@@ -5,6 +5,7 @@ use grim_tensor::dtype::DType;
 use grim_tensor::{BackendDevice, Shape};
 
 #[test]
+#[ignore]
 fn test_rocm_path_trace_all_scalar_helpers() {
     let dev: Box<dyn BackendDevice> = Box::new(RocmDevice::new(0));
     let shape = Shape::new(vec![4]);

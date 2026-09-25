@@ -44,7 +44,8 @@ pub fn gelu_tanh_mul_on_device(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     if let (Device::Rocm(o_g), Device::Rocm(o_u)) = (gate.device(), up.device()) {
         if o_g == o_u {
             let rocm_dev = RocmDevice::try_new(*o_g)?;
-            let out_st = rocm_dev.gelu_tanh_mul(&**gate.storage(), &**up.storage(), gate.shape())?;
+            let out_st =
+                rocm_dev.gelu_tanh_mul(&**gate.storage(), &**up.storage(), gate.shape())?;
             return Ok(Tensor::new(
                 Arc::from(out_st),
                 gate.shape().clone(),

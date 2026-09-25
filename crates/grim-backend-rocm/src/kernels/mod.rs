@@ -17,21 +17,22 @@ pub mod comm_fuse;
 pub mod compressed_gemm;
 pub mod compute_kernels;
 pub mod cross_attention;
-/// SPEED-DOT: VOP3 vector dot-product GEMV kernels for M=1 decode on RDNA3/4
-/// (`grim_dot4_q80_q81_gemv` + q8_1 activation quantizer). WMMA wastes 15/16 rows
-/// at M=1; these use one wave per output column with the VOP3 `v_dot4_i32_i8`.
-pub mod dot_gemv;
-pub mod rmsnorm_quant;
 pub mod decode_gemm;
 /// WI-X3: device-side stochastic sampler (`grim_sample_logits_stochastic`) —
 /// temperature/top-k/top-p + Gumbel-max multinomial draw, 4-byte token readback.
 pub mod device_sampler;
+/// SPEED-DOT: VOP3 vector dot-product GEMV kernels for M=1 decode on RDNA3/4
+/// (`grim_dot4_q80_q81_gemv` + q8_1 activation quantizer). WMMA wastes 15/16 rows
+/// at M=1; these use one wave per output column with the VOP3 `v_dot4_i32_i8`.
+pub mod dot_gemv;
 pub mod extend_attention;
 pub mod flash_decode;
 pub mod fp8_gemm_rdna4;
 pub mod fp8_standalone;
 pub mod fused_dequant_gemm;
 pub mod fused_linear_ce;
+pub mod gla_kernels;
+pub mod gla_mega_kernel;
 /// GPTQ/EfficientQAT GroupInt fused dequant-GEMM (forward + backward).
 pub mod gptq_gemm;
 pub mod iq_dequant;
@@ -56,6 +57,7 @@ pub mod q6k_gemm;
 pub mod qkv_attention;
 pub mod quant_standalone;
 pub mod quant_tiled_gemm;
+pub mod rmsnorm_quant;
 pub mod rwkv;
 pub mod sage_attention;
 pub mod scythe_persistent;
@@ -66,7 +68,7 @@ pub mod selective_scan;
 pub mod shared_device_fns;
 pub mod source_asm;
 pub mod tile_picker;
-pub mod wmma_gemm;
-pub mod wmma_quantized_gemm;
-pub mod wmma_iq_gemm;
 pub mod wmma_fp8_gemm;
+pub mod wmma_gemm;
+pub mod wmma_iq_gemm;
+pub mod wmma_quantized_gemm;

@@ -4,16 +4,18 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::backend::{ BackendStorage };
+use grim_tensor::backend::BackendStorage;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
-use crate::device::roc_device::{CharonForwardStash, RocmDevice};
 #[cfg(feature = "training")]
 use crate::device::roc_device::CharonBackwardResult;
+use crate::device::roc_device::{CharonForwardStash, RocmDevice};
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, arg, as_rocm, check_hip, dev_ptr, hipFreeAsync, hipMemsetAsync, upload_device_buffer };
+use crate::{
+    HipDim3, arg, as_rocm, check_hip, dev_ptr, hipFreeAsync, hipMemsetAsync, upload_device_buffer,
+};
 impl RocmDevice {
     /// Device launcher for the #1 token-sorted (grouped) fused MoE dispatch.
     /// Mirrors `launch_charon_fused_dispatch` but feeds the sorted routing layout (`SortedRouting`) produced by `moe_align_block_size` and calls `grim_moe_fused_grouped`.

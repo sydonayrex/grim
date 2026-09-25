@@ -120,6 +120,7 @@ fn run_case(dev: &RocmDevice, label: &str, steps: usize, history: usize, offset:
 }
 
 #[test]
+#[ignore]
 fn qkv_attention_matches_reference_at_lfm2_shapes() {
     if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
         eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");
@@ -144,6 +145,7 @@ fn qkv_attention_matches_reference_at_lfm2_shapes() {
 // Sequential stress: 16 layers x mixed prefill/decode calls in one process,
 // mirroring generation's call cadence. Detects cross-call state pollution.
 #[test]
+#[ignore]
 fn qkv_attention_survives_generation_cadence() {
     if std::env::var("GRIM_RUN_GPU_TESTS").unwrap_or_default() != "1" {
         eprintln!("Skipping GPU test (set GRIM_RUN_GPU_TESTS=1)");

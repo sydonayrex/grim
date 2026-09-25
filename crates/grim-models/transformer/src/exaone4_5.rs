@@ -116,8 +116,8 @@ impl Exaone45Block {
         let wv = Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim])?;
         let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
 
-        let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
-            .map(std::sync::Arc::new);
+        let wqkv_q80_fused =
+            crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv).map(std::sync::Arc::new);
 
         let input_layernorm = RmsNorm::load(
             &ws.scoped("input_layernorm"),

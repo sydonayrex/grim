@@ -1,14 +1,12 @@
 //! Core tensor computation, GEMM, elementwise, autograd, and optimizer operations for `RocmDevice`.
 //! The trait-required `impl OptimizerOps for RocmDevice` block, kept whole.
 
-
-
-use grim_tensor::backend::{ ComputeHandle };
+use grim_tensor::backend::ComputeHandle;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, OptimizerOps };
+use grim_tensor::{BackendStorage, OptimizerOps};
 
 use crate::device::roc_device::RocmDevice;
-use crate::{ RocmHandle, arg, as_rocm, dev_ptr, linear_launch };
+use crate::{arg, as_rocm, dev_ptr, linear_launch, RocmHandle};
 
 impl OptimizerOps for RocmDevice {
     fn fused_adamw_step(

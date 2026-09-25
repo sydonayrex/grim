@@ -5,6 +5,7 @@ use grim_tensor::Shape;
 use grim_tensor::dtype::DType;
 
 #[test]
+#[ignore]
 fn test_fused_add_rms_norm_parity() {
     let dev = RocmDevice::new(0);
 

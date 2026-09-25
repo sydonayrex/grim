@@ -2,9 +2,9 @@ use super::common::*;
 
 #[cfg(test)]
 mod tests {
-    use grim_tensor::dtype::{ DType };
     use super::*;
-    use grim_tensor::{ CoreTensorOps, Shape };
+    use grim_tensor::dtype::DType;
+    use grim_tensor::{CoreTensorOps, Shape};
 
     #[test]
     fn test_cuda_qkv_attention_parity() {

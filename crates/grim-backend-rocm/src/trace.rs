@@ -1429,4 +1429,93 @@ mod tests {
         assert!(shortlist.contains(&cfg_fast));
         assert!(shortlist.contains(&cfg_slow));
     }
+
+    // D3: golden full-field roundtrip — save → load must preserve every
+    // KernelTrace field, not just the lookup winner's block_dim.
+
+    #[test]
+    fn trace_table_golden_full_field_roundtrip() {
+        let dir = make_temp_dir();
+        let mut table = TraceTable::default();
+        let cfg = AutotuneConfig {
+            block_dim: 128,
+            tile_kv: 64,
+            grid_stride: 3,
+            cycles_per_invocation: 77,
+            ..Default::default()
+        };
+        table
+            .insert(KernelTrace {
+                kernel: "grim_qkv_attention".to_string(),
+                gpu_arch: "gfx1201".to_string(),
+                m_class: TraceShapeClass::Prefill,
+                format: TraceQuantFormat::Q8_0,
+                solution: cfg.clone(),
+                evaluation: TraceEval {
+                    parity_ok: true,
+                    latency_us: 4242,
+                    ts: 1_700_000_000,
+                },
+            })
+            .unwrap();
+        save_trace_table(dir.as_ref(), "gfx1201", &table);
+        let loaded = load_trace_table(dir.as_ref(), "gfx1201");
+        assert_eq!(loaded.len(), 1);
+        let row = &loaded.entries()[0];
+        assert_eq!(row.kernel, "grim_qkv_attention");
+        assert_eq!(row.gpu_arch, "gfx1201");
+        assert_eq!(row.m_class, TraceShapeClass::Prefill);
+        assert_eq!(row.format, TraceQuantFormat::Q8_0);
+        assert_eq!(row.solution, cfg, "full solution must round-trip");
+        assert!(row.evaluation.parity_ok);
+        assert_eq!(row.evaluation.latency_us, 4242);
+        assert_eq!(row.evaluation.ts, 1_700_000_000);
+    }
+
+    // D3: seeded shortlist determinism — identical table + candidate list
+    // must produce identical survivor order across repeated runs (the
+    // shortlist is a pure filter; any order churn is a regression).
+
+    #[test]
+    fn latency_predictor_shortlist_deterministic_across_runs() {
+        let build_table = || {
+            let mut table = TraceTable::default();
+            for (bd, lat) in [(64u32, 100u64), (128, 120), (256, 300)] {
+                table
+                    .insert(KernelTrace::new(
+                        "qkv",
+                        "gfx1036",
+                        TraceShapeClass::Decode,
+                        TraceQuantFormat::Fp16,
+                        AutotuneConfig {
+                            block_dim: bd,
+                            ..Default::default()
+                        },
+                        lat,
+                        true,
+                    ))
+                    .unwrap();
+            }
+            table
+        };
+        let build_cands = || -> Vec<AutotuneConfig> {
+            [64u32, 128, 256]
+                .into_iter()
+                .map(|bd| AutotuneConfig {
+                    block_dim: bd,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let predictor = LatencyPredictor::new(build_table(), 2.0);
+        let first = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, build_cands());
+        let second = predictor.shortlist("qkv", "gfx1036", TraceShapeClass::Decode, build_cands());
+        assert_eq!(first, second, "shortlist must be deterministic across runs");
+        // factor 2.0 keeps {64 (100us), 128 (120us)}; 256 (300us) drops.
+        assert_eq!(first.len(), 2);
+        assert!(first.contains(&AutotuneConfig {
+            block_dim: 64,
+            ..Default::default()
+        }));
+    }
 }

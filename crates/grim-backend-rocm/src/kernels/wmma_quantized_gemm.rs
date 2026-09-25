@@ -179,7 +179,11 @@ fn wmma_quant_kernel_source(
     deq_fn: &str,
     a_suffix: &str,
 ) -> String {
-    let a_ty = if a_suffix.is_empty() { "float" } else { "_Float16" };
+    let a_ty = if a_suffix.is_empty() {
+        "float"
+    } else {
+        "_Float16"
+    };
     let a_cast = if a_suffix.is_empty() {
         "(_Float16)"
     } else {
@@ -365,7 +369,9 @@ mod self_tests {
     #[test]
     fn source_uses_cooperative_fill() {
         let src = quant_kernel_source();
-        let coop = src.matches("for (int idx = tid; idx < 128; idx += 128)").count();
+        let coop = src
+            .matches("for (int idx = tid; idx < 128; idx += 128)")
+            .count();
         assert!(
             coop >= 12,
             "expected >= 12 cooperative dequant loops (12 kernels), got {coop}"
@@ -408,7 +414,10 @@ mod self_tests {
         // Multi-wave blocks need workgroup-scope sync; wave_barrier is
         // wave-scope only and races across waves (verified: pad-token garbage).
         let barriers = src.matches("__syncthreads()").count();
-        assert!(barriers >= 48, "expected >= 48 __syncthreads, got {barriers}");
+        assert!(
+            barriers >= 48,
+            "expected >= 48 __syncthreads, got {barriers}"
+        );
         assert!(
             !src.contains("__builtin_amdgcn_wave_barrier()"),
             "wave_barrier is wave-scope — races in multi-wave blocks"

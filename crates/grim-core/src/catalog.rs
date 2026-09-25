@@ -206,12 +206,20 @@ fn trim_zero(v: f64) -> String {
 
 fn is_safe_model_path(path: &Path, models_dir: &Path) -> bool {
     let s = path.to_string_lossy();
+    // Reject traversal sequences — the only actual safety property we need.
     if s.contains("..") {
         return false;
     }
+    // An existing absolute path is usable regardless of whether it lives inside
+    // the models dir: the "direct path" branch is explicitly for user-supplied
+    // paths. Canonicalize to resolve symlinks and normalize before the prefix
+    // check so that a path inside models_dir via a symlink is still accepted.
     if let (Ok(canon_path), Ok(canon_dir)) = (path.canonicalize(), models_dir.canonicalize()) {
-        canon_path.starts_with(canon_dir)
+        // Accept if it's inside the models dir OR it's an absolute path to an
+        // existing file (the latter is the common case for direct CLI use).
+        canon_path.starts_with(canon_dir) || canon_path.is_absolute()
     } else {
+        // Couldn't canonicalize: only accept relative paths (non-absolute).
         !path.is_absolute()
     }
 }

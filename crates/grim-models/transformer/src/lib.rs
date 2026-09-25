@@ -29,6 +29,60 @@ pub fn decode_graph_active(device: &grim_tensor::Device) -> bool {
     )
 }
 
+/// 1-2-many P0: per-architecture GDL eligibility.
+///
+/// GDL (Gated DeltaNet-2 recurrence) changes the attention function, so it is
+/// correct only for LFM2-native layers and DeltaNet-shaped KDA legs. Softmax
+/// weights, MLA latents, or SSM states must never route into a GDL recurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdlEligibility {
+    EligibleNative,
+    EligibleKdaMigration,
+    IneligibleSoftmax,
+    IneligibleSsm,
+    IneligibleMlaSparse,
+}
+
+fn is_ssm_arch(arch: &str) -> bool {
+    matches!(arch, "falcon-h1" | "mamba2" | "rwkv")
+}
+
+fn is_mla_sparse_arch(arch: &str) -> bool {
+    matches!(
+        arch,
+        "deepseek2"
+            | "deepseek32"
+            | "deepseek4"
+            | "kimi_k3"
+            | "longcat_flash"
+            | "glmdsa"
+            | "qwen3_8_flash_next"
+            | "minimax_m3"
+    )
+}
+
+/// Map a `ModelConfig::name()` arch string to its GDL eligibility class.
+pub fn gdl_eligibility(arch: &str) -> GdlEligibility {
+    if arch == "lfm2" {
+        return GdlEligibility::EligibleNative;
+    }
+    if arch == "solar_open2" || arch == "delta-net-base" {
+        return GdlEligibility::EligibleKdaMigration;
+    }
+    if is_ssm_arch(arch) {
+        return GdlEligibility::IneligibleSsm;
+    }
+    if is_mla_sparse_arch(arch) {
+        return GdlEligibility::IneligibleMlaSparse;
+    }
+    GdlEligibility::IneligibleSoftmax
+}
+
+/// Convenience wrapper over `ModelConfig::name()`.
+pub fn gdl_eligibility_for_config(cfg: &dyn grim_core::ModelConfig) -> GdlEligibility {
+    gdl_eligibility(cfg.name())
+}
+
 pub mod afmoe;
 pub mod apertus;
 pub mod arcee;
@@ -56,7 +110,7 @@ pub mod configs;
 pub mod dbrx;
 pub mod deci;
 pub mod decode_graph;
-pub use decode_graph::{llama_wrapper_graph_model, DecodeGraphModel};
+pub use decode_graph::{DecodeGraphModel, llama_wrapper_graph_model};
 pub mod deepseek;
 pub mod deepseek2;
 pub mod deepseek2ocr;
@@ -83,6 +137,10 @@ pub mod gemma2;
 pub mod gemma3n;
 pub mod gemma4_assistant;
 pub mod gemma_embedding;
+pub mod gla;
+pub mod gla_graph;
+pub mod gla_mega;
+pub mod gla_train;
 pub mod glm4;
 pub mod glm4_moe_lite;
 pub mod glm4moe;
@@ -132,8 +190,6 @@ pub mod mla_common;
 pub mod model;
 /// Shared MoE block (router + expert bank + optional shared expert).
 pub mod moe_block;
-/// Shared MoE dispatch (Phase 3a): Charon grouped-kernel + per-expert fallback.
-pub mod shared_moe;
 pub mod mpt;
 pub mod multimodal;
 pub mod muse_glimmer;
@@ -169,6 +225,8 @@ pub mod refact;
 pub mod rnd1;
 pub mod seed_oss;
 pub mod shared_attention;
+/// Shared MoE dispatch (Phase 3a): Charon grouped-kernel + per-expert fallback.
+pub mod shared_moe;
 pub mod smallthinker;
 pub mod smollm2;
 pub mod smollm3;
@@ -265,7 +323,7 @@ pub use internlm2::{InternLm2, InternLm2Config};
 pub use jais::{Jais, JaisConfig};
 pub use jais2::{Jais2, Jais2Config};
 pub use kimi_linear::{KimiLinear, KimiLinearConfig};
-pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
+pub use lfm2::{Lfm2, Lfm2AttentionMode, Lfm2Config, Lfm2LayerCache};
 pub use llada::{Llada, LladaConfig};
 pub use lladamoe::{LladaMoe, LladaMoeConfig};
 pub use llama_embed::{LlamaEmbed, LlamaEmbedConfig};
@@ -475,5 +533,60 @@ mod tests {
                 && decode_graph_active(&rocm);
             assert!(!rope_dev);
         });
+    }
+
+    /// 1-2-many P0: GDL eligibility is pinned per arch. Softmax weights, MLA
+    /// latents, and SSM states must never route into a GDL recurrence.
+    #[test]
+    fn gdl_eligibility_classification() {
+        use crate::{GdlEligibility, gdl_eligibility};
+        assert_eq!(gdl_eligibility("lfm2"), GdlEligibility::EligibleNative);
+        for arch in ["solar_open2", "delta-net-base"] {
+            assert_eq!(
+                gdl_eligibility(arch),
+                GdlEligibility::EligibleKdaMigration,
+                "{arch} must migrate KDA legs only"
+            );
+        }
+        for arch in ["falcon-h1", "mamba2", "rwkv"] {
+            assert_eq!(
+                gdl_eligibility(arch),
+                GdlEligibility::IneligibleSsm,
+                "{arch} is selective-scan, not delta-rule"
+            );
+        }
+        for arch in [
+            "deepseek2",
+            "deepseek32",
+            "deepseek4",
+            "kimi_k3",
+            "longcat_flash",
+            "glmdsa",
+            "qwen3_8_flash_next",
+            "minimax_m3",
+        ] {
+            assert_eq!(
+                gdl_eligibility(arch),
+                GdlEligibility::IneligibleMlaSparse,
+                "{arch} is MLA/sparse, not GDN-2"
+            );
+        }
+        for arch in [
+            "llama",
+            "qwen3",
+            "gemma",
+            "gpt2",
+            "bloom",
+            "kimi_linear",
+            "qwen3next",
+            "minimax_m2",
+            "lfm2moe",
+        ] {
+            assert_eq!(
+                gdl_eligibility(arch),
+                GdlEligibility::IneligibleSoftmax,
+                "{arch} serves softmax; GDL would corrupt weights"
+            );
+        }
     }
 }

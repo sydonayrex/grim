@@ -6,7 +6,7 @@
 //!
 //! Adapted from arXiv:2603.12646v1, §IV-B signal 1.
 
-use crate::tfidf::{cosine_similarity, TfIdfStats, TfVector};
+use crate::tfidf::{TfIdfStats, TfVector, cosine_similarity};
 use std::collections::HashMap;
 
 /// Damping factor for PageRank (standard value from the PageRank paper).
@@ -65,9 +65,11 @@ pub fn textrank_scores(sentences: &[String], stats: &TfIdfStats) -> Vec<f32> {
     }
 
     // Normalize to [0, 1]
-    let (min, max) = scores.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &s| {
-        (lo.min(s), hi.max(s))
-    });
+    let (min, max) = scores
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &s| {
+            (lo.min(s), hi.max(s))
+        });
     let range = max - min;
     if range < 1e-9 {
         vec![0.5; n]

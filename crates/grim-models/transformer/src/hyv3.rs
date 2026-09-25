@@ -137,11 +137,14 @@ impl HyV3MoeBlock {
         let router_logits = self.gate.forward(x)?;
 
         if x.device() != &Device::Cpu {
-            let shared_exp = self.shared_expert.as_ref().map(|s| crate::shared_moe::MoeExpert {
-                gate: s.gate_proj.clone(),
-                up: s.up_proj.clone(),
-                down: s.down_proj.clone(),
-            });
+            let shared_exp = self
+                .shared_expert
+                .as_ref()
+                .map(|s| crate::shared_moe::MoeExpert {
+                    gate: s.gate_proj.clone(),
+                    up: s.up_proj.clone(),
+                    down: s.down_proj.clone(),
+                });
             let moe_experts: Vec<crate::shared_moe::MoeExpert> = self
                 .experts
                 .iter()

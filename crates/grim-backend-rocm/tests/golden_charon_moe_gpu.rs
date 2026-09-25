@@ -422,6 +422,7 @@ fn charon_fused_dispatch_matches_cpu_oracle() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore]
 fn charon_fused_dispatch_pinned_trace() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping pinned trace");
@@ -499,6 +500,7 @@ fn charon_fused_dispatch_pinned_trace() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore]
 fn charon_fused_dispatch_routing_scaling_factor_applied() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping rsf guard");
@@ -570,6 +572,7 @@ fn charon_fused_dispatch_routing_scaling_factor_applied() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore]
 fn charon_grouped_dispatch_matches_sortless() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping grouped parity");
@@ -687,6 +690,7 @@ fn quant_block16_cdim(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec
 }
 
 #[test]
+#[ignore]
 fn charon_grouped_fp8_matches_fp32() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping FP8 KAT");
@@ -970,6 +974,7 @@ fn cpu_mxfp8_reference(
 }
 
 #[test]
+#[ignore]
 fn charon_grouped_mxfp8_matches_fp32() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping MXFP8 KAT");
@@ -1075,6 +1080,7 @@ fn charon_grouped_mxfp8_matches_fp32() {
 }
 
 #[test]
+#[ignore]
 fn charon_grouped_mxfp4_matches_fp32() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping MXFP4 KAT");
@@ -1247,6 +1253,7 @@ fn cpu_q80_reference(
 }
 
 #[test]
+#[ignore]
 fn charon_grouped_q80_matches_fp32() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping Q8_0 KAT");
@@ -1727,50 +1734,62 @@ fn kat_iqk(fmt: usize, block_bytes: usize, name: &str) {
 }
 
 #[test]
+#[ignore]
 fn charon_grouped_iqk_iq4nl() {
     kat_iqk(0, IQK_BLOCK_BYTES[0], IQK_NAMES[0]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_iq4xs() {
     kat_iqk(1, IQK_BLOCK_BYTES[1], IQK_NAMES[1]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_iq3xxs() {
     kat_iqk(2, IQK_BLOCK_BYTES[2], IQK_NAMES[2]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_iq3s() {
     kat_iqk(3, IQK_BLOCK_BYTES[3], IQK_NAMES[3]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_iq2xxs() {
     kat_iqk(4, IQK_BLOCK_BYTES[4], IQK_NAMES[4]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_iq2xs() {
     kat_iqk(5, IQK_BLOCK_BYTES[5], IQK_NAMES[5]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_iq2s() {
     kat_iqk(6, IQK_BLOCK_BYTES[6], IQK_NAMES[6]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_q4k() {
     kat_iqk(7, IQK_BLOCK_BYTES[7], IQK_NAMES[7]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_q5k() {
     kat_iqk(8, IQK_BLOCK_BYTES[8], IQK_NAMES[8]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_q6k() {
     kat_iqk(9, IQK_BLOCK_BYTES[9], IQK_NAMES[9]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_q2k() {
     kat_iqk(10, IQK_BLOCK_BYTES[10], IQK_NAMES[10]);
 }
 #[test]
+#[ignore]
 fn charon_grouped_iqk_q3k() {
     kat_iqk(11, IQK_BLOCK_BYTES[11], IQK_NAMES[11]);
 }

@@ -357,6 +357,7 @@ impl FusionOps for ProbeDevice {
         _mscale: f32,
         _eps: f32,
         _max_seq_len: usize,
+        _rope_interleaved: bool,
     ) -> grim_tensor::Result<Box<dyn ComputeHandle>> {
         probe_err("fused_mxfp4_gemm_qk_norm_rope_kv")?;
         unreachable!()
@@ -563,7 +564,8 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
             None,
             1.0,
             1e-6,
-            16
+            16,
+            false,
         ),
         "fused_mxfp4_gemm_qk_norm_rope_kv"
     );

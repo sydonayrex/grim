@@ -8,7 +8,10 @@ use grim_backend_rocm::RocmDevice;
 use grim_nn::moe::ExpertBank;
 fn o1_vec(n: usize, seed: f32) -> Vec<f32> {
     (0..n)
-        .map(|i| ((i as f32 + 1.0) * 0.37 + seed).sin() + ((i as f32 + 1.0) * 0.11 + seed * 2.0).cos() * 0.5)
+        .map(|i| {
+            ((i as f32 + 1.0) * 0.37 + seed).sin()
+                + ((i as f32 + 1.0) * 0.11 + seed * 2.0).cos() * 0.5
+        })
         .collect()
 }
 
@@ -54,9 +57,10 @@ impl grim_tensor::provider::TensorProvider for MemProvider {
         &self,
         name: &str,
     ) -> Result<grim_tensor::provider::RawTensor, grim_tensor::error::Error> {
-        let (bytes, shape, dtype, provenance) = self.tensors.get(name).cloned().ok_or_else(|| {
-            grim_tensor::error::Error::Backend(format!("missing tensor '{name}'"))
-        })?;
+        let (bytes, shape, dtype, provenance) =
+            self.tensors.get(name).cloned().ok_or_else(|| {
+                grim_tensor::error::Error::Backend(format!("missing tensor '{name}'"))
+            })?;
         Ok(grim_tensor::provider::RawTensor {
             bytes,
             shape,
@@ -112,12 +116,7 @@ impl Drop for NativeArmEnv {
 /// Per-row symmetric W4A16 quantization with EXACT dequant round-trip:
 /// reference weights are rewritten to `(code - 8) * scale` so parity is not
 /// limited by quantization error.
-fn w4a16_quantize_rowmajor(
-    w: &mut [f32],
-    rows: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<u8> {
+fn w4a16_quantize_rowmajor(w: &mut [f32], rows: usize, k: usize, group_size: usize) -> Vec<u8> {
     let words_per_row = k / 8;
     let groups_per_row = k.div_ceil(group_size);
     let mut codes = vec![0u32; rows * words_per_row];
@@ -150,7 +149,9 @@ fn w4a16_quantize_rowmajor(
 
 #[test]
 fn test_quantized_w4a16_d2d_engages_and_matches_native() {
-    use grim_models_transformer::shared_moe::{CharonCache, MoeExpert, fused_moe_dispatch_from_logits};
+    use grim_models_transformer::shared_moe::{
+        CharonCache, MoeExpert, fused_moe_dispatch_from_logits,
+    };
 
     let _guard = gpu_lock();
     let Some(dev) = gpu_device() else {
@@ -171,10 +172,14 @@ fn test_quantized_w4a16_d2d_engages_and_matches_native() {
     };
 
     // Packed fixture + exact-dequant native twin.
-    let mut packed_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
-    let mut native_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
+    let mut packed_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
+    let mut native_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
     for (name, out, k) in [
         ("ffn_gate_exps.weight", INTER, HIDDEN),
         ("ffn_up_exps.weight", INTER, HIDDEN),
@@ -189,9 +194,9 @@ fn test_quantized_w4a16_d2d_engages_and_matches_native() {
                 vec![E, out, k],
                 DType {
                     arith: grim_tensor::ArithType::F32,
-                    storage: grim_tensor::Storage::W4A16(
-                        grim_tensor::dtype::W4A16Config { group_size: GROUP },
-                    ),
+                    storage: grim_tensor::Storage::W4A16(grim_tensor::dtype::W4A16Config {
+                        group_size: GROUP,
+                    }),
                 },
                 grim_tensor::QuantProvenance::GrimNative,
             ),
@@ -248,7 +253,15 @@ fn test_quantized_w4a16_d2d_engages_and_matches_native() {
         let logits_gpu = router_lin.forward(&x_gpu).unwrap();
         let cache = CharonCache::new();
         let out = fused_moe_dispatch_from_logits(
-            &dev, &x_gpu, &logits_gpu, &experts, None, TOP_K, 1.0, 0, &cache,
+            &dev,
+            &x_gpu,
+            &logits_gpu,
+            &experts,
+            None,
+            TOP_K,
+            1.0,
+            0,
+            &cache,
         )
         .unwrap()
         .expect("quantized D2D dispatch returned Ok(None) — silent fallback, FAIL");
@@ -294,7 +307,11 @@ fn w8a8_int8_pack_rows(w: &mut [f32], rows: usize, k: usize) -> Vec<u8> {
     let mut scales = vec![0.0f32; rows];
     for r in 0..rows {
         let max_abs = (0..k).map(|c| w[r * k + c].abs()).fold(0.0f32, f32::max);
-        let scale = if max_abs == 0.0 { 1e-12 } else { max_abs / 127.0 };
+        let scale = if max_abs == 0.0 {
+            1e-12
+        } else {
+            max_abs / 127.0
+        };
         scales[r] = scale;
         for c in 0..k {
             let q = ((w[r * k + c] / scale).round() as i32).clamp(-128, 127);
@@ -344,10 +361,14 @@ fn test_w8a8_native_d2d_engages_and_matches_dequant() {
     };
 
     // O(1) magnitudes so a wrong arm or bad scales exceed tolerance.
-    let mut packed_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
-    let mut native_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
+    let mut packed_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
+    let mut native_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
     for (name, out, k) in [
         ("ffn_gate_exps.weight", INTER, HIDDEN),
         ("ffn_up_exps.weight", INTER, HIDDEN),
@@ -367,7 +388,15 @@ fn test_w8a8_native_d2d_engages_and_matches_dequant() {
             w[e * out * k..(e + 1) * out * k]
                 .copy_from_slice(&flat[e * out * k..(e + 1) * out * k]);
         }
-        packed_map.insert(name.to_string(), (bank, vec![E, out, k], pack_dtype(), grim_tensor::QuantProvenance::GrimNative));
+        packed_map.insert(
+            name.to_string(),
+            (
+                bank,
+                vec![E, out, k],
+                pack_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
+        );
         native_map.insert(
             name.to_string(),
             (
@@ -412,7 +441,15 @@ fn test_w8a8_native_d2d_engages_and_matches_dequant() {
         let logits_gpu = router_lin.forward(&x_gpu).unwrap();
         let cache = CharonCache::new();
         let out = fused_moe_dispatch_from_logits(
-            &dev, &x_gpu, &logits_gpu, &experts, None, TOP_K, 1.0, 0, &cache,
+            &dev,
+            &x_gpu,
+            &logits_gpu,
+            &experts,
+            None,
+            TOP_K,
+            1.0,
+            0,
+            &cache,
         )
         .unwrap()
         .expect("W8A8 D2D dispatch returned Ok(None) — silent fallback, FAIL");
@@ -472,7 +509,11 @@ fn test_w8a8_native_d2d_engages_and_matches_dequant() {
 /// see backend harness for why). Returns per-expert blob.
 fn fp8_pack_rows(w: &mut [f32]) -> Vec<u8> {
     let max_abs = w.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    let scale = if max_abs == 0.0 { 1e-12 } else { max_abs / 240.0 };
+    let scale = if max_abs == 0.0 {
+        1e-12
+    } else {
+        max_abs / 240.0
+    };
     let mut codes = vec![0u8; w.len()];
     for (i, v) in w.iter_mut().enumerate() {
         let target = *v / scale;
@@ -532,10 +573,14 @@ fn test_w8a8_fp8_native_d2d_engages_and_matches_dequant() {
         storage: grim_tensor::Storage::Native,
     };
 
-    let mut packed_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
-    let mut native_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
+    let mut packed_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
+    let mut native_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
     for (name, out, k) in [
         ("ffn_gate_exps.weight", INTER, HIDDEN),
         ("ffn_up_exps.weight", INTER, HIDDEN),
@@ -549,10 +594,23 @@ fn test_w8a8_fp8_native_d2d_engages_and_matches_dequant() {
             bank.extend_from_slice(&fp8_pack_rows(&mut slab));
             flat.extend_from_slice(&slab);
         }
-        packed_map.insert(name.to_string(), (bank, vec![E, out, k], pack_dtype(), grim_tensor::QuantProvenance::GrimNative));
+        packed_map.insert(
+            name.to_string(),
+            (
+                bank,
+                vec![E, out, k],
+                pack_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
+        );
         native_map.insert(
             name.to_string(),
-            (f32_bytes(&flat), vec![E, out, k], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&flat),
+                vec![E, out, k],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
     let router: Vec<f32> = vec![
@@ -561,7 +619,12 @@ fn test_w8a8_fp8_native_d2d_engages_and_matches_dequant() {
     for map in [&mut packed_map, &mut native_map] {
         map.insert(
             "ffn_gate_inp.weight".to_string(),
-            (f32_bytes(&router), vec![E, HIDDEN], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&router),
+                vec![E, HIDDEN],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
 
@@ -575,27 +638,59 @@ fn test_w8a8_fp8_native_d2d_engages_and_matches_dequant() {
                 down: bank.down[e].clone(),
             })
             .collect();
-        let gate_w = ws.get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight").unwrap();
+        let gate_w = ws
+            .get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight")
+            .unwrap();
         let x_data: Vec<f32> = (0..HIDDEN).map(|i| ((i % 7) as f32 * 0.4) - 1.2).collect();
         let x_gpu = rocm_tensor(&dev, x_data, Shape::new(vec![1, HIDDEN]));
         let logits_gpu = Linear::from_tensor(gate_w, None).forward(&x_gpu).unwrap();
         let cache = CharonCache::new();
         let out = fused_moe_dispatch_from_logits(
-            &dev, &x_gpu, &logits_gpu, &experts, None, TOP_K, 1.0, 0, &cache,
+            &dev,
+            &x_gpu,
+            &logits_gpu,
+            &experts,
+            None,
+            TOP_K,
+            1.0,
+            0,
+            &cache,
         )
         .unwrap()
         .expect("fp8 D2D dispatch returned Ok(None) — silent fallback, FAIL");
-        assert!(cache.is_routing_engaged(), "fp8 D2D routing not engaged — FAIL");
+        assert!(
+            cache.is_routing_engaged(),
+            "fp8 D2D routing not engaged — FAIL"
+        );
         (out.to_vec_f32().unwrap(), cache.last_dispatch_kind())
     };
 
-    let (got, got_kind) = run_d2d(&MemProvider { tensors: Arc::new(packed_map) });
-    assert_eq!(got_kind, DispatchKind::W8a8Fp8Native, "packed-fp8 must take NATIVE arm, got {got_kind:?}");
-    let (want, want_kind) = run_d2d(&MemProvider { tensors: Arc::new(native_map) });
-    assert_eq!(want_kind, DispatchKind::F32Dequant, "native-f32 must take F32 arm, got {want_kind:?}");
+    let (got, got_kind) = run_d2d(&MemProvider {
+        tensors: Arc::new(packed_map),
+    });
+    assert_eq!(
+        got_kind,
+        DispatchKind::W8a8Fp8Native,
+        "packed-fp8 must take NATIVE arm, got {got_kind:?}"
+    );
+    let (want, want_kind) = run_d2d(&MemProvider {
+        tensors: Arc::new(native_map),
+    });
+    assert_eq!(
+        want_kind,
+        DispatchKind::F32Dequant,
+        "native-f32 must take F32 arm, got {want_kind:?}"
+    );
 
-    let max_diff = got.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < 5e-3, "W8A8 native vs dequant-arm max diff {max_diff:.5} exceeds 5e-3");
+    let max_diff = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 5e-3,
+        "W8A8 native vs dequant-arm max diff {max_diff:.5} exceeds 5e-3"
+    );
     eprintln!("W8A8 native-arm parity OK  max_diff={max_diff:.2e}");
 }
 
@@ -639,10 +734,14 @@ fn test_w8a8_dot4_selected_at_aligned_shapes() {
         arith: grim_tensor::ArithType::F32,
         storage: grim_tensor::Storage::Native,
     };
-    let mut packed_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
-    let mut native_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
+    let mut packed_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
+    let mut native_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
     for (name, out, k) in [
         ("ffn_gate_exps.weight", INTER, HIDDEN),
         ("ffn_up_exps.weight", INTER, HIDDEN),
@@ -656,17 +755,35 @@ fn test_w8a8_dot4_selected_at_aligned_shapes() {
             bank.extend_from_slice(&w8a8_int8_pack_rows(&mut slab, out, k));
             flat.extend_from_slice(&slab);
         }
-        packed_map.insert(name.to_string(), (bank, vec![E, out, k], pack_dtype(), grim_tensor::QuantProvenance::GrimNative));
+        packed_map.insert(
+            name.to_string(),
+            (
+                bank,
+                vec![E, out, k],
+                pack_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
+        );
         native_map.insert(
             name.to_string(),
-            (f32_bytes(&flat), vec![E, out, k], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&flat),
+                vec![E, out, k],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
     let router: Vec<f32> = (0..E * HIDDEN).map(|_| rand()).collect();
     for map in [&mut packed_map, &mut native_map] {
         map.insert(
             "ffn_gate_inp.weight".to_string(),
-            (f32_bytes(&router), vec![E, HIDDEN], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&router),
+                vec![E, HIDDEN],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
     // One shared input: both arms must see identical activations or the
@@ -683,21 +800,39 @@ fn test_w8a8_dot4_selected_at_aligned_shapes() {
                 down: bank.down[e].clone(),
             })
             .collect();
-        let gate_w = ws.get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight").unwrap();
+        let gate_w = ws
+            .get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight")
+            .unwrap();
         let x_gpu = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![1, HIDDEN]));
         let logits_gpu = Linear::from_tensor(gate_w, None).forward(&x_gpu).unwrap();
         let cache = CharonCache::new();
         let out = fused_moe_dispatch_from_logits(
-            &dev, &x_gpu, &logits_gpu, &experts, None, TOP_K, 1.0, 0, &cache,
+            &dev,
+            &x_gpu,
+            &logits_gpu,
+            &experts,
+            None,
+            TOP_K,
+            1.0,
+            0,
+            &cache,
         )
         .unwrap()
         .expect("dot4 D2D dispatch returned Ok(None) — silent fallback, FAIL");
         (out.to_vec_f32().unwrap(), cache.last_dispatch_kind())
     };
 
-    let (got, got_kind) = run_d2d(&MemProvider { tensors: Arc::new(packed_map) });
-    assert_eq!(got_kind, DispatchKind::W8a8NativeDot4, "aligned int8 must select DOT4, got {got_kind:?}");
-    let (want, _) = run_d2d(&MemProvider { tensors: Arc::new(native_map) });
+    let (got, got_kind) = run_d2d(&MemProvider {
+        tensors: Arc::new(packed_map),
+    });
+    assert_eq!(
+        got_kind,
+        DispatchKind::W8a8NativeDot4,
+        "aligned int8 must select DOT4, got {got_kind:?}"
+    );
+    let (want, _) = run_d2d(&MemProvider {
+        tensors: Arc::new(native_map),
+    });
     // RELATIVE tolerance: the dot4 contraction quantizes activations to
     // int8 (Q8_1, ~1/127 per element), so absolute error scales with output
     // magnitude (here O(1e4) from 64-wide O(1) accumulation). Misalignment
@@ -708,9 +843,16 @@ fn test_w8a8_dot4_selected_at_aligned_shapes() {
         .zip(want.iter())
         .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
         .fold(0.0f32, f32::max);
-    let max_diff = got.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("dot4-selection parity OK  max_abs_diff={max_diff:.2e} max_rel={max_rel:.2e}");
-    assert!(max_rel < 1e-2, "dot4 vs dequant twin blew past Q8_1 noise: rel {max_rel:.5}");
+    assert!(
+        max_rel < 1e-2,
+        "dot4 vs dequant twin blew past Q8_1 noise: rel {max_rel:.5}"
+    );
 }
 
 #[test]
@@ -752,20 +894,32 @@ fn test_fp8_native_arm_gated_off_by_default() {
         }
         map.insert(
             name.to_string(),
-            (bank, vec![E, out, k], fp8_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                bank,
+                vec![E, out, k],
+                fp8_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
-    let router: Vec<f32> = (0..E * HIDDEN).map(|i| ((i as f32 + 1.0) * 0.5).sin()).collect();
+    let router: Vec<f32> = (0..E * HIDDEN)
+        .map(|i| ((i as f32 + 1.0) * 0.5).sin())
+        .collect();
     map.insert(
         "ffn_gate_inp.weight".to_string(),
         (
             f32_bytes(&router),
             vec![E, HIDDEN],
-            DType { arith: grim_tensor::ArithType::F32, storage: grim_tensor::Storage::Native },
+            DType {
+                arith: grim_tensor::ArithType::F32,
+                storage: grim_tensor::Storage::Native,
+            },
             grim_tensor::QuantProvenance::GrimNative,
         ),
     );
-    let provider = MemProvider { tensors: Arc::new(map) };
+    let provider = MemProvider {
+        tensors: Arc::new(map),
+    };
     let ws = grim_nn::WeightSource::root(&provider, Device::Rocm(0));
     let bank = ExpertBank::load(&ws, E, HIDDEN, INTER, false).expect("expert bank load");
     let experts: Vec<MoeExpert> = (0..E)
@@ -775,12 +929,22 @@ fn test_fp8_native_arm_gated_off_by_default() {
             down: bank.down[e].clone(),
         })
         .collect();
-    let gate_w = ws.get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight").unwrap();
+    let gate_w = ws
+        .get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight")
+        .unwrap();
     let x_gpu = rocm_tensor(&dev, vec![0.1f32; HIDDEN], Shape::new(vec![1, HIDDEN]));
     let logits_gpu = Linear::from_tensor(gate_w, None).forward(&x_gpu).unwrap();
     let cache = CharonCache::new();
     let out = fused_moe_dispatch_from_logits(
-        &dev, &x_gpu, &logits_gpu, &experts, None, 2, 1.0, 0, &cache,
+        &dev,
+        &x_gpu,
+        &logits_gpu,
+        &experts,
+        None,
+        2,
+        1.0,
+        0,
+        &cache,
     )
     .unwrap()
     .expect("fp8-gated dispatch must still engage (via F32 arm)");
@@ -860,7 +1024,8 @@ fn awq4_pack_rows(w: &mut [f32], rows: usize, k: usize) -> Vec<u8> {
             sc[g * rows + r] = fscale;
             let fsc = f16_bits_to_f32(fscale);
             for c in lo..hi {
-                let q = ((w[r * k + c] / fsc).round().clamp(-8.0, 7.0) as i32 + 8).clamp(0, 15) as u32;
+                let q =
+                    ((w[r * k + c] / fsc).round().clamp(-8.0, 7.0) as i32 + 8).clamp(0, 15) as u32;
                 qw[(c / VPW) * rows + r] |= q << ((c % VPW) * 4);
                 w[r * k + c] = (q as f32 - 8.0) * fsc;
             }
@@ -927,10 +1092,14 @@ fn test_awq_native_d2d_engages_and_matches_dequant() {
         storage: grim_tensor::Storage::Native,
     };
 
-    let mut packed_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
-    let mut native_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
+    let mut packed_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
+    let mut native_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
     for (name, out, k) in [
         ("ffn_gate_exps.weight", INTER, HIDDEN),
         ("ffn_up_exps.weight", INTER, HIDDEN),
@@ -944,10 +1113,23 @@ fn test_awq_native_d2d_engages_and_matches_dequant() {
             bank.extend_from_slice(&awq4_pack_rows(&mut slab, out, k));
             flat.extend_from_slice(&slab);
         }
-        packed_map.insert(name.to_string(), (bank, vec![E, out, k], awq_dtype(), grim_tensor::QuantProvenance::GrimNative));
+        packed_map.insert(
+            name.to_string(),
+            (
+                bank,
+                vec![E, out, k],
+                awq_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
+        );
         native_map.insert(
             name.to_string(),
-            (f32_bytes(&flat), vec![E, out, k], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&flat),
+                vec![E, out, k],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
     let router: Vec<f32> = vec![
@@ -956,7 +1138,12 @@ fn test_awq_native_d2d_engages_and_matches_dequant() {
     for map in [&mut packed_map, &mut native_map] {
         map.insert(
             "ffn_gate_inp.weight".to_string(),
-            (f32_bytes(&router), vec![E, HIDDEN], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&router),
+                vec![E, HIDDEN],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
     // One shared input: both arms must see identical activations or the
@@ -973,23 +1160,49 @@ fn test_awq_native_d2d_engages_and_matches_dequant() {
                 down: bank.down[e].clone(),
             })
             .collect();
-        let gate_w = ws.get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight").unwrap();
+        let gate_w = ws
+            .get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight")
+            .unwrap();
         let x_gpu = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![1, HIDDEN]));
         let logits_gpu = Linear::from_tensor(gate_w, None).forward(&x_gpu).unwrap();
         let cache = CharonCache::new();
         let out = fused_moe_dispatch_from_logits(
-            &dev, &x_gpu, &logits_gpu, &experts, None, TOP_K, 1.0, 0, &cache,
+            &dev,
+            &x_gpu,
+            &logits_gpu,
+            &experts,
+            None,
+            TOP_K,
+            1.0,
+            0,
+            &cache,
         )
         .unwrap()
         .expect("AWQ D2D dispatch returned Ok(None) — silent fallback, FAIL");
         (out.to_vec_f32().unwrap(), cache.last_dispatch_kind())
     };
 
-    let (got, got_kind) = run_d2d(&MemProvider { tensors: Arc::new(packed_map) });
-    assert_eq!(got_kind, DispatchKind::AwqNative, "packed-AWQ must take NATIVE arm, got {got_kind:?}");
-    let (want, want_kind) = run_d2d(&MemProvider { tensors: Arc::new(native_map) });
-    assert_eq!(want_kind, DispatchKind::F32Dequant, "native-f32 must take F32 arm, got {want_kind:?}");
-    let max_diff = got.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let (got, got_kind) = run_d2d(&MemProvider {
+        tensors: Arc::new(packed_map),
+    });
+    assert_eq!(
+        got_kind,
+        DispatchKind::AwqNative,
+        "packed-AWQ must take NATIVE arm, got {got_kind:?}"
+    );
+    let (want, want_kind) = run_d2d(&MemProvider {
+        tensors: Arc::new(native_map),
+    });
+    assert_eq!(
+        want_kind,
+        DispatchKind::F32Dequant,
+        "native-f32 must take F32 arm, got {want_kind:?}"
+    );
+    let max_diff = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("AWQ native-arm parity OK  max_diff={max_diff:.2e}");
     dev.synchronize(); // drain deferred async work so faults surface here, not in the next test
     // Also drain the SHARED device singleton: the charon dispatch path
@@ -1001,7 +1214,10 @@ fn test_awq_native_d2d_engages_and_matches_dequant() {
     if let Ok(d1) = grim_backend_rocm::RocmDevice::try_new(1) {
         d1.synchronize();
     }
-    assert!(max_diff < 5e-3, "AWQ native vs dequant twin diverged: {max_diff:.5}");
+    assert!(
+        max_diff < 5e-3,
+        "AWQ native vs dequant twin diverged: {max_diff:.5}"
+    );
 }
 
 #[test]
@@ -1047,20 +1263,32 @@ fn test_awq_native_arm_gated_off_by_default() {
         }
         map.insert(
             name.to_string(),
-            (bank, vec![E, out, k], awq_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                bank,
+                vec![E, out, k],
+                awq_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
-    let router: Vec<f32> = (0..E * HIDDEN).map(|i| ((i as f32 + 1.0) * 0.5).sin()).collect();
+    let router: Vec<f32> = (0..E * HIDDEN)
+        .map(|i| ((i as f32 + 1.0) * 0.5).sin())
+        .collect();
     map.insert(
         "ffn_gate_inp.weight".to_string(),
         (
             f32_bytes(&router),
             vec![E, HIDDEN],
-            DType { arith: grim_tensor::ArithType::F32, storage: grim_tensor::Storage::Native },
+            DType {
+                arith: grim_tensor::ArithType::F32,
+                storage: grim_tensor::Storage::Native,
+            },
             grim_tensor::QuantProvenance::GrimNative,
         ),
     );
-    let provider = MemProvider { tensors: Arc::new(map) };
+    let provider = MemProvider {
+        tensors: Arc::new(map),
+    };
     let ws = grim_nn::WeightSource::root(&provider, Device::Rocm(0));
     let bank = ExpertBank::load(&ws, E, HIDDEN, INTER, false).expect("expert bank load");
     let experts: Vec<MoeExpert> = (0..E)
@@ -1070,12 +1298,22 @@ fn test_awq_native_arm_gated_off_by_default() {
             down: bank.down[e].clone(),
         })
         .collect();
-    let gate_w = ws.get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight").unwrap();
+    let gate_w = ws
+        .get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight")
+        .unwrap();
     let x_gpu = rocm_tensor(&dev, vec![0.1f32; HIDDEN], Shape::new(vec![1, HIDDEN]));
     let logits_gpu = Linear::from_tensor(gate_w, None).forward(&x_gpu).unwrap();
     let cache = CharonCache::new();
     let out = fused_moe_dispatch_from_logits(
-        &dev, &x_gpu, &logits_gpu, &experts, None, 2, 1.0, 0, &cache,
+        &dev,
+        &x_gpu,
+        &logits_gpu,
+        &experts,
+        None,
+        2,
+        1.0,
+        0,
+        &cache,
     )
     .unwrap()
     .expect("AWQ-gated dispatch must still engage (via F32 arm)");
@@ -1153,16 +1391,23 @@ fn test_mxfp4_native_d2d_engages_and_matches_dequant() {
 
     // Bank-level framed layout: [u64 clen | codes(all experts) | u64 xlen |
     // exps(all experts)] per projection (loader splits per expert).
-    let mut packed_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
-    let mut native_map: HashMap<String, (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance)> =
-        HashMap::new();
+    let mut packed_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
+    let mut native_map: HashMap<
+        String,
+        (Vec<u8>, Vec<usize>, DType, grim_tensor::QuantProvenance),
+    > = HashMap::new();
     for (name, out, k) in [
         ("ffn_gate_exps.weight", INTER, HIDDEN),
         ("ffn_up_exps.weight", INTER, HIDDEN),
         ("ffn_down_exps.weight", HIDDEN, INTER),
     ] {
-        assert!((out * k) % 32 == 0, "fixture dims must give whole 32-groups");
+        assert!(
+            (out * k) % 32 == 0,
+            "fixture dims must give whole 32-groups"
+        );
         let mut codes_all = Vec::new();
         let mut exps_all = Vec::new();
         let mut flat = Vec::with_capacity(E * out * k);
@@ -1175,7 +1420,8 @@ fn test_mxfp4_native_d2d_engages_and_matches_dequant() {
             let blob = mxfp4_pack_rows(&mut w);
             let clen = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
             let xlen_off = 8 + clen;
-            let xlen = u64::from_le_bytes(blob[xlen_off..xlen_off + 8].try_into().unwrap()) as usize;
+            let xlen =
+                u64::from_le_bytes(blob[xlen_off..xlen_off + 8].try_into().unwrap()) as usize;
             codes_all.extend_from_slice(&blob[8..8 + clen]);
             exps_all.extend_from_slice(&blob[xlen_off + 8..xlen_off + 8 + xlen]);
             flat.extend_from_slice(&w);
@@ -1186,10 +1432,23 @@ fn test_mxfp4_native_d2d_engages_and_matches_dequant() {
         bank.extend_from_slice(&codes_all);
         bank.extend_from_slice(&(exps_all.len() as u64).to_le_bytes());
         bank.extend_from_slice(&exps_all);
-        packed_map.insert(name.to_string(), (bank, vec![E, out, k], mxfp4_dtype(), grim_tensor::QuantProvenance::GrimNative));
+        packed_map.insert(
+            name.to_string(),
+            (
+                bank,
+                vec![E, out, k],
+                mxfp4_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
+        );
         native_map.insert(
             name.to_string(),
-            (f32_bytes(&flat), vec![E, out, k], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&flat),
+                vec![E, out, k],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
     let router: Vec<f32> = vec![
@@ -1198,7 +1457,12 @@ fn test_mxfp4_native_d2d_engages_and_matches_dequant() {
     for map in [&mut packed_map, &mut native_map] {
         map.insert(
             "ffn_gate_inp.weight".to_string(),
-            (f32_bytes(&router), vec![E, HIDDEN], native_dtype(), grim_tensor::QuantProvenance::GrimNative),
+            (
+                f32_bytes(&router),
+                vec![E, HIDDEN],
+                native_dtype(),
+                grim_tensor::QuantProvenance::GrimNative,
+            ),
         );
     }
 
@@ -1212,27 +1476,59 @@ fn test_mxfp4_native_d2d_engages_and_matches_dequant() {
                 down: bank.down[e].clone(),
             })
             .collect();
-        let gate_w = ws.get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight").unwrap();
+        let gate_w = ws
+            .get(Shape::new(vec![E, HIDDEN]), "ffn_gate_inp.weight")
+            .unwrap();
         let x_data: Vec<f32> = (0..HIDDEN).map(|i| ((i % 7) as f32 * 0.4) - 1.2).collect();
         let x_gpu = rocm_tensor(&dev, x_data, Shape::new(vec![1, HIDDEN]));
         let logits_gpu = Linear::from_tensor(gate_w, None).forward(&x_gpu).unwrap();
         let cache = CharonCache::new();
         let out = fused_moe_dispatch_from_logits(
-            &dev, &x_gpu, &logits_gpu, &experts, None, TOP_K, 1.0, 0, &cache,
+            &dev,
+            &x_gpu,
+            &logits_gpu,
+            &experts,
+            None,
+            TOP_K,
+            1.0,
+            0,
+            &cache,
         )
         .unwrap()
         .expect("MXFP4 D2D dispatch returned Ok(None) — silent fallback, FAIL");
-        assert!(cache.is_routing_engaged(), "MXFP4 D2D routing not engaged — FAIL");
+        assert!(
+            cache.is_routing_engaged(),
+            "MXFP4 D2D routing not engaged — FAIL"
+        );
         (out.to_vec_f32().unwrap(), cache.last_dispatch_kind())
     };
 
-    let (got, got_kind) = run_d2d(&MemProvider { tensors: Arc::new(packed_map) });
-    assert_eq!(got_kind, DispatchKind::Mxfp4Native, "packed-MXFP4 must take NATIVE arm, got {got_kind:?}");
-    let (want, want_kind) = run_d2d(&MemProvider { tensors: Arc::new(native_map) });
-    assert_eq!(want_kind, DispatchKind::F32Dequant, "native-f32 must take F32 arm, got {want_kind:?}");
+    let (got, got_kind) = run_d2d(&MemProvider {
+        tensors: Arc::new(packed_map),
+    });
+    assert_eq!(
+        got_kind,
+        DispatchKind::Mxfp4Native,
+        "packed-MXFP4 must take NATIVE arm, got {got_kind:?}"
+    );
+    let (want, want_kind) = run_d2d(&MemProvider {
+        tensors: Arc::new(native_map),
+    });
+    assert_eq!(
+        want_kind,
+        DispatchKind::F32Dequant,
+        "native-f32 must take F32 arm, got {want_kind:?}"
+    );
 
-    let max_diff = got.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < 5e-3, "MXFP4 native vs dequant-arm max diff {max_diff:.5} exceeds 5e-3");
+    let max_diff = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 5e-3,
+        "MXFP4 native vs dequant-arm max diff {max_diff:.5} exceeds 5e-3"
+    );
     eprintln!("MXFP4 native-arm parity OK  max_diff={max_diff:.2e}");
     dev.synchronize(); // drain deferred async work so faults surface here, not in the next test
     // Also drain the SHARED device singleton: the charon dispatch path
@@ -1308,9 +1604,19 @@ fn d2d_vs_host_latency_gate() {
             let backend = grim_nn::modules::pick_device_for_storage_device(x_gpu.device());
 
             // Warmup (stack builds + JIT) outside timing.
-            eprintln!("[gate] warmup start e={E} h={HIDDEN} i={INTER} topk={TOPK} seq={seq} mode={route_mode}");
+            eprintln!(
+                "[gate] warmup start e={E} h={HIDDEN} i={INTER} topk={TOPK} seq={seq} mode={route_mode}"
+            );
             let _ = fused_moe_dispatch_from_logits(
-                backend.as_ref(), &x_gpu, &logits_gpu, &experts, None, TOPK, 1.0, route_mode, &cache,
+                backend.as_ref(),
+                &x_gpu,
+                &logits_gpu,
+                &experts,
+                None,
+                TOPK,
+                1.0,
+                route_mode,
+                &cache,
             )
             .unwrap()
             .unwrap()
@@ -1323,7 +1629,14 @@ fn d2d_vs_host_latency_gate() {
             for _ in 0..ITERS {
                 let start = std::time::Instant::now();
                 let out = fused_moe_dispatch_from_logits(
-                    backend.as_ref(), &x_gpu, &logits_gpu, &experts, None, TOPK, 1.0, route_mode,
+                    backend.as_ref(),
+                    &x_gpu,
+                    &logits_gpu,
+                    &experts,
+                    None,
+                    TOPK,
+                    1.0,
+                    route_mode,
                     &cache,
                 )
                 .unwrap()
@@ -1340,7 +1653,13 @@ fn d2d_vs_host_latency_gate() {
                 let logits_v = logits_gpu.to_vec_f32().unwrap();
                 let routings = route_topk(&logits_v, E, TOPK).unwrap();
                 let out = fused_moe_dispatch(
-                    backend.as_ref(), &x_gpu, &experts, None, &routings, 1.0, &cache,
+                    backend.as_ref(),
+                    &x_gpu,
+                    &experts,
+                    None,
+                    &routings,
+                    1.0,
+                    &cache,
                 )
                 .unwrap();
                 let _ = out.to_vec_f32().unwrap();
@@ -1361,4 +1680,3 @@ fn d2d_vs_host_latency_gate() {
 }
 
 // ── Decode Graph Capture & Replay parity for non-Llama standalone MoEs ─────
-

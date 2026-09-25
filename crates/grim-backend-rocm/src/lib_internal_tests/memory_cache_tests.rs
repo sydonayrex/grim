@@ -488,5 +488,4 @@ mod tests {
             "pinned+async unexpectedly slower: {async_us:.1} vs {sync_us:.1} us"
         );
     }
-
 }

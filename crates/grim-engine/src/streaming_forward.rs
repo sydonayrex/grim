@@ -679,7 +679,9 @@ impl StreamingBlockForward {
         let ffn_norm_id = tape.register(ffn_norm_out.clone());
 
         let gate_lin = block.w_gate.as_ref().ok_or_else(|| {
-            grim_core::error::Error::Backend("dense FFN step: block has no w_gate (MoE block in dense training path)".into())
+            grim_core::error::Error::Backend(
+                "dense FFN step: block has no w_gate (MoE block in dense training path)".into(),
+            )
         })?;
         let gate_base = gate_lin.forward(&ffn_norm_out)?;
         let gate_base_id = if autograd_reg.scope == AutogradScope::FullParameter {

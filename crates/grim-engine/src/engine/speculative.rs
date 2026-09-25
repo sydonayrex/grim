@@ -156,16 +156,19 @@ impl Engine {
                 ));
                 let modality = base_model.config().modality();
                 let wrapped = Self::build_dspark_model(base_model, drafter);
-                self.models.insert(id.to_string(), LoadedModel {
-                    model: wrapped,
-                    config: Box::new(grim_core::config::GenericModelConfig {
-                        name: id.to_string(),
-                        modality,
-                    }),
-                    device: dev,
-                    tp_config: self.tp_config(),
-                    arch_hyperparams: hyper,
-                });
+                self.models.insert(
+                    id.to_string(),
+                    LoadedModel {
+                        model: wrapped,
+                        config: Box::new(grim_core::config::GenericModelConfig {
+                            name: id.to_string(),
+                            modality,
+                        }),
+                        device: dev,
+                        tp_config: self.tp_config(),
+                        arch_hyperparams: hyper,
+                    },
+                );
             }
         } else {
             self.register_model(id, base_model);

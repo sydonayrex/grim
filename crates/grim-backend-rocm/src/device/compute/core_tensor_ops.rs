@@ -3,16 +3,21 @@
 
 use std::ffi::c_void;
 
-
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, CoreTensorOps, Shape };
+use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 
-use crate::device::gemm_tuning::{ lookup_gemm_config };
+use crate::device::gemm_tuning::lookup_gemm_config;
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ ROCBLAS_GEMM_FLAGS_NONE, RocblasInt, RocblasOperation, RocmHandle, arg, arith_to_compute_dtype, arith_to_rocblas_dtype, as_rocm, check_hip, dev_ptr, dtype_f32, hipFree, hipFreeAsync, hipMemAdvise, hipMemsetAsync, hipSuccess, linear_launch, rocblas_gemm_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success, select_gemm_algo, upload_device_buffer, warp_rows_launch };
+use crate::{
+    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, as_rocm, check_hip, dev_ptr, dtype_f32,
+    hipFree, hipFreeAsync, hipMemAdvise, hipMemsetAsync, hipSuccess, linear_launch,
+    rocblas_gemm_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success, select_gemm_algo,
+    upload_device_buffer, warp_rows_launch, RocblasInt, RocblasOperation, RocmHandle,
+    ROCBLAS_GEMM_FLAGS_NONE,
+};
 
 impl CoreTensorOps for RocmDevice {
     /// Audit B5: delegate to the device-resident `grim_transpose_2d_f32` HIP kernel via the existing inherent helper - the tensor
@@ -94,7 +99,10 @@ impl CoreTensorOps for RocmDevice {
         // pathologically slow at M=1 GEMV due to workspace allocation and
         // teardown per call. The custom kernel is ~3x faster.
         let dims = out_shape.dims();
-        let m = dims[..dims.len().saturating_sub(1)].iter().product::<usize>().max(1);
+        let m = dims[..dims.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1);
         let n = dims.last().copied().unwrap_or(0);
         let k = a.shape().dims().last().copied().unwrap_or(0);
         if m == 1 && n >= 2048 {
@@ -106,10 +114,7 @@ impl CoreTensorOps for RocmDevice {
                     && matches!(a_s.dtype().storage, crate::DTypeStorage::Native);
                 let b_is_f32 = b_s.dtype().arith == ArithType::F32
                     && matches!(b_s.dtype().storage, crate::DTypeStorage::Native);
-                if a_is_f32 && b_is_f32
-                    && a_s.device_ptr_is_valid()
-                    && b_s.device_ptr_is_valid()
-                {
+                if a_is_f32 && b_is_f32 && a_s.device_ptr_is_valid() && b_s.device_ptr_is_valid() {
                     let out_storage = RocmStorage::alloc_gpu(
                         out_shape,
                         grim_tensor::DType {

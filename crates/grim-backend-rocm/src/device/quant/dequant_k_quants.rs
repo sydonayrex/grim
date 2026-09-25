@@ -6,11 +6,9 @@ use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
-use crate::device::roc_device::{ RocmDevice };
+use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, arg };
-
-
+use crate::{HipDim3, arg};
 
 impl RocmDevice {
     /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
@@ -457,21 +455,21 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = a
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: a has no device ptr".into()))?;
-        let b_ptr = b
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: b has no device ptr".into()))?;
-        let out_ptr = out
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: out has no device ptr".into()))?;
+        let a_ptr = a.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q8_0_rows4: a has no device ptr".into())
+        })?;
+        let b_ptr = b.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q8_0_rows4: b has no device ptr".into())
+        })?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q8_0_rows4: out has no device ptr".into())
+        })?;
         const BLOCK_SIZE: usize = 256;
         let cols_per_thread: u64 = 4;
         let n_slots = (n / cols_per_thread as usize) as u64;
-        let total_slots: u64 = (m as u64)
-            .checked_mul(n_slots)
-            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q8_0_rows4: m*(n/4) overflow".into()))?;
+        let total_slots: u64 = (m as u64).checked_mul(n_slots).ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q8_0_rows4: m*(n/4) overflow".into())
+        })?;
         let grid_x: u32 = (total_slots.div_ceil(BLOCK_SIZE as u64))
             .try_into()
             .map_err(|_| Error::Backend("fused_dequant_gemm_q8_0_rows4: grid overflow".into()))?;

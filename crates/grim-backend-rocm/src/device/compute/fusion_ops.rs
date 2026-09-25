@@ -3,14 +3,13 @@
 
 use std::ffi::c_void;
 
-
-use grim_tensor::backend::{ ComputeHandle };
+use grim_tensor::backend::ComputeHandle;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage, FusionOps, Shape };
+use grim_tensor::{BackendStorage, FusionOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch };
+use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, RocmHandle};
 
 impl FusionOps for RocmDevice {
     fn fused_mxfp4_gemm_qk_norm_rope_kv(
@@ -36,6 +35,7 @@ impl FusionOps for RocmDevice {
         mscale: f32,
         eps: f32,
         max_seq_len: usize,
+        rope_interleaved: bool,
     ) -> Result<Box<dyn ComputeHandle>> {
         self.fused_mxfp4_gemm_qk_norm_rope_kv(
             x,
@@ -59,6 +59,7 @@ impl FusionOps for RocmDevice {
             mscale,
             eps,
             max_seq_len,
+            rope_interleaved,
         )
     }
 

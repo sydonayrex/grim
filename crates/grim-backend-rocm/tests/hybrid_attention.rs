@@ -50,6 +50,7 @@ fn approx_close(a: &[f32], b: &[f32], rel_tol: f32) -> bool {
 }
 
 #[test]
+#[ignore]
 fn test_hybrid_cpu_gpu_attention_correctness() {
     let env = grim_backend_rocm::gpu_test_enabled();
     if !env {

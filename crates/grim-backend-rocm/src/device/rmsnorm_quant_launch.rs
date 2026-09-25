@@ -12,7 +12,7 @@ use grim_tensor::error::{Error, Result};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, HipDim3};
+use crate::{HipDim3, arg};
 
 impl RocmDevice {
     /// Fused weighted-RMSNorm + int8 q8_1 quantization in one launch
@@ -43,9 +43,7 @@ impl RocmDevice {
         let out_ptr = out_q81
             .device_ptr
             .ok_or_else(|| Error::Backend("rmsnorm_quant_i8: out_q81 has no device ptr".into()))?;
-        let cache_ptr = norm_cache
-            .and_then(|s| s.device_ptr)
-            .unwrap_or(0);
+        let cache_ptr = norm_cache.and_then(|s| s.device_ptr).unwrap_or(0);
 
         let grid_dim = HipDim3::new(1, 1, 1);
         let block_dim = HipDim3::new(32, 1, 1);

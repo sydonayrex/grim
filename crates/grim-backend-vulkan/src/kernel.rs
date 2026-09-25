@@ -5,7 +5,7 @@ use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
-use crate::context::{QUEUE_LOCK, VulkanContext};
+use crate::context::{VulkanContext, QUEUE_LOCK};
 use crate::ffi::*;
 
 pub(crate) fn run_compute_shader(

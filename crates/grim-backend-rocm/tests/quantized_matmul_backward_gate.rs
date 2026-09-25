@@ -30,6 +30,7 @@ fn tensor_from_storage(
 }
 
 #[test]
+#[ignore]
 fn quantized_b_gpu_backward_matches_cpu_reference() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,

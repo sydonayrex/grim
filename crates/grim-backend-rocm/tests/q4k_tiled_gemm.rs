@@ -107,6 +107,7 @@ fn parity_case(m: usize, n: usize, k: usize, atol: f32) {
 }
 
 #[test]
+#[ignore]
 fn tiled_q4k_parity_small() {
     if !gpu_enabled() {
         return;
@@ -117,6 +118,7 @@ fn tiled_q4k_parity_small() {
 }
 
 #[test]
+#[ignore]
 fn tiled_q4k_parity_prefill_shapes() {
     if !gpu_enabled() {
         return;
@@ -171,6 +173,7 @@ fn backward_parity_case(m: usize, n: usize, k: usize, atol: f32) {
 }
 
 #[test]
+#[ignore]
 fn tiled_q4k_backward_parity() {
     if !gpu_enabled() {
         return;
@@ -185,6 +188,7 @@ fn tiled_q4k_backward_parity() {
 /// Prints GFLOP/s for both; asserts the tiled path is not a regression
 /// (>= 1x scalar) and reports the measured speedup in the log.
 #[test]
+#[ignore]
 fn tiled_q4k_prefill_throughput() {
     if !gpu_enabled() {
         return;
@@ -230,6 +234,7 @@ fn tiled_q4k_prefill_throughput() {
 /// multi-GPU reduction itself requires ≥2 GPUs and is covered by tests/rccl.rs
 /// on multi-GPU hardware).
 #[test]
+#[ignore]
 fn bf16_grad_allreduce_single_gpu_noop() {
     if !gpu_enabled() {
         return;

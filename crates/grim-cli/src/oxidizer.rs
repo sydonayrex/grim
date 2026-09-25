@@ -228,7 +228,9 @@ pub fn cmd_oxidizer_calibrate(
         }).collect::<Vec<_>>(),
     });
     let json_path = format!("{}.importance.json", output_path);
-    fs::write(&json_path, serde_json::to_string_pretty(&out_json).unwrap())
+    let json_text = serde_json::to_string_pretty(&out_json)
+        .map_err(|e| format!("failed to serialize importance scores: {e}"))?;
+    fs::write(&json_path, json_text)
         .map_err(|e| format!("failed to write importance scores: {e}"))?;
     Ok(result)
 }

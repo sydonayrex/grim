@@ -486,7 +486,10 @@ impl SafetensorsProvider {
         }
         if let Some(ref o) = ostquant {
             for (base_name, ost_info) in &o.tensors {
-                let qweight_name = format!("{}.qweight", base_name.strip_suffix(".weight").unwrap_or(base_name));
+                let qweight_name = format!(
+                    "{}.qweight",
+                    base_name.strip_suffix(".weight").unwrap_or(base_name)
+                );
                 if let Some(qw_info) = info.get(&qweight_name) {
                     tensors.insert(
                         base_name.clone(),

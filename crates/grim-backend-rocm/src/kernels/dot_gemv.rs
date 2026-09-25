@@ -2067,7 +2067,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod sdot4_probe {
     use crate::RocmDevice;
@@ -2077,7 +2076,6 @@ mod sdot4_probe {
     /// `grim_quantize_q8_1` output must equal the host reference bit-for-bit.
     #[test]
     fn quantize_q81_stage_matches_host_on_rdna2() {
-
         if !crate::gpu_test_enabled() {
             return;
         }
@@ -2093,13 +2091,27 @@ mod sdot4_probe {
         let (m, k) = (1usize, 256usize);
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32 - 5.0) * 0.08).collect();
 
-        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
-        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let f32ty = DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        };
+        let u8ty = DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        };
         let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let a_st = MemoryOps::from_cpu_bytes(&dev, &a_bytes, &Shape::new(vec![m * k]), f32ty.clone()).unwrap();
+        let a_st =
+            MemoryOps::from_cpu_bytes(&dev, &a_bytes, &Shape::new(vec![m * k]), f32ty.clone())
+                .unwrap();
         let n_q_blocks = k / 32;
         let dst_len = m * n_q_blocks * 36;
-        let d_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; dst_len], &Shape::new(vec![dst_len]), u8ty.clone()).unwrap();
+        let d_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; dst_len],
+            &Shape::new(vec![dst_len]),
+            u8ty.clone(),
+        )
+        .unwrap();
 
         let mut src_ptr = a_st.device_ptr().unwrap() as *mut std::ffi::c_void;
         let mut dst_ptr = d_st.device_ptr().unwrap() as *mut std::ffi::c_void;
@@ -2156,13 +2168,23 @@ mod sdot4_probe {
             }
             if got_bytes[i] != want[i] {
                 if mismatches < 8 {
-                    eprintln!("[quantize-probe] byte {i}: gpu={} host={}", got_bytes[i], want[i]);
+                    eprintln!(
+                        "[quantize-probe] byte {i}: gpu={} host={}",
+                        got_bytes[i], want[i]
+                    );
                 }
                 mismatches += 1;
             }
         }
-        assert_eq!(mismatches, 0, "quantize stage diverges on {} ({mismatches} bytes)", dev.gpu_target);
-        eprintln!("[quantize-probe] quantize stage MATCHES host on {}", dev.gpu_target);
+        assert_eq!(
+            mismatches, 0,
+            "quantize stage diverges on {} ({mismatches} bytes)",
+            dev.gpu_target
+        );
+        eprintln!(
+            "[quantize-probe] quantize stage MATCHES host on {}",
+            dev.gpu_target
+        );
 
         // ---- Stage 2: the q4k GEMV kernel with HOST-quantized activations,
         // vs CPU two-dot using grim_quant::dequant_q4k. Isolates the GEMV
@@ -2170,16 +2192,33 @@ mod sdot4_probe {
         let n = 4usize;
         let b_f32: Vec<f32> = (0..n * k).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
         let b_packed = grim_quant::quant_q4k(&b_f32).expect("quant_q4k");
-        let bty = DType { arith: ArithType::F32, storage: Storage::KQuant(grim_tensor::KQuantScheme::Q4K) };
-        let b_st = MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), bty.clone()).unwrap();
-        let o_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; (n + 1) * 4], &Shape::new(vec![n + 1]), f32ty.clone()).unwrap();
+        let bty = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(grim_tensor::KQuantScheme::Q4K),
+        };
+        let b_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_packed,
+            &Shape::new(vec![b_packed.len()]),
+            bty.clone(),
+        )
+        .unwrap();
+        let o_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; (n + 1) * 4],
+            &Shape::new(vec![n + 1]),
+            f32ty.clone(),
+        )
+        .unwrap();
 
         // Host q8_1 for row 0 (from the stage-1 reference).
         let mut act_q81 = vec![0u8; n_q_blocks * 36];
         for blk in 0..n_q_blocks {
             let base = blk * 32;
             let mut amax = 0.0f32;
-            for j in 0..32 { amax = amax.max(a[base + j].abs()); }
+            for j in 0..32 {
+                amax = amax.max(a[base + j].abs());
+            }
             let d = (amax / 127.0).max(1e-30);
             let d_bits = half::f16::from_f32(d).to_bits();
             let off = blk * 36;
@@ -2197,15 +2236,24 @@ mod sdot4_probe {
             act_q81[off + 2] = (s_bits & 0xFF) as u8;
             act_q81[off + 3] = (s_bits >> 8) as u8;
         }
-        let act_st = MemoryOps::from_cpu_bytes(&dev, &act_q81, &Shape::new(vec![act_q81.len()]), u8ty.clone()).unwrap();
+        let act_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &act_q81,
+            &Shape::new(vec![act_q81.len()]),
+            u8ty.clone(),
+        )
+        .unwrap();
 
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
         let mut args2: Vec<*mut std::ffi::c_void> = vec![
-            &mut (act_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _ as *mut std::ffi::c_void,
-            &mut (b_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _ as *mut std::ffi::c_void,
-            &mut (o_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _ as *mut std::ffi::c_void,
+            &mut (act_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _
+                as *mut std::ffi::c_void,
+            &mut (b_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _
+                as *mut std::ffi::c_void,
+            &mut (o_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _
+                as *mut std::ffi::c_void,
             &mut mm as *mut _ as *mut std::ffi::c_void,
             &mut nn as *mut _ as *mut std::ffi::c_void,
             &mut kk as *mut _ as *mut std::ffi::c_void,
@@ -2225,17 +2273,25 @@ mod sdot4_probe {
             .unwrap()
             .copy_to_host()
             .unwrap();
-        let got_f32: Vec<f32> = got_f32.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let got_f32: Vec<f32> = got_f32
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         eprintln!("[probe] warpSize on {}: {}", dev.gpu_target, got_f32[n]);
 
         // CPU reference: dequant_q4k weights dot host-quantized activations.
         let row_len = (k / 256) * 144;
         let mut worst = 0.0f32;
         for col in 0..n {
-            let b_deq = grim_quant::dequant_q4k(&b_packed[col * row_len..(col + 1) * row_len], k).unwrap();
+            let b_deq =
+                grim_quant::dequant_q4k(&b_packed[col * row_len..(col + 1) * row_len], k).unwrap();
             let mut acc = 0.0f32;
             for blk in 0..n_q_blocks {
-                let d = half::f16::from_bits(u16::from_le_bytes([act_q81[blk * 36], act_q81[blk * 36 + 1]])).to_f32();
+                let d = half::f16::from_bits(u16::from_le_bytes([
+                    act_q81[blk * 36],
+                    act_q81[blk * 36 + 1],
+                ]))
+                .to_f32();
                 for j in 0..32 {
                     let code = act_q81[blk * 36 + 4 + j] as i8;
                     acc += code as f32 * d * b_deq[blk * 32 + j];
@@ -2243,10 +2299,20 @@ mod sdot4_probe {
             }
             let diff = (acc - got_f32[col]).abs();
             worst = worst.max(diff);
-            eprintln!("[gemv-probe] col {col}: gpu={} cpu={acc} diff={diff}", got_f32[col]);
+            eprintln!(
+                "[gemv-probe] col {col}: gpu={} cpu={acc} diff={diff}",
+                got_f32[col]
+            );
         }
-        assert!(worst < 1e-3, "q4k GEMV diverges with host q8_1 on {}: {worst}", dev.gpu_target);
-        eprintln!("[gemv-probe] q4k GEMV MATCHES host two-dot on {}", dev.gpu_target);
+        assert!(
+            worst < 1e-3,
+            "q4k GEMV diverges with host q8_1 on {}: {worst}",
+            dev.gpu_target
+        );
+        eprintln!(
+            "[gemv-probe] q4k GEMV MATCHES host two-dot on {}",
+            dev.gpu_target
+        );
 
         // ---- Stage 3: replicate the FAILING parity test exactly (n=128,
         // its activation values, GPU-quantized activations through the same
@@ -2261,12 +2327,26 @@ mod sdot4_probe {
         let a3: Vec<f32> = (0..m * k).map(|_| rand()).collect();
         let b3_f32: Vec<f32> = (0..n3 * k).map(|_| rand()).collect();
         let b3_packed = grim_quant::quant_q4k(&b3_f32).expect("quant_q4k");
-        let b3_st = MemoryOps::from_cpu_bytes(&dev, &b3_packed, &Shape::new(vec![b3_packed.len()]), bty.clone()).unwrap();
+        let b3_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &b3_packed,
+            &Shape::new(vec![b3_packed.len()]),
+            bty.clone(),
+        )
+        .unwrap();
         let a3_bytes: Vec<u8> = a3.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let a3_st = MemoryOps::from_cpu_bytes(&dev, &a3_bytes, &Shape::new(vec![m * k]), f32ty.clone()).unwrap();
+        let a3_st =
+            MemoryOps::from_cpu_bytes(&dev, &a3_bytes, &Shape::new(vec![m * k]), f32ty.clone())
+                .unwrap();
         // GPU-quantize into a fresh buffer (same launch as the dispatch).
         let q81_len = n_q_blocks * 36;
-        let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone()).unwrap();
+        let q81_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; q81_len],
+            &Shape::new(vec![q81_len]),
+            u8ty.clone(),
+        )
+        .unwrap();
         let mut src_ptr = a3_st.device_ptr().unwrap() as *mut std::ffi::c_void;
         let mut dst_ptr = q81_st.device_ptr().unwrap() as *mut std::ffi::c_void;
         let mut kk = k as i32;
@@ -2286,13 +2366,22 @@ mod sdot4_probe {
         .expect("stage3 quantize launch");
         dev.synchronize();
 
-        let o3_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; n3 * 4], &Shape::new(vec![n3]), f32ty.clone()).unwrap();
+        let o3_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; n3 * 4],
+            &Shape::new(vec![n3]),
+            f32ty.clone(),
+        )
+        .unwrap();
         let mut mm3 = m as i32;
         let mut nn3 = n3 as i32;
         let mut args3: Vec<*mut std::ffi::c_void> = vec![
-            &mut (q81_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _ as *mut std::ffi::c_void,
-            &mut (b3_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _ as *mut std::ffi::c_void,
-            &mut (o3_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _ as *mut std::ffi::c_void,
+            &mut (q81_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _
+                as *mut std::ffi::c_void,
+            &mut (b3_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _
+                as *mut std::ffi::c_void,
+            &mut (o3_st.device_ptr().unwrap() as *mut std::ffi::c_void) as *mut _
+                as *mut std::ffi::c_void,
             &mut mm3 as *mut _ as *mut std::ffi::c_void,
             &mut nn3 as *mut _ as *mut std::ffi::c_void,
             &mut kk as *mut _ as *mut std::ffi::c_void,
@@ -2327,10 +2416,15 @@ mod sdot4_probe {
             .unwrap();
         let mut red_cols = 0;
         for col in 0..n3 {
-            let b_deq = grim_quant::dequant_q4k(&b3_packed[col * row_len..(col + 1) * row_len], k).unwrap();
+            let b_deq =
+                grim_quant::dequant_q4k(&b3_packed[col * row_len..(col + 1) * row_len], k).unwrap();
             let mut acc = 0.0f32;
             for blk in 0..n_q_blocks {
-                let d = half::f16::from_bits(u16::from_le_bytes([gpu_q81[blk * 36], gpu_q81[blk * 36 + 1]])).to_f32();
+                let d = half::f16::from_bits(u16::from_le_bytes([
+                    gpu_q81[blk * 36],
+                    gpu_q81[blk * 36 + 1],
+                ]))
+                .to_f32();
                 for j in 0..32 {
                     let code = gpu_q81[blk * 36 + 4 + j] as i8;
                     acc += code as f32 * d * b_deq[blk * 32 + j];
@@ -2339,13 +2433,20 @@ mod sdot4_probe {
             let diff = (acc - got3[col]).abs();
             if diff > 1e-3 && red_cols < 3 {
                 red_cols += 1;
-                eprintln!("[stage3] RED col {col}: gpu={} cpu={acc} diff={diff}", got3[col]);
+                eprintln!(
+                    "[stage3] RED col {col}: gpu={} cpu={acc} diff={diff}",
+                    got3[col]
+                );
             }
         }
         if red_cols == 0 {
-            eprintln!("[stage3] ALL {n3} columns match CPU within 1e-3 — divergence is NOT in the kernels");
+            eprintln!(
+                "[stage3] ALL {n3} columns match CPU within 1e-3 — divergence is NOT in the kernels"
+            );
         } else {
-            eprintln!("[stage3] {red_cols}+ columns diverge — kernels differ from dequant reference");
+            eprintln!(
+                "[stage3] {red_cols}+ columns diverge — kernels differ from dequant reference"
+            );
         }
 
         // ---- Stage 4: the SAME data through quantized_matmul (the dispatch
@@ -2399,10 +2500,16 @@ mod sdot4_probe {
                 .collect();
             let mut worst = 0.0f32;
             for col in 0..n3 {
-                let b_deq = grim_quant::dequant_q4k(&b3_packed[col * row_len..(col + 1) * row_len], k).unwrap();
+                let b_deq =
+                    grim_quant::dequant_q4k(&b3_packed[col * row_len..(col + 1) * row_len], k)
+                        .unwrap();
                 let mut acc = 0.0f32;
                 for blk in 0..n_q_blocks {
-                    let d = half::f16::from_bits(u16::from_le_bytes([gpu_q81[blk * 36], gpu_q81[blk * 36 + 1]])).to_f32();
+                    let d = half::f16::from_bits(u16::from_le_bytes([
+                        gpu_q81[blk * 36],
+                        gpu_q81[blk * 36 + 1],
+                    ]))
+                    .to_f32();
                     for j in 0..32 {
                         let code = gpu_q81[blk * 36 + 4 + j] as i8;
                         acc += code as f32 * d * b_deq[blk * 32 + j];
@@ -2410,14 +2517,23 @@ mod sdot4_probe {
                 }
                 worst = worst.max((acc - rep[col]).abs());
             }
-            eprintln!("[stage5] dispatch call {}: worst diff = {}", rep_i + 1, worst);
+            eprintln!(
+                "[stage5] dispatch call {}: worst diff = {}",
+                rep_i + 1,
+                worst
+            );
         }
         let mut red4 = 0;
         for col in 0..n3 {
-            let b_deq = grim_quant::dequant_q4k(&b3_packed[col * row_len..(col + 1) * row_len], k).unwrap();
+            let b_deq =
+                grim_quant::dequant_q4k(&b3_packed[col * row_len..(col + 1) * row_len], k).unwrap();
             let mut acc = 0.0f32;
             for blk in 0..n_q_blocks {
-                let d = half::f16::from_bits(u16::from_le_bytes([gpu_q81[blk * 36], gpu_q81[blk * 36 + 1]])).to_f32();
+                let d = half::f16::from_bits(u16::from_le_bytes([
+                    gpu_q81[blk * 36],
+                    gpu_q81[blk * 36 + 1],
+                ]))
+                .to_f32();
                 for j in 0..32 {
                     let code = gpu_q81[blk * 36 + 4 + j] as i8;
                     acc += code as f32 * d * b_deq[blk * 32 + j];
@@ -2426,10 +2542,16 @@ mod sdot4_probe {
             let diff = (acc - got4[col]).abs();
             if diff > 1e-3 && red4 < 3 {
                 red4 += 1;
-                eprintln!("[stage4] RED col {col}: gpu={} cpu={acc} diff={diff}", got4[col]);
+                eprintln!(
+                    "[stage4] RED col {col}: gpu={} cpu={acc} diff={diff}",
+                    got4[col]
+                );
             }
         }
-        eprintln!("[stage4] {} divergent columns via dispatch (GRIM_DOT_GEMV=1)", red4);
+        eprintln!(
+            "[stage4] {} divergent columns via dispatch (GRIM_DOT_GEMV=1)",
+            red4
+        );
         unsafe {
             std::env::set_var("GRIM_DOT_GEMV", "0");
         }

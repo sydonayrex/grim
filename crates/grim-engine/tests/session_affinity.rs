@@ -94,7 +94,11 @@ fn session_slot_affinity_groups_turns_and_splits_sessions() {
 
     run_session_request(&mut engine, 1, prompt.clone(), Some("alpha"), 3);
     let keys_after_a1 = session_slot_keys(&engine, "small");
-    assert_eq!(keys_after_a1.len(), 1, "one session-scoped key after turn 1");
+    assert_eq!(
+        keys_after_a1.len(),
+        1,
+        "one session-scoped key after turn 1"
+    );
 
     run_session_request(&mut engine, 2, prompt.clone(), Some("alpha"), 3);
     let keys_after_a2 = session_slot_keys(&engine, "small");
@@ -133,7 +137,9 @@ fn session_tag_pins_blocks_and_absence_does_not() {
     run_session_request(&mut tagged, 1, prompt.clone(), Some("alpha"), 2);
     {
         let pool = tagged.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-        let pinned: Vec<usize> = (0..pool.capacity()).filter(|&b| pool.is_block_pinned(b)).collect();
+        let pinned: Vec<usize> = (0..pool.capacity())
+            .filter(|&b| pool.is_block_pinned(b))
+            .collect();
         assert!(
             !pinned.is_empty(),
             "session-tagged request must pin its blocks"
@@ -144,8 +150,13 @@ fn session_tag_pins_blocks_and_absence_does_not() {
     let mut untagged = fresh_engine();
     run_session_request(&mut untagged, 1, prompt.clone(), None, 2);
     {
-        let pool = untagged.block_pool.lock().unwrap_or_else(|e| e.into_inner());
-        let pinned: Vec<usize> = (0..pool.capacity()).filter(|&b| pool.is_block_pinned(b)).collect();
+        let pool = untagged
+            .block_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let pinned: Vec<usize> = (0..pool.capacity())
+            .filter(|&b| pool.is_block_pinned(b))
+            .collect();
         assert!(
             pinned.is_empty(),
             "session-less request must not pin anything, got {pinned:?}"
@@ -166,7 +177,10 @@ fn dropping_session_field_is_byte_identical_to_layer15() {
     let mut without_tag = fresh_engine();
     let plain_logits = run_session_request(&mut without_tag, 1, prompt, None, 3);
 
-    assert_eq!(tagged_logits, plain_logits, "session tag must not change output");
+    assert_eq!(
+        tagged_logits, plain_logits,
+        "session tag must not change output"
+    );
 }
 
 /// Two different sessions on the same model must not observe each other's
@@ -182,6 +196,12 @@ fn two_sessions_produce_their_own_outputs() {
     let alpha_logits = run_session_request(&mut shared, 1, prompt.clone(), Some("alpha"), 3);
     let beta_logits = run_session_request(&mut shared, 2, prompt, Some("beta"), 3);
 
-    assert_eq!(alpha_logits, lone_logits, "session alpha must match the lone run");
-    assert_eq!(beta_logits, lone_logits, "session beta must match the lone run");
+    assert_eq!(
+        alpha_logits, lone_logits,
+        "session alpha must match the lone run"
+    );
+    assert_eq!(
+        beta_logits, lone_logits,
+        "session beta must match the lone run"
+    );
 }

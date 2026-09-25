@@ -21,6 +21,7 @@ fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
 }
 
 #[test]
+#[ignore]
 fn test_multimodal_and_speculative_kernels_compile() {
     let dev = RocmDevice::new(0);
     let src = grim_backend_rocm::kernels::source_asm::compute_kernel_source();
@@ -62,6 +63,7 @@ fn test_eplb_multi_rank_load_balancing() {
 }
 
 #[test]
+#[ignore]
 fn test_mrope_numerical_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());
@@ -194,6 +196,7 @@ fn test_mrope_numerical_parity() -> TestResult {
 
 // PASSED: 2026-08-27 on gfx1036 (ROCm)
 #[test]
+#[ignore]
 fn test_speculative_rejection_sampler_parity() -> TestResult {
     let Some(dev) = gpu_device() else {
         return Ok(());

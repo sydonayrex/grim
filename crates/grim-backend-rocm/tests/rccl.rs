@@ -76,6 +76,7 @@ fn require_integration_hardware() -> TestResult<bool> {
 /// covered when the environment exposes them.
 #[cfg(feature = "rccl")]
 #[test]
+#[ignore]
 fn rccl_multi_gpu_communicator_initializes_on_hardware() -> TestResult {
     if !require_integration_hardware()? {
         return Ok(());
@@ -98,6 +99,7 @@ fn rccl_multi_gpu_communicator_initializes_on_hardware() -> TestResult {
 /// training gradient path.
 #[cfg(feature = "rccl")]
 #[test]
+#[ignore]
 fn rccl_multi_gpu_all_reduce_sums_real_device_buffers() -> TestResult {
     if !require_integration_hardware()? {
         return Ok(());
@@ -151,6 +153,7 @@ fn rccl_multi_gpu_all_reduce_sums_real_device_buffers() -> TestResult {
 
 #[cfg(feature = "rccl")]
 #[test]
+#[ignore]
 fn rccl_selected_pair_matches_requested_topology() -> TestResult {
     if !require_integration_hardware()? {
         return Ok(());

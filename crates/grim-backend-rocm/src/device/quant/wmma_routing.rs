@@ -5,15 +5,13 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::dtype::{ ArithType, Storage as DTypeStorage };
+use grim_tensor::BackendStorage;
+use grim_tensor::dtype::{ArithType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{ BackendStorage };
 
-use crate::device::roc_device::{ RocmDevice };
+use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{ HipDim3, arg };
-
-
+use crate::{HipDim3, arg};
 
 impl RocmDevice {
     /// Returns `true` when the activation storage holds native FP16 data
@@ -34,8 +32,24 @@ impl RocmDevice {
         m: usize,
         n: usize,
         k: usize,
-        wmma_method: fn(&Self, &RocmStorage, &RocmStorage, &RocmStorage, usize, usize, usize) -> Result<*mut c_void>,
-        scalar_method: fn(&Self, &RocmStorage, &RocmStorage, &RocmStorage, usize, usize, usize) -> Result<*mut c_void>,
+        wmma_method: fn(
+            &Self,
+            &RocmStorage,
+            &RocmStorage,
+            &RocmStorage,
+            usize,
+            usize,
+            usize,
+        ) -> Result<*mut c_void>,
+        scalar_method: fn(
+            &Self,
+            &RocmStorage,
+            &RocmStorage,
+            &RocmStorage,
+            usize,
+            usize,
+            usize,
+        ) -> Result<*mut c_void>,
     ) -> Result<()> {
         let is_rdna34 = self.is_rdna34;
         if is_rdna34 && m <= 4 {
@@ -323,10 +337,7 @@ impl RocmDevice {
             ],
         )
     }
-
-
 }
-
 
 /// P1-WI-1: pure routing decision for the WMMA GEMM path. Extracted from [see: `RocmDevice::should_use_wmma_path`]
 pub(crate) fn wmma_route_decision(
@@ -350,6 +361,7 @@ pub(crate) fn wmma_route_decision(
 }
 
 impl grim_format::convert::GpuDequant for RocmDevice {
+    /// `Ok(None)` => storage has no WMMA host-dequant arm; caller must use the generic dequant path.
     fn dequantize(
         &self,
         storage: &grim_tensor::dtype::Storage,
@@ -404,7 +416,6 @@ impl grim_format::convert::GpuDequant for RocmDevice {
         }
     }
 }
-
 
 #[cfg(test)]
 mod wmma_route_tests {
@@ -494,4 +505,3 @@ mod wmma_route_tests {
         assert!(!wmma_route_decision(Some(&ext), ArithType::F16, true));
     }
 }
-

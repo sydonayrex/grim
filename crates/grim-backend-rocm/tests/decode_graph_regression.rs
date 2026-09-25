@@ -6,11 +6,11 @@
 //! behaviour (capture/replay parity, determinism, stress) lives in
 //! `grim-models-transformer::tests::lfm2_graph_{capture,p4}`.
 
-use grim_backend_rocm::decode_graph_buffers::{
-    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
-    write_embedding_to_buffer, DecodeGraphBuffers,
-};
 use grim_backend_rocm::decode_graph_buffers::DecodeGraph;
+use grim_backend_rocm::decode_graph_buffers::{
+    DecodeGraphBuffers, check_layer_topology, decode_graph_enabled, launch_attention,
+    launch_qkv_gemv, write_embedding_to_buffer,
+};
 use grim_backend_rocm::{DecodeBatchBucket, FullDecodeGraph};
 
 // ===========================================================================
@@ -36,7 +36,10 @@ fn env_disabled_by_false_off_spellings() {
     // Matches the exact spellings decode_graph_enabled() recognises.
     for v in ["false", "False", "off", "OFF"] {
         temp_env::with_vars(
-            [("GRIM_DECODE_GRAPH", None::<&str>), ("GRIM_CAPTURE_GRAPH", None::<&str>)],
+            [
+                ("GRIM_DECODE_GRAPH", None::<&str>),
+                ("GRIM_CAPTURE_GRAPH", None::<&str>),
+            ],
             || {
                 temp_env::with_var("GRIM_CAPTURE_GRAPH", Some(v), || {
                     assert!(!decode_graph_enabled(), "expected {v} to disable");
@@ -50,7 +53,10 @@ fn env_disabled_by_false_off_spellings() {
 fn env_case_sensitive_exact_match() {
     // Values NOT in the match set are treated as enabled (non-"0"/"false"/"off").
     temp_env::with_var("GRIM_CAPTURE_GRAPH", Some("FALSE"), || {
-        assert!(decode_graph_enabled(), "FALSE (all-caps) is not a disable token");
+        assert!(
+            decode_graph_enabled(),
+            "FALSE (all-caps) is not a disable token"
+        );
     });
     temp_env::with_var("GRIM_CAPTURE_GRAPH", Some("no"), || {
         assert!(decode_graph_enabled(), "\"no\" is not a disable token");
@@ -90,21 +96,54 @@ fn env_one_enabled_one_disabled() {
 
 #[test]
 fn bucket_exact_matches() {
-    assert_eq!(DecodeBatchBucket::from_batch_size(1), Some(DecodeBatchBucket::B1));
-    assert_eq!(DecodeBatchBucket::from_batch_size(2), Some(DecodeBatchBucket::B2));
-    assert_eq!(DecodeBatchBucket::from_batch_size(4), Some(DecodeBatchBucket::B4));
-    assert_eq!(DecodeBatchBucket::from_batch_size(8), Some(DecodeBatchBucket::B8));
-    assert_eq!(DecodeBatchBucket::from_batch_size(16), Some(DecodeBatchBucket::B16));
-    assert_eq!(DecodeBatchBucket::from_batch_size(32), Some(DecodeBatchBucket::B32));
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(1),
+        Some(DecodeBatchBucket::B1)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(2),
+        Some(DecodeBatchBucket::B2)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(4),
+        Some(DecodeBatchBucket::B4)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(8),
+        Some(DecodeBatchBucket::B8)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(16),
+        Some(DecodeBatchBucket::B16)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(32),
+        Some(DecodeBatchBucket::B32)
+    );
 }
 
 #[test]
 fn bucket_ceiling_matches() {
-    assert_eq!(DecodeBatchBucket::from_batch_size(3), Some(DecodeBatchBucket::B4));
-    assert_eq!(DecodeBatchBucket::from_batch_size(5), Some(DecodeBatchBucket::B8));
-    assert_eq!(DecodeBatchBucket::from_batch_size(9), Some(DecodeBatchBucket::B16));
-    assert_eq!(DecodeBatchBucket::from_batch_size(17), Some(DecodeBatchBucket::B32));
-    assert_eq!(DecodeBatchBucket::from_batch_size(31), Some(DecodeBatchBucket::B32));
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(3),
+        Some(DecodeBatchBucket::B4)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(5),
+        Some(DecodeBatchBucket::B8)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(9),
+        Some(DecodeBatchBucket::B16)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(17),
+        Some(DecodeBatchBucket::B32)
+    );
+    assert_eq!(
+        DecodeBatchBucket::from_batch_size(31),
+        Some(DecodeBatchBucket::B32)
+    );
 }
 
 #[test]

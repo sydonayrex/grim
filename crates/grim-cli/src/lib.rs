@@ -23,6 +23,8 @@
 pub mod calibrate_channels;
 pub mod catalog;
 pub mod config;
+pub mod distill;
+pub mod distill_fm;
 pub mod doctor;
 pub mod echo;
 pub mod eval;

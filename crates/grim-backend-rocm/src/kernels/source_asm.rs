@@ -11,6 +11,11 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
+    // GRAVE Phase 4: fused GDN-2 state-update + output + gated norm, one
+    // launch per GDL layer. Standalone TU (no cross-kernel helpers).
+    s.push_str(crate::kernels::gla_kernels::GLA_KERNEL_SOURCE);
+    // GRAVE Phase 5: persistent wavefront megakernel whole-step decode
+    s.push_str(crate::kernels::gla_mega_kernel::GLA_MEGA_KERNEL_SOURCE);
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_dequant_gemm::KERNEL_SOURCE);
     // F-1: the IQ-family fused dequant+GEMM kernels (incl.
@@ -161,6 +166,8 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_wmma_gemm"));
         // Q8_0 dequant kernel lives in q4k_dequant::Q8_0_DEQUANT_SOURCE.
         assert!(src.contains("grim_dequant_q8_0"));
+        // GRAVE Phase 4 fused GDN-2 kernel lives in gla_kernels.
+        assert!(src.contains("grim_gla_state_update_output"));
     }
 
     #[test]

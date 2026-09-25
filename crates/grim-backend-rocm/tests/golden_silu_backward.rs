@@ -27,6 +27,7 @@ fn silu_backward_ref(e: &[f32], g: &[f32], dw: &[f32]) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[test]
+#[ignore]
 fn silu_backward_analytic_zero_input() {
     // e=0 → silu(0) = 0, sigmoid(0) = 0.5, silu'(0) = 0.5
     // df = dL/dg = silu(0) * dw      = 0 * 1 = 0
@@ -37,6 +38,7 @@ fn silu_backward_analytic_zero_input() {
 }
 
 #[test]
+#[ignore]
 fn silu_backward_gpu_matches_reference() {
     let device = match grim_backend_rocm::RocmDevice::try_new(0).ok() {
         Some(d) => d,

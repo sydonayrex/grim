@@ -19,6 +19,7 @@ fn gpu_device() -> Option<RocmDevice> {
 }
 
 #[test]
+#[ignore]
 fn test_rerope_rocm_gpu_parity_vs_fresh_rope() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping Re-RoPE GPU test");

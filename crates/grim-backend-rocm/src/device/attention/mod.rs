@@ -1,10 +1,6 @@
 //! Module root: the `AttentionOps` trait impl plus bare-impl launchers grouped
 //! by kernel family (RoPE, flash decode, paged attention).
 
-
-
-
-
 mod attention_ops;
 mod flash_decode;
 mod paged_attention;
@@ -21,8 +17,8 @@ pub use rope::*;
 
 #[cfg(test)]
 mod attention_dispatch_selection_tests {
+    use crate::as_rocm;
     use crate::device::roc_device::RocmDevice;
-    use crate::{as_rocm};
     use grim_tensor::Shape;
     use grim_tensor::backend::BackendStorage;
 
@@ -65,9 +61,7 @@ mod attention_dispatch_selection_tests {
         let k = as_rocm(kb.as_ref()).expect("rocm storage");
         let v = as_rocm(vb.as_ref()).expect("rocm storage");
         let o = as_rocm(ob.as_ref()).expect("rocm storage");
-        let split = |kv: usize| {
-            dev.flash_decode_split_count(q, k, v, o, 8, 8, 64, kv)
-        };
+        let split = |kv: usize| dev.flash_decode_split_count(q, k, v, o, 8, 8, 64, kv);
         assert_eq!(split(100), 2, "kv_len=100 -> clamp(0,2,64)=2");
         assert_eq!(split(1024), 4, "kv_len=1024 -> 1024/256 = 4");
         assert_eq!(split(1 << 20), 64, "kv_len=1M -> clamp saturates at 64");
@@ -111,4 +105,3 @@ mod attention_dispatch_selection_tests {
         assert_eq!(called, 0);
     }
 }
-

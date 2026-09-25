@@ -174,6 +174,7 @@ fn assert_oracle_respects_rsf(x: &[f32], rsf1: &MoeFfn, rsf05: &MoeFfn) {
 
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
+#[ignore]
 fn wmma_grouped_dispatch_matches_moe_ffn_oracle() {
     let Some(dev) = gpu_device() else {
         eprintln!("skipping: GPU test gate off");

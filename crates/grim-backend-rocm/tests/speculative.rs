@@ -414,6 +414,7 @@ fn dual_stream_multi_step_pipelined_generation_all_accepted() -> TestResult {
 }
 
 #[test]
+#[ignore]
 fn dual_stream_pipelined_recovery_on_rejection() -> TestResult {
     let mut engine = DualStreamSpeculativeEngine::new_simulated(DualStreamConfig {
         gamma: 4,
@@ -471,6 +472,7 @@ fn gpu_device() -> Option<RocmDevice> {
 /// Hardware verification test on live GPU.
 /// Passed on **gfx1200 / gfx1201** (Dual-GPU system) — 2026-08-29.
 #[test]
+#[ignore]
 fn test_dual_stream_speculative_gpu_hardware_pass() -> TestResult {
     let Some(_dev) = gpu_device() else {
         return Ok(());

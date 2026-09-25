@@ -407,28 +407,57 @@ fn p2_charon_backward_device_verifier() {
     // ────────────────────────────────────────────────────────────────────────
     let recompute_grads = dev
         .charon_grouped_backward_roundtrip_stashed(
-            &fw.x, &gw_flat, &uw_flat, &dw_flat, &dy, &assignment,
-            BATCH, HIDDEN, INTER, RSF, false,
+            &fw.x,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &dy,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            RSF,
+            false,
         )
         .expect("recompute roundtrip")
         .to_cpu()
         .expect("recompute readback");
     let stashed_grads = dev
         .charon_grouped_backward_roundtrip_stashed(
-            &fw.x, &gw_flat, &uw_flat, &dw_flat, &dy, &assignment,
-            BATCH, HIDDEN, INTER, RSF, true,
+            &fw.x,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &dy,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            RSF,
+            true,
         )
         .expect("stashed roundtrip")
         .to_cpu()
         .expect("stashed readback");
     let stash_tol = 1e-5f32;
     for (name, re, st) in [
-        ("d_gate_w", &recompute_grads.d_gate_w, &stashed_grads.d_gate_w),
+        (
+            "d_gate_w",
+            &recompute_grads.d_gate_w,
+            &stashed_grads.d_gate_w,
+        ),
         ("d_up_w", &recompute_grads.d_up_w, &stashed_grads.d_up_w),
-        ("d_down_w", &recompute_grads.d_down_w, &stashed_grads.d_down_w),
+        (
+            "d_down_w",
+            &recompute_grads.d_down_w,
+            &stashed_grads.d_down_w,
+        ),
         ("d_x", &recompute_grads.d_x, &stashed_grads.d_x),
     ] {
-        let max_diff = re.iter().zip(st.iter()).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        let max_diff = re
+            .iter()
+            .zip(st.iter())
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
         eprintln!("stash-vs-recompute {name}: max_abs_diff = {max_diff:.2e} (tol={stash_tol:.0e})");
         assert!(
             max_diff <= stash_tol,
@@ -460,8 +489,14 @@ fn p2_charon_backward_device_verifier() {
         "\n--- Charon MoE Backward Step Time Benchmark ({} iterations) ---",
         iters
     );
-    eprintln!("Before (recompute h_gate/h_up): {:.2} µs / step", recompute_us_per_step);
-    eprintln!("After  (stashed activations):   {:.2} µs / step", stashed_us_per_step);
+    eprintln!(
+        "Before (recompute h_gate/h_up): {:.2} µs / step",
+        recompute_us_per_step
+    );
+    eprintln!(
+        "After  (stashed activations):   {:.2} µs / step",
+        stashed_us_per_step
+    );
     if stashed_us_per_step < recompute_us_per_step {
         eprintln!(
             "Speedup: {:.2}x faster ({:.1}% step time reduction)",
@@ -492,9 +527,15 @@ fn p2_charon_backward_benchmark_realistic() {
     };
 
     let x: Vec<f32> = (0..batch * hidden).map(|_| next_f32()).collect();
-    let gw: Vec<f32> = (0..num_experts * inter * hidden).map(|_| next_f32()).collect();
-    let uw: Vec<f32> = (0..num_experts * inter * hidden).map(|_| next_f32()).collect();
-    let dw: Vec<f32> = (0..num_experts * hidden * inter).map(|_| next_f32()).collect();
+    let gw: Vec<f32> = (0..num_experts * inter * hidden)
+        .map(|_| next_f32())
+        .collect();
+    let uw: Vec<f32> = (0..num_experts * inter * hidden)
+        .map(|_| next_f32())
+        .collect();
+    let dw: Vec<f32> = (0..num_experts * hidden * inter)
+        .map(|_| next_f32())
+        .collect();
     let dy: Vec<f32> = (0..batch * hidden).map(|_| next_f32()).collect();
 
     // Balanced routing: 4 tokens per expert
@@ -533,8 +574,14 @@ fn p2_charon_backward_benchmark_realistic() {
         "\n--- Realistic MoE Layer Backward Benchmark (batch={}, hidden={}, inter={}, iters={}) ---",
         batch, hidden, inter, iters
     );
-    eprintln!("Before (recompute h_gate/h_up): {:.2} ms / step", recompute_us / 1000.0);
-    eprintln!("After  (stashed activations):   {:.2} ms / step", stashed_us / 1000.0);
+    eprintln!(
+        "Before (recompute h_gate/h_up): {:.2} ms / step",
+        recompute_us / 1000.0
+    );
+    eprintln!(
+        "After  (stashed activations):   {:.2} ms / step",
+        stashed_us / 1000.0
+    );
     if stashed_us < recompute_us {
         eprintln!(
             "Speedup: {:.2}x faster ({:.1}% step time reduction)",

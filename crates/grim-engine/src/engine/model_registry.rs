@@ -24,7 +24,11 @@ impl Engine {
             .unwrap_or(128256);
         // ponytail: UniformMarkovHead ignores hidden today; pass it through
         // anyway once the head grows a projection.
-        let markov = Arc::new(grim_speculative::UniformMarkovHead::new(vocab, 8, 0xD5_A4_ED_u64));
+        let markov = Arc::new(grim_speculative::UniformMarkovHead::new(
+            vocab,
+            8,
+            0xD5_A4_ED_u64,
+        ));
         let confidence = Arc::new(grim_speculative::EntropyConfidenceHead);
         let scheduler = grim_speculative::ConfidenceScheduler::new(
             grim_speculative::ThroughputProfile::default(),

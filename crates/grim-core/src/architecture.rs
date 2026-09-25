@@ -303,7 +303,7 @@ impl ModelArchitecture {
             "hunyuan-moe" => Self::HunyuanMoe,
             "hunyuan-dense" => Self::HunyuanDense,
             "hunyuan-vl" => Self::HunyuanVl,
-            "lfm2" | "liquid" => Self::Lfm2,
+            "lfm2" | "liquid" | "lfm2grave" => Self::Lfm2,
             "lfm2moe" => Self::Lfm2Moe,
             "dream" => Self::Dream,
             "llada" => Self::Llada,

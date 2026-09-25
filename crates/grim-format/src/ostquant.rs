@@ -28,9 +28,9 @@ impl OstQuantMetadata {
         let val: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| Error::Backend(format!("OSTQuant: invalid config.json: {e}")))?;
 
-        let ost_obj = val
-            .get("ostquant_int4_packed")
-            .ok_or_else(|| Error::Backend("OSTQuant: missing 'ostquant_int4_packed' in config.json".into()))?;
+        let ost_obj = val.get("ostquant_int4_packed").ok_or_else(|| {
+            Error::Backend("OSTQuant: missing 'ostquant_int4_packed' in config.json".into())
+        })?;
 
         let group_size = ost_obj
             .get("groupsize")
@@ -158,8 +158,14 @@ pub fn pack_ostquant_native(
     scales: &[u8],
     zeros: &[u8],
 ) -> Result<Vec<u8>> {
-    let out_features = *info.shape.first().ok_or_else(|| Error::Backend("OSTQuant: missing out_features".into()))?;
-    let in_features = *info.shape.get(1).ok_or_else(|| Error::Backend("OSTQuant: missing in_features".into()))?;
+    let out_features = *info
+        .shape
+        .first()
+        .ok_or_else(|| Error::Backend("OSTQuant: missing out_features".into()))?;
+    let in_features = *info
+        .shape
+        .get(1)
+        .ok_or_else(|| Error::Backend("OSTQuant: missing in_features".into()))?;
 
     let qw_expected = out_features * (in_features / 8) * 4;
     let n_groups = in_features.div_ceil(info.group_size);
@@ -169,19 +175,25 @@ pub fn pack_ostquant_native(
     if qweight.len() < qw_expected {
         return Err(Error::Backend(format!(
             "OSTQuant {}: qweight truncated ({} bytes, need {})",
-            info.name, qweight.len(), qw_expected
+            info.name,
+            qweight.len(),
+            qw_expected
         )));
     }
     if scales.len() < sc_expected {
         return Err(Error::Backend(format!(
             "OSTQuant {}: scales truncated ({} bytes, need {})",
-            info.name, scales.len(), sc_expected
+            info.name,
+            scales.len(),
+            sc_expected
         )));
     }
     if zeros.len() < zr_expected {
         return Err(Error::Backend(format!(
             "OSTQuant {}: zeros truncated ({} bytes, need {})",
-            info.name, zeros.len(), zr_expected
+            info.name,
+            zeros.len(),
+            zr_expected
         )));
     }
 

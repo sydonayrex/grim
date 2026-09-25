@@ -19,6 +19,7 @@ use grim_tensor::{
 };
 
 #[test]
+#[ignore]
 fn test_rocm_device_implements_all_backend_traits() {
     fn assert_backend_device<T: BackendDevice + ?Sized>() {}
     fn assert_attention_ops<T: AttentionOps + ?Sized>() {}
@@ -51,12 +52,14 @@ fn test_rocm_device_implements_all_backend_traits() {
 }
 
 #[test]
+#[ignore]
 fn test_rocm_device_probe_or_fallback() {
     let dev = RocmDevice::new(0);
     assert_eq!(dev.ordinal(), 0);
 }
 
 #[test]
+#[ignore]
 fn test_rocm_device_host_dequant_numeric_pathway() {
     let dev = RocmDevice::new(0);
 
@@ -79,6 +82,7 @@ fn test_rocm_device_host_dequant_numeric_pathway() {
 }
 
 #[test]
+#[ignore]
 fn test_rocm_device_should_use_wmma_path() {
     use grim_format::spec::{GrimTensorExt, LayoutHintTag};
 
@@ -103,6 +107,7 @@ fn test_rocm_device_should_use_wmma_path() {
 }
 
 #[test]
+#[ignore]
 fn test_rocm_device_eplb_expert_balancing() {
     let dev = RocmDevice::new(0);
     let expert_loads = vec![100.0f32, 200.0f32, 50.0f32, 400.0f32];

@@ -137,7 +137,10 @@ unsafe extern "C" {
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipErrorT;
     pub fn hipDeviceGetAttribute(value: *mut i32, attribute: i32, device: i32) -> HipErrorT;
     #[allow(non_snake_case)]
-    pub fn hipPointerGetAttributes(attributes: *mut HipPointerAttribute, ptr: *const std::ffi::c_void) -> HipErrorT;
+    pub fn hipPointerGetAttributes(
+        attributes: *mut HipPointerAttribute,
+        ptr: *const std::ffi::c_void,
+    ) -> HipErrorT;
     pub fn hipMemAdvise(devPtr: *const c_void, count: usize, advice: i32, device: i32)
     -> HipErrorT;
 
@@ -265,7 +268,12 @@ pub unsafe fn hipMemcpy(
     kind: HipMemcpyKind,
 ) -> HipErrorT {
     if std::env::var("GRIM_HIP_TRACE").is_ok() {
-        eprintln!("[hipMemcpy-trace] bytes={} kind={:?}\n{:?}", count, kind, std::backtrace::Backtrace::capture());
+        eprintln!(
+            "[hipMemcpy-trace] bytes={} kind={:?}\n{:?}",
+            count,
+            kind,
+            std::backtrace::Backtrace::capture()
+        );
     }
     unsafe { raw_hipMemcpy(dst, src, count, kind) }
 }
@@ -282,7 +290,10 @@ pub unsafe fn hipMemcpy(
 #[allow(non_snake_case)]
 pub unsafe fn hipDeviceSynchronize() -> HipErrorT {
     if std::env::var("GRIM_HIP_TRACE").is_ok() {
-        eprintln!("[hipDeviceSync-trace]\n{:?}", std::backtrace::Backtrace::capture());
+        eprintln!(
+            "[hipDeviceSync-trace]\n{:?}",
+            std::backtrace::Backtrace::capture()
+        );
     }
     unsafe { raw_hipDeviceSynchronize() }
 }

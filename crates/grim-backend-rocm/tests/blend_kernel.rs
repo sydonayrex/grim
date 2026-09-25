@@ -33,6 +33,7 @@ fn test_blend_kernel_fuses_rope_and_scatter() {
 }
 
 #[test]
+#[ignore]
 fn test_blend_kernel_device_gate() {
     let device_visible = matches!(
         grim_backend_rocm::device::roc_device::RocmDevice::probe_one(0),

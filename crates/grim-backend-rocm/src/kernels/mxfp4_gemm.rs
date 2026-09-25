@@ -84,7 +84,8 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
     const float* __restrict__ inv_freq,  // optional YaRN inv_freq[rotary_half]; null => plain theta
     float mscale,                         // YaRN attention_factor applied to sin/cos; 1.0 = none
     float eps,
-    int max_seq_len
+    int max_seq_len,
+    int rope_interleaved
 ) {
     const int row = blockIdx.x; // token index in batch/seq (0..M-1)
     const int col = blockIdx.y * blockDim.x + threadIdx.x; // output feature index
@@ -154,8 +155,9 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
 
         float q_val = acc;
         if (d < rotary_dim) {
-            int pair_idx = d / 2;
-            int is_odd = d % 2;
+            int rot_half = rotary_dim / 2;
+            int pair_idx = rope_interleaved ? (d / 2) : (d % rot_half);
+            int is_second = rope_interleaved ? (d % 2) : (d >= rot_half);
             float freq = (inv_freq != nullptr)
                 ? inv_freq[pair_idx]
                 : 1.0f / powf(rope_theta, (float)(2 * pair_idx) / (float)rotary_dim);
@@ -165,11 +167,22 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
             cos_a *= mscale;
             sin_a *= mscale;
 
-            // Partner GEMM result lives in the adjacent lane (col ^ 1); both lanes of a
-            // RoPE pair are in the same warp, so one shuffle replaces the full partner-column dot-product recompute.
-            float partner_acc = __shfl_xor(acc, 1, warpSize);
+            float partner_acc;
+            if (rope_interleaved) {
+                // Partner GEMM result lives in the adjacent lane (col ^ 1); both lanes of a
+                // RoPE pair are in the same warp, so one shuffle replaces the full partner-column dot-product recompute.
+                partner_acc = __shfl_xor(acc, 1, warpSize);
+            } else {
+                // Half-split (NeoX): partner column is +/- rot_half within the same head.
+                // blockDim.x == head_dim == 64, so the partner lane is inside this block:
+                // exchange the accumulators through shared memory instead of a shuffle.
+                int partner_d = (d < rot_half) ? (d + rot_half) : (d - rot_half);
+                s_sum[threadIdx.x] = acc;
+                __syncthreads();
+                partner_acc = s_sum[(threadIdx.x - d) + partner_d];
+            }
 
-            if (is_odd) {
+            if (is_second) {
                 q_val = partner_acc * sin_a + acc * cos_a;
             } else {
                 q_val = acc * cos_a - partner_acc * sin_a;
@@ -185,8 +198,9 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
 
         float k_val = acc;
         if (d < rotary_dim) {
-            int pair_idx = d / 2;
-            int is_odd = d % 2;
+            int rot_half = rotary_dim / 2;
+            int pair_idx = rope_interleaved ? (d / 2) : (d % rot_half);
+            int is_second = rope_interleaved ? (d % 2) : (d >= rot_half);
             float freq = (inv_freq != nullptr)
                 ? inv_freq[pair_idx]
                 : 1.0f / powf(rope_theta, (float)(2 * pair_idx) / (float)rotary_dim);
@@ -196,9 +210,17 @@ grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
             cos_a *= mscale;
             sin_a *= mscale;
 
-            float partner_acc = __shfl_xor(acc, 1, warpSize);
+            float partner_acc;
+            if (rope_interleaved) {
+                partner_acc = __shfl_xor(acc, 1, warpSize);
+            } else {
+                int partner_d = (d < rot_half) ? (d + rot_half) : (d - rot_half);
+                s_sum[threadIdx.x] = acc;
+                __syncthreads();
+                partner_acc = s_sum[(threadIdx.x - d) + partner_d];
+            }
 
-            if (is_odd) {
+            if (is_second) {
                 k_val = partner_acc * sin_a + acc * cos_a;
             } else {
                 k_val = acc * cos_a - partner_acc * sin_a;
@@ -388,7 +410,7 @@ grim_qk_norm_rope(
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int rotary_dim, float rope_theta,
     const float* __restrict__ inv_freq,    // optional YaRN inv_freq[rotary_half]
-    float mscale, float eps, int max_seq_len
+    float mscale, float eps, int max_seq_len, int rope_interleaved
 ) {
     int N_k = num_kv_heads * head_dim;
     int N_q = num_q_heads * head_dim;
@@ -412,7 +434,8 @@ grim_qk_norm_rope(
         }
         float rms = rsqrtf(ss / (float)head_dim + eps);
         for (int i = 0; i < (rotary_dim / 2); ++i) {
-            int d0 = 2 * i, d1 = 2 * i + 1;
+            int d0 = rope_interleaved ? 2 * i : i;
+            int d1 = rope_interleaved ? 2 * i + 1 : i + (rotary_dim / 2);
             float v0 = gemm_out[base + d0] * rms * gamma_q[d0];
             float v1 = gemm_out[base + d1] * rms * gamma_q[d1];
             float freq = (inv_freq != nullptr)
@@ -443,7 +466,8 @@ grim_qk_norm_rope(
         }
         float rms = rsqrtf(ss / (float)head_dim + eps);
         for (int i = 0; i < (rotary_dim / 2); ++i) {
-            int d0 = 2 * i, d1 = 2 * i + 1;
+            int d0 = rope_interleaved ? 2 * i : i;
+            int d1 = rope_interleaved ? 2 * i + 1 : i + (rotary_dim / 2);
             float v0 = gemm_out[base + d0] * rms * gamma_k[d0];
             float v1 = gemm_out[base + d1] * rms * gamma_k[d1];
             float freq = (inv_freq != nullptr)

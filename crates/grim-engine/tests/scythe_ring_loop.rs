@@ -109,9 +109,9 @@ fn ring_norm_then_gemm_chain_matches_host_reference() {
             .collect();
         for (j, cell) in want[r * n..(r + 1) * n].iter_mut().enumerate() {
             let mut acc = 0f32;
-                for p in 0..k {
-                    acc += normed[p] * g_data[p * n + j];
-                }
+            for p in 0..k {
+                acc += normed[p] * g_data[p * n + j];
+            }
             *cell = acc;
         }
     }

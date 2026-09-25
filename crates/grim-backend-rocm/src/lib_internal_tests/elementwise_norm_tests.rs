@@ -5,7 +5,7 @@ use super::common::approx_eq;
 mod tests {
     use super::*;
     use crate::*;
-    use grim_tensor::error::{ Result };
+    use grim_tensor::error::Result;
 
     const GPU_TEST_ENV: &str = "GRIM_GPU_TEST";
 
@@ -392,5 +392,4 @@ mod tests {
             assert_eq!(out, vec![50.0, 60.0, 10.0, 20.0]);
         }
     }
-
 }

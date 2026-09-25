@@ -817,13 +817,7 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             let scales = read_segment(&raw.bytes, &mut cursor)?;
             let zeros = read_segment(&raw.bytes, &mut cursor)?;
 
-            grim_quant::dequant_ostquant_w4a4(
-                &qweight,
-                &scales,
-                &zeros,
-                &raw.shape,
-                cfg.group_size,
-            )
+            grim_quant::dequant_ostquant_w4a4(&qweight, &scales, &zeros, &raw.shape, cfg.group_size)
         }
         Storage::CompressedTensorsW8A8Int8 | Storage::CompressedTensorsW8A8Fp8 => {
             // These W8A8 formats are resident-capable on ROCm/CUDA and reach the

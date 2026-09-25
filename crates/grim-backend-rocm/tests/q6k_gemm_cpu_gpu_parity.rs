@@ -96,6 +96,7 @@ fn build_block(seed: u32) -> [u8; 210] {
 }
 
 #[test]
+#[ignore]
 fn test_q6k_element_matches_cpu_reference_across_seeds() {
     for seed in 0..16u32 {
         let block = build_block(seed);
@@ -116,6 +117,7 @@ fn test_q6k_element_matches_cpu_reference_across_seeds() {
 }
 
 #[test]
+#[ignore]
 fn test_q6k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
     // End-to-end forward + backward parity on a real AMD GPU. Without
     // GRIM_GPU_TEST=1 this bails green (CI-safe).

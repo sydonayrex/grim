@@ -10,7 +10,6 @@ use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 // GPU fallback guard
 
-
 // Config
 
 /// Configuration for Kimi-K3 architecture.
@@ -501,7 +500,8 @@ impl KimiK3Moe {
         }
         let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
 
-        let routings = crate::shared_moe::route_topk(logits_v, self.experts.len(), self.num_experts_per_tok)?;
+        let routings =
+            crate::shared_moe::route_topk(logits_v, self.experts.len(), self.num_experts_per_tok)?;
 
         let experts: Vec<crate::shared_moe::MoeExpert> = self
             .experts

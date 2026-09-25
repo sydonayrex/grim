@@ -21,7 +21,7 @@ use std::path::Path;
 
 use grim_core::error::{Error, Result};
 use grim_kvquant::channel_importance::{
-    ChannelImportanceComputer, ChannelImportanceScores, CHANNEL_GROUP_SIZE,
+    CHANNEL_GROUP_SIZE, ChannelImportanceComputer, ChannelImportanceScores,
 };
 
 /// Built-in calibration prompts (short, varied register).
@@ -79,12 +79,13 @@ fn run_synthetic(args: &CalibrateChannelsArgs) -> Result<ChannelImportanceScores
         for h in 0..args.kv_heads {
             let base = h * args.head_dim;
             for d in 0..args.head_dim {
-                k_buf[base + d] =
-                    ((d as f32 * 0.3 + seed).sin() + (d as f32 * 0.05).cos()) * 0.5;
+                k_buf[base + d] = ((d as f32 * 0.3 + seed).sin() + (d as f32 * 0.05).cos()) * 0.5;
                 v_buf[base + d] = (d as f32 * 0.2 + seed * 1.5).cos() * 0.5;
             }
         }
-        computer.update_kv(&k_buf, &v_buf, 1).map_err(Error::Config)?;
+        computer
+            .update_kv(&k_buf, &v_buf, 1)
+            .map_err(Error::Config)?;
     }
     Ok(computer.finish())
 }
@@ -112,11 +113,20 @@ fn run_model_calibration(
     let device = grim_tensor::Device::Cpu;
     let lc = resolved.to_string_lossy().to_lowercase();
     let model: Box<dyn CausalLm> = if lc.ends_with(".gguf") {
-        grim_engine::model_loader::load_model_from_gguf(&resolved.to_string_lossy(), device.clone())?
+        grim_engine::model_loader::load_model_from_gguf(
+            &resolved.to_string_lossy(),
+            device.clone(),
+        )?
     } else if lc.ends_with(".grim") {
-        grim_engine::model_loader::load_model_from_grim(&resolved.to_string_lossy(), device.clone())?
+        grim_engine::model_loader::load_model_from_grim(
+            &resolved.to_string_lossy(),
+            device.clone(),
+        )?
     } else if lc.ends_with(".safetensors") || lc.ends_with(".bin") {
-        grim_engine::model_loader::load_model_from_safetensors(&resolved.to_string_lossy(), device.clone())?
+        grim_engine::model_loader::load_model_from_safetensors(
+            &resolved.to_string_lossy(),
+            device.clone(),
+        )?
     } else {
         return Err(Error::Config(format!(
             "unsupported model extension for {lc} (want .gguf/.grim/.safetensors)"
@@ -136,7 +146,10 @@ fn run_model_calibration(
     let num_layers = model
         .num_layers_hint()
         .ok_or_else(|| Error::Config("model does not report num_layers_hint".into()))?;
-    println!("  layers: {num_layers}  kv_heads: {}  head_dim: {}", args.kv_heads, args.head_dim);
+    println!(
+        "  layers: {num_layers}  kv_heads: {}  head_dim: {}",
+        args.kv_heads, args.head_dim
+    );
 
     // Tokenizer comes from the model file (GGUF metadata) when available;
     // otherwise fall back to a deterministic char-order proxy so the code path
@@ -217,11 +230,13 @@ fn run_model_calibration(
             if k_all.len() < c.past_len * row_elems || v_all.len() < c.past_len * row_elems {
                 continue;
             }
-            computers[layer].update_kv(
-                &k_all[..c.past_len * row_elems],
-                &v_all[..c.past_len * row_elems],
-                c.past_len,
-            ).map_err(Error::Config)?;
+            computers[layer]
+                .update_kv(
+                    &k_all[..c.past_len * row_elems],
+                    &v_all[..c.past_len * row_elems],
+                    c.past_len,
+                )
+                .map_err(Error::Config)?;
         }
     }
     if total_rows == 0 {
@@ -229,7 +244,10 @@ fn run_model_calibration(
     }
 
     println!("  rows captured: {total_rows}");
-    Ok(computers.into_iter().map(ChannelImportanceComputer::finish).collect())
+    Ok(computers
+        .into_iter()
+        .map(ChannelImportanceComputer::finish)
+        .collect())
 }
 
 fn write_sidecar(
@@ -280,8 +298,8 @@ fn write_sidecar(
                 .map_err(|e| Error::Config(format!("create {}: {e}", parent.display())))?;
         }
     }
-    let mut f = File::create(&out_path)
-        .map_err(|e| Error::Config(format!("create {out_path}: {e}")))?;
+    let mut f =
+        File::create(&out_path).map_err(|e| Error::Config(format!("create {out_path}: {e}")))?;
     f.write_all(json.as_bytes())
         .map_err(|e| Error::Config(format!("write {out_path}: {e}")))?;
     println!("Calibration written: {out_path}");

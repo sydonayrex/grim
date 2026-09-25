@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::*;
-    use grim_tensor::error::{ Error };
+    use grim_tensor::error::Error;
 
     #[test]
     fn dtype_byte_size_layout() {
@@ -228,5 +228,4 @@ mod tests {
             let _ = dev.device_accumulate(&[storage], 0, &bf16_dt);
         }
     }
-
 }

@@ -234,11 +234,7 @@ pub fn arena_append(
         tokens_this_step * row_elems,
     )?;
     arena.tokens = total;
-    Ok((
-        k_arena.clone(),
-        v_arena.clone(),
-        total,
-    ))
+    Ok((k_arena.clone(), v_arena.clone(), total))
 }
 
 #[cfg(test)]

@@ -29,7 +29,9 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.2
         })
         .collect()
@@ -84,18 +86,26 @@ fn test_dbrx_real_routing_gpu_vs_cpu_parity() {
     let top_k = 2usize;
 
     let router_w = rand_vec(hidden * num_experts, 7);
-    let w1_ws: Vec<Vec<f32>> = (0..num_experts).map(|i| rand_vec(inter * hidden, 300 + i as u64)).collect();
-    let v1_ws: Vec<Vec<f32>> = (0..num_experts).map(|i| rand_vec(inter * hidden, 400 + i as u64)).collect();
-    let w2_ws: Vec<Vec<f32>> = (0..num_experts).map(|i| rand_vec(hidden * inter, 500 + i as u64)).collect();
+    let w1_ws: Vec<Vec<f32>> = (0..num_experts)
+        .map(|i| rand_vec(inter * hidden, 300 + i as u64))
+        .collect();
+    let v1_ws: Vec<Vec<f32>> = (0..num_experts)
+        .map(|i| rand_vec(inter * hidden, 400 + i as u64))
+        .collect();
+    let w2_ws: Vec<Vec<f32>> = (0..num_experts)
+        .map(|i| rand_vec(hidden * inter, 500 + i as u64))
+        .collect();
     let x_data = rand_vec(seq * hidden, 99);
 
-    use grim_models_transformer::shared_moe::{fused_moe_dispatch_from_logits, CharonCache, MoeExpert};
+    use grim_models_transformer::shared_moe::{
+        CharonCache, MoeExpert, fused_moe_dispatch_from_logits,
+    };
 
     let cache = CharonCache::new();
     let experts_gpu: Vec<MoeExpert> = (0..num_experts)
         .map(|i| MoeExpert {
             gate: make_linear_rocm(&dev, w1_ws[i].clone(), inter, hidden),
-            up:   make_linear_rocm(&dev, v1_ws[i].clone(), inter, hidden),
+            up: make_linear_rocm(&dev, v1_ws[i].clone(), inter, hidden),
             down: make_linear_rocm(&dev, w2_ws[i].clone(), hidden, inter),
         })
         .collect();
@@ -132,7 +142,10 @@ fn test_dbrx_real_routing_gpu_vs_cpu_parity() {
         let mut idx: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
         idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let topk = &idx[..top_k];
-        let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+        let max_l = topk
+            .iter()
+            .map(|(_, l)| *l)
+            .fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
         let sum: f32 = exps.iter().sum();
         let ws: Vec<f32> = exps.iter().map(|e| e / (sum + 1e-12)).collect();
@@ -145,27 +158,44 @@ fn test_dbrx_real_routing_gpu_vs_cpu_parity() {
             let w2 = &w2_ws[*ei];
             let mut g = vec![0.0f32; inter];
             for r in 0..inter {
-                for c in 0..hidden { g[r] += w1[r * hidden + c] * token_x[c]; }
+                for c in 0..hidden {
+                    g[r] += w1[r * hidden + c] * token_x[c];
+                }
             }
             let mut u = vec![0.0f32; inter];
             for r in 0..inter {
-                for c in 0..hidden { u[r] += v1[r * hidden + c] * token_x[c]; }
+                for c in 0..hidden {
+                    u[r] += v1[r * hidden + c] * token_x[c];
+                }
             }
-            let act: Vec<f32> = g.iter().zip(u.iter()).map(|(gi, ui)| {
-                let sig = 1.0 / (1.0 + (-gi).exp());
-                gi * sig * ui
-            }).collect();
+            let act: Vec<f32> = g
+                .iter()
+                .zip(u.iter())
+                .map(|(gi, ui)| {
+                    let sig = 1.0 / (1.0 + (-gi).exp());
+                    gi * sig * ui
+                })
+                .collect();
             for r in 0..hidden {
                 let mut v = 0.0f32;
-                for c in 0..inter { v += w2[r * inter + c] * act[c]; }
+                for c in 0..inter {
+                    v += w2[r * inter + c] * act[c];
+                }
                 out_cpu[s * hidden + r] += w * v;
             }
         }
     }
 
     assert_eq!(out_gpu.len(), out_cpu.len());
-    let max_diff = out_gpu.iter().zip(out_cpu.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < 1e-3, "DBRX real-routing GPU vs CPU max diff {max_diff:.6} exceeds 1e-3");
+    let max_diff = out_gpu
+        .iter()
+        .zip(out_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-3,
+        "DBRX real-routing GPU vs CPU max diff {max_diff:.6} exceeds 1e-3"
+    );
     eprintln!("DBRX real-routing parity OK  max_diff={max_diff:.2e}");
 }
 
@@ -188,11 +218,15 @@ fn test_glm52_gelu_gpu_vs_cpu_parity() {
     let top_k = 2usize;
 
     let gate_w = rand_vec(num_experts * hidden, 1);
-    let proj_ws: Vec<Vec<f32>> = (0..num_experts).map(|i| rand_vec(inter * hidden, 100 + i as u64)).collect();
-    let down_ws: Vec<Vec<f32>> = (0..num_experts).map(|i| rand_vec(hidden * inter, 200 + i as u64)).collect();
+    let proj_ws: Vec<Vec<f32>> = (0..num_experts)
+        .map(|i| rand_vec(inter * hidden, 100 + i as u64))
+        .collect();
+    let down_ws: Vec<Vec<f32>> = (0..num_experts)
+        .map(|i| rand_vec(hidden * inter, 200 + i as u64))
+        .collect();
     let x_data = rand_vec(seq * hidden, 42);
 
-    use grim_models_transformer::shared_moe::{gelu_charon_dispatch, CharonCache, TokenRouting};
+    use grim_models_transformer::shared_moe::{CharonCache, TokenRouting, gelu_charon_dispatch};
 
     // ── GPU: compute router logits CPU-side then build routings ──
     let gate_cpu = make_linear_cpu(gate_w.clone(), num_experts, hidden);
@@ -205,10 +239,18 @@ fn test_glm52_gelu_gpu_vs_cpu_parity() {
         let mut idx: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
         idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let topk = &idx[..top_k];
-        let max_l = topk.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+        let max_l = topk
+            .iter()
+            .map(|(_, l)| *l)
+            .fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = topk.iter().map(|(_, l)| (l - max_l).exp()).collect();
         let sum: f32 = exps.iter().sum();
-        routings.push(topk.iter().zip(exps.iter()).map(|((ei, _), e)| (*ei, e / (sum + 1e-12))).collect());
+        routings.push(
+            topk.iter()
+                .zip(exps.iter())
+                .map(|((ei, _), e)| (*ei, e / (sum + 1e-12)))
+                .collect(),
+        );
     }
 
     // Build GPU tensors for gate/down weights.
@@ -224,19 +266,12 @@ fn test_glm52_gelu_gpu_vs_cpu_parity() {
     let x_gpu = rocm_tensor(&dev, x_data.clone(), Shape::new(vec![seq, hidden]));
     let cache = CharonCache::new();
 
-    let out_gpu = gelu_charon_dispatch(
-        &dev,
-        &x_gpu,
-        &gate_refs,
-        &down_refs,
-        &routings,
-        1.0,
-        &cache,
-    )
-    .unwrap()
-    .expect("expected GELU GPU dispatch to return Some")
-    .to_vec_f32()
-    .unwrap();
+    let out_gpu =
+        gelu_charon_dispatch(&dev, &x_gpu, &gate_refs, &down_refs, &routings, 1.0, &cache)
+            .unwrap()
+            .expect("expected GELU GPU dispatch to return Some")
+            .to_vec_f32()
+            .unwrap();
 
     // ── CPU reference: GELU loop ──
     let xv = x_data.clone();
@@ -249,23 +284,35 @@ fn test_glm52_gelu_gpu_vs_cpu_parity() {
             // proj = dense_h_to_4h: [inter, hidden] @ [hidden]
             let mut h = vec![0.0f32; inter];
             for r in 0..inter {
-                for c in 0..hidden { h[r] += pw[r * hidden + c] * token_x[c]; }
+                for c in 0..hidden {
+                    h[r] += pw[r * hidden + c] * token_x[c];
+                }
             }
             // GELU tanh approx
-            let gelu: Vec<f32> = h.iter().map(|&v| {
-                0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v.powi(3))).tanh())
-            }).collect();
+            let gelu: Vec<f32> = h
+                .iter()
+                .map(|&v| 0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v.powi(3))).tanh()))
+                .collect();
             // down = dense_4h_to_h: [hidden, inter] @ [inter]
             for r in 0..hidden {
                 let mut v = 0.0f32;
-                for c in 0..inter { v += dw[r * inter + c] * gelu[c]; }
+                for c in 0..inter {
+                    v += dw[r * inter + c] * gelu[c];
+                }
                 out_cpu[s * hidden + r] += w * v;
             }
         }
     }
 
     assert_eq!(out_gpu.len(), out_cpu.len());
-    let max_diff = out_gpu.iter().zip(out_cpu.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < 1e-3, "GLM-5.2 GELU GPU vs CPU max diff {max_diff:.6} exceeds 1e-3");
+    let max_diff = out_gpu
+        .iter()
+        .zip(out_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-3,
+        "GLM-5.2 GELU GPU vs CPU max diff {max_diff:.6} exceeds 1e-3"
+    );
     eprintln!("GLM-5.2 GELU parity OK  max_diff={max_diff:.2e}");
 }

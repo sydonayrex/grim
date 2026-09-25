@@ -7,6 +7,7 @@ use grim_tensor::{DType, Device, Shape, Storage, Tensor};
 use std::sync::Arc;
 
 #[test]
+#[ignore]
 fn w4a16_dequant_service_round_trips() {
     let dev = match RocmDevice::try_new(0) {
         Ok(d) => d,

@@ -140,11 +140,14 @@ impl GraniteMoeBlock {
         let router_logits = self.gate.forward(x)?;
 
         if x.device() != &Device::Cpu {
-            let shared_exp = self.shared_expert.as_ref().map(|s| crate::shared_moe::MoeExpert {
-                gate: s.gate_proj.clone(),
-                up: s.up_proj.clone(),
-                down: s.down_proj.clone(),
-            });
+            let shared_exp = self
+                .shared_expert
+                .as_ref()
+                .map(|s| crate::shared_moe::MoeExpert {
+                    gate: s.gate_proj.clone(),
+                    up: s.up_proj.clone(),
+                    down: s.down_proj.clone(),
+                });
             let moe_experts: Vec<crate::shared_moe::MoeExpert> = self
                 .experts
                 .iter()
@@ -185,7 +188,8 @@ impl GraniteMoeBlock {
                         Some(a) => grim_nn::modules::axpy_on_device(&a, weight, &e_out)?,
                         None => {
                             let dev = grim_nn::modules::pick_device_for_tensor(&e_out);
-                            let (scaled_st, _) = dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
+                            let (scaled_st, _) =
+                                dev.mul_scalar(&**e_out.storage(), weight, e_out.shape())?;
                             Tensor::new(
                                 std::sync::Arc::from(scaled_st),
                                 e_out.shape().clone(),
@@ -321,13 +325,15 @@ impl GraniteMoeHybridBlock {
         let attn_proj = self.wo.forward(&attn_tensor)?;
 
         // Residual 1: res1 = x + residual_multiplier * attn_proj directly on-device
-        let res1_tensor = grim_nn::modules::axpy_on_device(x, self.residual_multiplier, &attn_proj)?;
+        let res1_tensor =
+            grim_nn::modules::axpy_on_device(x, self.residual_multiplier, &attn_proj)?;
 
         let normed_ffn = self.post_attention_layernorm.forward(&res1_tensor)?;
         let moe_out = self.moe.forward(&normed_ffn)?;
 
         // Residual 2: res2 = res1 + residual_multiplier * moe_out directly on-device
-        let res2_tensor = grim_nn::modules::axpy_on_device(&res1_tensor, self.residual_multiplier, &moe_out)?;
+        let res2_tensor =
+            grim_nn::modules::axpy_on_device(&res1_tensor, self.residual_multiplier, &moe_out)?;
 
         Ok(res2_tensor)
     }

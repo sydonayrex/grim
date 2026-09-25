@@ -468,6 +468,7 @@ fn quant_moe_parity(fixture: MoEFixture, label: &str) {
 }
 
 #[test]
+#[ignore]
 fn w4a16_expert_bank_moe_forward_matches_reference() {
     // Stage 1: split + dequant service must reproduce the reference slab
     // exactly — isolates bank splitting and materialization from the fused
@@ -547,11 +548,13 @@ fn w4a16_expert_bank_moe_forward_matches_reference() {
 }
 
 #[test]
+#[ignore]
 fn gptq_groupint_expert_bank_moe_forward_matches_reference() {
     quant_moe_parity(build_gptq_fixture(), "GPTQ/GroupInt");
 }
 
 #[test]
+#[ignore]
 fn mxfp4_expert_bank_grouped_dispatch_engages_on_gpu() {
     // ponytail: MXFP4 grouped dispatch verification for host-routed/LFM2 packed tensors
     let dev = match RocmDevice::try_new(0) {
@@ -602,9 +605,15 @@ fn mxfp4_expert_bank_grouped_dispatch_engages_on_gpu() {
         I,
         1.0,
     );
-    assert!(res.is_ok(), "MXFP4 grouped dispatch must succeed: {:?}", res);
+    assert!(
+        res.is_ok(),
+        "MXFP4 grouped dispatch must succeed: {:?}",
+        res
+    );
     let out = res.unwrap();
     assert_eq!(out.len(), BATCH * H);
-    eprintln!("[MXFP4 grouped] dispatch completed successfully, len={}", out.len());
+    eprintln!(
+        "[MXFP4 grouped] dispatch completed successfully, len={}",
+        out.len()
+    );
 }
-

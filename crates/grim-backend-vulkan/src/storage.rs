@@ -7,7 +7,7 @@ use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendStorage, Shape};
 
-use crate::context::{QUEUE_LOCK, global_context};
+use crate::context::{global_context, QUEUE_LOCK};
 use crate::dtype_byte_size;
 use crate::ffi::*;
 

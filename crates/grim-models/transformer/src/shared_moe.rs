@@ -19,8 +19,8 @@
 use std::sync::{Arc, Mutex};
 
 use grim_core::error::Result;
-use grim_nn::modules::silu_mul_on_device;
 use grim_nn::Linear;
+use grim_nn::modules::silu_mul_on_device;
 use grim_tensor::backend::BackendDevice;
 use grim_tensor::{CoreTensorOps, DType, Device, MemoryOps, Shape, Tensor};
 
@@ -180,10 +180,7 @@ impl CharonCache {
     /// dispatch took. Quantized-engagement tests assert `W8a8Native` for
     /// packed-int8 experts to prove the native arm ran.
     pub fn last_dispatch_kind(&self) -> DispatchKind {
-        *self
-            .last_dispatch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        *self.last_dispatch.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn record_dispatch(&self, kind: DispatchKind) {
@@ -323,7 +320,14 @@ pub fn ensure_charon_scratch(
         }
     };
 
-    Ok((tokens_buf, experts_buf, weights_buf, gate_buf, up_buf, down_buf))
+    Ok((
+        tokens_buf,
+        experts_buf,
+        weights_buf,
+        gate_buf,
+        up_buf,
+        down_buf,
+    ))
 }
 
 pub fn fused_moe_dispatch(
@@ -348,7 +352,14 @@ pub fn fused_moe_dispatch(
             return Ok(out);
         }
     }
-    per_expert_loop(dev, x, experts, shared_expert, routings, routed_scaling_factor)
+    per_expert_loop(
+        dev,
+        x,
+        experts,
+        shared_expert,
+        routings,
+        routed_scaling_factor,
+    )
 }
 
 /// Opt-in gate for native quantized arms that trail the f32 dequant path
@@ -506,10 +517,7 @@ pub fn fused_moe_dispatch_from_logits(
                         storage: grim_tensor::Storage::Native,
                     },
                 )?);
-                let weights = Arc::from(rocm.zeros(
-                    &Shape::new(vec![num_pairs]),
-                    DType::F32,
-                )?);
+                let weights = Arc::from(rocm.zeros(&Shape::new(vec![num_pairs]), DType::F32)?);
                 *guard = Some((
                     seq_len,
                     top_k,
@@ -560,11 +568,9 @@ pub fn fused_moe_dispatch_from_logits(
             let mut guard = cache.w8a8.lock().unwrap_or_else(|e| e.into_inner());
             let key = (num_experts, hidden, inter, TAG_W8A8_INT8);
             match guard.as_ref() {
-                Some(r) if r.fingerprint == key => (
-                    Arc::clone(&r.gate),
-                    Arc::clone(&r.up),
-                    Arc::clone(&r.down),
-                ),
+                Some(r) if r.fingerprint == key => {
+                    (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+                }
                 _ => {
                     let (gate_flat, up_flat, down_flat) =
                         stack_w8a8_blobs(experts, num_experts, hidden, inter)?;
@@ -629,8 +635,8 @@ pub fn fused_moe_dispatch_from_logits(
         // sortless kernel is the exact-math fallback. The variant is a
         // perf detail inside one numeric path (both recorded distinctly
         // so tests/benches can tell them apart).
-        let use_dot4 = hidden % 32 == 0
-            && grim_backend_rocm::kernels::charon::dot4_supported(rocm.gcn_arch());
+        let use_dot4 =
+            hidden % 32 == 0 && grim_backend_rocm::kernels::charon::dot4_supported(rocm.gcn_arch());
         let (out_storage, _handle) = if use_dot4 {
             cache.record_dispatch(DispatchKind::W8a8NativeDot4);
             rocm.moe_fused_dispatch_resident_routing_w8a8_int8_dot4(
@@ -686,11 +692,9 @@ pub fn fused_moe_dispatch_from_logits(
             let mut guard = cache.w8a8fp8.lock().unwrap_or_else(|e| e.into_inner());
             let key = (num_experts, hidden, inter, TAG_W8A8_FP8);
             match guard.as_ref() {
-                Some(r) if r.fingerprint == key => (
-                    Arc::clone(&r.gate),
-                    Arc::clone(&r.up),
-                    Arc::clone(&r.down),
-                ),
+                Some(r) if r.fingerprint == key => {
+                    (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+                }
                 _ => {
                     let (gate_flat, up_flat, down_flat) =
                         stack_w8a8_fp8_blobs(experts, num_experts, hidden, inter)?;
@@ -765,26 +769,25 @@ pub fn fused_moe_dispatch_from_logits(
     // banks fall through to the f32 dequant arm (which handles per-tensor
     // configs). Gated by GRIM_MOE_NATIVE_AWQ (bench: 1.7x slower than
     // dequant — per-element unpack under an occupancy-starved launch).
-    if let Some((bits, group_size)) = awq_uniform_config(experts)
-        .filter(|_| native_quant_allowed("awq"))
+    if let Some((bits, group_size)) =
+        awq_uniform_config(experts).filter(|_| native_quant_allowed("awq"))
     {
         let (gate_buf, up_buf, down_buf) = {
             let mut guard = cache.awq.lock().unwrap_or_else(|e| e.into_inner());
             let key = (num_experts, hidden, inter, stack_tag_awq(bits, group_size));
             match guard.as_ref() {
-                Some(r) if r.fingerprint == key => (
-                    Arc::clone(&r.gate),
-                    Arc::clone(&r.up),
-                    Arc::clone(&r.down),
-                ),
+                Some(r) if r.fingerprint == key => {
+                    (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+                }
                 _ => {
                     let (gate_flat, up_flat, down_flat) =
                         stack_awq_blobs(experts, num_experts, hidden, inter, bits, group_size)?;
                     let pack_dtype = || DType {
                         arith: grim_tensor::ArithType::F32,
-                        storage: grim_tensor::Storage::Awq(
-                            grim_tensor::dtype::AwqStorageConfig { bits, group_size },
-                        ),
+                        storage: grim_tensor::Storage::Awq(grim_tensor::dtype::AwqStorageConfig {
+                            bits,
+                            group_size,
+                        }),
                     };
                     let gate = Arc::from(rocm.from_cpu_bytes(
                         &gate_flat,
@@ -877,13 +880,14 @@ pub fn fused_moe_dispatch_from_logits(
                     };
                     // from_cpu_bytes failures propagate as dispatch errors
                     // (loud) — never unwrap into a panic inside serving.
-                    let build = |v: &Vec<u8>| -> Result<Arc<dyn grim_tensor::backend::BackendStorage>> {
-                        Ok(Arc::from(rocm.from_cpu_bytes(
-                            v,
-                            &Shape::new(vec![v.len()]),
-                            pack_dtype(),
-                        )?))
-                    };
+                    let build =
+                        |v: &Vec<u8>| -> Result<Arc<dyn grim_tensor::backend::BackendStorage>> {
+                            Ok(Arc::from(rocm.from_cpu_bytes(
+                                v,
+                                &Shape::new(vec![v.len()]),
+                                pack_dtype(),
+                            )?))
+                        };
                     let cg_b = build(&cg_v)?;
                     let cu_b = build(&cu_v)?;
                     let cd_b = build(&cd_v)?;
@@ -948,11 +952,9 @@ pub fn fused_moe_dispatch_from_logits(
         let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
         let key = (num_experts, hidden, inter, TAG_F32);
         match guard.as_ref() {
-            Some(r) if r.fingerprint == key => (
-                Arc::clone(&r.gate),
-                Arc::clone(&r.up),
-                Arc::clone(&r.down),
-            ),
+            Some(r) if r.fingerprint == key => {
+                (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+            }
             _ => {
                 let (gate_flat, up_flat, down_flat) =
                     stack_expert_weights(experts, num_experts, hidden, inter)?;
@@ -1083,9 +1085,8 @@ fn charon_grouped_dispatch(
         .iter()
         .map(|r| r.iter().map(|(_, w)| *w).collect())
         .collect();
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )?;
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)?;
     if assignment.num_pairs() == 0 {
         // No routed pairs: output belongs to the shared expert alone (or zeros).
         let out = dev.zeros(x.shape(), DType::F32)?;
@@ -1112,11 +1113,9 @@ fn charon_grouped_dispatch(
         let mut guard = cache.resident.lock().unwrap_or_else(|e| e.into_inner());
         let key = (num_experts, hidden, inter, TAG_F32);
         match guard.as_ref() {
-            Some(r) if r.fingerprint == key => (
-                Arc::clone(&r.gate),
-                Arc::clone(&r.up),
-                Arc::clone(&r.down),
-            ),
+            Some(r) if r.fingerprint == key => {
+                (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+            }
             _ => {
                 let (gate_flat, up_flat, down_flat) =
                     stack_expert_weights(experts, num_experts, hidden, inter)?;
@@ -1232,9 +1231,8 @@ pub fn gelu_charon_dispatch(
         .iter()
         .map(|r| r.iter().map(|(_, w)| *w).collect())
         .collect();
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )?;
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)?;
     if assignment.num_pairs() == 0 {
         let out = dev.zeros(x.shape(), DType::F32)?;
         let out_t = Tensor::new(
@@ -1409,10 +1407,7 @@ fn stack_w8a8_blobs(
 /// W8A8-fp8 packed-blob strides, in bytes: `[u64 prefix | fp8 codes |
 /// ONE f32 scale]`. MUST match `grim_moe_fused_dispatch_w8a8_fp8`.
 fn w8a8_fp8_strides(hidden: usize, inter: usize) -> (usize, usize) {
-    (
-        8 + inter * hidden + 4,
-        8 + hidden * inter + 4,
-    )
+    (8 + inter * hidden + 4, 8 + hidden * inter + 4)
 }
 
 /// Native-arm predicate for W8A8-fp8 (mirrors [`experts_use_w8a8_native`]).
@@ -1596,7 +1591,12 @@ fn experts_use_mxfp4_native(experts: &[MoeExpert], hidden: usize, inter: usize) 
 /// Split one framed MXFP4 per-expert blob (`[u64 clen | codes | u64 xlen |
 /// exps]`, as produced by the bank loader) into its `(codes, exps)` parts
 /// with exact length validation.
-fn split_mxfp4_blob(bytes: &[u8], rows: usize, k: usize, label: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+fn split_mxfp4_blob(
+    bytes: &[u8],
+    rows: usize,
+    k: usize,
+    label: &str,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let need_codes = rows * k / 2;
     let need_exps = (rows * k).div_ceil(32);
     if bytes.len() < 8 {
@@ -1683,10 +1683,8 @@ fn stack_expert_weights(
             (&mut down_flat, &e.down),
         ] {
             let w = match lin.weight.device() {
-                Device::Rocm(ord) => {
-                    grim_nn::moe::rocm_dequant_expert_weight(&lin.weight, *ord)
-                        .map_err(grim_core::error::Error::Tensor)?
-                }
+                Device::Rocm(ord) => grim_nn::moe::rocm_dequant_expert_weight(&lin.weight, *ord)
+                    .map_err(grim_core::error::Error::Tensor)?,
                 _ => lin.weight.to_vec_f32()?,
             };
             if w.len() != lin.weight.shape().elem_count() {
@@ -1835,7 +1833,9 @@ pub fn normalize_weights(topk: &[(usize, f32)]) -> Vec<f32> {
 }
 
 fn expert_forward(expert: &MoeExpert, x: &Tensor) -> Result<Tensor> {
-    let lift = |r: std::result::Result<Tensor, grim_tensor::Error>| r.map_err(grim_core::error::Error::from);
+    let lift = |r: std::result::Result<Tensor, grim_tensor::Error>| {
+        r.map_err(grim_core::error::Error::from)
+    };
     let gate = lift(expert.gate.forward(x))?;
     let up = lift(expert.up.forward(x))?;
     let swiglu = silu_mul_on_device(&gate, &up).map_err(grim_core::error::Error::from)?;
@@ -1893,11 +1893,8 @@ mod tests {
                 assert_eq!(routing.len(), top_k.min(4));
                 // Re-derive expected top-k from raw logits.
                 let row = &logits[s * 4..(s + 1) * 4];
-                let mut indexed: Vec<(usize, f32)> =
-                    row.iter().cloned().enumerate().collect();
-                indexed.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let k = top_k.min(4);
                 let expected_w = normalize_weights(&indexed[..k]);
                 for (j, (idx, w)) in routing.iter().enumerate() {

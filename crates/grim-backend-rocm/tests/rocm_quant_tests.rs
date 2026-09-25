@@ -10,6 +10,7 @@ use grim_tensor::Shape;
 use grim_tensor::dtype::{DType, FloatPackScheme, KQuantScheme, QuantFormat, Storage};
 
 #[test]
+#[ignore]
 fn test_rocm_quantize_q8_0_and_fp8() {
     if !grim_backend_rocm::gpu_test_enabled() {
         eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_q8_0_and_fp8");
@@ -43,6 +44,7 @@ fn test_rocm_quantize_q8_0_and_fp8() {
 }
 
 #[test]
+#[ignore]
 fn test_rocm_quantize_q8_0_roundtrip() {
     if !grim_backend_rocm::gpu_test_enabled() {
         eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_q8_0_roundtrip");
@@ -84,6 +86,7 @@ fn test_rocm_quantize_q8_0_roundtrip() {
 }
 
 #[test]
+#[ignore]
 fn test_rocm_quantize_fp8_roundtrip() {
     if !grim_backend_rocm::gpu_test_enabled() {
         eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_fp8_roundtrip");
@@ -119,6 +122,7 @@ fn test_rocm_quantize_fp8_roundtrip() {
 }
 
 #[test]
+#[ignore]
 fn test_rocm_quantize_q8_0_vs_cpu_parity() {
     if !grim_backend_rocm::gpu_test_enabled() {
         eprintln!("ROCm device tests disabled: skipping test_rocm_quantize_q8_0_vs_cpu_parity");

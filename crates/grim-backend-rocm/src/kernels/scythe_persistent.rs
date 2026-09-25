@@ -389,9 +389,9 @@ mod tests {
             ("OP_ATTN", "3u"),
             ("OP_NORM", "4u"),
             ("OP_COMMFUSE", "5u"),
-        ("OP_PEER_REDUCE", "8u"),
-        ("OP_PEER_BROADCAST", "9u"),
-        ("OP_PEER_GATHER", "10u"),
+            ("OP_PEER_REDUCE", "8u"),
+            ("OP_PEER_BROADCAST", "9u"),
+            ("OP_PEER_GATHER", "10u"),
             ("OP_MOE", "6u"),
             ("OP_ADD", "7u"),
         ] {

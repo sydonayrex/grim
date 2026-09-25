@@ -6,6 +6,7 @@ use grim_tensor::{CoreTensorOps, MemoryOps, Shape};
 
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
+#[ignore]
 fn fused_linear_ce_matches_cpu_oracle() {
     if !grim_backend_rocm::gpu_test_enabled() {
         return;

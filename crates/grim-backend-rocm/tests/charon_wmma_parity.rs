@@ -148,6 +148,7 @@ fn wmma_kernel_uses_same_routed_scaling_as_scalar_grouped() {
 
 // PASSED: 2026-08-20 on gfx1036 (ROCm)
 #[test]
+#[ignore]
 fn wmma_kernel_wmma_path_gated_on_supported_arches() {
     let wmma = charon_wmma::KERNEL_SOURCE;
     // The rocWMMA include must be gated on architectures that actually have

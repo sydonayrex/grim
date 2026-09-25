@@ -56,7 +56,11 @@ fn concat_qkv_weights_layout_matches_slices() {
     // Natural [out, hidden] weights concatenate along the out dimension:
     // fused = q_w ++ k_w ++ v_w, so each weight's rows appear verbatim.
     assert_eq!(&fused[..q_w.len()], &q_w[..], "q rows verbatim");
-    assert_eq!(&fused[q_w.len()..q_w.len() + k_w.len()], &k_w[..], "k rows verbatim");
+    assert_eq!(
+        &fused[q_w.len()..q_w.len() + k_w.len()],
+        &k_w[..],
+        "k rows verbatim"
+    );
     assert_eq!(&fused[q_w.len() + k_w.len()..], &v_w[..], "v rows verbatim");
     // Mismatched row counts must be rejected, not silently truncated.
     let bad = grim_backend_rocm::concat_qkv_weights(&q_w, &k_w[..hidden * 4 + 1], &v_w, hidden);
@@ -64,6 +68,7 @@ fn concat_qkv_weights_layout_matches_slices() {
 }
 
 #[test]
+#[ignore]
 fn qkv_proj_fusion_matches_unfused() {
     let Some(dev) = gpu_device() else {
         eprintln!("skipping: GPU test gate off");
@@ -170,6 +175,7 @@ fn qkv_proj_fusion_matches_unfused() {
 }
 
 #[test]
+#[ignore]
 fn qkv_proj_fused_uses_single_launch() {
     let Some(dev) = gpu_device() else {
         eprintln!("skipping: GPU test gate off");

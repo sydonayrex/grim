@@ -46,7 +46,12 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn test_linear(dev: &RocmDevice, ordinal: usize, out: usize, inn: usize, seed: u64) -> Linear {
-    let w = rocm_tensor(dev, ordinal, rand_vec(out * inn, seed), Shape::new(vec![out, inn]));
+    let w = rocm_tensor(
+        dev,
+        ordinal,
+        rand_vec(out * inn, seed),
+        Shape::new(vec![out, inn]),
+    );
     Linear {
         weight: w.clone(),
         bias: None,
@@ -74,6 +79,13 @@ fn attention_block(
     let nh = n_q / hd;
     let nkv = n_kv / hd;
     Lfm2Block {
+        index: 0,
+        attention_mode: grim_models_transformer::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
         attn_norm: test_norm(dev, ordinal, hidden),
         wq: Some(test_linear(dev, ordinal, n_q, hidden, 11)),
         wk: Some(test_linear(dev, ordinal, n_kv, hidden, 22)),
@@ -136,6 +148,8 @@ fn tiny_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
     };
     Lfm2 {
         cfg: Lfm2Config {
+            attention_mode: grim_models_transformer::Lfm2AttentionMode::Softmax,
+            attention_mode_per_layer: None,
             vocab_size: vocab,
             hidden_size: hidden,
             num_heads: nh,
@@ -185,9 +199,7 @@ fn main() {
     }
     let dev = RocmDevice::shared(ordinal);
 
-    println!(
-        "decode_speed_bench  ordinal={ordinal} steps={n_steps}  (tiny in-memory LFM2)"
-    );
+    println!("decode_speed_bench  ordinal={ordinal} steps={n_steps}  (tiny in-memory LFM2)");
 
     for &n_layers in &[1usize, 2, 4] {
         let model = tiny_lfm2(&dev, ordinal, n_layers);

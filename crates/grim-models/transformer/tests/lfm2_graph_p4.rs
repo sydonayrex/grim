@@ -94,6 +94,7 @@ fn attention_block(
     let nkv = n_kv / hd;
 
     Lfm2Block {
+        index: 0,
         attn_norm: test_norm(dev, ordinal, hidden),
         wq: Some(test_linear(dev, ordinal, n_q, hidden, 11)),
         wk: Some(test_linear(dev, ordinal, n_kv, hidden, 22)),
@@ -129,6 +130,12 @@ fn attention_block(
         head_dim: hd,
         rope_theta: 10000.0,
         eps: 1e-5,
+        attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+        gdl_gates: grim_models_transformer::gla::gdl_gate_defaults(64),
+        gdl_b_proj: None,
+        gdl_w_proj: None,
+        gdl_f_proj: None,
+        gdl_fused_qkv_gates: None,
     }
 }
 
@@ -170,6 +177,8 @@ fn tiny_lfm2(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2 {
             n_ff_exp: 0,
             n_embd_out: 0,
             mxfp4_qkv_attention: false,
+            attention_mode: grim_models_transformer::lfm2::Lfm2AttentionMode::Softmax,
+            attention_mode_per_layer: None,
         },
         device: Device::Rocm(ordinal),
         tok_embeddings,
@@ -245,15 +254,12 @@ fn p4_1000_step_replay_stable_addresses() {
         model.forward_replay(&mut graph, token).unwrap();
 
         // Address stability: layer_input[0] MUST NOT move for 1000 replays.
-        let cur_in_ptr = graph
-            .buffers
-            .layer_input[0]
+        let cur_in_ptr = graph.buffers.layer_input[0]
             .device_ptr_u64()
             .expect("layer_input has ptr");
         if let Some(pp) = prev_in_ptr {
             assert_eq!(
-                cur_in_ptr,
-                pp,
+                cur_in_ptr, pp,
                 "step {step}: layer_input address moved ({cur_in_ptr:x} vs {pp:x})"
             );
         }
@@ -329,8 +335,7 @@ fn p4_50_step_eager_vs_graph_parity() {
     let mut prev_token = 7u32;
     for step in 0..50 {
         model.forward_replay(&mut graph, prev_token).unwrap();
-        graph.buffers.current_pos =
-            graph.buffers.current_pos.wrapping_add(1);
+        graph.buffers.current_pos = graph.buffers.current_pos.wrapping_add(1);
         let logits = graph.read_logits_f32().expect("read_logits_f32");
         assert_eq!(logits.len(), 32);
         assert!(
@@ -478,8 +483,6 @@ fn p4_batch_bucket_matches_single_slot0() {
         );
     }
 }
-
-
 
 // ===========================================================================
 // P4.3 — Bucket mapping correctness (DecodeBatchBucket)
@@ -676,7 +679,8 @@ fn p4_debug_batch_row_uniformity() {
         0,
     )
     .unwrap();
-    dev.launch_f32_gemv_into(&norm_buf, wg, &gemv_out, n, k).unwrap();
+    dev.launch_f32_gemv_into(&norm_buf, wg, &gemv_out, n, k)
+        .unwrap();
     dev.synchronize();
     let gout = gemv_out.to_cpu_vec_f32().unwrap();
     for s in 1..batch {
@@ -750,7 +754,10 @@ fn p4_benchmark_eager_vs_graph() {
     eprintln!();
     eprintln!("[bench] {STEPS} steps 2-layer tiny LFM2 (ms/token):");
     eprintln!("  eager enqueue : {eager_ms:.3}");
-    eprintln!("  graph replay  : {graph_ms:.3}  ({:.2}x)", eager_ms / graph_ms);
+    eprintln!(
+        "  graph replay  : {graph_ms:.3}  ({:.2}x)",
+        eager_ms / graph_ms
+    );
     // Replay should never be slower than eager enqueue for equal kernels;
     // a slower replay means capture adds overhead instead of removing it.
     assert!(

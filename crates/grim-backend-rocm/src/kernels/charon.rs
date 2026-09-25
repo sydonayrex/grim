@@ -3012,7 +3012,9 @@ mod tests {
             "sudot4/sdot4 ISA helper must be present"
         );
         // The kernels are inference-only: no backward stash writes.
-        let dot4_start = KERNEL_SOURCE.find("grim_moe_fused_grouped_q4k_dot4").unwrap();
+        let dot4_start = KERNEL_SOURCE
+            .find("grim_moe_fused_grouped_q4k_dot4")
+            .unwrap();
         let dot4_src = &KERNEL_SOURCE[dot4_start..];
         let q4k_end = dot4_src.find("grim_moe_fused_grouped_q80_dot4").unwrap();
         assert!(
@@ -3027,7 +3029,10 @@ mod tests {
         use CharonDot4Quant::*;
         // RDNA2/3/4 all supported (sdot4 vs sudot4 selected in-device).
         for arch in ["gfx1036", "gfx1100", "gfx1201"] {
-            assert_eq!(dot4_entry_for(Q4K, arch, false), Some("grim_moe_fused_grouped_q4k_dot4"));
+            assert_eq!(
+                dot4_entry_for(Q4K, arch, false),
+                Some("grim_moe_fused_grouped_q4k_dot4")
+            );
         }
         // CDNA / unknown: no dot4.
         assert_eq!(dot4_entry_for(Q8_0, "gfx90a", false), None);
