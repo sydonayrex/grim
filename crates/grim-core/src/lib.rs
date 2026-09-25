@@ -27,7 +27,10 @@ pub use disagg_placement::{
 };
 pub use env_config::{Backend, RuntimeEnv};
 pub use error::{Error, Result, TensorError};
-pub use hyperparams::{ArchHyperparameters, HyperparameterExtractor, MetadataLookup};
+pub use hyperparams::{
+    ArchHyperparameters, HyperparameterExtractor, MetadataLookup, fit_context_to_vram,
+    kv_bytes_per_token,
+};
 pub use kv_cache::KvCache;
 pub use memory_certificate::{
     AuthorityGrade, BoundaryVector, ExactnessContract, MemoryCertificate, ModelInventory,

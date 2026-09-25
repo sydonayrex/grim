@@ -29,6 +29,7 @@ use grim_models_transformer::{
     MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig, Qwen, Qwen2Vl, Qwen2VlConfig,
     Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig,
     Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext, Qwen38FlashNextConfig,
+    NemotronHMoe, NemotronHMoeConfig,
     QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
     WavTokenizerDec, WavTokenizerDecConfig,
 };
@@ -353,6 +354,11 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
         dbg_eprintln!("[meta-get-u32] {key} = MISSING");
         None
     }
+    fn get_array_len(&self, key: &str) -> Option<usize> {
+        let n = self.0.metadata(key)?.as_array()?.len();
+        dbg_eprintln!("[meta-get-array-len] {key} = {n}");
+        Some(n)
+    }
     fn get_f32(&self, key: &str) -> Option<f32> {
         let v = self.0.metadata(key)?;
         if let Some(f) = v.as_f32() {
@@ -367,12 +373,59 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
         }
         None
     }
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        let v = self.0.metadata(key)?;
+        if let Some(b) = v.as_bool() {
+            return Some(b);
+        }
+        if let Some(u) = v.as_u32() {
+            return Some(u != 0);
+        }
+        if let Some(s) = v.as_str() {
+            match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" => return Some(true),
+                "false" | "0" | "no" => return Some(false),
+                _ => {}
+            }
+        }
+        None
+    }
+    fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        self.0.metadata(key)?.as_u32_array()
+    }
+    fn get_i32_array(&self, key: &str) -> Option<Vec<i32>> {
+        self.0.metadata(key)?.as_i32_array()
+    }
 }
 
 fn qwen35_layer_split_enabled() -> bool {
     matches!(
         std::env::var("GRIM_QWEN_LAYER_SPLIT").as_deref(),
         Ok("1" | "true" | "on" | "yes")
+    )
+}
+
+/// `GRIM_CONTEXT_GROW_TO=1`: shrink the context window to what the visible VRAM
+/// can hold for KV arenas plus weights, rather than committing to the
+/// checkpoint's advertised maximum and failing at load.
+fn qwen_context_grow_to_enabled() -> bool {
+    matches!(
+        std::env::var("GRIM_CONTEXT_GROW_TO").as_deref(),
+        Ok("1" | "true" | "on" | "yes")
+    )
+}
+
+/// `GRIM_KV_QUANT` reports whether a 1-byte KV format is requested, which the
+/// `GRIM_CONTEXT_GROW_TO` fit math uses to size arenas at 1 byte/element:
+/// unset/`f32` = 4 bytes, `f16`/`bf16` = 2, `q8_0`/`q4_K`/`fp8` = 1.
+///
+/// This only sizes the *plan*. Quantized KV is served by the paged path
+/// (`launch_paged_attention_quant`), not by the dense decode-graph arena, whose
+/// reader is non-quantized and would reinterpret packed bytes.
+fn kv_quant_enabled() -> bool {
+    !matches!(
+        std::env::var("GRIM_KV_QUANT").as_deref(),
+        Ok("") | Err(_) | Ok("f32" | "none" | "off")
     )
 }
 
@@ -2554,6 +2607,88 @@ fn load_model_with_providers(
     // `effective_rope_theta`); YaRN rides `parse_yarn_scaling_gguf` unchanged.
     hparams.rope_theta = effective_rope_theta_gguf(&lookup, hparams.rope_theta, hparams.head_dim);
 
+    // `GRIM_CONTEXT` caps the effective context window without re-exporting the
+    // GGUF. The checkpoint's advertised limit is a ceiling: asking for more than
+    // the model supports is clamped down, never rounded up.
+    //
+    // This has to run here, on the shared `hparams`, rather than per-architecture
+    // branch. Every GGUF architecture below reads `hparams.max_seq_len` (58 sites),
+    // so clamping only the safetensors path left GGUF models - the primary format -
+    // silently ignoring the override, which then planned KV arenas for the
+    // checkpoint's full advertised context and oversubscribed VRAM.
+    if let Some(ctx) = grim_core::env_config::RuntimeEnv::from_env().context {
+        if ctx < hparams.max_seq_len {
+            log::info!(
+                "[grim] GRIM_CONTEXT={ctx} caps context window (checkpoint max {})",
+                hparams.max_seq_len
+            );
+            hparams.max_seq_len = ctx;
+        }
+    }
+
+    // `GRIM_CONTEXT_GROW_TO=1` shrinks the context to what the visible VRAM can
+    // actually hold, instead of planning arenas for the checkpoint's advertised
+    // maximum and discovering the shortfall as an OOM at load time.
+    //
+    // The decode graph pre-allocates one KV arena per full-attention layer at the
+    // FULL context, before any weight is placed, so an oversized window is the
+    // dominant consumer of VRAM on a large model. Weight footprint is taken from
+    // the on-disk size, which for a quantized GGUF is the right order of magnitude
+    // for the resident bytes.
+    if qwen_context_grow_to_enabled() {
+        let weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let devices = resolve_discrete_rocm_devices(&device);
+        let vram_budget: u64 = devices
+            .iter()
+            .map(|d| match d {
+                Device::Rocm(o) => grim_backend_rocm::vram_info(*o).1,
+                _ => 0,
+            })
+            .sum();
+        if vram_budget > 0 {
+            // Reserve 2 GB, or 15% of the budget when smaller, for activations,
+            // decode-graph scratch, and allocator fragmentation.
+            let headroom = (vram_budget / 7).max(2_000_000_000).min(vram_budget / 2);
+            let kv_elem_bytes = if kv_quant_enabled() { 1 } else { 4 };
+            let fitted = grim_core::fit_context_to_vram(
+                hparams.num_kv_heads,
+                hparams.head_dim,
+                hparams.num_layers,
+                hparams.full_attention_interval.unwrap_or(1).max(1),
+                kv_elem_bytes,
+                weight_bytes,
+                vram_budget,
+                headroom,
+                hparams.max_seq_len,
+            );
+            if fitted == 0 {
+                log::warn!(
+                    "[grim] GRIM_CONTEXT_GROW_TO: no VRAM left for KV arenas after \
+                     weights ({weight_bytes} B) + headroom ({headroom} B) of \
+                     {vram_budget} B; leaving context at {}",
+                    hparams.max_seq_len
+                );
+            } else if fitted < hparams.max_seq_len {
+                log::info!(
+                    "[grim] GRIM_CONTEXT_GROW_TO: context {} -> {fitted} \
+                     (weights {:.1} GB, VRAM {:.1} GB, headroom {:.1} GB)",
+                    hparams.max_seq_len,
+                    weight_bytes as f64 / 1e9,
+                    vram_budget as f64 / 1e9,
+                    headroom as f64 / 1e9
+                );
+                hparams.max_seq_len = fitted;
+            } else {
+                log::info!(
+                    "[grim] GRIM_CONTEXT_GROW_TO: context {} already fits",
+                    hparams.max_seq_len
+                );
+            }
+        } else {
+            log::warn!("[grim] GRIM_CONTEXT_GROW_TO: no ROCm VRAM queryable; context unchanged");
+        }
+    }
+
     log::info!(
         "[grim] Loading config: architecture={:?}, layers={}, hidden={}, vocab={}",
         model_arch,
@@ -3033,6 +3168,48 @@ fn load_model_with_providers(
                 falcon_h1_cfg
             );
             let m = FalconH1Model::load_tp(device.clone(), &ws, falcon_h1_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::NemotronHMoe => {
+            let schedule = if let Some(ref sched) = hparams.head_count_kv_schedule {
+                NemotronHMoeConfig::schedule_from_kv_heads(sched, hparams.num_layers)
+            } else {
+                NemotronHMoeConfig::default_schedule_53()
+            };
+            let rope_dim = lookup.get_u32("nemotron_h_moe.rope.dimension_count")
+                .or_else(|| lookup.get_u32("rope.dimension_count"))
+                .map(|v| v as usize)
+                .unwrap_or(84);
+
+            let nemotron_cfg = NemotronHMoeConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_layers: hparams.num_layers,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                layers_block_type: schedule,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                rope_dim,
+                ssm_d_state: hparams.ssm_d_state.unwrap_or(128),
+                ssm_d_inner: hparams.ssm_d_inner.unwrap_or(4096),
+                ssm_d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                ssm_dt_rank: hparams.ssm_dt_rank.unwrap_or(64),
+                ssm_n_group: hparams.ssm_n_group.unwrap_or(8),
+                num_routed_experts: hparams.expert_count.unwrap_or(128),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(6),
+                expert_feed_forward_length: hparams.expert_feed_forward_length.unwrap_or(1856),
+                expert_shared_feed_forward_length: hparams.expert_shared_feed_forward_length.unwrap_or(3712),
+                expert_weights_scale: hparams.routed_scaling_factor,
+                expert_weights_norm: hparams.norm_topk_prob,
+            };
+            log::info!(
+                "[grim] Loading Nemotron 3.5 Lightning (NemotronHMoe) model with config: {:?}",
+                nemotron_cfg
+            );
+            let m = NemotronHMoe::load_tp(device.clone(), &ws, nemotron_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Jamba => {

@@ -21,6 +21,7 @@ pub struct ArchHyperparameters {
     pub expert_count: Option<usize>,
     pub expert_used_count: Option<usize>,
     pub expert_feed_forward_length: Option<usize>,
+    pub expert_shared_feed_forward_length: Option<usize>,
     pub routed_scaling_factor: f32,
     pub norm_topk_prob: bool,
     // SSM specific
@@ -30,6 +31,7 @@ pub struct ArchHyperparameters {
     pub ssm_dt_rank: Option<usize>,
     pub ssm_n_group: Option<usize>,
     pub full_attention_interval: Option<usize>,
+    pub head_count_kv_schedule: Option<Vec<u32>>,
 }
 
 impl Default for ArchHyperparameters {
@@ -49,6 +51,7 @@ impl Default for ArchHyperparameters {
             expert_count: None,
             expert_used_count: None,
             expert_feed_forward_length: None,
+            expert_shared_feed_forward_length: None,
             routed_scaling_factor: 1.0,
             norm_topk_prob: false,
             ssm_d_state: None,
@@ -57,6 +60,7 @@ impl Default for ArchHyperparameters {
             ssm_dt_rank: None,
             ssm_n_group: None,
             full_attention_interval: None,
+            head_count_kv_schedule: None,
         }
     }
 }
@@ -151,8 +155,32 @@ pub trait MetadataLookup {
     fn get_str(&self, key: &str) -> Option<String>;
     /// Retrieve u32 metadata by key with fallback.
     fn get_u32(&self, key: &str) -> Option<u32>;
+    /// Retrieve the element count of an array-valued metadata key.
+    ///
+    /// GGUF stores the vocabulary as `tokenizer.ggml.tokens` (an array of token
+    /// strings), not as a scalar count, so [Self::get_u32] can never resolve it.
+    /// The array length is the authoritative vocabulary size.
+    fn get_array_len(&self, key: &str) -> Option<usize> {
+        let _ = key;
+        None
+    }
     /// Retrieve f32 metadata by key with fallback.
     fn get_f32(&self, key: &str) -> Option<f32>;
+    /// Retrieve boolean metadata by key.
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        let _ = key;
+        None
+    }
+    /// Retrieve u32 array metadata by key.
+    fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        let _ = key;
+        None
+    }
+    /// Retrieve i32 array metadata by key.
+    fn get_i32_array(&self, key: &str) -> Option<Vec<i32>> {
+        let _ = key;
+        None
+    }
 }
 
 /// Hyperparameter extraction engine that queries metadata based on architecture conventions.
@@ -165,26 +193,37 @@ impl HyperparameterExtractor {
         metadata: &M,
     ) -> ArchHyperparameters {
         // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"` and carries `llama.*` hyperparameter keys.
-        // Use those as the lookup prefix and prefer them over the often-stale `tokenizer.ggml.vocab_size` key (which.
+        // Use those as the lookup prefix.
         let is_smollm2 = arch == ModelArchitecture::SmolLm2;
         let arch_name = if is_smollm2 { "llama" } else { arch.as_str() };
 
-        let vocab_size = if is_smollm2 {
-            metadata
-                .get_u32("llama.vocab_size")
-                .or_else(|| metadata.get_u32("tokenizer.ggml.vocab_size"))
-                .or_else(|| metadata.get_u32("tokenizer.ggml.tokens"))
-                .map(|v| v as usize)
-                .unwrap_or(32000)
-        } else {
-            metadata
-                .get_u32("tokenizer.ggml.vocab_size")
-                .or_else(|| metadata.get_u32("tokenizer.ggml.tokens"))
-                .or_else(|| metadata.get_u32(&format!("{arch_name}.vocab_size")))
-                .or_else(|| metadata.get_u32("llama.vocab_size"))
-                .map(|v| v as usize)
-                .unwrap_or(32000)
-        };
+        // Vocabulary resolution order, most authoritative first:
+        //  1. `{arch}.vocab_size` - what llama.cpp computed for this architecture.
+        //  2. `tokenizer.ggml.tokens` array length - the actual token list, so it cannot
+        //     be stale the way a copied legacy count can be.
+        //  3. `tokenizer.ggml.vocab_size` - legacy key, often stale after a tokenizer
+        //     merge/extend, so it never outranks the two sources above.
+        // The array length matters because `tokenizer.ggml.tokens` is an array of
+        // token strings, not a scalar; a `get_u32` lookup on it always misses.
+        // Getting this wrong is not cosmetic: a wrong vocab_size produces a
+        // ShapeMismatch against `token_embd.weight` and an unusable output head.
+        let vocab_size = metadata
+            .get_u32(&format!("{arch_name}.vocab_size"))
+            .map(|v| v as usize)
+            .or_else(|| metadata.get_array_len("tokenizer.ggml.tokens"))
+            .or_else(|| {
+                if is_smollm2 {
+                    None
+                } else {
+                    metadata.get_u32("llama.vocab_size").map(|v| v as usize)
+                }
+            })
+            .or_else(|| {
+                metadata
+                    .get_u32("tokenizer.ggml.vocab_size")
+                    .map(|v| v as usize)
+            })
+            .unwrap_or(32000);
 
         let hidden_size = metadata
             .get_u32(&format!("{arch_name}.embedding_length"))
@@ -284,15 +323,31 @@ impl HyperparameterExtractor {
             .get_u32(&format!("{arch_name}.expert_feed_forward_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.expert_intermediate_size")))
             .map(|v| v as usize);
+        let expert_shared_feed_forward_length = metadata
+            .get_u32(&format!("{arch_name}.expert_shared_feed_forward_length"))
+            .map(|v| v as usize);
         let routed_scaling_factor = metadata
             .get_f32(&format!("{arch_name}.routed_scaling_factor"))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.moe_routed_scaling_factor")))
+            .or_else(|| metadata.get_f32(&format!("{arch_name}.expert_weights_scale")))
             .unwrap_or(1.0);
 
         let norm_topk_prob = metadata
-            .get_u32(&format!("{arch_name}.norm_topk_prob"))
-            .map(|v| v != 0)
+            .get_bool(&format!("{arch_name}.expert_weights_norm"))
+            .or_else(|| {
+                metadata
+                    .get_u32(&format!("{arch_name}.norm_topk_prob"))
+                    .map(|v| v != 0)
+            })
             .unwrap_or(false);
+
+        let head_count_kv_schedule = metadata
+            .get_u32_array(&format!("{arch_name}.attention.head_count_kv"))
+            .or_else(|| {
+                metadata
+                    .get_i32_array(&format!("{arch_name}.attention.head_count_kv"))
+                    .map(|arr| arr.into_iter().map(|x| x.max(0) as u32).collect())
+            });
 
         let ssm_d_state = metadata
             .get_u32(&format!("{arch_name}.ssm.state_size"))
@@ -328,6 +383,7 @@ impl HyperparameterExtractor {
             expert_count,
             expert_used_count,
             expert_feed_forward_length,
+            expert_shared_feed_forward_length,
             routed_scaling_factor,
             norm_topk_prob,
             ssm_d_state,
@@ -336,8 +392,80 @@ impl HyperparameterExtractor {
             ssm_dt_rank,
             ssm_n_group,
             full_attention_interval,
+            head_count_kv_schedule,
         }
     }
+}
+
+/// Bytes the decode graph needs for one token of KV across every
+/// full-attention layer: `kv_heads * head_dim` elements for K and again for V,
+/// at `bytes_per_element` per element.
+///
+/// `interval` is the full-attention interval: SSM/recurrent layers keep their
+/// state in a fixed-size ring, not a per-token arena, so they cost nothing here.
+pub fn kv_bytes_per_token(
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    interval: usize,
+    bytes_per_element: usize,
+) -> u64 {
+    let interval = interval.max(1);
+    let attn_layers = (0..num_layers).filter(|i| i % interval == 0).count();
+    (kv_heads as u64)
+        .saturating_mul(head_dim as u64)
+        .saturating_mul(2) // K and V
+        .saturating_mul(bytes_per_element as u64)
+        .saturating_mul(attn_layers as u64)
+}
+
+/// Resolve the context window against the VRAM actually available.
+///
+/// The checkpoint's advertised `max_seq_len` is an upper bound the hardware may
+/// not be able to honor: the decode graph pre-allocates every KV arena at full
+/// context, so a 232k window on this 27B model asks for ~32 GB of arenas before
+/// a single weight is placed. Rather than discovering that as an out-of-memory
+/// failure at load time, shrink the context to what fits.
+///
+/// `weight_bytes` is the resident weight footprint, `vram_budget_bytes` the total
+/// we are willing to commit, and `headroom_bytes` the reserve left for
+/// activations, the decode graph's scratch buffers, and allocator fragmentation.
+///
+/// Returns the largest context whose KV arenas fit in
+/// `vram_budget - weight_bytes - headroom`, never exceeding the checkpoint's
+/// advertised maximum. Rounds down to a whole multiple of `interval` so arena
+/// slots align with the attention layer stride.
+pub fn fit_context_to_vram(
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    interval: usize,
+    bytes_per_element: usize,
+    weight_bytes: u64,
+    vram_budget_bytes: u64,
+    headroom_bytes: u64,
+    max_context: usize,
+) -> usize {
+    let per_token = kv_bytes_per_token(
+        kv_heads,
+        head_dim,
+        num_layers,
+        interval,
+        bytes_per_element,
+    );
+    if per_token == 0 {
+        return max_context;
+    }
+    let available = vram_budget_bytes
+        .saturating_sub(weight_bytes)
+        .saturating_sub(headroom_bytes);
+    if available == 0 {
+        return 0;
+    }
+    let fits = (available / per_token) as usize;
+    let interval = interval.max(1);
+    let aligned = fits / interval * interval;
+    aligned.min(max_context)
 }
 
 #[cfg(test)]
@@ -346,13 +474,41 @@ mod extract_reference_tests {
     use std::collections::HashMap;
 
     /// HashMap-backed `MetadataLookup` for the fallback-chain tests.
+    ///
+    /// Scalars and arrays are tracked separately so the mock reproduces the real
+    /// `GgufProvider` behavior where a `get_u32` lookup on an array key misses.
     #[derive(Default)]
-    struct MockMeta(HashMap<String, String>);
+    struct MockMeta {
+        scalars: HashMap<String, String>,
+        arrays: HashMap<String, usize>,
+    }
 
     impl MockMeta {
         fn u32(mut self, pairs: &[(&str, u32)]) -> Self {
             for (k, v) in pairs {
-                self.0.insert(k.to_string(), v.to_string());
+                self.scalars.insert(k.to_string(), v.to_string());
+            }
+            self
+        }
+
+        fn f32(mut self, pairs: &[(&str, f32)]) -> Self {
+            for (k, v) in pairs {
+                self.scalars.insert(k.to_string(), v.to_string());
+            }
+            self
+        }
+
+        fn str(mut self, pairs: &[(&str, &str)]) -> Self {
+            for (k, v) in pairs {
+                self.scalars.insert(k.to_string(), v.to_string());
+            }
+            self
+        }
+
+        /// Register an array-valued key (e.g. `tokenizer.ggml.tokens`) with `len` elements.
+        fn array(mut self, pairs: &[(&str, usize)]) -> Self {
+            for (k, v) in pairs {
+                self.arrays.insert(k.to_string(), *v);
             }
             self
         }
@@ -360,13 +516,23 @@ mod extract_reference_tests {
 
     impl MetadataLookup for MockMeta {
         fn get_str(&self, key: &str) -> Option<String> {
-            self.0.get(key).cloned()
+            self.scalars.get(key).cloned()
         }
         fn get_u32(&self, key: &str) -> Option<u32> {
-            self.0.get(key).and_then(|v| v.parse().ok())
+            self.scalars.get(key).and_then(|v| v.parse().ok())
+        }
+        fn get_array_len(&self, key: &str) -> Option<usize> {
+            self.arrays.get(key).copied()
         }
         fn get_f32(&self, key: &str) -> Option<f32> {
-            self.0.get(key).and_then(|v| v.parse().ok())
+            self.scalars.get(key).and_then(|v| v.parse().ok())
+        }
+        fn get_bool(&self, key: &str) -> Option<bool> {
+            self.scalars.get(key).and_then(|v| match v.as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            })
         }
     }
 
@@ -442,5 +608,201 @@ mod extract_reference_tests {
         let hp = HyperparameterExtractor::extract(ModelArchitecture::Llama, &meta);
         assert_eq!(hp.num_heads, 8);
         assert_eq!(hp.num_kv_heads, 8);
+    }
+
+    /// Regression for the Qwen3.8-27B Q4_K checkpoint, whose metadata carries
+    /// NEITHER `tokenizer.ggml.vocab_size` NOR `qwen35.vocab_size`; the vocabulary
+    /// only exists as the `tokenizer.ggml.tokens` array (248320 entries). Every
+    /// scalar key in the old chain missed, so resolution fell through to the
+    /// hardcoded `unwrap_or(32000)` and `token_embd.weight` [248320, 5120] raised
+    /// a ShapeMismatch against an expected [32000, 5120].
+    #[test]
+    fn vocab_size_falls_back_to_tokens_array_length() {
+        let meta = MockMeta::default()
+            .u32(&[
+                ("qwen35.embedding_length", 5120),
+                ("qwen35.block_count", 65),
+            ])
+            .array(&[("tokenizer.ggml.tokens", 248_320)]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Qwen35, &meta);
+        assert_eq!(
+            hp.vocab_size, 248_320,
+            "vocabulary must come from the token array length, not the 32000 default"
+        );
+    }
+
+    /// A stale legacy count must never outrank the token array, which is what
+    /// actually determines the embedding row count.
+    #[test]
+    fn stale_tokenizer_vocab_key_loses_to_tokens_array() {
+        let meta = MockMeta::default()
+            .u32(&[("tokenizer.ggml.vocab_size", 32_000)])
+            .array(&[("tokenizer.ggml.tokens", 248_320)]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Qwen35, &meta);
+        assert_eq!(hp.vocab_size, 248_320);
+    }
+
+    /// The architecture-specific key is the most authoritative source and beats
+    /// both the token array and the legacy key when all three are present.
+    #[test]
+    fn arch_vocab_key_beats_tokens_array_and_legacy_key() {
+        let meta = MockMeta::default()
+            .u32(&[
+                ("qwen35.vocab_size", 151_936),
+                ("tokenizer.ggml.vocab_size", 32_000),
+            ])
+            .array(&[("tokenizer.ggml.tokens", 248_320)]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::Qwen35, &meta);
+        assert_eq!(hp.vocab_size, 151_936);
+    }
+
+    /// SmolLM2 is exported under `general.architecture = "llama"`, so its
+    /// arch-specific key is `llama.vocab_size` and it must still outrank the
+    /// stale tokenizer key.
+    #[test]
+    fn smollm2_still_prefers_llama_vocab_over_legacy_key() {
+        let meta = MockMeta::default()
+            .u32(&[
+                ("llama.vocab_size", 49_152),
+                ("tokenizer.ggml.vocab_size", 999),
+            ])
+            .array(&[("tokenizer.ggml.tokens", 49_152)]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::SmolLm2, &meta);
+        assert_eq!(hp.vocab_size, 49_152);
+    }
+
+    /// Nemotron-H MoE metadata extraction test: validates expert_weights_scale,
+    /// expert_weights_norm, expert_shared_feed_forward_length, and head_count_kv schedule.
+    #[test]
+    fn test_nemotron_hmoe_metadata_extraction() {
+        let meta = MockMeta::default()
+            .f32(&[("nemotron-h-moe.expert_weights_scale", 2.5)])
+            .str(&[("nemotron-h-moe.expert_weights_norm", "true")])
+            .u32(&[
+                ("nemotron-h-moe.expert_count", 128),
+                ("nemotron-h-moe.expert_used_count", 6),
+                ("nemotron-h-moe.expert_feed_forward_length", 1856),
+                ("nemotron-h-moe.expert_shared_feed_forward_length", 3712),
+                ("nemotron-h-moe.block_count", 53),
+                ("nemotron-h-moe.embedding_length", 2688),
+            ]);
+        let hp = HyperparameterExtractor::extract(ModelArchitecture::NemotronHMoe, &meta);
+        assert_eq!(hp.expert_count, Some(128));
+        assert_eq!(hp.expert_used_count, Some(6));
+        assert_eq!(hp.expert_feed_forward_length, Some(1856));
+        assert_eq!(hp.expert_shared_feed_forward_length, Some(3712));
+        assert_eq!(hp.routed_scaling_factor, 2.5);
+        assert_eq!(hp.num_layers, 53);
+        assert_eq!(hp.hidden_size, 2688);
+    }
+}
+
+#[cfg(test)]
+mod kv_fit_tests {
+    use super::{fit_context_to_vram, kv_bytes_per_token};
+
+    /// Real Qwen3.8-27B geometry: 4 KV heads x 256 head_dim, 65 layers with
+    /// full attention every 4th, f32 arenas. Cross-checked against the managed
+    /// memory the 228k run actually tried to allocate.
+    const QWEN_KV_HEADS: usize = 4;
+    const QWEN_HEAD_DIM: usize = 256;
+    const QWEN_LAYERS: usize = 65;
+    const QWEN_INTERVAL: usize = 4;
+    const F32: usize = 4;
+
+    #[test]
+    fn kv_bytes_per_token_matches_hand_computed_geometry() {
+        // 17 full-attention layers x 4 heads x 256 dim x 2 (K and V) x 4 bytes.
+        let expected = 17 * 4 * 256 * 2 * 4;
+        assert_eq!(
+            kv_bytes_per_token(QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32),
+            expected as u64
+        );
+    }
+
+    /// Only full-attention layers cost per-token KV. With interval 4 over 65
+    /// layers that is 17, not 65.
+    #[test]
+    fn recurrent_layers_do_not_consume_kv_budget() {
+        let per_token = kv_bytes_per_token(QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32);
+        // A single attention layer would be 4*256*2*4 = 8192 bytes/token.
+        assert_eq!(per_token, 17 * 8192);
+    }
+
+    /// The regression this exists for: at 228k the f32 arenas need ~32 GB,
+    /// which does not fit alongside the weights in 34 GB, so the fit must shrink
+    /// the context well below the advertised 232192.
+    #[test]
+    fn oversized_context_shrinks_to_what_fits() {
+        const WEIGHTS: u64 = 15_200_000_000; // ~15.2 GB Q4_K
+        const VRAM: u64 = 34_000_000_000; // 2 x 17 GB
+        const HEADROOM: u64 = 2_000_000_000; // activations + scratch + fragmentation
+
+        let fitted = fit_context_to_vram(
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            QWEN_LAYERS,
+            QWEN_INTERVAL,
+            F32,
+            WEIGHTS,
+            VRAM,
+            HEADROOM,
+            232_192,
+        );
+        assert!(
+            fitted < 232_192,
+            "228k arenas cannot fit in 34 GB; expected a shrink, got {fitted}"
+        );
+        // ~16.8 GB available for KV at 139264 B/token ≈ 120k, rounded to the
+        // interval stride. Assert the order of magnitude rather than an exact
+        // value so the test tracks the physics, not an arithmetic detail.
+        assert!(
+            (100_000..=130_000).contains(&fitted),
+            "expected roughly 100-130k, got {fitted}"
+        );
+        assert_eq!(fitted % QWEN_INTERVAL, 0, "must align to the interval stride");
+    }
+
+    /// f16 KV halves the per-token cost, so more context fits. This is the lever
+    /// that makes a large context reachable without more hardware.
+    #[test]
+    fn f16_kv_fits_more_context_than_f32() {
+        const WEIGHTS: u64 = 15_200_000_000;
+        const VRAM: u64 = 34_000_000_000;
+        const HEADROOM: u64 = 2_000_000_000;
+
+        let f32_fit = fit_context_to_vram(
+            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32,
+            WEIGHTS, VRAM, HEADROOM, 232_192,
+        );
+        let f16_fit = fit_context_to_vram(
+            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, 2,
+            WEIGHTS, VRAM, HEADROOM, 232_192,
+        );
+        assert!(
+            f16_fit > f32_fit,
+            "f16 must fit more context: {f16_fit} vs {f32_fit}"
+        );
+    }
+
+    /// When plenty of VRAM is present the checkpoint's own limit is kept; the
+    /// fit must never *grow* a context beyond what the model advertises.
+    #[test]
+    fn generous_vram_keeps_the_checkpoints_own_limit() {
+        let fitted = fit_context_to_vram(
+            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32,
+            0, 500_000_000_000, 0, 32_768,
+        );
+        assert_eq!(fitted, 32_768, "must not exceed the advertised maximum");
+    }
+
+    /// No room for KV at all must yield 0, never a silent wrap or a panic.
+    #[test]
+    fn no_headroom_yields_zero_context() {
+        let fitted = fit_context_to_vram(
+            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32,
+            34_000_000_000, 34_000_000_000, 0, 232_192,
+        );
+        assert_eq!(fitted, 0);
     }
 }

@@ -109,10 +109,20 @@ pub struct DeviceGuard {
 
 thread_local! {
     /// SPEED-CEREMONY: cached HIP current device for this thread (-1 = unknown).
-    /// All steady-state device switches route through [`DeviceGuard`] (direct
-    /// `hipSetDevice` calls exist only in one-time constructors), so the cache
-    /// stays coherent. Saves 3 driver calls per launch (get + set + restore).
+    /// Every device switch must keep this in sync with the real HIP context -
+    /// including [`raw_set_device`], which is called outside `DeviceGuard` from
+    /// the device constructor. A stale entry makes `DeviceGuard::set` skip the
+    /// `hipSetDevice` for a device the thread is not actually on, so a
+    /// `gfx1201` code object gets loaded while the thread sits on `gfx1200` and
+    /// `hipModuleLoad` fails with 209 (`hipErrorNoBinaryForGpu`).
+    /// Saves 3 driver calls per launch (get + set + restore).
     static CUR_DEV: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
+/// Record the device this thread is known to be on, so a later [`DeviceGuard`]
+/// fast path cannot mistake a stale value for the real HIP context.
+pub(crate) fn note_current_device(ordinal: i32) {
+    CUR_DEV.with(|c| c.set(ordinal));
 }
 
 impl DeviceGuard {
@@ -208,12 +218,21 @@ fn emit_ctx_trace(site: &str, target: i32, prev: i32) {
 }
 
 /// The sanctioned raw-context setter. Every `hipSetDevice` call outside `DeviceGuard` (i.e.
+///
+/// The [`CUR_DEV`] cache is updated on success so a following [`DeviceGuard`]
+/// fast path sees the true context. Without this the constructor's switch to
+/// `ordinal` is invisible to the cache, and the next guard can skip a required
+/// `hipSetDevice` - which is how a `gfx1201` module ended up loaded on the
+/// `gfx1200` device and failed with HIP error 209.
 pub fn raw_set_device(ordinal: i32) -> crate::HipErrorT {
     let mut prev: i32 = 0;
     unsafe {
         let _ = crate::device::handles::hipGetDevice(&mut prev);
     }
     let status = unsafe { crate::device::handles::hipSetDevice(ordinal) };
+    if status == crate::hipSuccess {
+        note_current_device(ordinal);
+    }
     emit_ctx_trace("raw_set_device", ordinal, prev);
     status
 }

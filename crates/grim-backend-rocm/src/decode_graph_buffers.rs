@@ -380,6 +380,14 @@ impl DecodeGraphBuffers {
             )?);
             // GRAVE Phase 1: KV arena element dtype follows GRIM_F16_KV so
             // the kv_append/attention kernels' f16 flag matches the storage.
+            //
+            // Only f32 and f16 are selectable here. Packed KQuant storage (q8_0 /
+            // q4_K) is deliberately NOT wired into this arena: its consumer is
+            // the non-quantized attention kernel, which reads these rows raw, so
+            // a packed dtype here would be reinterpreted rather than dequantized.
+            // Quantized KV goes through the paged path
+            // (`launch_paged_attention_quant`), whose reader inlines
+            // `dequant_kv_element` - see tests/paged_attention_quant.rs.
             let kv_dt = if crate::kernels::qkv_attention::kv_f16_enabled() {
                 DType {
                     arith: ArithType::F16,

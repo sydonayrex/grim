@@ -13,6 +13,10 @@ fn main() {
             || k.contains("intermediate")
             || k.contains("hidden")
             || k.contains("head")
+            || k.starts_with("general.")
+            || k.contains("block_count")
+            || k.contains("embedding_length")
+            || k.contains("expert")
         {
             println!("{} = {:?}", k, v);
         }

@@ -11,8 +11,12 @@ pub struct GpuCapability {
     pub tflops_fp16: f32,
     /// Effective FP8 TFLOPS — 0.0 if arch < RDNA 4 or un-measured.
     pub tflops_fp8: f32,
-    /// HBM read bandwidth in GB/s.
-    pub hbm_bandwidth_gbps: f32,
+    /// Measured device-memory bandwidth in GB/s.
+    ///
+    /// Named for DRAM rather than HBM because consumer RDNA parts (gfx1200/gfx1201)
+    /// carry GDDR6/GDDR7. The value is an achieved figure from a timed
+    /// device-to-device copy, not a spec-sheet lookup.
+    pub dram_bandwidth_gbps: f32,
     /// Free VRAM in bytes at the time of the last profiler sweep.
     pub vram_free_bytes: u64,
     /// Current thermal throttle fraction (0.0 = none, 1.0 = fully throttled).

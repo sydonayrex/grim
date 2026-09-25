@@ -528,7 +528,15 @@ impl RocmDevice {
     /// Fallible constructor that propagates the `hipSetDevice` error. [see: `probe()`, `RocmDevice::new`]
     pub fn try_new(ordinal: usize) -> Result<Self> {
         let detected = detect_gpu_arch(ordinal as i32);
-        crate::rocm_detect::auto_configure_hsa_override(&detected);
+        // `HSA_OVERRIDE_GFX_VERSION` is process-wide, not per-device. Applying it
+        // for every constructed ordinal lets a later device decide it for the whole
+        // process: on a mixed box (two RDNA4 dGPUs plus a gfx1036 APU iGPU) probing
+        // the iGPU set `10.3.0`, after which every genuine `gfx1201` code object was
+        // rejected by `hipModuleLoad` with 209 (`hipErrorNoBinaryForGpu`).
+        // Anchor the decision to ordinal 0, the device the runtime initializes first.
+        if ordinal == 0 {
+            crate::rocm_detect::auto_configure_hsa_override(&detected);
+        }
 
         // WI-M1/M2 context discipline: construction must run on the target device's context (streams and the rocBLAS handle bind to whatever device is current), but construction must be context-NEUTRAL for the caller.
         // This path used to park the constructing thread on `ordinal` permanently - first use of.

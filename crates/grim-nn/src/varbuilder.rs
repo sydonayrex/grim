@@ -259,6 +259,30 @@ impl<'a> WeightSource<'a> {
         self.tensors.meta(&name).is_ok()
     }
 
+    /// Total packed bytes of every tensor under the current prefix.
+    ///
+    /// Used by multi-GPU loaders to size a layer group before choosing which
+    /// device owns it: layer placement has to fit the destination's free VRAM,
+    /// and counting bytes from the checkpoint metadata is cheaper (and safer)
+    /// than loading the layer and discovering it did not fit.
+    pub fn prefix_bytes(&self) -> u64 {
+        let prefix = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}.", self.prefix.join("."))
+        };
+        self.tensors
+            .tensor_names()
+            .iter()
+            .filter(|n| n.starts_with(&prefix))
+            .filter_map(|n| self.tensors.meta(n).ok())
+            .map(|m| {
+                let elems: usize = m.shape.iter().product();
+                m.dtype.expected_bytes(elems) as u64
+            })
+            .sum()
+    }
+
     fn clone_prefix(&self) -> WeightSource<'a> {
         WeightSource {
             tensors: self.tensors,
