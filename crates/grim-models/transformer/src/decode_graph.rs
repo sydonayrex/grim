@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology,
-    decode_graph_enabled, launch_attention, launch_qkv_gemv,
+    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv, ConvRingSeed,
+    DecodeGraph, DecodeGraphBuffers, EagerKvSource,
 };
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
@@ -16,8 +16,8 @@ use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 use crate::block::LlamaBlock;
 use crate::chameleon::{Chameleon, ChameleonBlock};
 use crate::deepseek2::DeepSeek2;
-use crate::deepseek4::DeepSeek4;
 use crate::deepseek32::DeepSeek32;
+use crate::deepseek4::DeepSeek4;
 use crate::gemma2::{Gemma2, Gemma2Block};
 use crate::glm4_moe_lite::Glm4MoeLite;
 use crate::granite_moe_hybrid::GraniteMoeHybrid;
@@ -5355,6 +5355,61 @@ mod tests {
         }
     }
 
+    fn assert_graph_matches_eager_single_token<M: DecodeGraphModel>(
+        model: &M,
+        dev: &RocmDevice,
+        token_id: u32,
+        eager_logits: &[f32],
+        label: &str,
+    ) {
+        let mut graph = model
+            .get_or_create_decode_graph(128, 1)
+            .unwrap_or_else(|e| panic!("{label}: graph allocation failed: {e}"));
+        model
+            .forward_capture(&mut graph, token_id)
+            .unwrap_or_else(|e| panic!("{label}: warmup 1 failed: {e}"));
+        model
+            .forward_capture(&mut graph, token_id)
+            .unwrap_or_else(|e| panic!("{label}: warmup 2 failed: {e}"));
+        graph
+            .begin_capture()
+            .unwrap_or_else(|e| panic!("{label}: begin capture failed: {e}"));
+        model
+            .forward_capture(&mut graph, token_id)
+            .unwrap_or_else(|e| panic!("{label}: capture failed: {e}"));
+        graph
+            .end_capture()
+            .unwrap_or_else(|e| panic!("{label}: end capture failed: {e}"));
+        model
+            .forward_replay(&mut graph, token_id)
+            .unwrap_or_else(|e| panic!("{label}: replay failed: {e}"));
+        dev.synchronize();
+
+        let storage = graph.logits_device_storage();
+        let rocm = storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap_or_else(|| panic!("{label}: logits storage is not ROCm"));
+        let host_bytes = rocm.copy_to_host().expect("copy graph logits");
+        assert_eq!(
+            host_bytes.len(),
+            eager_logits.len() * 4,
+            "{label}: graph/eager logit length mismatch"
+        );
+        let graph_logits = unsafe {
+            std::slice::from_raw_parts(host_bytes.as_ptr() as *const f32, eager_logits.len())
+        };
+        let max_rel = graph_logits
+            .iter()
+            .zip(eager_logits)
+            .map(|(got, want)| (got - want).abs() / (want.abs() + 1e-3))
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_rel < 5e-2,
+            "{label}: graph/eager max relative difference {max_rel:.6}"
+        );
+    }
+
     fn make_test_llama(
         dev: &RocmDevice,
         ordinal: usize,
@@ -6134,30 +6189,16 @@ mod tests {
         assert!(!host.is_empty(), "no logits after replay");
     }
 
-    #[test]
-    fn test_llama_moe_decode_graph_capture_replay() {
-        if !grim_backend_rocm::device::util::gpu_test_enabled() {
-            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
-            return;
-        }
-        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
-        let dev = RocmDevice::shared(0);
-        unsafe {
-            std::env::set_var("GRIM_DECODE_GRAPH", "1");
-        }
-
-        let (mut llama, cfg) = make_test_llama(&dev, 0, false);
+    fn make_test_llama_moe(dev: &RocmDevice) -> (Llama, crate::model::LlamaConfig) {
+        let (mut llama, cfg) = make_test_llama(dev, 0, false);
         let num_experts = 4;
         let top_k = 2;
         let hidden_size = cfg.hidden_size;
         let intermediate_size = cfg.intermediate_size;
-
-        // Convert dense FFN layers to MoE layers
         for (i, layer) in llama.layers.iter_mut().enumerate() {
             layer.ffn_disabled = true;
-
             let seed = (i as u64) * 1000 + 40;
-            let router_gate = test_linear(&dev, 0, num_experts, hidden_size, seed + 20);
+            let router_gate = test_linear(dev, 0, num_experts, hidden_size, seed + 20);
             let router = MoeRouter::new(
                 router_gate,
                 RouterKind::SoftmaxTopK,
@@ -6165,28 +6206,27 @@ mod tests {
                 num_experts,
                 None,
             );
-
             let mut egate = Vec::new();
             let mut eup = Vec::new();
             let mut edown = Vec::new();
             for e in 0..num_experts {
                 let eseed = seed + 30 + (e as u64) * 10;
                 egate.push(test_linear(
-                    &dev,
+                    dev,
                     0,
                     intermediate_size,
                     hidden_size,
                     eseed + 1,
                 ));
                 eup.push(test_linear(
-                    &dev,
+                    dev,
                     0,
                     intermediate_size,
                     hidden_size,
                     eseed + 2,
                 ));
                 edown.push(test_linear(
-                    &dev,
+                    dev,
                     0,
                     hidden_size,
                     intermediate_size,
@@ -6199,13 +6239,67 @@ mod tests {
                 None,
                 1.0,
             );
-
             llama.moe_blocks[i] = Some(MoeBlock {
-                ffn_norm: test_norm(&dev, 0, hidden_size),
+                ffn_norm: test_norm(dev, 0, hidden_size),
                 moe: moe_ffn,
                 tp_config: layer.tp_config,
             });
         }
+        (llama, cfg)
+    }
+
+    fn eager_single_token_logits(model: &Llama, dev: &RocmDevice, token_id: u32) -> Vec<f32> {
+        let mut session = SessionInner::new(Device::Rocm(0));
+        let input = rocm_tensor(dev, 0, vec![token_id as f32], Shape::new(vec![1, 1]));
+        let positions = rocm_tensor(dev, 0, vec![0.0], Shape::new(vec![1, 1]));
+        model
+            .forward(&mut session, &input, &positions, &[])
+            .expect("eager single-token forward")
+            .to_vec_f32()
+            .expect("eager logits readback")
+    }
+
+    #[test]
+    fn test_llama_dense_and_moe_graph_match_eager_via_shared_contract() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+            return;
+        }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = RocmDevice::shared(0);
+        unsafe {
+            std::env::set_var("GRIM_DECODE_GRAPH", "1");
+        }
+        let token_id = 17u32;
+
+        let (dense, _) = make_test_llama(&dev, 0, false);
+        let dense_eager = eager_single_token_logits(&dense, &dev, token_id);
+        assert_graph_matches_eager_single_token(
+            &dense,
+            &dev,
+            token_id,
+            &dense_eager,
+            "Llama dense",
+        );
+
+        let (moe, _) = make_test_llama_moe(&dev);
+        let moe_eager = eager_single_token_logits(&moe, &dev, token_id);
+        assert_graph_matches_eager_single_token(&moe, &dev, token_id, &moe_eager, "Llama MoE");
+    }
+
+    #[test]
+    fn test_llama_moe_decode_graph_capture_replay() {
+        if !grim_backend_rocm::device::util::gpu_test_enabled() {
+            eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
+            return;
+        }
+        let _gpu_guard = grim_backend_rocm::device::util::gpu_test_lock();
+        let dev = RocmDevice::shared(0);
+        unsafe {
+            std::env::set_var("GRIM_DECODE_GRAPH", "1");
+        }
+
+        let (llama, cfg) = make_test_llama_moe(&dev);
 
         let mut graph = llama
             .get_or_create_decode_graph(512, 1)
