@@ -1243,6 +1243,17 @@ impl DecodeGraph {
                 "hipGraphInstantiate failed: {inst}"
             )));
         }
+        let upload = unsafe { crate::hipGraphUpload(exec, self.stream) };
+        if upload != crate::hipSuccess {
+            self.capturing = false;
+            unsafe {
+                let _ = hipGraphExecDestroy(exec);
+                let _ = hipGraphDestroy(graph);
+            }
+            return Err(Error::Backend(format!(
+                "hipGraphUpload failed: {upload}"
+            )));
+        }
         self.graph = graph;
         self.exec = exec;
         self.is_captured = true;
