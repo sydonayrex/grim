@@ -145,9 +145,9 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        let a_ptr = act_f32
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv: act_f32 has no device ptr".into()))?;
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_gemv: act_f32 has no device ptr".into())
+        })?;
         let b_ptr = b_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q80_f32act_gemv: b has no device ptr".into()))?;
@@ -200,9 +200,9 @@ impl RocmDevice {
         let res_ptr = res
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q80_norm_f32act: res has no device ptr".into()))?;
-        let gamma_ptr = gamma
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_q80_norm_f32act: gamma has no device ptr".into()))?;
+        let gamma_ptr = gamma.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_norm_f32act: gamma has no device ptr".into())
+        })?;
         let b_ptr = b_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q80_norm_f32act: b has no device ptr".into()))?;
@@ -274,9 +274,9 @@ impl RocmDevice {
         let residual_ptr = residual_out.device_ptr.ok_or_else(|| {
             Error::Backend("fused add+rms+gateup: residual output has no device ptr".into())
         })?;
-        let out_ptr = out
-            .device_ptr
-            .ok_or_else(|| Error::Backend("fused add+rms+gateup: output has no device ptr".into()))?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("fused add+rms+gateup: output has no device ptr".into())
+        })?;
         let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
         let (mut baseptr, mut attnptr, mut gammaptr) = (base_ptr, attn_ptr, gamma_ptr);
@@ -305,6 +305,54 @@ impl RocmDevice {
             ],
         )?;
         Ok(())
+    }
+
+    /// One-wave 8-output activation-reuse experiment for residual-add Q8_0 GEMV.
+    pub fn launch_dot4_q80_f32act_add_gemv_tile8(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        residual: Option<&RocmStorage>,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_q80_f32act_add_tile8: K must be 32-aligned (k={k})"
+            )));
+        }
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_tile8: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_tile8: weight has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_tile8: out has no device ptr".into())
+        })?;
+        let residual_ptr = residual.and_then(|r| r.device_ptr).unwrap_or(0);
+        let grid_dim = HipDim3::new((n as u32).div_ceil(8), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut aptr, mut bptr, mut resptr, mut optr) = (a_ptr, b_ptr, residual_ptr, out_ptr);
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q80_f32act_add_gemv_tile8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut resptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
 
     /// One-wave 16-output tile experiment for residual-add Q8_0 GEMV.
@@ -381,19 +429,33 @@ impl RocmDevice {
                 k,
             );
         }
-        let a_ptr = act_f32
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: act_f32 has no device ptr".into()))?;
-        let b_ptr = b_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: b has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: out has no device ptr".into()))?;
+        if matches!(
+            std::env::var("GRIM_DOT4_TILE8").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        ) {
+            return self.launch_dot4_q80_f32act_add_gemv_tile8(
+                act_f32,
+                b_storage,
+                residual,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_gemv: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_gemv: b has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q80_f32act_add_gemv: out has no device ptr".into())
+        })?;
         let res_ptr = match residual {
-            Some(r) => r
-                .device_ptr
-                .ok_or_else(|| Error::Backend("dot4_q80_f32act_add_gemv: residual has no device ptr".into()))?,
+            Some(r) => r.device_ptr.ok_or_else(|| {
+                Error::Backend("dot4_q80_f32act_add_gemv: residual has no device ptr".into())
+            })?,
             None => 0,
         };
         let grid_x = (n as u32).div_ceil(4);
@@ -566,9 +628,9 @@ impl RocmDevice {
         let res_ptr = res
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: res has no device ptr".into()))?;
-        let gamma_ptr = gamma
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: gamma has no device ptr".into()))?;
+        let gamma_ptr = gamma.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_qkv_norm_f32act: gamma has no device ptr".into())
+        })?;
         let wq_ptr = wq
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: wq has no device ptr".into()))?;
@@ -578,15 +640,15 @@ impl RocmDevice {
         let wv_ptr = wv
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: wv has no device ptr".into()))?;
-        let q_ptr = q_out
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: q out has no device ptr".into()))?;
-        let k_ptr = k_out
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: k out has no device ptr".into()))?;
-        let v_ptr = v_out
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_qkv_norm_f32act: v out has no device ptr".into()))?;
+        let q_ptr = q_out.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_qkv_norm_f32act: q out has no device ptr".into())
+        })?;
+        let k_ptr = k_out.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_qkv_norm_f32act: k out has no device ptr".into())
+        })?;
+        let v_ptr = v_out.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_qkv_norm_f32act: v out has no device ptr".into())
+        })?;
         let grid_x = ((n_q + 2 * n_kv) as u32).div_ceil(4);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
@@ -718,18 +780,18 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<()> {
-        let a_ptr = act_f32
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: act_f32 has no device ptr".into()))?;
-        let wg_ptr = wg
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: wg has no device ptr".into()))?;
-        let wu_ptr = wu
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: wu has no device ptr".into()))?;
-        let out_ptr = out
-            .device_ptr
-            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_f32act: out has no device ptr".into()))?;
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_f32act: act_f32 has no device ptr".into())
+        })?;
+        let wg_ptr = wg.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_f32act: wg has no device ptr".into())
+        })?;
+        let wu_ptr = wu.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_f32act: wu has no device ptr".into())
+        })?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_gate_up_silu_f32act: out has no device ptr".into())
+        })?;
         let grid_x = (n as u32).div_ceil(4);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
@@ -772,12 +834,12 @@ impl RocmDevice {
         let wg_ptr = wg.device_ptr.ok_or_else(|| {
             Error::Backend("dot4_gate_up_silu_256: gate has no device ptr".into())
         })?;
-        let wu_ptr = wu.device_ptr.ok_or_else(|| {
-            Error::Backend("dot4_gate_up_silu_256: up has no device ptr".into())
-        })?;
-        let out_ptr = out.device_ptr.ok_or_else(|| {
-            Error::Backend("dot4_gate_up_silu_256: out has no device ptr".into())
-        })?;
+        let wu_ptr = wu
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_256: up has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_gate_up_silu_256: out has no device ptr".into()))?;
         let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
         let block_dim = HipDim3::new(256, 1, 1);
         let (mut aptr, mut wgptr, mut wuptr, mut optr) = (a_ptr, wg_ptr, wu_ptr, out_ptr);
