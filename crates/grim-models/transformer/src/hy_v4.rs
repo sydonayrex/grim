@@ -1,12 +1,16 @@
 //! Tencent Hunyuan-V4 (HyV4) Transformer architecture with Grouped Query Attention (GQA), RoPE positional embeddings, SwiGLU feed-forward networks, and RMSNorm.
 //! # Architecture Details - **Attention**: GQA with RoPE rotation.
 
+use std::sync::Arc;
+
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, Device, Shape, Tensor, YaRNParams};
+use grim_tensor::{
+    ArithType, CoreTensorOps, DType, Device, QuantProvenance, Shape, Storage, Tensor, YaRNParams,
+};
 
 // Config
 
@@ -62,6 +66,8 @@ pub struct HyV4Mlp {
     pub gate_proj: Linear,
     pub up_proj: Linear,
     pub down_proj: Linear,
+    /// Fused Q8_0 Gate+Up projection blob on ROCm for single-token decode.
+    pub w_gate_up_q80_fused: Option<Arc<grim_backend_rocm::FusedGateUpWeights>>,
 }
 
 impl HyV4Mlp {
@@ -69,16 +75,118 @@ impl HyV4Mlp {
         let gate_proj = Linear::load_shape(&ws.scoped("gate_proj"), [in_dim, hidden_dim])?;
         let up_proj = Linear::load_shape(&ws.scoped("up_proj"), [in_dim, hidden_dim])?;
         let down_proj = Linear::load_shape(&ws.scoped("down_proj"), [hidden_dim, in_dim])?;
+        let device = gate_proj.weight.device().clone();
+        let is_q80 = |weight: &Tensor| {
+            matches!(
+                weight.dtype().storage,
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+            )
+        };
+        let w_gate_up_q80_fused = if matches!(&device, Device::Rocm(_))
+            && std::env::var("GRIM_FUSED_FFN").as_deref() != Ok("0")
+            && is_q80(&gate_proj.weight)
+            && is_q80(&up_proj.weight)
+        {
+            let ordinal = match &device {
+                Device::Rocm(ordinal) => *ordinal,
+                _ => 0,
+            };
+            grim_backend_rocm::RocmDevice::try_new(ordinal)
+                .ok()
+                .and_then(|dev| {
+                    dev.build_fused_gate_up_q80(
+                        gate_proj.weight.storage().as_ref(),
+                        up_proj.weight.storage().as_ref(),
+                    )
+                    .ok()
+                })
+                .map(Arc::new)
+        } else {
+            None
+        };
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
+            w_gate_up_q80_fused,
         })
     }
 
+    fn fused_gate_up_dot4_decode(
+        &self,
+        norm_x: &Tensor,
+        fused: &grim_backend_rocm::FusedGateUpWeights,
+    ) -> Result<(Tensor, Tensor)> {
+        let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+            Device::Rocm(ordinal) => *ordinal,
+            _ => 0,
+        });
+        let hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
+        let q81_bytes = (hidden / 32) * 36;
+        let act_q81 = Tensor::new(
+            Arc::from(dev.zeros(
+                &Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
+            )?),
+            Shape::new(vec![q81_bytes]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+            QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let x_rocm = grim_backend_rocm::as_rocm(norm_x.storage().as_ref())?;
+        let act_rocm = grim_backend_rocm::as_rocm(act_q81.storage().as_ref())?;
+        dev.launch_quantize_q8_1(x_rocm, act_rocm, 1, hidden)?;
+        let out = dev.launch_fused_gate_up_dot4(
+            act_rocm,
+            &fused.storage,
+            fused.n_gate,
+            fused.n_up,
+            hidden,
+        )?;
+        let out_arc: Arc<dyn grim_tensor::BackendStorage> = Arc::from(out);
+        let gate_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            0,
+            fused.n_gate * 4,
+            Shape::new(vec![1, fused.n_gate]),
+        )?;
+        let up_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc,
+            fused.n_gate * 4,
+            fused.n_up * 4,
+            Shape::new(vec![1, fused.n_up]),
+        )?;
+        Ok((
+            Tensor::new(
+                Arc::from(gate_view),
+                Shape::new(vec![1, fused.n_gate]),
+                DType::F32,
+                QuantProvenance::GrimNative,
+                norm_x.device().clone(),
+            ),
+            Tensor::new(
+                Arc::from(up_view),
+                Shape::new(vec![1, fused.n_up]),
+                DType::F32,
+                QuantProvenance::GrimNative,
+                norm_x.device().clone(),
+            ),
+        ))
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = self.gate_proj.forward(x)?;
-        let u = self.up_proj.forward(x)?;
+        let (g, u) = match self.w_gate_up_q80_fused.as_ref() {
+            Some(fused) if x.shape().dims().first().copied() == Some(1) => {
+                self.fused_gate_up_dot4_decode(x, fused)?
+            }
+            _ => (self.gate_proj.forward(x)?, self.up_proj.forward(x)?),
+        };
         let act = grim_nn::modules::silu_mul_on_device(&g, &u)?;
         Ok(self.down_proj.forward(&act)?)
     }

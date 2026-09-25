@@ -262,6 +262,27 @@ A model-agnostic baseline seam is now available before every checkpoint is prese
   checkpoint as `pending`. These are prefill forward baselines, not decode
   tok/s and not comparable to the 350 tok/s promotion gate.
 
+### P1.3b first wave — dense Q8_0 model migrations (Status: PARITY GREEN, REAL CHECKPOINTS PENDING)
+
+- **EXAONE 4.5** (`exaone4_5`): dense GQA/SwiGLU model. `Exaone45Mlp` now builds
+  `FusedGateUpWeights` at load time when both projections are Q8_0 and
+  `GRIM_FUSED_FFN` is not disabled. Single-token decode uses one fused Gate/Up
+  projection; multi-token forward keeps the split reference.
+- **Hunyuan V4** (`hy_v4`): same dense GQA/SwiGLU structure and gate-up seam;
+  the same opt-in construction and single-token dispatch are now wired.
+- **Gemma** (`gemma`): the existing QKV fusion now has the corresponding Q8_0
+  GateUp fusion. The shared ROCm GeGLU helper was corrected to consume
+  offset `RocmStorageView` inputs through `dev_ptr_dyn`.
+- Added device-gated split-versus-fused parity regressions:
+  `gemma_fused_gateup_parity`, `exaone_fused_gateup_parity`, and
+  `hy_v4_fused_gateup_parity`; all three pass on GPU 1.
+- No local EXAONE/Hunyuan/Gemma Q8_0 checkpoints are available yet, so these
+  are parity/ownership results, not real-model tok/s claims. The baseline
+  manifest command from P0.5 will report these checkpoints as `pending` until
+  their files arrive.
+- Next candidates remain Dots-3 Note and Command-R. Do not mark P1.3b complete
+  until each has its own parity, launch-budget, and real-model raw benchmark.
+
 ### P2 — GDL where needed (Status: PARTIALLY IMPLEMENTED)
 
 **P2.1 `solar_open2.rs` + `delta_net_base.rs` → GDN-2 (EligibleKdaMigration).**
@@ -418,7 +439,8 @@ MoE extras: `moe_all_models_parity_gpu.rs`, `moe_special_cases_gpu.rs` must pass
 - [ ] P1.1: arenas for the 16 `arena=0` files; per-file parity + budget-drop proven (standardizing on `AttentionDispatcher`).
 - [ ] P1.2: RoPE-dev-base for all bespoke decode paths; `GRIM_ROPE_DEV_BASE=0` fallback proven.
 - [x] P1.3a: LFM2 Q8_0 gfx1200 residual/GateUp fusion promoted; coalesced residual stores, 11-test graph parity, 468-test ROCm unit suite, clean-process 350+ tok/s gate, and `GRIM_FUSED_RESIDUAL_GATEUP=0` rollback switch verified.
-- [ ] P1.3b: extend fused GateUp to remaining Class-B dense Q80 models; 4-combo quant matrix and per-file budget/parity evidence green.
+- [x] P1.3b-first: EXAONE 4.5, Hunyuan V4, and Gemma dense Q8_0 GateUp paths pass GPU split/fused parity; Gemma GeGLU now accepts fused output views.
+- [ ] P1.3b-rest: migrate Dots-3 Note and Command-R, then run per-file 4-combo quant matrices, launch budgets, and real-model raw benchmarks.
 - [x] P0.5: model baseline harness discovers available/pending checkpoints, executes fixed prefill baselines through the normal loader, and reports JSON; small LFM2 Q4 executions and pending-manifest behavior verified.
 - [x] Promotion review: default is limited to `gfx1200`; cold-cache startup is recorded separately from warm tok/s; deterministic and stochastic output parity passed after excluding the calibration diagnostic.
 - [ ] P1.4: Charon for the 6 host-MoE files; `moe_*_parity_gpu` green.

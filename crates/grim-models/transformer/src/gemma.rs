@@ -1,12 +1,14 @@
 //! Gemma family — GeGLU activations, scale-norm normalization, and soft-capping.
 
+use std::sync::Arc;
+
 use grim_backend_cpu::{add_tensors, cpu_tensor};
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm, Rope};
-use grim_tensor::{ArithType, DType, Device, Tensor};
+use grim_tensor::{ArithType, CoreTensorOps, DType, Device, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct GemmaConfig {
@@ -47,6 +49,8 @@ pub struct GemmaBlock {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
+    /// Fused Q8_0 Gate+Up projection blob on ROCm for single-token decode.
+    pub w_gate_up_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedGateUpWeights>>,
 }
 
 impl GemmaBlock {
@@ -133,6 +137,38 @@ impl GemmaBlock {
                 None
             };
 
+        let w_gate_up_q80_fused =
+            if matches!(&device, Device::Rocm(_))
+                && std::env::var("GRIM_FUSED_FFN").as_deref() != Ok("0")
+            {
+                let is_q80 = |s: &grim_tensor::Tensor| {
+                    matches!(
+                        s.dtype().storage,
+                        grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+                    )
+                };
+                if is_q80(&ffn_gate.weight) && is_q80(&ffn_up.weight) {
+                    let ordinal = match &device {
+                        Device::Rocm(o) => *o,
+                        _ => 0,
+                    };
+                    match grim_backend_rocm::RocmDevice::try_new(ordinal) {
+                        Ok(rocm_dev) => rocm_dev
+                            .build_fused_gate_up_q80(
+                                ffn_gate.weight.storage().as_ref(),
+                                ffn_up.weight.storage().as_ref(),
+                            )
+                            .ok()
+                            .map(Arc::new),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         Ok(Self {
             attn_norm,
             wq,
@@ -148,6 +184,7 @@ impl GemmaBlock {
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
             wqkv_q80_fused,
+            w_gate_up_q80_fused,
         })
     }
 
@@ -239,6 +276,74 @@ impl GemmaBlock {
         add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 
+    fn fused_gate_up_dot4_decode(
+        &self,
+        norm_x: &Tensor,
+        fused: &grim_backend_rocm::FusedGateUpWeights,
+    ) -> Result<(Tensor, Tensor)> {
+        let dev = grim_backend_rocm::RocmDevice::shared(match norm_x.device() {
+            Device::Rocm(o) => *o,
+            _ => 0,
+        });
+        let hidden = norm_x.shape().dims().last().copied().unwrap_or(0);
+        let q81_bytes = (hidden / 32) * 36;
+        let act_q81 = Tensor::new(
+            Arc::from(dev.zeros(
+                &grim_tensor::Shape::new(vec![q81_bytes]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: grim_tensor::Storage::Native,
+                },
+            )?),
+            grim_tensor::Shape::new(vec![q81_bytes]),
+            DType {
+                arith: ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+            grim_tensor::dtype::QuantProvenance::GrimNative,
+            norm_x.device().clone(),
+        );
+        let x_rocm = grim_backend_rocm::as_rocm(norm_x.storage().as_ref())?;
+        let act_rocm = grim_backend_rocm::as_rocm(act_q81.storage().as_ref())?;
+        dev.launch_quantize_q8_1(x_rocm, act_rocm, 1, hidden)?;
+        let out = dev.launch_fused_gate_up_dot4(
+            act_rocm,
+            &fused.storage,
+            fused.n_gate,
+            fused.n_up,
+            hidden,
+        )?;
+        let out_arc: Arc<dyn grim_tensor::BackendStorage> = Arc::from(out);
+        let gate_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc.clone(),
+            0,
+            fused.n_gate * 4,
+            grim_tensor::Shape::new(vec![1, fused.n_gate]),
+        )?;
+        let up_view = grim_backend_rocm::RocmStorageView::from_offset(
+            out_arc,
+            fused.n_gate * 4,
+            fused.n_up * 4,
+            grim_tensor::Shape::new(vec![1, fused.n_up]),
+        )?;
+        Ok((
+            Tensor::new(
+                Arc::from(gate_view),
+                grim_tensor::Shape::new(vec![1, fused.n_gate]),
+                DType::F32,
+                grim_tensor::dtype::QuantProvenance::GrimNative,
+                norm_x.device().clone(),
+            ),
+            Tensor::new(
+                Arc::from(up_view),
+                grim_tensor::Shape::new(vec![1, fused.n_up]),
+                DType::F32,
+                grim_tensor::dtype::QuantProvenance::GrimNative,
+                norm_x.device().clone(),
+            ),
+        ))
+    }
+
     /// Device-first cache-aware forward: ONE `rope_2d_on_device` call per tensor (no per-head host loop), device-resident KV history via `concat_rows_on_device`, and fused `fused_attention_tensors` - no host roundtrip on GPU backends.
     /// The GeGLU activation stays host-side (gelu-tanh has no device kernel) and is re-uploaded once.
     pub fn forward_kv(
@@ -312,8 +417,10 @@ impl GemmaBlock {
         let x_res1 = grim_nn::modules::add_on_device(x, &attn_out)?;
 
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
-        let gate = self.ffn_gate.forward(&norm_x2)?;
-        let up = self.ffn_up.forward(&norm_x2)?;
+        let (gate, up) = match self.w_gate_up_q80_fused.as_ref() {
+            Some(fused) if new_tokens == 1 => self.fused_gate_up_dot4_decode(&norm_x2, fused)?,
+            _ => (self.ffn_gate.forward(&norm_x2)?, self.ffn_up.forward(&norm_x2)?),
+        };
         // GeGLU: on ROCm this runs entirely on device via `grim_gelu_tanh_mul`.
         let activated = grim_nn::modules::gelu_tanh_mul_on_device(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
@@ -513,6 +620,7 @@ mod tests {
             head_dim: 2,
             rope: Rope::new(2, 10000.0),
             wqkv_q80_fused: None,
+            w_gate_up_q80_fused: None,
         }
     }
 
