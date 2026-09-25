@@ -33,6 +33,25 @@ enum GraphDecodeResult {
 /// Shared tokenizer loader for the `grim run` entry points (M12/M15).
 /// Sibling `.gguf` provider or sibling `tokenizer.json`; `None` when neither
 /// exists. Non-UTF8 paths are a typed Config error (never `to_str().unwrap()`);
+/// BOS token to prepend, per the checkpoint's own tokenizer contract.
+///
+/// Previously this searched a hardcoded name list (`<|startoftext|>`, `<s>`,
+/// `<|im_start|>`) and pushed whatever it found. That guessed a token the
+/// checkpoint never declared: Qwen3.8 declares `add_bos_token = false` and
+/// `bos_token_id = 248044`, but the list matched `<|im_start|>` = 248045, which
+/// was prepended anyway — including in `--raw` mode, where the prompt is meant
+/// to go in verbatim. Feeding an undeclared special token at position 0 pushes
+/// the model off-distribution and it emits well-formed garbage.
+///
+/// Now: nothing in raw mode, and otherwise prepend only when the checkpoint
+/// says to, using the id it declares.
+fn bos_token_to_prepend(tok: &GgufTokenizer, raw_mode: bool) -> Option<u32> {
+    if raw_mode || !tok.add_bos_token {
+        return None;
+    }
+    tok.bos_token_id
+}
+
 /// a present-but-unreadable tokenizer warns loudly instead of vanishing into
 /// `.ok()` — sampling defaults then stay CLI-provided, visibly.
 fn load_run_tokenizer(
@@ -937,13 +956,9 @@ pub async fn cmd_run(
             });
             grim_format::render_messages_or_last(tok, &messages)
         } else {
-            // Prepend BOS token for models that expect it (e.g. <|startoftext|> for LFM2).
-            let bos_candidates = ["<|startoftext|>", "<s>", "<|im_start|>"];
-            for bos in &bos_candidates {
-                if let Some(&id) = tok.token_to_id.get(*bos) {
-                    ids.push(id);
-                    break;
-                }
+            // BOS only when the checkpoint says to, using the id it declares.
+            if let Some(bos) = bos_token_to_prepend(tok, raw) {
+                ids.push(bos);
             }
             prompt.clone()
         };
@@ -1937,12 +1952,9 @@ pub async fn cmd_run_interactive(
                 }
                 grim_format::render_messages_or_last(tok, &messages)
             } else {
-                let bos_candidates = ["<|startoftext|>", "<s>", "<|im_start|>"];
-                for bos in &bos_candidates {
-                    if let Some(&id) = tok.token_to_id.get(*bos) {
-                        ids.push(id);
-                        break;
-                    }
+                // BOS only when the checkpoint says to, using the id it declares.
+                if let Some(bos) = bos_token_to_prepend(tok, raw_mode) {
+                    ids.push(bos);
                 }
                 trimmed.to_string()
             };
@@ -2094,6 +2106,53 @@ pub async fn cmd_run_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Qwen3.8's own contract: `add_bos_token = false`, `bos_token_id = 248044`.
+    /// No BOS may be prepended, and certainly not a token the file never named.
+    #[test]
+    fn no_bos_when_checkpoint_declares_add_bos_token_false() {
+        let mut tok = GgufTokenizer::default();
+        tok.add_bos_token = false;
+        tok.bos_token_id = Some(248044);
+        tok.token_to_id.insert("<|im_start|>".into(), 248045);
+        assert_eq!(bos_token_to_prepend(&tok, false), None);
+    }
+
+    /// `--raw` means verbatim: never inject a BOS, whatever the metadata says.
+    #[test]
+    fn raw_mode_never_prepends_bos() {
+        let mut tok = GgufTokenizer::default();
+        tok.add_bos_token = true;
+        tok.bos_token_id = Some(1);
+        assert_eq!(
+            bos_token_to_prepend(&tok, true),
+            None,
+            "raw mode must feed the prompt verbatim"
+        );
+    }
+
+    /// When the checkpoint does ask for a BOS, use the id IT declares — never a
+    /// name guessed from a hardcoded list.
+    #[test]
+    fn bos_uses_the_declared_id_not_a_guessed_name() {
+        let mut tok = GgufTokenizer::default();
+        tok.add_bos_token = true;
+        tok.bos_token_id = Some(248044);
+        // A name list would have matched this and produced the wrong id.
+        tok.token_to_id.insert("<|im_start|>".into(), 248045);
+        assert_eq!(bos_token_to_prepend(&tok, false), Some(248044));
+    }
+
+    /// A checkpoint that wants a BOS but declares no id gets none, rather than
+    /// a token invented by name matching.
+    #[test]
+    fn bos_is_omitted_when_id_is_undeclared() {
+        let mut tok = GgufTokenizer::default();
+        tok.add_bos_token = true;
+        tok.bos_token_id = None;
+        tok.token_to_id.insert("<|startoftext|>".into(), 5);
+        assert_eq!(bos_token_to_prepend(&tok, false), None);
+    }
 
     #[test]
     fn requested_unavailable_backend_errors_loudly() {
