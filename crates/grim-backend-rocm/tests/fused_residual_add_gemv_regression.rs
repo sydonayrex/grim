@@ -1,0 +1,163 @@
+//! Task 11: Regression test for Phase D.2 fused residual add GEMV.
+//! Tests `launch_dot4_q80_f32act_add_gemv` for:
+//! 1. Parity against standalone GEMV + elementwise add.
+//! 2. In-place aliasing safety when `C == residual`.
+//! 3. Null residual (`residual == None`) behaves identically to standalone GEMV.
+//!
+//! Gated: canonical `gpu_test_enabled()`.
+
+use grim_backend_rocm::RocmStorage;
+use grim_backend_rocm::{RocmDevice, as_rocm, gpu_test_enabled};
+use grim_tensor::{ArithType, CoreTensorOps, DType, MemoryOps, Shape, Storage};
+
+fn gpu_device() -> Option<RocmDevice> {
+    if !gpu_test_enabled() {
+        return None;
+    }
+    std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")).ok()
+}
+
+fn f32_tensor(
+    dev: &RocmDevice,
+    data: &[f32],
+    shape: &Shape,
+) -> Box<dyn grim_tensor::BackendStorage> {
+    CoreTensorOps::from_cpu(dev, data, shape, DType::F32).unwrap()
+}
+
+fn pack_q80(w: &[f32], rows: usize, k: usize) -> Vec<u8> {
+    let blocks = k / 32;
+    let mut out = vec![0u8; rows * blocks * 34];
+    for r in 0..rows {
+        for b in 0..blocks {
+            let off = (r * blocks + b) * 34;
+            let mut amax = 0.0f32;
+            for e in 0..32 {
+                amax = amax.max(w[r * k + b * 32 + e].abs());
+            }
+            let d = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+            let h = half::f16::from_f32(d);
+            out[off..off + 2].copy_from_slice(&h.to_le_bytes());
+            for e in 0..32 {
+                let v = w[r * k + b * 32 + e] / d;
+                out[off + 2 + e] = v.round().clamp(-127.0, 127.0) as i8 as u8;
+            }
+        }
+    }
+    out
+}
+
+fn upload_q80(
+    dev: &RocmDevice,
+    packed: &[u8],
+    rows: usize,
+    k: usize,
+) -> Box<dyn grim_tensor::BackendStorage> {
+    let q_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80),
+    };
+    MemoryOps::from_cpu_bytes(dev, packed, &Shape::new(vec![rows, k]), q_dtype).unwrap()
+}
+
+fn rocm<'a>(s: &'a Box<dyn grim_tensor::BackendStorage>) -> &'a RocmStorage {
+    as_rocm(s.as_ref()).unwrap()
+}
+
+fn rand_f32(n: usize, seed: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| ((seed + i * 7) % 113) as f32 / 113.0 - 0.5)
+        .collect()
+}
+
+#[test]
+#[ignore]
+fn fused_residual_add_gemv_matches_gemv_plus_add() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    if !dev.supports_dot4() {
+        eprintln!("skipping: device does not support dot4");
+        return;
+    }
+
+    let k = 1024usize;
+    let n = 2048usize;
+    let m = 1usize;
+    let x = rand_f32(k, 301);
+    let res_data = rand_f32(n, 302);
+    let a = f32_tensor(&dev, &x, &Shape::new(vec![m, k]));
+    let w = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 303), n, k), n, k);
+    let residual = f32_tensor(&dev, &res_data, &Shape::new(vec![n]));
+
+    // Reference: standalone f32act GEMV + CPU add
+    let gemv_out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    dev.launch_dot4_q80_f32act_gemv(rocm(&a), rocm(&w), rocm(&gemv_out), m, n, k)
+        .unwrap();
+    let gemv_vec = gemv_out.to_cpu_vec_f32().unwrap();
+    let want_res: Vec<f32> = gemv_vec.iter().zip(res_data.iter()).map(|(g, r)| g + r).collect();
+
+    // Test 1: Distinct output buffer
+    let out_distinct = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    dev.launch_dot4_q80_f32act_add_gemv(
+        rocm(&a),
+        rocm(&w),
+        Some(rocm(&residual)),
+        rocm(&out_distinct),
+        m,
+        n,
+        k,
+    )
+    .unwrap();
+
+    let got_distinct = out_distinct.to_cpu_vec_f32().unwrap();
+    for (i, (g, w)) in got_distinct.iter().zip(want_res.iter()).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-4,
+            "distinct[{i}]: got={g} vs want={w}"
+        );
+    }
+
+    // Test 2: In-place aliasing (C == residual)
+    let in_place = f32_tensor(&dev, &res_data, &Shape::new(vec![n]));
+    dev.launch_dot4_q80_f32act_add_gemv(
+        rocm(&a),
+        rocm(&w),
+        Some(rocm(&in_place)),
+        rocm(&in_place),
+        m,
+        n,
+        k,
+    )
+    .unwrap();
+
+    let got_inplace = in_place.to_cpu_vec_f32().unwrap();
+    for (i, (g, w)) in got_inplace.iter().zip(want_res.iter()).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-4,
+            "inplace[{i}]: got={g} vs want={w}"
+        );
+    }
+
+    // Test 3: None residual matches standalone GEMV
+    let out_none = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    dev.launch_dot4_q80_f32act_add_gemv(
+        rocm(&a),
+        rocm(&w),
+        None,
+        rocm(&out_none),
+        m,
+        n,
+        k,
+    )
+    .unwrap();
+
+    let got_none = out_none.to_cpu_vec_f32().unwrap();
+    for (i, (g, w)) in got_none.iter().zip(gemv_vec.iter()).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-5,
+            "none_res[{i}]: got={g} vs gemv={w}"
+        );
+    }
+}

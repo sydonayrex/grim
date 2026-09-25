@@ -204,6 +204,228 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// PLAN-decode-throughput-restore: fused QK-norm + device-base RoPE,
+    /// written into caller-provided buffers (capture-safe, in place OK).
+    /// Normalizes each head row with `gamma`/`eps` (plain RMS over head_dim),
+    /// then applies NeoX/interleaved rotation. Requires head_dim == 64
+    /// (half == warpSize) — the caller falls back to the split path otherwise.
+    pub fn qk_rope_dev_base_into(
+        &self,
+        x: &dyn BackendStorage,
+        pos_base_dev: &dyn BackendStorage,
+        gamma: &dyn BackendStorage,
+        eps: f32,
+        out: &RocmStorage,
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+        num_heads: usize,
+        steps: usize,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dim = cfg.dim;
+        let base = cfg.base;
+        let x_s = as_rocm(x)?;
+        let pos_s = as_rocm(pos_base_dev)?;
+        if !x_s.device_ptr_is_valid() || !pos_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "qk_rope_dev_base_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || out_dims[2] != dim {
+            return Err(Error::Shape(format!(
+                "qk_rope_dev_base_into expects (B,S,D={}), got {:?}",
+                dim, out_dims
+            )));
+        }
+        let b = out_dims[0] as i32;
+        let s = out_dims[1] as i32;
+        let expected_s = (num_heads * steps) as i32;
+        if s != expected_s {
+            return Err(Error::Shape(format!(
+                "qk_rope_dev_base_into: middle dim {s} != num_heads*steps={expected_s}"
+            )));
+        }
+        let d = dim as i32;
+        let half = d / 2;
+        if half != 32 {
+            return Err(Error::Backend(format!(
+                "qk_rope_dev_base_into requires head_dim 64 (half==warpSize), got {d}"
+            )));
+        }
+
+        let mut out_ptr = dev_ptr(out)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut pos_ptr = dev_ptr(pos_s)?;
+        let mut g_ptr = dev_ptr(as_rocm(gamma)?)?;
+        let mut b_i = b;
+        let mut s_i = s;
+        let mut d_i = d;
+        let mut half_i = half;
+        let mut base_f = base;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
+        let mut heads_i = num_heads as i32;
+        let mut eps_f = eps;
+
+        let total = (b * s * half) as usize;
+        let (grid, block) = linear_launch(total);
+
+        self.launch_compute_kernel(
+            "grim_qk_rope_dev_base",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut pos_ptr),
+                arg(&mut g_ptr),
+                arg(&mut out_ptr),
+                arg(&mut b_i),
+                arg(&mut s_i),
+                arg(&mut d_i),
+                arg(&mut half_i),
+                arg(&mut base_f),
+                arg(&mut inter_i),
+                arg(&mut heads_i),
+                arg(&mut eps_f),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// PLAN 4 Task 4: QK-rope + KV-append fusion for the K/V pair — one
+    /// launch replaces (qk_rope k, kv_append k, kv_append v). Bit-identical
+    /// to the separate launches (pair-identical thread mapping, same
+    /// offsets, same f16 conversion). Q rope stays separate (no append);
+    /// bump stays after attention (which reads pre-bump total_dev).
+    /// Same `half == 32` warpSize constraint as `qk_rope_dev_base_into`;
+    /// caller falls back to the split path otherwise. Graph-capture safe
+    /// (caller-owned buffers, no H2D/sync/alloc).
+    ///
+    /// F16 gate replicated from `kernels::qkv_attention::kv_f16_enabled`
+    /// (not imported: that module's f16 plumbing stays out of this commit;
+    /// this 4-line contract is pinned by `docs/debug-vars.md`).
+    pub fn qk_rope_append_kv_into(
+        &self,
+        k: &dyn BackendStorage,
+        pos_base_dev: &dyn BackendStorage,
+        gamma_k: &dyn BackendStorage,
+        eps: f32,
+        v: &dyn BackendStorage,
+        k_out: &RocmStorage,
+        k_arena: &dyn BackendStorage,
+        v_arena: &dyn BackendStorage,
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+        nkv_heads: usize,
+        steps: usize,
+        kv_stride: usize,
+        arena_slot_stride: usize,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        // M3 fail-closed (mirrors kv_append): arena dtype must match GRIM_F16_KV.
+        fn rope_kv_f16_enabled() -> bool {
+            std::env::var("GRIM_F16_KV")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false)
+        }
+        for (arena, what) in [(k_arena, "rope_append k"), (v_arena, "rope_append v")] {
+            let s = arena
+                .as_any()
+                .downcast_ref::<RocmStorage>()
+                .ok_or_else(|| Error::Backend(format!("{what}: arena must be RocmStorage")))?;
+            let want_f16 = rope_kv_f16_enabled();
+            let is_f16 = s.dtype.arith == grim_tensor::dtype::ArithType::F16;
+            if is_f16 != want_f16 {
+                return Err(Error::Backend(format!(
+                    "{what}: arena dtype {:?} does not match GRIM_F16_KV={want_f16}",
+                    s.dtype.arith,
+                )));
+            }
+        }
+        let dim = cfg.dim;
+        let base = cfg.base;
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || out_dims[2] != dim {
+            return Err(Error::Shape(format!(
+                "qk_rope_append_kv expects (B,S,D={}), got {:?}",
+                dim, out_dims
+            )));
+        }
+        let b = out_dims[0] as i32;
+        let s = out_dims[1] as i32;
+        let expected_s = (nkv_heads * steps) as i32;
+        if s != expected_s {
+            return Err(Error::Shape(format!(
+                "qk_rope_append_kv: middle dim {s} != nkv_heads*steps={expected_s}"
+            )));
+        }
+        let d = dim as i32;
+        let half = d / 2;
+        if half != 32 {
+            return Err(Error::Backend(format!(
+                "qk_rope_append_kv requires head_dim 64 (half==warpSize), got {d}"
+            )));
+        }
+        let k_s = as_rocm(k)?;
+        let pos_s = as_rocm(pos_base_dev)?;
+        let v_s = as_rocm(v)?;
+        if !k_s.device_ptr_is_valid() || !pos_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "qk_rope_append_kv: input lacks a valid device pointer".into(),
+            ));
+        }
+        let mut k_ptr = dev_ptr(k_s)?;
+        let mut pos_ptr = dev_ptr(pos_s)?;
+        let mut g_ptr = dev_ptr(as_rocm(gamma_k)?)?;
+        let mut v_ptr = dev_ptr(v_s)?;
+        let mut k_out_ptr = dev_ptr(k_out)?;
+        let mut k_arena_ptr = dev_ptr(as_rocm(k_arena)?)?;
+        let mut v_arena_ptr = dev_ptr(as_rocm(v_arena)?)?;
+        let mut b_i = b;
+        let mut s_i = s;
+        let mut d_i = d;
+        let mut half_i = half;
+        let mut base_f = base;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
+        let mut nkv_i = nkv_heads as i32;
+        let mut eps_f = eps;
+        let mut kv_stride_i = kv_stride as i32;
+        let mut steps_i = steps as i32;
+        let mut slot_stride_i = arena_slot_stride as i32;
+        let mut f16_i = rope_kv_f16_enabled() as i32;
+
+        let total = (b * s * half) as usize;
+        let (grid, block) = linear_launch(total);
+
+        self.launch_compute_kernel(
+            "grim_qk_rope_append_kv",
+            grid,
+            block,
+            &mut [
+                arg(&mut k_ptr),
+                arg(&mut pos_ptr),
+                arg(&mut g_ptr),
+                arg(&mut v_ptr),
+                arg(&mut k_out_ptr),
+                arg(&mut k_arena_ptr),
+                arg(&mut v_arena_ptr),
+                arg(&mut b_i),
+                arg(&mut s_i),
+                arg(&mut d_i),
+                arg(&mut half_i),
+                arg(&mut base_f),
+                arg(&mut inter_i),
+                arg(&mut nkv_i),
+                arg(&mut eps_f),
+                arg(&mut kv_stride_i),
+                arg(&mut steps_i),
+                arg(&mut slot_stride_i),
+                arg(&mut f16_i),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Item 2: device-base RoPE for the decode path. Instead of uploading a
     /// per-layer per-token `positions[]` host vector, the single base position
     /// lives in a device buffer (`pos_base_dev`, one u32) and the kernel derives
