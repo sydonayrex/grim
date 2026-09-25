@@ -239,6 +239,29 @@ How: per-layer `check_layer_topology` + `seed_kv_arena_from_eager` (+ `seed_conv
 `seed_latent_kv_arena_from_eager` where applicable); GQA-mismatch / non-64 / missing-buffer layers stay eager
 by construction. Never bake host scalars into launches (the `past*kv_stride` bug class).
 
+### P0.5 — Model baseline preparation harness (Status: COMPLETE)
+
+A model-agnostic baseline seam is now available before every checkpoint is present:
+
+- **CLI:** `grim-cli baseline --model-dir models [--manifest path] [--run] [--device rocm]`.
+- **Discovery:** recursively inventories `.gguf`, `.grim`, `.safetensors`, and `.bin`
+  files. A manifest may list future paths; missing entries are reported as
+  `pending` without failing the inventory.
+- **Execution:** `--run` loads each available checkpoint through the existing
+  `grim_engine::model_loader` and runs a fixed prompt-length prefill baseline with
+  configurable warmup and measured iterations. Output is JSON with path, model
+  architecture, device, status, per-iteration samples, mean forward time, and
+  errors. This is intentionally a preparation/measurement surface, not a new
+  model-specific code path.
+- **Files:** `crates/grim-cli/src/baseline.rs`, `crates/grim-cli/src/main.rs`,
+  and the shared device-tensor constructor in `crates/grim-cli/src/run.rs`.
+- **Validation:** baseline unit tests pass (`3 passed`); inventory mode found
+  all current model files; execution mode passed on the available
+  `LFM2.5-230M-Q4_K_M` (`463.7 ms` mean 8-token forward) and
+  `LFM2.5-350M-Q4_K_M` (`608.6 ms`); manifest mode reported a missing future
+  checkpoint as `pending`. These are prefill forward baselines, not decode
+  tok/s and not comparable to the 350 tok/s promotion gate.
+
 ### P2 — GDL where needed (Status: PARTIALLY IMPLEMENTED)
 
 **P2.1 `solar_open2.rs` + `delta_net_base.rs` → GDN-2 (EligibleKdaMigration).**
@@ -396,6 +419,7 @@ MoE extras: `moe_all_models_parity_gpu.rs`, `moe_special_cases_gpu.rs` must pass
 - [ ] P1.2: RoPE-dev-base for all bespoke decode paths; `GRIM_ROPE_DEV_BASE=0` fallback proven.
 - [x] P1.3a: LFM2 Q8_0 gfx1200 residual/GateUp fusion promoted; coalesced residual stores, 11-test graph parity, 468-test ROCm unit suite, clean-process 350+ tok/s gate, and `GRIM_FUSED_RESIDUAL_GATEUP=0` rollback switch verified.
 - [ ] P1.3b: extend fused GateUp to remaining Class-B dense Q80 models; 4-combo quant matrix and per-file budget/parity evidence green.
+- [x] P0.5: model baseline harness discovers available/pending checkpoints, executes fixed prefill baselines through the normal loader, and reports JSON; small LFM2 Q4 executions and pending-manifest behavior verified.
 - [x] Promotion review: default is limited to `gfx1200`; cold-cache startup is recorded separately from warm tok/s; deterministic and stochastic output parity passed after excluding the calibration diagnostic.
 - [ ] P1.4: Charon for the 6 host-MoE files; `moe_*_parity_gpu` green.
 - [ ] P1.5: graph capture for block.rs-first cohort; replay bit-identical.

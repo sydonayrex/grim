@@ -1634,7 +1634,7 @@ fn sample_on_rocm(
     )
 }
 
-fn build_tensor(
+pub(crate) fn build_tensor(
     data: &[f32],
     shape: &grim_tensor::Shape,
     device: &grim_tensor::Device,

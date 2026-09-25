@@ -26,6 +26,7 @@ use grim_core::error::Result;
 pub mod adapter;
 pub mod arch_plugin;
 pub mod bench;
+pub mod baseline;
 pub mod calibrate_channels;
 pub mod catalog;
 pub mod client;
@@ -344,6 +345,30 @@ enum Commands {
         /// List all saved provider credentials.
         #[arg(short, long)]
         list: bool,
+    },
+    /// Prepare or run a model-agnostic baseline for every discovered checkpoint.
+    Baseline {
+        /// Directory searched recursively for model files.
+        #[arg(long, default_value = "models")]
+        model_dir: String,
+        /// Optional newline-delimited manifest; missing paths are reported as pending.
+        #[arg(long)]
+        manifest: Option<String>,
+        /// Load and execute available checkpoints; without this, only inventory them.
+        #[arg(long)]
+        run: bool,
+        /// Prompt length used by the fixed prefill baseline.
+        #[arg(long, default_value_t = 8)]
+        prompt_tokens: usize,
+        /// Warmup forwards before measurement.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Measured forwards per checkpoint.
+        #[arg(long, default_value_t = 3)]
+        steps: usize,
+        /// Target device passed to the normal device probe.
+        #[arg(long)]
+        device: Option<String>,
     },
     /// Benchmark / smoke test.
     Bench {
@@ -1538,6 +1563,25 @@ async fn main() -> Result<()> {
                     "Please specify a provider (e.g. 'grim login hf.co') or run 'grim login --list'."
                 );
             }
+        }
+        Commands::Baseline {
+            model_dir,
+            manifest,
+            run,
+            prompt_tokens,
+            warmup,
+            steps,
+            device,
+        } => {
+            baseline::cmd_baseline(baseline::BaselineOptions {
+                model_dir: model_dir.into(),
+                manifest: manifest.map(Into::into),
+                execute: run,
+                prompt_tokens,
+                warmup_iterations: warmup,
+                measured_iterations: steps,
+                device,
+            })?;
         }
         Commands::Bench {
             tokens,

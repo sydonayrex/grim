@@ -224,3 +224,37 @@ coalesced residual/GateUp path by default only for `gfx1200`; other targets
 retain the split path. `GRIM_FUSED_RESIDUAL_GATEUP=0` is the kill switch.
 Final promoted-default warm runs measured 357, 354, and 357 tok/s, while the
 kill-switch run measured 324 tok/s in the same review session.
+
+---
+
+## 10. Model Baseline Preparation
+
+A model-agnostic baseline command is now available for checkpoint preparation:
+
+```bash
+# Inventory all discovered checkpoints; missing manifest entries are pending.
+./target/release/grim-cli baseline --model-dir models
+
+# Execute fixed prefill baselines for selected available checkpoints.
+./target/release/grim-cli baseline \
+  --model-dir models \
+  --manifest /path/to/checkpoints.manifest \
+  --run --device rocm --prompt-tokens 8 --warmup 1 --steps 3
+```
+
+The command discovers `.gguf`, `.grim`, `.safetensors`, and `.bin` files
+recursively, loads through the normal model loader, and reports JSON containing
+path, architecture, device, status, forward samples, mean forward time, and
+errors. A manifest can name checkpoints before they are downloaded; unavailable
+entries are reported as `pending` without failing the inventory.
+
+Validation performed on GPU 1:
+
+- Baseline unit tests: `3 passed`.
+- Inventory mode discovered all current model files.
+- Execution mode passed on `LFM2.5-230M-Q4_K_M` at `463.7 ms` mean 8-token
+  forward and `LFM2.5-350M-Q4_K_M` at `608.6 ms`.
+- Manifest mode reported a future checkpoint as `pending`.
+
+These are prefill forward baselines for model preparation, not decode tok/s and
+not comparable to the 350 tok/s decode promotion gate.
