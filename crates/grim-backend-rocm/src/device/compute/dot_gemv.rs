@@ -236,6 +236,77 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// Graph fusion: residual add + RMSNorm + Q8_0 Gate/Up GEMV + SiLU.
+    pub fn fused_add_rms_norm_gate_up_silu_dot4_into(
+        &self,
+        base: &RocmStorage,
+        attn: &RocmStorage,
+        gamma: &RocmStorage,
+        eps: f32,
+        wg: &RocmStorage,
+        wu: &RocmStorage,
+        residual_out: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "fused add+rms+gateup: K must be 32-aligned (k={k})"
+            )));
+        }
+        let base_ptr = base
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused add+rms+gateup: base has no device ptr".into()))?;
+        let attn_ptr = attn
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused add+rms+gateup: attn has no device ptr".into()))?;
+        let gamma_ptr = gamma.device_ptr.ok_or_else(|| {
+            Error::Backend("fused add+rms+gateup: gamma has no device ptr".into())
+        })?;
+        let wg_ptr = wg
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused add+rms+gateup: gate has no device ptr".into()))?;
+        let wu_ptr = wu
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused add+rms+gateup: up has no device ptr".into()))?;
+        let residual_ptr = residual_out.device_ptr.ok_or_else(|| {
+            Error::Backend("fused add+rms+gateup: residual output has no device ptr".into())
+        })?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused add+rms+gateup: output has no device ptr".into()))?;
+        let grid_dim = HipDim3::new((n as u32).div_ceil(4), m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let (mut baseptr, mut attnptr, mut gammaptr) = (base_ptr, attn_ptr, gamma_ptr);
+        let (mut wgptr, mut wuptr) = (wg_ptr, wu_ptr);
+        let (mut residualptr, mut outptr) = (residual_ptr, out_ptr);
+        let mut epsv = eps;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_add_rms_norm_gate_up_silu_q80_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut baseptr),
+                arg(&mut attnptr),
+                arg(&mut gammaptr),
+                arg(&mut epsv),
+                arg(&mut wgptr),
+                arg(&mut wuptr),
+                arg(&mut residualptr),
+                arg(&mut outptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Phase D.2: Fused activation quantize + dot4 Q8_0 GEMV with optional residual add epilogue directly from f32 activations.
     /// When residual is Some, computes C = residual + A * B. Supports in-place addition when residual is out_storage.
     pub fn launch_dot4_q80_f32act_add_gemv(

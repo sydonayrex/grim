@@ -72,6 +72,98 @@ fn rand_f32(n: usize, seed: usize) -> Vec<f32> {
 
 #[test]
 #[ignore]
+fn fused_residual_rms_gateup_matches_split_path() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    if !dev.supports_dot4() {
+        eprintln!("skipping: device does not support dot4");
+        return;
+    }
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    let m = 1usize;
+    let k = 1024usize;
+    let n = 2048usize;
+    let eps = 1e-5f32;
+    let base = f32_tensor(&dev, &rand_f32(k, 501), &Shape::new(vec![m, k]));
+    let attn = f32_tensor(&dev, &rand_f32(k, 502), &Shape::new(vec![m, k]));
+    let gamma = f32_tensor(&dev, &vec![1.0; k], &Shape::new(vec![k]));
+    let wg = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 503), n, k), n, k);
+    let wu = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 504), n, k), n, k);
+
+    let residual_ref = f32_tensor(&dev, &vec![0.0; k], &Shape::new(vec![m, k]));
+    let norm_ref = f32_tensor(&dev, &vec![0.0; k], &Shape::new(vec![m, k]));
+    let activated_ref = f32_tensor(&dev, &vec![0.0; n], &Shape::new(vec![m, n]));
+    let act_q81 = f32_tensor(
+        &dev,
+        &vec![0.0; (k / 32) * 36],
+        &Shape::new(vec![(k / 32) * 36]),
+    );
+    dev.add_into(base.as_ref(), attn.as_ref(), rocm(&residual_ref))
+        .unwrap();
+    dev.rms_norm_into(
+        residual_ref.as_ref(),
+        gamma.as_ref(),
+        eps,
+        rocm(&norm_ref),
+        &Shape::new(vec![m, k]),
+    )
+    .unwrap();
+    dev.fused_gate_up_silu_dot4_into(
+        norm_ref.as_ref(),
+        rocm(&wg),
+        rocm(&wu),
+        rocm(&activated_ref),
+        n,
+        k,
+        rocm(&act_q81),
+    )
+    .unwrap();
+
+    let residual_got = f32_tensor(&dev, &vec![0.0; k], &Shape::new(vec![m, k]));
+    let activated_got = f32_tensor(&dev, &vec![0.0; n], &Shape::new(vec![m, n]));
+    dev.fused_add_rms_norm_gate_up_silu_dot4_into(
+        rocm(&base),
+        rocm(&attn),
+        rocm(&gamma),
+        eps,
+        rocm(&wg),
+        rocm(&wu),
+        rocm(&residual_got),
+        rocm(&activated_got),
+        m,
+        n,
+        k,
+    )
+    .unwrap();
+
+    for (i, (got, want)) in residual_got
+        .to_cpu_vec_f32()
+        .unwrap()
+        .iter()
+        .zip(residual_ref.to_cpu_vec_f32().unwrap())
+        .enumerate()
+    {
+        assert!((got - want).abs() < 1e-4, "residual[{i}]: {got} vs {want}");
+    }
+    for (i, (got, want)) in activated_got
+        .to_cpu_vec_f32()
+        .unwrap()
+        .iter()
+        .zip(activated_ref.to_cpu_vec_f32().unwrap())
+        .enumerate()
+    {
+        assert!(
+            (got - want).abs() < 1e-3 + want.abs() * 1e-4,
+            "activated[{i}]: {got} vs {want}"
+        );
+    }
+}
+
+#[test]
+#[ignore]
 fn fused_residual_add_gemv_matches_gemv_plus_add() {
     let Some(dev) = gpu_device() else {
         eprintln!("skipping: GPU test gate off");

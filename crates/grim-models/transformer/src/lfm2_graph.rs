@@ -715,111 +715,135 @@ impl Lfm2Block {
         check_layer_topology(buffers, layer_idx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
         let ffn_shape = buffers.layer_output[layer_idx].shape().clone();
-        if fuse_norm {
-            // PLAN-decode-throughput-restore Fix 3: ONE grim_add_rms_norm
-            // launch replaces the (residual-add + ffn-norm) pair. norm_out
-            // aliases the residual input (norm_buf) — safe: the kernel reads
-            // the residual only in pass 1 and only reads the sum in pass 2.
-            dev.fused_add_rms_norm_into(
-                &buffers.layer_input[layer_idx],
-                &buffers.norm_buf[layer_idx],
-                &**self.ffn_norm.weight.storage(),
-                self.ffn_norm.eps,
-                &buffers.layer_output[layer_idx],
-                &buffers.norm_buf[layer_idx],
-                &ffn_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-        } else {
-            // Norm the attention residual (layer_output currently holds it) into
-            // the staging slot; every GEMM below then writes a fixed pool slot.
-            dev.rms_norm_into(
-                &buffers.layer_output[layer_idx],
-                &**self.ffn_norm.weight.storage(),
-                self.ffn_norm.eps,
-                &buffers.norm_buf[layer_idx],
-                &ffn_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-        }
-        let normed: &Storage = &buffers.norm_buf[layer_idx];
+        let hidden = buffers.layer_output[layer_idx]
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let m = buffers.batch.max(1);
         let act = &buffers.act_q81_buf[layer_idx];
-        let hidden = normed.shape().dims().last().copied().unwrap_or(0);
-        // Fused gate+up (Q8_0 blob present): ONE dot4 GEMV into gate_up_buf,
-        // then slice halves into gate/up bufs. Works for any batch size —
-        // the quantize kernel quantizes [batch, hidden] and the fused GEMV
-        // writes to [batch, n_gate+n_up]. m = buffers.batch (not 1).
-        // PLAN-kernel-launch-reduction Phase A: ONE launch does gate GEMV +
-        // up GEMV + SiLU (replaces 2 GEMV + 2 quantize + silu_mul, or the
-        // blob path's GEMV + 2 slice copies + silu_mul).
-        let fused_ffn = dot_fused_ok(dev, hidden)
+        let fused_residual_ffn = fuse_norm
+            && matches!(
+                std::env::var("GRIM_FUSED_RESIDUAL_GATEUP").as_deref(),
+                Ok("1") | Ok("true") | Ok("on")
+            )
+            && dot_fused_ok(dev, hidden)
             && is_q80(&self.ffn_gate.weight)
             && is_q80(&self.ffn_up.weight);
-        if fused_ffn {
-            dev.fused_gate_up_silu_dot4_into(
-                normed,
+        if fused_residual_ffn {
+            dev.fused_add_rms_norm_gate_up_silu_dot4_into(
+                &buffers.layer_input[layer_idx],
+                &buffers.norm_buf[layer_idx],
+                rocm_storage(&self.ffn_norm.weight)?,
+                self.ffn_norm.eps,
                 rocm_storage(&self.ffn_gate.weight)?,
                 rocm_storage(&self.ffn_up.weight)?,
+                &buffers.layer_output[layer_idx],
                 &buffers.activated_buf[layer_idx],
+                m,
                 self.ffn_gate.weight.shape().dim(0).unwrap_or(0),
                 hidden,
-                act,
             )
-            .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup silu: {e}")))?;
-        } else if let Some(fused) = self
-            .w_gate_up_q80_fused
-            .as_ref()
-            .filter(|_| dot_fused_ok(dev, hidden))
-        {
-            let norm_rocm = dst_downcast(normed)?;
-            let m = buffers.batch.max(1);
-            dev.launch_quantize_q8_1(norm_rocm, act, m, hidden)
-                .map_err(|e| grim_core::error::Error::Backend(format!("gateup quant: {e}")))?;
-            dev.launch_fused_gate_up_dot4_into(
-                act,
-                &fused.storage,
-                &buffers.gate_up_buf[layer_idx],
-                fused.n_gate,
-                fused.n_up,
-                hidden,
-            )
-            .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup: {e}")))?;
-            let staged: &Storage = &buffers.gate_up_buf[layer_idx];
-            dev.copy_slice_into(&buffers.gate_buf[layer_idx], staged, 0, fused.n_gate)
-                .map_err(grim_core::error::Error::Tensor)?;
-            dev.copy_slice_range(
-                &buffers.up_buf[layer_idx],
-                0,
-                staged,
-                fused.n_gate,
-                fused.n_up,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("fused residual+gateup: {e}"))
+            })?;
         } else {
-            linear_into(
-                dev,
-                normed,
-                &self.ffn_gate.weight,
-                &buffers.gate_buf[layer_idx],
-                act,
-            )?;
-            linear_into(
-                dev,
-                normed,
-                &self.ffn_up.weight,
-                &buffers.up_buf[layer_idx],
-                act,
-            )?;
+            if fuse_norm {
+                // PLAN-decode-throughput-restore Fix 3: ONE grim_add_rms_norm
+                // launch replaces the (residual-add + ffn-norm) pair. norm_out
+                // aliases the residual input (norm_buf) — safe: the kernel reads
+                // the residual only in pass 1 and only reads the sum in pass 2.
+                dev.fused_add_rms_norm_into(
+                    &buffers.layer_input[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    &**self.ffn_norm.weight.storage(),
+                    self.ffn_norm.eps,
+                    &buffers.layer_output[layer_idx],
+                    &buffers.norm_buf[layer_idx],
+                    &ffn_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            } else {
+                // Norm the attention residual into the staging slot; every GEMM
+                // below then writes a fixed pool slot.
+                dev.rms_norm_into(
+                    &buffers.layer_output[layer_idx],
+                    &**self.ffn_norm.weight.storage(),
+                    self.ffn_norm.eps,
+                    &buffers.norm_buf[layer_idx],
+                    &ffn_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+            let normed: &Storage = &buffers.norm_buf[layer_idx];
+            let fused_gateup = dot_fused_ok(dev, hidden)
+                && is_q80(&self.ffn_gate.weight)
+                && is_q80(&self.ffn_up.weight);
+            if fused_gateup {
+                dev.fused_gate_up_silu_dot4_into(
+                    normed,
+                    rocm_storage(&self.ffn_gate.weight)?,
+                    rocm_storage(&self.ffn_up.weight)?,
+                    &buffers.activated_buf[layer_idx],
+                    self.ffn_gate.weight.shape().dim(0).unwrap_or(0),
+                    hidden,
+                    act,
+                )
+                .map_err(|e| {
+                    grim_core::error::Error::Backend(format!("fused gateup silu: {e}"))
+                })?;
+            } else if let Some(fused) = self
+                .w_gate_up_q80_fused
+                .as_ref()
+                .filter(|_| dot_fused_ok(dev, hidden))
+            {
+                let norm_rocm = dst_downcast(normed)?;
+                dev.launch_quantize_q8_1(norm_rocm, act, m, hidden)
+                    .map_err(|e| grim_core::error::Error::Backend(format!("gateup quant: {e}")))?;
+                dev.launch_fused_gate_up_dot4_into(
+                    act,
+                    &fused.storage,
+                    &buffers.gate_up_buf[layer_idx],
+                    fused.n_gate,
+                    fused.n_up,
+                    hidden,
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("fused gateup: {e}")))?;
+                let staged: &Storage = &buffers.gate_up_buf[layer_idx];
+                dev.copy_slice_into(&buffers.gate_buf[layer_idx], staged, 0, fused.n_gate)
+                    .map_err(grim_core::error::Error::Tensor)?;
+                dev.copy_slice_range(
+                    &buffers.up_buf[layer_idx],
+                    0,
+                    staged,
+                    fused.n_gate,
+                    fused.n_up,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            } else {
+                linear_into(
+                    dev,
+                    normed,
+                    &self.ffn_gate.weight,
+                    &buffers.gate_buf[layer_idx],
+                    act,
+                )?;
+                linear_into(
+                    dev,
+                    normed,
+                    &self.ffn_up.weight,
+                    &buffers.up_buf[layer_idx],
+                    act,
+                )?;
+                dev.silu_mul_into(
+                    &buffers.gate_buf[layer_idx],
+                    &buffers.up_buf[layer_idx],
+                    &buffers.activated_buf[layer_idx],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
         }
-        if !fused_ffn {
-            dev.silu_mul_into(
-                &buffers.gate_buf[layer_idx],
-                &buffers.up_buf[layer_idx],
-                &buffers.activated_buf[layer_idx],
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
-        }
-        // Down projection into staging (norm_buf free: gate/up consumed it),
         // then residual add in place (per-element independent, safe).
         // Phase D.2: If down weight is Q8_0 and dot4 is supported, fuse down-projection
         // GEMV directly with the residual add from layer_output into residual_dst.
