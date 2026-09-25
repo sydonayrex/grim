@@ -3,6 +3,10 @@
 use crate::*;
 use grim_models_transformer::DecodeGraphModel;
 
+fn scheduler_graph_capture_enabled(device: &grim_tensor::Device, device_capture_enabled: bool) -> bool {
+    matches!(device, grim_tensor::Device::Rocm(_)) && device_capture_enabled
+}
+
 impl Engine {
     /// Run one engine iteration. For each scheduled prefill or decode request,
     /// drive the speculative wrapper against the request's session and capture per-request outcomes.
@@ -521,19 +525,24 @@ impl Engine {
         let model_id = self.model_for_request(id).map(|(m, _)| m.to_string());
         let model_id = model_id.as_deref();
 
-        // Graph capture path: when GRIM_CAPTURE_GRAPH=1 and the model is on a
-        // ROCm device, use persistent GPU buffers for inputs so the graph can
-        // be replayed with in-place updates (matching the verified semantics
-        // from tests/test_hip_graph_capture.rs).
-        let graph_capture = std::env::var("GRIM_CAPTURE_GRAPH")
-            .map(|v| v != "0" && v != "false" && v != "off")
-            .unwrap_or(true)
-            && model_id.is_some_and(|mid| {
-                self.models
-                    .get(mid)
-                    .map(|m| matches!(m.device, grim_tensor::dtype::Device::Rocm(_)))
-                    .unwrap_or(false)
-            });
+        // Graph capture path: consult the actual ROCm device gate before
+        // allocating persistent graph input buffers. The scheduler must not
+        // perform graph-buffer work when the device itself has capture disabled.
+        let graph_capture = model_id.is_some_and(|mid| {
+            self.models
+                .get(mid)
+                .map(|m| match m.device {
+                    grim_tensor::dtype::Device::Rocm(ord) => {
+                        let rocm = grim_backend_rocm::RocmDevice::shared(ord);
+                        scheduler_graph_capture_enabled(
+                            &m.device,
+                            rocm.graph_capture_enabled(),
+                        )
+                    }
+                    _ => false,
+                })
+                .unwrap_or(false)
+        });
 
         if graph_capture {
             let capture_key = format!("decode_req_{id}");
@@ -1727,6 +1736,22 @@ mod scheduler_fallback_tests {
         let ids = grim_backend_cpu::cpu_tensor(vec![token], grim_tensor::Shape::new(vec![1]));
         let positions = grim_backend_cpu::cpu_tensor(vec![pos], grim_tensor::Shape::new(vec![1]));
         (ids, positions)
+    }
+
+    #[test]
+    fn graph_capture_gate_requires_rocm_and_device_opt_in() {
+        assert!(scheduler_graph_capture_enabled(
+            &grim_tensor::Device::Rocm(0),
+            true
+        ));
+        assert!(!scheduler_graph_capture_enabled(
+            &grim_tensor::Device::Rocm(0),
+            false
+        ));
+        assert!(!scheduler_graph_capture_enabled(
+            &grim_tensor::Device::Cpu,
+            true
+        ));
     }
 
     /// M6: on a non-ROCm device the graph-capture path must degrade to the
