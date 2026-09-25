@@ -632,7 +632,12 @@ impl Qwen35Block {
                     self.num_kv_heads,
                     self.head_dim,
                     seq_len,
-                    &device,
+                    // Use the device the K rows actually live on, not the
+                    // layer's declared device: the packed-page append and the
+                    // paged kernel both need the concrete ROCm device, and a
+                    // mismatch silently resolves to a backend without the
+                    // byte-copy primitive.
+                    k_dev_t.device(),
                 );
             }
 

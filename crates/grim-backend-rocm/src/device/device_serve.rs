@@ -461,6 +461,49 @@ impl MemoryOps for RocmDevice {
         })?;
         Ok(())
     }
+    /// Byte-counted D2D copy for packed KV pages.
+    ///
+    /// `copy_slice_range` derives the byte width from the storage dtype, so it
+    /// cannot address packed data whose element is a fraction of a byte. This
+    /// counts raw bytes, which is what a quantized page append needs.
+    fn copy_bytes_into(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_byte_offset: usize,
+        src: &dyn BackendStorage,
+        src_byte_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dst_ptr = dst
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("copy_bytes_into: dst lacks a device pointer".into()))?
+            as *mut c_void;
+        let src_ptr = src
+            .device_ptr()
+            .ok_or_else(|| Error::Backend("copy_bytes_into: src lacks a device pointer".into()))?
+            as *const c_void;
+        if dst.device_ordinal() != src.device_ordinal() {
+            return Err(Error::Backend(format!(
+                "copy_bytes_into: cross-device D2D (dst ordinal {}, src ordinal {})",
+                dst.device_ordinal(),
+                src.device_ordinal()
+            )));
+        }
+        let dst_ptr = unsafe { dst_ptr.add(dst_byte_offset) };
+        let src_ptr = unsafe { src_ptr.add(src_byte_offset) };
+        check_hip("copy_bytes_into: hipMemcpyAsync D2D", unsafe {
+            hipMemcpyAsync(
+                dst_ptr,
+                src_ptr,
+                count,
+                HipMemcpyKind::DeviceToDevice,
+                self.active_stream(),
+            )
+        })?;
+        Ok(())
+    }
+
 }
 
 impl GraphCaptureOps for RocmDevice {
