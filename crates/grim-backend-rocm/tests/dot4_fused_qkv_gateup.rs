@@ -304,10 +304,29 @@ fn dot4_gate_up_microbench_uses_real_arguments() {
     let _lock = grim_backend_rocm::device::util::gpu_test_lock();
     let k = 1024usize;
     let n = 4608usize;
-    let iters = 64usize;
+    let layers = 16usize;
+    let iters = 8usize;
     let a = f32_tensor(&dev, &rand_f32(k, 41), &Shape::new(vec![1, k]));
-    let wg = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 42), n, k), n, k);
-    let wu = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 43), n, k), n, k);
+    let wg_layers: Vec<_> = (0..layers)
+        .map(|layer| {
+            upload_q80(
+                &dev,
+                &pack_q80(&rand_f32(n * k, 42 + layer), n, k),
+                n,
+                k,
+            )
+        })
+        .collect();
+    let wu_layers: Vec<_> = (0..layers)
+        .map(|layer| {
+            upload_q80(
+                &dev,
+                &pack_q80(&rand_f32(n * k, 100 + layer), n, k),
+                n,
+                k,
+            )
+        })
+        .collect();
     let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
     let act = f32_tensor(
         &dev,
@@ -315,24 +334,11 @@ fn dot4_gate_up_microbench_uses_real_arguments() {
         &Shape::new(vec![(k / 32) * 36]),
     );
 
-    dev.fused_gate_up_silu_dot4_into(
-        a.as_ref(),
-        rocm(&wg),
-        rocm(&wu),
-        rocm(&out),
-        n,
-        k,
-        rocm(&act),
-    )
-    .unwrap();
-    dev.synchronize();
-
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
+    for layer in 0..layers {
         dev.fused_gate_up_silu_dot4_into(
             a.as_ref(),
-            rocm(&wg),
-            rocm(&wu),
+            rocm(&wg_layers[layer]),
+            rocm(&wu_layers[layer]),
             rocm(&out),
             n,
             k,
@@ -341,12 +347,30 @@ fn dot4_gate_up_microbench_uses_real_arguments() {
         .unwrap();
     }
     dev.synchronize();
+
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        for layer in 0..layers {
+            dev.fused_gate_up_silu_dot4_into(
+                a.as_ref(),
+                rocm(&wg_layers[layer]),
+                rocm(&wu_layers[layer]),
+                rocm(&out),
+                n,
+                k,
+                rocm(&act),
+            )
+            .unwrap();
+        }
+    }
+    dev.synchronize();
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let bytes = 2.0 * n as f64 * (k as f64 / 32.0) * 34.0;
-    let gbps = bytes / (elapsed_ms * 1.0e6) * iters as f64;
+    let bytes = layers as f64 * 2.0 * n as f64 * (k as f64 / 32.0) * 34.0;
+    let calls = (layers * iters) as f64;
+    let gbps = bytes / (elapsed_ms * 1.0e6);
     eprintln!(
-        "[dot4-gateup-microbench] shape=1x{k}x{n} iters={iters} total_ms={elapsed_ms:.3} per_iter_us={:.3} weight_GBps={:.2}",
-        elapsed_ms * 1000.0 / iters as f64,
+        "[dot4-gateup-microbench] shape=1x{k}x{n} layers={layers} iters={iters} total_ms={elapsed_ms:.3} per_call_us={:.3} weight_GBps={:.2}",
+        elapsed_ms * 1000.0 / calls,
         gbps
     );
     assert!(
