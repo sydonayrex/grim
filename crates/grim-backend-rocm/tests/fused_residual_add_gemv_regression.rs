@@ -253,3 +253,128 @@ fn fused_residual_add_gemv_matches_gemv_plus_add() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn fused_residual_add_gemv_tile16_matches_split() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    if !dev.supports_dot4() {
+        eprintln!("skipping: device does not support dot4");
+        return;
+    }
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    temp_env::with_var("GRIM_DOT4_TILE16", Some("1"), || {
+        let k = 1024usize;
+        let n = 2048usize;
+        let m = 1usize;
+        let x = rand_f32(k, 501);
+        let res_data = rand_f32(n, 502);
+        let a = f32_tensor(&dev, &x, &Shape::new(vec![m, k]));
+        let w = upload_q80(&dev, &pack_q80(&rand_f32(n * k, 503), n, k), n, k);
+        let residual = f32_tensor(&dev, &res_data, &Shape::new(vec![n]));
+
+        let gemv_out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+        dev.launch_dot4_q80_f32act_gemv(rocm(&a), rocm(&w), rocm(&gemv_out), m, n, k)
+            .unwrap();
+        let gemv_vec = gemv_out.to_cpu_vec_f32().unwrap();
+        let want: Vec<f32> = gemv_vec
+            .iter()
+            .zip(res_data.iter())
+            .map(|(g, r)| g + r)
+            .collect();
+
+        let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+        dev.launch_dot4_q80_f32act_add_gemv(
+            rocm(&a),
+            rocm(&w),
+            Some(rocm(&residual)),
+            rocm(&out),
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+        let got = out.to_cpu_vec_f32().unwrap();
+        for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+            assert!((got - want).abs() < 1e-4, "tile16[{i}]: got={got} vs want={want}");
+        }
+    });
+}
+
+#[test]
+#[ignore]
+fn dot4_add_microbench_compares_default_and_tile16() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    if !dev.supports_dot4() {
+        eprintln!("skipping: device does not support dot4");
+        return;
+    }
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let k = 4608usize;
+    let n = 1024usize;
+    let layers = 16usize;
+    let iters = 8usize;
+    let activation = f32_tensor(&dev, &rand_f32(k, 601), &Shape::new(vec![1, k]));
+    let residual = f32_tensor(&dev, &rand_f32(n, 602), &Shape::new(vec![n]));
+    let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
+    let weights: Vec<_> = (0..layers)
+        .map(|layer| {
+            upload_q80(
+                &dev,
+                &pack_q80(&rand_f32(n * k, 603 + layer), n, k),
+                n,
+                k,
+            )
+        })
+        .collect();
+
+    let run = |label: &str| {
+        for layer in 0..layers {
+            dev.launch_dot4_q80_f32act_add_gemv(
+                rocm(&activation),
+                rocm(&weights[layer]),
+                Some(rocm(&residual)),
+                rocm(&out),
+                1,
+                n,
+                k,
+            )
+            .unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            for layer in 0..layers {
+                dev.launch_dot4_q80_f32act_add_gemv(
+                    rocm(&activation),
+                    rocm(&weights[layer]),
+                    Some(rocm(&residual)),
+                    rocm(&out),
+                    1,
+                    n,
+                    k,
+                )
+                .unwrap();
+            }
+        }
+        dev.synchronize();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let calls = (layers * iters) as f64;
+        let bytes = calls * n as f64 * (k as f64 / 32.0) * 34.0;
+        eprintln!(
+            "[dot4-add-microbench] {label} shape=1x{k}x{n} layers={layers} per_call_us={:.3} weight_GBps={:.2}",
+            elapsed_ms * 1000.0 / calls,
+            bytes / (elapsed_ms * 1.0e6),
+        );
+    };
+
+    temp_env::with_var("GRIM_DOT4_TILE16", None::<&str>, || run("default"));
+    temp_env::with_var("GRIM_DOT4_TILE16", Some("1"), || run("tile16"));
+    assert!(out.to_cpu_vec_f32().unwrap().iter().all(|v| v.is_finite()));
+}
