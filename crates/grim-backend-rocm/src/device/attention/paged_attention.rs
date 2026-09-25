@@ -729,6 +729,89 @@ impl RocmDevice {
         ))
     }
 
+    /// Paged attention over a QUANTIZED KV cache.
+    ///
+    /// The unquantized `qkv_attention_paged` cannot serve this: its kernel
+    /// reads page rows as raw f32, so a packed page would be reinterpreted rather
+    /// than dequantized. This routes to `grim_qkv_attention_paged_quant`, whose
+    /// inlined `dequant_kv_element` handles int8 / FP8 / Nutcracker / NVFP4 /
+    /// MXFP4 / MXFP8.
+    ///
+    /// `k_scale`/`v_scale` are only consulted by the formats that do not carry
+    /// their scale inline; Nutcracker and NVFP4 read it from the buffer instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv_attention_paged_quant(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        out_shape: &Shape,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        quant_format: crate::kernels::qkv_attention::KvCacheQuantFormat,
+        k_scale: f32,
+        v_scale: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 {
+            return Err(Error::Shape(
+                "qkv_attention_paged_quant expects 3-D output shape [batch, num_heads, head_dim]"
+                    .into(),
+            ));
+        }
+        let batch = out_dims[0];
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+
+        let q_s = as_rocm(q)?;
+        let bt_s = as_rocm(block_tables)?;
+        let k_s = as_rocm(k_pages)?;
+        let v_s = as_rocm(v_pages)?;
+        if !q_s.device_ptr_is_valid()
+            || !bt_s.device_ptr_is_valid()
+            || !k_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "qkv_attention_paged_quant: inputs lack a valid device pointer".into(),
+            ));
+        }
+
+        let mut storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        crate::launch_paged_attention_quant(
+            self,
+            q_s,
+            bt_s,
+            k_s,
+            v_s,
+            &mut storage,
+            batch as u32,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            max_blocks as u32,
+            page_size as u32,
+            kv_seq_len as u32,
+            cache_offset,
+            0,
+            quant_format,
+            k_scale,
+            0.0,
+            v_scale,
+            0.0,
+        )?;
+
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
     pub fn tree_attention(
         &self,
         q: &dyn BackendStorage,

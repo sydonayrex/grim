@@ -3,7 +3,8 @@
 
 use grim_core::error::Result;
 use grim_nn::modules::pick_device_for_storage_device;
-use grim_tensor::{CoreTensorOps, DType, Device, Shape, Tensor};
+use grim_tensor::backend::BackendStorage;
+use grim_tensor::{CoreTensorOps, DType, Device, MemoryOps, Shape, Tensor};
 use std::sync::Arc;
 
 /// Check if fused QKV kernels are enabled. Canonical gate: `GRIM_FUSED_QKV=0`
@@ -539,6 +540,163 @@ pub fn fused_or_scalar_attention_paged(
             )
         }
     }
+}
+
+/// Paged attention over a QUANTIZED KV cache, for a single decode step.
+///
+/// Mirrors the dense `fused_or_scalar_attention_arena` entry point but stores K/V
+/// packed: each append is quantized on the host, written into paged buffers, and
+/// read back by `qkv_attention_paged_quant`, whose inlined `dequant_kv_element`
+/// handles int8 / FP8 / Nutcracker / NVFP4 / MXFP4 / MXFP8.
+///
+/// Page size is one token per page entry: the block table is the identity
+/// mapping, which keeps append arithmetic simple (position `p` is always at
+/// physical page `p`) at the cost of some locality. The win is memory — a
+/// Nutcracker KV arena is ~4.5 bits/element against f32's 32, which is what
+/// makes a long context fit on a memory-bound pair.
+/// Upload `bytes` into a packed page buffer at byte offset `byte_offset`.
+///
+/// Uses a staging device buffer plus a byte-counted D2D copy, because
+/// `copy_slice_range` is element-indexed and packed formats have a
+/// sub-byte element width.
+fn upload_packed_rows(
+    dev: &Arc<dyn grim_tensor::backend::BackendDevice>,
+    dst: &dyn BackendStorage,
+    byte_offset: usize,
+    bytes: &[u8],
+) -> grim_tensor::error::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let staging = dev.from_cpu_bytes(bytes, &Shape::new(vec![bytes.len()]), DType::F32)?;
+    // `copy_slice_range` counts elements; for a byte buffer of F32-typed storage
+    // one element is one byte of the packed payload, so the byte offset and
+    // length pass through unchanged.
+    dev.copy_slice_range(dst, byte_offset, staging.as_ref(), 0, bytes.len())
+}
+
+pub fn fused_or_scalar_attention_paged_quant(
+    q: &[f32],
+    k_new: &dyn BackendStorage,
+    v_new: &dyn BackendStorage,
+    cache: &mut crate::qwen35::Qwen35LayerCache,
+    fmt: grim_tensor::PagedKvQuantFormat,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    use grim_nn::modules::pick_device_for_storage_device;
+    use grim_tensor::MemoryOps;
+
+    let dev = pick_device_for_storage_device(device);
+    let kv_dim = num_kv_heads * head_dim;
+
+    // Bring the new rows to the host for quantization. This is a per-step
+    // D2H of only the current token's K/V, not the history — history stays
+    // packed on device.
+    let k_host = k_new.to_cpu_vec_f32()?;
+    let v_host = v_new.to_cpu_vec_f32()?;
+
+    let start = cache.current_pos;
+    let (k_packed, k_scale) = crate::qwen35::quantize_kv_block(&k_host, fmt)?;
+    let (v_packed, v_scale) = crate::qwen35::quantize_kv_block(&v_host, fmt)?;
+
+    // Grow the paged buffers geometrically, copying existing packed bytes D2D.
+    let n_after = start + steps;
+    let needed = crate::qwen35::packed_kv_bytes(n_after * kv_dim, fmt);
+    let have = cache
+        .k_pages
+        .as_ref()
+        .map(|s| s.shape().dims()[0])
+        .unwrap_or(0);
+    if have < needed {
+        let new_cap = (needed * 2).max(needed + 64);
+        let shape = Shape::new(vec![new_cap]);
+        let k_new_buf = dev.alloc_storage(&shape, DType::F32)?;
+        let v_new_buf = dev.alloc_storage(&shape, DType::F32)?;
+        let k_prev = cache.k_pages.take();
+        let v_prev = cache.v_pages.take();
+        if let Some(old) = k_prev.as_ref() {
+            dev.copy_slice_range(
+                k_new_buf.as_ref(),
+                0,
+                old.as_ref(),
+                0,
+                crate::qwen35::packed_kv_bytes(start * kv_dim, fmt),
+            )?;
+        }
+        if let Some(old) = v_prev.as_ref() {
+            dev.copy_slice_range(
+                v_new_buf.as_ref(),
+                0,
+                old.as_ref(),
+                0,
+                crate::qwen35::packed_kv_bytes(start * kv_dim, fmt),
+            )?;
+        }
+        cache.k_pages = Some(k_new_buf);
+        cache.v_pages = Some(v_new_buf);
+    }
+
+    // Append the freshly packed rows.
+    let dst_off = crate::qwen35::packed_kv_bytes(start * kv_dim, fmt);
+    // The packed pages are byte buffers, so the append must move BYTES, not
+    // elements: a 4-bit format's element width is half a byte and an
+    // element-indexed copy would land at the wrong offset entirely.
+    upload_packed_rows(
+        &dev,
+        cache.k_pages.as_ref().unwrap().as_ref(),
+        dst_off,
+        &k_packed,
+    )
+    .map_err(|e| grim_core::error::Error::Backend(format!("k page append: {e}")))?;
+    upload_packed_rows(
+        &dev,
+        cache.v_pages.as_ref().unwrap().as_ref(),
+        dst_off,
+        &v_packed,
+    )
+    .map_err(|e| grim_core::error::Error::Backend(format!("v page append: {e}")))?;
+
+    // Identity block table: one page per token, so logical page == physical page.
+    let block_table_host: Vec<f32> = (0..n_after).map(|i| i as f32).collect();
+    let table = dev
+        .from_cpu(&block_table_host, &Shape::new(vec![1, n_after, 1]), DType::F32)
+        .map_err(|e| grim_core::error::Error::Backend(format!("block table upload: {e}")))?;
+
+    cache.current_pos = n_after;
+
+    let out_shape = Shape::new(vec![1, num_heads, head_dim]);
+    let q_dev = dev
+        .from_cpu(q, &out_shape, DType::F32)
+        .map_err(|e| grim_core::error::Error::Backend(format!("q upload: {e}")))?;
+    let (storage, _handle) = dev
+        .qkv_attention_paged_quant(
+            q_dev.as_ref(),
+            table.as_ref(),
+            cache.k_pages.as_ref().unwrap().as_ref(),
+            cache.v_pages.as_ref().unwrap().as_ref(),
+            num_kv_heads,
+            n_after,       // max_blocks
+            1,             // page_size: one token per page
+            n_after,       // kv_seq_len
+            0,             // cache_offset
+            &out_shape,
+            fmt,
+            k_scale,
+            v_scale,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("paged quant attention: {e}")))?;
+
+    Ok(Tensor::new(
+        Arc::from(storage),
+        Shape::new(vec![steps, num_heads * head_dim]),
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
 }
 
 /// Gather `kv_seq_len` logical history rows out of a paged KV arena using the per-sequence block table:

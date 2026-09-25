@@ -528,6 +528,39 @@ pub trait SamplingOps {
 
 /// Attention kernel family: RoPE application, dense/ALiBi/paged/tree/
 /// flash/cross/sage attention, dequantized-KV attention, and MLA.
+/// KV-cache quantization formats for the paged attention path, backend-neutral.
+///
+/// Named `PagedKvQuantFormat` to stay distinct from the ROCm crate's
+/// `fusion::KvQuantFormat`, which describes a different block-quant family
+/// (Q8_0 / Q4K / Q4KHalf) for the non-paged KV kernels.
+///
+/// Values match the `quant_format` discriminants the paged attention kernel
+/// switches on, so backends convert by cast rather than by a table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum PagedKvQuantFormat {
+    /// Symmetric per-tensor int8; the caller supplies the scale.
+    Int8 = 0,
+    /// W4A16 packed 4-bit nibbles; the caller supplies the scale.
+    Int4 = 1,
+    /// FP8 E4M3, one byte per element.
+    Fp8E4M3 = 2,
+    /// FP8 E5M2, one byte per element.
+    Fp8E5M2 = 3,
+    /// Plain FP4 E2M1 with a caller scale (no block scale).
+    Fp4E2M1 = 4,
+    /// MXFP4: E2M1 with an E8M0 scale per 32 values.
+    MxFp4 = 5,
+    /// MXFP8: E4M3 with an E8M0 scale per 32 values.
+    MxFp8 = 6,
+    /// NVFP4: E2M1 with an inline E4M3 block scale per 16 values.
+    NvFp4 = 7,
+    /// Nutcracker: E2M1 with an inline per-16 block scale whose low 2 bits are
+    /// stolen as a special-value selector. Reads its scale from the buffer, so
+    /// the caller's per-tensor scale is ignored.
+    NutFp4 = 8,
+}
+
 pub trait AttentionOps {
     /// Block-Quantized SageAttention: INT8/FP8 block-scaled attention for ultra-long context windows (>128k tokens).
     /// Default: falls back to plain f32 [`Self::qkv_attention`] - correct output, WRONG precision class for the.
@@ -736,6 +769,34 @@ pub trait AttentionOps {
         );
         Err(crate::error::Error::Unimplemented(
             "qkv_attention_alibi not implemented for this backend".into(),
+        ))
+    }
+
+    /// Paged (block-table) attention over a QUANTIZED KV cache.
+    ///
+    /// Distinct from [`Self::qkv_attention_paged`], whose kernel reads page rows
+    /// as raw f32: handing it a packed page would reinterpret bytes rather than
+    /// dequantize them. Backends that cannot dequantize on the read return
+    /// `Unimplemented`, and callers should fall back to the dense path.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_paged_quant(
+        &self,
+        _q: &dyn BackendStorage,
+        _block_tables: &dyn BackendStorage,
+        _k_pages: &dyn BackendStorage,
+        _v_pages: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _max_blocks: usize,
+        _page_size: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _out_shape: &Shape,
+        _quant_format: PagedKvQuantFormat,
+        _k_scale: f32,
+        _v_scale: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_paged_quant not implemented for this backend".into(),
         ))
     }
 

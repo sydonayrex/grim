@@ -699,6 +699,21 @@ void grim_qkv_attention_wmma(
     }
 }
 
+__device__ inline float fp8_e4m3_scale_dev(unsigned char b) {
+    int sign = (b >> 7) & 1;
+    int exp = (b >> 3) & 0x0F;
+    int mant = b & 0x07;
+    float v;
+    if (exp == 0xF) {
+        v = (mant == 7) ? 0.0f / 0.0f : 448.0f;
+    } else if (exp != 0) {
+        v = (1.0f + (float)mant / 8.0f) * ldexpf(1.0f, exp - 7);
+    } else {
+        v = (float)mant / 512.0f;
+    }
+    return sign ? -v : v;
+}
+
 __device__ inline float dequant_kv_element(
     const unsigned char* data,
     int idx,
@@ -750,24 +765,79 @@ __device__ inline float dequant_kv_element(
         int sign = (nibble >> 3) & 1;
         int exp = (nibble >> 1) & 0x03;
         int mant = nibble & 1;
-        float val = (exp == 0) ? ((float)mant * 0.25f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
+        // OCP E2M1 subnormal step is 0.5 (codes 0x1/0x9 -> +/-0.5), matching
+        // mxfp4_to_float_hip and the CUDA NVFP4 LUT.
+        float val = (exp == 0) ? ((float)mant * 0.5f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
         return (sign ? -val : val) * scale;
-    } else if (quant_format == 5) { // MXFP4 (OCP E2M1 with shared block-32 scale)
-        int byte_idx = idx >> 1;
-        unsigned char b = data[byte_idx];
-        int nibble = (idx & 1) ? (b >> 4) : (b & 0x0F);
+    } else if (quant_format == 5) { // MXFP4 (OCP E2M1 + E8M0 scale per 32)
+        // 17 bytes per 32 values: 1 E8M0 scale byte then 16 code bytes.
+        // This arm previously ignored the block scale and used the caller's
+        // per-tensor `scale`, which is not MXFP4 at all.
+        const int MXFP4_GROUP = 32;
+        const int MXFP4_BYTES = 17;
+        int grp = idx / MXFP4_GROUP;
+        int in_grp = idx % MXFP4_GROUP;
+        const unsigned char* g = data + grp * MXFP4_BYTES;
+        float blk_scale = exp2f((float)(int)g[0] - 127.0f);
+        unsigned char cb = g[1 + (in_grp >> 1)];
+        int nibble = (in_grp & 1) ? (cb >> 4) : (cb & 0x0F);
         int sign = (nibble >> 3) & 1;
         int exp = (nibble >> 1) & 0x03;
         int mant = nibble & 1;
-        float val = (exp == 0) ? ((float)mant * 0.25f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
-        return (sign ? -val : val) * scale;
-    } else if (quant_format == 6) { // MXFP8 (OCP E4M3 with shared block-32 scale)
-        unsigned char b = data[idx];
+        float val = (exp == 0) ? ((float)mant * 0.5f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
+        return (sign ? -val : val) * blk_scale * scale;
+    } else if (quant_format == 6) { // MXFP8 (OCP E4M3 + E8M0 scale per 32)
+        // 33 bytes per 32 values: 1 E8M0 scale byte then 32 E4M3 code bytes.
+        const int MXFP8_GROUP = 32;
+        const int MXFP8_BYTES = 33;
+        int grp = idx / MXFP8_GROUP;
+        int in_grp = idx % MXFP8_GROUP;
+        const unsigned char* g = data + grp * MXFP8_BYTES;
+        float blk_scale = exp2f((float)(int)g[0] - 127.0f);
+        unsigned char b = g[1 + in_grp];
         int sign = (b >> 7) & 1;
+        // E4M3 has FOUR exponent bits. This was masked with 0x07, truncating
+        // every value >= 2^8 to the wrong binade.
         int exp = (b >> 3) & 0x0F;
         int mant = b & 0x07;
         float val = (exp == 0) ? ((float)mant / 512.0f) : ((1.0f + (float)mant / 8.0f) * ldexpf(1.0f, exp - 7));
-        return (sign ? -val : val) * scale;
+        return (sign ? -val : val) * blk_scale * scale;
+    } else if (quant_format == 7) { // NVFP4 (E2M1 + inline E4M3 scale per 16)
+        // 9 bytes per 16 values: [E4M3 scale byte][8 code bytes]. Zero codes
+        // decode to a real zero.
+        int sub = idx >> 4;
+        int in_sub = idx & 15;
+        const unsigned char* blk = data + sub * 9;
+        float blk_scale = fp8_e4m3_scale_dev(blk[0]);
+        unsigned char code_byte = blk[1 + (in_sub >> 1)];
+        int nibble = (in_sub & 1) ? (code_byte >> 4) : (code_byte & 0x0F);
+        int sign = (nibble >> 3) & 1;
+        int exp = (nibble >> 1) & 0x03;
+        int mant = nibble & 1;
+        float val = (exp == 0) ? ((float)mant * 0.5f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
+        return (sign ? -val : val) * blk_scale;
+    } else if (quant_format == 8) { // NUTCRACKER (E2M1 + inline per-16 block scale)
+        // 9 bytes per 16 values: [scale byte][8 code bytes]. The scale byte is
+        // [exp:6 | sel:2] — the low bits are stolen as the special-value
+        // selector, so the caller's per-tensor `scale` is deliberately unused.
+        int sub = idx >> 4;
+        int in_sub = idx & 15;
+        const unsigned char* blk = data + sub * 9;
+        int sel = blk[0] & 0x3;
+        float blk_scale = ldexpf(1.0f, (int)(blk[0] >> 2) - 31);
+        unsigned char code_byte = blk[1 + (in_sub >> 1)];
+        int nibble = (in_sub & 1) ? (code_byte >> 4) : (code_byte & 0x0F);
+        if ((nibble & 0x7) == 0) {
+            // Repurposed zero encoding: emit this block's special value. The
+            // sign comes from the selector, not from the nibble's sign bit.
+            float mag = (sel & 0x1) ? 2.5f : 5.0f;
+            return ((sel & 0x2) ? -mag : mag) * blk_scale;
+        }
+        int sign = (nibble >> 3) & 1;
+        int exp = (nibble >> 1) & 0x03;
+        int mant = nibble & 1;
+        float val = (exp == 0) ? ((float)mant * 0.5f) : ((1.0f + (float)mant * 0.5f) * ldexpf(1.0f, exp - 1));
+        return (sign ? -val : val) * blk_scale;
     }
     return 0.0f;
 }
@@ -1568,6 +1638,69 @@ pub enum KvCacheQuantFormat {
     Fp4E2M1 = 4,
     MxFp4 = 5,
     MxFp8 = 6,
+    /// NVFP4: E2M1 codes with an **E4M3** block scale stored inline per 16
+    /// values (9 bytes per 16). Same layout as [`Self::NutFp4`], different
+    /// scale decode — never share a page buffer between the two.
+    NvFp4 = 7,
+    /// Nutcracker: E2M1 codes with a per-16 block scale stored inline in the
+    /// packed buffer (9 bytes per 16 values), whose low 2 bits are stolen as a
+    /// special-value selector. 4-bit element, so this tags as FP4.
+    ///
+    /// Unlike every other variant here, this one reads its scale out of the
+    /// buffer and ignores the caller's per-tensor `k_scale`/`v_scale`.
+    NutFp4 = 8,
+}
+
+impl KvCacheQuantFormat {
+    /// Packed bytes needed to store `num_values` elements in this format.
+    ///
+    /// The per-tensor `k_scale`/`v_scale` is supplied separately by the caller
+    /// and is not counted here.
+    ///
+    /// Use this for page allocation; the decode arms in
+    /// `dequant_kv_element` index with exactly these strides.
+    pub fn packed_bytes(self, num_values: usize) -> usize {
+        let bits = self.element_bits() as usize;
+        // Number of inline scale bytes. `Fp4E2M1` and the unpacked formats
+        // carry no inline scale — the caller's per-tensor `k_scale`/`v_scale`
+        // covers them.
+        let groups = match self {
+            // Per-16 sub-blocks with one inline scale byte.
+            Self::NvFp4 | Self::NutFp4 => (num_values + 15) / 16,
+            // Per-32 microscale groups with one inline E8M0 scale byte.
+            Self::MxFp4 | Self::MxFp8 => (num_values + 31) / 32,
+            Self::Int8 | Self::Int4 | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::Fp4E2M1 => 0,
+        };
+        let payload = (num_values * bits).div_ceil(8);
+        payload + groups
+    }
+
+    /// Bits per stored element (before any per-tensor scaling).
+    pub fn element_bits(self) -> u32 {
+        match self {
+            Self::Int8 | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::MxFp8 => 8,
+            Self::Int4 | Self::Fp4E2M1 | Self::MxFp4 | Self::NvFp4 | Self::NutFp4 => 4,
+        }
+    }
+}
+
+impl From<grim_tensor::PagedKvQuantFormat> for KvCacheQuantFormat {
+    /// The neutral `grim_tensor` enum and this backend's enum share the same
+    /// discriminants (they are the values the kernel switches on), so the
+    /// conversion is a discriminant cast rather than a translation table.
+    fn from(f: grim_tensor::PagedKvQuantFormat) -> Self {
+        match f {
+            grim_tensor::PagedKvQuantFormat::Int8 => KvCacheQuantFormat::Int8,
+            grim_tensor::PagedKvQuantFormat::Int4 => KvCacheQuantFormat::Int4,
+            grim_tensor::PagedKvQuantFormat::Fp8E4M3 => KvCacheQuantFormat::Fp8E4M3,
+            grim_tensor::PagedKvQuantFormat::Fp8E5M2 => KvCacheQuantFormat::Fp8E5M2,
+            grim_tensor::PagedKvQuantFormat::Fp4E2M1 => KvCacheQuantFormat::Fp4E2M1,
+            grim_tensor::PagedKvQuantFormat::MxFp4 => KvCacheQuantFormat::MxFp4,
+            grim_tensor::PagedKvQuantFormat::MxFp8 => KvCacheQuantFormat::MxFp8,
+            grim_tensor::PagedKvQuantFormat::NvFp4 => KvCacheQuantFormat::NvFp4,
+            grim_tensor::PagedKvQuantFormat::NutFp4 => KvCacheQuantFormat::NutFp4,
+        }
+    }
 }
 
 /// Host launcher for quantized and microscaled paged KV-cache attention.
@@ -2511,7 +2644,7 @@ mod tests {
         let out_shape = Shape::new(vec![batch as usize, num_heads as usize, head_dim as usize]);
         let mut out_storage = dev.alloc_storage(&out_shape, DType::F32).unwrap();
 
-        // Verify across INT8, INT4 / W4A16, FP8, FP4, MXFP4, MXFP8
+        // Verify across INT8, INT4 / W4A16, FP8, FP4, MXFP4, MXFP8, Nutcracker FP4
         for fmt in [
             KvCacheQuantFormat::Int8,
             KvCacheQuantFormat::Int4,
@@ -2520,6 +2653,8 @@ mod tests {
             KvCacheQuantFormat::Fp4E2M1,
             KvCacheQuantFormat::MxFp4,
             KvCacheQuantFormat::MxFp8,
+            KvCacheQuantFormat::NvFp4,
+            KvCacheQuantFormat::NutFp4,
         ] {
             launch_paged_attention_quant(
                 &dev,
@@ -2550,6 +2685,184 @@ mod tests {
             assert_eq!(out_vec.len(), (batch * num_heads * head_dim) as usize);
             assert!(out_vec[0].is_finite());
         }
+    }
+
+    // ── Nutcracker / E2M1 decode guards ───────────────────────────────────
+
+    /// The paged-KV FP4 arms must use the OCP E2M1 subnormal step of 0.5.
+    /// This caught a real 2x error on codes 0x1/0x9 (they decoded as +/-0.25).
+    #[test]
+    fn e2m1_subnormal_step_is_half_not_quarter() {
+        // No E2M1 arm may reintroduce the 0.25 step.
+        assert!(
+            !KERNEL_SOURCE.contains("* 0.25f"),
+            "E2M1 subnormal step regressed to 0.25; OCP E2M1 uses 0.5"
+        );
+        // Pin the corrected step in each of the four 4-bit arms (Fp4E2M1,
+        // MxFp4, NvFp4, NutFp4). The subnormal ternary head is the unambiguous
+        // marker: the normalized branch also contains "* 0.5f" as a mantissa
+        // addend, so a bare substring count double-counts each arm.
+        let count = KERNEL_SOURCE.matches("? ((float)mant * 0.5f) :").count();
+        assert_eq!(
+            count, 4,
+            "expected Fp4E2M1, MxFp4, NvFp4 and NutFp4 to use the 0.5 subnormal step"
+        );
+    }
+
+    /// Every E2M1 decoder in grim must agree on the subnormal step.
+    #[test]
+    fn e2m1_decoders_agree_with_grim_quant() {
+        for code in [0x1u8, 0x9] {
+            assert_eq!(
+                grim_quant::mxfp4_e2m1_to_f32(code, 127),
+                if code & 0x8 != 0 { -0.5 } else { 0.5 },
+                "grim-quant E2M1 subnormal step drifted for code {code:#04x}"
+            );
+        }
+    }
+
+    /// Nutcracker is a 4-bit element format, so it must tag as FP4 and not FP8.
+    #[test]
+    fn nutcracker_kv_tag_is_four_bit() {
+        assert_eq!(KvCacheQuantFormat::NvFp4 as i32, 7);
+        assert_eq!(KvCacheQuantFormat::NutFp4 as i32, 8);
+        assert!(KvCacheQuantFormat::NutFp4 as i32 > KvCacheQuantFormat::NvFp4 as i32);
+        // Distinct tag: reusing an existing one would silently decode as that
+        // format, since the wire layout is byte-identical to NvFp4.
+        let all = [
+            KvCacheQuantFormat::Int8,
+            KvCacheQuantFormat::Int4,
+            KvCacheQuantFormat::Fp8E4M3,
+            KvCacheQuantFormat::Fp8E5M2,
+            KvCacheQuantFormat::Fp4E2M1,
+            KvCacheQuantFormat::MxFp4,
+            KvCacheQuantFormat::MxFp8,
+            KvCacheQuantFormat::NvFp4,
+            KvCacheQuantFormat::NutFp4,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for f in all {
+            assert!(
+                seen.insert(f as i32),
+                "duplicate KvCacheQuantFormat tag {f:?}"
+            );
+        }
+    }
+
+    /// The kernel's Nutcracker arm must keep matching the grim-quant reference.
+    ///
+    /// There is no GPU in this test path, so this is a two-part guard: the
+    /// behavioural check pins the intended semantics against
+    /// `grim_quant::nutcracker_e2m1_to_f32`, and the source assertions below
+    /// pin the kernel text so the two cannot drift apart silently.
+    #[test]
+    fn nutcracker_kv_arm_matches_grim_quant_reference() {
+        // Transcribe the kernel arm's index math verbatim and check it against
+        // the reference decoder for every code x selector pair.
+        for sel in 0..4u8 {
+            for code in 0u8..16 {
+                let scale_byte = (31u8 << 2) | sel; // exp = 31 -> scale 1.0
+                let packed = nutcracker_pack_reference(scale_byte, code);
+
+                let sub = 0i32;
+                let in_sub = code as i32; // one value per idx, idx < 16
+                let blk = &packed[(sub * 9) as usize..];
+                let sel_k = blk[0] & 0x3;
+                let blk_scale = (2.0f32).powi((blk[0] >> 2) as i32 - 31);
+                let code_byte = blk[1 + (in_sub >> 1) as usize];
+                let nibble = if in_sub & 1 != 0 {
+                    code_byte >> 4
+                } else {
+                    code_byte & 0x0F
+                };
+
+                let kernel_val = if nibble & 0x7 == 0 {
+                    let mag = if sel_k & 0x1 != 0 { 2.5f32 } else { 5.0f32 };
+                    (if sel_k & 0x2 != 0 { -mag } else { mag }) * blk_scale
+                } else {
+                    let sign = (nibble >> 3) & 1;
+                    let exp = (nibble >> 1) & 0x03;
+                    let mant = nibble & 1;
+                    let val = if exp == 0 {
+                        mant as f32 * 0.5
+                    } else {
+                        (1.0 + mant as f32 * 0.5) * (2.0f32).powi(exp as i32 - 1)
+                    };
+                    (if sign != 0 { -val } else { val }) * blk_scale
+                };
+
+                assert_eq!(
+                    kernel_val,
+                    grim_quant::nutcracker_e2m1_to_f32(code, scale_byte),
+                    "sel {sel} code {code:#04x} diverged between the KV kernel and grim-quant"
+                );
+            }
+        }
+    }
+
+    /// Pin the kernel source literals so the arm cannot be edited in isolation.
+    #[test]
+    fn nutcracker_kv_arm_source_is_pinned() {
+        assert!(KERNEL_SOURCE.contains("quant_format == 8"));
+        // Reads its own scale: 9 bytes per 16 values.
+        assert!(KERNEL_SOURCE.contains("const unsigned char* blk = data + sub * 9;"));
+        // Selector steals the low 2 bits, bias 31, matching grim-quant.
+        assert!(KERNEL_SOURCE.contains("int sel = blk[0] & 0x3;"));
+        assert!(KERNEL_SOURCE.contains("ldexpf(1.0f, (int)(blk[0] >> 2) - 31)"));
+        // Repurposed-zero test keys on the low 3 bits, never the sign.
+        assert!(KERNEL_SOURCE.contains("if ((nibble & 0x7) == 0)"));
+    }
+
+    /// Regression guards for the two pre-existing paged-KV decode bugs.
+    #[test]
+    fn mxfp8_uses_a_four_bit_exponent_mask() {
+        // E4M3 has 4 exponent bits. This was masked with 0x07, truncating every
+        // value >= 2^8 into the wrong binade.
+        assert!(
+            KERNEL_SOURCE.contains("(b >> 3) & 0x0F"),
+            "MXFP8 must mask the exponent with 0x0F (E4M3 has 4 exponent bits)"
+        );
+        assert!(
+            !KERNEL_SOURCE.contains("int exp = (b >> 3) & 0x07;"),
+            "MXFP8 regressed to a 3-bit exponent mask"
+        );
+    }
+
+    #[test]
+    fn mxfp4_reads_its_block32_scale() {
+        // The arm previously applied only the caller's per-tensor scale, which
+        // is not MXFP4. It must read the inline E8M0 byte per 32 values.
+        assert!(KERNEL_SOURCE.contains("const int MXFP4_GROUP = 32;"));
+        assert!(KERNEL_SOURCE.contains("const int MXFP4_BYTES = 17;"));
+        assert!(KERNEL_SOURCE.contains("exp2f((float)(int)g[0] - 127.0f)"));
+        assert!(KERNEL_SOURCE.contains("const int MXFP8_GROUP = 32;"));
+        assert!(KERNEL_SOURCE.contains("const int MXFP8_BYTES = 33;"));
+    }
+
+    /// Page allocation must agree with the decode strides.
+    #[test]
+    fn packed_bytes_matches_the_kernel_strides() {
+        use KvCacheQuantFormat::*;
+        for n in [16usize, 32, 64, 100] {
+            // 9 bytes per 16 values for the per-16 inline-scale formats.
+            assert_eq!(NvFp4.packed_bytes(n), n.div_ceil(2) + n.div_ceil(16));
+            assert_eq!(NutFp4.packed_bytes(n), n.div_ceil(2) + n.div_ceil(16));
+            // 17 bytes per 32 for MxFp4, 33 per 32 for MxFp8.
+            assert_eq!(MxFp4.packed_bytes(n), n.div_ceil(2) + n.div_ceil(32));
+            assert_eq!(MxFp8.packed_bytes(n), n + n.div_ceil(32));
+            // No inline scale byte for the caller-scaled formats.
+            assert_eq!(Fp4E2M1.packed_bytes(n), n.div_ceil(2));
+            assert_eq!(Int8.packed_bytes(n), n);
+            assert_eq!(Fp8E4M3.packed_bytes(n), n);
+        }
+    }
+
+    /// Build a 9-byte Nutcracker sub-block carrying a single code at `idx`.
+    fn nutcracker_pack_reference(scale_byte: u8, idx: u8) -> [u8; 9] {
+        let mut blk = [0u8; 9];
+        blk[0] = scale_byte;
+        blk[1 + (idx as usize / 2)] = if idx % 2 == 0 { idx & 0x0F } else { idx << 4 };
+        blk
     }
 
     // ── Item 3 parity tests ────────────────────────────────────────────────
