@@ -25,10 +25,146 @@ extern "C" __global__ void grim_mul_scalar(const float* x, float s, float* out, 
     out[i] = x[i] * s;
 }
 
+// Per-row vector scale: out[r, c] = scale[r] * x[r, c] (row-major).
+// The device-resident primitive for per-token gating (Xing4.0 hyper-connections).
+extern "C" __global__ void grim_row_scale(const float* x, const float* scale, float* out,
+                                          int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) return;
+    int r = i / cols;
+    out[i] = x[i] * scale[r];
+}
+
 extern "C" __global__ void grim_add_scalar(const float* x, float s, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = x[i] + s;
+}
+
+// Contiguous row-range copy: dst[(start + r) * cols + c] = src[r * cols + c].
+// Backs the narrow_rows / write_rows sub-block addressing primitives.
+// Row-range copy, one block per row, threads walking the row: no integer
+// division or modulo. (The flat-index form compiles to a float-reciprocal
+// divide, which is both slower and a correctness hazard.)
+//
+// `grim_row_copy`      : dst[r]           = src[start + r]   (read a row range out)
+// `grim_row_copy_into` : dst[start + r]   = src[r]           (write a row range in)
+// The two directions are separate kernels because the *source* and the
+// *destination* carry the offset in each case, and the output buffer of the
+// read form is exactly rows*cols floats.
+extern "C" __global__ void grim_row_copy(const float* src, float* dst,
+                                         int start, int rows, int cols) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const long long src_base = (long long)(start + r) * cols;
+    const long long dst_base = (long long)r * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        dst[dst_base + c] = src[src_base + c];
+    }
+}
+
+extern "C" __global__ void grim_row_copy_into(const float* src, float* dst,
+                                              int start, int rows, int cols) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const long long src_base = (long long)r * cols;
+    const long long dst_base = (long long)(start + r) * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        dst[dst_base + c] = src[src_base + c];
+    }
+}
+
+// Xing4.0 manifold hyper-connection gates — one block per token.
+//
+// Input `proj` is the [seq, mix] projection with mix = (2 + hc) * hc laid out
+// as [pre(hc) | post(hc) | comb(hc*hc)]; `base` is [mix] and `scale` is [3]
+// (pre / post / comb multipliers). Writes the collapse gate `pre` [seq, hc], the
+// stream-write gate `post` [seq, hc] (already 2*sigmoid), and the Sinkhorn
+// combiner `comb` [seq, hc*hc].
+//
+// The whole gate math is fused here because it is a fixed 4x4 (hc=4) per token:
+// the Sinkhorn iterations need per-token row/column reductions over hc*hc
+// values, which no dim-wise reduction primitive exposes. Keeping it in one
+// block per token leaves the [seq, hc*hc] projection resident and avoids a
+// D2H/H2D round-trip of the gates on every layer.
+//
+// `hc` is a template-style runtime arg but the launch uses 4; the block covers
+// MAX_HC*MAX_HC entries so a smaller hc still indexes in-bounds.
+#define MHC_MAX_HC 8
+extern "C" __global__ void grim_mhc_gates(const float* __restrict__ proj,
+                                          const float* __restrict__ base,
+                                          const float* __restrict__ scale,
+                                          float* __restrict__ pre_out,
+                                          float* __restrict__ post_out,
+                                          float* __restrict__ comb_out,
+                                          int seq, int hc, int iters,
+                                          float hc_eps, float clamp_min, float clamp_max) {
+    const int tok = blockIdx.x;
+    if (tok >= seq) return;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int mix = (2 + hc) * hc;
+    const float* prow = proj + (long long)tok * mix;
+
+    // pre = sigmoid(w * scale[0] + base); post = 2 * sigmoid(w * scale[1] + base)
+    for (int h = tid; h < hc; h += nthreads) {
+        pre_out[(long long)h * seq + tok] =
+            1.0f / (1.0f + expf(-(prow[h] * scale[0] + base[h])));
+        post_out[(long long)h * seq + tok] =
+            2.0f / (1.0f + expf(-(prow[hc + h] * scale[1] + base[hc + h])));
+    }
+
+    // Combiner logits -> clamp -> exp (row-max stabilized), then Sinkhorn.
+    __shared__ float c[MHC_MAX_HC * MHC_MAX_HC];
+    __shared__ float s_red[MHC_MAX_HC * MHC_MAX_HC];
+    const int comb_off = 2 * hc;
+    float m = -1e30f;
+    for (int k = tid; k < hc * hc; k += nthreads) {
+        float v = prow[comb_off + k] * scale[2] + base[comb_off + k];
+        if (v < clamp_min) v = clamp_min;
+        if (v > clamp_max) v = clamp_max;
+        c[k] = v;
+        if (v > m) m = v;
+    }
+    // Block-reduce the per-token row max through a separate buffer so `c`
+    // keeps its clamped logits until the exp pass.
+    s_red[tid] = m;
+    __syncthreads();
+    for (int stride = (nthreads >> 1); stride > 0; stride >>= 1) {
+        if (tid < stride) s_red[tid] = fmaxf(s_red[tid], s_red[tid + stride]);
+        __syncthreads();
+    }
+    const float mx = s_red[0];
+    for (int k = tid; k < hc * hc; k += nthreads) {
+        c[k] = expf(c[k] - mx);
+    }
+    __syncthreads();
+
+    for (int it = 0; it < iters; ++it) {
+        // Row normalize.
+        for (int r = tid; r < hc; r += nthreads) {
+            float s = 0.0f;
+            for (int i = 0; i < hc; ++i) s += c[r * hc + i];
+            const float d = s + hc_eps;
+            for (int i = 0; i < hc; ++i) c[r * hc + i] /= d;
+        }
+        __syncthreads();
+        // Column normalize.
+        for (int i = tid; i < hc; i += nthreads) {
+            float s = 0.0f;
+            for (int r = 0; r < hc; ++r) s += c[r * hc + i];
+            const float d = s + hc_eps;
+            for (int r = 0; r < hc; ++r) c[r * hc + i] /= d;
+        }
+        __syncthreads();
+    }
+
+    // Emit stream-major / token-last: comb_out[(h_out * hc + h_in) * seq + tok].
+    // That makes every downstream per-(stream, source-stream) weight vector a
+    // contiguous row slice, so the write-back needs no gather.
+    for (int k = tid; k < hc * hc; k += nthreads) {
+        comb_out[(long long)k * seq + tok] = c[k];
+    }
 }
 
 // Fused AXPY: out = a + s * b (e.g. residual + residual_multiplier * branch)
@@ -1081,6 +1217,27 @@ extern "C" __global__ void grim_embedding(float* weight, float* out,
     int i = idx / dim;
     int j = idx % dim;
     out[idx] = weight[indices[i] * dim + j];
+}
+
+// Q4_K row gather: out[i, :] = dequantized row indices[i].
+//
+// Keeps a large-vocabulary embedding table packed on device. `dim` must be a
+// whole number of 256-element super-blocks (5120 = 20 blocks), so every row
+// starts at a block boundary and the address math stays exact.
+//
+// The leaf decode is the same `dequant_q4k_element` the weight path uses, so
+// there is exactly one Q4_K decoder to trust. Blocks are 144 bytes.
+extern "C" __global__ void grim_embedding_q4k(const unsigned char* packed, float* out,
+                                              int* indices, int dim, int total) {
+    const int QK_BLOCK = 256;
+    const int QK_BLOCK_BYTES = 144;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int i = idx / dim;
+    int j = idx % dim;
+    long long row = (long long)indices[i] * (long long)dim + (long long)j;
+    const unsigned char* blk = packed + (row / QK_BLOCK) * QK_BLOCK_BYTES;
+    out[idx] = dequant_q4k_element(blk, (int)(row % QK_BLOCK));
 }
 
 extern "C" __global__ void grim_rmsnorm_matmul(

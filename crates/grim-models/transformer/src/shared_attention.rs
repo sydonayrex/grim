@@ -657,7 +657,10 @@ pub fn fused_or_scalar_attention_paged_quant(
         dst_off,
         &k_packed,
     )
-    .map_err(|e| grim_core::error::Error::Backend(format!("k page append: {e}")))?;
+    .map_err(|e| grim_core::error::Error::Backend(format!(
+        "k page append: {e} [device={:?}]",
+        device
+    )))?;
     upload_packed_rows(
         &dev,
         cache.v_pages.as_ref().unwrap().as_ref(),

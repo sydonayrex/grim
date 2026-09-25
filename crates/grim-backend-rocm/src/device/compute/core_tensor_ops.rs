@@ -525,6 +525,24 @@ impl CoreTensorOps for RocmDevice {
                 ));
             }
         };
+        // Reject an out-of-range token BEFORE launching. The kernel indexes
+        // `weight[indices[i] * dim + j]` with no bounds check, so a bad id
+        // either faults or returns another token's row. This is cheap: it is
+        // one host-side pass over the (small) index vector.
+        {
+            let dims = w_s.shape().dims();
+            if dims.len() != 2 {
+                return Err(Error::Shape(format!(
+                    "embedding: weight must be 2-D, got {dims:?}"
+                )));
+            }
+            let rows = dims[0];
+            if let Some(bad) = indices.iter().find(|&&t| t as usize >= rows) {
+                return Err(Error::Backend(format!(
+                    "embedding: token id {bad} is out of range for a {rows}-row table"
+                )));
+            }
+        }
         if !w_s.device_ptr_is_valid() {
             return Err(Error::Backend(
                 "embedding: weight lacks a valid device pointer".into(),
@@ -567,6 +585,104 @@ impl CoreTensorOps for RocmDevice {
         )?;
         // The fused kernel reads idx_ptr from the GPU.
         // Free stream-ordered so the release happens after the kernel's reads; this is also graph-capturable (the.
+        unsafe {
+            let free_stream = stream
+                .as_ref()
+                .map(|_| self.active_stream())
+                .unwrap_or(std::ptr::null_mut());
+            let _ = hipFreeAsync(idx_ptr, free_stream);
+        }
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// Q4_K embedding gather: rows stay packed in VRAM and are dequantized on
+    /// read, so a 248320 x 5120 table costs 715 MB instead of 5.09 GB of f32
+    /// (and no 5 GB transient host buffer during load).
+    fn embedding_q4k(
+        &self,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out: &Shape,
+        dim: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // Q4_K geometry: 256 elements per 144-byte super-block.
+        const QK_BLOCK: usize = 256;
+        const QK_BLOCK_BYTES: usize = 144;
+
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let w_s = as_rocm(weight)
+            .map_err(|_| Error::Backend("embedding_q4k: weight is not RocmStorage".into()))?;
+        if !w_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "embedding_q4k: weight lacks a valid device pointer".into(),
+            ));
+        }
+        let out_dims = out.dims();
+        if out_dims.len() != 2 {
+            return Err(Error::Shape("embedding_q4k: out must be [n, dim]".into()));
+        }
+        if out_dims[1] != dim {
+            return Err(Error::Shape(format!(
+                "embedding_q4k: out width {} != dim {dim}",
+                out_dims[1]
+            )));
+        }
+        if out_dims[0] != indices.len() {
+            return Err(Error::Shape(format!(
+                "embedding_q4k: indices len {} != out leading dim {}",
+                indices.len(),
+                out_dims[0]
+            )));
+        }
+        // The kernel's address math is `(row/256)*144`, which is only exact when
+        // every row is a whole number of super-blocks. Reject rather than
+        // silently reading misaligned bytes.
+        if dim == 0 || dim % QK_BLOCK != 0 {
+            return Err(Error::Shape(format!(
+                "embedding_q4k: dim {dim} must be a non-zero multiple of the \
+                 Q4_K super-block size {QK_BLOCK}"
+            )));
+        }
+        // Derive the row count from the packed byte length so an out-of-range
+        // token is caught before the kernel indexes off the end.
+        let packed_bytes = w_s.shape().dims()[0];
+        let expected = (dim / QK_BLOCK) * QK_BLOCK_BYTES;
+        if expected == 0 || packed_bytes % expected != 0 {
+            return Err(Error::Shape(format!(
+                "embedding_q4k: packed table of {packed_bytes} B is not a whole \
+                 number of {expected}-B rows"
+            )));
+        }
+        let rows = packed_bytes / expected;
+        if let Some(bad) = indices.iter().find(|&&t| t as usize >= rows) {
+            return Err(Error::Backend(format!(
+                "embedding_q4k: token id {bad} is out of range for a {rows}-row table"
+            )));
+        }
+
+        let total = out.elem_count();
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut w_ptr = dev_ptr(w_s)?;
+        let mut idx_ptr = upload_device_buffer(self.ordinal, indices)?;
+        let mut dim_i = dim as i32;
+        let mut total_i = total as i32;
+        let (grid, block) = linear_launch(total);
+        let stream = self.launch_compute_kernel(
+            "grim_embedding_q4k",
+            grid,
+            block,
+            &mut [
+                arg(&mut w_ptr),
+                arg(&mut out_ptr),
+                arg(&mut idx_ptr),
+                arg(&mut dim_i),
+                arg(&mut total_i),
+            ],
+        )?;
         unsafe {
             let free_stream = stream
                 .as_ref()

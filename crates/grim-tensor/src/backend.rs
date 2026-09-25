@@ -251,12 +251,42 @@ pub trait CoreTensorOps {
 
     /// Embedding gather: `out[i] = weight[indices[i], :]`.
     /// `indices` is a host-side u32 vector of the same length as the leading dim of.
+    ///
+    /// Implementations must reject an out-of-range index rather than reading past
+    /// the table: a bad token id otherwise faults, or silently returns another
+    /// token's row.
     fn embedding(
         &self,
         weight: &dyn BackendStorage,
         indices: &[u32],
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+    /// Embedding gather from a Q4_K block-quantized table: `out[i]` is row
+    /// `indices[i]`, dequantized on the read.
+    ///
+    /// This exists so a large-vocabulary table can stay packed on device. A
+    /// 248320 x 5120 table is 715 MB as Q4_K but 5.09 GB if dequantized to f32 —
+    /// a 7.1x blowup, plus a transient host buffer of the same size during the
+    /// dequant. Gathering one row at a time is O(dim) instead of O(vocab * dim).
+    ///
+    /// `weight` must be the raw Q4_K bytes (256 elements per 144-byte
+    /// super-block); `out` is `[n, dim]` f32. The row width must be a whole
+    /// number of super-blocks so every row is block-aligned.
+    ///
+    /// `Unimplemented` by default; backends without an on-device Q4_K decoder
+    /// should fall back to dequantizing once on the host.
+    fn embedding_q4k(
+        &self,
+        _weight: &dyn BackendStorage,
+        _indices: &[u32],
+        _out: &Shape,
+        _dim: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "embedding_q4k not implemented for this backend".into(),
+        ))
+    }
 
     /// Copy a slice of F32 values from host memory to the device storage.
     /// `from_cpu` is the established workspace-wide device-API name ("construct this backend's storage from host data"); renaming.
@@ -276,6 +306,73 @@ pub trait CoreTensorOps {
 /// Scalar and binary elementwise ops plus device reductions.
 /// All methods have defaults (mostly `Err(Unimplemented)`; reductions fall back to the host).
 pub trait ElementwiseOps {
+    /// Per-row vector scale: `out[r, c] = scale[r] * x[r, c]`.
+    ///
+    /// The device-resident primitive for per-token gating. `scale` is a rank-1
+    /// `[rows]` vector broadcast down each row of a `[rows, cols]` matrix — the
+    /// shape every gated residual / MoE-router scale needs, and the operation
+    /// that would otherwise force a D2H of the full activation to build a
+    /// `mul_scalar` chain on the host.
+    ///
+    /// `rows * cols` must equal `x`'s element count. Backends that cannot do
+    /// this leave the `Unimplemented` default, which callers treat as
+    /// "use the documented host fallback".
+    fn row_scale(
+        &self,
+        x: &dyn BackendStorage,
+        scale: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, scale, rows, cols, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "row_scale not implemented for this backend".into(),
+        ))
+    }
+
+    /// Contiguous row slice: reads rows `[start_row, start_row + rows)` of a
+    /// row-major `[total_rows, cols]` tensor into a fresh `[rows, cols]` tensor.
+    ///
+    /// The device-side addressing primitive for per-head / per-stream
+    /// sub-blocks. It exists so arch code can address a sub-block of a device
+    /// tensor without pulling the whole tensor to the host; row ranges are
+    /// chosen stream-major so the slice is always contiguous.
+    fn narrow_rows(
+        &self,
+        x: &dyn BackendStorage,
+        start_row: usize,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, start_row, rows, cols, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "narrow_rows not implemented for this backend".into(),
+        ))
+    }
+
+    /// Contiguous row write: copies `[rows, cols]` `src` into rows
+    /// `[start_row, start_row + rows)` of the row-major `dst` tensor, in place.
+    ///
+    /// Takes `&mut` because a write is a mutation. Backends whose storage is
+    /// immutably shared (the CPU backend's `Arc<Vec<f32>>`) leave this
+    /// `Unimplemented`; they serve the same sub-block composition through their
+    /// native in-place paths instead.
+    fn write_rows(
+        &self,
+        dst: &mut dyn BackendStorage,
+        start_row: usize,
+        src: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (dst, start_row, src, rows, cols);
+        Err(crate::error::Error::Unimplemented(
+            "write_rows not implemented for this backend".into(),
+        ))
+    }
+
     /// Elementwise multiply by a scalar broadcast: `out = x * scalar`.
     /// Used by autograd (`scale_backward`, LoRA grad scaling) and by the device-resident AdamW optimizer step to.
     fn mul_scalar(
