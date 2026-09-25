@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Edge Cases, Limitations, and Quirks
 
-1. **Dynamic Library Resolution**: `grim-backend-rocm` dynamically resolves `libamdhip64.so` and `librocblas.so` at runtime using `libloading`. If ROCm libraries are missing from `/opt/rocm/lib` or `LD_LIBRARY_PATH`, `RocmDevice::probe()` returns an empty list without panicking.
+1. **ROCm linking**: the core HIP, rocBLAS, and HIPRTC FFI is linked at build time through the ROCm toolchain. Optional integrations such as MIOpen/SMI use runtime `libloading`; if their optional libraries are absent, the corresponding optional path fails cleanly. `RocmDevice::probe()` reports unavailable devices without panicking.
 2. **RCCL Device Synchronization**: Real multi-GPU on-device collectives (`all_gather_storage`, `reduce_scatter_storage`) require valid GPU device pointers and stream synchronization. In environments without physical GPUs or RCCL, operations fall back to the mutex-synchronized `HostStagingRing`.
 3. **Wavefront Size Specialization**: RDNA architectures (`gfx1030`, `gfx1100`, `gfx1151`, `gfx1200`) use Wave32 execution, while CDNA architectures (`gfx906`, `gfx908`, `gfx90a`, `gfx942`) use Wave64. Kernels are JIT-specialized using the device's native wavefront width.
 

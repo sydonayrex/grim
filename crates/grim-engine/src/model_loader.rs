@@ -40,14 +40,12 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// PLAN-reduce-d2h-h2d A4: load-time decision for the LFM2 fused MXFP4 QKV
-/// attention path. Default-on for the LFM2 family (the fused pack is built by
-/// quantizing the loaded weights at load time, so there is no separate
-/// "already-MXFP4" weight layout to detect — the win applies whenever the
-/// device is ROCm and the pack builds); escape hatch
-/// `GRIM_LFM2_MXFP4_QKV=0/false/off`. The `Lfm2Config` struct default stays
-/// `false` (F32 golden reference); only the loader opts in. The fused path
-/// additionally requires a ROCm device at `Lfm2::load` time (`lfm2.rs`), so
-/// CPU loads are unaffected by this flag.
+/// attention path. The pack is built only when the loaded Q/K/V weights are
+/// already native MXFP4; F32 and Q8_0 weights are not requantized at load time.
+/// The escape hatch remains `GRIM_LFM2_MXFP4_QKV=0/false/off`. The
+/// `Lfm2Config` struct default stays `false` (F32 golden reference); only the
+/// loader opts in. The fused path additionally requires a ROCm device at
+/// `Lfm2::load` time (`lfm2.rs`), so CPU loads are unaffected by this flag.
 pub(crate) fn lfm2_mxfp4_qkv_enabled() -> bool {
     std::env::var("GRIM_LFM2_MXFP4_QKV")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
