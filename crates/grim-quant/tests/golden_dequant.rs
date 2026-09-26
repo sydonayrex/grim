@@ -461,3 +461,39 @@ fn q6k_golden_dequant_hand_constructed() {
     //   val = d * sc_0 * (q1 - 32) = 2.0 * 5 * (20 - 32) = -120.0
     assert_close(out[0], -120.0, "q6k quarter 0 weight at l=0");
 }
+
+#[test]
+fn test_gsq_rco_3p5_golden_block_dequant() {
+    use grim_quant::dequant_gsq_rco_3p5;
+
+    let mut block = vec![0u8; 72];
+    // d = 1.0 (fp16: 0x3C00)
+    block[0] = 0x00;
+    block[1] = 0x3C;
+    // dmin = 0.5 (fp16: 0x3800)
+    block[2] = 0x00;
+    block[3] = 0x38;
+    // Sub-block scales sc: sc[0]=2, sc[1]=3 -> 0x32, etc.
+    block[4] = 0x32;
+    block[5] = 0x54;
+    block[6] = 0x76;
+    block[7] = 0x98;
+    // Quants: fill bytes 8..72 with alternating patterns (0, 1, 2, 3) -> 0b11100100 = 0xE4
+    for b in 8..72 {
+        block[b] = 0xE4;
+    }
+
+    let deq = dequant_gsq_rco_3p5(&block, 256).expect("dequant_gsq_rco_3p5 must succeed");
+    assert_eq!(deq.len(), 256);
+
+    // Check sub-block 0 (sc = 2, d = 1.0, dmin = 0.5):
+    // q=0 -> 1.0 * 2.0 * 0.0 - 0.5 = -0.5
+    // q=1 -> 1.0 * 2.0 * 1.0 - 0.5 = 1.5
+    // q=2 -> 1.0 * 2.0 * 2.0 - 0.5 = 3.5
+    // q=3 -> 1.0 * 2.0 * 3.0 - 0.5 = 5.5
+    assert!((deq[0] - (-0.5)).abs() < 1e-4);
+    assert!((deq[1] - 1.5).abs() < 1e-4);
+    assert!((deq[2] - 3.5).abs() < 1e-4);
+    assert!((deq[3] - 5.5).abs() < 1e-4);
+}
+
