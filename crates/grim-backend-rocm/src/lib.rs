@@ -44,6 +44,7 @@ pub mod perf_gate;
 pub mod quantization;
 pub mod rccl;
 pub mod rocm_detect;
+pub mod scythe2_placement;
 pub mod speculative;
 pub mod trace;
 
