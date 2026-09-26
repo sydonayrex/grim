@@ -281,10 +281,16 @@ impl Qwen35Block {
 
         let (wq, wk, wv, wo, attn_q_norm, attn_k_norm, attn_qkv, attn_gate, ssm_out) =
             if is_full_attention {
+                // attn_q is FUSED query + output gate, per llama.cpp qwen35.cpp:
+                // `create_tensor_qkv(..., n_embd_head_k * n_head * 2, ...)` and the
+                // graph splits it with two `ggml_view_3d`s into Q and gate. So the
+                // out-width is 2 * q_dim (12288 for 24 heads x 256), NOT a fixed
+                // literal. The previous `q_dim.max(12288)` happened to match this
+                // checkpoint while being wrong for any other head count.
                 let wq = Linear::load_column_parallel(
                     &ws.pp("attn_q"),
                     cfg.hidden_size,
-                    q_dim.max(12288),
+                    2 * q_dim,
                     false,
                     tp,
                 )
@@ -635,20 +641,68 @@ impl Qwen35Block {
             // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
             // (pre-rope) instead of 3 separate GEMVs; the same rope_ext and
             // arena-attention path follow unchanged.
-            let (q_dev, k_dev_t, v_dev_t) = match self.wqkv_q80_fused.as_ref() {
+            let (q_dev, k_dev_t, v_dev_t, q_gate) = match self.wqkv_q80_fused.as_ref() {
                 Some(fused) if seq_len == 1 => {
-                    crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?
+                    let (q, k, v) =
+                        crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?;
+                    // The fused-QKV path has no separate attn_q tensor, so there
+                    // is no gate half to split out here.
+                    let g = Tensor::new(
+                        dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?.into(),
+                        Shape::new(vec![seq_len, q_dim]),
+                        DType::F32,
+                        x_normed.provenance().clone(),
+                        x_normed.device().clone(),
+                    );
+                    (q, k, v, g)
                 }
                 _ => {
-                    let q_dev = match self.wq.as_ref() {
-                        Some(wq) => exact(wq.forward(&x_normed)?, seq_len, q_dim)?,
-                        None => Tensor::new(
-                            dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
-                                .into(),
-                            Shape::new(vec![seq_len, q_dim]),
-                            DType::F32,
-                            x_normed.provenance().clone(),
-                            x_normed.device().clone(),
+                    // attn_q emits [Q(q_dim) | gate(q_dim)] fused, so split it
+                    // ROW-AWARE per token. A flat byte-range copy of the first
+                    // q_dim elements is wrong for seq_len > 1: it cuts across
+                    // row boundaries and scrambles Q itself, not just the gate.
+                    let (q_dev, q_gate) = match self.wq.as_ref() {
+                        Some(wq) => {
+                            let full = wq.forward(&x_normed)?.to_vec_f32()?;
+                            let wide = full.len() / seq_len.max(1);
+                            let mut q_rows = vec![0.0f32; seq_len * q_dim];
+                            let mut gate_rows = vec![0.0f32; seq_len * q_dim];
+                            for t in 0..seq_len {
+                                let base = t * wide;
+                                if base + wide > full.len() {
+                                    continue;
+                                }
+                                let row = &full[base..base + wide];
+                                let n = q_dim.min(wide);
+                                q_rows[t * q_dim..t * q_dim + n]
+                                    .copy_from_slice(&row[..n]);
+                                if wide >= 2 * q_dim {
+                                    gate_rows[t * q_dim..t * q_dim + n]
+                                        .copy_from_slice(&row[q_dim..q_dim + n]);
+                                }
+                            }
+                            (
+                                device_tensor(q_rows, Shape::new(vec![seq_len, q_dim]), &device)?,
+                                device_tensor(gate_rows, Shape::new(vec![seq_len, q_dim]), &device)?,
+                            )
+                        }
+                        None => (
+                            Tensor::new(
+                                dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                                    .into(),
+                                Shape::new(vec![seq_len, q_dim]),
+                                DType::F32,
+                                x_normed.provenance().clone(),
+                                x_normed.device().clone(),
+                            ),
+                            Tensor::new(
+                                dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                                    .into(),
+                                Shape::new(vec![seq_len, q_dim]),
+                                DType::F32,
+                                x_normed.provenance().clone(),
+                                x_normed.device().clone(),
+                            ),
                         ),
                     };
                     let k_dev_t = match self.wk.as_ref() {
@@ -673,7 +727,7 @@ impl Qwen35Block {
                             x_normed.device().clone(),
                         ),
                     };
-                    (q_dev, k_dev_t, v_dev_t)
+                    (q_dev, k_dev_t, v_dev_t, q_gate)
                 }
             };
 
@@ -810,7 +864,20 @@ impl Qwen35Block {
                 None,
                 &device,
             )?;
-            out_branch = attn_tensor.to_vec_f32()?;
+            let mut attn_out = attn_tensor.to_vec_f32()?;
+            // Output gate: attn_out * sigmoid(attn_q's gate half), per
+            // llama.cpp qwen35.cpp:
+            //   gate = ggml_sigmoid(gate_view)
+            //   cur  = ggml_mul(cur, gate_sigmoid)   // "attn_gated"
+            // applied BEFORE `wo`. Without this the gate half of attn_q is
+            // computed and discarded.
+            if self.wq.is_some() {
+                let g = q_gate.to_vec_f32()?;
+                for i in 0..attn_out.len().min(g.len()) {
+                    attn_out[i] *= 1.0 / (1.0 + (-g[i]).exp());
+                }
+            }
+            out_branch = attn_out;
         } else {
             // Gated DeltaNet recurrence (see `gated_delta_net_forward`).
             gated_delta_net_forward(
@@ -2278,6 +2345,52 @@ mod tests {
              did not run, or ran with beta/alpha = 0, or the state is too small"
         );
         eprintln!("[kda-reach] ssm_state advanced in {nonzero} elements");
+    }
+
+
+    /// `attn_q` is a fused [Q | gate] projection, so it must be split ROW-AWARE.
+    ///
+    /// The previous code used `exact(wq.forward(..), seq_len, q_dim)`, a flat
+    /// prefix copy. For seq_len == 1 that happens to yield the right Q and merely
+    /// drops the gate; for seq_len > 1 it cuts ACROSS row boundaries and
+    /// scrambles Q itself, which is a silent numerical corruption.
+    ///
+    /// This pins the actual splitting rule with distinguishable values.
+    #[test]
+    fn fused_qkv_split_is_row_aware() {
+        let q_dim = 3usize;
+        let seq_len = 3usize;
+        // Per token: [q0 q1 q2 | g0 g1 g2] with token-unique values.
+        let wide = 2 * q_dim;
+        let full: Vec<f32> = (0..seq_len * wide)
+            .map(|i| i as f32)
+            .collect();
+        // What a FLAT prefix copy would produce, and what row-aware gives.
+        let mut flat = vec![0.0f32; seq_len * q_dim];
+        flat.copy_from_slice(&full[..seq_len * q_dim]);
+
+        let mut q_rows = vec![0.0f32; seq_len * q_dim];
+        let mut gate_rows = vec![0.0f32; seq_len * q_dim];
+        for t in 0..seq_len {
+            let base = t * wide;
+            let row = &full[base..base + wide];
+            q_rows[t * q_dim..(t + 1) * q_dim].copy_from_slice(&row[..q_dim]);
+            gate_rows[t * q_dim..(t + 1) * q_dim].copy_from_slice(&row[q_dim..]);
+        }
+
+        // Row-aware Q is the interleaved per-token prefix, NOT the flat prefix.
+        assert_eq!(
+            q_rows,
+            vec![0., 1., 2., 6., 7., 8., 12., 13., 14.],
+            "row-aware split must take each token's own prefix"
+        );
+        assert_ne!(
+            q_rows, flat,
+            "a flat prefix copy must NOT coincide with the row-aware split at \
+             seq_len > 1 — that was the scrambling bug"
+        );
+        // Gate is the second half of each row.
+        assert_eq!(gate_rows, vec![3., 4., 5., 9., 10., 11., 15., 16., 17.]);
     }
 
 }
