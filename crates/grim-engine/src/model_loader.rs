@@ -964,6 +964,38 @@ fn load_model_from_config(
     let hidden_size = config.hidden_size;
     let num_layers = config.num_hidden_layers;
     let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-5);
+    // Qwen3.5/3.8 ships a multi-token-prediction head as a trailing layer and
+    // `block_count` counts it, so the GGUF says 65 for a 64-layer transformer.
+    // The reference separates the two: `n_layer() { return n_layer_all -
+    // n_layer_nextn; }` (llama-hparams.cpp:349), and the forward loop runs
+    // `n_layer()`, not `n_layer_all` (qwen35.cpp:155) - the nextn block is only
+    // used for speculative decoding.
+    //
+    // Running that extra layer in a normal forward adds a residual contribution
+    // the reference never applies, immediately before the output projection.
+    // Detected structurally from the `nextn.*` tensors rather than hardcoded, so
+    // it follows the checkpoint instead of a magic 64.
+    let num_layers = match provider
+        .tensor_names()
+        .iter()
+        .filter_map(|n| n.strip_prefix("blk."))
+        .filter(|n| n.contains(".nextn."))
+        .filter_map(|n| n.split('.').next())
+        .filter_map(|i| i.parse::<usize>().ok())
+        .min()
+    {
+        Some(first_nextn) if first_nextn < num_layers => {
+            eprintln!(
+                "[qwen35] excluding {} MTP layer(s) from the forward: block_count={} but \
+                 blk.{} carries nextn.* tensors",
+                num_layers - first_nextn,
+                num_layers,
+                first_nextn
+            );
+            first_nextn
+        }
+        _ => num_layers,
+    };
     let num_heads = config.num_attention_heads.unwrap_or(32);
     let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
     let head_dim = config
