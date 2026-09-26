@@ -355,8 +355,8 @@ impl GgufDType {
             // NVFP4: 256 weights per super-block. 1 byte E8M0 scale per 16-elem
             // sub-block (16 scales) + 128 bytes packed E2M1 codes (2 per byte).
             GgufDType::NVFP4 => 16 + 128,
-            // GsqRco3p5: 256 weights per super-block (72 bytes: 2 fp16 d/dmin + 4 byte sc + 64 byte qs).
-            GgufDType::GsqRco3p5 => 72,
+            // GsqRco3p5 (GGUF Q2_0, QK2_0=64): 2-byte fp16 delta + 64*2/8 packed codes.
+            GgufDType::GsqRco3p5 => 18,
             _ => 0,
         }
     }
@@ -2004,7 +2004,7 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
         },
         GgufDType::GsqRco3p5 => DType {
             arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q2K),
+            storage: Storage::KQuant(KQuantScheme::GsqRco3p5),
         },
     }
 }
@@ -2046,7 +2046,11 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::NVFP4 => Some(4),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
-        GgufDType::Q2K | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S | GgufDType::GsqRco3p5 => Some(2),
+        GgufDType::Q2K
+        | GgufDType::IQ2_XXS
+        | GgufDType::IQ2_XS
+        | GgufDType::IQ2_S
+        | GgufDType::GsqRco3p5 => Some(2),
         GgufDType::Q3K | GgufDType::IQ3_XXS | GgufDType::IQ3_S => Some(3),
         GgufDType::IQ1_S | GgufDType::IQ1_M => Some(1),
         GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),

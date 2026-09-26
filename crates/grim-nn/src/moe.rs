@@ -1372,6 +1372,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 KQuantScheme::IQ2XXS => 2,
                 KQuantScheme::IQ2XS => 2,
                 KQuantScheme::IQ2S => 2,
+                KQuantScheme::GsqRco3p5 => 3,
             };
             (elem_count * bits).div_ceil(8)
         }

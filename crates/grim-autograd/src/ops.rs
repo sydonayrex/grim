@@ -390,6 +390,10 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             KQuantScheme::IQ4NL | KQuantScheme::IQ4XS => 4,
             KQuantScheme::IQ3XXS | KQuantScheme::IQ3S => 3,
             KQuantScheme::IQ2XXS | KQuantScheme::IQ2XS | KQuantScheme::IQ2S => 2,
+            // No bits-per-weight table for this variant yet; 4 is the block's
+            // packed density (72 B per 256 elements) rounded down, matching the
+            // `expected_bytes` entry in grim-tensor.
+            KQuantScheme::GsqRco3p5 => 3,
         },
         Storage::Block(bd) => match bd {
             BlockDtype::Fp4 | BlockDtype::Fp4Block16 => 4,
