@@ -8,6 +8,8 @@ mod builtin_name_oracle_tests;
 #[cfg(test)]
 mod common;
 #[cfg(test)]
+mod fp8_gemv_hoist_tests;
+#[cfg(test)]
 mod device_lifecycle_tests;
 #[cfg(test)]
 mod elementwise_norm_tests;

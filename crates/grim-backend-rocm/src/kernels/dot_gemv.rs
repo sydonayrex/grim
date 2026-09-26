@@ -1699,17 +1699,27 @@ extern "C" __global__ void grim_dot4_fp8_gemv(
     // Q8_0 dot4 GEMV): 8 fp8 dot4s per chunk.
     for (int chunk = lane; chunk < n_chunks; chunk += 32) {
         const float* a_chunk = a_row + (long long)chunk * 32;
+
+        // WS-C1: pack the 32 activations ONCE per chunk. This used to sit inside
+        // the `j` loop below, so the f32->E4M3 ladder ran 4x per group of four —
+        // sixteen conversions per chunk to produce four identical words. The
+        // words depend only on `chunk`, never on `j`. Costs 8 VGPRs.
+        int a4_words[8];
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            a4_words[e] = grim_pack4_fp8(a_chunk + e * 4);
+        }
+
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             if (j >= active_cols) break;
             const unsigned char* b_chunk = b_col[j] + (long long)chunk * 32;
             float acc = 0.0f;
             #pragma unroll
-            for (int e = 0; e < 32; e += 4) {
-                int a4 = grim_pack4_fp8(a_chunk + e);
+            for (int e = 0; e < 8; ++e) {
                 int b4;
-                __builtin_memcpy(&b4, b_chunk + e, 4);
-                acc = grim_fdot4_fp8(acc, a4, b4);
+                __builtin_memcpy(&b4, b_chunk + e * 4, 4);
+                acc = grim_fdot4_fp8(acc, a4_words[e], b4);
             }
             facc[j] += acc;
         }
