@@ -210,6 +210,7 @@ impl Qwen35Block {
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,
+            ssm_d_conv_hint: cfg.ssm_d_conv,
             post_attention_norm,
             ffn_gate,
             ffn_up,
