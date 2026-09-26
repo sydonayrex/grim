@@ -1576,8 +1576,53 @@ extern "C" __global__ void grim_short_conv1d_causal_step(
     }
 }
 
+// Gated DeltaNet, one step per row of the value dimension.
+//
+// Published update (ICLR 2025, Eq. 10), matching the CPU reference in
+// `grim-backend-cpu/src/device.rs`:
+//
+//     decay = exp(a_gate)
+//     pred  = sum_k k * (decay * S)     <- decay applied BEFORE the dot
+//     delta = beta * (v - pred)         <- beta scales the FULL delta term
+//     S_new = decay * S + k * delta
+//     out   = sum_k q * S_new
+//
+// This kernel previously used sigmoid(a_gate), omitted decay from the key dot,
+// and folded beta inside as `v - beta*(k.S)`. It also indexed beta and a_gate
+// per-row, while they are per-call scalars (the CPU reference reads data()[0]),
+// so every row past 0 read past the end of a one-element buffer and ran the
+// recurrence on garbage. Fixed alongside the identical ROCm defect in 23f809f5;
+// see tests/kda_delta_rule_parity.rs.
 extern "C" __global__ void grim_kda_gated_delta_rule_step(
     const float* q, const float* k, const float* v, const float* beta,
+    const float* a_gate, float* S_state, float* out,
+    int d_k, int d_v
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= d_v) return;
+
+    // beta and a_gate are per-call scalars, not per-row.
+    const float decay = expf(a_gate[0]);
+    const float beta_val = beta[0];
+    float* s_row = S_state + (long long)row * d_k;
+
+    // pred = sum_k k * (decay * S)
+    float pred = 0.0f;
+    for (int col = 0; col < d_k; ++col) {
+        pred += k[col] * (decay * s_row[col]);
+    }
+
+    // delta = beta * (v - pred): beta scales the whole delta term.
+    const float delta = beta_val * (v[row] - pred);
+
+    float y_val = 0.0f;
+    for (int col = 0; col < d_k; ++col) {
+        const float new_s = decay * s_row[col] + k[col] * delta;
+        s_row[col] = new_s;
+        y_val += q[col] * new_s;
+    }
+    out[row] = y_val;
+}
     const float* a_gate, float* S_state, float* out,
     int d_k, int d_v
 ) {
