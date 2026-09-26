@@ -81,9 +81,15 @@ fn a_fresh_cache_is_advanced_by_the_recurrence() {
         "a fresh cache must be zeroed"
     );
 
+    // Stream is [Q key_dim][K key_dim][V value_dim] (upstream byte offsets 0,
+    // head_k_dim*num_k_heads, 2*head_k_dim*num_k_heads), so k and v must both
+    // be written or the delta has nothing to write.
+    let key_dim = n_k * hd;
     let mut conv = vec![0.0f32; conv_dim];
-    conv[0] = 1.0; // k[0] = 1
-    conv[2 * n_k * hd] = 2.0; // v[0] = 2
+    conv[0] = 1.0; // q[0] = 1; the read-out is q . S, so an empty
+    // query block yields a zero output regardless of state
+    conv[key_dim] = 1.0; // k[0] = 1
+    conv[2 * key_dim] = 2.0; // v[0] = 2
     let alpha = vec![0.0; n_v];
     let beta = vec![0.0; n_v]; // sigmoid(0) = 0.5
     let a = vec![0.0; n_v];
@@ -99,6 +105,7 @@ fn a_fresh_cache_is_advanced_by_the_recurrence() {
             a: &a,
             dt_bias: &dt,
             norm: &norm,
+            eps: 1e-6,
             n_v_heads: n_v,
             n_k_heads: n_k,
             head_dim: hd,
@@ -130,9 +137,13 @@ fn repeated_steps_diverge_because_state_accumulates() {
     let conv_dim = 2 * n_k * hd + n_v * hd;
     let mut cache = Qwen38GdnCache::new(n_v, hd, hd, 4, conv_dim);
 
+    // [Q key_dim][K key_dim][V value_dim]: k and v both need to be non-zero.
+    let key_dim = n_k * hd;
     let mut conv = vec![0.0f32; conv_dim];
-    conv[0] = 1.0;
-    conv[2 * n_k * hd] = 1.0;
+    conv[0] = 1.0; // q[0] = 1; the read-out is q . S, so an empty
+    // query block yields a zero output regardless of state
+    conv[key_dim] = 1.0; // k[0]
+    conv[2 * key_dim] = 1.0; // v[0]
     let alpha = vec![0.0; n_v];
     let beta = vec![0.0; n_v];
     let a = vec![0.0; n_v];
@@ -149,6 +160,7 @@ fn repeated_steps_diverge_because_state_accumulates() {
                 a: &a,
                 dt_bias: &dt,
                 norm: &norm,
+                eps: 1e-6,
                 n_v_heads: n_v,
                 n_k_heads: n_k,
                 head_dim: hd,

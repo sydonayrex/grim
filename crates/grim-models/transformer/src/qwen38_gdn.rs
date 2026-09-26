@@ -27,6 +27,17 @@
 //! # Gating
 //!
 //! ```text
+//! Content features, per the report Eq. (6)-(8):
+//!
+//! ```text
+//!   q = L2Norm(SiLU(ShortConv(Wq x)))
+//!   k = L2Norm(SiLU(ShortConv(Wk x)))
+//!   v =        SiLU(ShortConv(Wv x))     <- no norm on v
+//! ```
+//!
+//! Gates, per Eq. (9)-(10):
+//!
+//! ```text
 //!   alpha_biased   = alpha + ssm_dt
 //!   alpha_softplus = softplus(alpha_biased)
 //!   gate           = alpha_softplus * ssm_a
@@ -52,6 +63,19 @@
 //! the update just wrote.
 
 use grim_core::error::{Error, Result};
+
+/// L2-normalize a head of `n` values: `rms_norm(x, eps/n) * 1/sqrt(n)`.
+///
+/// Matches `build_gdn_l2_norm` in llama.cpp's `src/models/models.h`:
+/// `ggml_scale(ggml_rms_norm(x, eps/n), 1/sqrt(n))`. `ggml_rms_norm(x, e)`
+/// computes `x / sqrt(mean(x^2) + e)`, so the effective epsilon here is the
+/// caller's `eps` and the width scaling is folded in exactly as upstream does.
+fn l2_normalize(x: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len().max(1) as f32;
+    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n;
+    let inv = 1.0 / (mean_sq + eps / n).sqrt() / n.sqrt();
+    x.iter().map(|v| v * inv).collect()
+}
 
 /// Softplus, `log1p(exp(x))`, stable at both ends. Mirrors `qwen35.rs::Softplus`.
 pub fn softplus(x: f32) -> f32 {
@@ -197,6 +221,10 @@ pub struct GdnParams<'a> {
     pub seq_len: usize,
     /// How value heads map to key heads.
     pub pairing: KdaHeadPairing,
+    /// RMS epsilon for the q/k L2 normalization, `layer_norm_rms_eps`
+    /// (1e-6). Upstream passes `hparams.f_norm_rms_eps` to
+    /// `build_gdn_l2_norm`.
+    pub eps: f32,
 }
 
 /// Run the GDN recurrence over `params`, writing `[seq, value_dim]` into
@@ -219,6 +247,7 @@ pub fn gated_delta_net_forward(
         a,
         dt_bias,
         norm,
+        eps,
         n_v_heads,
         n_k_heads,
         head_dim,
@@ -252,6 +281,8 @@ pub fn gated_delta_net_forward(
     let values_per_group = (n_v_heads / n_k_heads).max(1);
     let out_width = value_dim;
 
+    let read_scale = 1.0f32 / (head_dim as f32).sqrt();
+
     for t in 0..seq_len {
         let base = t * expect_conv;
         for h in 0..n_v_heads {
@@ -259,9 +290,32 @@ pub fn gated_delta_net_forward(
                 KdaHeadPairing::Interleaved => h % n_k_heads,
                 KdaHeadPairing::Grouped => h / values_per_group,
             };
-            // [K key_dim][K key_dim][V value_dim]: key, key, value.
-            let k_off = base + key_head * head_dim;
-            let q_off = base + 2 * key_dim + h * head_dim;
+            // Upstream views the conv stream as three blocks with byte
+            // offsets 0, head_k_dim*num_k_heads, and 2*head_k_dim*num_k_heads:
+            //
+            //   q_conv offset 0
+            //   k_conv offset head_k_dim * num_k_heads
+            //   v_conv offset 2 * head_k_dim * num_k_heads
+            //
+            // so the order is [Q][K][V], not [K][K][V], and this code had Q and
+            // K swapped. It also read the query twice and never read the value
+            // at all, so the delta update wrote q*beta*q into the state instead
+            // of the real content.
+            let q_off = base + key_head * head_dim;
+            let k_off = base + key_dim + key_head * head_dim;
+            let v_off = base + 2 * key_dim + h * head_dim;
+
+            // Eq. (6)-(7): q and k are L2-normalized after the conv+SiLU, v is
+            // not. Without this the delta transition is unscaled: the report
+            // says it "bounds the magnitudes of q/k and stabilizes the
+            // rank-one delta transition", and upstream applies
+            // build_gdn_l2_norm to q_conv and k_conv only.
+            //
+            // build_gdn_l2_norm is `rms_norm(x, eps/n) * (1/sqrt(n))`, i.e. an
+            // L2 normalize with eps scaled by the width.
+            let n = head_dim as f32;
+            let k_n = l2_normalize(&conv_mix[k_off..k_off + head_dim], eps * n);
+            let q_n = l2_normalize(&conv_mix[q_off..q_off + head_dim], eps * n);
 
             // gate = softplus(alpha + dt_bias) * ssm_a. ssm_a multiplies AFTER
             // the softplus; folding it inside changes the function.
@@ -281,8 +335,8 @@ pub fn gated_delta_net_forward(
 
             let st_off = h * state_len;
             gated_delta_rule_row(
-                &conv_mix[k_off..k_off + head_dim],
-                &conv_mix[q_off..q_off + head_dim],
+                &k_n,
+                &conv_mix[v_off..v_off + head_dim],
                 beta_t,
                 gate,
                 &mut cache.ssm_state[st_off..st_off + state_len],
@@ -293,7 +347,11 @@ pub fn gated_delta_net_forward(
             // out = (q . S_new) * norm, read from the state just written.
             // Emitting `q[i] * norm[i]` instead would compute the correct state
             // and then ignore it, which is exactly the bug that shipped once.
-            let q_slice = &conv_mix[q_off..q_off + head_dim];
+            // Upstream scales the query by 1/sqrt(S_k) before the read-out.
+            // The report's Eq. (4) writes y = S q with no explicit scale, but
+            // the executable reference applies it, so it is part of the
+            // definition of y in this codebase.
+            let q_slice: Vec<f32> = q_n.iter().map(|v| v * read_scale).collect();
             for i in 0..head_dim {
                 let row = &cache.ssm_state[st_off + i * head_dim..st_off + (i + 1) * head_dim];
                 let acc: f32 = q_slice.iter().zip(row.iter()).map(|(qq, ss)| qq * ss).sum();
@@ -308,6 +366,11 @@ pub fn gated_delta_net_forward(
     cache.pos += seq_len;
     Ok(())
 }
+
+/// `1/sqrt(S_k)`, the read-out scale upstream applies to the query.
+/// Recurrence order: the query is scaled AFTER the state update, matching
+/// `q = ggml_scale(q, 1/sqrtf(S_k))` before the permute in
+/// `build_delta_net_autoregressive`.
 
 #[cfg(test)]
 mod tests {
@@ -336,6 +399,7 @@ mod tests {
             a,
             dt_bias: dt,
             norm,
+            eps: 1e-6,
             n_v_heads,
             n_k_heads,
             head_dim,
@@ -590,9 +654,12 @@ mod tests {
         let warm_then_read = |a_val: f32| -> f32 {
             let mut cache = Qwen38GdnCache::new(n_v, hd, hd, 4, conv_dim);
             // Warm with a k/v that writes a known state.
+            // [Q key_dim][K key_dim][V value_dim]: the delta writes
+            // k * beta * v, so both must be non-zero in their own blocks.
+            let key_dim = n_k * hd;
             let mut warm_conv = vec![0.0f32; conv_dim];
-            warm_conv[0] = 1.0;
-            warm_conv[2 * n_k * hd] = 1.0;
+            warm_conv[key_dim] = 1.0; // k[0]
+            warm_conv[2 * key_dim] = 1.0; // v[0]
             let mut ignore = vec![0.0; n_v * hd];
             gated_delta_net_forward(
                 &params_step(&warm_conv, &alpha, &beta, &[a_val], &dt, &norm, n_k),
@@ -745,9 +812,26 @@ mod tests {
         let n_v = 1;
         let hd = 2;
         let conv_dim = 2 * hd + n_v * hd;
+        // Layout is [K key_dim][K key_dim][V value_dim], and with
+        // n_k_heads = n_v_heads = 1 every block is one head wide:
+        //   k at 0, q at 2*hd, v at 2*hd + hd.
+        // The old indices wrote the value into the QUERY slot, which is why the
+        // expected output was wrong before the L2 norm existed and why it
+        // changed when the norm was added.
+        // key_dim = n_k_heads * head_dim = 2, so k at 0, q at 4, v at 6+0=6...
+        // but conv_dim is 2*hd + n_v*hd = 6, so the v block starts at 2*key_dim
+        // = 4, which collides with q. That means the stream is
+        // [K key_dim][K key_dim][V value_dim] = 2+2+2 = 6 elements and v is at
+        // index 4 as well -- so the test must use distinct k/q/v by putting the
+        // value in the v slot that the loader actually addresses.
+        // Stream is [Q key_dim][K key_dim][V value_dim] (upstream byte offsets
+        // 0, head_k_dim*num_k_heads, 2*head_k_dim*num_k_heads), so with
+        // key_dim == 2: q at 0..2, k at 2..4, v at 4..6.
+        let key_dim = hd; // n_k_heads == 1
         let mut conv = vec![0.0f32; conv_dim];
-        conv[0] = 1.0; // k[0] = 1 at the first key slot
-        conv[2 * hd] = 3.0; // v[0] = 3 at the value slot
+        conv[0] = 1.0; // q[0] = 1
+        conv[key_dim] = 1.0; // k[0] = 1
+        conv[2 * key_dim] = 3.0; // v[0] = 3
         let alpha = vec![50.0f32]; // softplus(50) would be ~50
         let beta = vec![0.0f32]; // sigmoid(0) = 0.5
         let a = vec![0.0f32]; // gate collapses
@@ -762,14 +846,18 @@ mod tests {
             &mut out,
         )
         .expect("forward");
-        // From S = 0 with gate 0 (decay 1): S[j] = k * beta * v[j].
-        //   S[0] = [1,0] * 0.5 * 3 = [1.5, 0]
-        // The query is the value stream, q = [3, 0], so out[0] = q . S[0] = 4.5.
-        // The 1.5 is the state; the extra 3 is the read-out, and conflating them
-        // is how a `q * norm` implementation would appear to pass.
+        // Eq. (6)-(7) L2-normalizes q and k; Eq. (8) leaves v alone.
+        //   q = L2([1,0]) = [1,0], k = L2([1,0]) = [1,0], v = [3,0]
+        // gate 0 -> decay 1. S[0] = k * beta * v[0] = [1,0] * 0.5 * 3 = [1.5, 0]
+        // out[0] = (q/sqrt(d_k)) . S[0] = (1/sqrt(2)) * 1.5 = 1.0607
+        //
+        // Every one of those factors is load-bearing: drop the L2 norm and the
+        // query becomes [1,0] still but the state is unaffected; drop the
+        // 1/sqrt(d_k) read scale and this is 1.5 instead.
         assert!(
-            (out[0] - 4.5).abs() < 1e-5,
-            "a=0 must zero the gate regardless of alpha, got {out:?}"
+            (out[0] - 1.5 / 2.0f32.sqrt()).abs() < 1e-3,
+            "a=0 must zero the gate regardless of alpha; with q/k L2-normalized \
+             the answer is 1.5, not the 4.5 an unnormalized q would give, got {out:?}"
         );
         assert!((out[1]).abs() < 1e-5, "second state row stays zero");
     }
