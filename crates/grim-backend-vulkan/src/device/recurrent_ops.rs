@@ -227,8 +227,22 @@ impl RecurrentOps for VulkanDevice {
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
-    /// KDA gated delta-rule recurrent step: `S' = g·S + β·v·kᵀ`, `o = q·S'` (gated delta rule, DeltaNet-family).
-    /// ROCm kernel: `grim_kda_gated_delta_rule_step`.
+    /// Gated DeltaNet recurrent step, matching the published update
+    /// (ICLR 2025, Eq. 10) and the CPU reference in
+    /// `grim-backend-cpu/src/device.rs`:
+    ///
+    /// ```text
+    /// decay = exp(a_gate)
+    /// pred  = sum_k k * (decay * S)     <- decay applied BEFORE the dot
+    /// delta = beta * (v - pred)         <- beta scales the FULL delta term
+    /// S_new = decay * S + k * delta
+    /// out   = sum_k q * S_new
+    /// ```
+    ///
+    /// This previously implemented a DIFFERENT recurrence —
+    /// `S' = gate*S + beta*v*kᵀ`, with no prediction/delta term at all — and
+    /// stored S as `[d_k, d_v]` where the other backends use `[d_v, d_k]`.
+    /// ROCm/CUDA kernel: `grim_kda_gated_delta_rule_step`.
     fn kda_gated_delta_rule_step(
         &self,
         q: &dyn BackendStorage,
@@ -254,24 +268,32 @@ impl RecurrentOps for VulkanDevice {
         if q_v.len() < d_k || k_v.len() < d_k || v_v.len() < d_v {
             return Err(Error::Shape("kda: q/k/v size mismatch".into()));
         }
-        // S is [d_k, d_v]; update S'[i,j] = gate*S[i,j] + beta*v[j]*k[i].
+        // beta and a_gate are per-call scalars, matching the CPU reference.
+        let decay = g_v.first().copied().unwrap_or(0.0).exp();
+        let b = beta_v.first().copied().unwrap_or(0.0);
+        // S is [d_v, d_k] row-major, one row per value dimension.
         let mut s_new = vec![0.0f32; state_len];
-        let gate = g_v.first().copied().unwrap_or(1.0);
-        let b = beta_v.first().copied().unwrap_or(1.0);
-        for i in 0..d_k {
-            for j in 0..d_v {
-                s_new[i * d_v + j] = gate * s_v[i * d_v + j] + b * v_v[j] * k_v[i];
-            }
-        }
-        // output o[i] = Σ_j q[i] ... -> o = q-weighted readout: o[j] = Σ_i q[i]*S'[i,j].
         let out_len = out_shape.elem_count();
         let mut out = vec![0.0f32; out_len];
-        for j in 0..d_v.min(out_len) {
+        for j in 0..d_v {
+            let row = &s_v[j * d_k..(j + 1) * d_k];
+            // pred = sum_k k * (decay * S) - decay applied BEFORE the dot.
+            let pred: f32 = k_v
+                .iter()
+                .zip(row.iter())
+                .map(|(kk, ss)| kk * (decay * ss))
+                .sum();
+            // delta = beta * (v - pred): beta scales the whole delta term.
+            let delta = b * (v_v[j] - pred);
             let mut acc = 0.0f32;
             for i in 0..d_k {
-                acc += q_v[i] * s_new[i * d_v + j];
+                let s = decay * row[i] + k_v[i] * delta;
+                s_new[j * d_k + i] = s;
+                acc += q_v[i] * s;
             }
-            out[j] = acc;
+            if j < out_len {
+                out[j] = acc;
+            }
         }
         let storage = self.from_cpu(&out, out_shape, DType::F32)?;
         Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
