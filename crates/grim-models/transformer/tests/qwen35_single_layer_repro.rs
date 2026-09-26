@@ -306,3 +306,120 @@ fn single_attention_layer_forward_on_gpu() {
         "attention output must be finite"
     );
 }
+
+/// N-layer scaling repro, single device (ordinal 1).
+///
+/// Both layer types are clean in isolation, so the 27B fault needs SCALE. This
+/// builds a stack of N layers with the real alternating pattern ((i+1)%4==0 is
+/// attention, otherwise recurrent) and runs one forward through all of them,
+/// to find whether the fault appears with depth alone.
+///
+/// N is capped so a failure stays cheap; the 27B run has 65 layers across two
+/// GPUs, and this keeps the same per-layer geometry at a fraction of the cost.
+fn build_layer(
+    provider: &MapProvider,
+    cfg: &grim_models_transformer::qwen35::Qwen35Config,
+    idx: usize,
+) -> grim_models_transformer::qwen35::Qwen35Block {
+    let ws = grim_nn::WeightSource::root(provider, grim_tensor::Device::Rocm(1));
+    grim_models_transformer::qwen35::Qwen35Block::load_tp(
+        &ws,
+        cfg,
+        idx,
+        grim_nn::TensorParallelConfig::default(),
+    )
+    .unwrap_or_else(|e| panic!("load layer {idx}: {e}"))
+}
+
+#[test]
+fn n_layer_stack_forward_on_gpu() {
+    let Some(dev) = gpu1() else { return };
+    let _ = &dev;
+    let n_layers = 8usize;
+    eprintln!("[repro-scale] {n_layers} layers on ordinal 1");
+
+    let mut cfg = grim_models_transformer::qwen35::Qwen35Config::default();
+    cfg.vocab_size = 64;
+    cfg.hidden_size = 5120;
+    cfg.num_heads = 24;
+    cfg.num_kv_heads = 4;
+    cfg.head_dim = 256;
+    cfg.num_layers = 65;
+    cfg.intermediate_size = 256;
+    cfg.full_attention_interval = 4;
+    cfg.ssm_d_conv = 4;
+    cfg.ssm_d_inner = 6144;
+    cfg.ssm_d_state = 128;
+    cfg.ssm_dt_rank = 48;
+    cfg.ssm_n_group = 16;
+
+    let q_dim = cfg.num_heads * cfg.head_dim;
+    let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    let value_dim = cfg.ssm_dt_rank * cfg.ssm_d_state;
+    let key_dim = cfg.ssm_n_group * cfg.ssm_d_state;
+    let ssm_qkv_dim = 2 * key_dim + value_dim;
+
+    // Every tensor both layer types need, at the real widths.
+    let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+    {
+        let mat = |rows: usize, cols: usize| (vec![0.1f32; rows * cols], vec![rows, cols]);
+        let vec1 = |n: usize| (vec![0.1f32; n], vec![n]);
+        tensors.insert("attn_norm.weight".into(), vec1(cfg.hidden_size));
+        tensors.insert("post_attention_norm.weight".into(), vec1(cfg.hidden_size));
+        tensors.insert("attn_q.weight".into(), mat(2 * q_dim, cfg.hidden_size));
+        tensors.insert("attn_k.weight".into(), mat(kv_dim, cfg.hidden_size));
+        tensors.insert("attn_v.weight".into(), mat(kv_dim, cfg.hidden_size));
+        tensors.insert("attn_output.weight".into(), mat(cfg.hidden_size, q_dim));
+        tensors.insert("attn_q_norm.weight".into(), vec1(cfg.head_dim));
+        tensors.insert("attn_k_norm.weight".into(), vec1(cfg.head_dim));
+        tensors.insert("ssm_alpha.weight".into(), mat(cfg.hidden_size, cfg.ssm_dt_rank));
+        tensors.insert("ssm_beta.weight".into(), mat(cfg.hidden_size, cfg.ssm_dt_rank));
+        tensors.insert("ssm_a".into(), vec1(cfg.ssm_dt_rank));
+        tensors.insert("ssm_dt.bias".into(), vec1(cfg.ssm_dt_rank));
+        tensors.insert("ssm_norm.weight".into(), vec1(cfg.ssm_d_state));
+        tensors.insert("ssm_out.weight".into(), mat(value_dim, cfg.hidden_size));
+        tensors.insert("ssm_conv1d.weight".into(), mat(cfg.ssm_d_conv, ssm_qkv_dim));
+        tensors.insert("ffn_gate.weight".into(), mat(cfg.intermediate_size, cfg.hidden_size));
+        tensors.insert("ffn_up.weight".into(), mat(cfg.intermediate_size, cfg.hidden_size));
+        tensors.insert("ffn_down.weight".into(), mat(cfg.hidden_size, cfg.intermediate_size));
+    }
+    let provider = MapProvider { tensors };
+
+    let mut caches: Vec<_> = (0..n_layers)
+        .map(|_| grim_models_transformer::qwen35::Qwen35LayerCache::new(&cfg))
+        .collect();
+    let blocks: Vec<_> = (0..n_layers)
+        .map(|i| build_layer(&provider, &cfg, i))
+        .collect();
+
+    let dev_t = grim_nn::modules::pick_device_for_storage_device(&grim_tensor::Device::Rocm(1));
+    let x_storage = grim_tensor::CoreTensorOps::from_cpu(
+        &dev_t,
+        &vec![0.1; cfg.hidden_size],
+        &grim_tensor::Shape::new(vec![1, cfg.hidden_size]),
+        DType::F32,
+    )
+    .expect("upload x");
+    let mut h = grim_tensor::Tensor::new(
+        Arc::from(x_storage),
+        grim_tensor::Shape::new(vec![1, cfg.hidden_size]),
+        DType::F32,
+        QuantProvenance::GrimNative,
+        grim_tensor::Device::Rocm(1),
+    );
+
+    for (i, blk) in blocks.iter().enumerate() {
+        eprintln!("[repro-scale] layer {i}");
+        h = blk
+            .forward(&h, &[i as u32], &mut caches[i])
+            .unwrap_or_else(|e| panic!("layer {i} forward: {e}"));
+    }
+    let vals = h.to_vec_f32().expect("read output");
+    eprintln!(
+        "[repro-scale] OK: {} layers, {} elems, all_finite={}",
+        n_layers,
+        vals.len(),
+        vals.iter().all(|v| v.is_finite())
+    );
+    assert!(vals.iter().all(|v| v.is_finite()));
+}
