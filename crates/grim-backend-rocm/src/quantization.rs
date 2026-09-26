@@ -77,6 +77,36 @@ impl TileConfig {
 }
 
 /// Bucket an `hipGetDeviceProperties::gcnArchName` value into a coarse [see: `GcnArch`, `":N"`, `gfx`, `gfx1200`]
+/// Whether the device can run the native W4A4 OSTQuant path
+/// (`V_DOT8_I32_IU4`, WhiteCrow).
+///
+/// # Why gfx12 only, when the ISA is wider
+///
+/// `V_DOT8_I32_IU4` is documented in the RDNA3 manual as well as RDNA4, and
+/// RDNA2 carries the pre-rename `V_DOT8_I32_I4`. So this is *grim's* gate, not
+/// an ISA limit: the W4A4 blob layout assumes dot8's 4x-per-instruction rate,
+/// and widening this to gfx11 halves that without measuring. Keep the comment
+/// when editing — a future reader will otherwise "fix" it.
+///
+/// Without this gate the dispatch arm reached `grim_dot8_w4a4_gemv`, which the
+/// preprocessor strips on non-gfx12 targets, and the launch died at
+/// `hipModuleGetFunction` with an opaque status 500 instead of naming the GPU as
+/// the problem.
+pub fn w4a4_ostquant_supported(arch: GcnArch, k: usize) -> Result<(), String> {
+    if !matches!(arch, GcnArch::RDNA4 | GcnArch::UDNA) {
+        return Err(format!(
+            "w4a4_ostquant: needs gfx1200/gfx1201 (gfx12) for v_dot8_i32_iu4, \
+             got {arch:?}. Use a W4A16 or int8 path on this GPU."
+        ));
+    }
+    if k % 128 != 0 {
+        return Err(format!(
+            "w4a4_ostquant: K={k} must be divisible by 128"
+        ));
+    }
+    Ok(())
+}
+
 pub fn gcn_arch(name: &str) -> GcnArch {
     // Strip the optional `:N` revision suffix.
     let raw = name.split(':').next().unwrap_or(name);

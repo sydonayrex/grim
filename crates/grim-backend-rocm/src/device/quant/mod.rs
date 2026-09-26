@@ -1130,11 +1130,13 @@ impl QuantOps for RocmDevice {
             DTypeStorage::W4A4OstQuant(cfg) => {
                 // OSTQuant native W4A4 GEMV via sudot8 on RDNA4:
                 // resident packed blob: [u64 qw_len][qweight][u64 sc_len][scales][u64 zr_len][zeros]
-                if k % 128 != 0 {
-                    return Err(Error::Backend(format!(
-                        "w4a4_ostquant quantized_matmul: K={k} must be divisible by 128"
-                    )));
-                }
+                // Arch first, then K: on a non-gfx12 card the GPU is the problem,
+                // and a "K must be divisible by 128" message would mislead.
+                crate::quantization::w4a4_ostquant_supported(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    k,
+                )
+                .map_err(Error::Backend)?;
                 self.launch_w4a4_ostquant_gemv_blob(
                     a_storage,
                     b_storage,

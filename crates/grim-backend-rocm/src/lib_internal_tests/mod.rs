@@ -10,6 +10,8 @@ mod common;
 #[cfg(test)]
 mod fp8_gemv_hoist_tests;
 #[cfg(test)]
+mod w4a4_arch_gate_tests;
+#[cfg(test)]
 mod device_lifecycle_tests;
 #[cfg(test)]
 mod elementwise_norm_tests;
