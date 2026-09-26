@@ -66,32 +66,3 @@ fn four_tap_conv_retains_full_history_across_decode_steps() {
         );
     }
 }
-
-/// The state layout the recurrent layers actually need: `(d_conv-1) * qkv_width`
-/// where qkv_width is the fused attn_qkv output width (10240 for Qwen3.8), not
-/// the attention q+k+v width.
-#[test]
-fn recurrent_conv_state_is_sized_for_the_fused_qkv_width() {
-    let qkv_width = 10240usize; // measured attn_qkv.weight
-    let d_conv = 4usize;
-    let needed = (d_conv - 1) * qkv_width;
-
-    // What Qwen35LayerCache::new currently computes for this checkpoint.
-    let hidden = 5120usize;
-    let d_inner = 6144usize;
-    let current = (d_conv - 1) * hidden.max(d_inner) * 2;
-
-    assert_eq!(
-        needed, 30720,
-        "10240 fused channels x 3 history taps"
-    );
-    assert_eq!(
-        current, 36864,
-        "documents the current (wrong) allocation so the fix is visible"
-    );
-    assert_ne!(
-        current, needed,
-        "current conv_state sizing assumes an attention q+k+v split that \
-         recurrent layers do not have; it must become (d_conv-1) * qkv_width"
-    );
-}
