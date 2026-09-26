@@ -2168,6 +2168,10 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(raw, n),
                 grim_tensor::dtype::KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(raw, n),
                 grim_tensor::dtype::KQuantScheme::IQ2S => grim_quant::dequant_iq2s(raw, n),
+                // Not yet wired: this variant landed ahead of its decoder.
+                other => Err(Error::Backend(format!(
+                    "cpu to_cpu_vec_f32: unsupported KQuantScheme {other:?}"
+                ))),
             },
             Storage::FloatPack(fp) => match fp {
                 grim_tensor::dtype::FloatPackScheme::Fp4 => grim_quant::dequant_fp4(raw, n),

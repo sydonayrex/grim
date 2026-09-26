@@ -149,6 +149,12 @@ impl QuantOps for VulkanDevice {
                     KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2S => grim_quant::dequant_iq2s(&b_bytes_cpu, k * n)?,
+                    // Not yet wired: this variant landed ahead of its decoder.
+                    other => {
+                        return Err(Error::Backend(format!(
+                            "vulkan dequant: unsupported KQuantScheme {other:?}"
+                        )));
+                    }
                 })
             }
             Storage::FloatPack(scheme) => {

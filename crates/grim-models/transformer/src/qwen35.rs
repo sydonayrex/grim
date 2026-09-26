@@ -1139,35 +1139,35 @@ fn gated_delta_net_forward(
     let norm_vec: &[f32] = blk.ssm_norm.as_deref().unwrap_or(&[]);
     let values_per_group = (n_val_heads / n_key_heads).max(1);
 
-    // Width of the q stream inside the fused `attn_qkv`. This is the SSM's own
-    // head geometry, NOT the attention `q_dim` (num_heads * head_dim).
+    // Fused `attn_qkv` layout, per llama.cpp `src/models/qwen35.cpp`:
     //
-    // Measured layout of `attn_qkv.weight` [10240, 5120] on Qwen3.8-27B, derived
-    // from the tensor shapes rather than assumed:
+    //   head_k_dim = head_v_dim = ssm_d_state
+    //   n_k_heads  = ssm_n_group    (16)
+    //   n_v_heads  = ssm_dt_rank    (48)
+    //   key_dim    = head_k * n_k   (2048)
+    //   value_dim  = head_v * n_v   (6144)
+    //   conv_dim   = key_dim * 2 + value_dim  (10240)
     //
-    //   ssm_out.weight  [5120, 6144] -> the recurrence's output is 6144 wide,
-    //                                    so q shares that head count: 48 * 128
-    //                                    (48 = ssm_d_state * ssm_time_step_rank,
-    //                                     128 = ssm_state_size, confirmed by
-    //                                     ssm_norm.weight = [128])
-    //   remaining 10240 - 6144 = 4096 splits evenly as k and v, because a delta
-    //   rule reads S with k and writes it with v against the same d_k
+    // so the stream is [K key_dim][K key_dim][V value_dim] — key, key, value.
+    // Q and K are both key-width; the VALUE stream supplies both the query and
+    // the write for each value head, and q/k are broadcast from n_k_heads to
+    // n_v_heads (`ggml_repeat_4d` in the reference) when the counts differ.
     //
-    //     q [0..6144)      48 value heads x 128
-    //     k [6144..8192)   16 key   heads x 128   (num_key_heads = ssm_group_count)
-    //     v [8192..10240)  16 key   heads x 128
-    //
-    // For THIS checkpoint 48*128 == 24*256 == the attention q_dim, so using the
-    // attention value happens to work. It is a coincidence: a different model with
-    // a different head split would read the wrong channels silently.
-    let ssm_q_width = n_val_heads * head_dim;
-    let ssm_kv_width = n_key_heads * head_dim;
+    // A previous version of this derived [q 48*128][k 16*128][v 16*128], which
+    // also sums to 10240 and so passed a sum-only check while reading the wrong
+    // channels. These asserts pin each stream's width separately.
+    let key_dim = n_key_heads * head_dim;
+    let value_dim = n_val_heads * head_dim;
     debug_assert_eq!(
-        ssm_q_width + 2 * ssm_kv_width,
+        2 * key_dim + value_dim,
         per_tok,
-        "fused attn_qkv width should be q + k + v; got q={ssm_q_width} k={ssm_kv_width} \
-         v={ssm_kv_width} total={} per_tok={per_tok}",
-        ssm_q_width + 2 * ssm_kv_width
+        "fused attn_qkv width should be 2*key_dim + value_dim; got key={key_dim} \
+         value={value_dim} total={} per_tok={per_tok}",
+        2 * key_dim + value_dim
+    );
+    debug_assert_eq!(
+        value_dim, branch_width,
+        "recurrent branch width must equal value_dim"
     );
 
     // Per-head state [n_val_heads][d_k][d_v]. cache.ssm_state is allocated as
@@ -1191,9 +1191,11 @@ fn gated_delta_net_forward(
         let base = t * per_tok;
         for h in 0..n_val_heads {
             let kh = kda_key_head(h, n_key_heads, values_per_group);
-            let q_off = base + h * head_dim;
-            let k_off = base + ssm_q_width + kh * head_dim;
-            let v_off = base + ssm_q_width + ssm_kv_width + kh * head_dim;
+            // [K key_dim][K key_dim][V value_dim]; q comes off the value
+            // stream, and k is broadcast from its key head to this value head.
+            let k_off = base + kh * head_dim;
+            let q_off = base + 2 * key_dim + h * head_dim;
+            let v_off = q_off;
 
             // decay logit = ssm_a + ssm_dt.bias + alpha_t, through softplus.
             let mut z = alpha[t * n_val_heads + h];
