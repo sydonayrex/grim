@@ -589,6 +589,35 @@ mod tests {
         assert_eq!(top_k_cells(&scores, 2), vec![1, 3], "descending by score");
     }
 
+    /// A cell scoring -inf was never a candidate. Truncating without the
+    /// filter hands the budget to masked cells whenever the selectable count
+    /// is below the width, which is the normal case early in a sequence.
+    ///
+    /// This is the only place that behaviour is pinned: the end-to-end forward
+    /// cannot see it, because an all-masked selection still yields a finite
+    /// result that happens to match the dense arm at those positions.
+    #[test]
+    fn top_k_never_selects_a_masked_cell() {
+        // Two selectable cells and three masked ones; the width is 5, larger
+        // than the selectable count, which is the case that matters.
+        let scores = vec![1.0f32, -f32::INFINITY, 2.0, -f32::INFINITY, -f32::INFINITY];
+        let sel = top_k_cells(&scores, 5);
+        // Score descending: cell 2 scores 2.0, cell 0 scores 1.0.
+        assert_eq!(
+            sel,
+            vec![2, 0],
+            "only the finite-scoring cells may be selected, even when the \
+             budget exceeds them"
+        );
+        assert!(
+            sel.iter().all(|&i| scores[i] != f32::NEG_INFINITY),
+            "no -inf cell may appear in the selection"
+        );
+        // An all-masked input selects nothing rather than everything.
+        let all_masked = vec![-f32::INFINITY; 4];
+        assert!(top_k_cells(&all_masked, 4).is_empty());
+    }
+
     #[test]
     fn top_k_breaks_ties_by_cell_ascending() {
         let scores = vec![0.5f32, 0.5, 0.5, 0.5];
