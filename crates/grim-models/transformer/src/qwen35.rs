@@ -643,83 +643,90 @@ impl Qwen35Block {
             // arena-attention path follow unchanged.
             let (q_dev, k_dev_t, v_dev_t, q_gate): (Tensor, Tensor, Tensor, Option<Tensor>) =
                 match self.wqkv_q80_fused.as_ref() {
-                Some(fused) if seq_len == 1 => {
-                    let (q, k, v) =
-                        crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?;
-                    // The fused-QKV path has no separate attn_q tensor, so it
-                    // has NO gate half. `None` means "do not apply a gate" —
-                    // a zero tensor would be read as sigmoid(0) = 0.5 and
-                    // uniformly halve every decode step.
-                    (q, k, v, None)
-                }
-                _ => {
-                    // attn_q emits [Q(q_dim) | gate(q_dim)] fused, so split it
-                    // ROW-AWARE per token. A flat byte-range copy of the first
-                    // q_dim elements is wrong for seq_len > 1: it cuts across
-                    // row boundaries and scrambles Q itself, not just the gate.
-                    let (q_dev, q_gate) = match self.wq.as_ref() {
-                        Some(wq) => {
-                            let full = wq.forward(&x_normed)?.to_vec_f32()?;
-                            let wide = full.len() / seq_len.max(1);
-                            let mut q_rows = vec![0.0f32; seq_len * q_dim];
-                            let mut gate_rows = vec![0.0f32; seq_len * q_dim];
-                            for t in 0..seq_len {
-                                let base = t * wide;
-                                if base + wide > full.len() {
-                                    continue;
+                    Some(fused) if seq_len == 1 => {
+                        let (q, k, v) =
+                            crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?;
+                        // The fused-QKV path has no separate attn_q tensor, so it
+                        // has NO gate half. `None` means "do not apply a gate" —
+                        // a zero tensor would be read as sigmoid(0) = 0.5 and
+                        // uniformly halve every decode step.
+                        (q, k, v, None)
+                    }
+                    _ => {
+                        // attn_q emits [Q(q_dim) | gate(q_dim)] fused, so split it
+                        // ROW-AWARE per token. A flat byte-range copy of the first
+                        // q_dim elements is wrong for seq_len > 1: it cuts across
+                        // row boundaries and scrambles Q itself, not just the gate.
+                        let (q_dev, q_gate) = match self.wq.as_ref() {
+                            Some(wq) => {
+                                let full = wq.forward(&x_normed)?.to_vec_f32()?;
+                                let wide = full.len() / seq_len.max(1);
+                                let mut q_rows = vec![0.0f32; seq_len * q_dim];
+                                let mut gate_rows = vec![0.0f32; seq_len * q_dim];
+                                for t in 0..seq_len {
+                                    let base = t * wide;
+                                    if base + wide > full.len() {
+                                        continue;
+                                    }
+                                    let row = &full[base..base + wide];
+                                    let n = q_dim.min(wide);
+                                    q_rows[t * q_dim..t * q_dim + n].copy_from_slice(&row[..n]);
+                                    if wide >= 2 * q_dim {
+                                        gate_rows[t * q_dim..t * q_dim + n]
+                                            .copy_from_slice(&row[q_dim..q_dim + n]);
+                                    }
                                 }
-                                let row = &full[base..base + wide];
-                                let n = q_dim.min(wide);
-                                q_rows[t * q_dim..t * q_dim + n]
-                                    .copy_from_slice(&row[..n]);
-                                if wide >= 2 * q_dim {
-                                    gate_rows[t * q_dim..t * q_dim + n]
-                                        .copy_from_slice(&row[q_dim..q_dim + n]);
-                                }
+                                (
+                                    device_tensor(
+                                        q_rows,
+                                        Shape::new(vec![seq_len, q_dim]),
+                                        &device,
+                                    )?,
+                                    Some(device_tensor(
+                                        gate_rows,
+                                        Shape::new(vec![seq_len, q_dim]),
+                                        &device,
+                                    )?),
+                                )
                             }
-                            (
-                                device_tensor(q_rows, Shape::new(vec![seq_len, q_dim]), &device)?,
-                                Some(device_tensor(gate_rows, Shape::new(vec![seq_len, q_dim]), &device)?),
-                            )
-                        }
-                        None => (
-                            Tensor::new(
-                                dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                            None => (
+                                Tensor::new(
+                                    dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
+                                        .into(),
+                                    Shape::new(vec![seq_len, q_dim]),
+                                    DType::F32,
+                                    x_normed.provenance().clone(),
+                                    x_normed.device().clone(),
+                                ),
+                                // No attn_q weights at all: nothing to gate with.
+                                None,
+                            ),
+                        };
+                        let k_dev_t = match self.wk.as_ref() {
+                            Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
+                            None => Tensor::new(
+                                dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
                                     .into(),
-                                Shape::new(vec![seq_len, q_dim]),
+                                Shape::new(vec![seq_len, kv_dim]),
                                 DType::F32,
                                 x_normed.provenance().clone(),
                                 x_normed.device().clone(),
                             ),
-                            // No attn_q weights at all: nothing to gate with.
-                            None,
-                        ),
-                    };
-                    let k_dev_t = match self.wk.as_ref() {
-                        Some(wk) => exact(wk.forward(&x_normed)?, seq_len, kv_dim)?,
-                        None => Tensor::new(
-                            dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
-                                .into(),
-                            Shape::new(vec![seq_len, kv_dim]),
-                            DType::F32,
-                            x_normed.provenance().clone(),
-                            x_normed.device().clone(),
-                        ),
-                    };
-                    let v_dev_t = match self.wv.as_ref() {
-                        Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
-                        None => Tensor::new(
-                            dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
-                                .into(),
-                            Shape::new(vec![seq_len, kv_dim]),
-                            DType::F32,
-                            x_normed.provenance().clone(),
-                            x_normed.device().clone(),
-                        ),
-                    };
-                    (q_dev, k_dev_t, v_dev_t, q_gate)
-                }
-            };
+                        };
+                        let v_dev_t = match self.wv.as_ref() {
+                            Some(wv) => exact(wv.forward(&x_normed)?, seq_len, kv_dim)?,
+                            None => Tensor::new(
+                                dev.zeros(&Shape::new(vec![seq_len, kv_dim]), DType::F32)?
+                                    .into(),
+                                Shape::new(vec![seq_len, kv_dim]),
+                                DType::F32,
+                                x_normed.provenance().clone(),
+                                x_normed.device().clone(),
+                            ),
+                        };
+                        (q_dev, k_dev_t, v_dev_t, q_gate)
+                    }
+                };
 
             let q_rope = rope_ext(&q_dev, self.num_heads)?;
             let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
@@ -895,11 +902,8 @@ impl Qwen35Block {
             }
         }
 
-        let branch_tensor = device_tensor(
-            out_branch,
-            Shape::new(vec![seq_len, branch_width]),
-            &device,
-        )?;
+        let branch_tensor =
+            device_tensor(out_branch, Shape::new(vec![seq_len, branch_width]), &device)?;
 
         let proj_out = if let Some(ref wo) = self.wo {
             wo.forward(&branch_tensor)?
@@ -1261,7 +1265,11 @@ fn gated_delta_net_forward(
             let taps = blk.cfg_ssm_d_conv().max(1);
             let chans = per_tok;
             let x = Tensor::new(
-                std::sync::Arc::from(dev.from_cpu(&qkv_vec, &Shape::new(vec![1, seq_len, chans]), DType::F32)?),
+                std::sync::Arc::from(dev.from_cpu(
+                    &qkv_vec,
+                    &Shape::new(vec![1, seq_len, chans]),
+                    DType::F32,
+                )?),
                 Shape::new(vec![1, seq_len, chans]),
                 DType::F32,
                 qkv.provenance().clone(),
@@ -1270,10 +1278,10 @@ fn gated_delta_net_forward(
             let w = blk.ssm_conv1d.as_ref().unwrap().clone();
             let w_t = Tensor::new(
                 std::sync::Arc::from(dev.from_cpu(
-                        &w.to_vec_f32()?,
-                        &Shape::new(vec![chans, taps]),
-                        DType::F32,
-                    )?),
+                    &w.to_vec_f32()?,
+                    &Shape::new(vec![chans, taps]),
+                    DType::F32,
+                )?),
                 Shape::new(vec![chans, taps]),
                 DType::F32,
                 w.provenance().clone(),
@@ -1309,11 +1317,7 @@ fn gated_delta_net_forward(
 
     let slice = |off: usize, len: usize| -> &[f32] {
         let end = (off + len).min(conv_mix.len());
-        if off >= end {
-            &[]
-        } else {
-            &conv_mix[off..end]
-        }
+        if off >= end { &[] } else { &conv_mix[off..end] }
     };
 
     for t in 0..seq_len {
@@ -1411,11 +1415,7 @@ pub enum KdaHeadPairing {
 pub const KDA_HEAD_PAIRING: KdaHeadPairing = KdaHeadPairing::Interleaved;
 
 /// Resolve the key head feeding a given value head.
-fn kda_key_head(
-    value_head: usize,
-    num_key_heads: usize,
-    values_per_group: usize,
-) -> usize {
+fn kda_key_head(value_head: usize, num_key_heads: usize, values_per_group: usize) -> usize {
     let raw = match KDA_HEAD_PAIRING {
         KdaHeadPairing::Interleaved => value_head % num_key_heads.max(1),
         KdaHeadPairing::Grouped => value_head / values_per_group.max(1),
@@ -1515,9 +1515,8 @@ pub(crate) fn quantize_kv_block(
             Ok((bytes, scale))
         }
         F::Fp8E4M3 => {
-            let bytes = grim_quant::quant_fp8(data).map_err(|e| {
-                grim_core::error::Error::Backend(format!("quant_fp8 failed: {e}"))
-            })?;
+            let bytes = grim_quant::quant_fp8(data)
+                .map_err(|e| grim_core::error::Error::Backend(format!("quant_fp8 failed: {e}")))?;
             Ok((bytes, 1.0))
         }
         F::NutFp4 => {
@@ -1638,28 +1637,59 @@ fn plan_layer_devices(
     // pushed the run into HIP managed memory. Reserving first lets weights and
     // KV share the budget honestly, and makes an oversized context visible as a
     // warning rather than a silent spill.
-    let kv_bytes_per_attn_layer = |ctx: usize| -> u64 {
-        (ctx as u64)
+    let num_attn_layers = (0..num_layers)
+        .filter(|i| (i + 1) % interval.max(1) == 0)
+        .count();
+
+    // Bound the arenas by the VRAM that can actually hold them, BEFORE
+    // reserving. The arena is sized from the model's context, and this 27B
+    // advertises 232k: 16 attention layers at that context reserve 30.4 GB,
+    // more than one 17.1 GB card holds. A reservation the device cannot hold is
+    // not a slow path, it is a guaranteed failure - the weights then have
+    // nowhere to go and the run dies at `vram_free=0.00` before the forward
+    // pass. Tests are pinned to 4k (GRIM_CONTEXT=4096), which is far smaller,
+    // but the bound holds whatever context is asked for.
+    let arena_budget: u64 = devices
+        .iter()
+        .map(|d| match d {
+            Device::Rocm(ord) => {
+                let (free, total) = grim_backend_rocm::vram_info(*ord);
+                if total == 0 {
+                    0
+                } else {
+                    free
+                }
+            }
+            _ => 0,
+        })
+        .sum();
+    let kv_per_attn = |c: usize| -> u64 {
+        (c as u64)
             .saturating_mul(kv_heads as u64)
             .saturating_mul(head_dim as u64)
             .saturating_mul(4) // f32
             .saturating_mul(2) // K and V
     };
-    // Must match `Qwen35Block`'s own predicate exactly: full attention is every
-    // `interval`-th layer counting from ONE, i.e. (i + 1) % interval == 0, not
-    // i % interval == 0. Using a different predicate here over-reserved one
-    // layer of KV (17 vs 16) and, more importantly, duplicated a rule that must
-    // not be able to drift from the model it is sizing.
-    let num_attn_layers = (0..num_layers)
-        .filter(|i| (i + 1) % interval.max(1) == 0)
-        .count();
-    let kv_total = kv_bytes_per_attn_layer(ctx.max(1)).saturating_mul(num_attn_layers as u64);
-    if kv_total > 0 {
+    let (eff_ctx, kv_total) = bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, ctx.max(1));
+    if eff_ctx < ctx {
         eprintln!(
-            "[qwen35] reserving KV arenas: ctx={ctx}, kv_heads={kv_heads}, \
-             head_dim={head_dim}, attn_layers={num_attn_layers} \
-             -> {:.1} GB total",
+            "[qwen35] KV arena BOUNDED: requested ctx={ctx} needs {:.1} GB across \
+             {num_attn_layers} attention layers, but only {:.1} GB is free across {} \
+             device(s). Capping the arena at ctx={eff_ctx} ({:.1} GB). Set GRIM_CONTEXT \
+             explicitly (tests use 4096) to choose the context.",
+            ctx as f64 * kv_heads as f64 * head_dim as f64 * 4.0 * 2.0 * num_attn_layers as f64
+                / 1e9,
+            arena_budget as f64 / 1e9,
+            devices.len(),
             kv_total as f64 / 1e9
+        );
+    } else if kv_total > 0 {
+        eprintln!(
+            "[qwen35] reserving KV arenas: ctx={eff_ctx}, kv_heads={kv_heads}, \
+             head_dim={head_dim}, attn_layers={num_attn_layers} \
+             -> {:.1} GB total (budget {:.1} GB)",
+            kv_total as f64 / 1e9,
+            arena_budget as f64 / 1e9
         );
     }
 
@@ -1895,6 +1925,35 @@ pub(crate) fn apply_rope_neox(
     }
 }
 
+/// Bound the KV arenas by the VRAM that can actually hold them.
+///
+/// The arena is sized from the model's context, which for this 27B is 232k and
+/// alone reserves 30.4 GB across 16 attention layers - more than one 17.1 GB
+/// card. A reservation the device cannot hold is not a slow path, it is a
+/// guaranteed failure: the weights then have nowhere to go and the run reports
+/// `vram_free=0.00` before it ever reaches the forward pass.
+///
+/// So the effective context is the largest one whose arenas fit `budget`, capped
+/// at `requested`. Returns `(effective_ctx, arena_bytes)`.
+fn bound_kv_arena(
+    kv_bytes_at: &dyn Fn(usize) -> u64,
+    num_attn_layers: usize,
+    budget: u64,
+    requested: usize,
+) -> (usize, u64) {
+    let at = |ctx: usize| kv_bytes_at(ctx).saturating_mul(num_attn_layers as u64);
+    if at(requested) <= budget {
+        return (requested, at(requested));
+    }
+    // Arena bytes grow linearly in ctx, so solve directly rather than search.
+    let per_ctx = at(1);
+    if per_ctx == 0 {
+        return (requested, 0);
+    }
+    let fit = (budget / per_ctx).min(usize::MAX as u64) as usize;
+    (fit, at(fit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,9 +2116,17 @@ mod tests {
         // f16 is deliberately rejected: the dense arena's f16 reader is a
         // different representation, and the f32<->f16 cast is unverified.
         unsafe { std::env::set_var("GRIM_KV_QUANT", "f16") };
-        assert_eq!(kv_quant_format(), None, "f16 must not select a paged format");
+        assert_eq!(
+            kv_quant_format(),
+            None,
+            "f16 must not select a paged format"
+        );
         unsafe { std::env::set_var("GRIM_KV_QUANT", "bogus") };
-        assert_eq!(kv_quant_format(), None, "unknown value must not select a format");
+        assert_eq!(
+            kv_quant_format(),
+            None,
+            "unknown value must not select a format"
+        );
         unsafe { std::env::remove_var("GRIM_KV_QUANT") };
     }
 
@@ -2273,10 +2340,12 @@ mod tests {
     fn layer_split_uses_the_models_own_predicate() {
         let interval = 4usize;
         let n_layers = 65usize;
-        let attn: Vec<usize> = (0..n_layers)
-            .filter(|i| (i + 1) % interval == 0)
-            .collect();
-        assert_eq!(attn.len(), 16, "65 layers at interval 4 has 16 attention layers");
+        let attn: Vec<usize> = (0..n_layers).filter(|i| (i + 1) % interval == 0).collect();
+        assert_eq!(
+            attn.len(),
+            16,
+            "65 layers at interval 4 has 16 attention layers"
+        );
         assert_eq!(attn[0], 3, "first full-attention layer is index 3, not 0");
         assert_eq!(attn[15], 63);
         // Verified against the GGUF: 48 of the 65 layers carry the KDA
@@ -2317,7 +2386,6 @@ mod tests {
         );
     }
 
-
     /// The decisive check: drive a RECURRENT layer's real forward and require
     /// that `cache.ssm_state` becomes non-zero. If the KDA branch were not
     /// reached — or were reached with zero alpha/beta, or with a state buffer
@@ -2355,9 +2423,8 @@ mod tests {
 
         // Build the recurrent block the way the real loader does, but with the
         // tensors the toy test already builds.
-        let b = |r: usize, c: usize| -> Tensor {
-            cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c]))
-        };
+        let b =
+            |r: usize, c: usize| -> Tensor { cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c])) };
         let ssm_d_inner = cfg.ssm_d_inner;
         let blk = Qwen35Block {
             device: Device::Cpu,
@@ -2367,7 +2434,10 @@ mod tests {
             head_dim: cfg.head_dim,
             is_full_attention: false,
             attn_norm: RmsNorm::new(
-                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 cfg.rms_norm_eps,
             ),
             wq: None,
@@ -2382,9 +2452,7 @@ mod tests {
                 cpu_tensor(
                     vec![
                         0.1;
-                        (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group)
-                            * cfg.ssm_d_state
-                            * cfg.hidden_size
+                        (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state * cfg.hidden_size
                     ],
                     Shape::new(vec![
                         (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state,
@@ -2419,7 +2487,10 @@ mod tests {
             ssm_d_state_hint: cfg.ssm_d_state,
             ssm_d_conv_hint: cfg.ssm_d_conv,
             post_attention_norm: RmsNorm::new(
-                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 cfg.rms_norm_eps,
             ),
             ffn_gate: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
@@ -2451,7 +2522,6 @@ mod tests {
         eprintln!("[kda-reach] ssm_state advanced in {nonzero} elements");
     }
 
-
     /// `attn_q` is a fused [Q | gate] projection, so it must be split ROW-AWARE.
     ///
     /// The previous code used `exact(wq.forward(..), seq_len, q_dim)`, a flat
@@ -2466,9 +2536,7 @@ mod tests {
         let seq_len = 3usize;
         // Per token: [q0 q1 q2 | g0 g1 g2] with token-unique values.
         let wide = 2 * q_dim;
-        let full: Vec<f32> = (0..seq_len * wide)
-            .map(|i| i as f32)
-            .collect();
+        let full: Vec<f32> = (0..seq_len * wide).map(|i| i as f32).collect();
         // What a FLAT prefix copy would produce, and what row-aware gives.
         let mut flat = vec![0.0f32; seq_len * q_dim];
         flat.copy_from_slice(&full[..seq_len * q_dim]);
@@ -2497,7 +2565,6 @@ mod tests {
         assert_eq!(gate_rows, vec![3., 4., 5., 9., 10., 11., 15., 16., 17.]);
     }
 
-
     /// The KDA output must depend on the recurrent STATE, not just the query.
     ///
     /// It previously emitted `q[d] * norm[d]` — a static elementwise scale of the
@@ -2520,11 +2587,7 @@ mod tests {
             (0..d)
                 .map(|i| {
                     let row = &state[i * d..(i + 1) * d];
-                    let acc: f32 = q
-                        .iter()
-                        .zip(row.iter())
-                        .map(|(qq, ss)| qq * ss)
-                        .sum();
+                    let acc: f32 = q.iter().zip(row.iter()).map(|(qq, ss)| qq * ss).sum();
                     acc * norm[i]
                 })
                 .collect()
@@ -2545,7 +2608,6 @@ mod tests {
         let bare: Vec<f32> = q.iter().zip(norm.iter()).map(|(a, b)| a * b).collect();
         assert_ne!(a, bare, "output must be q . S, not q[i] * norm[i]");
     }
-
 
     /// A recurrent layer's OUTPUT must depend on the recurrent state, not just on
     /// the query. This is the guard that the kernel-level parity tests cannot
@@ -2575,9 +2637,8 @@ mod tests {
         cfg.ssm_n_group = 16;
         cfg.ssm_n_group = 16;
 
-        let b = |r: usize, c: usize| -> Tensor {
-            cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c]))
-        };
+        let b =
+            |r: usize, c: usize| -> Tensor { cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c])) };
         let value_dim = cfg.ssm_dt_rank * cfg.ssm_d_state;
         let key_dim = cfg.ssm_n_group * cfg.ssm_d_state;
         let ssm_qkv_dim = 2 * key_dim + value_dim;
@@ -2594,7 +2655,10 @@ mod tests {
             intermediate_size: cfg.intermediate_size,
             is_full_attention: false,
             attn_norm: RmsNorm::new(
-                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 cfg.rms_norm_eps,
             ),
             wq: None,
@@ -2603,20 +2667,20 @@ mod tests {
             wo: None,
             attn_q_norm: None,
             attn_k_norm: None,
-            attn_qkv: Some(Linear::from_tensor(
-                b(ssm_qkv_dim, cfg.hidden_size),
-                None,
-            )),
+            attn_qkv: Some(Linear::from_tensor(b(ssm_qkv_dim, cfg.hidden_size), None)),
             attn_gate: None,
-            ssm_out: Some(Linear::from_tensor(
-                b(cfg.hidden_size, value_dim),
-                None,
-            )),
+            ssm_out: Some(Linear::from_tensor(b(cfg.hidden_size, value_dim), None)),
             ssm_conv1d: None,
             ssm_conv_vec: None,
             ssm_a: Some(vec![0.5; cfg.ssm_dt_rank]),
-            ssm_alpha: Some(Linear::from_tensor(b(cfg.ssm_dt_rank, cfg.hidden_size), None)),
-            ssm_beta: Some(Linear::from_tensor(b(cfg.ssm_dt_rank, cfg.hidden_size), None)),
+            ssm_alpha: Some(Linear::from_tensor(
+                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                None,
+            )),
+            ssm_beta: Some(Linear::from_tensor(
+                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                None,
+            )),
             ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
             ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
@@ -2626,7 +2690,10 @@ mod tests {
             wqkv_q80_fused: None,
             w_gate_up_q4k_fused: None,
             post_attention_norm: RmsNorm::new(
-                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 cfg.rms_norm_eps,
             ),
             ffn_gate: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
@@ -2661,7 +2728,6 @@ mod tests {
         );
     }
 
-
     /// LIVE guard for the recurrent conv-state size: builds a real
     /// `Qwen35LayerCache` and asserts it matches the fused qkv width derived
     /// from the checkpoint.
@@ -2693,5 +2759,55 @@ mod tests {
         );
         assert_eq!(expected, 30720);
     }
+}
 
+#[cfg(test)]
+mod kv_bound_tests {
+    use super::bound_kv_arena;
+
+    /// The real 27B case: 16 attention layers at 232k context reserve 30.4 GB.
+    /// Bounded by a 17.1 GB card, the arena must come down and the caller must
+    /// be told, not silently reserve more than the device holds.
+    #[test]
+    fn arena_is_capped_to_what_the_card_can_hold() {
+        // ctx * kv_heads * head_dim * 4 * 2 (K and V) per attention layer.
+        let kv = |ctx: usize| (ctx as u64) * 4 * 256 * 4 * 2;
+        let card = 17_095_983_104u64;
+        let (ctx, bytes) = bound_kv_arena(&kv, 16, card, 232_192);
+        assert!(ctx < 232_192, "must clamp, got {ctx}");
+        assert!(bytes <= card, "arena {bytes} must fit card {card}");
+    }
+
+    /// At 4k the arena is small and must be left exactly as requested - the
+    /// bound must not shrink a context that already fits.
+    #[test]
+    fn a_context_that_fits_is_left_alone() {
+        let kv = |ctx: usize| (ctx as u64) * 4 * 256 * 4 * 2;
+        let (ctx, bytes) = bound_kv_arena(&kv, 16, 17_095_983_104, 4096);
+        assert_eq!(ctx, 4096);
+        assert_eq!(bytes, kv(4096) * 16);
+    }
+
+    /// A zero-layer or degenerate model must not divide by zero or loop.
+    #[test]
+    fn degenerate_shapes_do_not_panic() {
+        let kv = |_ctx: usize| 0u64;
+        let (ctx, bytes) = bound_kv_arena(&kv, 0, 1000, 4096);
+        assert_eq!(ctx, 4096);
+        assert_eq!(bytes, 0);
+
+        let kv1 = |ctx: usize| ctx as u64;
+        let (ctx, _) = bound_kv_arena(&kv1, 0, 1000, 4096);
+        assert_eq!(ctx, 4096, "zero attention layers costs nothing");
+    }
+
+    /// A budget too small for any context must still return a usable value
+    /// rather than something absurd.
+    #[test]
+    fn an_impossible_budget_does_not_inflate_the_request() {
+        let kv = |ctx: usize| (ctx as u64) * 1024;
+        let (ctx, bytes) = bound_kv_arena(&kv, 16, 10, 4096);
+        assert!(bytes <= 10, "must respect even a tiny budget, got {bytes}");
+        assert!(ctx <= 4096);
+    }
 }
