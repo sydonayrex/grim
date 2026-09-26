@@ -148,6 +148,22 @@ pub fn tracked() -> u64 {
     TRACKED.load(Ordering::Relaxed)
 }
 
+/// Write every live allocation to `path` as TSV.
+///
+/// The ledger is in-process, and a device page fault kills the process. A dump
+/// taken at end-of-load is the only copy that survives the fault, which is what
+/// makes post-mortem attribution possible at all.
+pub fn dump_to_file(path: &str) -> std::io::Result<usize> {
+    use std::io::Write;
+    let all = snapshot();
+    let mut f = std::fs::File::create(path)?;
+    writeln!(f, "# ptr\tbytes\tordinal\tmanaged\towner")?;
+    for r in &all {
+        writeln!(f, "0x{:x}\t{}\t{}\t{}\t{}", r.ptr, r.bytes, r.ordinal, r.managed, r.owner)?;
+    }
+    Ok(all.len())
+}
+
 /// Clear the ledger (test hook).
 pub fn reset() {
     let mut t = table().lock().unwrap_or_else(|e| e.into_inner());

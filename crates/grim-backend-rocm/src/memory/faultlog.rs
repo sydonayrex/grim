@@ -181,6 +181,90 @@ pub fn resolve_all(
         .collect()
 }
 
+/// One allocation read back from a ledger dump.
+#[derive(Debug, Clone)]
+pub struct DumpRecord {
+    pub ptr: u64,
+    pub bytes: u64,
+    pub ordinal: usize,
+    pub managed: bool,
+    pub owner: String,
+}
+
+/// Load a ledger dump written by [`crate::memory::ledger::dump_to_file`].
+///
+/// Needed because the live ledger dies with the process: a page fault kills it,
+/// so post-mortem attribution has to run against the file instead.
+pub fn load_dump(path: &str) -> Result<Vec<DumpRecord>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let mut f = line.split('\t');
+        let ptr = f
+            .next()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| format!("{path}:{}: bad ptr", n + 1))?;
+        let bytes = f
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| format!("{path}:{}: bad bytes", n + 1))?;
+        let ordinal = f
+            .next()
+            .and_then(|v| v.parse::<usize>().ok())
+            .ok_or_else(|| format!("{path}:{}: bad ordinal", n + 1))?;
+        let managed = f.next().unwrap_or("false").trim() == "true";
+        let owner = f.next().unwrap_or("").to_string();
+        out.push(DumpRecord { ptr, bytes, ordinal, managed, owner });
+    }
+    Ok(out)
+}
+
+/// Attribute a parsed fault against a loaded dump, returning one line.
+///
+/// `owner` is reported for the allocation that contains the faulting address.
+/// A device mismatch is called out explicitly, because that is the
+/// cross-device placement bug and it is invisible without the comparison.
+pub fn resolve_against_dump(
+    fault: &GpuPageFault,
+    records: &[DumpRecord],
+    pci_to_ordinal: &dyn Fn(&str) -> Option<usize>,
+) -> String {
+    let ordinal = pci_to_ordinal(&fault.pci);
+    let Some(addr) = fault.address else {
+        return format!(
+            "amdgpu {} pid={:?}: fault recorded but no address in the record",
+            fault.pci, fault.pid
+        );
+    };
+    let mut hits: Vec<&DumpRecord> =
+        records.iter().filter(|r| addr >= r.ptr && addr < r.ptr.saturating_add(r.bytes)).collect();
+    hits.sort_by_key(|r| r.bytes);
+    match (hits.first(), ordinal) {
+        (None, _) => format!(
+            "amdgpu {} pid={:?}: addr 0x{addr:x} is in NO live allocation - buffer lifetime \
+             (freed early, or a bad host pointer), not placement",
+            fault.pci, fault.pid
+        ),
+        (Some(r), Some(o)) if r.ordinal != o => format!(
+            "CROSS-DEVICE: amdgpu {} (device {o}) faulted at 0x{addr:x}, 0x{:x} bytes 
+             into the allocation named [{}] - but that allocation lives on device {}",
+            fault.pci, addr - r.ptr, r.owner, r.ordinal
+        ),
+        (Some(r), Some(_)) => format!(
+            "amdgpu {}: addr 0x{addr:x} is {} bytes into \"{}\" on its own device {} - buffer \
+             lifetime, not placement",
+            fault.pci, addr - r.ptr, r.owner, r.ordinal
+        ),
+        (Some(r), None) => format!(
+            "amdgpu {} (device UNKNOWN): addr 0x{addr:x} is {} bytes into \"{}\" on device {}",
+            fault.pci, addr - r.ptr, r.owner, r.ordinal
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,3 +459,72 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
             "the deliberate OOB fault from GRIM_FAULT_PROBE should be in the log"
         );
     }
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+
+    const REAL_DMESG: &str = "\
+Sep 26 12:39:54 syd-beasty kernel: amdgpu 0000:0a:00.0: [gfxhub] page fault (src_id:0 ring:24 vmid:8 pasid:14617)
+Sep 26 12:39:54 syd-beasty kernel: amdgpu 0000:0a:00.0:  Process grim_backend_ro pid 2600701 thread lib_internal_te pid 2600702
+Sep 26 12:39:54 syd-beasty kernel: amdgpu 0000:0a:00.0:   in page starting at address 0x00007fea88000000 from client 10
+Sep 26 12:39:54 syd-beasty kernel: amdgpu 0000:0a:00.0:        PERMISSION_FAULTS: 0x3
+";
+
+    /// The live ledger dies with the process, so post-mortem attribution runs
+    /// against the dump. This round-trips a real dump through disk and resolves
+    /// a fault with it, which is the path a crashed 27B load actually takes.
+    #[test]
+    fn dump_round_trips_and_resolves_a_cross_device_fault() {
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock();
+        let dir = std::env::temp_dir().join("grim_ledger_dump_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.tsv");
+        let p = path.to_str().unwrap();
+
+        crate::memory::ledger::register(0x7fea_8800_0000, 4096, 0, false, "layer 12 attn_q");
+        let n = crate::memory::ledger::dump_to_file(p).expect("dump");
+        assert!(n >= 1, "the registered allocation must be dumped");
+
+        let records = load_dump(p).expect("load");
+        let mine: Vec<&DumpRecord> =
+            records.iter().filter(|r| r.owner == "layer 12 attn_q").collect();
+        assert_eq!(mine.len(), 1, "the registered allocation must round-trip");
+        assert_eq!(mine[0].ordinal, 0);
+        assert_eq!(mine[0].bytes, 4096);
+        assert!(!mine[0].managed);
+
+        let faults = parse(REAL_DMESG);
+        let line = resolve_against_dump(&faults[0], &records, &|pci| {
+            (pci == "0000:0a:00.0").then_some(1)
+        });
+        assert!(line.contains("CROSS-DEVICE"), "got: {line}");
+        crate::memory::ledger::deregister(0x7fea_8800_0000);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// An address inside no live allocation is a lifetime problem, and the
+    /// wording must say so rather than implying a placement fault.
+    #[test]
+    fn dump_reports_an_unowned_address_as_lifetime() {
+        let records = vec![DumpRecord {
+            ptr: 0x1000,
+            bytes: 256,
+            ordinal: 0,
+            managed: false,
+            owner: "somewhere".into(),
+        }];
+        let faults = parse(REAL_DMESG);
+        let line = resolve_against_dump(&faults[0], &records, &|_| Some(1));
+        assert!(line.contains("buffer lifetime"), "got: {line}");
+        assert!(!line.contains("CROSS-DEVICE"));
+    }
+
+    /// A missing dump must be an error the caller can report, not an empty
+    /// result that reads as "nothing was ever allocated".
+    #[test]
+    fn a_missing_dump_is_an_error_not_an_empty_ledger() {
+        let err = load_dump("/tmp/definitely_not_a_ledger_9f2a.tsv").unwrap_err();
+        assert!(err.contains("definitely_not_a_ledger_9f2a.tsv"), "got: {err}");
+    }
+}
