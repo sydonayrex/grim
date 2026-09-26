@@ -100,3 +100,54 @@ fn ws_c2_dispatch_arm_consults_the_gate() {
         "the bare k % 128 check should be replaced by the gate, not duplicated"
     );
 }
+
+/// RED (C0): one codename per instruction, both directions.
+///
+/// The plan was rewritten once because `Raven` and `ForestRaven` were both
+/// bound to `V_DOT4_F32_FP8_FP8`. Nothing in the compiler catches that; only an
+/// explicit bijection does.
+#[test]
+fn corvid_binding_is_one_to_one() {
+    use crate::quantization::CORVID_INSTRUCTION_BINDING as B;
+    use std::collections::HashSet;
+
+    let mut names: HashSet<&str> = HashSet::new();
+    let mut insts: HashSet<&str> = HashSet::new();
+    for (name, inst) in B {
+        assert!(
+            names.insert(name),
+            "codename {name} appears twice in CORVID_INSTRUCTION_BINDING"
+        );
+        assert!(
+            insts.insert(inst),
+            "instruction {inst} is bound to more than one codename; each \\
+             instruction gets exactly one name (see {name})"
+        );
+    }
+    assert_eq!(names.len(), insts.len(), "binding must be a bijection");
+}
+
+/// Every bound instruction must be one the RDNA4 manual actually documents, and
+/// every bound builtin must exist in the toolchain (checked by the oracle).
+/// Catches a typo'd mnemonic that no compiler sees, because the codename layer
+/// is pure data.
+#[test]
+fn corvid_instructions_are_documented_rdna4_mnemonics() {
+    use crate::quantization::CORVID_INSTRUCTION_BINDING as B;
+    // V_DOT4_F32_FP8_FP8 and V_SWMMAC_F32_16X16X32_FP8_FP8 are RDNA4-only;
+    // V_DOT4_I32_IU8 / V_DOT8_I32_IU4 are RDNA3+.
+    const KNOWN: &[&str] = &[
+        "V_DOT4_F32_FP8_FP8",
+        "V_WMMA_F32_16X16X16_FP8_FP8",
+        "V_SWMMAC_F32_16X16X32_FP8_FP8",
+        "V_DOT4_I32_IU8",
+        "V_DOT8_I32_IU4",
+    ];
+    for (name, inst) in B {
+        assert!(
+            KNOWN.contains(inst),
+            "{name} binds {inst}, which is not a mnemonic this plan has verified \\
+             against old/amd-isa/rdna4-instruction-set-architecture.pdf"
+        );
+    }
+}

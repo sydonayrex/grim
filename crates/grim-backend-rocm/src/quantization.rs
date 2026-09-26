@@ -92,6 +92,25 @@ impl TileConfig {
 /// preprocessor strips on non-gfx12 targets, and the launch died at
 /// `hipModuleGetFunction` with an opaque status 500 instead of naming the GPU as
 /// the problem.
+/// Canonical codename -> ISA instruction binding for the corvid formats.
+///
+/// Single source of truth. One codename per instruction, enforced by
+/// `corvid_binding_is_one_to_one` — an earlier revision of the precision plan
+/// bound two codenames (`Raven` and `ForestRaven`) to the same
+/// `V_DOT4_F32_FP8_FP8`, which is the kind of collision that silently
+/// mislabels work later. Adding a row here is how a new corvid is introduced.
+///
+/// `WeightFormat` in grim-format carries tags for only some of these (see
+/// docs §11.1); the naming discipline holds for the whole family regardless of
+/// which subset has a storage tag yet.
+pub const CORVID_INSTRUCTION_BINDING: &[(&str, &str)] = &[
+    ("Raven", "V_DOT4_F32_FP8_FP8"),
+    ("WhiteRaven", "V_WMMA_F32_16X16X16_FP8_FP8"),
+    ("GreyRaven", "V_SWMMAC_F32_16X16X32_FP8_FP8"),
+    ("ForestRaven", "V_DOT4_I32_IU8"),
+    ("WhiteCrow", "V_DOT8_I32_IU4"),
+];
+
 pub fn w4a4_ostquant_supported(arch: GcnArch, k: usize) -> Result<(), String> {
     if !matches!(arch, GcnArch::RDNA4 | GcnArch::UDNA) {
         return Err(format!(
