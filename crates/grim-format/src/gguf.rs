@@ -180,6 +180,8 @@ pub enum GgufDType {
     /// Same OCP E2M1 encoding as MXFP4 but uses a different block-scaling convention (per-16-element block with.
     #[allow(non_camel_case_types)]
     NVFP4 = 78,
+    #[allow(non_camel_case_types)]
+    GsqRco3p5 = 42,
 }
 
 impl GgufDType {
@@ -218,6 +220,7 @@ impl GgufDType {
             36 => Some(GgufDType::IQ4_XS),
             39 => Some(GgufDType::MXFP4),
             78 => Some(GgufDType::NVFP4),
+            42 => Some(GgufDType::GsqRco3p5),
             _ => None,
         }
     }
@@ -258,6 +261,7 @@ impl GgufDType {
             GgufDType::IQ4_XS => 36,
             GgufDType::MXFP4 => 39,
             GgufDType::NVFP4 => 78,
+            GgufDType::GsqRco3p5 => 42,
         }
     }
 
@@ -307,7 +311,8 @@ impl GgufDType {
             | GgufDType::IQ1_S
             | GgufDType::IQ1_M
             | GgufDType::MXFP4
-            | GgufDType::NVFP4 => 256,
+            | GgufDType::NVFP4
+            | GgufDType::GsqRco3p5 => 256,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
         }
@@ -350,6 +355,8 @@ impl GgufDType {
             // NVFP4: 256 weights per super-block. 1 byte E8M0 scale per 16-elem
             // sub-block (16 scales) + 128 bytes packed E2M1 codes (2 per byte).
             GgufDType::NVFP4 => 16 + 128,
+            // GsqRco3p5: 256 weights per super-block (72 bytes: 2 fp16 d/dmin + 4 byte sc + 64 byte qs).
+            GgufDType::GsqRco3p5 => 72,
             _ => 0,
         }
     }
@@ -386,6 +393,7 @@ pub const ALL_GGUF_DTYPES: &[GgufDType] = &[
     GgufDType::IQ2_S,
     GgufDType::IQ1_S,
     GgufDType::MXFP4,
+    GgufDType::GsqRco3p5,
 ];
 
 /// Byte size a tensor of `dtype` and `dims` must occupy, per gguf's own rule:
@@ -1994,6 +2002,10 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::FloatPack(FloatPackScheme::NutFp4),
         },
+        GgufDType::GsqRco3p5 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q2K),
+        },
     }
 }
 
@@ -2034,7 +2046,7 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::NVFP4 => Some(4),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
-        GgufDType::Q2K | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S => Some(2),
+        GgufDType::Q2K | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S | GgufDType::GsqRco3p5 => Some(2),
         GgufDType::Q3K | GgufDType::IQ3_XXS | GgufDType::IQ3_S => Some(3),
         GgufDType::IQ1_S | GgufDType::IQ1_M => Some(1),
         GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),
@@ -2072,6 +2084,7 @@ impl GgufDType {
                 | GgufDType::IQ1_M
                 | GgufDType::MXFP4
                 | GgufDType::NVFP4
+                | GgufDType::GsqRco3p5
         )
     }
 
@@ -2111,6 +2124,7 @@ impl GgufDType {
             GgufDType::IQ1_M => "IQ1_M",
             GgufDType::MXFP4 => "MXFP4",
             GgufDType::NVFP4 => "NVFP4",
+            GgufDType::GsqRco3p5 => "Q2_0",
         }
     }
 }

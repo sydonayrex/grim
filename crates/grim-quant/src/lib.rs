@@ -6784,3 +6784,41 @@ pub fn dequant_fp8_block128(data: &[u8]) -> Result<Vec<f32>> {
     }
     Ok(w)
 }
+
+pub const BLOCK_SIZE_GSQ_RCO_3P5: usize = 256;
+pub const BLOCK_BYTES_GSQ_RCO_3P5: usize = 72;
+
+pub fn dequant_gsq_rco_3p5(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    if num_weights == 0 {
+        return Ok(Vec::new());
+    }
+    let num_blocks = num_weights.div_ceil(BLOCK_SIZE_GSQ_RCO_3P5);
+    let expected_bytes = num_blocks * BLOCK_BYTES_GSQ_RCO_3P5;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "dequant_gsq_rco_3p5: buffer too short: expected {expected_bytes}, have {}",
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        let dmin = f16_to_f32(data[pos + 2], data[pos + 3]);
+        let sc = &data[pos + 4..pos + 8];
+        let qs = &data[pos + 8..pos + 72];
+        for i in 0..256 {
+            if out.len() < num_weights {
+                let sub = i / 32;
+                let sub_sc = ((sc[sub / 2] >> ((sub % 2) * 4)) & 0x0F) as f32;
+                let q_byte = qs[i / 4];
+                let shift = (i % 4) * 2;
+                let q_val = ((q_byte >> shift) & 0x03) as f32;
+                out.push(d * sub_sc * q_val - dmin);
+            }
+        }
+        pos += BLOCK_BYTES_GSQ_RCO_3P5;
+    }
+    Ok(out)
+}
+

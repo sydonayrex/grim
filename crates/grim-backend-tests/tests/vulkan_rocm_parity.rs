@@ -2,7 +2,6 @@
 //! Gated: `GRIM_RUN_GPU_TESTS=1`, features `vulkan` + `rocm`.
 //! Skills: caveman-cloud-ops (separate cost/savings), grim-grave-gld-gqa (parity first), ponytail-minimalism (shortest contract).
 
-use grim_tensor::{BackendDevice, BackendStorage, DType, Shape};
 
 pub fn generate_input(n: usize, seed: u64) -> Vec<f32> {
     let mut state = seed;
