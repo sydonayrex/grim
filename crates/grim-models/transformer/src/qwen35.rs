@@ -1306,6 +1306,26 @@ fn gated_delta_net_forward(
     }
 
     let a_vec: &[f32] = blk.ssm_a.as_deref().unwrap_or(&[]);
+    // z (the KDA output gate), from the checkpoint's `attn_gate` projection.
+    //
+    // The reference splits z out of the fused qkvz tensor and applies
+    // `build_norm_gated` = rms_norm(core) * silu(z) (qwen35.cpp:243-252).
+    // config.json names the activation `output_gate_type: "swish"`, and the
+    // GGUF gives attn_gate.weight as [6144, 5120] = [value_dim, hidden] on
+    // EVERY layer - so on linear-attention layers this tensor IS z, laid out
+    // [n_val_heads, head_dim]. On full-attention layers the same tensor is the
+    // sigmoid attention gate, which grim already applies.
+    //
+    // Without it the recurrent output reaches ssm_out ungated: multiplicative
+    // and per-dimension, so its absence does not blow up numerically, it just
+    // makes the model confidently wrong.
+    let mut z_vec: Vec<f32> = Vec::new();
+    if let Some(ref gl) = blk.attn_gate {
+        z_vec = gl.forward(x_normed)?.to_vec_f32()?;
+    }
+    let z_stride = if z_vec.is_empty() { 0 } else { z_vec.len() / seq_len.max(1) };
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+
     let dt_bias: &[f32] = blk.ssm_dt_bias.as_deref().unwrap_or(&[]);
     let norm_vec: &[f32] = blk.ssm_norm.as_deref().unwrap_or(&[]);
     let values_per_group = (n_val_heads / n_key_heads).max(1);
@@ -1496,7 +1516,15 @@ fn gated_delta_net_forward(
                 let w = norm_vec.get(i).copied().unwrap_or(1.0);
                 let out_idx = t * branch_width + h * head_dim + i;
                 if out_idx < out_branch.len() {
-                    out_branch[out_idx] = a * inv_rms * w;
+                    // ...then multiply by silu(z), the reference ordering:
+                    // build_norm first, then ggml_mul with silu(gate).
+                    let g = if z_stride > 0 {
+                        let zi = t * z_stride + h * head_dim + i;
+                        silu(z_vec.get(zi).copied().unwrap_or(0.0))
+                    } else {
+                        1.0
+                    };
+                    out_branch[out_idx] = a * inv_rms * w * g;
                 }
             }
         }
