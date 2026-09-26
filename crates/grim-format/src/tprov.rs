@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::{Read, Seek};
 
-use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
+use grim_tensor::dtype::{ArithType, DType, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider, shard_raw_tensor};
 
@@ -74,6 +74,95 @@ impl GgufProvider {
                     companion_path, content
                 );
             }
+        }
+
+        // Companion-JSON `quant_overrides`: declare a tensor's TRUE dtype when the
+        // GGUF header's tag contradicts its payload. Names may contain `*` so a
+        // whole family (every layer's expert stack) is declared once.
+        let mut overrides = overrides;
+        if std::path::Path::new(&companion_path).exists() {
+            let text = std::fs::read_to_string(&companion_path).map_err(|e| {
+                Error::Backend(format!("cannot read companion {companion_path}: {e}"))
+            })?;
+            let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                Error::Backend(format!("companion {companion_path} is not valid JSON: {e}"))
+            })?;
+            let list = parsed
+                .get("quant_overrides")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    Error::Backend(format!(
+                        "companion {companion_path} has no `quant_overrides` array"
+                    ))
+                })?;
+            for entry in list {
+                let pattern = entry
+                    .get("tensor_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Backend("quant_overrides entry needs `tensor_name`".into()))?;
+                let dtype_name = entry
+                    .get("override_dtype")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        Error::Backend("quant_overrides entry needs `override_dtype`".into())
+                    })?;
+                let dtype = gguftag_from_name(dtype_name)?;
+                let effective_bpw =
+                    entry.get("effective_bpw").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                for t in &gguf.tensors {
+                    if glob_match(pattern, &t.name) {
+                        overrides.insert(
+                            t.name.clone(),
+                            GrimQuantOverride {
+                                tensor_name: t.name.clone(),
+                                effective_bpw,
+                                override_dtype: dtype,
+                                importance_score: 0.0,
+                                layout_hint: None,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // Refuse to open a file whose header tags contradict the payloads.
+        //
+        // A mis-tagged tensor is not a cosmetic problem: `effective_dtype` feeds
+        // every downstream reader, so an F64 tag over 4-bit codes yields a
+        // 29-billion-element F32 view of packed nibbles and the model emits
+        // garbage. Payload geometry is ground truth -- a span SMALLER than the
+        // declared dtype requires cannot be explained by GGUF start alignment.
+        let file_len = std::fs::metadata(path)
+            .map_err(|e| Error::Backend(format!("cannot stat GGUF file '{path}': {e}")))?
+            .len();
+        let data_len = file_len.saturating_sub(gguf.data_start);
+        // An override is the explicit, user-attested resolution, so those tensors
+        // are exempt: their declared dtype is known-bad and already replaced.
+        let unresolved: Vec<GgufTensorInfo> = gguf
+            .tensors
+            .iter()
+            .filter(|t| !overrides.contains_key(&t.name))
+            .cloned()
+            .collect();
+        let contradictions = crate::gguf::dtype_contradictions(&unresolved, data_len);
+        if !contradictions.is_empty() {
+            let mut msg = format!(
+                "GGUF dtype/payload mismatch in '{path}': {} tensor(s) declare a dtype larger than their stored bytes. \
+                 Refusing to open rather than silently reinterpreting packed weights. \
+                 Declare the true dtype in a companion '{path}.json' under \"quant_overrides\".",
+                contradictions.len()
+            );
+            for c in contradictions.iter().take(8) {
+                msg.push_str(&format!(
+                    "\n  - {}: declared {:?} needs {} B, has {} B; true dtype is one of {:?}",
+                    c.name, c.declared, c.expected, c.actual, c.candidates
+                ));
+            }
+            if contradictions.len() > 8 {
+                msg.push_str(&format!("\n  ... and {} more", contradictions.len() - 8));
+            }
+            return Err(Error::Backend(msg));
         }
 
         // Map the whole file read-only and slice tensors directly out of it.
@@ -178,6 +267,45 @@ impl GgufProvider {
 /// Delegates to [`crate::gguf::map_gguf_dtype_to_storage`] so there is a single source of truth for GGUF→DType conversion.
 fn dtype_from_gguf(gguf_dtype: GgufDType) -> DType {
     crate::gguf::map_gguf_dtype_to_storage(gguf_dtype)
+}
+
+/// Parses a companion-JSON dtype name (e.g. `IQ4_NL`, `Q4_K`) into a GGUF dtype.
+/// Matches the same `Debug` spelling the refusal errors already print, so a user
+/// can copy a candidate straight out of the error into the companion file.
+fn gguftag_from_name(name: &str) -> Result<GgufDType> {
+    crate::gguf::ALL_GGUF_DTYPES
+        .iter()
+        .copied()
+        .find(|d| format!("{d:?}").eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            Error::Backend(format!(
+                "companion `override_dtype` '{name}' is not a known GGUF dtype"
+            ))
+        })
+}
+
+/// Byte length a tensor's payload must have under its EFFECTIVE dtype. Used when
+/// an override corrects a mis-tagged tensor, so the slice matches the dtype the
+/// rest of the stack will decode with.
+fn effective_size_bytes(info: &GgufTensorInfo, overrides: &HashMap<String, GrimQuantOverride>) -> usize {
+    match overrides.get(&info.name) {
+        Some(ov) => crate::gguf::expected_tensor_bytes(ov.override_dtype, &info.dims)
+            .and_then(|b| usize::try_from(b).ok())
+            .unwrap_or(info.size_bytes as usize),
+        None => info.size_bytes as usize,
+    }
+}
+
+/// Single-`*` glob used by companion `quant_overrides` tensor_name patterns.
+/// Declaring one expert-stack family is `blk.0.ffn_gate_exps.weight`; declaring
+/// every layer is `blk.*.ffn_gate_exps.weight`.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => name.len() >= prefix.len() + suffix.len()
+            && name.starts_with(prefix)
+            && name.ends_with(suffix),
+        None => pattern == name,
+    }
 }
 
 /// Resolves the effective dtype for a tensor, applying any `.grim` per-tensor
@@ -369,7 +497,11 @@ impl GgufProvider {
         let start = self.data_start.checked_add(info.offset).ok_or_else(|| {
             Error::Backend(format!("GGUF tensor '{}' offset overflow", info.name))
         })?;
-        self.read_region(start, info.size_bytes as usize)
+        // A companion override changes the element width, so the length must be
+        // recomputed from the effective dtype -- the header's `size_bytes`
+        // describes the declared (wrong) dtype and would over-read the payload.
+        let len = effective_size_bytes(info, &self.overrides);
+        self.read_region(start, len)
     }
 
     /// Reframe GGUF-native MXFP4 (llama.cpp 17-byte blocks: E8M0 scale first, then nibble-packed codes) into the length-prefixed `[codes][exps]` layout every downstream dequant path expects.
@@ -421,6 +553,129 @@ pub struct SafetensorsProvider {
 }
 
 impl SafetensorsProvider {
+    /// Lightweight applicability check for the block-FP8 arm (no dequant):
+    /// F8_E4M3 dtype tag + a `weight_scale_inv` sibling in the header.
+    #[allow(dead_code)]
+    fn is_fp8_block(&self, name: &str, info: &SafetensorInfo) -> bool {
+        if info.dtype_tag.as_str() != "F8_E4M3" {
+            return false;
+        }
+        let base = match name.strip_suffix(".weight") {
+            Some(b) => b,
+            None => return false,
+        };
+        self.info
+            .contains_key(&format!("{base}.weight_scale_inv"))
+    }
+
+    /// DeepSeek-style block-FP8 arm (Xing4.0 / DeepSeek-V3 family native FP8 exports):
+    /// weight tensors are raw F8_E4M3 codes with a separate `weight_scale_inv` F32
+    /// sibling of shape `[out/BR, in/BC]`. When the sibling exists, dequant to F32
+    /// inline — `w[i][j] = fp8(code[i][j]) * scale_inv[i/BR][j/BC]` — with block
+    /// sizes derived from the scale shape, not hardcoded. Without the sibling the
+    /// caller still fails loudly (unsupported dtype) — never a silent unscaled dequant.
+    fn fp8_block_fold(&self, name: &str, info: &SafetensorInfo) -> Option<Result<RawTensor>> {
+        if !self.is_fp8_block(name, info) {
+            return None;
+        }
+        let base = name.strip_suffix(".weight")?;
+        let sibling_name = format!("{base}.weight_scale_inv");
+        let scale_info = self.info.get(&sibling_name)?;
+        if info.dims.len() != 2 || scale_info.dims.len() != 2 {
+            return Some(Err(Error::Backend(format!(
+                "fp8 block dequant for '{name}': expected 2D weight + 2D weight_scale_inv, got {:?} + {:?}",
+                info.dims, scale_info.dims
+            ))));
+        }
+        let (out, in_dim) = (info.dims[0], info.dims[1]);
+        // `weight_scale_inv` dims are the scale GRID (`[out/block_rows, in/block_cols]`),
+        // not the block extent. Derive the block size, then validate the tiling.
+        let (grid_rows, grid_cols) = (scale_info.dims[0], scale_info.dims[1]);
+        if grid_rows == 0 || grid_cols == 0 || out % grid_rows != 0 || in_dim % grid_cols != 0 {
+            return Some(Err(Error::Backend(format!(
+                "fp8 block dequant for '{name}': weight [{out},{in_dim}] not tileable by scale grid [{grid_rows},{grid_cols}]"
+            ))));
+        }
+        // The scale grid is uniform in both axes; record the derived tile so a
+        // later misread of grid_rows/grid_cols shows up as a shape mismatch here
+        // rather than as transposed weights inside the GEMM.
+        let block_rows = out / grid_rows;
+        let block_cols = in_dim / grid_cols;
+        debug_assert_eq!(block_rows * grid_rows, out);
+        debug_assert_eq!(block_cols * grid_cols, in_dim);
+        let codes_start = match self
+            .data_region_start
+            .checked_add(info.data_start)
+        {
+            Some(s) => s,
+            None => {
+                return Some(Err(Error::Backend(format!(
+                    "fp8 block dequant for '{name}': offset overflow"
+                ))))
+            }
+        };
+        let codes_len = (info.data_end - info.data_start) as usize;
+        let scale_start = match self
+            .data_region_start
+            .checked_add(scale_info.data_start)
+        {
+            Some(s) => s,
+            None => {
+                return Some(Err(Error::Backend(format!(
+                    "fp8 block dequant for '{name}': scale offset overflow"
+                ))))
+            }
+        };
+        let scale_len = (scale_info.data_end - scale_info.data_start) as usize;
+        let codes = match self.read_region(codes_start, codes_len) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        let scales = match self.read_region(scale_start, scale_len) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        if codes.len() < out * in_dim || scales.len() < grid_rows * grid_cols * 4 {
+            return Some(Err(Error::Backend(format!(
+                "fp8 block dequant for '{name}': short region (codes {}, scales {})",
+                codes.len(),
+                scales.len()
+            ))));
+        }
+        let grid: Vec<f32> = scales[..grid_rows * grid_cols * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // Pack rather than dequantize. Folding to F32 here cost 4 bytes/param: a
+        // 20 GiB FP8 checkpoint became 80 GiB resident before the first token, and
+        // the scales were re-applied on every load. The packed blob keeps the
+        // codes and the 128x128 scale grid together and stays FP8-resident.
+        let blob = match grim_quant::pack_fp8_block128(
+            &codes[..out * in_dim],
+            &grid,
+            out,
+            in_dim,
+            grid_rows,
+            grid_cols,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                return Some(Err(Error::Backend(format!(
+                    "fp8 block pack for '{name}': {e}"
+                ))))
+            }
+        };
+        Some(Ok(RawTensor {
+            bytes: blob,
+            shape: vec![out, in_dim],
+            dtype: DType {
+                arith: ArithType::F32,
+                storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Block128),
+            },
+            provenance: QuantProvenance::GrimNative,
+        }))
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot open safetensors file '{path}': {e}")))?;
@@ -635,6 +890,13 @@ impl TensorProvider for SafetensorsProvider {
         let info = self.info.get(name).ok_or_else(|| {
             Error::Backend(format!("tensor '{name}' not found in safetensors file"))
         })?;
+
+        // DeepSeek-style block-FP8 arm: raw F8_E4M3 codes + separate
+        // `weight_scale_inv` sibling dequant to F32 inline (see `fp8_block_fold`).
+        if let Some(folded) = self.fp8_block_fold(name, &info) {
+            return folded;
+        }
+
         // Zero-copy slice of the mmap. `data_offsets` in the safetensors
         // header are relative to the data section, so add the section base.
         let start = self
@@ -689,6 +951,21 @@ impl TensorProvider for SafetensorsProvider {
         let info = self.info.get(name).ok_or_else(|| {
             Error::Backend(format!("tensor '{name}' not found in safetensors file"))
         })?;
+        // A folded block-FP8 weight is served as a packed 128x128 FP8 blob, so
+        // `meta` must declare the SAME dtype `get` returns. `WeightSource` reads
+        // the dtype from `meta` and the bytes from `get`, so a disagreement here
+        // makes the loader reinterpret packed codes as F32.
+        if self.is_fp8_block(name, &info) {
+            return Ok(TensorMeta {
+                dtype: DType {
+                    arith: ArithType::F32,
+                    storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Block128),
+                },
+                provenance: QuantProvenance::GrimNative,
+                shape: info.shape(),
+                fusion_mask: 0,
+            });
+        }
         Ok(TensorMeta {
             dtype: info.grim_dtype()?,
             provenance: QuantProvenance::GrimNative,
@@ -1315,5 +1592,101 @@ mod tests {
             .get("blk.0.attn_q.weight")
             .expect("mapped get lookup");
         assert_eq!(raw.bytes.len(), 16);
+    }
+
+    /// DeepSeek-style block-FP8 arm: an F8_E4M3 weight with a separate
+    /// `weight_scale_inv` F32 sibling must dequant to F32 inline
+    /// (`w[i][j] = fp8(code[i][j]) * scale_inv[i/BR][j/BC]`), and an F8_E4M3
+    /// weight WITHOUT the sibling must still fail loudly (unsupported dtype).
+        /// `get` and `meta` must never disagree on a quantized weight's dtype.
+    fn raw_dtype_of(p: &SafetensorsProvider, name: &str) -> DType {
+        p.get(name).unwrap().dtype
+    }
+
+#[test]
+    fn fp8_block_fold_dequants_with_sibling_and_fails_without() {
+        // 2x4 fp8 codes, 2x2 f32 scale_inv (128x128 layout scaled down 64x).
+        // codes[0] = 0x38 (1.0), codes[1] = 0x3C (1.5), codes[2] = 0xC0 (-2.0),
+        // codes[3] = 0x00 (0.0); row 1: 0x38, 0x38, 0x3C, 0x38.
+        let codes: [u8; 8] = [0x38, 0x3C, 0xC0, 0x00, 0x38, 0x38, 0x3C, 0x38];
+        let scales: [f32; 4] = [2.0, 4.0, 1.0, 8.0];
+        let header = format!(
+            r#"{{"w.weight":{{"dtype":"F8_E4M3","shape":[2,4],"data_offsets":[0,8]}},"w.weight_scale_inv":{{"dtype":"F32","shape":[2,2],"data_offsets":[8,24]}}}}"#
+        );
+        let header_len = header.len() as u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&header_len.to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&codes);
+        for v in scales {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fp8.safetensors");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let provider = SafetensorsProvider::open(path.to_str().unwrap()).unwrap();
+
+        let meta = provider.meta("w.weight").unwrap();
+        // The fold packs rather than dequantizes, so the weight stays FP8-resident.
+        // `meta` and `get` must agree, or the loader reinterprets codes as F32.
+        assert_eq!(
+            meta.dtype,
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Block128),
+            },
+            "block-FP8 fold must report the packed dtype"
+        );
+        assert_eq!(raw_dtype_of(&provider, "w.weight"), meta.dtype);
+        let raw = provider.get("w.weight").unwrap();
+        assert_eq!(raw.shape, vec![2, 4]);
+        // Exact packed layout: 20-byte header (magic, out, in, grid rows/cols)
+        // + the 2x2 f32 scale grid + 8 raw codes. A real 1024x1024 weight is
+        // 1 MiB of codes + 256 B of scales, versus 4 MiB for the F32 fold.
+        assert_eq!(
+            raw.bytes.len(),
+            20 + 2 * 2 * 4 + 8,
+            "packed blob must be header + scale grid + codes, nothing expanded"
+        );
+        // Unpacking must reproduce the old F32 fold EXACTLY, bit for bit:
+        // w[i][j] = fp8(code) * scale_inv[i/2][j/2], row 0 scales (2.0, 4.0),
+        // row 1 scales (1.0, 8.0).
+        let w = grim_quant::dequant_fp8_block128(&raw.bytes).unwrap();
+        let expect: [f32; 8] = [
+            1.0 * 2.0,
+            1.5 * 2.0,
+            -2.0 * 4.0,
+            0.0 * 4.0,
+            1.0 * 1.0,
+            1.0 * 1.0,
+            1.5 * 8.0,
+            1.0 * 8.0,
+        ];
+        assert_eq!(w.len(), expect.len(), "dequant length must match the fold");
+        for (i, (got, want)) in w.iter().zip(expect.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "w[{i}] = {got}, expected {want} (bit-exact vs the F32 fold)"
+            );
+        }
+
+        // Without the sibling, the F8_E4M3 tag must still fail loudly.
+        let header_bare = r#"{"w.weight":{"dtype":"F8_E4M3","shape":[2,4],"data_offsets":[0,8]}}"#;
+        let header_len_bare = header_bare.len() as u64;
+        let mut bytes_bare = Vec::new();
+        bytes_bare.extend_from_slice(&header_len_bare.to_le_bytes());
+        bytes_bare.extend_from_slice(header_bare.as_bytes());
+        bytes_bare.extend_from_slice(&codes);
+        let dir_bare = tempfile::tempdir().unwrap();
+        let path_bare = dir_bare.path().join("fp8_bare.safetensors");
+        std::fs::write(&path_bare, &bytes_bare).unwrap();
+        let provider_bare = SafetensorsProvider::open(path_bare.to_str().unwrap()).unwrap();
+        assert!(
+            provider_bare.get("w.weight").is_err(),
+            "F8_E4M3 without weight_scale_inv must fail loudly, not dequant unscaled"
+        );
     }
 }

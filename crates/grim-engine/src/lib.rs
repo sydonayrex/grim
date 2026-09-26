@@ -1587,7 +1587,7 @@ mod tests {
         grim_tensor::backend::GpuCapability {
             tflops_fp16: tflops,
             tflops_fp8: 0.0,
-            hbm_bandwidth_gbps: 100.0,
+            dram_bandwidth_gbps: 100.0,
             vram_free_bytes: 16 << 30,
             throttle_pct: 0.0,
             ordinal,
@@ -1837,7 +1837,7 @@ mod tests {
         let cap_with_vram = |vram: u64| grim_tensor::backend::GpuCapability {
             tflops_fp16: 10.0,
             tflops_fp8: 0.0,
-            hbm_bandwidth_gbps: 100.0,
+            dram_bandwidth_gbps: 100.0,
             vram_free_bytes: vram,
             throttle_pct: 0.0,
             ordinal: 0,
@@ -1909,7 +1909,7 @@ mod tests {
         let cap_with_vram = |tflops: f32, vram: u64| grim_tensor::backend::GpuCapability {
             tflops_fp16: tflops,
             tflops_fp8: 0.0,
-            hbm_bandwidth_gbps: 100.0,
+            dram_bandwidth_gbps: 100.0,
             vram_free_bytes: vram,
             throttle_pct: 0.0,
             ordinal: 0,

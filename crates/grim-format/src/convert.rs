@@ -353,6 +353,11 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
             grim_tensor::dtype::BlockDtype::Fp8 | grim_tensor::dtype::BlockDtype::Fp8Block16 => {
                 grim_quant::dequant_fp8_block16(&raw.bytes, elem_count)
             }
+            // 128x128 block FP8 carries its scale grid inside the blob, so the
+            // decode is self-describing and needs no shape argument.
+            grim_tensor::dtype::BlockDtype::Fp8Block128 => {
+                grim_quant::dequant_fp8_block128(&raw.bytes)
+            }
         },
         grim_tensor::dtype::Storage::FloatPack(scheme) => match scheme {
             grim_tensor::dtype::FloatPackScheme::Fp4 => {

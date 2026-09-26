@@ -8,7 +8,9 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, CoreTensorOps, DType, Device, QuantProvenance, Shape, Storage, Tensor, YaRNParams};
+use grim_tensor::{
+    ArithType, CoreTensorOps, DType, Device, QuantProvenance, Shape, Storage, Tensor, YaRNParams,
+};
 
 // Config
 

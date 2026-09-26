@@ -964,15 +964,20 @@ impl Linear {
                     Err(e) => return Err(e),
                 }
             } else {
-                // Quantized storage without a QuantFormat mapping (e.g.
-                // FloatPack(MxFp4)): plain `matmul` would misread the packed bytes as F32.
-                dev.quantized_matmul(
-                    a_storage,
-                    b_storage,
-                    &[],
-                    grim_tensor::QuantFormat::Fp4,
-                    &out_shape,
-                )?
+                // Quantized storage with no fused kernel (block FP4/FP8, FloatPack, ...).
+                // Use the dtype's OWN format mapping: hardcoding one format here
+                // made every block-FP8 weight decode through the MXFP4 reader.
+                let fmt = grim_tensor::QuantFormat::try_from(&self.weight.dtype().storage)
+                    .map_err(|()| {
+                        Error::Unimplemented(format!(
+                            "Linear::forward: quantized storage {:?} has no QuantFormat mapping",
+                            self.weight.dtype().storage
+                        ))
+                    })?;
+                if qmm_trace {
+                    eprintln!("[linear] branch=quantized_matmul fmt={fmt:?}");
+                }
+                dev.quantized_matmul(a_storage, b_storage, &[], fmt, &out_shape)?
             }
         } else {
             CoreTensorOps::matmul(&*dev, a_storage, b_storage, &out_shape)?

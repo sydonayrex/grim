@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use grim_backend_rocm::{as_rocm, RocmDevice};
+use grim_backend_rocm::{RocmDevice, as_rocm};
 use grim_models_transformer::exaone4_5::Exaone45Mlp;
 use grim_nn::Linear;
 use grim_tensor::{
@@ -99,8 +99,5 @@ fn exaone_fused_gateup_matches_split_on_gpu() {
         .zip(&fused_out)
         .map(|(split, fused)| (split - fused).abs())
         .fold(0.0f32, f32::max);
-    assert!(
-        max_abs < 2e-3,
-        "EXAONE fused/split max abs error {max_abs}"
-    );
+    assert!(max_abs < 2e-3, "EXAONE fused/split max abs error {max_abs}");
 }

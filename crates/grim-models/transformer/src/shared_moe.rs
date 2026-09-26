@@ -453,6 +453,41 @@ pub fn fused_moe_dispatch_from_logits(
     route_mode: i32,
     cache: &CharonCache,
 ) -> Result<Option<Tensor>> {
+    fused_moe_dispatch_from_logits_with_bias(
+        dev,
+        x,
+        logits,
+        None,
+        experts,
+        shared_expert,
+        top_k,
+        routed_scaling_factor,
+        route_mode,
+        cache,
+    )
+}
+
+/// [`fused_moe_dispatch_from_logits`] with the per-expert `e_score_correction_bias`.
+///
+/// Only meaningful for `route_mode == 2` (sigmoid+bias, DeepSeek-V2/V3 and
+/// Xing4.0's `noaux_tc`), where the kernel uses `sigmoid(logit) + bias[i]` to
+/// *select* experts while the combine weight stays the raw `sigmoid(logit)`.
+/// The bias must be a device-resident `[num_experts]` F32 tensor matching
+/// `logits`' device; it is read on the device, so supplying it does not
+/// reintroduce a host round-trip.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_moe_dispatch_from_logits_with_bias(
+    dev: &dyn BackendDevice,
+    x: &Tensor,
+    logits: &Tensor,
+    bias: Option<&Tensor>,
+    experts: &[MoeExpert],
+    shared_expert: Option<&MoeExpert>,
+    top_k: usize,
+    routed_scaling_factor: f32,
+    route_mode: i32,
+    cache: &CharonCache,
+) -> Result<Option<Tensor>> {
     if !charon_enabled() {
         return Ok(None);
     }
@@ -546,9 +581,19 @@ pub fn fused_moe_dispatch_from_logits(
         .ok_or_else(|| grim_tensor::Error::Backend("weights not RocmStorage".into()))?;
 
     // 1. Device-side routing (D2D): write sortless routing triples.
+    // `bias` is consumed on the device by route_mode 2; a non-ROCm or
+    // wrong-width bias degrades to the unbiased selection rather than failing.
+    let bias_rocm: Option<&grim_backend_rocm::RocmStorage> = bias.and_then(|b| {
+        if b.shape().elem_count() != experts.len() || b.device() != logits.device() {
+            return None;
+        }
+        b.storage()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+    });
     rocm.moe_route_topk_on_device(
         logits_rocm,
-        None,
+        bias_rocm,
         tokens_rocm,
         experts_rocm,
         weights_rocm,

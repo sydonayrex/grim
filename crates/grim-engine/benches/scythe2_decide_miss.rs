@@ -26,7 +26,7 @@ fn caps_asymmetric() -> Vec<GpuCapability> {
         GpuCapability {
             tflops_fp16: 8.0,
             tflops_fp8: 0.0,
-            hbm_bandwidth_gbps: 51.2,
+            dram_bandwidth_gbps: 51.2,
             vram_free_bytes: 16 << 30,
             throttle_pct: 0.0,
             ordinal: 0,
@@ -34,7 +34,7 @@ fn caps_asymmetric() -> Vec<GpuCapability> {
         GpuCapability {
             tflops_fp16: 80.0,
             tflops_fp8: 160.0,
-            hbm_bandwidth_gbps: 960.0,
+            dram_bandwidth_gbps: 960.0,
             vram_free_bytes: 16 << 30,
             throttle_pct: 0.0,
             ordinal: 1,

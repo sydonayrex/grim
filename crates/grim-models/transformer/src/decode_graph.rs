@@ -5727,6 +5727,7 @@ mod tests {
             ssm_d_conv: 4,
             ssm_dt_rank: 8,
             ssm_n_group: 2,
+            rotary_dim: None,
             devices: Vec::new(),
         };
 
@@ -5809,6 +5810,7 @@ mod tests {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+                rotary_dim: head_dim,
                 rope_theta: cfg.rope_theta,
                 hidden_size,
                 intermediate_size,

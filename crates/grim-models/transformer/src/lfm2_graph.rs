@@ -10,12 +10,12 @@
 //! on host today, which poisons capture. Caller falls back eager for those
 //! stacks (spec §Fallback). Same for MoE blocks (host top-1 routing).
 
+use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
-    write_embeddings_to_buffer_batch, DecodeGraph, DecodeGraphBuffers, EagerKvSource,
+    DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
+    launch_attention, launch_qkv_gemv, write_embeddings_to_buffer_batch,
 };
-use grim_backend_rocm::RocmStorage;
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 

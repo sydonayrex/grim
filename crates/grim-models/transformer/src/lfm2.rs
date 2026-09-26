@@ -6,7 +6,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{add_tensors, broadcast_bias, Embedding, Linear, RmsNorm};
+use grim_nn::{Embedding, Linear, RmsNorm, add_tensors, broadcast_bias};
 use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
 use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, DType, Device, Shape, Tensor};
 use std::sync::Arc;
@@ -2965,12 +2965,14 @@ impl Lfm2Block {
                 )?;
             }
 
-            let (k_launch, v_launch): (&dyn grim_tensor::BackendStorage, &dyn grim_tensor::BackendStorage) =
-                if nkv != nh {
-                    (k1_exp.as_ref(), v1_exp.as_ref())
-                } else {
-                    (k1.as_ref(), v1.as_ref())
-                };
+            let (k_launch, v_launch): (
+                &dyn grim_tensor::BackendStorage,
+                &dyn grim_tensor::BackendStorage,
+            ) = if nkv != nh {
+                (k1_exp.as_ref(), v1_exp.as_ref())
+            } else {
+                (k1.as_ref(), v1.as_ref())
+            };
             dev.launch_gla_state_update_output_into(&GlaLaunchArgs {
                 q: grim_backend_rocm::as_rocm(q1.as_ref())?,
                 k: grim_backend_rocm::as_rocm(k_launch)?,
@@ -3229,12 +3231,14 @@ impl Lfm2Block {
             dev.sigmoid_into(logit_f_s, logit_f_s)?;
             dev.broadcast_heads(logit_f_s, gates_f_s, fused.dk, nh)?;
 
-            let (k_launch, v_launch): (&dyn grim_tensor::BackendStorage, &dyn grim_tensor::BackendStorage) =
-                if nkv != nh {
-                    (k1_exp.as_ref(), v1_exp.as_ref())
-                } else {
-                    (k1.as_ref(), v1.as_ref())
-                };
+            let (k_launch, v_launch): (
+                &dyn grim_tensor::BackendStorage,
+                &dyn grim_tensor::BackendStorage,
+            ) = if nkv != nh {
+                (k1_exp.as_ref(), v1_exp.as_ref())
+            } else {
+                (k1.as_ref(), v1.as_ref())
+            };
             dev.launch_gla_state_update_output_into(&GlaLaunchArgs {
                 q: grim_backend_rocm::as_rocm(q1.as_ref())?,
                 k: grim_backend_rocm::as_rocm(k_launch)?,

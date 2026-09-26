@@ -174,6 +174,7 @@ impl QuantOps for VulkanDevice {
                     BlockDtype::Fp8 => grim_quant::dequant_fp8_block16(&b_bytes_cpu, k * n)?,
                     BlockDtype::Fp4Block16 => grim_quant::dequant_fp4_block16(&b_bytes_cpu, k * n)?,
                     BlockDtype::Fp8Block16 => grim_quant::dequant_fp8_block16(&b_bytes_cpu, k * n)?,
+                    BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&b_bytes_cpu)?,
                 })
             }
             Storage::CompressedTensorsW8A8Fp8 => {

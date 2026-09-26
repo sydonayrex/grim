@@ -104,6 +104,8 @@ pub(crate) fn cuda_dequant_quantized_storage(
             BlockDtype::Fp8 | BlockDtype::Fp8Block16 => {
                 grim_quant::dequant_fp8_block16(b_bytes, elem_count)
             }
+            // Self-describing blob: the 128x128 scale grid rides with the codes.
+            BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(b_bytes),
         },
         DTypeStorage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(
             "quantized_matmul_backward_dx: ResidualPacked (bpw {}) host dequant not implemented; \

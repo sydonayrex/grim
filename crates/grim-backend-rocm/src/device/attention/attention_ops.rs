@@ -220,6 +220,129 @@ impl AttentionOps for RocmDevice {
         ))))
     }
 
+    fn mla_absorbed_prefill(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        out: &dyn BackendStorage,
+        q_len: usize,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        q_abs_offset: usize,
+        kv_len: usize,
+        inv_sqrt_d: f32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let q_abs = q_absorbed
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_prefill: q_absorbed is not RocmStorage".into())
+            })?;
+        let q_r = q_rope
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("mla_absorbed_prefill: q_rope is not RocmStorage".into()))?;
+        let kv = kv_cache
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_prefill: kv_cache is not RocmStorage".into())
+            })?;
+        let o = out
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("mla_absorbed_prefill: out is not RocmStorage".into()))?;
+
+        if q_len == 0 || num_heads == 0 {
+            return Ok(Box::new(crate::device::handles::RocmHandle::new(Some(
+                self.active_stream(),
+            ))));
+        }
+        // The kernel's per-thread accumulator is a fixed 8 registers deep.
+        if kv_lora_rank > 8 * crate::device::util::ROCM_COMPUTE_BLOCK as usize {
+            return Err(Error::Backend(format!(
+                "mla_absorbed_prefill: kv_lora_rank {kv_lora_rank} exceeds the kernel's \
+                 8 x block_size accumulator capacity"
+            )));
+        }
+        let q_abs_elems = q_len * num_heads * kv_lora_rank;
+        if q_abs.shape().elem_count() != q_abs_elems {
+            return Err(Error::Shape(format!(
+                "mla_absorbed_prefill: q_absorbed holds {} elements, expected {q_abs_elems}",
+                q_abs.shape().elem_count()
+            )));
+        }
+        if q_rope.shape().elem_count() != q_len * num_heads * qk_rope_dim {
+            return Err(Error::Shape(
+                "mla_absorbed_prefill: q_rope element count mismatch".into(),
+            ));
+        }
+        if kv.shape().elem_count() != kv_len * (kv_lora_rank + qk_rope_dim) {
+            return Err(Error::Shape(
+                "mla_absorbed_prefill: kv_cache element count mismatch".into(),
+            ));
+        }
+        if o.shape().elem_count() != q_abs_elems {
+            return Err(Error::Shape(
+                "mla_absorbed_prefill: out element count mismatch".into(),
+            ));
+        }
+        if q_abs_offset + q_len > kv_len {
+            return Err(Error::Shape(format!(
+                "mla_absorbed_prefill: query block ends at {} but kv_len is {kv_len}",
+                q_abs_offset + q_len
+            )));
+        }
+
+        let mut q_abs_ptr = q_abs.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_prefill: q_absorbed has no device ptr".into())
+        })?;
+        let mut q_rope_ptr = q_r.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_prefill: q_rope has no device ptr".into())
+        })?;
+        let mut kv_ptr = kv.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_prefill: kv_cache has no device ptr".into())
+        })?;
+        let mut out_ptr = o.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_prefill: out has no device ptr".into())
+        })?;
+        let mut a_q = q_len as i32;
+        let mut a_h = num_heads as i32;
+        let mut a_rank = kv_lora_rank as i32;
+        let mut a_rope = qk_rope_dim as i32;
+        let mut a_off = q_abs_offset as i32;
+        let mut a_kv = kv_len as i32;
+        let mut a_scale = inv_sqrt_d;
+
+        // One block per (query, head); `s_dot` needs block_size floats.
+        let block = 256usize;
+        self.launch_compute_kernel_with_solution(
+            "grim_mla_absorbed_prefill",
+            crate::HipDim3::new((q_len * num_heads) as u32, 1, 1),
+            crate::HipDim3::new(block as u32, 1, 1),
+            &mut [
+                arg(&mut q_abs_ptr),
+                arg(&mut q_rope_ptr),
+                arg(&mut kv_ptr),
+                arg(&mut out_ptr),
+                arg(&mut a_q),
+                arg(&mut a_h),
+                arg(&mut a_rank),
+                arg(&mut a_rope),
+                arg(&mut a_off),
+                arg(&mut a_kv),
+                arg(&mut a_scale),
+            ],
+            None,
+            block * std::mem::size_of::<f32>(),
+        )?;
+        Ok(Box::new(crate::device::handles::RocmHandle::new(Some(
+            self.active_stream(),
+        ))))
+    }
+
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,

@@ -69,6 +69,7 @@ const TINY_CFG: Qwen35Config = Qwen35Config {
     ssm_d_conv: 2,
     ssm_dt_rank: 4,
     ssm_n_group: 4,
+    rotary_dim: None,
     devices: Vec::new(),
 };
 
@@ -212,6 +213,7 @@ impl Qwen35Block {
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
+            rotary_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,

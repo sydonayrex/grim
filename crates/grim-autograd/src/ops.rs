@@ -394,7 +394,7 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
         Storage::Block(bd) => match bd {
             BlockDtype::Fp4 | BlockDtype::Fp4Block16 => 4,
             BlockDtype::Nf4 => 4,
-            BlockDtype::Fp8 | BlockDtype::Fp8Block16 => 8,
+            BlockDtype::Fp8 | BlockDtype::Fp8Block16 | BlockDtype::Fp8Block128 => 8,
         },
         Storage::FloatPack(scheme) => match scheme {
             FloatPackScheme::Fp4 => 4,

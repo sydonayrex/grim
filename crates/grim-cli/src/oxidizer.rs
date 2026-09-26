@@ -834,7 +834,8 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         | QuantFormat::Nf4
         | QuantFormat::Fp8
         | QuantFormat::Fp4Block16
-        | QuantFormat::Fp8Block16 => Err(format!(
+        | QuantFormat::Fp8Block16
+        | QuantFormat::Fp8Block128 => Err(format!(
             "quantization format {:?} is not supported in GGUF writer",
             format
         )),

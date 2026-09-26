@@ -17,6 +17,9 @@ fn main() {
             || k.contains("block_count")
             || k.contains("embedding_length")
             || k.contains("expert")
+            || k.contains("rope")
+            || k.contains("context")
+            || k.contains("layer_count")
         {
             println!("{} = {:?}", k, v);
         }

@@ -3213,6 +3213,15 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         QuantFormat::Fp8 => quant_fp8(data)?,
         QuantFormat::Fp4Block16 => quant_fp4_block16(data, 16)?,
         QuantFormat::Fp8Block16 => quant_fp8_block16(data, 16)?,
+        // 128x128 block FP8 is a *load-time* format for checkpoints that already
+        // ship it (DeepSeek-style `weight_scale_inv`). There is no f32 -> packed
+        // rewriter: producing one would need a source-side scale grid.
+        QuantFormat::Fp8Block128 => {
+            return Err(Error::Backend(
+                "rewrite_tensor_data: Fp8Block128 is a load-time format, not a rewrite target"
+                    .into(),
+            ))
+        }
         QuantFormat::Iq4Nl => quant_iq4nl(data)?,
         QuantFormat::Iq4Xs => quant_iq4xs(data)?,
         QuantFormat::Iq3Xxs => quant_iq3xxs(data)?,
@@ -6662,4 +6671,116 @@ fn gemm_q4k_packed_scalar(a: &[f32], b_q4k_bytes: &[u8], m: usize, n: usize, k: 
     }
 
     c
+}
+
+/// Magic tag for the packed 128x128 block-FP8 blob header.
+const FP8_BLOCK128_MAGIC: u32 = 0x4250_3846; // "FP8B" little-endian
+/// `[magic u32][out u32][in u32][grid_rows u32][grid_cols u32]`
+const FP8_BLOCK128_HEADER: usize = 20;
+
+/// Pack E4M3 codes plus a 128x128 `f32` scale grid into one self-describing blob.
+///
+/// Layout: `[magic][out][in][grid_rows][grid_cols][exps: grid f32][codes: out*in u8]`
+///
+/// Keeping the scales in the same buffer is what lets the GPU quantized-matmul
+/// path consume the format: it takes no separate scale argument, so a two-tensor
+/// (codes + `weight_scale_inv`) representation would have to be paired on the
+/// host, which is the round-trip this format exists to avoid.
+pub fn pack_fp8_block128(
+    codes: &[u8],
+    exps: &[f32],
+    out: usize,
+    in_dim: usize,
+    grid_rows: usize,
+    grid_cols: usize,
+) -> Result<Vec<u8>> {
+    if codes.len() < out * in_dim {
+        return Err(Error::Backend(format!(
+            "pack_fp8_block128: {} codes for a {out}x{in_dim} weight",
+            codes.len()
+        )));
+    }
+    if exps.len() < grid_rows * grid_cols {
+        return Err(Error::Backend(format!(
+            "pack_fp8_block128: {} scales for a [{grid_rows},{grid_cols}] grid",
+            exps.len()
+        )));
+    }
+    if grid_rows == 0 || grid_cols == 0 || out % grid_rows != 0 || in_dim % grid_cols != 0 {
+        return Err(Error::Backend(format!(
+            "pack_fp8_block128: [{out},{in_dim}] not tileable by grid [{grid_rows},{grid_cols}]"
+        )));
+    }
+    let mut blob = Vec::with_capacity(
+        FP8_BLOCK128_HEADER + grid_rows * grid_cols * 4 + out * in_dim,
+    );
+    blob.extend_from_slice(&FP8_BLOCK128_MAGIC.to_le_bytes());
+    blob.extend_from_slice(&(out as u32).to_le_bytes());
+    blob.extend_from_slice(&(in_dim as u32).to_le_bytes());
+    blob.extend_from_slice(&(grid_rows as u32).to_le_bytes());
+    blob.extend_from_slice(&(grid_cols as u32).to_le_bytes());
+    for e in &exps[..grid_rows * grid_cols] {
+        blob.extend_from_slice(&e.to_le_bytes());
+    }
+    blob.extend_from_slice(&codes[..out * in_dim]);
+    Ok(blob)
+}
+
+/// Unpack a 128x128 block-FP8 blob back to row-major `f32`.
+///
+/// This is the reference decode: `out[i, j] = e4m3(codes[i, j]) *
+/// exps[(i / block_rows) * grid_cols + (j / block_cols)]`, which is exactly the
+/// arithmetic the previous fold-to-F32 loader performed.
+pub fn dequant_fp8_block128(data: &[u8]) -> Result<Vec<f32>> {
+    if data.len() < FP8_BLOCK128_HEADER {
+        return Err(Error::Backend(format!(
+            "dequant_fp8_block128: blob is {} bytes, shorter than its {FP8_BLOCK128_HEADER}-byte header",
+            data.len()
+        )));
+    }
+    let rd = |off: usize| -> u32 {
+        u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    };
+    if rd(0) != FP8_BLOCK128_MAGIC {
+        return Err(Error::Backend(
+            "dequant_fp8_block128: bad magic — not a packed block-FP8 blob".into(),
+        ));
+    }
+    let (out, in_dim) = (rd(4) as usize, rd(8) as usize);
+    let (grid_rows, grid_cols) = (rd(12) as usize, rd(16) as usize);
+    if out == 0 || in_dim == 0 || grid_rows == 0 || grid_cols == 0 {
+        return Err(Error::Backend(
+            "dequant_fp8_block128: zero-sized header".into(),
+        ));
+    }
+    if out % grid_rows != 0 || in_dim % grid_cols != 0 {
+        return Err(Error::Backend(format!(
+            "dequant_fp8_block128: [{out},{in_dim}] not tileable by grid [{grid_rows},{grid_cols}]"
+        )));
+    }
+    let exps_at = FP8_BLOCK128_HEADER;
+    let codes_at = exps_at + grid_rows * grid_cols * 4;
+    if data.len() < codes_at + out * in_dim {
+        return Err(Error::Backend(format!(
+            "dequant_fp8_block128: blob is {} bytes, need {} for a {out}x{in_dim} weight",
+            data.len(),
+            codes_at + out * in_dim
+        )));
+    }
+    let block_rows = out / grid_rows;
+    let block_cols = in_dim / grid_cols;
+    let mut w = vec![0.0f32; out * in_dim];
+    for i in 0..out {
+        let gr = i / block_rows;
+        for j in 0..in_dim {
+            let e = f32::from_le_bytes([
+                data[exps_at + (gr * grid_cols + j / block_cols) * 4],
+                data[exps_at + (gr * grid_cols + j / block_cols) * 4 + 1],
+                data[exps_at + (gr * grid_cols + j / block_cols) * 4 + 2],
+                data[exps_at + (gr * grid_cols + j / block_cols) * 4 + 3],
+            ]);
+            w[i * in_dim + j] = fp8_e4m3_to_f32(data[codes_at + i * in_dim + j]) * e;
+        }
+    }
+    Ok(w)
 }

@@ -72,7 +72,7 @@ pub fn run_doctor(
             {
                 // WI-2: OOM-adjacent — suggest a smaller quant tier by name.
                 eprintln!(
-                    "  -> VRAM INSUFFICIENT: Re-quantize to a smaller codec (Rook/Jay ~4.1 bpw instead of Raven/Jackdaw ~8 bpw, or Crow ~4.5 bpw), \
+                    "  -> VRAM INSUFFICIENT: Re-quantize to a smaller codec (Rook/Jay ~4.1 bpw instead of Raven/Jackdaw/Magpie ~8 bpw, or Crow/Nutcracker ~4.5 bpw), \
                      or reduce the model's context_length. See `WeightFormat::bpw`."
                 );
             } else if err.contains("no supported dispatch path")

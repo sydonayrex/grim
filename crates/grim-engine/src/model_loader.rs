@@ -31,7 +31,7 @@ use grim_models_transformer::{
     Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext, Qwen38FlashNextConfig,
     NemotronHMoe, NemotronHMoeConfig,
     QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
-    WavTokenizerDec, WavTokenizerDecConfig,
+    WavTokenizerDec, WavTokenizerDecConfig, Xing40, Xing40Config,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -1028,6 +1028,7 @@ fn load_model_from_config(
                 ssm_d_conv: 4,
                 ssm_dt_rank: 48,
                 ssm_n_group: 16,
+                rotary_dim: None,
                 devices,
             };
             log::info!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
@@ -1760,6 +1761,42 @@ fn load_model_from_config(
                 compressor_indexer_enabled: true,
             };
             let m = DeepSeek4::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Xing40 => {
+            // Xing4.0-29B-A4B: MLA + noaux_tc sigmoid MoE + 4-stream MHC residual.
+            // MLA dims and MHC hyper-parameters are fixed by the architecture
+            // family; the rest come from config.json.
+            let cfg = Xing40Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                kv_lora_rank: 512,
+                q_lora_rank: Some(768),
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                moe_intermediate_size,
+                n_routed_experts: expert_count,
+                n_shared_experts: 1,
+                num_experts_per_tok: expert_used_count,
+                first_k_dense_replace: 2,
+                routed_scaling_factor,
+                noaux_tc_routing: true,
+                hc_mult: 4,
+                hc_sinkhorn_iters: 20,
+                hc_eps: 1e-6,
+                mhc_h_res_clamp_min: -30.0,
+                mhc_h_res_clamp_max: 30.0,
+            };
+            let m = Xing40::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::CommandR => {
@@ -2718,7 +2755,7 @@ fn load_model_with_providers(
     let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
     ws.prefetch_all();
 
-    match model_arch {
+    let model: Result<Box<dyn CausalLm>> = match model_arch {
         ModelArchitecture::Falcon => {
             let falcon_cfg = FalconConfig {
                 vocab_size: hparams.vocab_size,
@@ -2949,6 +2986,10 @@ fn load_model_with_providers(
                 ssm_d_conv: hparams.ssm_d_conv.unwrap_or(4),
                 ssm_dt_rank: hparams.ssm_dt_rank.unwrap_or(48),
                 ssm_n_group: hparams.ssm_n_group.unwrap_or(16),
+                rotary_dim: lookup
+                    .get_u32("qwen35.rope.dimension_count")
+                    .or_else(|| lookup.get_u32("rope.dimension_count"))
+                    .map(|v| v as usize),
                 devices: qwen_devices,
             };
             log::info!(
@@ -3800,6 +3841,78 @@ fn load_model_with_providers(
             let m = DeepSeek4::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::Xing40 => {
+            // Xing4.0-29B-A4B: MLA + noaux_tc sigmoid MoE + 4-stream MHC residual.
+            // Read the arch-specific GGUF keys where the extractor provides them
+            // (`expert_count`, `expert_used_count`, `expert_feed_forward_length`,
+            // `routed_scaling_factor`) and fall back to the published values.
+            let hc_mult = lookup
+                .get_u32("xing4_0.hyper_connection.count")
+                .unwrap_or(4) as usize;
+            let hc_sinkhorn_iters = lookup
+                .get_u32("xing4_0.hyper_connection.sinkhorn_iterations")
+                .unwrap_or(20) as usize;
+            let hc_eps = lookup
+                .get_f32("xing4_0.hyper_connection.epsilon")
+                .unwrap_or(1e-6);
+            let kv_lora_rank = lookup
+                .get_u32("xing4_0.attention.kv_lora_rank")
+                .unwrap_or(512) as usize;
+            let q_lora_rank = lookup
+                .get_u32("xing4_0.attention.q_lora_rank")
+                .map(|v| v as usize);
+            // `key_length_mla` is nope+rope (192); the value half is `value_length_mla`.
+            let rope_dim = lookup
+                .get_u32("xing4_0.rope.dimension_count")
+                .unwrap_or(64) as usize;
+            let qk_nope_head_dim = lookup
+                .get_u32("xing4_0.attention.key_length_mla")
+                .map(|klm| klm as usize - rope_dim)
+                .unwrap_or(128);
+            let v_head_dim = lookup
+                .get_u32("xing4_0.attention.value_length_mla")
+                .unwrap_or(128) as usize;
+            let leading_dense = lookup
+                .get_u32("xing4_0.leading_dense_block_count")
+                .unwrap_or(2) as usize;
+            let shared_experts = lookup
+                .get_u32("xing4_0.expert_shared_count")
+                .unwrap_or(1) as usize;
+
+            let cfg = Xing40Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                kv_lora_rank,
+                q_lora_rank,
+                qk_nope_head_dim,
+                qk_rope_head_dim: rope_dim,
+                v_head_dim,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                moe_intermediate_size: hparams
+                    .expert_feed_forward_length
+                    .unwrap_or(hparams.intermediate_size),
+                n_routed_experts: hparams.expert_count.unwrap_or(64),
+                n_shared_experts: shared_experts,
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(4),
+                first_k_dense_replace: leading_dense,
+                routed_scaling_factor: hparams.routed_scaling_factor,
+                noaux_tc_routing: true,
+                hc_mult,
+                hc_sinkhorn_iters,
+                hc_eps,
+                mhc_h_res_clamp_min: -30.0,
+                mhc_h_res_clamp_max: 30.0,
+            };
+            let m = Xing40::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
         ModelArchitecture::MuseGlimmer => {
             let softcap = lookup
                 .get_f32("muse_glimmer.final_logit_softcapping")
@@ -4618,16 +4731,27 @@ fn load_model_with_providers(
                         yarn: None,
                     };
                     let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
-                    return Ok(Box::new(m));
+                    Ok(Box::new(m))
                 }
+            } else {
+                Err(Error::Config(format!(
+                    "Unsupported GGUF architecture '{}': no plugin compat spec and no native loader",
+                    arch_str
+                )))
             }
+        }
+    };
 
-            Err(Error::Config(format!(
-                "Unsupported GGUF architecture '{}': no plugin compat spec and no native loader",
-                arch_str
-            )))
+    // Reclaim duplicated host memory and flush pinned buffers
+    ws.clear_prefetch_caches();
+    #[cfg(feature = "rocm")]
+    for dev in resolve_discrete_rocm_devices(&device) {
+        if let Device::Rocm(ord) = dev {
+            grim_backend_rocm::RocmDevice::shared(ord).synchronize();
         }
     }
+
+    model
 }
 
 /// Convenience wrapper: detect the best available device and load a GGUF or GRIM model.

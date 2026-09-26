@@ -10,9 +10,9 @@
 //! fused path cannot serve (GQA mismatch, non-64 dims, missing GDL buffers)
 //! returns `Unimplemented` so the caller falls back eager (spec §Fallback).
 
+use grim_backend_rocm::RocmStorage;
 use grim_backend_rocm::decode_graph_buffers::DecodeGraphBuffers;
 use grim_backend_rocm::device::compute::gla_launchers::GlaLaunchArgs;
-use grim_backend_rocm::RocmStorage;
 use grim_core::error::{Error, Result};
 use grim_tensor::BackendStorage;
 

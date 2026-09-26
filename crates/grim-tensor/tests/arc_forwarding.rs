@@ -184,6 +184,23 @@ impl CoreTensorOps for ProbeDevice {
         })
     }
 
+    fn embedding_q4k(
+        &self,
+        _weight: &dyn BackendStorage,
+        _indices: &[u32],
+        _out: &Shape,
+        _dim: usize,
+    ) -> grim_tensor::Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        probe_err("embedding_q4k").map(|()| {
+            (
+                Box::new(ProbeStorage {
+                    shape: Shape::new(vec![0]),
+                }) as Box<dyn BackendStorage>,
+                Box::new(grim_tensor::ReadyHandle) as Box<dyn ComputeHandle>,
+            )
+        })
+    }
+
     fn from_cpu(
         &self,
         data: &[f32],
@@ -202,6 +219,53 @@ impl CoreTensorOps for ProbeDevice {
 }
 
 impl ElementwiseOps for ProbeDevice {
+    fn row_scale(
+        &self,
+        _x: &dyn BackendStorage,
+        _scale: &dyn BackendStorage,
+        _rows: usize,
+        _cols: usize,
+        _out_shape: &Shape,
+    ) -> grim_tensor::Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        probe_err("row_scale").map(|()| {
+            (
+                Box::new(ProbeStorage {
+                    shape: Shape::new(vec![0]),
+                }) as Box<dyn BackendStorage>,
+                Box::new(grim_tensor::ReadyHandle) as Box<dyn ComputeHandle>,
+            )
+        })
+    }
+
+    fn narrow_rows(
+        &self,
+        _x: &dyn BackendStorage,
+        _start_row: usize,
+        _rows: usize,
+        _cols: usize,
+        _out_shape: &Shape,
+    ) -> grim_tensor::Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        probe_err("narrow_rows").map(|()| {
+            (
+                Box::new(ProbeStorage {
+                    shape: Shape::new(vec![0]),
+                }) as Box<dyn BackendStorage>,
+                Box::new(grim_tensor::ReadyHandle) as Box<dyn ComputeHandle>,
+            )
+        })
+    }
+
+    fn write_rows(
+        &self,
+        _dst: &mut dyn BackendStorage,
+        _start_row: usize,
+        _src: &dyn BackendStorage,
+        _rows: usize,
+        _cols: usize,
+    ) -> grim_tensor::Result<Box<dyn ComputeHandle>> {
+        probe_err("write_rows").map(|()| Box::new(grim_tensor::ReadyHandle) as Box<dyn ComputeHandle>)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn sub(
         &self,
@@ -481,7 +545,18 @@ impl RecurrentOps for ProbeDevice {
 
 impl CollectiveOps for ProbeDevice {}
 
-impl MemoryOps for ProbeDevice {}
+impl MemoryOps for ProbeDevice {
+    fn copy_bytes_into(
+        &self,
+        _dst: &dyn BackendStorage,
+        _dst_byte_offset: usize,
+        _src: &dyn BackendStorage,
+        _src_byte_offset: usize,
+        _count: usize,
+    ) -> grim_tensor::Result<()> {
+        probe_err("copy_bytes_into")
+    }
+}
 
 impl GraphCaptureOps for ProbeDevice {}
 
@@ -518,6 +593,27 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
     assert_probe!(dev.reduce_sum(s.as_ref()), "reduce_sum");
     assert_probe!(dev.reduce_max(s.as_ref()), "reduce_max");
     assert_probe!(dev.argmax(s.as_ref()), "argmax");
+    assert_probe!(
+        dev.row_scale(s.as_ref(), s.as_ref(), 2, 2, &shape),
+        "row_scale"
+    );
+    assert_probe!(
+        dev.narrow_rows(s.as_ref(), 0, 1, 4, &shape),
+        "narrow_rows"
+    );
+    let mut s_mut = dev.zeros(&shape, DType::F32).expect("zeros");
+    assert_probe!(
+        dev.write_rows(s_mut.as_mut(), 0, s.as_ref(), 1, 4),
+        "write_rows"
+    );
+    assert_probe!(
+        dev.embedding_q4k(s.as_ref(), &[0], &shape, 4),
+        "embedding_q4k"
+    );
+    assert_probe!(
+        dev.copy_bytes_into(s.as_ref(), 0, s.as_ref(), 0, 4),
+        "copy_bytes_into"
+    );
     // B5: transpose_2d must forward through the Arc blanket impls too.
     assert_probe!(dev.transpose_2d(s.as_ref(), 2, 2, &shape), "transpose_2d");
     assert_probe!(

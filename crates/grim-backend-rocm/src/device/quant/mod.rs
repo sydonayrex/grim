@@ -1206,6 +1206,14 @@ impl QuantOps for RocmDevice {
                     &mut [],
                 )?;
             }
+            DTypeStorage::Block(bd) => {
+                // No fused block-quant GEMM on this backend. Falling through to
+                // `matmul` would reinterpret packed codes as F32 and emit
+                // garbage, so refuse explicitly and let the caller fall back.
+                return Err(Error::Unimplemented(format!(
+                    "ROCm quantized_matmul: no fused kernel for block format {bd:?}"
+                )));
+            }
             _ => {
                 return self.matmul(a, b_packed, out_shape);
             }

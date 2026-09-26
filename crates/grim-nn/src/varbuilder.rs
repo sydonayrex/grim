@@ -164,6 +164,12 @@ impl<'a> WeightSource<'a> {
         });
     }
 
+    /// Clear prefetch and dequantization caches to release host RAM after loading completes.
+    pub fn clear_prefetch_caches(&self) {
+        self.prefetch_cache.lock().clear();
+        self.dequant_cache.lock().clear();
+    }
+
     /// Look up a host-dequantized f32 buffer produced by the prefetch worker.
     /// Returns `None` when the tensor was not pre-dequantized (either not prefetched, or a packed-resident format.
     fn prefetched_f32(&self, name: &str) -> Option<std::sync::Arc<Vec<f32>>> {
@@ -775,6 +781,7 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp8 => dequant_fp8(&raw.bytes, n),
             BlockDtype::Fp4Block16 => dequant_fp4_block16(&raw.bytes, n),
             BlockDtype::Fp8Block16 => dequant_fp8_block16(&raw.bytes, n),
+            BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&raw.bytes),
         },
         Storage::ResidualPacked(_) => Err(Error::Unimplemented(
             "dequant_to_f32: ResidualPacked not yet supported".into(),

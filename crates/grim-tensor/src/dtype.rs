@@ -116,6 +116,14 @@ pub enum BlockDtype {
     Fp8,
     Fp4Block16,
     Fp8Block16,
+    /// E4M3 codes with a 128x128 (row x col) grid of `f32` inverse scales —
+    /// the DeepSeek-V2/V3 / Xing4.0 `weight_scale_inv` layout.
+    ///
+    /// The codes and the scale grid live in ONE buffer (see
+    /// `grim_quant::pack_fp8_block128`) because the GPU quantized-matmul path
+    /// takes no separate scale argument, so a two-tensor representation would
+    /// force a host round-trip to pair them.
+    Fp8Block128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -179,6 +187,8 @@ pub enum QuantFormat {
     Fp8,
     Fp4Block16,
     Fp8Block16,
+    /// E4M3 with a 128x128 block scale grid; scales are embedded in the blob.
+    Fp8Block128,
     Iq4Nl,
     Iq4Xs,
     Iq3Xxs,
@@ -311,6 +321,9 @@ impl DType {
                 BlockDtype::Fp8 => elem_count,
                 BlockDtype::Fp4Block16 => elem_count.div_ceil(2) + (elem_count.div_ceil(16)) * 2,
                 BlockDtype::Fp8Block16 => elem_count + (elem_count.div_ceil(16)) * 2,
+                // codes + 128x128 scale grid; the grid extent is in the blob
+                // header, so the caller must supply the real byte length.
+                BlockDtype::Fp8Block128 => elem_count,
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
             Storage::W4A4OstQuant(cfg) => {
@@ -336,6 +349,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Fp8 => Storage::FloatPack(FloatPackScheme::Fp8),
             QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
+            QuantFormat::Fp8Block128 => Storage::Block(BlockDtype::Fp8Block128),
             QuantFormat::Iq4Nl => Storage::KQuant(KQuantScheme::IQ4NL),
             QuantFormat::Iq4Xs => Storage::KQuant(KQuantScheme::IQ4XS),
             QuantFormat::Iq3Xxs => Storage::KQuant(KQuantScheme::IQ3XXS),
@@ -375,6 +389,7 @@ impl TryFrom<&Storage> for QuantFormat {
             Storage::Block(b) => match b {
                 BlockDtype::Fp4Block16 => Ok(QuantFormat::Fp4Block16),
                 BlockDtype::Fp8Block16 => Ok(QuantFormat::Fp8Block16),
+                BlockDtype::Fp8Block128 => Ok(QuantFormat::Fp8Block128),
                 BlockDtype::Fp4 => Ok(QuantFormat::Fp4),
                 BlockDtype::Nf4 => Ok(QuantFormat::Nf4),
                 BlockDtype::Fp8 => Ok(QuantFormat::Fp8),
