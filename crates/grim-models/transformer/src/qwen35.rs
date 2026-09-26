@@ -349,16 +349,18 @@ impl Qwen35Block {
                     // 27B by coincidence (its q_dim IS 6144) and 2048 rows too wide
                     // for the 9B, whose tensor is [4096, 4096] - the GEMM then strides
                     // past the end of the weight on every token.
-                    q_dim.max(
-                        blk_value_dim(cfg),
-                    ),
+                    q_dim.max(blk_value_dim(cfg)),
                     false,
                     tp,
                 )
                 .ok();
+                // `ssm_out` consumes the GATED recurrent output, whose width is value_dim -
+                // not q_dim. Same literal-vs-derived mismatch as attn_gate above:
+                // 6144 is right for the 27B by coincidence and 2048 rows too wide
+                // for the 9B, whose ssm_out is [4096, 4096].
                 let ssm_out = Linear::load_row_parallel(
                     &ws.pp("ssm_out"),
-                    q_dim.max(6144),
+                    q_dim.max(blk_value_dim(cfg)),
                     cfg.hidden_size,
                     false,
                     tp,
