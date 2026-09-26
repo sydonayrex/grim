@@ -275,7 +275,14 @@ impl Qwen35Block {
         let is_full_attention = (layer_idx + 1) % cfg.full_attention_interval.max(1) == 0;
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        let qkv_dim = q_dim + 2 * kv_dim;
+        // The recurrent path fused QKV is the CONV width, NOT the attention
+        // q+2kv width: [K K V] = 2*(n_group*d_state) + (dt_rank*d_state).
+        // Deriving it from the attention geometry gave 6144 for the 9B, which
+        // the old `.max(10240)` floor then widened to 10240 - 2048 rows past
+        // the end of an [8192, 4096] weight, on every KDA layer, feeding the
+        // conv. The floor was silently correct for the 27B, where the two
+        // numbers coincide.
+        let kda_qkv_dim = (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state;
 
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
 
@@ -328,7 +335,7 @@ impl Qwen35Block {
                 let attn_qkv = Linear::load_column_parallel(
                     &ws.pp("attn_qkv"),
                     cfg.hidden_size,
-                    qkv_dim.max(10240),
+                    kda_qkv_dim,
                     false,
                     tp,
                 )
