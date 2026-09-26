@@ -1758,6 +1758,17 @@ fn plan_layer_devices(
     // load: a delta much larger than this points at staging copies rather than
     // at the spill itself. No-op when nothing spilled.
     grim_backend_rocm::memory::budget::report_managed_fallback_summary();
+    // Dump the allocation ledger when asked. The ledger is in-process and a page
+    // fault kills the process, so this is the only copy that outlives the crash
+    // and the only way to attribute the faulting address afterwards.
+    if let Ok(path) = std::env::var("GRIM_LEDGER_DUMP") {
+        match grim_backend_rocm::memory::ledger::dump_to_file(&path) {
+            Ok(n) => eprintln!(
+                "[qwen35] wrote {n} live allocation(s) to {path} for post-mortem attribution"
+            ),
+            Err(e) => eprintln!("[qwen35] WARNING: ledger dump to {path} failed: {e}"),
+        }
+    }
     assignment
 }
 
