@@ -1629,21 +1629,30 @@ extern "C" __global__ void grim_kda_gated_delta_rule_step(
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= d_v) return;
 
-    // A_t = sigmoid(a_gate)
-    float a_t = 1.0f / (1.0f + expf(-a_gate[row]));
-    float beta_val = beta[row];
+    // beta and a_gate are PER-CALL SCALARS, not per-row: the CPU reference
+    // reads data()[0] for both. Indexing them as [row] made every row past 0
+    // read past the end of a one-element buffer and run the recurrence on
+    // garbage, while row 0 stayed correct - so nothing failed visibly.
+    const float decay = expf(a_gate[0]);
+    const float beta_val = beta[0];
+    float* s_row = S_state + (long long)row * d_k;
 
-    float k_dot_s = 0.0f;
+    // pred = sum_k k * (decay * S): the state is decayed BEFORE the dot, which
+    // is what the reference does (ggml-cuda/gated_delta_net.cu, KDA branch).
+    float pred = 0.0f;
     for (int col = 0; col < d_k; ++col) {
-        k_dot_s += k[col] * S_state[row * d_k + col];
+        pred += k[col] * (decay * s_row[col]);
     }
-    float delta_v = v[row] - beta_val * k_dot_s;
+
+    // delta = beta * (v - pred): beta scales the whole delta term. Applying
+    // beta inside the subtraction and again in the write is a different
+    // function, not an algebraically equal spelling.
+    const float delta = beta_val * (v[row] - pred);
 
     float y_val = 0.0f;
     for (int col = 0; col < d_k; ++col) {
-        float old_s = S_state[row * d_k + col];
-        float new_s = a_t * old_s + beta_val * delta_v * k[col];
-        S_state[row * d_k + col] = new_s;
+        const float new_s = decay * s_row[col] + k[col] * delta;
+        s_row[col] = new_s;
         y_val += q[col] * new_s;
     }
     out[row] = y_val;
