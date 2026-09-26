@@ -10,7 +10,6 @@
 //! and deterministic. The real 2-shard Qwen3.8 pair is covered by
 //! `gguf_split_loader_real_checkpoint_test` (ignored unless the model is present).
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -452,5 +451,4 @@ fn gguf_split_loader_real_checkpoint() {
         !provider.tensor_names().iter().any(|n| n.starts_with("mm.")),
         "mmproj shard leaked into the language-model namespace"
     );
-    let _ = HashMap::<String, u32>::new();
 }
