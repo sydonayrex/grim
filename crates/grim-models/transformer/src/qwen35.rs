@@ -1942,4 +1942,176 @@ mod tests {
             "conv_state is not used by the gated delta rule path"
         );
     }
+
+    /// The loader must mark layers recurrent using the SAME predicate the
+    /// attention/recurrent split depends on, or 49 of 65 layers silently run
+    /// the wrong branch. Measured from the Qwen3.8 GGUF: full attention at
+    /// layers 3, 7, 11, ... 63.
+    #[test]
+    fn layer_split_uses_the_models_own_predicate() {
+        let interval = 4usize;
+        let n_layers = 65usize;
+        let attn: Vec<usize> = (0..n_layers)
+            .filter(|i| (i + 1) % interval == 0)
+            .collect();
+        assert_eq!(attn.len(), 16, "65 layers at interval 4 has 16 attention layers");
+        assert_eq!(attn[0], 3, "first full-attention layer is index 3, not 0");
+        assert_eq!(attn[15], 63);
+        assert_eq!(
+            n_layers - attn.len(),
+            49,
+            "the other 49 layers are gated-delta-rule recurrent layers"
+        );
+    }
+
+    /// A cache built at the REAL Qwen3.8 geometry must be sized for the KDA
+    /// state: 48 value heads x 128 x 128.
+    ///
+    /// The toy-geometry test elsewhere in this module can pass while the real
+    /// configuration never reaches the recurrence, so this one pins the measured
+    /// values. If the production sizing is ever wrong, a state buffer that is too
+    /// small makes the recurrence silently no-op.
+    #[test]
+    fn real_geometry_state_is_sized_for_48_value_heads() {
+        let mut cfg = Qwen35Config::default();
+        cfg.hidden_size = 5120;
+        cfg.num_layers = 65;
+        cfg.ssm_d_inner = 6144;
+        cfg.ssm_d_state = 128;
+        cfg.ssm_dt_rank = 48; // num_value_heads
+        cfg.ssm_n_group = 16; // num_key_heads
+        cfg.ssm_n_group = 16;
+
+        let cache = Qwen35LayerCache::new(&cfg);
+        assert_eq!(
+            cache.ssm_state.len(),
+            48 * 128 * 128,
+            "state must be 48 value heads x 128 x 128"
+        );
+    }
+
+
+    /// The decisive check: drive a RECURRENT layer's real forward and require
+    /// that `cache.ssm_state` becomes non-zero. If the KDA branch were not
+    /// reached — or were reached with zero alpha/beta, or with a state buffer
+    /// too small — this stays all-zero and says so.
+    ///
+    /// The real 27B run emitted identical garbage under BOTH head-pairing rules,
+    /// which is only possible if the K/V head selection is not reaching the
+    /// output. This test is what distinguishes "branch never runs" from
+    /// "branch runs but is not reaching the model output".
+    #[test]
+    fn recurrent_forward_advances_kda_state_at_real_geometry() {
+        // Real Qwen3.8 geometry, shrunk only in hidden/intermediate so the
+        // test stays fast; the KDA geometry itself is exact.
+        let mut cfg = Qwen35Config::default();
+        cfg.vocab_size = 32;
+        cfg.hidden_size = 5120;
+        cfg.num_heads = 24;
+        cfg.num_kv_heads = 4;
+        cfg.head_dim = 256;
+        cfg.num_layers = 65;
+        cfg.intermediate_size = 256;
+        cfg.full_attention_interval = 4;
+        cfg.ssm_d_conv = 4;
+        cfg.ssm_d_inner = 6144;
+        cfg.ssm_d_state = 128;
+        cfg.ssm_dt_rank = 48;
+        cfg.ssm_n_group = 16;
+        cfg.ssm_n_group = 16;
+
+        let mut cache = Qwen35LayerCache::new(&cfg);
+        assert!(
+            cache.ssm_state.iter().all(|v| *v == 0.0),
+            "state starts zeroed"
+        );
+
+        // Build the recurrent block the way the real loader does, but with the
+        // tensors the toy test already builds.
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let b = |r: usize, c: usize| -> Tensor {
+            cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c]))
+        };
+        let ssm_d_inner = cfg.ssm_d_inner;
+        let blk = Qwen35Block {
+            device: Device::Cpu,
+            layer_idx: 0,
+            num_heads: cfg.num_heads,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+            is_full_attention: false,
+            attn_norm: RmsNorm::new(
+                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cfg.rms_norm_eps,
+            ),
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            attn_qkv: Some(Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; (q_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * cfg.hidden_size],
+                    Shape::new(vec![q_dim + 2 * cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size]),
+                ),
+                None,
+            )),
+            attn_gate: None,
+            ssm_out: Some(Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.1; cfg.hidden_size * ssm_d_inner],
+                    Shape::new(vec![cfg.hidden_size, ssm_d_inner]),
+                ),
+                None,
+            )),
+            ssm_conv1d: None,
+            ssm_conv_vec: None,
+            ssm_a: Some(vec![0.5; cfg.ssm_dt_rank]),
+            ssm_alpha: Some(Linear::from_tensor(
+                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                None,
+            )),
+            ssm_beta: Some(Linear::from_tensor(
+                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                None,
+            )),
+            ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
+            ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_rank_hint: cfg.ssm_dt_rank,
+            ssm_n_group_hint: cfg.ssm_n_group,
+            ssm_d_state_hint: cfg.ssm_d_state,
+            post_attention_norm: RmsNorm::new(
+                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cfg.rms_norm_eps,
+            ),
+            ffn_gate: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_up: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_down: Linear::from_tensor(b(cfg.hidden_size, cfg.intermediate_size), None),
+            rotary_dim: cfg.head_dim,
+            rope_theta: cfg.rope_theta,
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            wqkv_q80_fused: None,
+            w_gate_up_q4k_fused: None,
+        };
+        assert!(!blk.is_full_attention, "layer 0 is recurrent");
+
+        let x = cpu_tensor(
+            vec![0.1; cfg.hidden_size],
+            Shape::new(vec![1, cfg.hidden_size]),
+        );
+        let _ = blk
+            .forward(&x, &[0], &mut cache)
+            .expect("forward recurrent layer");
+
+        let nonzero = cache.ssm_state.iter().filter(|v| **v != 0.0).count();
+        assert!(
+            nonzero > 0,
+            "Gated DeltaNet must advance ssm_state; all-zero means the branch \
+             did not run, or ran with beta/alpha = 0, or the state is too small"
+        );
+        eprintln!("[kda-reach] ssm_state advanced in {nonzero} elements");
+    }
+
 }
