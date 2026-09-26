@@ -29,6 +29,11 @@ const ENTRY: &str = "grim_dot4_fp8_gemv";
 /// The instruction the fixed `grim_fdot4_fp8` must lower to.
 const WANTED: &str = "v_dot4_f32_fp8_fp8";
 
+/// WS-D: the WhiteRaven kernel must lower to the FP8 WMMA instruction. Its two
+/// `mma_sync` calls (one per N tile) are the only two sites in the aggregate;
+/// every other WMMA in there is FP16 or BF16 and belongs to `wmma_gemm.rs`.
+const WANTED_WMMA: &str = "v_wmma_f32_16x16x16_fp8_fp8";
+
 #[test]
 #[ignore = "needs a gfx12 device + hiprtc; see module doc"]
 fn jit_aggregate_emits_native_fp8_dot() {
@@ -84,6 +89,17 @@ fn jit_aggregate_emits_native_fp8_dot() {
 
     let hits = disasm.matches(WANTED).count();
     eprintln!("{WANTED} occurrences: {hits}");
+
+    // WS-D: WhiteRaven must be real, not an FP16 WMMA wearing the FP8 name.
+    let wmma_hits = disasm.matches(WANTED_WMMA).count();
+    eprintln!("{WANTED_WMMA} occurrences: {wmma_hits}");
+    assert!(
+        wmma_hits > 0,
+        "JIT-compiled aggregate contains no {WANTED_WMMA}. grim_wmma_gemm_fp8_e4m3 \
+         (the WhiteRaven kernel) is not lowering its float8_t fragments to the \
+         hardware instruction - check that rocWMMA's FP8 fragment path is \
+         selected and not silently falling back."
+    );
 
     assert!(
         hits > 0,
