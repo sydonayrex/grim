@@ -222,6 +222,10 @@ pub fn batched_lora_dispatched_device(
     token_adapter_idx: &[u32],
     adapters: &[DispatchedLoraAdapter],
 ) -> Result<()> {
+    // P1-3: every seam below (uploads, hipMalloc, kernel launches) binds to the
+    // CALLING THREAD's current device. Pin the ordinal for the whole call so a
+    // drifted thread cannot launch against another card's context.
+    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal as i32);
     if in_dim == 0 || out_dim == 0 {
         return Err(Error::Backend(
             "batched_lora_dispatched_device: in_dim and out_dim must be > 0".into(),
@@ -545,6 +549,10 @@ pub fn batched_lora_group_device(
     out_dim: usize,
     groups: &[BatchedLoraGroup<'_>],
 ) -> Result<()> {
+    // P1-3: every seam below (uploads, hipMalloc, kernel launches) binds to the
+    // CALLING THREAD's current device. Pin the ordinal for the whole call so a
+    // drifted thread cannot launch against another card's context.
+    let _dev_guard = crate::device::util::DeviceGuard::set(device.ordinal as i32);
     if in_dim == 0 || out_dim == 0 {
         return Err(Error::Backend(
             "batched_lora_group_device: in_dim and out_dim must be > 0".into(),
