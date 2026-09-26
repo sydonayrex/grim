@@ -336,7 +336,15 @@ impl Qwen35Block {
                 let attn_gate = Linear::load_column_parallel(
                     &ws.pp("attn_gate"),
                     cfg.hidden_size,
-                    q_dim.max(6144),
+                    // `attn_gate` serves BOTH layer types at two different widths:
+                    // the KDA output gate is value_dim, the attention gate is q_dim.
+                    // The 6144 here was a hardcoded literal, which is correct for the
+                    // 27B by coincidence (its q_dim IS 6144) and 2048 rows too wide
+                    // for the 9B, whose tensor is [4096, 4096] - the GEMM then strides
+                    // past the end of the weight on every token.
+                    q_dim.max(
+                        blk_value_dim(cfg),
+                    ),
                     false,
                     tp,
                 )
@@ -1257,6 +1265,20 @@ impl CausalLm for Qwen35 {
 /// the delta rule vectors that are orders of magnitude off, and the error
 /// compounds across all the KDA layers. A synthetic repro with constant 0.1
 /// weights cannot see this, which is why it survived.
+/// KDA value width: `num_value_heads * head_dim`, i.e. `ssm_d_inner`.
+///
+/// `attn_gate` is the KDA output gate on linear-attention layers and the
+/// attention output gate on full-attention layers, so a single loaded Linear
+/// has to cover the wider of `q_dim` and this. For the 27B both are 6144; for
+/// the 9B both are 4096. Deriving it keeps the loader correct on a checkpoint
+/// whose geometry differs, instead of relying on a literal that happens to
+/// match one of them.
+fn blk_value_dim(cfg: &Qwen35Config) -> usize {
+    // The reference sets `head_v_dim = d_inner / num_v_heads`, which equals
+    // `ssm_d_state` for this family: 48x128=6144 (27B) and 32x128=4096 (9B).
+    cfg.ssm_dt_rank.max(1) * cfg.ssm_d_state.max(1)
+}
+
 /// Per-head Q/K RMS norm, applied BEFORE MRoPE.
 ///
 /// `llama.cpp` qwen35.cpp normalizes Q and K with `attn_q_norm` /
