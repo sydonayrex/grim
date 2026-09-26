@@ -21,42 +21,113 @@ use grim_tensor::{DType, QuantProvenance, Result as TResult, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Minimal in-memory provider: f32 tensors named exactly as a Qwen35 recurrent
-/// layer expects, at the real widths.
+/// One weight in whichever dtype the checkpoint would actually carry.
+enum Rep {
+    F32(Vec<f32>, Vec<usize>),
+    Q4K(Vec<u8>, Vec<usize>),
+}
+
+impl Rep {
+    fn shape(&self) -> &[usize] {
+        match self {
+            Rep::F32(_, s) | Rep::Q4K(_, s) => s,
+        }
+    }
+
+    fn dtype(&self) -> DType {
+        match self {
+            Rep::F32(..) => DType {
+                arith: grim_tensor::ArithType::F32,
+                storage: Storage::Native,
+            },
+            Rep::Q4K(..) => DType {
+                arith: grim_tensor::ArithType::F32,
+                storage: Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K),
+            },
+        }
+    }
+}
+
+/// Minimal in-memory provider: tensors named exactly as a Qwen35 recurrent layer
+/// expects, at the real widths.
+///
+/// Matrices are packed to Q4_K rather than left f32, because that is what the
+/// real checkpoint carries and the difference decides whether this repro can
+/// cover the model's full depth. At f32 the 27B geometry costs 563 MB per layer
+/// and 65 layers ask for ~36.6 GB — more than twice a 17.1 GB card — which
+/// spilled to managed memory and failed a module load. At Q4_K the same tensors
+/// cost ~78 MB per layer, so all 65 layers fit in about 5.1 GB. One-dimensional
+/// norms and biases stay f32, as they do in the checkpoint: they are negligible
+/// in bytes, and their element counts are not multiples of the 256-element
+/// super-block.
 struct MapProvider {
-    tensors: HashMap<String, (Vec<f32>, Vec<usize>)>,
+    tensors: HashMap<String, Rep>,
+}
+
+/// Pack a weight into the dtype a real checkpoint would carry: 2-D projections
+/// as Q4_K super-blocks, 1-D norms and biases left as f32.
+fn rep(data: Vec<f32>, shape: Vec<usize>) -> Rep {
+    if shape.len() == 2 {
+        Rep::Q4K(
+            grim_quant::quant_q4k(&data).expect("Q4_K super-block packing"),
+            shape,
+        )
+    } else {
+        Rep::F32(data, shape)
+    }
 }
 
 impl TensorProvider for MapProvider {
     fn get(&self, name: &str) -> TResult<RawTensor> {
-        let (data, shape) = self
+        let rep = self
             .tensors
             .get(name)
             .ok_or_else(|| grim_tensor::Error::Backend(format!("no tensor {name}")))?;
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes: Vec<u8> = match rep {
+            Rep::F32(data, _) => data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            Rep::Q4K(bytes, _) => bytes.clone(),
+        };
         Ok(RawTensor {
             bytes,
-            shape: shape.clone(),
-            dtype: DType { arith: grim_tensor::ArithType::F32, storage: Storage::Native },
+            shape: rep.shape().to_vec(),
+            dtype: rep.dtype(),
             provenance: QuantProvenance::GrimNative,
         })
     }
 
     fn meta(&self, name: &str) -> TResult<TensorMeta> {
-        let (_d, shape) = self
+        let rep = self
             .tensors
             .get(name)
             .ok_or_else(|| grim_tensor::Error::Backend(format!("no tensor {name}")))?;
         Ok(TensorMeta {
-            dtype: DType { arith: grim_tensor::ArithType::F32, storage: Storage::Native },
+            dtype: rep.dtype(),
             provenance: QuantProvenance::GrimNative,
-            shape: shape.clone(),
+            shape: rep.shape().to_vec(),
             fusion_mask: 0,
         })
     }
 
     fn tensor_names(&self) -> Vec<String> {
         self.tensors.keys().cloned().collect()
+    }
+
+    /// The default shard path refuses quantized bytes outright, because a
+    /// super-block cannot be split at an arbitrary byte offset. These tests run
+    /// `TensorParallelConfig::default()` - world size 1 - where the shard is the
+    /// whole tensor and no slicing happens, so short-circuiting is exact rather
+    /// than a convenience. Multi-rank callers still get the library helper.
+    fn get_packed_sharded(
+        &self,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> TResult<RawTensor> {
+        if world_size <= 1 {
+            return self.get(name);
+        }
+        grim_tensor::provider::shard_raw_tensor(self.get(name)?, dim, rank, world_size)
     }
 }
 
@@ -96,10 +167,10 @@ fn single_recurrent_layer_forward_on_gpu() {
     let ssm_qkv_dim = 2 * key_dim + value_dim;
     eprintln!("[repro] ssm_qkv_dim={ssm_qkv_dim} (expect 10240)");
 
-    let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+    let mut tensors: HashMap<String, Rep> = HashMap::new();
     {
-        let mat = |rows: usize, cols: usize| (vec![0.1f32; rows * cols], vec![rows, cols]);
-        let vec1 = |n: usize| (vec![0.1f32; n], vec![n]);
+        let mat = |rows: usize, cols: usize| rep(vec![0.1f32; rows * cols], vec![rows, cols]);
+        let vec1 = |n: usize| rep(vec![0.1f32; n], vec![n]);
         tensors.insert("attn_norm.weight".into(), vec1(cfg.hidden_size));
         tensors.insert("post_attention_norm.weight".into(), vec1(cfg.hidden_size));
         tensors.insert("ssm_a".into(), vec1(cfg.ssm_dt_rank));
@@ -229,10 +300,10 @@ fn single_attention_layer_forward_on_gpu() {
     let q_dim = cfg.num_heads * cfg.head_dim; // 6144
     let kv_dim = cfg.num_kv_heads * cfg.head_dim; // 1024
 
-    let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+    let mut tensors: HashMap<String, Rep> = HashMap::new();
     {
-        let mat = |rows: usize, cols: usize| (vec![0.1f32; rows * cols], vec![rows, cols]);
-        let vec1 = |n: usize| (vec![0.1f32; n], vec![n]);
+        let mat = |rows: usize, cols: usize| rep(vec![0.1f32; rows * cols], vec![rows, cols]);
+        let vec1 = |n: usize| rep(vec![0.1f32; n], vec![n]);
         tensors.insert("attn_norm.weight".into(), vec1(cfg.hidden_size));
         tensors.insert("post_attention_norm.weight".into(), vec1(cfg.hidden_size));
         // The fused Q + gate projection, at the REAL width.
@@ -359,29 +430,38 @@ fn n_layer_stack_forward_on_gpu() {
 
     // Depth is bounded by what the card can actually hold, not hardcoded to 65.
     //
-    // The full 27B geometry in f32 is ~563 MB per layer, so 65 layers asks for
-    // ~36.6 GB - more than twice this card's 17.1 GB. While that was hardcoded,
-    // the over-subscription silently spilled to HIP managed memory (`storage.rs`
+    // This model was previously built in f32, which costs ~563 MB per layer at
+    // the 27B geometry, so 65 layers asked for ~36.6 GB on a 17.1 GB card. That
+    // over-subscription silently spilled to HIP managed memory (`storage.rs`
     // falls back to `hipMallocManaged` whenever `allocator.alloc` fails) and the
     // run died four minutes later with `hipModuleLoad 209` on whichever kernel
-    // happened to be loading at the time - `grim_silu_mul` before, `grim_rms_norm`
-    // after, which is a resource symptom and not a kernel-specific fault. The
-    // message it prints settles the arch question directly: `gpu_target=gfx1200,
-    // self.ordinal=1, ctx_device=1, ctx_arch=gfx1200, hsa_override=None`. The
-    // code object and the context agreed; 209 was reporting exhaustion.
+    // happened to be loading - `grim_silu_mul` before, `grim_rms_norm` after,
+    // which is a resource symptom and not a kernel-specific fault. The message
+    // settled the arch question directly: `gpu_target=gfx1200, self.ordinal=1,
+    // ctx_device=1, ctx_arch=gfx1200, hsa_override=None`. The code object and
+    // the context agreed; 209 was reporting exhaustion.
     //
-    // So measure the real per-layer footprint, run the deepest stack that
-    // genuinely fits, and say so when that is shallower than the model.
+    // The real checkpoint is Q4_K, and packing to it drops the footprint to
+    // ~78 MB per layer, so full 65-layer depth now fits (~5.1 GB) and this repro
+    // can finally guard the geometry the model actually has. The clamp stays as
+    // a guard: a card too small for the model should say so rather than spill.
     let per_layer_bytes: u64 = {
-        let f32s = |n: usize, m: usize| (n * m * 4) as u64;
-        f32s(2 * q_dim, cfg.hidden_size) // attn_q
-            + f32s(kv_dim, cfg.hidden_size) * 2 // attn_k, attn_v
-            + f32s(cfg.hidden_size, q_dim) // attn_output
-            + f32s(cfg.hidden_size, 48) * 2 // ssm_alpha, ssm_beta
-            + f32s(value_dim, cfg.hidden_size) // ssm_out
-            + f32s(cfg.ssm_d_conv, ssm_qkv_dim) // ssm_conv1d
-            + f32s(cfg.intermediate_size, cfg.hidden_size) * 2 // ffn_gate, ffn_up
-            + f32s(cfg.hidden_size, cfg.intermediate_size) // ffn_down
+        // 2-D projections are Q4_K: 144 bytes per 256-element super-block.
+        let q4k = |n: usize, m: usize| ((n * m).div_ceil(256) * 144) as u64;
+        // 1-D norms and biases stay f32, as they do in the checkpoint.
+        let f32v = |n: usize| (n * 4) as u64;
+        q4k(2 * q_dim, cfg.hidden_size) // attn_q
+            + q4k(kv_dim, cfg.hidden_size) * 2 // attn_k, attn_v
+            + q4k(cfg.hidden_size, q_dim) // attn_output
+            + q4k(cfg.hidden_size, 48) * 2 // ssm_alpha, ssm_beta
+            + q4k(value_dim, cfg.hidden_size) // ssm_out
+            + q4k(cfg.ssm_d_conv, ssm_qkv_dim) // ssm_conv1d
+            + q4k(cfg.intermediate_size, cfg.hidden_size) * 2 // ffn_gate, ffn_up
+            + q4k(cfg.hidden_size, cfg.intermediate_size) // ffn_down
+            + f32v(cfg.hidden_size) * 2 // attn_norm, post_attention_norm
+            + f32v(cfg.head_dim) * 2 // attn_q_norm, attn_k_norm
+            + f32v(48) * 2 // ssm_a, ssm_dt.bias
+            + f32v(cfg.ssm_d_state) // ssm_norm
     };
     let (free, total) = grim_backend_rocm::vram_info(1);
     // Headroom for the decode-graph KV/SSM arenas and activation scratch.
@@ -403,10 +483,10 @@ fn n_layer_stack_forward_on_gpu() {
     cfg.num_layers = n_layers;
 
     // Every tensor both layer types need, at the real widths.
-    let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+    let mut tensors: HashMap<String, Rep> = HashMap::new();
     {
-        let mat = |rows: usize, cols: usize| (vec![0.1f32; rows * cols], vec![rows, cols]);
-        let vec1 = |n: usize| (vec![0.1f32; n], vec![n]);
+        let mat = |rows: usize, cols: usize| rep(vec![0.1f32; rows * cols], vec![rows, cols]);
+        let vec1 = |n: usize| rep(vec![0.1f32; n], vec![n]);
         tensors.insert("attn_norm.weight".into(), vec1(cfg.hidden_size));
         tensors.insert("post_attention_norm.weight".into(), vec1(cfg.hidden_size));
         tensors.insert("attn_q.weight".into(), mat(2 * q_dim, cfg.hidden_size));
