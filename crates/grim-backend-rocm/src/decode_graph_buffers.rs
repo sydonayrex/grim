@@ -650,6 +650,10 @@ impl DecodeGraphBuffers {
         dk: usize,
         dv: usize,
     ) -> Result<()> {
+        // P1-3: the H2D copies below bind to the CALLING THREAD's current
+        // device. Pin `dev` for the whole call so a drifted thread cannot stage
+        // into another card's context.
+        let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
         if layer_idx >= self.gdl.len() {
             return Err(Error::Backend(format!(
                 "allocate_gdl_layer: layer {layer_idx} >= {}",
