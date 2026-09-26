@@ -884,7 +884,6 @@ impl Qwen35Block {
                 &mut out_branch,
                 seq_len,
                 branch_width,
-
             )?;
         }
 
@@ -1196,7 +1195,6 @@ fn gated_delta_net_forward(
     out_branch: &mut [f32],
     seq_len: usize,
     branch_width: usize,
-
 ) -> Result<()> {
     let n_val_heads = blk.cfg_ssm_num_value_heads();
     let n_key_heads = blk.cfg_ssm_num_key_heads();
@@ -1403,17 +1401,34 @@ fn gated_delta_net_forward(
             // The query is L2-normalized the same way, so the output depends on the
             // query DIRECTION rather than its magnitude.
             let q_slice = gdn_l2_norm(slice(q_off, head_dim), gdn_eps);
-            for i in 0..head_dim {
-                // state row i spans head_dim columns: S[i][0..head_dim]
+            // Pass 1: the raw head output, out[i] = q . S_new[i,:].
+            let mut acc = vec![0.0f32; head_dim];
+            for (i, slot) in acc.iter_mut().enumerate() {
                 let row = &cache.ssm_state[st_off + i * head_dim..st_off + (i + 1) * head_dim];
-                let mut acc = 0.0f32;
-                for j in 0..head_dim {
-                    acc += q_slice.get(j).copied().unwrap_or(0.0) * row[j];
+                let mut a = 0.0f32;
+                for (j, qj) in q_slice.iter().enumerate() {
+                    a += *qj * row[j];
                 }
+                *slot = a;
+            }
+            // Pass 2: RMS normalize the head output BEFORE the weight.
+            //
+            // The reference does `build_norm(input, weights, nullptr,
+            // LLM_NORM_RMS, layer)` then multiplies by the gate
+            // (qwen35.cpp:243-252). grim applied the norm WEIGHT alone, so the
+            // recurrent output reached `ssm_out` at whatever magnitude the
+            // state happened to hold - unbounded, and different per head, per
+            // layer and per token. The projection expects a normalized input.
+            //
+            // The norm is over the whole head (all `head_dim` elements), not
+            // per element, which is why this cannot be folded into pass 1.
+            let ss: f32 = acc.iter().map(|a| a * a).sum();
+            let inv_rms = 1.0 / ((ss / head_dim as f32) + gdn_eps).sqrt();
+            for (i, a) in acc.iter().enumerate() {
                 let w = norm_vec.get(i).copied().unwrap_or(1.0);
                 let out_idx = t * branch_width + h * head_dim + i;
                 if out_idx < out_branch.len() {
-                    out_branch[out_idx] = acc * w;
+                    out_branch[out_idx] = a * inv_rms * w;
                 }
             }
         }
