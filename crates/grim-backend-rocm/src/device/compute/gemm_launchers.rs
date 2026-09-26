@@ -703,8 +703,19 @@ impl RocmDevice {
     }
 
     /// SPEED-ROC: FP8 E4M3 WMMA GEMM launcher (RDNA4 only, 383 TFLOPS).
-    #[allow(dead_code)]
-    pub(crate) fn launch_wmma_gemm_fp8_e4m3(
+    ///
+    /// Deliberately NOT routed through `launch_wmma_fused_dequant_quant`. That
+    /// shared body launches the fused-dequant kernels, which use a 64-wide N
+    /// tile; `grim_wmma_gemm_fp8_e4m3` packs **two 16-wide** N tiles per block
+    /// (`tile_col_base = blockIdx.x * 2`, `col_base = tile_col_base * 16`, i.e.
+    /// `blockIdx.x * 32`). Launching it with `ceil(N/64)` covers only half the
+    /// output columns and silently leaves the rest unwritten.
+    ///
+    /// Block is 32, not 128: `mma_sync` and `store_matrix_sync` are per-wave
+    /// in rocwmma, so extra waves recompute the same tile and race on the same
+    /// shared `c_out`. The `256` in the kernel's store loop is the size of the
+    /// 16x16 output tile, not the block width.
+    pub fn launch_wmma_gemm_fp8_e4m3_for_ab(
         &self,
         a: &RocmStorage,
         b: &RocmStorage,
@@ -713,7 +724,53 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_gemm_fp8_e4m3", a, b, out, m, n, k)
+        const TILE_M: usize = 16;
+        const TILE_N: usize = 16;
+        /// N tiles handled per block; must match `blockIdx.x * 2` in the kernel.
+        const N_TILES_PER_BLOCK: usize = 2;
+        let n_per_block = TILE_N * N_TILES_PER_BLOCK;
+
+        let a_ptr = a.device_ptr
+            .ok_or_else(|| Error::Backend("wmma_fp8_e4m3: a has no device ptr".into()))?;
+        let b_ptr = b.device_ptr
+            .ok_or_else(|| Error::Backend("wmma_fp8_e4m3: b has no device ptr".into()))?;
+        let out_ptr = out.device_ptr
+            .ok_or_else(|| Error::Backend("wmma_fp8_e4m3: out has no device ptr".into()))?;
+
+        // rocwmma walks K in 16-element steps with no tail handling.
+        if k % 16 != 0 {
+            return Err(Error::Backend(format!(
+                "wmma_fp8_e4m3: K={k} must be divisible by 16"
+            )));
+        }
+
+        let grid_dim = HipDim3::new(
+            (n as u32).div_ceil(n_per_block as u32),
+            (m as u32).div_ceil(TILE_M as u32),
+            1,
+        );
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_gemm_fp8_e4m3",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
     }
 
     /// Shared launcher body for all WMMA fused-dequant quant GEMM kernels.
