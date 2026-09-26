@@ -543,6 +543,26 @@ impl BackendStorage for RocmStorage {
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
         let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let elem_count = self.shape.elem_count();
+        // A shape larger than the allocation makes every DtoH below read past
+        // the end of the mapping. That is not a wrong answer, it is a device
+        // page fault - and it surfaces far from its cause, attributed to
+        // whatever kernel happened to be resident rather than to the view that
+        // had the wrong extent. Checked before any branch so every dtype path
+        // is covered, including the quantized one that copies `self.bytes`.
+        //
+        // A 9B Qwen3.5 run faulted 196 KB past a [4096] f32 allocation: a large
+        // overrun, which is the signature of a size derived from a wrong shape
+        // rather than a loop bound being off by one.
+        let need = (elem_count as u64).saturating_mul(crate::dtype_byte_size(&self.dtype) as u64);
+        if need > self.bytes as u64 {
+            return Err(Error::Backend(format!(
+                "DtoH shape exceeds allocation: shape {:?} at {} bytes/elem needs {need} bytes, \
+                 but only {} are allocated",
+                self.shape,
+                crate::dtype_byte_size(&self.dtype),
+                self.bytes
+            )));
+        }
 
         // WI-M1 context discipline: every DtoH branch below issues a synchronous `hipMemcpy` against the calling thread's current device context.
         // Pin the owning ordinal so a drifted thread reads the right allocation (and so the.
