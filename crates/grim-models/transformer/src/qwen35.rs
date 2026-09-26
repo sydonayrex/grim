@@ -1699,7 +1699,30 @@ fn plan_layer_devices(
     let layer_bytes: Vec<u64> = (0..num_layers)
         .map(|i| ws.pp("blk").pp(&i.to_string()).prefix_bytes())
         .collect();
-    let (targets, unplaced) = assign_by_headroom(&layer_bytes, &mut remaining);
+
+    // Measured per-device capability, in `devices` order.
+    //
+    // Gated rather than always-on: `CapabilityProfiler::new()` runs a rocBLAS
+    // calibration GEMM and a malloc/free on every visible GPU, and this function
+    // is called *while* the loader is deciding how much VRAM it may spend. Doing
+    // that unconditionally would perturb the very free-VRAM numbers being read
+    // here, on a path that has not yet been run against real hardware. With the
+    // gate off every row is zero and `assign_by_headroom` degrades to exactly
+    // the headroom-only split it has always used.
+    let caps: Vec<grim_tensor::backend::GpuCapability> =
+        if std::env::var("GRIM_CAPABILITY_PLACEMENT").as_deref() == Ok("1") {
+            let measured = grim_backend_rocm::CapabilityProfiler::new().capabilities();
+            devices
+                .iter()
+                .map(|d| match d {
+                    Device::Rocm(ord) => measured.get(*ord).cloned().unwrap_or_default(),
+                    _ => Default::default(),
+                })
+                .collect()
+        } else {
+            vec![Default::default(); devices.len()]
+        };
+    let (targets, unplaced) = assign_by_headroom(&layer_bytes, &mut remaining, &caps);
     for t in targets {
         assignment.push(devices[t].clone());
     }
@@ -1730,30 +1753,61 @@ fn plan_layer_devices(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // How much of the model ended up host-backed. Managed memory is host RAM, so
+    // this is the number to compare against a host-memory delta observed during
+    // load: a delta much larger than this points at staging copies rather than
+    // at the spill itself. No-op when nothing spilled.
+    grim_backend_rocm::memory::budget::report_managed_fallback_summary();
     assignment
 }
 
-/// Greedy first-fit-decreasing-free placement: each layer goes to the device
-/// with the most remaining headroom, and `remaining` is decremented in place.
+/// Capacity- and capability-aware placement: each layer goes to the device that
+/// can hold it and has the most measured throughput to spend, and `remaining` is
+/// decremented in place.
+///
+/// `caps` is the per-device capability snapshot the in-bone capability system
+/// measures. Measured throughput is the primary key, so a card that is several
+/// times faster is preferred over an identical-VRAM slower one; remaining
+/// headroom only breaks throughput ties. That tie-break is what keeps the
+/// previous headroom-only behavior exactly when capability is uniform, or when
+/// no snapshot is available (a CPU device, or a backend that cannot measure),
+/// so the conservative default is unchanged rather than merely similar.
 ///
 /// Returns the chosen device index per layer plus the count of layers that did
 /// not fit anywhere (those are placed on device 0 and will fall back to managed
 /// memory). Pure function so placement can be unit-tested without a GPU.
-fn assign_by_headroom(layer_bytes: &[u64], remaining: &mut [u64]) -> (Vec<usize>, usize) {
+fn assign_by_headroom(
+    layer_bytes: &[u64],
+    remaining: &mut [u64],
+    caps: &[grim_tensor::backend::GpuCapability],
+) -> (Vec<usize>, usize) {
+    // Effective FP16 throughput. A throttled card advertises less than its peak,
+    // and a device with no measured row scores 0 rather than an invented number.
+    let throughput = |i: usize| -> f32 {
+        caps.get(i)
+            .map(|c| c.tflops_fp16 * (1.0 - c.throttle_pct))
+            .unwrap_or(0.0)
+    };
     let mut targets = Vec::with_capacity(layer_bytes.len());
     let mut unplaced = 0usize;
     for &bytes in layer_bytes {
-        let max_remaining = remaining.iter().copied().max().unwrap_or(0);
-        let target = if bytes <= max_remaining {
-            remaining
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, rem)| **rem)
-                .map(|(idx, _)| idx)
-                .unwrap_or(0)
-        } else {
-            unplaced += 1;
-            0
+        // A device is a candidate only if this layer actually fits on it.
+        let target = match (0..remaining.len())
+            .filter(|&i| bytes <= remaining[i])
+            .max_by(|&a, &b| {
+                throughput(a)
+                    .partial_cmp(&throughput(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| remaining[a].cmp(&remaining[b]))
+                    // `max_by` yields the LAST of several equal maxima, so
+                    // invert the index to make the lowest ordinal win a tie.
+                    .then_with(|| b.cmp(&a))
+            }) {
+            Some(idx) => idx,
+            None => {
+                unplaced += 1;
+                0
+            }
         };
         remaining[target] = remaining[target].saturating_sub(bytes);
         targets.push(target);
@@ -1834,6 +1888,44 @@ pub(crate) fn apply_rope_neox(
 mod tests {
     use super::*;
 
+    /// Uniform capability rows: every device measures identically, so placement
+    /// must fall back to the headroom-only split it used before capability was
+    /// part of the decision.
+    fn uniform_caps(n: usize) -> Vec<grim_tensor::backend::GpuCapability> {
+        vec![grim_tensor::backend::GpuCapability::default(); n]
+    }
+
+    /// Placement must follow the *measured* capability of each card, not only
+    /// how much free VRAM it has. Two cards with identical free VRAM but very
+    /// different FP16 throughput are not interchangeable, and a VRAM-only
+    /// heuristic cannot tell them apart: on the tie it splits 4/4 and puts the
+    /// same work on a 4x-slower GPU. This is the seam the in-bone capability
+    /// system exists to close - Scythe2 measures `GpuCapability`, and
+    /// `plan_layer_devices` was discarding every field of it except VRAM.
+    #[test]
+    fn placement_follows_measured_capability_not_only_free_vram() {
+        let layers = vec![100u64; 8];
+        let mut remaining = vec![1000u64, 1000];
+        let caps = vec![
+            grim_tensor::backend::GpuCapability {
+                tflops_fp16: 400.0,
+                ..Default::default()
+            },
+            grim_tensor::backend::GpuCapability {
+                tflops_fp16: 100.0,
+                ..Default::default()
+            },
+        ];
+        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
+        assert_eq!(unplaced, 0, "all 8 layers fit on the fast card alone");
+        let on0 = targets.iter().filter(|&&t| t == 0).count();
+        let on1 = targets.iter().filter(|&&t| t == 1).count();
+        assert!(
+            on0 > on1,
+            "the 4x-faster card should take strictly more layers, got {on0} vs {on1}"
+        );
+    }
+
     /// A missing tensor is the one case where trying the alternate name prefix
     /// is correct, so the fallback must run.
     #[test]
@@ -1886,7 +1978,8 @@ mod tests {
     fn placement_spreads_equal_layers_across_devices() {
         let layers = vec![100u64; 8];
         let mut remaining = vec![1000u64, 1000];
-        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        let caps = uniform_caps(remaining.len());
+        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
         assert_eq!(unplaced, 0);
         let on0 = targets.iter().filter(|&&t| t == 0).count();
         let on1 = targets.iter().filter(|&&t| t == 1).count();
@@ -1900,7 +1993,8 @@ mod tests {
     fn placement_flags_layers_that_exceed_all_headroom() {
         let layers = vec![100u64, 5000u64, 100u64];
         let mut remaining = vec![300u64, 300];
-        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        let caps = uniform_caps(remaining.len());
+        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
         assert_eq!(unplaced, 1, "the 5000-byte layer fits nowhere");
         assert_eq!(targets[1], 0, "unplaced layers fall back to device 0");
     }
@@ -1912,7 +2006,8 @@ mod tests {
         let layers = vec![100u64; 6];
         // Device 1 has 3x the room; it should take strictly more layers.
         let mut remaining = vec![500u64, 1500];
-        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        let caps = uniform_caps(remaining.len());
+        let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
         assert_eq!(unplaced, 0);
         let on0 = targets.iter().filter(|&&t| t == 0).count();
         let on1 = targets.iter().filter(|&&t| t == 1).count();
@@ -1927,7 +2022,8 @@ mod tests {
     fn placement_never_underflows_budget() {
         let layers = vec![400u64; 4];
         let mut remaining = vec![500u64, 10];
-        let (_targets, unplaced) = assign_by_headroom(&layers, &mut remaining);
+        let caps = uniform_caps(remaining.len());
+        let (_targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
         assert!(remaining.iter().all(|&r| r <= 500), "budgets must not wrap");
         let _ = unplaced;
     }
