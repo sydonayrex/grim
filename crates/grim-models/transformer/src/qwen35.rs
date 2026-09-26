@@ -146,7 +146,14 @@ impl Clone for Qwen35LayerCache {
 
 impl Qwen35LayerCache {
     pub fn new(cfg: &Qwen35Config) -> Self {
-        let conv_dim = cfg.hidden_size.max(cfg.ssm_d_inner) * 2;
+        // The short conv runs over the FUSED attn_qkv width of a recurrent
+        // layer, which is not the attention q+k+v width. Measured on
+        // Qwen3.8-27B: ssm_conv1d.weight is [10240, 4] and the derived layout is
+        // q 48*128 + k 16*128 + v 16*128 = 10240. The previous formula
+        // (`max(hidden, d_inner) * 2`) encodes an attention split that recurrent
+        // layers do not have, and over-allocates by 2048 per tap
+        // (36864 vs the 30720 required).
+        let conv_dim = (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state;
         let conv_size = (cfg.ssm_d_conv.max(1) - 1) * conv_dim;
         let ssm_size = cfg.ssm_n_group.max(1)
             * cfg.ssm_d_state.max(1)
