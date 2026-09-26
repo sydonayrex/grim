@@ -1633,7 +1633,16 @@ __device__ __forceinline__ unsigned char grim_f32_to_fp8_e4m3(float f) {
     if (__builtin_isnan(f)) return 0x7F;
     unsigned sign = __builtin_signbit(f) ? 0x80u : 0x00u;
     float a = __builtin_fabsf(f);
-    if (__builtin_isinf(a) || a >= 480.0f) return (unsigned char)(sign | 0x7E); // saturate to 448
+    // E4M3 has no infinities: exp=15,mant=7 (0x7F) is NaN and the largest
+    // finite value is exp=15,mant=6 (0x7E) = 1.75*2^8 = 448. Saturate at 448.
+    //
+    // This guard used to be 480.0, which is off by exactly one mantissa step.
+    // Any f32 in [448,480) has exponent field E=15, so its 3-bit mantissa q
+    // runs 0..7 -- and q==7 lands on 0x7F, the NaN slot. f32 in [464.01,480)
+    // therefore encoded to NaN, which then propagated through the f32 dot as
+    // NaN rather than as a saturated value. 448 is the correct threshold: the
+    // first f32 that would carry q past 6 is 464, well inside it.
+    if (__builtin_isinf(a) || a >= 448.0f) return (unsigned char)(sign | 0x7E); // saturate to 448
     unsigned bits;
     __builtin_memcpy(&bits, &a, 4);
     unsigned m = bits & 0x7FFFFFu;

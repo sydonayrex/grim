@@ -35,6 +35,10 @@
 //!   cargo test -p grim-backend-rocm --test precision_kernel_ab -- --ignored --nocapture
 //! ```
 
+#[path = "precision_kernel_ab/e4m3.rs"]
+mod e4m3;
+use e4m3::{from_e4m3, to_e4m3_rne};
+
 use grim_backend_rocm::precision_ab::*;
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{
@@ -119,80 +123,6 @@ fn rocm(t: &dyn grim_tensor::BackendStorage) -> &grim_backend_rocm::RocmStorage 
 }
 
 // ---------------------------------------------------------------- packers --
-
-/// f32 -> E4M3, round-to-nearest-even. Mirrors `grim_f32_to_fp8_e4m3` in
-/// dot_gemv.rs: a different rounding here would make the accuracy gate measure
-/// the packer instead of the kernel.
-fn to_e4m3_rne(f: f32) -> u8 {
-    if f.is_nan() {
-        return 0x7F;
-    }
-    let sign: u8 = if f.is_sign_negative() { 0x80 } else { 0 };
-    let a = f.abs();
-    if a.is_infinite() || a >= 480.0 {
-        return sign | 0x7E; // saturate to 448
-    }
-    let bits = a.to_bits();
-    let m = bits & 0x7FFFFF;
-    let e = ((bits >> 23) & 0xFF) as i32;
-    if e == 0 {
-        return sign;
-    }
-    let mut ee = e - 120; // E4M3 bias 7
-    if ee >= 1 {
-        let mut q = m >> 20;
-        let r = m & 0xFFFFF;
-        if r > 0x80000 || (r == 0x80000 && q & 1 == 1) {
-            q += 1;
-        }
-        if q == 8 {
-            q = 0;
-            ee += 1;
-        }
-        if ee > 15 {
-            return sign | 0x7E;
-        }
-        return sign | ((ee as u8) << 3) | q as u8;
-    }
-    let sh = 21 - ee;
-    // The device does `mant >> sh` and `1u << sh` in 32-bit, where sh reaches
-    // 140 for small f32 and `1u << sh` is undefined. In u64 the shift is still
-    // out of range, but the result is pinned: for sh >= 25, q = 0 and
-    // r = mant < 2^24 = half, so the round-up branch can never fire and the
-    // correct answer is always zero. sh == 24 must NOT be folded in here --
-    // mant > 0x800000 there does round up to the min subnormal.
-    if sh >= 25 {
-        return sign;
-    }
-    let mant = 0x800000u64 | m as u64;
-    let mut q = mant >> sh;
-    let r = mant & ((1u64 << sh) - 1);
-    let half = 1u64 << (sh - 1);
-    if r > half || (r == half && q & 1 == 1) {
-        q += 1;
-    }
-    if q == 0 {
-        return sign;
-    }
-    sign | q as u8
-}
-
-/// Mirror of the device's `fp8_e4m3_to_float_hip`, which the crate also carries
-/// privately in `memory/storage.rs`. A separate decode would put packer error
-/// and unpacker error in the same residual, hiding a real kernel regression.
-fn from_e4m3(v: u8) -> f32 {
-    if v == 0x7F || v == 0xFF {
-        return f32::NAN;
-    }
-    let sign = if v & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
-    let e = (v >> 3) & 0x0F;
-    let m = v & 0x07;
-    if e == 0 {
-        sign * m as f32 * (1.0 / 512.0)
-    } else {
-        sign * (1.0 + m as f32 / 8.0) * ((e as i32 - 7) as f32).exp2()
-    }
-}
 
 /// Q8_0: 34 B per 32 values — f16 scale then 32 int8 codes.
 fn pack_q8_0(vals: &[f32]) -> Vec<u8> {
