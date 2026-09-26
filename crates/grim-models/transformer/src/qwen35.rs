@@ -2439,4 +2439,152 @@ mod tests {
         assert_ne!(a, bare, "output must be q . S, not q[i] * norm[i]");
     }
 
+
+    /// A recurrent layer's OUTPUT must depend on the recurrent state, not just on
+    /// the query. This is the guard that the kernel-level parity tests cannot
+    /// provide: they exercise `kda_gated_delta_rule_row` directly and would pass
+    /// even if `gated_delta_net_forward` computed the correct state update and
+    /// then emitted `q * norm` as the layer output — which is exactly the bug
+    /// that shipped in 86374fc9 and was not caught until review.
+    ///
+    /// It drives a real recurrent layer's `forward` twice with identical inputs
+    /// and a warm vs cold cache. The inputs and weights are identical, so any
+    /// output difference is attributable to the state alone.
+    #[test]
+    fn recurrent_layer_output_depends_on_state() {
+        let mut cfg = Qwen35Config::default();
+        cfg.vocab_size = 8;
+        cfg.hidden_size = 5120;
+        cfg.num_heads = 24;
+        cfg.num_kv_heads = 4;
+        cfg.head_dim = 256;
+        cfg.num_layers = 65;
+        cfg.intermediate_size = 256;
+        cfg.full_attention_interval = 4;
+        cfg.ssm_d_conv = 4;
+        cfg.ssm_d_inner = 6144;
+        cfg.ssm_d_state = 128;
+        cfg.ssm_dt_rank = 48;
+        cfg.ssm_n_group = 16;
+        cfg.ssm_n_group = 16;
+
+        let b = |r: usize, c: usize| -> Tensor {
+            cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c]))
+        };
+        let value_dim = cfg.ssm_dt_rank * cfg.ssm_d_state;
+        let key_dim = cfg.ssm_n_group * cfg.ssm_d_state;
+        let ssm_qkv_dim = 2 * key_dim + value_dim;
+
+        let blk = Qwen35Block {
+            device: Device::Cpu,
+            layer_idx: 0, // (0+1) % 4 != 0 -> recurrent
+            num_heads: cfg.num_heads,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+            rotary_dim: cfg.head_dim,
+            rope_theta: cfg.rope_theta,
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            is_full_attention: false,
+            attn_norm: RmsNorm::new(
+                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cfg.rms_norm_eps,
+            ),
+            wq: None,
+            wk: None,
+            wv: None,
+            wo: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            attn_qkv: Some(Linear::from_tensor(
+                b(ssm_qkv_dim, cfg.hidden_size),
+                None,
+            )),
+            attn_gate: None,
+            ssm_out: Some(Linear::from_tensor(
+                b(cfg.hidden_size, value_dim),
+                None,
+            )),
+            ssm_conv1d: None,
+            ssm_conv_vec: None,
+            ssm_a: Some(vec![0.5; cfg.ssm_dt_rank]),
+            ssm_alpha: Some(Linear::from_tensor(b(cfg.ssm_dt_rank, cfg.hidden_size), None)),
+            ssm_beta: Some(Linear::from_tensor(b(cfg.ssm_dt_rank, cfg.hidden_size), None)),
+            ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
+            ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_rank_hint: cfg.ssm_dt_rank,
+            ssm_n_group_hint: cfg.ssm_n_group,
+            ssm_d_state_hint: cfg.ssm_d_state,
+            ssm_d_conv_hint: cfg.ssm_d_conv,
+            wqkv_q80_fused: None,
+            w_gate_up_q4k_fused: None,
+            post_attention_norm: RmsNorm::new(
+                cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                cfg.rms_norm_eps,
+            ),
+            ffn_gate: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_up: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_down: Linear::from_tensor(b(cfg.hidden_size, cfg.intermediate_size), None),
+        };
+
+        let x = cpu_tensor(
+            vec![0.1; cfg.hidden_size],
+            Shape::new(vec![1, cfg.hidden_size]),
+        );
+
+        // Cold cache: no history.
+        let mut cold = Qwen35LayerCache::new(&cfg);
+        let out_cold = blk.forward(&x, &[0], &mut cold).expect("cold forward");
+
+        // Warm cache: the SAME state buffer pre-filled, so the only difference
+        // is the recurrent history.
+        let mut warm = Qwen35LayerCache::new(&cfg);
+        for v in warm.ssm_state.iter_mut() {
+            *v = 0.05;
+        }
+        let out_warm = blk.forward(&x, &[0], &mut warm).expect("warm forward");
+
+        let a = out_cold.to_vec_f32().expect("read cold");
+        let b = out_warm.to_vec_f32().expect("read warm");
+        assert_eq!(a.len(), b.len(), "outputs must be comparable");
+        assert_ne!(
+            a, b,
+            "a recurrent layer's output must depend on its state; identical \
+             outputs mean the state is written but never read"
+        );
+    }
+
+
+    /// LIVE guard for the recurrent conv-state size: builds a real
+    /// `Qwen35LayerCache` and asserts it matches the fused qkv width derived
+    /// from the checkpoint.
+    ///
+    /// The companion test in grim-nn restates the geometry as literals; this one
+    /// calls the constructor, so a regression in the sizing formula is caught.
+    #[test]
+    fn recurrent_conv_state_is_sized_for_fused_qkv() {
+        let mut cfg = Qwen35Config::default();
+        cfg.hidden_size = 5120;
+        cfg.num_layers = 65;
+        cfg.ssm_d_conv = 4;
+        cfg.ssm_d_inner = 6144;
+        cfg.ssm_d_state = 128;
+        cfg.ssm_dt_rank = 48; // num_value_heads
+        cfg.ssm_n_group = 16; // num_key_heads
+        cfg.ssm_n_group = 16;
+
+        let cache = Qwen35LayerCache::new(&cfg);
+        // fused qkv width = 2 * key_dim + value_dim
+        let key_dim = cfg.ssm_n_group * cfg.ssm_d_state;
+        let value_dim = cfg.ssm_dt_rank * cfg.ssm_d_state;
+        let expected = (cfg.ssm_d_conv - 1) * (2 * key_dim + value_dim);
+        assert_eq!(2 * key_dim + value_dim, 10240, "measured attn_qkv width");
+        assert_eq!(
+            cache.conv_state.len(),
+            expected,
+            "conv state must be (d_conv-1) * fused qkv width"
+        );
+        assert_eq!(expected, 30720);
+    }
+
 }
