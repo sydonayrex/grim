@@ -992,8 +992,19 @@ impl RocmDevice {
         let entry_c = std::ffi::CString::new(lowered_name.as_str())
             .map_err(|e| Error::Backend(format!("entry CString: {}", e)))?;
 
-        // Load the HIP module once per unique kernel; reuse the cached module + Pin the current device to self.ordinal before loading: the JIT pipeline queries CapabilityProfiler which sweeps every device and can leave the thread on a foreign ordinal.
-        // Loading a gfx1201 hsaco on gfx1200 yields HIP error 209 (no binary for device).
+        // Load the HIP module once per unique kernel; reuse the cached module +
+        // Pin the current device to self.ordinal before loading.
+        //
+        // This guard is correct but is NOT the explanation for status 209. A
+        // measured failure on ordinal 1 printed `gpu_target=gfx1200,
+        // self.ordinal=1, ctx_device=1, ctx_arch=gfx1200, hsa_override=None` -
+        // code object, cached ordinal and real context all agreed, with the
+        // request asking for ~36 GB on a 17.1 GB card. 209 there was the driver
+        // failing to materialize a code object under VRAM exhaustion, reported
+        // through the "no binary for gpu" code, and the failing entry moved
+        // between runs (grim_silu_mul, then grim_rms_norm) which an arch fault
+        // would not do. Check the bytes, not just the ordinals, before blaming
+        // the context.
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         self.stamp_launch_post_pin(trace_on, entry, grid);
         let mut module_cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -1007,22 +1018,29 @@ impl RocmDevice {
             let mut module: *mut c_void = std::ptr::null_mut();
             let load_res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
             if load_res != hipSuccess {
-                // Report the real HIP context, not just our cached ordinal: a
-                // mismatch here means the thread was not actually on `self.ordinal`,
-                // which is how a `gfx1201` object gets loaded on `gfx1200` (status 209).
+                // Report the real HIP context alongside the cached ordinal, and
+                // free VRAM alongside both. When these agree (`ctx_device ==
+                // self.ordinal`, `ctx_arch == gpu_target`) the 209 is not a
+                // context problem - look at how much memory was being asked for.
                 let mut ctx_dev: i32 = -1;
                 unsafe {
                     let _ = crate::device::handles::hipGetDevice(&mut ctx_dev);
                 }
                 let ctx_arch = crate::device::util::detect_gpu_arch(ctx_dev);
                 let hsa_override = std::env::var("HSA_OVERRIDE_GFX_VERSION").ok();
+                let (vram_free, vram_total) = crate::vram_info(self.ordinal);
+                let spilled = crate::memory::budget::managed_fallback_bytes();
                 return Err(Error::Backend(format!(
                     "hipModuleLoad failed: {load_res} (entry={entry}, path={}, \
                      gpu_target={}, self.ordinal={}, ctx_device={ctx_dev}, \
-                     ctx_arch={ctx_arch}, hsa_override={hsa_override:?})",
+                     ctx_arch={ctx_arch}, hsa_override={hsa_override:?}, \
+                     vram_free={:.2}/{:.2} GB, managed_fallback={:.2} GB)",
                     path.display(),
                     self.gpu_target,
-                    self.ordinal
+                    self.ordinal,
+                    vram_free as f64 / 1e9,
+                    vram_total as f64 / 1e9,
+                    spilled as f64 / 1e9
                 )));
             }
             let mut func: *mut c_void = std::ptr::null_mut();
