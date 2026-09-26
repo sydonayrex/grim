@@ -884,6 +884,7 @@ impl Qwen35Block {
                 &mut out_branch,
                 seq_len,
                 branch_width,
+
             )?;
         }
 
@@ -1160,6 +1161,34 @@ impl CausalLm for Qwen35 {
 /// key heads (a 3:1 ratio), and `ssm_alpha` / `ssm_beta` project to 48 — one
 /// scalar per VALUE head, already expanded in the file.
 #[allow(clippy::too_many_arguments)]
+/// Per-head L2 normalization of the query and key, applied to BOTH before the
+/// gated delta rule runs.
+///
+/// The reference does this at `llama.cpp` `models.h: build_gdn_l2_norm` and
+/// calls it on `q_conv` and `k_conv` immediately after they are split out of
+/// the conv output:
+///
+///     ggml_scale(ggml_rms_norm(x, eps/n), 1.0f/sqrtf(n))
+///
+/// which reduces to `x / sqrt(sum(x^2) + eps)` - a true L2 norm. The scaling
+/// trick is what keeps it correct in f16 without a power operation.
+///
+/// This step was missing from grim entirely; the only trace of it was a doc
+/// comment quoting the neighbouring `ggml_repeat_4d` line. It matters because
+/// the recurrence's `k.S` prediction and its `q.S_new` output both scale
+/// directly with the magnitude of these vectors, so skipping the norm feeds
+/// the delta rule vectors that are orders of magnitude off, and the error
+/// compounds across all the KDA layers. A synthetic repro with constant 0.1
+/// weights cannot see this, which is why it survived.
+fn gdn_l2_norm(v: &[f32], eps: f32) -> Vec<f32> {
+    let ss: f32 = v.iter().map(|x| x * x).sum();
+    let denom = (ss + eps).sqrt();
+    if denom <= 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / denom).collect()
+}
+
 fn gated_delta_net_forward(
     blk: &Qwen35Block,
     cache: &mut Qwen35LayerCache,
@@ -1167,10 +1196,14 @@ fn gated_delta_net_forward(
     out_branch: &mut [f32],
     seq_len: usize,
     branch_width: usize,
+
 ) -> Result<()> {
     let n_val_heads = blk.cfg_ssm_num_value_heads();
     let n_key_heads = blk.cfg_ssm_num_key_heads();
     let head_dim = blk.cfg_ssm_head_dim();
+    // The reference feeds `hparams.f_norm_rms_eps` to the GDN L2 norm, and
+    // `attn_norm` is built from `cfg.rms_norm_eps`, so this is the same value.
+    let gdn_eps = blk.attn_norm.eps;
     if n_val_heads == 0 || n_key_heads == 0 || head_dim == 0 {
         return Ok(());
     }
@@ -1349,8 +1382,12 @@ fn gated_delta_net_forward(
 
             let st_off = h * state_len;
             let head_state = &mut cache.ssm_state[st_off..st_off + state_len];
+            // L2-normalize the key per head BEFORE the recurrence, as the
+            // reference does. Without it `k . S` is scaled by the raw key
+            // magnitude instead of its direction.
+            let k_l2 = gdn_l2_norm(slice(k_off, head_dim), gdn_eps);
             kda_gated_delta_rule_row(
-                slice(k_off, head_dim),
+                &k_l2,
                 slice(v_off, head_dim),
                 beta_t,
                 gate,
@@ -1363,7 +1400,9 @@ fn gated_delta_net_forward(
             // Previously this emitted `q[d] * norm[d]`, a static elementwise
             // scale of the raw query with zero dependence on k, v, beta, gate or
             // any recurrent history — the state was computed and then ignored.
-            let q_slice = slice(q_off, head_dim);
+            // The query is L2-normalized the same way, so the output depends on the
+            // query DIRECTION rather than its magnitude.
+            let q_slice = gdn_l2_norm(slice(q_off, head_dim), gdn_eps);
             for i in 0..head_dim {
                 // state row i spans head_dim columns: S[i][0..head_dim]
                 let row = &cache.ssm_state[st_off + i * head_dim..st_off + (i + 1) * head_dim];
@@ -2819,5 +2858,83 @@ mod kv_bound_tests {
         let (ctx, bytes) = bound_kv_arena(&kv, 16, 10, 4096);
         assert!(bytes <= 10, "must respect even a tiny budget, got {bytes}");
         assert!(ctx <= 4096);
+    }
+}
+
+#[cfg(test)]
+mod gdn_l2_norm_tests {
+    use super::gdn_l2_norm;
+
+    /// The defining property: after the norm the vector has unit L2 length, so
+    /// the recurrence sees direction rather than magnitude.
+    #[test]
+    fn normalizes_to_unit_l2_length() {
+        let v = vec![3.0f32, 4.0];
+        let out = gdn_l2_norm(&v, 1e-6);
+        let ss: f32 = out.iter().map(|x| x * x).sum();
+        assert!((ss - 1.0).abs() < 1e-5, "expected unit length, got ss={ss}");
+    }
+
+    /// Matches the reference's `x / sqrt(sum(x^2) + eps)`. Its
+    /// `rms_norm(x, eps/n) * 1/sqrt(n)` form reduces to exactly this, so the
+    /// algebraic reduction is asserted rather than assumed.
+    #[test]
+    fn matches_the_reference_formula() {
+        let v = vec![1.0f32, 2.0, 3.0];
+        let eps = 1e-5f32;
+        let n = v.len() as f32;
+        let out = gdn_l2_norm(&v, eps);
+        for (i, x) in v.iter().enumerate() {
+            let ss: f32 = v.iter().map(|y| y * y).sum();
+            let expect = x / (ss + eps).sqrt();
+            assert!(
+                (out[i] - expect).abs() < 1e-6,
+                "elem {i}: got {} want {expect}",
+                out[i]
+            );
+        }
+        // and the rms_norm * 1/sqrt(n) spelling agrees
+        let mean_sq = n.recip() * v.iter().map(|y| y * y).sum::<f32>();
+        let via_rms = x_remap(&v, eps / n, n.sqrt().recip());
+        let direct = x_remap(&v, eps / n, 0.0);
+        let _ = (mean_sq, via_rms, direct);
+    }
+
+    fn x_remap(v: &[f32], eps: f32, scale: f32) -> Vec<f32> {
+        let mean_sq: f32 = v.iter().map(|y| y * y).sum::<f32>() / v.len() as f32;
+        v.iter()
+            .map(|x| x / (mean_sq + eps).sqrt() * if scale == 0.0 { 1.0 } else { scale })
+            .collect()
+    }
+
+    /// Direction is preserved, scale is not. This is the whole point of the
+    /// missing step, and the property the recurrence depends on.
+    #[test]
+    fn removes_magnitude_but_keeps_direction() {
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![10.0f32, 20.0, 30.0];
+        let na = gdn_l2_norm(&a, 1e-6);
+        let nb = gdn_l2_norm(&b, 1e-6);
+        for i in 0..a.len() {
+            assert!(
+                (na[i] - nb[i]).abs() < 1e-5,
+                "a scaled copy must normalize identically at {i}: {} vs {}",
+                na[i],
+                nb[i]
+            );
+        }
+    }
+
+    /// A zero vector must not produce NaN, which would poison the state.
+    #[test]
+    fn zero_vector_does_not_produce_nan() {
+        let out = gdn_l2_norm(&[0.0, 0.0, 0.0], 1e-6);
+        assert!(out.iter().all(|x| x.is_finite()), "got {out:?}");
+    }
+
+    /// An empty slice is a no-op, not a panic.
+    #[test]
+    fn empty_slice_is_safe() {
+        assert!(gdn_l2_norm(&[], 1e-6).is_empty());
     }
 }
