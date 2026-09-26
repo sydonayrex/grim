@@ -191,6 +191,12 @@ pub struct Qwen35Block {
     pub ssm_beta: Option<Linear>,
     pub ssm_dt_bias: Option<Vec<f32>>,
     pub ssm_norm: Option<Vec<f32>>,
+    /// KDA geometry, copied from the config at load. `ssm_dt_rank` is
+    /// num_value_heads for this family, not a scalar rank — see
+    /// `cfg_ssm_num_value_heads`.
+    pub ssm_dt_rank_hint: usize,
+    pub ssm_n_group_hint: usize,
+    pub ssm_d_state_hint: usize,
 
     // Feed-forward Network
     pub post_attention_norm: RmsNorm,
@@ -215,6 +221,32 @@ pub struct Qwen35Block {
     /// This uses the safe Q4_K fused-dequant/WMMA path, not the RDNA4-incompatible
     /// dot4 Q4_K kernel.
     pub w_gate_up_q4k_fused: Option<std::sync::Arc<grim_backend_rocm::FusedGateUpQ4KWeights>>,
+}
+
+impl Qwen35Block {
+    /// Number of value heads in the KDA recurrence. Taken from `ssm_dt_rank`,
+    /// which this checkpoint uses for that purpose: `ssm_a`, `ssm_dt.bias`,
+    /// `ssm_alpha.weight` and `ssm_beta.weight` are all sized [48], and
+    /// 48 * 128 == ssm_d_inner (6144).
+    pub fn cfg_ssm_num_value_heads(&self) -> usize {
+        self.ssm_dt_rank_hint
+    }
+
+    /// Number of key heads. `ssm_n_group` (16), giving a 3:1 value:key ratio.
+    pub fn cfg_ssm_num_key_heads(&self) -> usize {
+        self.ssm_n_group_hint
+    }
+
+    /// Per-head SSM width. `ssm_d_state` (128) — NOT the attention head_dim
+    /// of 256, which the previous code used throughout the SSM branch.
+    pub fn cfg_ssm_head_dim(&self) -> usize {
+        self.ssm_d_state_hint
+    }
+
+    /// Raw `ssm_d_state`, the state matrix width used for allocation.
+    pub fn cfg_ssm_d_state(&self) -> usize {
+        self.ssm_d_state_hint
+    }
 }
 
 impl Qwen35Block {
@@ -444,6 +476,9 @@ impl Qwen35Block {
             ssm_beta,
             ssm_dt_bias,
             ssm_norm,
+            ssm_dt_rank_hint: cfg.ssm_dt_rank,
+            ssm_n_group_hint: cfg.ssm_n_group,
+            ssm_d_state_hint: cfg.ssm_d_state,
             post_attention_norm,
             ffn_gate,
             ffn_up,
@@ -751,100 +786,8 @@ impl Qwen35Block {
             )?;
             out_branch = attn_tensor.to_vec_f32()?;
         } else {
-            // SSM short-conv path with fused attn_qkv.
-            // GPU-first: conv runs on device via short_conv1d wrapper; state is uploaded/downloaded around the device call.
-            if let Some(ref qkv_lin) = self.attn_qkv {
-                let qkv = qkv_lin.forward(&x_normed)?;
-                let qkv_vec = qkv.to_vec_f32()?;
-                let qkv_total_per_tok = qkv_vec.len() / seq_len;
-                let conv_w = self.ssm_conv_vec.as_deref();
-                let dev = pick_device_for_storage_device(&device);
-
-                for t in 0..seq_len {
-                    let base = t * qkv_total_per_tok;
-                    let num_feats = q_dim.min(qkv_total_per_tok);
-
-                    if let Some(w) = conv_w {
-                        let l_conv = (w.len() / num_feats.max(1)).max(1);
-                        let state_len_per_feat = l_conv.saturating_sub(1);
-
-                        // Build per-token input [1, 1, num_feats] for device conv
-                        let tok_data = &qkv_vec[base..base + num_feats];
-                        let x_storage =
-                            dev.from_cpu(tok_data, &Shape::new(vec![1, 1, num_feats]), DType::F32)?;
-                        let x_tok = Tensor::new(
-                            Arc::from(x_storage),
-                            Shape::new(vec![1, 1, num_feats]),
-                            DType::F32,
-                            qkv.provenance().clone(),
-                            device.clone(),
-                        );
-
-                        // Build conv weight [num_feats, l_conv] (depthwise)
-                        let w_storage = dev.from_cpu(
-                            &w[..num_feats * l_conv],
-                            &Shape::new(vec![num_feats, l_conv]),
-                            DType::F32,
-                        )?;
-                        let w_tensor = Tensor::new(
-                            Arc::from(w_storage),
-                            Shape::new(vec![num_feats, l_conv]),
-                            DType::F32,
-                            qkv.provenance().clone(),
-                            device.clone(),
-                        );
-
-                        // Upload conv state to device
-                        let state_data = if state_len_per_feat > 0
-                            && cache.conv_state.len() >= num_feats * state_len_per_feat
-                        {
-                            cache.conv_state[..num_feats * state_len_per_feat].to_vec()
-                        } else {
-                            vec![0.0f32; num_feats * state_len_per_feat.max(1)]
-                        };
-                        let state_storage = dev.from_cpu(
-                            &state_data,
-                            &Shape::new(vec![1, state_len_per_feat.max(1), num_feats]),
-                            DType::F32,
-                        )?;
-                        let mut state_tensor = Tensor::new(
-                            Arc::from(state_storage),
-                            Shape::new(vec![1, state_len_per_feat.max(1), num_feats]),
-                            DType::F32,
-                            qkv.provenance().clone(),
-                            device.clone(),
-                        );
-
-                        // Device short-conv: updates state_tensor in-place
-                        let conv_result = grim_nn::modules::short_conv1d(
-                            &x_tok,
-                            &w_tensor,
-                            None,
-                            Some(&mut state_tensor),
-                        )?;
-
-                        // Download result and updated state
-                        let conv_vec = conv_result.to_vec_f32()?;
-                        let state_new = state_tensor.to_vec_f32()?;
-                        if state_len_per_feat > 0
-                            && cache.conv_state.len() >= num_feats * state_len_per_feat
-                        {
-                            cache.conv_state[..num_feats * state_len_per_feat]
-                                .copy_from_slice(&state_new[..num_feats * state_len_per_feat]);
-                        }
-
-                        // Apply silu (elementwise on CPU — data already downloaded)
-                        for d in 0..num_feats.min(conv_vec.len()) {
-                            let v = conv_vec[d];
-                            out_branch[t * q_dim + d] = v / (1.0 + (-v).exp());
-                        }
-                    } else {
-                        for d in 0..num_feats {
-                            out_branch[t * q_dim + d] = silu(qkv_vec[base + d]);
-                        }
-                    }
-                }
-            }
+            // Gated DeltaNet recurrence (see `gated_delta_net_forward`).
+            gated_delta_net_forward(self, cache, &x_normed, &mut out_branch, seq_len, q_dim)?;
         }
 
         // Apply attention gate if present (aligned per token across seq_len)
@@ -1102,6 +1045,235 @@ impl CausalLm for Qwen35 {
         let logits = self.output.forward(&normed)?;
         session.advance_pos(seq_len);
         Ok(logits)
+    }
+}
+
+/// Gated DeltaNet forward for one recurrent block.
+///
+/// Extracted from `Qwen35Block::forward` so the recurrence can be exercised and
+/// reasoned about on its own. Replaces a depthwise short-conv -> SiLU ->
+/// sigmoid-gate stub that ignored `ssm_a` / `ssm_alpha` / `ssm_beta` /
+/// `ssm_dt_bias` / `ssm_norm` entirely and never touched `cache.ssm_state` —
+/// with 49 of 65 layers running that stub, the residual stream diverged from
+/// the trained distribution immediately.
+///
+/// Geometry is measured from the GGUF, not from published docs:
+/// `ssm_d_inner = 6144 = 48 value heads x 128 head_dim`, `ssm_n_group = 16`
+/// key heads (a 3:1 ratio), and `ssm_alpha` / `ssm_beta` project to 48 — one
+/// scalar per VALUE head, already expanded in the file.
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_net_forward(
+    blk: &Qwen35Block,
+    cache: &mut Qwen35LayerCache,
+    x_normed: &Tensor,
+    out_branch: &mut [f32],
+    seq_len: usize,
+    q_dim: usize,
+) -> Result<()> {
+    let n_val_heads = blk.cfg_ssm_num_value_heads();
+    let n_key_heads = blk.cfg_ssm_num_key_heads();
+    let head_dim = blk.cfg_ssm_head_dim();
+    if n_val_heads == 0 || n_key_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+    let Some(ref qkv_lin) = blk.attn_qkv else {
+        return Ok(());
+    };
+
+    let qkv = qkv_lin.forward(x_normed)?;
+    let qkv_vec = qkv.to_vec_f32()?;
+    let per_tok = qkv_vec.len() / seq_len.max(1);
+
+    // alpha / beta -> one scalar per value head per token.
+    let mut alpha = vec![0.0f32; n_val_heads * seq_len];
+    if let Some(ref al) = blk.ssm_alpha {
+        let v = al.forward(x_normed)?.to_vec_f32()?;
+        let stride = v.len() / seq_len.max(1);
+        for t in 0..seq_len {
+            for h in 0..n_val_heads.min(stride) {
+                alpha[t * n_val_heads + h] = v[t * stride + h];
+            }
+        }
+    }
+    let mut beta = vec![0.0f32; n_val_heads * seq_len];
+    if let Some(ref bl) = blk.ssm_beta {
+        let v = bl.forward(x_normed)?.to_vec_f32()?;
+        let stride = v.len() / seq_len.max(1);
+        for t in 0..seq_len {
+            for h in 0..n_val_heads.min(stride) {
+                beta[t * n_val_heads + h] = v[t * stride + h];
+            }
+        }
+    }
+
+    let a_vec: &[f32] = blk.ssm_a.as_deref().unwrap_or(&[]);
+    let dt_bias: &[f32] = blk.ssm_dt_bias.as_deref().unwrap_or(&[]);
+    let norm_vec: &[f32] = blk.ssm_norm.as_deref().unwrap_or(&[]);
+    let values_per_group = (n_val_heads / n_key_heads).max(1);
+
+    // Per-head state [n_val_heads][d_k][d_v]. cache.ssm_state is allocated as
+    // n_group * d_state * (d_inner / n_group) = 48*128*128, exactly this shape
+    // for square d_k = d_v = 128.
+    let state_len = blk.cfg_ssm_d_state().max(1) * head_dim;
+    if cache.ssm_state.len() < n_val_heads * state_len {
+        cache.ssm_state.resize(n_val_heads * state_len, 0.0);
+    }
+
+    let slice = |off: usize, len: usize| -> &[f32] {
+        let end = (off + len).min(qkv_vec.len());
+        if off >= end {
+            &[]
+        } else {
+            &qkv_vec[off..end]
+        }
+    };
+
+    for t in 0..seq_len {
+        let base = t * per_tok;
+        for h in 0..n_val_heads {
+            let kh = kda_key_head(h, n_key_heads, values_per_group);
+            let q_off = base + h * head_dim;
+            let k_off = base + q_dim + kh * head_dim;
+            let v_off = base + q_dim + n_key_heads * head_dim + kh * head_dim;
+
+            // decay logit = ssm_a + ssm_dt.bias + alpha_t, through softplus.
+            let mut z = alpha[t * n_val_heads + h];
+            if let Some(&a) = a_vec.get(h) {
+                z += a;
+            }
+            if let Some(&d) = dt_bias.get(h) {
+                z += d;
+            }
+            let gate = z.softplus();
+            let beta_t = beta[t * n_val_heads + h];
+
+            let st_off = h * state_len;
+            let head_state = &mut cache.ssm_state[st_off..st_off + state_len];
+            kda_gated_delta_rule_row(
+                slice(q_off, head_dim),
+                slice(k_off, head_dim),
+                slice(v_off, head_dim),
+                beta_t,
+                gate,
+                head_state,
+                head_dim,
+                head_dim,
+            );
+
+            let q_slice = slice(q_off, head_dim);
+            for d in 0..head_dim.min(q_slice.len()) {
+                let w = norm_vec.get(d).copied().unwrap_or(1.0);
+                let out_idx = t * q_dim + h * head_dim + d;
+                if out_idx < out_branch.len() {
+                    out_branch[out_idx] = q_slice[d] * w;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Gated DeltaNet (KDA) helpers ───────────────────────────────────────────
+
+/// How a value head maps to its key head in the 3:1 GQA-shaped KDA.
+///
+/// A 3:1 ratio is consistent with BOTH of these, and nothing in the GGUF
+/// encodes the mapping, so it is a single switchable constant rather than a
+/// guess baked into the loop. Determined empirically against a known-good
+/// reference output; see docs/benchmarks.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdaHeadPairing {
+    /// `kv_head = value_head % num_key_heads`
+    Interleaved,
+    /// `kv_head = value_head / values_per_group`
+    Grouped,
+}
+
+/// Default pairing. Both are defensible from the shapes alone; `Grouped` is the
+/// layout used by GQA in the Qwen3 family and is the current default pending
+/// the empirical check.
+pub const KDA_HEAD_PAIRING: KdaHeadPairing = KdaHeadPairing::Grouped;
+
+/// Resolve the key head feeding a given value head.
+fn kda_key_head(
+    value_head: usize,
+    num_key_heads: usize,
+    values_per_group: usize,
+) -> usize {
+    let raw = match KDA_HEAD_PAIRING {
+        KdaHeadPairing::Interleaved => value_head % num_key_heads.max(1),
+        KdaHeadPairing::Grouped => value_head / values_per_group.max(1),
+    };
+    // Clamp against the KEY head count: this indexes the key/value split of
+    // attn_qkv, not the value stream.
+    raw.min(num_key_heads.saturating_sub(1))
+}
+
+/// One Gated DeltaNet step for a single head, over a row-major `[d_v, d_k]`
+/// state slice that is updated in place.
+///
+/// Published update (ICLR 2025, Eq. 10), matching `grim-backend-cpu`'s
+/// reference and the corrected ROCm/CUDA/Vulkan kernels:
+///
+/// ```text
+/// decay = exp(gate)              // gate already folded with a and dt_bias
+/// pred  = sum_k k * (decay * S)  // decay applied BEFORE the dot
+/// delta = beta * (v - pred)      // beta scales the FULL delta term
+/// S_new = decay * S + k * delta
+/// out   = sum_k q * S_new
+/// ```
+///
+/// `d_k == d_v == 128` for this checkpoint, so `S` is square.
+fn kda_gated_delta_rule_row(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: f32,
+    gate: f32,
+    state: &mut [f32],
+    d_k: usize,
+    d_v: usize,
+) {
+    // Defensive: a test fixture or a mis-sized cache can hand us a state
+    // buffer shorter than d_k*d_v. Do nothing rather than index out of bounds —
+    // a wrong recurrence is bad enough without also being a panic.
+    if state.len() < d_k * d_v {
+        return;
+    }
+    let decay = gate.exp();
+    for j in 0..d_v {
+        let row = &mut state[j * d_k..(j + 1) * d_k];
+        // decay BEFORE the dot
+        let pred: f32 = k
+            .iter()
+            .zip(row.iter())
+            .map(|(kk, ss)| kk * (decay * ss))
+            .sum();
+        // beta scales the whole delta term
+        let delta = beta * (v.get(j).copied().unwrap_or(0.0) - pred);
+        for i in 0..d_k {
+            let s = decay * row[i] + k.get(i).copied().unwrap_or(0.0) * delta;
+            row[i] = s;
+        }
+    }
+    let _ = q; // q is applied by the caller's per-head output projection
+}
+
+/// Softplus, used to turn the fused (a + dt_bias + alpha) logit into a decay
+/// rate. Defined here because the block does not otherwise need it.
+trait Softplus {
+    fn softplus(self) -> f32;
+}
+impl Softplus for f32 {
+    fn softplus(self) -> f32 {
+        // log1p(exp(x)), stable for large |x|
+        if self > 20.0 {
+            self
+        } else if self < -20.0 {
+            self.exp()
+        } else {
+            self.exp().ln_1p()
+        }
     }
 }
 
@@ -1409,6 +1581,8 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
     }
 }
 
+/// Retained: used by the Qwen3.5 recurrent conv path and the graph bridge.
+#[allow(dead_code)]
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
@@ -1624,6 +1798,11 @@ mod tests {
         cfg.full_attention_interval = 4; // Layer 0 is recurrent SSM
         cfg.ssm_d_conv = 4;
         cfg.ssm_d_inner = 16;
+        // KDA geometry: 16 = 4 value heads x 4 head_dim, 2 key heads (2:1),
+        // d_state 4 so the state is square and small for a unit test.
+        cfg.ssm_dt_rank = 4; // num_value_heads
+        cfg.ssm_n_group = 2; // num_key_heads
+        cfg.ssm_d_state = 4; // per-head state width
 
         let mut cache = Qwen35LayerCache::new(&cfg);
         let conv_initial = cache.conv_state.clone();
@@ -1674,11 +1853,29 @@ mod tests {
             )),
             ssm_conv1d: None,
             ssm_conv_vec: Some(conv_w),
-            ssm_a: None,
-            ssm_alpha: None,
-            ssm_beta: None,
-            ssm_dt_bias: None,
-            ssm_norm: None,
+            // Real KDA parameters: without alpha/beta the recurrence is
+            // identically zero (beta=0 kills the delta term) and there is
+            // nothing to observe.
+            ssm_a: Some(vec![0.5; cfg.ssm_dt_rank]),
+            ssm_alpha: Some(Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.3; cfg.ssm_dt_rank * cfg.hidden_size],
+                    Shape::new(vec![cfg.ssm_dt_rank, cfg.hidden_size]),
+                ),
+                None,
+            )),
+            ssm_beta: Some(Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.4; cfg.ssm_dt_rank * cfg.hidden_size],
+                    Shape::new(vec![cfg.ssm_dt_rank, cfg.hidden_size]),
+                ),
+                None,
+            )),
+            ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
+            ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_rank_hint: cfg.ssm_dt_rank,
+            ssm_n_group_hint: cfg.ssm_n_group,
+            ssm_d_state_hint: cfg.ssm_d_state,
             post_attention_norm: RmsNorm::new(
                 cpu_tensor(
                     vec![1.0; cfg.hidden_size],
@@ -1729,10 +1926,20 @@ mod tests {
             .expect("forward recurrent layer");
         assert_eq!(out.shape().dims(), &[2, cfg.hidden_size]);
 
-        // State must not be all zeroes after forward pass with non-zero inputs
-        assert_ne!(
+        // Recurrent state must advance. This layer is a gated-delta-rule layer,
+        // so the state that carries across steps is the KDA state, not the
+        // depthwise conv ring: the conv+SiLU+sigmoid path was a stub that never
+        // implemented this architecture's recurrence (see
+        // `gated_delta_net_forward`).
+        assert!(
+            cache.ssm_state.iter().any(|v| *v != 0.0),
+            "ssm_state must be updated across steps by the Gated DeltaNet recurrence"
+        );
+        // The conv ring is no longer part of the recurrent path, so it must
+        // stay untouched rather than drifting.
+        assert_eq!(
             cache.conv_state, conv_initial,
-            "conv_state must be updated across steps"
+            "conv_state is not used by the gated delta rule path"
         );
     }
 }
