@@ -12,8 +12,10 @@ use grim_tensor::backend::{GpuCapability, ScytheLink};
 // The C²PLR controller moved to `grim_backend_rocm::scythe2_placement` so model loaders
 // can reach it - see that module for why. Re-exported here so engine callers and
 // the existing benches/tests keep compiling unchanged.
-pub use grim_backend_rocm::scythe2_placement::{C2plrController, PlacementCache, PlacementKey, bucketize};
-
+pub use grim_backend_rocm::scythe2_placement::{
+    C2plrController, PlacementCache, PlacementKey, bucketize,
+};
+pub use grim_tensor::backend::ScythePlacement;
 
 // ── ScytheRing + ScytheTaskDescriptor (WI-7) ─────────────────────────────────
 
