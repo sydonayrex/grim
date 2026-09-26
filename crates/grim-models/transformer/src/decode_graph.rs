@@ -5804,6 +5804,7 @@ mod tests {
                 ssm_dt_rank_hint: 0,
                 ssm_n_group_hint: 0,
                 ssm_d_state_hint: 0,
+            ssm_d_conv_hint: 4,
                 post_attention_norm: test_norm(&dev, 0, hidden_size),
                 ffn_gate: test_linear(&dev, 0, intermediate_size, hidden_size, seed + 5),
                 ffn_up: test_linear(&dev, 0, intermediate_size, hidden_size, seed + 6),

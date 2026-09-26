@@ -204,6 +204,8 @@ pub struct Qwen35Block {
     pub ssm_dt_rank_hint: usize,
     pub ssm_n_group_hint: usize,
     pub ssm_d_state_hint: usize,
+    /// Conv taps over the fused qkv stream, from `ssm_conv1d.weight`'s width.
+    pub ssm_d_conv_hint: usize,
 
     // Feed-forward Network
     pub post_attention_norm: RmsNorm,
@@ -253,6 +255,12 @@ impl Qwen35Block {
     /// Raw `ssm_d_state`, the state matrix width used for allocation.
     pub fn cfg_ssm_d_state(&self) -> usize {
         self.ssm_d_state_hint
+    }
+
+    /// Taps in the causal short conv over the fused qkv stream.
+    /// `ssm_conv1d.weight` is [conv_dim, d_conv] = [10240, 4] on Qwen3.8.
+    pub fn cfg_ssm_d_conv(&self) -> usize {
+        self.ssm_d_conv_hint
     }
 }
 
@@ -486,6 +494,7 @@ impl Qwen35Block {
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,
+            ssm_d_conv_hint: cfg.ssm_d_conv,
             post_attention_norm,
             ffn_gate,
             ffn_up,
@@ -1123,13 +1132,15 @@ fn gated_delta_net_forward(
             }
         }
     }
+    // beta = sigmoid(ssm_beta(x)) per llama.cpp qwen35.cpp: `beta = ggml_sigmoid(...)`.
+    // It is a per-value-head gate in (0,1), not a raw projection.
     let mut beta = vec![0.0f32; n_val_heads * seq_len];
     if let Some(ref bl) = blk.ssm_beta {
         let v = bl.forward(x_normed)?.to_vec_f32()?;
         let stride = v.len() / seq_len.max(1);
         for t in 0..seq_len {
             for h in 0..n_val_heads.min(stride) {
-                beta[t * n_val_heads + h] = v[t * stride + h];
+                beta[t * n_val_heads + h] = 1.0 / (1.0 + (-v[t * stride + h]).exp());
             }
         }
     }
@@ -1178,12 +1189,73 @@ fn gated_delta_net_forward(
         cache.ssm_state.resize(n_val_heads * state_len, 0.0);
     }
 
+    // Causal short conv + SiLU over the FUSED stream, before the q/k/v split
+    // (llama.cpp qwen35.cpp: `ggml_ssm_conv` then `ggml_silu`, and the views for
+    // q/k/v are taken from `conv_qkv_mix`). The conv is depthwise with
+    // d_conv taps and carries (d_conv-1) previous inputs per channel.
+    //
+    // `ssm_conv1d.weight` is [10240, 4] and the conv state is
+    // (d_conv-1) * conv_dim; if this checkpoint has no conv weights the stream is
+    // used as-is, which is the only correct fallback (a stub conv would feed the
+    // recurrence pre-convolution projections).
+    let dev = pick_device_for_storage_device(qkv.device());
+    let qkv_conv = match blk.ssm_conv1d.as_ref() {
+        Some(_) => {
+            let taps = blk.cfg_ssm_d_conv().max(1);
+            let chans = per_tok;
+            let x = Tensor::new(
+                std::sync::Arc::from(dev.from_cpu(&qkv_vec, &Shape::new(vec![1, seq_len, chans]), DType::F32)?),
+                Shape::new(vec![1, seq_len, chans]),
+                DType::F32,
+                qkv.provenance().clone(),
+                qkv.device().clone(),
+            );
+            let w = blk.ssm_conv1d.as_ref().unwrap().clone();
+            let w_t = Tensor::new(
+                std::sync::Arc::from(dev.from_cpu(
+                        &w.to_vec_f32()?,
+                        &Shape::new(vec![chans, taps]),
+                        DType::F32,
+                    )?),
+                Shape::new(vec![chans, taps]),
+                DType::F32,
+                w.provenance().clone(),
+                w.device().clone(),
+            );
+            // conv_state is [1, chans*(taps-1)] flat; reshape to [1, taps-1, chans].
+            let need = (taps - 1) * chans;
+            if cache.conv_state.len() < need {
+                cache.conv_state.resize(need, 0.0);
+            }
+            let state_flat = cache.conv_state[..need].to_vec();
+            let mut state_t = Tensor::new(
+                std::sync::Arc::from(dev.from_cpu(
+                    &state_flat,
+                    &Shape::new(vec![1, taps - 1, chans]),
+                    DType::F32,
+                )?),
+                Shape::new(vec![1, taps - 1, chans]),
+                DType::F32,
+                qkv.provenance().clone(),
+                qkv.device().clone(),
+            );
+            let out = grim_nn::modules::short_conv1d(&x, &w_t, None, Some(&mut state_t))?;
+            // Write the updated history back.
+            let updated = state_t.to_vec_f32()?;
+            cache.conv_state[..need].copy_from_slice(&updated[..need]);
+            out.to_vec_f32()?
+        }
+        None => qkv_vec.clone(),
+    };
+    // SiLU on the convolved stream, per the reference.
+    let conv_mix: Vec<f32> = qkv_conv.iter().map(|v| v / (1.0 + (-v).exp())).collect();
+
     let slice = |off: usize, len: usize| -> &[f32] {
-        let end = (off + len).min(qkv_vec.len());
+        let end = (off + len).min(conv_mix.len());
         if off >= end {
             &[]
         } else {
-            &qkv_vec[off..end]
+            &conv_mix[off..end]
         }
     };
 
@@ -1197,15 +1269,21 @@ fn gated_delta_net_forward(
             let q_off = base + 2 * key_dim + h * head_dim;
             let v_off = q_off;
 
-            // decay logit = ssm_a + ssm_dt.bias + alpha_t, through softplus.
+            // gate = softplus(alpha + dt_bias) * ssm_a, per llama.cpp qwen35.cpp:
+            //   alpha_biased   = alpha + ssm_dt
+            //   alpha_softplus = softplus(alpha_biased)
+            //   gate           = alpha_softplus * ssm_a
+            // ssm_a MULTIPLIES after the softplus; it is not added inside it.
+            // Adding it before would be a different function, since softplus is
+            // nonlinear.
             let mut z = alpha[t * n_val_heads + h];
-            if let Some(&a) = a_vec.get(h) {
-                z += a;
-            }
             if let Some(&d) = dt_bias.get(h) {
                 z += d;
             }
-            let gate = z.softplus();
+            let mut gate = z.softplus();
+            if let Some(&a) = a_vec.get(h) {
+                gate *= a;
+            }
             let beta_t = beta[t * n_val_heads + h];
 
             let st_off = h * state_len;
@@ -1250,10 +1328,21 @@ pub enum KdaHeadPairing {
     Grouped,
 }
 
-/// Default pairing. Both are defensible from the shapes alone; `Grouped` is the
-/// layout used by GQA in the Qwen3 family and is the current default pending
-/// the empirical check.
-pub const KDA_HEAD_PAIRING: KdaHeadPairing = KdaHeadPairing::Grouped;
+/// Default pairing, per llama.cpp `src/models/qwen35.cpp`:
+///
+/// ```cpp
+/// if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+///     GGML_ASSERT(num_v_heads % num_k_heads == 0);
+///     q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+///     k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+/// }
+/// ```
+///
+/// `ggml_repeat_4d` tiles the 16 key heads to fill 48 value heads, so value head
+/// `h` reads key head `h % num_key_heads`. This was previously left as an open
+/// question on the grounds that a 3:1 ratio fits both rules; the reference
+/// settles it.
+pub const KDA_HEAD_PAIRING: KdaHeadPairing = KdaHeadPairing::Interleaved;
 
 /// Resolve the key head feeding a given value head.
 fn kda_key_head(
@@ -1937,6 +2026,7 @@ mod tests {
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,
+            ssm_d_conv_hint: cfg.ssm_d_conv,
             post_attention_norm: RmsNorm::new(
                 cpu_tensor(
                     vec![1.0; cfg.hidden_size],
@@ -2156,6 +2246,7 @@ mod tests {
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,
+            ssm_d_conv_hint: cfg.ssm_d_conv,
             post_attention_norm: RmsNorm::new(
                 cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
                 cfg.rms_norm_eps,
