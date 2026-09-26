@@ -47,7 +47,52 @@ impl RecurrentOps for RocmDevice {
             .iter()
             .product::<usize>()
             .max(1)) as i32;
-        let mut k_size = (w_s.bytes / (channels as usize * 4)) as i32;
+        // `k_size` is recovered by dividing the weight's byte count by
+        // `channels * 4`, and the kernel trusts it completely: it builds
+        // `state_offset = (b*channels + c) * (kernel_size - 1)` into
+        // conv_state with no bounds check of its own. If that division
+        // truncates, or `channels` has drifted from the weight's real row
+        // width, the state walk runs off the end of a buffer nobody checked -
+        // a fault far from this call, or a hang.
+        //
+        // The CPU path has no such seam: it passes `taps` down explicitly.
+        // Here the division has to be made safe instead.
+        let row_bytes = (channels.max(0) as usize).saturating_mul(4);
+        if row_bytes == 0 {
+            return Err(Error::Backend(format!(
+                "short_conv1d: channels={channels} gives a zero row width for a {}-byte weight",
+                w_s.bytes
+            )));
+        }
+        if w_s.bytes % row_bytes != 0 {
+            return Err(Error::Backend(format!(
+                "short_conv1d: weight is {} bytes, not a whole multiple of \
+                 channels({channels}) * 4 = {row_bytes}; the tap count is not recoverable",
+                w_s.bytes
+            )));
+        }
+        let mut k_size = (w_s.bytes / row_bytes) as i32;
+        if k_size <= 0 {
+            return Err(Error::Backend(format!(
+                "short_conv1d: derived k_size={k_size} from a {}-byte weight",
+                w_s.bytes
+            )));
+        }
+        // The state ring must cover `batch * channels * (k_size - 1)` floats,
+        // or the offsets above leave it. The caller sizes conv_state from the
+        // config's tap count, which need not equal the derived one.
+        let need_state = (batch.max(0) as usize)
+            .saturating_mul(channels.max(0) as usize)
+            .saturating_mul((k_size - 1).max(0) as usize);
+        if (st_s.bytes / 4) < need_state {
+            return Err(Error::Backend(format!(
+                "short_conv1d: conv_state holds {} floats but the kernel indexes \
+                 batch({batch}) * channels({channels}) * (k_size-1={}) = {need_state}",
+                st_s.bytes / 4,
+                k_size - 1
+            )));
+        }
+
 
         let total = (batch * channels) as usize;
         let (grid, block) = linear_launch(total);
@@ -288,7 +333,52 @@ impl RocmDevice {
             .iter()
             .product::<usize>()
             .max(1)) as i32;
-        let mut k_size = (w_s.bytes / (channels as usize * 4)) as i32;
+        // `k_size` is recovered by dividing the weight's byte count by
+        // `channels * 4`, and the kernel trusts it completely: it builds
+        // `state_offset = (b*channels + c) * (kernel_size - 1)` into
+        // conv_state with no bounds check of its own. If that division
+        // truncates, or `channels` has drifted from the weight's real row
+        // width, the state walk runs off the end of a buffer nobody checked -
+        // a fault far from this call, or a hang.
+        //
+        // The CPU path has no such seam: it passes `taps` down explicitly.
+        // Here the division has to be made safe instead.
+        let row_bytes = (channels.max(0) as usize).saturating_mul(4);
+        if row_bytes == 0 {
+            return Err(Error::Backend(format!(
+                "short_conv1d: channels={channels} gives a zero row width for a {}-byte weight",
+                w_s.bytes
+            )));
+        }
+        if w_s.bytes % row_bytes != 0 {
+            return Err(Error::Backend(format!(
+                "short_conv1d: weight is {} bytes, not a whole multiple of \
+                 channels({channels}) * 4 = {row_bytes}; the tap count is not recoverable",
+                w_s.bytes
+            )));
+        }
+        let mut k_size = (w_s.bytes / row_bytes) as i32;
+        if k_size <= 0 {
+            return Err(Error::Backend(format!(
+                "short_conv1d: derived k_size={k_size} from a {}-byte weight",
+                w_s.bytes
+            )));
+        }
+        // The state ring must cover `batch * channels * (k_size - 1)` floats,
+        // or the offsets above leave it. The caller sizes conv_state from the
+        // config's tap count, which need not equal the derived one.
+        let need_state = (batch.max(0) as usize)
+            .saturating_mul(channels.max(0) as usize)
+            .saturating_mul((k_size - 1).max(0) as usize);
+        if (st_s.bytes / 4) < need_state {
+            return Err(Error::Backend(format!(
+                "short_conv1d: conv_state holds {} floats but the kernel indexes \
+                 batch({batch}) * channels({channels}) * (k_size-1={}) = {need_state}",
+                st_s.bytes / 4,
+                k_size - 1
+            )));
+        }
+
         let mut out_ptr = dev_ptr(out)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut w_ptr = dev_ptr(w_s)?;
