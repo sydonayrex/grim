@@ -12,6 +12,8 @@ mod elementwise_norm_tests;
 #[cfg(test)]
 mod gemm_matmul_tests;
 #[cfg(test)]
+#[cfg(test)]
+mod fault_probe_tests;
 mod graph_capture_tests;
 #[cfg(test)]
 mod layout_tests;
