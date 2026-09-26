@@ -62,6 +62,16 @@ pub struct Qwen38FlashNextConfig {
     /// [`Self::head_dim`] but tracked separately because the GQA key and value
     /// widths are independently declared in GGUF.
     pub value_head_dim: usize,
+    /// `qwen4exp.attention.indexer.head_count` (4) — indexer QUERY heads.
+    /// The indexer has a single key head; see [`Self::indexer_key_length`].
+    pub indexer_n_heads: usize,
+    /// `qwen4exp.attention.indexer.key_length` (128) — indexer head width,
+    /// for both the one key head and each of the `n_heads` query heads.
+    pub indexer_key_length: usize,
+    /// `qwen4exp.attention.compress_ratios[layer]`, per layer: 4 on the 12
+    /// full-attention layers, 0 on the 36 Gated DeltaNet ones. Only the former
+    /// reach the QSA path, and upstream asserts `r > 0` there.
+    pub attention_compress_ratios: Vec<usize>,
 }
 
 impl Qwen38FlashNextConfig {
@@ -246,6 +256,12 @@ impl Qwen38FlashNextConfig {
             ssm_d_state,
             ssm_d_inner,
             value_head_dim: val_len,
+            indexer_n_heads: gu("qwen4exp.attention.indexer.head_count").unwrap_or(4),
+            indexer_key_length: gu("qwen4exp.attention.indexer.key_length").unwrap_or(128),
+            attention_compress_ratios: m
+                .get_u32_array("qwen4exp.attention.compress_ratios")
+                .map(|v| v.into_iter().map(|x| x as usize).collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -298,6 +314,13 @@ impl Default for Qwen38FlashNextConfig {
             ssm_d_state: 128,
             ssm_d_inner: 6144,
             value_head_dim: 256,
+            indexer_n_heads: 4,
+            indexer_key_length: 128,
+            // Every 4th layer is full attention and carries a ratio of 4; the
+            // GDN layers carry 0 and never reach QSA.
+            attention_compress_ratios: (0..48)
+                .map(|i| if (i + 1) % 4 == 0 { 4 } else { 0 })
+                .collect(),
         }
     }
 }
@@ -742,6 +765,8 @@ pub enum Qwen38Attention {
 }
 
 pub struct Qwen38FlashNextBlock {
+    /// Index of this block in the model, for per-layer metadata lookup.
+    pub layer_index: usize,
     pub hc_attn: Qwen38HyperConnection,
     pub attn: Qwen38Attention,
     pub hc_ffn: Qwen38HyperConnection,
@@ -755,6 +780,7 @@ impl Qwen38FlashNextBlock {
     pub fn load(
         ws: &WeightSource<'_>,
         cfg: &Qwen38FlashNextConfig,
+        layer_index: usize,
         _tp: TensorParallelConfig,
     ) -> Result<Self> {
         let hc_lowrank = cfg.hc_lowrank;
@@ -982,6 +1008,49 @@ impl Qwen38FlashNextBlock {
             ffn_norm,
             moe_block,
             gated_residual_scale: 1.0 / (cfg.hc_count as f32).sqrt(),
+            layer_index,
+        })
+    }
+
+    /// This block's QSA indexer geometry, or `None` for a Gated DeltaNet layer.
+    ///
+    /// `compress_ratio` is 4 on the 12 full-attention layers and 0 on the 36
+    /// GDN ones; upstream asserts `r > 0` on the QSA path, so a 0 ratio is
+    /// reported as "not sparse" rather than as a geometry error.
+    pub fn qsa_geometry(
+        &self,
+        cfg: &Qwen38FlashNextConfig,
+    ) -> Option<crate::qwen38_qsa::QsaIndexConfig> {
+        if matches!(&self.attn, Qwen38Attention::Linear { .. }) {
+            return None;
+        }
+        let idx = self.layer_index;
+        let r = cfg
+            .attention_compress_ratios
+            .get(idx)
+            .copied()
+            .unwrap_or_else(|| if (idx + 1) % 4 == 0 { 4 } else { 0 });
+        if r == 0 {
+            return None;
+        }
+        // The indexer weights are absent on a checkpoint without an indexer;
+        // fall back to dense rather than failing to load.
+        let has_indexer = matches!(
+            &self.attn,
+            Qwen38Attention::Full {
+                indexer_q: Some(_),
+                indexer_k: Some(_),
+                ..
+            }
+        );
+        if !has_indexer {
+            return None;
+        }
+        Some(crate::qwen38_qsa::QsaIndexConfig {
+            idx_dim: cfg.indexer_key_length,
+            n_idx_h: cfg.indexer_n_heads,
+            top_k: cfg.indexer_top_k,
+            compress_ratio: r,
         })
     }
 
@@ -1020,6 +1089,7 @@ impl Qwen38FlashNextBlock {
         positions: &[u32],
         cfg: &Qwen38FlashNextConfig,
         gdn_cache: &mut crate::qwen38_gdn::Qwen38GdnCache,
+        qsa_keys: &mut Vec<f32>,
     ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
 
@@ -1143,10 +1213,10 @@ impl Qwen38FlashNextBlock {
                 wo,
                 q_norm,
                 k_norm,
-                indexer_q: _,
-                indexer_k: _,
-                indexer_q_norm: _,
-                indexer_k_norm: _,
+                indexer_q,
+                indexer_k,
+                indexer_q_norm,
+                indexer_k_norm,
                 rope: _,
                 num_heads,
                 num_kv_heads,
@@ -1212,6 +1282,100 @@ impl Qwen38FlashNextBlock {
                 let q_rope = rope_ext(&q, *num_heads)?;
                 let k_rope = rope_ext(&k, *num_kv_heads)?;
 
+                // --- Qwen Sparse Attention indexer (plan 4d) ---
+                //
+                // The indexer runs on the K/V history this layer is about to
+                // attend over, and its selection becomes an additive mask.
+                // Without it the layer is dense, which is what upstream
+                // f3f1a8f did (it computed top_k and passed 0) and what this
+                // implementation did before; current upstream applies it.
+                // The indexer and the masked softmax are host reference code
+                // today. On a GPU run that means reading the K/V history back
+                // across the bus once per token per sparse layer, which is a
+                // real cost. Set GRIM_QWEN38_QSA=0 to force dense and measure
+                // the difference; the indexer weights stay loaded either way.
+                let qsa_enabled = std::env::var("GRIM_QWEN38_QSA")
+                    .ok()
+                    .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
+                    .unwrap_or(true);
+                let qsa_geom = if qsa_enabled {
+                    self.qsa_geometry(cfg)
+                } else {
+                    None
+                };
+                let qsa_keep: Option<Vec<f32>> = match qsa_geom {
+                    Some(qcfg) => {
+                        // Raw indexer keys for the NEW tokens are cached
+                        // unpooled and un-normed; pooling, norm and rotation
+                        // all happen on the pooled result.
+                        let k_new = indexer_k
+                            .as_ref()
+                            .expect("qsa_geometry implies an indexer")
+                            .forward(&branch_attn)?
+                            .to_vec_f32()?;
+                        let idx_dim = qcfg.idx_dim;
+                        // `qsa_keys` is this layer's flat raw-key history.
+                        qsa_keys.extend_from_slice(&k_new);
+                        let n_kv = qsa_keys.len() / idx_dim.max(1);
+                        let keys = qsa_keys.clone();
+                        // Indexer query: project, norm per head, then reuse the
+                        // block's rope so the two are on the same frequency
+                        // schedule.
+                        let q_idx = indexer_q
+                            .as_ref()
+                            .expect("qsa_geometry implies an indexer")
+                            .forward(&branch_attn)?
+                            .to_vec_f32()?;
+                        let mut q_normed = q_idx.clone();
+                        if let Some(n) = indexer_q_norm.as_ref() {
+                            let w = n.weight.to_vec_f32()?;
+                            crate::qwen38_qsa::rms_norm_rows(
+                                &mut q_normed,
+                                qcfg.n_idx_h * idx_dim,
+                                &w,
+                                cfg.rms_norm_eps,
+                            );
+                        }
+                        // Pool + norm the keys. Upstream pools first, then
+                        // norms the pooled rows.
+                        let mut pooled = crate::qwen38_qsa::pool_indexer_keys(
+                            &keys,
+                            n_kv,
+                            idx_dim,
+                            qcfg.compress_ratio,
+                        )?;
+                        if let Some(n) = indexer_k_norm.as_ref() {
+                            let w = n.weight.to_vec_f32()?;
+                            crate::qwen38_qsa::rms_norm_rows(
+                                &mut pooled,
+                                idx_dim,
+                                &w,
+                                cfg.rms_norm_eps,
+                            );
+                        }
+                        // Score, expand, select. One query row: the last token
+                        // of this step decides which history cells stay visible.
+                        let scores = crate::qwen38_qsa::indexer_block_scores(
+                            &pooled,
+                            &q_normed[q_normed.len() - qcfg.n_idx_h * idx_dim..],
+                            qcfg.n_blocks(n_kv),
+                            qcfg.n_idx_h,
+                            idx_dim,
+                            1,
+                        )?;
+                        let cells = crate::qwen38_qsa::expand_block_scores(
+                            &scores,
+                            qcfg.n_blocks(n_kv),
+                            n_kv,
+                            qcfg.compress_ratio,
+                            1,
+                        )?;
+                        let sel = crate::qwen38_qsa::top_k_cells(&cells, qcfg.select_width(n_kv));
+                        Some(crate::qwen38_qsa::build_top_k_mask(n_kv, &sel, None)?)
+                    }
+                    None => None,
+                };
+
                 let out_shape = Shape::new(vec![seq_len, *num_heads * *head_dim]);
                 let attn_tensor = match dev.qkv_attention(
                     q_rope.storage().as_ref(),
@@ -1236,17 +1400,55 @@ impl Qwen38FlashNextBlock {
                         let q_heads = q_rope.to_vec_f32()?;
                         let k_heads = k_rope.to_vec_f32()?;
                         let v_heads = v.to_vec_f32()?;
-                        crate::shared_attention::fused_or_scalar_attention(
-                            &q_heads,
-                            &k_heads,
-                            &v_heads,
-                            *num_heads,
-                            *num_kv_heads,
-                            *head_dim,
-                            seq_len,
-                            None,
-                            x.device(),
-                        )?
+                        match qsa_keep.as_ref() {
+                            // Sparse: restrict the softmax to the cells the
+                            // indexer selected. Only valid when this step's K/V
+                            // history IS the cells the mask was built over,
+                            // which holds for a single-token decode.
+                            Some(keep) if seq_len == 1 => {
+                                let kv_len = keep.len();
+                                let out = crate::qwen38_qsa::masked_gqa_attention(
+                                    &q_heads,
+                                    &k_heads,
+                                    &v_heads,
+                                    *num_heads,
+                                    *num_kv_heads,
+                                    *head_dim,
+                                    seq_len,
+                                    kv_len,
+                                    kv_len.saturating_sub(seq_len),
+                                    keep,
+                                )?;
+                                // The indexer and the masked softmax are host
+                                // reference code, so their result arrives on the
+                                // CPU. Land it on the tensor's own device or
+                                // every later op in the block silently mixes
+                                // devices.
+                                let host = cpu_tensor(out, out_shape.clone());
+                                if *x.device() == Device::Cpu {
+                                    host
+                                } else {
+                                    grim_nn::modules::move_to_device(&host, x.device())?
+                                }
+                            }
+                            // Prefill with a multi-token step cannot apply a
+                            // single-row mask, so fall back to dense. The
+                            // indexer is a decode-time accelerator; upstream
+                            // scores per token and masks per token, which needs
+                            // the full [n_kv, n_tps] mask this path does not
+                            // build.
+                            _ => crate::shared_attention::fused_or_scalar_attention(
+                                &q_heads,
+                                &k_heads,
+                                &v_heads,
+                                *num_heads,
+                                *num_kv_heads,
+                                *head_dim,
+                                seq_len,
+                                None,
+                                x.device(),
+                            )?,
+                        }
                     }
                 };
                 wo.forward(&attn_tensor)?
@@ -1441,6 +1643,12 @@ pub struct Qwen38FlashNext {
 #[derive(Debug, Clone, Default)]
 pub struct Qwen38GdnSession {
     pub caches: Vec<crate::qwen38_gdn::Qwen38GdnCache>,
+    /// Raw indexer keys per full-attention layer, `[n_kv, indexer_key_length]`.
+    ///
+    /// Stored RAW on purpose: upstream caches `index_k_proj` output and applies
+    /// pooling, then the norm and the rotation, to the pooled result. Caching a
+    /// normed or rotated key would not commute with the mean.
+    pub qsa_keys: Vec<Vec<f32>>,
 }
 
 impl Qwen38GdnSession {
@@ -1567,7 +1775,7 @@ impl Qwen38FlashNext {
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
             let layer_ws = root.scoped("layers").scoped(&i.to_string());
-            let block = Qwen38FlashNextBlock::load(&layer_ws, &cfg, tp)?;
+            let block = Qwen38FlashNextBlock::load(&layer_ws, &cfg, i, tp)?;
             layers.push(block);
         }
 
@@ -1748,12 +1956,16 @@ impl CausalLm for Qwen38FlashNext {
             None => Qwen38GdnSession::default(),
         };
         gdn_state.ensure(&self.layers, &self.cfg);
+        if gdn_state.qsa_keys.len() < self.layers.len() {
+            gdn_state.qsa_keys.resize(self.layers.len(), Vec::new());
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             let cache = gdn_state
                 .caches
                 .get_mut(i)
                 .expect("ensure() sized one cache per layer");
-            h = layer.forward(&h, &pos_u32, &self.cfg, cache)?;
+            let keys = gdn_state.qsa_keys.get_mut(i).expect("qsa_keys sized above");
+            h = layer.forward(&h, &pos_u32, &self.cfg, cache, keys)?;
         }
         session.set_model_state(Box::new(gdn_state));
 
