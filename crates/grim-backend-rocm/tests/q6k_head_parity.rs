@@ -49,14 +49,19 @@ fn q6k_fused_gemm_matches_host_reference() {
     let w_packed = grim_quant::quant_q6k(&w_host).expect("quant_q6k");
     let w_ref = grim_quant::dequant_q6k(&w_packed, N_ROWS * DIM).expect("dequant_q6k");
 
-    // Upload the packed weights and an activation row.
+    // Typed KQuant(Q6K) as the loader assigns to a resident quantized weight —
+    // the dispatcher switches on this, and a U8/Native buffer silently falls
+    // through to an f32 read of packed bytes.
     let packed_storage = dev
         .from_cpu_bytes(
             &w_packed,
             &Shape::new(vec![N_ROWS, DIM]),
+            // MUST be typed KQuant(Q6K), which is what the loader gives a
+            // resident quantized weight. Forcing U8/Native here made the
+            // dispatcher skip every KQuant arm and read packed bytes as f32.
             DType {
-                arith: grim_tensor::ArithType::U8,
-                storage: grim_tensor::Storage::Native,
+                arith: grim_tensor::ArithType::F32,
+                storage: grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q6K),
             },
         )
         .expect("upload packed q6k");
