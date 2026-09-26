@@ -37,7 +37,10 @@
 
 #[path = "precision_kernel_ab/e4m3.rs"]
 mod e4m3;
+#[path = "precision_kernel_ab/w4a4.rs"]
+mod w4a4;
 use e4m3::{from_e4m3, to_e4m3_rne};
+use w4a4::{dot_packed, pack_a, pack_b, GROUP};
 
 use grim_backend_rocm::precision_ab::*;
 use grim_backend_rocm::RocmDevice;
@@ -65,6 +68,22 @@ const ATOL_I32: f64 = 1e-2;
 /// Q8_0/Q8_1 store their scales as f16, so ~1e-3 relative is the floor here,
 /// not the i32 accumulator (which is exact over the products).
 const RTOL_I32: f64 = 1e-3;
+const ATOL_I4: f64 = 1e-2;
+/// WhiteCrow is 4-bit, and its error is set by the quantizer rather than the
+/// accumulator: `sudot8` is exact over the products.
+///
+/// Derived, not chosen. Group-wise, A's step is `amax/15`, so rounding error is
+/// at most `step/2 = amax/30`. For a well-conditioned group the typical |a| is
+/// around `amax/3`, giving a per-element relative error near
+/// `(amax/30) / (amax/3)` = 10%. B's asymmetric quantizer adds the same order.
+/// So int4's own format ceiling is ~10%, two orders of magnitude looser than
+/// int8's 1e-3, and no amount of correct kernel code can do better.
+///
+/// 0.25 leaves headroom for the tail of the distribution while still being
+/// derived rather than fitted: the measured worst case in
+/// `measured_int4_error_sits_under_the_derived_budget` is checked against this
+/// constant rather than the other way round.
+const RTOL_I4: f64 = 0.25;
 
 /// Output positions scored per shape. Bounds host cost; see module docs.
 const N_CHECK: usize = 32;
@@ -203,6 +222,22 @@ fn pooled(samples: Vec<Vec<f32>>) -> Vec<f32> {
         .collect();
     per_pass.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     per_pass
+}
+
+/// Reinterpret a typed slice as bytes for upload. The crate has no `bytemuck`,
+/// and adding a dependency to a test for four casts is a poor trade.
+fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn bytemuck_cast_u32(v: &[u32]) -> &[u8] {
+    as_bytes(v)
+}
+fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
+    as_bytes(v)
+}
+fn bytemuck_cast_u16(v: &[u16]) -> &[u8] {
+    as_bytes(v)
 }
 
 /// Max |gpu - oracle| over the sampled output positions.
@@ -447,6 +482,131 @@ fn run_forest_raven(
     Ok((samples, err, tol))
 }
 
+/// WhiteCrow: unsigned int4 via `v_dot8_i32_iu4`.
+///
+/// Asymmetric, with a two-dot zero-point identity:
+/// `sum(A_i * W_i) = d_a * d_b * (iacc - z_b * sum_a_code)`.
+///
+/// A is quantized over non-negative values only (`w4a4::A_MIN`): the kernel
+/// applies a zero-point correction to B alone, so a signed activation would
+/// have no compensating term and the offset would not be recoverable from the
+/// output. The fixture honours that rather than pretending otherwise.
+fn run_white_crow(
+    dev: &RocmDevice,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(Vec<f32>, f64, f64), String> {
+    if k % GROUP != 0 {
+        return Err(format!("WhiteCrow needs K % {} == 0, got {k}", GROUP));
+    }
+    let pa = pack_a(a, m, k);
+    let pb = pack_b(b, n, k);
+
+    // codes: u32 | scales: f32 (A) / bf16 (B) | zeros: u8
+    let a_codes = MemoryOps::from_cpu_bytes(
+        dev,
+        bytemuck_cast_u32(&pa.codes),
+        &Shape::new(vec![pa.codes.len()]),
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("a_codes h2d: {e}"))?;
+    let a_scales = CoreTensorOps::from_cpu(dev, &pa.scales, &Shape::new(vec![pa.scales.len()]), DType::F32)
+        .map_err(|e| format!("a_scales h2d: {e}"))?;
+    // A_sums is i32 on the device side; upload as raw bytes at 4 B/element.
+    let a_sums = MemoryOps::from_cpu_bytes(
+        dev,
+        bytemuck_cast_i32(&pa.sums),
+        &Shape::new(vec![pa.sums.len()]),
+        DType {
+            // The kernel reads A_sums as `const int*` (4 B/element). ArithType
+            // has no I32, and I64 is also 4 B wide here, so the dtype only has
+            // to agree on element size for the byte upload -- the bytes are
+            // reinterpreted by the kernel, not by the tensor layer.
+            arith: ArithType::I64,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("a_sums h2d: {e}"))?;
+    let b_codes = MemoryOps::from_cpu_bytes(
+        dev,
+        bytemuck_cast_u32(&pb.codes),
+        &Shape::new(vec![pb.codes.len()]),
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("b_codes h2d: {e}"))?;
+    let b_scales = MemoryOps::from_cpu_bytes(
+        dev,
+        bytemuck_cast_u16(&pb.scales),
+        &Shape::new(vec![pb.scales.len()]),
+        DType {
+            // bf16 scales: 2 B/element, which is F16's width. Again the dtype
+            // governs the upload width only.
+            arith: ArithType::F16,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("b_scales h2d: {e}"))?;
+    let b_zeros = MemoryOps::from_cpu_bytes(
+        dev,
+        &pb.zeros,
+        &Shape::new(vec![pb.zeros.len()]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("b_zeros h2d: {e}"))?;
+    let out_t = MemoryOps::alloc_storage(
+        dev,
+        &Shape::new(vec![m * n]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("out alloc: {e}"))?;
+
+    let (ac, asc, asum, bc, bsc, bz, out_r) = (
+        rocm(a_codes.as_ref()),
+        rocm(a_scales.as_ref()),
+        rocm(a_sums.as_ref()),
+        rocm(b_codes.as_ref()),
+        rocm(b_scales.as_ref()),
+        rocm(b_zeros.as_ref()),
+        rocm(out_t.as_ref()),
+    );
+
+    let launch = || {
+        let _ = dev.launch_dot8_w4a4_gemv(ac, asc, asum, bc, bsc, bz, out_r, m, n, k);
+    };
+    let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
+    for _ in 0..REPEATS {
+        passes.push(timed(dev, launch));
+    }
+    let samples = pooled(passes);
+    dev.synchronize();
+
+    // Oracle over the packed operands, via the kernel's own identity.
+    let pos = check_positions(m * n);
+    let mut oracle = Vec::with_capacity(pos.len());
+    for &p in &pos {
+        let (i, j) = (p / n, p % n);
+        oracle.push(dot_packed(&pa, &pb, i, j, k));
+    }
+    let err = max_err(out_r, &pos, &oracle);
+    let tol = ATOL_I4 + RTOL_I4 * oracle.iter().fold(0f64, |m, o| m.max(o.abs()));
+    Ok((samples, err, tol))
+}
+
 // ------------------------------------------------------------------ driver --
 
 #[test]
@@ -527,6 +687,24 @@ fn precision_kernel_ab() {
                 tolerance: tol,
             }),
             Err(e) => eprintln!("ForestRaven m={m} k={k}: {e}"),
+        }
+        // WhiteCrow's A must be non-negative: the kernel applies a zero-point
+        // correction to B alone, so a signed activation has no compensating
+        // term. The other arms take `a` signed, so this one gets its own
+        // non-negative copy rather than the fixture being reshaped for everyone.
+        let a_nonneg: Vec<f32> = a.iter().map(|v| v.abs()).collect();
+        match run_white_crow(&dev, &a_nonneg, b, m, n, k) {
+            Ok((samples, err, tol)) => results.push(ArmResult {
+                arm: "WhiteCrow",
+                instruction: "V_DOT8_I32_IU4",
+                m,
+                n,
+                k,
+                samples_ms: samples,
+                max_abs_err: err,
+                tolerance: tol,
+            }),
+            Err(e) => eprintln!("WhiteCrow m={m} k={k}: {e}"),
         }
     }
 
