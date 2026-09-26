@@ -4,8 +4,11 @@
 /// `SpillableEmbedding` is a drop-in wrapper around `Embedding` that adds a config-gated NvMe spill path for.
 pub mod embedding_spill;
 pub mod modules;
-/// Mixture-of-Experts primitives (router, expert bank, routed FFN).
 pub mod moe;
+pub use moe::{
+    ExpertBank, ExpertTriple, MoeFfn, MoeRouter, NonGatedExpertBank, NonGatedSharedExpert,
+    RouterKind,
+};
 /// Deterministic token mapping and scoreboard synchronization (UniEP).
 pub mod moe_deterministic;
 /// Bandwidth-adaptive CPU-GPU hybrid execution (FreeToken).

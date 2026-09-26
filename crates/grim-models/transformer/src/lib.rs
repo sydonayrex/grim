@@ -58,6 +58,7 @@ fn is_mla_sparse_arch(arch: &str) -> bool {
             | "glmdsa"
             | "qwen3_8_flash_next"
             | "minimax_m3"
+            | "xing4_0"
     )
 }
 
@@ -237,6 +238,7 @@ pub mod step35;
 pub mod t5;
 pub mod talkie;
 pub mod wav_tokenizer_dec;
+pub mod xing40;
 pub mod xverse;
 
 pub use arcee::{Arcee, ArceeConfig};
@@ -341,7 +343,7 @@ pub use mpt::{Mpt, MptConfig};
 pub use multimodal::*;
 pub use native_mtp::{LlamaMtp, MtpDepthProvider, Qwen38FlashNextMtp};
 pub use nemotron::{Nemotron, NemotronConfig};
-pub use nemotron_hmoe::{NemotronHMoe, NemotronHMoeConfig};
+pub use nemotron_hmoe::{NemotronHBlockType, NemotronHMoe, NemotronHMoeConfig};
 pub use olmo::{Olmo, OlmoConfig};
 pub use olmo2::{Olmo2, Olmo2Config};
 pub use olmoe::{Olmoe, OlmoeConfig};
@@ -374,6 +376,7 @@ pub use step35::{Step35, Step35Config};
 pub use t5::{T5, T5Config};
 pub use talkie::{Talkie, TalkieConfig};
 pub use wav_tokenizer_dec::{WavTokenizerDec, WavTokenizerDecConfig};
+pub use xing40::{Xing40, Xing40Config, Xing40HcGates, Xing40HyperConnection};
 pub use xverse::{Xverse, XverseConfig};
 
 #[cfg(test)]
@@ -564,6 +567,7 @@ mod tests {
             "glmdsa",
             "qwen3_8_flash_next",
             "minimax_m3",
+            "xing4_0",
         ] {
             assert_eq!(
                 gdl_eligibility(arch),

@@ -803,6 +803,219 @@ impl ExpertBank {
     }
 }
 
+// ── Non-Gated 2-Projection Expert Bank (Nemotron-H MoE style: up + down with ReLU^2) ──
+
+/// Holds 2-projection non-gated feed-forward pairs `{up, down}` with squared-ReLU activation:
+/// `FFN(x) = down(relu(up(x))^2)`.
+pub struct NonGatedExpertBank {
+    pub up: Vec<Linear>,
+    pub down: Vec<Linear>,
+}
+
+impl NonGatedExpertBank {
+    pub fn from_linears(up: Vec<Linear>, down: Vec<Linear>) -> Self {
+        Self { up, down }
+    }
+
+    pub fn num_experts(&self) -> usize {
+        self.up.len()
+    }
+
+    /// Load 2-projection experts from checkpoint (`ffn_up_exps.weight` and `ffn_down_exps.weight`).
+    pub fn load(
+        ws: &WeightSource<'_>,
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        has_bias: bool,
+    ) -> Result<Self, grim_tensor::error::Error> {
+        let probe = ws.get_raw_packed("ffn_up_exps.weight")?;
+        if probe.dtype.storage == grim_tensor::dtype::Storage::Native {
+            return Self::load_native(ws, num_experts, hidden, inter, has_bias);
+        }
+        Self::load_quantized(ws, num_experts, has_bias, [
+            ("ffn_up_exps.weight", inter, hidden),
+            ("ffn_down_exps.weight", hidden, inter),
+        ])
+    }
+
+    fn load_quantized(
+        ws: &WeightSource<'_>,
+        num_experts: usize,
+        has_bias: bool,
+        projections: [(&'static str, usize, usize); 2],
+    ) -> Result<Self, grim_tensor::error::Error> {
+        let mut up = Vec::with_capacity(num_experts);
+        let mut down = Vec::with_capacity(num_experts);
+
+        for (p_idx, (name, out, in_)) in projections.iter().enumerate() {
+            let raw = ws.get_raw_packed(name)?;
+            let dims = &raw.shape;
+            let expected = vec![num_experts, *out, *in_];
+            if *dims != expected {
+                return Err(grim_tensor::error::Error::ShapeMismatch {
+                    expected,
+                    got: dims.clone(),
+                });
+            }
+
+            let per_expert_blobs: Option<Vec<Vec<u8>>> = match &raw.dtype.storage {
+                Storage::W4A16(w4) => Some(w4a16_split_bank(
+                    &raw.bytes,
+                    num_experts,
+                    *out,
+                    *in_,
+                    w4.group_size,
+                )?),
+                Storage::GroupInt(gi) => Some(gptq_split_bank(
+                    &raw.bytes,
+                    gi.bits,
+                    gi.group_size,
+                    num_experts,
+                    *out,
+                    *in_,
+                )?),
+                Storage::WNA16 => {
+                    Some(wna16_split_or_dequant(&raw.bytes, num_experts, *out, *in_)?)
+                }
+                Storage::Awq(awq) => Some(awq_split_bank(
+                    &raw.bytes,
+                    awq.bits,
+                    awq.group_size,
+                    num_experts,
+                    *out,
+                    *in_,
+                )?),
+                Storage::CompressedTensorsW8A8Int8 => {
+                    Some(w8a8_int8_split_bank(&raw.bytes, num_experts, *out, *in_)?)
+                }
+                Storage::CompressedTensorsW8A8Fp8 => {
+                    Some(w8a8_fp8_split_bank(&raw.bytes, num_experts, *out, *in_)?)
+                }
+                _ => None,
+            };
+
+            for e in 0..num_experts {
+                let (bytes, dtype) = if let Some(ref blobs) = per_expert_blobs {
+                    (blobs[e].clone(), raw.dtype.clone())
+                } else {
+                    if raw.bytes.len() % num_experts != 0 {
+                        return Err(grim_tensor::error::Error::Backend(format!(
+                            "non-gated expert bank '{name}': {} bytes not divisible by {num_experts} experts",
+                            raw.bytes.len()
+                        )));
+                    }
+                    let stride = raw.bytes.len() / num_experts;
+                    (
+                        raw.bytes[e * stride..(e + 1) * stride].to_vec(),
+                        raw.dtype.clone(),
+                    )
+                };
+                let shape = Shape::new(vec![*out, *in_]);
+                let rt = grim_tensor::provider::RawTensor {
+                    bytes,
+                    shape: vec![*out, *in_],
+                    dtype,
+                    provenance: raw.provenance.clone(),
+                };
+                let t = ws.materialize_raw(rt, shape)?;
+                let lin = Linear::from_tensor(t, bias_opt(has_bias, *out));
+                if p_idx == 0 {
+                    up.push(lin);
+                } else {
+                    down.push(lin);
+                }
+            }
+        }
+        Ok(Self { up, down })
+    }
+
+    fn load_native(
+        ws: &WeightSource<'_>,
+        num_experts: usize,
+        _hidden: usize,
+        _inter: usize,
+        has_bias: bool,
+    ) -> Result<Self, grim_tensor::error::Error> {
+        let t_up = ws.get(Shape::new(vec![num_experts, _inter, _hidden]), "ffn_up_exps.weight")?;
+        let t_down = ws.get(Shape::new(vec![num_experts, _hidden, _inter]), "ffn_down_exps.weight")?;
+        let v_up = t_up.to_vec_f32()?;
+        let v_down = t_down.to_vec_f32()?;
+
+        let mut up = Vec::with_capacity(num_experts);
+        let mut down = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let b_up = slice_expert(&v_up, e, _inter, _hidden);
+            let b_down = slice_expert(&v_down, e, _hidden, _inter);
+            up.push(Linear::from_tensor(
+                cpu_tensor(b_up, Shape::new(vec![_inter, _hidden])),
+                bias_opt(has_bias, _inter),
+            ));
+            down.push(Linear::from_tensor(
+                cpu_tensor(b_down, Shape::new(vec![_hidden, _inter])),
+                bias_opt(has_bias, _hidden),
+            ));
+        }
+        Ok(Self { up, down })
+    }
+
+    /// Run a single expert's squared-ReLU feed-forward on `x` (`[batch, hidden]`),
+    /// returning `[batch, hidden]`.
+    pub fn expert_forward(
+        &self,
+        e: usize,
+        x: &Tensor,
+    ) -> Result<Tensor, grim_tensor::error::Error> {
+        let u = self.up[e].forward(x)?; // [batch, inter]
+        let uv = u.to_vec_f32()?;
+        // relu(u)^2
+        let relu2: Vec<f32> = uv
+            .into_iter()
+            .map(|val| {
+                let r = val.max(0.0);
+                r * r
+            })
+            .collect();
+        let h = cpu_tensor(relu2, u.shape().clone());
+        self.down[e].forward(&h) // [batch, hidden]
+    }
+}
+
+/// 2-projection non-gated shared expert with ReLU^2 activation (`ffn_up_shexp` & `ffn_down_shexp`).
+pub struct NonGatedSharedExpert {
+    pub up: Linear,
+    pub down: Linear,
+}
+
+impl NonGatedSharedExpert {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        hidden: usize,
+        inter: usize,
+        has_bias: bool,
+    ) -> Result<Self, grim_tensor::error::Error> {
+        let up = Linear::load(&ws.pp("ffn_up_shexp"), hidden, inter, has_bias)
+            .or_else(|_| Linear::load(&ws.pp("ffn_up_she"), hidden, inter, has_bias))?;
+        let down = Linear::load(&ws.pp("ffn_down_shexp"), inter, hidden, has_bias)
+            .or_else(|_| Linear::load(&ws.pp("ffn_down_she"), inter, hidden, has_bias))?;
+        Ok(Self { up, down })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
+        let u = self.up.forward(x)?;
+        let uv = u.to_vec_f32()?;
+        let relu2: Vec<f32> = uv
+            .into_iter()
+            .map(|val| {
+                let r = val.max(0.0);
+                r * r
+            })
+            .collect();
+        let h = cpu_tensor(relu2, u.shape().clone());
+        self.down.forward(&h)
+    }
+}
+
 // MoE FFN
 
 /// On-device resident copy of the flattened expert weight banks for the ROCm fused MoE dispatch.
@@ -1136,7 +1349,7 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 FloatPackScheme::MxFp8 => 8,
                 FloatPackScheme::Fp4 => 4,
                 FloatPackScheme::Fp8 => 8,
-                FloatPackScheme::NvFp4 => 4,
+                FloatPackScheme::NvFp4 | FloatPackScheme::NutFp4 => 4,
                 _ => 32, // fallback: treat as fp32
             };
             // Round up: ceil(elem_count * bits / 8)
@@ -1172,6 +1385,9 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 BlockDtype::Fp8 => 8,
                 BlockDtype::Fp4Block16 => 4,
                 BlockDtype::Fp8Block16 => 8,
+                // codes only; the 128x128 scale grid adds a small header the
+                // size estimate cannot know without the shape.
+                BlockDtype::Fp8Block128 => 8,
             };
             (elem_count * bits).div_ceil(8)
         }
@@ -3353,7 +3569,7 @@ mod tests {
             ordinal,
             tflops_fp16: tflops,
             tflops_fp8: 0.0,
-            hbm_bandwidth_gbps: 0.0,
+            dram_bandwidth_gbps: 0.0,
             vram_free_bytes: vram_gib * 1024 * 1024 * 1024,
             throttle_pct: throttle,
         }

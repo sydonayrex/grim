@@ -558,6 +558,79 @@ impl CoreTensorOps for CpuDevice {
 }
 
 impl ElementwiseOps for CpuDevice {
+    fn row_scale(
+        &self,
+        x: &dyn BackendStorage,
+        scale: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        let s = a_storage(scale)?;
+        if x.data().len() != rows * cols {
+            return Err(Error::Shape(format!(
+                "row_scale: x holds {} elements, expected {rows}x{cols}",
+                x.data().len()
+            )));
+        }
+        if s.data().len() < rows {
+            return Err(Error::Shape(format!(
+                "row_scale: scale holds {} elements, expected {rows}",
+                s.data().len()
+            )));
+        }
+        let xd = x.data();
+        let sd = s.data();
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let sval = sd[r];
+            let (src, dst) = (r * cols, r * cols);
+            for c in 0..cols {
+                out[dst + c] = xd[src + c] * sval;
+            }
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn narrow_rows(
+        &self,
+        x: &dyn BackendStorage,
+        start_row: usize,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        let total = x.data().len();
+        if (start_row + rows) * cols > total {
+            return Err(Error::Shape(format!(
+                "narrow_rows: rows [{start_row}, {}) of {cols} exceed {total} elements",
+                start_row + rows
+            )));
+        }
+        let xd = x.data();
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let src = (start_row + r) * cols;
+            let dst = r * cols;
+            out[dst..dst + cols].copy_from_slice(&xd[src..src + cols]);
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    // `write_rows` is intentionally not implemented here: CPU storage is an
+    // immutably shared `Arc<Vec<f32>>`, so an in-place row write has nowhere to
+    // land. The CPU backend serves the same sub-block composition natively in
+    // its host reference paths, which is not a device->host fallback because
+    // the data was never off-device.
+
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -1549,6 +1622,13 @@ impl QuantOps for CpuDevice {
                             Error::Backend(format!("CPU quantized_matmul FP8Block16 dequant: {e}"))
                         })?
                     }
+                    // Self-describing blob: the 128x128 scale grid rides along
+                    // with the codes, so no shape argument is needed.
+                    grim_tensor::QuantFormat::Fp8Block128 => {
+                        grim_quant::dequant_fp8_block128(b_bytes).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul FP8Block128 dequant: {e}"))
+                        })?
+                    }
                     grim_tensor::QuantFormat::Nf4 => grim_quant::dequant_nf4(b_bytes, k * n)
                         .map_err(|e| {
                             Error::Backend(format!("CPU quantized_matmul NF4 dequant: {e}"))
@@ -2096,11 +2176,15 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(raw, n),
                 grim_tensor::dtype::FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(raw, n),
+                grim_tensor::dtype::FloatPackScheme::NutFp4 => grim_quant::dequant_nutcracker(raw, n),
             },
             Storage::Block(block_type) => match block_type {
                 grim_tensor::dtype::BlockDtype::Fp4 => grim_quant::dequant_fp4(raw, n),
                 grim_tensor::dtype::BlockDtype::Nf4 => grim_quant::dequant_nf4(raw, n),
                 grim_tensor::dtype::BlockDtype::Fp8 => grim_quant::dequant_fp8(raw, n),
+                grim_tensor::dtype::BlockDtype::Fp8Block128 => {
+                    grim_quant::dequant_fp8_block128(raw)
+                }
                 grim_tensor::dtype::BlockDtype::Fp4Block16 => {
                     grim_quant::dequant_fp4_block16(raw, n)
                 }

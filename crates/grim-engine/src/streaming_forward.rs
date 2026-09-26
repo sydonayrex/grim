@@ -991,7 +991,7 @@ mod tests {
             .map(|(tflops, ordinal)| GpuCapability {
                 tflops_fp16: tflops,
                 tflops_fp8: 0.0,
-                hbm_bandwidth_gbps: 100.0,
+                dram_bandwidth_gbps: 100.0,
                 vram_free_bytes: 16 << 30,
                 throttle_pct: 0.0,
                 ordinal,

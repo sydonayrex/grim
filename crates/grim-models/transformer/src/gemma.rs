@@ -137,37 +137,36 @@ impl GemmaBlock {
                 None
             };
 
-        let w_gate_up_q80_fused =
-            if matches!(&device, Device::Rocm(_))
-                && std::env::var("GRIM_FUSED_FFN").as_deref() != Ok("0")
-            {
-                let is_q80 = |s: &grim_tensor::Tensor| {
-                    matches!(
-                        s.dtype().storage,
-                        grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
-                    )
+        let w_gate_up_q80_fused = if matches!(&device, Device::Rocm(_))
+            && std::env::var("GRIM_FUSED_FFN").as_deref() != Ok("0")
+        {
+            let is_q80 = |s: &grim_tensor::Tensor| {
+                matches!(
+                    s.dtype().storage,
+                    grim_tensor::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80)
+                )
+            };
+            if is_q80(&ffn_gate.weight) && is_q80(&ffn_up.weight) {
+                let ordinal = match &device {
+                    Device::Rocm(o) => *o,
+                    _ => 0,
                 };
-                if is_q80(&ffn_gate.weight) && is_q80(&ffn_up.weight) {
-                    let ordinal = match &device {
-                        Device::Rocm(o) => *o,
-                        _ => 0,
-                    };
-                    match grim_backend_rocm::RocmDevice::try_new(ordinal) {
-                        Ok(rocm_dev) => rocm_dev
-                            .build_fused_gate_up_q80(
-                                ffn_gate.weight.storage().as_ref(),
-                                ffn_up.weight.storage().as_ref(),
-                            )
-                            .ok()
-                            .map(Arc::new),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
+                match grim_backend_rocm::RocmDevice::try_new(ordinal) {
+                    Ok(rocm_dev) => rocm_dev
+                        .build_fused_gate_up_q80(
+                            ffn_gate.weight.storage().as_ref(),
+                            ffn_up.weight.storage().as_ref(),
+                        )
+                        .ok()
+                        .map(Arc::new),
+                    Err(_) => None,
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             attn_norm,
@@ -419,7 +418,10 @@ impl GemmaBlock {
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let (gate, up) = match self.w_gate_up_q80_fused.as_ref() {
             Some(fused) if new_tokens == 1 => self.fused_gate_up_dot4_decode(&norm_x2, fused)?,
-            _ => (self.ffn_gate.forward(&norm_x2)?, self.ffn_up.forward(&norm_x2)?),
+            _ => (
+                self.ffn_gate.forward(&norm_x2)?,
+                self.ffn_up.forward(&norm_x2)?,
+            ),
         };
         // GeGLU: on ROCm this runs entirely on device via `grim_gelu_tanh_mul`.
         let activated = grim_nn::modules::gelu_tanh_mul_on_device(&gate, &up)?;

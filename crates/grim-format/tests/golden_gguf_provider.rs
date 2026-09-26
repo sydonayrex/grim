@@ -89,8 +89,10 @@ fn golden_gguf_provider_meta_returns_expected_metadata() {
     let info_end = header.len() as u64;
     let data_start = (info_end + 31) & !31;
     header.resize(data_start as usize, 0x00);
-    // Write 32 zeros (4*8*4 bytes)
-    header.extend_from_slice(&[0u8; 32]);
+    // Write 4*8 f32 zeros (128 bytes). This must match the declared F32 shape:
+    // the provider now refuses a tensor whose payload is smaller than its dtype
+    // requires, so a short write here is a genuine error, not padding.
+    header.extend_from_slice(&[0u8; 4 * 8 * 4]);
 
     let path = write_gguf_bytes(&header);
     let provider = GgufProvider::open(path.to_str().unwrap()).unwrap();

@@ -63,6 +63,31 @@ extern "C" __global__ void grim_row_copy(const float* src, float* dst,
     }
 }
 
+// Column-range copy, one block per row: out[r, c] = src[r * src_cols + start + c].
+extern "C" __global__ void grim_col_copy(const float* src, float* dst,
+                                         int start, int rows, int src_cols, int cols) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const long long src_base = (long long)r * src_cols + start;
+    const long long dst_base = (long long)r * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        dst[dst_base + c] = src[src_base + c];
+    }
+}
+
+// in: dst[(start + r) * dst_cols + c] = src[r * cols + c]
+extern "C" __global__ void grim_col_copy_into(const float* src, float* dst,
+                                              int start, int rows, int dst_cols, int cols) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const long long src_base = (long long)r * cols;
+    // `start` is a COLUMN offset here, not a row offset (contrast grim_row_copy_into).
+    const long long dst_base = (long long)r * dst_cols + start;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        dst[dst_base + c] = src[src_base + c];
+    }
+}
+
 extern "C" __global__ void grim_row_copy_into(const float* src, float* dst,
                                               int start, int rows, int cols) {
     const int r = blockIdx.x;

@@ -93,6 +93,7 @@ fn roundtrip_budget_not_exceeded() {
         ("mistral3.rs", 0),
         ("muse_glimmer.rs", 16),
         ("native_mtp.rs", 7),
+        ("nemotron_hmoe.rs", 16),
         ("qwen35.rs", 12),
         ("qwen35_perf.rs", 4),
         ("qwen35moe.rs", 6),
@@ -126,6 +127,9 @@ fn roundtrip_budget_not_exceeded() {
         ("gptj.rs", 6),
         ("hyv3.rs", 4),
         ("hy_v4.rs", 5),
+        // MHC stream math (collapse + write-back) and the MLA absorbed path run
+        // host-side; quant storage dequantizes inside `Linear`.
+        ("xing40.rs", 26),
     ];
 
     let mut violations = Vec::new();

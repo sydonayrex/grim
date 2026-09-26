@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use grim_backend_rocm::{as_rocm, RocmDevice};
+use grim_backend_rocm::{RocmDevice, as_rocm};
 use grim_models_transformer::commandr::CommandRMlp;
 use grim_nn::Linear;
 use grim_tensor::{

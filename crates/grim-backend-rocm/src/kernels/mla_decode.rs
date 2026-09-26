@@ -126,6 +126,113 @@ __global__ void grim_mla_absorbed_decode(
     }
 }
 
+// DeepSeek MLA Matrix-Absorbed **Prefill** kernel.
+//
+// Same latent-space attention as `grim_mla_absorbed_decode`, generalised to a
+// query block of `q_len` tokens with causal masking. One block per
+// (query, head) pair, grid = (q_len * num_heads).
+//
+// The value up-projection is deliberately NOT fused here (unlike decode): the
+// caller applies `W_vc` as a per-head `[q_len, rank] @ [rank, v_head]` GEMM
+// after this kernel. Fusing it would recompute a `v_head_dim * kv_lora_rank`
+// matmul per block; split out, it amortises across all `q_len` queries and
+// reuses the ordinary (already-verified) matmul path. The output is the
+// normalized latent vector `[q_len, num_heads, kv_lora_rank]`.
+//
+// `q_absorbed` must already be `q_absorbed_here * W_UK` (the host code
+// pre-scales it to reconcile the softmax denominator with the
+// 1/sqrt(nope + rope_d) the model was trained with, as decode does).
+__global__ void grim_mla_absorbed_prefill(
+    const float* __restrict__ q_absorbed, // [q_len, num_heads, kv_lora_rank]
+    const float* __restrict__ q_rope,     // [q_len, num_heads, qk_rope_dim]
+    const float* __restrict__ kv_cache,   // [kv_len, kv_lora_rank + qk_rope_dim]
+    float* __restrict__ out,              // [q_len, num_heads, kv_lora_rank]
+    int q_len,
+    int num_heads,
+    int kv_lora_rank,
+    int qk_rope_dim,
+    int q_abs_offset,                     // absolute KV position of query 0
+    int kv_len,
+    float inv_sqrt_d
+) {
+    const int idx = blockIdx.x; // q_len * num_heads
+    if (idx >= q_len * num_heads) return;
+    const int h = idx % num_heads;
+    const int qi = idx / num_heads;
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    const int qh = qi * num_heads + h; // [q_len, num_heads, *] row base
+    const int q_c_base = qh * kv_lora_rank;
+    const int q_r_base = qh * qk_rope_dim;
+    const int o_base = qh * kv_lora_rank;
+
+    // Causal bound: query `qi` sits at absolute position q_abs_offset + qi and
+    // may attend to every cached position up to and including it.
+    const int last = min(kv_len, q_abs_offset + qi + 1);
+
+    extern __shared__ float s_dot[];
+
+    float running_max = -1e20f;
+    float running_sum = 0.0f;
+    float acc_local[8];
+    const int items_per_thread = (kv_lora_rank + block_size - 1) / block_size;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        acc_local[i] = 0.0f;
+    }
+
+    for (int j = 0; j < last; ++j) {
+        const int token_base = j * (kv_lora_rank + qk_rope_dim);
+
+        // 1. Q_C . c_kv  +  2. Q_R . k_pe
+        float local_score = 0.0f;
+        for (int c = tid; c < kv_lora_rank; c += block_size) {
+            local_score += q_absorbed[q_c_base + c] * kv_cache[token_base + c];
+        }
+        for (int r = tid; r < qk_rope_dim; r += block_size) {
+            local_score += q_rope[q_r_base + r] * kv_cache[token_base + kv_lora_rank + r];
+        }
+
+        s_dot[tid] = local_score;
+        __syncthreads();
+
+        for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                s_dot[tid] += s_dot[tid + stride];
+            }
+            __syncthreads();
+        }
+        const float score = s_dot[0] * inv_sqrt_d;
+        __syncthreads();
+
+        // 3. Online softmax update.
+        const float new_max = max(running_max, score);
+        const float alpha = expf(running_max - new_max);
+        const float beta = expf(score - new_max);
+
+        running_sum = running_sum * alpha + beta;
+        running_max = new_max;
+
+        // 4. Accumulate the latent value vector in c_kv space.
+        for (int i = 0; i < items_per_thread; ++i) {
+            const int c = tid + i * block_size;
+            if (c < kv_lora_rank) {
+                acc_local[i] = acc_local[i] * alpha + beta * kv_cache[token_base + c];
+            }
+        }
+    }
+
+    // Normalize and emit the latent vector; the caller applies W_vc.
+    const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+    for (int i = 0; i < items_per_thread; ++i) {
+        const int c = tid + i * block_size;
+        if (c < kv_lora_rank) {
+            out[o_base + c] = acc_local[i] * inv_sum;
+        }
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -136,5 +243,6 @@ mod tests {
     #[test]
     fn kernel_source_contains_mla_absorbed_decode() {
         assert!(KERNEL_SOURCE.contains("grim_mla_absorbed_decode"));
+        assert!(KERNEL_SOURCE.contains("grim_mla_absorbed_prefill"));
     }
 }

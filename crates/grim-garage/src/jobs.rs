@@ -218,7 +218,7 @@ pub struct TrainingJob {
     pub epochs: u32,
     pub rocm_fusion_rmsnorm_matmul: bool,
     pub rocm_fusion_qkv_attention: bool,
-    /// Codec format for base weights: Bf16, Crow, Raven, Rook, Jay, Jackdaw, Magpie.
+    /// Codec format for base weights: Bf16, Crow, Raven, Rook, Jay, Jackdaw, Magpie, Nutcracker.
     #[serde(default)]
     pub weight_format: crate::weight_format::WeightFormat,
     /// Backend the user selected for this job. `None` = auto (top of the

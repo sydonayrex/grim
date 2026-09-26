@@ -36,7 +36,7 @@ impl SafetensorInfo {
             "F32" | "I32" | "U32" => 4,
             "F16" | "BF16" => 2,
             "F64" | "I64" | "U64" => 8,
-            "I8" | "U8" => 1,
+            "I8" | "U8" | "F8_E4M3" | "F8_E5M2" => 1,
             _ => 0,
         };
         self.elem_count().saturating_mul(elem)

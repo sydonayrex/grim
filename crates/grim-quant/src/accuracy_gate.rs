@@ -28,6 +28,13 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.04,
                 max_delta_ppl: 0.02,
             },
+            // Same E4M3 element format as `Fp8`; only the scale granularity
+            // differs (128x128 grid vs per-tensor), so the same tolerances apply.
+            QuantFormat::Fp8Block128 => Self {
+                min_cosine_similarity: 0.9995,
+                max_relative_l2_error: 0.03,
+                max_delta_ppl: 0.015,
+            },
             QuantFormat::Fp4 | QuantFormat::Fp4Block16 => Self {
                 min_cosine_similarity: 0.9950,
                 max_relative_l2_error: 0.10,

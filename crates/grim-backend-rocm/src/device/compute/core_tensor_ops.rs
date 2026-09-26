@@ -648,7 +648,14 @@ impl CoreTensorOps for RocmDevice {
         }
         // Derive the row count from the packed byte length so an out-of-range
         // token is caught before the kernel indexes off the end.
-        let packed_bytes = w_s.shape().dims()[0];
+        // If w_s is shaped as [vocab, dim], bytes is bytes_count; if 1D [bytes], dims()[0].
+        let packed_bytes = if w_s.shape().dims().len() == 1 {
+            w_s.shape().dims()[0]
+        } else {
+            let elem_count = w_s.shape().elem_count();
+            // Q4_K is 144 bytes per 256 elements
+            (elem_count / QK_BLOCK) * QK_BLOCK_BYTES
+        };
         let expected = (dim / QK_BLOCK) * QK_BLOCK_BYTES;
         if expected == 0 || packed_bytes % expected != 0 {
             return Err(Error::Shape(format!(

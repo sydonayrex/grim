@@ -726,3 +726,113 @@ impl RocmDevice {
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
 }
+
+/// Xing4.0 MHC gate tensors produced by one `grim_mhc_gates` launch.
+pub struct MhcGateTensors {
+    pub pre: Box<dyn BackendStorage>,
+    pub post: Box<dyn BackendStorage>,
+    pub comb: Box<dyn BackendStorage>,
+}
+
+impl RocmDevice {
+    /// Fused Xing4.0 hyper-connection gate math, one block per token.
+    ///
+    /// `proj` is `[seq, (2 + hc) * hc]` (pre | post | comb), `base` is `[mix]`,
+    /// `scale` is `[3]`. Emits `pre` `[hc, seq]`, `post` `[hc, seq]`, and the
+    /// Sinkhorn-normalized `comb` `[hc * hc, seq]` — all stream-major with the
+    /// token index last, so downstream per-stream weight vectors are contiguous
+    /// row slices. All device-resident.
+    ///
+    /// This exists so the gate math never round-trips to the host: the Sinkhorn
+    /// iterations need per-token row/column reductions over `hc * hc` values,
+    /// which no dim-wise reduction primitive exposes, and the projection is
+    /// only 24 floats per token.
+    pub fn mhc_gates_into(
+        &self,
+        proj: &dyn BackendStorage,
+        base: &dyn BackendStorage,
+        scale: &dyn BackendStorage,
+        seq: usize,
+        hc: usize,
+        iters: usize,
+        hc_eps: f32,
+        clamp_min: f32,
+        clamp_max: f32,
+    ) -> Result<MhcGateTensors> {
+        if seq == 0 {
+            return Err(Error::Backend("mhc_gates_into: empty sequence".into()));
+        }
+        if hc == 0 || hc > 8 {
+            return Err(Error::Backend(format!(
+                "mhc_gates_into: hc must be 1..=8, got {hc}"
+            )));
+        }
+        let proj_s = as_rocm(proj)?;
+        let base_s = as_rocm(base)?;
+        let scale_s = as_rocm(scale)?;
+        if !proj_s.device_ptr_is_valid()
+            || !base_s.device_ptr_is_valid()
+            || !scale_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "mhc_gates_into: an input lacks a valid device pointer".into(),
+            ));
+        }
+        let mix = (2 + hc) * hc;
+        if proj_s.shape().elem_count() != seq * mix {
+            return Err(Error::Shape(format!(
+                "mhc_gates_into: proj holds {} elements, expected {seq}x{mix}",
+                proj_s.shape().elem_count()
+            )));
+        }
+
+        // Stream-major / token-last so each per-stream weight vector is a
+        // contiguous row slice downstream (see grim_mhc_gates).
+        let pre_shape = Shape::new(vec![hc, seq]);
+        let comb_shape = Shape::new(vec![hc * hc, seq]);
+        let pre = RocmStorage::alloc_gpu(&pre_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let post = RocmStorage::alloc_gpu(&pre_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let comb = RocmStorage::alloc_gpu(&comb_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        let mut proj_ptr = dev_ptr(proj_s)?;
+        let mut base_ptr = dev_ptr(base_s)?;
+        let mut scale_ptr = dev_ptr(scale_s)?;
+        let mut pre_ptr = dev_ptr(&pre)?;
+        let mut post_ptr = dev_ptr(&post)?;
+        let mut comb_ptr = dev_ptr(&comb)?;
+        let mut s = seq as i32;
+        let mut h = hc as i32;
+        let mut it = iters as i32;
+        let mut eps = hc_eps;
+        let mut cmin = clamp_min;
+        let mut cmax = clamp_max;
+
+        // One block per token; 64 threads keeps the shared-memory max reduction
+        // in two wave32 waves on RDNA.
+        self.launch_compute_kernel(
+            "grim_mhc_gates",
+            crate::HipDim3::new(seq as u32, 1, 1),
+            crate::HipDim3::new(64, 1, 1),
+            &mut [
+                arg(&mut proj_ptr),
+                arg(&mut base_ptr),
+                arg(&mut scale_ptr),
+                arg(&mut pre_ptr),
+                arg(&mut post_ptr),
+                arg(&mut comb_ptr),
+                arg(&mut s),
+                arg(&mut h),
+                arg(&mut it),
+                arg(&mut eps),
+                arg(&mut cmin),
+                arg(&mut cmax),
+            ],
+        )?;
+
+        Ok(MhcGateTensors {
+            pre: Box::new(pre),
+            post: Box::new(post),
+            comb: Box::new(comb),
+        })
+    }
+}

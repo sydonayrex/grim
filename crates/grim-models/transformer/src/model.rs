@@ -529,6 +529,7 @@ impl CausalLm for Llama {
             expert_count: None,
             expert_used_count: None,
             expert_feed_forward_length: None,
+            expert_shared_feed_forward_length: None,
             routed_scaling_factor: 1.0,
             norm_topk_prob: false,
             ssm_d_state: None,
@@ -537,6 +538,7 @@ impl CausalLm for Llama {
             ssm_dt_rank: None,
             ssm_n_group: None,
             full_attention_interval: None,
+            head_count_kv_schedule: None,
         })
     }
 

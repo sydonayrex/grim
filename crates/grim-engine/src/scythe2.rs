@@ -259,7 +259,7 @@ impl C2plrController {
             if base + 5 < input_dim {
                 input[base] = c.tflops_fp16;
                 input[base + 1] = c.tflops_fp8;
-                input[base + 2] = c.hbm_bandwidth_gbps;
+                input[base + 2] = c.dram_bandwidth_gbps;
                 input[base + 3] = (c.vram_free_bytes >> 20) as f32; // in MiB
                 input[base + 4] = c.throttle_pct;
                 input[base + 5] = c.ordinal as f32;
@@ -1544,7 +1544,7 @@ mod tests {
         GpuCapability {
             tflops_fp16: tflops,
             tflops_fp8: 0.0,
-            hbm_bandwidth_gbps: 100.0,
+            dram_bandwidth_gbps: 100.0,
             vram_free_bytes: 16 << 30,
             throttle_pct: 0.0,
             ordinal,
@@ -1565,7 +1565,7 @@ mod tests {
             .map(|i| GpuCapability {
                 tflops_fp16: 60.0,
                 tflops_fp8: 0.0,
-                hbm_bandwidth_gbps: 800.0,
+                dram_bandwidth_gbps: 800.0,
                 vram_free_bytes: 16 << 30,
                 throttle_pct: 0.0,
                 ordinal: i,
@@ -1705,7 +1705,7 @@ mod tests {
             GpuCapability {
                 tflops_fp16: 8.0,
                 tflops_fp8: 0.0,
-                hbm_bandwidth_gbps: 51.2,
+                dram_bandwidth_gbps: 51.2,
                 vram_free_bytes: 16 << 30,
                 throttle_pct: 0.0,
                 ordinal: 0,
@@ -1713,7 +1713,7 @@ mod tests {
             GpuCapability {
                 tflops_fp16: 80.0,
                 tflops_fp8: 160.0,
-                hbm_bandwidth_gbps: 960.0,
+                dram_bandwidth_gbps: 960.0,
                 vram_free_bytes: 16 << 30,
                 throttle_pct: 0.0,
                 ordinal: 1,

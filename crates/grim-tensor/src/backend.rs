@@ -352,6 +352,42 @@ pub trait ElementwiseOps {
         ))
     }
 
+    /// Column-range read: `out[r, c] = x[r, total_cols + start + c]`.
+    ///
+    /// The strided counterpart to [`Self::narrow_rows`], for addressing a
+    /// sub-block that is contiguous within a row but not across rows — e.g. one
+    /// hyper-connection stream inside a token-major `[seq, hc * hidden]` state.
+    fn narrow_cols(
+        &self,
+        x: &dyn BackendStorage,
+        total_cols: usize,
+        start_col: usize,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, total_cols, start_col, rows, cols, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "narrow_cols not implemented for this backend".into(),
+        ))
+    }
+
+    /// Column-range write: `dst[r * total_cols + start_col + c] = src[r * cols + c]`.
+    fn write_cols(
+        &self,
+        dst: &mut dyn BackendStorage,
+        total_cols: usize,
+        start_col: usize,
+        src: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (dst, total_cols, start_col, src, rows, cols);
+        Err(crate::error::Error::Unimplemented(
+            "write_cols not implemented for this backend".into(),
+        ))
+    }
+
     /// Contiguous row write: copies `[rows, cols]` `src` into rows
     /// `[start_row, start_row + rows)` of the row-major `dst` tensor, in place.
     ///
@@ -804,6 +840,54 @@ pub trait AttentionOps {
         );
         Err(crate::error::Error::Unimplemented(
             "mla_absorbed_decode not implemented for this backend".into(),
+        ))
+    }
+
+    /// Latent-absorbed MLA attention over a **query block** (`q_len` tokens) with
+    /// causal masking — the prefill sibling of [`Self::mla_absorbed_decode`].
+    ///
+    /// `q_absorbed` is `[q_len, num_heads, kv_lora_rank]` (already multiplied by
+    /// `W_UK`, and pre-scaled so the softmax denominator matches the model's
+    /// `1/sqrt(qk_nope_head_dim + qk_rope_head_dim)`), `q_rope` is
+    /// `[q_len, num_heads, qk_rope_dim]`, and `kv_cache` is
+    /// `[kv_len, kv_lora_rank + qk_rope_dim]` packed latent rows.
+    ///
+    /// Query `qi` is at absolute cache position `q_abs_offset + qi` and attends to
+    /// every cached position up to and including it.
+    ///
+    /// `out` receives the **normalized latent** `[q_len, num_heads, kv_lora_rank]`
+    /// — the value up-projection `W_vc` is deliberately left to the caller so it
+    /// runs as one batched GEMM across the whole query block rather than a
+    /// `v_head_dim * kv_lora_rank` matmul per (query, head) block.
+    fn mla_absorbed_prefill(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        out: &dyn BackendStorage,
+        q_len: usize,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        q_abs_offset: usize,
+        kv_len: usize,
+        inv_sqrt_d: f32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            out,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            q_abs_offset,
+            kv_len,
+            inv_sqrt_d,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "mla_absorbed_prefill not implemented for this backend".into(),
         ))
     }
 
@@ -1936,6 +2020,16 @@ impl<T: CoreTensorOps + ?Sized> CoreTensorOps for std::sync::Arc<T> {
         (**self).embedding(weight, indices, out)
     }
 
+    fn embedding_q4k(
+        &self,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out: &Shape,
+        dim: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).embedding_q4k(weight, indices, out, dim)
+    }
+
     fn from_cpu(
         &self,
         data: &[f32],
@@ -2023,6 +2117,63 @@ impl<T: ElementwiseOps + ?Sized> ElementwiseOps for std::sync::Arc<T> {
     fn argmax(&self, x: &dyn BackendStorage) -> Result<u32> {
         (**self).argmax(x)
     }
+
+    fn row_scale(
+        &self,
+        x: &dyn BackendStorage,
+        scale: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).row_scale(x, scale, rows, cols, out_shape)
+    }
+
+    fn narrow_rows(
+        &self,
+        x: &dyn BackendStorage,
+        start_row: usize,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).narrow_rows(x, start_row, rows, cols, out_shape)
+    }
+
+    fn write_rows(
+        &self,
+        dst: &mut dyn BackendStorage,
+        start_row: usize,
+        src: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).write_rows(dst, start_row, src, rows, cols)
+    }
+    fn narrow_cols(
+        &self,
+        x: &dyn BackendStorage,
+        total_cols: usize,
+        start_col: usize,
+        rows: usize,
+        cols: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).narrow_cols(x, total_cols, start_col, rows, cols, out_shape)
+    }
+
+    fn write_cols(
+        &self,
+        dst: &mut dyn BackendStorage,
+        total_cols: usize,
+        start_col: usize,
+        src: &dyn BackendStorage,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).write_cols(dst, total_cols, start_col, src, rows, cols)
+    }
+
 }
 
 impl<T: SamplingOps + ?Sized> SamplingOps for std::sync::Arc<T> {
@@ -2301,6 +2452,35 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
             w_uv_head_stride_words,
         )
     }
+    fn mla_absorbed_prefill(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        out: &dyn BackendStorage,
+        q_len: usize,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        q_abs_offset: usize,
+        kv_len: usize,
+        inv_sqrt_d: f32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).mla_absorbed_prefill(
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            out,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            q_abs_offset,
+            kv_len,
+            inv_sqrt_d,
+        )
+    }
+
 }
 
 impl<T: FusionOps + ?Sized> FusionOps for std::sync::Arc<T> {
@@ -2760,6 +2940,17 @@ impl<T: MemoryOps + ?Sized> MemoryOps for std::sync::Arc<T> {
         count: usize,
     ) -> Result<()> {
         (**self).copy_slice_range(dst, dst_elem_offset, src, src_elem_offset, count)
+    }
+
+    fn copy_bytes_into(
+        &self,
+        dst: &dyn BackendStorage,
+        dst_byte_offset: usize,
+        src: &dyn BackendStorage,
+        src_byte_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        (**self).copy_bytes_into(dst, dst_byte_offset, src, src_byte_offset, count)
     }
 }
 

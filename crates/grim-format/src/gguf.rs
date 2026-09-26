@@ -85,6 +85,19 @@ impl GgufValue {
             _ => None,
         }
     }
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            GgufValue::Int8(v) => Some(*v as i32),
+            GgufValue::Int16(v) => Some(*v as i32),
+            GgufValue::Int32(v) => Some(*v),
+            GgufValue::Int64(v) => i32::try_from(*v).ok(),
+            GgufValue::Uint8(v) => Some(*v as i32),
+            GgufValue::Uint16(v) => Some(*v as i32),
+            GgufValue::Uint32(v) => i32::try_from(*v).ok(),
+            GgufValue::Uint64(v) => i32::try_from(*v).ok(),
+            _ => None,
+        }
+    }
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             GgufValue::Bool(v) => Some(*v),
@@ -96,6 +109,22 @@ impl GgufValue {
             GgufValue::Array(v) => Some(v),
             _ => None,
         }
+    }
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        let arr = self.as_array()?;
+        let mut res = Vec::with_capacity(arr.len());
+        for item in arr {
+            res.push(item.as_u32()?);
+        }
+        Some(res)
+    }
+    pub fn as_i32_array(&self) -> Option<Vec<i32>> {
+        let arr = self.as_array()?;
+        let mut res = Vec::with_capacity(arr.len());
+        for item in arr {
+            res.push(item.as_i32()?);
+        }
+        Some(res)
     }
 }
 
@@ -327,6 +356,128 @@ impl GgufDType {
 }
 
 /// One tensor index entry from a GGUF file.
+/// Every GGUF dtype tag, for geometry-based candidate search.
+pub const ALL_GGUF_DTYPES: &[GgufDType] = &[
+    GgufDType::F32,
+    GgufDType::F16,
+    GgufDType::BF16,
+    GgufDType::F64,
+    GgufDType::I8,
+    GgufDType::I16,
+    GgufDType::I32,
+    GgufDType::I64,
+    GgufDType::Q4_0,
+    GgufDType::Q4_1,
+    GgufDType::Q5_0,
+    GgufDType::Q5_1,
+    GgufDType::Q8_0,
+    GgufDType::Q2K,
+    GgufDType::Q3K,
+    GgufDType::Q4K,
+    GgufDType::Q5K,
+    GgufDType::Q6K,
+    GgufDType::Q8K,
+    GgufDType::IQ4_NL,
+    GgufDType::IQ4_XS,
+    GgufDType::IQ3_XXS,
+    GgufDType::IQ3_S,
+    GgufDType::IQ2_XXS,
+    GgufDType::IQ2_XS,
+    GgufDType::IQ2_S,
+    GgufDType::IQ1_S,
+    GgufDType::MXFP4,
+];
+
+/// Byte size a tensor of `dtype` and `dims` must occupy, per gguf's own rule:
+/// `(params * type_size_per_block) / block_size`.
+pub fn expected_tensor_bytes(dtype: GgufDType, dims: &[u64]) -> Option<u64> {
+    let block = dtype.block_size();
+    let tsize = dtype.type_size_per_block();
+    if block == 0 || tsize == 0 {
+        return None;
+    }
+    let params = dims.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d))?;
+    if block == 1 {
+        params.checked_mul(tsize)
+    } else {
+        params.checked_mul(tsize).map(|t| t / block)
+    }
+}
+
+/// A tensor whose on-disk payload contradicts its declared dtype tag.
+#[derive(Debug, Clone)]
+pub struct DtypeContradiction {
+    pub name: String,
+    pub declared: GgufDType,
+    /// Bytes the declared dtype implies for this shape.
+    pub expected: u64,
+    /// Bytes actually occupied (offset span to the next tensor).
+    pub actual: u64,
+    /// Dtypes whose geometry matches the actual span exactly.
+    pub candidates: Vec<GgufDType>,
+}
+
+/// Find tensors whose payload span contradicts their declared dtype tag.
+///
+/// A GGUF file stores tensors back to back, so each tensor's byte length is the
+/// gap to the next tensor's offset. `data_len` is the length of the whole tensor
+/// data section — tensor `offset`s are **relative to the section start**, not
+/// absolute file offsets. Comparing the span against
+/// [`expected_tensor_bytes`] catches exporters that wrote a wrong dtype tag —
+/// e.g. a 4-bit-quantized tensor tagged `F64`. Without this check the loader
+/// reinterprets packed bytes as floats (silently wrong weights) and allocates
+/// `expected` bytes rather than `actual` (an OOM).
+///
+/// This is deliberately detection, not repair: several formats share a byte
+/// density (Q4_0, IQ4_NL and Q4_K are all 0.5625 B/element), so the payload
+/// alone cannot identify the format. A mismatch must be resolved explicitly.
+pub fn dtype_contradictions(tensors: &[GgufTensorInfo], data_len: u64) -> Vec<DtypeContradiction> {
+    let mut order: Vec<usize> = (0..tensors.len()).collect();
+    order.sort_by_key(|&i| tensors[i].offset);
+
+    let mut out = Vec::new();
+    for (pos, &i) in order.iter().enumerate() {
+        let t = &tensors[i];
+        let next_offset = order
+            .get(pos + 1)
+            .map(|&j| tensors[j].offset)
+            .unwrap_or(data_len);
+        let Some(actual) = next_offset.checked_sub(t.offset) else {
+            continue;
+        };
+        let Some(expected) = expected_tensor_bytes(t.dtype, &t.dims) else {
+            continue;
+        };
+        if actual == expected {
+            continue;
+        }
+        // GGUF aligns tensor starts, so a span modestly LARGER than expected is
+        // benign padding. A span SMALLER than expected cannot be explained by
+        // alignment: the declared dtype claims more bytes than exist.
+        if actual >= expected {
+            continue;
+        }
+        let innermost = t.dims.last().copied().unwrap_or(1).max(1);
+        let candidates = ALL_GGUF_DTYPES
+            .iter()
+            .copied()
+            .filter(|c| expected_tensor_bytes(*c, &t.dims) == Some(actual))
+            .filter(|c| {
+                let b = c.block_size();
+                b == 1 || innermost % b == 0 || t.dims.iter().product::<u64>() % b as u64 == 0
+            })
+            .collect();
+        out.push(DtypeContradiction {
+            name: t.name.clone(),
+            declared: t.dtype,
+            expected,
+            actual,
+            candidates,
+        });
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct GgufTensorInfo {
     pub name: String,
@@ -1611,8 +1762,13 @@ pub fn read_tensor_bytes<R: Read + Seek>(
     let start = file.data_start.checked_add(info.offset).ok_or_else(|| {
         Error::Backend(format!("GGUF tensor '{}' start offset overflow", info.name))
     })?;
-    let size = info.size_bytes as usize;
-    let end = start.checked_add(info.size_bytes).ok_or_else(|| {
+    // Derive the length from the dtype rather than trusting the header's cached
+    // `size_bytes`: callers that correct a wrong dtype tag (via an override)
+    // need the length to follow the corrected dtype, and for an honest tensor the
+    // recomputation is identical.
+    let size_u64 = expected_tensor_bytes(info.dtype, &info.dims).unwrap_or(info.size_bytes);
+    let size = size_u64 as usize;
+    let end = start.checked_add(size_u64).ok_or_else(|| {
         Error::Backend(format!("GGUF tensor '{}' end offset overflow", info.name))
     })?;
     let file_len = reader.seek(SeekFrom::End(0))?;
@@ -1836,7 +1992,7 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
         },
         GgufDType::NVFP4 => DType {
             arith: grim_tensor::ArithType::F32,
-            storage: Storage::FloatPack(FloatPackScheme::NvFp4),
+            storage: Storage::FloatPack(FloatPackScheme::NutFp4),
         },
     }
 }

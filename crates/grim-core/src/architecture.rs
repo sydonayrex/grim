@@ -166,6 +166,7 @@ pub enum ModelArchitecture {
     LongCatFlash,
     HyV4,
     Dots3Note,
+    Xing40,
     Unknown,
 }
 
@@ -261,7 +262,9 @@ impl ModelArchitecture {
             "jais2" => Self::Jais2,
             "nemotron" => Self::Nemotron,
             "nemotron-h" | "nemotron_h" => Self::NemotronH,
-            "nemotron-h-moe" => Self::NemotronHMoe,
+            "nemotron-h-moe" | "nemotron_h_moe" | "nemotronhmoe" | "nemotronhforcausallm" => {
+                Self::NemotronHMoe
+            }
             "exaone" => Self::Exaone,
             "exaone4" => Self::Exaone4,
             "exaone-moe" => Self::ExaoneMoe,
@@ -342,6 +345,7 @@ impl ModelArchitecture {
             "longcat_flash" | "longcat-flash" | "longcat" => Self::LongCatFlash,
             "hy_v4" | "hy-v4" | "hyv4" => Self::HyV4,
             "dots3_note" | "dots3-note" | "dots-note" => Self::Dots3Note,
+            "xing4_0" | "xing40" | "xing4.0" | "xing4-0" | "xing4_0_moe" => Self::Xing40,
             _ => Self::Unknown,
         }
     }
@@ -508,6 +512,7 @@ impl ModelArchitecture {
             Self::LongCatFlash => "longcat_flash",
             Self::HyV4 => "hy_v4",
             Self::Dots3Note => "dots3_note",
+            Self::Xing40 => "xing4_0",
             Self::Unknown => "unknown",
         }
     }
@@ -571,6 +576,7 @@ impl ModelArchitecture {
                 | Self::LladaMoe
                 | Self::GroveMoe
                 | Self::Mellum
+                | Self::Xing40
         )
     }
 
@@ -578,7 +584,12 @@ impl ModelArchitecture {
     pub fn is_ssm(&self) -> bool {
         matches!(
             self,
-            Self::Mamba | Self::Mamba2 | Self::Jamba | Self::NemotronH | Self::GraniteHybrid
+            Self::Mamba
+                | Self::Mamba2
+                | Self::Jamba
+                | Self::NemotronH
+                | Self::NemotronHMoe
+                | Self::GraniteHybrid
         )
     }
 
