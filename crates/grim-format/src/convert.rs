@@ -344,6 +344,13 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
             grim_tensor::dtype::KQuantScheme::IQ2S => {
                 grim_quant::dequant_iq2s(&raw.bytes, elem_count)
             }
+        
+            // Not yet wired: this variant landed ahead of its decoder.
+            other => {
+                return Err(Error::Backend(format!(
+                    "dequant_from_raw: unsupported KQuantScheme {other:?}"
+                )));
+            }
         },
         grim_tensor::dtype::Storage::Block(bd) => match bd {
             grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
