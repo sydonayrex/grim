@@ -708,6 +708,19 @@ pub enum Qwen38Attention {
         ssm_alpha: Linear,
         ssm_norm: RmsNorm,
         ssm_out: Linear,
+        /// `n_v_heads` = `ssm_dt_rank` (48). Carried here rather than read
+        /// from config at forward time so the mixer cannot be sized from the
+        /// wrong quantity if the two ever diverge.
+        n_v_heads: usize,
+        /// `n_k_heads` = `ssm_n_group` (16).
+        n_k_heads: usize,
+        /// `head_dim` = `d_k` = `d_v` = `ssm_d_state` (128).
+        head_dim: usize,
+        /// `conv_dim` = `key_dim * 2 + value_dim` (10240).
+        conv_dim: usize,
+        /// Value-head to key-head mapping. A 3:1 ratio is consistent with both
+        /// pairings and the GGUF does not encode it, so it is explicit.
+        pairing: crate::qwen38_gdn::KdaHeadPairing,
     },
     Full {
         wq: Linear,
@@ -891,6 +904,11 @@ impl Qwen38FlashNextBlock {
                 ssm_alpha,
                 ssm_norm,
                 ssm_out,
+                n_v_heads: cfg.ssm_dt_rank,
+                n_k_heads: cfg.ssm_n_group,
+                head_dim: cfg.ssm_d_state,
+                conv_dim,
+                pairing: crate::qwen38_gdn::KdaHeadPairing::default(),
             }
         } else {
             let q_dim = cfg.num_heads * cfg.head_dim;
@@ -967,9 +985,43 @@ impl Qwen38FlashNextBlock {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
+    /// This block's GDN geometry, or [`GdnGeometry::Unknown`](crate::qwen38_gdn::GdnGeometry::Unknown)
+    /// for a full-attention layer.
+    pub fn gdn_geometry(&self) -> crate::qwen38_gdn::GdnGeometry {
+        match &self.attn {
+            Qwen38Attention::Linear {
+                n_v_heads,
+                n_k_heads,
+                head_dim,
+                conv_dim,
+                ..
+            } => crate::qwen38_gdn::GdnGeometry::Known(crate::qwen38_gdn::GdnShape {
+                n_v_heads: *n_v_heads,
+                n_k_heads: *n_k_heads,
+                head_dim: *head_dim,
+                conv_dim: *conv_dim,
+            }),
+            Qwen38Attention::Full { .. } => crate::qwen38_gdn::GdnGeometry::Unknown,
+        }
+    }
+
+    /// Forward one block.
+    ///
+    /// `cfg` is the model's real config, not a default: the previous signature
+    /// built one internally, so every geometry this block depends on (hidden
+    /// size, HC count, conv width) was whatever `Default` happened to say rather
+    /// than what the checkpoint declares.
+    ///
+    /// `gdn_cache` carries the Gated DeltaNet recurrent state for this layer
+    /// and is advanced in place. Layers that are full attention ignore it.
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        cfg: &Qwen38FlashNextConfig,
+        gdn_cache: &mut crate::qwen38_gdn::Qwen38GdnCache,
+    ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
-        let cfg = Qwen38FlashNextConfig::default();
 
         // 1. Attention sub-layer with HC Prepare/Inject
         let (x_norm_attn, branch_attn) = if x.shape().dims().last() == Some(&cfg.hidden_size) {
@@ -984,27 +1036,103 @@ impl Qwen38FlashNextBlock {
                 attn_qkv,
                 attn_gate,
                 ssm_conv1d,
-                ssm_dt: _,
-                ssm_a: _,
-                ssm_beta: _,
-                ssm_alpha: _,
+                ssm_dt,
+                ssm_a,
+                ssm_beta,
+                ssm_alpha,
                 ssm_norm,
                 ssm_out,
+                n_v_heads,
+                n_k_heads,
+                head_dim,
+                conv_dim,
+                pairing,
             } => {
+                let (n_v_heads, n_k_heads, head_dim, conv_dim) =
+                    (*n_v_heads, *n_k_heads, *head_dim, *conv_dim);
+                let pairing = *pairing;
+                // 1. Fused qkv projection, then the depthwise causal conv over
+                //    the whole [K K V] stream. The conv history lives in the
+                //    cache so it survives across decode steps.
                 let qkv = attn_qkv.forward(&branch_attn)?;
-                let conv_out = ssm_conv1d.forward(&qkv)?;
-                let normed = ssm_norm.forward(&conv_out)?;
+                let conv_mix = {
+                    let taps = cfg.linear_conv_kernel_dim.max(2);
+                    let need = (taps - 1) * conv_dim;
+                    if gdn_cache.conv_state.len() < need {
+                        gdn_cache.conv_state.resize(need, 0.0);
+                    }
+                    let history = gdn_cache.conv_state[..need].to_vec();
+                    let mut state_t = cpu_tensor(
+                        history,
+                        grim_tensor::Shape::new(vec![1, taps - 1, conv_dim]),
+                    );
+                    let out = grim_nn::modules::short_conv1d(
+                        &qkv,
+                        &ssm_conv1d.weight,
+                        None,
+                        Some(&mut state_t),
+                    )?;
+                    let updated = out.to_vec_f32()?;
+                    // The conv kernel advances the state in place; mirror it back
+                    // so the next decode step sees the history.
+                    let hist = state_t.to_vec_f32()?;
+                    gdn_cache.conv_state[..need].copy_from_slice(&hist[..need]);
+                    // SiLU on the convolved stream, per the reference.
+                    updated
+                        .iter()
+                        .map(|v| v / (1.0 + (-v).exp()))
+                        .collect::<Vec<f32>>()
+                };
+
+                // 2. Per-timestep-rank gates: alpha raw (softplus + ssm_a inside
+                //    the recurrence), beta raw (sigmoid inside).
+                let alpha_raw = ssm_alpha.forward(&branch_attn)?.to_vec_f32()?;
+                let beta_raw = ssm_beta.forward(&branch_attn)?.to_vec_f32()?;
+                let a_vec: Vec<f32> = ssm_a.to_vec_f32()?;
+                let dt_vec: Vec<f32> = ssm_dt.to_vec_f32()?;
+                // ssm_norm is an RmsNorm over the 128-wide state channel, but
+                // the recurrence applies it as a per-channel weight (the
+                // normalization itself already happened upstream in the
+                // reference; here it is the output scale). Take the weights
+                // directly rather than running the norm, which would subtract
+                // a mean the recurrence does not.
+                let ssm_norm_weight: Vec<f32> = ssm_norm.weight.to_vec_f32()?;
+
+                // 3. The recurrence itself, over the [seq] axis in order.
+                let value_dim = n_v_heads * head_dim;
+                let mut gdn_out = vec![0.0f32; seq_len * value_dim];
+                crate::qwen38_gdn::gated_delta_net_forward(
+                    &crate::qwen38_gdn::GdnParams {
+                        conv_mix: &conv_mix,
+                        alpha: &alpha_raw,
+                        beta: &beta_raw,
+                        a: &a_vec,
+                        dt_bias: &dt_vec,
+                        norm: &ssm_norm_weight,
+                        n_v_heads,
+                        n_k_heads,
+                        head_dim,
+                        conv_dim,
+                        seq_len,
+                        pairing,
+                    },
+                    gdn_cache,
+                    &mut gdn_out,
+                )?;
+                let gdn_t = cpu_tensor(gdn_out, grim_tensor::Shape::new(vec![seq_len, value_dim]));
+
+                // 4. Output gate: sigmoid(attn_gate) elementwise, then ssm_out.
                 let gate = attn_gate.forward(&branch_attn)?;
                 let gate_sig = grim_nn::modules::sigmoid_on_device(&gate)?;
-                let dev = grim_nn::modules::pick_device_for_tensor(&normed);
+                let dev = grim_nn::modules::pick_device_for_tensor(&gdn_t);
                 let (gated, _) =
-                    dev.mul(&**normed.storage(), &**gate_sig.storage(), normed.shape())?;
+                    dev.mul(&**gdn_t.storage(), &**gate_sig.storage(), gdn_t.shape())?;
                 let gated_tensor = Tensor::new(
                     std::sync::Arc::from(gated),
-                    normed.shape().clone(),
-                    normed.dtype(),
-                    normed.provenance().clone(),
-                    normed.device().clone(),
+                    gdn_t.shape().clone(),
+                    gdn_t.dtype(),
+                    gdn_t.provenance().clone(),
+                    gdn_t.device().clone(),
                 );
                 ssm_out.forward(&gated_tensor)?
             }
@@ -1303,6 +1431,42 @@ pub struct Qwen38FlashNext {
     pub output: Linear,
 }
 
+/// Per-session Gated DeltaNet state, one [`Qwen38GdnCache`] per layer.
+///
+/// Held in [`SessionT::model_state`](grim_core::session::SessionT::model_state)
+/// rather than on the model: `CausalLm::forward` takes `&self`, so a
+/// model-owned cache could not be advanced in place and decode would be
+/// stateless across steps. The slot is typed `Any + Send`, so this needs no
+/// change to the core session contract.
+#[derive(Debug, Clone, Default)]
+pub struct Qwen38GdnSession {
+    pub caches: Vec<crate::qwen38_gdn::Qwen38GdnCache>,
+}
+
+impl Qwen38GdnSession {
+    /// Ensure a cache exists for every layer, sizing each from the layer's own
+    /// declared geometry.
+    pub fn ensure(&mut self, layers: &[Qwen38FlashNextBlock], cfg: &Qwen38FlashNextConfig) {
+        if self.caches.len() < layers.len() {
+            self.caches.resize(layers.len(), Default::default());
+        }
+        for (i, layer) in layers.iter().enumerate() {
+            if !self.caches[i].ssm_state.is_empty() {
+                continue;
+            }
+            if let crate::qwen38_gdn::GdnGeometry::Known(g) = layer.gdn_geometry() {
+                self.caches[i] = crate::qwen38_gdn::Qwen38GdnCache::new(
+                    g.n_v_heads,
+                    g.head_dim,
+                    g.head_dim,
+                    cfg.linear_conv_kernel_dim.max(2),
+                    g.conv_dim,
+                );
+            }
+        }
+    }
+}
+
 impl Qwen38FlashNext {
     pub fn load(
         device: Device,
@@ -1573,9 +1737,25 @@ impl CausalLm for Qwen38FlashNext {
             )
         };
 
-        for layer in &self.layers {
-            h = layer.forward(&h, &pos_u32)?;
+        // Per-session GDN state. Created on first use and reused thereafter, so
+        // the recurrence accumulates across decode steps within a request and
+        // starts clean for the next one.
+        // Take the typed slot out of the session, use it, and put it back: the
+        // borrow checker cannot hold a `&mut dyn Any` across the layer loop
+        // while also borrowing `self`.
+        let mut gdn_state = match session.model_state_mut().and_then(|s| s.downcast_mut()) {
+            Some(s) => std::mem::take(s),
+            None => Qwen38GdnSession::default(),
+        };
+        gdn_state.ensure(&self.layers, &self.cfg);
+        for (i, layer) in self.layers.iter().enumerate() {
+            let cache = gdn_state
+                .caches
+                .get_mut(i)
+                .expect("ensure() sized one cache per layer");
+            h = layer.forward(&h, &pos_u32, &self.cfg, cache)?;
         }
+        session.set_model_state(Box::new(gdn_state));
 
         let normed = self.norm.forward(&h)?;
         session.set_last_hidden_state(normed.clone());
