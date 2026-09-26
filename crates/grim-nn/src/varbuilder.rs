@@ -17,7 +17,7 @@ use grim_quant::{
     dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs,
     dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_nutcracker, dequant_nvfp4, dequant_q2k,
     dequant_q3k,
-    dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
+    dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, dequant_gsq_rco_3p5,
 };
 
 #[cfg(feature = "cuda-mem")]
@@ -428,6 +428,45 @@ impl<'a> WeightSource<'a> {
         ))
     }
 
+    pub fn get_unconstrained_f32(&self, leaf: &str) -> Result<Tensor> {
+        let name = self.full_name(leaf);
+        let raw = self.cached_raw(&name)?;
+        let shape = Shape::new(raw.shape.clone());
+        let (dtype, provenance) = match self.tensors.meta(&name) {
+            Ok(m) => (m.dtype, m.provenance),
+            Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),
+        };
+        let f32s: Vec<f32> = if let Some(cached) = self.prefetched_f32(&name) {
+            (*cached).clone()
+        } else {
+            dequant_to_f32(&raw, &dtype)?
+        };
+        if self.device.is_cpu() {
+            return Ok(cpu_tensor(f32s, shape));
+        }
+        #[cfg(feature = "rocm-mem")]
+        if let Device::Rocm(ordinal) = self.device {
+            let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+            let storage = dev.upload_from_host_stream_ordered(&f32s, &shape, DType::F32)?;
+            return Ok(Tensor::new(
+                std::sync::Arc::from(storage),
+                shape,
+                DType::F32,
+                provenance,
+                self.device.clone(),
+            ));
+        }
+        let dev = crate::modules::pick_device_for_storage_device(&self.device);
+        let storage = dev.from_cpu(&f32s, &shape, DType::F32)?;
+        Ok(Tensor::new(
+            std::sync::Arc::from(storage),
+            shape,
+            DType::F32,
+            provenance,
+            self.device.clone(),
+        ))
+    }
+
     /// Materialize a tensor for training. Quantized storage types (Q4_K, Q5_K, Q6_K, Q8_0, ...) are dequantized to
     /// native F32 in CPU memory so the optimization pass has full-precision weights to take gradients against.
     pub fn get_for_training(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
@@ -765,6 +804,7 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             KQuantScheme::IQ2XXS => dequant_iq2xxs(&raw.bytes, n),
             KQuantScheme::IQ2XS => dequant_iq2xs(&raw.bytes, n),
             KQuantScheme::IQ2S => dequant_iq2s(&raw.bytes, n),
+            KQuantScheme::GsqRco3p5 => dequant_gsq_rco_3p5(&raw.bytes, n),
         },
         Storage::FloatPack(fp) => match fp {
             FloatPackScheme::Fp4 => dequant_fp4(&raw.bytes, n),

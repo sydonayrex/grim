@@ -142,6 +142,9 @@ pub enum KQuantScheme {
     IQ2XXS,
     IQ2XS,
     IQ2S,
+    /// GGUF `Q2_0` (dtype tag 42): 64 weights per 18-byte block, 2.25 bpw.
+    /// Used by the Qwen3.8-Flash-Next GSQ-RCO release for expert down-proj.
+    GsqRco3p5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -303,6 +306,7 @@ impl DType {
                 KQuantScheme::IQ2XXS => (elem_count.div_ceil(256)) * 66,
                 KQuantScheme::IQ2XS => (elem_count.div_ceil(256)) * 74,
                 KQuantScheme::IQ2S => (elem_count.div_ceil(256)) * 82,
+                KQuantScheme::GsqRco3p5 => (elem_count.div_ceil(64)) * 18,
             },
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => elem_count.div_ceil(2),

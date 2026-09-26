@@ -99,7 +99,9 @@ impl GgufProvider {
                 let pattern = entry
                     .get("tensor_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::Backend("quant_overrides entry needs `tensor_name`".into()))?;
+                    .ok_or_else(|| {
+                        Error::Backend("quant_overrides entry needs `tensor_name`".into())
+                    })?;
                 let dtype_name = entry
                     .get("override_dtype")
                     .and_then(|v| v.as_str())
@@ -107,8 +109,10 @@ impl GgufProvider {
                         Error::Backend("quant_overrides entry needs `override_dtype`".into())
                     })?;
                 let dtype = gguftag_from_name(dtype_name)?;
-                let effective_bpw =
-                    entry.get("effective_bpw").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let effective_bpw = entry
+                    .get("effective_bpw")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 for t in &gguf.tensors {
                     if glob_match(pattern, &t.name) {
                         overrides.insert(
@@ -287,7 +291,10 @@ fn gguftag_from_name(name: &str) -> Result<GgufDType> {
 /// Byte length a tensor's payload must have under its EFFECTIVE dtype. Used when
 /// an override corrects a mis-tagged tensor, so the slice matches the dtype the
 /// rest of the stack will decode with.
-fn effective_size_bytes(info: &GgufTensorInfo, overrides: &HashMap<String, GrimQuantOverride>) -> usize {
+fn effective_size_bytes(
+    info: &GgufTensorInfo,
+    overrides: &HashMap<String, GrimQuantOverride>,
+) -> usize {
     match overrides.get(&info.name) {
         Some(ov) => crate::gguf::expected_tensor_bytes(ov.override_dtype, &info.dims)
             .and_then(|b| usize::try_from(b).ok())
@@ -301,9 +308,11 @@ fn effective_size_bytes(info: &GgufTensorInfo, overrides: &HashMap<String, GrimQ
 /// every layer is `blk.*.ffn_gate_exps.weight`.
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.split_once('*') {
-        Some((prefix, suffix)) => name.len() >= prefix.len() + suffix.len()
-            && name.starts_with(prefix)
-            && name.ends_with(suffix),
+        Some((prefix, suffix)) => {
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
         None => pattern == name,
     }
 }
@@ -564,8 +573,7 @@ impl SafetensorsProvider {
             Some(b) => b,
             None => return false,
         };
-        self.info
-            .contains_key(&format!("{base}.weight_scale_inv"))
+        self.info.contains_key(&format!("{base}.weight_scale_inv"))
     }
 
     /// DeepSeek-style block-FP8 arm (Xing4.0 / DeepSeek-V3 family native FP8 exports):
@@ -603,27 +611,21 @@ impl SafetensorsProvider {
         let block_cols = in_dim / grid_cols;
         debug_assert_eq!(block_rows * grid_rows, out);
         debug_assert_eq!(block_cols * grid_cols, in_dim);
-        let codes_start = match self
-            .data_region_start
-            .checked_add(info.data_start)
-        {
+        let codes_start = match self.data_region_start.checked_add(info.data_start) {
             Some(s) => s,
             None => {
                 return Some(Err(Error::Backend(format!(
                     "fp8 block dequant for '{name}': offset overflow"
-                ))))
+                ))));
             }
         };
         let codes_len = (info.data_end - info.data_start) as usize;
-        let scale_start = match self
-            .data_region_start
-            .checked_add(scale_info.data_start)
-        {
+        let scale_start = match self.data_region_start.checked_add(scale_info.data_start) {
             Some(s) => s,
             None => {
                 return Some(Err(Error::Backend(format!(
                     "fp8 block dequant for '{name}': scale offset overflow"
-                ))))
+                ))));
             }
         };
         let scale_len = (scale_info.data_end - scale_info.data_start) as usize;
@@ -662,7 +664,7 @@ impl SafetensorsProvider {
             Err(e) => {
                 return Some(Err(Error::Backend(format!(
                     "fp8 block pack for '{name}': {e}"
-                ))))
+                ))));
             }
         };
         Some(Ok(RawTensor {
@@ -1271,6 +1273,16 @@ pub struct SplitGgufProvider {
     total_expected_tensors: usize,
 }
 
+impl std::fmt::Debug for SplitGgufProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitGgufProvider")
+            .field("shards", &self.shards.len())
+            .field("tensors", &self.tensor_map.len())
+            .field("total_expected_tensors", &self.total_expected_tensors)
+            .finish()
+    }
+}
+
 impl SplitGgufProvider {
     pub fn open(primary_path: &str) -> Result<Self> {
         let primary = GgufProvider::open(primary_path)?;
@@ -1310,7 +1322,11 @@ impl SplitGgufProvider {
                             if let Some(no_val) =
                                 companion.metadata("split.no").and_then(|v| v.as_u32())
                             {
-                                shards_by_no.insert(no_val as usize, companion);
+                                // First shard wins. The primary is inserted before
+                                // the scan, and two unrelated models of the same
+                                // architecture in one directory would otherwise
+                                // silently evict each other's shard 0.
+                                shards_by_no.entry(no_val as usize).or_insert(companion);
                             }
                         }
                     }
@@ -1320,7 +1336,9 @@ impl SplitGgufProvider {
             if shards_by_no.len() < split_count {
                 return Err(Error::Backend(format!(
                     "SplitGgufProvider: expected {} shards for architecture '{}', but found {}",
-                    split_count, primary_arch, shards_by_no.len()
+                    split_count,
+                    primary_arch,
+                    shards_by_no.len()
                 )));
             }
         }
@@ -1362,35 +1380,60 @@ impl SplitGgufProvider {
     pub fn total_expected_tensors(&self) -> usize {
         self.total_expected_tensors
     }
+
+    pub fn metadata(&self, key: &str) -> Option<&crate::gguf::GgufValue> {
+        self.shards.first().and_then(|s| s.metadata(key))
+    }
+
+    pub fn architecture(&self) -> Option<&str> {
+        self.shards.first().and_then(|s| s.architecture())
+    }
+
+    pub fn tokenizer(&self) -> Result<crate::tokenizer::GgufTokenizer> {
+        self.shards
+            .first()
+            .ok_or_else(|| Error::Backend("SplitGgufProvider has no shards".into()))
+            .and_then(|s| s.tokenizer())
+    }
 }
 
 impl TensorProvider for SplitGgufProvider {
     fn get(&self, name: &str) -> Result<RawTensor> {
-        let idx = self
-            .tensor_map
-            .get(name)
-            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found across GGUF splits")))?;
+        let idx = self.tensor_map.get(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found across GGUF splits"))
+        })?;
         self.shards[*idx].get(name)
     }
 
     fn get_packed(&self, name: &str) -> Result<RawTensor> {
-        let idx = self
-            .tensor_map
-            .get(name)
-            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found across GGUF splits")))?;
+        let idx = self.tensor_map.get(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found across GGUF splits"))
+        })?;
         self.shards[*idx].get_packed(name)
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
-        let idx = self
-            .tensor_map
-            .get(name)
-            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found across GGUF splits")))?;
+        let idx = self.tensor_map.get(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found across GGUF splits"))
+        })?;
         self.shards[*idx].meta(name)
     }
 
     fn tensor_names(&self) -> Vec<String> {
         self.tensor_map.keys().cloned().collect()
+    }
+
+    fn get_packed_sharded(
+        &self,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<RawTensor> {
+        let idx = self.tensor_map.get(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found across GGUF splits"))
+        })?;
+        self.shards[*idx].get_packed_sharded(name, dim, rank, world_size)
     }
 }
 
@@ -1727,12 +1770,12 @@ mod tests {
     /// `weight_scale_inv` F32 sibling must dequant to F32 inline
     /// (`w[i][j] = fp8(code[i][j]) * scale_inv[i/BR][j/BC]`), and an F8_E4M3
     /// weight WITHOUT the sibling must still fail loudly (unsupported dtype).
-        /// `get` and `meta` must never disagree on a quantized weight's dtype.
+    /// `get` and `meta` must never disagree on a quantized weight's dtype.
     fn raw_dtype_of(p: &SafetensorsProvider, name: &str) -> DType {
         p.get(name).unwrap().dtype
     }
 
-#[test]
+    #[test]
     fn fp8_block_fold_dequants_with_sibling_and_fails_without() {
         // 2x4 fp8 codes, 2x2 f32 scale_inv (128x128 layout scaled down 64x).
         // codes[0] = 0x38 (1.0), codes[1] = 0x3C (1.5), codes[2] = 0xC0 (-2.0),
