@@ -1595,10 +1595,29 @@ extern "C" __global__ void grim_dot2_q80_gemv(
 // V_DOT4_F32_FP8_FP8 with f32 accumulation.
 
 __device__ __forceinline__ float grim_fdot4_fp8(float c, int a, int b) {
-#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_fdot4_f32_fp8_fp8)
-    return __builtin_amdgcn_fdot4_f32_fp8_fp8(c, a, b);
+// Builtin name is `dot4_*`, NOT `fdot4_*` — there is no `fdot4` builtin in any
+// ROCm clang. The old spelling made __has_builtin false, so this helper silently
+// ran the #else scalar branch on gfx1201 (which has the native instruction) and
+// paid a powf() per E4M3 element for four products.
+//
+// ARGUMENT ORDER is (packed_a, packed_b, f32_addend) -> f32, i.e. the two packed
+// FP8 operands come FIRST and the accumulator LAST. BuiltinsAMDGPU.def records
+// this as "fUiUif", which reads like (f, u, u) but lists the RETURN type first:
+// the real params are (u, i, u, i, f) = a, a_neg, b, b_neg, acc. Passing
+// (c, a, b) compiles cleanly, emits a correct-looking
+// `v_dot4_f32_fp8_fp8 v, 0, b, c` with `a` constant-folded to literal 0, and
+// silently discards every A contribution — parity diverges by ~1e10. Verified
+// numerically on gfx1201 before and after.
+//
+// Guarded by builtin_name_oracle_tests (names) and
+// tests/jit_instruction_emit.rs (emission) plus dot_gemv_parity (numerics).
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_dot4_f32_fp8_fp8)
+    return __builtin_amdgcn_dot4_f32_fp8_fp8((unsigned int)a, (unsigned int)b, c);
 #else
-    // Portable fallback: unpack 4 E4M3 codes per operand and fma in f32.
+    // Portable fallback for gfx10/gfx11, which lack dot11-insts. Unpack 4 E4M3
+    // codes per operand and fma in f32. Correct but far slower than the
+    // instruction it stands in for — do not "optimise" this into being the
+    // gfx12 path.
     float acc = c;
     for (int e = 0; e < 4; ++e) {
         float av = fp8_e4m3_to_float_hip((unsigned char)((a >> (8 * e)) & 0xFF));
