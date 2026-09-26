@@ -29,6 +29,13 @@ pub struct RocmStorage {
     pub(crate) managed: bool,
 }
 
+/// Human-readable label for a ledger entry. Deliberately cheap: it is built
+/// once per allocation, and the pointer range is what actually identifies the
+/// allocation, not this string.
+fn alloc_label(dtype: &DType, shape: &Shape) -> String {
+    format!("{:?} {:?}B", dtype, shape)
+}
+
 impl RocmStorage {
     pub fn shape_metadata(&self) -> &Shape {
         &self.shape
@@ -86,6 +93,13 @@ impl RocmStorage {
             check_hip("hipMallocManaged", unsafe {
                 hipMallocManaged(&mut ptr, bytes, 1)
             })?;
+            crate::memory::ledger::register(
+                ptr as u64,
+                bytes as u64,
+                ordinal,
+                true,
+                &alloc_label(&dtype, shape),
+            );
             return Ok(RocmStorage {
                 device_ptr: Some(ptr as u64),
                 bytes,
@@ -104,6 +118,13 @@ impl RocmStorage {
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
                     crate::memory::budget::note_managed_fallback(ordinal, bytes);
+                    crate::memory::ledger::register(
+                        ptr as u64,
+                        bytes as u64,
+                        ordinal,
+                        true,
+                        &alloc_label(&dtype, shape),
+                    );
                     return Ok(RocmStorage {
                         device_ptr: Some(ptr as u64),
                         bytes,
@@ -118,6 +139,13 @@ impl RocmStorage {
                 return Err(vram_error);
             }
         };
+        crate::memory::ledger::register(
+            dev_ptr_void as u64,
+            bytes as u64,
+            ordinal,
+            false,
+            &alloc_label(&dtype, shape),
+        );
         Ok(RocmStorage {
             device_ptr: Some(dev_ptr_void as u64),
             bytes,
@@ -478,6 +506,13 @@ impl Drop for RocmStorage {
             // The managed branch issues a real `hipFree` and MUST pin the owning ordinal - a.
             if self.managed {
                 let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                // Only the managed branch really unmaps memory: `hipFree` returns the
+                // range to the driver, so the ledger record must go with it. Pooled
+                // (non-managed) memory deliberately stays registered - the caching
+                // allocator still has it mapped and may hand the same range out again,
+                // so a fault into it is still a real fault. Deregistering here would
+                // erase a live allocation and hide exactly the faults we want.
+                crate::memory::ledger::deregister(ptr_val);
                 unsafe {
                     let _ = crate::hipFree(ptr_val as *mut c_void);
                 }
