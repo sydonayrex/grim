@@ -39,6 +39,21 @@ pub struct Qwen38FlashNextConfig {
     pub split_ngram_parts: usize,
     pub ple_layer_ids: Vec<usize>,
     pub ple_conv_kernel_size: usize,
+    /// `ple.layer_multipliers`: the published 64-bit hash constants, one per
+    /// n-gram order. `ngram_size` entries.
+    pub ple_layer_multipliers: Vec<u64>,
+    /// `ple.head_offsets`: row offset of each head's slice in the shared table.
+    /// `(ngram_size - 1) * heads_per_ngram` entries.
+    pub ple_head_offsets: Vec<u64>,
+    /// `ple.head_vocab_sizes`: per-head modulus. NOT uniform: the released file
+    /// has 16 distinct values around 2.0e7, so a single shared vocab is wrong.
+    pub ple_head_vocab_sizes: Vec<u64>,
+    /// `ple.heads_per_ngram`.
+    pub ple_heads_per_ngram: usize,
+    /// `ple.eos_token_id`; resets the n-gram window.
+    pub ple_eos_token_id: u32,
+    /// `ple.image_token_id`, hashed in place of a token for embedding batches.
+    pub ple_image_token_id: Option<u32>,
     pub mrope_section: [usize; 4],
     pub partial_rotary_factor: f32,
     pub rms_norm_eps: f32,
@@ -238,6 +253,18 @@ impl Qwen38FlashNextConfig {
             hc_lowrank: gu("qwen4exp.hyper_connection.low_rank").unwrap_or(320),
             ngram_vocab_size,
             ngram_dim: Some(ple_heads),
+            ple_layer_multipliers: m
+                .get_u64_array("qwen4exp.ple.layer_multipliers")
+                .unwrap_or_default(),
+            ple_head_offsets: m
+                .get_u64_array("qwen4exp.ple.head_offsets")
+                .unwrap_or_default(),
+            ple_head_vocab_sizes: m
+                .get_u64_array("qwen4exp.ple.head_vocab_sizes")
+                .unwrap_or_default(),
+            ple_heads_per_ngram: heads_per_ngram,
+            ple_eos_token_id: gu("qwen4exp.ple.eos_token_id").unwrap_or(0) as u32,
+            ple_image_token_id: gu("qwen4exp.ple.image_token_id").map(|v| v as u32),
             ngram_size: ple_ngram,
             split_ngram_parts: heads_per_ngram * 2,
             ple_layer_ids,
@@ -263,6 +290,25 @@ impl Qwen38FlashNextConfig {
                 .map(|v| v.into_iter().map(|x| x as usize).collect())
                 .unwrap_or_default(),
         }
+    }
+}
+
+impl Qwen38FlashNextConfig {
+    /// Build the PLE addressing from the checkpoint's published constants.
+    ///
+    /// # Errors
+    /// Propagates the metadata validation from
+    /// [`Qwen38NgramAddressing::from_metadata`].
+    pub fn ple_addressing(&self) -> Result<Qwen38NgramAddressing> {
+        Qwen38NgramAddressing::from_metadata(
+            self.ple_layer_multipliers.clone(),
+            self.ple_head_offsets.clone(),
+            self.ple_head_vocab_sizes.clone(),
+            self.ple_heads_per_ngram,
+            self.ngram_size,
+            self.ple_eos_token_id,
+            self.ple_image_token_id,
+        )
     }
 }
 
@@ -296,12 +342,27 @@ impl Default for Qwen38FlashNextConfig {
             linear_conv_kernel_dim: 4,
             hc_count: 4,
             hc_lowrank: 320,
-            ngram_vocab_size: Some(20_000_000),
-            ngram_dim: Some(2560),
+            ngram_vocab_size: Some(320_001_446),
+            ngram_dim: Some(160),
             ngram_size: 3,
             split_ngram_parts: 128,
             ple_layer_ids: vec![1],
             ple_conv_kernel_size: 4,
+            // The released GSQ-RCO file's exact PLE constants. 16 heads =
+            // (ngram_size - 1) * heads_per_ngram = 2 * 8.
+            ple_layer_multipliers: vec![23703573157769, 20109073645365, 8052911324071],
+            ple_head_offsets: vec![
+                0, 20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297,
+                160000374, 180000455, 200000548, 220000655, 240000802, 260000955, 280001114,
+                300001275,
+            ],
+            ple_head_vocab_sizes: vec![
+                20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077,
+                20000081, 20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171,
+            ],
+            ple_heads_per_ngram: 8,
+            ple_eos_token_id: 248044,
+            ple_image_token_id: Some(248056),
             mrope_section: [11, 11, 10, 0],
             partial_rotary_factor: 0.25,
             rms_norm_eps: 1e-6,
@@ -1580,87 +1641,181 @@ impl Qwen38FlashNextBlock {
     }
 }
 
-/// Precomputed modular polynomial weights and moduli for N-gram embedding addressing
-/// (matching SGLang / vLLM LongCat-Flash & Qwen Flash N-gram architecture).
+/// PLE n-gram hash addressing.
+///
+/// Transcribed from `old/repo/llama.cpp-master/src/models/qwen4exp.cpp` at
+/// commit `d7241ac8`, `llm_graph_input_ple::set_input`:
+///
+/// ```text
+/// mixed_n = (t[p] * m[0]) ^ (t[p-1] * m[1]) ^ ... ^ (t[p-n+1] * m[n-1])
+/// row    = mixed_n % vocab[h] + offset[h]
+/// ```
+///
+/// for every `n` in `2..=ngram_size` and, within each `n`, for all
+/// `heads_per_ngram` heads. Note this is an XOR of scaled products, NOT a
+/// polynomial modular hash, and the moduli are PER-HEAD vocab sizes taken
+/// from the checkpoint, not `vocab_size` of the model. The previous
+/// implementation synthesised coprime moduli from an `m_base` and used a
+/// polynomial sum, neither of which appears in the reference.
+///
+/// The hash is host-side because it needs 64-bit multiply-xor; upstream says
+/// the same ("ggml has no int64 and no xor").
 #[derive(Clone, Debug)]
 pub struct Qwen38NgramAddressing {
-    pub vocab_size: usize,
-    pub m_base: usize,
-    pub split_parts: usize,
-    pub neighbor_num: usize,
-    pub ne_mods: Vec<u64>,
-    pub ne_weights: Vec<u64>,
-    pub exclusive_sizes: Vec<usize>,
+    /// `ple_layer_multipliers`, length `ngram_size`. These are the published
+    /// 64-bit constants, NOT a base to derive weights from.
+    pub layer_multipliers: Vec<u64>,
+    /// `ple_head_offsets`, length `(ngram_size - 1) * heads_per_ngram`.
+    pub head_offsets: Vec<u64>,
+    /// `ple_head_vocab_sizes`, same length as `head_offsets`. These differ per
+    /// head (the released file has 16 distinct values around 2.0e7), so a single
+    /// shared vocabulary is not a valid approximation.
+    pub head_vocab_sizes: Vec<u64>,
+    /// `ple_heads_per_ngram`.
+    pub heads_per_ngram: usize,
+    /// `ple_ngram_size`.
+    pub ngram_size: usize,
+    /// `ple_eos_token_id`; an EOS in the window resets everything at or before it.
+    pub eos_token_id: u32,
+    /// `ple_image_token_id`, used when a batch arrives as embeddings.
+    pub image_token_id: Option<u32>,
 }
 
 impl Qwen38NgramAddressing {
-    /// Construct addressing tables with coprime moduli and precomputed power weights: $\text{mod}_{i, j} = m +
-    /// 2 \cdot (i \cdot k + j) + 1$, $w_{i, j, \delta} = V^\delta \pmod{\text{mod}_{i, j}}$.
-    pub fn new(vocab_size: usize, m_base: usize, split_parts: usize, neighbor_num: usize) -> Self {
-        let n_minus_1 = neighbor_num.saturating_sub(1).max(1);
-        let k = split_parts.max(1);
-        let num_configs = n_minus_1 * k;
-
-        let mut ne_mods = Vec::with_capacity(num_configs);
-        let mut ne_weights = Vec::with_capacity(num_configs * neighbor_num);
-        let mut sizes = Vec::with_capacity(num_configs);
-        let mut exclusive_sizes = Vec::with_capacity(num_configs + 1);
-        exclusive_sizes.push(0);
-
-        for i in 0..n_minus_1 {
-            for j in 0..k {
-                let mod_val = (m_base + 2 * (i * k + j) + 1) as u64;
-                ne_mods.push(mod_val);
-                sizes.push(mod_val as usize);
-
-                for delta in 0..neighbor_num {
-                    let mut w = 1u64;
-                    for _ in 0..delta {
-                        w = ((w as u128 * vocab_size as u128) % mod_val as u128) as u64;
-                    }
-                    ne_weights.push(w);
-                }
-            }
-        }
-
-        let mut sum = 0;
-        for &s in &sizes {
-            sum += s;
-            exclusive_sizes.push(sum);
-        }
-
-        Self {
-            vocab_size,
-            m_base,
-            split_parts: k,
-            neighbor_num,
-            ne_mods,
-            ne_weights,
-            exclusive_sizes,
-        }
+    /// Total head count, `(ngram_size - 1) * heads_per_ngram`. Upstream
+    /// requires this to equal the lengths of `head_offsets` and
+    /// `head_vocab_sizes`.
+    pub fn n_heads(&self) -> usize {
+        (self.ngram_size.saturating_sub(1)).saturating_mul(self.heads_per_ngram)
     }
 
-    /// Computes the exact SGLang / vLLM polynomial n-gram ID for a token sequence ending at position `curr_pos`.
-    pub fn compute_ngram_id(&self, tokens: &[u32], curr_pos: usize, config_idx: usize) -> usize {
-        let n_minus_1 = self.neighbor_num.saturating_sub(1).max(1);
-        let k = self.split_parts;
-        let c_idx = config_idx % (n_minus_1 * k);
-        let n = c_idx / k;
-        let ne_mod = self.ne_mods[c_idx];
-        let weight_base = c_idx * self.neighbor_num;
+    /// Row count the shared PLE table must provide: `max(offset + vocab_size)`.
+    ///
+    /// The released file's 16 heads are contiguous but have per-head vocab
+    /// sizes, so the total is `320_001_446`, not `16 * 20_000_000`.
+    pub fn table_rows(&self) -> usize {
+        self.head_offsets
+            .iter()
+            .zip(self.head_vocab_sizes.iter())
+            .map(|(o, v)| (o + v) as usize)
+            .max()
+            .unwrap_or(0)
+    }
 
-        let mut ngram_id = 0u64;
-        for j in 0..(n + 2).min(self.neighbor_num) {
-            if curr_pos < j {
-                break;
-            }
-            let tok = tokens[curr_pos - j] as u64;
-            let weight = self.ne_weights[weight_base + j];
-            let term = ((tok as u128 * weight as u128) % ne_mod as u128) as u64;
-            ngram_id = (ngram_id + term) % ne_mod;
+    /// Build the addressing from checkpoint metadata.
+    ///
+    /// # Errors
+    /// Returns a config error when the arrays are inconsistent: upstream
+    /// requires `layer_multipliers` to have `ngram_size` entries and both head
+    /// arrays to have `n_heads`. Silently accepting a mismatch would gather
+    /// from the wrong rows and produce plausible, wrong embeddings.
+    pub fn from_metadata(
+        layer_multipliers: Vec<u64>,
+        head_offsets: Vec<u64>,
+        head_vocab_sizes: Vec<u64>,
+        heads_per_ngram: usize,
+        ngram_size: usize,
+        eos_token_id: u32,
+        image_token_id: Option<u32>,
+    ) -> Result<Self> {
+        let probe = Self {
+            layer_multipliers: layer_multipliers.clone(),
+            head_offsets: head_offsets.clone(),
+            head_vocab_sizes: head_vocab_sizes.clone(),
+            heads_per_ngram,
+            ngram_size,
+            eos_token_id,
+            image_token_id,
+        };
+        let n_heads = probe.n_heads();
+        if ngram_size < 2 {
+            return Err(grim_core::Error::Config(format!(
+                "PLE n-gram size {ngram_size} is out of range (must be >= 2)"
+            )));
         }
+        if n_heads == 0 {
+            return Err(grim_core::Error::Config(
+                "PLE head count is zero".to_string(),
+            ));
+        }
+        if layer_multipliers.len() != ngram_size {
+            return Err(grim_core::Error::Config(format!(
+                "PLE layer_multipliers has {} entries, expected ngram_size={ngram_size}",
+                layer_multipliers.len()
+            )));
+        }
+        if head_offsets.len() != n_heads || head_vocab_sizes.len() != n_heads {
+            return Err(grim_core::Error::Config(format!(
+                "PLE head arrays have {}/{} entries, expected n_heads={n_heads} \
+                 (=(ngram_size-1) * heads_per_ngram)",
+                head_offsets.len(),
+                head_vocab_sizes.len()
+            )));
+        }
+        if head_vocab_sizes.iter().any(|v| *v == 0) {
+            return Err(grim_core::Error::Config(
+                "PLE head_vocab_sizes contains a zero".to_string(),
+            ));
+        }
+        Ok(probe)
+    }
 
-        ngram_id as usize
+    /// Gather row indices for one position.
+    ///
+    /// `ctx` is the token window oldest-first with `ctx[0]` the current token,
+    /// as upstream builds it: an EOS in the window resets everything at or
+    /// before it, a missing predecessor reads as EOS, and the current token's
+    /// own EOS does not cut its own context.
+    ///
+    /// Returns `n_heads` row indices into the shared table.
+    pub fn rows_for_context(&self, ctx: &[u32]) -> Vec<u32> {
+        let n_heads = self.n_heads();
+        let mut idx = vec![0u32; n_heads];
+        let per_gram = self.heads_per_ngram;
+        for n in 2..=self.ngram_size {
+            // XOR of the scaled products for the n newest tokens.
+            let mut mixed = (ctx.first().copied().unwrap_or(self.eos_token_id) as u64)
+                .wrapping_mul(self.layer_multipliers[0]);
+            for j in 1..n {
+                let t = ctx.get(j).copied().unwrap_or(self.eos_token_id) as u64;
+                mixed ^= t.wrapping_mul(self.layer_multipliers[j]);
+            }
+            let base = (n - 2) * per_gram;
+            for g in 0..per_gram {
+                let h = base + g;
+                idx[h] = (mixed % self.head_vocab_sizes[h] + self.head_offsets[h]) as u32;
+            }
+        }
+        idx
+    }
+
+    /// Build the window for position `i` from the token history, applying the
+    /// EOS reset rule.
+    ///
+    /// `prev` is the `ngram_size - 1` preceding tokens, oldest-first, with
+    /// `None` for anything before the start of the sequence.
+    pub fn context_at(&self, token: u32, prev: &[Option<u32>]) -> Vec<u32> {
+        let n_gram = self.ngram_size;
+        let mut ctx = vec![self.eos_token_id; n_gram];
+        ctx[0] = token;
+        let mut cut = false;
+        for s in 1..n_gram {
+            // prev is oldest-first, so the token s positions back is
+            // prev[n_prev - s].
+            let n_prev = n_gram - 1;
+            let t = if cut {
+                None
+            } else {
+                prev.get(n_prev - s).copied().flatten()
+            };
+            cut = cut || t.is_none_or(|v| v == self.eos_token_id);
+            ctx[s] = if cut {
+                self.eos_token_id
+            } else {
+                t.unwrap_or(self.eos_token_id)
+            };
+        }
+        ctx
     }
 }
 
@@ -1695,25 +1850,38 @@ impl Qwen38NgramEmbedding {
         }
 
         let table_vec = self.table.to_vec_f32()?;
-        let mut gathered_ngram = vec![0.0f32; seq_len * self.ngram_dim];
+        let n_heads = self.addressing.n_heads();
+        // Upstream lays the gathered rows out as [ple_n_heads * n_tokens] and
+        // then reshapes to [n_tokens, ple_n_heads * ple_head_dim], so the
+        // per-token block is the concatenation of that token's n_heads rows in
+        // head order. One row per (n, g) pair, not one row per position.
+        let row_dim = n_heads * self.ngram_dim;
+        let mut gathered_ngram = vec![0.0f32; seq_len * row_dim];
 
+        let n_prev = self.addressing.ngram_size - 1;
         for i in 0..seq_len {
-            // N-gram lookup for positions with context history
-            if i >= 1 {
-                let ngram_idx =
-                    self.addressing.compute_ngram_id(tokens, i, 0) % self.ngram_vocab_size;
-                let table_offset = ngram_idx * self.ngram_dim;
-                let dst_offset = i * self.ngram_dim;
-                if table_offset + self.ngram_dim <= table_vec.len() {
-                    gathered_ngram[dst_offset..dst_offset + self.ngram_dim]
-                        .copy_from_slice(&table_vec[table_offset..table_offset + self.ngram_dim]);
+            let prev: Vec<Option<u32>> = (0..n_prev)
+                .map(|j| tokens.get(i + 1 + j).copied())
+                .collect();
+            let ctx = self.addressing.context_at(tokens[i], &prev);
+            let rows = self.addressing.rows_for_context(&ctx);
+            for (h, &row) in rows.iter().enumerate() {
+                let src = row as usize * self.ngram_dim;
+                let dst = i * row_dim + h * self.ngram_dim;
+                if src + self.ngram_dim <= table_vec.len() {
+                    gathered_ngram[dst..dst + self.ngram_dim]
+                        .copy_from_slice(&table_vec[src..src + self.ngram_dim]);
                 }
             }
         }
 
+        // The gathered block is n_heads * ngram_dim wide, so the tensor shape
+        // must say so. Declaring ngram_dim here while the buffer is
+        // n_heads * ngram_dim long is a size mismatch, and the projection is
+        // sized [ngram_dim, hidden] to match the reference's ple_head_dim.
         let ngram_tensor = cpu_tensor(
             gathered_ngram,
-            grim_tensor::Shape::new(vec![seq_len, self.ngram_dim]),
+            grim_tensor::Shape::new(vec![seq_len, row_dim]),
         );
         Ok(self.proj.forward(&ngram_tensor)?)
     }
@@ -1808,6 +1976,14 @@ impl Qwen38FlashNext {
         let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
             (cfg.ngram_vocab_size, cfg.ngram_dim)
         {
+            // The gather yields `ple_n_heads` rows per token, each
+            // `ple_head_dim` (= ngram_dim) wide, so the projected block is
+            // n_heads * ngram_dim wide. For the released geometry that is
+            // 16 * 160 = 2560 = hidden_size, and the reference applies no
+            // projection at all (`reshape_2d(emb, ple_head_dim * n_heads,
+            // n_tokens)`). Declaring the projection at ngram_dim is a size
+            // mismatch against that gather.
+            let ple_gathered_dim = cfg.ple_addressing()?.n_heads() * ngram_dim;
             let table = root
                 .scoped("layers")
                 .scoped("1")
@@ -1836,13 +2012,19 @@ impl Qwen38FlashNext {
                     .scoped("1")
                     .scoped("ple")
                     .scoped("key_proj"),
-                [ngram_dim, cfg.hidden_size],
+                [ple_gathered_dim, cfg.hidden_size],
             )
             .or_else(|_| {
-                Linear::load_shape(&root.scoped("ngram_proj"), [ngram_dim, cfg.hidden_size])
+                Linear::load_shape(
+                    &root.scoped("ngram_proj"),
+                    [ple_gathered_dim, cfg.hidden_size],
+                )
             })
             .or_else(|_| {
-                Linear::load_shape(&root.scoped("ple_ngram_proj"), [ngram_dim, cfg.hidden_size])
+                Linear::load_shape(
+                    &root.scoped("ple_ngram_proj"),
+                    [ple_gathered_dim, cfg.hidden_size],
+                )
             })
             .map_err(|e| {
                 grim_core::Error::Config(format!(
@@ -1851,12 +2033,7 @@ impl Qwen38FlashNext {
                 ))
             })?;
 
-            let addressing = Qwen38NgramAddressing::new(
-                cfg.vocab_size,
-                ngram_vocab,
-                cfg.split_ngram_parts,
-                cfg.ngram_size,
-            );
+            let addressing = cfg.ple_addressing()?;
 
             Some(Qwen38NgramEmbedding {
                 ngram_vocab_size: ngram_vocab,
@@ -1909,36 +2086,38 @@ impl Qwen38FlashNext {
             ),
             None,
         );
-        let ngram_embeddings =
-            if let (Some(ngram_vocab), Some(ngram_dim)) = (cfg.ngram_vocab_size, cfg.ngram_dim) {
-                let table = cpu_tensor(
-                    vec![0.01f32; ngram_vocab * ngram_dim],
-                    grim_tensor::Shape::new(vec![ngram_vocab, ngram_dim]),
-                );
-                let proj = Linear::from_tensor(
-                    cpu_tensor(
-                        vec![0.01f32; cfg.hidden_size * ngram_dim],
-                        grim_tensor::Shape::new(vec![cfg.hidden_size, ngram_dim]),
-                    ),
-                    None,
-                );
-                let addressing = Qwen38NgramAddressing::new(
-                    cfg.vocab_size,
-                    ngram_vocab,
-                    cfg.split_ngram_parts,
-                    cfg.ngram_size,
-                );
-                Some(Qwen38NgramEmbedding {
-                    ngram_vocab_size: ngram_vocab,
-                    ngram_dim,
-                    hidden_size: cfg.hidden_size,
-                    table,
-                    proj,
-                    addressing,
-                })
-            } else {
-                None
-            };
+        let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
+            (cfg.ngram_vocab_size, cfg.ngram_dim)
+        {
+            let table = cpu_tensor(
+                vec![0.01f32; ngram_vocab * ngram_dim],
+                grim_tensor::Shape::new(vec![ngram_vocab, ngram_dim]),
+            );
+            let ple_gathered_dim = cfg.ple_addressing().expect("default PLE").n_heads() * ngram_dim;
+            let proj = Linear::from_tensor(
+                cpu_tensor(
+                    vec![0.01f32; cfg.hidden_size * ple_gathered_dim],
+                    grim_tensor::Shape::new(vec![cfg.hidden_size, ple_gathered_dim]),
+                ),
+                None,
+            );
+            // `random` returns Self, so it cannot propagate a metadata
+            // error. Use the default (well-formed) addressing; the real
+            // constants arrive through `load_tp`, which does propagate.
+            let addressing = cfg
+                .ple_addressing()
+                .expect("the default PLE constants are well-formed");
+            Some(Qwen38NgramEmbedding {
+                ngram_vocab_size: ngram_vocab,
+                ngram_dim,
+                hidden_size: cfg.hidden_size,
+                table,
+                proj,
+                addressing,
+            })
+        } else {
+            None
+        };
 
         let norm = RmsNorm {
             weight: cpu_tensor(
@@ -2105,35 +2284,24 @@ mod tests {
         assert_eq!(cfg.hc_lowrank, 320);
         assert_eq!(cfg.mrope_section, [11, 11, 10, 0]);
         assert_eq!(cfg.max_seq_len, 262144);
-        assert_eq!(cfg.ngram_vocab_size, Some(20_000_000));
-        assert_eq!(cfg.ngram_dim, Some(2560));
-        assert_eq!(cfg.split_ngram_parts, 128);
-    }
-
-    #[test]
-    fn test_qwen38_ngram_addressing_determinism_and_bounds() {
-        let vocab = 248320;
-        let m_base = 20_000_000;
-        let addressing = Qwen38NgramAddressing::new(vocab, m_base, 128, 3);
-
-        let tokens1 = vec![101, 202];
-        let tokens2 = vec![101, 202];
-        let tokens3 = vec![101, 203];
-
-        let id1 = addressing.compute_ngram_id(&tokens1, 1, 0);
-        let id2 = addressing.compute_ngram_id(&tokens2, 1, 0);
-        let id3 = addressing.compute_ngram_id(&tokens3, 1, 0);
-
+        // The PLE table must provide max(head_offset + head_vocab_size) rows.
+        // The released file's 16 heads total 320_001_446, NOT 20_000_000 and
+        // NOT 16 * 20_000_000: the per-head vocab sizes are all distinct.
         assert_eq!(
-            id1, id2,
-            "identical token sequences must produce identical polynomial IDs"
+            cfg.ngram_vocab_size,
+            Some(320_001_446),
+            "the PLE table row count is max(offset + vocab) over all heads"
         );
-        assert_ne!(
-            id1, id3,
-            "distinct token sequences should produce distinct polynomial IDs"
+        assert_eq!(
+            cfg.ngram_dim,
+            Some(160),
+            "ple_head_dim, not the model hidden"
         );
-        assert!(id1 < m_base + 256);
-        assert!(id3 < m_base + 256);
+        assert_eq!(cfg.ple_heads_per_ngram, 8);
+        assert_eq!(cfg.ple_layer_multipliers.len(), 3);
+        assert_eq!(cfg.ple_head_offsets.len(), 16);
+        assert_eq!(cfg.ple_head_vocab_sizes.len(), 16);
+        assert_eq!(cfg.split_ngram_parts, 128);
     }
 
     #[allow(clippy::field_reassign_with_default)]
@@ -2156,108 +2324,6 @@ mod tests {
             .forward(session.as_mut(), &input_ids, &positions, &[])
             .unwrap();
         assert_eq!(out.shape().dims(), &[3, 32]);
-    }
-
-    #[allow(clippy::field_reassign_with_default)]
-    #[test]
-    fn test_qwen38_single_token_prefix_isolation() {
-        let mut cfg = Qwen38FlashNextConfig::default();
-        cfg.vocab_size = 16;
-        cfg.hidden_size = 8;
-        cfg.ngram_vocab_size = Some(50);
-        cfg.ngram_dim = Some(4);
-
-        let table = cpu_tensor(vec![99.0f32; 50 * 4], grim_tensor::Shape::new(vec![50, 4]));
-        let proj = Linear::from_tensor(
-            cpu_tensor(vec![1.0f32; 8 * 4], grim_tensor::Shape::new(vec![8, 4])),
-            None,
-        );
-        let addressing = Qwen38NgramAddressing::new(16, 50, 4, 3);
-        let ngram_emb = Qwen38NgramEmbedding {
-            ngram_vocab_size: 50,
-            ngram_dim: 4,
-            hidden_size: 8,
-            table,
-            proj,
-            addressing,
-        };
-
-        // For a single token [7], position 0 has no preceding n-gram (must return all 0s)
-        let res = ngram_emb.lookup_and_project(&[7]).unwrap();
-        let res_vec = res.to_vec_f32().unwrap();
-        assert_eq!(
-            res_vec,
-            vec![0.0f32; 8],
-            "Single token at pos 0 must have zero n-gram contribution"
-        );
-    }
-
-    #[test]
-    fn test_qwen38_ngram_mathematical_precision() {
-        let ngram_vocab_size = 10;
-        let ngram_dim = 2;
-        let hidden_size = 4;
-
-        // Table with distinct row vectors: row 0=[1, 2], row 1=[3, 4], ..., row 9=[19, 20]
-        let mut table_data = Vec::with_capacity(ngram_vocab_size * ngram_dim);
-        for r in 0..ngram_vocab_size {
-            table_data.push((r * 2 + 1) as f32);
-            table_data.push((r * 2 + 2) as f32);
-        }
-        let table = cpu_tensor(
-            table_data.clone(),
-            grim_tensor::Shape::new(vec![ngram_vocab_size, ngram_dim]),
-        );
-
-        // Proj weight: shape [hidden_size, ngram_dim] = [4, 2]
-        // W = [[1, 0], [0, 1], [1, 1], [2, 1]]
-        let proj_w = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0];
-        let proj = Linear::from_tensor(
-            cpu_tensor(
-                proj_w,
-                grim_tensor::Shape::new(vec![hidden_size, ngram_dim]),
-            ),
-            None,
-        );
-
-        let addressing = Qwen38NgramAddressing::new(16, ngram_vocab_size, 2, 3);
-        let ngram_emb = Qwen38NgramEmbedding {
-            ngram_vocab_size,
-            ngram_dim,
-            hidden_size,
-            table,
-            proj,
-            addressing: addressing.clone(),
-        };
-
-        let tokens = vec![4u32, 8u32];
-        let res = ngram_emb.lookup_and_project(&tokens).unwrap();
-        let res_vec = res.to_vec_f32().unwrap();
-
-        // Token 0: [0, 0, 0, 0]
-        assert_eq!(&res_vec[0..4], &[0.0, 0.0, 0.0, 0.0]);
-
-        // Token 1 (bigram [4, 8]):
-        let id = addressing.compute_ngram_id(&tokens, 1, 0) % ngram_vocab_size;
-        let e0 = table_data[id * 2];
-        let e1 = table_data[id * 2 + 1];
-
-        let expected_t1 = [
-            1.0 * e0 + 0.0 * e1, // e0
-            0.0 * e0 + 1.0 * e1, // e1
-            1.0 * e0 + 1.0 * e1, // e0 + e1
-            2.0 * e0 + 1.0 * e1, // 2*e0 + e1
-        ];
-
-        for k in 0..4 {
-            let diff = (res_vec[4 + k] - expected_t1[k]).abs();
-            assert!(
-                diff < 1e-6,
-                "Numeric discrepancy at dim {k}: got {}, expected {}",
-                res_vec[4 + k],
-                expected_t1[k]
-            );
-        }
     }
 
     #[test]
@@ -2337,6 +2403,8 @@ mod tests {
         let kv_dim = cfg.num_kv_heads * cfg.head_dim; // 4
         let ngram_vocab = 20;
         let ngram_dim = 4;
+        // Matches the loader: the gathered block is n_heads * ple_head_dim wide.
+        let ple_gathered_dim = cfg.ple_addressing().expect("default PLE").n_heads() * ngram_dim;
 
         fn raw_f32_tensor(
             val: f32,
@@ -2382,7 +2450,8 @@ mod tests {
         );
         tensors.insert(
             "model.layers.1.ple.key_proj.weight".into(),
-            raw_f32_tensor(0.05, vec![cfg.hidden_size, ngram_dim]),
+            // The PLE projection consumes n_heads * ple_head_dim, not ple_head_dim.
+            raw_f32_tensor(0.05, vec![cfg.hidden_size, ple_gathered_dim]),
         );
 
         // Layer 0 Attention & MoE weights
