@@ -1421,6 +1421,27 @@ extern "C" __global__ void grim_short_conv1d_causal_step(
     }
 }
 
+// Gated DeltaNet, one step per row of the value dimension.
+//
+// Published update (ICLR 2025, Eq. 10), matching the CPU reference in
+// `grim-backend-cpu/src/device.rs`:
+//
+//     decay = exp(a_gate)
+//     pred  = sum_k k * (decay * S)     <- decay applied BEFORE the dot
+//     delta = beta * (v - pred)         <- beta scales the FULL delta term
+//     S_new = decay * S + k * delta
+//     out   = sum_k q * S_new
+//
+// The previous version diverged on all three points: it used sigmoid(a_gate)
+// instead of exp, omitted decay from the key dot (so the error term was computed
+// against a stale state), and folded beta inside as `v - beta*(k.S)` so beta
+// never scaled the v term. Each is a different recurrence, not a rounding
+// difference, and with a non-zero initial state the divergence is large — see
+// tests/kda_delta_rule_parity.rs, which had no numeric coverage anywhere before.
+//
+// NOTE the decayed read: `decay * S_state[...]` must be used for BOTH the
+// prediction and the carried state, so the decayed row is computed once and
+// reused rather than recomputed inside the second loop.
 extern "C" __global__ void grim_kda_gated_delta_rule_step(
     const float* q, const float* k, const float* v, const float* beta,
     const float* a_gate, float* S_state, float* out,
@@ -1429,23 +1450,28 @@ extern "C" __global__ void grim_kda_gated_delta_rule_step(
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= d_v) return;
 
-    // A_t = sigmoid(a_gate)
-    float a_t = 1.0f / (1.0f + expf(-a_gate[row]));
-    float beta_val = beta[row];
+    // beta and a_gate are PER-CALL SCALARS, not per-row: the CPU reference
+    // reads data()[0] for both. The previous kernel indexed them as
+    // beta[row] / a_gate[row], so every row past 0 read past the end of a
+    // one-element buffer and ran the recurrence on garbage. Row 0 happened to
+    // be correct, which is why nothing caught it: there were no numeric tests.
+    const float decay = expf(a_gate[0]);
+    const float beta_val = beta[0];
+    float* s_row = S_state + (long long)row * d_k;
 
-    // Compute a_t_decay = a_t * S_{row, col}
-    // and update state S_t = a_t * S_{t-1} + beta_t * (v_t - a_prev) * k_t^T
-    float k_dot_s = 0.0f;
+    // pred = sum_k k * (decay * S)
+    float pred = 0.0f;
     for (int col = 0; col < d_k; ++col) {
-        k_dot_s += k[col] * S_state[row * d_k + col];
+        pred += k[col] * (decay * s_row[col]);
     }
-    float delta_v = v[row] - beta_val * k_dot_s;
+
+    // delta = beta * (v - pred): beta scales the whole delta term.
+    const float delta = beta_val * (v[row] - pred);
 
     float y_val = 0.0f;
     for (int col = 0; col < d_k; ++col) {
-        float old_s = S_state[row * d_k + col];
-        float new_s = a_t * old_s + beta_val * delta_v * k[col];
-        S_state[row * d_k + col] = new_s;
+        const float new_s = decay * s_row[col] + k[col] * delta;
+        s_row[col] = new_s;
         y_val += q[col] * new_s;
     }
     out[row] = y_val;
