@@ -1957,10 +1957,15 @@ mod tests {
         assert_eq!(attn.len(), 16, "65 layers at interval 4 has 16 attention layers");
         assert_eq!(attn[0], 3, "first full-attention layer is index 3, not 0");
         assert_eq!(attn[15], 63);
+        // Verified against the GGUF: 48 of the 65 layers carry the KDA
+        // signature (attn_qkv [10240,5120], ssm_conv1d [10240,4], ssm_out
+        // [5120,6144], ssm_norm [128]). Layer 64 is a `nextn` block
+        // (eh_proj/enorm/hnorm/shared_head_norm), not a KDA layer, so the
+        // recurrent count is 48, not 65-16.
         assert_eq!(
-            n_layers - attn.len(),
-            49,
-            "the other 49 layers are gated-delta-rule recurrent layers"
+            n_layers - attn.len() - 1,
+            48,
+            "48 layers are gated-delta-rule; layer 64 is a nextn block"
         );
     }
 
