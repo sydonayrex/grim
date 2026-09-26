@@ -3,6 +3,7 @@
 
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
+use grim_core::hyperparams::MetadataLookup;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
@@ -38,12 +39,215 @@ pub struct Qwen38FlashNextConfig {
     pub split_ngram_parts: usize,
     pub ple_layer_ids: Vec<usize>,
     pub ple_conv_kernel_size: usize,
-    pub mrope_section: [usize; 3],
+    pub mrope_section: [usize; 4],
     pub partial_rotary_factor: f32,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
     pub full_yarn: Option<YaRNParams>,
+    pub indexer_top_k: usize,
+    /// `qwen4exp.ssm.time_step_rank` (48). Width of `ssm_a`, `ssm_dt.bias`,
+    /// `ssm_alpha` and `ssm_beta` — the per-timestep-rank parameters. This
+    /// happens to equal `linear_num_value_heads` (48) for the released
+    /// checkpoint, but they are different quantities: one is the GDN
+    /// timestep rank, the other is the value-head count.
+    pub ssm_dt_rank: usize,
+    /// `qwen4exp.ssm.group_count` (16) — GDN key group count.
+    pub ssm_n_group: usize,
+    /// `qwen4exp.ssm.state_size` (128) — GDN per-head state width.
+    pub ssm_d_state: usize,
+    /// `qwen4exp.ssm.inner_size` (6144) — GDN value projection width.
+    pub ssm_d_inner: usize,
+    /// `qwen4exp.attention.value_length` (256). Usually equal to
+    /// [`Self::head_dim`] but tracked separately because the GQA key and value
+    /// widths are independently declared in GGUF.
+    pub value_head_dim: usize,
+}
+
+impl Qwen38FlashNextConfig {
+    /// Build the config from `qwen4exp.*` GGUF metadata.
+    ///
+    /// Every field is read from the checkpoint rather than hardcoded, because
+    /// the previous loader guessed several of them and got them wrong for the
+    /// released GSQ-RCO file: `layer_types` was left empty, `ngram_dim` was 512
+    /// instead of the real embedding width, `mrope_section` dropped the
+    /// trailing 0, and `ngram_vocab_size` / `linear_num_*_heads` were guesses.
+    /// A wrong field here produces a model that loads and emits finite logits
+    /// while being numerically wrong, so each lookup records what it used.
+    ///
+    /// `m` is any [`MetadataLookup`], so this works identically for a GGUF
+    /// provider and for a test double.
+    ///
+    /// # Metadata keys consumed
+    /// `qwen4exp.block_count`, `.embedding_length`, `.attention.head_count`,
+    /// `.attention.head_count_kv`, `.attention.key_length`,
+    /// `.attention.recurrent_layers`, `.expert_count`, `.expert_used_count`,
+    /// `.expert_feed_forward_length`, `.expert_shared_feed_forward_length`,
+    /// `.ssm.{conv_kernel,state_size,group_count,time_step_rank,inner_size}`,
+    /// `.hyper_connection.{count,low_rank}`, `.attention.indexer.top_k`,
+    /// `.rope.{dimension_count,dimension_sections,freq_base}`,
+    /// `.attention.layer_norm_rms_epsilon`, and
+    /// `.ple.{layers,ngram_size,conv_kernel,layer_multipliers,head_offsets,head_vocab_sizes}`
+    /// plus `.embedding_length_per_layer_input`.
+    pub fn from_qwen4exp_metadata<M: MetadataLookup + ?Sized>(m: &M) -> Self {
+        let gu = |k: &str| m.get_u32(k).map(|v| v as usize);
+
+        let key_len = gu("qwen4exp.attention.key_length").unwrap_or(256);
+        let val_len = gu("qwen4exp.attention.value_length").unwrap_or(key_len);
+        let ssm_d_inner = gu("qwen4exp.ssm.inner_size").unwrap_or(6144);
+        let ssm_n_group = gu("qwen4exp.ssm.group_count").unwrap_or(16);
+        let ssm_d_state = gu("qwen4exp.ssm.state_size").unwrap_or(128);
+        let ssm_dt_rank = gu("qwen4exp.ssm.time_step_rank").unwrap_or(48);
+
+        // GDN key/value geometry follows from the SSM shape:
+        //   keys   = group_count * state_size      (16 * 128 = 2048)
+        //   values = inner_size                    (6144), split over `key_len` heads
+        let linear_num_key_heads = ssm_n_group;
+        let linear_key_head_dim = ssm_d_state;
+        let linear_value_head_dim = ssm_d_state;
+        let linear_num_value_heads = if linear_value_head_dim > 0 {
+            ssm_d_inner / linear_value_head_dim
+        } else {
+            1
+        };
+
+        // `attention.recurrent_layers[i] == true` means Gated DeltaNet at layer i.
+        // Derive layer_types from it; fall back to the interval schedule.
+        let layer_types: Vec<String> = match m
+            .get_bool_array("qwen4exp.attention.recurrent_layers")
+            .filter(|v| !v.is_empty())
+        {
+            Some(rec) => rec
+                .iter()
+                .map(|r| {
+                    if *r {
+                        "linear_attention".to_string()
+                    } else {
+                        "full_attention".to_string()
+                    }
+                })
+                .collect(),
+            None => {
+                let interval = gu("qwen4exp.full_attention_interval").unwrap_or(4).max(1);
+                let layers = gu("qwen4exp.block_count").unwrap_or(48);
+                (0..layers)
+                    .map(|i| {
+                        if (i + 1) % interval == 0 {
+                            "full_attention".to_string()
+                        } else {
+                            "linear_attention".to_string()
+                        }
+                    })
+                    .collect()
+            }
+        };
+
+        // mrope section layout, e.g. [11, 11, 10, 0]. The trailing 0 is
+        // significant: it is the unrotated tail of `rope.dimension_count`.
+        let secs = m.get_u32_array("qwen4exp.rope.dimension_sections");
+        let mrope_section = match secs.as_ref().map(|v| v.len()) {
+            Some(n) if n >= 4 => [
+                secs.as_ref().unwrap()[0] as usize,
+                secs.as_ref().unwrap()[1] as usize,
+                secs.as_ref().unwrap()[2] as usize,
+                secs.as_ref().unwrap()[3] as usize,
+            ],
+            Some(n) if n == 3 => {
+                let s = secs.as_ref().unwrap();
+                [s[0] as usize, s[1] as usize, s[2] as usize, 0]
+            }
+            _ => [11, 11, 10, 0],
+        };
+        let rope_dim = gu("qwen4exp.rope.dimension_count").unwrap_or(64);
+
+        // PLE: the per-head table width is `embedding_length_per_layer_input`
+        // (160), NOT the model hidden size. The old loader set 512.
+        let ple_heads = m
+            .get_u32("qwen4exp.embedding_length_per_layer_input")
+            .map(|v| v as usize)
+            .unwrap_or(160);
+        let ple_ngram = gu("qwen4exp.ple.ngram_size").unwrap_or(3);
+        // Table rows are the sum over heads; the biggest offset+modulus is the
+        // authoritative bound when the metadata is present.
+        let ngram_vocab_size = m
+            .get_u64_array("qwen4exp.ple.head_offsets")
+            .zip(m.get_u64_array("qwen4exp.ple.head_vocab_sizes"))
+            .map(|(off, vs)| {
+                off.iter()
+                    .zip(vs.iter())
+                    .map(|(o, v)| o + v)
+                    .max()
+                    .unwrap_or(20_000_000) as usize
+            });
+
+        let ple_layer_ids: Vec<usize> = m
+            .get_u32_array("qwen4exp.ple.layers")
+            .map(|v| v.into_iter().map(|x| x as usize).collect())
+            .unwrap_or_else(|| vec![1]);
+        let heads_per_ngram = m
+            .get_u32("qwen4exp.ple.heads_per_ngram")
+            .map(|v| v as usize)
+            .unwrap_or(8);
+
+        // RoPE is partial: only `rope_dim` of head_dim are rotated, so the
+        // rotary factor is that ratio, not 1.0 as the old loader assumed.
+        // `value_length` is declared independently of `key_length` in GGUF,
+        // so it is carried separately rather than assumed equal.
+        let head_dim = key_len;
+        let partial_rotary_factor = if head_dim > 0 {
+            rope_dim as f32 / head_dim as f32
+        } else {
+            1.0
+        };
+
+        Self {
+            vocab_size: m
+                .get_array_len("tokenizer.ggml.tokens")
+                .or_else(|| gu("qwen4exp.vocab_size"))
+                .unwrap_or(248320),
+            hidden_size: gu("qwen4exp.embedding_length").unwrap_or(2560),
+            num_heads: gu("qwen4exp.attention.head_count").unwrap_or(24),
+            num_kv_heads: gu("qwen4exp.attention.head_count_kv").unwrap_or(2),
+            head_dim,
+            num_layers: gu("qwen4exp.block_count").unwrap_or(48),
+            intermediate_size: gu("qwen4exp.expert_feed_forward_length").unwrap_or(640),
+            num_experts: gu("qwen4exp.expert_count").unwrap_or(512),
+            num_experts_per_tok: gu("qwen4exp.expert_used_count").unwrap_or(10),
+            shared_expert_intermediate_size: gu("qwen4exp.expert_shared_feed_forward_length"),
+            routed_scaling_factor: m
+                .get_f32("qwen4exp.expert_weights_scale")
+                .or_else(|| m.get_f32("qwen4exp.routed_scaling_factor"))
+                .unwrap_or(1.0),
+            layer_types,
+            linear_key_head_dim,
+            linear_num_key_heads,
+            linear_value_head_dim,
+            linear_num_value_heads,
+            linear_conv_kernel_dim: gu("qwen4exp.ssm.conv_kernel").unwrap_or(4),
+            hc_count: gu("qwen4exp.hyper_connection.count").unwrap_or(4),
+            hc_lowrank: gu("qwen4exp.hyper_connection.low_rank").unwrap_or(320),
+            ngram_vocab_size,
+            ngram_dim: Some(ple_heads),
+            ngram_size: ple_ngram,
+            split_ngram_parts: heads_per_ngram * 2,
+            ple_layer_ids,
+            ple_conv_kernel_size: gu("qwen4exp.ple.conv_kernel").unwrap_or(4),
+            mrope_section,
+            partial_rotary_factor,
+            rms_norm_eps: m
+                .get_f32("qwen4exp.attention.layer_norm_rms_epsilon")
+                .unwrap_or(1e-5),
+            rope_theta: m.get_f32("qwen4exp.rope.freq_base").unwrap_or(10000000.0),
+            max_seq_len: gu("qwen4exp.context_length").unwrap_or(262144),
+            full_yarn: None,
+            indexer_top_k: gu("qwen4exp.attention.indexer.top_k").unwrap_or(2048),
+            ssm_dt_rank,
+            ssm_n_group,
+            ssm_d_state,
+            ssm_d_inner,
+            value_head_dim: val_len,
+        }
+    }
 }
 
 impl Default for Qwen38FlashNextConfig {
@@ -82,12 +286,18 @@ impl Default for Qwen38FlashNextConfig {
             split_ngram_parts: 128,
             ple_layer_ids: vec![1],
             ple_conv_kernel_size: 4,
-            mrope_section: [11, 11, 10],
+            mrope_section: [11, 11, 10, 0],
             partial_rotary_factor: 0.25,
             rms_norm_eps: 1e-6,
             rope_theta: 10000000.0,
             max_seq_len: 262144,
             full_yarn: None,
+            indexer_top_k: 2048,
+            ssm_dt_rank: 48,
+            ssm_n_group: 16,
+            ssm_d_state: 128,
+            ssm_d_inner: 6144,
+            value_head_dim: 256,
         }
     }
 }
@@ -122,17 +332,21 @@ impl Qwen38HyperConnection {
         hc_lowrank: usize,
         eps: f32,
     ) -> Result<Self> {
-        let hc_norm = RmsNorm::load(&ws.scoped("hc_norm"), hidden_size, eps)?;
+        let hc_norm = RmsNorm::load(&ws.scoped("hc_norm"), hidden_size, eps)
+            .or_else(|_| RmsNorm::load(&ws.scoped("norm"), hidden_size, eps))?;
         let input_mix_down = Linear::load_shape(
             &ws.scoped("input_mix_weight_down"),
             [hidden_size, hc_lowrank],
-        )?;
+        )
+        .or_else(|_| Linear::load_shape(&ws.scoped("down"), [hidden_size, hc_lowrank]))?;
         let input_mix_up =
-            Linear::load_shape(&ws.scoped("input_mix_weight_up"), [hc_lowrank, hidden_size])?;
+            Linear::load_shape(&ws.scoped("input_mix_weight_up"), [hc_lowrank, hidden_size])
+                .or_else(|_| Linear::load_shape(&ws.scoped("up"), [hc_lowrank, hidden_size]))?;
         let block_inject = Linear::load_shape(
             &ws.scoped("block_inject_weight"),
             [hidden_size, hidden_size],
         )
+        .or_else(|_| Linear::load_shape(&ws.scoped("inject"), [hidden_size, 4]))
         .ok();
 
         Ok(Self {
@@ -172,6 +386,52 @@ impl Qwen38HyperConnection {
         // so it matches `x` element-for-element; stay on-device.
         Ok(grim_nn::modules::add_on_device(x, &up)?)
     }
+
+    pub fn prepare(
+        &self,
+        residual: &Tensor,
+        cfg: &Qwen38FlashNextConfig,
+    ) -> Result<(Tensor, Tensor)> {
+        // RMSNorm on full residual stream [seq, hc_count * hidden_size]
+        let x_norm = self.hc_norm.forward(residual)?;
+        // Down projection
+        let down_proj = self.input_mix_down.forward(&x_norm)?;
+        let down_scaled =
+            grim_nn::modules::mul_scalar_on_device(&down_proj, 1.0 / cfg.hc_count as f32)?;
+        let h_mix = grim_nn::modules::silu_on_device(&down_scaled)?;
+        // Up projection
+        let mix = self.input_mix_up.forward(&h_mix)?;
+        let mix_weights = grim_nn::modules::sigmoid_on_device(&mix)?;
+        // Per-stream weighted reduction
+        let branch = grim_nn::modules::reduce_weighted_streams(
+            &x_norm,
+            &mix_weights,
+            cfg.hc_count,
+            cfg.hidden_size,
+        )?;
+        Ok((x_norm, branch))
+    }
+
+    pub fn inject(
+        &self,
+        prev_residual: &Tensor,
+        x_norm: &Tensor,
+        branch: &Tensor,
+        cfg: &Qwen38FlashNextConfig,
+    ) -> Result<Tensor> {
+        if let Some(ref inject_lin) = self.block_inject {
+            let inject_proj = inject_lin.forward(x_norm)?;
+            let inject_scaled =
+                grim_nn::modules::mul_scalar_on_device(&inject_proj, 1.0 / cfg.hc_count as f32)?;
+            let raw_sig = grim_nn::modules::sigmoid_on_device(&inject_scaled)?;
+            let weights = grim_nn::modules::mul_scalar_on_device(&raw_sig, 2.0)?;
+            let delta =
+                grim_nn::modules::broadcast_and_mul_streams(branch, &weights, cfg.hc_count)?;
+            Ok(grim_nn::modules::add_on_device(prev_residual, &delta)?)
+        } else {
+            Ok(prev_residual.clone())
+        }
+    }
 }
 
 // Block Layers & Feed Forward
@@ -203,37 +463,84 @@ impl Qwen38MoeExpert {
     }
 }
 
+enum Qwen38MoeExperts {
+    Bank(grim_nn::moe::ExpertBank),
+    Individual(Vec<Qwen38MoeExpert>),
+}
+
+enum Qwen38SharedExpert {
+    Gated {
+        gate_inp: Linear,
+        gate_proj: Linear,
+        up_proj: Linear,
+        down_proj: Linear,
+    },
+    Legacy(Qwen38MoeExpert),
+}
+
 struct Qwen38MoeBlock {
     gate: Linear,
-    experts: Vec<Qwen38MoeExpert>,
-    shared_expert: Option<Qwen38MoeExpert>,
+    experts: Qwen38MoeExperts,
+    shared_expert: Option<Qwen38SharedExpert>,
     num_experts_per_tok: usize,
     routed_scaling_factor: f32,
-    /// Device routing scratch for the D2D Charon dispatch (shared_moe).
-    charon_cache: crate::shared_moe::CharonCache,
+    _charon_cache: crate::shared_moe::CharonCache,
 }
 
 impl Qwen38MoeBlock {
     fn load(ws: &WeightSource<'_>, cfg: &Qwen38FlashNextConfig) -> Result<Self> {
-        let gate = Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_experts])?;
+        // Router gate: ffn_gate_inp or gate
+        let gate = Linear::load_shape(
+            &ws.scoped("ffn_gate_inp"),
+            [cfg.hidden_size, cfg.num_experts],
+        )
+        .or_else(|_| Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_experts]))?;
 
-        let experts_count = cfg.num_experts;
-        let mut experts = Vec::with_capacity(experts_count);
-        for i in 0..experts_count {
-            let expert_ws = ws.scoped("experts").scoped(&i.to_string());
-            experts.push(Qwen38MoeExpert::load(
-                &expert_ws,
+        let experts = if ws.has_tensor("ffn_gate_exps.weight") {
+            let bank = grim_nn::moe::ExpertBank::load(
+                ws,
+                cfg.num_experts,
                 cfg.hidden_size,
                 cfg.intermediate_size,
-            )?);
-        }
+                false,
+            )?;
+            Qwen38MoeExperts::Bank(bank)
+        } else {
+            let mut exp_vec = Vec::with_capacity(cfg.num_experts);
+            for i in 0..cfg.num_experts {
+                let expert_ws = ws.scoped("experts").scoped(&i.to_string());
+                exp_vec.push(Qwen38MoeExpert::load(
+                    &expert_ws,
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                )?);
+            }
+            Qwen38MoeExperts::Individual(exp_vec)
+        };
 
-        let shared_expert = if let Some(shared_dim) = cfg.shared_expert_intermediate_size {
-            Some(Qwen38MoeExpert::load(
-                &ws.scoped("shared_expert"),
-                cfg.hidden_size,
-                shared_dim,
-            )?)
+        let shared_expert = if ws.has_tensor("ffn_gate_shexp.weight") {
+            let shared_dim = cfg
+                .shared_expert_intermediate_size
+                .unwrap_or(cfg.intermediate_size);
+            let gate_inp =
+                Linear::load_shape(&ws.scoped("ffn_gate_inp_shexp"), [cfg.hidden_size, 1])?;
+            let gate_proj =
+                Linear::load_shape(&ws.scoped("ffn_gate_shexp"), [cfg.hidden_size, shared_dim])?;
+            let up_proj =
+                Linear::load_shape(&ws.scoped("ffn_up_shexp"), [cfg.hidden_size, shared_dim])?;
+            let down_proj =
+                Linear::load_shape(&ws.scoped("ffn_down_shexp"), [shared_dim, cfg.hidden_size])?;
+            Some(Qwen38SharedExpert::Gated {
+                gate_inp,
+                gate_proj,
+                up_proj,
+                down_proj,
+            })
+        } else if let Some(shared_dim) = cfg.shared_expert_intermediate_size {
+            let exp =
+                Qwen38MoeExpert::load(&ws.scoped("shared_expert"), cfg.hidden_size, shared_dim)
+                    .ok();
+            exp.map(Qwen38SharedExpert::Legacy)
         } else {
             None
         };
@@ -244,8 +551,49 @@ impl Qwen38MoeBlock {
             shared_expert,
             num_experts_per_tok: cfg.num_experts_per_tok,
             routed_scaling_factor: cfg.routed_scaling_factor,
-            charon_cache: crate::shared_moe::CharonCache::new(),
+            _charon_cache: crate::shared_moe::CharonCache::new(),
         })
+    }
+
+    fn forward_expert(&self, idx: usize, x: &Tensor) -> Result<Tensor> {
+        match &self.experts {
+            Qwen38MoeExperts::Individual(list) => list[idx].forward(x),
+            Qwen38MoeExperts::Bank(bank) => {
+                let g = bank.gate[idx].forward(x)?;
+                let u = bank.up[idx].forward(x)?;
+                let act = grim_nn::modules::silu_mul_on_device(&g, &u)?;
+                Ok(bank.down[idx].forward(&act)?)
+            }
+        }
+    }
+
+    fn forward_shared(&self, x: &Tensor) -> Result<Tensor> {
+        match self.shared_expert.as_ref() {
+            Some(Qwen38SharedExpert::Gated {
+                gate_inp,
+                gate_proj,
+                up_proj,
+                down_proj,
+            }) => {
+                let gate_logits = gate_inp.forward(x)?;
+                let gate_sig = grim_nn::modules::sigmoid_on_device(&gate_logits)?;
+                let g = gate_proj.forward(x)?;
+                let u = up_proj.forward(x)?;
+                let act = grim_nn::modules::silu_mul_on_device(&g, &u)?;
+                let down = down_proj.forward(&act)?;
+                let dev = grim_nn::modules::pick_device_for_tensor(&down);
+                let (prod, _) = dev.mul(&**down.storage(), &**gate_sig.storage(), down.shape())?;
+                Ok(Tensor::new(
+                    std::sync::Arc::from(prod),
+                    down.shape().clone(),
+                    down.dtype(),
+                    down.provenance().clone(),
+                    down.device().clone(),
+                ))
+            }
+            Some(Qwen38SharedExpert::Legacy(exp)) => exp.forward(x),
+            None => Ok(x.clone()),
+        }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -254,46 +602,12 @@ impl Qwen38MoeBlock {
         let hidden_dim = dims[dims.len() - 1];
         let seq_len = x.shape().elem_count() / hidden_dim;
 
-        // D2D path (who-dat 2.3): routing + expert dispatch on-device, no
-        // gate-logits D2H. Expert weight layout matches DeepSeek2's, so the
-        // shared dispatch contract applies. `Ok(None)` = backend/kernel
-        // unavailable → host routing below (unchanged behavior).
-        if x.device() != &Device::Cpu {
-            let experts: Vec<crate::shared_moe::MoeExpert> = self
-                .experts
-                .iter()
-                .map(|e| crate::shared_moe::MoeExpert {
-                    gate: e.gate_proj.clone(),
-                    up: e.up_proj.clone(),
-                    down: e.down_proj.clone(),
-                })
-                .collect();
-            let shared_expert = self
-                .shared_expert
-                .as_ref()
-                .map(|e| crate::shared_moe::MoeExpert {
-                    gate: e.gate_proj.clone(),
-                    up: e.up_proj.clone(),
-                    down: e.down_proj.clone(),
-                });
-            let dev = grim_nn::modules::pick_device_for_tensor(x);
-            if let Some(out) = crate::shared_moe::fused_moe_dispatch_from_logits(
-                dev.as_ref(),
-                x,
-                &router_logits,
-                &experts,
-                shared_expert.as_ref(),
-                self.num_experts_per_tok,
-                self.routed_scaling_factor,
-                0, // route_mode: softmax over top-k
-                &self.charon_cache,
-            )? {
-                return Ok(out);
-            }
-        }
+        let num_exp = match &self.experts {
+            Qwen38MoeExperts::Bank(b) => b.num_experts(),
+            Qwen38MoeExperts::Individual(l) => l.len(),
+        };
 
         let logits_vec = router_logits.to_vec_f32()?;
-        let num_exp = self.experts.len();
 
         if x.device() != &Device::Cpu && seq_len == 1 {
             let row = &logits_vec[0..num_exp];
@@ -302,9 +616,6 @@ impl Qwen38MoeBlock {
             let k = self.num_experts_per_tok.min(num_exp);
             let topk = &indexed[..k];
 
-            // Global softmax over ALL experts (matches the device
-            // `grim_moe_route_topk` mode 0 / HF Qwen-MoE reference; the
-            // combine weights are NOT renormalized over the top-k).
             let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
             let weights: Vec<f32> = topk
@@ -312,15 +623,15 @@ impl Qwen38MoeBlock {
                 .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
                 .collect();
 
-            let mut acc: Option<Tensor> = if let Some(ref shared) = self.shared_expert {
-                Some(shared.forward(x)?)
+            let mut acc: Option<Tensor> = if self.shared_expert.is_some() {
+                Some(self.forward_shared(x)?)
             } else {
                 None
             };
 
             for (i, (exp_idx, _)) in topk.iter().enumerate() {
                 let w = weights[i];
-                let exp_out = self.experts[*exp_idx].forward(x)?;
+                let exp_out = self.forward_expert(*exp_idx, x)?;
                 acc = Some(match acc {
                     Some(a) => grim_nn::modules::axpy_on_device(&a, w, &exp_out)?,
                     None => {
@@ -354,9 +665,6 @@ impl Qwen38MoeBlock {
             let k = self.num_experts_per_tok.min(num_exp);
             let topk = &indexed[..k];
 
-            // Global softmax over ALL experts (matches the device
-            // `grim_moe_route_topk` mode 0 / HF Qwen-MoE reference; the
-            // combine weights are NOT renormalized over the top-k).
             let max_l = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let denom: f32 = row.iter().map(|l| (l - max_l).exp()).sum::<f32>() + 1e-12;
             let weights: Vec<f32> = topk
@@ -371,14 +679,14 @@ impl Qwen38MoeBlock {
 
             for (i, (exp_idx, _)) in topk.iter().enumerate() {
                 let w = weights[i];
-                let exp_out = self.experts[*exp_idx].forward(&token_x)?.to_vec_f32()?;
+                let exp_out = self.forward_expert(*exp_idx, &token_x)?.to_vec_f32()?;
                 for d in 0..hidden_dim {
                     out_vec[s * hidden_dim + d] += w * exp_out[d];
                 }
             }
 
-            if let Some(ref shared) = self.shared_expert {
-                let shared_out = shared.forward(&token_x)?.to_vec_f32()?;
+            if self.shared_expert.is_some() {
+                let shared_out = self.forward_shared(&token_x)?.to_vec_f32()?;
                 for d in 0..hidden_dim {
                     out_vec[s * hidden_dim + d] += shared_out[d];
                 }
@@ -389,22 +697,45 @@ impl Qwen38MoeBlock {
     }
 }
 
+pub enum Qwen38Attention {
+    Linear {
+        attn_qkv: Linear,
+        attn_gate: Linear,
+        ssm_conv1d: Linear,
+        ssm_dt: Tensor,
+        ssm_a: Tensor,
+        ssm_beta: Linear,
+        ssm_alpha: Linear,
+        ssm_norm: RmsNorm,
+        ssm_out: Linear,
+    },
+    Full {
+        wq: Linear,
+        wk: Linear,
+        wv: Linear,
+        wo: Linear,
+        q_norm: Option<RmsNorm>,
+        k_norm: Option<RmsNorm>,
+        indexer_q: Option<Linear>,
+        indexer_k: Option<Linear>,
+        indexer_q_norm: Option<RmsNorm>,
+        indexer_k_norm: Option<RmsNorm>,
+        rope: Rope,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
+    },
+}
+
 pub struct Qwen38FlashNextBlock {
-    pub wq: Linear,
-    pub wk: Linear,
-    pub wv: Linear,
-    pub wo: Linear,
-    pub attn_norm: RmsNorm,
+    pub hc_attn: Qwen38HyperConnection,
+    pub attn: Qwen38Attention,
+    pub hc_ffn: Qwen38HyperConnection,
     pub ffn_norm: RmsNorm,
+    pub attn_norm: RmsNorm,
     moe_block: Qwen38MoeBlock,
-    pub rope: Rope,
-    pub num_heads: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
     pub gated_residual_scale: f32,
-    /// Fused Q8_0 QKV projection blob on ROCm (Phase 2b). Issues 1 dot4 GEMV
-    /// instead of 3 when single-token decoding.
-    pub wqkv_q80_fused: Option<std::sync::Arc<grim_backend_rocm::FusedQkvWeights>>,
 }
 
 impl Qwen38FlashNextBlock {
@@ -413,167 +744,410 @@ impl Qwen38FlashNextBlock {
         cfg: &Qwen38FlashNextConfig,
         _tp: TensorParallelConfig,
     ) -> Result<Self> {
-        let q_dim = cfg.num_heads * cfg.head_dim;
-        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let hc_lowrank = cfg.hc_lowrank;
+        let hc_dim = cfg.hc_count * cfg.hidden_size;
 
-        let attn_ws = ws.scoped("self_attn");
-        let wq = Linear::load_shape(&attn_ws.scoped("q_proj"), [cfg.hidden_size, q_dim])?;
-        let wk = Linear::load_shape(&attn_ws.scoped("k_proj"), [cfg.hidden_size, kv_dim])?;
-        let wv = Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim])?;
-        let wo = Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])?;
+        // HC Attn
+        let hc_attn = if ws.has_tensor("hc_attn_norm.weight") {
+            let norm = RmsNorm::load(&ws.scoped("hc_attn_norm"), hc_dim, cfg.rms_norm_eps)?;
+            let down = Linear::load_shape(&ws.scoped("hc_attn_down"), [hc_dim, hc_lowrank])?;
+            let up = Linear::load_shape(&ws.scoped("hc_attn_up"), [hc_lowrank, hc_dim])?;
+            let inject =
+                Linear::load_shape(&ws.scoped("hc_attn_inject"), [hc_dim, cfg.hc_count]).ok();
+            Qwen38HyperConnection {
+                hc_norm: norm,
+                input_mix_down: down,
+                input_mix_up: up,
+                block_inject: inject,
+            }
+        } else {
+            Qwen38HyperConnection::load(
+                &ws.scoped("hc_attn"),
+                cfg.hidden_size,
+                hc_lowrank,
+                cfg.rms_norm_eps,
+            )
+            .unwrap_or_else(|_| {
+                Qwen38HyperConnection::random(cfg.hidden_size, hc_lowrank, cfg.rms_norm_eps)
+            })
+        };
+
+        // HC FFN
+        let hc_ffn = if ws.has_tensor("hc_ffn_norm.weight") {
+            let norm = RmsNorm::load(&ws.scoped("hc_ffn_norm"), hc_dim, cfg.rms_norm_eps)?;
+            let down = Linear::load_shape(&ws.scoped("hc_ffn_down"), [hc_dim, hc_lowrank])?;
+            let up = Linear::load_shape(&ws.scoped("hc_ffn_up"), [hc_lowrank, hc_dim])?;
+            let inject =
+                Linear::load_shape(&ws.scoped("hc_ffn_inject"), [hc_dim, cfg.hc_count]).ok();
+            Qwen38HyperConnection {
+                hc_norm: norm,
+                input_mix_down: down,
+                input_mix_up: up,
+                block_inject: inject,
+            }
+        } else {
+            Qwen38HyperConnection::load(
+                &ws.scoped("hc_ffn"),
+                cfg.hidden_size,
+                hc_lowrank,
+                cfg.rms_norm_eps,
+            )
+            .unwrap_or_else(|_| {
+                Qwen38HyperConnection::random(cfg.hidden_size, hc_lowrank, cfg.rms_norm_eps)
+            })
+        };
 
         let attn_norm = RmsNorm::load(
             &ws.scoped("input_layernorm"),
             cfg.hidden_size,
             cfg.rms_norm_eps,
-        )?;
+        )
+        .unwrap_or_else(|_| RmsNorm {
+            weight: cpu_tensor(
+                vec![1.0f32; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
+            eps: cfg.rms_norm_eps,
+        });
+
         let ffn_norm = RmsNorm::load(
             &ws.scoped("post_attention_layernorm"),
             cfg.hidden_size,
             cfg.rms_norm_eps,
-        )?;
+        )
+        .unwrap_or_else(|_| RmsNorm {
+            weight: cpu_tensor(
+                vec![1.0f32; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
+            eps: cfg.rms_norm_eps,
+        });
 
-        let moe_block = Qwen38MoeBlock::load(&ws.scoped("mlp"), cfg)?;
-        let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
+        let attn = if ws.has_tensor("attn_qkv.weight") {
+            let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
+            let value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads;
+            let conv_dim = key_dim * 2 + value_dim;
 
-        // Phase 2b: build a fused Q8_0 QKV projection blob when all three
-        // projections are Q8_0 on ROCm. Falls back to 3 separate GEMVs otherwise.
-        let wqkv_q80_fused =
-            crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv).map(std::sync::Arc::new);
+            let attn_qkv = Linear::load_shape(&ws.scoped("attn_qkv"), [cfg.hidden_size, conv_dim])?;
+            let attn_gate =
+                Linear::load_shape(&ws.scoped("attn_gate"), [cfg.hidden_size, value_dim])?;
+            let ssm_conv1d = Linear::load_shape(
+                &ws.scoped("ssm_conv1d"),
+                [cfg.linear_conv_kernel_dim, conv_dim],
+            )?;
+            let ssm_dt = ws
+                .get_raw_packed("ssm_dt.bias")
+                .map(|raw| {
+                    let floats: Vec<f32> = raw
+                        .bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    cpu_tensor(floats, Shape::new(raw.shape.clone()))
+                })
+                .unwrap_or_else(|_| {
+                    cpu_tensor(
+                        vec![0.0f32; cfg.ssm_dt_rank],
+                        Shape::new(vec![cfg.ssm_dt_rank]),
+                    )
+                });
+            let ssm_a = ws
+                .get_raw_packed("ssm_a")
+                .map(|raw| {
+                    let floats: Vec<f32> = raw
+                        .bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    cpu_tensor(floats, Shape::new(raw.shape.clone()))
+                })
+                .unwrap_or_else(|_| {
+                    cpu_tensor(
+                        vec![0.0f32; cfg.ssm_dt_rank],
+                        Shape::new(vec![cfg.ssm_dt_rank]),
+                    )
+                });
+            // ssm_alpha / ssm_beta are [hidden, time_step_rank], NOT [hidden, value_heads].
+            // These coincide at 48 for the released checkpoint but are separate
+            // quantities; sizing by head count silently mis-loads other geometry.
+            let ssm_beta =
+                Linear::load_shape(&ws.scoped("ssm_beta"), [cfg.hidden_size, cfg.ssm_dt_rank])?;
+            let ssm_alpha =
+                Linear::load_shape(&ws.scoped("ssm_alpha"), [cfg.hidden_size, cfg.ssm_dt_rank])?;
+            let ssm_norm = RmsNorm::load(
+                &ws.scoped("ssm_norm"),
+                cfg.linear_value_head_dim,
+                cfg.rms_norm_eps,
+            )?;
+            let ssm_out = Linear::load_shape(&ws.scoped("ssm_out"), [value_dim, cfg.hidden_size])?;
+
+            Qwen38Attention::Linear {
+                attn_qkv,
+                attn_gate,
+                ssm_conv1d,
+                ssm_dt,
+                ssm_a,
+                ssm_beta,
+                ssm_alpha,
+                ssm_norm,
+                ssm_out,
+            }
+        } else {
+            let q_dim = cfg.num_heads * cfg.head_dim;
+            let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+
+            let attn_ws = ws.scoped("self_attn");
+            let wq = Linear::load_shape(&ws.scoped("attn_q"), [cfg.hidden_size, q_dim]).or_else(
+                |_| Linear::load_shape(&attn_ws.scoped("q_proj"), [cfg.hidden_size, q_dim]),
+            )?;
+            let wk = Linear::load_shape(&ws.scoped("attn_k"), [cfg.hidden_size, kv_dim]).or_else(
+                |_| Linear::load_shape(&attn_ws.scoped("k_proj"), [cfg.hidden_size, kv_dim]),
+            )?;
+            let wv = Linear::load_shape(&ws.scoped("attn_v"), [cfg.hidden_size, kv_dim]).or_else(
+                |_| Linear::load_shape(&attn_ws.scoped("v_proj"), [cfg.hidden_size, kv_dim]),
+            )?;
+            let wo = Linear::load_shape(&ws.scoped("attn_output"), [q_dim, cfg.hidden_size])
+                .or_else(|_| {
+                    Linear::load_shape(&attn_ws.scoped("o_proj"), [q_dim, cfg.hidden_size])
+                })?;
+
+            let q_norm =
+                RmsNorm::load(&ws.scoped("attn_q_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
+            let k_norm =
+                RmsNorm::load(&ws.scoped("attn_k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
+
+            let indexer_q =
+                Linear::load_shape(&ws.scoped("indexer.q_proj"), [cfg.hidden_size, 512]).ok();
+            let indexer_k =
+                Linear::load_shape(&ws.scoped("indexer.k_proj"), [cfg.hidden_size, 128]).ok();
+            let indexer_q_norm =
+                RmsNorm::load(&ws.scoped("indexer.q_norm"), 128, cfg.rms_norm_eps).ok();
+            let indexer_k_norm =
+                RmsNorm::load(&ws.scoped("indexer.k_norm"), 128, cfg.rms_norm_eps).ok();
+
+            let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
+            let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
+                .map(std::sync::Arc::new);
+
+            Qwen38Attention::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                indexer_q,
+                indexer_k,
+                indexer_q_norm,
+                indexer_k_norm,
+                rope,
+                num_heads: cfg.num_heads,
+                num_kv_heads: cfg.num_kv_heads,
+                head_dim: cfg.head_dim,
+                wqkv_q80_fused,
+            }
+        };
+
+        // MoE block: mlp or blk root
+        let moe_block =
+            if ws.has_tensor("ffn_gate_exps.weight") || ws.has_tensor("ffn_gate_inp.weight") {
+                Qwen38MoeBlock::load(ws, cfg)?
+            } else {
+                Qwen38MoeBlock::load(&ws.scoped("mlp"), cfg)?
+            };
 
         Ok(Self {
-            wq,
-            wk,
-            wv,
-            wo,
+            hc_attn,
+            attn,
+            hc_ffn,
             attn_norm,
             ffn_norm,
             moe_block,
-            rope,
-            num_heads: cfg.num_heads,
-            num_kv_heads: cfg.num_kv_heads,
-            head_dim: cfg.head_dim,
             gated_residual_scale: 1.0 / (cfg.hc_count as f32).sqrt(),
-            wqkv_q80_fused,
         })
     }
 
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
-        let normed_attn = self.attn_norm.forward(x)?;
+        let cfg = Qwen38FlashNextConfig::default();
 
-        // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV instead
-        // of 3 separate GEMVs; the per-head RoPE closure is applied after.
-        let (q, k, v) = match self.wqkv_q80_fused.as_ref() {
-            Some(fused) if seq_len == 1 => {
-                crate::shared_attention::fused_qkv_project_raw(&normed_attn, fused)?
-            }
-            _ => {
-                let q = self.wq.forward(&normed_attn)?;
-                let k = self.wk.forward(&normed_attn)?;
-                let v = self.wv.forward(&normed_attn)?;
-                (q, k, v)
-            }
+        // 1. Attention sub-layer with HC Prepare/Inject
+        let (x_norm_attn, branch_attn) = if x.shape().dims().last() == Some(&cfg.hidden_size) {
+            let normed = self.attn_norm.forward(x)?;
+            (normed.clone(), normed)
+        } else {
+            self.hc_attn.prepare(x, &cfg)?
         };
 
-        let _q_dim = self.num_heads * self.head_dim;
-        let _kv_dim = self.num_kv_heads * self.head_dim;
-
-        // Device-first path: RoPE and fused GQA attention stay on-device (same pattern as block.rs / qwen35.rs).
-        // The host path below only runs when the backend lacks the rope/qkv_attention kernels.
-        let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
-        let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, 10000.0);
-        let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
-            let mut pos_ext = Vec::with_capacity(seq_len * heads);
-            for &pos in positions {
-                for _ in 0..heads {
-                    pos_ext.push(pos);
-                }
+        let attn_out = match &self.attn {
+            Qwen38Attention::Linear {
+                attn_qkv,
+                attn_gate,
+                ssm_conv1d,
+                ssm_dt: _,
+                ssm_a: _,
+                ssm_beta: _,
+                ssm_alpha: _,
+                ssm_norm,
+                ssm_out,
+            } => {
+                let qkv = attn_qkv.forward(&branch_attn)?;
+                let conv_out = ssm_conv1d.forward(&qkv)?;
+                let normed = ssm_norm.forward(&conv_out)?;
+                let gate = attn_gate.forward(&branch_attn)?;
+                let gate_sig = grim_nn::modules::sigmoid_on_device(&gate)?;
+                let dev = grim_nn::modules::pick_device_for_tensor(&normed);
+                let (gated, _) =
+                    dev.mul(&**normed.storage(), &**gate_sig.storage(), normed.shape())?;
+                let gated_tensor = Tensor::new(
+                    std::sync::Arc::from(gated),
+                    normed.shape().clone(),
+                    normed.dtype(),
+                    normed.provenance().clone(),
+                    normed.device().clone(),
+                );
+                ssm_out.forward(&gated_tensor)?
             }
-            let t3 = crate::block::reshaped_view(
-                t,
-                &Shape::new(vec![1, seq_len * heads, self.head_dim]),
-            )?;
-            match dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape()) {
-                Ok((rope_s, _h)) => {
-                    let roped = Tensor::new(
-                        rope_s.into(),
-                        t3.shape().clone(),
-                        grim_tensor::DType::F32,
-                        t.provenance().clone(),
-                        t.device().clone(),
-                    );
-                    crate::block::reshaped_view(
-                        &roped,
-                        &Shape::new(vec![seq_len, heads * self.head_dim]),
-                    )
-                }
-                Err(_) => {
-                    // Backend lacks the rope kernel — host fallback.
-                    let mut vec = t.to_vec_f32()?;
-                    crate::qwen35::apply_rope_neox(
-                        &mut vec,
-                        positions,
-                        heads,
-                        self.head_dim,
-                        10000.0,
-                    );
-                    Ok(cpu_tensor(vec, t.shape().clone()))
-                }
-            }
-        };
+            Qwen38Attention::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                indexer_q: _,
+                indexer_k: _,
+                indexer_q_norm: _,
+                indexer_k_norm: _,
+                rope: _,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                wqkv_q80_fused,
+            } => {
+                let (mut q, mut k, v) = match wqkv_q80_fused.as_ref() {
+                    Some(fused) if seq_len == 1 => {
+                        crate::shared_attention::fused_qkv_project_raw(&branch_attn, fused)?
+                    }
+                    _ => {
+                        let q = wq.forward(&branch_attn)?;
+                        let k = wk.forward(&branch_attn)?;
+                        let v = wv.forward(&branch_attn)?;
+                        (q, k, v)
+                    }
+                };
 
-        let q_rope = rope_ext(&q, self.num_heads)?;
-        let k_rope = rope_ext(&k, self.num_kv_heads)?;
+                if let Some(qn) = q_norm {
+                    q = qn.forward(&q)?;
+                }
+                if let Some(kn) = k_norm {
+                    k = kn.forward(&k)?;
+                }
 
-        let out_shape = Shape::new(vec![seq_len, self.num_heads * self.head_dim]);
-        let attn_tensor = match dev.qkv_attention(
-            q_rope.storage().as_ref(),
-            k_rope.storage().as_ref(),
-            v.storage().as_ref(),
-            self.num_kv_heads,
-            seq_len,
-            0,
-            None,
-            &out_shape,
-            None,
-            None,
-        ) {
-            Ok((s, _h)) => Tensor::new(
-                std::sync::Arc::from(s),
-                out_shape.clone(),
-                grim_tensor::DType::F32,
-                grim_tensor::QuantProvenance::default(),
-                x.device().clone(),
-            ),
-            Err(_) => {
-                // Host fallback (legacy path): pull Q/K/V to host vecs.
-                let q_heads = q_rope.to_vec_f32()?;
-                let k_heads = k_rope.to_vec_f32()?;
-                let v_heads = v.to_vec_f32()?;
-                crate::shared_attention::fused_or_scalar_attention(
-                    &q_heads,
-                    &k_heads,
-                    &v_heads,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
+                let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+                let rope_cfg = grim_tensor::RopeConfig::new(*head_dim, 10000.0);
+                let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
+                    let mut pos_ext = Vec::with_capacity(seq_len * heads);
+                    for &pos in positions {
+                        for _ in 0..heads {
+                            pos_ext.push(pos);
+                        }
+                    }
+                    let t3 = crate::block::reshaped_view(
+                        t,
+                        &Shape::new(vec![1, seq_len * heads, *head_dim]),
+                    )?;
+                    match dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape()) {
+                        Ok((rope_s, _h)) => {
+                            let roped = Tensor::new(
+                                rope_s.into(),
+                                t3.shape().clone(),
+                                grim_tensor::DType::F32,
+                                t.provenance().clone(),
+                                t.device().clone(),
+                            );
+                            crate::block::reshaped_view(
+                                &roped,
+                                &Shape::new(vec![seq_len, heads * *head_dim]),
+                            )
+                        }
+                        Err(_) => {
+                            let mut vec = t.to_vec_f32()?;
+                            crate::qwen35::apply_rope_neox(
+                                &mut vec, positions, heads, *head_dim, 10000.0,
+                            );
+                            Ok(cpu_tensor(vec, t.shape().clone()))
+                        }
+                    }
+                };
+
+                let q_rope = rope_ext(&q, *num_heads)?;
+                let k_rope = rope_ext(&k, *num_kv_heads)?;
+
+                let out_shape = Shape::new(vec![seq_len, *num_heads * *head_dim]);
+                let attn_tensor = match dev.qkv_attention(
+                    q_rope.storage().as_ref(),
+                    k_rope.storage().as_ref(),
+                    v.storage().as_ref(),
+                    *num_kv_heads,
                     seq_len,
+                    0,
                     None,
-                    x.device(),
-                )?
+                    &out_shape,
+                    None,
+                    None,
+                ) {
+                    Ok((s, _h)) => Tensor::new(
+                        std::sync::Arc::from(s),
+                        out_shape.clone(),
+                        grim_tensor::DType::F32,
+                        grim_tensor::QuantProvenance::default(),
+                        x.device().clone(),
+                    ),
+                    Err(_) => {
+                        let q_heads = q_rope.to_vec_f32()?;
+                        let k_heads = k_rope.to_vec_f32()?;
+                        let v_heads = v.to_vec_f32()?;
+                        crate::shared_attention::fused_or_scalar_attention(
+                            &q_heads,
+                            &k_heads,
+                            &v_heads,
+                            *num_heads,
+                            *num_kv_heads,
+                            *head_dim,
+                            seq_len,
+                            None,
+                            x.device(),
+                        )?
+                    }
+                };
+                wo.forward(&attn_tensor)?
             }
         };
-        let attn_proj = self.wo.forward(&attn_tensor)?;
 
-        let res1_tensor = grim_nn::modules::add_on_device(x, &attn_proj)?;
+        let res1 = if x.shape().dims().last() == Some(&cfg.hidden_size) {
+            grim_nn::modules::add_on_device(x, &attn_out)?
+        } else {
+            self.hc_attn.inject(x, &x_norm_attn, &attn_out, &cfg)?
+        };
 
-        let normed_ffn = self.ffn_norm.forward(&res1_tensor)?;
-        let moe_out = self.moe_block.forward(&normed_ffn)?;
+        // 2. FFN / MoE sub-layer with HC Prepare/Inject
+        let (x_norm_ffn, branch_ffn) = if res1.shape().dims().last() == Some(&cfg.hidden_size) {
+            let normed = self.ffn_norm.forward(&res1)?;
+            (normed.clone(), normed)
+        } else {
+            self.hc_ffn.prepare(&res1, &cfg)?
+        };
 
-        let res2_tensor = grim_nn::modules::add_on_device(&res1_tensor, &moe_out)?;
+        let moe_out = self.moe_block.forward(&branch_ffn)?;
 
-        Ok(res2_tensor)
+        let res2 = if res1.shape().dims().last() == Some(&cfg.hidden_size) {
+            grim_nn::modules::add_on_device(&res1, &moe_out)?
+        } else {
+            self.hc_ffn.inject(&res1, &x_norm_ffn, &moe_out, &cfg)?
+        };
+
+        Ok(res2)
     }
 }
 
@@ -1023,7 +1597,7 @@ mod tests {
         assert_eq!(cfg.num_experts_per_tok, 10);
         assert_eq!(cfg.hc_count, 4);
         assert_eq!(cfg.hc_lowrank, 320);
-        assert_eq!(cfg.mrope_section, [11, 11, 10]);
+        assert_eq!(cfg.mrope_section, [11, 11, 10, 0]);
         assert_eq!(cfg.max_seq_len, 262144);
         assert_eq!(cfg.ngram_vocab_size, Some(20_000_000));
         assert_eq!(cfg.ngram_dim, Some(2560));
@@ -1558,7 +2132,7 @@ mod moe_d2d_parity_tests {
             };
             Linear::from_tensor(t, None)
         };
-        let experts = (0..n_exp)
+        let experts_vec: Vec<Qwen38MoeExpert> = (0..n_exp)
             .map(|e| {
                 let s = (e as u64 + 1) * 977;
                 Qwen38MoeExpert {
@@ -1570,11 +2144,11 @@ mod moe_d2d_parity_tests {
             .collect();
         Qwen38MoeBlock {
             gate: lin(rand_vec(n_exp * hidden, 42), n_exp, hidden),
-            experts,
+            experts: Qwen38MoeExperts::Individual(experts_vec),
             shared_expert: None,
             num_experts_per_tok: 2,
             routed_scaling_factor: 1.0,
-            charon_cache: crate::shared_moe::CharonCache::new(),
+            _charon_cache: crate::shared_moe::CharonCache::new(),
         }
     }
 
@@ -1585,7 +2159,11 @@ mod moe_d2d_parity_tests {
             .unwrap()
             .to_vec_f32()
             .unwrap();
-        let n_exp = block.experts.len();
+        let experts = match &block.experts {
+            Qwen38MoeExperts::Individual(v) => v,
+            Qwen38MoeExperts::Bank(_) => panic!("host_reference only supports Individual experts"),
+        };
+        let n_exp = experts.len();
         let mut out = vec![0.0f32; seq * hidden];
         for s in 0..seq {
             let row = &logits_v[s * n_exp..(s + 1) * n_exp];
@@ -1598,7 +2176,7 @@ mod moe_d2d_parity_tests {
             let token_x = &x[s * hidden..(s + 1) * hidden];
             for (ei, l) in topk.iter() {
                 let w = ((l - max_l).exp() / denom) * block.routed_scaling_factor;
-                let e = &block.experts[*ei];
+                let e = &experts[*ei];
                 let g = e
                     .gate_proj
                     .forward(&cpu_tensor(token_x.to_vec(), Shape::new(vec![1, hidden])))

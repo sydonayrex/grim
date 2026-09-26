@@ -176,6 +176,23 @@ pub trait MetadataLookup {
         let _ = key;
         None
     }
+    /// Retrieve u64 metadata by key. GGUF stores `split.*` and PLE
+    /// `layer_multipliers` as u64; a u32 accessor silently truncates them
+    /// (the multipliers are ~2.0e13, well past u32).
+    fn get_u64(&self, key: &str) -> Option<u64> {
+        let _ = key;
+        None
+    }
+    /// Retrieve u64 array metadata by key (PLE `layer_multipliers`).
+    fn get_u64_array(&self, key: &str) -> Option<Vec<u64>> {
+        let _ = key;
+        None
+    }
+    /// Retrieve bool array metadata by key (`attention.recurrent_layers`).
+    fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        let _ = key;
+        None
+    }
     /// Retrieve i32 array metadata by key.
     fn get_i32_array(&self, key: &str) -> Option<Vec<i32>> {
         let _ = key;

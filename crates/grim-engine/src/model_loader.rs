@@ -26,12 +26,11 @@ use grim_models_transformer::{
     HyV4, HyV4Config, InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig,
     KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2AttentionMode, Lfm2Config, Llama,
     LlamaConfig, LongCatFlash, LongCatFlashConfig, Mellum, MellumConfig, MiniCpmConfig,
-    MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig, Qwen, Qwen2Vl, Qwen2VlConfig,
-    Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig,
-    Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, Qwen38FlashNext, Qwen38FlashNextConfig,
-    NemotronHMoe, NemotronHMoeConfig,
-    QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
-    WavTokenizerDec, WavTokenizerDecConfig, Xing40, Xing40Config,
+    MiniCpmModel, MiniMaxM3, MiniMaxM3Config, NemotronHMoe, NemotronHMoeConfig, Phi2, PhiConfig,
+    Qwen, Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl,
+    Qwen3VlConfig, Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig,
+    Qwen38FlashNext, Qwen38FlashNextConfig, QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2,
+    SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig, Xing40, Xing40Config,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -328,8 +327,159 @@ fn get_meta_array<'a>(provider: &'a GgufProvider, key: &str) -> Option<&'a [Gguf
 
 /// Returns true if `provider` can resolve a tensor by the given (GGUF) name, without materialising it.
 /// Used for architecture detection by tensor signature (e.g.
+/// Returns true if `provider` can resolve a tensor by the given (GGUF) name, without materialising it.
+/// Used for architecture detection by tensor signature (e.g.
 fn weight_provider_has_tensor(provider: &dyn TensorProvider, name: &str) -> bool {
     provider.meta(name).is_ok()
+}
+
+/// Metadata accessor over a parsed `config.json`, so the same
+/// [`Qwen38FlashNextConfig::from_qwen4exp_metadata`] builder serves both
+/// container formats.
+///
+/// HF `config.json` is a nested JSON tree with different key names than GGUF,
+/// so each canonical `qwen4exp.*` key is projected onto its nested path. A
+/// path that is absent returns `None` and the builder falls back to its
+/// documented default, so a safetensors checkpoint missing an exotic key still
+/// loads instead of failing.
+struct SafetensorsLookup<'a>(&'a serde_json::Value);
+
+impl<'a> SafetensorsLookup<'a> {
+    /// Resolve a canonical `qwen4exp.*` key to a JSON pointer on `config.json`.
+    ///
+    /// The mapping is explicit rather than mechanical because the two schemas
+    /// genuinely differ; e.g. GGUF's `attention.head_count` is HF's
+    /// `num_attention_heads`, and GGUF's flat `ssm.inner_size` is
+    /// `linear_num_value_heads * linear_key_head_dim`.
+    fn resolve(&self, key: &str) -> Option<&'a serde_json::Value> {
+        let v = self.0;
+        // Try the dotted path verbatim first, so a config that mirrors GGUF
+        // naming works with no mapping at all.
+        if let Some(found) = v.pointer(&format!("/{}", key.replace('.', "/"))) {
+            return Some(found);
+        }
+        let get = |p: &str| v.get(p);
+        match key {
+            "qwen4exp.block_count" => get("num_hidden_layers"),
+            "qwen4exp.embedding_length" => get("hidden_size"),
+            "qwen4exp.attention.head_count" => get("num_attention_heads"),
+            "qwen4exp.attention.head_count_kv" => get("num_key_value_heads"),
+            "qwen4exp.attention.key_length" => get("head_dim"),
+            "qwen4exp.attention.value_length" => get("head_dim"),
+            // `recurrent_layers` is a bool array with no JSON equivalent, so
+            // it is derived from `layer_types` inside `get_bool_array`.
+            "qwen4exp.expert_count" => get("num_local_experts").or_else(|| get("num_experts")),
+            "qwen4exp.expert_used_count" => get("num_experts_per_tok"),
+            "qwen4exp.expert_feed_forward_length" => get("moe_intermediate_size"),
+            "qwen4exp.expert_shared_feed_forward_length" => get("shared_expert_intermediate_size"),
+            "qwen4exp.ssm.conv_kernel" => get("linear_conv_kernel_dim"),
+            "qwen4exp.ssm.group_count" => get("linear_num_key_heads"),
+            "qwen4exp.ssm.state_size" => get("linear_key_head_dim"),
+            "qwen4exp.ssm.time_step_rank" => get("linear_num_value_heads"),
+            // `ssm.inner_size` is a product in GGUF; derived in `get_u32`.
+            "qwen4exp.hyper_connection.count" => get("num_hyper_connections"),
+            "qwen4exp.hyper_connection.low_rank" => get("hyper_connection_lowrank"),
+            "qwen4exp.attention.indexer.top_k" => get("indexer_top_k"),
+            // `rope.dimension_count` is a fraction times head_dim in HF;
+            // derived in `get_u32`.
+            "qwen4exp.rope.freq_base" => get("rope_theta"),
+            "qwen4exp.attention.layer_norm_rms_epsilon" => get("rms_norm_eps"),
+            "qwen4exp.context_length" => get("max_position_embeddings"),
+            "qwen4exp.vocab_size" => get("vocab_size"),
+            "qwen4exp.embedding_length_per_layer_input" => get("embedding_length_per_layer_input"),
+            "qwen4exp.ple.layers" => get("ple_layers"),
+            "qwen4exp.ple.ngram_size" => get("ple_ngram_size"),
+            "qwen4exp.ple.conv_kernel" => get("ple_conv_kernel"),
+            "qwen4exp.ple.heads_per_ngram" => get("ple_heads_per_ngram"),
+            "qwen4exp.ple.head_offsets" => get("ple_head_offsets"),
+            "qwen4exp.ple.head_vocab_sizes" => get("ple_head_vocab_sizes"),
+            "qwen4exp.ple.layer_multipliers" => get("ple_layer_multipliers"),
+            "qwen4exp.rope.dimension_sections" => get("mrope_section"),
+            "qwen4exp.expert_weights_scale" => get("routed_scaling_factor"),
+            _ => {
+                // For a key with >3 segments, try progressively flatter joins
+                // before giving up, so new GGUF keys degrade gracefully.
+                let segs: Vec<&str> = key.split('.').collect();
+                for take in (1..=segs.len()).rev() {
+                    let joined = segs[..take].join(".");
+                    if let Some(found) = v.get(&joined) {
+                        return Some(found);
+                    }
+                    if let Some(found) = v.get(&joined.replace('.', "_")) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+impl<'a> MetadataLookup for SafetensorsLookup<'a> {
+    fn get_str(&self, key: &str) -> Option<String> {
+        self.resolve(key)?.as_str().map(|s| s.to_string())
+    }
+    fn get_u32(&self, key: &str) -> Option<u32> {
+        if key == "qwen4exp.ssm.inner_size" {
+            // GGUF states the GDN value width directly; HF only gives the head
+            // count and the per-head width.
+            let n = self.0.get("linear_num_value_heads")?.as_u64()?;
+            let d = self.0.get("linear_key_head_dim")?.as_u64()?;
+            return u32::try_from(n * d).ok();
+        }
+        if key == "qwen4exp.rope.dimension_count" && self.0.get("rope.dimension_count").is_none() {
+            // HF gives the rotary *fraction*; GGUF gives the absolute count.
+            let f = self.0.get("partial_rotary_factor")?.as_f64()?;
+            let hd = self.0.get("head_dim")?.as_f64()?;
+            return Some((f * hd) as u32);
+        }
+        let v = self.resolve(key)?;
+        if let Some(n) = v.as_u64() {
+            return u32::try_from(n).ok();
+        }
+        v.as_f64().map(|f| f as u32)
+    }
+    fn get_u64(&self, key: &str) -> Option<u64> {
+        let v = self.resolve(key)?;
+        if let Some(n) = v.as_u64() {
+            return Some(n);
+        }
+        v.as_f64().and_then(|f| u64::try_from(f as i64).ok())
+    }
+    fn get_f32(&self, key: &str) -> Option<f32> {
+        self.resolve(key)?.as_f64().map(|f| f as f32)
+    }
+    fn get_array_len(&self, key: &str) -> Option<usize> {
+        self.resolve(key)?.as_array().map(|a| a.len())
+    }
+    fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        let a = self.resolve(key)?.as_array()?;
+        a.iter()
+            .map(|x| x.as_u64().and_then(|n| u32::try_from(n).ok()))
+            .collect()
+    }
+    fn get_i32_array(&self, key: &str) -> Option<Vec<i32>> {
+        let a = self.resolve(key)?.as_array()?;
+        a.iter().map(|x| x.as_i64().map(|n| n as i32)).collect()
+    }
+    fn get_u64_array(&self, key: &str) -> Option<Vec<u64>> {
+        let a = self.resolve(key)?.as_array()?;
+        a.iter().map(|x| x.as_u64()).collect()
+    }
+    fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        if key == "qwen4exp.attention.recurrent_layers" {
+            // HF declares layer *kinds*, not a bool mask: a layer is recurrent
+            // (Gated DeltaNet) when it is not full attention.
+            let arr = self.0.get("linear_layer_types")?.as_array()?;
+            return Some(
+                arr.iter()
+                    .map(|x| x.as_str() == Some("linear_attention"))
+                    .collect(),
+            );
+        }
+        let a = self.resolve(key)?.as_array()?;
+        a.iter().map(|x| x.as_bool()).collect()
+    }
 }
 
 /// Metadata accessor implementation wrapping `GgufProvider`.
@@ -395,6 +545,32 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
     }
     fn get_i32_array(&self, key: &str) -> Option<Vec<i32>> {
         self.0.metadata(key)?.as_i32_array()
+    }
+    fn get_u64(&self, key: &str) -> Option<u64> {
+        // `GgufValue::as_u32` already widens every integer variant (u8..u64,
+        // i8..i64) through an i128 round-trip and fails loudly on overflow, so
+        // there is no separate `as_u64` to call. PLE `layer_multipliers`
+        // (~2.0e13) resolve here, and a genuine >u32 value returns None rather
+        // than silently truncating.
+        self.0.metadata(key)?.as_u32().map(|u| u as u64)
+    }
+    fn get_u64_array(&self, key: &str) -> Option<Vec<u64>> {
+        // `GgufValue::as_u32` widens every integer variant via i128 and returns
+        // None on overflow, which is what we want for the ~2.0e13 PLE
+        // multipliers: no silent truncation.
+        self.0
+            .metadata(key)?
+            .as_u32_array()
+            .map(|v| v.into_iter().map(|u| u as u64).collect())
+    }
+    fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        let v = self.0.metadata(key)?;
+        let arr = v.as_array()?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            out.push(item.as_bool()?);
+        }
+        Some(out)
     }
 }
 
@@ -1067,38 +1243,21 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen38FlashNext => {
-            let qwen38_cfg = Qwen38FlashNextConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                num_layers,
-                intermediate_size,
-                num_experts: expert_count.max(512),
-                num_experts_per_tok: expert_used_count.max(10),
-                shared_expert_intermediate_size: Some(intermediate_size),
-                routed_scaling_factor,
-                layer_types: vec![],
-                linear_key_head_dim: 128,
-                linear_num_key_heads: 8,
-                linear_value_head_dim: 128,
-                linear_num_value_heads: 8,
-                linear_conv_kernel_dim: 4,
-                hc_count: 4,
-                hc_lowrank: 320,
-                ngram_vocab_size: Some(20_000_000),
-                ngram_dim: Some(512),
-                ngram_size: 3,
-                split_ngram_parts: 128,
-                ple_layer_ids: vec![1],
-                ple_conv_kernel_size: 4,
-                mrope_section: [11, 11, 10],
-                partial_rotary_factor: config.partial_rotary_factor.unwrap_or(1.0),
-                rms_norm_eps,
-                rope_theta,
-                max_seq_len,
-                full_yarn: parse_yarn_scaling(&config.rope_scaling),
+            // Prefer the raw config.json tree: it carries keys (layer kinds,
+            // PLE geometry, indexer budget) that the typed SafetensorsConfig
+            // does not model. Fall back to the defaults inside the builder if
+            // no raw JSON was supplied.
+            let qwen38_cfg = match raw_config_str
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            {
+                Some(v) => Qwen38FlashNextConfig::from_qwen4exp_metadata(&SafetensorsLookup(&v)),
+                None => {
+                    log::warn!(
+                        "[grim] Qwen3.8-Flash-Next: no raw config.json available; \
+                         using documented defaults for PLE/indexer geometry"
+                    );
+                    Qwen38FlashNextConfig::default()
+                }
             };
             log::info!(
                 "[grim] Loading Qwen3.8-Flash-Next model with config: {:?}",
@@ -3043,39 +3202,7 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen38FlashNext => {
-            let qwen38_cfg = Qwen38FlashNextConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                num_experts: hparams.expert_count.unwrap_or(512).max(512),
-                num_experts_per_tok: hparams.expert_used_count.unwrap_or(10).max(10),
-                shared_expert_intermediate_size: Some(hparams.intermediate_size),
-                routed_scaling_factor: hparams.routed_scaling_factor,
-                layer_types: vec![],
-                linear_key_head_dim: 128,
-                linear_num_key_heads: 8,
-                linear_value_head_dim: 128,
-                linear_num_value_heads: 8,
-                linear_conv_kernel_dim: 4,
-                hc_count: 4,
-                hc_lowrank: 320,
-                ngram_vocab_size: Some(20_000_000),
-                ngram_dim: Some(512),
-                ngram_size: 3,
-                split_ngram_parts: 128,
-                ple_layer_ids: vec![1],
-                ple_conv_kernel_size: 4,
-                mrope_section: [11, 11, 10],
-                partial_rotary_factor: 1.0,
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
-                full_yarn: parse_yarn_scaling_gguf(&lookup),
-            };
+            let qwen38_cfg = Qwen38FlashNextConfig::from_qwen4exp_metadata(&lookup);
             log::info!(
                 "[grim] Loading Qwen3.8-Flash-Next model from GGUF with config: {:?}",
                 qwen38_cfg
@@ -3217,7 +3344,8 @@ fn load_model_with_providers(
             } else {
                 NemotronHMoeConfig::default_schedule_53()
             };
-            let rope_dim = lookup.get_u32("nemotron_h_moe.rope.dimension_count")
+            let rope_dim = lookup
+                .get_u32("nemotron_h_moe.rope.dimension_count")
                 .or_else(|| lookup.get_u32("rope.dimension_count"))
                 .map(|v| v as usize)
                 .unwrap_or(84);
@@ -3242,7 +3370,9 @@ fn load_model_with_providers(
                 num_routed_experts: hparams.expert_count.unwrap_or(128),
                 num_experts_per_tok: hparams.expert_used_count.unwrap_or(6),
                 expert_feed_forward_length: hparams.expert_feed_forward_length.unwrap_or(1856),
-                expert_shared_feed_forward_length: hparams.expert_shared_feed_forward_length.unwrap_or(3712),
+                expert_shared_feed_forward_length: hparams
+                    .expert_shared_feed_forward_length
+                    .unwrap_or(3712),
                 expert_weights_scale: hparams.routed_scaling_factor,
                 expert_weights_norm: hparams.norm_topk_prob,
             };
@@ -3862,9 +3992,7 @@ fn load_model_with_providers(
                 .get_u32("xing4_0.attention.q_lora_rank")
                 .map(|v| v as usize);
             // `key_length_mla` is nope+rope (192); the value half is `value_length_mla`.
-            let rope_dim = lookup
-                .get_u32("xing4_0.rope.dimension_count")
-                .unwrap_or(64) as usize;
+            let rope_dim = lookup.get_u32("xing4_0.rope.dimension_count").unwrap_or(64) as usize;
             let qk_nope_head_dim = lookup
                 .get_u32("xing4_0.attention.key_length_mla")
                 .map(|klm| klm as usize - rope_dim)
@@ -3875,9 +4003,8 @@ fn load_model_with_providers(
             let leading_dense = lookup
                 .get_u32("xing4_0.leading_dense_block_count")
                 .unwrap_or(2) as usize;
-            let shared_experts = lookup
-                .get_u32("xing4_0.expert_shared_count")
-                .unwrap_or(1) as usize;
+            let shared_experts =
+                lookup.get_u32("xing4_0.expert_shared_count").unwrap_or(1) as usize;
 
             let cfg = Xing40Config {
                 vocab_size: hparams.vocab_size,

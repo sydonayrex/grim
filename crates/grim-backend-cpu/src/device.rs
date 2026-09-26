@@ -2168,10 +2168,10 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(raw, n),
                 grim_tensor::dtype::KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(raw, n),
                 grim_tensor::dtype::KQuantScheme::IQ2S => grim_quant::dequant_iq2s(raw, n),
-                // Not yet wired: this variant landed ahead of its decoder.
-                other => Err(Error::Backend(format!(
-                    "cpu to_cpu_vec_f32: unsupported KQuantScheme {other:?}"
-                ))),
+                // GGUF Q2_0 (tag 42): 64 weights per 18-byte block.
+                grim_tensor::dtype::KQuantScheme::GsqRco3p5 => {
+                    grim_quant::dequant_gsq_rco_3p5(raw, n)
+                }
             },
             Storage::FloatPack(fp) => match fp {
                 grim_tensor::dtype::FloatPackScheme::Fp4 => grim_quant::dequant_fp4(raw, n),
@@ -2180,7 +2180,9 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(raw, n),
                 grim_tensor::dtype::FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(raw, n),
-                grim_tensor::dtype::FloatPackScheme::NutFp4 => grim_quant::dequant_nutcracker(raw, n),
+                grim_tensor::dtype::FloatPackScheme::NutFp4 => {
+                    grim_quant::dequant_nutcracker(raw, n)
+                }
             },
             Storage::Block(block_type) => match block_type {
                 grim_tensor::dtype::BlockDtype::Fp4 => grim_quant::dequant_fp4(raw, n),
