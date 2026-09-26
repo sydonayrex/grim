@@ -467,13 +467,7 @@ pub fn fit_context_to_vram(
     headroom_bytes: u64,
     max_context: usize,
 ) -> usize {
-    let per_token = kv_bytes_per_token(
-        kv_heads,
-        head_dim,
-        num_layers,
-        interval,
-        bytes_per_element,
-    );
+    let per_token = kv_bytes_per_token(kv_heads, head_dim, num_layers, interval, bytes_per_element);
     if per_token == 0 {
         return max_context;
     }
@@ -738,10 +732,12 @@ mod kv_fit_tests {
     #[test]
     fn attention_layer_count_matches_model_predicate() {
         let (layers, interval) = (65usize, 4usize);
-        let counted = kv_bytes_per_token(4, 256, layers, interval, 4)
-            / (4 * 256 * 2 * 4);
+        let counted = kv_bytes_per_token(4, 256, layers, interval, 4) / (4 * 256 * 2 * 4);
         let expected = (0..layers).filter(|i| (i + 1) % interval == 0).count();
-        assert_eq!(expected, 16, "65 layers at interval 4 has 16 attention layers");
+        assert_eq!(
+            expected, 16,
+            "65 layers at interval 4 has 16 attention layers"
+        );
         assert_eq!(
             counted as usize, expected,
             "kv_bytes_per_token must count the same attention layers the model does"
@@ -753,7 +749,13 @@ mod kv_fit_tests {
         // 16 full-attention layers x 4 heads x 256 dim x 2 (K and V) x 4 bytes.
         let expected = 16 * 4 * 256 * 2 * 4;
         assert_eq!(
-            kv_bytes_per_token(QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32),
+            kv_bytes_per_token(
+                QWEN_KV_HEADS,
+                QWEN_HEAD_DIM,
+                QWEN_LAYERS,
+                QWEN_INTERVAL,
+                F32
+            ),
             expected as u64
         );
     }
@@ -762,7 +764,13 @@ mod kv_fit_tests {
     /// layers that is 16, not 65.
     #[test]
     fn recurrent_layers_do_not_consume_kv_budget() {
-        let per_token = kv_bytes_per_token(QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32);
+        let per_token = kv_bytes_per_token(
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            QWEN_LAYERS,
+            QWEN_INTERVAL,
+            F32,
+        );
         // A single attention layer would be 4*256*2*4 = 8192 bytes/token.
         assert_eq!(per_token, 16 * 8192);
     }
@@ -798,7 +806,11 @@ mod kv_fit_tests {
             (100_000..=130_000).contains(&fitted),
             "expected roughly 100-130k, got {fitted}"
         );
-        assert_eq!(fitted % QWEN_INTERVAL, 0, "must align to the interval stride");
+        assert_eq!(
+            fitted % QWEN_INTERVAL,
+            0,
+            "must align to the interval stride"
+        );
     }
 
     /// f16 KV halves the per-token cost, so more context fits. This is the lever
@@ -810,12 +822,26 @@ mod kv_fit_tests {
         const HEADROOM: u64 = 2_000_000_000;
 
         let f32_fit = fit_context_to_vram(
-            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32,
-            WEIGHTS, VRAM, HEADROOM, 232_192,
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            QWEN_LAYERS,
+            QWEN_INTERVAL,
+            F32,
+            WEIGHTS,
+            VRAM,
+            HEADROOM,
+            232_192,
         );
         let f16_fit = fit_context_to_vram(
-            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, 2,
-            WEIGHTS, VRAM, HEADROOM, 232_192,
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            QWEN_LAYERS,
+            QWEN_INTERVAL,
+            2,
+            WEIGHTS,
+            VRAM,
+            HEADROOM,
+            232_192,
         );
         assert!(
             f16_fit > f32_fit,
@@ -828,8 +854,15 @@ mod kv_fit_tests {
     #[test]
     fn generous_vram_keeps_the_checkpoints_own_limit() {
         let fitted = fit_context_to_vram(
-            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32,
-            0, 500_000_000_000, 0, 32_768,
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            QWEN_LAYERS,
+            QWEN_INTERVAL,
+            F32,
+            0,
+            500_000_000_000,
+            0,
+            32_768,
         );
         assert_eq!(fitted, 32_768, "must not exceed the advertised maximum");
     }
@@ -838,8 +871,15 @@ mod kv_fit_tests {
     #[test]
     fn no_headroom_yields_zero_context() {
         let fitted = fit_context_to_vram(
-            QWEN_KV_HEADS, QWEN_HEAD_DIM, QWEN_LAYERS, QWEN_INTERVAL, F32,
-            34_000_000_000, 34_000_000_000, 0, 232_192,
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            QWEN_LAYERS,
+            QWEN_INTERVAL,
+            F32,
+            34_000_000_000,
+            34_000_000_000,
+            0,
+            232_192,
         );
         assert_eq!(fitted, 0);
     }
