@@ -695,10 +695,19 @@ impl Qwen38MoeBlock {
                 .map(|(_, l)| ((l - max_l).exp() / denom) * self.routed_scaling_factor)
                 .collect();
 
-            let token_x = cpu_tensor(
+            // The per-token slice is staged on the host, so it has to be put
+            // back on the model's device: the expert Linears are device matmuls
+            // and reject host storage with "matmul: input b is not
+            // RocmStorage". On the CPU this is a no-op clone.
+            let token_host = cpu_tensor(
                 x_vec[s * hidden_dim..(s + 1) * hidden_dim].to_vec(),
                 Shape::new(vec![1, hidden_dim]),
             );
+            let token_x = if x.device().is_cpu() {
+                token_host
+            } else {
+                grim_nn::modules::move_to_device(&token_host, x.device())?
+            };
 
             for (i, (exp_idx, _)) in topk.iter().enumerate() {
                 let w = weights[i];
@@ -716,7 +725,15 @@ impl Qwen38MoeBlock {
             }
         }
 
-        Ok(cpu_tensor(out_vec, x.shape().clone()))
+        // The multi-token path accumulates on the host, so the result is host
+        // storage. Return it on the model's device: the block's residual add is
+        // dispatched on-device and rejects host input.
+        let out_host = cpu_tensor(out_vec, x.shape().clone());
+        if x.device().is_cpu() {
+            Ok(out_host)
+        } else {
+            Ok(grim_nn::modules::move_to_device(&out_host, x.device())?)
+        }
     }
 }
 
@@ -1166,12 +1183,20 @@ impl Qwen38FlashNextBlock {
                         qkv.to_vec_f32()?,
                         grim_tensor::Shape::new(vec![1, qkv_seq, qkv_chan]),
                     );
-                    let out = grim_nn::modules::short_conv1d(
-                        &qkv_b1,
-                        &ssm_conv1d.weight,
-                        None,
-                        Some(&mut state_t),
-                    )?;
+                    // short_conv1d is a HOST reference op: it reads its
+                    // weight through to_vec_f32, so handing it a device tensor
+                    // fails with "storage is not CpuStorage" on a ROCm run.
+                    // The activations are already on the host here (qkv_b1 is a
+                    // cpu_tensor), so the weight must come down to match.
+                    let conv_w = if ssm_conv1d.weight.device().is_cpu() {
+                        ssm_conv1d.weight.clone()
+                    } else {
+                        let w = ssm_conv1d.weight.to_vec_f32()?;
+                        let shape = ssm_conv1d.weight.shape().clone();
+                        cpu_tensor(w, shape)
+                    };
+                    let out =
+                        grim_nn::modules::short_conv1d(&qkv_b1, &conv_w, None, Some(&mut state_t))?;
                     let updated = out.to_vec_f32()?;
                     // The conv kernel advances the state in place; mirror it back
                     // so the next decode step sees the history.
@@ -1188,15 +1213,15 @@ impl Qwen38FlashNextBlock {
                 //    the recurrence), beta raw (sigmoid inside).
                 let alpha_raw = ssm_alpha.forward(&branch_attn)?.to_vec_f32()?;
                 let beta_raw = ssm_beta.forward(&branch_attn)?.to_vec_f32()?;
-                let a_vec: Vec<f32> = ssm_a.to_vec_f32()?;
-                let dt_vec: Vec<f32> = ssm_dt.to_vec_f32()?;
+                let a_vec: Vec<f32> = host_f32(&ssm_a)?;
+                let dt_vec: Vec<f32> = host_f32(&ssm_dt)?;
                 // ssm_norm is an RmsNorm over the 128-wide state channel, but
                 // the recurrence applies it as a per-channel weight (the
                 // normalization itself already happened upstream in the
                 // reference; here it is the output scale). Take the weights
                 // directly rather than running the norm, which would subtract
                 // a mean the recurrence does not.
-                let ssm_norm_weight: Vec<f32> = ssm_norm.weight.to_vec_f32()?;
+                let ssm_norm_weight: Vec<f32> = host_f32(&ssm_norm.weight)?;
 
                 // 3. The recurrence itself, over the [seq] axis in order.
                 let value_dim = n_v_heads * head_dim;
@@ -1219,22 +1244,33 @@ impl Qwen38FlashNextBlock {
                     gdn_cache,
                     &mut gdn_out,
                 )?;
-                let gdn_t = cpu_tensor(gdn_out, grim_tensor::Shape::new(vec![seq_len, value_dim]));
 
-                // 4. Output gate: sigmoid(attn_gate) elementwise, then ssm_out.
+                // 4. Output gate, then ssm_out.
+                //
+                // The gate multiply must happen on ONE device. Picking the
+                // device from `gdn_t` (the recurrence output, which is host)
+                // and then multiplying a device `gate_sig` through the CPU
+                // backend fails with "storage is not CpuStorage"; picking the
+                // device from the gate and multiplying host data through the
+                // ROCm backend fails the same way. The recurrence is host code,
+                // so the gate is folded on the host and the PRODUCT is lifted
+                // back to the model's device for `ssm_out`.
                 let gate = attn_gate.forward(&branch_attn)?;
-                let gate_sig = grim_nn::modules::sigmoid_on_device(&gate)?;
-                let dev = grim_nn::modules::pick_device_for_tensor(&gdn_t);
-                let (gated, _) =
-                    dev.mul(&**gdn_t.storage(), &**gate_sig.storage(), gdn_t.shape())?;
-                let gated_tensor = Tensor::new(
-                    std::sync::Arc::from(gated),
-                    gdn_t.shape().clone(),
-                    gdn_t.dtype(),
-                    gdn_t.provenance().clone(),
-                    gdn_t.device().clone(),
-                );
-                ssm_out.forward(&gated_tensor)?
+                let gate_host = host_f32(&gate)?;
+                let gated: Vec<f32> = gdn_out
+                    .iter()
+                    .zip(gate_host.iter())
+                    .map(|(g, s)| g / (1.0 + (-s).exp()))
+                    .collect();
+                let gated_t = if branch_attn.device().is_cpu() {
+                    cpu_tensor(gated, grim_tensor::Shape::new(vec![seq_len, value_dim]))
+                } else {
+                    grim_nn::modules::move_to_device(
+                        &cpu_tensor(gated, grim_tensor::Shape::new(vec![seq_len, value_dim])),
+                        branch_attn.device(),
+                    )?
+                };
+                ssm_out.forward(&gated_t)?
             }
             Qwen38Attention::Full {
                 wq,
@@ -1429,6 +1465,15 @@ impl Qwen38FlashNextBlock {
                 };
 
                 let out_shape = Shape::new(vec![seq_len, *num_heads * *head_dim]);
+                // The fused device kernel takes no additive mask, so it CANNOT
+                // honour the QSA selection. Trying it first and only falling
+                // back to the masked path on Err means a device that supports
+                // the kernel silently runs DENSE -- the indexer weights load,
+                // the scores are computed, and the result is thrown away. That
+                // is the f3f1a8f behaviour with none of the visibility.
+                //
+                // So: when a mask exists, the masked path is the path. The
+                // kernel is only eligible for a dense step.
                 let attn_tensor = match dev.qkv_attention(
                     q_rope.storage().as_ref(),
                     k_rope.storage().as_ref(),
@@ -1441,14 +1486,16 @@ impl Qwen38FlashNextBlock {
                     None,
                     None,
                 ) {
-                    Ok((s, _h)) => Tensor::new(
+                    Ok((s, _h)) if qsa_keep.is_none() => Tensor::new(
                         std::sync::Arc::from(s),
                         out_shape.clone(),
                         grim_tensor::DType::F32,
                         grim_tensor::QuantProvenance::default(),
                         x.device().clone(),
                     ),
-                    Err(_) => {
+                    // Any other outcome (kernel failed, or a mask exists that the
+                    // kernel cannot honour) takes the masked/dense host path.
+                    _ => {
                         let q_heads = q_rope.to_vec_f32()?;
                         let k_heads = k_rope.to_vec_f32()?;
                         let v_heads = v.to_vec_f32()?;
@@ -1917,6 +1964,21 @@ impl Qwen38FlashNext {
             output,
         }
     }
+}
+
+/// Read a tensor into a host `Vec<f32>` for the host reference paths.
+///
+/// Every GDN and QSA tensor is consumed by host code (the delta rule, the
+/// indexer, `short_conv1d`). Those read through `to_vec_f32`, which works for a
+/// device storage, but the ops they then call -- `short_conv1d` and friends --
+/// downcast to `CpuStorage` and fail with "storage is not CpuStorage" when handed
+/// a device tensor. This helper is the one place that boundary is crossed, so
+/// there is one thing to audit rather than a scattering of `.to_vec_f32()`.
+///
+/// # Errors
+/// Propagates the device-to-host failure.
+fn host_f32(t: &Tensor) -> Result<Vec<f32>> {
+    Ok(t.to_vec_f32()?)
 }
 
 impl Model for Qwen38FlashNext {

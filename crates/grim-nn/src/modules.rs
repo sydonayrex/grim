@@ -10,7 +10,9 @@ use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, BackendStorage, CoreTensorOps, DType, Device, ElementwiseOps, Tensor};
+use grim_tensor::{
+    BackendDevice, BackendStorage, CoreTensorOps, DType, Device, ElementwiseOps, Tensor,
+};
 
 use crate::varbuilder::WeightSource;
 
@@ -1202,7 +1204,8 @@ impl RmsNorm {
         let effective_w = if offset == 0.0 {
             self.weight.clone()
         } else {
-            let (shifted_st, _) = dev.add_scalar(&**self.weight.storage(), offset, self.weight.shape())?;
+            let (shifted_st, _) =
+                dev.add_scalar(&**self.weight.storage(), offset, self.weight.shape())?;
             Tensor::new(
                 Arc::from(shifted_st),
                 self.weight.shape().clone(),
@@ -1296,7 +1299,10 @@ impl Embedding {
             }
             // Packed Q4_K embedding on devices supporting on-the-fly dequant gather:
             // keep the table packed in VRAM (715 MB instead of 5.09 GB for Qwen).
-            if matches!(t.dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)) {
+            if matches!(
+                t.dtype().storage,
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+            ) {
                 return Ok(Self { weight: t });
             }
             // Other quantized embeddings: dequantize to f32.
@@ -1319,7 +1325,10 @@ impl Embedding {
 
         // Case 1: Row-major layout [actual_vocab, dim] where s1 == dim.
         if s1 == dim {
-            if matches!(raw_tensor.dtype().storage, Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)) {
+            if matches!(
+                raw_tensor.dtype().storage,
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+            ) {
                 return Ok(Self { weight: raw_tensor });
             }
             return Ok(Self {
@@ -1555,6 +1564,43 @@ impl Rope {
     }
 }
 
+/// Squared-ReLU activation `relu(x)^2`, dispatched on-device.
+///
+/// Used by the Nemotron-H style non-gated experts
+/// (`FFN(x) = down(relu(up(x))^2)`). The previous implementation read `x` into
+/// a host `Vec` and rebuilt a CPU tensor, so on a ROCm run the following
+/// `Linear::forward` -- a device matmul -- received host storage and failed with
+/// "matmul: input b is not RocmStorage". Mirrors `sigmoid_on_device`: a fused
+/// device kernel where one exists, otherwise a host computation whose result is
+/// uploaded back to the input's own device.
+///
+/// # Errors
+/// Propagates the device upload failure, or the device read-back on the
+/// device-native path.
+pub fn relu2_on_device(x: &Tensor) -> Result<Tensor> {
+    // There is no fused relu2 ROCm kernel today, so this reads the tensor back,
+    // computes, and uploads to the SAME device. That still fixes the seam: the
+    // result is device storage, so the following device matmul is legal. The
+    // round trip remains a cost to remove once a kernel exists.
+    let v = x.to_vec_f32()?;
+    let out: Vec<f32> = v
+        .into_iter()
+        .map(|val| {
+            let r = val.max(0.0);
+            r * r
+        })
+        .collect();
+    let dev = pick_device_for_tensor(x);
+    let st = dev.from_cpu(&out, x.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(st),
+        x.shape().clone(),
+        x.dtype(),
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
 pub fn mul_scalar_on_device(x: &Tensor, s: f32) -> Result<Tensor> {
     let dev = pick_device_for_tensor(x);
     let (scaled, _) = dev.mul_scalar(&**x.storage(), s, x.shape())?;
@@ -1581,7 +1627,10 @@ pub fn silu_on_device(x: &Tensor) -> Result<Tensor> {
         ));
     }
     let v = x.to_vec_f32()?;
-    let out: Vec<f32> = v.into_iter().map(|val| val / (1.0 + (-val).exp())).collect();
+    let out: Vec<f32> = v
+        .into_iter()
+        .map(|val| val / (1.0 + (-val).exp()))
+        .collect();
     let dev = pick_device_for_tensor(x);
     let st = dev.from_cpu(&out, x.shape(), DType::F32)?;
     Ok(Tensor::new(
@@ -1607,7 +1656,10 @@ pub fn sigmoid_on_device(x: &Tensor) -> Result<Tensor> {
         ));
     }
     let v = x.to_vec_f32()?;
-    let out: Vec<f32> = v.into_iter().map(|val| 1.0 / (1.0 + (-val).exp())).collect();
+    let out: Vec<f32> = v
+        .into_iter()
+        .map(|val| 1.0 / (1.0 + (-val).exp()))
+        .collect();
     let dev = pick_device_for_tensor(x);
     let st = dev.from_cpu(&out, x.shape(), DType::F32)?;
     Ok(Tensor::new(
@@ -2390,8 +2442,7 @@ pub fn short_conv1d(
                     // Then the last `shift` samples of this sequence.
                     for j in 0..shift {
                         let src_step = s - shift + j;
-                        new_state[dst_off + keep + j] =
-                            x_vec[(bi * s + src_step) * d + di];
+                        new_state[dst_off + keep + j] = x_vec[(bi * s + src_step) * d + di];
                     }
                 }
             }
@@ -3534,4 +3585,3 @@ mod mla_cache_tests {
         assert!((b_vec[0] - 2.0).abs() < 1e-5);
     }
 }
-

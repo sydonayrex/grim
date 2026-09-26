@@ -767,6 +767,23 @@ impl ExpertBank {
             flat.push((t.to_vec_f32()?, out, in_));
         }
 
+        // The per-expert blocks are staged on the host (the bank is read as one
+        // packed tensor and sliced), so they have to be uploaded to the
+        // WeightSource's device. Hardcoding cpu_tensor made every bank
+        // host-resident, and a device forward then handed a host weight to a
+        // device matmul: "matmul: input b is not RocmStorage". On the CPU this
+        // is a no-op clone.
+        let target = ws.device();
+        let to_target =
+            |block: Vec<f32>, shape: Shape| -> Result<Tensor, grim_tensor::error::Error> {
+                let host = cpu_tensor(block, shape);
+                if target.is_cpu() {
+                    Ok(host)
+                } else {
+                    Ok(crate::modules::move_to_device(&host, &target)?)
+                }
+            };
+
         let mut gate = Vec::with_capacity(num_experts);
         let mut up = Vec::with_capacity(num_experts);
         let mut down = Vec::with_capacity(num_experts);
@@ -777,7 +794,7 @@ impl ExpertBank {
                 // GGUF row-major per expert is [out, in] when the bank stores [n_experts, out, in] - matches Linear directly.
                 // gate/up banks store [inter, hidden] (out=inter) and down stores [hidden, inter] (out=hidden), so no transpose.
                 lins.push(Linear::from_tensor(
-                    cpu_tensor(block, Shape::new(vec![*out, *in_])),
+                    to_target(block, Shape::new(vec![*out, *in_]))?,
                     bias_opt(has_bias, *out),
                 ));
             }
@@ -798,7 +815,9 @@ impl ExpertBank {
     ) -> Result<Tensor, grim_tensor::error::Error> {
         let g = self.gate[e].forward(x)?; // [batch, inter]
         let u = self.up[e].forward(x)?; // [batch, inter]
-        let h = silu_mul_host(&g, &u)?; // [batch, inter]
+        // Device-dispatched: the host variant returned a cpu_tensor, which the
+        // following device matmul cannot consume.
+        let h = crate::modules::silu_mul_on_device(&g, &u)?; // [batch, inter]
         self.down[e].forward(&h) // [batch, hidden]
     }
 }
@@ -833,10 +852,15 @@ impl NonGatedExpertBank {
         if probe.dtype.storage == grim_tensor::dtype::Storage::Native {
             return Self::load_native(ws, num_experts, hidden, inter, has_bias);
         }
-        Self::load_quantized(ws, num_experts, has_bias, [
-            ("ffn_up_exps.weight", inter, hidden),
-            ("ffn_down_exps.weight", hidden, inter),
-        ])
+        Self::load_quantized(
+            ws,
+            num_experts,
+            has_bias,
+            [
+                ("ffn_up_exps.weight", inter, hidden),
+                ("ffn_down_exps.weight", hidden, inter),
+            ],
+        )
     }
 
     fn load_quantized(
@@ -937,8 +961,14 @@ impl NonGatedExpertBank {
         _inter: usize,
         has_bias: bool,
     ) -> Result<Self, grim_tensor::error::Error> {
-        let t_up = ws.get(Shape::new(vec![num_experts, _inter, _hidden]), "ffn_up_exps.weight")?;
-        let t_down = ws.get(Shape::new(vec![num_experts, _hidden, _inter]), "ffn_down_exps.weight")?;
+        let t_up = ws.get(
+            Shape::new(vec![num_experts, _inter, _hidden]),
+            "ffn_up_exps.weight",
+        )?;
+        let t_down = ws.get(
+            Shape::new(vec![num_experts, _hidden, _inter]),
+            "ffn_down_exps.weight",
+        )?;
         let v_up = t_up.to_vec_f32()?;
         let v_down = t_down.to_vec_f32()?;
 
@@ -967,16 +997,9 @@ impl NonGatedExpertBank {
         x: &Tensor,
     ) -> Result<Tensor, grim_tensor::error::Error> {
         let u = self.up[e].forward(x)?; // [batch, inter]
-        let uv = u.to_vec_f32()?;
-        // relu(u)^2
-        let relu2: Vec<f32> = uv
-            .into_iter()
-            .map(|val| {
-                let r = val.max(0.0);
-                r * r
-            })
-            .collect();
-        let h = cpu_tensor(relu2, u.shape().clone());
+        // relu(u)^2, device-dispatched: the host path handed the following
+        // device matmul a cpu_tensor.
+        let h = crate::modules::relu2_on_device(&u)?;
         self.down[e].forward(&h) // [batch, hidden]
     }
 }
@@ -1003,15 +1026,7 @@ impl NonGatedSharedExpert {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let u = self.up.forward(x)?;
-        let uv = u.to_vec_f32()?;
-        let relu2: Vec<f32> = uv
-            .into_iter()
-            .map(|val| {
-                let r = val.max(0.0);
-                r * r
-            })
-            .collect();
-        let h = cpu_tensor(relu2, u.shape().clone());
+        let h = crate::modules::relu2_on_device(&u)?;
         self.down.forward(&h)
     }
 }
@@ -1514,7 +1529,7 @@ impl ExpertTriple {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let g = self.gate.forward(x)?;
         let u = self.up.forward(x)?;
-        let h = silu_mul_host(&g, &u)?;
+        let h = crate::modules::silu_mul_on_device(&g, &u)?;
         self.down.forward(&h)
     }
 }
@@ -2569,18 +2584,6 @@ fn softmax(v: &[f32]) -> Vec<f32> {
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-/// Elementwise `silu(g) * u` on host (SwiGLU activation).
-fn silu_mul_host(g: &Tensor, u: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
-    let gv = g.to_vec_f32()?;
-    let uv = u.to_vec_f32()?;
-    let out: Vec<f32> = gv
-        .iter()
-        .zip(uv.iter())
-        .map(|(&a, &b)| a * sigmoid(a) * b)
-        .collect();
-    Ok(cpu_tensor(out, g.shape().clone()))
 }
 
 fn slice_expert(flat: &[f32], e: usize, out: usize, in_dim: usize) -> Vec<f32> {
