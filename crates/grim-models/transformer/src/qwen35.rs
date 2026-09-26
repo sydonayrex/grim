@@ -1104,7 +1104,6 @@ impl Qwen35 {
             }
         }
 
-
         Ok(Self {
             cfg,
             device,
@@ -1184,12 +1183,34 @@ impl CausalLm for Qwen35 {
                 )
             })?;
 
+        // Per-layer trace, off by default. A device page fault kills the
+        // process with no stack, so the only way to learn which layer faulted
+        // is to say so on the way in: the last line printed is the culprit.
+        let trace = std::env::var("GRIM_TRACE_LAYERS").is_ok();
+        if trace {
+            eprintln!(
+                "[qwen35-trace] {} layers, entering forward on {}",
+                self.blocks.len(),
+                h.device()
+            );
+        }
         for (i, block) in self.blocks.iter().enumerate() {
             if h.device() != &block.device {
                 h = grim_nn::modules::move_to_device(&h, &block.device)?;
             }
+            if trace {
+                let kind = if block.is_full_attention {
+                    "attn"
+                } else {
+                    "kda"
+                };
+                eprintln!("[qwen35-trace] layer {i} ({kind}) on {}", block.device);
+            }
             h = block.forward(&h, &positions_vec, &mut caches[i])?;
             caches[i].current_pos += seq_len;
+        }
+        if trace {
+            eprintln!("[qwen35-trace] all layers done, entering output norm");
         }
 
         if h.device() != self.output_norm.weight.device() {
@@ -1245,7 +1266,13 @@ impl CausalLm for Qwen35 {
 /// after RoPE instead would be a different function, not a reordering detail.
 ///
 /// `x` is `[seq_len, n_heads * head_dim]`; the norm is per head, over `head_dim`.
-fn apply_head_rms_norm(x: &[f32], n_heads: usize, head_dim: usize, weight: &[f32], eps: f32) -> Vec<f32> {
+fn apply_head_rms_norm(
+    x: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    weight: &[f32],
+    eps: f32,
+) -> Vec<f32> {
     let row_stride = n_heads.max(1) * head_dim.max(1);
     if row_stride == 0 || x.is_empty() {
         return x.to_vec();
@@ -1340,7 +1367,11 @@ fn gated_delta_net_forward(
     if let Some(ref gl) = blk.attn_gate {
         z_vec = gl.forward(x_normed)?.to_vec_f32()?;
     }
-    let z_stride = if z_vec.is_empty() { 0 } else { z_vec.len() / seq_len.max(1) };
+    let z_stride = if z_vec.is_empty() {
+        0
+    } else {
+        z_vec.len() / seq_len.max(1)
+    };
     let silu = |v: f32| v / (1.0 + (-v).exp());
 
     let dt_bias: &[f32] = blk.ssm_dt_bias.as_deref().unwrap_or(&[]);
