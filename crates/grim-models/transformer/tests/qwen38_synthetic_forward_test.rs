@@ -122,13 +122,17 @@ fn synth_cfg(n_layers: usize) -> Qwen38FlashNextConfig {
     // GDN geometry, shrunk but internally consistent.
     cfg.ssm_d_state = 4;
     cfg.ssm_n_group = 2;
+    // ssm_d_inner must stay linear_value_head_dim * linear_num_value_heads.
     cfg.ssm_d_inner = 16;
     cfg.ssm_dt_rank = 4;
     cfg.linear_conv_kernel_dim = 2;
     cfg.linear_num_key_heads = 2;
     cfg.linear_key_head_dim = 4;
-    cfg.linear_value_head_dim = 4;
-    cfg.linear_num_value_heads = 4;
+    // Deliberately 8, not 4: the released checkpoint has ssm_d_state ==
+    // linear_value_head_dim == 128, so a synthetic config that mirrors that
+    // cannot tell the two apart and would let a mis-sized ssm_norm through.
+    cfg.linear_value_head_dim = 8;
+    cfg.linear_num_value_heads = 2;
     // QSA geometry.
     cfg.indexer_n_heads = 2;
     cfg.indexer_key_length = 4;
