@@ -728,6 +728,46 @@ impl Qwen35Block {
                     }
                 };
 
+            // Q/K RMS norm, BEFORE RoPE. The reference does exactly this at
+            // qwen35.cpp:281/286 with MRoPE following at line 299. Both weights
+            // were previously loaded from the checkpoint and never applied, so
+            // unnormalized q and k reached RoPE and the softmax. Normalizing
+            // after RoPE would be a different function, not a reordering detail.
+            let q_dev = match self.attn_q_norm.as_ref() {
+                Some(n) => {
+                    let w = n.weight.to_vec_f32()?;
+                    let cur = q_dev.to_vec_f32()?;
+                    let normed =
+                        apply_head_rms_norm(&cur, self.num_heads, self.head_dim, &w, n.eps);
+                    let sh = Shape::new(vec![seq_len, self.num_heads * self.head_dim]);
+                    Tensor::new(
+                        dev.from_cpu(&normed, &sh, DType::F32)?.into(),
+                        sh,
+                        DType::F32,
+                        q_dev.provenance().clone(),
+                        q_dev.device().clone(),
+                    )
+                }
+                None => q_dev,
+            };
+            let k_dev_t = match self.attn_k_norm.as_ref() {
+                Some(n) => {
+                    let w = n.weight.to_vec_f32()?;
+                    let cur = k_dev_t.to_vec_f32()?;
+                    let normed =
+                        apply_head_rms_norm(&cur, self.num_kv_heads, self.head_dim, &w, n.eps);
+                    let sh = Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]);
+                    Tensor::new(
+                        dev.from_cpu(&normed, &sh, DType::F32)?.into(),
+                        sh,
+                        DType::F32,
+                        k_dev_t.provenance().clone(),
+                        k_dev_t.device().clone(),
+                    )
+                }
+                None => k_dev_t,
+            };
+
             let q_rope = rope_ext(&q_dev, self.num_heads)?;
             let k_rope = rope_ext(&k_dev_t, self.num_kv_heads)?;
 
@@ -1179,6 +1219,34 @@ impl CausalLm for Qwen35 {
 /// the delta rule vectors that are orders of magnitude off, and the error
 /// compounds across all the KDA layers. A synthetic repro with constant 0.1
 /// weights cannot see this, which is why it survived.
+/// Per-head Q/K RMS norm, applied BEFORE MRoPE.
+///
+/// `llama.cpp` qwen35.cpp normalizes Q and K with `attn_q_norm` /
+/// `attn_k_norm` at lines 281 and 286, and only then applies MRoPE at line 299.
+/// grim loaded both weights from the checkpoint and never applied them at all,
+/// so unnormalized q and k went into RoPE and into the softmax. Normalizing
+/// after RoPE instead would be a different function, not a reordering detail.
+///
+/// `x` is `[seq_len, n_heads * head_dim]`; the norm is per head, over `head_dim`.
+fn apply_head_rms_norm(x: &[f32], n_heads: usize, head_dim: usize, weight: &[f32], eps: f32) -> Vec<f32> {
+    let row_stride = n_heads.max(1) * head_dim.max(1);
+    if row_stride == 0 || x.is_empty() {
+        return x.to_vec();
+    }
+    let mut out = x.to_vec();
+    for seq in 0..(x.len() / row_stride) {
+        for h in 0..n_heads {
+            let base = seq * row_stride + h * head_dim;
+            let ss: f32 = out[base..base + head_dim].iter().map(|v| v * v).sum();
+            let inv = 1.0 / ((ss / head_dim as f32) + eps).sqrt();
+            for i in 0..head_dim {
+                out[base + i] = out[base + i] * inv * weight.get(i).copied().unwrap_or(1.0);
+            }
+        }
+    }
+    out
+}
+
 fn gdn_l2_norm(v: &[f32], eps: f32) -> Vec<f32> {
     let ss: f32 = v.iter().map(|x| x * x).sum();
     let denom = (ss + eps).sqrt();
@@ -2951,5 +3019,76 @@ mod gdn_l2_norm_tests {
     #[test]
     fn empty_slice_is_safe() {
         assert!(gdn_l2_norm(&[], 1e-6).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod qk_norm_tests {
+    use super::apply_head_rms_norm;
+
+    /// After the norm each head has unit RMS, so Q and K reach RoPE and the
+    /// softmax at a scale that does not depend on the state's magnitude.
+    #[test]
+    fn normalizes_each_head_to_unit_rms() {
+        let (n_heads, head_dim) = (2usize, 4usize);
+        let mut x = vec![0.0f32; n_heads * head_dim];
+        x[0] = 3.0;
+        x[1] = 4.0;
+        x[head_dim + 0] = 30.0; // a much hotter head
+        let w = vec![1.0f32; head_dim];
+        let out = apply_head_rms_norm(&x, n_heads, head_dim, &w, 1e-6);
+        for h in 0..n_heads {
+            let row = &out[h * head_dim..(h + 1) * head_dim];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+            assert!((ms - 1.0).abs() < 1e-4, "head {h} rms^2 was {ms}");
+        }
+    }
+
+    /// Heads are normalized INDEPENDENTLY: one hot head must not drag the
+    /// others down. A whole-tensor norm would fail this.
+    #[test]
+    fn heads_are_normalized_independently() {
+        let (n_heads, head_dim) = (3usize, 2usize);
+        let x = vec![1.0f32, 1.0, 100.0, 100.0, 1.0, 1.0];
+        let w = vec![1.0f32; head_dim];
+        let out = apply_head_rms_norm(&x, n_heads, head_dim, &w, 1e-6);
+        let hot = &out[2..4];
+        let ms_hot = hot.iter().map(|v| v * v).sum::<f32>() / 2.0;
+        assert!((ms_hot - 1.0).abs() < 1e-4, "hot head rms^2 {ms_hot}");
+    }
+
+    /// The norm weight is applied AFTER the division, matching
+    /// build_norm(..., LLM_NORM_RMS, ...).
+    #[test]
+    fn weight_is_applied_after_the_division() {
+        let (n_heads, head_dim) = (1usize, 2usize);
+        let x = vec![3.0f32, 4.0];
+        let w = vec![2.0f32, 0.5];
+        let out = apply_head_rms_norm(&x, n_heads, head_dim, &w, 1e-6);
+        let inv = 1.0 / (25.0f32 / 2.0 + 1e-6).sqrt();
+        assert!((out[0] - 3.0 * inv * 2.0).abs() < 1e-5, "got {}", out[0]);
+        assert!((out[1] - 4.0 * inv * 0.5).abs() < 1e-5, "got {}", out[1]);
+    }
+
+    /// Multi-token input: every sequence position is its own head row, so the
+    /// norm must not bleed across the sequence axis.
+    #[test]
+    fn each_sequence_position_is_normalized_separately() {
+        let (n_heads, head_dim) = (1usize, 2usize);
+        let x = vec![3.0, 4.0, 30.0, 40.0]; // two tokens
+        let w = vec![1.0f32; head_dim];
+        let out = apply_head_rms_norm(&x, n_heads, head_dim, &w, 1e-6);
+        for t in 0..2 {
+            let row = &out[t * head_dim..(t + 1) * head_dim];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / 2.0;
+            assert!((ms - 1.0).abs() < 1e-4, "token {t} rms^2 {ms}");
+        }
+    }
+
+    /// An all-zero row must not divide by zero into NaN.
+    #[test]
+    fn zero_row_is_finite() {
+        let out = apply_head_rms_norm(&[0.0, 0.0], 1, 2, &[1.0, 1.0], 1e-6);
+        assert!(out.iter().all(|v| v.is_finite()), "got {out:?}");
     }
 }
