@@ -921,6 +921,15 @@ impl QuantOps for RocmDevice {
                     k,
                 )?;
             }
+            // NVFP4 is NOT a validated RDNA4 path. It was found incompatible with
+            // RDNA4 (gfx1200) and dropped from the tested set; the tests covering
+            // `dequant_nvfp4` went with it, so neither the host dequant nor these
+            // kernels has test coverage any more. The code is kept only so an
+            // existing NVFP4 checkpoint can still be read. There is no gfx1200
+            // gate here on purpose: gating it would hide the decision, whereas
+            // reaching this arm on RDNA4 is exactly the case we do not trust.
+            // Do not add new work on this path, and do not read it as a working
+            // RDNA4 GEMM. See `launch_nvfp4_gemv` / `launch_nvfp4_gemm_tiled`.
             DTypeStorage::FloatPack(FloatPackScheme::NvFp4) => {
                 if m <= 4 {
                     self.launch_nvfp4_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
