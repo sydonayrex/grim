@@ -170,6 +170,9 @@ impl RocmDevice {
     }
 
     /// Fused NVFP4 GEMV with cooperative Wave reduction in LDS (for decode batch M <= 4).
+    ///
+    /// Untested and known-incompatible with RDNA4; see the NVFP4 dispatch arm in
+    /// `quant/mod.rs` before treating this as a working path.
     pub fn launch_nvfp4_gemv(
         &self,
         a_storage: &RocmStorage,
@@ -215,6 +218,9 @@ impl RocmDevice {
     }
 
     /// Tiled NVFP4 GEMM for prefill batch (M > 4).
+    ///
+    /// Untested and known-incompatible with RDNA4; see the NVFP4 dispatch arm in
+    /// `quant/mod.rs` before treating this as a working path.
     pub fn launch_nvfp4_gemm_tiled(
         &self,
         a_storage: &RocmStorage,
