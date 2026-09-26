@@ -1,12 +1,12 @@
 //! Proves the QSA indexer is WIRED, not merely implemented — and that both
 //! fallbacks behave.
 //!
-//! `qwen38_qsa.rs` proves the math. These prove the layer reaches it, that the
+//! `qwen4exp_qsa.rs` proves the math. These prove the layer reaches it, that the
 //! `GRIM_QWEN38_QSA=0` gate turns it off, and that the host reference result
 //! lands on the tensor's own device rather than always on the CPU.
 
-use grim_models_transformer::qwen38_flash_next::Qwen38FlashNextConfig;
-use grim_models_transformer::qwen38_qsa::{
+use grim_models_transformer::qwen4exp_flash_next::Qwen38FlashNextConfig;
+use grim_models_transformer::qwen4exp_qsa::{
     QsaIndexConfig, build_top_k_mask, expand_block_scores, indexer_block_scores, pool_indexer_keys,
     top_k_cells,
 };

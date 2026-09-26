@@ -20,7 +20,7 @@
 //! 6. the tail is always visible (Eq. 16), via the `+1e9` bias
 //! 7. pooling is a mean over exactly `r` cells
 
-use grim_models_transformer::qwen38_qsa_blocks::{CellInfo, allocate_blocks};
+use grim_models_transformer::qwen4exp_qsa_blocks::{CellInfo, allocate_blocks};
 
 /// A dense single-sequence cache: cell `j` holds position `j`.
 fn dense(n: u32, seq: u32) -> Vec<CellInfo> {
@@ -81,7 +81,7 @@ fn two_sequences_in_the_same_bucket_never_share_a_block() {
     assert_eq!(lay.blk_cells, vec![1, 2, 3, 4], "only sequence 2's cells");
     assert_eq!(
         lay.blk_of[0],
-        grim_models_transformer::qwen38_qsa_blocks::NO_BLOCK
+        grim_models_transformer::qwen4exp_qsa_blocks::NO_BLOCK
     );
     assert_eq!(lay.blk_of[1], 0, "sequence 2's cells are in block 0");
 }
@@ -106,7 +106,7 @@ fn an_incomplete_group_is_never_promoted() {
     for j in 0..3 {
         assert_eq!(
             lay.blk_of[j],
-            grim_models_transformer::qwen38_qsa_blocks::NO_BLOCK,
+            grim_models_transformer::qwen4exp_qsa_blocks::NO_BLOCK,
             "cell {j} is unpooled"
         );
     }
@@ -267,7 +267,7 @@ fn on_a_dense_single_sequence_the_allocator_agrees_with_cell_over_r() {
         .collect();
     let via_allocator = lay.pooled(&k_raw, n_kv, idx_dim, r).expect("pool");
     let via_cell_over_r =
-        grim_models_transformer::qwen38_qsa::pool_indexer_keys(&k_raw, n_kv, idx_dim, r)
+        grim_models_transformer::qwen4exp_qsa::pool_indexer_keys(&k_raw, n_kv, idx_dim, r)
             .expect("pool");
     assert_eq!(
         via_allocator.len(),
@@ -301,6 +301,6 @@ fn an_empty_cell_is_skipped_entirely() {
     assert_eq!(lay.blk_cells, vec![0, 2, 3, 4], "cell 1 is the hole");
     assert_eq!(
         lay.blk_of[1],
-        grim_models_transformer::qwen38_qsa_blocks::NO_BLOCK
+        grim_models_transformer::qwen4exp_qsa_blocks::NO_BLOCK
     );
 }

@@ -155,7 +155,7 @@ fn test_gpt_oss_forward_and_device_residency() {
 
 #[test]
 #[allow(clippy::field_reassign_with_default)]
-fn test_qwen38_flash_next_loads_all_configured_layers_and_dynamic_routing() {
+fn test_qwen4exp_flash_next_loads_all_configured_layers_and_dynamic_routing() {
     use grim_models_transformer::{Qwen38FlashNext, Qwen38FlashNextConfig};
 
     let mut cfg = Qwen38FlashNextConfig::default();

@@ -32,7 +32,7 @@ use grim_nn::WeightSource;
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 use grim_tensor::{CoreTensorOps, DType, Device, QuantProvenance, Shape};
 
-use grim_models_transformer::qwen38_flash_next::{Qwen38FlashNext, Qwen38FlashNextConfig};
+use grim_models_transformer::qwen4exp_flash_next::{Qwen38FlashNext, Qwen38FlashNextConfig};
 
 // ---------------------------------------------------------------------------
 // Synthetic checkpoint

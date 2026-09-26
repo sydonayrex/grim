@@ -286,16 +286,19 @@ impl MtpDepthProvider for LlamaMtp {
 
 /// Qwen3.8-Flash-Next model with genuine Multi-Token Prediction (MTP) layers.
 pub struct Qwen38FlashNextMtp {
-    pub base: crate::qwen38_flash_next::Qwen38FlashNext,
+    pub base: crate::qwen4exp_flash_next::Qwen38FlashNext,
     pub mtp_layers: Vec<MtpLayer>,
 }
 
 impl Qwen38FlashNextMtp {
-    pub fn new(base: crate::qwen38_flash_next::Qwen38FlashNext, mtp_layers: Vec<MtpLayer>) -> Self {
+    pub fn new(
+        base: crate::qwen4exp_flash_next::Qwen38FlashNext,
+        mtp_layers: Vec<MtpLayer>,
+    ) -> Self {
         Self { base, mtp_layers }
     }
 
-    pub fn new_random(base: crate::qwen38_flash_next::Qwen38FlashNext, depth: usize) -> Self {
+    pub fn new_random(base: crate::qwen4exp_flash_next::Qwen38FlashNext, depth: usize) -> Self {
         let hidden_size = base.cfg.hidden_size;
         let vocab_size = base.cfg.vocab_size;
         let eps = base.cfg.rms_norm_eps;
@@ -509,8 +512,8 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen38_flash_next_mtp_creation_and_prediction() {
-        let cfg = crate::qwen38_flash_next::Qwen38FlashNextConfig {
+    fn test_qwen4exp_flash_next_mtp_creation_and_prediction() {
+        let cfg = crate::qwen4exp_flash_next::Qwen38FlashNextConfig {
             vocab_size: 128,
             hidden_size: 64,
             num_layers: 1,
@@ -518,7 +521,7 @@ mod tests {
             ngram_dim: Some(16),
             ..Default::default()
         };
-        let base = crate::qwen38_flash_next::Qwen38FlashNext::random(Device::Cpu, cfg);
+        let base = crate::qwen4exp_flash_next::Qwen38FlashNext::random(Device::Cpu, cfg);
         let mtp = Qwen38FlashNextMtp::new_random(base, 3);
         assert_eq!(mtp.mtp_depth(), 3);
 

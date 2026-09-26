@@ -25,7 +25,7 @@
 //! compute by hand. The 16-head released geometry is checked against the
 //! metadata directly.
 
-use grim_models_transformer::qwen38_flash_next::{Qwen38FlashNextConfig, Qwen38NgramAddressing};
+use grim_models_transformer::qwen4exp_flash_next::{Qwen38FlashNextConfig, Qwen38NgramAddressing};
 
 /// A tiny 4-head PLE: ngram_size 3, heads_per_ngram 2 -> (3-1)*2 = 4 heads.
 fn tiny() -> Qwen38NgramAddressing {

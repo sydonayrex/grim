@@ -821,7 +821,7 @@ pub enum Qwen38Attention {
         conv_dim: usize,
         /// Value-head to key-head mapping. A 3:1 ratio is consistent with both
         /// pairings and the GGUF does not encode it, so it is explicit.
-        pairing: crate::qwen38_gdn::KdaHeadPairing,
+        pairing: crate::qwen4exp_gdn::KdaHeadPairing,
     },
     Full {
         wq: Linear,
@@ -1013,7 +1013,7 @@ impl Qwen38FlashNextBlock {
                 n_k_heads: cfg.ssm_n_group,
                 head_dim: cfg.ssm_d_state,
                 conv_dim,
-                pairing: crate::qwen38_gdn::KdaHeadPairing::default(),
+                pairing: crate::qwen4exp_gdn::KdaHeadPairing::default(),
             }
         } else {
             let q_dim = cfg.num_heads * cfg.head_dim;
@@ -1104,7 +1104,7 @@ impl Qwen38FlashNextBlock {
     pub fn qsa_geometry(
         &self,
         cfg: &Qwen38FlashNextConfig,
-    ) -> Option<crate::qwen38_qsa::QsaIndexConfig> {
+    ) -> Option<crate::qwen4exp_qsa::QsaIndexConfig> {
         if matches!(&self.attn, Qwen38Attention::Linear { .. }) {
             return None;
         }
@@ -1130,7 +1130,7 @@ impl Qwen38FlashNextBlock {
         if !has_indexer {
             return None;
         }
-        Some(crate::qwen38_qsa::QsaIndexConfig {
+        Some(crate::qwen4exp_qsa::QsaIndexConfig {
             idx_dim: cfg.indexer_key_length,
             n_idx_h: cfg.indexer_n_heads,
             top_k: cfg.indexer_top_k,
@@ -1138,9 +1138,9 @@ impl Qwen38FlashNextBlock {
         })
     }
 
-    /// This block's GDN geometry, or [`GdnGeometry::Unknown`](crate::qwen38_gdn::GdnGeometry::Unknown)
+    /// This block's GDN geometry, or [`GdnGeometry::Unknown`](crate::qwen4exp_gdn::GdnGeometry::Unknown)
     /// for a full-attention layer.
-    pub fn gdn_geometry(&self) -> crate::qwen38_gdn::GdnGeometry {
+    pub fn gdn_geometry(&self) -> crate::qwen4exp_gdn::GdnGeometry {
         match &self.attn {
             Qwen38Attention::Linear {
                 n_v_heads,
@@ -1148,13 +1148,13 @@ impl Qwen38FlashNextBlock {
                 head_dim,
                 conv_dim,
                 ..
-            } => crate::qwen38_gdn::GdnGeometry::Known(crate::qwen38_gdn::GdnShape {
+            } => crate::qwen4exp_gdn::GdnGeometry::Known(crate::qwen4exp_gdn::GdnShape {
                 n_v_heads: *n_v_heads,
                 n_k_heads: *n_k_heads,
                 head_dim: *head_dim,
                 conv_dim: *conv_dim,
             }),
-            Qwen38Attention::Full { .. } => crate::qwen38_gdn::GdnGeometry::Unknown,
+            Qwen38Attention::Full { .. } => crate::qwen4exp_gdn::GdnGeometry::Unknown,
         }
     }
 
@@ -1172,7 +1172,7 @@ impl Qwen38FlashNextBlock {
         x: &Tensor,
         positions: &[u32],
         cfg: &Qwen38FlashNextConfig,
-        gdn_cache: &mut crate::qwen38_gdn::Qwen38GdnCache,
+        gdn_cache: &mut crate::qwen4exp_gdn::Qwen38GdnCache,
         qsa_keys: &mut Vec<f32>,
     ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
@@ -1287,8 +1287,8 @@ impl Qwen38FlashNextBlock {
                 // 3. The recurrence itself, over the [seq] axis in order.
                 let value_dim = n_v_heads * head_dim;
                 let mut gdn_out = vec![0.0f32; seq_len * value_dim];
-                crate::qwen38_gdn::gated_delta_net_forward(
-                    &crate::qwen38_gdn::GdnParams {
+                crate::qwen4exp_gdn::gated_delta_net_forward(
+                    &crate::qwen4exp_gdn::GdnParams {
                         conv_mix: &conv_mix,
                         alpha: &alpha_raw,
                         beta: &beta_raw,
@@ -1466,10 +1466,10 @@ impl Qwen38FlashNextBlock {
                         // case where `pos / r` and the correct grouping coincide, and a
                         // multi-sequence cache will need this to be per-sequence.
                         let n_blocks = qcfg.n_blocks(n_kv);
-                        let cell_info: Vec<crate::qwen38_qsa_blocks::CellInfo> = (0..n_kv)
-                            .map(|j| crate::qwen38_qsa_blocks::CellInfo::new(j as u32, 0))
+                        let cell_info: Vec<crate::qwen4exp_qsa_blocks::CellInfo> = (0..n_kv)
+                            .map(|j| crate::qwen4exp_qsa_blocks::CellInfo::new(j as u32, 0))
                             .collect();
-                        let layout = crate::qwen38_qsa_blocks::allocate_blocks(
+                        let layout = crate::qwen4exp_qsa_blocks::allocate_blocks(
                             &cell_info,
                             n_blocks,
                             qcfg.compress_ratio,
@@ -1493,7 +1493,7 @@ impl Qwen38FlashNextBlock {
                         let mut q_normed = q_idx.clone();
                         if let Some(n) = indexer_q_norm.as_ref() {
                             let w = n.weight.to_vec_f32()?;
-                            crate::qwen38_qsa::rms_norm_rows(
+                            crate::qwen4exp_qsa::rms_norm_rows(
                                 &mut q_normed,
                                 qcfg.n_idx_h * idx_dim,
                                 &w,
@@ -1507,7 +1507,7 @@ impl Qwen38FlashNextBlock {
                             layout.pooled(&keys, n_kv, idx_dim, qcfg.compress_ratio)?;
                         if let Some(n) = indexer_k_norm.as_ref() {
                             let w = n.weight.to_vec_f32()?;
-                            crate::qwen38_qsa::rms_norm_rows(
+                            crate::qwen4exp_qsa::rms_norm_rows(
                                 &mut pooled,
                                 idx_dim,
                                 &w,
@@ -1523,7 +1523,7 @@ impl Qwen38FlashNextBlock {
                         // to the scores before top-k; without it a query
                         // attends to future blocks and the tail can be dropped.
                         let bias = layout.block_bias(q_pos, qcfg.compress_ratio, &|_| true);
-                        let mut scores = crate::qwen38_qsa::indexer_block_scores(
+                        let mut scores = crate::qwen4exp_qsa::indexer_block_scores(
                             &pooled,
                             &q_normed[q_normed.len() - qcfg.n_idx_h * idx_dim..],
                             layout.n_bid,
@@ -1538,7 +1538,7 @@ impl Qwen38FlashNextBlock {
                         // `cell / r`. Unpooled cells land at -inf and so are
                         // never selected, which also covers the first token of
                         // a sequence, where no complete block exists yet.
-                        let cells = crate::qwen38_qsa::expand_allocated_block_scores(
+                        let cells = crate::qwen4exp_qsa::expand_allocated_block_scores(
                             &scores,
                             &layout.blk_of,
                             1,
@@ -1548,12 +1548,12 @@ impl Qwen38FlashNextBlock {
                         // must span the ATTENTION kv cells, so clamp the
                         // selection to that length. `k` is [S, n_kv * head_dim]
                         // and is available here, before the host materialization.
-                        let sel = crate::qwen38_qsa::top_k_cells(&cells, qcfg.select_width(n_kv));
+                        let sel = crate::qwen4exp_qsa::top_k_cells(&cells, qcfg.select_width(n_kv));
                         let kv_stride = (*num_kv_heads * *head_dim).max(1);
                         let k_elems = k.to_vec_f32()?.len();
                         let kv_len = (k_elems / kv_stride).max(1);
                         let sel = sel.into_iter().filter(|c| *c < kv_len).collect::<Vec<_>>();
-                        Some(crate::qwen38_qsa::build_top_k_mask(kv_len, &sel, None)?)
+                        Some(crate::qwen4exp_qsa::build_top_k_mask(kv_len, &sel, None)?)
                     }
                     None => None,
                 };
@@ -1600,7 +1600,7 @@ impl Qwen38FlashNextBlock {
                             // which holds for a single-token decode.
                             Some(keep) if seq_len == 1 => {
                                 let kv_len = keep.len();
-                                let out = crate::qwen38_qsa::masked_gqa_attention(
+                                let out = crate::qwen4exp_qsa::masked_gqa_attention(
                                     &q_heads,
                                     &k_heads,
                                     &v_heads,
@@ -1942,7 +1942,7 @@ pub struct Qwen38FlashNext {
 /// change to the core session contract.
 #[derive(Debug, Clone, Default)]
 pub struct Qwen38GdnSession {
-    pub caches: Vec<crate::qwen38_gdn::Qwen38GdnCache>,
+    pub caches: Vec<crate::qwen4exp_gdn::Qwen38GdnCache>,
     /// Raw indexer keys per full-attention layer, `[n_kv, indexer_key_length]`.
     ///
     /// Stored RAW on purpose: upstream caches `index_k_proj` output and applies
@@ -1962,8 +1962,8 @@ impl Qwen38GdnSession {
             if !self.caches[i].ssm_state.is_empty() {
                 continue;
             }
-            if let crate::qwen38_gdn::GdnGeometry::Known(g) = layer.gdn_geometry() {
-                self.caches[i] = crate::qwen38_gdn::Qwen38GdnCache::new(
+            if let crate::qwen4exp_gdn::GdnGeometry::Known(g) = layer.gdn_geometry() {
+                self.caches[i] = crate::qwen4exp_gdn::Qwen38GdnCache::new(
                     g.n_v_heads,
                     g.head_dim,
                     g.head_dim,
@@ -2306,7 +2306,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_qwen38_flash_next_config_defaults() {
+    fn test_qwen4exp_flash_next_config_defaults() {
         let cfg = Qwen38FlashNextConfig::default();
         assert_eq!(cfg.name(), "qwen3_8_flash_next");
         assert_eq!(cfg.vocab_size, 248320);

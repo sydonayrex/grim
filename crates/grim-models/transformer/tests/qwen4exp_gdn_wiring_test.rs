@@ -1,12 +1,12 @@
 //! Proves the GDN recurrence is WIRED, not merely implemented.
 //!
-//! `qwen38_gdn.rs` proves the math. These tests prove the block actually calls
+//! `qwen4exp_gdn.rs` proves the math. These tests prove the block actually calls
 //! it, because a correct recurrence that nothing invokes is the same as no
 //! recurrence — which is exactly the state 4c started in: the mixer computed a
 //! plausible `ssm_norm(ssm_conv1d(qkv))` and never touched the state at all.
 
-use grim_models_transformer::qwen38_flash_next::{Qwen38FlashNextConfig, Qwen38GdnSession};
-use grim_models_transformer::qwen38_gdn::{
+use grim_models_transformer::qwen4exp_flash_next::{Qwen38FlashNextConfig, Qwen38GdnSession};
+use grim_models_transformer::qwen4exp_gdn::{
     GdnParams, KdaHeadPairing, Qwen38GdnCache, gated_delta_net_forward,
 };
 

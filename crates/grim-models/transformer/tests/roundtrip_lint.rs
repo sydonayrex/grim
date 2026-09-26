@@ -97,7 +97,7 @@ fn roundtrip_budget_not_exceeded() {
         ("qwen35.rs", 12),
         ("qwen35_perf.rs", 4),
         ("qwen35moe.rs", 6),
-        ("qwen38_flash_next.rs", 23),
+        ("qwen4exp_flash_next.rs", 23),
         ("shared_attention.rs", 8),
         ("shared_moe.rs", 3), // Phase 3a: once-built Charon resident weight stack (not per-decode)
         ("solar_open2.rs", 2),

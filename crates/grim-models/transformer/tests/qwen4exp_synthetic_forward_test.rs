@@ -2,8 +2,8 @@
 //!
 //! # Why this file exists
 //!
-//! `qwen38_qsa.rs` and `qwen38_gdn.rs` prove the math. Nothing proved the layer
-//! forward path actually reaches them. A mutation check over `qwen38_flash_next.rs`
+//! `qwen4exp_qsa.rs` and `qwen4exp_gdn.rs` prove the math. Nothing proved the layer
+//! forward path actually reaches them. A mutation check over `qwen4exp_flash_next.rs`
 //! found five survivors, all in the forward path:
 //!
 //!   - ReLU moved outside the indexer head sum
@@ -36,7 +36,7 @@ use grim_nn::WeightSource;
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 use grim_tensor::{DType, Device, QuantProvenance, Shape};
 
-use grim_models_transformer::qwen38_flash_next::{Qwen38FlashNext, Qwen38FlashNextConfig};
+use grim_models_transformer::qwen4exp_flash_next::{Qwen38FlashNext, Qwen38FlashNextConfig};
 
 /// A deterministic pseudo-random f32 tensor, so a run is reproducible without
 /// pulling in an RNG dependency.

@@ -9,7 +9,7 @@
 //! values against the real GGUF header.
 
 use grim_core::hyperparams::MetadataLookup;
-use grim_models_transformer::qwen38_flash_next::Qwen38FlashNextConfig;
+use grim_models_transformer::qwen4exp_flash_next::Qwen38FlashNextConfig;
 
 /// A `MetadataLookup` over the parsed real checkpoint.
 ///
