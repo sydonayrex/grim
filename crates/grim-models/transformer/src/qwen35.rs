@@ -554,7 +554,17 @@ impl Qwen35Block {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
 
-        let mut out_branch = vec![0.0f32; seq_len * q_dim];
+        // Branch width is layer-type dependent. Attention layers emit
+        // num_heads * head_dim; recurrent (KDA) layers emit
+        // num_value_heads * d_state, which `ssm_out.weight` consumes. For
+        // Qwen3.8-27B these happen to be equal (6144), but they are different
+        // quantities and must not be conflated.
+        let branch_width = if self.is_full_attention {
+            q_dim
+        } else {
+            self.cfg_ssm_num_value_heads() * self.cfg_ssm_head_dim()
+        };
+        let mut out_branch = vec![0.0f32; seq_len * branch_width];
 
         if self.is_full_attention {
             // Attention path with separated wq, wk, wv.
@@ -787,7 +797,14 @@ impl Qwen35Block {
             out_branch = attn_tensor.to_vec_f32()?;
         } else {
             // Gated DeltaNet recurrence (see `gated_delta_net_forward`).
-            gated_delta_net_forward(self, cache, &x_normed, &mut out_branch, seq_len, q_dim)?;
+            gated_delta_net_forward(
+                self,
+                cache,
+                &x_normed,
+                &mut out_branch,
+                seq_len,
+                branch_width,
+            )?;
         }
 
         // Apply attention gate if present (aligned per token across seq_len)
@@ -797,15 +814,19 @@ impl Qwen35Block {
             let gate_len_per_tok = gate_vec.len() / seq_len.max(1);
             for t in 0..seq_len {
                 let gate_base = t * gate_len_per_tok;
-                let out_base = t * q_dim;
-                for d in 0..q_dim.min(gate_len_per_tok) {
+                let out_base = t * branch_width;
+                for d in 0..branch_width.min(gate_len_per_tok) {
                     let g = gate_vec[gate_base + d];
                     out_branch[out_base + d] *= 1.0 / (1.0 + (-g).exp()); // sigmoid gate
                 }
             }
         }
 
-        let branch_tensor = device_tensor(out_branch, Shape::new(vec![seq_len, q_dim]), &device)?;
+        let branch_tensor = device_tensor(
+            out_branch,
+            Shape::new(vec![seq_len, branch_width]),
+            &device,
+        )?;
 
         let proj_out = if let Some(ref wo) = self.wo {
             wo.forward(&branch_tensor)?
@@ -1068,7 +1089,7 @@ fn gated_delta_net_forward(
     x_normed: &Tensor,
     out_branch: &mut [f32],
     seq_len: usize,
-    q_dim: usize,
+    branch_width: usize,
 ) -> Result<()> {
     let n_val_heads = blk.cfg_ssm_num_value_heads();
     let n_key_heads = blk.cfg_ssm_num_key_heads();
@@ -1111,6 +1132,37 @@ fn gated_delta_net_forward(
     let norm_vec: &[f32] = blk.ssm_norm.as_deref().unwrap_or(&[]);
     let values_per_group = (n_val_heads / n_key_heads).max(1);
 
+    // Width of the q stream inside the fused `attn_qkv`. This is the SSM's own
+    // head geometry, NOT the attention `q_dim` (num_heads * head_dim).
+    //
+    // Measured layout of `attn_qkv.weight` [10240, 5120] on Qwen3.8-27B, derived
+    // from the tensor shapes rather than assumed:
+    //
+    //   ssm_out.weight  [5120, 6144] -> the recurrence's output is 6144 wide,
+    //                                    so q shares that head count: 48 * 128
+    //                                    (48 = ssm_d_state * ssm_time_step_rank,
+    //                                     128 = ssm_state_size, confirmed by
+    //                                     ssm_norm.weight = [128])
+    //   remaining 10240 - 6144 = 4096 splits evenly as k and v, because a delta
+    //   rule reads S with k and writes it with v against the same d_k
+    //
+    //     q [0..6144)      48 value heads x 128
+    //     k [6144..8192)   16 key   heads x 128   (num_key_heads = ssm_group_count)
+    //     v [8192..10240)  16 key   heads x 128
+    //
+    // For THIS checkpoint 48*128 == 24*256 == the attention q_dim, so using the
+    // attention value happens to work. It is a coincidence: a different model with
+    // a different head split would read the wrong channels silently.
+    let ssm_q_width = n_val_heads * head_dim;
+    let ssm_kv_width = n_key_heads * head_dim;
+    debug_assert_eq!(
+        ssm_q_width + 2 * ssm_kv_width,
+        per_tok,
+        "fused attn_qkv width should be q + k + v; got q={ssm_q_width} k={ssm_kv_width} \
+         v={ssm_kv_width} total={} per_tok={per_tok}",
+        ssm_q_width + 2 * ssm_kv_width
+    );
+
     // Per-head state [n_val_heads][d_k][d_v]. cache.ssm_state is allocated as
     // n_group * d_state * (d_inner / n_group) = 48*128*128, exactly this shape
     // for square d_k = d_v = 128.
@@ -1133,8 +1185,8 @@ fn gated_delta_net_forward(
         for h in 0..n_val_heads {
             let kh = kda_key_head(h, n_key_heads, values_per_group);
             let q_off = base + h * head_dim;
-            let k_off = base + q_dim + kh * head_dim;
-            let v_off = base + q_dim + n_key_heads * head_dim + kh * head_dim;
+            let k_off = base + ssm_q_width + kh * head_dim;
+            let v_off = base + ssm_q_width + ssm_kv_width + kh * head_dim;
 
             // decay logit = ssm_a + ssm_dt.bias + alpha_t, through softplus.
             let mut z = alpha[t * n_val_heads + h];
@@ -1163,7 +1215,7 @@ fn gated_delta_net_forward(
             let q_slice = slice(q_off, head_dim);
             for d in 0..head_dim.min(q_slice.len()) {
                 let w = norm_vec.get(d).copied().unwrap_or(1.0);
-                let out_idx = t * q_dim + h * head_dim + d;
+                let out_idx = t * branch_width + h * head_dim + d;
                 if out_idx < out_branch.len() {
                     out_branch[out_idx] = q_slice[d] * w;
                 }
@@ -2033,7 +2085,6 @@ mod tests {
 
         // Build the recurrent block the way the real loader does, but with the
         // tensors the toy test already builds.
-        let q_dim = cfg.num_heads * cfg.head_dim;
         let b = |r: usize, c: usize| -> Tensor {
             cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c]))
         };
@@ -2055,10 +2106,20 @@ mod tests {
             wo: None,
             attn_q_norm: None,
             attn_k_norm: None,
+            // attn_qkv must be SSM width (q 48 + k 16 + v 16 = 80 heads of 128),
+            // NOT the attention width — the geometry declared above is the SSM's.
             attn_qkv: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; (q_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * cfg.hidden_size],
-                    Shape::new(vec![q_dim + 2 * cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size]),
+                    vec![
+                        0.1;
+                        (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group)
+                            * cfg.ssm_d_state
+                            * cfg.hidden_size
+                    ],
+                    Shape::new(vec![
+                        (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state,
+                        cfg.hidden_size,
+                    ]),
                 ),
                 None,
             )),

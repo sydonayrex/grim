@@ -128,7 +128,6 @@ impl Qwen35Block {
         let is_full_attention = (layer_idx + 1) % cfg.full_attention_interval.max(1) == 0;
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        let qkv_dim = q_dim + 2 * kv_dim;
 
         let attn_norm = b.rms_norm(cfg.hidden_size, cfg.rms_norm_eps);
 
@@ -152,9 +151,13 @@ impl Qwen35Block {
                     None,
                 )
             } else {
-                let attn_qkv = b.tensor_2d(qkv_dim, cfg.hidden_size);
-                let attn_gate = b.tensor_2d(q_dim, cfg.hidden_size);
-                let ssm_out = b.tensor_2d(cfg.hidden_size, q_dim);
+                // SSM-width fused qkv, matching the real layout:
+                // q = ssm_dt_rank*d_state, k = v = ssm_n_group*d_state.
+                let ssm_qkv_dim = (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state;
+                let attn_qkv = b.tensor_2d(ssm_qkv_dim, cfg.hidden_size);
+                let attn_gate = b.tensor_2d(cfg.ssm_dt_rank * cfg.ssm_d_state, cfg.hidden_size);
+                // consumes the SSM value stream: ssm_dt_rank * ssm_d_state
+                let ssm_out = b.tensor_2d(cfg.hidden_size, cfg.ssm_dt_rank * cfg.ssm_d_state);
                 (
                     None,
                     None,
