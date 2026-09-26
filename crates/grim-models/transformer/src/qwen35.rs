@@ -36,6 +36,8 @@ pub struct Qwen35Config {
     pub ssm_dt_rank: usize,
     pub ssm_n_group: usize,
 
+    pub rotary_dim: Option<usize>,
+
     // Multi-device pipeline distribution
     pub devices: Vec<Device>,
 }
@@ -59,6 +61,7 @@ impl Default for Qwen35Config {
             ssm_d_conv: 4,
             ssm_dt_rank: 48,
             ssm_n_group: 16,
+            rotary_dim: None,
             devices: Vec::new(),
         }
     }
@@ -200,6 +203,7 @@ pub struct Qwen35Block {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    pub rotary_dim: usize,
     pub rope_theta: f32,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -449,6 +453,7 @@ impl Qwen35Block {
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
+            rotary_dim: cfg.rotary_dim.unwrap_or(cfg.head_dim),
             rope_theta: cfg.rope_theta,
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
@@ -538,7 +543,8 @@ impl Qwen35Block {
                 ))
             };
 
-            let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
+            let mut rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
+            rope_cfg.rotary_dim = self.rotary_dim;
             let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
                 let mut pos_ext = Vec::with_capacity(seq_len * heads);
                 for &pos in positions {
@@ -1706,6 +1712,7 @@ mod tests {
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
+            rotary_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
             hidden_size: cfg.hidden_size,
             intermediate_size: cfg.intermediate_size,
