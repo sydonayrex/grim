@@ -44,6 +44,10 @@ fn f32_to_f16_le(v: f32) -> [u8; 2] {
     (sign | ((e as u16) << 10) | ((mant >> 13) as u16)).to_le_bytes()
 }
 
+fn assert_close_f32(got: f32, want: f32, what: &str) {
+    assert!((got - want).abs() < 1e-4, "{what}: got {got}, want {want}");
+}
+
 #[test]
 fn geometry_is_64_weights_per_18_byte_block() {
     // 2.25 bits/weight. A 256-weight/72-byte reading is 4x wrong and silently
@@ -211,6 +215,40 @@ fn all_zero_block_has_no_representable_scale_on_encode() {
     let mut packed = vec![0u8; BLOCK_BYTES_GSQ_RCO_3P5];
     let err = quantize_q2_0_block(&vals, &mut packed).expect_err("all-zero block");
     assert!(format!("{err}").contains("all zeros"));
+}
+
+/// Hand-constructed golden vector in the style of `golden_dequant.rs`: the packed
+/// bytes are built from explicit bit arithmetic and the expected values are
+/// derived from the format spec, never from this crate's own quantizer.
+///
+/// Block: `d = 1.0` (fp16 0x3C00), then 16 code bytes each holding the pattern
+/// `0b11_10_01_00` so every group of four weights is `-d, 0, +d, +2d`.
+#[test]
+fn golden_hand_built_block_matches_spec_derived_values() {
+    let mut block = [0u8; BLOCK_BYTES_GSQ_RCO_3P5];
+    block[0] = 0x00;
+    block[1] = 0x3C; // d = 1.0
+    for b in block[2..].iter_mut() {
+        *b = 0b11_10_01_00;
+    }
+
+    let deq = dequant_gsq_rco_3p5(&block, BLOCK_SIZE_GSQ_RCO_3P5).expect("dequant");
+    assert_eq!(deq.len(), 64);
+
+    // y[j] = (code(j) - 1) * d, and the code pattern repeats every 4 weights.
+    const CODEBOOK: [f32; 4] = [-1.0, 0.0, 1.0, 2.0];
+    for (j, &got) in deq.iter().enumerate() {
+        let want = CODEBOOK[j % 4];
+        assert!(
+            (got - want).abs() < 1e-4,
+            "weight {j}: code {} should decode to {want}, got {got}",
+            j % 4
+        );
+    }
+    assert_close_f32(deq[0], -1.0, "code 0 -> -d");
+    assert_close_f32(deq[1], 0.0, "code 1 -> 0 (zero is code 1, not code 0)");
+    assert_close_f32(deq[2], 1.0, "code 2 -> +d");
+    assert_close_f32(deq[3], 2.0, "code 3 -> +2d");
 }
 
 // ---- Real checkpoint bytes --------------------------------------------
