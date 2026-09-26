@@ -1967,3 +1967,95 @@ mod wi_e3_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod leading_space_tests {
+    use super::*;
+
+    /// A minimal but faithful byte-level BPE tokenizer: the two words that a
+    /// leading-space bug would collapse, plus the pieces a BPE pass would
+    /// otherwise assemble, so the encode path is genuinely exercised.
+    fn toy() -> GgufTokenizer {
+        let tokens: Vec<String> = vec![
+            // byte-level pieces, spelled the way a GPT-2 vocab spells them
+            "H", "e", "l", "o", "Hello",
+            "ĠH", "ĠHello", "Ġ",
+            "<unk>",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let token_to_id: HashMap<String, u32> =
+            tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        GgufTokenizer {
+            tokens,
+            token_to_id,
+            scores: None,
+            model_type: "bpe".into(),
+            bpe_merges: Some(HashMap::new()),
+            byte_decoder: None,
+            eos_token_id: None,
+            bos_token_id: None,
+            add_bos_token: false,
+            unk_token_id: None,
+            chat_template: None,
+            architecture: None,
+        }
+    }
+
+    fn id(t: &GgufTokenizer, piece: &str) -> u32 {
+        *t.token_to_id.get(piece).unwrap_or_else(|| panic!("no id for {piece}"))
+    }
+
+    /// THE TEST. A raw prompt of "Hello" and one of " Hello" are different
+    /// strings and must not collapse onto the same token.
+    ///
+    /// Observed on a real run: both encoded to a single token displayed as
+    /// "ĠHello", so the leading space was being invented or discarded, and the
+    /// model conditioned its very first logit on the wrong input. That is
+    /// sufficient to produce gibberish at temperature 0.
+    #[test]
+    fn leading_space_is_not_invented_and_not_discarded() {
+        let t = toy();
+        let bare = t.encode("Hello");
+        let spaced = t.encode(" Hello");
+        assert_ne!(
+            bare, spaced,
+            "\"Hello\" and \" Hello\" must not encode to the same tokens"
+        );
+    }
+
+    /// "Hello" with no leading space must select the unprefixed token, so the
+    /// first token the model sees is the one the caller wrote.
+    #[test]
+    fn a_bare_prompt_encodes_without_a_space_prefix() {
+        let t = toy();
+        let ids = t.encode("Hello");
+        assert_eq!(ids, vec![id(&t, "Hello")], "bare prompt must not gain a Ġ prefix");
+    }
+
+    /// And the converse: a prompt that really does start with a space must
+    /// select the space-prefixed token, not be trimmed to the bare one.
+    #[test]
+    fn a_spaced_prompt_keeps_its_space_prefix() {
+        let t = toy();
+        let ids = t.encode(" Hello");
+        assert_eq!(ids, vec![id(&t, "ĠHello")], "a real leading space must survive");
+    }
+
+    /// A space in the MIDDLE must also be preserved, which is the same rule
+    /// applied where it is easier to get right.
+    #[test]
+    fn an_inner_space_is_preserved() {
+        let t = toy();
+        let ids = t.encode("Hello world");
+        assert!(
+            ids.len() >= 2,
+            "inner space must split the words, got {ids:?}"
+        );
+        assert_ne!(
+            ids[0], ids[1],
+            "the two words must not collapse onto one token"
+        );
+    }
+}
