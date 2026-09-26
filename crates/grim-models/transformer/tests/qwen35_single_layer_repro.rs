@@ -335,8 +335,6 @@ fn build_layer(
 fn n_layer_stack_forward_on_gpu() {
     let Some(dev) = gpu1() else { return };
     let _ = &dev;
-    let n_layers = 8usize;
-    eprintln!("[repro-scale] {n_layers} layers on ordinal 1");
 
     let mut cfg = grim_models_transformer::qwen35::Qwen35Config::default();
     cfg.vocab_size = 64;
@@ -358,6 +356,51 @@ fn n_layer_stack_forward_on_gpu() {
     let value_dim = cfg.ssm_dt_rank * cfg.ssm_d_state;
     let key_dim = cfg.ssm_n_group * cfg.ssm_d_state;
     let ssm_qkv_dim = 2 * key_dim + value_dim;
+
+    // Depth is bounded by what the card can actually hold, not hardcoded to 65.
+    //
+    // The full 27B geometry in f32 is ~563 MB per layer, so 65 layers asks for
+    // ~36.6 GB - more than twice this card's 17.1 GB. While that was hardcoded,
+    // the over-subscription silently spilled to HIP managed memory (`storage.rs`
+    // falls back to `hipMallocManaged` whenever `allocator.alloc` fails) and the
+    // run died four minutes later with `hipModuleLoad 209` on whichever kernel
+    // happened to be loading at the time - `grim_silu_mul` before, `grim_rms_norm`
+    // after, which is a resource symptom and not a kernel-specific fault. The
+    // message it prints settles the arch question directly: `gpu_target=gfx1200,
+    // self.ordinal=1, ctx_device=1, ctx_arch=gfx1200, hsa_override=None`. The
+    // code object and the context agreed; 209 was reporting exhaustion.
+    //
+    // So measure the real per-layer footprint, run the deepest stack that
+    // genuinely fits, and say so when that is shallower than the model.
+    let per_layer_bytes: u64 = {
+        let f32s = |n: usize, m: usize| (n * m * 4) as u64;
+        f32s(2 * q_dim, cfg.hidden_size) // attn_q
+            + f32s(kv_dim, cfg.hidden_size) * 2 // attn_k, attn_v
+            + f32s(cfg.hidden_size, q_dim) // attn_output
+            + f32s(cfg.hidden_size, 48) * 2 // ssm_alpha, ssm_beta
+            + f32s(value_dim, cfg.hidden_size) // ssm_out
+            + f32s(cfg.ssm_d_conv, ssm_qkv_dim) // ssm_conv1d
+            + f32s(cfg.intermediate_size, cfg.hidden_size) * 2 // ffn_gate, ffn_up
+            + f32s(cfg.hidden_size, cfg.intermediate_size) // ffn_down
+    };
+    let (free, total) = grim_backend_rocm::vram_info(1);
+    // Headroom for the decode-graph KV/SSM arenas and activation scratch.
+    let fits = (((free as f64 * 0.80) as u64) / per_layer_bytes.max(1)) as usize;
+    let n_layers = fits.min(65);
+    eprintln!(
+        "[repro-scale] depth {n_layers}/65 layers: per-layer {:.1} MB, free {:.1} of \
+         {:.1} GB on ordinal 1{}",
+        per_layer_bytes as f64 / 1e6,
+        free as f64 / 1e9,
+        total as f64 / 1e9,
+        if n_layers < 65 {
+            " -- CLAMPED, full depth exceeds this card's VRAM"
+        } else {
+            ""
+        }
+    );
+    assert!(n_layers > 0, "ordinal 1 cannot hold even one layer");
+    cfg.num_layers = n_layers;
 
     // Every tensor both layer types need, at the real widths.
     let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();

@@ -1,10 +1,18 @@
 //! Global ROCm residency policy for VRAM overflow.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Total number of allocations routed to the managed-memory fallback since
 /// process start (WI-P3 instrumentation: makes the otherwise-silent oversubscription path observable).
 static MANAGED_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Total *bytes* routed to the managed-memory fallback since process start.
+///
+/// The count above cannot distinguish a load that spilled five hundred small
+/// tensors from one that spilled a single 12 GB tensor, and managed memory is
+/// host-backed - so this is the figure that explains a host-memory spike
+/// during load rather than merely confirming that one occurred.
+static MANAGED_FALLBACK_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the one-time user-facing warning about the managed-memory fallback
 /// has already been emitted (avoid warning spam on every oversubscribed alloc).
@@ -15,6 +23,15 @@ pub fn managed_fallback_count() -> usize {
     MANAGED_FALLBACK_COUNT.load(Ordering::Relaxed)
 }
 
+/// How many bytes have been routed to `hipMallocManaged` (WI-P3).
+///
+/// Managed allocations are host-backed, so this is the number to compare
+/// against an observed host-RAM delta: a delta far larger than this tally
+/// points at the staging copies rather than at the spill itself.
+pub fn managed_fallback_bytes() -> u64 {
+    MANAGED_FALLBACK_BYTES.load(Ordering::Relaxed)
+}
+
 /// Whether the one-time managed-fallback warning has been emitted (WI-P3).
 pub fn managed_fallback_warned() -> bool {
     MANAGED_FALLBACK_WARNED.load(Ordering::Relaxed)
@@ -23,13 +40,31 @@ pub fn managed_fallback_warned() -> bool {
 /// Reset the WI-P3 instrumentation (test hook).
 pub fn reset_managed_fallback_instrumentation() {
     MANAGED_FALLBACK_COUNT.store(0, Ordering::Relaxed);
+    MANAGED_FALLBACK_BYTES.store(0, Ordering::Relaxed);
     MANAGED_FALLBACK_WARNED.store(false, Ordering::Relaxed);
+}
+
+/// Print the cumulative spill tally, in the units that matter for a host-memory
+/// investigation. No-op when nothing spilled, so it is safe to call
+/// unconditionally at the end of a load.
+pub fn report_managed_fallback_summary() {
+    let count = managed_fallback_count();
+    if count == 0 {
+        return;
+    }
+    let bytes = managed_fallback_bytes();
+    eprintln!(
+        "[grim-backend-rocm] managed-memory spill total: {count} allocations, \
+         {:.2} GB host-backed (cumulative since process start)",
+        bytes as f64 / 1e9
+    );
 }
 
 /// Record that an allocation fell back to HIP managed memory and surface the risk to the user once per process.
 /// AMD's SVM (the backing mechanism for `hipMallocManaged`) evicts FIFO with no reuse awareness and -.
 pub fn note_managed_fallback(ordinal: usize, bytes: usize) {
     MANAGED_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    MANAGED_FALLBACK_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     if MANAGED_FALLBACK_WARNED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
@@ -79,8 +114,8 @@ fn should_use_managed(mode: &str, free: u64, total: u64, bytes: u64, budget: u64
 #[cfg(test)]
 mod tests {
     use super::{
-        managed_fallback_count, managed_fallback_warned, note_managed_fallback,
-        reset_managed_fallback_instrumentation, should_use_managed,
+        managed_fallback_bytes, managed_fallback_count, managed_fallback_warned,
+        note_managed_fallback, reset_managed_fallback_instrumentation, should_use_managed,
     };
 
     #[test]
@@ -113,6 +148,29 @@ mod tests {
     }
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The allocation *count* cannot answer the question host memory actually
+    /// raises. A load that spills five hundred small tensors and a load that
+    /// spills one 12 GB tensor both report the same count, yet they differ by
+    /// orders of magnitude in what they add to host RAM - and managed memory is
+    /// host-backed, so a byte tally is the number that explains a host-memory
+    /// spike during load rather than merely confirming that one happened.
+    #[test]
+    fn managed_fallback_tallies_bytes_not_just_allocations() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_managed_fallback_instrumentation();
+        assert_eq!(managed_fallback_bytes(), 0, "tally must start clean");
+
+        note_managed_fallback(0, 4_000_000_000);
+        note_managed_fallback(1, 2_000_000_000);
+
+        assert_eq!(managed_fallback_count(), 2);
+        assert_eq!(
+            managed_fallback_bytes(),
+            6_000_000_000_u64,
+            "host-backed bytes must accumulate across devices and calls"
+        );
+    }
 
     /// WI-P3: the managed fallback must be observable — note_managed_fallback
     /// bumps the counter and emits the user-facing warning exactly once.
