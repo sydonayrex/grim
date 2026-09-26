@@ -316,106 +316,116 @@ impl CudaDevice {
         let elem_count = packed.shape.elem_count();
         let packed_ptr = Self::dev_ptr_or_err("dequantize_on_device", packed)? as *const c_void;
 
-        let (kernel, block_bytes, weights_per_block): (&str, usize, usize) =
-            match &packed.dtype.storage {
-                DTypeStorage::KQuant(scheme) => match scheme {
-                    KQuantScheme::Q4K => ("grim_dequant_q4k", 144, 256),
-                    KQuantScheme::Q80 => ("grim_dequant_q8_0", 34, 32),
-                    KQuantScheme::Q5K => ("grim_dequant_q5k", 176, 256),
-                    KQuantScheme::Q6K => ("grim_dequant_q6k", 210, 256),
-                    KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 144, 256),
-                    KQuantScheme::IQ4XS => ("grim_dequant_iq4xs", 136, 256),
-                    KQuantScheme::IQ3XXS => ("grim_dequant_iq3xxs", 96, 256),
-                    KQuantScheme::IQ3S => ("grim_dequant_iq3s", 110, 256),
-                    KQuantScheme::IQ2XXS => ("grim_dequant_iq2xxs", 66, 256),
-                    KQuantScheme::IQ2XS => ("grim_dequant_iq2xs", 74, 256),
-                    KQuantScheme::IQ2S => ("grim_dequant_iq2s", 82, 256),
-                    _ => {
-                        return Err(Error::Backend(format!(
-                            "dequantize_on_device: no GPU kernel for KQuant {:?}",
-                            scheme
-                        )));
-                    }
-                },
-                DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
-                    // FP8: 4-byte f32 scale header + 1 byte/weight. n_weights = elem_count.
-                    let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
-                    let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(fp8)", &out)?;
-                    let handle = self.launch_dequant_fp8(packed_ptr, out_ptr, elem_count)?;
-                    handle.synchronize()?;
-                    return Ok(out);
+        let (kernel, block_bytes, weights_per_block): (&str, usize, usize) = match &packed
+            .dtype
+            .storage
+        {
+            DTypeStorage::KQuant(scheme) => match scheme {
+                KQuantScheme::Q4K => ("grim_dequant_q4k", 144, 256),
+                KQuantScheme::Q80 => ("grim_dequant_q8_0", 34, 32),
+                KQuantScheme::Q5K => ("grim_dequant_q5k", 176, 256),
+                KQuantScheme::Q6K => ("grim_dequant_q6k", 210, 256),
+                KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 144, 256),
+                KQuantScheme::IQ4XS => ("grim_dequant_iq4xs", 136, 256),
+                KQuantScheme::IQ3XXS => ("grim_dequant_iq3xxs", 96, 256),
+                KQuantScheme::IQ3S => ("grim_dequant_iq3s", 110, 256),
+                KQuantScheme::IQ2XXS => ("grim_dequant_iq2xxs", 66, 256),
+                KQuantScheme::IQ2XS => ("grim_dequant_iq2xs", 74, 256),
+                KQuantScheme::IQ2S => ("grim_dequant_iq2s", 82, 256),
+                // GGUF Q2_0 (tag 42) has no CUDA kernel; it is dequantized on
+                // the host by cuda_dequant_quantized_storage instead.
+                KQuantScheme::GsqRco3p5 => {
+                    return Err(Error::Backend(
+                            "dequantize_on_device: GGUF Q2_0 (tag 42, KQuantScheme::GsqRco3p5) has no CUDA kernel; use the host dequant path"
+                                .into(),
+                        ));
                 }
-                DTypeStorage::FloatPack(FloatPackScheme::MxFp4)
-                | DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
-                    let is_mxfp4 = matches!(
-                        packed.dtype.storage,
-                        DTypeStorage::FloatPack(FloatPackScheme::MxFp4)
-                    );
-                    let raw = stage_packed_bytes(packed)?;
-                    let mut cursor = 0usize;
-                    let codes = read_length_prefixed(&raw, &mut cursor)?;
-                    let exps = read_length_prefixed(&raw, &mut cursor)?;
-                    let num_groups = elem_count.div_ceil(32);
-                    if exps.len() < num_groups {
-                        return Err(Error::Backend(format!(
-                            "dequantize_on_device(mxfp): expected {num_groups} exp bytes, got {}",
-                            exps.len()
-                        )));
-                    }
-                    let min_codes_len = if is_mxfp4 {
-                        elem_count.div_ceil(2)
-                    } else {
-                        elem_count
-                    };
-                    if codes.len() < min_codes_len {
-                        return Err(Error::Backend(format!(
-                            "dequantize_on_device(mxfp): expected {} code bytes, got {}",
-                            min_codes_len,
-                            codes.len()
-                        )));
-                    }
-                    let codes_shape_external = Shape::new(vec![codes.len()]);
-                    let codes_storage = CudaStorage::copy_from_host_raw_bytes(
-                        &codes,
-                        &codes_shape_external,
-                        DType {
-                            arith: ArithType::U8,
-                            storage: DTypeStorage::Native,
-                        },
-                        self.ordinal,
-                    )?;
-                    let exps_shape = Shape::new(vec![exps.len()]);
-                    let exps_storage = CudaStorage::copy_from_host_raw_bytes(
-                        &exps,
-                        &exps_shape,
-                        DType {
-                            arith: ArithType::U8,
-                            storage: DTypeStorage::Native,
-                        },
-                        self.ordinal,
-                    )?;
-                    let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
-                    let codes_ptr =
-                        Self::dev_ptr_or_err("dequantize_on_device(mxfp codes)", &codes_storage)?;
-                    let exps_ptr =
-                        Self::dev_ptr_or_err("dequantize_on_device(mxfp exps)", &exps_storage)?;
-                    let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp out)", &out)?;
-                    let handle = if is_mxfp4 {
-                        self.launch_dequant_mxfp4(codes_ptr, exps_ptr, out_ptr, elem_count)?
-                    } else {
-                        self.launch_dequant_mxfp8(codes_ptr, exps_ptr, out_ptr, elem_count)?
-                    };
-                    handle.synchronize()?;
-                    return Ok(out);
-                }
-                // FP4/NF4/MXFP8 and Block(Fp4/Nf4/Fp8Block16) keep the host path.
                 _ => {
                     return Err(Error::Backend(format!(
-                        "dequantize_on_device: no GPU kernel for dtype {:?}",
-                        packed.dtype
+                        "dequantize_on_device: no GPU kernel for KQuant {:?}",
+                        scheme
                     )));
                 }
-            };
+            },
+            DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
+                // FP8: 4-byte f32 scale header + 1 byte/weight. n_weights = elem_count.
+                let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
+                let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(fp8)", &out)?;
+                let handle = self.launch_dequant_fp8(packed_ptr, out_ptr, elem_count)?;
+                handle.synchronize()?;
+                return Ok(out);
+            }
+            DTypeStorage::FloatPack(FloatPackScheme::MxFp4)
+            | DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
+                let is_mxfp4 = matches!(
+                    packed.dtype.storage,
+                    DTypeStorage::FloatPack(FloatPackScheme::MxFp4)
+                );
+                let raw = stage_packed_bytes(packed)?;
+                let mut cursor = 0usize;
+                let codes = read_length_prefixed(&raw, &mut cursor)?;
+                let exps = read_length_prefixed(&raw, &mut cursor)?;
+                let num_groups = elem_count.div_ceil(32);
+                if exps.len() < num_groups {
+                    return Err(Error::Backend(format!(
+                        "dequantize_on_device(mxfp): expected {num_groups} exp bytes, got {}",
+                        exps.len()
+                    )));
+                }
+                let min_codes_len = if is_mxfp4 {
+                    elem_count.div_ceil(2)
+                } else {
+                    elem_count
+                };
+                if codes.len() < min_codes_len {
+                    return Err(Error::Backend(format!(
+                        "dequantize_on_device(mxfp): expected {} code bytes, got {}",
+                        min_codes_len,
+                        codes.len()
+                    )));
+                }
+                let codes_shape_external = Shape::new(vec![codes.len()]);
+                let codes_storage = CudaStorage::copy_from_host_raw_bytes(
+                    &codes,
+                    &codes_shape_external,
+                    DType {
+                        arith: ArithType::U8,
+                        storage: DTypeStorage::Native,
+                    },
+                    self.ordinal,
+                )?;
+                let exps_shape = Shape::new(vec![exps.len()]);
+                let exps_storage = CudaStorage::copy_from_host_raw_bytes(
+                    &exps,
+                    &exps_shape,
+                    DType {
+                        arith: ArithType::U8,
+                        storage: DTypeStorage::Native,
+                    },
+                    self.ordinal,
+                )?;
+                let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
+                let codes_ptr =
+                    Self::dev_ptr_or_err("dequantize_on_device(mxfp codes)", &codes_storage)?;
+                let exps_ptr =
+                    Self::dev_ptr_or_err("dequantize_on_device(mxfp exps)", &exps_storage)?;
+                let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp out)", &out)?;
+                let handle = if is_mxfp4 {
+                    self.launch_dequant_mxfp4(codes_ptr, exps_ptr, out_ptr, elem_count)?
+                } else {
+                    self.launch_dequant_mxfp8(codes_ptr, exps_ptr, out_ptr, elem_count)?
+                };
+                handle.synchronize()?;
+                return Ok(out);
+            }
+            // FP4/NF4/MXFP8 and Block(Fp4/Nf4/Fp8Block16) keep the host path.
+            _ => {
+                return Err(Error::Backend(format!(
+                    "dequantize_on_device: no GPU kernel for dtype {:?}",
+                    packed.dtype
+                )));
+            }
+        };
 
         // Super-block path (Q5_K/Q6_K/IQ*).
         let n_blocks = elem_count.div_ceil(weights_per_block);
@@ -1112,8 +1122,7 @@ impl QuantOps for CudaDevice {
                     let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
                     let a_ptr = Self::dev_ptr_or_err("quantized_matfp4) a", a_s)?;
                     let b_ptr = Self::dev_ptr_or_err("quantized_matfp4) b", b_s)?;
-                    let out_ptr =
-                        Self::dev_ptr_or_err("quantized_matfp4) out", &out_storage)?;
+                    let out_ptr = Self::dev_ptr_or_err("quantized_matfp4) out", &out_storage)?;
                     let handle = self.launch_nutcracker_gemm(a_ptr, b_ptr, out_ptr, m, n, k)?;
                     return Ok((Box::new(out_storage), handle));
                 }
@@ -1370,9 +1379,7 @@ impl QuantOps for CudaDevice {
                         }
                         Storage::FloatPack(FloatPackScheme::NutFp4) => {
                             grim_quant::dequant_nutcracker(&b_bytes, k * n).map_err(|e| {
-                                Error::Backend(format!(
-                                    "quantized_matmul Nutcracker dequant: {e}"
-                                ))
+                                Error::Backend(format!("quantized_matmul Nutcracker dequant: {e}"))
                             })?
                         }
                         Storage::CompressedTensorsW8A8Fp8 => {

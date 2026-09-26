@@ -86,6 +86,9 @@ pub(crate) fn cuda_dequant_quantized_storage(
             KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(b_bytes, elem_count),
             KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(b_bytes, elem_count),
             KQuantScheme::IQ2S => grim_quant::dequant_iq2s(b_bytes, elem_count),
+            // GGUF Q2_0 (tag 42). No CUDA dequant kernel exists; this path
+            // runs on the host, so weights land back in VRAM as f32.
+            KQuantScheme::GsqRco3p5 => grim_quant::dequant_gsq_rco_3p5(b_bytes, elem_count),
         },
         DTypeStorage::FloatPack(scheme) => match scheme {
             FloatPackScheme::Fp4 => grim_quant::dequant_fp4(b_bytes, elem_count),

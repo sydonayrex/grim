@@ -10,10 +10,10 @@ use grim_tensor::{ArithType, BackendStorage, CoreTensorOps, QuantOps, Shape};
 
 use crate::context::global_context;
 use crate::kernel::{
-    push_params, push_params_backward, run_compute_shader, run_compute_shader_kernel, spirv_for,
-    VulkanKernel,
+    VulkanKernel, push_params, push_params_backward, run_compute_shader, run_compute_shader_kernel,
+    spirv_for,
 };
-use crate::{extract_raw_bytes, VulkanDevice, VulkanHandle, VulkanStorage};
+use crate::{VulkanDevice, VulkanHandle, VulkanStorage, extract_raw_bytes};
 use grim_tensor::MemoryOps;
 
 impl QuantOps for VulkanDevice {
@@ -149,11 +149,9 @@ impl QuantOps for VulkanDevice {
                     KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2S => grim_quant::dequant_iq2s(&b_bytes_cpu, k * n)?,
-                    // Not yet wired: this variant landed ahead of its decoder.
-                    other => {
-                        return Err(Error::Backend(format!(
-                            "vulkan dequant: unsupported KQuantScheme {other:?}"
-                        )));
+                    // GGUF Q2_0 (tag 42): 64 weights per 18-byte block.
+                    KQuantScheme::GsqRco3p5 => {
+                        grim_quant::dequant_gsq_rco_3p5(&b_bytes_cpu, k * n)?
                     }
                 })
             }
