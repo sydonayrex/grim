@@ -641,20 +641,16 @@ impl Qwen35Block {
             // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
             // (pre-rope) instead of 3 separate GEMVs; the same rope_ext and
             // arena-attention path follow unchanged.
-            let (q_dev, k_dev_t, v_dev_t, q_gate) = match self.wqkv_q80_fused.as_ref() {
+            let (q_dev, k_dev_t, v_dev_t, q_gate): (Tensor, Tensor, Tensor, Option<Tensor>) =
+                match self.wqkv_q80_fused.as_ref() {
                 Some(fused) if seq_len == 1 => {
                     let (q, k, v) =
                         crate::shared_attention::fused_qkv_project_raw(&x_normed, fused)?;
-                    // The fused-QKV path has no separate attn_q tensor, so there
-                    // is no gate half to split out here.
-                    let g = Tensor::new(
-                        dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?.into(),
-                        Shape::new(vec![seq_len, q_dim]),
-                        DType::F32,
-                        x_normed.provenance().clone(),
-                        x_normed.device().clone(),
-                    );
-                    (q, k, v, g)
+                    // The fused-QKV path has no separate attn_q tensor, so it
+                    // has NO gate half. `None` means "do not apply a gate" —
+                    // a zero tensor would be read as sigmoid(0) = 0.5 and
+                    // uniformly halve every decode step.
+                    (q, k, v, None)
                 }
                 _ => {
                     // attn_q emits [Q(q_dim) | gate(q_dim)] fused, so split it
@@ -683,7 +679,7 @@ impl Qwen35Block {
                             }
                             (
                                 device_tensor(q_rows, Shape::new(vec![seq_len, q_dim]), &device)?,
-                                device_tensor(gate_rows, Shape::new(vec![seq_len, q_dim]), &device)?,
+                                Some(device_tensor(gate_rows, Shape::new(vec![seq_len, q_dim]), &device)?),
                             )
                         }
                         None => (
@@ -695,14 +691,8 @@ impl Qwen35Block {
                                 x_normed.provenance().clone(),
                                 x_normed.device().clone(),
                             ),
-                            Tensor::new(
-                                dev.zeros(&Shape::new(vec![seq_len, q_dim]), DType::F32)?
-                                    .into(),
-                                Shape::new(vec![seq_len, q_dim]),
-                                DType::F32,
-                                x_normed.provenance().clone(),
-                                x_normed.device().clone(),
-                            ),
+                            // No attn_q weights at all: nothing to gate with.
+                            None,
                         ),
                     };
                     let k_dev_t = match self.wk.as_ref() {
@@ -871,8 +861,8 @@ impl Qwen35Block {
             //   cur  = ggml_mul(cur, gate_sigmoid)   // "attn_gated"
             // applied BEFORE `wo`. Without this the gate half of attn_q is
             // computed and discarded.
-            if self.wq.is_some() {
-                let g = q_gate.to_vec_f32()?;
+            if let Some(ref gate_t) = q_gate {
+                let g = gate_t.to_vec_f32()?;
                 for i in 0..attn_out.len().min(g.len()) {
                     attn_out[i] *= 1.0 / (1.0 + (-g[i]).exp());
                 }
@@ -1356,7 +1346,6 @@ fn gated_delta_net_forward(
             let st_off = h * state_len;
             let head_state = &mut cache.ssm_state[st_off..st_off + state_len];
             kda_gated_delta_rule_row(
-                slice(q_off, head_dim),
                 slice(k_off, head_dim),
                 slice(v_off, head_dim),
                 beta_t,
@@ -1366,12 +1355,22 @@ fn gated_delta_net_forward(
                 head_dim,
             );
 
+            // out = q . S_new, read from the state the update just wrote.
+            // Previously this emitted `q[d] * norm[d]`, a static elementwise
+            // scale of the raw query with zero dependence on k, v, beta, gate or
+            // any recurrent history — the state was computed and then ignored.
             let q_slice = slice(q_off, head_dim);
-            for d in 0..head_dim.min(q_slice.len()) {
-                let w = norm_vec.get(d).copied().unwrap_or(1.0);
-                let out_idx = t * branch_width + h * head_dim + d;
+            for i in 0..head_dim {
+                // state row i spans head_dim columns: S[i][0..head_dim]
+                let row = &cache.ssm_state[st_off + i * head_dim..st_off + (i + 1) * head_dim];
+                let mut acc = 0.0f32;
+                for j in 0..head_dim {
+                    acc += q_slice.get(j).copied().unwrap_or(0.0) * row[j];
+                }
+                let w = norm_vec.get(i).copied().unwrap_or(1.0);
+                let out_idx = t * branch_width + h * head_dim + i;
                 if out_idx < out_branch.len() {
-                    out_branch[out_idx] = q_slice[d] * w;
+                    out_branch[out_idx] = acc * w;
                 }
             }
         }
@@ -1442,7 +1441,6 @@ fn kda_key_head(
 ///
 /// `d_k == d_v == 128` for this checkpoint, so `S` is square.
 fn kda_gated_delta_rule_row(
-    q: &[f32],
     k: &[f32],
     v: &[f32],
     beta: f32,
@@ -1473,7 +1471,6 @@ fn kda_gated_delta_rule_row(
             row[i] = s;
         }
     }
-    let _ = q; // q is applied by the caller's per-head output projection
 }
 
 /// Softplus, used to turn the fused (a + dt_bias + alpha) logit into a decay
@@ -2391,6 +2388,55 @@ mod tests {
         );
         // Gate is the second half of each row.
         assert_eq!(gate_rows, vec![3., 4., 5., 9., 10., 11., 15., 16., 17.]);
+    }
+
+
+    /// The KDA output must depend on the recurrent STATE, not just the query.
+    ///
+    /// It previously emitted `q[d] * norm[d]` — a static elementwise scale of the
+    /// raw query, with no dependence on k, v, beta, gate or any history. The
+    /// state was updated and then ignored, so the recurrent layers still had no
+    /// functional memory. This asserts the output CHANGES when the state
+    /// changes, holding the query fixed.
+    #[test]
+    fn kda_output_depends_on_state_not_only_query() {
+        let d = 4usize;
+        let q = vec![1.0f32, 0.5, -0.5, 2.0];
+        let k = vec![0.1f32; d];
+        let v = vec![1.0f32; d];
+        let norm = vec![1.0f32; d];
+
+        let read_out = |state_init: &[f32]| -> Vec<f32> {
+            let mut state = state_init.to_vec();
+            // beta = 0.5, gate = 0.0 (decay = 1)
+            kda_gated_delta_rule_row(&k, &v, 0.5, 0.0, &mut state, d, d);
+            (0..d)
+                .map(|i| {
+                    let row = &state[i * d..(i + 1) * d];
+                    let acc: f32 = q
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(qq, ss)| qq * ss)
+                        .sum();
+                    acc * norm[i]
+                })
+                .collect()
+        };
+
+        let zero_state = vec![0.0f32; d * d];
+        let warm_state = vec![0.5f32; d * d];
+        let a = read_out(&zero_state);
+        let b = read_out(&warm_state);
+
+        assert_ne!(
+            a, b,
+            "KDA output must change with the recurrent state; if it does not, the \
+             state is being written but never read"
+        );
+        // And it must not be a bare per-element scale of q: every output element
+        // is a dot over a whole state row, not q[i] * norm[i].
+        let bare: Vec<f32> = q.iter().zip(norm.iter()).map(|(a, b)| a * b).collect();
+        assert_ne!(a, bare, "output must be q . S, not q[i] * norm[i]");
     }
 
 }
