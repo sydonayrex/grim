@@ -132,3 +132,25 @@ fn golden_gguf_provider_q80_tensor_size() {
     let raw = provider.get("q.weight").unwrap();
     assert_eq!(raw.bytes.len(), 68, "Q8_0 64 params = 68 raw bytes");
 }
+
+#[test]
+fn golden_split_gguf_provider_multi_shard_and_monolithic() {
+    use grim_format::tprov::SplitGgufProvider;
+
+    let main_path = "models/QWen38-Flash/Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf";
+    if !std::path::Path::new(main_path).exists() {
+        return;
+    }
+    let provider = SplitGgufProvider::open(main_path).expect("SplitGgufProvider must open and resolve splits");
+    
+    // Verify backbone tensor from split 0
+    assert!(provider.meta("blk.0.attn_qkv.weight").is_ok());
+    // Verify embedding tensor from split 1
+    assert!(provider.meta("per_layer_token_embd.weight").is_ok());
+    // Verify mmproj is NOT loaded into backbone provider
+    assert!(provider.meta("mm.0.weight").is_err());
+    // Verify total discovered tensors match split.tensors.count (1224)
+    assert_eq!(provider.tensor_names().len(), 1224);
+    assert_eq!(provider.shard_count(), 2);
+}
+

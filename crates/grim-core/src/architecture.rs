@@ -210,7 +210,7 @@ impl ModelArchitecture {
             "qwen3vlmoe" => Self::Qwen3VlMoe,
             "qwen35" | "qwen3.5" | "qwen3_5" => Self::Qwen35,
             "qwen35moe" | "qwen3_5_moe" | "qwen3_5_moe_text" => Self::Qwen35Moe,
-            "qwen38flashnext" | "qwen3_8_flash_next" | "qwen3.8-flash-next" | "qwen4_exp" => {
+            "qwen38flashnext" | "qwen3_8_flash_next" | "qwen3.8-flash-next" | "qwen4_exp" | "qwen4exp" => {
                 Self::Qwen38FlashNext
             }
             "phi" | "phi2" | "phi-2" => Self::Phi2,
@@ -1724,4 +1724,14 @@ mod tests {
             "output_norm.weight"
         );
     }
+
+    #[test]
+    fn test_qwen4exp_architecture_match() {
+        assert_eq!(ModelArchitecture::from_str("qwen4exp"), ModelArchitecture::Qwen38FlashNext);
+        assert_eq!(ModelArchitecture::from_str("qwen4_exp"), ModelArchitecture::Qwen38FlashNext);
+        assert_eq!(ModelArchitecture::from_str("qwen38flashnext"), ModelArchitecture::Qwen38FlashNext);
+        assert_eq!(ModelArchitecture::from_str("qwen3_8_flash_next"), ModelArchitecture::Qwen38FlashNext);
+        assert_eq!(ModelArchitecture::from_str("qwen3.8-flash-next"), ModelArchitecture::Qwen38FlashNext);
+    }
 }
+
