@@ -1265,6 +1265,135 @@ impl<'a> TensorProvider for RemappingTensorProvider<'a> {
     }
 }
 
+pub struct SplitGgufProvider {
+    shards: Vec<GgufProvider>,
+    tensor_map: HashMap<String, usize>,
+    total_expected_tensors: usize,
+}
+
+impl SplitGgufProvider {
+    pub fn open(primary_path: &str) -> Result<Self> {
+        let primary = GgufProvider::open(primary_path)?;
+        let primary_arch = primary.architecture().unwrap_or("").to_string();
+
+        let split_count = primary
+            .metadata("split.count")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(1) as usize;
+
+        let expected_tensors = primary
+            .metadata("split.tensors.count")
+            .and_then(|v| v.as_u32())
+            .map(|v| v as usize)
+            .unwrap_or_else(|| primary.tensor_names().len());
+
+        let mut shards_by_no: HashMap<usize, GgufProvider> = HashMap::new();
+        let primary_no = primary
+            .metadata("split.no")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0) as usize;
+        shards_by_no.insert(primary_no, primary);
+
+        // Header-driven companion search: supports 1 (monolithic), 2 (dual shard), or 3..6+ shards
+        if split_count > 1 {
+            let primary_file = std::path::Path::new(primary_path);
+            let parent = primary_file.parent().unwrap_or(std::path::Path::new("."));
+
+            for entry in std::fs::read_dir(parent).map_err(|e| Error::Backend(e.to_string()))? {
+                let entry = entry.map_err(|e| Error::Backend(e.to_string()))?;
+                let path = entry.path();
+                let path_str = path.to_str().unwrap_or("");
+                if path_str.ends_with(".gguf") && path_str != primary_path {
+                    if let Ok(companion) = GgufProvider::open(path_str) {
+                        let comp_arch = companion.architecture().unwrap_or("");
+                        if comp_arch == primary_arch {
+                            if let Some(no_val) =
+                                companion.metadata("split.no").and_then(|v| v.as_u32())
+                            {
+                                shards_by_no.insert(no_val as usize, companion);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if shards_by_no.len() < split_count {
+                return Err(Error::Backend(format!(
+                    "SplitGgufProvider: expected {} shards for architecture '{}', but found {}",
+                    split_count, primary_arch, shards_by_no.len()
+                )));
+            }
+        }
+
+        let mut ordered_shards = Vec::with_capacity(shards_by_no.len());
+        for i in 0..shards_by_no.len() {
+            let shard = shards_by_no.remove(&i).ok_or_else(|| {
+                Error::Backend(format!("SplitGgufProvider: missing split index {i}"))
+            })?;
+            ordered_shards.push(shard);
+        }
+
+        let mut tensor_map = HashMap::new();
+        for (shard_idx, shard) in ordered_shards.iter().enumerate() {
+            for name in shard.tensor_names() {
+                tensor_map.entry(name).or_insert(shard_idx);
+            }
+        }
+
+        if split_count > 1 && tensor_map.len() != expected_tensors {
+            return Err(Error::Backend(format!(
+                "SplitGgufProvider: expected {} tensors from split.tensors.count, but mapped {}",
+                expected_tensors,
+                tensor_map.len()
+            )));
+        }
+
+        Ok(Self {
+            shards: ordered_shards,
+            tensor_map,
+            total_expected_tensors: expected_tensors,
+        })
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn total_expected_tensors(&self) -> usize {
+        self.total_expected_tensors
+    }
+}
+
+impl TensorProvider for SplitGgufProvider {
+    fn get(&self, name: &str) -> Result<RawTensor> {
+        let idx = self
+            .tensor_map
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found across GGUF splits")))?;
+        self.shards[*idx].get(name)
+    }
+
+    fn get_packed(&self, name: &str) -> Result<RawTensor> {
+        let idx = self
+            .tensor_map
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found across GGUF splits")))?;
+        self.shards[*idx].get_packed(name)
+    }
+
+    fn meta(&self, name: &str) -> Result<TensorMeta> {
+        let idx = self
+            .tensor_map
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found across GGUF splits")))?;
+        self.shards[*idx].meta(name)
+    }
+
+    fn tensor_names(&self) -> Vec<String> {
+        self.tensor_map.keys().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
