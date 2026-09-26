@@ -1654,11 +1654,7 @@ fn plan_layer_devices(
         .map(|d| match d {
             Device::Rocm(ord) => {
                 let (free, total) = grim_backend_rocm::vram_info(*ord);
-                if total == 0 {
-                    0
-                } else {
-                    free
-                }
+                if total == 0 { 0 } else { free }
             }
             _ => 0,
         })
@@ -1670,7 +1666,8 @@ fn plan_layer_devices(
             .saturating_mul(4) // f32
             .saturating_mul(2) // K and V
     };
-    let (eff_ctx, kv_total) = bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, ctx.max(1));
+    let (eff_ctx, kv_total) =
+        bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, ctx.max(1));
     if eff_ctx < ctx {
         eprintln!(
             "[qwen35] KV arena BOUNDED: requested ctx={ctx} needs {:.1} GB across \
@@ -1847,7 +1844,17 @@ fn assign_by_headroom(
             Some(idx) => idx,
             None => {
                 unplaced += 1;
-                0
+                // Overflow must SPREAD. Sending every unplaced layer to device 0
+                // concentrated the entire model on one card: a 27B run reported
+                // `65/65 layers exceed aggregate plannable VRAM` and then placed
+                // all 65 on GPU 0, which is what filled it and locked the system.
+                // The least-loaded device is the safe overflow target.
+                remaining
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| **r)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
             }
         };
         remaining[target] = remaining[target].saturating_sub(bytes);
@@ -2066,7 +2073,10 @@ mod tests {
         let caps = uniform_caps(remaining.len());
         let (targets, unplaced) = assign_by_headroom(&layers, &mut remaining, &caps);
         assert_eq!(unplaced, 1, "the 5000-byte layer fits nowhere");
-        assert_eq!(targets[1], 0, "unplaced layers fall back to device 0");
+        assert_eq!(
+            targets[1], 1,
+            "an unplaced layer must go to the LEAST-loaded device, not device 0"
+        );
     }
 
     /// Unequal devices: the bigger card should absorb proportionally more work
