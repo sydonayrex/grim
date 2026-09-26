@@ -1049,6 +1049,22 @@ impl RocmDevice {
 
     /// Phase 4.5c: FP8 E4M3 GEMV via V_DOT4_F32_FP8_FP8 (RDNA4 dot11-insts).
     /// A is f32 [M,K] (quantized to E4M3 in-kernel), B is E4M3 column-major [N,K].
+    /// Public door for the §6 A/B (`tests/precision_kernel_ab.rs`), which times
+    /// one codegen path at a time instead of letting `quantized_matmul` choose.
+    /// A thin wrapper, not a copy: both entry points must stay in lockstep or
+    /// the A/B would measure a kernel the runtime never runs.
+    pub fn launch_dot4_fp8_gemv_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_fp8_gemv(a_storage, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_dot4_fp8_gemv(
         &self,
         a_storage: &RocmStorage,

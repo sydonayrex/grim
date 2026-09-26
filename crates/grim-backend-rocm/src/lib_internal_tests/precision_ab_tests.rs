@@ -144,9 +144,13 @@ fn artifact_json_is_parseable_and_carries_the_verdict() {
     assert!(j.contains("\"arm\": \"Raven\""));
     assert!(j.contains("\"verdict\": \"eligible\""));
     assert!(j.contains("\"verdict\": \"disqualified_accuracy\""));
-    // Exactly one arm per result, no trailing comma before the closing bracket.
-    assert_eq!(j.matches("\"arm\":").count(), results.len());
+    // Exactly one arm per result row. Scoped to the results array: the summary
+    // block repeats the arm names by design, so a global count would flag the
+    // rollup as a duplicate.
+    let results_section = j.split("\"summary\"").next().unwrap();
+    assert_eq!(results_section.matches("\"arm\":").count(), results.len());
     assert!(!j.contains(",\n  ]"));
+    assert!(!j.contains(",\n  }\n  ]"), "trailing comma in summary: {j}");
     let grouped = by_arm(&results);
     assert_eq!(grouped.len(), 2);
     assert_eq!(grouped["Raven"].len(), 1);
@@ -166,4 +170,111 @@ fn every_pinned_builtin_is_referenced_by_some_arm() {
         );
     }
     assert!(json.contains("precision_ab"));
+}
+
+#[test]
+fn artifact_records_the_ship_decision_not_just_eligibility() {
+    // Raven 1.0ms control; the challenger runs 20% faster, so it clears both
+    // the 1.05x decode bar and the 1.10x prefill bar.
+    let results = vec![
+        r("Raven", 1, 1024, &[1.0], 1e-4, TOL_F32),
+        r("ForestRaven", 1, 1024, &[0.8], 1e-4, TOL_I32),
+    ];
+    let j = to_artifact_json(&results, "gfx1201");
+    assert!(j.contains("\"vs_control\": 1.2500"), "ratio not emitted: {j}");
+    assert!(j.contains("\"ship\": \"control\""), "control mislabelled: {j}");
+    assert!(
+        j.contains("\"ship\": \"ship\""),
+        "a 1.25x eligible arm must record ship: {j}"
+    );
+    assert!(j.contains("\"summary\": ["));
+    assert!(j.contains("\"ships\": 1"));
+}
+
+#[test]
+fn an_unmeasured_control_yields_null_not_a_fake_tie() {
+    // A challenger with no Raven at its shape. Reporting 1.0x here would let it
+    // clear a bar it never raced, so the ratio must be null and the label
+    // explicit.
+    let results = vec![r("ForestRaven", 1, 1024, &[0.5], 1e-4, TOL_I32)];
+    let j = to_artifact_json(&results, "gfx1201");
+    assert!(
+        j.contains("\"vs_control\": null"),
+        "absent control must not read as 1.0x: {j}"
+    );
+    assert!(j.contains("\"ship\": \"no_control\""), "{j}");
+    assert!(j.contains("\"vs_control_min\": null"), "{j}");
+}
+
+#[test]
+fn a_disqualified_arm_never_records_ship_however_fast_it_is() {
+    // 10x faster and 1000x wrong. Speed is not a defence.
+    let results = vec![
+        r("Raven", 1, 1024, &[1.0], 1e-4, TOL_F32),
+        r("WildRaven", 1, 1024, &[0.1], 1e3, TOL_F32),
+    ];
+    let j = to_artifact_json(&results, "gfx1201");
+    assert!(j.contains("\"vs_control\": 10.0000"), "{j}");
+    assert!(j.contains("\"verdict\": \"disqualified_accuracy\""));
+    assert!(
+        !j.contains("\"ship\": \"ship\""),
+        "an inaccurate arm must not be marked ship: {j}"
+    );
+    assert!(j.contains("\"disqualified\": 1"));
+    assert!(j.contains("\"ships\": 0"));
+}
+
+#[test]
+fn artifact_json_is_well_formed_on_every_branch() {
+    // The emitter is hand-rolled because the crate has no serde, so every branch
+    // that can produce a different field set gets checked. A malformed artifact
+    // is the worst failure mode here: it writes, logs success, and only breaks
+    // when something downstream parses it.
+    let cases: Vec<Vec<ArmResult>> = vec![
+        // no arms at all
+        vec![],
+        // control only: no ratios to report
+        vec![r("Raven", 1, 1024, &[1.0], 1e-4, TOL_F32)],
+        // challenger with no control -> null branch of the ratio pair
+        vec![r("ForestRaven", 1, 1024, &[0.5], 1e-4, TOL_I32)],
+        // control + challenger -> numeric branch
+        vec![
+            r("Raven", 1, 1024, &[1.0], 1e-4, TOL_F32),
+            r("ForestRaven", 1, 1024, &[0.8], 1e-4, TOL_I32),
+        ],
+        // several arms, mixed eligibility, multiple shapes
+        vec![
+            r("Raven", 1, 1024, &[1.0, 1.1], 1e-4, TOL_F32),
+            r("Raven", 8, 4096, &[4.0], 1e-4, TOL_F32),
+            r("ForestRaven", 1, 1024, &[0.8], 1e-4, TOL_I32),
+            r("ForestRaven", 8, 4096, &[9.9], 5e3, TOL_I32),
+            r("WhiteRaven", 8, 4096, &[2.0], 1e-4, TOL_F32),
+        ],
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        let j = to_artifact_json(c, "gfx1201");
+        assert!(
+            json_is_well_formed(&j),
+            "case {i} produced malformed JSON:\n{j}"
+        );
+        // Sanity: the guard must actually reject broken input, or it is decoration.
+        assert!(!json_is_well_formed("{\"a\": 1\"}"), "guard missed stray quote");
+        assert!(!json_is_well_formed("{\"a\": 1,}"), "guard missed trailing comma");
+        assert!(!json_is_well_formed("{\"a\": 1"), "guard missed unclosed brace");
+        assert!(!json_is_well_formed("[1, 2"), "guard missed unclosed bracket");
+        assert!(!json_is_well_formed("{\"a\": 1}x"), "guard missed junk after close");
+    }
+}
+
+#[test]
+fn a_numeric_field_never_ends_in_a_quote() {
+    // Regression for the exact defect: format!("...: {v:.4}\"") on a numeric
+    // value emits `1.0"}`, which still reads fine in a substring assertion.
+    let results = vec![
+        r("Raven", 1, 1024, &[1.0], 1e-4, TOL_F32),
+        r("ForestRaven", 1, 1024, &[0.8], 1e-4, TOL_I32),
+    ];
+    let j = to_artifact_json(&results, "gfx1201");
+    assert!(!j.contains("0.8000\""), "numeric field closed as a string: {j}");
+    assert!(j.contains("\"vs_control_max\": 1.2500"), "{j}");
 }

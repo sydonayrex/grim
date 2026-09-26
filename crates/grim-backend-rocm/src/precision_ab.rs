@@ -101,6 +101,10 @@ pub const SHIP_BAR: f64 = 1.10;
 /// Decode arms must clear this against the FP8 control.
 pub const DECODE_BAR: f64 = 1.05;
 
+/// Every other arm is measured relative to this one. Named once so the control
+/// cannot drift between the console report and the artifact.
+pub const CONTROL_ARM: &str = "Raven";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapeClass {
     Decode,
@@ -178,6 +182,49 @@ pub fn clears_ship_bar(arm: &ArmResult, baseline_ms: f32) -> bool {
 /// Serialise results to the artifact JSON. Deliberately a hand-rolled string
 /// builder: grim has no serde in this crate's dependency set and a dependency for
 /// a test artifact would be a poor trade.
+/// The control arm's median for `r`'s shape: Raven on the same (m, n, k).
+///
+/// Returns `None` when the control was not measured at this shape, which is a
+/// real possibility in a partial run. A missing control must not silently
+/// become "1.00x" -- that would let an unmeasured arm look like it tied the
+/// baseline and clear a bar it never faced.
+pub fn control_for(results: &[ArmResult], r: &ArmResult) -> Option<f32> {
+    results
+        .iter()
+        .find(|c| c.arm == CONTROL_ARM && c.m == r.m && c.n == r.n && c.k == r.k)
+        .map(|c| c.median_ms())
+}
+
+/// `baseline / arm` -- how much faster this arm is than the control. >1 is a win.
+pub fn vs_control(results: &[ArmResult], r: &ArmResult) -> Option<f64> {
+    let b = control_for(results, r)?;
+    if r.median_ms() > 0.0 {
+        Some(b as f64 / r.median_ms() as f64)
+    } else {
+        None
+    }
+}
+
+/// What the artifact should record for one row: the accuracy verdict *and* the
+/// ship decision. Kept separate because a fast arm that failed accuracy is
+/// neither eligible nor a candidate, and collapsing the two is how a
+/// disqualified arm ends up in a shipping table.
+fn ship_label(results: &[ArmResult], r: &ArmResult) -> String {
+    if !r.accuracy_ok() {
+        return "disqualified_accuracy".into();
+    }
+    if r.arm == CONTROL_ARM {
+        return "control".into();
+    }
+    match vs_control(results, r) {
+        None => "no_control".into(),
+        Some(_) if clears_ship_bar(r, control_for(results, r).unwrap_or(f32::NAN)) => {
+            "ship".into()
+        }
+        Some(_) => "below_bar".into(),
+    }
+}
+
 pub fn to_artifact_json(results: &[ArmResult], arch: &str) -> String {
     let mut s = String::from("{\n  \"schema\": \"grim.precision_ab.v1\",\n");
     s.push_str(&format!("  \"arch\": \"{arch}\",\n"));
@@ -193,15 +240,142 @@ pub fn to_artifact_json(results: &[ArmResult], arch: &str) -> String {
         s.push_str(&format!("\"p90_ms\": {:.6}, ", r.p90_ms()));
         s.push_str(&format!("\"max_abs_err\": {:.6e}, ", r.max_abs_err));
         s.push_str(&format!("\"tolerance\": {:.6e}, ", r.tolerance));
-        s.push_str(&format!("\"verdict\": \"{}\"", r.accuracy_ok().then_some("eligible").unwrap_or("disqualified_accuracy")));
+        // null, not 1.0, when this shape had no control measurement.
+        match vs_control(results, r) {
+            Some(v) => s.push_str(&format!("\"vs_control\": {v:.4}, ")),
+            None => s.push_str("\"vs_control\": null, "),
+        }
+        s.push_str(&format!("\"verdict\": \"{}\", ", r.accuracy_ok().then_some("eligible").unwrap_or("disqualified_accuracy")));
+        s.push_str(&format!("\"ship\": \"{}\"", ship_label(results, r)));
         s.push('}');
         if i + 1 < results.len() {
             s.push(',');
         }
         s.push('\n');
     }
+    s.push_str("  ],\n");
+
+    // Per-arm rollup: the shape-by-shape table answers "where", this answers
+    // "does it ship" without re-deriving it from 40 rows.
+    s.push_str("  \"summary\": [\n");
+    let arms: Vec<&str> = by_arm(results).keys().copied().collect();
+    for (i, arm) in arms.iter().enumerate() {
+        let rows: Vec<&ArmResult> = results.iter().filter(|r| r.arm == *arm).collect();
+        let ships = rows.iter().filter(|r| ship_label(results, r) == "ship").count();
+        let disq = rows.iter().filter(|r| !r.accuracy_ok()).count();
+
+        // Build the row as a field list joined by ", " rather than by appending
+        // separators by hand. Hand-appending is what produced a stray quote
+        // after a numeric field and a missing comma on the null branch -- both
+        // of which produced un-parseable JSON that the tests still passed,
+        // because they asserted on substrings rather than well-formedness.
+        let mut f: Vec<String> = vec![
+            format!("\"arm\": \"{arm}\""),
+            format!("\"instruction\": \"{}\"", rows[0].instruction),
+            format!("\"shapes\": {}", rows.len()),
+            format!("\"disqualified\": {disq}"),
+            format!("\"ships\": {ships}"),
+        ];
+        let ratios: Vec<f64> = rows.iter().filter_map(|r| vs_control(results, r)).collect();
+        if let (Some(lo), Some(hi)) = (
+            ratios.iter().cloned().fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.min(b)))),
+            ratios.iter().cloned().fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.max(b)))),
+        ) {
+            f.push(format!("\"vs_control_min\": {lo:.4}"));
+            f.push(format!("\"vs_control_max\": {hi:.4}"));
+        } else {
+            f.push("\"vs_control_min\": null".into());
+            f.push("\"vs_control_max\": null".into());
+        }
+        s.push_str("    {");
+        s.push_str(&f.join(", "));
+        s.push('}');
+        if i + 1 < arms.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
     s.push_str("  ]\n}\n");
     s
+}
+
+/// Structural well-formedness check for a generated artifact.
+///
+/// Hand-rolled JSON in a crate with no serde needs *some* guard, because a
+/// malformed artifact is silently useless: it still writes, still prints a
+/// success line, and fails only when something downstream tries to parse it.
+/// Not a full parser -- it checks the things this emitter can actually get
+/// wrong: balanced brackets, no trailing comma, no digit immediately followed
+/// by a closing quote, and no field missing its comma.
+pub fn json_is_well_formed(s: &str) -> bool {
+    let b: Vec<char> = s.chars().collect();
+    let (mut ds, mut db) = (0i32, 0i32);
+    let mut in_str = false;
+    let mut esc = false;
+    let mut after_colon = false;
+
+    let next_sig = |from: usize| -> Option<char> { b[from..].iter().find(|c| !c.is_whitespace()).copied() };
+    let prev_sig = |i: usize| -> Option<char> { b[..i].iter().rev().find(|c| !c.is_whitespace()).copied() };
+
+    for (i, &c) in b.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+                // A key must be followed by ':'; a value by ',', '}' or ']'.
+                // This is what catches a dropped comma between fields.
+                match next_sig(i + 1) {
+                    Some(':') if !after_colon => {}
+                    Some(x) if after_colon && matches!(x, ',' | '}' | ']') => {}
+                    _ => return false,
+                }
+                after_colon = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            ':' => after_colon = true,
+            ',' => after_colon = false,
+            '[' => {
+                ds += 1;
+                after_colon = false;
+            }
+            '{' => {
+                db += 1;
+                after_colon = false;
+            }
+            ']' | '}' => {
+                if c == ']' {
+                    ds -= 1;
+                    if ds < 0 {
+                        return false;
+                    }
+                } else {
+                    db -= 1;
+                    if db < 0 {
+                        return false;
+                    }
+                }
+                // Trailing comma: nothing was pushed into the container.
+                if prev_sig(i) == Some(',') {
+                    return false;
+                }
+                // Junk between a close and the next token.
+                match next_sig(i + 1) {
+                    None => {}
+                    Some(x) if matches!(x, ',' | '}' | ']') => {}
+                    _ => return false,
+                }
+                after_colon = false;
+            }
+            _ => {}
+        }
+    }
+    !in_str && ds == 0 && db == 0
 }
 
 /// Group results by arm for the console report.
