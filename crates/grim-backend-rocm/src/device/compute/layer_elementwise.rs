@@ -241,6 +241,28 @@ impl RocmDevice {
         Ok(())
     }
 
+    /// Elementwise SiLU activation returning newly allocated storage.
+    pub fn silu(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let out = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        self.silu_into(x, &out)?;
+        Ok(Box::new(out))
+    }
+
+    /// Elementwise Sigmoid activation returning newly allocated storage.
+    pub fn sigmoid(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let out = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        self.sigmoid_into(x, &out)?;
+        Ok(Box::new(out))
+    }
+
     /// Elementwise `out = gelu(x)` into CALLER-PROVIDED `out` — no allocation inside.
     pub fn gelu_into(&self, x: &dyn BackendStorage, out: &RocmStorage) -> Result<()> {
         let x_s = as_rocm(x)?;

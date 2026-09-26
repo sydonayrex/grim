@@ -10,7 +10,7 @@ use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, BackendStorage, CoreTensorOps, DType, Device, Tensor};
+use grim_tensor::{BackendDevice, BackendStorage, CoreTensorOps, DType, Device, ElementwiseOps, Tensor};
 
 use crate::varbuilder::WeightSource;
 
@@ -1515,6 +1515,176 @@ impl Rope {
             ))
         }
     }
+}
+
+pub fn mul_scalar_on_device(x: &Tensor, s: f32) -> Result<Tensor> {
+    let dev = pick_device_for_tensor(x);
+    let (scaled, _) = dev.mul_scalar(&**x.storage(), s, x.shape())?;
+    Ok(Tensor::new(
+        Arc::from(scaled),
+        x.shape().clone(),
+        x.dtype(),
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
+pub fn silu_on_device(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "rocm-mem")]
+    if let Device::Rocm(ord) = x.device() {
+        let rdev = RocmDevice::shared(*ord);
+        let out_st = rdev.silu(&**x.storage(), x.shape())?;
+        return Ok(Tensor::new(
+            Arc::from(out_st),
+            x.shape().clone(),
+            x.dtype(),
+            x.provenance().clone(),
+            x.device().clone(),
+        ));
+    }
+    let v = x.to_vec_f32()?;
+    let out: Vec<f32> = v.into_iter().map(|val| val / (1.0 + (-val).exp())).collect();
+    let dev = pick_device_for_tensor(x);
+    let st = dev.from_cpu(&out, x.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(st),
+        x.shape().clone(),
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
+pub fn sigmoid_on_device(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "rocm-mem")]
+    if let Device::Rocm(ord) = x.device() {
+        let rdev = RocmDevice::shared(*ord);
+        let out_st = rdev.sigmoid(&**x.storage(), x.shape())?;
+        return Ok(Tensor::new(
+            Arc::from(out_st),
+            x.shape().clone(),
+            x.dtype(),
+            x.provenance().clone(),
+            x.device().clone(),
+        ));
+    }
+    let v = x.to_vec_f32()?;
+    let out: Vec<f32> = v.into_iter().map(|val| 1.0 / (1.0 + (-val).exp())).collect();
+    let dev = pick_device_for_tensor(x);
+    let st = dev.from_cpu(&out, x.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(st),
+        x.shape().clone(),
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
+pub fn full_on_device(val: f32, dims: &[usize], dev_type: &Device) -> Result<Tensor> {
+    let shape = Shape::new(dims.to_vec());
+    let dev = pick_device_for_storage_device(dev_type);
+    let storage = dev.from_cpu(&vec![val; shape.elem_count()], &shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        dev_type.clone(),
+    ))
+}
+
+/// Weighted reduction matching HC Prepare math:
+/// Branch = (1 / count) * sum_{s=1}^count (X_norm[s] * sigma(Mix[s]))
+pub fn reduce_weighted_streams(
+    normed_streams: &Tensor,
+    mix_weights: &Tensor,
+    count: usize,
+    hidden_size: usize,
+) -> Result<Tensor> {
+    let dev = pick_device_for_tensor(normed_streams);
+    // Elementwise multiplication on device: [seq, count * hidden_size]
+    let (prod_st, _handle) = dev.mul(
+        &**normed_streams.storage(),
+        &**mix_weights.storage(),
+        normed_streams.shape(),
+    )?;
+    let prod_tensor = Tensor::new(
+        Arc::from(prod_st),
+        normed_streams.shape().clone(),
+        DType::F32,
+        normed_streams.provenance().clone(),
+        normed_streams.device().clone(),
+    );
+
+    let stream_slices = split_2d_horizontal_on_device(&prod_tensor, &vec![hidden_size; count])?;
+    let mut sum = stream_slices[0].clone();
+    for s in &stream_slices[1..] {
+        sum = add_on_device(&sum, s)?;
+    }
+    mul_scalar_on_device(&sum, 1.0 / count as f32)
+}
+
+pub fn broadcast_and_mul_streams(
+    branch: &Tensor,
+    weights: &Tensor,
+    count: usize,
+) -> Result<Tensor> {
+    let dims = branch.shape().dims();
+    let seq_len = dims[0];
+    let hidden_size = dims[1];
+
+    // Split weights [seq, count] into individual stream weight columns [seq, 1]
+    let weight_cols = split_2d_horizontal_on_device(weights, &vec![1; count])?;
+    let mut scaled_streams = Vec::with_capacity(count);
+
+    #[cfg(feature = "rocm-mem")]
+    if let Device::Rocm(ord) = branch.device() {
+        let rdev = RocmDevice::shared(*ord);
+        for w_col in weight_cols {
+            // ElementwiseOps::row_scale takes (x, scale, rows, cols, out_shape) and returns (Box<dyn BackendStorage>, Box<dyn ComputeHandle>)
+            let (out_st, _handle) = rdev.row_scale(
+                &**branch.storage(),
+                &**w_col.storage(),
+                seq_len,
+                hidden_size,
+                branch.shape(),
+            )?;
+            scaled_streams.push(Tensor::new(
+                Arc::from(out_st),
+                branch.shape().clone(),
+                DType::F32,
+                branch.provenance().clone(),
+                branch.device().clone(),
+            ));
+        }
+        return concat_2d_slices_horizontal_on_device(&scaled_streams.iter().collect::<Vec<_>>());
+    }
+
+    // Host fallback for non-ROCm
+    let b_vec = branch.to_vec_f32()?;
+    let w_vec = weights.to_vec_f32()?;
+    let mut out_vec = vec![0.0f32; seq_len * count * hidden_size];
+    for s in 0..seq_len {
+        for c in 0..count {
+            let w = w_vec[s * count + c];
+            let src_off = s * hidden_size;
+            let dst_off = s * (count * hidden_size) + c * hidden_size;
+            for i in 0..hidden_size {
+                out_vec[dst_off + i] = b_vec[src_off + i] * w;
+            }
+        }
+    }
+    let dev = pick_device_for_tensor(branch);
+    let out_shape = Shape::new(vec![seq_len, count * hidden_size]);
+    let st = dev.from_cpu(&out_vec, &out_shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(st),
+        out_shape,
+        DType::F32,
+        branch.provenance().clone(),
+        branch.device().clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -3267,4 +3437,38 @@ mod mla_cache_tests {
             );
         }
     }
+
+    #[test]
+    fn test_stream_reduce_weighted_and_broadcast() {
+        let count = 4;
+        let hidden = 2560;
+        let seq = 1;
+        // Input streams [seq, count * hidden]
+        let input = cpu_tensor(
+            vec![2.0f32; seq * count * hidden],
+            Shape::new(vec![seq, count * hidden]),
+        );
+        // Mix weights [seq, count * hidden] (already sigmoid-activated, e.g. 0.5)
+        let mix_weights = cpu_tensor(
+            vec![0.5f32; seq * count * hidden],
+            Shape::new(vec![seq, count * hidden]),
+        );
+
+        let reduced = reduce_weighted_streams(&input, &mix_weights, count, hidden)
+            .expect("reduce_weighted_streams ok");
+        assert_eq!(reduced.shape().dims(), &[seq, hidden]);
+        // Each element: (1/4) * sum_{s=1}^4 (2.0 * 0.5) = (1/4) * 4 * 1.0 = 1.0
+        let r_vec = reduced.to_vec_f32().unwrap();
+        assert!((r_vec[0] - 1.0).abs() < 1e-5);
+
+        // Dynamic block injection weights [seq, count]
+        let inject_weights = cpu_tensor(vec![2.0f32; seq * count], Shape::new(vec![seq, count]));
+        let broadcasted =
+            broadcast_and_mul_streams(&reduced, &inject_weights, count).expect("broadcast ok");
+        assert_eq!(broadcasted.shape().dims(), &[seq, count * hidden]);
+        let b_vec = broadcasted.to_vec_f32().unwrap();
+        // 1.0 * 2.0 = 2.0
+        assert!((b_vec[0] - 2.0).abs() < 1e-5);
+    }
 }
+
