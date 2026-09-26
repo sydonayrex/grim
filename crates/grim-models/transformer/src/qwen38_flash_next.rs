@@ -913,11 +913,12 @@ impl Qwen38FlashNextBlock {
                 Linear::load_shape(&ws.scoped("ssm_beta"), [cfg.hidden_size, cfg.ssm_dt_rank])?;
             let ssm_alpha =
                 Linear::load_shape(&ws.scoped("ssm_alpha"), [cfg.hidden_size, cfg.ssm_dt_rank])?;
-            let ssm_norm = RmsNorm::load(
-                &ws.scoped("ssm_norm"),
-                cfg.linear_value_head_dim,
-                cfg.rms_norm_eps,
-            )?;
+            // ssm_norm is [ssm_d_state], the GDN head width, and the
+            // recurrence applies it per state channel of that width. It is not
+            // [linear_value_head_dim]: the released checkpoint happens to have
+            // both equal to 128, so the two only differ under another geometry.
+            let ssm_norm =
+                RmsNorm::load(&ws.scoped("ssm_norm"), cfg.ssm_d_state, cfg.rms_norm_eps)?;
             let ssm_out = Linear::load_shape(&ws.scoped("ssm_out"), [value_dim, cfg.hidden_size])?;
 
             Qwen38Attention::Linear {
@@ -960,14 +961,19 @@ impl Qwen38FlashNextBlock {
             let k_norm =
                 RmsNorm::load(&ws.scoped("attn_k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
 
+            // Widths come from the config, not literals: the released values
+            // are 4 query heads x 128 and one 128-wide key head, but hardcoding
+            // them makes any other geometry fail to load with a shape error.
+            let idx_q_dim = cfg.indexer_n_heads * cfg.indexer_key_length;
+            let idx_k_dim = cfg.indexer_key_length;
             let indexer_q =
-                Linear::load_shape(&ws.scoped("indexer.q_proj"), [cfg.hidden_size, 512]).ok();
+                Linear::load_shape(&ws.scoped("indexer.q_proj"), [cfg.hidden_size, idx_q_dim]).ok();
             let indexer_k =
-                Linear::load_shape(&ws.scoped("indexer.k_proj"), [cfg.hidden_size, 128]).ok();
+                Linear::load_shape(&ws.scoped("indexer.k_proj"), [cfg.hidden_size, idx_k_dim]).ok();
             let indexer_q_norm =
-                RmsNorm::load(&ws.scoped("indexer.q_norm"), 128, cfg.rms_norm_eps).ok();
+                RmsNorm::load(&ws.scoped("indexer.q_norm"), idx_k_dim, cfg.rms_norm_eps).ok();
             let indexer_k_norm =
-                RmsNorm::load(&ws.scoped("indexer.k_norm"), 128, cfg.rms_norm_eps).ok();
+                RmsNorm::load(&ws.scoped("indexer.k_norm"), idx_k_dim, cfg.rms_norm_eps).ok();
 
             let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
             let wqkv_q80_fused = crate::shared_attention::build_fused_qkv_q80(&wq, &wk, &wv)
@@ -1136,8 +1142,32 @@ impl Qwen38FlashNextBlock {
                         history,
                         grim_tensor::Shape::new(vec![1, taps - 1, conv_dim]),
                     );
+                    // short_conv1d takes [B, S, D] and the block stream is
+                    // [S, D]. Do the conv on the host, alongside the recurrence
+                    // that consumes it, rather than pushing a rank change through
+                    // a device tensor.
+                    let qkv_dims = qkv.shape().dims().to_vec();
+                    let (qkv_seq, qkv_chan) = match qkv_dims.as_slice() {
+                        [s, d] => (*s, *d),
+                        [b, s, d] => (*s * *b, *d),
+                        other => {
+                            return Err(grim_core::error::Error::Shape(format!(
+                                "qwen38 GDN conv: expected [S, D] or [B, S, D], got {other:?}"
+                            )));
+                        }
+                    };
+                    if qkv_chan != conv_dim {
+                        return Err(grim_core::error::Error::Shape(format!(
+                            "qwen38 GDN conv: attn_qkv produced {qkv_chan} channels, \
+                             expected {conv_dim} (key_dim*2 + value_dim)"
+                        )));
+                    }
+                    let qkv_b1 = cpu_tensor(
+                        qkv.to_vec_f32()?,
+                        grim_tensor::Shape::new(vec![1, qkv_seq, qkv_chan]),
+                    );
                     let out = grim_nn::modules::short_conv1d(
-                        &qkv,
+                        &qkv_b1,
                         &ssm_conv1d.weight,
                         None,
                         Some(&mut state_t),
@@ -1235,11 +1265,24 @@ impl Qwen38FlashNextBlock {
                     }
                 };
 
+                // q/k norms are PER HEAD: the weight is [head_dim] and the
+                // tensor is [S, n_heads * head_dim], so it has to be viewed as
+                // [S * n_heads, head_dim] and viewed back. Norming the flat
+                // tensor with a head_dim weight is a shape error at best and a
+                // silently wrong scale at worst.
                 if let Some(qn) = q_norm {
-                    q = qn.forward(&q)?;
+                    let nh = *num_heads;
+                    let hd = *head_dim;
+                    let v = crate::block::reshaped_view(&q, &Shape::new(vec![seq_len * nh, hd]))?;
+                    let n = qn.forward(&v)?;
+                    q = crate::block::reshaped_view(&n, &Shape::new(vec![seq_len, nh * hd]))?;
                 }
                 if let Some(kn) = k_norm {
-                    k = kn.forward(&k)?;
+                    let nh = *num_kv_heads;
+                    let hd = *head_dim;
+                    let v = crate::block::reshaped_view(&k, &Shape::new(vec![seq_len * nh, hd]))?;
+                    let n = kn.forward(&v)?;
+                    k = crate::block::reshaped_view(&n, &Shape::new(vec![seq_len, nh * hd]))?;
                 }
 
                 let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
@@ -1370,8 +1413,17 @@ impl Qwen38FlashNextBlock {
                             qcfg.compress_ratio,
                             1,
                         )?;
+                        // The indexer scores its own key history, whose length
+                        // is not necessarily the attention K/V length. The mask
+                        // must span the ATTENTION kv cells, so clamp the
+                        // selection to that length. `k` is [S, n_kv * head_dim]
+                        // and is available here, before the host materialization.
                         let sel = crate::qwen38_qsa::top_k_cells(&cells, qcfg.select_width(n_kv));
-                        Some(crate::qwen38_qsa::build_top_k_mask(n_kv, &sel, None)?)
+                        let kv_stride = (*num_kv_heads * *head_dim).max(1);
+                        let k_elems = k.to_vec_f32()?.len();
+                        let kv_len = (k_elems / kv_stride).max(1);
+                        let sel = sel.into_iter().filter(|c| *c < kv_len).collect::<Vec<_>>();
+                        Some(crate::qwen38_qsa::build_top_k_mask(kv_len, &sel, None)?)
                     }
                     None => None,
                 };
