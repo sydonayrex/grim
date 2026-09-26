@@ -107,6 +107,25 @@ pub enum Storage {
     Awq(AwqStorageConfig),
     /// OSTQuant W4A4: 4-bit unsigned packed weights with group scales (bf16) and zeros (u8).
     W4A4OstQuant(OstQuantConfig),
+    /// A format Grim can identify and size but has no backend for. Carries a
+    /// human-readable reason so the failure names the format and what to do
+    /// about it, instead of surfacing as an unknown-tag parse failure or, worse,
+    /// as silently-wrong data reinterpreted under a similar scheme.
+    Unsupported(UnsupportedFormat),
+}
+
+/// Why a recognized quant format has no backend, plus the geometry Grim does
+/// know about it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnsupportedFormat {
+    /// GGUF display name, e.g. `"PQ2_0"`.
+    pub name: &'static str,
+    /// Weights per block, when known.
+    pub block_size: Option<usize>,
+    /// Bytes per block, when known.
+    pub bytes_per_block: Option<usize>,
+    /// Explanation surfaced to the user.
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -330,6 +349,12 @@ impl DType {
                 BlockDtype::Fp8Block128 => elem_count,
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
+            Storage::Unsupported(f) => match (f.block_size, f.bytes_per_block) {
+                (Some(bs), Some(bpb)) => (elem_count.div_ceil(bs)) * bpb,
+                // Without geometry we cannot claim a size; report the dense
+                // f32 size rather than 0, which would read as an empty tensor.
+                _ => elem_count * self.arith.byte_size(),
+            },
             Storage::W4A4OstQuant(cfg) => {
                 let group = cfg.group_size.max(1);
                 24 + elem_count.div_ceil(2)

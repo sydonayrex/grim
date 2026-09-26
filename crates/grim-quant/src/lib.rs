@@ -6923,3 +6923,167 @@ pub fn quantize_q2_0_block(values: &[f32], out: &mut [u8]) -> Result<()> {
     }
     Ok(())
 }
+
+// ============================================================================
+// Prism-private GGUF quant formats (decoded, not yet wired into any loader)
+//
+// `PQ2_0` (tag 142) and `PTQ1_0` (tag 143) are private to the PrismML
+// llama.cpp fork (branch `prism`, commit adfffbe4). They are registered here
+// so a checkpoint using them produces a clear "not implemented" error naming
+// the format, rather than "unknown GGUF dtype tag 142" from the parser. The
+// decode paths are implemented and KAT-tested against the C reference, but
+// no provider currently routes them, so nothing constructs them at runtime.
+//
+// Upstream `Q2_0` is tag 42 at group 64 and is a *different* format; these
+// high ids were chosen by the fork precisely so the two can coexist.
+// ============================================================================
+
+/// Weights per `PQ2_0` block (`QK_PQ2_0`): 128, one fp16 scale per 128 weights.
+pub const BLOCK_SIZE_PQ2_0: usize = 128;
+/// Bytes per `PQ2_0` block: 2-byte fp16 delta + 128*2/8 packed codes.
+pub const BLOCK_BYTES_PQ2_0: usize = 34;
+/// Weights per `PTQ1_0` block (`QK_PTQ1_0`).
+pub const BLOCK_SIZE_PTQ1_0: usize = 128;
+/// `qs` bytes in a `PTQ1_0` block: 120 values at 5 trits/byte.
+pub const PTQ1_0_QS_BYTES: usize = 24;
+/// `qh` bytes in a `PTQ1_0` block: 8 values at 4 trits/byte.
+pub const PTQ1_0_QH_BYTES: usize = 2;
+/// Bytes per `PTQ1_0` block: 24 + 2 + 2 (fp16 delta last).
+pub const BLOCK_BYTES_PTQ1_0: usize = 28;
+
+/// Decode a `PQ2_0` codebyte per element: same `(q - 1) * d` law as `Q2_0`.
+fn pq2_0_element(d: f32, qs: &[u8], j: usize) -> f32 {
+    let q = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+    (q as f32 - 1.0) * d
+}
+
+/// Dequantize Prism `PQ2_0` (GGUF tag 142) packed weights.
+///
+/// Layout from `ggml-common.h` on branch `prism`:
+/// ```c
+/// #define QK_PQ2_0 128
+/// typedef struct { ggml_half d; uint8_t qs[QK_PQ2_0 / 4]; } block_pq2_0;
+/// ```
+/// and `dequantize_row_pq2_0` is byte-identical in body to `dequantize_row_q2_0`
+/// apart from `qk`. 128 weights per 34-byte block = 2.125 bits per weight.
+///
+/// # Errors
+/// Returns [`Error::Backend`] if `num_weights` is not a multiple of
+/// [`BLOCK_SIZE_PQ2_0`] or if `data` is shorter than the block-aligned size.
+pub fn dequant_pq2_0(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    if num_weights == 0 {
+        return Ok(Vec::new());
+    }
+    if num_weights % BLOCK_SIZE_PQ2_0 != 0 {
+        return Err(Error::Backend(format!(
+            "dequant_pq2_0: {num_weights} weights is not a multiple of block size {BLOCK_SIZE_PQ2_0}"
+        )));
+    }
+    let num_blocks = num_weights / BLOCK_SIZE_PQ2_0;
+    let expected = num_blocks * BLOCK_BYTES_PQ2_0;
+    if data.len() < expected {
+        return Err(Error::Backend(format!(
+            "dequant_pq2_0: buffer too short: expected {expected}, have {}",
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    for b in 0..num_blocks {
+        let base = b * BLOCK_BYTES_PQ2_0;
+        let d = f16_to_f32(data[base], data[base + 1]);
+        let qs = &data[base + 2..base + BLOCK_BYTES_PQ2_0];
+        for j in 0..BLOCK_SIZE_PQ2_0 {
+            out.push(pq2_0_element(d, qs, j));
+        }
+    }
+    Ok(out)
+}
+
+/// Extract the base-3 digit at position `n` from a ceil-encoded base-243 byte.
+///
+/// The fork stores 5 trits in one byte as a base-243 number rounded *up* to the
+/// nearest multiple of 243/256, so the inverse is not a plain division. The C
+/// code does `int16_t xi = ((uint16_t) q * pow3[n] * 3) >> 8;`, reproduced here
+/// exactly; the intermediate can exceed a byte, which is why this is not `q / pow3`.
+fn ptq1_0_trit(q: u8, n: usize) -> i16 {
+    const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+    // The C is two steps, and the first one truncates:
+    //     uint8_t  q  = x[i].qs[j + m] * pow3[n];   // <-- uint8_t: wraps mod 256
+    //     int16_t xi = ((uint16_t) q * 3) >> 8;
+    // Skipping the wrap changes the result for every trit where the product
+    // exceeds 255, so it is reproduced explicitly rather than folded into one
+    // wider multiply.
+    let scaled = q.wrapping_mul(POW3[n]);
+    (((scaled as u16) * 3) >> 8) as i16
+}
+
+/// Dequantize Prism `PTQ1_0` (GGUF tag 143) ternary packed weights.
+///
+/// Layout from `ggml-common.h` on branch `prism`:
+/// ```c
+/// #define QK_PTQ1_0 128
+/// typedef struct {
+///     uint8_t qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 B, 5 trits/byte -> 120
+///     uint8_t qh[QK_PTQ1_0/64];                   //  2 B, 4 trits/byte ->   8
+///     ggml_half d;
+/// } block_ptq1_0;
+/// ```
+/// Each trit is a base-3 digit mapping `-1, 0, +1` to codes `0, 1, 2`, decoded as
+/// `(xi - 1) * d`. 128 weights per 28-byte block = 1.75 bits per weight.
+///
+/// `qs` is walked with stage widths 32/16/8 (generalized from upstream `TQ1_0`'s
+/// 32-then-16, which cannot cover a 24-byte `qs`); that yields 120 values, then
+/// `qh` contributes the final 8. The `d` field sits at the END of the struct,
+/// unlike every other 2-bit format here.
+///
+/// # Errors
+/// Returns [`Error::Backend`] if `num_weights` is not a multiple of
+/// [`BLOCK_SIZE_PTQ1_0`] or if `data` is shorter than the block-aligned size.
+pub fn dequant_ptq1_0(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    if num_weights == 0 {
+        return Ok(Vec::new());
+    }
+    if num_weights % BLOCK_SIZE_PTQ1_0 != 0 {
+        return Err(Error::Backend(format!(
+            "dequant_ptq1_0: {num_weights} weights is not a multiple of block size {BLOCK_SIZE_PTQ1_0}"
+        )));
+    }
+    let num_blocks = num_weights / BLOCK_SIZE_PTQ1_0;
+    let expected = num_blocks * BLOCK_BYTES_PTQ1_0;
+    if data.len() < expected {
+        return Err(Error::Backend(format!(
+            "dequant_ptq1_0: buffer too short: expected {expected}, have {}",
+            data.len()
+        )));
+    }
+
+    const STAGES: [usize; 3] = [32, 16, 8];
+    let mut out = Vec::with_capacity(num_weights);
+    for b in 0..num_blocks {
+        let base = b * BLOCK_BYTES_PTQ1_0;
+        let qs = &data[base..base + PTQ1_0_QS_BYTES];
+        let qh = &data[base + PTQ1_0_QS_BYTES..base + PTQ1_0_QS_BYTES + PTQ1_0_QH_BYTES];
+        let d_off = base + PTQ1_0_QS_BYTES + PTQ1_0_QH_BYTES;
+        let d = f16_to_f32(data[d_off], data[d_off + 1]);
+
+        let mut j = 0usize;
+        for &c in STAGES.iter() {
+            while j + c <= PTQ1_0_QS_BYTES {
+                for n in 0..5usize {
+                    for m in 0..c {
+                        // One byte `qs[j + m]` holds the `n`-th trit of the
+                        // `m`-th weight in this group of `c`.
+                        out.push((ptq1_0_trit(qs[j + m], n) as f32 - 1.0) * d);
+                    }
+                }
+                j += c;
+            }
+        }
+        for n in 0..4usize {
+            for &byte in qh.iter() {
+                out.push((ptq1_0_trit(byte, n) as f32 - 1.0) * d);
+            }
+        }
+    }
+    Ok(out)
+}

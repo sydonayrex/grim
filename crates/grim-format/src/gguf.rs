@@ -182,6 +182,14 @@ pub enum GgufDType {
     NVFP4 = 78,
     #[allow(non_camel_case_types)]
     GsqRco3p5 = 42,
+    /// Prism-private Q2_0 at group size 128 (2.125 bpw). Distinct id from
+    /// upstream's group-64 `Q2_0` at tag 42 so the two coexist; see
+    /// PrismML-Eng/llama.cpp branch `prism`.
+    #[allow(non_camel_case_types)]
+    PQ2_0 = 142,
+    /// Prism-private ternary at group size 128 (1.75 bpw), base-3 trits.
+    #[allow(non_camel_case_types)]
+    PTQ1_0 = 143,
 }
 
 impl GgufDType {
@@ -221,6 +229,8 @@ impl GgufDType {
             39 => Some(GgufDType::MXFP4),
             78 => Some(GgufDType::NVFP4),
             42 => Some(GgufDType::GsqRco3p5),
+            142 => Some(GgufDType::PQ2_0),
+            143 => Some(GgufDType::PTQ1_0),
             _ => None,
         }
     }
@@ -262,6 +272,8 @@ impl GgufDType {
             GgufDType::MXFP4 => 39,
             GgufDType::NVFP4 => 78,
             GgufDType::GsqRco3p5 => 42,
+            GgufDType::PQ2_0 => 142,
+            GgufDType::PTQ1_0 => 143,
         }
     }
 
@@ -311,8 +323,12 @@ impl GgufDType {
             | GgufDType::IQ1_S
             | GgufDType::IQ1_M
             | GgufDType::MXFP4
-            | GgufDType::NVFP4
-            | GgufDType::GsqRco3p5 => 256,
+            | GgufDType::NVFP4 => 256,
+            // GGUF Q2_0 (tag 42) packs 64 weights per block (QK2_0), not 256.
+            GgufDType::GsqRco3p5 => 64,
+            // Prism-private: both are group-size 128.
+            GgufDType::PQ2_0 => 128,
+            GgufDType::PTQ1_0 => 128,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
         }
@@ -357,6 +373,10 @@ impl GgufDType {
             GgufDType::NVFP4 => 16 + 128,
             // GsqRco3p5 (GGUF Q2_0, QK2_0=64): 2-byte fp16 delta + 64*2/8 packed codes.
             GgufDType::GsqRco3p5 => 18,
+            // PQ2_0: 2-byte fp16 delta + 128*2/8 packed codes.
+            GgufDType::PQ2_0 => 34,
+            // PTQ1_0: 24 B qs (5 trits/byte) + 2 B qh (4 trits/byte) + 2 B fp16 delta.
+            GgufDType::PTQ1_0 => 28,
             _ => 0,
         }
     }
@@ -394,6 +414,8 @@ pub const ALL_GGUF_DTYPES: &[GgufDType] = &[
     GgufDType::IQ1_S,
     GgufDType::MXFP4,
     GgufDType::GsqRco3p5,
+    GgufDType::PQ2_0,
+    GgufDType::PTQ1_0,
 ];
 
 /// Byte size a tensor of `dtype` and `dims` must occupy, per gguf's own rule:
@@ -2006,6 +2028,28 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::GsqRco3p5),
         },
+        // Prism-private formats: parsed and sized correctly so a checkpoint
+        // using them fails later with a clear "not implemented" naming the
+        // format, rather than an unknown-tag parse failure here. They are
+        // deliberately NOT given a KQuant scheme, so no existing fused kernel
+        // can be selected for them by accident.
+        GgufDType::PQ2_0 | GgufDType::PTQ1_0 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
+                name: gguf_dtype.display_name(),
+                block_size: Some(gguf_dtype.block_size() as usize),
+                bytes_per_block: Some(gguf_dtype.type_size_per_block() as usize),
+                reason: format!(
+                    "Prism-private quant format {} (GGUF tag {}) is recognized and \
+                     decodable via grim_quant::dequant_{}, but no GPU/CPU Storage \
+                     backend is wired up for it. Re-quantize to a supported type \
+                     (Q2_0 tag 42, Q4_K, Q8_0) or add a Storage implementation.",
+                    gguf_dtype.display_name(),
+                    gguf_dtype.tag(),
+                    gguf_dtype.display_name().to_lowercase(),
+                ),
+            }),
+        },
     }
 }
 
@@ -2050,7 +2094,9 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::IQ2_XXS
         | GgufDType::IQ2_XS
         | GgufDType::IQ2_S
-        | GgufDType::GsqRco3p5 => Some(2),
+        | GgufDType::GsqRco3p5
+        | GgufDType::PQ2_0
+        | GgufDType::PTQ1_0 => Some(2),
         GgufDType::Q3K | GgufDType::IQ3_XXS | GgufDType::IQ3_S => Some(3),
         GgufDType::IQ1_S | GgufDType::IQ1_M => Some(1),
         GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),
@@ -2089,6 +2135,8 @@ impl GgufDType {
                 | GgufDType::MXFP4
                 | GgufDType::NVFP4
                 | GgufDType::GsqRco3p5
+                | GgufDType::PQ2_0
+                | GgufDType::PTQ1_0
         )
     }
 
@@ -2129,6 +2177,8 @@ impl GgufDType {
             GgufDType::MXFP4 => "MXFP4",
             GgufDType::NVFP4 => "NVFP4",
             GgufDType::GsqRco3p5 => "Q2_0",
+            GgufDType::PQ2_0 => "PQ2_0",
+            GgufDType::PTQ1_0 => "PTQ1_0",
         }
     }
 }
