@@ -1190,6 +1190,44 @@ impl RmsNorm {
         }
         linear.forward(&self.forward(x)?)
     }
+
+    /// RMSNorm forward with a scalar offset added to the weight vector (e.g. weight + offset).
+    /// Used by Hyper-Connection mixer where weight is stored as residual delta: `(w + 1.0)`.
+    pub fn forward_with_offset(&self, x: &Tensor, offset: f32) -> Result<Tensor> {
+        let dev = pick_device_for_tensor(x);
+        let dim = x.shape().dims().last().copied().unwrap_or(0);
+        let batch = x.shape().elem_count() / dim;
+        let out_shape = Shape::new(vec![batch, dim]);
+
+        let effective_w = if offset == 0.0 {
+            self.weight.clone()
+        } else {
+            let (shifted_st, _) = dev.add_scalar(&**self.weight.storage(), offset, self.weight.shape())?;
+            Tensor::new(
+                Arc::from(shifted_st),
+                self.weight.shape().clone(),
+                DType::F32,
+                self.weight.provenance().clone(),
+                self.weight.device().clone(),
+            )
+        };
+
+        let (s, h) = CoreTensorOps::rms_norm(
+            &*dev,
+            x.storage().as_ref(),
+            effective_w.storage().as_ref(),
+            self.eps,
+            &out_shape,
+        )?;
+        let _ = h;
+        Ok(Tensor::new(
+            Arc::from(s),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        ))
+    }
 }
 
 // ---------- LayerNorm ----------
@@ -2320,15 +2358,40 @@ pub fn short_conv1d(
 
     if let Some(state) = conv_state {
         if s > 0 {
-            let mut new_state = vec![0.0f32; b * d * (k_size - 1)];
+            // Carry the previous `k-1` inputs forward, then append the tail of
+            // this sequence.
+            //
+            // The previous version rebuilt the state entirely from the CURRENT
+            // sequence: `src_step = s - (k-1-ki)` is only in range for ki = k-1
+            // when s = 1, so on the decode path (one token per call) the state
+            // collapsed to `[0, 0, x_t]` and taps 0..2 read zeros forever. A
+            // 2-tap conv masked it because ki-2 is then in range for ki=1.
+            //
+            // The fix shifts the OLD state down by however many tokens arrived
+            // and fills the remaining slots from this sequence, so history
+            // survives across calls regardless of s.
+            let hist = k_size - 1;
+            let shift = s.min(hist);
+            let old_state = state.to_vec_f32()?;
+            let old_k = (old_state.len() / (b * d)).max(1);
+            let mut new_state = vec![0.0f32; b * d * hist];
             for bi in 0..b {
                 for di in 0..d {
-                    for ki in 0..(k_size - 1) {
-                        let src_step = s as isize - (k_size - 1 - ki) as isize;
-                        if src_step >= 0 {
-                            new_state[(bi * d + di) * (k_size - 1) + ki] =
-                                x_vec[(bi * s + src_step as usize) * d + di];
-                        }
+                    let dst_off = (bi * d + di) * hist;
+                    // Keep the `hist - shift` oldest samples, drop the rest.
+                    let keep = hist - shift;
+                    for j in 0..keep {
+                        let src_idx = old_k - keep + j;
+                        new_state[dst_off + j] = old_state
+                            .get((bi * d + di) * old_k + src_idx)
+                            .copied()
+                            .unwrap_or(0.0);
+                    }
+                    // Then the last `shift` samples of this sequence.
+                    for j in 0..shift {
+                        let src_step = s - shift + j;
+                        new_state[dst_off + keep + j] =
+                            x_vec[(bi * s + src_step) * d + di];
                     }
                 }
             }
