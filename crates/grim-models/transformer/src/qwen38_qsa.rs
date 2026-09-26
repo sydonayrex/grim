@@ -239,6 +239,34 @@ pub fn expand_block_scores(
     Ok(cells)
 }
 
+/// Expand allocated block scores onto attention cells.
+///
+/// `blk_of[cell]` is the block holding that cell, or [`NO_BLOCK`] when the cell
+/// sits in no complete block. Deriving the block from the cell index instead
+/// (`cell / r`) is the bug the allocator exists to remove: it is only equal
+/// when every cell sits in a full block at its own bucket, which fails as soon
+/// as the cache is paged or a bucket is incomplete.
+///
+/// A cell with no block gets `NEG_INFINITY` so it can never be selected, which
+/// is the same outcome upstream reaches with a `-inf` bias.
+pub fn expand_allocated_block_scores(
+    block_scores: &[f32],
+    blk_of: &[i32],
+    n_tps: usize,
+) -> Vec<f32> {
+    let n_bid = block_scores.len() / n_tps.max(1);
+    let mut cells = vec![f32::NEG_INFINITY; n_tps * blk_of.len()];
+    for t in 0..n_tps {
+        for (c, &b) in blk_of.iter().enumerate() {
+            if b < 0 || b as usize >= n_bid {
+                continue; // unpooled: never selectable
+            }
+            cells[t * blk_of.len() + c] = block_scores[t * n_bid + b as usize];
+        }
+    }
+    cells
+}
+
 /// Indices of the `width` highest-scoring cells.
 ///
 /// Ranked by score descending, ties broken by cell ascending, which matches
@@ -255,6 +283,13 @@ pub fn top_k_cells(cell_scores: &[f32], width: usize) -> Vec<usize> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(&b))
     });
+    // Cells that scored -inf were never a candidate: they sit in no complete
+    // block, or their block is unobserved, or they are in the future. Truncating
+    // without this filter can hand the budget to a masked cell when the number
+    // of selectable cells is below the width -- which is the normal case early
+    // in a sequence, so it would silently select exactly the cells the block
+    // allocator excluded.
+    idx.retain(|&i| cell_scores[i] != f32::NEG_INFINITY);
     idx.truncate(width);
     idx
 }

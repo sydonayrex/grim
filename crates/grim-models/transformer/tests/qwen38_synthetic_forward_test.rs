@@ -372,7 +372,11 @@ fn decode_once(
     tok: u32,
 ) -> Vec<f32> {
     let ids = grim_backend_cpu::cpu_tensor(vec![tok as f32], Shape::new(vec![1]));
-    let pos = grim_backend_cpu::cpu_tensor(vec![0.0f32], Shape::new(vec![1]));
+    // Position must ADVANCE across decode steps. Holding it at 0 was a harness
+    // bug that hid the block-causal defect: with q_pos pinned to 0 no block is
+    // ever "observed", so the mask degenerated to selecting the tail alone and
+    // sparse and dense produced identical logits.
+    let pos = grim_backend_cpu::cpu_tensor(vec![tok as f32], Shape::new(vec![1]));
     let out = model
         .forward(session, &ids, &pos, &[])
         .expect("forward must succeed");

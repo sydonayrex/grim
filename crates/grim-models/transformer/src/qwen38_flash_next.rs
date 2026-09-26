@@ -1295,6 +1295,8 @@ impl Qwen38FlashNextBlock {
                         a: &a_vec,
                         dt_bias: &dt_vec,
                         norm: &ssm_norm_weight,
+                        // layer_norm_rms_eps, used by the q/k L2 norm.
+                        eps: cfg.rms_norm_eps,
                         n_v_heads,
                         n_k_heads,
                         head_dim,
@@ -1457,6 +1459,28 @@ impl Qwen38FlashNextBlock {
                         // `qsa_keys` is this layer's flat raw-key history.
                         qsa_keys.extend_from_slice(&k_new);
                         let n_kv = qsa_keys.len() / idx_dim.max(1);
+
+                        // QSA block allocation is keyed on (sequence set, index bucket), not on
+                        // cell index. Grim's Qwen3.8 session is single-sequence today, so every
+                        // cell carries sequence 0; the allocator still runs because that is the
+                        // case where `pos / r` and the correct grouping coincide, and a
+                        // multi-sequence cache will need this to be per-sequence.
+                        let n_blocks = qcfg.n_blocks(n_kv);
+                        let cell_info: Vec<crate::qwen38_qsa_blocks::CellInfo> = (0..n_kv)
+                            .map(|j| crate::qwen38_qsa_blocks::CellInfo::new(j as u32, 0))
+                            .collect();
+                        let layout = crate::qwen38_qsa_blocks::allocate_blocks(
+                            &cell_info,
+                            n_blocks,
+                            qcfg.compress_ratio,
+                        )?;
+                        if layout.out_of_range {
+                            return Err(grim_core::error::Error::Config(format!(
+                                "qwen38 QSA: a cell position runs past the block window \
+                                 (n_kv={n_kv}, n_blocks={n_blocks}, r={})",
+                                qcfg.compress_ratio
+                            )));
+                        }
                         let keys = qsa_keys.clone();
                         // Indexer query: project, norm per head, then reuse the
                         // block's rope so the two are on the same frequency
@@ -1476,14 +1500,11 @@ impl Qwen38FlashNextBlock {
                                 cfg.rms_norm_eps,
                             );
                         }
-                        // Pool + norm the keys. Upstream pools first, then
-                        // norms the pooled rows.
-                        let mut pooled = crate::qwen38_qsa::pool_indexer_keys(
-                            &keys,
-                            n_kv,
-                            idx_dim,
-                            qcfg.compress_ratio,
-                        )?;
+                        // Pool + norm the keys, over the ALLOCATED blocks
+                        // rather than cell/r. Upstream pools first, then norms
+                        // the pooled rows.
+                        let mut pooled =
+                            layout.pooled(&keys, n_kv, idx_dim, qcfg.compress_ratio)?;
                         if let Some(n) = indexer_k_norm.as_ref() {
                             let w = n.weight.to_vec_f32()?;
                             crate::qwen38_qsa::rms_norm_rows(
@@ -1495,21 +1516,33 @@ impl Qwen38FlashNextBlock {
                         }
                         // Score, expand, select. One query row: the last token
                         // of this step decides which history cells stay visible.
-                        let scores = crate::qwen38_qsa::indexer_block_scores(
+                        let q_pos = positions.last().copied().unwrap_or(0);
+                        // Eq. (15): a block is scored only once all r of its
+                        // tokens are observed, and Eq. (16) makes the tail
+                        // always visible. Upstream folds both into a bias added
+                        // to the scores before top-k; without it a query
+                        // attends to future blocks and the tail can be dropped.
+                        let bias = layout.block_bias(q_pos, qcfg.compress_ratio, &|_| true);
+                        let mut scores = crate::qwen38_qsa::indexer_block_scores(
                             &pooled,
                             &q_normed[q_normed.len() - qcfg.n_idx_h * idx_dim..],
-                            qcfg.n_blocks(n_kv),
+                            layout.n_bid,
                             qcfg.n_idx_h,
                             idx_dim,
                             1,
                         )?;
-                        let cells = crate::qwen38_qsa::expand_block_scores(
+                        for (b, s) in scores.iter_mut().enumerate() {
+                            *s += bias.get(b).copied().unwrap_or(0.0);
+                        }
+                        // Cell -> block comes from the ALLOCATION, not from
+                        // `cell / r`. Unpooled cells land at -inf and so are
+                        // never selected, which also covers the first token of
+                        // a sequence, where no complete block exists yet.
+                        let cells = crate::qwen38_qsa::expand_allocated_block_scores(
                             &scores,
-                            qcfg.n_blocks(n_kv),
-                            n_kv,
-                            qcfg.compress_ratio,
+                            &layout.blk_of,
                             1,
-                        )?;
+                        );
                         // The indexer scores its own key history, whose length
                         // is not necessarily the attention K/V length. The mask
                         // must span the ATTENTION kv cells, so clamp the

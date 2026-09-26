@@ -221,6 +221,7 @@ pub mod qwen35moe;
 pub mod qwen38_flash_next;
 pub mod qwen38_gdn;
 pub mod qwen38_qsa;
+pub mod qwen38_qsa_blocks;
 pub mod qwen3moe;
 pub mod qwen3next;
 pub mod qwen3vl;

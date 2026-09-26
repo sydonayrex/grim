@@ -351,7 +351,9 @@ fn decode(
 ) -> grim_tensor::Tensor {
     let device = model.device().clone();
     let ids = device_f32(&device, vec![tok as f32], Shape::new(vec![1]));
-    let pos = device_f32(&device, vec![0.0f32], Shape::new(vec![1]));
+    // Position must advance. Holding it at 0 makes no block ever "observed",
+    // so the QSA mask degenerates to the tail alone and sparse == dense.
+    let pos = device_f32(&device, vec![tok as f32], Shape::new(vec![1]));
     model
         .forward(session, &ids, &pos, &[])
         .expect("forward must succeed")
