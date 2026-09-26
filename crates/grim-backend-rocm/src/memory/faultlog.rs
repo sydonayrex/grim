@@ -185,9 +185,7 @@ pub fn resolve_all(
 mod tests {
     use super::*;
     use crate::memory::ledger;
-    use std::sync::Mutex;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Verbatim capture from the deliberate OOB probe, `dmesg` form.
     const REAL_DMESG: &str = "\
@@ -278,7 +276,7 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
     /// kernel text.
     #[test]
     fn parsed_fault_resolves_to_a_cross_device_allocation() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         // The buffer lives on ordinal 0; the fault came from PCI 0000:0a:00.0,
         // which this box maps to ordinal 1.
@@ -298,7 +296,7 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
     /// problem. The two must never be reported the same way.
     #[test]
     fn parsed_fault_on_the_owning_device_is_not_cross_device() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         ledger::register(0x0000_7fea_8800_0000, 4096, 1, false, "kv_k");
         let faults = parse(REAL_DMESG);
@@ -319,7 +317,7 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
     /// than defaulting to ordinal 0 and blaming the wrong card.
     #[test]
     fn unknown_pci_is_not_guessed() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         ledger::register(0x0000_7fea_8800_0000, 4096, 0, false, "x");
         let faults = parse(REAL_DMESG);
