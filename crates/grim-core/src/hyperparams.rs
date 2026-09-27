@@ -375,6 +375,12 @@ impl HyperparameterExtractor {
         let ssm_d_conv = metadata
             .get_u32(&format!("{arch_name}.ssm.conv_kernel"))
             .map(|v| v as usize);
+        // This one key had a hardcoded, non-existent name, so it never
+        // resolved and `unwrap_or(48)` fired on every load. For the 27B that
+        // default happens to be the true value (48), so it was invisible; for
+        // Qwen3.5-9B the file says 32 and the wrong 48 made `n_val_heads`,
+        // `value_dim` and `conv_dim` 1.5x too wide — the file's own attn_qkv is
+        // 8192 wide, so config and weight disagreed. Read it like its siblings.
         let ssm_dt_rank = metadata
             .get_u32(&format!("{arch_name}.ssm.time_step_rank"))
             .map(|v| v as usize);
