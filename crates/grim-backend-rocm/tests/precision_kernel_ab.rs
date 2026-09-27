@@ -40,12 +40,12 @@ mod e4m3;
 #[path = "precision_kernel_ab/w4a4.rs"]
 mod w4a4;
 use e4m3::{from_e4m3, to_e4m3_rne};
-use w4a4::{dot_packed, pack_a, pack_b, GROUP};
+use w4a4::{dot_packed, pack_a, GROUP};
 
 use grim_backend_rocm::precision_ab::*;
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{
-    ArithType, BlockDtype, CoreTensorOps, DType, MemoryOps, Shape, Storage,
+    ArithType, BackendStorage, BlockDtype, CoreTensorOps, DType, MemoryOps, Shape, Storage,
 };
 use std::time::Instant;
 
@@ -144,7 +144,7 @@ fn rocm(t: &dyn grim_tensor::BackendStorage) -> &grim_backend_rocm::RocmStorage 
 // ---------------------------------------------------------------- packers --
 
 /// Q8_0: 34 B per 32 values — f16 scale then 32 int8 codes.
-fn pack_q8_0(vals: &[f32]) -> Vec<u8> {
+fn pack_q8_0_host(vals: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vals.len() / 32 * 34);
     for blk in vals.chunks(32) {
         let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -236,9 +236,6 @@ fn bytemuck_cast_u32(v: &[u32]) -> &[u8] {
 fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
     as_bytes(v)
 }
-fn bytemuck_cast_u16(v: &[u16]) -> &[u8] {
-    as_bytes(v)
-}
 
 /// Max |gpu - oracle| over the sampled output positions.
 ///
@@ -321,31 +318,89 @@ fn leak_name(s: &str) -> &'static str {
     leaked
 }
 
+/// Every packed form of B, resident on the device for one K.
+///
+/// Built once per K and shared by all arms and all M values. B does not depend
+/// on M, and the untiled and row-tiled twins consume byte-identical operands --
+/// they differ only in launch geometry -- so one upload serves all of them.
+struct BOnDevice {
+    /// E4M3 bytes, for Raven, WhiteRaven and RavenRowTiled.
+    fp8: Box<dyn BackendStorage>,
+    /// Host copy of the same E4M3 bytes, for the oracles. The oracle has to
+    /// read what the kernel consumed, not the f32 source.
+    fp8_host: Vec<u8>,
+    /// Q8_0, for ForestRaven and its row-tiled twin.
+    q80: Box<dyn BackendStorage>,
+    /// Host copy of the Q8_0 bytes, for the oracle.
+    q80_host: Vec<u8>,
+    /// int4 codes / bf16 scales / u8 zeros, for WhiteCrow and its twin.
+    i4_codes: Box<dyn BackendStorage>,
+    i4_scales: Box<dyn BackendStorage>,
+    i4_zeros: Box<dyn BackendStorage>,
+    /// Host-side int4 pack, kept for the oracle (which must read the packed
+    /// values, not the f32 source, or it charges the kernel for the quantizer).
+    i4_host: w4a4::PackedB,
+}
+
+impl BOnDevice {
+    fn build(dev: &RocmDevice, b: &[f32], n: usize, k: usize) -> Result<Self, String> {
+        let fp8_host: Vec<u8> = b.iter().map(|&v| to_e4m3_rne(v)).collect();
+        let q80_host = pack_q8_0_host(b);
+        let i4_host = w4a4::pack_b(b, n, k);
+        let u8_dtype = DType { arith: ArithType::U8, storage: Storage::Native };
+
+        let fp8t = MemoryOps::from_cpu_bytes(
+            dev,
+            &fp8_host,
+            &Shape::new(vec![fp8_host.len()]),
+            DType { arith: ArithType::F32, storage: Storage::Block(BlockDtype::Fp8) },
+        )
+        .map_err(|e| format!("b fp8 h2d: {e}"))?;
+        let q80t = MemoryOps::from_cpu_bytes(dev, &q80_host, &Shape::new(vec![q80_host.len()]), u8_dtype)
+            .map_err(|e| format!("b q80 h2d: {e}"))?;
+        let i4c = MemoryOps::from_cpu_bytes(
+            dev,
+            as_bytes(&i4_host.codes),
+            &Shape::new(vec![i4_host.codes.len()]),
+            DType { arith: ArithType::U32, storage: Storage::Native },
+        )
+        .map_err(|e| format!("b int4 codes h2d: {e}"))?;
+        let i4s = MemoryOps::from_cpu_bytes(
+            dev,
+            as_bytes(&i4_host.scales),
+            &Shape::new(vec![i4_host.scales.len()]),
+            DType { arith: ArithType::F16, storage: Storage::Native },
+        )
+        .map_err(|e| format!("b int4 scales h2d: {e}"))?;
+        let i4z = MemoryOps::from_cpu_bytes(
+            dev,
+            &i4_host.zeros,
+            &Shape::new(vec![i4_host.zeros.len()]),
+            DType { arith: ArithType::U8, storage: Storage::Native },
+        )
+        .map_err(|e| format!("b int4 zeros h2d: {e}"))?;
+
+        Ok(Self {
+            fp8: fp8t, fp8_host, q80: q80t, q80_host,
+            i4_codes: i4c, i4_scales: i4s, i4_zeros: i4z,
+            i4_host,
+        })
+    }
+}
+
 // ------------------------------------------------------------------- arms --
 
 fn run_raven(
     dev: &RocmDevice,
     a: &[f32],
-    b: &[f32],
+    bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
     variant: Variant,
 ) -> Result<(Vec<f32>, f64, f64), String> {
-    let b_fp8: Vec<u8> = b.iter().map(|&v| to_e4m3_rne(v)).collect();
-
     let a_t = CoreTensorOps::from_cpu(dev, a, &Shape::new(vec![m, k]), DType::F32)
         .map_err(|e| format!("a h2d: {e}"))?;
-    let b_t = MemoryOps::from_cpu_bytes(
-        dev,
-        &b_fp8,
-        &Shape::new(vec![b_fp8.len()]),
-        DType {
-            arith: ArithType::F32,
-            storage: Storage::Block(BlockDtype::Fp8),
-        },
-    )
-    .map_err(|e| format!("b h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         dev,
         &Shape::new(vec![m * n]),
@@ -356,7 +411,7 @@ fn run_raven(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(b_t.as_ref()), rocm(out_t.as_ref()));
+    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.fp8.as_ref()), rocm(out_t.as_ref()));
 
     let launch = || match variant {
         Variant::Untiled => {
@@ -384,7 +439,7 @@ fn run_raven(
         let mut acc = 0f64;
         for kk in 0..k {
             let av = from_e4m3(to_e4m3_rne(a[i * k + kk]));
-            acc += av as f64 * from_e4m3(b_fp8[j * k + kk]) as f64;
+            acc += av as f64 * from_e4m3(bd.fp8_host[j * k + kk]) as f64;
         }
         oracle.push(acc);
     }
@@ -402,7 +457,7 @@ fn run_raven(
 fn run_white_raven(
     dev: &RocmDevice,
     a: &[f32],
-    b: &[f32],
+    bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
@@ -411,7 +466,6 @@ fn run_white_raven(
     // Same values, same encoder — so the two oracles agree by construction and
     // any accuracy difference is the arithmetic, not the packing.
     let a_fp8: Vec<u8> = a.iter().map(|&v| to_e4m3_rne(v)).collect();
-    let b_fp8: Vec<u8> = b.iter().map(|&v| to_e4m3_rne(v)).collect();
     let fp8_dtype = DType {
         arith: ArithType::F32,
         storage: Storage::Block(BlockDtype::Fp8),
@@ -419,8 +473,6 @@ fn run_white_raven(
 
     let a_t = MemoryOps::from_cpu_bytes(dev, &a_fp8, &Shape::new(vec![m * k]), fp8_dtype.clone())
         .map_err(|e| format!("a h2d: {e}"))?;
-    let b_t = MemoryOps::from_cpu_bytes(dev, &b_fp8, &Shape::new(vec![n * k]), fp8_dtype.clone())
-        .map_err(|e| format!("b h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         dev,
         &Shape::new(vec![m * n]),
@@ -431,7 +483,7 @@ fn run_white_raven(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(b_t.as_ref()), rocm(out_t.as_ref()));
+    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.fp8.as_ref()), rocm(out_t.as_ref()));
 
     let launch = || {
         let _ = dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_r, b_r, out_r, m, n, k);
@@ -450,7 +502,7 @@ fn run_white_raven(
         let mut acc = 0f64;
         for kk in 0..k {
             let av = from_e4m3(a_fp8[i * k + kk]);
-            acc += av as f64 * from_e4m3(b_fp8[j * k + kk]) as f64;
+            acc += av as f64 * from_e4m3(bd.fp8_host[j * k + kk]) as f64;
         }
         oracle.push(acc);
     }
@@ -462,14 +514,13 @@ fn run_white_raven(
 fn run_forest_raven(
     dev: &RocmDevice,
     a: &[f32],
-    b: &[f32],
+    bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
     variant: Variant,
 ) -> Result<(Vec<f32>, f64, f64), String> {
     let a_q81 = pack_q8_1(a);
-    let b_q80 = pack_q8_0(b);
     let bytes = DType {
         arith: ArithType::U8,
         storage: Storage::Native,
@@ -477,8 +528,6 @@ fn run_forest_raven(
 
     let a_t = MemoryOps::from_cpu_bytes(dev, &a_q81, &Shape::new(vec![a_q81.len()]), bytes.clone())
         .map_err(|e| format!("a h2d: {e}"))?;
-    let b_t = MemoryOps::from_cpu_bytes(dev, &b_q80, &Shape::new(vec![b_q80.len()]), bytes)
-        .map_err(|e| format!("b h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         dev,
         &Shape::new(vec![m * n]),
@@ -489,7 +538,7 @@ fn run_forest_raven(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(b_t.as_ref()), rocm(out_t.as_ref()));
+    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.q80.as_ref()), rocm(out_t.as_ref()));
 
     let launch = || match variant {
         Variant::Untiled => {
@@ -526,8 +575,10 @@ fn run_forest_raven(
             let ad = half::f16::from_bits(u16::from_le_bytes([a_q81[ab], a_q81[ab + 1]])).to_f32();
             let av = ad * (a_q81[ab + 4 + kk % 32] as i8) as f32;
             let bb = (j * nb + kk / 32) * 34;
-            let bd = half::f16::from_bits(u16::from_le_bytes([b_q80[bb], b_q80[bb + 1]])).to_f32();
-            let bv = bd * (b_q80[bb + 2 + kk % 32] as i8) as f32;
+            let bscale = half::f16::from_bits(u16::from_le_bytes([
+                bd.q80_host[bb], bd.q80_host[bb + 1],
+            ])).to_f32();
+            let bv = bscale * (bd.q80_host[bb + 2 + kk % 32] as i8) as f32;
             acc += av as f64 * bv as f64;
         }
         oracle.push(acc);
@@ -549,7 +600,7 @@ fn run_forest_raven(
 fn run_white_crow(
     dev: &RocmDevice,
     a: &[f32],
-    b: &[f32],
+    bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
@@ -559,7 +610,7 @@ fn run_white_crow(
         return Err(format!("WhiteCrow needs K % {} == 0, got {k}", GROUP));
     }
     let pa = pack_a(a, m, k);
-    let pb = pack_b(b, n, k);
+    let pb = &bd.i4_host;
 
     // codes: u32 | scales: f32 (A) / bf16 (B) | zeros: u8
     let a_codes = MemoryOps::from_cpu_bytes(
@@ -589,38 +640,6 @@ fn run_white_crow(
         },
     )
     .map_err(|e| format!("a_sums h2d: {e}"))?;
-    let b_codes = MemoryOps::from_cpu_bytes(
-        dev,
-        bytemuck_cast_u32(&pb.codes),
-        &Shape::new(vec![pb.codes.len()]),
-        DType {
-            arith: ArithType::U32,
-            storage: Storage::Native,
-        },
-    )
-    .map_err(|e| format!("b_codes h2d: {e}"))?;
-    let b_scales = MemoryOps::from_cpu_bytes(
-        dev,
-        bytemuck_cast_u16(&pb.scales),
-        &Shape::new(vec![pb.scales.len()]),
-        DType {
-            // bf16 scales: 2 B/element, which is F16's width. Again the dtype
-            // governs the upload width only.
-            arith: ArithType::F16,
-            storage: Storage::Native,
-        },
-    )
-    .map_err(|e| format!("b_scales h2d: {e}"))?;
-    let b_zeros = MemoryOps::from_cpu_bytes(
-        dev,
-        &pb.zeros,
-        &Shape::new(vec![pb.zeros.len()]),
-        DType {
-            arith: ArithType::U8,
-            storage: Storage::Native,
-        },
-    )
-    .map_err(|e| format!("b_zeros h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         dev,
         &Shape::new(vec![m * n]),
@@ -635,9 +654,9 @@ fn run_white_crow(
         rocm(a_codes.as_ref()),
         rocm(a_scales.as_ref()),
         rocm(a_sums.as_ref()),
-        rocm(b_codes.as_ref()),
-        rocm(b_scales.as_ref()),
-        rocm(b_zeros.as_ref()),
+        rocm(bd.i4_codes.as_ref()),
+        rocm(bd.i4_scales.as_ref()),
+        rocm(bd.i4_zeros.as_ref()),
         rocm(out_t.as_ref()),
     );
 
@@ -703,6 +722,17 @@ fn precision_kernel_ab() {
     // which is why the run appeared to hang while never touching the GPU hard.
     // A is (m, k)-dependent and stays per-shape.
     let mut b_cache: std::collections::BTreeMap<usize, Vec<f32>> = std::collections::BTreeMap::new();
+    // Device-side B, packed once per K and shared by every arm and every M.
+    //
+    // B does not depend on M, and each arm wants the same rows of it in a
+    // different format. Uploading per (arm, shape) meant ~1.9 GB of PCIe per
+    // shape and ~75 GB over the sweep, which at 25 GB/s is ~50 minutes of pure
+    // transfer -- the run hit a 230 s cap still uploading. Hoisting to one
+    // upload per format per K brings it to ~8 GB total, and the packed forms
+    // are reused by the untiled and row-tiled twins alike since they differ only
+    // in launch geometry.
+    let mut bdev: std::collections::BTreeMap<usize, BOnDevice> =
+        std::collections::BTreeMap::new();
 
     for (m, n_fixed, k) in sweep_plan() {
         // N is widened per K so B cannot live in L2. At the old N=4096 and
@@ -718,6 +748,19 @@ fn precision_kernel_ab() {
             let mut r = lcg(0xB0B0_0000 ^ k as u64);
             (0..n * k).map(|_| r() * 16.0).collect()
         });
+        // Uploaded once per K and shared by every arm and every M.
+        let bdk: &BOnDevice = match bdev.entry(k) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                match BOnDevice::build(&dev, b, n, k) {
+                    Ok(v) => e.insert(v),
+                    Err(err) => {
+                        eprintln!("B upload failed at K={k}: {err}");
+                        continue;
+                    }
+                }
+            }
+        };
 
         // WhiteCrow's A must be non-negative: the kernel applies a zero-point
         // correction to B alone, so a signed activation has no compensating
@@ -732,17 +775,17 @@ fn precision_kernel_ab() {
             (
                 "Raven",
                 "V_DOT4_F32_FP8_FP8",
-                run_raven as fn(&RocmDevice, &[f32], &[f32], usize, usize, usize, Variant) -> _,
+                run_raven as fn(&RocmDevice, &[f32], &BOnDevice, usize, usize, usize, Variant) -> _,
             ),
             (
                 "ForestRaven",
                 "V_DOT4_I32_IU8",
-                run_forest_raven as fn(&RocmDevice, &[f32], &[f32], usize, usize, usize, Variant) -> _,
+                run_forest_raven as fn(&RocmDevice, &[f32], &BOnDevice, usize, usize, usize, Variant) -> _,
             ),
         ] {
             for variant in [Variant::Untiled, Variant::RowTiled] {
                 let (name, ins) = variant.describe(base, inst);
-                match f(&dev, &a, b, m, n, k, variant) {
+                match f(&dev, &a, &bdk, m, n, k, variant) {
                     Ok((samples, err, tol)) => results.push(ArmResult {
                         arm: name,
                         instruction: ins,
@@ -759,7 +802,7 @@ fn precision_kernel_ab() {
         }
         for variant in [Variant::Untiled, Variant::RowTiled] {
             let (name, ins) = variant.describe("WhiteCrow", "V_DOT8_I32_IU4");
-            match run_white_crow(&dev, &a_nonneg, b, m, n, k, variant) {
+            match run_white_crow(&dev, &a_nonneg, &bdk, m, n, k, variant) {
                 Ok((samples, err, tol)) => results.push(ArmResult {
                     arm: name,
                     instruction: ins,
@@ -777,7 +820,7 @@ fn precision_kernel_ab() {
         // and its grid is (N/32) x (M/16), so it already amortises B across a
         // 16-row tile. Tiling it further would be a different kernel, not a
         // launch-config change.
-        match run_white_raven(&dev, &a, b, m, n, k) {
+        match run_white_raven(&dev, &a, &bdk, m, n, k) {
             Ok((samples, err, tol)) => results.push(ArmResult {
                 arm: "WhiteRaven",
                 instruction: "V_WMMA_F32_16X16X16_FP8_FP8",
