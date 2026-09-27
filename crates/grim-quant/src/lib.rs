@@ -2237,44 +2237,97 @@ pub fn quant_fp8(data: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Quantize f32 to FP8 E4M3 format.
+/// Quantize f32 to FP8 E4M3, round-to-nearest-**even**.
+///
+/// # Rounding
+///
+/// This rounds; it does not truncate. Truncation is not a smaller error, it is
+/// a *systematic* one: every value is biased toward zero, so a dot product over
+/// truncated weights is quietly computing something slightly wrong in a
+/// consistent direction, which no tolerance test on the mean will catch. RNE is
+/// unbiased, matches IEEE's default for every other format here, and is the only
+/// one of grim's E4M3 converters that is round-to-nearest-even -- so it is also
+/// the only one whose result is independent of accumulation order.
+///
+/// The device converter this must agree with is
+/// `dot_gemv.rs::grim_f32_to_fp8_e4m3`. `quant_standalone.rs` still rounds
+/// half-up and is the remaining divergence. See
+/// `tests/e4m3_rne_convergence.rs`.
 pub fn f32_to_fp8_e4m3(v: f32) -> u8 {
     if v.is_nan() {
-        return 0x7F; // NaN in E4M3
+        return 0x7F; // the NaN slot in E4M3
     }
     let sign = if v.is_sign_negative() { 0x80u8 } else { 0u8 };
-    let abs_v = v.abs();
-    if abs_v == 0.0 {
+    let a = v.abs();
+
+    // E4M3 has no infinities: exp=15,mant=7 (0x7F) is NaN, so the largest finite
+    // value is exp=15,mant=6 (0x7E) = 1.75*2^8 = 448.
+    //
+    // The threshold must be 448, not 480. Any f32 in [448,480) has exponent
+    // field E=15, so its 3-bit mantissa q runs 0..7 -- and q==7 lands on 0x7F,
+    // the NaN slot. f32 in [464.01,480) therefore encoded as NaN and propagated
+    // as NaN rather than as a saturated value. 448 is correct: the first f32
+    // that would carry q past 6 is 464, well inside it.
+    if a.is_infinite() || a >= 448.0 {
+        return sign | 0x7E; // saturate
+    }
+    if a == 0.0 {
         return sign;
     }
 
-    let bits = abs_v.to_bits();
-    let raw_exp = ((bits >> 23) & 0xFF) as i32 - 127;
-    let raw_mant = bits & 0x007F_FFFF;
+    let bits = a.to_bits();
+    let raw_exp = ((bits >> 23) & 0xFF) as i32;
+    if raw_exp == 0 {
+        // f32 subnormal: far below E4M3's min subnormal (2^-9), rounds to zero.
+        // Checked explicitly because the shift below would overflow.
+        return sign;
+    }
+    let m = bits & 0x007F_FFFF;
+    let e4m3_exp = raw_exp - 127 + 7; // unbiased exponent, then rebiased to 7
 
-    let e4m3_exp = raw_exp + 7;
-
-    if e4m3_exp <= 0 {
-        let shift = 1 - e4m3_exp;
-        if shift > 4 {
+    if e4m3_exp >= 1 {
+        // Normal: round the 23-bit fraction to 3 bits, RNE.
+        let mut q = m >> 20;
+        let r = m & 0x000F_FFFF;
+        let half = 0x0008_0000u32;
+        if r > half || (r == half && (q & 1) == 1) {
+            q += 1;
+        }
+        if q == 8 {
+            // Carry into the exponent. Wrapping the mantissa instead would emit
+            // a code that is not on the grid at all -- silently corrupt.
+            q = 0;
+            let e4m3_exp = e4m3_exp + 1;
+            if e4m3_exp > 15 {
+                return sign | 0x7E;
+            }
+            return sign | ((e4m3_exp as u8) << 3) | q as u8;
+        }
+        sign | ((e4m3_exp as u8) << 3) | q as u8
+    } else {
+        // Subnormal: value = (mant/8) * 2^-6, so value*512 is a 3-bit integer.
+        // Shift the implicit leading 1 into place, then RNE.
+        let sh = 21 - e4m3_exp; // 21 at the top of the range, unbounded below
+        if sh >= 32 {
+            // Below half the min subnormal: rounds to zero. Checked before the
+            // masks, which would overflow for a shift this large.
             return sign;
         }
-        let full_mant = 0x0080_0000 | raw_mant;
-        let mant = (full_mant >> (20 + shift)) & 0x07;
-        return sign | (mant as u8);
+        let full = 0x0080_0000u32 | m;
+        let mut q = full >> sh;
+        let r = full & ((1u32 << sh) - 1);
+        let half = 1u32 << (sh - 1);
+        if r > half || (r == half && (q & 1) == 1) {
+            q += 1;
+        }
+        if q == 0 {
+            return sign;
+        }
+        // q can reach 8 after rounding, which is exactly the min normal (code
+        // 8 = 2^-6) -- correct as-is, since the subnormal and normal rows are
+        // contiguous in E4M3.
+        sign | q as u8
     }
-
-    if e4m3_exp > 15 {
-        return sign | 0x7E;
-    }
-
-    let mant = (raw_mant >> 20) as u8 & 0x07;
-    let code = sign | ((e4m3_exp as u8) << 3) | mant;
-    // exp == 15, mant == 7 is the NaN encoding (0x7F); clamp to max finite 0x7E.
-    if code == (sign | 0x7F) {
-        return sign | 0x7E;
-    }
-    code
 }
 
 /// Convert MXFP4 E2M1 (2-bit exp, 1-bit mantissa) + E8M0 shared exponent to f32.

@@ -1237,30 +1237,60 @@ __device__ inline unsigned short grim_f32_to_f16(float v) {
     return (unsigned short)((sign << 15) | ((unsigned int)new_exp << 10) | (mant >> 13));
 }
 
-// f32 → FP8 E4M3 conversion (mirrors grim_quant::f32_to_fp8_e4m3, lib.rs:1662).
+// f32 → FP8 E4M3 conversion, round-to-nearest-even.
+//
+// Mirrors `grim_quant::f32_to_fp8_e4m3`. Kept in sync deliberately: this used to
+// be a byte-for-byte copy of a *truncating* host implementation, and the two
+// drifting apart is exactly the divergence WS-C C5 exists to close. A truncating
+// encoder is not a smaller error, it is a systematic bias toward zero on every
+// value, so a dot product over truncated weights is quietly wrong in a
+// consistent direction.
+//
+// The ROCm converter this also mirrors is `dot_gemv.rs::grim_f32_to_fp8_e4m3`.
+// `quant_standalone.rs` still rounds half-up and is the remaining divergence.
 __device__ inline unsigned char grim_f32_to_fp8_e4m3(float v) {
-    if (isnan(v)) return 0x7F; // NaN in E4M3
+    if (isnan(v)) return 0x7F; // the NaN slot in E4M3
     unsigned char sign = signbit(v) ? 0x80u : 0u;
-    float abs_v = fabsf(v);
-    if (abs_v == 0.0f) return sign;
+    float a = fabsf(v);
 
-    unsigned int bits = __float_as_int(abs_v);
-    int raw_exp = (int)((bits >> 23) & 0xFFu) - 127;
-    unsigned int raw_mant = bits & 0x007FFFFFu;
+    // E4M3 has no infinities: exp=15,mant=7 (0x7F) is NaN, so the largest finite
+    // value is exp=15,mant=6 (0x7E) = 1.75*2^8 = 448. The threshold must be
+    // 448, not 480 -- see the ROCm converter for why [464.01,480) is the band
+    // that used to become NaN.
+    if (isinf(a) || a >= 448.0f) return (unsigned char)(sign | 0x7Eu);
+    if (a == 0.0f) return sign;
 
-    int e4m3_exp = raw_exp + 7;
+    unsigned int bits = __float_as_uint(a);
+    int raw_exp = (int)((bits >> 23) & 0xFFu);
+    if (raw_exp == 0) return sign; // f32 subnormal: below E4M3's range
+    unsigned int m = bits & 0x007FFFFFu;
+    int e4m3_exp = raw_exp - 127 + 7; // unbiased, then rebiased to 7
 
-    if (e4m3_exp <= 0) {
-        int shift = 1 - e4m3_exp;
-        if (shift > 4) return sign;
-        unsigned int full_mant = 0x00800000u | raw_mant;
-        unsigned int mant = (full_mant >> (20 + shift)) & 0x07u;
-        return sign | (unsigned char)mant;
+    if (e4m3_exp >= 1) {
+        // Normal: round 23-bit fraction to 3 bits, RNE.
+        unsigned int q = m >> 20;
+        unsigned int r = m & 0x000FFFFFu;
+        unsigned int half = 0x00080000u;
+        if (r > half || (r == half && (q & 1u))) q++;
+        if (q == 8u) {
+            q = 0; // carry into the exponent, never wrap the mantissa
+            e4m3_exp += 1;
+            if (e4m3_exp > 15) return (unsigned char)(sign | 0x7Eu);
+        }
+        return (unsigned char)(sign | ((unsigned)e4m3_exp << 3) | q);
     }
-    if (e4m3_exp >= 15) return sign | 0x7Eu;
 
-    unsigned char mant = (unsigned char)(raw_mant >> 20);
-    return sign | ((unsigned char)e4m3_exp << 3) | (mant & 0x07u);
+    // Subnormal: value = (mant/8) * 2^-6, so value*512 is a 3-bit integer.
+    int sh = 21 - e4m3_exp;
+    if (sh >= 32) return sign; // below half the min subnormal
+    unsigned int full = 0x00800000u | m;
+    unsigned int sq = full >> sh;
+    unsigned int sr = full & ((1u << sh) - 1u);
+    unsigned int shalf = 1u << (sh - 1);
+    if (sr > shalf || (sr == shalf && (sq & 1u))) sq++;
+    if (sq == 0) return sign;
+    // sq may reach 8, which is exactly the min normal (code 8 = 2^-6).
+    return (unsigned char)(sign | (unsigned char)sq);
 }
 
 // ---- Standalone Q8_0 quantization (34 B / 32 weights) ------------------------ Mirrors grim_quant::quant_q80 (lib.rs:1397).
