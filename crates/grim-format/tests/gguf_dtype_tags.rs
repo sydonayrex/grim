@@ -54,6 +54,9 @@ fn gguf_dtype_tags_match_the_canonical_ggml_enum() {
         (GgufDType::TQ1_0, 34),
         (GgufDType::TQ2_0, 35),
         (GgufDType::MXFP4, 39),
+        (GgufDType::NVFP4, 40),
+        (GgufDType::Q1_0, 41),
+        (GgufDType::Q2_0, 42),
     ];
     for (t, want) in canonical {
         assert_eq!(
@@ -79,10 +82,16 @@ fn iq4_nl_and_f64_are_not_transposed() {
 /// how F64 ended up shadowing IQ4_NL. They live on private ids instead.
 #[test]
 fn removed_types_do_not_squat_standard_tags() {
-    for t in [GgufDType::Q4_2, GgufDType::Q8_1Hx] {
+    for t in [
+        GgufDType::Q4_2,
+        GgufDType::Q8_1Hx,
+        GgufDType::GsqRco3p5,
+        GgufDType::PQ2_0,
+        GgufDType::PTQ1_0,
+    ] {
         let v = t as u32;
         assert!(
-            v > 39,
+            v > 42,
             "{:?} was removed upstream and must hold a private tag, not {v}",
             t
         );
@@ -113,6 +122,10 @@ fn tag_round_trips() {
         GgufDType::Q4_2,
         GgufDType::Q8_1Hx,
         GgufDType::MXFP4,
+        GgufDType::NVFP4,
+        GgufDType::Q1_0,
+        GgufDType::Q2_0,
+        GgufDType::GsqRco3p5,
     ] {
         assert_eq!(tag(&t), t as u32, "{:?} did not round-trip", t);
     }

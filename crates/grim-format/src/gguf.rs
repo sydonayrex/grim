@@ -190,17 +190,23 @@ pub enum GgufDType {
     /// Same: removed upstream, private id, never written by a real file.
     Q8_1Hx = 80,
     /// NVFP4: NVIDIA 4-bit floating point (E2M1 codebook) for Blackwell.
-    /// Same OCP E2M1 encoding as MXFP4 but uses a different block-scaling convention (per-16-element block with.
+    /// Same OCP E2M1 encoding as MXFP4 but uses a different block-scaling
+    /// convention (per-16-element block with E4M3 scales). Upstream tag 40.
     #[allow(non_camel_case_types)]
-    NVFP4 = 78,
+    NVFP4 = 40,
+    /// Upstream's ternary-ish group quant. Not implemented here; parsed and
+    /// sized so a file using it fails with a clear "not implemented" naming
+    /// the format rather than an unknown-tag parse error.
+    Q1_0 = 41,
+    Q2_0 = 42,
+    /// Prism-private 2-bit group quant at group size 128 (2.125 bpw). Upstream
+    /// assigned tag 42 to its own group-64 `Q2_0`; upstream wins, so this sits
+    /// on a private id and the two coexist.
     #[allow(non_camel_case_types)]
-    GsqRco3p5 = 42,
-    /// Prism-private Q2_0 at group size 128 (2.125 bpw). Distinct id from
-    /// upstream's group-64 `Q2_0` at tag 42 so the two coexist; see
-    /// PrismML-Eng/llama.cpp branch `prism`.
+    GsqRco3p5 = 81,
+    /// Prism-private ternary at group size 128 (1.75 bpw), base-3 trits.
     #[allow(non_camel_case_types)]
     PQ2_0 = 142,
-    /// Prism-private ternary at group size 128 (1.75 bpw), base-3 trits.
     #[allow(non_camel_case_types)]
     PTQ1_0 = 143,
 }
@@ -242,8 +248,10 @@ impl GgufDType {
             39 => Some(GgufDType::MXFP4),
             79 => Some(GgufDType::Q4_2),
             80 => Some(GgufDType::Q8_1Hx),
-            78 => Some(GgufDType::NVFP4),
-            42 => Some(GgufDType::GsqRco3p5),
+            40 => Some(GgufDType::NVFP4),
+            41 => Some(GgufDType::Q1_0),
+            42 => Some(GgufDType::Q2_0),
+            81 => Some(GgufDType::GsqRco3p5),
             142 => Some(GgufDType::PQ2_0),
             143 => Some(GgufDType::PTQ1_0),
             _ => None,
@@ -287,8 +295,10 @@ impl GgufDType {
             GgufDType::MXFP4 => 39,
             GgufDType::Q4_2 => 79,
             GgufDType::Q8_1Hx => 80,
-            GgufDType::NVFP4 => 78,
-            GgufDType::GsqRco3p5 => 42,
+            GgufDType::NVFP4 => 40,
+            GgufDType::Q1_0 => 41,
+            GgufDType::Q2_0 => 42,
+            GgufDType::GsqRco3p5 => 81,
             GgufDType::PQ2_0 => 142,
             GgufDType::PTQ1_0 => 143,
         }
@@ -2050,7 +2060,12 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
         // format, rather than an unknown-tag parse failure here. They are
         // deliberately NOT given a KQuant scheme, so no existing fused kernel
         // can be selected for them by accident.
-        GgufDType::PQ2_0 | GgufDType::PTQ1_0 | GgufDType::TQ1_0 | GgufDType::TQ2_0 => DType {
+        GgufDType::PQ2_0
+        | GgufDType::PTQ1_0
+        | GgufDType::TQ1_0
+        | GgufDType::TQ2_0
+        | GgufDType::Q1_0
+        | GgufDType::Q2_0 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
                 name: gguf_dtype.display_name(),
@@ -2114,9 +2129,10 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::GsqRco3p5
         | GgufDType::PQ2_0
         | GgufDType::PTQ1_0
-        | GgufDType::TQ2_0 => Some(2),
+        | GgufDType::TQ2_0
+        | GgufDType::Q2_0 => Some(2),
         GgufDType::Q3K | GgufDType::IQ3_XXS | GgufDType::IQ3_S => Some(3),
-        GgufDType::IQ1_S | GgufDType::IQ1_M | GgufDType::TQ1_0 => Some(1),
+        GgufDType::IQ1_S | GgufDType::IQ1_M | GgufDType::TQ1_0 | GgufDType::Q1_0 => Some(1),
         GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),
     };
     (dtype, bpw)
@@ -2155,6 +2171,8 @@ impl GgufDType {
                 | GgufDType::GsqRco3p5
                 | GgufDType::TQ1_0
                 | GgufDType::TQ2_0
+                | GgufDType::Q1_0
+                | GgufDType::Q2_0
         )
     }
 
@@ -2192,6 +2210,8 @@ impl GgufDType {
             GgufDType::IQ2_S => "IQ2_S",
             GgufDType::IQ1_S => "IQ1_S",
             GgufDType::IQ1_M => "IQ1_M",
+            GgufDType::Q1_0 => "Q1_0",
+            GgufDType::Q2_0 => "Q2_0",
             GgufDType::TQ1_0 => "TQ1_0",
             GgufDType::TQ2_0 => "TQ2_0",
             GgufDType::MXFP4 => "MXFP4",
