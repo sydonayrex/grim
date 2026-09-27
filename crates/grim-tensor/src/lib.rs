@@ -16,10 +16,9 @@ pub mod wavefront;
 
 pub use backend::{
     AttentionOps, AutogradOps, BackendDevice, BackendStorage, CollectiveOps, CoreTensorOps,
-    PagedKvQuantFormat,
     ElementwiseOps, FusionOps, GpuCapability, GraphCaptureOps, MemAdvice, MemoryOps, OptimizerOps,
-    QuantOps, QuantizedMatmulBackwardResiduals, ReadyHandle, RecurrentOps, RopeConfig, SamplingOps,
-    ScytheLink, ScythePlacement, YaRNParams,
+    PagedKvQuantFormat, QuantOps, QuantizedMatmulBackwardResiduals, ReadyHandle, RecurrentOps,
+    RopeConfig, SamplingOps, ScytheLink, ScythePlacement, YaRNParams,
 };
 
 pub use dtype::{

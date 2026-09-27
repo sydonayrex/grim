@@ -6,9 +6,7 @@
 //! the packed bytes as floats *and* allocate the float-sized buffer. These tests
 //! pin the refusal and the escape hatch.
 
-use grim_format::gguf::{
-    dtype_contradictions, expected_tensor_bytes, read_gguf, GgufDType,
-};
+use grim_format::gguf::{GgufDType, dtype_contradictions, expected_tensor_bytes, read_gguf};
 use grim_format::tprov::GgufProvider;
 use grim_tensor::TensorProvider;
 use std::io::{Cursor, Write};
@@ -29,9 +27,7 @@ fn push_tensor(buf: &mut Vec<u8>, name: &str, dims: &[u64], dtype: GgufDType, of
 }
 
 /// Full builder with explicit per-tensor payload sizes.
-fn build_gguf_with_payloads(
-    tensors: &[(&str, Vec<u64>, GgufDType, usize)],
-) -> Vec<u8> {
+fn build_gguf_with_payloads(tensors: &[(&str, Vec<u64>, GgufDType, usize)]) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&grim_format::gguf::GGUF_MAGIC.to_le_bytes());
     buf.extend_from_slice(&grim_format::gguf::GGUF_VERSION.to_le_bytes());
@@ -57,7 +53,11 @@ fn build_gguf_with_payloads(
 
 fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("grim-gguf-geometry-{}-{}", std::process::id(), name));
+    p.push(format!(
+        "grim-gguf-geometry-{}-{}",
+        std::process::id(),
+        name
+    ));
     std::fs::write(&p, bytes).expect("write temp gguf");
     p
 }
@@ -88,7 +88,11 @@ fn contradiction_is_detected_and_candidates_reported() {
     let g = read_gguf(Cursor::new(bytes.clone())).expect("parse");
     let data_len = 64 * 64 * 9 / 16;
     let contradictions = dtype_contradictions(&g.tensors, data_len as u64);
-    assert_eq!(contradictions.len(), 1, "expected exactly one contradiction");
+    assert_eq!(
+        contradictions.len(),
+        1,
+        "expected exactly one contradiction"
+    );
     let c = &contradictions[0];
     assert_eq!(c.name, "blk.0.ffn_gate_exps.weight");
     assert_eq!(c.declared, GgufDType::F64);
@@ -97,10 +101,7 @@ fn contradiction_is_detected_and_candidates_reported() {
     // The candidate set must contain the 4-bit formats, and must NOT contain F64.
     let names: Vec<_> = c.candidates.iter().map(|d| format!("{d:?}")).collect();
     assert!(names.iter().any(|n| n == "Q4_0"), "candidates: {names:?}");
-    assert!(
-        names.iter().any(|n| n == "IQ4_NL"),
-        "candidates: {names:?}"
-    );
+    assert!(names.iter().any(|n| n == "IQ4_NL"), "candidates: {names:?}");
     assert!(!names.iter().any(|n| n == "F64"), "candidates: {names:?}");
 }
 
@@ -108,7 +109,12 @@ fn contradiction_is_detected_and_candidates_reported() {
 fn honest_file_has_no_contradictions() {
     // Tags that match the payload: a clean file must not be flagged.
     let bytes = build_gguf_with_payloads(&[
-        ("blk.0.attn_q_a.weight", vec![8, 8], GgufDType::BF16, 8 * 8 * 2),
+        (
+            "blk.0.attn_q_a.weight",
+            vec![8, 8],
+            GgufDType::BF16,
+            8 * 8 * 2,
+        ),
         ("blk.0.norm.weight", vec![8], GgufDType::F32, 8 * 4),
     ]);
     let g = read_gguf(Cursor::new(bytes)).expect("parse");
@@ -145,7 +151,12 @@ fn companion_override_declares_the_true_dtype() {
             GgufDType::F64,
             64 * 64 * 9 / 16,
         ),
-        ("blk.0.attn_q_a.weight", vec![8, 8], GgufDType::BF16, 8 * 8 * 2),
+        (
+            "blk.0.attn_q_a.weight",
+            vec![8, 8],
+            GgufDType::BF16,
+            8 * 8 * 2,
+        ),
     ]);
     let p = write_temp("override", &bytes);
     let companion = {

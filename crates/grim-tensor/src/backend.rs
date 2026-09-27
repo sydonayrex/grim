@@ -2240,7 +2240,6 @@ impl<T: ElementwiseOps + ?Sized> ElementwiseOps for std::sync::Arc<T> {
     ) -> Result<Box<dyn ComputeHandle>> {
         (**self).write_cols(dst, total_cols, start_col, src, rows, cols)
     }
-
 }
 
 impl<T: SamplingOps + ?Sized> SamplingOps for std::sync::Arc<T> {
@@ -2547,7 +2546,6 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
             inv_sqrt_d,
         )
     }
-
 }
 
 impl<T: FusionOps + ?Sized> FusionOps for std::sync::Arc<T> {

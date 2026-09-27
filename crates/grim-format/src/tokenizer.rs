@@ -1978,15 +1978,16 @@ mod leading_space_tests {
     fn toy() -> GgufTokenizer {
         let tokens: Vec<String> = vec![
             // byte-level pieces, spelled the way a GPT-2 vocab spells them
-            "H", "e", "l", "o", "Hello",
-            "ĠH", "ĠHello", "Ġ",
-            "<unk>",
+            "H", "e", "l", "o", "Hello", "ĠH", "ĠHello", "Ġ", "<unk>",
         ]
         .into_iter()
         .map(String::from)
         .collect();
-        let token_to_id: HashMap<String, u32> =
-            tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        let token_to_id: HashMap<String, u32> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
         GgufTokenizer {
             tokens,
             token_to_id,
@@ -2004,7 +2005,9 @@ mod leading_space_tests {
     }
 
     fn id(t: &GgufTokenizer, piece: &str) -> u32 {
-        *t.token_to_id.get(piece).unwrap_or_else(|| panic!("no id for {piece}"))
+        *t.token_to_id
+            .get(piece)
+            .unwrap_or_else(|| panic!("no id for {piece}"))
     }
 
     /// THE TEST. A raw prompt of "Hello" and one of " Hello" are different
@@ -2031,7 +2034,11 @@ mod leading_space_tests {
     fn a_bare_prompt_encodes_without_a_space_prefix() {
         let t = toy();
         let ids = t.encode("Hello");
-        assert_eq!(ids, vec![id(&t, "Hello")], "bare prompt must not gain a Ġ prefix");
+        assert_eq!(
+            ids,
+            vec![id(&t, "Hello")],
+            "bare prompt must not gain a Ġ prefix"
+        );
     }
 
     /// And the converse: a prompt that really does start with a space must
@@ -2040,7 +2047,11 @@ mod leading_space_tests {
     fn a_spaced_prompt_keeps_its_space_prefix() {
         let t = toy();
         let ids = t.encode(" Hello");
-        assert_eq!(ids, vec![id(&t, "ĠHello")], "a real leading space must survive");
+        assert_eq!(
+            ids,
+            vec![id(&t, "ĠHello")],
+            "a real leading space must survive"
+        );
     }
 
     /// A space in the MIDDLE must also be preserved, which is the same rule

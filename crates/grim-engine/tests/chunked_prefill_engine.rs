@@ -183,8 +183,7 @@ fn chunked_prefill_preempt_resume_processes_remainder_exactly_once() {
         .expect("enqueue");
 
     let pos = |e: &Engine| e.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
-    let progress =
-        |e: &Engine| e.prefill_progress.get(&1).copied().unwrap_or(usize::MAX);
+    let progress = |e: &Engine| e.prefill_progress.get(&1).copied().unwrap_or(usize::MAX);
 
     // Tick 1: first chunk [0, 50). No preemption (nothing running yet).
     let out = engine.tick().expect("tick 1");
@@ -203,7 +202,11 @@ fn chunked_prefill_preempt_resume_processes_remainder_exactly_once() {
     assert_eq!(out.preempted_ids, vec![1], "tick 2 must preempt request 1");
     assert_eq!(out.prefill_ids, vec![1]);
     assert_single_copy(&engine, &out, "tick 2");
-    assert_eq!(pos(&engine), 100, "tick 2 must continue at offset 50, not restart");
+    assert_eq!(
+        pos(&engine),
+        100,
+        "tick 2 must continue at offset 50, not restart"
+    );
     assert_eq!(progress(&engine), 100);
 
     // Tick 3: pressure lifts. The stale swapped copy (consumed = 50) must be

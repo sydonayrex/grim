@@ -48,8 +48,8 @@ fn four_tap_conv_retains_full_history_across_decode_steps() {
     let mut state = cpu(&[1, d * (k - 1)], vec![0.0; d * (k - 1)]);
 
     let want = [
-        1.0f32,                            // 1 * 1
-        10.0 * 1.0 + 1.0 * 2.0,            // 12
+        1.0f32,                               // 1 * 1
+        10.0 * 1.0 + 1.0 * 2.0,               // 12
         100.0 * 1.0 + 10.0 * 2.0 + 1.0 * 3.0, // 123
     ];
     for (i, wv) in want.iter().enumerate() {

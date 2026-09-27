@@ -13,11 +13,10 @@ use grim_tensor::{CoreTensorOps, MemoryOps, RawTensor};
 
 use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_quant::{
-    dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_iq2s,
-    dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs,
-    dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_nutcracker, dequant_nvfp4, dequant_q2k,
-    dequant_q3k,
-    dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, dequant_gsq_rco_3p5,
+    dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_gsq_rco_3p5,
+    dequant_iq2s, dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl,
+    dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_nutcracker, dequant_nvfp4,
+    dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
 };
 
 #[cfg(feature = "cuda-mem")]
@@ -250,6 +249,13 @@ impl<'a> WeightSource<'a> {
     /// Push a path segment and return a new `WeightSource` whose prefix is
     /// `self.prefix + [name]`. Mirrors `candle::VarBuilder::pp`.
     pub fn pp(&self, name: &str) -> WeightSource<'a> {
+        // An empty name means "no scope". Pushing it would add a component that
+        // `full_name` joins with a '.', turning a root lookup into "..leaf",
+        // which no provider can satisfy -- and a GGUF checkpoint keeps every
+        // tensor at the root, so the root must be expressible.
+        if name.is_empty() {
+            return self.clone_prefix();
+        }
         let mut next = self.clone_prefix();
         next.prefix.push(name.to_owned());
         next
@@ -264,6 +270,16 @@ impl<'a> WeightSource<'a> {
     pub fn has_tensor(&self, leaf: &str) -> bool {
         let name = self.full_name(leaf);
         self.tensors.meta(&name).is_ok()
+    }
+
+    /// Shape metadata of a leaf under the current prefix, without reading its
+    /// payload.
+    ///
+    /// Needed when the stored shape is not derivable from the config -- the
+    /// Qwen3.8 PLE table is padded to 320_001_536 rows while the head ranges
+    /// only need 320_001_446, so a config-derived shape can never match.
+    pub fn meta(&self, leaf: &str) -> Option<grim_tensor::TensorMeta> {
+        self.tensors.meta(&self.full_name(leaf)).ok()
     }
 
     /// Total packed bytes of every tensor under the current prefix.

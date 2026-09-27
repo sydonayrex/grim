@@ -1,8 +1,8 @@
 //! Vulkan context: device initialization, queue management, pipeline setup.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use grim_tensor::error::{Error, Result};
 

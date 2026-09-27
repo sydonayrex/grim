@@ -571,16 +571,17 @@ fn upload_packed_rows(
     let staging = dev.from_cpu_bytes(
         bytes,
         &Shape::new(vec![bytes.len()]),
-        DType { arith: grim_tensor::ArithType::U8, storage: grim_tensor::Storage::Native },
+        DType {
+            arith: grim_tensor::ArithType::U8,
+            storage: grim_tensor::Storage::Native,
+        },
     )?;
     // Byte-counted: `copy_slice_range` would derive a 4-byte element width from
     // the storage dtype and copy 4x the payload, overrunning the page.
     // The page buffer's owning ordinal, for diagnosing ownership mismatches.
     let dst_ord = dst.device_ordinal();
     dev.copy_bytes_into(dst, byte_offset, staging.as_ref(), 0, bytes.len())
-        .map_err(|e| {
-            grim_tensor::Error::Backend(format!("{e} (dst_ordinal={dst_ord})"))
-        })
+        .map_err(|e| grim_tensor::Error::Backend(format!("{e} (dst_ordinal={dst_ord})")))
 }
 
 pub fn fused_or_scalar_attention_paged_quant(
@@ -624,7 +625,10 @@ pub fn fused_or_scalar_attention_paged_quant(
         // U8-typed: the page holds raw packed bytes, and byte-offset arithmetic
         // in `copy_slice_range` is only correct when one element is one byte.
         let shape = Shape::new(vec![new_cap]);
-        let byte_dt = DType { arith: grim_tensor::ArithType::U8, storage: grim_tensor::Storage::Native };
+        let byte_dt = DType {
+            arith: grim_tensor::ArithType::U8,
+            storage: grim_tensor::Storage::Native,
+        };
         let k_new_buf = dev.alloc_storage(&shape, byte_dt.clone())?;
         let v_new_buf = dev.alloc_storage(&shape, byte_dt)?;
         let k_prev = cache.k_pages.take();
@@ -662,10 +666,9 @@ pub fn fused_or_scalar_attention_paged_quant(
         dst_off,
         &k_packed,
     )
-    .map_err(|e| grim_core::error::Error::Backend(format!(
-        "k page append: {e} [device={:?}]",
-        device
-    )))?;
+    .map_err(|e| {
+        grim_core::error::Error::Backend(format!("k page append: {e} [device={:?}]", device))
+    })?;
     upload_packed_rows(
         &dev,
         cache.v_pages.as_ref().unwrap().as_ref(),
@@ -710,10 +713,10 @@ pub fn fused_or_scalar_attention_paged_quant(
             cache.k_pages.as_ref().unwrap().as_ref(),
             cache.v_pages.as_ref().unwrap().as_ref(),
             num_kv_heads,
-            n_after,       // max_blocks
-            1,             // page_size: one token per page
-            n_after,       // kv_seq_len
-            0,             // cache_offset
+            n_after, // max_blocks
+            1,       // page_size: one token per page
+            n_after, // kv_seq_len
+            0,       // cache_offset
             &out_shape,
             fmt,
             k_scale,

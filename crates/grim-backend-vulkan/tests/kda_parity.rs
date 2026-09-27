@@ -19,7 +19,11 @@ fn reference(q: &[f32], k: &[f32], v: &[f32], beta: f32, a_gate: f32, s: &[f32])
     let mut out = vec![0.0f32; D_V];
     for j in 0..D_V {
         let row = &s[j * D_K..(j + 1) * D_K];
-        let pred: f32 = k.iter().zip(row.iter()).map(|(kk, ss)| kk * (decay * ss)).sum();
+        let pred: f32 = k
+            .iter()
+            .zip(row.iter())
+            .map(|(kk, ss)| kk * (decay * ss))
+            .sum();
         let delta = beta * (v[j] - pred);
         let mut acc = 0.0f32;
         for i in 0..D_K {
@@ -40,16 +44,30 @@ fn vulkan_kda_step_matches_published_recurrence() {
     let beta = 0.35f32;
     let a_gate = -0.4f32;
     // Non-zero state: with a zero state the decay-before-dot error is invisible.
-    let state: Vec<f32> = (0..D_V * D_K).map(|i| (i as f32 * 0.017).sin() * 0.3).collect();
+    let state: Vec<f32> = (0..D_V * D_K)
+        .map(|i| (i as f32 * 0.017).sin() * 0.3)
+        .collect();
 
     let want = reference(&q, &k, &v, beta, a_gate, &state);
 
-    let qs = dev.from_cpu(&q, &Shape::new(vec![D_K]), DType::F32).unwrap();
-    let ks = dev.from_cpu(&k, &Shape::new(vec![D_K]), DType::F32).unwrap();
-    let vs = dev.from_cpu(&v, &Shape::new(vec![D_V]), DType::F32).unwrap();
-    let bs = dev.from_cpu(&[beta], &Shape::new(vec![1]), DType::F32).unwrap();
-    let gs = dev.from_cpu(&[a_gate], &Shape::new(vec![1]), DType::F32).unwrap();
-    let ss = dev.from_cpu(&state, &Shape::new(vec![D_V, D_K]), DType::F32).unwrap();
+    let qs = dev
+        .from_cpu(&q, &Shape::new(vec![D_K]), DType::F32)
+        .unwrap();
+    let ks = dev
+        .from_cpu(&k, &Shape::new(vec![D_K]), DType::F32)
+        .unwrap();
+    let vs = dev
+        .from_cpu(&v, &Shape::new(vec![D_V]), DType::F32)
+        .unwrap();
+    let bs = dev
+        .from_cpu(&[beta], &Shape::new(vec![1]), DType::F32)
+        .unwrap();
+    let gs = dev
+        .from_cpu(&[a_gate], &Shape::new(vec![1]), DType::F32)
+        .unwrap();
+    let ss = dev
+        .from_cpu(&state, &Shape::new(vec![D_V, D_K]), DType::F32)
+        .unwrap();
 
     let (out, _h) = dev
         .kda_gated_delta_rule_step(

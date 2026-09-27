@@ -1862,7 +1862,13 @@ pub struct Qwen38NgramEmbedding {
     pub ngram_dim: usize,
     /// Model hidden dimension ($d_{\text{model}}$, e.g. 2560).
     pub hidden_size: usize,
-    /// Host-pinned N-gram embedding table ($V_{\text{ngram}} \times d_{\text{ngram}}$).
+    /// N-gram embedding table, `[ngram_vocab, ple_head_dim]`.
+    ///
+    /// Row count is PADDED past the largest head range: the checkpoint stores
+    /// 320_001_536 rows while `max(head_offset + head_vocab_size)` is
+    /// 320_001_446, so a config-derived row count cannot be used to fetch it.
+    /// Both container formats expose the table row-major, so the gather's
+    /// `row * ngram_dim` indexing is correct for either.
     pub table: Tensor,
     /// Linear projection from $d_{\text{ngram}} \to d_{\text{model}}$.
     pub proj: Linear,
@@ -1990,21 +1996,56 @@ impl Qwen38FlashNext {
         cfg: Qwen38FlashNextConfig,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
+        // Root resolution, in the order the two container formats need.
+        //
+        // safetensors nests everything under `model.language_model`, so a
+        // probe there succeeds and that becomes the root. GGUF has NO prefix at
+        // all: the checkpoint provides `token_embd.weight`,
+        // `per_layer_token_embd.weight`, `blk.N.*` and `output.weight` at the
+        // top level. Probing only the prefixed form made every real GGUF load
+        // fail on `model.embed_tokens.weight`, while the synthetic tests -- which
+        // emit the prefixed names -- passed.
+        //
+        // The token embedding is therefore probed under all three real names.
+        // Probe by NAME, never by shape: the two containers disagree on the
+        // token embedding's orientation. safetensors stores
+        // [vocab, hidden]; GGUF stores `token_embd.weight` as [hidden, vocab],
+        // so one shared shape probe matches at most one of them and silently
+        // falls through to the wrong root.
         let root = if ws
             .scoped("model")
             .scoped("language_model")
-            .get([cfg.vocab_size, cfg.hidden_size], "embed_tokens")
-            .is_ok()
+            .has_tensor("embed_tokens")
         {
             ws.scoped("model").scoped("language_model")
+        } else if ws.scoped("model").has_tensor("embed_tokens") {
+            ws.scoped("model")
+        } else if ws.has_tensor("token_embd.weight") {
+            // GGUF: every tensor sits at the root -- `blk.N.*`, `output.weight`,
+            // `token_embd.weight`, `per_layer_token_embd.weight`.
+            ws.scoped("")
         } else {
             ws.scoped("model")
         };
 
+        // The token embedding under any of its three real names.
         let tok_embeddings = Linear::load_shape(
             &root.scoped("embed_tokens"),
             [cfg.vocab_size, cfg.hidden_size],
-        )?;
+        )
+        .or_else(|_| {
+            Linear::load_shape(
+                &root.scoped("token_embd"),
+                [cfg.vocab_size, cfg.hidden_size],
+            )
+        })
+        .or_else(|_| {
+            // GGUF orientation: [hidden, vocab].
+            Linear::load_shape(
+                &root.scoped("token_embd"),
+                [cfg.hidden_size, cfg.vocab_size],
+            )
+        })?;
 
         let ngram_embeddings = if let (Some(ngram_vocab), Some(ngram_dim)) =
             (cfg.ngram_vocab_size, cfg.ngram_dim)
@@ -2017,27 +2058,43 @@ impl Qwen38FlashNext {
             // n_tokens)`). Declaring the projection at ngram_dim is a size
             // mismatch against that gather.
             let ple_gathered_dim = cfg.ple_addressing()?.n_heads() * ngram_dim;
-            let table = root
-                .scoped("layers")
-                .scoped("1")
-                .scoped("ple")
-                .scoped("ple_embedding")
-                .scoped("ngram_embedding")
-                .get([ngram_vocab, ngram_dim], "shard_0")
-                .or_else(|_| {
-                    root.scoped("ngram_embeddings")
-                        .get([ngram_vocab, ngram_dim], "weight")
-                })
-                .or_else(|_| {
-                    root.scoped("ple_ngram_embd")
-                        .get([ngram_vocab, ngram_dim], "weight")
-                })
-                .map_err(|e| {
-                    grim_core::Error::Config(format!(
-                        "Qwen38FlashNext: checkpoint config defines ngram_vocab_size={ngram_vocab}, \
-                         ngram_dim={ngram_dim}, but PLE table shards were not found: {e}"
-                    ))
-                })?;
+            // The row count is PADDED past the largest head range, so it
+            // comes from the tensor's own metadata and not from the config.
+            let padded_rows = root
+                .meta("per_layer_token_embd.weight")
+                .map(|m| m.shape[0])
+                .unwrap_or(ngram_vocab);
+            // The checkpoint PADS the PLE table past the largest head range:
+            // `per_layer_token_embd.weight` is [160, 320001536] while
+            // max(head_offset + head_vocab_size) is 320001446. Probing the
+            // derived row count can therefore never match, so the tensor is
+            // fetched by name and its own shape is trusted.
+            let table = match root.get([padded_rows, ngram_dim], "per_layer_token_embd.weight") {
+                Ok(t) => t,
+                Err(_) => root
+                    .scoped("layers")
+                    .scoped("1")
+                    .scoped("ple")
+                    .scoped("ple_embedding")
+                    .scoped("ngram_embedding")
+                    .get([ngram_vocab, ngram_dim], "shard_0")
+                    .or_else(|_| {
+                        root.scoped("ngram_embeddings")
+                            .get([ngram_vocab, ngram_dim], "weight")
+                    })
+                    .or_else(|_| {
+                        root.scoped("ple_ngram_embd")
+                            .get([ngram_vocab, ngram_dim], "weight")
+                    })
+                    .map_err(|e| {
+                        grim_core::Error::Config(format!(
+                            "Qwen38FlashNext: config defines ngram_vocab_size={ngram_vocab}, \
+                             ngram_dim={ngram_dim}, but no PLE table was found under any known \
+                             name (per_layer_token_embd [{ngram_dim}, {ngram_vocab}], \
+                             layers.1.ple.*, ngram_embeddings, ple_ngram_embd): {e}"
+                        ))
+                    })?,
+            };
 
             let proj = Linear::load_shape(
                 &root
@@ -2083,7 +2140,14 @@ impl Qwen38FlashNext {
         let num_layers_to_load = cfg.num_layers;
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for i in 0..num_layers_to_load {
+            // safetensors nests blocks under `layers.N`, GGUF names them
+            // `blk.N`. Probe both, so one loader serves either container.
             let layer_ws = root.scoped("layers").scoped(&i.to_string());
+            let layer_ws = if layer_ws.scoped("input_layernorm").has_tensor("weight") {
+                layer_ws
+            } else {
+                root.scoped("blk").scoped(&i.to_string())
+            };
             let block = Qwen38FlashNextBlock::load(&layer_ws, &cfg, i, tp)?;
             layers.push(block);
         }

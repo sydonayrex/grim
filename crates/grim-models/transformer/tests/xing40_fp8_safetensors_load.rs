@@ -27,11 +27,7 @@ struct Fp8Tensor {
 
 /// 0x38 = +1.0, 0xB8 = -1.0 in E4M3 (sign | exp 0111 | mant 000).
 fn code_sign(v: f32) -> u8 {
-    if v >= 0.0 {
-        0x38
-    } else {
-        0xB8
-    }
+    if v >= 0.0 { 0x38 } else { 0xB8 }
 }
 
 fn fp8_tensor(rows: usize, cols: usize, seed: u32) -> Fp8Tensor {
@@ -166,10 +162,11 @@ fn build(dir: &Path, first_k_dense_replace: usize) -> Xing40Config {
     let mut fp8: BTreeMap<String, Fp8Tensor> = BTreeMap::new();
     let mut native: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
     let mut seed = 7u32;
-    let mut add_fp8 = |fp8: &mut BTreeMap<String, Fp8Tensor>, name: &str, rows: usize, cols: usize| {
-        seed = seed.wrapping_add(101);
-        fp8.insert(name.to_string(), fp8_tensor(rows, cols, seed));
-    };
+    let mut add_fp8 =
+        |fp8: &mut BTreeMap<String, Fp8Tensor>, name: &str, rows: usize, cols: usize| {
+            seed = seed.wrapping_add(101);
+            fp8.insert(name.to_string(), fp8_tensor(rows, cols, seed));
+        };
     let add_f32 = |native: &mut BTreeMap<String, (Vec<usize>, Vec<f32>)>,
                    name: &str,
                    shape: Vec<usize>,
@@ -178,14 +175,24 @@ fn build(dir: &Path, first_k_dense_replace: usize) -> Xing40Config {
         native.insert(name.to_string(), (shape, vec![fill; n]));
     };
 
-    add_f32(&mut native, "model.embed_tokens.weight", vec![VOCAB, HIDDEN], 0.05);
+    add_f32(
+        &mut native,
+        "model.embed_tokens.weight",
+        vec![VOCAB, HIDDEN],
+        0.05,
+    );
     // `lm_head.weight` is `[vocab, hidden]` in both containers.
     add_f32(&mut native, "lm_head.weight", vec![VOCAB, HIDDEN], 0.05);
     add_f32(&mut native, "model.norm.weight", vec![HIDDEN], 1.0);
 
     for l in 0..cfg.num_layers {
         let p = format!("model.layers.{l}");
-        add_f32(&mut native, &format!("{p}.input_layernorm.weight"), vec![HIDDEN], 1.0);
+        add_f32(
+            &mut native,
+            &format!("{p}.input_layernorm.weight"),
+            vec![HIDDEN],
+            1.0,
+        );
         add_f32(
             &mut native,
             &format!("{p}.post_attention_layernorm.weight"),
@@ -215,7 +222,12 @@ fn build(dir: &Path, first_k_dense_replace: usize) -> Xing40Config {
             add_f32(&mut native, &format!("{p}.{hc}.hc_scale"), vec![3], 1.0);
         }
 
-        add_fp8(&mut fp8, &format!("{p}.self_attn.q_a_proj.weight"), Q_RANK, HIDDEN);
+        add_fp8(
+            &mut fp8,
+            &format!("{p}.self_attn.q_a_proj.weight"),
+            Q_RANK,
+            HIDDEN,
+        );
         add_fp8(
             &mut fp8,
             &format!("{p}.self_attn.q_b_proj.weight"),
@@ -242,9 +254,19 @@ fn build(dir: &Path, first_k_dense_replace: usize) -> Xing40Config {
         );
 
         if l < first_k_dense_replace {
-            add_fp8(&mut fp8, &format!("{p}.mlp.gate_proj.weight"), INTER, HIDDEN);
+            add_fp8(
+                &mut fp8,
+                &format!("{p}.mlp.gate_proj.weight"),
+                INTER,
+                HIDDEN,
+            );
             add_fp8(&mut fp8, &format!("{p}.mlp.up_proj.weight"), INTER, HIDDEN);
-            add_fp8(&mut fp8, &format!("{p}.mlp.down_proj.weight"), HIDDEN, INTER);
+            add_fp8(
+                &mut fp8,
+                &format!("{p}.mlp.down_proj.weight"),
+                HIDDEN,
+                INTER,
+            );
         } else {
             // Router gate + noaux_tc bias stay unquantized.
             add_f32(

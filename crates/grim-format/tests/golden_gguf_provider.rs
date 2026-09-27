@@ -141,8 +141,9 @@ fn golden_split_gguf_provider_multi_shard_and_monolithic() {
     if !std::path::Path::new(main_path).exists() {
         return;
     }
-    let provider = SplitGgufProvider::open(main_path).expect("SplitGgufProvider must open and resolve splits");
-    
+    let provider =
+        SplitGgufProvider::open(main_path).expect("SplitGgufProvider must open and resolve splits");
+
     // Verify backbone tensor from split 0
     assert!(provider.meta("blk.0.attn_qkv.weight").is_ok());
     // Verify embedding tensor from split 1
@@ -153,4 +154,3 @@ fn golden_split_gguf_provider_multi_shard_and_monolithic() {
     assert_eq!(provider.tensor_names().len(), 1224);
     assert_eq!(provider.shard_count(), 2);
 }
-

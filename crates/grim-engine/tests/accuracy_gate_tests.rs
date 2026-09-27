@@ -112,8 +112,8 @@ fn test_cross_entropy_ppl_monotonicity() {
 ///   measured budget still catches silent quant regressions, honestly.
 fn golden_llama_activations() -> Vec<f32> {
     use grim_backend_cpu::cpu_tensor;
-    use grim_core::session::Inner;
     use grim_core::CausalLm;
+    use grim_core::session::Inner;
     use grim_models_transformer::{Llama, LlamaConfig};
     use grim_tensor::{Device, Shape};
 
@@ -141,10 +141,7 @@ fn golden_llama_activations() -> Vec<f32> {
         PROMPT.iter().map(|&t| t as f32).collect(),
         Shape::new(vec![1, 8]),
     );
-    let positions = cpu_tensor(
-        (0..8).map(|t| t as f32).collect(),
-        Shape::new(vec![1, 8]),
-    );
+    let positions = cpu_tensor((0..8).map(|t| t as f32).collect(), Shape::new(vec![1, 8]));
     model
         .forward(&mut session, &input, &positions, &[])
         .expect("golden forward")
@@ -184,7 +181,10 @@ fn test_quant_golden_activations_fixed_prompt() {
     // Determinism leg: a fresh model + session on the same fixed prompt
     // must reproduce the fixture bit-for-bit (else the golden is unstable).
     let oracle2 = golden_llama_activations();
-    assert_eq!(oracle, oracle2, "fixed prompt must forward deterministically");
+    assert_eq!(
+        oracle, oracle2,
+        "fixed prompt must forward deterministically"
+    );
 
     let gate = AccuracyGate::new();
 

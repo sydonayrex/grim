@@ -35,7 +35,13 @@ fn test_vulkan_autotuner_shape_class_routing() {
 
 #[test]
 fn test_vulkan_resource_limits_gating() {
-    let caps = VulkanCaps::probe_default("Vulkan Low Shared Mem Device".into(), 0x1002, 0x744c, 1, false);
+    let caps = VulkanCaps::probe_default(
+        "Vulkan Low Shared Mem Device".into(),
+        0x1002,
+        0x744c,
+        1,
+        false,
+    );
     assert!(caps.validate_resource_limits(16384, 256));
     assert!(!caps.validate_resource_limits(65536, 256)); // Exceeds 32KB shared memory
     assert!(!caps.validate_resource_limits(16384, 2048)); // Exceeds 1024 workgroup invocations

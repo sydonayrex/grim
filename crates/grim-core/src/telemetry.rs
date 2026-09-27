@@ -42,11 +42,7 @@ pub struct FallbackEvent {
 }
 
 impl FallbackEvent {
-    pub fn new(
-        component: &'static str,
-        reason: FallbackReason,
-        detail: impl Into<String>,
-    ) -> Self {
+    pub fn new(component: &'static str, reason: FallbackReason, detail: impl Into<String>) -> Self {
         Self {
             component,
             reason,
@@ -75,11 +71,7 @@ pub fn fallback_enabled() -> bool {
 
 /// Emit one JSON line to stderr when enabled; silent no-op otherwise.
 /// Never fails — a logging path must not break the path it observes.
-pub fn emit_fallback(
-    component: &'static str,
-    reason: FallbackReason,
-    detail: impl Into<String>,
-) {
+pub fn emit_fallback(component: &'static str, reason: FallbackReason, detail: impl Into<String>) {
     if !fallback_enabled() {
         return;
     }

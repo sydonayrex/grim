@@ -15,8 +15,7 @@ fn gguf_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("XING40_GGUF") {
         return p.into();
     }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../models/xing4_0-29b-IQ4_NL.gguf")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../models/xing4_0-29b-IQ4_NL.gguf")
 }
 
 #[test]
@@ -86,8 +85,14 @@ fn probe_split_mla_up_projection_metadata() {
             let msg = e.to_string();
             assert!(msg.contains("dtype/payload mismatch"), "msg: {msg}");
             assert!(msg.contains("ffn_gate.weight"), "msg: {msg}");
-            assert!(msg.contains("IQ4_NL"), "msg: {msg} must name candidate formats");
-            println!("refusal (first lines):\n{}", msg.lines().take(4).collect::<Vec<_>>().join("\n"));
+            assert!(
+                msg.contains("IQ4_NL"),
+                "msg: {msg} must name candidate formats"
+            );
+            println!(
+                "refusal (first lines):\n{}",
+                msg.lines().take(4).collect::<Vec<_>>().join("\n")
+            );
         }
     }
 
@@ -106,7 +111,11 @@ fn probe_split_mla_up_projection_metadata() {
     let (v_heads, v_dim, v_rank) = (v[0], v[1], v[2]);
     assert_eq!(v_heads, heads, "attn_k_b / attn_v_b head count mismatch");
     assert_eq!(v_rank, rank, "attn_k_b / attn_v_b rank mismatch");
-    assert_eq!(heads * rank * nope, heads * v_dim * rank, "bank sizes disagree");
+    assert_eq!(
+        heads * rank * nope,
+        heads * v_dim * rank,
+        "bank sizes disagree"
+    );
 
     println!(
         "reassembled kv_b_proj.weight = [{heads} * ({nope} + {v_dim}), {rank}] \

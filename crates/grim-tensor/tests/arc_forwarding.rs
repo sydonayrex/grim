@@ -263,7 +263,8 @@ impl ElementwiseOps for ProbeDevice {
         _rows: usize,
         _cols: usize,
     ) -> grim_tensor::Result<Box<dyn ComputeHandle>> {
-        probe_err("write_rows").map(|()| Box::new(grim_tensor::ReadyHandle) as Box<dyn ComputeHandle>)
+        probe_err("write_rows")
+            .map(|()| Box::new(grim_tensor::ReadyHandle) as Box<dyn ComputeHandle>)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -618,10 +619,7 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
         dev.row_scale(s.as_ref(), s.as_ref(), 2, 2, &shape),
         "row_scale"
     );
-    assert_probe!(
-        dev.narrow_rows(s.as_ref(), 0, 1, 4, &shape),
-        "narrow_rows"
-    );
+    assert_probe!(dev.narrow_rows(s.as_ref(), 0, 1, 4, &shape), "narrow_rows");
     let mut s_mut = dev.zeros(&shape, DType::F32).expect("zeros");
     assert_probe!(
         dev.write_rows(s_mut.as_mut(), 0, s.as_ref(), 1, 4),

@@ -605,10 +605,44 @@ fn kv_quant_enabled() -> bool {
     )
 }
 
-/// Load a model from a GGUF file.
+/// Load a model from a GGUF file, resolving split shards if present.
+///
+/// A GGUF whose header declares `split.count > 1` is split across files that do
+/// NOT have to be single-file-loadable: the Qwen3.8-Flash-Next checkpoint is
+/// `split.no` 0 (the 44.6 GB main weights) plus `split.no` 1 (the 27.5 GB PLE
+/// table and token embeddings), and the engine must see both or the embedding
+/// lookup fails. `SplitGgufProvider` already resolves the sibling set, validates
+/// the shard count and the total tensor count, and excludes foreign-architecture
+/// siblings such as the `clip` mmproj shard.
+///
+/// For a single-file GGUF it defers to `GgufProvider`, so this is the only
+/// entry point callers need.
 pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
+    // A split checkpoint is the only case that needs the sibling set, and
+    // resolving it is cheap when the header says there is nothing to resolve.
+    if gguf_is_split(path)? {
+        // The arch comes from the primary shard, which is a plain GgufProvider
+        // and carries the same `general.architecture` as the whole set; the
+        // weights come from the split, which is the only view that has every
+        // tensor.
+        let primary = GgufProvider::open(path)?;
+        let split = grim_format::tprov::SplitGgufProvider::open(path)?;
+        return load_model_with_providers(&primary, &split, device, path);
+    }
     let provider = GgufProvider::open(path)?;
     load_model_with_providers(&provider, &provider, device, path)
+}
+
+/// Whether `path`'s GGUF header declares itself one shard of a multi-file split.
+///
+/// Reads only the metadata block, so it does not touch tensor payloads.
+fn gguf_is_split(path: &str) -> Result<bool> {
+    let provider = GgufProvider::open(path)?;
+    let count = provider
+        .metadata("split.count")
+        .and_then(|v| v.as_u32())
+        .unwrap_or(1);
+    Ok(count > 1)
 }
 
 /// Load a model from a native `.grim` file with a sibling `.gguf` file containing metadata.

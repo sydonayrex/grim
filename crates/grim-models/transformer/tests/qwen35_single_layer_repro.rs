@@ -176,10 +176,7 @@ fn single_recurrent_layer_forward_on_gpu() {
         tensors.insert("ssm_a".into(), vec1(cfg.ssm_dt_rank));
         tensors.insert("ssm_dt.bias".into(), vec1(cfg.ssm_dt_rank));
         tensors.insert("ssm_norm.weight".into(), vec1(cfg.ssm_d_state));
-        tensors.insert(
-            "attn_qkv.weight".into(),
-            mat(cfg.hidden_size, ssm_qkv_dim),
-        );
+        tensors.insert("attn_qkv.weight".into(), mat(cfg.hidden_size, ssm_qkv_dim));
         tensors.insert(
             "ssm_alpha.weight".into(),
             mat(cfg.hidden_size, cfg.ssm_dt_rank),
@@ -201,10 +198,7 @@ fn single_recurrent_layer_forward_on_gpu() {
             "ffn_down.weight".into(),
             mat(cfg.hidden_size, cfg.intermediate_size),
         );
-        tensors.insert(
-            "ssm_conv1d.weight".into(),
-            mat(cfg.ssm_d_conv, ssm_qkv_dim),
-        );
+        tensors.insert("ssm_conv1d.weight".into(), mat(cfg.ssm_d_conv, ssm_qkv_dim));
     }
 
     let provider = MapProvider { tensors };
@@ -495,16 +489,31 @@ fn n_layer_stack_forward_on_gpu() {
         tensors.insert("attn_output.weight".into(), mat(cfg.hidden_size, q_dim));
         tensors.insert("attn_q_norm.weight".into(), vec1(cfg.head_dim));
         tensors.insert("attn_k_norm.weight".into(), vec1(cfg.head_dim));
-        tensors.insert("ssm_alpha.weight".into(), mat(cfg.hidden_size, cfg.ssm_dt_rank));
-        tensors.insert("ssm_beta.weight".into(), mat(cfg.hidden_size, cfg.ssm_dt_rank));
+        tensors.insert(
+            "ssm_alpha.weight".into(),
+            mat(cfg.hidden_size, cfg.ssm_dt_rank),
+        );
+        tensors.insert(
+            "ssm_beta.weight".into(),
+            mat(cfg.hidden_size, cfg.ssm_dt_rank),
+        );
         tensors.insert("ssm_a".into(), vec1(cfg.ssm_dt_rank));
         tensors.insert("ssm_dt.bias".into(), vec1(cfg.ssm_dt_rank));
         tensors.insert("ssm_norm.weight".into(), vec1(cfg.ssm_d_state));
         tensors.insert("ssm_out.weight".into(), mat(value_dim, cfg.hidden_size));
         tensors.insert("ssm_conv1d.weight".into(), mat(cfg.ssm_d_conv, ssm_qkv_dim));
-        tensors.insert("ffn_gate.weight".into(), mat(cfg.intermediate_size, cfg.hidden_size));
-        tensors.insert("ffn_up.weight".into(), mat(cfg.intermediate_size, cfg.hidden_size));
-        tensors.insert("ffn_down.weight".into(), mat(cfg.hidden_size, cfg.intermediate_size));
+        tensors.insert(
+            "ffn_gate.weight".into(),
+            mat(cfg.intermediate_size, cfg.hidden_size),
+        );
+        tensors.insert(
+            "ffn_up.weight".into(),
+            mat(cfg.intermediate_size, cfg.hidden_size),
+        );
+        tensors.insert(
+            "ffn_down.weight".into(),
+            mat(cfg.hidden_size, cfg.intermediate_size),
+        );
     }
     let provider = MapProvider { tensors };
 

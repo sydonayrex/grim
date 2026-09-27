@@ -35,8 +35,8 @@ pub use grim_tensor::{
 };
 
 // Re-exported from submodules for use within trait impls.
-pub(crate) use context::global_context;
 pub(crate) use context::QUEUE_LOCK;
+pub(crate) use context::global_context;
 use ffi::*;
 pub(crate) use kernel::{push_params, run_compute_shader, run_compute_shader_kernel};
 

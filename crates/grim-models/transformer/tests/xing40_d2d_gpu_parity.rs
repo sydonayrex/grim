@@ -10,10 +10,10 @@
 //! one tiny synthetic model, runs it on `Device::Cpu` (host reference) and on
 //! `Device::Rocm(0)` (D2D), and compares the logits.
 
-use grim_core::model::CausalLm;
-use grim_models_transformer::{Xing40, Xing40Config};
 use grim_backend_cpu::cpu_tensor;
+use grim_core::model::CausalLm;
 use grim_format::tprov::SafetensorsProvider;
+use grim_models_transformer::{Xing40, Xing40Config};
 use grim_nn::WeightSource;
 use grim_tensor::{Device, Shape};
 use std::collections::BTreeMap;
@@ -122,13 +122,23 @@ fn build(dir: &Path) -> Xing40Config {
         t.insert(name, (shape, vals));
     };
 
-    add(&mut t, "model.embed_tokens.weight".into(), vec![VOCAB, HIDDEN], None);
+    add(
+        &mut t,
+        "model.embed_tokens.weight".into(),
+        vec![VOCAB, HIDDEN],
+        None,
+    );
     add(&mut t, "lm_head.weight".into(), vec![VOCAB, HIDDEN], None);
     add(&mut t, "model.norm.weight".into(), vec![HIDDEN], Some(1.0));
 
     for l in 0..cfg.num_layers {
         let p = format!("model.layers.{l}");
-        add(&mut t, format!("{p}.input_layernorm.weight"), vec![HIDDEN], Some(1.0));
+        add(
+            &mut t,
+            format!("{p}.input_layernorm.weight"),
+            vec![HIDDEN],
+            Some(1.0),
+        );
         add(
             &mut t,
             format!("{p}.post_attention_layernorm.weight"),
@@ -151,12 +161,22 @@ fn build(dir: &Path) -> Xing40Config {
         // real export; keep them random and unquantized so the gate math is
         // actually exercised rather than collapsing to a constant.
         for hc in ["attn_hc", "ffn_hc"] {
-            add(&mut t, format!("{p}.{hc}.hc_fn"), vec![MIX, HIDDEN * HC], None);
+            add(
+                &mut t,
+                format!("{p}.{hc}.hc_fn"),
+                vec![MIX, HIDDEN * HC],
+                None,
+            );
             add(&mut t, format!("{p}.{hc}.hc_base"), vec![MIX], None);
             add(&mut t, format!("{p}.{hc}.hc_scale"), vec![3], None);
         }
 
-        add(&mut t, format!("{p}.self_attn.q_a_proj.weight"), vec![Q_RANK, HIDDEN], None);
+        add(
+            &mut t,
+            format!("{p}.self_attn.q_a_proj.weight"),
+            vec![Q_RANK, HIDDEN],
+            None,
+        );
         add(
             &mut t,
             format!("{p}.self_attn.q_b_proj.weight"),
@@ -182,9 +202,24 @@ fn build(dir: &Path) -> Xing40Config {
             None,
         );
 
-        add(&mut t, format!("{p}.mlp.gate_proj.weight"), vec![INTER, HIDDEN], None);
-        add(&mut t, format!("{p}.mlp.up_proj.weight"), vec![INTER, HIDDEN], None);
-        add(&mut t, format!("{p}.mlp.down_proj.weight"), vec![HIDDEN, INTER], None);
+        add(
+            &mut t,
+            format!("{p}.mlp.gate_proj.weight"),
+            vec![INTER, HIDDEN],
+            None,
+        );
+        add(
+            &mut t,
+            format!("{p}.mlp.up_proj.weight"),
+            vec![INTER, HIDDEN],
+            None,
+        );
+        add(
+            &mut t,
+            format!("{p}.mlp.down_proj.weight"),
+            vec![HIDDEN, INTER],
+            None,
+        );
     }
 
     write_safetensors(&dir.join("model.safetensors"), &t);
@@ -192,10 +227,8 @@ fn build(dir: &Path) -> Xing40Config {
 }
 
 fn load(dir: &Path, cfg: Xing40Config, device: Device) -> Xing40 {
-    let provider = SafetensorsProvider::open(
-        dir.join("model.safetensors").to_str().unwrap(),
-    )
-    .expect("open safetensors");
+    let provider = SafetensorsProvider::open(dir.join("model.safetensors").to_str().unwrap())
+        .expect("open safetensors");
     let ws = WeightSource::root(&provider, device.clone());
     Xing40::load(device, &ws, cfg).expect("load Xing4.0")
 }
@@ -205,7 +238,10 @@ fn forward_logits(model: &Xing40, ids: &[f32], device: &Device) -> Vec<f32> {
     let dev = grim_nn::pick_device_for_storage_device(device);
     let mk = |v: &[f32], d: &[usize]| {
         grim_tensor::Tensor::new(
-            std::sync::Arc::from(dev.from_cpu(v, &Shape::new(d.to_vec()), grim_tensor::DType::F32).unwrap()),
+            std::sync::Arc::from(
+                dev.from_cpu(v, &Shape::new(d.to_vec()), grim_tensor::DType::F32)
+                    .unwrap(),
+            ),
             Shape::new(d.to_vec()),
             grim_tensor::DType::F32,
             grim_tensor::QuantProvenance::default(),
@@ -283,13 +319,28 @@ fn device_hyper_connection_matches_host_reference() {
 fn rocm_device_exposes_hc_primitives() {
     use grim_tensor::Shape;
     let dev = grim_nn::pick_device_for_storage_device(&Device::Rocm(0));
-    let src = dev.from_cpu(&[1.0f32, 2.0, 3.0, 4.0], &Shape::new(vec![2, 2]), grim_tensor::DType::F32).unwrap();
-    let mut dst = dev.from_cpu(&[9.0f32; 4], &Shape::new(vec![2, 2]), grim_tensor::DType::F32).unwrap();
+    let src = dev
+        .from_cpu(
+            &[1.0f32, 2.0, 3.0, 4.0],
+            &Shape::new(vec![2, 2]),
+            grim_tensor::DType::F32,
+        )
+        .unwrap();
+    let mut dst = dev
+        .from_cpu(
+            &[9.0f32; 4],
+            &Shape::new(vec![2, 2]),
+            grim_tensor::DType::F32,
+        )
+        .unwrap();
     let h = dev
         .write_cols(dst.as_mut(), 2, 0, src.as_ref(), 2, 2)
         .expect("write_cols on the picked ROCm device");
     h.synchronize().unwrap();
-    println!("picked device: {:?}", std::any::type_name::<dyn grim_tensor::BackendDevice>());
+    println!(
+        "picked device: {:?}",
+        std::any::type_name::<dyn grim_tensor::BackendDevice>()
+    );
     println!("write_cols ok -> {:?}", dst.to_cpu_vec_f32().unwrap());
 }
 
@@ -329,7 +380,8 @@ fn per_head_v_up_projection_loop_matches_host() {
 
     let latent_t = Tensor::new(
         std::sync::Arc::from(
-            dev.from_cpu(&latent, &Shape::new(vec![seq, nh * rank]), DType::F32).unwrap(),
+            dev.from_cpu(&latent, &Shape::new(vec![seq, nh * rank]), DType::F32)
+                .unwrap(),
         ),
         Shape::new(vec![seq, nh * rank]),
         DType::F32,
@@ -355,13 +407,7 @@ fn per_head_v_up_projection_loop_matches_host() {
             .unwrap()
             .0;
         let w_h = dev
-            .narrow_rows(
-                w_t.as_ref(),
-                h * vd,
-                vd,
-                rank,
-                &Shape::new(vec![vd, rank]),
-            )
+            .narrow_rows(w_t.as_ref(), h * vd, vd, rank, &Shape::new(vec![vd, rank]))
             .unwrap()
             .0;
         let projected = dev
@@ -423,17 +469,19 @@ fn hyper_connection_matches_host_for_multi_token() {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             t.insert(
                 name,
-                (shape, pseudo_random(n, seed).iter().map(|v| v * 0.5).collect()),
+                (
+                    shape,
+                    pseudo_random(n, seed).iter().map(|v| v * 0.5).collect(),
+                ),
             );
         }
     }
     write_safetensors(&tmp.path().join("hc.safetensors"), &t);
 
     for seq in [1usize, 2, 3, 7, 8] {
-        let provider = SafetensorsProvider::open(
-            tmp.path().join("hc.safetensors").to_str().unwrap(),
-        )
-        .expect("open hc safetensors");
+        let provider =
+            SafetensorsProvider::open(tmp.path().join("hc.safetensors").to_str().unwrap())
+                .expect("open hc safetensors");
 
         let ws_cpu = WeightSource::root(&provider, Device::Cpu);
         let cpu = Xing40HyperConnection::load(&ws_cpu, &cfg, "attn").expect("hc cpu");
@@ -455,7 +503,8 @@ fn hyper_connection_matches_host_for_multi_token() {
         let dev = grim_nn::pick_device_for_storage_device(&Device::Rocm(0));
         let streams = Tensor::new(
             std::sync::Arc::from(
-                dev.from_cpu(&streams_v, &Shape::new(vec![seq, flat]), DType::F32).unwrap(),
+                dev.from_cpu(&streams_v, &Shape::new(vec![seq, flat]), DType::F32)
+                    .unwrap(),
             ),
             Shape::new(vec![seq, flat]),
             DType::F32,
@@ -464,7 +513,8 @@ fn hyper_connection_matches_host_for_multi_token() {
         );
         let y = Tensor::new(
             std::sync::Arc::from(
-                dev.from_cpu(&y_v, &Shape::new(vec![seq, hidden]), DType::F32).unwrap(),
+                dev.from_cpu(&y_v, &Shape::new(vec![seq, hidden]), DType::F32)
+                    .unwrap(),
             ),
             Shape::new(vec![seq, hidden]),
             DType::F32,
@@ -505,11 +555,18 @@ fn hyper_connection_matches_host_for_multi_token() {
         for (a, b) in got_n.iter().zip(next.iter()) {
             worst_n = worst_n.max((a - b).abs());
         }
-        println!(
-            "seq={seq}: gates {worst_gate:e}, collapse {worst_c:e}, write-back {worst_n:e}"
+        println!("seq={seq}: gates {worst_gate:e}, collapse {worst_c:e}, write-back {worst_n:e}");
+        assert!(
+            worst_gate < 1e-5,
+            "seq={seq}: gates diverge by {worst_gate:e}"
         );
-        assert!(worst_gate < 1e-5, "seq={seq}: gates diverge by {worst_gate:e}");
-        assert!(worst_c < 1e-5, "seq={seq}: collapse diverges by {worst_c:e}");
-        assert!(worst_n < 1e-5, "seq={seq}: write-back diverges by {worst_n:e}");
+        assert!(
+            worst_c < 1e-5,
+            "seq={seq}: collapse diverges by {worst_c:e}"
+        );
+        assert!(
+            worst_n < 1e-5,
+            "seq={seq}: write-back diverges by {worst_n:e}"
+        );
     }
 }

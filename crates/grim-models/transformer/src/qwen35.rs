@@ -1412,6 +1412,14 @@ fn gated_delta_net_forward(
     // The reference feeds `hparams.f_norm_rms_eps` to the GDN L2 norm, and
     // `attn_norm` is built from `cfg.rms_norm_eps`, so this is the same value.
     let gdn_eps = blk.attn_norm.eps;
+    let ktrace = std::env::var("GRIM_TRACE_KDA").is_ok();
+    if ktrace {
+        eprintln!(
+            "[kda-trace] enter seq={seq_len} val_heads={n_val_heads} key_heads={n_key_heads} \
+             head_dim={head_dim} state_len={} branch_width={branch_width}",
+            blk.cfg_ssm_d_state().max(1) * head_dim
+        );
+    }
     if n_val_heads == 0 || n_key_heads == 0 || head_dim == 0 {
         return Ok(());
     }
@@ -1446,8 +1454,8 @@ fn gated_delta_net_forward(
             }
         }
     }
-
     let a_vec: &[f32] = blk.ssm_a.as_deref().unwrap_or(&[]);
+
     // z (the KDA output gate), from the checkpoint's `attn_gate` projection.
     //
     // The reference splits z out of the fused qkvz tensor and applies
@@ -1463,7 +1471,9 @@ fn gated_delta_net_forward(
     // makes the model confidently wrong.
     let mut z_vec: Vec<f32> = Vec::new();
     if let Some(ref gl) = blk.attn_gate {
-        z_vec = gl.forward(x_normed)?.to_vec_f32()?;
+        if std::env::var("GRIM_SKIP_Z").is_err() {
+            z_vec = gl.forward(x_normed)?.to_vec_f32()?;
+        }
     }
     let z_stride = if z_vec.is_empty() {
         0

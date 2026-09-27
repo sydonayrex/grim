@@ -3,7 +3,10 @@
 use crate::*;
 use grim_models_transformer::DecodeGraphModel;
 
-fn scheduler_graph_capture_enabled(device: &grim_tensor::Device, device_capture_enabled: bool) -> bool {
+fn scheduler_graph_capture_enabled(
+    device: &grim_tensor::Device,
+    device_capture_enabled: bool,
+) -> bool {
     matches!(device, grim_tensor::Device::Rocm(_)) && device_capture_enabled
 }
 
@@ -168,7 +171,10 @@ impl Engine {
     }
 
     pub(crate) fn drive_prefill_inner(&mut self, id: u64) -> Result<usize> {
-        eprintln!("[pin-dbg] prefill req {id} session_recorded={}", self.request_session.contains_key(&id));
+        eprintln!(
+            "[pin-dbg] prefill req {id} session_recorded={}",
+            self.request_session.contains_key(&id)
+        );
         // Chunked prefill (F9 follow-on): the scheduler may carry several running copies of `id` (one per
         // pass, each with the cumulative consumed count), so take the LATEST bound, not the first copy's.
         let mut prompt_tokens = None;
@@ -228,8 +234,7 @@ impl Engine {
                 let raw = matched_tokens.min(skip_cap);
                 raw - (raw % grim_memory::BLOCK_SIZE)
             };
-            let seed_ok = skip_tokens >= grim_memory::BLOCK_SIZE
-                && !self.model_uses_hybrid_kv(id);
+            let seed_ok = skip_tokens >= grim_memory::BLOCK_SIZE && !self.model_uses_hybrid_kv(id);
             if seed_ok {
                 let seed_blocks = &matched_blocks[..skip_tokens / grim_memory::BLOCK_SIZE];
                 // Claim the matched nodes for the lifetime of this request.
@@ -424,12 +429,14 @@ impl Engine {
                     .map(|t| t.iter().map(|&b| b as usize).collect())
                     .unwrap_or_default();
                 if !block_ids.is_empty() {
-                    let mut pool =
-                        self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut pool = self.block_pool.lock().unwrap_or_else(|e| e.into_inner());
                     pool.pin_blocks(&block_ids, pin_secs);
                     eprintln!(
                         "[pin-dbg] prefill pinned {block_ids:?} for {pin_secs}s; is_pinned now: {:?}",
-                        block_ids.iter().map(|&b| pool.is_block_pinned(b)).collect::<Vec<_>>()
+                        block_ids
+                            .iter()
+                            .map(|&b| pool.is_block_pinned(b))
+                            .collect::<Vec<_>>()
                     );
                 }
             }
@@ -534,10 +541,7 @@ impl Engine {
                 .map(|m| match m.device {
                     grim_tensor::dtype::Device::Rocm(ord) => {
                         let rocm = grim_backend_rocm::RocmDevice::shared(ord);
-                        scheduler_graph_capture_enabled(
-                            &m.device,
-                            rocm.graph_capture_enabled(),
-                        )
+                        scheduler_graph_capture_enabled(&m.device, rocm.graph_capture_enabled())
                     }
                     _ => false,
                 })
@@ -559,19 +563,17 @@ impl Engine {
                 // Update the persistent GPU buffers in-place with the new token/position.
                 // Async H2D on the active stream, ordered vs later launches — no host sync.
                 let rocm = grim_backend_rocm::device::roc_device::RocmDevice::shared(ordinal);
-                rocm.write_f32_into_async(
-                    &**buffers.input_ids.storage(),
-                    &[next_token as f32],
-                )?;
-                rocm.write_f32_into_async(
-                    &**buffers.positions.storage(),
-                    &[start_pos as f32],
-                )?;
+                rocm.write_f32_into_async(&**buffers.input_ids.storage(), &[next_token as f32])?;
+                rocm.write_f32_into_async(&**buffers.positions.storage(), &[start_pos as f32])?;
                 // Clone the tensor handles (Arc clones are cheap) to release the borrow.
                 (buffers.input_ids.clone(), buffers.positions.clone())
             };
             let outcome = self.drive_forward_graph_capture(
-                model_id, id, &input_ids, &positions, &capture_key,
+                model_id,
+                id,
+                &input_ids,
+                &positions,
+                &capture_key,
             )?;
             Ok(Some(outcome))
         } else {
@@ -697,10 +699,8 @@ impl Engine {
         use grim_tensor::backend::BackendStorage as _;
         let logits = logits_storage.to_cpu_vec_f32().ok()?;
         let vocab = logits.len();
-        let logits_tensor = grim_backend_cpu::cpu_tensor(
-            logits,
-            grim_tensor::Shape::new(vec![1, vocab]),
-        );
+        let logits_tensor =
+            grim_backend_cpu::cpu_tensor(logits, grim_tensor::Shape::new(vec![1, vocab]));
         let accepted = self
             .sessions
             .get_mut(&req_id)
@@ -758,7 +758,10 @@ impl Engine {
                 grim_tensor::dtype::QuantProvenance::default(),
                 grim_tensor::dtype::Device::Rocm(ordinal),
             );
-            let buffers = GraphCaptureInputBuffers { input_ids, positions };
+            let buffers = GraphCaptureInputBuffers {
+                input_ids,
+                positions,
+            };
             self.decode_graph_input_buffers.insert(request_id, buffers);
         }
         self.decode_graph_input_buffers
@@ -955,7 +958,9 @@ impl Engine {
                             Ok(())
                         })();
                         if let Err(e) = seed_ok {
-                            eprintln!("[grim] decode-graph: KV seed failed for request {request_id} ({e}); eager fallback");
+                            eprintln!(
+                                "[grim] decode-graph: KV seed failed for request {request_id} ({e}); eager fallback"
+                            );
                             grim_core::emit_fallback(
                                 "grim-engine/scheduler",
                                 grim_core::FallbackReason::KvSeed,
@@ -966,7 +971,8 @@ impl Engine {
                         if g.begin_capture().is_err() {
                             return self.drive_forward(model_id, request_id, input_ids, positions);
                         }
-                        let ok = lfm2.forward_capture(&mut g, tid).is_ok() && g.end_capture().is_ok();
+                        let ok =
+                            lfm2.forward_capture(&mut g, tid).is_ok() && g.end_capture().is_ok();
                         if !ok {
                             let _ = g.abort_capture();
                             return self.drive_forward(model_id, request_id, input_ids, positions);
@@ -1021,9 +1027,7 @@ impl Engine {
                     let caches = sess
                         .model_state()
                         .and_then(|s| {
-                            s.downcast_ref::<
-                                Vec<Option<grim_models_transformer::Lfm2LayerCache>>,
-                            >()
+                            s.downcast_ref::<Vec<Option<grim_models_transformer::Lfm2LayerCache>>>()
                         })
                         .ok_or_else(|| "no LFM2 caches".to_string())?;
                     let srcs = lfm2
@@ -1145,16 +1149,15 @@ impl Engine {
                 .get_mut(&request_id)
                 .ok_or_else(|| Error::Config("no session for request".into()))?
                 .as_mut();
-            let live =
-                self.scheduler.running.len() as f32 / self.config.max_num_seqs.max(1) as f32;
+            let live = self.scheduler.running.len() as f32 / self.config.max_num_seqs.max(1) as f32;
             let running = self.scheduler.running.len();
             let loaded = self
                 .models
                 .get(model_id)
                 .ok_or_else(|| Error::Config(format!("unknown model {model_id}")))?;
-            let out = loaded.model.decode_one(
-                session, input_ids, positions, live, running, &adapters,
-            );
+            let out = loaded
+                .model
+                .decode_one(session, input_ids, positions, live, running, &adapters);
             let acc = session.last_accepted_tokens();
             (out, acc, running)
         };
@@ -1314,11 +1317,12 @@ impl Engine {
         if !rocm.graph_capture_enabled() {
             return Ok(false);
         }
-        let lfm2 = match self
-            .models
-            .get(model_id)
-            .and_then(|m| m.model.target().as_any().downcast_ref::<grim_models_transformer::Lfm2>())
-        {
+        let lfm2 = match self.models.get(model_id).and_then(|m| {
+            m.model
+                .target()
+                .as_any()
+                .downcast_ref::<grim_models_transformer::Lfm2>()
+        }) {
             Some(l) => l,
             None => return Ok(false),
         };
@@ -1376,8 +1380,7 @@ impl Engine {
                 )?;
                 let seed = token_ids.clone();
                 pool.capture_batch_graph(bucket, |g| {
-                    lfm2
-                        .forward_capture_batch(g, &seed)
+                    lfm2.forward_capture_batch(g, &seed)
                         .map_err(|e| grim_backend_rocm::Error::Backend(format!("{e}")))
                 })?;
                 self.batch_bucket_slots.insert(key, req_ids.clone());
@@ -1388,12 +1391,8 @@ impl Engine {
             .batch_graph_pools
             .get_mut(model_id)
             .ok_or_else(|| Error::Backend("batch pool missing after capture".into()))?;
-        let logits_storage = pool.replay_batch_with_pos(
-            bucket,
-            &rocm,
-            &token_ids,
-            &positions_u32,
-        )?;
+        let logits_storage =
+            pool.replay_batch_with_pos(bucket, &rocm, &token_ids, &positions_u32)?;
         use grim_tensor::backend::BackendStorage as _;
         let logits = logits_storage.to_cpu_vec_f32()?;
         let vocab = lfm2.cfg.vocab_size;
@@ -1407,10 +1406,7 @@ impl Engine {
             let idx = idxs[oi];
             let (req_id, ..) = items[idx];
             let row = logits[slot * vocab..(slot + 1) * vocab].to_vec();
-            let t = grim_backend_cpu::cpu_tensor(
-                row,
-                grim_tensor::Shape::new(vec![1, vocab]),
-            );
+            let t = grim_backend_cpu::cpu_tensor(row, grim_tensor::Shape::new(vec![1, vocab]));
             let accepted = self
                 .sessions
                 .get_mut(&req_id)
@@ -1472,8 +1468,7 @@ impl Engine {
             if let Some(h) = self.request_session.get(&req_id).copied() {
                 let key = format!("{model_id}#s{h}");
                 let prefix = format!("{model_id}#s");
-                let graph_keys: Vec<String> =
-                    self.decode_graphs.keys().cloned().collect();
+                let graph_keys: Vec<String> = self.decode_graphs.keys().cloned().collect();
                 if let Some(victim) = session_slot_victim(
                     &prefix,
                     &graph_keys,
@@ -2025,7 +2020,9 @@ mod scheduler_fallback_gpu_tests {
         let _guard = grim_backend_rocm::device::util::gpu_test_lock();
         let prev_env = capture_env();
         if !grim_backend_rocm::RocmDevice::shared(0).graph_capture_enabled() {
-            eprintln!("Skipping: shared device predates capture opt-in (CPU test covers off-branch)");
+            eprintln!(
+                "Skipping: shared device predates capture opt-in (CPU test covers off-branch)"
+            );
             restore_capture_env(prev_env);
             return;
         }
@@ -2082,7 +2079,9 @@ mod scheduler_fallback_gpu_tests {
         let _guard = grim_backend_rocm::device::util::gpu_test_lock();
         let prev_env = capture_env();
         if !grim_backend_rocm::RocmDevice::shared(0).graph_capture_enabled() {
-            eprintln!("Skipping: shared device predates capture opt-in (CPU test covers off-branch)");
+            eprintln!(
+                "Skipping: shared device predates capture opt-in (CPU test covers off-branch)"
+            );
             restore_capture_env(prev_env);
             return;
         }
@@ -2165,8 +2164,14 @@ mod scheduler_fallback_gpu_tests {
         for (token, pos) in prefill {
             let ids = rocm_tensor(&dev, vec![token], grim_tensor::Shape::new(vec![1]));
             let positions = rocm_tensor(&dev, vec![pos], grim_tensor::Shape::new(vec![1]));
-            grim_core::model::CausalLm::forward(&lfm2, eager_session.as_mut(), &ids, &positions, &[])
-                .expect("eager shortconv prefill");
+            grim_core::model::CausalLm::forward(
+                &lfm2,
+                eager_session.as_mut(),
+                &ids,
+                &positions,
+                &[],
+            )
+            .expect("eager shortconv prefill");
         }
         let eager_ids = rocm_tensor(&dev, vec![7.0], grim_tensor::Shape::new(vec![1]));
         let eager_pos = rocm_tensor(&dev, vec![2.0], grim_tensor::Shape::new(vec![1]));

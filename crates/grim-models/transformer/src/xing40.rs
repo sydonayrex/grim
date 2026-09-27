@@ -39,13 +39,15 @@
 //! `_keys_to_ignore_on_load_unexpected = [r"model\.layers\.40.*"]`.
 
 use grim_backend_cpu::cpu_tensor;
-use grim_nn::pick_device_for_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
+use grim_nn::pick_device_for_tensor;
 use grim_nn::{Linear, RmsNorm, Rope, TensorParallelConfig, WeightSource};
-use grim_tensor::{ArithType, AttentionOps, BackendStorage, CoreTensorOps, DType, Device,
-    ElementwiseOps, QuantProvenance, RopeConfig, Shape, Tensor};
+use grim_tensor::{
+    ArithType, AttentionOps, BackendStorage, CoreTensorOps, DType, Device, ElementwiseOps,
+    QuantProvenance, RopeConfig, Shape, Tensor,
+};
 use std::sync::{Arc, OnceLock};
 
 // Config
@@ -181,7 +183,14 @@ fn seed_streams_device(
     let dev = grim_nn::modules::pick_device_for_storage_device(device);
     let mut dst = dev.zeros(full, DType::F32)?;
     for h in 0..hc {
-        dev.write_cols(dst.as_mut(), hc * hidden, h * hidden, x0.storage().as_ref(), seq_len, hidden)?;
+        dev.write_cols(
+            dst.as_mut(),
+            hc * hidden,
+            h * hidden,
+            x0.storage().as_ref(),
+            seq_len,
+            hidden,
+        )?;
     }
     Ok(Tensor::new(
         Arc::from(dst),
@@ -376,8 +385,7 @@ pub(crate) fn assemble_split_mla_banks(
         kv_b[k_dst..k_dst + nope * rank]
             .copy_from_slice(&w_kc[h * nope * rank..(h + 1) * nope * rank]);
         let v_dst = k_dst + nope * rank;
-        kv_b[v_dst..v_dst + vd * rank]
-            .copy_from_slice(&w_vc[h * vd * rank..(h + 1) * vd * rank]);
+        kv_b[v_dst..v_dst + vd * rank].copy_from_slice(&w_vc[h * vd * rank..(h + 1) * vd * rank]);
     }
 
     (w_kc, w_vc, kv_b)
@@ -424,12 +432,11 @@ impl Xing40HyperConnection {
         // `hc_*` tensors are never quantized.
         let (hc_fn, hc_base, scale_v) = if ws.has_tensor(&format!("hc_{gguf_tag}_fn.weight")) {
             (
-                Linear::load_shape(
-                    &ws.scoped(&format!("hc_{gguf_tag}_fn")),
-                    [flat, mix],
-                )?,
-                ws.get([mix], &format!("hc_{gguf_tag}_base.weight"))?.to_vec_f32()?,
-                ws.get([3], &format!("hc_{gguf_tag}_scale.weight"))?.to_vec_f32()?,
+                Linear::load_shape(&ws.scoped(&format!("hc_{gguf_tag}_fn")), [flat, mix])?,
+                ws.get([mix], &format!("hc_{gguf_tag}_base.weight"))?
+                    .to_vec_f32()?,
+                ws.get([3], &format!("hc_{gguf_tag}_scale.weight"))?
+                    .to_vec_f32()?,
             )
         } else {
             // safetensors: nested `<tag>_hc.hc_fn` with no `.weight` suffix.
@@ -478,10 +485,7 @@ impl Xing40HyperConnection {
         let flat = cfg.hidden_size * hc;
         let mix = (2 + hc) * hc;
         let hc_fn = Linear::from_tensor(
-            cpu_tensor(
-                vec![0.0f32; mix * flat],
-                Shape::new(vec![mix, flat]),
-            ),
+            cpu_tensor(vec![0.0f32; mix * flat], Shape::new(vec![mix, flat])),
             None,
         );
         let input_norm = RmsNorm::new(
@@ -608,7 +612,11 @@ impl Xing40HyperConnection {
     /// These are 24 + 3 floats of static checkpoint constants; caching them
     /// keeps the per-layer gate math free of any host involvement.
     fn dev_param(&self, ordinal: usize, base: bool) -> Result<&dyn BackendStorage> {
-        let cell = if base { &self.dev_base } else { &self.dev_scale };
+        let cell = if base {
+            &self.dev_base
+        } else {
+            &self.dev_scale
+        };
         let slot = cell.get_or_init(|| {
             let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
             let mix = (2 + self.hc_mult) * self.hc_mult;
@@ -697,12 +705,7 @@ impl Xing40HyperConnection {
     /// The destination is allocated once and each stream's column block is
     /// written in place, so the whole update is `hc * (hc + 2)` device ops with
     /// no host round-trip.
-    pub fn update_d2d(
-        &self,
-        streams: &Tensor,
-        y: &Tensor,
-        g: &Xing40HcGatesD2D,
-    ) -> Result<Tensor> {
+    pub fn update_d2d(&self, streams: &Tensor, y: &Tensor, g: &Xing40HcGatesD2D) -> Result<Tensor> {
         let dev = pick_device_for_tensor(streams);
         let hc = self.hc_mult;
         let hidden = self.hidden_size;
@@ -728,9 +731,11 @@ impl Xing40HyperConnection {
                     Some(m) => dev.add(m.as_ref(), scaled.as_ref(), &plane)?.0,
                 });
             }
-            let mixed = mixed.ok_or_else(|| Error::Config("Xing40: hc_mult must be >= 1".into()))?;
+            let mixed =
+                mixed.ok_or_else(|| Error::Config("Xing40: hc_mult must be >= 1".into()))?;
             let pw = g.post_row(&dev, h)?;
-            let (gated, _) = dev.row_scale(y.storage().as_ref(), pw.as_ref(), g.seq, hidden, &plane)?;
+            let (gated, _) =
+                dev.row_scale(y.storage().as_ref(), pw.as_ref(), g.seq, hidden, &plane)?;
             let (out_h, _) = dev.add(gated.as_ref(), mixed.as_ref(), &plane)?;
             dev.write_cols(
                 dst.as_mut(),
@@ -749,11 +754,7 @@ impl Xing40HyperConnection {
     /// The stream math is host-side (the established `softplus_mul_on_device`
     /// pattern): the tensors involved are `[seq, hc*hidden]`, while the projection
     /// itself stays on-device.
-    pub fn forward(
-        &self,
-        streams: &Tensor,
-        seq_len: usize,
-    ) -> Result<(Xing40HcGates, Vec<f32>)> {
+    pub fn forward(&self, streams: &Tensor, seq_len: usize) -> Result<(Xing40HcGates, Vec<f32>)> {
         let proj = self.project(streams)?;
         let gates = self.gates_from_projection(&proj, seq_len);
         let streams_v = streams.to_vec_f32()?;
@@ -857,7 +858,8 @@ impl Xing40Mla {
                 [cfg.q_lora_rank.unwrap_or(0), q_dim],
             )
             .ok();
-            let kv_a_proj = Linear::load_shape(&ws.scoped("attn_kv_a_mqa"), [cfg.hidden_size, kv_lora_out])?;
+            let kv_a_proj =
+                Linear::load_shape(&ws.scoped("attn_kv_a_mqa"), [cfg.hidden_size, kv_lora_out])?;
             let kv_a_layernorm = RmsNorm::load(
                 &ws.scoped("attn_kv_a_norm"),
                 cfg.kv_lora_rank,
@@ -895,25 +897,15 @@ impl Xing40Mla {
         } else {
             // ---- safetensors container ----
             // `ws` arrives already scoped to the attention module by the caller.
-            let (q_a_proj, q_a_layernorm, q_b_proj, q_proj_direct) =
-                if let Some(q_rank) = cfg.q_lora_rank {
-                    let qa_r = Linear::load_shape(&ws.scoped("q_a_proj"), [cfg.hidden_size, q_rank]);
-                    let qn_r = RmsNorm::load(&ws.scoped("q_a_layernorm"), q_rank, cfg.rms_norm_eps);
-                    let qb_r = Linear::load_shape(&ws.scoped("q_b_proj"), [q_rank, q_dim]);
-                    let (qa, qn, qb) = (qa_r.ok(), qn_r.ok(), qb_r.ok());
-                    if qa.is_some() && qn.is_some() && qb.is_some() {
-                        (qa, qn, qb, None)
-                    } else {
-                        (
-                            None,
-                            None,
-                            None,
-                            Some(Linear::load_shape(
-                                &ws.scoped("q_proj"),
-                                [cfg.hidden_size, q_dim],
-                            )?),
-                        )
-                    }
+            let (q_a_proj, q_a_layernorm, q_b_proj, q_proj_direct) = if let Some(q_rank) =
+                cfg.q_lora_rank
+            {
+                let qa_r = Linear::load_shape(&ws.scoped("q_a_proj"), [cfg.hidden_size, q_rank]);
+                let qn_r = RmsNorm::load(&ws.scoped("q_a_layernorm"), q_rank, cfg.rms_norm_eps);
+                let qb_r = Linear::load_shape(&ws.scoped("q_b_proj"), [q_rank, q_dim]);
+                let (qa, qn, qb) = (qa_r.ok(), qn_r.ok(), qb_r.ok());
+                if qa.is_some() && qn.is_some() && qb.is_some() {
+                    (qa, qn, qb, None)
                 } else {
                     (
                         None,
@@ -924,14 +916,28 @@ impl Xing40Mla {
                             [cfg.hidden_size, q_dim],
                         )?),
                     )
-                };
+                }
+            } else {
+                (
+                    None,
+                    None,
+                    None,
+                    Some(Linear::load_shape(
+                        &ws.scoped("q_proj"),
+                        [cfg.hidden_size, q_dim],
+                    )?),
+                )
+            };
 
             let kv_a_proj = Linear::load_shape(
                 &ws.scoped("kv_a_proj_with_mqa"),
                 [cfg.hidden_size, kv_lora_out],
             )?;
-            let kv_a_layernorm =
-                RmsNorm::load(&ws.scoped("kv_a_layernorm"), cfg.kv_lora_rank, cfg.rms_norm_eps)?;
+            let kv_a_layernorm = RmsNorm::load(
+                &ws.scoped("kv_a_layernorm"),
+                cfg.kv_lora_rank,
+                cfg.rms_norm_eps,
+            )?;
             let kv_b_proj = Linear::load_shape(
                 &ws.scoped("kv_b_proj"),
                 [
@@ -1003,7 +1009,10 @@ impl Xing40Mla {
     /// it (the host path uses `w_kc`/`w_vc`), and a transpose here would
     /// allocate and fill a second `[rank, nh * (nope + vd)]` buffer for nothing.
     fn split_kv_b_linear(kv_b: Vec<f32>, cfg: &Xing40Config, device: &Device) -> Result<Linear> {
-        let shape = Shape::new(vec![cfg.num_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim), cfg.kv_lora_rank]);
+        let shape = Shape::new(vec![
+            cfg.num_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim),
+            cfg.kv_lora_rank,
+        ]);
         let weight = const_tensor(kv_b, shape, device)?;
         Ok(Linear {
             w_t: weight.clone(),
@@ -1247,14 +1256,16 @@ impl Xing40Mla {
         let q_rope_shape = Shape::new(vec![seq_len, nh * rope_d]);
         let mut q_rope = dev.zeros(&q_rope_shape, DType::F32)?;
         for h in 0..nh {
-            let src = dev.narrow_cols(
-                q_full.storage().as_ref(),
-                nh * q_stride,
-                h * q_stride + nope,
-                seq_len,
-                rope_d,
-                &Shape::new(vec![seq_len, rope_d]),
-            )?.0;
+            let src = dev
+                .narrow_cols(
+                    q_full.storage().as_ref(),
+                    nh * q_stride,
+                    h * q_stride + nope,
+                    seq_len,
+                    rope_d,
+                    &Shape::new(vec![seq_len, rope_d]),
+                )?
+                .0;
             let Some(roped) = or_host_fallback(dev.rope(
                 src.as_ref(),
                 positions,
@@ -1267,7 +1278,8 @@ impl Xing40Mla {
                     interleaved: false,
                 },
                 &Shape::new(vec![1, seq_len, rope_d]),
-            ))? else {
+            ))?
+            else {
                 return Ok(None);
             };
             dev.write_cols(
@@ -1291,26 +1303,32 @@ impl Xing40Mla {
         let q_abs_shape = Shape::new(vec![seq_len, nh * rank]);
         let mut q_absorbed = dev.zeros(&q_abs_shape, DType::F32)?;
         for h in 0..nh {
-            let q_nope_h = dev.narrow_cols(
-                q_full.storage().as_ref(),
-                nh * q_stride,
-                h * q_stride,
-                seq_len,
-                nope,
-                &Shape::new(vec![seq_len, nope]),
-            )?.0;
-            let w_h = dev.narrow_rows(
-                w_kc_dev,
-                h * rank,
-                rank,
-                nope,
-                &Shape::new(vec![rank, nope]),
-            )?.0;
-            let absorbed = dev.matmul(
-                q_nope_h.as_ref(),
-                w_h.as_ref(),
-                &Shape::new(vec![seq_len, rank]),
-            )?.0;
+            let q_nope_h = dev
+                .narrow_cols(
+                    q_full.storage().as_ref(),
+                    nh * q_stride,
+                    h * q_stride,
+                    seq_len,
+                    nope,
+                    &Shape::new(vec![seq_len, nope]),
+                )?
+                .0;
+            let w_h = dev
+                .narrow_rows(
+                    w_kc_dev,
+                    h * rank,
+                    rank,
+                    nope,
+                    &Shape::new(vec![rank, nope]),
+                )?
+                .0;
+            let absorbed = dev
+                .matmul(
+                    q_nope_h.as_ref(),
+                    w_h.as_ref(),
+                    &Shape::new(vec![seq_len, rank]),
+                )?
+                .0;
             dev.write_cols(
                 q_absorbed.as_mut(),
                 nh * rank,
@@ -1324,23 +1342,29 @@ impl Xing40Mla {
 
         // 4. KV latent projection: norm c_kv, rope k_pe, pack [c_kv || k_pe].
         let kv_latent = self.kv_a_proj.forward(x)?;
-        let c_kv = dev.narrow_cols(
-            kv_latent.storage().as_ref(),
-            row,
-            0,
-            seq_len,
-            rank,
-            &Shape::new(vec![seq_len, rank]),
-        )?.0;
-        let c_kv = self.kv_a_layernorm.forward(&wrap_like(x, c_kv, Shape::new(vec![seq_len, rank])))?;
-        let k_pe = dev.narrow_cols(
-            kv_latent.storage().as_ref(),
-            row,
-            rank,
-            seq_len,
-            rope_d,
-            &Shape::new(vec![seq_len, rope_d]),
-        )?.0;
+        let c_kv = dev
+            .narrow_cols(
+                kv_latent.storage().as_ref(),
+                row,
+                0,
+                seq_len,
+                rank,
+                &Shape::new(vec![seq_len, rank]),
+            )?
+            .0;
+        let c_kv =
+            self.kv_a_layernorm
+                .forward(&wrap_like(x, c_kv, Shape::new(vec![seq_len, rank])))?;
+        let k_pe = dev
+            .narrow_cols(
+                kv_latent.storage().as_ref(),
+                row,
+                rank,
+                seq_len,
+                rope_d,
+                &Shape::new(vec![seq_len, rope_d]),
+            )?
+            .0;
         let Some((k_pe, _k_pe_handle)) = or_host_fallback(dev.rope(
             k_pe.as_ref(),
             positions,
@@ -1352,14 +1376,29 @@ impl Xing40Mla {
                 interleaved: false,
             },
             &Shape::new(vec![1, seq_len, rope_d]),
-        ))? else {
+        ))?
+        else {
             return Ok(None);
         };
 
         let latent_new_shape = Shape::new(vec![seq_len, row]);
         let mut latent_new = dev.zeros(&latent_new_shape, DType::F32)?;
-        dev.write_cols(latent_new.as_mut(), row, 0, c_kv.storage().as_ref(), seq_len, rank)?;
-        dev.write_cols(latent_new.as_mut(), row, rank, k_pe.as_ref(), seq_len, rope_d)?;
+        dev.write_cols(
+            latent_new.as_mut(),
+            row,
+            0,
+            c_kv.storage().as_ref(),
+            seq_len,
+            rank,
+        )?;
+        dev.write_cols(
+            latent_new.as_mut(),
+            row,
+            rank,
+            k_pe.as_ref(),
+            seq_len,
+            rope_d,
+        )?;
         let latent_new = wrap_like(x, latent_new, latent_new_shape);
 
         // 5. Append to the latent KV cache.
@@ -1385,14 +1424,15 @@ impl Xing40Mla {
         //    the ratio that reconciles it with the model's 1/sqrt(nope + rope_d) —
         //    the same correction the host decode path applies.
         let scale = 1.0 / ((nope + rope_d) as f32).sqrt();
-        if seq_len == 1
-            && rank <= 512
-            && !self.kv_b_proj.weight.dtype().is_quantized()
-        {
+        if seq_len == 1 && rank <= 512 && !self.kv_b_proj.weight.dtype().is_quantized() {
             let kernel_scale = 1.0f32 / ((rank + rope_d) as f32).sqrt();
             let ratio = scale / kernel_scale;
-            let qa_s = dev.mul_scalar(q_absorbed.storage().as_ref(), ratio, &q_abs_shape)?.0;
-            let qr_s = dev.mul_scalar(q_rope.storage().as_ref(), ratio, &q_rope_shape)?.0;
+            let qa_s = dev
+                .mul_scalar(q_absorbed.storage().as_ref(), ratio, &q_abs_shape)?
+                .0;
+            let qr_s = dev
+                .mul_scalar(q_rope.storage().as_ref(), ratio, &q_rope_shape)?
+                .0;
             let attn_shape = Shape::new(vec![1, nh * vd]);
             let mut attn = dev.zeros(&attn_shape, DType::F32)?;
             let fused = or_host_fallback(dev.mla_absorbed_decode(
@@ -1439,27 +1479,34 @@ impl Xing40Mla {
         let attn_shape = Shape::new(vec![seq_len, nh * vd]);
         let mut attn = dev.zeros(&attn_shape, DType::F32)?;
         for h in 0..nh {
-            let latent_h = dev.narrow_cols(
-                out_latent.as_ref(),
-                nh * rank,
-                h * rank,
-                seq_len,
-                rank,
-                &Shape::new(vec![seq_len, rank]),
-            )?.0;
-            let w_h = dev.narrow_rows(
-                w_vc_dev,
+            let latent_h = dev
+                .narrow_cols(
+                    out_latent.as_ref(),
+                    nh * rank,
+                    h * rank,
+                    seq_len,
+                    rank,
+                    &Shape::new(vec![seq_len, rank]),
+                )?
+                .0;
+            let w_h = dev
+                .narrow_rows(w_vc_dev, h * vd, vd, rank, &Shape::new(vec![vd, rank]))?
+                .0;
+            let projected = dev
+                .matmul(
+                    latent_h.as_ref(),
+                    w_h.as_ref(),
+                    &Shape::new(vec![seq_len, vd]),
+                )?
+                .0;
+            dev.write_cols(
+                attn.as_mut(),
+                nh * vd,
                 h * vd,
+                projected.as_ref(),
+                seq_len,
                 vd,
-                rank,
-                &Shape::new(vec![vd, rank]),
-            )?.0;
-            let projected = dev.matmul(
-                latent_h.as_ref(),
-                w_h.as_ref(),
-                &Shape::new(vec![seq_len, vd]),
-            )?.0;
-            dev.write_cols(attn.as_mut(), nh * vd, h * vd, projected.as_ref(), seq_len, vd)?;
+            )?;
         }
         let attn = wrap_like(x, attn, attn_shape);
 
@@ -1703,15 +1750,24 @@ impl Xing40Moe {
                     Some(Xing40Expert {
                         w1: Linear::load_shape(
                             &ws.scoped("ffn_gate_shexp"),
-                            [cfg.hidden_size, cfg.moe_intermediate_size * cfg.n_shared_experts],
+                            [
+                                cfg.hidden_size,
+                                cfg.moe_intermediate_size * cfg.n_shared_experts,
+                            ],
                         )?,
                         w3: Linear::load_shape(
                             &ws.scoped("ffn_up_shexp"),
-                            [cfg.hidden_size, cfg.moe_intermediate_size * cfg.n_shared_experts],
+                            [
+                                cfg.hidden_size,
+                                cfg.moe_intermediate_size * cfg.n_shared_experts,
+                            ],
                         )?,
                         w2: Linear::load_shape(
                             &ws.scoped("ffn_down_shexp"),
-                            [cfg.moe_intermediate_size * cfg.n_shared_experts, cfg.hidden_size],
+                            [
+                                cfg.moe_intermediate_size * cfg.n_shared_experts,
+                                cfg.hidden_size,
+                            ],
                         )?,
                     })
                 } else {
@@ -1773,7 +1829,11 @@ impl Xing40Moe {
     /// Per-token routing for `noaux_tc` sigmoid gating: select on
     /// `sigmoid(logit) + bias`, combine on the raw `sigmoid(logit)`, then
     /// `norm_topk_prob` normalize and apply `routed_scaling_factor`.
-    fn route_sigmoid(&self, logits_v: &[f32], seq_len: usize) -> Vec<crate::shared_moe::TokenRouting> {
+    fn route_sigmoid(
+        &self,
+        logits_v: &[f32],
+        seq_len: usize,
+    ) -> Vec<crate::shared_moe::TokenRouting> {
         let num_exp = self.experts.len();
         let k = self.num_experts_per_tok.min(num_exp);
         let bias = self
@@ -1837,11 +1897,14 @@ impl Xing40Moe {
                     down: e.w2.clone(),
                 })
                 .collect();
-            let shared_expert = self.shared_experts.as_ref().map(|e| crate::shared_moe::MoeExpert {
-                gate: e.w1.clone(),
-                up: e.w3.clone(),
-                down: e.w2.clone(),
-            });
+            let shared_expert =
+                self.shared_experts
+                    .as_ref()
+                    .map(|e| crate::shared_moe::MoeExpert {
+                        gate: e.w1.clone(),
+                        up: e.w3.clone(),
+                        down: e.w2.clone(),
+                    });
             if let Ok(Some(out)) = crate::shared_moe::fused_moe_dispatch_from_logits_with_bias(
                 dev.as_ref(),
                 x,
@@ -1976,11 +2039,7 @@ impl Xing40Block {
                     )?,
                 }
             } else {
-                Xing40Expert::load_dense(
-                    &ws.scoped("mlp"),
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                )?
+                Xing40Expert::load_dense(&ws.scoped("mlp"), cfg.hidden_size, cfg.intermediate_size)?
             };
             (Some(mlp), None)
         } else {
@@ -2076,10 +2135,7 @@ impl Xing40Block {
         let seq_len = x.shape().dims()[0];
         // 1. attn_hc: collapse the multi-stream state into the single attention input.
         let (attn_gates, collapsed_v) = self.attn_hc.forward(x, seq_len)?;
-        let collapsed = cpu_tensor(
-            collapsed_v,
-            Shape::new(vec![seq_len, self.hidden_size]),
-        );
+        let collapsed = cpu_tensor(collapsed_v, Shape::new(vec![seq_len, self.hidden_size]));
         let collapsed = self.attn_norm.forward(&collapsed)?;
 
         // 2. Self-attention on the collapsed stream.
@@ -2096,10 +2152,7 @@ impl Xing40Block {
 
         // 4. ffn_hc: collapse for the feed-forward.
         let (ffn_gates, collapsed_v) = self.ffn_hc.forward(&streams, seq_len)?;
-        let collapsed = cpu_tensor(
-            collapsed_v,
-            Shape::new(vec![seq_len, self.hidden_size]),
-        );
+        let collapsed = cpu_tensor(collapsed_v, Shape::new(vec![seq_len, self.hidden_size]));
         let collapsed = self.ffn_norm.forward(&collapsed)?;
 
         // 5. Dense SwiGLU or sparse MoE.
@@ -2114,7 +2167,9 @@ impl Xing40Block {
         // 6. Write the FFN result back into the streams.
         let streams_v = streams.to_vec_f32()?;
         let ffn_v = ffn_out.to_vec_f32()?;
-        let next_v = self.ffn_hc.write_back(&streams_v, &ffn_v, seq_len, &ffn_gates);
+        let next_v = self
+            .ffn_hc
+            .write_back(&streams_v, &ffn_v, seq_len, &ffn_gates);
         self.upload_streams(&next_v, streams_shape, x.device())
     }
 
@@ -2146,11 +2201,7 @@ pub struct Xing40 {
 }
 
 impl Xing40 {
-    pub fn load(
-        device: Device,
-        ws: &grim_nn::WeightSource<'_>,
-        cfg: Xing40Config,
-    ) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Xing40Config) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
@@ -2310,9 +2361,8 @@ mod tests {
             .collect();
 
         // The safetensors arm derives its host up-projections from exactly this.
-        let (kc_true, vc_true) = crate::mla_common::extract_kv_b_up_projs(
-            &kv_b_true, nh, nope, vd, rank,
-        );
+        let (kc_true, vc_true) =
+            crate::mla_common::extract_kv_b_up_projs(&kv_b_true, nh, nope, vd, rank);
 
         // Now express the same weights the way GGUF stores them: k_b transposed
         // to [nh, rank, nope], v_b as [nh, vd, rank].
@@ -2372,7 +2422,10 @@ mod tests {
         for h in 0..nh {
             for d in 0..nope {
                 for r in 0..rank {
-                    assert_eq!(kc[(h * nope + d) * rank + r], k_b[(h * rank + r) * nope + d]);
+                    assert_eq!(
+                        kc[(h * nope + d) * rank + r],
+                        k_b[(h * rank + r) * nope + d]
+                    );
                 }
             }
             for d in 0..vd {
@@ -2454,18 +2507,9 @@ mod tests {
         let num_exp = 4;
         let k = 2;
         let tiny_expert = || Xing40Expert {
-            w1: Linear::from_tensor(
-                cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1, 1])),
-                None,
-            ),
-            w3: Linear::from_tensor(
-                cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1, 1])),
-                None,
-            ),
-            w2: Linear::from_tensor(
-                cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1, 1])),
-                None,
-            ),
+            w1: Linear::from_tensor(cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1, 1])), None),
+            w3: Linear::from_tensor(cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1, 1])), None),
+            w2: Linear::from_tensor(cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1, 1])), None),
         };
         let moe = Xing40Moe {
             gate: Linear::from_tensor(

@@ -6,7 +6,13 @@ fn main() {
     let g = read_gguf(&mut f).unwrap();
     for t in &g.tensors {
         if t.name == "token_embd.weight" || t.name == "output.weight" {
-            println!("{}: shape={:?} dtype={:?} bytes={}", t.name, t.shape(), t.dtype, t.size_bytes);
+            println!(
+                "{}: shape={:?} dtype={:?} bytes={}",
+                t.name,
+                t.shape(),
+                t.dtype,
+                t.size_bytes
+            );
         }
     }
 }
