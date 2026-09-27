@@ -87,3 +87,72 @@ fn kernel_requires_k_multiple_of_16() {
         assert_ne!(k % 16, 0, "K={k} must be rejected by the launcher");
     }
 }
+
+/// WS-D D2: the kernel declares `__launch_bounds__`.
+///
+/// The plan found zero `__launch_bounds__` across every WMMA kernel in the tree.
+/// Without it the compiler picks a register budget freely, and this kernel
+/// stages A in registers so that budget is the difference between fitting and
+/// spilling to scratch -- the same class of failure that cost 60x at
+/// `wmma_quantized_gemm.rs:8` ("384 VGPRs, over the 256 limit").
+///
+/// The bound must be 32: the launcher passes `block_dim = (32, 1, 1)` and the
+/// kernel's own doc header says one wavefront owns a 16x32 output tile. A bound
+/// that disagreed with the launch configuration would be worse than none, so the
+/// value is checked against the kernel's own wavefront arithmetic rather than
+/// hardcoded.
+#[test]
+fn white_raven_declares_launch_bounds() {
+    assert!(
+        KERNEL_SOURCE.contains("__launch_bounds__"),
+        "WhiteRaven kernel must declare __launch_bounds__; without it the \
+         compiler is free to pick a register budget that spills A to scratch"
+    );
+}
+
+/// The declared bound must match the launch configuration, and that
+/// configuration is one wavefront.
+///
+/// Derived from the kernel: `blockIdx.x * 2` with a 16-wide N tile means each
+/// block covers 32 columns, and the WMMA fragment is 16x16, so a block computes
+/// exactly two 16x16 tiles -- one wavefront's worth of `mma_sync` on RDNA's
+/// 32-wide wavefront. Anything else and the bound would be a lie the compiler
+/// optimises against.
+#[test]
+fn the_launch_bound_matches_one_wavefront() {
+    // Anchor on the kernel's actual declaration rather than the first textual
+    // occurrence: the file's comments discuss `__launch_bounds__` and
+    // `block_dim = (32,1,1)` in prose, so a naive search finds a `)` from a
+    // parenthetical in a comment. Scoping to the text immediately preceding the
+    // kernel name also proves the attribute is on *this* kernel.
+    let decl = KERNEL_SOURCE
+        .find("void grim_wmma_gemm_fp8_e4m3")
+        .unwrap_or_else(|| panic!("WhiteRaven kernel declaration not found"));
+    let before = &KERNEL_SOURCE[..decl];
+    let attr = before
+        .rfind("__launch_bounds__")
+        .unwrap_or_else(|| panic!("no __launch_bounds__ on the kernel declaration"));
+    let after = &before[attr + "__launch_bounds__".len()..];
+    let open = after
+        .find('(')
+        .unwrap_or_else(|| panic!("__launch_bounds__ is not followed by '('"));
+    let close = after[open..]
+        .find(')')
+        .map(|i| i + open)
+        .unwrap_or_else(|| panic!("__launch_bounds__ has no closing ')'"));
+
+    let bound = &after[open + 1..close];
+    let threads: u32 = bound
+        .split(',')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("could not read a thread count from {bound:?}"));
+
+    assert_eq!(
+        threads, 32,
+        "WhiteRaven launches with block_dim = (32,1,1) -- one wavefront. A \
+         __launch_bounds__ of {threads} would not match the launch config."
+    );
+}

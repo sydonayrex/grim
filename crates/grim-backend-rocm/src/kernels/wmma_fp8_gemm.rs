@@ -34,7 +34,15 @@ pub const KERNEL_SOURCE: &str = r#"
 using namespace rocwmma;
 
 // WhiteRaven: FP8 E4M3 x FP8 E4M3 -> FP32, 16x32 output tile per wavefront.
-extern "C" __global__ void grim_wmma_gemm_fp8_e4m3(
+//
+// __launch_bounds__(32) matches the launcher's block_dim = (32,1,1): one
+// wavefront, two 16x16 WMMA fragments. The bound is not decoration -- A is staged
+// in registers and reused across both mma_sync calls, so the register budget is
+// the difference between fitting and spilling to scratch, the same failure class
+// that cost 60x at wmma_quantized_gemm.rs:8 ("384 VGPRs, over the 256 limit").
+// RDNA4's 96-VGPR-per-wave budget is 3x the 32 registers a wavefront holds at
+// full occupancy, so there is headroom for the A fragment here.
+extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3(
     const float8_t* __restrict__ A,  // [M, K] FP8 E4M3, row-major
     const float8_t* __restrict__ B,  // [N, K] FP8 E4M3 (B^T is [K, N])
     float* __restrict__ C,           // [M, N] FP32, tightly packed
