@@ -104,9 +104,31 @@ pub struct DecodeGraphBuffers {
     /// Filled by [`DecodeGraphBuffers::allocate_gdl_layer`] — never inside
     /// capture (the Taylor-default H2D uploads + sync live there).
     pub gdl: Vec<Option<GdlLayerBuffers>>,
+    /// KDA recurrent staging: per-layer alpha/beta/acc/state/conv_out buffers (`None` for non-KDA layers).
+    /// Filled by [`DecodeGraphBuffers::allocate_kda_layer`] — never inside capture.
+    pub kda: Vec<Option<KdaLayerBuffers>>,
     pub num_layers: usize,
     pub max_ctx: usize,
     pub batch: usize,
+}
+
+/// KDA per-layer device state + projection buffers for HIP graph capture.
+#[derive(Debug)]
+pub struct KdaLayerBuffers {
+    /// Recurrent state `[num_val_heads * head_dim * head_dim]` f32, zeros at alloc.
+    pub state: RocmStorage,
+    /// Projected alpha `[batch, num_val_heads]` f32.
+    pub alpha: RocmStorage,
+    /// Projected beta `[batch, num_val_heads]` f32.
+    pub beta: RocmStorage,
+    /// Delta-rule accumulator scratch `[batch * num_val_heads * head_dim]` f32.
+    pub acc_scratch: RocmStorage,
+    /// Short-conv output `[batch, conv_dim]` f32 before delta rule.
+    pub conv_out: RocmStorage,
+    pub num_val_heads: usize,
+    pub num_key_heads: usize,
+    pub head_dim: usize,
+    pub conv_dim: usize,
 }
 
 /// GRAVE Phase 4 — per-layer GDN-2 device state + gate buffers.
@@ -157,6 +179,13 @@ pub struct EagerKvSource<'a> {
     /// Points to `[batch*heads*dk*dv]` f32 device buffer.
     pub gdl_state: Option<*const f32>,
     /// Borrow anchor so the pointers can't outlive the session caches.
+    pub _anchor: std::marker::PhantomData<&'a ()>,
+}
+
+/// KDA recurrent state seeding from eager prefill.
+pub struct EagerKdaSource<'a> {
+    /// Points to `[num_val_heads*head_dim*head_dim]` f32 device buffer.
+    pub kda_state: *const f32,
     pub _anchor: std::marker::PhantomData<&'a ()>,
 }
 
@@ -615,6 +644,7 @@ impl DecodeGraphBuffers {
             act_q81_buf,
             fused_qkv_out,
             gdl: (0..num_layers).map(|_| None).collect(),
+            kda: (0..num_layers).map(|_| None).collect(),
             moe_gate_logits,
             moe_out,
             moe_route_tokens,
@@ -632,6 +662,74 @@ impl DecodeGraphBuffers {
             max_ctx,
             batch,
         })
+    }
+
+    /// Allocate one layer's KDA recurrent device buffers (state + projections).
+    /// MUST run outside capture.
+    pub fn allocate_kda_layer(
+        &mut self,
+        dev: &RocmDevice,
+        layer_idx: usize,
+        batch: usize,
+        num_val_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        conv_dim: usize,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        if layer_idx >= self.kda.len() {
+            return Err(Error::Backend(format!(
+                "allocate_kda_layer: layer {layer_idx} >= {}",
+                self.kda.len()
+            )));
+        }
+        if batch == 0 || num_val_heads == 0 || num_key_heads == 0 || head_dim == 0 || conv_dim == 0 {
+            return Err(Error::Backend("allocate_kda_layer: zero dim".into()));
+        }
+        let dt = dtype_f32();
+        let state = RocmStorage::alloc_gpu(
+            &Shape::new(vec![num_val_heads * head_dim * head_dim]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let alpha = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch, num_val_heads]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let beta = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch, num_val_heads]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let acc_scratch = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch * num_val_heads * head_dim]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let conv_out = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch, conv_dim]),
+            dt,
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+
+        self.kda[layer_idx] = Some(KdaLayerBuffers {
+            state,
+            alpha,
+            beta,
+            acc_scratch,
+            conv_out,
+            num_val_heads,
+            num_key_heads,
+            head_dim,
+            conv_dim,
+        });
+        Ok(())
     }
 
     /// GRAVE Phase 4: allocate one layer's GDN-2 device buffers with the
@@ -951,6 +1049,45 @@ impl DecodeGraphBuffers {
             if res != crate::hipSuccess {
                 return Err(Error::Backend(format!(
                     "seed_gdl_state: hipMemcpyAsync failed: {res}"
+                )));
+            }
+        }
+        dev.synchronize();
+        Ok(())
+    }
+
+    /// KDA recurrent state seeding: D2D copy each layer's eager recurrent `ssm_state_dev`
+    /// into the graph's `kda.state` buffer. Must run OUTSIDE a capture bracket.
+    pub fn seed_kda_state_from_eager(
+        &mut self,
+        dev: &RocmDevice,
+        per_layer: &[Option<EagerKdaSource<'_>>],
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let stream = dev.active_stream();
+        for (layer_idx, src) in per_layer.iter().enumerate() {
+            let Some(src) = src else { continue };
+            let state_ptr = src.kda_state;
+            let Some(kda) = self.kda.get(layer_idx).and_then(|o| o.as_ref()) else {
+                continue;
+            };
+            let n_elem = kda.state.shape().elem_count();
+            if n_elem == 0 {
+                continue;
+            }
+            let bytes = n_elem * 4; // f32
+            let dst = kda
+                .state
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("seed_kda_state: no dst ptr".into()))?
+                as *mut c_void;
+            let src_ptr = state_ptr as *const c_void;
+            let res: crate::HipErrorT = unsafe {
+                crate::hipMemcpyAsync(dst, src_ptr, bytes, HipMemcpyKind::DeviceToDevice, stream)
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!(
+                    "seed_kda_state: hipMemcpyAsync failed: {res}"
                 )));
             }
         }

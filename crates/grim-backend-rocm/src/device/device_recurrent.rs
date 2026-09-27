@@ -1177,4 +1177,100 @@ impl RocmDevice {
             ],
         )
     }
+
+    /// Graph-capture safe KDA gated delta rule + head norm gate without dynamic allocations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kda_gated_delta_rule_batched_into(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        acc_scratch: &RocmStorage,
+        out: &RocmStorage,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let cm_s = as_rocm(conv_out)?;
+        let al_s = as_rocm(alpha)?;
+        let be_s = as_rocm(beta)?;
+        let db_s = as_rocm(dt_bias)?;
+        let sa_s = as_rocm(ssm_a)?;
+        let nw_s = as_rocm(norm_weight)?;
+        let z_s = match z {
+            Some(zz) => Some(as_rocm(zz)?),
+            None => None,
+        };
+        let s_s = as_rocm(state)?;
+
+        let mut cm_ptr = dev_ptr(cm_s)?;
+        let mut al_ptr = dev_ptr(al_s)?;
+        let mut be_ptr = dev_ptr(be_s)?;
+        let mut db_ptr = dev_ptr(db_s)?;
+        let mut sa_ptr = dev_ptr(sa_s)?;
+        let mut s_ptr = dev_ptr(s_s)?;
+        let mut acc_ptr = dev_ptr(acc_scratch)?;
+        let mut nv_i = num_value_heads as i32;
+        let mut nk_i = num_key_heads as i32;
+        let mut hd_i = head_dim as i32;
+        let mut eps_f = eps;
+
+        let (grid, block) = linear_launch(num_value_heads * head_dim);
+        self.launch_compute_kernel(
+            "grim_kda_gated_delta_rule_batched",
+            grid,
+            block,
+            &mut [
+                arg(&mut cm_ptr),
+                arg(&mut al_ptr),
+                arg(&mut be_ptr),
+                arg(&mut db_ptr),
+                arg(&mut sa_ptr),
+                arg(&mut s_ptr),
+                arg(&mut acc_ptr),
+                arg(&mut nv_i),
+                arg(&mut nk_i),
+                arg(&mut hd_i),
+                arg(&mut eps_f),
+            ],
+        )?;
+
+        let mut acc_ptr2 = dev_ptr(acc_scratch)?;
+        let mut nw_ptr = dev_ptr(nw_s)?;
+        let mut z_ptr = match z_s {
+            Some(zz) => dev_ptr(zz)?,
+            None => 0u64,
+        };
+        let mut out_ptr = dev_ptr(out)?;
+        let mut nv2_i = num_value_heads as i32;
+        let mut hd2_i = head_dim as i32;
+        let mut eps2_f = eps;
+        let mut has_z_i = i32::from(z_s.is_some());
+
+        let (grid2, block2) = linear_launch(num_value_heads);
+        self.launch_compute_kernel(
+            "grim_kda_head_norm_gate",
+            grid2,
+            block2,
+            &mut [
+                arg(&mut acc_ptr2),
+                arg(&mut nw_ptr),
+                arg(&mut z_ptr),
+                arg(&mut out_ptr),
+                arg(&mut nv2_i),
+                arg(&mut hd2_i),
+                arg(&mut eps2_f),
+                arg(&mut has_z_i),
+            ],
+        )?;
+
+        Ok(())
+    }
 }
+
