@@ -1551,9 +1551,26 @@ fn gated_delta_net_forward(
                 qkv.device().clone(),
             );
             let w = blk.ssm_conv1d.as_ref().unwrap().clone();
+            // `ssm_conv1d.weight` is stored [taps, conv_dim] — llama.cpp reads
+            // `conv_kernel->ne[0]` as the TAP COUNT, and the real tensors agree
+            // (9B: [4, 8192], 27B: [4, 10240]). It was being relabelled as
+            // [chans, taps] without transposing, so every tap was read from the
+            // wrong channel and the conv fed scrambled values into all three of
+            // q, k and v on every recurrent layer. Transpose for real.
+            let w_raw = w.to_vec_f32()?;
+            let mut w_chw = vec![0.0f32; chans * taps];
+            if w_raw.len() >= chans * taps {
+                for k in 0..taps {
+                    for ch in 0..chans {
+                        w_chw[ch * taps + k] = w_raw[k * chans + ch];
+                    }
+                }
+            } else {
+                w_chw.copy_from_slice(&w_raw);
+            }
             let w_t = Tensor::new(
                 std::sync::Arc::from(dev.from_cpu(
-                    &w.to_vec_f32()?,
+                    &w_chw,
                     &Shape::new(vec![chans, taps]),
                     DType::F32,
                 )?),
@@ -1783,12 +1800,19 @@ fn gated_delta_net_forward_d2d(
     let taps = blk.cfg_ssm_d_conv().max(1);
     // The short conv weight must already be plain f32 of the right shape: the
     // op reads it directly and has no quantized path of its own.
+    // The checkpoint stores it [taps, conv_dim] (llama.cpp reads
+    // `conv_kernel->ne[0]` as the tap count; 9B is [4, 8192]). The device conv
+    // op indexes [channel, tap], so it is transposed on the way in, exactly as
+    // the host path now does.
     let cw_dims = conv_w.shape().dims().to_vec();
-    if cw_dims.len() != 2 || cw_dims[0] != conv_dim || cw_dims[1] != taps {
-        return Ok(None);
+    if cw_dims.len() != 2 || cw_dims[0] != taps || cw_dims[1] != conv_dim {
+        d2d_decline!("kda: conv_w shape {cw_dims:?} != [{taps}, {conv_dim}]");
     }
     if !matches!(conv_w.dtype().storage, Storage::Native) {
-        return Ok(None);
+        d2d_decline!(
+            "kda: ssm_conv1d.weight is {:?}, not Native/f32 — the conv op has no quantized path",
+            conv_w.dtype().storage,
+        );
     }
 
     let dev = pick_device_for_storage_device(x_normed.device());
@@ -1827,9 +1851,17 @@ fn gated_delta_net_forward_d2d(
     let conv_state = cache.conv_state_dev.as_ref().ok_or_else(|| {
         grim_core::error::Error::Backend("conv_state_dev vanished after allocation".into())
     })?;
+    let cw_raw = conv_w.to_vec_f32()?;
+    let mut cw_chw = vec![0.0f32; conv_dim * taps];
+    for k in 0..taps {
+        for ch in 0..conv_dim {
+            cw_chw[ch * taps + k] = cw_raw[k * conv_dim + ch];
+        }
+    }
+    let cw_dev = dev.from_cpu(&cw_chw, &Shape::new(vec![conv_dim, taps]), DType::F32)?;
     let (conv_out, _) = dev.short_conv1d_causal_step(
         qkv.storage().as_ref(),
-        conv_w.storage().as_ref(),
+        cw_dev.as_ref(),
         None,
         conv_state.as_ref(),
         &Shape::new(vec![1, conv_dim]),

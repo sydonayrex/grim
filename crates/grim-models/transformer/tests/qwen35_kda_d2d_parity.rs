@@ -111,14 +111,21 @@ fn build_block(device: &Device, dev: Option<&RocmDevice>) -> Qwen35Block {
         // Present and f32, which is what the device path requires.
         ssm_conv1d: Some(mk(
             w(5, conv_dim() * TAPS),
-            Shape::new(vec![conv_dim(), TAPS]),
+            Shape::new(vec![TAPS, conv_dim()]),
         )),
         ssm_conv_vec: None,
         ssm_a: Some(w(6, NV)),
         ssm_alpha: Some(lin(w(7, NV * HIDDEN), Shape::new(vec![NV, HIDDEN]))),
         ssm_beta: Some(lin(w(8, NV * HIDDEN), Shape::new(vec![NV, HIDDEN]))),
         ssm_dt_bias: Some(w(9, NV)),
-        ssm_norm: Some(w(10, value_dim())),
+        // The real width, and the one the checkpoint actually stores:
+        // `ssm_norm.weight` is `ssm_d_state` (HD) elements, indexed by position
+        // WITHIN a head by both host reference and both device kernels. This
+        // fixture was `value_dim()` wide, which is 3x too wide for this
+        // geometry (NV=6, NK=2) and so let the D2D guard's `ssm_norm.len() <
+        // value_dim` requirement pass in the test while failing on every real
+        // checkpoint — a survivor that hid the bug for the life of the path.
+        ssm_norm: Some(w(10, HD)),
         ssm_dt_rank_hint: NV,
         ssm_n_group_hint: NK,
         ssm_d_state_hint: HD,
