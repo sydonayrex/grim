@@ -8,6 +8,7 @@ mod packed_gemm;
 pub mod qat_mxfp4;
 pub mod rco;
 pub mod soul_eater;
+pub mod scrub_jay;
 pub mod spqr;
 pub mod tree_pie;
 
