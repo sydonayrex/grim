@@ -1981,6 +1981,109 @@ impl RecurrentOps for CpuDevice {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_scan(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        seq_len: usize,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let cm_s = a_storage(conv_out)?;
+        let al_s = a_storage(alpha)?;
+        let be_s = a_storage(beta)?;
+        let db_s = a_storage(dt_bias)?;
+        let sa_s = a_storage(ssm_a)?;
+        let nw_s = a_storage(norm_weight)?;
+        let z_s = z.map(a_storage).transpose()?;
+        let st_s = a_storage(state)?;
+
+        let key_dim = num_key_heads * head_dim;
+        let value_dim = num_value_heads * head_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+
+        let mut out = vec![0.0f32; seq_len * value_dim];
+        let _values_per_group = (num_value_heads / num_key_heads.max(1)).max(1);
+
+        let s_ptr = st_s.data.as_ptr() as *mut f32;
+        let state_head_len = head_dim * head_dim;
+        let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
+
+        for t in 0..seq_len {
+            let conv_t = &cm_s.data()[t * conv_dim..(t + 1) * conv_dim];
+            let q_raw = &conv_t[..key_dim];
+            let k_raw = &conv_t[key_dim..2 * key_dim];
+            let v_raw = &conv_t[2 * key_dim..2 * key_dim + value_dim];
+
+            for h in 0..num_value_heads {
+                let kh = h % num_key_heads;
+                let k_head = &k_raw[kh * head_dim..(kh + 1) * head_dim];
+                let q_head = &q_raw[kh * head_dim..(kh + 1) * head_dim];
+                let v_head = &v_raw[h * head_dim..(h + 1) * head_dim];
+
+                let a_val = sa_s.data().get(h).copied().unwrap_or(1.0);
+                let dt = db_s.data().get(h).copied().unwrap_or(0.0);
+                let alpha_val = al_s.data().get(t * num_value_heads + h).copied().unwrap_or(0.0);
+                let beta_raw = be_s.data().get(t * num_value_heads + h).copied().unwrap_or(0.0);
+
+                let gate = kda_softplus(alpha_val + dt) * a_val;
+                let decay = gate.exp();
+                let beta_val = 1.0 / (1.0 + (-beta_raw).exp());
+
+                let k_l2 = kda_l2_norm(k_head, eps);
+                let q_l2 = kda_l2_norm(q_head, eps);
+
+                let s_head = unsafe {
+                    std::slice::from_raw_parts_mut(s_ptr.add(h * state_head_len), state_head_len)
+                };
+
+                let mut acc = vec![0.0f32; head_dim];
+                for j in 0..head_dim {
+                    let row = &mut s_head[j * head_dim..(j + 1) * head_dim];
+                    let pred: f32 = k_l2
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(k, s)| k * (decay * s))
+                        .sum();
+                    let delta = beta_val * (kda_silu(v_head[j]) - pred);
+                    let mut a = 0.0f32;
+                    for (i, kk) in k_l2.iter().enumerate() {
+                        let s = decay * row[i] + kk * delta;
+                        row[i] = s;
+                        a += q_l2[i] * s;
+                    }
+                    acc[j] = a * inv_sqrt_d;
+                }
+
+                let ss: f32 = acc.iter().map(|a| a * a).sum();
+                let inv_rms = 1.0 / ((ss / head_dim as f32) + eps).sqrt();
+                for i in 0..head_dim {
+                    let w = nw_s.data().get(i).copied().unwrap_or(1.0);
+                    let g = match z_s {
+                        Some(t_z) => kda_silu(t_z.data().get(t * value_dim + h * head_dim + i).copied().unwrap_or(0.0)),
+                        None => 1.0,
+                    };
+                    out[t * value_dim + h * head_dim + i] = acc[i] * inv_rms * w * g;
+                }
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn rwkv_wkv_recurrence(
         &self,
         k: &dyn BackendStorage,
