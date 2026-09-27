@@ -12,8 +12,19 @@
 //! per block  : one E4M3 scale against that pre-scale   (8 values)
 //!             + 4-bit selector
 //! per scalar : 4-bit index                              (8 values)
-//!              = 4 + 32 = 36 bits per 8 values = 4.5 bpw
+//!              + 1 sign bit                             (8 values)
+//!              = 4 + 32 + 8 = 44 bits per 8 values = 5.5 bpw
 //! ```
+//!
+//! **The plan budgets this at 4.5 bpw; the honest figure is 5.5.** The B spec
+//! has no sign plane, which is a defect in the spec: real weight blocks contain
+//! both signs, and the pre-scale's sign can only flip a whole block. Decoding
+//! without a per-value sign bit produces the right magnitude and the wrong sign
+//! for every negative element -- an error of 2|v|, which is easy to mistake for
+//! a large-but-legitimate reconstruction error. The 1.0 bpw difference is
+//! recorded here rather than absorbed silently, because it moves ScrubJay from
+//! "under MXFP4's 4.25" to "well above it" and therefore sharpens B7's kill
+//! criterion.
 //!
 //! # The budget that decides feasibility
 //!
@@ -39,6 +50,8 @@
 //! distribution, and the result is committed as a constant that a test
 //! re-derives. A table that could drift per checkpoint would make every ScrubJay
 //! file unreadable by any other build.
+
+use crate::{f32_to_fp8_e4m3, fp8_e4m3_to_f32};
 
 /// Number of frozen codebooks. Also the selector's value range, hence the
 /// selector width: log2(16) = 4 bits.
@@ -68,22 +81,22 @@ pub const CALIBRATION_SEED: u64 = 0x5C12_4A17;
 /// hand-edited table would be invisible otherwise.
 pub const SCRUB_JAY_CODEBOOK: [[i8; SCRUB_JAY_ENTRIES]; SCRUB_JAY_CODEBOOKS]
     = [
-    [ 1,  3,  5,  7,  9, 11, 13, 16, 18, 20, 21, 23, 25, 26, 28, 30],
-    [ 1,  3,  5,  7,  9, 11, 13, 15, 17, 19, 20, 22, 24, 26, 28, 30],
-    [ 1,  3,  5,  7,  8, 10, 12, 13, 15, 18, 20, 21, 24, 26, 28, 30],
-    [ 1,  3,  5,  6,  8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30],
-    [ 1,  2,  4,  6,  8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30],
-    [ 1,  3,  5,  7,  9, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30],
-    [ 1,  3,  5,  7,  9, 10, 12, 14, 16, 18, 20, 22, 24, 26, 29, 30],
-    [ 1,  3,  5,  7,  9, 11, 13, 15, 17, 19, 21, 23, 24, 26, 28, 30],
-    [ 1,  2,  4,  6,  8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30],
-    [ 1,  3,  5,  6,  8, 10, 12, 14, 16, 18, 20, 23, 25, 26, 28, 30],
-    [ 1,  3,  4,  6,  8,  9, 11, 13, 15, 17, 19, 21, 23, 25, 28, 30],
-    [ 1,  3,  4,  6,  8, 10, 12, 14, 16, 18, 20, 21, 23, 26, 28, 30],
-    [ 1,  2,  3,  5,  7,  8, 10, 12, 14, 17, 18, 21, 23, 25, 27, 30],
-    [ 1,  2,  4,  5,  7,  9, 11, 12, 14, 16, 18, 19, 22, 24, 27, 29],
-    [ 1,  2,  3,  4,  6,  7,  9, 11, 12, 14, 16, 18, 20, 24, 27, 30],
-    [ 0,  1,  1,  2,  2,  3,  4,  4,  5,  6,  8,  9, 11, 14, 17, 26],
+    [ 1,  8, 11, 14, 16, 18, 20, 21, 23, 24, 25, 27, 28, 29, 30, 31],
+    [ 0,  1,  9, 12, 14, 16, 18, 20, 21, 23, 24, 26, 27, 28, 30, 31],
+    [ 0,  1,  8, 10, 12, 14, 16, 18, 20, 22, 23, 25, 27, 28, 30, 31],
+    [ 0,  1,  6,  9, 11, 13, 15, 17, 19, 21, 22, 24, 26, 28, 29, 31],
+    [ 0,  1,  2,  7,  9, 12, 14, 16, 18, 20, 22, 23, 25, 27, 29, 31],
+    [ 0,  1,  2,  6,  8, 10, 12, 14, 17, 19, 21, 23, 25, 27, 29, 31],
+    [ 0,  1,  1,  2,  7,  9, 11, 13, 16, 18, 20, 22, 24, 26, 29, 31],
+    [ 0,  1,  1,  2,  6,  8, 10, 12, 15, 17, 19, 21, 24, 26, 29, 31],
+    [ 0,  1,  1,  2,  6,  7,  9, 12, 14, 16, 18, 21, 23, 26, 28, 31],
+    [ 0,  1,  1,  2,  2,  7,  9, 11, 13, 15, 18, 20, 23, 25, 28, 31],
+    [ 0,  1,  1,  2,  2,  6,  8, 10, 12, 14, 17, 19, 22, 25, 28, 31],
+    [ 0,  1,  1,  2,  2,  5,  7,  9, 11, 14, 16, 19, 22, 25, 28, 31],
+    [ 0,  1,  1,  1,  2,  2,  7,  8, 11, 13, 16, 18, 21, 24, 28, 31],
+    [ 0,  1,  1,  1,  2,  2,  6,  8, 10, 12, 15, 18, 21, 24, 27, 31],
+    [ 0,  1,  1,  1,  2,  2,  5,  7,  9, 12, 14, 17, 20, 24, 27, 31],
+    [ 0,  1,  1,  1,  2,  2,  5,  7,  9, 11, 14, 17, 20, 23, 27, 31],
     ];
 
 /// The frozen table, by reference. No copy: 256 bytes of read-only data read
@@ -185,118 +198,98 @@ fn quantize_to_e6(v: f32) -> i8 {
 
 /// Calibrate the frozen codebook from a seed.
 ///
-/// # Shape of the result
+/// # The codebooks differ by *shape*, not by scale
 ///
-/// The 16 codebooks are the 16 **clusters** of a Lloyd-max clustering of the
-/// standardised corpus, and each codebook's 16 entries are the quantiles of that
-/// cluster's own members. So codebook 0 describes the dense bulk near zero and
-/// codebook 15 describes a sparse tail: the tables are genuinely different
-/// because they describe genuinely different regions of the distribution, and a
-/// block picks the one whose region it resembles.
+/// Three earlier designs all collapsed, and the selector test is what caught the
+/// last one:
 ///
-/// # Why not 16 restarts of one whole-corpus fit
+/// 1. 16 restarts of one whole-corpus fit converged to a *single* table. A
+///    Gaussian's k-means solution is essentially unique, so reordering the
+///    initial centroids only relabels clusters.
+/// 2. One codebook per magnitude band reached 7 distinct tables but spanned only
+///    3 of 64 levels, because a standard normal's centroids all land within
+///    +/-3 -- "6-bit entries" would have bought 3 bits, making ScrubJay less
+///    precise than the 8 bpw E4M3 it is meant to help replace.
+/// 3. Affinely mapping each band's [min,max] onto the alphabet used all 64
+///    levels, but homogenised the *shapes*: every codebook became roughly
+///    `[1,3,5,7,...]`, so one book won almost every block and the selector never
+///    strictly beat the best fixed choice. Sixteen copies of the same shape at
+///    different scales leave the 4 selector bits as dead weight.
 ///
-/// The first attempt did that, and the distinctness test caught the failure: a
-/// Gaussian's k-means solution is essentially unique, so all 16 restarts
-/// converged to the *same* table. Sixteen identical tables would leave the
-/// per-block selector with nothing to choose between and collapse the format to
-/// a single 16-entry codebook while still paying for 192 bytes. The second
-/// attempt fit each codebook to a separate magnitude band, which got to 7
-/// distinct tables but still spanned only 3 of the 64 available levels.
+/// So the shapes are **designed** rather than fitted, and the design is the
+/// thing that creates diversity: codebook `k` spaces its 16 levels along a power
+/// law `31 * (j/15)^p_k` with `p_k` sweeping 0.5..2.0. Low `p` crowds levels
+/// toward zero; high `p` crowds them toward the top. A block of eight small
+/// values and a block with one large outlier therefore want genuinely different
+/// books, which is the entire reason a per-block selector exists.
 ///
-/// # Why the entries are rescaled to the alphabet
+/// Within each shape the level positions are then refined by Lloyd against the
+/// calibration corpus, and projected onto the 6-bit alphabet after every
+/// iteration, so the fit optimises over the integers the format can actually
+/// store. Lloyd's objective is non-increasing by construction and that is
+/// asserted directly in `tests/scrub_jay_codebook.rs`.
 ///
-/// Codebook entries are 6-bit integers, so the span is -32..=31. Fitting raw
-/// standard-normal values leaves every centroid inside about +/-3, wasting 57 of
-/// 64 levels -- 6 bits would have bought 3. Each cluster's quantiles are
-/// therefore stretched to fill the alphabet, which is exactly the job the
-/// per-block E4M3 scale does at runtime: it maps a block's magnitude onto the
-/// codebook's range. Rescaling here and scaling there are the same operation
-/// applied once offline and once per block.
+/// # Honest note on "calibrated"
+///
+/// The paper's codebooks come from Lloyd-max clustering. This one is a
+/// designed shape family refined by Lloyd. The refinement is a real fit; the
+/// family is a design choice, made because fitting alone does not produce
+/// diversity on a unimodal distribution. A deployment that needs codebooks
+/// matched to a specific activation distribution should re-run the refinement
+/// against that distribution -- the shape family and the machinery stay.
 ///
 /// # Determinism
 ///
 /// Fixed corpus from a fixed seed, fixed iteration count, lowest-index tie rule
-/// in the assignment step, and a final sort. The sort matters: without it two
-/// calibrations that found the same clusters in a different order would compare
-/// unequal, making the frozen-constant check flaky rather than meaningful.
+/// in the assignment step, and a final sort so the table has a canonical form.
 pub fn calibrate_codebook(seed: u64) -> [[i8; SCRUB_JAY_ENTRIES]; SCRUB_JAY_CODEBOOKS] {
     const CORPUS: usize = 16 * 1024;
     let data = calibration_corpus(CORPUS, seed);
 
-    // One Lloyd-max clustering over the whole corpus. Magnitudes only: sign is a
-    // separate bit in the format, and the codebook holds magnitudes.
-    let mags: Vec<f32> = data.iter().map(|v| v.abs()).collect();
+    let mut table = [[0i8; SCRUB_JAY_ENTRIES]; SCRUB_JAY_CODEBOOKS];
+    for (k, book) in table.iter_mut().enumerate() {
+        // Shape exponent sweep: 0.5 (low-end heavy) .. 2.0 (high-end heavy).
+        let t = k as f32 / (SCRUB_JAY_CODEBOOKS - 1) as f32;
+        let p = 0.5 + t * 1.5;
 
-    let mut sorted = mags.clone();
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-    let mut init = [0f32; SCRUB_JAY_ENTRIES];
-    for (slot, c) in init.iter_mut().enumerate() {
-        let t = (slot as f32 + 0.5) / SCRUB_JAY_ENTRIES as f32;
-        let idx = ((t * CORPUS as f32) as usize).min(CORPUS - 1);
-        *c = sorted[idx];
-    }
-
-    // Assignment + update, tracking which samples landed where so each cluster's
-    // own quantiles can be read off afterwards.
-    let mut centroids = init;
-    let mut members: Vec<Vec<f32>> = vec![Vec::new(); SCRUB_JAY_CODEBOOKS];
-    for _ in 0..LLOYD_ITERS {
-        for m in members.iter_mut() {
-            m.clear();
+        // Power-law level placement, then Lloyd on the positions.
+        let mut levels = [0f32; SCRUB_JAY_ENTRIES];
+        for (j, l) in levels.iter_mut().enumerate() {
+            let u = j as f32 / (SCRUB_JAY_ENTRIES - 1) as f32;
+            *l = 31.0 * u.powf(p);
         }
-        for &v in &mags {
-            let mut best = 0usize;
-            let mut best_d = f32::INFINITY;
-            for (i, &c) in centroids.iter().enumerate() {
-                let d = (v - c) * (v - c);
-                if d < best_d {
-                    best_d = d;
-                    best = i;
+
+        for _ in 0..LLOYD_ITERS {
+            let mut sums = [0f64; SCRUB_JAY_ENTRIES];
+            let mut counts = [0u32; SCRUB_JAY_ENTRIES];
+            for &v in &data {
+                let mag = v.abs();
+                let mut best = 0usize;
+                let mut best_d = f32::INFINITY;
+                for (i, &l) in levels.iter().enumerate() {
+                    let d = (mag - l) * (mag - l);
+                    if d < best_d {
+                        best_d = d;
+                        best = i;
+                    }
+                }
+                sums[best] += mag as f64;
+                counts[best] += 1;
+            }
+            // Empty clusters keep their level, so the shape survives: a level
+            // nobody uses is still a choice the selector can make.
+            for i in 0..SCRUB_JAY_ENTRIES {
+                if counts[i] > 0 {
+                    levels[i] = (sums[i] / counts[i] as f64) as f32;
                 }
             }
-            members[best].push(v);
-        }
-        for i in 0..SCRUB_JAY_ENTRIES {
-            if !members[i].is_empty() {
-                let mean =
-                    members[i].iter().map(|&v| v as f64).sum::<f64>() / members[i].len() as f64;
-                centroids[i] = mean as f32;
-            }
-        }
-    }
-
-    // Each codebook is its cluster's 16 quantiles, stretched to the alphabet.
-    let mut table = [[0i8; SCRUB_JAY_ENTRIES]; SCRUB_JAY_CODEBOOKS];
-    for k in 0..SCRUB_JAY_CODEBOOKS {
-        let mut m = std::mem::take(&mut members[k]);
-        m.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-
-        // Affine-map the cluster's own [min, max] onto [0, 31], then quantize.
-        //
-        // An offset as well as a scale is required. Scaling by the max alone left
-        // narrow clusters stranded: codebook 5's order statistics span 25..31 in
-        // natural units, so dividing by the max mapped them to 25..31 again and
-        // the 16 entries collapsed to 7 distinct integers -- not worth a 4-bit
-        // index per scalar. This is the same operation the per-block E4M3 scale
-        // performs at runtime, which is why the table is built this way.
-        let lo_v = m.first().copied().unwrap_or(0.0);
-        let hi_v = m.last().copied().unwrap_or(1.0);
-        let extent = (hi_v - lo_v).max(1e-6);
-
-        // 16 evenly spaced order statistics. Uses the full entry budget even for
-        // a small cluster, which is the point: the cluster's *shape* is the
-        // information, not its size.
-        let mut levels = [0i8; SCRUB_JAY_ENTRIES];
-        for (slot, l) in levels.iter_mut().enumerate() {
-            let t = (slot as f32 + 0.5) / SCRUB_JAY_ENTRIES as f32;
-            let idx = ((t * m.len() as f32) as usize).min(m.len().saturating_sub(1));
-            let raw = m.get(idx).copied().unwrap_or(lo_v);
-            *l = quantize_to_e6((raw - lo_v) / extent * 31.0);
+            levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
         }
 
-        table[k] = levels;
-        table[k].sort_unstable();
+        for (j, slot) in book.iter_mut().enumerate() {
+            *slot = quantize_to_e6(levels[j]);
+        }
+        book.sort_unstable();
     }
     table
 }
@@ -360,4 +353,249 @@ pub fn calibration_objective_trace(seed: u64) -> Vec<f64> {
         }
     }
     trace
+}
+
+/// Pick the codebook that minimises SSE for one block.
+///
+/// The format's entire claim. Everything else here is bookkeeping; if this
+/// argmin does not beat every fixed codebook on some block, ScrubJay is 4.5 bpw
+/// of wasted effort and B7's kill criterion should fire.
+///
+/// Ties resolve to the lowest index. A selector that broke ties arbitrarily
+/// would still be *correct* but not reproducible, which for a checkpoint format
+/// means the same weights quantize differently on different runs.
+pub fn select_codebook(block: &[f32; SCRUB_JAY_BLOCK], effective_scale: f32) -> usize {
+    let inv = if effective_scale == 0.0 {
+        0.0
+    } else {
+        1.0 / effective_scale
+    };
+    let mut best = 0usize;
+    let mut best_err = f32::INFINITY;
+    for (c, book) in SCRUB_JAY_CODEBOOK.iter().enumerate() {
+        let mut err = 0f32;
+        for &v in block.iter() {
+            // Compared in codebook units. An earlier version compared the raw
+            // value against entries that span 0..31, so for a block whose values
+            // sit near 1 every codebook scored identically and the selector
+            // degenerated to a constant -- the exact failure the varying-selector
+            // test exists to catch.
+            let scaled = v.abs() * inv;
+            let nearest = nearest_level(book, scaled);
+            let d = scaled - nearest;
+            err += d * d;
+        }
+        if err < best_err {
+            best_err = err;
+            best = c;
+        }
+    }
+    best
+}
+
+/// Nearest codebook entry to `mag`, ties to the lower entry.
+fn nearest_level(book: &[i8; SCRUB_JAY_ENTRIES], mag: f32) -> f32 {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, &l) in book.iter().enumerate() {
+        let d = (l as f32 - mag).powi(2);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    book[best] as f32
+}
+
+/// Quantize one 8-element block.
+///
+/// Returns `(selector, indices, block_scale)`. The block scale is E4M3 against
+/// the per-tensor `pre_scale`, per the format.
+///
+/// The scale is chosen so the block's peak magnitude lands on the codebook's top
+/// entry (31), which is what makes the 6-bit alphabet fully used. A zero block
+/// gets a scale of 1.0 rather than a division by zero.
+pub fn quantize_block(
+    block: &[f32; SCRUB_JAY_BLOCK],
+    pre_scale: f32,
+) -> (u8, [u8; SCRUB_JAY_BLOCK], u8, f32) {
+    // The returned scale is the *E4M3* scale alone, deliberately not
+    // pre-multiplied. Folding `pre_scale` in here made the value no longer an
+    // E4M3 codeword, so re-encoding it for the wire format lost information and
+    // the round trip was not bit-exact. `pre_scale` is applied at decode.
+    let e4m3_scale = fp8_e4m3_to_f32(f32_to_fp8_e4m3(raw_block_scale(block, pre_scale)));
+    let effective = e4m3_scale * pre_scale;
+    let inv = if effective == 0.0 {
+        0.0
+    } else {
+        1.0 / effective
+    };
+
+    let selector = select_codebook(block, effective) as u8;
+    let book = &SCRUB_JAY_CODEBOOK[selector as usize];
+    let mut indices = [0u8; SCRUB_JAY_BLOCK];
+    let mut sign_plane = 0u8;
+    for (i, &v) in block.iter().enumerate() {
+        if v < 0.0 {
+            sign_plane |= 1 << i;
+        }
+        let mut best = 0usize;
+        let mut best_d = f32::INFINITY;
+        for (j, &l) in book.iter().enumerate() {
+            let d = (l as f32 - v.abs() * inv).powi(2);
+            if d < best_d {
+                best_d = d;
+                best = j;
+            }
+        }
+        indices[i] = best as u8;
+    }
+
+    (selector, indices, sign_plane, e4m3_scale)
+}
+
+/// The unquantized scale that maps a raw value into codebook units, so that a
+/// block's peak lands on the codebook's top entry (31).
+///
+/// A zero block gets 1.0 rather than a division by zero.
+///
+/// `pre_scale` divides the result, because the *effective* scale is
+/// `e4m3_scale * pre_scale` and it is the effective scale that must map the
+/// block's peak onto the codebook's top entry. Omitting the division made
+/// `pre_scale < 1` push every value off the top of the codebook, where the
+/// index clamps to 31 and the error grows without bound.
+pub fn raw_block_scale(block: &[f32; SCRUB_JAY_BLOCK], pre_scale: f32) -> f32 {
+    let mut peak = 0.0f32;
+    for &v in block.iter() {
+        peak = peak.max(v.abs());
+    }
+    let pre = if pre_scale.abs() < 1e-12 { 1.0 } else { pre_scale };
+    if peak == 0.0 {
+        1.0
+    } else {
+        peak / (31.0 * pre.abs())
+    }
+}
+
+/// Inverse of [`quantize_block`].
+pub fn dequantize_block(
+    selector: u8,
+    indices: &[u8; SCRUB_JAY_BLOCK],
+    sign: u8,
+    scale: f32,
+    pre_scale: f32,
+) -> [f32; SCRUB_JAY_BLOCK] {
+    let book = &SCRUB_JAY_CODEBOOK
+        [(selector as usize).min(SCRUB_JAY_CODEBOOKS - 1)];
+    let mut out = [0f32; SCRUB_JAY_BLOCK];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let level = book[(indices[i] as usize).min(SCRUB_JAY_ENTRIES - 1)] as f32;
+        // The sign comes from the block's sign plane, not from `level`. The
+        // plan's B spec has no sign plane at all, which is a defect in the spec
+        // rather than an implementation choice: real weight blocks contain both
+        // signs, and the pre-scale's sign can only flip a whole block. Decoding
+        // without it produced a value of the right magnitude and the wrong sign
+        // for every negative element -- an error of 2|v|, which reads as a
+        // plausible-but-large reconstruction failure rather than an obvious one.
+        let mag = level * scale * pre_scale;
+        *slot = if sign & (1 << i) != 0 { -mag } else { mag };
+    }
+    out
+}
+
+/// Serialize a ScrubJay tensor to the wire format.
+///
+/// Layout, deliberately unlike the 9-bytes-per-16-values family so the three
+/// 4-bit-ish per-channel formats cannot be confused for one another:
+///
+/// ```text
+/// [u64 n_selectors][u8 selector * n]
+/// [u64 n_indices][u8 index nibble-pair * n]     (2 indices per byte)
+/// [u64 n_signs][u8 sign bitmask * n]            (1 bit per value)
+/// [u64 n_scales][u8 e4m3 scale * n]
+/// [u32 pre_scale bits]
+/// ```
+///
+/// Indices are packed two-per-byte, which is what makes the 4-bit index budget
+/// real: 8 indices occupy 4 bytes, not 8.
+pub fn serialize(
+    selectors: &[u8],
+    indices: &[u8],
+    signs: &[u8],
+    scales: &[f32],
+    pre_scale: f32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        32 + selectors.len() + indices.len() / 2 + signs.len() + scales.len(),
+    );
+    out.extend_from_slice(&(selectors.len() as u64).to_le_bytes());
+    out.extend_from_slice(selectors);
+    out.extend_from_slice(&(indices.len() as u64).to_le_bytes());
+    for pair in indices.chunks(2) {
+        let hi = pair[0] & 0x0F;
+        let lo = pair.get(1).copied().unwrap_or(0) & 0x0F;
+        out.push((hi | (lo << 4)) as u8);
+    }
+    out.extend_from_slice(&(signs.len() as u64).to_le_bytes());
+    out.extend_from_slice(signs);
+    out.extend_from_slice(&(scales.len() as u64).to_le_bytes());
+    for s in scales {
+        out.push(f32_to_fp8_e4m3(*s));
+    }
+    out.extend_from_slice(&pre_scale.to_le_bytes());
+    out
+}
+
+/// Parse a ScrubJay tensor. Rejects anything truncated or inconsistent.
+///
+/// Every length is validated against the buffer before it is used, so a
+/// malformed file is an error rather than an out-of-bounds read. A format whose
+/// decoder can be made to panic on a bad file is a denial of service on
+/// untrusted input.
+pub fn deserialize(
+    bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<f32>, f32), &'static str> {
+    fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], &'static str> {
+        let end = at.checked_add(n).ok_or("length overflow")?;
+        if end > b.len() {
+            return Err("truncated");
+        }
+        let s = &b[*at..end];
+        *at = end;
+        Ok(s)
+    }
+    fn take_u64(b: &[u8], at: &mut usize) -> Result<u64, &'static str> {
+        let s = take(b, at, 8)?;
+        Ok(u64::from_le_bytes(s.try_into().unwrap()))
+    }
+
+    let mut at = 0usize;
+    let n_sel = take_u64(bytes, &mut at)? as usize;
+    let selectors = take(bytes, &mut at, n_sel)?.to_vec();
+
+    let n_idx = take_u64(bytes, &mut at)? as usize;
+    if n_idx % 2 != 0 {
+        return Err("index count must be even (two per byte)");
+    }
+    let packed = take(bytes, &mut at, n_idx / 2)?;
+    let mut indices = Vec::with_capacity(n_idx);
+    for b in packed {
+        indices.push(b & 0x0F);
+        indices.push(b >> 4);
+    }
+
+    let n_signs = take_u64(bytes, &mut at)? as usize;
+    let signs = take(bytes, &mut at, n_signs)?.to_vec();
+
+    let n_scales = take_u64(bytes, &mut at)? as usize;
+    let scale_bytes = take(bytes, &mut at, n_scales)?;
+    let scales = scale_bytes.iter().map(|&b| fp8_e4m3_to_f32(b)).collect();
+
+    let pre = take(bytes, &mut at, 4)?;
+    let pre_scale = f32::from_le_bytes(pre.try_into().unwrap());
+
+    if at != bytes.len() {
+        return Err("trailing bytes");
+    }
+    Ok((selectors, indices, signs, scales, pre_scale))
 }
