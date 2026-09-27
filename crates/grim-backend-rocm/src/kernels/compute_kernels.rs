@@ -2,11 +2,6 @@
 
 /// HIP source for the six non-QKV compute kernels. [see: `crate::compute_kernel_source`]
 pub const OTHER_KERNEL_SOURCE: &str = r#"
-// `uintptr_t` is used by the vectorised copy path below and hiprtc does not
-// pre-include it; without this the whole module fails to compile with
-// "use of undeclared identifier 'uintptr_t'".
-#include <stdint.h>
-
 extern "C" __global__ void grim_add(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;

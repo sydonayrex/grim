@@ -393,44 +393,84 @@ impl Qwen35Block {
                     RmsNorm::load(&ws.pp("attn_k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
                 (wq, wk, wv, wo, attn_q_norm, attn_k_norm, None, None, None)
             } else {
-                let attn_qkv = Linear::load_column_parallel(
+                // Every load in this arm used to end in `.ok()`, which turned a
+                // width mismatch into a silent `None`. That is how
+                // `attn_qkv` could be absent on a checkpoint that plainly has
+                // it, and the only symptom was a per-layer D2D decline 30 lines
+                // downstream in `gated_delta_net_forward_d2d` — which reads like
+                // a device problem and is a loader problem. Report the reason.
+                fn report<E: std::fmt::Display>(
+                    layer_idx: usize,
+                    tag: &str,
+                    r: std::result::Result<Linear, E>,
+                ) -> Option<Linear> {
+                    r.map_err(|e| {
+                        eprintln!("[qwen35] layer {layer_idx} (KDA): {tag} did not load — {e}");
+                    })
+                    .ok()
+                }
+                let attn_qkv = match Linear::load_column_parallel(
                     &ws.pp("attn_qkv"),
                     cfg.hidden_size,
                     kda_qkv_dim,
                     false,
                     tp,
-                )
-                .ok();
-                let attn_gate = Linear::load_column_parallel(
-                    &ws.pp("attn_gate"),
-                    cfg.hidden_size,
-                    // `attn_gate` serves BOTH layer types at two different widths:
-                    // the KDA output gate is value_dim, the attention gate is q_dim.
-                    // The 6144 here was a hardcoded literal, which is correct for the
-                    // 27B by coincidence (its q_dim IS 6144) and 2048 rows too wide
-                    // for the 9B, whose tensor is [4096, 4096] - the GEMM then strides
-                    // past the end of the weight on every token.
-                    q_dim.max(blk_value_dim(cfg)),
-                    false,
-                    tp,
-                )
-                .ok();
+                ) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        eprintln!("[qwen35-load-error] layer {layer_idx} attn_qkv failed to load: {e}");
+                        return Err(grim_core::error::Error::Backend(format!(
+                            "qwen35 layer {layer_idx} attn_qkv failed: {e}"
+                        )));
+                    }
+                };
+                let attn_gate = report(
+                    layer_idx,
+                    "attn_gate",
+                    Linear::load_column_parallel(
+                        &ws.pp("attn_gate"),
+                        cfg.hidden_size,
+                        // `attn_gate` serves BOTH layer types at two different widths:
+                        // the KDA output gate is value_dim, the attention gate is q_dim.
+                        // The 6144 here was a hardcoded literal, which is correct for the
+                        // 27B by coincidence (its q_dim IS 6144) and 2048 rows too wide
+                        // for the 9B, whose tensor is [4096, 4096] - the GEMM then strides
+                        // past the end of the weight on every token.
+                        q_dim.max(blk_value_dim(cfg)),
+                        false,
+                        tp,
+                    ),
+                );
                 // `ssm_out` consumes the GATED recurrent output, whose width is value_dim -
                 // not q_dim. Same literal-vs-derived mismatch as attn_gate above:
                 // 6144 is right for the 27B by coincidence and 2048 rows too wide
                 // for the 9B, whose ssm_out is [4096, 4096].
-                let ssm_out = Linear::load_row_parallel(
-                    &ws.pp("ssm_out"),
-                    q_dim.max(blk_value_dim(cfg)),
-                    cfg.hidden_size,
-                    false,
-                    tp,
-                )
-                .ok();
+                let ssm_out = report(
+                    layer_idx,
+                    "ssm_out",
+                    Linear::load_row_parallel(
+                        &ws.pp("ssm_out"),
+                        q_dim.max(blk_value_dim(cfg)),
+                        cfg.hidden_size,
+                        false,
+                        tp,
+                    ),
+                );
                 (
                     None, None, None, None, None, None, attn_qkv, attn_gate, ssm_out,
                 )
             };
+
+        if std::env::var("GRIM_DEBUG_QKV_LOAD").is_ok() {
+            eprintln!(
+                "[qkv-load] layer={layer_idx} full_attn={is_full_attention} \
+                 kda_qkv_dim={kda_qkv_dim} wq={} attn_qkv={} attn_gate={} ssm_out={}",
+                wq.is_some(),
+                attn_qkv.is_some(),
+                attn_gate.is_some(),
+                ssm_out.is_some(),
+            );
+        }
 
         let (ssm_conv1d, ssm_conv_vec) = if let Ok(t) = ws.get_unconstrained("ssm_conv1d.weight") {
             let vec = t.to_vec_f32().ok();
@@ -694,10 +734,7 @@ impl Qwen35Block {
         if self.is_full_attention {
             if let Some(t) = attention_layer_d2d(self, &x_normed, positions, cache, seq_len)? {
                 branch_dev = Some(t);
-            }
-        }
-
-        if self.is_full_attention && branch_dev.is_none() {
+            } else {
             // TEMP probe: the attention branch aborts on a bad transfer at the
             // first attention layer, on both the D2D and host routes. Print the
             // geometry each step assumes so a wrong width is visible without
@@ -1049,6 +1086,7 @@ impl Qwen35Block {
                 }
             }
             out_branch = attn_out;
+            }
         } else {
             // Gated DeltaNet recurrence. Prefer the device path, which keeps
             // the conv and recurrent state in VRAM across tokens; it declines
@@ -1839,7 +1877,8 @@ fn gated_delta_net_forward_d2d(
         d2d_decline!("kda: degenerate head config (v={n_val_heads} k={n_key_heads} d={head_dim})");
     }
     let Some(ref qkv_lin) = blk.attn_qkv else {
-        d2d_decline!("kda: attn_qkv is None");
+        d2d_decline!("kda: layer {} attn_qkv is None (is_full_attn={}, wq={})",
+            blk.layer_idx, blk.is_full_attention, blk.wq.is_some());
     };
     // No conv weights means the stream is used un-convolved, which is a real
     // fallback case the host path supports; this one does not.
