@@ -47,6 +47,7 @@ use grim_backend_rocm::RocmDevice;
 use grim_tensor::{
     ArithType, BackendStorage, BlockDtype, CoreTensorOps, DType, MemoryOps, Shape, Storage,
 };
+use std::rc::Rc;
 use std::time::Instant;
 
 /// Accuracy bounds, as `atol + rtol * |oracle|`.
@@ -137,10 +138,6 @@ fn lcg(seed: u64) -> impl FnMut() -> f32 {
     }
 }
 
-fn rocm(t: &dyn grim_tensor::BackendStorage) -> &grim_backend_rocm::RocmStorage {
-    grim_backend_rocm::as_rocm(t).expect("storage is RocmStorage")
-}
-
 // ---------------------------------------------------------------- packers --
 
 /// Q8_0: 34 B per 32 values — f16 scale then 32 int8 codes.
@@ -189,40 +186,6 @@ fn pack_q8_1(vals: &[f32]) -> Vec<u8> {
 /// overhead, which is flat in M and K and made every arm look identical in the
 /// first run. The leading synchronize drains the previous round so its cost
 /// lands outside the measurement rather than inside it.
-fn timed<F: FnMut()>(dev: &RocmDevice, mut launch: F) -> Vec<f32> {
-    for _ in 0..WARMUP {
-        launch();
-    }
-    dev.synchronize();
-    let mut s = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        dev.synchronize();
-        let t0 = Instant::now();
-        launch();
-        dev.synchronize();
-        s.push((t0.elapsed().as_secs_f64() * 1e3) as f32);
-    }
-    s
-}
-
-/// Pool the samples from `REPEATS` independent measurement passes.
-///
-/// Concatenating raw samples and taking one median would let the passes
-/// disagree about which samples are central. Taking the median per pass and
-/// then the median of those is robust to a whole pass being disturbed, which is
-/// what actually happens when another process shares the GPU.
-fn pooled(samples: Vec<Vec<f32>>) -> Vec<f32> {
-    let mut per_pass: Vec<f32> = samples
-        .iter()
-        .map(|s| {
-            let mut v = s.clone();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            v[v.len() / 2]
-        })
-        .collect();
-    per_pass.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    per_pass
-}
 
 /// Reinterpret a typed slice as bytes for upload. The crate has no `bytemuck`,
 /// and adding a dependency to a test for four casts is a poor trade.
@@ -281,18 +244,18 @@ fn check_positions(n: usize) -> Vec<usize> {
 /// they differ only in launch geometry -- so one upload serves all of them.
 struct BOnDevice {
     /// E4M3 bytes, for Raven, WhiteRaven and RavenRowTiled.
-    fp8: Box<dyn BackendStorage>,
+    fp8: Buf,
     /// Host copy of the same E4M3 bytes, for the oracles. The oracle has to
     /// read what the kernel consumed, not the f32 source.
     fp8_host: Vec<u8>,
     /// Q8_0, for ForestRaven and its row-tiled twin.
-    q80: Box<dyn BackendStorage>,
+    q80: Buf,
     /// Host copy of the Q8_0 bytes, for the oracle.
     q80_host: Vec<u8>,
     /// int4 codes / bf16 scales / u8 zeros, for WhiteCrow and its twin.
-    i4_codes: Box<dyn BackendStorage>,
-    i4_scales: Box<dyn BackendStorage>,
-    i4_zeros: Box<dyn BackendStorage>,
+    i4_codes: Buf,
+    i4_scales: Buf,
+    i4_zeros: Buf,
     /// Host-side int4 pack, kept for the oracle (which must read the packed
     /// values, not the f32 source, or it charges the kernel for the quantizer).
     i4_host: w4a4::PackedB,
@@ -337,8 +300,8 @@ impl BOnDevice {
         .map_err(|e| format!("b int4 zeros h2d: {e}"))?;
 
         Ok(Self {
-            fp8: fp8t, fp8_host, q80: q80t, q80_host,
-            i4_codes: i4c, i4_scales: i4s, i4_zeros: i4z,
+            fp8: buf(fp8t), fp8_host, q80: buf(q80t), q80_host,
+            i4_codes: buf(i4c), i4_scales: buf(i4s), i4_zeros: buf(i4z),
             i4_host,
         })
     }
@@ -346,14 +309,133 @@ impl BOnDevice {
 
 // ------------------------------------------------------------------- arms --
 
-fn run_raven(
+/// One arm, uploaded and ready to be timed or scored.
+///
+/// The driver alternates arms *within* each round, so an arm cannot own its own
+/// timing loop: it has to split into "get onto the device" and "launch once".
+/// That is the entire reason this is a struct.
+struct Armed {
+    arm: &'static str,
+    instruction: &'static str,
+    m: usize,
+    n: usize,
+    k: usize,
+    /// Enqueues the kernel once. Asynchronous: the caller must synchronize to
+    /// time it.
+    ///
+    /// The device is a parameter rather than a capture: `RocmDevice` holds a
+    /// `Mutex` and is not `Clone`, so a stored closure cannot own one, and
+    /// capturing `&dev` would borrow a local that is gone by the time the driver
+    /// runs these. Passing it in keeps every buffer `Rc`-owned and every borrow
+    /// confined to a single call.
+    launch: Box<dyn FnMut(&RocmDevice)>,
+    /// Max |gpu - oracle| and the tolerance it is judged against, from the
+    /// output of the last launch. `FnOnce` because it consumes `out`.
+    score: Option<Box<dyn FnOnce(&RocmDevice) -> (f64, f64)>>,
+}
+
+/// Time every arm round-robin, so a disturbance lands on all of them equally.
+///
+/// The previous driver measured each arm to completion before starting the next,
+/// so the control's rounds occupied one time window and the challenger's
+/// occupied another. On a shared card that is not a fair comparison: anything
+/// that perturbs the GPU -- another process, a clock event -- lands entirely on
+/// one side of the ratio, which is how a single unlucky control sample became a
+/// 42x "speedup" in an earlier run.
+///
+/// Interleaving makes the comparison paired. In round i every arm sees the same
+/// conditions and is measured adjacent in time, so a transient shows up in all
+/// four and largely cancels in the ratio instead of inflating one side.
+///
+/// Returns per-arm samples, aligned by round index so the caller can compute a
+/// *paired* ratio (round i of control against round i of challenger) as well as
+/// the per-arm medians. The spread between those two is the honest error bar.
+fn timed_interleaved(dev: &RocmDevice, arms: &mut [Armed]) -> Vec<Vec<f32>> {
+    for a in arms.iter_mut() {
+        for _ in 0..WARMUP {
+            (a.launch)(dev);
+        }
+    }
+    dev.synchronize();
+
+    let mut out: Vec<Vec<f32>> = arms.iter().map(|_| Vec::with_capacity(ROUNDS)).collect();
+    for _ in 0..ROUNDS {
+        for (i, a) in arms.iter_mut().enumerate() {
+            dev.synchronize();
+            let t0 = Instant::now();
+            (a.launch)(dev);
+            dev.synchronize();
+            out[i].push((t0.elapsed().as_secs_f64() * 1e3) as f32);
+        }
+    }
+    out
+}
+
+/// Median of a sample, ignoring NaN.
+fn median(xs: &[f32]) -> f32 {
+    let mut v: Vec<f32> = xs.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return f32::NAN;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
+/// Ratio of two arms' per-round samples, round by round.
+///
+/// This is the diagnostic the interleaving exists to enable. The ratio of
+/// medians mixes the kernels' difference with any drift between the two
+/// measurement windows; the paired median cancels drift, because both samples
+/// come from the same round. When the two agree, the ratio is measuring the
+/// kernel. When they diverge, the box was not quiet enough for the median ratio
+/// to mean anything, and the artifact should say so rather than quietly
+/// reporting the flattering number.
+fn paired_ratio(control: &[f32], challenger: &[f32]) -> (f64, f64) {
+    let pairs: Vec<f64> = control
+        .iter()
+        .zip(challenger.iter())
+        .filter(|(c, x)| c.is_finite() && x.is_finite() && **x > 0.0)
+        .map(|(c, x)| *c as f64 / *x as f64)
+        .collect();
+    if pairs.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    let mut s = pairs.clone();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = s[s.len() / 2];
+    // Relative IQR as a stability signal: tight means the box was quiet.
+    let q1 = s[s.len() / 4];
+    let q3 = s[3 * s.len() / 4];
+    let spread = if med.abs() > 0.0 { (q3 - q1) / med } else { f64::NAN };
+    (med, spread)
+}
+
+/// Owning device buffer that a stored closure can still reach.
+///
+/// The `launch` and `score` closures live in `Armed` and run after the arm
+/// function has returned, so they cannot borrow a local `Box`. Each takes an
+/// `Rc` clone and resolves the storage inside the closure body, where the borrow
+/// is short and obviously sound -- no `unsafe`, no lifetime widening.
+type Buf = Rc<Box<dyn BackendStorage>>;
+
+fn buf(t: Box<dyn BackendStorage>) -> Buf {
+    Rc::new(t)
+}
+
+fn raw(b: &Buf) -> &grim_backend_rocm::RocmStorage {
+    grim_backend_rocm::as_rocm(b.as_ref().as_ref()).expect("storage is RocmStorage")
+}
+
+
+
+fn arm_raven(
     dev: &RocmDevice,
     a: &[f32],
     bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<(Vec<f32>, f64, f64), String> {
+) -> Result<Armed, String> {
     let a_t = CoreTensorOps::from_cpu(dev, a, &Shape::new(vec![m, k]), DType::F32)
         .map_err(|e| format!("a h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
@@ -365,18 +447,6 @@ fn run_raven(
         },
     )
     .map_err(|e| format!("out alloc: {e}"))?;
-
-    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.fp8.as_ref()), rocm(out_t.as_ref()));
-
-    let launch = || {
-        let _ = dev.launch_dot4_fp8_gemv_for_ab(a_r, b_r, out_r, m, n, k);
-    };
-    let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
-    for _ in 0..REPEATS {
-        passes.push(timed(dev, launch));
-    }
-    let samples = pooled(passes);
-    dev.synchronize();
 
     // Oracle over the *quantized* operands, matching what the kernel consumed.
     // A must be pushed through the same E4M3 rounding the kernel applies
@@ -393,9 +463,33 @@ fn run_raven(
         }
         oracle.push(acc);
     }
-    let err = max_err(out_r, &pos, &oracle);
     let tol = ATOL_F32 + RTOL_F32 * oracle.iter().fold(0f64, |m, o| m.max(o.abs()));
-    Ok((samples, err, tol))
+
+    // B is already resident (BOnDevice); only A and out belong to this arm.
+    let a_buf = buf(a_t);
+    let out_buf = buf(out_t);
+    let b_buf = bd.fp8.clone();
+
+    Ok(Armed {
+        arm: "Raven",
+        instruction: "V_DOT4_F32_FP8_FP8",
+        m, n, k,
+        launch: {
+            let (a_buf, b_buf, out_buf) = (a_buf.clone(), b_buf.clone(), out_buf.clone());
+            Box::new(move |dev: &RocmDevice| {
+                let _ = dev.launch_dot4_fp8_gemv_for_ab(raw(&a_buf), raw(&b_buf), raw(&out_buf), m, n, k);
+            })
+        },
+        score: Some({
+            let out_buf = out_buf.clone();
+            let pos = pos.clone();
+            let oracle = oracle.clone();
+            Box::new(move |dev: &RocmDevice| {
+                dev.synchronize();
+                (max_err(raw(&out_buf), &pos, &oracle), tol)
+            })
+        }),
+    })
 }
 
 /// WhiteRaven: FP8 E4M3 via `v_wmma_f32_16x16x16_fp8_fp8`.
@@ -404,14 +498,14 @@ fn run_raven(
 /// f32 across a 16-wide K step with a wave-wide reduction, where Raven
 /// accumulates through `v_dot4` per lane. Same accuracy class, different
 /// instruction mix — which is the only reason to measure it separately.
-fn run_white_raven(
+fn arm_white_raven(
     dev: &RocmDevice,
     a: &[f32],
     bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<(Vec<f32>, f64, f64), String> {
+) -> Result<Armed, String> {
     // WhiteRaven reads A already packed, unlike Raven which quantizes in-kernel.
     // Same values, same encoder — so the two oracles agree by construction and
     // any accuracy difference is the arithmetic, not the packing.
@@ -433,17 +527,6 @@ fn run_white_raven(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.fp8.as_ref()), rocm(out_t.as_ref()));
-
-    let launch = || {
-        let _ = dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_r, b_r, out_r, m, n, k);
-    };
-    let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
-    for _ in 0..REPEATS {
-        passes.push(timed(dev, launch));
-    }
-    let samples = pooled(passes);
-    dev.synchronize();
 
     let pos = check_positions(m * n);
     let mut oracle = Vec::with_capacity(pos.len());
@@ -456,19 +539,42 @@ fn run_white_raven(
         }
         oracle.push(acc);
     }
-    let err = max_err(out_r, &pos, &oracle);
     let tol = ATOL_F32 + RTOL_F32 * oracle.iter().fold(0f64, |m, o| m.max(o.abs()));
-    Ok((samples, err, tol))
+
+    let a_buf = buf(a_t);
+    let out_buf = buf(out_t);
+    let b_buf = bd.fp8.clone();
+
+    Ok(Armed {
+        arm: "WhiteRaven",
+        instruction: "V_WMMA_F32_16X16X16_FP8_FP8",
+        m, n, k,
+        launch: {
+            let (a_buf, b_buf, out_buf) = (a_buf.clone(), b_buf.clone(), out_buf.clone());
+            Box::new(move |dev: &RocmDevice| {
+                let _ = dev.launch_wmma_gemm_fp8_e4m3_for_ab(raw(&a_buf), raw(&b_buf), raw(&out_buf), m, n, k);
+            })
+        },
+        score: Some({
+            let out_buf = out_buf.clone();
+            let pos = pos.clone();
+            let oracle = oracle.clone();
+            Box::new(move |dev: &RocmDevice| {
+                dev.synchronize();
+                (max_err(raw(&out_buf), &pos, &oracle), tol)
+            })
+        }),
+    })
 }
 
-fn run_forest_raven(
+fn arm_forest_raven(
     dev: &RocmDevice,
     a: &[f32],
     bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<(Vec<f32>, f64, f64), String> {
+) -> Result<Armed, String> {
     let a_q81 = pack_q8_1(a);
     let bytes = DType {
         arith: ArithType::U8,
@@ -487,17 +593,6 @@ fn run_forest_raven(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-    let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.q80.as_ref()), rocm(out_t.as_ref()));
-
-    let launch = || {
-        let _ = dev.launch_dot4_q80_q81_gemv(a_r, b_r, out_r, m, n, k);
-    };
-    let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
-    for _ in 0..REPEATS {
-        passes.push(timed(dev, launch));
-    }
-    let samples = pooled(passes);
-    dev.synchronize();
 
     let pos = check_positions(m * n);
     let mut oracle = Vec::with_capacity(pos.len());
@@ -527,9 +622,32 @@ fn run_forest_raven(
         }
         oracle.push(acc);
     }
-    let err = max_err(out_r, &pos, &oracle);
     let tol = ATOL_I32 + RTOL_I32 * oracle.iter().fold(0f64, |m, o| m.max(o.abs()));
-    Ok((samples, err, tol))
+
+    let a_buf = buf(a_t);
+    let out_buf = buf(out_t);
+    let b_buf = bd.q80.clone();
+
+    Ok(Armed {
+        arm: "ForestRaven",
+        instruction: "V_DOT4_I32_IU8",
+        m, n, k,
+        launch: {
+            let (a_buf, b_buf, out_buf) = (a_buf.clone(), b_buf.clone(), out_buf.clone());
+            Box::new(move |dev: &RocmDevice| {
+                let _ = dev.launch_dot4_q80_q81_gemv(raw(&a_buf), raw(&b_buf), raw(&out_buf), m, n, k);
+            })
+        },
+        score: Some({
+            let out_buf = out_buf.clone();
+            let pos = pos.clone();
+            let oracle = oracle.clone();
+            Box::new(move |dev: &RocmDevice| {
+                dev.synchronize();
+                (max_err(raw(&out_buf), &pos, &oracle), tol)
+            })
+        }),
+    })
 }
 
 /// WhiteCrow: unsigned int4 via `v_dot8_i32_iu4`.
@@ -541,14 +659,14 @@ fn run_forest_raven(
 /// applies a zero-point correction to B alone, so a signed activation would
 /// have no compensating term and the offset would not be recoverable from the
 /// output. The fixture honours that rather than pretending otherwise.
-fn run_white_crow(
+fn arm_white_crow(
     dev: &RocmDevice,
     a: &[f32],
     bd: &BOnDevice,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<(Vec<f32>, f64, f64), String> {
+) -> Result<Armed, String> {
     if k % GROUP != 0 {
         return Err(format!("WhiteCrow needs K % {} == 0, got {k}", GROUP));
     }
@@ -593,25 +711,6 @@ fn run_white_crow(
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 
-    let (ac, asc, asum, bc, bsc, bz, out_r) = (
-        rocm(a_codes.as_ref()),
-        rocm(a_scales.as_ref()),
-        rocm(a_sums.as_ref()),
-        rocm(bd.i4_codes.as_ref()),
-        rocm(bd.i4_scales.as_ref()),
-        rocm(bd.i4_zeros.as_ref()),
-        rocm(out_t.as_ref()),
-    );
-
-    let launch = || {
-        let _ = dev.launch_dot8_w4a4_gemv(ac, asc, asum, bc, bsc, bz, out_r, m, n, k);
-    };
-    let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
-    for _ in 0..REPEATS {
-        passes.push(timed(dev, launch));
-    }
-    let samples = pooled(passes);
-    dev.synchronize();
 
     // Oracle over the packed operands, via the kernel's own identity.
     let pos = check_positions(m * n);
@@ -620,9 +719,40 @@ fn run_white_crow(
         let (i, j) = (p / n, p % n);
         oracle.push(dot_packed(&pa, &pb, i, j, k));
     }
-    let err = max_err(out_r, &pos, &oracle);
     let tol = ATOL_I4 + RTOL_I4 * oracle.iter().fold(0f64, |m, o| m.max(o.abs()));
-    Ok((samples, err, tol))
+
+    let a_codes = buf(a_codes);
+    let a_scales = buf(a_scales);
+    let a_sums = buf(a_sums);
+    let out_buf = buf(out_t);
+
+    Ok(Armed {
+        arm: "WhiteCrow",
+        instruction: "V_DOT8_I32_IU4",
+        m, n, k,
+        launch: {
+            let (ac, asc, asum, bc, bsc, bz, o) = (
+                a_codes.clone(), a_scales.clone(), a_sums.clone(),
+                bd.i4_codes.clone(), bd.i4_scales.clone(), bd.i4_zeros.clone(),
+                out_buf.clone(),
+            );
+            Box::new(move |dev: &RocmDevice| {
+                let _ = dev.launch_dot8_w4a4_gemv(
+                    raw(&ac), raw(&asc), raw(&asum), raw(&bc), raw(&bsc), raw(&bz), raw(&o),
+                    m, n, k,
+                );
+            })
+        },
+        score: Some({
+            let out_buf = out_buf.clone();
+            let pos = pos.clone();
+            let oracle = oracle.clone();
+            Box::new(move |dev: &RocmDevice| {
+                dev.synchronize();
+                (max_err(raw(&out_buf), &pos, &oracle), tol)
+            })
+        }),
+    })
 }
 
 // ------------------------------------------------------------------ driver --
@@ -651,6 +781,8 @@ fn precision_kernel_ab() {
     unsafe { std::env::set_var("GRIM_DOT_GEMV", "1") };
 
     let mut results: Vec<ArmResult> = Vec::new();
+    // (challenger arm, m, k, paired ratio, relative IQR)
+    let mut paired_ratio_report: Vec<(&str, usize, usize, f64, f64)> = Vec::new();
 
     // B depends only on (n, k), so generate it once per K and share it across
     // all ten M values. Regenerating inside the loop meant 1.56e9 LCG calls and
@@ -704,54 +836,81 @@ fn precision_kernel_ab() {
         // non-negative copy rather than the fixture being reshaped for everyone.
         let a_nonneg: Vec<f32> = a.iter().map(|v| v.abs()).collect();
 
-        // One arm per codepath. B is already on the device (see BOnDevice), so
-        // an arm only uploads its own A and its output.
-        for (name, ins, r) in [
-            (
-                "Raven",
-                "V_DOT4_F32_FP8_FP8",
-                run_raven(&dev, &a, &bdk, m, n, k),
-            ),
-            (
-                "ForestRaven",
-                "V_DOT4_I32_IU8",
-                run_forest_raven(&dev, &a, &bdk, m, n, k),
-            ),
-            (
-                "WhiteCrow",
-                "V_DOT8_I32_IU4",
-                run_white_crow(&dev, &a_nonneg, &bdk, m, n, k),
-            ),
+        // Arm every arm first, then time them together round-robin. Oracle work
+        // is done during setup, never inside a timed region.
+        let mut armed: Vec<Armed> = Vec::new();
+        for r in [
+            arm_raven(&dev, &a, &bdk, m, n, k),
+            arm_forest_raven(&dev, &a, &bdk, m, n, k),
+            arm_white_crow(&dev, &a_nonneg, &bdk, m, n, k),
+            arm_white_raven(&dev, &a, &bdk, m, n, k),
         ] {
             match r {
-                Ok((samples, err, tol)) => results.push(ArmResult {
-                    arm: name,
-                    instruction: ins,
-                    m,
-                    n,
-                    k,
-                    samples_ms: samples,
-                    max_abs_err: err,
-                    tolerance: tol,
-                }),
-                Err(e) => eprintln!("{name} m={m} k={k}: {e}"),
+                Ok(x) => armed.push(x),
+                Err(e) => eprintln!("arm setup failed at m={m} k={k}: {e}"),
             }
         }
-        // WhiteRaven has its own 16-row tile and a (N/32) x (M/16) grid, so it
-        // already amortises B across a tile; it is measured once, on its own.
-        match run_white_raven(&dev, &a, &bdk, m, n, k) {
-            Ok((samples, err, tol)) => results.push(ArmResult {
-                arm: "WhiteRaven",
-                instruction: "V_WMMA_F32_16X16X16_FP8_FP8",
-                m,
-                n,
-                k,
-                samples_ms: samples,
+        if armed.is_empty() {
+            continue;
+        }
+
+        // REPEATS interleaved passes. Each pass times every arm once per round,
+        // so a disturbance inside a round is shared by all four.
+        let mut passes: Vec<Vec<Vec<f32>>> = vec![Vec::new(); armed.len()];
+        for _ in 0..REPEATS {
+            for (slot, p) in passes.iter_mut().zip(timed_interleaved(&dev, &mut armed)) {
+                slot.push(p);
+            }
+        }
+
+        // Score from the last launch, then take each arm's median across passes.
+        let mut scores: Vec<Option<(f64, f64)>> = vec![None; armed.len()];
+        for (slot, a) in scores.iter_mut().zip(armed.iter_mut()) {
+            *slot = Some(a.score.take().expect("scored once")(&dev));
+        }
+
+        // The control is whichever arm is named CONTROL_ARM, matched by shape.
+        let control_idx = armed.iter().position(|a| a.arm == CONTROL_ARM);
+        // Paired diagnostic, computed while `passes` is still owned: control
+        // round i against challenger round i, within the same pass. If this
+        // disagrees with the ratio of medians, the box was not quiet enough for
+        // the median ratio to mean anything, and the report says so rather than
+        // quietly printing the flattering number.
+        if let Some(ci) = control_idx {
+            for (i, a) in armed.iter().enumerate() {
+                if i == ci {
+                    continue;
+                }
+                let mut ratios = Vec::new();
+                let mut spreads = Vec::new();
+                for (c, x) in passes[ci].iter().zip(passes[i].iter()) {
+                    let (r, sp) = paired_ratio(c, x);
+                    ratios.push(r as f32);
+                    spreads.push(sp as f32);
+                }
+                paired_ratio_report.push((
+                    a.arm, a.m, a.k, median(&ratios) as f64, median(&spreads) as f64,
+                ));
+            }
+        }
+
+        for (i, (a, samples)) in armed.iter().zip(passes).enumerate() {
+            let (err, tol) = scores[i].expect("scored");
+            // Flatten the passes' per-round samples; the median over all of them
+            // is the headline, and the paired ratio below is the error bar.
+            let flat: Vec<f32> = samples.into_iter().flatten().collect();
+            results.push(ArmResult {
+                arm: a.arm,
+                instruction: a.instruction,
+                m: a.m,
+                n: a.n,
+                k: a.k,
+                samples_ms: flat,
                 max_abs_err: err,
                 tolerance: tol,
-            }),
-            Err(e) => eprintln!("WhiteRaven m={m} k={k}: {e}"),
+            });
         }
+
     }
 
     if results.is_empty() {
@@ -788,6 +947,35 @@ fn precision_kernel_ab() {
             "{:<13} {:>4} {:>6} {:>10.4} {:>10.4} {:>10.2e} {:>8}  {}",
             r.arm, r.m, r.k, r.median_ms(), r.p90_ms(), r.max_abs_err, ratio, label
         );
+    }
+
+    // ---- paired-ratio diagnostic ----------------------------------------
+    // The headline ratio is control-median / challenger-median. The paired ratio
+    // is the median of per-round ratios within a pass, which cancels drift
+    // because both samples come from the same round. When the two disagree, the
+    // box was not quiet enough for the median ratio to be a kernel measurement,
+    // and the artifact should say so instead of printing the flattering one.
+    if !paired_ratio_report.is_empty() {
+        println!("\npaired vs median ratio (relative IQR = run-to-run noise):");
+        println!("{:<13} {:>4} {:>6} {:>10} {:>10} {:>8}", "arm", "M", "K", "paired", "median", "spread");
+        let mut worst: Option<(&str, f64)> = None;
+        for (arm, m, k, paired, spread) in &paired_ratio_report {
+            let (paired, spread) = (*paired, *spread);
+            let med = vs_control(&results, results.iter().find(|r| r.arm == *arm
+                && r.m == *m && r.k == *k).expect("row exists"))
+                .unwrap_or(f64::NAN);
+            if spread.is_finite() && worst.as_ref().map_or(true, |(_, w)| spread > *w) {
+                worst = Some((arm, spread));
+            }
+            // Only the noisiest few rows: 40 shapes x 3 arms is 120 lines.
+            if *k == sweep_plan().last().map(|p| p.2).unwrap_or(0) {
+                println!("{:<13} {:>4} {:>6} {:>10.3} {:>10.3} {:>8.1}%", arm, m, k, paired, med, spread * 100.0);
+            }
+        }
+        if let Some((arm, sp)) = worst {
+            println!("worst IQR: {arm} at {:.1}% -- a spread that wide means the", sp * 100.0);
+            println!("median ratio carries that much uncertainty, whatever it says.");
+        }
     }
 
     let bad: Vec<&str> = results.iter().filter(|r| !r.accuracy_ok()).map(|r| r.arm).collect();
