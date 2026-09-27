@@ -75,12 +75,18 @@ void grim_qkv_attention(
     // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
     const int num_waves = blockDim.x / wave_size;
 
+    // Every head_dim axis loop must cover the SAME range as the q staging loop
+    // (8 chunks). It used to be 4, which covered only 4*wave_size = 128 dims, so
+    // for head_dim 256 the upper half of every output row was never written and
+    // read back as whatever the allocation held - observed as exactly half the
+    // output elements wrong. s_acc[8][260] and the head_dim>256 guard already
+    // assumed 256.
     const int d = lane_id;
     const bool thread_active = d < head_dim;
 
     // Hardware-aware head-dim cap.
     if (head_dim > 256) {
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
                 out[q_offset + d] = nanf("");
@@ -108,7 +114,7 @@ void grim_qkv_attention(
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
 
-    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
@@ -157,7 +163,7 @@ void grim_qkv_attention(
         const float scale_new = expf(score - running_max);
 
         running_sum = running_sum * scale_old + scale_new;
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
                 out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_head[j * (num_kv_heads * head_dim) + d];
@@ -170,7 +176,7 @@ void grim_qkv_attention(
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    for (int chunk = 0; chunk < 4; ++chunk) {
+    for (int chunk = 0; chunk < 8; ++chunk) {
         int d = lane_id + chunk * wave_size;
         if (d < head_dim) {
             s_acc[wave_id][d] = out_acc[chunk];
@@ -200,9 +206,9 @@ void grim_qkv_attention(
     const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
 
     // Reconstruct this lane's slice of the normalized attention vector.
-    float attn_reg[4];
+    float attn_reg[8];
     #pragma unroll
-    for (int chunk = 0; chunk < 4; ++chunk) {
+    for (int chunk = 0; chunk < 8; ++chunk) {
         attn_reg[chunk] = 0.0f;
         int d = lane_id + chunk * wave_size;
         if (d < head_dim) {
@@ -217,7 +223,7 @@ void grim_qkv_attention(
     }
 
     if (fuse_o == 0) {
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
                 out[q_offset + d] = attn_reg[chunk];
@@ -229,7 +235,7 @@ void grim_qkv_attention(
         for (int oc = 0; oc < o_dim; ++oc) {
             float partial = 0.0f;
             #pragma unroll
-            for (int chunk = 0; chunk < 4; ++chunk) {
+            for (int chunk = 0; chunk < 8; ++chunk) {
                 int d = lane_id + chunk * wave_size;
                 if (d < head_dim) {
                     partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];

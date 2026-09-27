@@ -243,7 +243,9 @@ impl AttentionOps for RocmDevice {
         let q_r = q_rope
             .as_any()
             .downcast_ref::<RocmStorage>()
-            .ok_or_else(|| Error::Backend("mla_absorbed_prefill: q_rope is not RocmStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_prefill: q_rope is not RocmStorage".into())
+            })?;
         let kv = kv_cache
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -305,9 +307,9 @@ impl AttentionOps for RocmDevice {
         let mut kv_ptr = kv.device_ptr.ok_or_else(|| {
             Error::Backend("mla_absorbed_prefill: kv_cache has no device ptr".into())
         })?;
-        let mut out_ptr = o.device_ptr.ok_or_else(|| {
-            Error::Backend("mla_absorbed_prefill: out has no device ptr".into())
-        })?;
+        let mut out_ptr = o
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mla_absorbed_prefill: out has no device ptr".into()))?;
         let mut a_q = q_len as i32;
         let mut a_h = num_heads as i32;
         let mut a_rank = kv_lora_rank as i32;
@@ -372,20 +374,36 @@ impl AttentionOps for RocmDevice {
             let (seq_len, num_heads, head_dim) = if out_dims.len() == 3 {
                 (out_dims[0], out_dims[1], out_dims[2])
             } else if out_dims.len() == 2 {
+                // A flat out shape carries no head_dim, so it has to be recovered.
+                // It must come from K, whose last axis IS head_dim (3-D) or
+                // num_kv_heads*head_dim (2-D). Recovering it from the QUERY width
+                // and dividing by num_kv_heads was wrong for GQA: the query is
+                // num_heads*head_dim wide, so that yields
+                // head_dim*num_heads/num_kv_heads, and num_heads then comes back
+                // as num_kv_heads. It accidentally worked only when
+                // num_heads == num_kv_heads, and for Qwen3.8 (24/4) it asked the
+                // kernel for 4 heads of 1536 - a geometry that runs and returns
+                // nonsense rather than failing.
                 let seq_len = out_dims[0];
                 let hidden_dim = out_dims[1];
+                let k_dims = k.shape().dims();
                 let q_dims = q.shape().dims();
-                let head_dim = if q_dims.len() == 3 {
-                    q_dims[2]
-                } else if q_dims.len() == 2 && num_kv_heads > 0 {
-                    q_dims[1] / num_kv_heads
-                } else {
-                    hidden_dim / num_kv_heads.max(1)
+                let head_dim = match (q_dims.len(), k_dims.len()) {
+                    (_, 3) => k_dims[2],
+                    (_, 2) if num_kv_heads > 0 => k_dims[1] / num_kv_heads,
+                    (3, _) => q_dims[2],
+                    _ => hidden_dim / num_kv_heads.max(1),
                 };
                 if head_dim == 0 {
                     return Err(Error::Shape(
                         "qkv_attention head_dim resolved to zero; malformed model dimension".into(),
                     ));
+                }
+                if hidden_dim % head_dim != 0 {
+                    return Err(Error::Shape(format!(
+                        "qkv_attention: out width {hidden_dim} is not a whole number of \
+                         head_dim {head_dim} rows"
+                    )));
                 }
                 let num_heads = hidden_dim / head_dim;
                 (seq_len, num_heads, head_dim)

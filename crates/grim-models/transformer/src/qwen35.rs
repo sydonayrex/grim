@@ -1882,30 +1882,27 @@ fn attention_layer_d2d(
     if x_normed.device().is_cpu() {
         return Ok(None);
     }
-    // OFF by default. Everything this path owns — the row-aware [Q | gate]
-    // split, the per-head Q/K norm, RoPE, and the A * sigmoid(gate) — is
-    // verified against the host reference. The one thing it does NOT own is
-    // the attention call itself, and that is currently wrong on device:
-    // `fused_or_scalar_attention_arena_device` returns exactly half its
-    // elements as zero at the real Qwen3.8 geometry (24 q heads / 4 kv heads /
-    // head_dim 256) instead of erroring, for both 2-D and 3-D arenas. Enabling
-    // this path on top of that would silently halve every attention layer,
-    // which is far worse than the transfers it saves.
-    //
-    // Turn on with GRIM_QWEN_ATTN_D2D=1 once the device attention kernel is
-    // fixed; the parity test is `qwen35_attn_d2d_parity` and the kernel
-    // characterisation is `qwen35_attention_device_kernel_is_wrong`.
-    if !matches!(
-        std::env::var("GRIM_QWEN_ATTN_D2D").as_deref(),
-        Ok("1" | "true" | "on" | "yes")
-    ) {
+    // Decode only. Prefill walks several query positions against a growing
+    // arena and is not covered by the parity gate, which runs single-token
+    // steps; the host reference still handles it.
+    if seq_len != 1 {
         return Ok(None);
     }
-    // The fused-QKV path emits no gate half, so the output gate cannot be
-    // applied. It is a Q8_0 fast path for decode; leave it to the host route
-    // rather than silently dropping the gate (a zero gate reads as
-    // sigmoid(0) = 0.5 and uniformly halves every step).
-    if blk.wqkv_q80_fused.is_some() && seq_len == 1 {
+    // The device attention kernel this path calls had a real defect: it staged
+    // the query in 8 chunks (256 dims) but accumulated and wrote V in 4, so at
+    // head_dim 256 it never wrote the upper half of every output row and the
+    // caller read back exactly half zeros. Fixed in `kernels/qkv_attention.rs`
+    // (every head_dim loop now covers 8 chunks) and in the flat-output
+    // head_dim recovery in `attention_ops.rs`, which divided the QUERY width by
+    // num_kv_heads and so asked for the wrong geometry under GQA.
+    // `qwen35_attention_device_kernel_is_wrong` is the gate, and this path is
+    // verified against the host reference over chained decode steps.
+    //
+    // Escape hatch: GRIM_QWEN_ATTN_D2D=0 forces the host reference.
+    if matches!(
+        std::env::var("GRIM_QWEN_ATTN_D2D").as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    ) {
         return Ok(None);
     }
     // `wo` is deliberately not required here: the caller applies it to whatever

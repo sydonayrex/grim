@@ -1,29 +1,27 @@
 //! Device-resident attention for qwen35: the D2D path's parity gate, and a
 //! canary for the kernel defect that currently keeps the path switched off.
 //!
-//! # Status
+//! # The defect this file was written for, now fixed
 //!
-//! `attention_layer_d2d` is **off unless `GRIM_QWEN_ATTN_D2D=1`**. Every step
-//! it owns is verified — the row-aware `[Q | gate]` split of the fused
-//! `attn_q`, the per-head Q/K RMS norm before RoPE, RoPE itself, and the
-//! `A * sigmoid(q_gate)` output gate. The step it does *not* own is the
-//! attention call, and that is wrong on device: see the canary below.
+//! `grim_qkv_attention` staged the query in 8 chunks (256 dims) but accumulated
+//! and wrote V in 4, so at head_dim 256 it never wrote the upper half of every
+//! output row: callers read back **exactly half zeros** at the real Qwen3.8
+//! geometry (24 query heads, 4 KV heads, head_dim 256), for both 2-D and 3-D
+//! arenas. `s_acc[8][260]` and the `head_dim > 256` guard already assumed 256.
 //!
-//! # The defect
+//! A second, independent bug sat upstream of it: recovering `head_dim` from a
+//! flat output shape divided the **query** width by `num_kv_heads`, which asks
+//! for `head_dim*num_heads/num_kv_heads` — correct only when
+//! `num_heads == num_kv_heads`. Under GQA that is a wrong geometry that runs
+//! and returns nonsense rather than failing. It now derives `head_dim` from K.
 //!
-//! `fused_or_scalar_attention_arena_device` returns **exactly half its output
-//! elements as zero** at the real Qwen3.8 attention geometry (24 query heads,
-//! 4 KV heads, head_dim 256) instead of raising an error. It is wrong for both
-//! 2-D `[kv_len, kv_heads*head_dim]` and 3-D `[kv_len, kv_heads, head_dim]`
-//! arenas, so it is not an addressing mismatch. At `kv_len == 1` the answer is
-//! defined — softmax over a single key is 1, so the output is V broadcast by the
-//! GQA mapping — which makes the wrongness unambiguous rather than a tolerance
-//! question.
+//! Both were pre-existing and reachable from the ordinary host path, which
+//! tries `dev.qkv_attention` first.
 //!
-//! This is pre-existing and not introduced by the D2D work, but it is not
-//! harmless: the host path also tries `dev.qkv_attention` first, so ordinary
-//! ROCm attention can take the same kernel and silently return half zeros. That
-//! is worth chasing ahead of any transfer optimisation.
+//! `kv_len == 1` is what makes this unambiguous rather than a tolerance
+//! question: softmax over a single key is 1, so the output is V broadcast by
+//! the GQA mapping `kv_head = h * kv_heads / num_heads`, and the expected
+//! values are exact.
 //!
 //! Gated: `GRIM_GPU_TEST=1` + a real ROCm device.
 
@@ -189,8 +187,7 @@ fn worst_rel(a: &[f32], b: &[f32]) -> (f32, usize) {
 /// softmax over a single key is 1, so the output is V, broadcast across query
 /// heads by the GQA mapping `kv_head = h * kv_heads / num_heads`.
 #[test]
-#[ignore = "KNOWN DEFECT: the device attention kernel returns half zeros; drop this ignore once fixed"]
-fn qwen35_attention_device_kernel_is_wrong() {
+fn qwen35_attention_device_kernel_writes_every_element() {
     for (heads, kvheads, hd) in [(24usize, 4usize, 256usize), (HEADS, KV_HEADS, HEAD_DIM)] {
         let Some((device, dev)) = gpu_device() else {
             return;
@@ -257,20 +254,13 @@ fn qwen35_attention_device_kernel_is_wrong() {
 /// must demonstrably have run (the KV arenas populated) rather than silently
 /// fallen back.
 ///
-/// Requires `GRIM_QWEN_ATTN_D2D=1`, which the path itself gates on.
+/// The path is on by default for single-token decode; `GRIM_QWEN_ATTN_D2D=0`
+/// forces the host reference, and this test then exercises that instead.
 #[test]
-#[ignore = "needs GRIM_QWEN_ATTN_D2D=1; currently blocked on the device attention kernel"]
 fn qwen35_attention_device_path_engages_and_matches_host() {
     let Some((device, dev)) = gpu_device() else {
         return;
     };
-    if !matches!(
-        std::env::var("GRIM_QWEN_ATTN_D2D").as_deref(),
-        Ok("1" | "true" | "on" | "yes")
-    ) {
-        eprintln!("[SKIP] set GRIM_QWEN_ATTN_D2D=1 to exercise the device path");
-        return;
-    }
     let c = cfg();
     let cpu_blk = build_block(&Device::Cpu, None);
     let gpu_blk = build_block(&device, Some(dev.as_ref()));
