@@ -1910,9 +1910,19 @@ impl RecurrentOps for CpuDevice {
 
         for h in 0..num_value_heads {
             let kh = h % num_key_heads;
-            let k_base = kh * head_dim;
-            // q and v are the same value-stream slice in this architecture.
-            let q_base = 2 * key_dim + h * head_dim;
+            // The conv stream is [q | k | v], NOT [k | k | v]. q and k are each
+            // num_key_heads wide and tile out to num_value_heads (llama.cpp's
+            // `ggml_repeat_4d`); v is num_value_heads wide.
+            //   llama.cpp qwen35.cpp:404-424 — q_conv at byte offset 0,
+            //   k_conv at key_dim, v_conv at 2*key_dim.
+            //   vLLM qwen_gdn_linear_attn.py:704 — "Qwen3.5: weights are in
+            //   [q, k, v, z] order".
+            // Reading section 0 as k and sharing section 2 between q and v
+            // drives the recurrence with the query and projects with the
+            // values, which is coherent arithmetic on the wrong channels.
+            let q_base = kh * head_dim;
+            let k_base = key_dim + kh * head_dim;
+            let v_base = 2 * key_dim + h * head_dim;
 
             let a_biased = al_s.data().get(h).copied().unwrap_or(0.0)
                 + db_s.data().get(h).copied().unwrap_or(0.0);
@@ -1922,7 +1932,7 @@ impl RecurrentOps for CpuDevice {
 
             let k_l2 = kda_l2_norm(&cm[k_base..k_base + head_dim], eps);
             let q_l2 = kda_l2_norm(&cm[q_base..q_base + head_dim], eps);
-            let v = &cm[q_base..q_base + head_dim];
+            let v = &cm[v_base..v_base + head_dim];
             // The reference scales the head output by 1/sqrt(S_v) before the
             // gated norm (llama.cpp `gated_delta_net.cu:281` + `attn_data[col] =
             // attn_col * scale`; the chunked path folds the same factor into

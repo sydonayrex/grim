@@ -1526,9 +1526,15 @@ extern "C" __global__ void grim_kda_gated_delta_rule_batched(
     int h = idx / head_dim;
     int j = idx - h * head_dim;
 
+    // The conv stream is [q | k | v], NOT [k | k | v]. q and k are each
+    // num_k heads wide and tile out to num_v heads (llama.cpp's
+    // ggml_repeat_4d); v is num_v heads wide. llama.cpp qwen35.cpp:404-424 puts
+    // q_conv at byte offset 0, k_conv at key_dim and v_conv at 2*key_dim; vLLM
+    // qwen_gdn_linear_attn.py:704 states the same "[q, k, v, z] order".
     int key_dim = num_k * head_dim;
-    const float* k_raw = conv_out + (h % num_k) * head_dim;
-    const float* qv    = conv_out + 2 * key_dim + h * head_dim;
+    const float* q_raw = conv_out + (h % num_k) * head_dim;
+    const float* k_raw = conv_out + key_dim + (h % num_k) * head_dim;
+    const float* v_raw = conv_out + 2 * key_dim + h * head_dim;
 
     // gate = softplus(alpha + dt_bias) * ssm_a, beta = sigmoid(beta).
     float gate = kda_softplus_dev(alpha[h] + dt_bias[h]) * ssm_a[h];
@@ -1539,7 +1545,7 @@ extern "C" __global__ void grim_kda_gated_delta_rule_batched(
     float kss = 0.0f, qss = 0.0f;
     for (int i = 0; i < head_dim; ++i) {
         float kk = kda_silu_dev(k_raw[i]);
-        float qq = kda_silu_dev(qv[i]);
+        float qq = kda_silu_dev(q_raw[i]);
         kss += kk * kk;
         qss += qq * qq;
     }
@@ -1555,12 +1561,12 @@ extern "C" __global__ void grim_kda_gated_delta_rule_batched(
         pred += kk * (decay * s_row[i]);
     }
     // delta = beta * (v - pred): beta scales the whole delta term.
-    float delta = beta_val * (kda_silu_dev(qv[j]) - pred);
+    float delta = beta_val * (kda_silu_dev(v_raw[j]) - pred);
 
     float a = 0.0f;
     for (int i = 0; i < head_dim; ++i) {
         float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
-        float qq = (qden > 0.0f) ? kda_silu_dev(qv[i]) / qden : kda_silu_dev(qv[i]);
+        float qq = (qden > 0.0f) ? kda_silu_dev(q_raw[i]) / qden : kda_silu_dev(q_raw[i]);
         float s = decay * s_row[i] + kk * delta;
         s_row[i] = s;
         a += qq * s;

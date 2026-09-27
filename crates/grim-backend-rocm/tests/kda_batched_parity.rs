@@ -97,16 +97,21 @@ fn reference_step(
 
     let mut out = vec![0.0f64; NV * D];
     for h in 0..NV {
-        let k_base = (h % NK) * D;
-        let q_base = 2 * key_dim + h * D;
+        // [q | k | v]: llama.cpp qwen35.cpp:404-424 and vLLM
+        // qwen_gdn_linear_attn.py:704 both put q at offset 0, k at key_dim and
+        // v at 2*key_dim.
+        let q_base = (h % NK) * D;
+        let k_base = key_dim + (h % NK) * D;
+        let v_base = 2 * key_dim + h * D;
+        let q_raw: Vec<f64> = conv[q_base..q_base + D].iter().map(|&v| v as f64).collect();
         let k_raw: Vec<f64> = conv[k_base..k_base + D].iter().map(|&v| v as f64).collect();
-        let qv: Vec<f64> = conv[q_base..q_base + D].iter().map(|&v| v as f64).collect();
+        let qv: Vec<f64> = conv[v_base..v_base + D].iter().map(|&v| v as f64).collect();
 
         let gate = softplus(alpha[h] as f64 + dt_bias[h] as f64) * ssm_a[h] as f64;
         let beta_val = 1.0 / (1.0 + (-(beta[h] as f64)).exp());
         let decay = gate.exp();
         let k_l2 = l2(&k_raw);
-        let q_l2 = l2(&qv);
+        let q_l2 = l2(&q_raw);
 
         let head = &mut state[h * D * D..(h + 1) * D * D];
         let mut acc = vec![0.0f64; D];

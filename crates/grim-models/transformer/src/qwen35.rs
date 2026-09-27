@@ -1495,10 +1495,10 @@ fn gated_delta_net_forward(
     //   value_dim  = head_v * n_v   (6144)
     //   conv_dim   = key_dim * 2 + value_dim  (10240)
     //
-    // so the stream is [K key_dim][K key_dim][V value_dim] — key, key, value.
-    // Q and K are both key-width; the VALUE stream supplies both the query and
-    // the write for each value head, and q/k are broadcast from n_k_heads to
-    // n_v_heads (`ggml_repeat_4d` in the reference) when the counts differ.
+    // so the stream is [q key_dim][k key_dim][V value_dim] — query, key, value.
+    // q and k are both key-width and both tile from n_k_heads to n_v_heads
+    // (`ggml_repeat_4d` in the reference) when the counts differ; v is
+    // value-width and already per value head.
     //
     // A previous version of this derived [q 48*128][k 16*128][v 16*128], which
     // also sums to 10240 and so passed a sum-only check while reading the wrong
@@ -1599,11 +1599,21 @@ fn gated_delta_net_forward(
         let base = t * per_tok;
         for h in 0..n_val_heads {
             let kh = kda_key_head(h, n_key_heads, values_per_group);
-            // [K key_dim][K key_dim][V value_dim]; q comes off the value
-            // stream, and k is broadcast from its key head to this value head.
-            let k_off = base + kh * head_dim;
-            let q_off = base + 2 * key_dim + h * head_dim;
-            let v_off = q_off;
+            // The conv stream is [q | k | v]. q and k are each num_key_heads
+            // wide and tile out to num_value_heads (llama.cpp's
+            // `ggml_repeat_4d`, and the same `h % n_key_heads` mapping `kh`
+            // already encodes); v is num_value_heads wide.
+            //   llama.cpp qwen35.cpp:404-424 — q_conv at byte offset 0, k_conv
+            //   at key_dim, v_conv at 2*key_dim.
+            //   vLLM qwen_gdn_linear_attn.py:704 — "Qwen3.5: weights are in
+            //   [q, k, v, z] order".
+            // The previous code read section 0 as k and shared section 2
+            // between q and v, so the recurrence was driven by the query and
+            // the output projection used the values. Every width still summed
+            // to conv_dim, which is why only a sum check let it through.
+            let q_off = base + kh * head_dim;
+            let k_off = base + key_dim + kh * head_dim;
+            let v_off = base + 2 * key_dim + h * head_dim;
 
             // gate = softplus(alpha + dt_bias) * ssm_a, per llama.cpp qwen35.cpp:
             //   alpha_biased   = alpha + ssm_dt
