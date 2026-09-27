@@ -201,16 +201,17 @@ pub fn sparsify_2_4_flat(values: &[f32]) -> Result<Sparsified, &'static str> {
         // and cannot be perturbed by the sort implementation's stability
         // guarantees.
         let mut order = [0usize; GROUP];
-        for i in 0..GROUP {
-            order[i] = i;
+        for (i, slot) in order.iter_mut().enumerate() {
+            *slot = i;
         }
         for i in 0..GROUP {
             for j in (i + 1)..GROUP {
                 let (a, b) = (order[i], order[j]);
                 let (ma, mb) = (group[a].abs(), group[b].abs());
-                // Swap when b is strictly larger, or equal and earlier -- the
-                // `b < a` arm never fires for distinct i, so it is written as
-                // an index comparison to make the intent unambiguous.
+                // Swap when b is strictly larger, or equal and earlier. Written
+                // as an explicit comparison rather than a sort_with so the tie
+                // rule is visible and cannot be perturbed by the sort
+                // implementation's stability guarantees.
                 if mb > ma || (mb == ma && b < a) {
                     order[i] = b;
                     order[j] = a;
@@ -252,8 +253,7 @@ pub fn sparsify_2_4_flat(values: &[f32]) -> Result<Sparsified, &'static str> {
 pub fn densify_flat(s: &Sparsified) -> Vec<f32> {
     let mut out = vec![0.0f32; s.num_groups() * GROUP];
     for g in 0..s.num_groups() {
-        let rank = s.rank_of_group(g) as usize;
-        let pair = PAIRS[rank];
+        let pair = PAIRS[s.rank_of_group(g)];
         out[g * GROUP + pair[0]] = s.values[g * GROUP_SURVIVORS];
         out[g * GROUP + pair[1]] = s.values[g * GROUP_SURVIVORS + 1];
     }

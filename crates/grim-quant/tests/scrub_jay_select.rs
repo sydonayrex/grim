@@ -339,7 +339,10 @@ fn the_wire_format_round_trips() {
     }
 
     let bytes = serialize(&selectors, &all_indices, &all_signs, &scales, pre_scale);
-    let (sel2, idx2, sign2, sc2, pre2) = deserialize(&bytes).expect("must deserialize");
+    let t = deserialize(&bytes).expect("must deserialize");
+    let (sel2, idx2, sign2, sc2, pre2) = (
+        t.selectors, t.indices, t.signs, t.scales, t.pre_scale,
+    );
 
     assert_eq!(sel2, selectors, "selectors must round trip");
     assert_eq!(idx2, all_indices, "indices must round trip");

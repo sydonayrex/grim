@@ -534,7 +534,7 @@ pub fn serialize(
     for pair in indices.chunks(2) {
         let hi = pair[0] & 0x0F;
         let lo = pair.get(1).copied().unwrap_or(0) & 0x0F;
-        out.push((hi | (lo << 4)) as u8);
+        out.push(hi | (lo << 4));
     }
     out.extend_from_slice(&(signs.len() as u64).to_le_bytes());
     out.extend_from_slice(signs);
@@ -546,15 +546,33 @@ pub fn serialize(
     out
 }
 
+/// A parsed ScrubJay tensor.
+///
+/// A struct rather than a tuple: `deserialize` returns five fields of which
+/// three are `Vec`, and a bare 5-tuple is exactly the shape that makes it easy to
+/// transpose two of them silently. Two of the arguments to `serialize` are also
+/// `&[u8]`, so a swapped pair would still typecheck.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrubJayTensor {
+    /// Per-block codebook selector.
+    pub selectors: Vec<u8>,
+    /// Per-scalar 4-bit indices, unpacked from the 2-per-byte wire form.
+    pub indices: Vec<u8>,
+    /// Per-block sign bitmasks, one bit per scalar.
+    pub signs: Vec<u8>,
+    /// Per-block E4M3 scales, decoded to f32.
+    pub scales: Vec<f32>,
+    /// The per-tensor FP32 pre-scale.
+    pub pre_scale: f32,
+}
+
 /// Parse a ScrubJay tensor. Rejects anything truncated or inconsistent.
 ///
 /// Every length is validated against the buffer before it is used, so a
 /// malformed file is an error rather than an out-of-bounds read. A format whose
 /// decoder can be made to panic on a bad file is a denial of service on
 /// untrusted input.
-pub fn deserialize(
-    bytes: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<f32>, f32), &'static str> {
+pub fn deserialize(bytes: &[u8]) -> Result<ScrubJayTensor, &'static str> {
     fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], &'static str> {
         let end = at.checked_add(n).ok_or("length overflow")?;
         if end > b.len() {
@@ -597,5 +615,11 @@ pub fn deserialize(
     if at != bytes.len() {
         return Err("trailing bytes");
     }
-    Ok((selectors, indices, signs, scales, pre_scale))
+    Ok(ScrubJayTensor {
+        selectors,
+        indices,
+        signs,
+        scales,
+        pre_scale,
+    })
 }

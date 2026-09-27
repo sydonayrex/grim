@@ -37,6 +37,13 @@ pub fn codec_quant_mode(format: WeightFormat) -> Option<QuantMode> {
         WeightFormat::Crow | WeightFormat::Jay | WeightFormat::Magpie => {
             return None;
         }
+        // TreePie decodes to native FP16 and feeds the existing FP16 dot path, so
+        // it has no dispatch gate of its own either. Kept in step with
+        // `WeightFormat::as_quant_mode_hint`, which is the canonical answer; this
+        // mirror must not drift from it.
+        WeightFormat::TreePie => {
+            return None;
+        }
     })
 }
 
@@ -78,7 +85,14 @@ mod tests {
 
     #[test]
     fn test_storage_aliases_have_no_dispatch_gate() {
-        for fmt in [WeightFormat::Crow, WeightFormat::Jay, WeightFormat::Magpie] {
+        for fmt in [
+            WeightFormat::Crow,
+            WeightFormat::Jay,
+            WeightFormat::Magpie,
+            // TreePie decodes to native FP16 and feeds the existing FP16 dot
+            // path, so it has no gate of its own either.
+            WeightFormat::TreePie,
+        ] {
             assert!(
                 codec_quant_mode(fmt).is_none(),
                 "{fmt:?} is a storage-only alias with no dispatch gate"
@@ -135,3 +149,65 @@ mod tests {
         );
     }
 }
+
+    /// The two answers to "does this format have a runtime dispatch gate?" must
+    /// agree, for every format.
+    ///
+    /// `WeightFormat::as_quant_mode_hint` (in grim-format) is the canonical
+    /// answer; `codec_quant_mode` here is a mirror of it onto the backend's
+    /// `QuantMode`. Two functions answering one question is a drift hazard, and
+    /// it already drifted once: adding `WeightFormat::TreePie` updated the
+    /// canonical side and left this mirror missing an arm, which surfaced as a
+    /// non-exhaustive-match build error in a crate four steps away in the
+    /// dependency graph.
+    ///
+    /// The list below is deliberately exhaustive and written out. Adding a
+    /// `WeightFormat` variant makes this fail to *compile* until the new format
+    /// is classified here, which is the point -- a hand-maintained subset list
+    /// passes vacuously for anything it forgot, which is exactly what happened.
+    #[test]
+    fn both_dispatch_bridges_agree_for_every_format() {
+        use grim_format::QuantModeHint;
+
+        /// (format, expected mode) with `None` meaning "no dispatch gate".
+        const ALL: [(WeightFormat, Option<(QuantModeHint, QuantMode)>); 9] = [
+            (WeightFormat::Bf16, Some((QuantModeHint::Bf16, QuantMode::Bf16))),
+            (WeightFormat::Raven, Some((QuantModeHint::Fp8Native, QuantMode::Fp8Native))),
+            (WeightFormat::Rook, Some((QuantModeHint::MxFp4Emulated, QuantMode::MxFp4Emulated))),
+            (WeightFormat::Jay, None),
+            (WeightFormat::Crow, None),
+            (WeightFormat::Jackdaw, Some((QuantModeHint::MxFp8Emulated, QuantMode::MxFp8Emulated))),
+            (WeightFormat::Magpie, None),
+            (WeightFormat::Nutcracker, Some((QuantModeHint::MxFp4Emulated, QuantMode::MxFp4Emulated))),
+            (WeightFormat::TreePie, None),
+        ];
+
+        for (fmt, expected) in ALL {
+            let hint = fmt.as_quant_mode_hint();
+            let mirror = codec_quant_mode(fmt);
+            match expected {
+                Some((h, m)) => {
+                    assert_eq!(hint, Some(h), "{fmt:?}: canonical hint drifted");
+                    assert_eq!(mirror, Some(m), "{fmt:?}: mirrored mode drifted");
+                }
+                None => {
+                    assert_eq!(hint, None, "{fmt:?}: canonical hint should be None");
+                    assert_eq!(
+                        mirror, None,
+                        "{fmt:?}: mirror disagrees with the canonical hint"
+                    );
+                }
+            }
+            // A format with no gate is treated as native, since it is resolved at
+            // conversion time and there is nothing left to gate.
+            if expected.is_none() {
+                assert!(
+                    matches!(
+                        check_support(fmt, GcnArch::RDNA3),
+                        CompatResult::NativeSupport
+                    ),
+                    "{fmt:?} has no gate, so the compat check must pass it"
+                );
+            }
+        }
+    }
