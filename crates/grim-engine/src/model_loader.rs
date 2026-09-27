@@ -735,6 +735,15 @@ struct SafetensorsConfig {
     /// LFM2 layer types: "conv" (recurrent) or "full_attention".
     #[serde(default)]
     layer_types: Option<Vec<String>>,
+    // Gated-delta-net geometry. HF states this family the way the qwen4exp
+    // resolve map already reads it (linear_*), while GGUF states it as
+    // `qwen35.ssm.*`. Both arms must source these from the file; hardcoding
+    // them silently gives every model one checkpoint's geometry.
+    linear_num_value_heads: Option<usize>,
+    linear_num_key_heads: Option<usize>,
+    linear_key_head_dim: Option<usize>,
+    linear_conv_kernel_dim: Option<usize>,
+    full_attention_interval: Option<usize>,
     // MoE specific
     #[serde(rename = "num_local_experts")]
     num_local_experts: Option<usize>,
@@ -1264,12 +1273,23 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-                full_attention_interval: 4,
-                ssm_d_state: 128,
-                ssm_d_inner: 6144,
-                ssm_d_conv: 4,
-                ssm_dt_rank: 48,
-                ssm_n_group: 16,
+                // Read, do not assume: these were literals, so any model
+                // loaded through this arm silently got 27B geometry. The
+                // literals remain only as a last-resort default for a config
+                // that genuinely omits a key.
+                full_attention_interval: config.full_attention_interval.unwrap_or(4),
+                ssm_d_state: config.linear_key_head_dim.unwrap_or(128),
+                // HF gives the value-head count and the per-head width, not
+                // the GDN value width directly (same derivation as
+                // `qwen4exp.ssm.inner_size` in the resolve map).
+                ssm_d_inner: config
+                    .linear_num_value_heads
+                    .zip(config.linear_key_head_dim)
+                    .map(|(n, d)| n * d)
+                    .unwrap_or(6144),
+                ssm_d_conv: config.linear_conv_kernel_dim.unwrap_or(4),
+                ssm_dt_rank: config.linear_num_value_heads.unwrap_or(48),
+                ssm_n_group: config.linear_num_key_heads.unwrap_or(16),
                 rotary_dim: None,
                 devices,
             };

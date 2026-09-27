@@ -1291,7 +1291,14 @@ impl DecodeGraphModel for Qwen35 {
             .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
 
         let hidden = self.cfg.hidden_size;
-        let n_q = self.cfg.num_heads * self.cfg.head_dim;
+        // `q_buf` doubles as the recurrent conv scratch: a KDA layer projects
+        // into it with the fused `attn_qkv` weight, whose output is the conv
+        // width, and that is WIDER than the attention query for this family
+        // (9B: 8192 vs 4096; 27B: 10240 vs 6144). Sizing it from n_q alone
+        // tripped the graph's own shape check, so capture was abandoned and
+        // every token decoded eagerly. Size for whichever is larger.
+        let kda_conv = (self.cfg.ssm_dt_rank + 2 * self.cfg.ssm_n_group) * self.cfg.ssm_d_state;
+        let n_q = (self.cfg.num_heads * self.cfg.head_dim).max(kda_conv);
         let n_k = self.cfg.num_kv_heads * self.cfg.head_dim;
         let n_v = n_k;
         let inter = self.cfg.intermediate_size;
