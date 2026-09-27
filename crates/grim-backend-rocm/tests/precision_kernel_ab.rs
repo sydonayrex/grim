@@ -274,50 +274,6 @@ fn check_positions(n: usize) -> Vec<usize> {
     let step = (total / N_CHECK).max(1);
     (0..N_CHECK).map(|i| (i * step).min(total - 1)).collect()
 }
-
-/// Which launch geometry an arm uses.
-///
-/// The row-tiled variants share their untiled twin's arithmetic, operand layout
-/// and oracle exactly; they differ only in how many rows a block covers, so the
-/// delta between the two is the B-reuse effect measured directly rather than
-/// inferred from two unrelated kernels.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Variant {
-    Untiled,
-    RowTiled,
-}
-
-impl Variant {
-    /// (arm name, instruction, rows-per-block) for a base arm.
-    fn describe(self, base: &str, inst: &str) -> (&'static str, &'static str) {
-        match self {
-            Variant::Untiled => (leak_name(base), leak_name(inst)),
-            Variant::RowTiled => (
-                leak_name(&format!("{base}RowTiled")),
-                leak_name(inst),
-            ),
-        }
-    }
-}
-
-/// Turn a `&str` into a `&'static str` for `ArmResult`, which stores names
-/// without allocating. The set is closed and tiny, so interning once is cheaper
-/// and clearer than threading `String` through every arm signature.
-fn leak_name(s: &str) -> &'static str {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut g = pool.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(v) = g.get(s) {
-        return v;
-    }
-    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    g.insert(leaked);
-    leaked
-}
-
 /// Every packed form of B, resident on the device for one K.
 ///
 /// Built once per K and shared by all arms and all M values. B does not depend
@@ -397,7 +353,6 @@ fn run_raven(
     m: usize,
     n: usize,
     k: usize,
-    variant: Variant,
 ) -> Result<(Vec<f32>, f64, f64), String> {
     let a_t = CoreTensorOps::from_cpu(dev, a, &Shape::new(vec![m, k]), DType::F32)
         .map_err(|e| format!("a h2d: {e}"))?;
@@ -413,13 +368,8 @@ fn run_raven(
 
     let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.fp8.as_ref()), rocm(out_t.as_ref()));
 
-    let launch = || match variant {
-        Variant::Untiled => {
-            let _ = dev.launch_dot4_fp8_gemv_for_ab(a_r, b_r, out_r, m, n, k);
-        }
-        Variant::RowTiled => {
-            let _ = dev.launch_dot4_fp8_gemv_rowtiled_for_ab(a_r, b_r, out_r, m, n, k);
-        }
+    let launch = || {
+        let _ = dev.launch_dot4_fp8_gemv_for_ab(a_r, b_r, out_r, m, n, k);
     };
     let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
@@ -518,7 +468,6 @@ fn run_forest_raven(
     m: usize,
     n: usize,
     k: usize,
-    variant: Variant,
 ) -> Result<(Vec<f32>, f64, f64), String> {
     let a_q81 = pack_q8_1(a);
     let bytes = DType {
@@ -540,13 +489,8 @@ fn run_forest_raven(
 
     let (a_r, b_r, out_r) = (rocm(a_t.as_ref()), rocm(bd.q80.as_ref()), rocm(out_t.as_ref()));
 
-    let launch = || match variant {
-        Variant::Untiled => {
-            let _ = dev.launch_dot4_q80_q81_gemv(a_r, b_r, out_r, m, n, k);
-        }
-        Variant::RowTiled => {
-            let _ = dev.launch_dot4_q80_q81_gemv_rowtiled_for_ab(a_r, b_r, out_r, m, n, k);
-        }
+    let launch = || {
+        let _ = dev.launch_dot4_q80_q81_gemv(a_r, b_r, out_r, m, n, k);
     };
     let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
@@ -604,7 +548,6 @@ fn run_white_crow(
     m: usize,
     n: usize,
     k: usize,
-    variant: Variant,
 ) -> Result<(Vec<f32>, f64, f64), String> {
     if k % GROUP != 0 {
         return Err(format!("WhiteCrow needs K % {} == 0, got {k}", GROUP));
@@ -660,15 +603,8 @@ fn run_white_crow(
         rocm(out_t.as_ref()),
     );
 
-    let launch = || match variant {
-        Variant::Untiled => {
-            let _ = dev.launch_dot8_w4a4_gemv(ac, asc, asum, bc, bsc, bz, out_r, m, n, k);
-        }
-        Variant::RowTiled => {
-            let _ = dev.launch_dot8_w4a4_gemv_rowtiled_for_ab(
-                ac, asc, asum, bc, bsc, bz, out_r, m, n, k,
-            );
-        }
+    let launch = || {
+        let _ = dev.launch_dot8_w4a4_gemv(ac, asc, asum, bc, bsc, bz, out_r, m, n, k);
     };
     let mut passes: Vec<Vec<f32>> = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
@@ -768,41 +704,26 @@ fn precision_kernel_ab() {
         // non-negative copy rather than the fixture being reshaped for everyone.
         let a_nonneg: Vec<f32> = a.iter().map(|v| v.abs()).collect();
 
-        // Each base arm is measured in both launch geometries. The pair differs
-        // only in rows-per-block, so the delta is the B-reuse effect and not a
-        // difference between two unrelated kernels.
-        for (base, inst, f) in [
+        // One arm per codepath. B is already on the device (see BOnDevice), so
+        // an arm only uploads its own A and its output.
+        for (name, ins, r) in [
             (
                 "Raven",
                 "V_DOT4_F32_FP8_FP8",
-                run_raven as fn(&RocmDevice, &[f32], &BOnDevice, usize, usize, usize, Variant) -> _,
+                run_raven(&dev, &a, &bdk, m, n, k),
             ),
             (
                 "ForestRaven",
                 "V_DOT4_I32_IU8",
-                run_forest_raven as fn(&RocmDevice, &[f32], &BOnDevice, usize, usize, usize, Variant) -> _,
+                run_forest_raven(&dev, &a, &bdk, m, n, k),
+            ),
+            (
+                "WhiteCrow",
+                "V_DOT8_I32_IU4",
+                run_white_crow(&dev, &a_nonneg, &bdk, m, n, k),
             ),
         ] {
-            for variant in [Variant::Untiled, Variant::RowTiled] {
-                let (name, ins) = variant.describe(base, inst);
-                match f(&dev, &a, &bdk, m, n, k, variant) {
-                    Ok((samples, err, tol)) => results.push(ArmResult {
-                        arm: name,
-                        instruction: ins,
-                        m,
-                        n,
-                        k,
-                        samples_ms: samples,
-                        max_abs_err: err,
-                        tolerance: tol,
-                    }),
-                    Err(e) => eprintln!("{name} m={m} k={k}: {e}"),
-                }
-            }
-        }
-        for variant in [Variant::Untiled, Variant::RowTiled] {
-            let (name, ins) = variant.describe("WhiteCrow", "V_DOT8_I32_IU4");
-            match run_white_crow(&dev, &a_nonneg, &bdk, m, n, k, variant) {
+            match r {
                 Ok((samples, err, tol)) => results.push(ArmResult {
                     arm: name,
                     instruction: ins,
@@ -816,10 +737,8 @@ fn precision_kernel_ab() {
                 Err(e) => eprintln!("{name} m={m} k={k}: {e}"),
             }
         }
-        // WhiteRaven has no row-tiled variant: its tile is already 16 rows of M
-        // and its grid is (N/32) x (M/16), so it already amortises B across a
-        // 16-row tile. Tiling it further would be a different kernel, not a
-        // launch-config change.
+        // WhiteRaven has its own 16-row tile and a (N/32) x (M/16) grid, so it
+        // already amortises B across a tile; it is measured once, on its own.
         match run_white_raven(&dev, &a, &bdk, m, n, k) {
             Ok((samples, err, tol)) => results.push(ArmResult {
                 arm: "WhiteRaven",
