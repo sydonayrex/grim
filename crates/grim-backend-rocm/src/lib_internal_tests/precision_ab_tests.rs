@@ -278,3 +278,44 @@ fn a_numeric_field_never_ends_in_a_quote() {
     assert!(!j.contains("0.8000\""), "numeric field closed as a string: {j}");
     assert!(j.contains("\"vs_control_max\": 1.2500"), "{j}");
 }
+
+#[test]
+fn l2_eviction_width_puts_b_past_the_cache() {
+    // The whole point: B must not fit in L2, or the arm that re-reads B the
+    // fewest times wins on cache and the ratio measures nothing real.
+    const L2: usize = 96 * 1024 * 1024;
+    for &k in K_SWEEP {
+        let n = n_for_l2_eviction(k);
+        let b_1byte = n * k;
+        assert!(
+            b_1byte > L2 * 2,
+            "K={k}: N={n} gives only {} MB of B, need > {} MB",
+            b_1byte / 1_000_000,
+            L2 * 2 / 1_000_000
+        );
+        // int4 is half the size, so check the denser packing too.
+        assert!(
+            n * k / 2 > L2,
+            "K={k}: int4 B is only {} MB, still cacheable",
+            n * k / 2 / 1_000_000
+        );
+        assert_eq!(n % 4, 0, "N={n} must tile evenly into 4-column groups");
+    }
+}
+
+#[test]
+fn l2_eviction_width_grows_as_k_shrinks() {
+    // N is inversely proportional to K: the same B footprint at every K.
+    let wide = n_for_l2_eviction(1024);
+    let narrow = n_for_l2_eviction(22016);
+    assert!(wide > narrow, "smaller K must use a wider N");
+    // ...and lands in a comparable footprint.
+    for &k in K_SWEEP {
+        let n = n_for_l2_eviction(k);
+        let mb = n * k / 1_000_000;
+        assert!(
+            (250..=600).contains(&mb),
+            "K={k}: N={n} gives {mb} MB, outside the intended 250-600 MB band"
+        );
+    }
+}

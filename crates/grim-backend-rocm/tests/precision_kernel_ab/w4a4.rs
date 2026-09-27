@@ -183,6 +183,7 @@ pub fn pack_a(a: &[f32], m: usize, k: usize) -> PackedA {
 }
 
 /// B packed for `launch_dot8_w4a4_gemv`: codes, bf16 scales, u8 zeros.
+#[derive(Clone)]
 pub struct PackedB {
     pub codes: Vec<u32>,
     pub scales: Vec<u16>,

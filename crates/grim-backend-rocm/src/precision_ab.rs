@@ -139,6 +139,32 @@ pub fn sweep_plan() -> Vec<(usize, usize, usize)> {
     out
 }
 
+/// A sweep whose B footprint is guaranteed to exceed the L2 cache.
+///
+/// The first sweep used `N_FIXED = 4096`, which at K=22016 is 90 MB of B for
+/// the 1-byte formats -- suspiciously close to this box's 96 MB L2. The
+/// int4 arm's B is 45 MB and fits outright, so its M-fold re-read of B was
+/// served from cache and it reported an impossible 3.5 TB/s, roughly twice HBM
+/// peak. Those ratios measured the cache, not the kernel.
+///
+/// `N_L2_EVICTION` puts B at >= 256 MB for every format, well past L2, so the
+/// re-reads go to HBM as they would in a real model whose B is a whole weight
+/// matrix rather than one reused fixture.
+pub const N_L2_EVICTION: usize = 16384;
+
+/// Smallest N at which B exceeds L2 by a wide margin for a 1-byte format.
+///
+/// Derived from the cache size, not picked: gfx1200/1201 report 96 MB of L2, and
+/// the driver asserts at least this much headroom.
+pub fn n_for_l2_eviction(k: usize) -> usize {
+    const L2_BYTES: usize = 96 * 1024 * 1024;
+    const MARGIN: usize = 3;
+    let need = L2_BYTES * MARGIN / k + 1;
+    // Round up to a multiple of 4 so the 4-column tiles divide evenly and the
+    // last tile is not a ragged one.
+    need.div_ceil(4) * 4
+}
+
 /// Decide one cell. `baseline_ms` is the control arm's median at the same shape.
 pub fn judge(arm: &ArmResult, baseline_ms: f32) -> Verdict {
     if arm.samples_ms.is_empty() {
