@@ -1664,6 +1664,46 @@ pub trait RecurrentOps {
         ))
     }
 
+    /// GPU KDA Recurrent Prefill scan across sequence positions (`seq_len > 1`).
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_scan(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        seq_len: usize,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (
+            conv_out,
+            alpha,
+            beta,
+            dt_bias,
+            ssm_a,
+            norm_weight,
+            z,
+            state,
+            seq_len,
+            num_value_heads,
+            num_key_heads,
+            head_dim,
+            eps,
+            out_shape,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "kda_gated_delta_rule_scan not implemented for this backend".into(),
+        ))
+    }
+
     /// Mamba selective scan (Phase 2 - mambo5.md Item 11).
     /// Computes the recurrent hidden-state update `h_t = a * h_{t-1} + x_t * b_t` in.
     fn selective_scan(

@@ -1450,6 +1450,99 @@ extern "C" __global__ void grim_short_conv1d_causal_step(
     }
 }
 
+// WhiteRaven format: FP8 E4M3 weights (stored as uint8_t byte array).
+// Dequantize in-register: E4M3 unpack (1 sign, 4 exponent with bias 7, 3 mantissa).
+__device__ inline float dequant_fp8_e4m3(uint8_t byte) {
+    if (byte == 0x7F || byte == 0xFF) return 0.0f; // NaN/Inf
+    int sign = (byte >> 7) & 1;
+    int exp = (byte >> 3) & 0x0F;
+    int mant = byte & 0x07;
+    float f;
+    if (exp == 0) {
+        // subnormal: 2^(-6) * (mant / 8)
+        f = (mant / 8.0f) * 0.015625f;
+    } else {
+        // normal: 2^(exp - 7) * (1 + mant / 8)
+        f = (1.0f + mant / 8.0f) * powf(2.0f, (float)(exp - 7));
+    }
+    return sign ? -f : f;
+}
+
+extern "C" __global__ void grim_short_conv1d_fp8_step(
+    const float* x, const uint8_t* weight_fp8, const float* scale, const float* bias,
+    float* conv_state, float* out, int batch, int channels, int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (idx >= total) return;
+    int b = idx / channels;
+    int c = idx % channels;
+
+    float s = scale ? scale[c] : 1.0f;
+    float val = x[idx];
+    int state_offset = (b * channels + c) * (kernel_size - 1);
+    float last_w = dequant_fp8_e4m3(weight_fp8[c * kernel_size + (kernel_size - 1)]) * s;
+    float sum = val * last_w;
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        float wk = dequant_fp8_e4m3(weight_fp8[c * kernel_size + k]) * s;
+        sum += conv_state[state_offset + k] * wk;
+    }
+    if (bias) {
+        sum += bias[c];
+    }
+    out[idx] = sum;
+
+    for (int k = 0; k < kernel_size - 2; ++k) {
+        conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+    }
+    if (kernel_size > 1) {
+        conv_state[state_offset + kernel_size - 2] = val;
+    }
+}
+
+// WhiteCrow format: Unsigned INT4 weights (packed 2 nibbles per byte or 8 nibbles per u32)
+// with scale and zero-point.
+// w_unpacked = scale * (nibble - zero)
+extern "C" __global__ void grim_short_conv1d_iu4_step(
+    const float* x, const uint8_t* weight_packed, const float* scale, const uint8_t* zero,
+    const float* bias, float* conv_state, float* out, int batch, int channels, int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (idx >= total) return;
+    int b = idx / channels;
+    int c = idx % channels;
+
+    float sc = scale ? scale[c] : 1.0f;
+    float zp = zero ? (float)zero[c] : 0.0f;
+    float val = x[idx];
+    int state_offset = (b * channels + c) * (kernel_size - 1);
+
+    auto get_tap = [&](int tap) -> float {
+        int flat_tap = c * kernel_size + tap;
+        uint8_t byte = weight_packed[flat_tap / 2];
+        uint8_t nibble = (flat_tap % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+        return sc * ((float)nibble - zp);
+    };
+
+    float last_w = get_tap(kernel_size - 1);
+    float sum = val * last_w;
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        sum += conv_state[state_offset + k] * get_tap(k);
+    }
+    if (bias) {
+        sum += bias[c];
+    }
+    out[idx] = sum;
+
+    for (int k = 0; k < kernel_size - 2; ++k) {
+        conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+    }
+    if (kernel_size > 1) {
+        conv_state[state_offset + kernel_size - 2] = val;
+    }
+}
+
 // Gated DeltaNet, one step per row of the value dimension.
 //
 // Published update (ICLR 2025, Eq. 10), matching the CPU reference in
@@ -1632,6 +1725,108 @@ extern "C" __global__ void grim_kda_head_norm_gate(
             g = zv / (1.0f + expf(-zv));
         }
         out[h * head_dim + i] = acc[h * head_dim + i] * inv_rms * norm_weight[i] * g;
+    }
+}
+
+// GPU KDA Recurrent Prefill scan kernel for seq_len > 1.
+// Runs across all value heads and recurrent state rows over time t in 0..seq_len.
+// Conv stream layout per token: [q (num_k * head_dim) | k (num_k * head_dim) | v (num_v * head_dim)].
+extern "C" __global__ void grim_kda_gated_delta_rule_scan(
+    const float* conv_out_seq,  // [seq_len, conv_dim]
+    const float* alpha_seq,     // [seq_len, num_v]
+    const float* beta_seq,      // [seq_len, num_v]
+    const float* dt_bias,       // [num_v]
+    const float* ssm_a,         // [num_v]
+    const float* norm_weight,   // [head_dim]
+    const float* z_seq,         // [seq_len, num_v * head_dim] optional
+    float* S,                   // [num_v, head_dim, head_dim] persistent recurrent state
+    float* out_seq,             // [seq_len, num_v * head_dim] output branch
+    int seq_len, int num_v, int num_k, int head_dim, float eps, int has_z
+) {
+    // One thread per (value_head h, state_row j)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_v * head_dim;
+    if (idx >= total) return;
+    int h = idx / head_dim;
+    int j = idx - h * head_dim;
+
+    int key_dim = num_k * head_dim;
+    int value_dim = num_v * head_dim;
+    int conv_dim = 2 * key_dim + value_dim;
+
+    float* s_row = S + ((long long)h * head_dim + j) * head_dim;
+
+    for (int t = 0; t < seq_len; ++t) {
+        const float* conv_tok = conv_out_seq + (long long)t * conv_dim;
+        const float* q_raw = conv_tok + (h % num_k) * head_dim;
+        const float* k_raw = conv_tok + key_dim + (h % num_k) * head_dim;
+        const float* v_raw = conv_tok + 2 * key_dim + h * head_dim;
+
+        float alpha_t = alpha_seq[t * num_v + h];
+        float beta_t = beta_seq[t * num_v + h];
+
+        float gate = kda_softplus_dev(alpha_t + dt_bias[h]) * ssm_a[h];
+        float beta_val = 1.0f / (1.0f + expf(-beta_t));
+        float decay = expf(gate);
+
+        // GDN L2 norm on k and q
+        float kss = 0.0f, qss = 0.0f;
+        for (int i = 0; i < head_dim; ++i) {
+            float kk = kda_silu_dev(k_raw[i]);
+            float qq = kda_silu_dev(q_raw[i]);
+            kss += kk * kk;
+            qss += qq * qq;
+        }
+        float kden = sqrtf(kss + eps);
+        float qden = sqrtf(qss + eps);
+
+        // pred = sum_k k * (decay * S)
+        float pred = 0.0f;
+        for (int i = 0; i < head_dim; ++i) {
+            float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
+            pred += kk * (decay * s_row[i]);
+        }
+        float delta = beta_val * (kda_silu_dev(v_raw[j]) - pred);
+
+        // S_new = decay * S + k * delta
+        float a = 0.0f;
+        for (int i = 0; i < head_dim; ++i) {
+            float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
+            float qq = (qden > 0.0f) ? kda_silu_dev(q_raw[i]) / qden : kda_silu_dev(q_raw[i]);
+            float s = decay * s_row[i] + kk * delta;
+            s_row[i] = s;
+            a += qq * s;
+        }
+        float a_scaled = a * rsqrtf((float)head_dim);
+
+        // Temporary accumulator stored directly into output row before head norm
+        out_seq[t * value_dim + h * head_dim + j] = a_scaled;
+    }
+
+    // Wait for all rows of all heads to complete per token before head-norm reduction
+    __syncthreads();
+
+    // Normalization & gating across each head
+    if (j == 0) {
+        for (int t = 0; t < seq_len; ++t) {
+            float* head_out = out_seq + t * value_dim + h * head_dim;
+            float ss = 0.0f;
+            for (int i = 0; i < head_dim; ++i) {
+                float a = head_out[i];
+                ss += a * a;
+            }
+            float inv_rms = 1.0f / sqrtf(ss / head_dim + eps);
+
+            const float* z_tok = z_seq ? (z_seq + t * value_dim + h * head_dim) : nullptr;
+            for (int i = 0; i < head_dim; ++i) {
+                float g = 1.0f;
+                if (has_z && z_tok) {
+                    float zv = z_tok[i];
+                    g = zv / (1.0f + expf(-zv));
+                }
+                head_out[i] = head_out[i] * inv_rms * norm_weight[i] * g;
+            }
+        }
     }
 }
 extern "C" __global__ void grim_mla_q_kv_norm_split(

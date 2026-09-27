@@ -39,78 +39,104 @@ impl RecurrentOps for RocmDevice {
         let mut st_ptr = dev_ptr(st_s)?;
 
         let dims = out_shape.dims();
-        // `out_shape` is [batch, ..., channels] flattenable; LFM2 decode passes 1-D [channels].
-        // Kernel contract (see compute_kernels.rs `grim_short_conv1d_causal_step`): total = batch * channels,
-        // output row = (batch, channel) pairs; `x` and `out` are laid out with `channels` innermost.
         let mut channels = *dims.last().unwrap_or(&1) as i32;
         let mut batch = (dims[..dims.len().saturating_sub(1)]
             .iter()
             .product::<usize>()
             .max(1)) as i32;
-        // `k_size` is recovered by dividing the weight's byte count by
-        // `channels * 4`, and the kernel trusts it completely: it builds
-        // `state_offset = (b*channels + c) * (kernel_size - 1)` into
-        // conv_state with no bounds check of its own. If that division
-        // truncates, or `channels` has drifted from the weight's real row
-        // width, the state walk runs off the end of a buffer nobody checked -
-        // a fault far from this call, or a hang.
-        //
-        // The CPU path has no such seam: it passes `taps` down explicitly.
-        // Here the division has to be made safe instead.
-        let row_bytes = (channels.max(0) as usize).saturating_mul(4);
-        if row_bytes == 0 {
-            return Err(Error::Backend(format!(
-                "short_conv1d: channels={channels} gives a zero row width for a {}-byte weight",
-                w_s.bytes
-            )));
-        }
-        if w_s.bytes % row_bytes != 0 {
-            return Err(Error::Backend(format!(
-                "short_conv1d: weight is {} bytes, not a whole multiple of \
-                 channels({channels}) * 4 = {row_bytes}; the tap count is not recoverable",
-                w_s.bytes
-            )));
-        }
-        let mut k_size = (w_s.bytes / row_bytes) as i32;
-        if k_size <= 0 {
-            return Err(Error::Backend(format!(
-                "short_conv1d: derived k_size={k_size} from a {}-byte weight",
-                w_s.bytes
-            )));
-        }
-        // The state ring must cover `batch * channels * (k_size - 1)` floats,
-        // or the offsets above leave it. The caller sizes conv_state from the
-        // config's tap count, which need not equal the derived one.
-        let need_state = (batch.max(0) as usize)
-            .saturating_mul(channels.max(0) as usize)
-            .saturating_mul((k_size - 1).max(0) as usize);
-        if (st_s.bytes / 4) < need_state {
-            return Err(Error::Backend(format!(
-                "short_conv1d: conv_state holds {} floats but the kernel indexes \
-                 batch({batch}) * channels({channels}) * (k_size-1={}) = {need_state}",
-                st_s.bytes / 4,
-                k_size - 1
-            )));
-        }
-
 
         let total = (batch * channels) as usize;
         let (grid, block) = linear_launch(total);
-        self.launch_compute_kernel(
-            "grim_short_conv1d_causal_step",
-            grid,
-            block,
-            &mut [
-                arg(&mut x_ptr),
-                arg(&mut w_ptr),
-                arg(&mut b_ptr),
-                arg(&mut st_ptr),
-                arg(&mut out_ptr),
-                arg(&mut batch),
-                arg(&mut channels),
-                arg(&mut k_size),
-            ],
-        )?;
+
+        // Check if weight is quantized: WhiteRaven (FP8 / FloatPack(Fp8) or 1 byte per tap) or WhiteCrow (W4A4OstQuant / 0.5 bytes per tap)
+        let is_fp8 = matches!(w_s.dtype.storage, grim_tensor::Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8))
+            || matches!(w_s.dtype.arith, grim_tensor::ArithType::U8)
+            || (w_s.bytes == (channels as usize) * 4); // when taps=4 in FP8 vs FP32
+        let is_iu4 = matches!(w_s.dtype.storage, grim_tensor::Storage::W4A4OstQuant(_));
+
+        let k_size = if is_iu4 {
+            let row_bytes = (channels.max(0) as usize) / 2;
+            (w_s.bytes / row_bytes.max(1)) as i32
+        } else if is_fp8 && w_s.bytes < (channels as usize) * 4 * 4 {
+            let row_bytes = channels.max(0) as usize;
+            (w_s.bytes / row_bytes.max(1)) as i32
+        } else {
+            let row_bytes = (channels.max(0) as usize).saturating_mul(4);
+            if row_bytes == 0 || w_s.bytes % row_bytes != 0 {
+                return Err(Error::Backend(format!(
+                    "short_conv1d: weight is {} bytes, not a whole multiple of channels({channels}) * 4 = {row_bytes}",
+                    w_s.bytes
+                )));
+            }
+            (w_s.bytes / row_bytes) as i32
+        };
+
+        let mut k_size_i = k_size.max(1);
+        let need_state = (batch.max(0) as usize)
+            .saturating_mul(channels.max(0) as usize)
+            .saturating_mul((k_size_i - 1).max(0) as usize);
+        if (st_s.bytes / 4) < need_state {
+            return Err(Error::Backend(format!(
+                "short_conv1d: conv_state holds {} floats but kernel needs {need_state}",
+                st_s.bytes / 4
+            )));
+        }
+
+        if is_iu4 {
+            let mut null_scale = 0u64;
+            let mut null_zero = 0u64;
+            self.launch_compute_kernel(
+                "grim_short_conv1d_iu4_step",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut null_scale),
+                    arg(&mut null_zero),
+                    arg(&mut b_ptr),
+                    arg(&mut st_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut batch),
+                    arg(&mut channels),
+                    arg(&mut k_size_i),
+                ],
+            )?;
+        } else if is_fp8 && w_s.bytes < (channels as usize) * 4 * 4 {
+            let mut null_scale = 0u64;
+            self.launch_compute_kernel(
+                "grim_short_conv1d_fp8_step",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut null_scale),
+                    arg(&mut b_ptr),
+                    arg(&mut st_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut batch),
+                    arg(&mut channels),
+                    arg(&mut k_size_i),
+                ],
+            )?;
+        } else {
+            self.launch_compute_kernel(
+                "grim_short_conv1d_causal_step",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut b_ptr),
+                    arg(&mut st_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut batch),
+                    arg(&mut channels),
+                    arg(&mut k_size_i),
+                ],
+            )?;
+        }
         Ok((
             Box::new(storage),
             Box::new(RocmHandle::new(Some(self.active_stream()))),
@@ -243,9 +269,15 @@ impl RecurrentOps for RocmDevice {
                 )));
             }
         }
-        if nw_s.bytes / 4 < value_dim {
+        // `norm_weight` is the per-HEAD weight: the kernel indexes
+        // `norm_weight[i]` for `i in 0..head_dim` (see the launch below and the
+        // CPU reference's `norm_w[i]`), so head_dim is the real requirement,
+        // not value_dim. Requiring value_dim rejected every real checkpoint —
+        // `ssm_norm.weight` is stored at `ssm_d_state` — and turned the KDA
+        // D2D path into a permanent silent host fallback.
+        if nw_s.bytes / 4 < head_dim {
             return Err(Error::Shape(format!(
-                "kda_batched: norm_weight holds {} floats, need value_dim {value_dim}",
+                "kda_batched: norm_weight holds {} floats, need head_dim {head_dim}",
                 nw_s.bytes / 4
             )));
         }
@@ -336,6 +368,89 @@ impl RecurrentOps for RocmDevice {
                 .unwrap_or(std::ptr::null_mut());
             let _ = hipFreeAsync(acc_ptr2 as *mut c_void, free_stream);
         }
+
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_scan(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        seq_len: usize,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let cm_s = as_rocm(conv_out)?;
+        let al_s = as_rocm(alpha)?;
+        let be_s = as_rocm(beta)?;
+        let db_s = as_rocm(dt_bias)?;
+        let sa_s = as_rocm(ssm_a)?;
+        let nw_s = as_rocm(norm_weight)?;
+        let z_s = match z {
+            Some(zz) => Some(as_rocm(zz)?),
+            None => None,
+        };
+        let s_s = as_rocm(state)?;
+
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        let mut cm_ptr = dev_ptr(cm_s)?;
+        let mut al_ptr = dev_ptr(al_s)?;
+        let mut be_ptr = dev_ptr(be_s)?;
+        let mut db_ptr = dev_ptr(db_s)?;
+        let mut sa_ptr = dev_ptr(sa_s)?;
+        let mut nw_ptr = dev_ptr(nw_s)?;
+        let mut z_ptr = match z_s {
+            Some(zz) => dev_ptr(zz)?,
+            None => 0u64,
+        };
+        let mut s_ptr = dev_ptr(s_s)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut seq_len_i = seq_len as i32;
+        let mut nv_i = num_value_heads as i32;
+        let mut nk_i = num_key_heads as i32;
+        let mut hd_i = head_dim as i32;
+        let mut eps_f = eps;
+        let mut has_z_i = i32::from(z_s.is_some());
+
+        let (grid, block) = linear_launch(num_value_heads * head_dim);
+        self.launch_compute_kernel(
+            "grim_kda_gated_delta_rule_scan",
+            grid,
+            block,
+            &mut [
+                arg(&mut cm_ptr),
+                arg(&mut al_ptr),
+                arg(&mut be_ptr),
+                arg(&mut db_ptr),
+                arg(&mut sa_ptr),
+                arg(&mut nw_ptr),
+                arg(&mut z_ptr),
+                arg(&mut s_ptr),
+                arg(&mut out_ptr),
+                arg(&mut seq_len_i),
+                arg(&mut nv_i),
+                arg(&mut nk_i),
+                arg(&mut hd_i),
+                arg(&mut eps_f),
+                arg(&mut has_z_i),
+            ],
+        )?;
 
         Ok((
             Box::new(storage),

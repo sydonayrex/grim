@@ -29,13 +29,23 @@ fn d2d_trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("GRIM_D2D_TRACE").is_ok())
 }
 
-/// Declare an `Ok(None)` decline site: `d2d_decline!("ssm_conv1d is Q4_K_M");`
-/// Takes the same arguments as [`format!`], so a site can print the value that
-/// made it decline rather than just its name.
+/// Check if D2D is strictly required (panics or errors on fallback)
+fn d2d_strict_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GRIM_FORCE_D2D").map(|v| v != "0").unwrap_or(false))
+}
+
+/// Declare a D2D fallback site.
+/// When D2D is default, falling back is an exceptional event: log warning and emit fallback event.
+/// If `GRIM_FORCE_D2D=1`, halts with error rather than silently degrading.
 macro_rules! d2d_decline {
     ($($arg:tt)*) => {{
-        if d2d_trace_enabled() {
-            eprintln!("[d2d-decline] {}: {}", line!(), format_args!($($arg)*));
+        let reason = format!($($arg)*);
+        eprintln!("[d2d-fallback-warning] {}:{}: D2D fallback to host: {}", file!(), line!(), reason);
+        if d2d_strict_enabled() {
+            return Err(grim_core::error::Error::Backend(format!(
+                "D2D is required but declined: {reason}"
+            )));
         }
         return Ok(None);
     }};
@@ -249,6 +259,9 @@ pub struct Qwen35Block {
     pub ssm_beta: Option<Linear>,
     pub ssm_dt_bias: Option<Vec<f32>>,
     pub ssm_norm: Option<Vec<f32>>,
+    pub ssm_dt_bias_dev: Option<std::sync::Arc<dyn grim_tensor::BackendStorage>>,
+    pub ssm_a_dev: Option<std::sync::Arc<dyn grim_tensor::BackendStorage>>,
+    pub ssm_norm_dev: Option<std::sync::Arc<dyn grim_tensor::BackendStorage>>,
     /// KDA geometry, copied from the config at load. `ssm_dt_rank` is
     /// num_value_heads for this family, not a scalar rank — see
     /// `cfg_ssm_num_value_heads`.
@@ -546,6 +559,24 @@ impl Qwen35Block {
             None
         };
 
+        let (ssm_dt_bias_dev, ssm_a_dev, ssm_norm_dev) = if !device.is_cpu() {
+            let dev = pick_device_for_storage_device(&device);
+            let n_val = cfg.ssm_dt_rank.max(1);
+            let h_dim = cfg.ssm_d_state.max(1);
+            let dt_b = ssm_dt_bias.as_ref().and_then(|v| {
+                dev.from_cpu(&v[..n_val.min(v.len())], &Shape::new(vec![n_val]), DType::F32).ok().map(std::sync::Arc::from)
+            });
+            let sa_b = ssm_a.as_ref().and_then(|v| {
+                dev.from_cpu(&v[..n_val.min(v.len())], &Shape::new(vec![n_val]), DType::F32).ok().map(std::sync::Arc::from)
+            });
+            let sn_b = ssm_norm.as_ref().and_then(|v| {
+                dev.from_cpu(&v[..h_dim.min(v.len())], &Shape::new(vec![h_dim]), DType::F32).ok().map(std::sync::Arc::from)
+            });
+            (dt_b, sa_b, sn_b)
+        } else {
+            (None, None, None)
+        };
+
         Ok(Self {
             device,
             attn_norm,
@@ -565,6 +596,9 @@ impl Qwen35Block {
             ssm_beta,
             ssm_dt_bias,
             ssm_norm,
+            ssm_dt_bias_dev,
+            ssm_a_dev,
+            ssm_norm_dev,
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,
@@ -1797,15 +1831,9 @@ fn gated_delta_net_forward_d2d(
     seq_len: usize,
     branch_width: usize,
 ) -> Result<Option<Tensor>> {
-    if seq_len != 1 {
-        d2d_decline!("kda: prefill (seq_len != 1) — host reference by design");
-    }
-    // Accelerators only. The batched op also exists on the CPU backend, but
-    // that one is the numeric ORACLE for the GPU gate, not a production path:
-    // running it here would silently move every CPU model off the reference
-    // implementation it is checked against, for no gain.
+    // Accelerators only.
     if x_normed.device().is_cpu() {
-        d2d_decline!("kda: CPU device — host reference is the oracle");
+        return Ok(None);
     }
     let n_val_heads = blk.cfg_ssm_num_value_heads();
     let n_key_heads = blk.cfg_ssm_num_key_heads();
@@ -1865,9 +1893,17 @@ fn gated_delta_net_forward_d2d(
     if cw_dims.len() != 2 || cw_dims[0] != conv_dim || cw_dims[1] != taps {
         d2d_decline!("kda: conv_w shape {cw_dims:?} != [{conv_dim}, {taps}]");
     }
-    if !matches!(conv_w.dtype().storage, Storage::Native) {
+    let is_quant_conv = matches!(
+        conv_w.dtype().storage,
+        Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8)
+            | Storage::W4A4OstQuant(_)
+            | Storage::KQuant(grim_tensor::KQuantScheme::Q80)
+            | Storage::KQuant(grim_tensor::KQuantScheme::Q4K)
+    ) || matches!(conv_w.dtype().arith, grim_tensor::ArithType::U8);
+
+    if !matches!(conv_w.dtype().storage, Storage::Native) && !is_quant_conv {
         d2d_decline!(
-            "kda: ssm_conv1d.weight is {:?}, not Native/f32 — the conv op has no quantized path",
+            "kda: ssm_conv1d.weight is {:?}, unsupported quantization",
             conv_w.dtype().storage,
         );
     }
@@ -1887,25 +1923,19 @@ fn gated_delta_net_forward_d2d(
     // the host path reaches through `z_stride`.
     let z = gate_lin.forward(x_normed)?;
 
-    // Small per-head vectors. These are a few KB each, so uploading them per
-    // call is negligible next to the ~3.1 MB of state it replaces.
-    let up = |v: &[f32],
-              n: usize,
-              shp: Shape|
-     -> std::result::Result<
-        Box<dyn grim_tensor::BackendStorage>,
-        grim_tensor::error::Error,
-    > { dev.from_cpu(&v[..n], &shp, DType::F32) };
-    let dt_bias_d = up(dt_bias, n_val_heads, Shape::new(vec![n_val_heads]))?;
-    let ssm_a_d = up(ssm_a, n_val_heads, Shape::new(vec![n_val_heads]))?;
-    // `ssm_norm` is the per-HEAD norm weight, indexed by element within the
-    // head: both the host reference (`norm_vec.get(i)` over `head_dim`) and
-    // both backends' kernels (`norm_weight[i]`, `i in 0..head_dim`) read
-    // `head_dim` of it and no more. It is NOT value_dim wide — the checkpoint
-    // stores `ssm_norm.weight` at `ssm_d_state` (128), so demanding value_dim
-    // (6144) here declined on every recurrent layer of every token and sent
-    // the whole KDA branch to the host fallback forever.
-    let ssm_norm_d = up(ssm_norm, head_dim, Shape::new(vec![head_dim]))?;
+    // Static per-head vectors pre-uploaded to device. Fallback to upload only if not pre-cached.
+    let dt_bias_d = match blk.ssm_dt_bias_dev.as_ref() {
+        Some(st) => st.clone(),
+        None => std::sync::Arc::from(dev.from_cpu(&dt_bias[..n_val_heads], &Shape::new(vec![n_val_heads]), DType::F32)?),
+    };
+    let ssm_a_d = match blk.ssm_a_dev.as_ref() {
+        Some(st) => st.clone(),
+        None => std::sync::Arc::from(dev.from_cpu(&ssm_a[..n_val_heads], &Shape::new(vec![n_val_heads]), DType::F32)?),
+    };
+    let ssm_norm_d = match blk.ssm_norm_dev.as_ref() {
+        Some(st) => st.clone(),
+        None => std::sync::Arc::from(dev.from_cpu(&ssm_norm[..head_dim], &Shape::new(vec![head_dim]), DType::F32)?),
+    };
 
     // --- short conv, state in place on device ------------------------------
     if cache.conv_state_dev.is_none() {
@@ -1935,27 +1965,46 @@ fn gated_delta_net_forward_d2d(
     })?;
 
     let eps = blk.attn_norm.eps;
-    let (branch, _) = dev.kda_gated_delta_rule_batched(
-        conv_out.as_ref(),
-        alpha.storage().as_ref(),
-        beta.storage().as_ref(),
-        dt_bias_d.as_ref(),
-        ssm_a_d.as_ref(),
-        ssm_norm_d.as_ref(),
-        Some(z.storage().as_ref()),
-        ssm_state.as_ref(),
-        n_val_heads,
-        n_key_heads,
-        head_dim,
-        eps,
-        &Shape::new(vec![1, value_dim]),
-    )?;
+    let (branch, _) = if seq_len == 1 {
+        dev.kda_gated_delta_rule_batched(
+            conv_out.as_ref(),
+            alpha.storage().as_ref(),
+            beta.storage().as_ref(),
+            dt_bias_d.as_ref(),
+            ssm_a_d.as_ref(),
+            ssm_norm_d.as_ref(),
+            Some(z.storage().as_ref()),
+            ssm_state.as_ref(),
+            n_val_heads,
+            n_key_heads,
+            head_dim,
+            eps,
+            &Shape::new(vec![1, value_dim]),
+        )?
+    } else {
+        dev.kda_gated_delta_rule_scan(
+            conv_out.as_ref(),
+            alpha.storage().as_ref(),
+            beta.storage().as_ref(),
+            dt_bias_d.as_ref(),
+            ssm_a_d.as_ref(),
+            ssm_norm_d.as_ref(),
+            Some(z.storage().as_ref()),
+            ssm_state.as_ref(),
+            seq_len,
+            n_val_heads,
+            n_key_heads,
+            head_dim,
+            eps,
+            &Shape::new(vec![seq_len, value_dim]),
+        )?
+    };
 
     // No readback at all: the gated branch output and the recurrent state both
     // stay in VRAM, and `ssm_out` consumes the tensor directly.
     Ok(Some(Tensor::new(
         std::sync::Arc::from(branch),
-        Shape::new(vec![1, value_dim]),
+        Shape::new(vec![seq_len, value_dim]),
         DType::F32,
         x_normed.provenance().clone(),
         x_normed.device().clone(),
@@ -1988,13 +2037,7 @@ fn attention_layer_d2d(
 ) -> Result<Option<Tensor>> {
     // Accelerators only: the CPU reference stays the production path there.
     if x_normed.device().is_cpu() {
-        d2d_decline!("attn: CPU device — host reference is the oracle");
-    }
-    // Decode only. Prefill walks several query positions against a growing
-    // arena and is not covered by the parity gate, which runs single-token
-    // steps; the host reference still handles it.
-    if seq_len != 1 {
-        d2d_decline!("attn: prefill (seq_len != 1) — host reference by design");
+        return Ok(None);
     }
     // The device attention kernel this path calls had a real defect: it staged
     // the query in 8 chunks (256 dims) but accumulated and wrote V in 4, so at
