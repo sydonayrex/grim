@@ -15,23 +15,15 @@ use grim_tensor::{
 
 // Config
 
+
 /// Why a D2D decode path declined, for `GRIM_D2D_TRACE=1`.
-///
-/// The D2D functions return `Ok(None)` for a dozen different reasons and were
-/// silent about all of them, so a permanently-declining path looked exactly
-/// like a working one. `GRIM_D2D_TRACE=1` prints `site` + `why` per decline.
-///
-/// ponytail: a `OnceLock<bool>` read of the env var per site; if this ever
-/// needs per-run toggling at runtime, add a setter — a channel nobody uses
-/// today is not a feature.
-#[allow(dead_code)]
-fn d2d_trace_enabled() -> bool {
+pub(crate) fn d2d_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GRIM_D2D_TRACE").is_ok())
 }
 
 /// Check if D2D is strictly required (panics or errors on fallback)
-fn d2d_strict_enabled() -> bool {
+pub(crate) fn d2d_strict_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GRIM_FORCE_D2D").map(|v| v != "0").unwrap_or(false))
 }
@@ -42,7 +34,11 @@ fn d2d_strict_enabled() -> bool {
 macro_rules! d2d_decline {
     ($($arg:tt)*) => {{
         let reason = format!($($arg)*);
-        eprintln!("[d2d-fallback-warning] {}:{}: D2D fallback to host: {}", file!(), line!(), reason);
+        if d2d_trace_enabled() {
+            eprintln!("[d2d-decline] {}: {}", line!(), reason);
+        } else {
+            eprintln!("[d2d-fallback-warning] {}:{}: D2D fallback to host: {}", file!(), line!(), reason);
+        }
         if d2d_strict_enabled() {
             return Err(grim_core::error::Error::Backend(format!(
                 "D2D is required but declined: {reason}"
