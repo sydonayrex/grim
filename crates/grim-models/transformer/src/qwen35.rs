@@ -10,7 +10,7 @@ use grim_core::session::{Inner, SessionT};
 use grim_nn::modules::{Embedding, Linear, RmsNorm, pick_device_for_storage_device};
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_tensor::{
-    ArithType, CoreTensorOps, DType, Device, QuantProvenance, Shape, Storage, Tensor,
+    ArithType, CoreTensorOps, DType, Device, QuantProvenance, RecurrentOps, Shape, Storage, Tensor,
 };
 
 // Config
@@ -106,6 +106,25 @@ pub struct Qwen35LayerCache {
     pub v_pages: Option<Box<dyn grim_tensor::BackendStorage>>,
     #[doc(hidden)]
     pub block_table: Option<Box<dyn grim_tensor::BackendStorage>>,
+    /// Device-resident short-conv history for the recurrent (KDA) path, shaped
+    /// `[1, d_conv-1, conv_dim]`.
+    ///
+    /// The host `conv_state` above is the reference path. When this is `Some`,
+    /// the KDA branch convolves and gates on device and the host copy is left
+    /// untouched — the two are alternatives, not a mirror, so a run that takes
+    /// the device path must not also assert on the host vectors.
+    #[doc(hidden)]
+    pub conv_state_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
+    /// Device-resident KDA state, shaped
+    /// `[n_value_heads, head_dim, head_dim]`, updated in place by
+    /// `kda_gated_delta_rule_batched`.
+    ///
+    /// This is what keeps the recurrence off the host: the CPU path copies
+    /// `ssm_state` to the device and back on every token of every recurrent
+    /// layer, so 49 of 65 layers each pay four transfers and two syncs per
+    /// token before any arithmetic happens.
+    #[doc(hidden)]
+    pub ssm_state_dev: Option<Box<dyn grim_tensor::BackendStorage>>,
 }
 
 // `BackendStorage` doesn't implement Debug — hand-roll one that prints the
@@ -121,6 +140,8 @@ impl std::fmt::Debug for Qwen35LayerCache {
             .field("k_device", &self.k_device.is_some())
             .field("v_device", &self.v_device.is_some())
             .field("k_pages", &self.k_pages.is_some())
+            .field("conv_state_dev", &self.conv_state_dev.is_some())
+            .field("ssm_state_dev", &self.ssm_state_dev.is_some())
             .finish()
     }
 }
@@ -140,6 +161,8 @@ impl Clone for Qwen35LayerCache {
             k_pages: None,
             v_pages: None,
             block_table: None,
+            conv_state_dev: None,
+            ssm_state_dev: None,
         }
     }
 }
@@ -169,6 +192,8 @@ impl Qwen35LayerCache {
             k_pages: None,
             v_pages: None,
             block_table: None,
+            conv_state_dev: None,
+            ssm_state_dev: None,
         }
     }
 }
@@ -604,8 +629,18 @@ impl Qwen35Block {
             self.cfg_ssm_num_value_heads() * self.cfg_ssm_head_dim()
         };
         let mut out_branch = vec![0.0f32; seq_len * branch_width];
+        // Set when a branch ran entirely on device. Then the branch output is
+        // already a device tensor and must NOT be copied through `out_branch`:
+        // doing so is exactly the host round-trip these paths exist to remove.
+        let mut branch_dev: Option<Tensor> = None;
 
         if self.is_full_attention {
+            if let Some(t) = attention_layer_d2d(self, &x_normed, positions, cache, seq_len)? {
+                branch_dev = Some(t);
+            }
+        }
+
+        if self.is_full_attention && branch_dev.is_none() {
             // Attention path with separated wq, wk, wv.
             // GPU-first: projections stay on-device; RoPE runs through the device kernel; K/V are appended into the.
             let dev = pick_device_for_storage_device(&device);
@@ -933,34 +968,66 @@ impl Qwen35Block {
             }
             out_branch = attn_out;
         } else {
-            // Gated DeltaNet recurrence (see `gated_delta_net_forward`).
-            gated_delta_net_forward(
-                self,
-                cache,
-                &x_normed,
-                &mut out_branch,
-                seq_len,
-                branch_width,
-            )?;
-        }
-
-        // Apply attention gate if present (aligned per token across seq_len)
-        if let Some(ref gate_lin) = self.attn_gate {
-            let gate_tensor = gate_lin.forward(&x_normed)?;
-            let gate_vec = gate_tensor.to_vec_f32()?;
-            let gate_len_per_tok = gate_vec.len() / seq_len.max(1);
-            for t in 0..seq_len {
-                let gate_base = t * gate_len_per_tok;
-                let out_base = t * branch_width;
-                for d in 0..branch_width.min(gate_len_per_tok) {
-                    let g = gate_vec[gate_base + d];
-                    out_branch[out_base + d] *= 1.0 / (1.0 + (-g).exp()); // sigmoid gate
+            // Gated DeltaNet recurrence. Prefer the device path, which keeps
+            // the conv and recurrent state in VRAM across tokens; it declines
+            // (without touching state) for prefill or any missing weight, in
+            // which case the host reference runs instead.
+            let on_device =
+                gated_delta_net_forward_d2d(self, cache, &x_normed, seq_len, branch_width)?;
+            match on_device {
+                Some(t) => branch_dev = Some(t),
+                None => {
+                    gated_delta_net_forward(
+                        self,
+                        cache,
+                        &x_normed,
+                        &mut out_branch,
+                        seq_len,
+                        branch_width,
+                    )?;
                 }
             }
         }
 
-        let branch_tensor =
-            device_tensor(out_branch, Shape::new(vec![seq_len, branch_width]), &device)?;
+        // A device-resident branch already carries its own output gate (the
+        // attention path applies `A * sigmoid(q_gate)` on device, the recurrent
+        // path folds z into the KDA kernel), so the host sigmoid gate below
+        // applies only to a branch that is still in host memory. Applying it
+        // twice would gate an already-gated value.
+        let branch_tensor = match branch_dev {
+            Some(t) => t,
+            None => {
+                // The sigmoid output gate is the ATTENTION layer's, and only
+                // the attention layer's. The reference applies it inside the
+                // attention branch, before `wo`:
+                //
+                //   llama.cpp qwen35.cpp:323-327
+                //     gate_sigmoid = ggml_sigmoid(gate);  cur = ggml_mul(cur, gate_sigmoid)
+                //
+                // A recurrent layer gates differently and exactly once, with
+                // `silu(z)`, inside `build_norm_gated` (qwen35.cpp:454). Since
+                // `attn_gate` is the tensor that supplies z on a recurrent
+                // layer, gating it here as well applied BOTH gates to the 49
+                // recurrent layers of a 65-layer model. The condition below
+                // restores the reference's one-gate-per-layer-type behaviour.
+                if self.is_full_attention {
+                    if let Some(ref gate_lin) = self.attn_gate {
+                        let gate_tensor = gate_lin.forward(&x_normed)?;
+                        let gate_vec = gate_tensor.to_vec_f32()?;
+                        let gate_len_per_tok = gate_vec.len() / seq_len.max(1);
+                        for t in 0..seq_len {
+                            let gate_base = t * gate_len_per_tok;
+                            let out_base = t * branch_width;
+                            for d in 0..branch_width.min(gate_len_per_tok) {
+                                let g = gate_vec[gate_base + d];
+                                out_branch[out_base + d] *= 1.0 / (1.0 + (-g).exp()); // sigmoid
+                            }
+                        }
+                    }
+                }
+                device_tensor(out_branch, Shape::new(vec![seq_len, branch_width]), &device)?
+            }
+        };
 
         let proj_out = if let Some(ref wo) = self.wo {
             wo.forward(&branch_tensor)?
@@ -1570,13 +1637,20 @@ fn gated_delta_net_forward(
             let q_slice = gdn_l2_norm(slice(q_off, head_dim), gdn_eps);
             // Pass 1: the raw head output, out[i] = q . S_new[i,:].
             let mut acc = vec![0.0f32; head_dim];
+            // The reference scales the head output by 1/sqrt(S_v) before the
+            // gated norm: `const float scale = 1.0f / sqrtf((float) S_v);` and
+            // `attn_data[col] = attn_col * scale` in llama.cpp
+            // `gated_delta_net.cu:281`. The chunked path folds the same factor
+            // into the query instead (`delta-net-base.cpp:47`). The RMS norm
+            // below cancels most of it, but not exactly, because of its eps.
+            let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let row = &cache.ssm_state[st_off + i * head_dim..st_off + (i + 1) * head_dim];
                 let mut a = 0.0f32;
                 for (j, qj) in q_slice.iter().enumerate() {
                     a += *qj * row[j];
                 }
-                *slot = a;
+                *slot = a * inv_sqrt_d;
             }
             // Pass 2: RMS normalize the head output BEFORE the weight.
             //
@@ -1609,6 +1683,467 @@ fn gated_delta_net_forward(
         }
     }
     Ok(())
+}
+
+/// KDA decode step with the short-conv and recurrent state left on the device.
+///
+/// Returns `Ok(false)` without touching any state when this path does not
+/// apply, so the caller can fall back to the host reference. The two are
+/// alternatives, not a pair: whichever runs owns the state, and mixing them
+/// would read a state the other one wrote.
+///
+/// Why this exists: the host path keeps `conv_state`/`ssm_state` in `Vec<f32>`,
+/// so every recurrent layer copies ~3.1 MB of state to the device and back on
+/// every token, and the delta rule itself runs on the CPU. For 49 of 65 layers
+/// that is the bulk of the decode traffic, and it is also what stops the decode
+/// graph from being capturable.
+///
+/// Decode only (`seq_len == 1`). Prefill walks the sequence in order with a
+/// different state update, so it still uses the host reference.
+fn gated_delta_net_forward_d2d(
+    blk: &Qwen35Block,
+    cache: &mut Qwen35LayerCache,
+    x_normed: &Tensor,
+    seq_len: usize,
+    branch_width: usize,
+) -> Result<Option<Tensor>> {
+    if seq_len != 1 {
+        return Ok(None);
+    }
+    // Accelerators only. The batched op also exists on the CPU backend, but
+    // that one is the numeric ORACLE for the GPU gate, not a production path:
+    // running it here would silently move every CPU model off the reference
+    // implementation it is checked against, for no gain.
+    if x_normed.device().is_cpu() {
+        return Ok(None);
+    }
+    let n_val_heads = blk.cfg_ssm_num_value_heads();
+    let n_key_heads = blk.cfg_ssm_num_key_heads();
+    let head_dim = blk.cfg_ssm_head_dim();
+    if n_val_heads == 0 || n_key_heads == 0 || head_dim == 0 {
+        return Ok(None);
+    }
+    let Some(ref qkv_lin) = blk.attn_qkv else {
+        return Ok(None);
+    };
+    // No conv weights means the stream is used un-convolved, which is a real
+    // fallback case the host path supports; this one does not.
+    let Some(ref conv_w) = blk.ssm_conv1d else {
+        return Ok(None);
+    };
+    let Some(ref alpha_lin) = blk.ssm_alpha else {
+        return Ok(None);
+    };
+    let Some(ref beta_lin) = blk.ssm_beta else {
+        return Ok(None);
+    };
+    let Some(ref gate_lin) = blk.attn_gate else {
+        return Ok(None);
+    };
+    let Some(ref dt_bias) = blk.ssm_dt_bias else {
+        return Ok(None);
+    };
+    let Some(ref ssm_a) = blk.ssm_a else {
+        return Ok(None);
+    };
+    let Some(ref ssm_norm) = blk.ssm_norm else {
+        return Ok(None);
+    };
+
+    let key_dim = n_key_heads * head_dim;
+    let value_dim = n_val_heads * head_dim;
+    let conv_dim = 2 * key_dim + value_dim;
+    if branch_width != value_dim {
+        return Ok(None);
+    }
+    if dt_bias.len() < n_val_heads || ssm_a.len() < n_val_heads || ssm_norm.len() < value_dim {
+        return Ok(None);
+    }
+
+    let taps = blk.cfg_ssm_d_conv().max(1);
+    // The short conv weight must already be plain f32 of the right shape: the
+    // op reads it directly and has no quantized path of its own.
+    let cw_dims = conv_w.shape().dims().to_vec();
+    if cw_dims.len() != 2 || cw_dims[0] != conv_dim || cw_dims[1] != taps {
+        return Ok(None);
+    }
+    if !matches!(conv_w.dtype().storage, Storage::Native) {
+        return Ok(None);
+    }
+
+    let dev = pick_device_for_storage_device(x_normed.device());
+
+    // --- conv + projections, all on device ---------------------------------
+    let qkv = qkv_lin.forward(x_normed)?;
+    if qkv.device() != x_normed.device() {
+        return Ok(None);
+    }
+    let alpha = alpha_lin.forward(x_normed)?;
+    let beta = beta_lin.forward(x_normed)?;
+    // z is the KDA output gate. `attn_gate` is loaded at
+    // `q_dim.max(value_dim)` because the same tensor serves both layer types;
+    // the op reads the leading `value_dim` elements, which is the same slice
+    // the host path reaches through `z_stride`.
+    let z = gate_lin.forward(x_normed)?;
+
+    // Small per-head vectors. These are a few KB each, so uploading them per
+    // call is negligible next to the ~3.1 MB of state it replaces.
+    let up = |v: &[f32],
+              n: usize,
+              shp: Shape|
+     -> std::result::Result<
+        Box<dyn grim_tensor::BackendStorage>,
+        grim_tensor::error::Error,
+    > { dev.from_cpu(&v[..n], &shp, DType::F32) };
+    let dt_bias_d = up(dt_bias, n_val_heads, Shape::new(vec![n_val_heads]))?;
+    let ssm_a_d = up(ssm_a, n_val_heads, Shape::new(vec![n_val_heads]))?;
+    let ssm_norm_d = up(ssm_norm, value_dim, Shape::new(vec![value_dim]))?;
+
+    // --- short conv, state in place on device ------------------------------
+    if cache.conv_state_dev.is_none() {
+        cache.conv_state_dev =
+            Some(dev.zeros(&Shape::new(vec![1, taps - 1, conv_dim]), DType::F32)?);
+    }
+    let conv_state = cache.conv_state_dev.as_ref().ok_or_else(|| {
+        grim_core::error::Error::Backend("conv_state_dev vanished after allocation".into())
+    })?;
+    let (conv_out, _) = dev.short_conv1d_causal_step(
+        qkv.storage().as_ref(),
+        conv_w.storage().as_ref(),
+        None,
+        conv_state.as_ref(),
+        &Shape::new(vec![1, conv_dim]),
+    )?;
+
+    // --- batched delta rule, state in place on device ----------------------
+    if cache.ssm_state_dev.is_none() {
+        cache.ssm_state_dev = Some(dev.zeros(
+            &Shape::new(vec![n_val_heads, head_dim, head_dim]),
+            DType::F32,
+        )?);
+    }
+    let ssm_state = cache.ssm_state_dev.as_ref().ok_or_else(|| {
+        grim_core::error::Error::Backend("ssm_state_dev vanished after allocation".into())
+    })?;
+
+    let eps = blk.attn_norm.eps;
+    let (branch, _) = dev.kda_gated_delta_rule_batched(
+        conv_out.as_ref(),
+        alpha.storage().as_ref(),
+        beta.storage().as_ref(),
+        dt_bias_d.as_ref(),
+        ssm_a_d.as_ref(),
+        ssm_norm_d.as_ref(),
+        Some(z.storage().as_ref()),
+        ssm_state.as_ref(),
+        n_val_heads,
+        n_key_heads,
+        head_dim,
+        eps,
+        &Shape::new(vec![1, value_dim]),
+    )?;
+
+    // No readback at all: the gated branch output and the recurrent state both
+    // stay in VRAM, and `ssm_out` consumes the tensor directly.
+    Ok(Some(Tensor::new(
+        std::sync::Arc::from(branch),
+        Shape::new(vec![1, value_dim]),
+        DType::F32,
+        x_normed.provenance().clone(),
+        x_normed.device().clone(),
+    )))
+}
+
+/// Full-attention decode step with Q, K, V and the attention output all left
+/// on the device.
+///
+/// Returns `Ok(None)` — declining, without touching the KV arena — when this
+/// path does not apply, in which case the caller runs the host reference. The
+/// two are alternatives: whichever runs owns the arena append.
+///
+/// Why: the host path downloads the fused `attn_q` output, splits it on the
+/// host, re-uploads both halves, downloads Q again for the per-head norm,
+/// downloads it *again* after RoPE, and downloads the attention result. That
+/// is five device→host transfers per layer per token, and it is also what
+/// keeps the attention branch out of any captured graph.
+///
+/// Q and the attention output are what the caller asked to move; K and V move
+/// with them because they share this one code path, and splitting the branch
+/// to keep just Q and A on device would have meant two near-identical
+/// attention implementations to keep in step.
+fn attention_layer_d2d(
+    blk: &Qwen35Block,
+    x_normed: &Tensor,
+    positions: &[u32],
+    cache: &mut Qwen35LayerCache,
+    seq_len: usize,
+) -> Result<Option<Tensor>> {
+    // Accelerators only: the CPU reference stays the production path there.
+    if x_normed.device().is_cpu() {
+        return Ok(None);
+    }
+    // OFF by default. Everything this path owns — the row-aware [Q | gate]
+    // split, the per-head Q/K norm, RoPE, and the A * sigmoid(gate) — is
+    // verified against the host reference. The one thing it does NOT own is
+    // the attention call itself, and that is currently wrong on device:
+    // `fused_or_scalar_attention_arena_device` returns exactly half its
+    // elements as zero at the real Qwen3.8 geometry (24 q heads / 4 kv heads /
+    // head_dim 256) instead of erroring, for both 2-D and 3-D arenas. Enabling
+    // this path on top of that would silently halve every attention layer,
+    // which is far worse than the transfers it saves.
+    //
+    // Turn on with GRIM_QWEN_ATTN_D2D=1 once the device attention kernel is
+    // fixed; the parity test is `qwen35_attn_d2d_parity` and the kernel
+    // characterisation is `qwen35_attention_device_kernel_is_wrong`.
+    if !matches!(
+        std::env::var("GRIM_QWEN_ATTN_D2D").as_deref(),
+        Ok("1" | "true" | "on" | "yes")
+    ) {
+        return Ok(None);
+    }
+    // The fused-QKV path emits no gate half, so the output gate cannot be
+    // applied. It is a Q8_0 fast path for decode; leave it to the host route
+    // rather than silently dropping the gate (a zero gate reads as
+    // sigmoid(0) = 0.5 and uniformly halves every step).
+    if blk.wqkv_q80_fused.is_some() && seq_len == 1 {
+        return Ok(None);
+    }
+    // `wo` is deliberately not required here: the caller applies it to whatever
+    // this returns, and its own `Option` handling is unchanged by this path.
+    let (Some(wq), Some(wk), Some(wv)) = (blk.wq.as_ref(), blk.wk.as_ref(), blk.wv.as_ref()) else {
+        return Ok(None);
+    };
+
+    let q_dim = blk.num_heads * blk.head_dim;
+    let kv_dim = blk.num_kv_heads * blk.head_dim;
+    let device = x_normed.device().clone();
+    let dev = pick_device_for_storage_device(&device);
+
+    // Some TP-sharded projections emit padded rows — cut to the exact
+    // [seq, width] extent via a D2D staging copy when needed.
+    let exact = |t: Tensor, rows: usize, width: usize| -> Result<Tensor> {
+        let want = Shape::new(vec![rows, width]);
+        if t.shape().elem_count() == rows * width {
+            return crate::block::reshaped_view(&t, &want);
+        }
+        let scratch = dev.alloc_storage(&want, DType::F32)?;
+        dev.copy_slice_range(scratch.as_ref(), 0, t.storage().as_ref(), 0, rows * width)?;
+        Ok(Tensor::new(
+            scratch.into(),
+            want,
+            DType::F32,
+            t.provenance().clone(),
+            t.device().clone(),
+        ))
+    };
+
+    // --- projections, on device -------------------------------------------
+    let q_full = exact(wq.forward(x_normed)?, seq_len, 2 * q_dim)?;
+    let k_dev_t = exact(wk.forward(x_normed)?, seq_len, kv_dim)?;
+    let v_dev_t = exact(wv.forward(x_normed)?, seq_len, kv_dim)?;
+
+    // --- split the fused [Q | gate] row-wise, on device --------------------
+    // A flat byte-range copy of the first q_dim elements is wrong for
+    // seq_len > 1: it cuts across row boundaries. `narrow_cols` copies a
+    // column RANGE out of every row, which is the row-aware split.
+    let q_split = Shape::new(vec![seq_len, q_dim]);
+    let (q_st, gate_st) = {
+        let (qs, _) = dev.narrow_cols(
+            q_full.storage().as_ref(),
+            2 * q_dim,
+            0,
+            seq_len,
+            q_dim,
+            &q_split,
+        )?;
+        let (gs, _) = dev.narrow_cols(
+            q_full.storage().as_ref(),
+            2 * q_dim,
+            q_dim,
+            seq_len,
+            q_dim,
+            &q_split,
+        )?;
+        (qs, gs)
+    };
+    let mk = |st: Box<dyn grim_tensor::BackendStorage>| -> Tensor {
+        Tensor::new(
+            Arc::from(st),
+            q_split.clone(),
+            DType::F32,
+            x_normed.provenance().clone(),
+            x_normed.device().clone(),
+        )
+    };
+    let mut q_dev = mk(q_st);
+    let q_gate_dev = mk(gate_st);
+
+    // --- per-head Q/K RMS norm, BEFORE RoPE, on device ---------------------
+    // The reference norms q and k before rotating (qwen35.cpp:281/286, MRoPE at
+    // :299); norming after RoPE would be a different function, not a reorder.
+    let head_norm = |t: &Tensor, heads: usize, n: Option<&RmsNorm>| -> Result<Tensor> {
+        let Some(n) = n else { return Ok(t.clone()) };
+        let three = Shape::new(vec![1, seq_len * heads, blk.head_dim]);
+        let t3 = crate::block::reshaped_view(t, &three)?;
+        // The weight is [head_dim]; broadcast it across the (seq*heads) rows
+        // the flattened view presents.
+        let w = n.weight.to_vec_f32()?;
+        let w_dev = dev.from_cpu(&w, &Shape::new(vec![blk.head_dim]), DType::F32)?;
+        let (out, _) = dev.rms_norm(t3.storage().as_ref(), w_dev.as_ref(), n.eps, &three)?;
+        // Back to [seq, heads*head_dim] — the tensor's OWN width, which is
+        // kv_dim for K and q_dim for Q. Reshaping to a single shared width
+        // would silently mis-slice the narrower K.
+        crate::block::reshaped_view(
+            &Tensor::new(
+                out.into(),
+                three.clone(),
+                DType::F32,
+                t.provenance().clone(),
+                t.device().clone(),
+            ),
+            &Shape::new(vec![seq_len, heads * blk.head_dim]),
+        )
+    };
+    q_dev = head_norm(&q_dev, blk.num_heads, blk.attn_q_norm.as_ref())?;
+    let k_dev_t = head_norm(&k_dev_t, blk.num_kv_heads, blk.attn_k_norm.as_ref())?;
+
+    // --- RoPE, on device ---------------------------------------------------
+    let mut rope_cfg = grim_tensor::RopeConfig::new(blk.head_dim, blk.rope_theta);
+    rope_cfg.rotary_dim = blk.rotary_dim;
+    let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
+        let mut pos_ext = Vec::with_capacity(seq_len * heads);
+        for &pos in positions {
+            for _ in 0..heads {
+                pos_ext.push(pos);
+            }
+        }
+        let t3 =
+            crate::block::reshaped_view(t, &Shape::new(vec![1, seq_len * heads, blk.head_dim]))?;
+        let (rope_s, _) = dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape())?;
+        crate::block::reshaped_view(
+            &Tensor::new(
+                rope_s.into(),
+                t3.shape().clone(),
+                DType::F32,
+                t.provenance().clone(),
+                t.device().clone(),
+            ),
+            &Shape::new(vec![seq_len, heads * blk.head_dim]),
+        )
+    };
+    let q_rope = rope_ext(&q_dev, blk.num_heads)?;
+    let k_rope = rope_ext(&k_dev_t, blk.num_kv_heads)?;
+
+    // --- append K/V to the device arena, then attend -----------------------
+    let k_new_rows = seq_len * blk.num_kv_heads;
+    let kv_elems = k_new_rows * blk.head_dim;
+    let k_cap_rows = cache
+        .k_device
+        .as_ref()
+        .map(|s| s.shape().dims()[0])
+        .unwrap_or(0);
+    let need_rows = cache.current_pos + k_new_rows;
+
+    if k_cap_rows >= need_rows {
+        let k_dev = cache
+            .k_device
+            .as_ref()
+            .ok_or_else(|| grim_core::error::Error::Backend("cache.k_device missing".into()))?;
+        let v_dev = cache
+            .v_device
+            .as_ref()
+            .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
+        dev.copy_slice_range(
+            &**k_dev,
+            cache.current_pos * blk.num_kv_heads * blk.head_dim,
+            k_rope.storage().as_ref(),
+            0,
+            kv_elems,
+        )?;
+        dev.copy_slice_range(
+            &**v_dev,
+            cache.current_pos * blk.num_kv_heads * blk.head_dim,
+            v_dev_t.storage().as_ref(),
+            0,
+            kv_elems,
+        )?;
+    } else {
+        let new_rows = ((need_rows * 2) + 64).next_power_of_two();
+        let k_idx = blk.num_kv_heads * blk.head_dim;
+        let full_shape = Shape::new(vec![new_rows, blk.num_kv_heads, blk.head_dim]);
+        let k_grown = dev.alloc_storage(&full_shape, DType::F32)?;
+        let v_grown = dev.alloc_storage(&full_shape, DType::F32)?;
+        if let Some(ref old_k) = cache.k_device {
+            dev.copy_slice_range(
+                k_grown.as_ref(),
+                0,
+                old_k.as_ref(),
+                0,
+                cache.current_pos * k_idx,
+            )?;
+        }
+        if let Some(ref old_v) = cache.v_device {
+            dev.copy_slice_range(
+                v_grown.as_ref(),
+                0,
+                old_v.as_ref(),
+                0,
+                cache.current_pos * k_idx,
+            )?;
+        }
+        dev.copy_slice_range(
+            k_grown.as_ref(),
+            cache.current_pos * k_idx,
+            k_rope.storage().as_ref(),
+            0,
+            kv_elems,
+        )?;
+        dev.copy_slice_range(
+            v_grown.as_ref(),
+            cache.current_pos * k_idx,
+            v_dev_t.storage().as_ref(),
+            0,
+            kv_elems,
+        )?;
+        cache.k_device = Some(k_grown);
+        cache.v_device = Some(v_grown);
+    }
+
+    let total_kv = cache.current_pos + seq_len;
+    let k_arena = cache
+        .k_device
+        .as_ref()
+        .ok_or_else(|| grim_core::error::Error::Backend("cache.k_device missing".into()))?;
+    let v_arena = cache
+        .v_device
+        .as_ref()
+        .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
+    let attn = crate::shared_attention::fused_or_scalar_attention_arena_device(
+        q_rope.storage().as_ref(),
+        k_arena.as_ref(),
+        v_arena.as_ref(),
+        total_kv,
+        blk.num_heads,
+        blk.num_kv_heads,
+        blk.head_dim,
+        seq_len,
+        None,
+        &device,
+    )?;
+
+    // --- output gate: attn_out * sigmoid(gate), on device ------------------
+    // Reuse the existing device sigmoid rather than adding a second one: the
+    // ROCm backend already exposes it and `grim_nn` wraps it for tensors.
+    let sig = grim_nn::modules::sigmoid_on_device(&q_gate_dev)?;
+    let (gated, _) = dev.mul(attn.storage().as_ref(), sig.storage().as_ref(), &q_split)?;
+
+    Ok(Some(Tensor::new(
+        Arc::from(gated),
+        q_split,
+        DType::F32,
+        x_normed.provenance().clone(),
+        x_normed.device().clone(),
+    )))
 }
 
 // ── Gated DeltaNet (KDA) helpers ───────────────────────────────────────────

@@ -1597,6 +1597,73 @@ pub trait RecurrentOps {
         ))
     }
 
+    /// Batched Gated DeltaNet (KDA) decode step: every value head of one token
+    /// in a single launch, with the recurrent state left on the device.
+    ///
+    /// `kda_gated_delta_rule_step` above is correct but per-head, so one decode
+    /// token is 48 launches plus 48 slice views per layer. This variant takes
+    /// the whole head loop instead, which is what lets the state stay resident
+    /// rather than being read back to the host on every token.
+    ///
+    /// `conv_out` is the short-conv output for ONE token, laid out
+    /// `[K key_dim][K key_dim][V value_dim]` — key, key, value, per
+    /// llama.cpp `src/models/qwen35.cpp`. The SiLU is applied by this op as it
+    /// reads the stream, which is the same function as the reference's
+    /// `ggml_silu` followed by the q/k/v split, and saves a whole-stream
+    /// elementwise launch per layer per token. Per value head `h`:
+    ///
+    /// * the key head is `h % num_key_heads` (`ggml_repeat_4d` tiles the key
+    ///   heads across the value heads),
+    /// * `q` and `v` are the SAME slice of the value stream, at
+    ///   `2*key_dim + h*head_dim`, and both `q` and `k` are L2-normalised,
+    /// * `gate = softplus(alpha[h] + dt_bias[h]) * ssm_a[h]`,
+    /// * `beta = sigmoid(beta[h])`,
+    /// * the published delta rule runs on `state[h*head_dim*head_dim..]`, which
+    ///   is updated in place,
+    /// * the head output is then RMS-normalised over `head_dim`, scaled by
+    ///   `norm_weight[i]` and multiplied by `silu(z[i])` — the reference's
+    ///   `build_norm_gated`. `z = None` applies a gate of 1.0.
+    ///
+    /// `alpha`, `beta`, `dt_bias` and `ssm_a` are per value head; `norm_weight`
+    /// and `z` are per value-stream element. `eps` is the GDN epsilon, used by
+    /// both the L2 norms and the output RMS norm.
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_batched(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (
+            conv_out,
+            alpha,
+            beta,
+            dt_bias,
+            ssm_a,
+            norm_weight,
+            z,
+            state,
+            num_value_heads,
+            num_key_heads,
+            head_dim,
+            eps,
+            out_shape,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "kda_gated_delta_rule_batched not implemented for this backend".into(),
+        ))
+    }
+
     /// Mamba selective scan (Phase 2 - mambo5.md Item 11).
     /// Computes the recurrent hidden-state update `h_t = a * h_{t-1} + x_t * b_t` in.
     fn selective_scan(
@@ -2827,6 +2894,45 @@ impl<T: RecurrentOps + ?Sized> RecurrentOps for std::sync::Arc<T> {
             recurrent_state,
             d_k,
             d_v,
+            out_shape,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_batched(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // Without this forwarder the blanket `Arc<T>` impl's own default wins
+        // method resolution for `Arc<RocmDevice>`, so the backend's override is
+        // silently skipped and the caller sees the trait's `Unimplemented` —
+        // which reads like "this backend has no such op" rather than "the
+        // forwarder is missing".
+        (**self).kda_gated_delta_rule_batched(
+            conv_out,
+            alpha,
+            beta,
+            dt_bias,
+            ssm_a,
+            norm_weight,
+            z,
+            state,
+            num_value_heads,
+            num_key_heads,
+            head_dim,
+            eps,
             out_shape,
         )
     }

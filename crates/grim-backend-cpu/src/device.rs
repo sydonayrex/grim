@@ -1838,6 +1838,139 @@ impl RecurrentOps for CpuDevice {
         ))
     }
 
+    /// Batched KDA step over every value head of one token, state updated in
+    /// place. This is the reference the ROCm batched kernel is checked against,
+    /// so it spells out the same steps `qwen35.rs::gated_delta_net_forward`
+    /// performs on the host today.
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_batched(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let cm_s = a_storage(conv_out)?;
+        let al_s = a_storage(alpha)?;
+        let be_s = a_storage(beta)?;
+        let db_s = a_storage(dt_bias)?;
+        let sa_s = a_storage(ssm_a)?;
+        let nw_s = a_storage(norm_weight)?;
+        let z_s = z.map(a_storage).transpose()?;
+        let st_s = a_storage(state)?;
+
+        if head_dim == 0 || num_value_heads == 0 || num_key_heads == 0 {
+            return Err(Error::Shape(format!(
+                "kda_batched: degenerate geometry v={num_value_heads} k={num_key_heads} d={head_dim}"
+            )));
+        }
+        let key_dim = num_key_heads * head_dim;
+        let value_dim = num_value_heads * head_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+        let state_len = head_dim * head_dim;
+
+        // Every dimension the kernel derives from the geometry is checked here
+        // too, so a caller that sizes the stream from the attention q+k+v width
+        // fails loudly instead of reading the wrong channels.
+        let cm_raw = cm_s.data();
+        if cm_raw.len() < conv_dim {
+            return Err(Error::Shape(format!(
+                "kda_batched: conv_out holds {} elements, need 2*key_dim+value_dim = {conv_dim}",
+                cm_raw.len()
+            )));
+        }
+        if st_s.data().len() < num_value_heads * state_len {
+            return Err(Error::Shape(format!(
+                "kda_batched: state holds {} floats, need {num_value_heads} heads x {state_len}",
+                st_s.data().len()
+            )));
+        }
+
+        // The state is updated in place and `data()` only lends a shared slice,
+        // so this uses the same `as *mut` seam as `rwkv_wkv_recurrence`.
+        let s_ptr = st_s.data.as_ptr() as *mut f32;
+
+        // The reference does `ggml_silu` on the whole conv stream and only then
+        // takes the q/k/v views, so the SiLU is applied here rather than being
+        // the caller's job. Same function, one less stream-sized launch.
+        let cm_silu: Vec<f32> = cm_raw.iter().map(|&x| kda_silu(x)).collect();
+        let cm = &cm_silu;
+
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+        let mut acc = vec![0.0f32; head_dim];
+
+        for h in 0..num_value_heads {
+            let kh = h % num_key_heads;
+            let k_base = kh * head_dim;
+            // q and v are the same value-stream slice in this architecture.
+            let q_base = 2 * key_dim + h * head_dim;
+
+            let a_biased = al_s.data().get(h).copied().unwrap_or(0.0)
+                + db_s.data().get(h).copied().unwrap_or(0.0);
+            let gate = kda_softplus(a_biased) * sa_s.data().get(h).copied().unwrap_or(1.0);
+            let beta_val = 1.0 / (1.0 + (-be_s.data().get(h).copied().unwrap_or(0.0)).exp());
+            let decay = gate.exp();
+
+            let k_l2 = kda_l2_norm(&cm[k_base..k_base + head_dim], eps);
+            let q_l2 = kda_l2_norm(&cm[q_base..q_base + head_dim], eps);
+            let v = &cm[q_base..q_base + head_dim];
+            // The reference scales the head output by 1/sqrt(S_v) before the
+            // gated norm (llama.cpp `gated_delta_net.cu:281` + `attn_data[col] =
+            // attn_col * scale`; the chunked path folds the same factor into
+            // `q = ggml_scale(q, 1/sqrtf(S_k))` at `delta-net-base.cpp:47`).
+            // The subsequent RMS norm cancels most of it, but not exactly,
+            // because of its eps.
+            let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
+
+            let s_head =
+                unsafe { std::slice::from_raw_parts_mut(s_ptr.add(h * state_len), state_len) };
+            for (j, slot) in acc.iter_mut().enumerate() {
+                let row = &mut s_head[j * head_dim..(j + 1) * head_dim];
+                // decay BEFORE the key dot; beta scales the whole delta term.
+                let pred: f32 = k_l2
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(k, s)| k * (decay * s))
+                    .sum();
+                let delta = beta_val * (v[j] - pred);
+                let mut a = 0.0f32;
+                for (i, kk) in k_l2.iter().enumerate() {
+                    let s = decay * row[i] + kk * delta;
+                    row[i] = s;
+                    a += q_l2[i] * s;
+                }
+                *slot = a * inv_sqrt_d;
+            }
+
+            // build_norm: RMS over the whole head, then the norm weight, then
+            // the z gate — the reference's ordering.
+            let ss: f32 = acc.iter().map(|a| a * a).sum();
+            let inv_rms = 1.0 / ((ss / head_dim as f32) + eps).sqrt();
+            for i in 0..head_dim {
+                let w = nw_s.data().get(i).copied().unwrap_or(1.0);
+                let g = match z_s {
+                    Some(t) => kda_silu(t.data().get(h * head_dim + i).copied().unwrap_or(0.0)),
+                    None => 1.0,
+                };
+                out[h * head_dim + i] = acc[i] * inv_rms * w * g;
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn rwkv_wkv_recurrence(
         &self,
         k: &dyn BackendStorage,
@@ -2237,6 +2370,33 @@ impl BackendStorage for CpuStorage {
 
 // ---------- helpers ----------
 
+/// Softplus, `log1p(exp(x))`, stable for large `|x|`. Used to turn the fused
+/// (alpha + dt_bias) logit into a decay rate.
+fn kda_softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp()
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
+/// SiLU, `x * sigmoid(x)`.
+fn kda_silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// L2-normalise a head vector. Returns the input unchanged when the norm
+/// underflows to zero, so a dead head cannot produce NaN.
+fn kda_l2_norm(v: &[f32], eps: f32) -> Vec<f32> {
+    let ss: f32 = v.iter().map(|x| x * x).sum();
+    let denom = (ss + eps).sqrt();
+    if denom <= 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / denom).collect()
+}
 fn a_storage(s: &dyn BackendStorage) -> Result<&CpuStorage> {
     s.as_any()
         .downcast_ref::<CpuStorage>()

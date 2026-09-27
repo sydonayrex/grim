@@ -1477,6 +1477,128 @@ extern "C" __global__ void grim_kda_gated_delta_rule_step(
     out[row] = y_val;
 }
 
+
+// Batched Gated DeltaNet (KDA) decode step over EVERY value head of one token.
+//
+// `grim_kda_gated_delta_rule_step` above is the same recurrence for a single
+// head, which forces one launch and one pair of slice views per head. This
+// version takes the whole head loop so a decode token costs two launches per
+// layer instead of 2 * num_value_heads, and so the [n_v][d_v][d_k] state can
+// stay resident on the device rather than being read back each token.
+//
+// One thread per (value head, state row) pair. A thread owns row `j` of one
+// head's row-major [d_v][d_k] state, so the delta rule needs no cross-thread
+// communication - the same `d_k`/`d_v` split the CPU reference uses.
+//
+// The head output's RMS norm DOES reduce over d_v, and that value is not known
+// until every row of the head has been updated, so this kernel writes the raw
+// per-row accumulator and `grim_kda_head_norm_gate` finishes the head.
+//
+// The reference runs `ggml_silu` over the conv stream and only then takes the
+// q/k/v views, so the SiLU is applied here on read: the same function, without
+// a whole-stream elementwise launch per layer per token.
+//
+// Stream layout is [K key_dim][K key_dim][V value_dim] (llama.cpp qwen35.cpp);
+// the key head for value head h is h % num_k (`ggml_repeat_4d` tiles the key
+// heads across the value heads), and q and v are the SAME value-stream slice.
+__device__ inline float kda_silu_dev(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+__device__ inline float kda_softplus_dev(float x) {
+    // Mirrors the host `kda_softplus` branch for bit-comparable behaviour:
+    // exp(x) overflows well before ln_1p does, and the small-x tail is
+    // exactly exp(x) to within f32 precision.
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+extern "C" __global__ void grim_kda_gated_delta_rule_batched(
+    const float* conv_out, const float* alpha, const float* beta,
+    const float* dt_bias, const float* ssm_a,
+    float* S, float* acc,
+    int num_v, int num_k, int head_dim, float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_v * head_dim;
+    if (idx >= total) return;
+    int h = idx / head_dim;
+    int j = idx - h * head_dim;
+
+    int key_dim = num_k * head_dim;
+    const float* k_raw = conv_out + (h % num_k) * head_dim;
+    const float* qv    = conv_out + 2 * key_dim + h * head_dim;
+
+    // gate = softplus(alpha + dt_bias) * ssm_a, beta = sigmoid(beta).
+    float gate = kda_softplus_dev(alpha[h] + dt_bias[h]) * ssm_a[h];
+    float beta_val = 1.0f / (1.0f + expf(-beta[h]));
+    float decay = expf(gate);
+
+    // build_gdn_l2_norm on both k and q, per head.
+    float kss = 0.0f, qss = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float kk = kda_silu_dev(k_raw[i]);
+        float qq = kda_silu_dev(qv[i]);
+        kss += kk * kk;
+        qss += qq * qq;
+    }
+    float kden = sqrtf(kss + eps);
+    float qden = sqrtf(qss + eps);
+
+    float* s_row = S + ((long long)h * head_dim + j) * head_dim;
+
+    // pred = sum_k k * (decay * S)   -- decay BEFORE the dot.
+    float pred = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
+        pred += kk * (decay * s_row[i]);
+    }
+    // delta = beta * (v - pred): beta scales the whole delta term.
+    float delta = beta_val * (kda_silu_dev(qv[j]) - pred);
+
+    float a = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
+        float qq = (qden > 0.0f) ? kda_silu_dev(qv[i]) / qden : kda_silu_dev(qv[i]);
+        float s = decay * s_row[i] + kk * delta;
+        s_row[i] = s;
+        a += qq * s;
+    }
+    // The reference scales the head output by 1/sqrt(S_v): `const float scale =
+    // 1.0f / sqrtf((float) S_v);` and `attn_data[col] = attn_col * scale` in
+    // gated_delta_net.cu:281. The chunked path folds the same factor into the
+    // query instead (delta-net-base.cpp:47). The gated RMS norm downstream
+    // cancels most of it, but not exactly, because of its eps.
+    acc[idx] = a * rsqrtf((float) head_dim);
+}
+
+// Second half of the batched KDA step: one thread per value head reduces its
+// d_v accumulators, then applies the reference's `build_norm_gated` - RMS over
+// the whole head, the ssm_norm weight, then the silu(z) gate.
+extern "C" __global__ void grim_kda_head_norm_gate(
+    const float* acc, const float* norm_weight, const float* z,
+    float* out, int num_v, int head_dim, float eps, int has_z
+) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= num_v) return;
+
+    float ss = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float a = acc[h * head_dim + i];
+        ss += a * a;
+    }
+    float inv_rms = 1.0f / sqrtf(ss / head_dim + eps);
+
+    for (int i = 0; i < head_dim; ++i) {
+        float g = 1.0f;
+        if (has_z) {
+            float zv = z[h * head_dim + i];
+            g = zv / (1.0f + expf(-zv));
+        }
+        out[h * head_dim + i] = acc[h * head_dim + i] * inv_rms * norm_weight[i] * g;
+    }
+}
 extern "C" __global__ void grim_mla_q_kv_norm_split(
     const float* q_raw, const float* kv_raw, const float* q_norm_w, const float* kv_norm_w,
     float* q_nope, float* q_rope, float* kv_nope, float* kv_rope,

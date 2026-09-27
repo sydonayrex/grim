@@ -541,6 +541,27 @@ impl RecurrentOps for ProbeDevice {
         probe_err("kda_gated_delta_rule_step")?;
         unreachable!()
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_batched(
+        &self,
+        _conv_mix: &dyn BackendStorage,
+        _alpha: &dyn BackendStorage,
+        _beta: &dyn BackendStorage,
+        _dt_bias: &dyn BackendStorage,
+        _ssm_a: &dyn BackendStorage,
+        _norm_weight: &dyn BackendStorage,
+        _z: Option<&dyn BackendStorage>,
+        _state: &dyn BackendStorage,
+        _num_value_heads: usize,
+        _num_key_heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+        _out_shape: &Shape,
+    ) -> grim_tensor::Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        probe_err("kda_gated_delta_rule_batched")?;
+        unreachable!()
+    }
 }
 
 impl CollectiveOps for ProbeDevice {}
@@ -609,6 +630,47 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
     assert_probe!(
         dev.embedding_q4k(s.as_ref(), &[0], &shape, 4),
         "embedding_q4k"
+    );
+    // The KDA recurrence family. A backend override added to `RecurrentOps`
+    // without a matching forwarder in the blanket `Arc<T>` impl is silently
+    // unreachable behind `Arc<Device>`, which is how every backend holds its
+    // device — the caller then sees the trait's `Unimplemented` and reads it
+    // as "this backend has no such op".
+    assert_probe!(
+        dev.kda_gated_delta_rule_batched(
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            Some(s.as_ref()),
+            s.as_ref(),
+            1,
+            1,
+            2,
+            1e-6,
+            &shape,
+        ),
+        "kda_gated_delta_rule_batched"
+    );
+    assert_probe!(
+        dev.kda_gated_delta_rule_step(
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            s.as_ref(),
+            2,
+            2,
+            &shape,
+        ),
+        "kda_gated_delta_rule_step"
+    );
+    assert_probe!(
+        dev.short_conv1d_causal_step(s.as_ref(), s.as_ref(), None, s.as_ref(), &shape),
+        "short_conv1d_causal_step"
     );
     assert_probe!(
         dev.copy_bytes_into(s.as_ref(), 0, s.as_ref(), 0, 4),

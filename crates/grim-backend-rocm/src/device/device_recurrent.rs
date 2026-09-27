@@ -8,7 +8,7 @@ use grim_tensor::{BackendStorage, RecurrentOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch};
+use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, hipFreeAsync, linear_launch};
 
 impl RecurrentOps for RocmDevice {
     fn short_conv1d_causal_step(
@@ -165,6 +165,178 @@ impl RecurrentOps for RocmDevice {
                 arg(&mut dv_i),
             ],
         )?;
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// Batched KDA step: every value head of one token, state left in place on
+    /// the device. Two launches — the delta rule over all heads, then the
+    /// per-head `build_norm_gated` — instead of two per head.
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_batched(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+
+        if head_dim == 0 || num_value_heads == 0 || num_key_heads == 0 {
+            return Err(Error::Shape(format!(
+                "kda_batched: degenerate geometry v={num_value_heads} k={num_key_heads} d={head_dim}"
+            )));
+        }
+        let cm_s = as_rocm(conv_out)?;
+        let al_s = as_rocm(alpha)?;
+        let be_s = as_rocm(beta)?;
+        let db_s = as_rocm(dt_bias)?;
+        let sa_s = as_rocm(ssm_a)?;
+        let nw_s = as_rocm(norm_weight)?;
+        let z_s = match z {
+            Some(zz) => Some(as_rocm(zz)?),
+            None => None,
+        };
+        let s_s = as_rocm(state)?;
+
+        let key_dim = num_key_heads * head_dim;
+        let value_dim = num_value_heads * head_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+        let state_len = (num_value_heads * head_dim) * head_dim;
+
+        // The kernel derives every offset from the geometry, so a stream sized
+        // from the attention q+k+v width instead of the conv width reads the
+        // wrong channels silently. Check the extents it will actually touch.
+        if cm_s.bytes / 4 < conv_dim {
+            return Err(Error::Shape(format!(
+                "kda_batched: conv_out holds {} floats, need 2*key_dim+value_dim = {conv_dim}",
+                cm_s.bytes / 4
+            )));
+        }
+        if s_s.bytes / 4 < state_len {
+            return Err(Error::Shape(format!(
+                "kda_batched: state holds {} floats, need {num_value_heads} heads x {state_len}",
+                s_s.bytes / 4
+            )));
+        }
+        for (name, st) in [
+            ("alpha", al_s),
+            ("beta", be_s),
+            ("dt_bias", db_s),
+            ("ssm_a", sa_s),
+        ] {
+            if st.bytes / 4 < num_value_heads {
+                return Err(Error::Shape(format!(
+                    "kda_batched: {name} holds {} floats, need {num_value_heads}",
+                    st.bytes / 4
+                )));
+            }
+        }
+        if nw_s.bytes / 4 < value_dim {
+            return Err(Error::Shape(format!(
+                "kda_batched: norm_weight holds {} floats, need value_dim {value_dim}",
+                nw_s.bytes / 4
+            )));
+        }
+        if let Some(zz) = z_s {
+            if zz.bytes / 4 < value_dim {
+                return Err(Error::Shape(format!(
+                    "kda_batched: z holds {} floats, need value_dim {value_dim}",
+                    zz.bytes / 4
+                )));
+            }
+        }
+
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        // Per-row accumulators live between the two launches. Ordered on the
+        // same stream, so the second kernel sees the first's writes.
+        let acc_shape = Shape::new(vec![num_value_heads, head_dim]);
+        let acc_s = RocmStorage::alloc_gpu(&acc_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        let mut cm_ptr = dev_ptr(cm_s)?;
+        let mut al_ptr = dev_ptr(al_s)?;
+        let mut be_ptr = dev_ptr(be_s)?;
+        let mut db_ptr = dev_ptr(db_s)?;
+        let mut sa_ptr = dev_ptr(sa_s)?;
+        let mut s_ptr = dev_ptr(s_s)?;
+        let mut acc_ptr = dev_ptr(&acc_s)?;
+        let mut nv_i = num_value_heads as i32;
+        let mut nk_i = num_key_heads as i32;
+        let mut hd_i = head_dim as i32;
+        let mut eps_f = eps;
+
+        let (grid, block) = linear_launch(num_value_heads * head_dim);
+        self.launch_compute_kernel(
+            "grim_kda_gated_delta_rule_batched",
+            grid,
+            block,
+            &mut [
+                arg(&mut cm_ptr),
+                arg(&mut al_ptr),
+                arg(&mut be_ptr),
+                arg(&mut db_ptr),
+                arg(&mut sa_ptr),
+                arg(&mut s_ptr),
+                arg(&mut acc_ptr),
+                arg(&mut nv_i),
+                arg(&mut nk_i),
+                arg(&mut hd_i),
+                arg(&mut eps_f),
+            ],
+        )?;
+
+        let mut acc_ptr2 = dev_ptr(&acc_s)?;
+        let mut nw_ptr = dev_ptr(nw_s)?;
+        let mut z_ptr = match z_s {
+            Some(zz) => dev_ptr(zz)?,
+            None => 0u64,
+        };
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut nv2_i = num_value_heads as i32;
+        let mut hd2_i = head_dim as i32;
+        let mut eps2_f = eps;
+        let mut has_z_i = i32::from(z_s.is_some());
+
+        let (grid2, block2) = linear_launch(num_value_heads);
+        let stream2 = self.launch_compute_kernel(
+            "grim_kda_head_norm_gate",
+            grid2,
+            block2,
+            &mut [
+                arg(&mut acc_ptr2),
+                arg(&mut nw_ptr),
+                arg(&mut z_ptr),
+                arg(&mut out_ptr),
+                arg(&mut nv2_i),
+                arg(&mut hd2_i),
+                arg(&mut eps2_f),
+                arg(&mut has_z_i),
+            ],
+        )?;
+
+        // The scratch is read by the kernel just enqueued, so release it
+        // stream-ordered rather than eagerly. This stays graph-capturable.
+        unsafe {
+            let free_stream = stream2
+                .as_ref()
+                .map(|_| self.active_stream())
+                .unwrap_or(std::ptr::null_mut());
+            let _ = hipFreeAsync(acc_ptr2 as *mut c_void, free_stream);
+        }
+
         Ok((
             Box::new(storage),
             Box::new(RocmHandle::new(Some(self.active_stream()))),
