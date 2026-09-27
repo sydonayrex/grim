@@ -2975,6 +2975,35 @@ impl<T: RecurrentOps + ?Sized> RecurrentOps for std::sync::Arc<T> {
         )
     }
 
+    /// Forwarder for the scan form of the KDA op. Without it the blanket
+    /// `Arc<T>` impl's own default wins method resolution for
+    /// `Arc<dyn BackendDevice>` — which is how every backend holds its device
+    /// — and the caller sees the trait's `Unimplemented` instead of the
+    /// backend's real implementation.
+    #[allow(clippy::too_many_arguments)]
+    fn kda_gated_delta_rule_scan(
+        &self,
+        conv_out: &dyn BackendStorage,
+        alpha: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        dt_bias: &dyn BackendStorage,
+        ssm_a: &dyn BackendStorage,
+        norm_weight: &dyn BackendStorage,
+        z: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        seq_len: usize,
+        num_value_heads: usize,
+        num_key_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).kda_gated_delta_rule_scan(
+            conv_out, alpha, beta, dt_bias, ssm_a, norm_weight, z, state, seq_len,
+            num_value_heads, num_key_heads, head_dim, eps, out_shape,
+        )
+    }
+
     fn selective_scan(
         &self,
         x: &dyn BackendStorage,
