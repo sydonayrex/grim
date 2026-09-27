@@ -48,6 +48,103 @@ pub const TREE_PIE_BPW: f32 = 5.0;
 /// Number of i32 words per 32 values: 4 payload + 1 sign plane.
 pub const TREE_PIE_WORDS_PER_32: usize = 5;
 
+/// Values per payload word: 8 nibbles.
+const PER_PAYLOAD_WORD: usize = 8;
+
+/// Payload words (the sign plane is the fifth).
+const PAYLOAD_WORDS: usize = 4;
+
+/// Pack 32 values into 5 i32 at exactly 5.0 bpw.
+///
+/// # Layout
+///
+/// ```text
+/// words 0..3 : 4-bit payload (exp|mant), 8 nibbles per i32, low nibble first
+/// word  4    : 1 sign bit per value, value i at bit i
+/// ```
+///
+/// The planes are separated rather than interleaved because a 5-bit code does
+/// not divide 32. Packing 6 codes per i32 the obvious way costs 5.33 bpw and
+/// wastes 2 bits per word forever; isolating the sign plane recovers those bits
+/// and is what makes the format exactly 5.0 bpw. It also gives the GPU decode
+/// (A6) a nibble plane it can load directly and a sign mask it can apply with
+/// one OR.
+///
+/// Total: never panics, and every output is a finite grid point. See
+/// `f32_to_e2m2` for the saturation and NaN policy.
+pub fn pack_tree_pie_32(values: &[f32; 32]) -> [i32; 5] {
+    let mut payload = [0i32; PAYLOAD_WORDS];
+    let mut signs = 0u32;
+
+    for (i, &v) in values.iter().enumerate() {
+        let code = f32_to_e2m2(v);
+        payload[i / PER_PAYLOAD_WORD] |= ((code & 0x0F) as i32) << ((i % PER_PAYLOAD_WORD) * 4);
+        if code & 0x10 != 0 {
+            signs |= 1 << i;
+        }
+    }
+
+    [
+        payload[0],
+        payload[1],
+        payload[2],
+        payload[3],
+        signs as i32,
+    ]
+}
+
+/// Inverse of [`pack_tree_pie_32`].
+pub fn unpack_tree_pie_32(packed: &[i32; 5]) -> [f32; 32] {
+    let signs = packed[4] as u32;
+    let mut out = [0f32; 32];
+
+    for (i, slot) in out.iter_mut().enumerate() {
+        let nibble =
+            ((packed[i / PER_PAYLOAD_WORD] as u32) >> ((i % PER_PAYLOAD_WORD) * 4)) & 0x0F;
+        let sign = ((signs >> i) & 1) << 4;
+        *slot = e2m2_to_f32(nibble as u8 | sign as u8);
+    }
+
+    out
+}
+
+/// Pack an arbitrary length slice, which must be a multiple of 32.
+///
+/// The multiple-of-32 requirement is structural rather than a convenience: the
+/// 5.0 bpw claim only holds at the 32-value granularity, and silently rounding
+/// up a ragged tail would overstate the density.
+pub fn pack_tree_pie(values: &[f32]) -> Vec<i32> {
+    assert!(
+        values.len() % 32 == 0,
+        "TreePie packs in blocks of 32, got {}",
+        values.len()
+    );
+    let mut out = Vec::with_capacity(values.len() / 32 * TREE_PIE_WORDS_PER_32);
+    for chunk in values.chunks(32) {
+        let mut block = [0f32; 32];
+        block.copy_from_slice(chunk);
+        out.extend_from_slice(&pack_tree_pie_32(&block));
+    }
+    out
+}
+
+/// Inverse of [`pack_tree_pie`].
+pub fn unpack_tree_pie(packed: &[i32]) -> Vec<f32> {
+    let words = TREE_PIE_WORDS_PER_32;
+    assert!(
+        packed.len() % words == 0,
+        "TreePie unpacks in blocks of {words} i32, got {}",
+        packed.len()
+    );
+    let mut out = Vec::with_capacity(packed.len() / words * 32);
+    for chunk in packed.chunks(words) {
+        let mut block = [0i32; 5];
+        block.copy_from_slice(chunk);
+        out.extend_from_slice(&unpack_tree_pie_32(&block));
+    }
+    out
+}
+
 /// One TreePie code: `sign << 4 | exp << 2 | mant`.
 pub type TreePieE2M2 = u8;
 
