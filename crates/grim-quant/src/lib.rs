@@ -3,6 +3,7 @@
 use grim_tensor::error::{Error, Result};
 
 pub mod accuracy_gate;
+pub mod grey_raven;
 pub mod gsq;
 mod packed_gemm;
 pub mod qat_mxfp4;
