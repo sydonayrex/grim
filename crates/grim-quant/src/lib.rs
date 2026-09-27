@@ -9,6 +9,7 @@ pub mod qat_mxfp4;
 pub mod rco;
 pub mod soul_eater;
 pub mod spqr;
+pub mod tree_pie;
 
 pub use accuracy_gate::{
     AccuracyGate, AccuracyTolerance, AccuracyVerdict, compute_cosine_similarity,
