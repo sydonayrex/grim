@@ -794,6 +794,27 @@ impl Qwen35Block {
                     t,
                     &Shape::new(vec![1, seq_len * heads, self.head_dim]),
                 )?;
+                if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() && heads == self.num_kv_heads {
+                    let pre_rope = t.to_vec_f32()?;
+                    let t3_flat = t3.to_vec_f32()?;
+                    eprintln!(
+                        "[rope_isolate pre] seq_len={} heads={} hd={} t_len={} t3_len={}",
+                        seq_len, heads, self.head_dim, pre_rope.len(), t3_flat.len()
+                    );
+                    for r in 0..seq_len.min(5) {
+                        let off = r * heads * self.head_dim;
+                        eprintln!(
+                            "[rope_isolate t_row {}] {:?} ...",
+                            r,
+                            &pre_rope[off..off + 4.min(pre_rope.len() - off)]
+                        );
+                        eprintln!(
+                            "[rope_isolate t3_row {}] {:?} ...",
+                            r,
+                            &t3_flat[off..off + 4.min(t3_flat.len() - off)]
+                        );
+                    }
+                }
                 let (rope_s, _) =
                     dev.rope(t3.storage().as_ref(), &pos_ext, &rope_cfg, t3.shape())?;
                 let roped = Tensor::new(
@@ -803,10 +824,28 @@ impl Qwen35Block {
                     t.provenance().clone(),
                     t.device().clone(),
                 );
-                crate::block::reshaped_view(
+                let reshaped = crate::block::reshaped_view(
                     &roped,
                     &Shape::new(vec![seq_len, heads * self.head_dim]),
-                )
+                )?;
+                if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() && heads == self.num_kv_heads {
+                    let roped_raw = roped.to_vec_f32()?;
+                    let res_raw = reshaped.to_vec_f32()?;
+                    for r in 0..seq_len.min(5) {
+                        let off = r * heads * self.head_dim;
+                        eprintln!(
+                            "[rope_isolate roped_row {}] {:?} ...",
+                            r,
+                            &roped_raw[off..off + 4.min(roped_raw.len() - off)]
+                        );
+                        eprintln!(
+                            "[rope_isolate res_row {}] {:?} ...",
+                            r,
+                            &res_raw[off..off + 4.min(res_raw.len() - off)]
+                        );
+                    }
+                }
+                Ok(reshaped)
             };
 
             // Phase 2b: single-token decode issues ONE fused Q8_0 QKV GEMV
@@ -927,6 +966,23 @@ impl Qwen35Block {
                     let cur = k_dev_t.to_vec_f32()?;
                     let normed =
                         apply_head_rms_norm(&cur, self.num_kv_heads, self.head_dim, &w, n.eps);
+                    if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
+                        let stride = self.num_kv_heads * self.head_dim;
+                        eprintln!("[rope_isolate k_norm] seq_len={} stride={}", seq_len, stride);
+                        for r in 0..seq_len.min(5) {
+                            let off = r * stride;
+                            eprintln!(
+                                "[rope_isolate k_raw_row {}] {:?} ...",
+                                r,
+                                &cur[off..off + 4.min(cur.len() - off)]
+                            );
+                            eprintln!(
+                                "[rope_isolate k_normed_row {}] {:?} ...",
+                                r,
+                                &normed[off..off + 4.min(normed.len() - off)]
+                            );
+                        }
+                    }
                     let sh = Shape::new(vec![seq_len, self.num_kv_heads * self.head_dim]);
                     Tensor::new(
                         dev.from_cpu(&normed, &sh, DType::F32)?.into(),
@@ -1001,6 +1057,19 @@ impl Qwen35Block {
                     0,
                     kv_elems,
                 )?;
+                if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
+                    let arena_k = k_dev.to_cpu_vec_f32()?;
+                    let stride = self.head_dim;
+                    eprintln!("[rope_isolate arena_dump] current_pos={} k_cap_rows={}", cache.current_pos, k_cap_rows);
+                    for r in 0..(cache.current_pos + k_new_rows).min(5) {
+                        let off = r * stride;
+                        eprintln!(
+                            "[rope_isolate arena_row {}] {:?} ...",
+                            r,
+                            &arena_k[off..off + 4.min(arena_k.len().saturating_sub(off))]
+                        );
+                    }
+                }
                 dev.copy_slice_range(
                     &**v_dev,
                     cache.current_pos * self.num_kv_heads * self.head_dim,
@@ -1365,6 +1434,20 @@ impl CausalLm for Qwen35 {
             }
             _ => return Err(grim_tensor::Error::Unimplemented("non-F32 positions".into()).into()),
         };
+
+        // TEMP probe: every gate in this repo hands `Qwen35Block::forward` its
+        // own explicit `positions`, so none of them can see whether the ENGINE
+        // builds the right ones. A prefill that passes all zeros is invisible to
+        // every layer test (RoPE at position 0 is the identity) and makes the
+        // model confidently wrong from the first real position on.
+        if std::env::var("GRIM_DEBUG_POSITIONS").is_ok() {
+            eprintln!(
+                "[positions] seq_len={} positions={:?} ids_len={}",
+                positions_vec.len(),
+                if positions_vec.len() <= 16 { positions_vec.clone() } else { positions_vec[..16].to_vec() },
+                ids.len()
+            );
+        }
 
         let seq_len = ids.len();
         let mut h = self

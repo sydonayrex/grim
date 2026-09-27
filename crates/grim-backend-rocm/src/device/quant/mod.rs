@@ -92,7 +92,7 @@ impl QuantOps for RocmDevice {
         };
         let k = a_storage.shape().dims().last().copied().unwrap_or(0);
         static QMM_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some()) {
+        if crate::device::util::is_debug_enabled() || *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some()) {
             eprintln!(
                 "[qmm] ordinal={} m={m} n={n} k={k} b_dtype={:?}",
                 self.ordinal,

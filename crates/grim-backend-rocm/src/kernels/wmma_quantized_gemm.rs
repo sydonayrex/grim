@@ -77,18 +77,22 @@ __device__ __forceinline__ void grim_deq_q5k(const unsigned char* blk, int w, fl
 }
 
 __device__ __forceinline__ void grim_deq_q2k(const unsigned char* blk, int w, float* out) {
-    float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-    float dmin = fp16_to_float_device(((const unsigned short*)blk)[1]);
-    const unsigned char* scales = blk + 4;
-    const unsigned char* qs = blk + 20;
+    const unsigned char* scales = blk;
+    const unsigned char* qs = blk + 16;
+    float d    = fp16_to_float_device(((const unsigned short*)(blk + 80))[0]);
+    float dmin = fp16_to_float_device(((const unsigned short*)(blk + 82))[0]);
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
         int wv = w + e;
-        int scale_idx = wv / 16;
-        unsigned char sc = (scales[scale_idx / 2] >> ((scale_idx % 2) * 4)) & 0x0F;
-        int qsi = wv / 64, qso = wv % 64;
-        unsigned char q = (qs[qsi * 8 + qso / 4] >> ((qso % 4) * 2)) & 0x03;
-        out[e] = d * (float)sc * (float)q - dmin * (float)sc;
+        int sub = wv / 16;
+        int in_sub = wv % 16;
+        unsigned char sc_byte = scales[sub];
+        float sc = (float)(sc_byte & 0x0F);
+        float m  = (float)(sc_byte >> 4);
+        int q_byte = sub * 4 + in_sub / 4;
+        int q_shift = (in_sub % 4) * 2;
+        unsigned char q = (qs[q_byte] >> q_shift) & 0x03;
+        out[e] = d * sc * (float)q - dmin * m;
     }
 }
 

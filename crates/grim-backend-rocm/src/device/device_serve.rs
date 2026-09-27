@@ -538,11 +538,14 @@ impl MemoryOps for RocmDevice {
             }
             // If the driver rejects hipMemcpy calls (e.g. virtual address translation quirk on unified memory),
             // launch the GPU grim_copy_bytes kernel directly.
-            let (grid, block) = crate::device::util::linear_launch((bytes / 4).max(1));
+            // 8-byte transfers if aligned, else byte-by-byte.
+            let is_aligned8 = (((dst_ptr as u64) | (src_ptr as u64) | (bytes as u64)) & 7) == 0;
+            let transfer_units = if is_aligned8 { bytes / 8 } else { bytes };
+            let (grid, block) = crate::device::util::linear_launch(transfer_units.max(1));
             let mut d_raw = dst_ptr as u64;
             let mut s_raw = src_ptr as u64;
-            let mut b_raw = bytes;
-            if self.launch_compute_kernel(
+            let mut b_raw = bytes as u64;
+            match self.launch_compute_kernel(
                 "grim_copy_bytes",
                 grid,
                 block,
@@ -551,8 +554,18 @@ impl MemoryOps for RocmDevice {
                     crate::device::util::arg(&mut s_raw),
                     crate::device::util::arg(&mut b_raw),
                 ],
-            ).is_ok() {
-                return Ok(());
+            ) {
+                Ok(stream) => {
+                    let sync_res = unsafe { crate::device::handles::hipStreamSynchronize(stream) };
+                    if sync_res == hipSuccess {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    if std::env::var("GRIM_DEBUG_COPY").is_ok() || crate::device::util::is_debug_enabled() {
+                        eprintln!("[copy] grim_copy_bytes launch failed: {e}");
+                    }
+                }
             }
             return Err(Error::Backend(format!(
                 "copy_slice_range: D2D refused — async {st} ({}), sync {st_sync} ({}), \
@@ -598,7 +611,7 @@ impl MemoryOps for RocmDevice {
         }
         let dst_ptr = unsafe { dst_ptr.add(dst_byte_offset) };
         let src_ptr = unsafe { src_ptr.add(src_byte_offset) };
-        check_hip("copy_bytes_into: hipMemcpyAsync D2D", unsafe {
+        let st = unsafe {
             hipMemcpyAsync(
                 dst_ptr,
                 src_ptr,
@@ -606,7 +619,51 @@ impl MemoryOps for RocmDevice {
                 HipMemcpyKind::DeviceToDevice,
                 self.active_stream(),
             )
-        })?;
+        };
+        if st != hipSuccess {
+            let st_sync = unsafe {
+                hipMemcpy(
+                    dst_ptr,
+                    src_ptr,
+                    count,
+                    HipMemcpyKind::DeviceToDevice,
+                )
+            };
+            if st_sync == hipSuccess {
+                return Ok(());
+            }
+            let is_aligned8 = (((dst_ptr as u64) | (src_ptr as u64) | (count as u64)) & 7) == 0;
+            let transfer_units = if is_aligned8 { count / 8 } else { count };
+            let (grid, block) = crate::device::util::linear_launch(transfer_units.max(1));
+            let mut d_raw = dst_ptr as u64;
+            let mut s_raw = src_ptr as u64;
+            let mut b_raw = count as u64;
+            match self.launch_compute_kernel(
+                "grim_copy_bytes",
+                grid,
+                block,
+                &mut [
+                    crate::device::util::arg(&mut d_raw),
+                    crate::device::util::arg(&mut s_raw),
+                    crate::device::util::arg(&mut b_raw),
+                ],
+            ) {
+                Ok(stream) => {
+                    let sync_res = unsafe { crate::device::handles::hipStreamSynchronize(stream) };
+                    if sync_res == hipSuccess {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    if std::env::var("GRIM_DEBUG_COPY").is_ok() || crate::device::util::is_debug_enabled() {
+                        eprintln!("[copy_bytes_into] grim_copy_bytes launch failed: {e}");
+                    }
+                }
+            }
+            return Err(Error::Backend(format!(
+                "copy_bytes_into: D2D refused — async {st}, sync {st_sync}, count={count}"
+            )));
+        }
         Ok(())
     }
 

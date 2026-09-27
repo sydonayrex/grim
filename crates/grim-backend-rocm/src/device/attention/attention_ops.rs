@@ -508,6 +508,24 @@ impl AttentionOps for RocmDevice {
         // Prior RoPE / cache ops were enqueued on the same stream, so stream ordering already guarantees they complete
         // before this kernel reads q/k/v - no host sync needed (each removed sync stalls the whole per-token pipeline).
 
+        if crate::device::util::is_debug_enabled() {
+            eprintln!(
+                "[GRIM_DEBUG attention] dev={} seq_len={} num_heads={} num_kv_heads={} head_dim={} kv_seq_len={} flash_decode={}",
+                self.ordinal,
+                seq_len,
+                config.num_heads,
+                config.num_kv_heads,
+                config.head_dim,
+                kv_seq_len,
+                seq_len == 1
+                    && kv_seq_len >= self.flash_decode_min_kv()
+                    && window.is_none()
+                    && out_max.is_none()
+                    && out_sum.is_none()
+                    && softcap <= 0.0
+            );
+        }
+
         // Split-KV FlashDecoding acceleration for long-context single-token decode
         if seq_len == 1
             && kv_seq_len >= self.flash_decode_min_kv()
@@ -526,6 +544,12 @@ impl AttentionOps for RocmDevice {
                 config.head_dim,
                 kv_seq_len,
             );
+            if crate::device::util::is_debug_enabled() {
+                eprintln!(
+                    "[GRIM_DEBUG flash_decode] dev={} num_splits={} kv_seq_len={}",
+                    self.ordinal, num_splits, kv_seq_len
+                );
+            }
             let stream = self.launch_flash_decode(
                 q_s,
                 k_s,

@@ -195,25 +195,23 @@ extern "C" {
     }
 
     // ===================== Q2_K standalone =====================
-
     __device__ inline float dequant_q2k_standalone(const unsigned char* block_ptr, int in_sb) {
-        const float d = fp16_to_float_device(((const unsigned short*)block_ptr)[0]);
-        const float dmin = fp16_to_float_device(((const unsigned short*)block_ptr)[1]);
-        const unsigned char* sc = block_ptr + 4;
-        const unsigned char* m  = block_ptr + 12;
-        const unsigned char* qs = block_ptr + 20;
+        const unsigned char* scales = block_ptr;
+        const unsigned char* qs = block_ptr + 16;
+        float d    = fp16_to_float_device(((const unsigned short*)(block_ptr + 80))[0]);
+        float dmin = fp16_to_float_device(((const unsigned short*)(block_ptr + 82))[0]);
 
-        int sub = in_sb / 32;
-        int in_sub = in_sb % 32;
+        int sub = in_sb / 16;
+        int w   = in_sb % 16;
 
-        float sub_sc = (float)(sc[sub] & 3);
-        float sub_m  = (float)(m[sub] & 3);
+        float sc = (float)(scales[sub] & 0x0F);
+        float m  = (float)(scales[sub] >> 4);
 
-        int q_byte = in_sub / 4;
-        int q_shift = (in_sub % 4) * 2;
+        int q_byte = sub * 4 + w / 4;
+        int q_shift = (w % 4) * 2;
         unsigned char q_code = (qs[q_byte] >> q_shift) & 0x03;
 
-        return d * sub_sc * (float)q_code - dmin * sub_m;
+        return d * sc * (float)q_code - dmin * m;
     }
 
     // ===================== Q3_K standalone ===================== Mirrors the corrected `dequant_q3k_element` in q3k_gemm.rs and the authoritative CPU reference `grim_quant::dequant_q3k`.

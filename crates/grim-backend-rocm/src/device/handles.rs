@@ -155,7 +155,8 @@ unsafe extern "C" {
     ) -> HipErrorT;
     pub fn hipStreamDestroy(stream: *mut c_void) -> HipErrorT;
     pub fn hipStreamSynchronize(stream: *mut c_void) -> HipErrorT;
-    pub fn hipMemcpyAsync(
+    #[link_name = "hipMemcpyAsync"]
+    fn raw_hipMemcpyAsync(
         dst: *mut c_void,
         src: *const c_void,
         count: usize,
@@ -267,15 +268,35 @@ pub unsafe fn hipMemcpy(
     count: usize,
     kind: HipMemcpyKind,
 ) -> HipErrorT {
-    if std::env::var("GRIM_HIP_TRACE").is_ok() {
+    if crate::device::util::is_debug_enabled() || std::env::var("GRIM_HIP_TRACE").is_ok() {
         eprintln!(
-            "[hipMemcpy-trace] bytes={} kind={:?}\n{:?}",
-            count,
-            kind,
-            std::backtrace::Backtrace::capture()
+            "[GRIM_DEBUG hipMemcpy] kind={:?} count={} dst={:?} src={:?}",
+            kind, count, dst, src
         );
     }
     unsafe { raw_hipMemcpy(dst, src, count, kind) }
+}
+
+/// Asynchronous memory copy on a specific stream.
+///
+/// # Safety
+/// Caller must ensure pointers are valid for `count` bytes on the device/host.
+#[inline]
+#[allow(non_snake_case)]
+pub unsafe fn hipMemcpyAsync(
+    dst: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    kind: HipMemcpyKind,
+    stream: *mut c_void,
+) -> HipErrorT {
+    if crate::device::util::is_debug_enabled() || std::env::var("GRIM_HIP_TRACE").is_ok() {
+        eprintln!(
+            "[GRIM_DEBUG hipMemcpyAsync] kind={:?} count={} stream={:?} dst={:?} src={:?}",
+            kind, count, stream, dst, src
+        );
+    }
+    unsafe { raw_hipMemcpyAsync(dst, src, count, kind, stream) }
 }
 
 /// Blocks the calling thread until all previously enqueued work on the

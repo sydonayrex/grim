@@ -6,29 +6,25 @@ pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
     /// Dequantize one Q2_K element from an 84-byte super-block.
+    /// Layout: scales[16] @0..16, qs[64] @16..80, d (f16) @80, dmin (f16) @82.
     /// `in_sb` is the weight index within the 256-weight super-block (0..255).
     __device__ inline float dequant_q2k_element(const unsigned char* block_ptr, int in_sb) {
-        const unsigned short* h_ptr = (const unsigned short*)block_ptr;
-        float d = fp16_to_float_device(h_ptr[0]);
-        float dmin = fp16_to_float_device(h_ptr[1]);
+        const unsigned char* scales = block_ptr;
+        const unsigned char* qs = block_ptr + 16;
+        float d    = fp16_to_float_device(((const unsigned short*)(block_ptr + 80))[0]);
+        float dmin = fp16_to_float_device(((const unsigned short*)(block_ptr + 82))[0]);
 
-        const unsigned char* sc = block_ptr + 4;
-        const unsigned char* m  = block_ptr + 12;
-        const unsigned char* qs = block_ptr + 20;
+        int sub = in_sb / 16;       // 16 sub-blocks of 16 weights
+        int w   = in_sb % 16;
 
-        int sub = in_sb / 32; // 0..7 sub-block index
-        int in_sub = in_sb % 32;
+        float sc = (float)(scales[sub] & 0x0F);
+        float m  = (float)(scales[sub] >> 4);
 
-        // 2-bit scale: lower 2 bits of sc[sub]
-        float sub_sc = (float)(sc[sub] & 3);
-        float sub_m  = (float)(m[sub] & 3);
-
-        // 2-bit code: 4 codes per byte, extract correct nibble
-        int q_byte = in_sub / 4;
-        int q_shift = (in_sub % 4) * 2;
+        int q_byte = sub * 4 + w / 4;
+        int q_shift = (w % 4) * 2;
         unsigned char q_code = (qs[q_byte] >> q_shift) & 0x03;
 
-        return d * sub_sc * (float)q_code - dmin * sub_m;
+        return d * sc * (float)q_code - dmin * m;
     }
 
     __global__ void grim_fused_dequant_gemm_q2k(

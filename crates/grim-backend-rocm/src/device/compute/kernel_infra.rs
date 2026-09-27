@@ -414,6 +414,12 @@ impl RocmDevice {
             return Err(Error::Backend(format!("{entry}: null cached function")));
         }
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        if crate::device::util::is_debug_enabled() {
+            eprintln!(
+                "[GRIM_DEBUG launch_on_stream] dev={} entry={} grid=({},{},{}) block=({},{},{}) smem={} stream={:?}",
+                self.ordinal, entry, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_mem_bytes, stream
+            );
+        }
         let args_ptr = args.as_mut_ptr();
         check_hip("hipModuleLaunchKernel (stream)", unsafe {
             hipModuleLaunchKernel(
@@ -908,6 +914,12 @@ impl RocmDevice {
                 let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 self.stamp_launch_post_pin(trace_on, entry, grid);
                 let stream = self.active_stream();
+                if crate::device::util::is_debug_enabled() {
+                    eprintln!(
+                        "[GRIM_DEBUG launch_cached] dev={} entry={} grid=({},{},{}) block=({},{},{}) smem={} stream={:?}",
+                        self.ordinal, entry, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_mem_bytes, stream
+                    );
+                }
                 let args_ptr = args.as_mut_ptr();
                 check_hip("hipModuleLaunchKernel (cached)", unsafe {
                     hipModuleLaunchKernel(
@@ -1065,6 +1077,12 @@ impl RocmDevice {
         drop(module_cache);
 
         let stream = self.active_stream();
+        if crate::device::util::is_debug_enabled() {
+            eprintln!(
+                "[GRIM_DEBUG launch] dev={} entry={} grid=({},{},{}) block=({},{},{}) smem={} stream={:?}",
+                self.ordinal, entry, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_mem_bytes, stream
+            );
+        }
 
         let args_ptr = args.as_mut_ptr();
         check_hip("hipModuleLaunchKernel", unsafe {

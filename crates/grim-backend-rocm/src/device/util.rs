@@ -11,6 +11,16 @@ use grim_tensor::{ArithType, BackendStorage, Error, Result};
 
 use crate::{RocmStorage, hipGetDeviceProperties};
 
+/// Returns true if GRIM_DEBUG is set (e.g. GRIM_DEBUG=1, true, or any non-empty non-zero value).
+pub fn is_debug_enabled() -> bool {
+    static DEBUG_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG_ON.get_or_init(|| {
+        std::env::var("GRIM_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v == "all")
+            .unwrap_or(false)
+    })
+}
+
 /// Default launch block size for 1-D elementwise launches (rotary, scale-bias, copy): 256 threads.
 /// These are latency-bound elementwise ops where more threads improve occupancy without register-pressure concerns.
 pub const ROCM_COMPUTE_BLOCK: u32 = 256;

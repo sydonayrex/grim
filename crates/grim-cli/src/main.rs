@@ -25,8 +25,8 @@ use grim_core::error::Result;
 
 pub mod adapter;
 pub mod arch_plugin;
-pub mod bench;
 pub mod baseline;
+pub mod bench;
 pub mod calibrate_channels;
 pub mod catalog;
 pub mod client;
