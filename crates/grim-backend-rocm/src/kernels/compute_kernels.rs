@@ -1450,7 +1450,8 @@ extern "C" __global__ void grim_short_conv1d_causal_step(
     }
 }
 
-// WhiteRaven format: FP8 E4M3 weights (stored as uint8_t byte array).
+// WhiteRaven / Raven format: FP8 E4M3 weights (stored as uint8_t byte array).
+// Raven: V_DOT4_F32_FP8_FP8 / WhiteRaven: V_WMMA_F32_16X16X16_FP8_FP8.
 // Dequantize in-register: E4M3 unpack (1 sign, 4 exponent with bias 7, 3 mantissa).
 __device__ inline float dequant_fp8_e4m3(uint8_t byte) {
     if (byte == 0x7F || byte == 0xFF) return 0.0f; // NaN/Inf
@@ -1486,6 +1487,82 @@ extern "C" __global__ void grim_short_conv1d_fp8_step(
     for (int k = 0; k < kernel_size - 1; ++k) {
         float wk = dequant_fp8_e4m3(weight_fp8[c * kernel_size + k]) * s;
         sum += conv_state[state_offset + k] * wk;
+    }
+    if (bias) {
+        sum += bias[c];
+    }
+    out[idx] = sum;
+
+    for (int k = 0; k < kernel_size - 2; ++k) {
+        conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+    }
+    if (kernel_size > 1) {
+        conv_state[state_offset + kernel_size - 2] = val;
+    }
+}
+
+// ForestRaven format: Q8_0 / INT8 signed 8-bit quantized weights with per-channel or per-block scale.
+// Computes dot with FP32 conv state: w = scale * int8_code.
+extern "C" __global__ void grim_short_conv1d_forestraven_step(
+    const float* x, const int8_t* weight_i8, const float* scale, const float* bias,
+    float* conv_state, float* out, int batch, int channels, int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (idx >= total) return;
+    int b = idx / channels;
+    int c = idx % channels;
+
+    float s = scale ? scale[c] : 1.0f;
+    float val = x[idx];
+    int state_offset = (b * channels + c) * (kernel_size - 1);
+    float last_w = (float)weight_i8[c * kernel_size + (kernel_size - 1)] * s;
+    float sum = val * last_w;
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        float wk = (float)weight_i8[c * kernel_size + k] * s;
+        sum += conv_state[state_offset + k] * wk;
+    }
+    if (bias) {
+        sum += bias[c];
+    }
+    out[idx] = sum;
+
+    for (int k = 0; k < kernel_size - 2; ++k) {
+        conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+    }
+    if (kernel_size > 1) {
+        conv_state[state_offset + kernel_size - 2] = val;
+    }
+}
+
+// Crow format: Q4_K GGML super-block (or signed 4-bit block quantized).
+// 4-bit nibbles with scale and min/zero offset per channel or block.
+extern "C" __global__ void grim_short_conv1d_crow_q4k_step(
+    const float* x, const uint8_t* weight_q4, const float* scales, const float* mins,
+    const float* bias, float* conv_state, float* out, int batch, int channels, int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (idx >= total) return;
+    int b = idx / channels;
+    int c = idx % channels;
+
+    float d = scales ? scales[c] : 1.0f;
+    float m = mins ? mins[c] : 0.0f;
+    float val = x[idx];
+    int state_offset = (b * channels + c) * (kernel_size - 1);
+
+    auto get_tap = [&](int tap) -> float {
+        int flat_tap = c * kernel_size + tap;
+        uint8_t byte = weight_q4[flat_tap / 2];
+        uint8_t nibble = (flat_tap % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+        return d * (float)nibble - m;
+    };
+
+    float last_w = get_tap(kernel_size - 1);
+    float sum = val * last_w;
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        sum += conv_state[state_offset + k] * get_tap(k);
     }
     if (bias) {
         sum += bias[c];

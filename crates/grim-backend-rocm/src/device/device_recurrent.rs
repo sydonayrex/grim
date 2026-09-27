@@ -54,10 +54,15 @@ impl RecurrentOps for RocmDevice {
             || (w_s.bytes == (channels as usize) * 4); // when taps=4 in FP8 vs FP32
         let is_iu4 = matches!(w_s.dtype.storage, grim_tensor::Storage::W4A4OstQuant(_));
 
-        let k_size = if is_iu4 {
+        let is_q4k = matches!(w_s.dtype.storage, grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q4K));
+        let is_i8 = matches!(w_s.dtype.storage, grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80))
+            || matches!(w_s.dtype.storage, grim_tensor::Storage::CompressedTensorsW8A8Int8)
+            || (w_s.bytes == (channels as usize) * 4 && !is_fp8);
+
+        let k_size = if is_iu4 || is_q4k {
             let row_bytes = (channels.max(0) as usize) / 2;
             (w_s.bytes / row_bytes.max(1)) as i32
-        } else if is_fp8 && w_s.bytes < (channels as usize) * 4 * 4 {
+        } else if (is_fp8 || is_i8) && w_s.bytes < (channels as usize) * 4 * 4 {
             let row_bytes = channels.max(0) as usize;
             (w_s.bytes / row_bytes.max(1)) as i32
         } else {
@@ -82,7 +87,45 @@ impl RecurrentOps for RocmDevice {
             )));
         }
 
-        if is_iu4 {
+        if is_q4k {
+            let mut null_scales = 0u64;
+            let mut null_mins = 0u64;
+            self.launch_compute_kernel(
+                "grim_short_conv1d_crow_q4k_step",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut null_scales),
+                    arg(&mut null_mins),
+                    arg(&mut b_ptr),
+                    arg(&mut st_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut batch),
+                    arg(&mut channels),
+                    arg(&mut k_size_i),
+                ],
+            )?;
+        } else if is_i8 && w_s.bytes < (channels as usize) * 4 * 4 {
+            let mut null_scale = 0u64;
+            self.launch_compute_kernel(
+                "grim_short_conv1d_forestraven_step",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut null_scale),
+                    arg(&mut b_ptr),
+                    arg(&mut st_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut batch),
+                    arg(&mut channels),
+                    arg(&mut k_size_i),
+                ],
+            )?;
+        } else if is_iu4 {
             let mut null_scale = 0u64;
             let mut null_zero = 0u64;
             self.launch_compute_kernel(
