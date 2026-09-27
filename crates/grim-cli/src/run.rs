@@ -108,9 +108,10 @@ fn load_run_tokenizer(
 /// when operating under single-token `Strategy::Plain`. Fails closed (`None`) if wrapped under
 /// multi-token strategies (e.g. DSpark) to prevent KV state / token offset corruption.
 pub(crate) fn resolve_graph_model<'a>(model: &'a dyn CausalLm) -> Option<&'a dyn DecodeGraphModel> {
-    let target: &'a dyn CausalLm = if let Some(spec) =
-        model.as_any().downcast_ref::<grim_speculative::SpeculativeCausalLm>()
-    {
+    let target: &'a dyn CausalLm = if let Some(spec) = model
+        .as_any()
+        .downcast_ref::<grim_speculative::SpeculativeCausalLm>(
+    ) {
         if spec.strategy() != grim_speculative::Strategy::Plain {
             return None;
         }
@@ -263,6 +264,14 @@ fn try_graph_decode_step(
                                     .seed_conv_rings(&conv_seeds)
                                     .map_err(|e| format!("conv seed: {e}"))?;
                             }
+                            let kda_seeds = graph_model
+                                .eager_kda_seed_sources(sess)
+                                .map_err(|e| format!("kda export: {e}"))?;
+                            if !kda_seeds.is_empty() {
+                                $g.buffers
+                                    .seed_kda_state_from_eager(&dev, &kda_seeds)
+                                    .map_err(|e| format!("kda seed: {e}"))?;
+                            }
                             Ok(())
                         })()
                     };
@@ -371,6 +380,14 @@ fn try_graph_decode_step(
                         $g.buffers
                             .seed_conv_rings(&conv_seeds)
                             .map_err(|e| format!("conv seed: {e}"))?;
+                    }
+                    let kda_seeds = graph_model
+                        .eager_kda_seed_sources(sess)
+                        .map_err(|e| format!("kda export: {e}"))?;
+                    if !kda_seeds.is_empty() {
+                        $g.buffers
+                            .seed_kda_state_from_eager(&dev, &kda_seeds)
+                            .map_err(|e| format!("kda seed: {e}"))?;
                     }
                     Ok(())
                 })()
@@ -1145,6 +1162,14 @@ pub async fn cmd_run(
     }
 
     let mut generated = 0;
+    // Absolute position of the next token fed to the model. Prefill consumes
+    // `prefill_len` tokens so the first decode step runs at position
+    // `prefill_len`. Every generated token needs its OWN position: RoPE at a
+    // constant position gives each of them the same sinusoidal embedding as
+    // prompt token 0, desynchronising Q from the KV history, which is what
+    // makes the model emit confident nonsense. The interactive path has always
+    // got this right via `total_tokens`; the one-shot path did not.
+    let mut prefill_len: usize = 0;
     let mut history: Vec<u32> = Vec::new();
     let mut first_pass = true;
     let mut generated_tokens: Vec<u32> = Vec::new();
@@ -1182,12 +1207,15 @@ pub async fn cmd_run(
         };
 
         // Host vecs: no transfer yet. Positions value matches old logic
-        // (decode step pos = n_tokens-1 == 0 for [1] inputs).
         let n_hint = input_ids.len();
         let positions: Vec<f32> = if is_prefill {
+            prefill_len = n_hint;
             (0..n_hint).map(|i| i as f32).collect()
         } else {
-            vec![n_hint as f32 - 1.0]
+            // The ABSOLUTE position of the token being decoded, not its index
+            // within this step — which is always 0 for a one-token step, and
+            // was the bug.
+            vec![(prefill_len + generated) as f32]
         };
         // SPEED-ROC: ROCm decode steps reuse preallocated [1]-shape tensors —
         // async in-place update, zero H2D allocs on the reuse path (old code

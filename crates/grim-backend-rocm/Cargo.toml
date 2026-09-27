@@ -160,6 +160,9 @@ grim-nn = { workspace = true }
 grim-autograd = { workspace = true }
 grim-backend-cpu = { path = "../grim-backend-cpu" }
 grim-kvquant = { path = "../grim-kvquant" }
+# Reading real checkpoint tensors out of a GGUF, for the Q6_K gates that check
+# the device kernels against llama.cpp on actual model weights.
+grim-format = { workspace = true }
 
 [lints]
 workspace = true

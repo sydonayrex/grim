@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKvSource, check_layer_topology,
-    decode_graph_enabled, launch_attention, launch_qkv_gemv,
+    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
+    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
 };
 use grim_core::error::Result;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
@@ -46,6 +46,14 @@ pub trait DecodeGraphModel: Send + Sync {
         session: &'a dyn grim_core::session::SessionT,
         valid_rows: u32,
     ) -> Result<Vec<Option<EagerKvSource<'a>>>>;
+
+    /// Export eager device KDA states for recurrent state seeding.
+    fn eager_kda_seed_sources<'a>(
+        &self,
+        _session: &'a dyn grim_core::session::SessionT,
+    ) -> Result<Vec<Option<EagerKdaSource<'a>>>> {
+        Ok(Vec::new())
+    }
 
     /// Host conv-ring snapshots for recurrent-layer seeding (default: no
     /// conv layers). Indexed by layer; `None` for attention layers. Borrowed
@@ -1175,100 +1183,130 @@ impl Qwen35Block {
                 act,
             )?;
         } else {
-            // Recurrent / ShortConv / SSM path.
-            //
-            // REFUSE rather than compute a different function. Everything below
-            // this point is conv -> SiLU -> gate -> ssm_out, and that is NOT the
-            // recurrent layer: the gated delta rule is never applied and
-            // `ssm_state` is never advanced, so for a KDA layer the graph
-            // produces conv-SiLU-gate-output where the model needs
-            // conv-SiLU-delta-rule-gate. It also gates with `sigmoid` on the
-            // attention side, where the reference gates a recurrent layer ONCE
-            // with `silu(z)` inside build_norm_gated (qwen35.cpp:454) — the
-            // eager path guards that with `is_full_attention` and this one
-            // never did.
-            //
-            // The graph would therefore run at full decode speed and emit
-            // confident nonsense for three quarters of the layers, with nothing
-            // failing. Every capture has been falling back to eager for other
-            // reasons, which is the only reason this has not shipped. Until the
-            // delta rule is in this path, decline and let eager — which does it
-            // correctly — run.
-            return Err(grim_core::error::Error::Backend(
-                "qwen35 decode graph: recurrent (KDA) layers are not implemented in the \
-                 captured graph — it omits the gated delta rule and gates with sigmoid \
-                 instead of silu(z). Refusing to capture so the correct eager path runs."
-                    .into(),
-            ));
-            #[allow(unreachable_code)]
-            if let Some(ref qkv_lin) = self.attn_qkv {
-                linear_into_named(
-                    dev,
-                    normed,
-                    qkv_lin.weight(),
-                    &buffers.q_buf[layer_idx],
-                    act,
-                    "kda.attn_qkv",
-                    layer_idx,
-                )?;
-
-                // If conv weight is present and we have allocated sc_state, run causal conv step
-                if let Some(ref conv_t) = self.ssm_conv1d {
-                    if layer_idx < buffers.sc_state.len() {
-                        dev.short_conv1d_causal_step_into(
-                            &buffers.q_buf[layer_idx],
-                            conv_t.storage().as_ref(),
-                            None,
-                            &buffers.sc_state[layer_idx],
-                            &buffers.attn_out_buf[layer_idx],
-                        )
-                        .map_err(|e| {
-                            grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}"))
-                        })?;
-                        // SiLU in-place on attn_out_buf
-                        dev.silu_into(
-                            &buffers.attn_out_buf[layer_idx],
-                            &buffers.attn_out_buf[layer_idx],
-                        )
-                        .map_err(grim_core::error::Error::Tensor)?;
-                    } else {
-                        dev.silu_into(&buffers.q_buf[layer_idx], &buffers.attn_out_buf[layer_idx])
-                            .map_err(grim_core::error::Error::Tensor)?;
-                    }
-                } else {
-                    dev.silu_into(&buffers.q_buf[layer_idx], &buffers.attn_out_buf[layer_idx])
-                        .map_err(grim_core::error::Error::Tensor)?;
-                }
-            } else {
+            // KDA Recurrent layer forward pass inside captured HIP graph
+            let qkv_lin = self.attn_qkv.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing attn_qkv".into())
+            })?;
+            let alpha_lin = self.ssm_alpha.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing ssm_alpha".into())
+            })?;
+            let beta_lin = self.ssm_beta.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing ssm_beta".into())
+            })?;
+            let gate_lin = self.attn_gate.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing attn_gate (z)".into())
+            })?;
+            let conv_w = self.ssm_conv1d.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing ssm_conv1d".into())
+            })?;
+            if conv_w.storage().device_ptr().is_none() {
                 return Err(grim_core::error::Error::Backend(
-                    "recurrent block missing attn_qkv".into(),
+                    "ssm_conv1d weight lacks valid device pointer for graph capture".into(),
                 ));
             }
+            let dt_bias_d = self.ssm_dt_bias_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing ssm_dt_bias_dev".into())
+            })?;
+            let ssm_a_d = self.ssm_a_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing ssm_a_dev".into())
+            })?;
+            let ssm_norm_d = self.ssm_norm_dev.as_ref().ok_or_else(|| {
+                grim_core::error::Error::Backend("recurrent block missing ssm_norm_dev".into())
+            })?;
+            let kda_buf = buffers
+                .kda
+                .get(layer_idx)
+                .and_then(|o| o.as_ref())
+                .ok_or_else(|| {
+                    grim_core::error::Error::Backend(format!(
+                        "missing KDA graph buffers for layer {layer_idx}"
+                    ))
+                })?;
 
+            // 1. Projections: QKV -> q_buf, alpha -> kda_alpha, beta -> kda_beta, gate (z) -> gate_buf
+            linear_into_named(
+                dev,
+                normed,
+                qkv_lin.weight(),
+                &buffers.q_buf[layer_idx],
+                act,
+                "kda.attn_qkv",
+                layer_idx,
+            )?;
+            linear_into_named(
+                dev,
+                normed,
+                alpha_lin.weight(),
+                &kda_buf.alpha,
+                act,
+                "kda.alpha",
+                layer_idx,
+            )?;
+            linear_into_named(
+                dev,
+                normed,
+                beta_lin.weight(),
+                &kda_buf.beta,
+                act,
+                "kda.beta",
+                layer_idx,
+            )?;
+            linear_into_named(
+                dev,
+                normed,
+                gate_lin.weight(),
+                &buffers.gate_buf[layer_idx],
+                act,
+                "kda.attn_gate",
+                layer_idx,
+            )?;
 
-
-            // Optional attn_gate (sigmoid gate)
-            if let Some(ref gate_lin) = self.attn_gate {
-                linear_into(
-                    dev,
-                    normed,
-                    gate_lin.weight(),
-                    &buffers.gate_buf[layer_idx],
-                    act,
-                )?;
-                dev.sigmoid_into(&buffers.gate_buf[layer_idx], &buffers.gate_buf[layer_idx])
-                    .map_err(grim_core::error::Error::Tensor)?;
-                dev.mul_into(
-                    &buffers.attn_out_buf[layer_idx],
-                    &buffers.gate_buf[layer_idx],
-                    &buffers.attn_out_buf[layer_idx],
-                )
-                .map_err(grim_core::error::Error::Tensor)?;
+            // 2. Short conv causal step into kda_buf.conv_out
+            if layer_idx >= buffers.sc_state.len() {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "layer {layer_idx} >= sc_state {}",
+                    buffers.sc_state.len()
+                )));
             }
+            dev.short_conv1d_causal_step_into(
+                &buffers.q_buf[layer_idx],
+                conv_w.storage().as_ref(),
+                None,
+                &buffers.sc_state[layer_idx],
+                &kda_buf.conv_out,
+            )
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}"))
+            })?;
 
-            // Output projection (wo or ssm_out)
-            let out_proj = self.wo.as_ref().or(self.ssm_out.as_ref()).ok_or_else(|| {
-                grim_core::error::Error::Backend("missing wo/ssm_out projection".into())
+            // 3. Batched KDA gated delta rule + head norm gate into attn_out_buf
+            let n_val_heads = self.cfg_ssm_num_value_heads();
+            let n_key_heads = self.cfg_ssm_num_key_heads();
+            let head_dim = self.cfg_ssm_head_dim();
+            let eps = self.attn_norm.eps;
+            dev.kda_gated_delta_rule_batched_into(
+                &kda_buf.conv_out,
+                &kda_buf.alpha,
+                &kda_buf.beta,
+                dt_bias_d.as_ref(),
+                ssm_a_d.as_ref(),
+                ssm_norm_d.as_ref(),
+                Some(&buffers.gate_buf[layer_idx]),
+                &kda_buf.state,
+                &kda_buf.acc_scratch,
+                &buffers.attn_out_buf[layer_idx],
+                n_val_heads,
+                n_key_heads,
+                head_dim,
+                eps,
+            )
+            .map_err(|e| {
+                grim_core::error::Error::Backend(format!("kda gated delta rule: {e}"))
+            })?;
+
+            // 4. Output projection (ssm_out)
+            let out_proj = self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
+                grim_core::error::Error::Backend("missing ssm_out projection".into())
             })?;
             linear_into(
                 dev,
@@ -1363,13 +1401,6 @@ impl DecodeGraphModel for Qwen35 {
             .get_stream_from_pool(0)
             .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
 
-        let hidden = self.cfg.hidden_size;
-        // `q_buf` doubles as the recurrent conv scratch: a KDA layer projects
-        // into it with the fused `attn_qkv` weight, whose output is the conv
-        // width, and that is WIDER than the attention query for this family
-        // (9B: 8192 vs 4096; 27B: 10240 vs 6144). Sizing it from n_q alone
-        // tripped the graph's own shape check, so capture was abandoned and
-        // every token decoded eagerly. Size for whichever is larger.
         // The recurrent conv width. `q_buf` doubles as the conv scratch, and
         // the Mamba short-conv staging below is sized from it, so it is
         // derived here rather than inherited from the attention query width —
@@ -1389,8 +1420,9 @@ impl DecodeGraphModel for Qwen35 {
         // attention query happened to be.
         let sc_h_dim = if kda_conv > 0 { kda_conv } else { n_q };
         let sc_l_cache = self.cfg.ssm_d_conv.max(4);
+        let hidden = self.cfg.hidden_size;
 
-        let buffers = DecodeGraphBuffers::allocate(
+        let mut buffers = DecodeGraphBuffers::allocate(
             &dev,
             self.blocks.len(),
             hidden,
@@ -1408,6 +1440,25 @@ impl DecodeGraphModel for Qwen35 {
             sc_l_cache,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
+        if self.cfg.ssm_dt_rank > 0 {
+            let n_val = self.cfg.ssm_dt_rank;
+            let n_key = self.cfg.ssm_n_group;
+            let d_state = self.cfg.ssm_d_state;
+            for (layer_idx, block) in self.blocks.iter().enumerate() {
+                if !block.is_full_attention {
+                    buffers.allocate_kda_layer(
+                        &dev,
+                        layer_idx,
+                        batch,
+                        n_val,
+                        n_key,
+                        d_state,
+                        kda_conv,
+                    )?;
+                }
+            }
+        }
 
         Ok(DecodeGraph::new(&dev, buffers, stream))
     }
@@ -1585,6 +1636,77 @@ impl DecodeGraphModel for Qwen35 {
             }));
         }
 
+        Ok(out)
+    }
+
+    fn eager_kda_seed_sources<'a>(
+        &self,
+        session: &'a dyn grim_core::session::SessionT,
+    ) -> Result<Vec<Option<EagerKdaSource<'a>>>> {
+        let caches = match session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Qwen35LayerCache>>())
+        {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut out = Vec::with_capacity(caches.len());
+        for (i, cache) in caches.iter().enumerate() {
+            if self.blocks.get(i).map(|b| b.is_full_attention).unwrap_or(true) {
+                out.push(None);
+                continue;
+            }
+            let ssm_ptr = cache
+                .ssm_state_dev
+                .as_ref()
+                .and_then(|s| as_rocm(s.as_ref()).ok())
+                .and_then(|r| r.device_ptr_u64())
+                .map(|p| p as *const f32);
+
+            match ssm_ptr {
+                Some(ptr) => out.push(Some(EagerKdaSource {
+                    kda_state: ptr,
+                    _anchor: std::marker::PhantomData,
+                })),
+                None => out.push(None),
+            }
+        }
+        Ok(out)
+    }
+
+    fn eager_conv_seed_rings<'a>(
+        &self,
+        session: &'a dyn grim_core::session::SessionT,
+    ) -> Result<Vec<Option<ConvRingSeed<'a>>>> {
+        let caches = match session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Qwen35LayerCache>>())
+        {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut out = Vec::with_capacity(caches.len());
+        let kc = self.cfg.ssm_d_conv.saturating_sub(1);
+        let kda_conv = (self.cfg.ssm_dt_rank + 2 * self.cfg.ssm_n_group) * self.cfg.ssm_d_state;
+
+        for (i, cache) in caches.iter().enumerate() {
+            if self.blocks.get(i).map(|b| b.is_full_attention).unwrap_or(true) {
+                out.push(None);
+                continue;
+            }
+            if cache.conv_state.is_empty() || kc == 0 || kda_conv == 0 {
+                out.push(None);
+                continue;
+            }
+            out.push(Some(ConvRingSeed {
+                host: &cache.conv_state,
+                h_dim: kda_conv,
+                kc,
+                _anchor: std::marker::PhantomData,
+            }));
+        }
         Ok(out)
     }
 }
@@ -5890,6 +6012,9 @@ mod tests {
                 ssm_beta: None,
                 ssm_dt_bias: None,
                 ssm_norm: None,
+                ssm_dt_bias_dev: None,
+                ssm_a_dev: None,
+                ssm_norm_dev: None,
                 ssm_dt_rank_hint: 0,
                 ssm_n_group_hint: 0,
                 ssm_d_state_hint: 0,
