@@ -56,6 +56,17 @@ pub use device::capability_profiler::{
 };
 pub use device::moe_hybrid_exec::{MoeGraphSyncFlag, MoeHybridExecutionPlan, MoeHybridExecutor};
 
+// S4: the dispatch route counter. Re-exported at the crate root because the T2
+// journey tests that consume it live in `tests/`, and an integration test can
+// only reach `pub` items on the crate root -- `device::compute::kernel_infra` is
+// `pub` all the way down, so without this the counter would be unreachable from
+// exactly the place it exists to serve.
+pub use device::compute::gemm_launchers::BLASLT_ROUTE;
+pub use device::compute::kernel_infra::{
+    kernel_route_snapshot, record_kernel_route, reset_kernel_route_counters,
+    rocm_kernel_route_counter,
+};
+
 // ----- Crate-root re-exports ------------------------------------ Existing callers (lib_internal_tests.rs + external crates) see
 // these names without needing to know which sub-module they live in.
 

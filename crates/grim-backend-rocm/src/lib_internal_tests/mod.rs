@@ -15,6 +15,7 @@ mod precision_ab_tests;
 mod w4a4_arch_gate_tests;
 #[cfg(test)]
 mod white_raven_purity_tests;
+mod route_counter_tests;
 mod white_raven_launcher_tests;
 #[cfg(test)]
 mod device_lifecycle_tests;

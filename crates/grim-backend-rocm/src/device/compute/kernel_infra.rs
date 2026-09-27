@@ -925,6 +925,7 @@ impl RocmDevice {
                     )
                 })?;
                 self.launch_counter.fetch_add(1, Ordering::Relaxed);
+                record_kernel_route(entry);
                 drop(_dev_guard);
                 return Ok(stream);
             }
@@ -1082,6 +1083,100 @@ impl RocmDevice {
             )
         })?;
         self.launch_counter.fetch_add(1, Ordering::Relaxed);
+        record_kernel_route(entry);
         Ok(stream)
+    }
+}
+
+// ----- S4: dispatch route counter -------------------------------------------
+//
+// Every workstream's T2 journey test asserts "route counter > 0" to prove a
+// model actually dispatched to the kernel under test. Before this, the only
+// number available was `RocmDevice::launch_counter`, a per-device **total**, so
+// such a test could not distinguish "my kernel ran" from "some other kernel ran
+// 40 times". A journey test that passes because an unrelated kernel incremented
+// a shared total is worse than no test: it reports success for a fallback.
+//
+// The lookup clones an `Arc` out of a shared `RwLock` and the add happens
+// *outside* the lock, so concurrent launches contend only for a read lock -- the
+// same shape as the `resolved_kernel_cache` read the fast path already performs
+// on every launch. Holding a `Mutex` across the add would serialise launches,
+// which is deliberately not what this does.
+//
+// Relaxed ordering is correct: increments are independent per launch and a
+// reader only needs eventual visibility, not a total order across kernels.
+// Journey tests read the value after the launch has completed on the stream, so
+// there is no cross-kernel ordering requirement to establish.
+
+type RouteCounters =
+    std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>>;
+
+fn route_counters() -> &'static RouteCounters {
+    static COUNTERS: std::sync::OnceLock<RouteCounters> = std::sync::OnceLock::new();
+    COUNTERS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Record one successful launch of `entry`.
+///
+/// Called from the launch path next to the existing `launch_counter` increment,
+/// so it counts *successful* launches only: a failed `hipModuleLaunchKernel`
+/// returns early via `check_hip(...)?` and never reaches here.
+pub fn record_kernel_route(entry: &str) {
+    // Fast path: the name is almost always already present, so this is a read
+    // lock plus an atomic add, and no allocation.
+    if let Some(c) = route_counters()
+        .read()
+        .ok()
+        .and_then(|m| m.get(entry).cloned())
+    {
+        c.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // Slow path: first sighting of this name. Allocation happens here and only
+    // here, which is why the map is keyed by `String` rather than by a leaked
+    // `&'static str`.
+    if let Ok(mut m) = route_counters().write() {
+        m.entry(entry.to_string())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    // A poisoned lock means some other thread panicked while holding it. The
+    // count is a diagnostic, not a correctness surface, so dropping the update
+    // is preferable to propagating a panic into the launch path.
+}
+
+/// Launches recorded for `entry`, or 0 if it has never run.
+///
+/// Reading an unknown name does **not** create an entry: a journey test that
+/// accidentally registered a phantom route would make the next test's "counter
+/// > 0" assertion pass for the wrong reason.
+pub fn rocm_kernel_route_counter(entry: &str) -> u64 {
+    route_counters()
+        .read()
+        .ok()
+        .and_then(|m| m.get(entry).map(|c| c.load(Ordering::Relaxed)))
+        .unwrap_or(0)
+}
+
+/// Every recorded route as `(name, count)`, sorted by name.
+///
+/// Sorted so a multi-kernel failure message is stable across runs; unsorted
+/// output is the sort of noise that gets a real regression dismissed.
+pub fn kernel_route_snapshot() -> Vec<(String, u64)> {
+    let Ok(m) = route_counters().read() else {
+        return Vec::new();
+    };
+    let mut v: Vec<(String, u64)> = m
+        .iter()
+        .map(|(k, c)| (k.clone(), c.load(Ordering::Relaxed)))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Clear every counter. For test isolation.
+pub fn reset_kernel_route_counters() {
+    if let Ok(mut m) = route_counters().write() {
+        m.clear();
     }
 }

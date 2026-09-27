@@ -990,6 +990,13 @@ impl RocmDevice {
         // The two staging/conversion kernels increment the generic counter;
         // account for the external BLASLt GEMM itself as one GEMM launch.
         self.launch_counter.fetch_add(1, Ordering::Relaxed);
+        // BLASLt is a vendor library, so there is no HIP entry-point name to
+        // record. It gets a stable synthetic route instead, because *where a
+        // dispatch went* is the question the counter exists to answer: a T2
+        // journey test asserting `route(grim_wmma_gemm_fp8_e4m3) > 0` can also
+        // assert `route(BLASLT_ROUTE) == 0` and thereby prove the kernel under
+        // test ran rather than silently falling back to cuBLASLt.
+        crate::device::compute::kernel_infra::record_kernel_route(BLASLT_ROUTE);
         Ok(Box::new(RocmHandle::new(Some(stream))))
     }
 
@@ -1124,6 +1131,10 @@ impl RocmDevice {
                 k,
             )?;
             self.launch_counter.fetch_add(1, Ordering::Relaxed);
+            // BLASLt has no HIP entry name; recorded synthetically so a
+            // fallback to it is detectable rather than invisible. See the
+            // sibling site and BLASLT_ROUTE.
+            crate::device::compute::kernel_infra::record_kernel_route(BLASLT_ROUTE);
             let compute_handle = Box::new(RocmHandle::new(Some(stream)));
             return Ok(compute_handle);
         }
@@ -1205,6 +1216,7 @@ impl RocmDevice {
                     ) {
                         Ok(_) => {
                             self.launch_counter.fetch_add(1, Ordering::Relaxed);
+                            crate::device::compute::kernel_infra::record_kernel_route(entry);
                             let compute_handle =
                                 Box::new(RocmHandle::new(Some(self.active_stream())));
                             return Ok(compute_handle);
@@ -1311,6 +1323,7 @@ impl RocmDevice {
                 )));
             }
             self.launch_counter.fetch_add(1, Ordering::Relaxed);
+            crate::device::compute::kernel_infra::record_kernel_route(entry);
 
             // Sum up the partials along the batch dimension using the hand-written reduction kernel
             let stream = self.launch_split_k_reduction(
@@ -1350,6 +1363,7 @@ impl RocmDevice {
                 let stream =
                     self.launch_dot2_bf16_gemv(a_storage, b_storage, out_storage, m, n, k)?;
                 self.launch_counter.fetch_add(1, Ordering::Relaxed);
+                crate::device::compute::kernel_infra::record_kernel_route(entry);
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok(compute_handle);
             }
@@ -1494,6 +1508,7 @@ impl RocmDevice {
                 return Ok(compute_handle);
             }
             self.launch_counter.fetch_add(1, Ordering::Relaxed);
+            crate::device::compute::kernel_infra::record_kernel_route(entry);
         };
 
         let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
@@ -1680,3 +1695,12 @@ impl RocmDevice {
         self.matmul_op(a, b, out_shape, crate::autotune::GemmOp::LmHead)
     }
 }
+
+/// Synthetic route name for a GEMM dispatched to the vendor BLASLt library
+/// rather than to a named HIP compute kernel.
+///
+/// Recorded so a journey test can assert the kernel under test actually ran.
+/// Without it a silent fallback to cuBLASLt would be invisible: the per-device
+/// total launch counter would still have moved, so "my kernel ran" could not be
+/// distinguished from "something ran".
+pub const BLASLT_ROUTE: &str = "blaslt_external";
