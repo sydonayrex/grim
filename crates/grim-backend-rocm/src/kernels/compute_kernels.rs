@@ -1252,6 +1252,35 @@ extern "C" __global__ void grim_embedding(float* weight, float* out,
 //
 // The leaf decode is the same `dequant_q4k_element` the weight path uses, so
 // there is exactly one Q4_K decoder to trust. Blocks are 144 bytes.
+// Graph-capturable Q4_K embedding gather.
+//
+// Same shape as `grim_embedding_q4k`, but it takes the row count so it can
+// BOUND-CHECK the device-resident index. This one runs inside a captured
+// graph, where the host cannot validate the token ids (reading them back would
+// sync and break capture), so the guard has to live in the kernel. The eager
+// `embedding_q4k` checks on the host instead; this keeps that safety on the
+// graph path rather than trading it for capture.
+//
+// An out-of-range id writes 0.0 rather than reading outside the table, so a
+// bad token degrades the output instead of faulting the device.
+extern "C" __global__ void grim_embedding_q4k_gather(
+    const unsigned char* packed, float* out, int* indices, int dim, int total, int rows) {
+    const int QK_BLOCK = 256;
+    const int QK_BLOCK_BYTES = 144;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int i = idx / dim;
+    int j = idx % dim;
+    int row = indices[i];
+    if (row < 0 || row >= rows) {
+        out[idx] = 0.0f;
+        return;
+    }
+    long long e = (long long)row * (long long)dim + (long long)j;
+    const unsigned char* blk = packed + (e / QK_BLOCK) * QK_BLOCK_BYTES;
+    out[idx] = dequant_q4k_element(blk, (int)(e % QK_BLOCK));
+}
+
 extern "C" __global__ void grim_embedding_q4k(const unsigned char* packed, float* out,
                                               int* indices, int dim, int total) {
     const int QK_BLOCK = 256;

@@ -200,6 +200,10 @@ enum Commands {
         /// Maximum tokens to generate.
         #[arg(long, default_value = "256")]
         max_tokens: usize,
+        /// Print the top-N token logprobs at each step (Ollama's `top_logprobs`
+        /// shape) so a run can be diffed against an Ollama reference. 0 = off.
+        #[arg(long, default_value = "0")]
+        logprobs: usize,
         /// RNG seed (0 = random).
         #[arg(long, default_value = "0")]
         seed: u64,
@@ -1330,6 +1334,7 @@ async fn main() -> Result<()> {
             top_p,
             top_k,
             max_tokens,
+            logprobs,
             seed,
             device,
             repeat_penalty,
@@ -1436,6 +1441,7 @@ async fn main() -> Result<()> {
                         top_p,
                         top_k,
                         max_tokens,
+                        logprobs,
                         seed,
                         repeat_penalty,
                         min_tokens,

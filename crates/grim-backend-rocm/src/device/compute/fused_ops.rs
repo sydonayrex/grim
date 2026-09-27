@@ -1,9 +1,7 @@
 //! Core tensor computation, GEMM, elementwise, autograd, and optimizer operations for `RocmDevice`.
 //! Fused layer ops: QKV/GateUp projections, RMSNorm fusions, cross-entropy, embedding gather.
 
-use super::{
-    FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvGateLogits, FusedQkvWeights,
-};
+use super::{FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvGateLogits, FusedQkvWeights};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -16,15 +14,15 @@ use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::memory::view::RocmStorageView;
 use crate::{
-    arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemsetAsync, hipSuccess, warp_rows_launch,
-    HipDim3, QkvAttentionFusionConfig, QuantMode, RmsNormMatMulFusionConfig, RocmHandle,
+    HipDim3, QkvAttentionFusionConfig, QuantMode, RmsNormMatMulFusionConfig, RocmHandle, arg,
+    as_rocm, check_hip, dev_ptr, dtype_f32, hipMemsetAsync, hipSuccess, warp_rows_launch,
 };
 
 impl RocmDevice {
     /// Graph-capturable embedding gather: `out[slot*dim + j] = weight[idx[slot]*dim + j]`.
     /// Unlike `embedding()`, indices are READ FROM DEVICE MEMORY (`indices`,
     /// i32/u32 per slot), so the captured graph node sees fresh token ids on
-    /// each replay. `weight` must be an F32 native table `[vocab, dim]`.
+    /// each replay. `weight` is an F32 native table `[vocab, dim]` or a packed Q4_K one.
     pub fn launch_embedding_gather_dev_idx(
         &self,
         weight: &RocmStorage,
@@ -33,11 +31,18 @@ impl RocmDevice {
         dim: usize,
         total: usize,
     ) -> Result<*mut c_void> {
-        use grim_tensor::dtype::ArithType;
+        use grim_tensor::dtype::{ArithType, KQuantScheme};
         let dt = weight.dtype();
-        if dt.arith != ArithType::F32 || !matches!(dt.storage, crate::DTypeStorage::Native) {
+        let is_f32_native =
+            dt.arith == ArithType::F32 && matches!(dt.storage, crate::DTypeStorage::Native);
+        // A packed Q4_K vocab is the form this model family actually ships, and
+        // refusing it here is what forced every quantized model to abandon
+        // graph capture and decode eagerly on every token.
+        let is_q4k = dt.arith == ArithType::F32
+            && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::Q4K));
+        if !is_f32_native && !is_q4k {
             return Err(Error::Unimplemented(
-                "embedding_gather_dev_idx: F32 native tables only (quant falls back eager)".into(),
+                "embedding_gather_dev_idx: F32 native or Q4_K tables only".into(),
             ));
         }
         let w_ptr = weight
@@ -55,8 +60,46 @@ impl RocmDevice {
         let mut i = i_ptr;
         let mut d = dim as i32;
         let mut t = total as i32;
+        if is_f32_native {
+            return self.launch_compute_kernel(
+                "grim_embedding",
+                grid,
+                block,
+                &mut [
+                    arg(&mut w),
+                    arg(&mut o),
+                    arg(&mut i),
+                    arg(&mut d),
+                    arg(&mut t),
+                ],
+            );
+        }
+
+        // Q4_K geometry: 256 elements per 144-byte super-block, so `dim` must be
+        // a whole number of blocks for every row to start block-aligned. All of
+        // the kernel's offsets are exact only under that.
+        const QK_BLOCK: usize = 256;
+        const QK_BLOCK_BYTES: usize = 144;
+        if dim == 0 || dim % QK_BLOCK != 0 {
+            return Err(Error::Shape(format!(
+                "embedding_gather_dev_idx: Q4_K dim {dim} must be a non-zero multiple of {QK_BLOCK}"
+            )));
+        }
+        let row_bytes = (dim / QK_BLOCK) * QK_BLOCK_BYTES;
+        if row_bytes == 0 || weight.bytes % row_bytes != 0 {
+            return Err(Error::Shape(format!(
+                "embedding_gather_dev_idx: Q4_K table of {} B is not a whole number of \
+                 {row_bytes}-B rows",
+                weight.bytes
+            )));
+        }
+        // Token ids are NOT range-checked on the host: they live in device
+        // memory and reading them back would sync in the middle of a capture.
+        // The kernel bounds-checks in-gpu instead, so the graph path keeps the
+        // safety the eager `embedding_q4k` gets from its host-side check.
+        let mut rows = (weight.bytes / row_bytes) as i32;
         self.launch_compute_kernel(
-            "grim_embedding",
+            "grim_embedding_q4k_gather",
             grid,
             block,
             &mut [
@@ -65,6 +108,7 @@ impl RocmDevice {
                 arg(&mut i),
                 arg(&mut d),
                 arg(&mut t),
+                arg(&mut rows),
             ],
         )
     }
@@ -525,8 +569,7 @@ impl RocmDevice {
         if hidden == 0 || hidden % 256 != 0 || hidden != u_dims[1] {
             return Err(Error::Backend(format!(
                 "build_fused_gate_up_q4k: hidden must be equal and 256-aligned, got gate={} up={}",
-                hidden,
-                u_dims[1]
+                hidden, u_dims[1]
             )));
         }
         let n_total = n_gate.checked_add(n_up).ok_or_else(|| {

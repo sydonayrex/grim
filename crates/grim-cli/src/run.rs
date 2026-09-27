@@ -684,6 +684,9 @@ pub async fn cmd_run(
     top_p: f32,
     top_k: u32,
     max_tokens: usize,
+    // Top-N token logprobs printed per step, shaped like Ollama's
+    // `top_logprobs` so a run diffs against an Ollama reference. 0 = off.
+    logprobs: usize,
     seed: u64,
     repeat_penalty: f32,
     min_tokens: u32,
@@ -1317,6 +1320,43 @@ pub async fn cmd_run(
                 // device tensor via the WI-X3 GPU sampler — skips the full-vocab D2H +
                 // CPU sampling that dominated per-token overhead. Prefill (multi-row)
                 // steps fall back to the CPU sampler.
+                // `--logprobs N`: materialise this step's logits and print the
+                // top-N, shaped like Ollama's `top_logprobs` so a run diffs
+                // directly against an Ollama reference. Costs a full-vocab D2H
+                // per step, so it is a diagnostic, not a decode path.
+                if logprobs > 0 {
+                    let logits_vec = logits.to_vec_f32()?;
+                    let last_start = logits_vec.len().saturating_sub(vocab);
+                    let last = &logits_vec[last_start..];
+                    let mx = last.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let sumexp: f64 = last.iter().map(|&v| ((v - mx) as f64).exp()).sum();
+                    let lse = mx as f64 + sumexp.ln();
+                    let mut idx: Vec<u32> = (0..vocab as u32).collect();
+                    idx.sort_by(|&a, &b| last[b as usize].total_cmp(&last[a as usize]));
+                    idx.truncate(logprobs);
+                    let parts: Vec<String> = idx
+                        .iter()
+                        .map(|&i| {
+                            let text = tokenizer
+                                .as_ref()
+                                .map(|t| t.decode(&[i]))
+                                .unwrap_or_default();
+                            format!(
+                                "{{\"token\": {:?}, \"id\": {}, \"logprob\": {:.6}}}",
+                                text,
+                                i,
+                                last[i as usize] as f64 - lse
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "[logprobs] step={} top{}: [{}]",
+                        generated,
+                        logprobs,
+                        parts.join(", ")
+                    );
+                }
+
                 // B1: repeat penalty applies on-device now; a device-kernel miss
                 // degrades to CPU sampling (never errors the run).
                 let gpu_sample_ok = logits.shape().elem_count() == vocab
