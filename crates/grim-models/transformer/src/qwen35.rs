@@ -1887,8 +1887,11 @@ fn gated_delta_net_forward_d2d(
     // count, so the tensor is row-major channel-major). The device conv op
     // indexes [channel, tap] already, so it is passed through unchanged.
     let cw_dims = conv_w.shape().dims().to_vec();
-    if cw_dims.len() != 2 || cw_dims[0] != conv_dim || cw_dims[1] != taps {
-        d2d_decline!("kda: conv_w shape {cw_dims:?} != [{conv_dim}, {taps}]");
+    let shape_ok = (cw_dims.len() == 2 && cw_dims[0] == conv_dim && cw_dims[1] == taps)
+        || (cw_dims.len() == 2 && cw_dims[0] == taps && cw_dims[1] == conv_dim)
+        || (cw_dims.len() == 1 && cw_dims[0] == conv_dim * taps);
+    if !shape_ok {
+        d2d_decline!("kda: conv_w shape {cw_dims:?} incompatible with conv_dim={conv_dim}, taps={taps}");
     }
     let is_quant_conv = matches!(
         conv_w.dtype().storage,
@@ -1947,7 +1950,7 @@ fn gated_delta_net_forward_d2d(
         conv_w.storage().as_ref(),
         None,
         conv_state.as_ref(),
-        &Shape::new(vec![1, conv_dim]),
+        &Shape::new(vec![seq_len, conv_dim]),
     )?;
 
     // --- batched delta rule, state in place on device ----------------------
@@ -3281,6 +3284,9 @@ mod tests {
             )),
             ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
             ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_bias_dev: None,
+            ssm_a_dev: None,
+            ssm_norm_dev: None,
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,
@@ -3502,6 +3508,9 @@ mod tests {
             )),
             ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
             ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_bias_dev: None,
+            ssm_a_dev: None,
+            ssm_norm_dev: None,
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,
@@ -3703,6 +3712,9 @@ mod tests {
             )),
             ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
             ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_bias_dev: None,
+            ssm_a_dev: None,
+            ssm_norm_dev: None,
             ssm_dt_rank_hint: cfg.ssm_dt_rank,
             ssm_n_group_hint: cfg.ssm_n_group,
             ssm_d_state_hint: cfg.ssm_d_state,

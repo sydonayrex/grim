@@ -23,6 +23,34 @@ pub fn check_hip(label: &str, res: HipErrorT) -> Result<()> {
     }
 }
 
+/// Name for the `hipError_t` codes this codebase actually trips over. Debug
+/// probes print the raw code, and `1` in a log tells you nothing while
+/// `hipErrorInvalidValue` does. Unlisted codes fall through to `hipError?`
+/// rather than being guessed at.
+pub fn hip_status_name(code: HipErrorT) -> &'static str {
+    match code {
+        0 => "hipSuccess",
+        1 => "hipErrorInvalidValue",
+        2 => "hipErrorOutOfMemory",
+        3 => "hipErrorNotInitialized",
+        4 => "hipErrorDeinitialized",
+        5 => "hipErrorNoDevice",
+        6 => "hipErrorUnknown",
+        10 => "hipErrorInvalidDevice",
+        11 => "hipErrorInvalidImage",
+        12 => "hipErrorInvalidContext",
+        13 => "hipErrorMapFailed",
+        20 => "hipErrorNoBinaryForGpu",
+        209 => "hipErrorNoBinaryForGpu",
+        700 => "hipErrorIllegalAddress",
+        701 => "hipErrorLaunchOutOfResources",
+        702 => "hipErrorLaunchTimeout",
+        704 => "hipErrorLaunchFailure",
+        719 => "hipErrorLaunchFailure",
+        _ => "hipError?",
+    }
+}
+
 /// Memory copy that handles XNACK automatically.
 /// WI-SB6 control-plane primitive: async u32-sized copy on an EXPLICIT non-blocking stream followed by synchronizing ONLY.
 pub fn hip_stream_synchronize_after_copy(

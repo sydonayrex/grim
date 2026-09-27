@@ -311,7 +311,9 @@ pub fn metrics_gpu_verdict(body: &str) -> MetricsGpuVerdict {
 fn check_metrics_endpoint(report: &mut DoctorReport) {
     let url = std::env::var("GRIM_DOCTOR_METRICS_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:11434/metrics".to_string());
-    let output = std::process::Command::new("curl").args(["-sf", &url]).output();
+    let output = std::process::Command::new("curl")
+        .args(["-sf", &url])
+        .output();
 
     match output {
         Ok(o) if o.status.success() => {
@@ -870,7 +872,10 @@ mod tests {
             metrics_gpu_verdict("{\"hardware\":{}}"),
             MetricsGpuVerdict::CpuFallback(-1)
         );
-        assert_eq!(metrics_gpu_verdict("not json at all"), MetricsGpuVerdict::Unparseable);
+        assert_eq!(
+            metrics_gpu_verdict("not json at all"),
+            MetricsGpuVerdict::Unparseable
+        );
     }
 
     /// D4: fake `/metrics` server reporting `rocm_gpu_count: 0` — the truth
@@ -906,10 +911,7 @@ mod tests {
         }
         server.join().expect("fake server thread finishes");
         assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| e.contains("0 GPUs")),
+            report.errors.iter().any(|e| e.contains("0 GPUs")),
             "GPU-count-0 must be a truth failure, got {:?}",
             report.errors
         );

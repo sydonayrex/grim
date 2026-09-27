@@ -166,7 +166,12 @@ fn case(step: usize) -> Case {
         beta: linspace(NV, -1.0, 1.0),
         dt_bias: linspace(NV, 0.1, 0.9),
         ssm_a: linspace(NV, 0.5, 1.5),
-        norm_w: linspace(NV * D, 0.8, 1.2),
+        // Per-HEAD width (D), not per-value-stream (NV*D). The kernel reads
+        // `norm_weight[i]` for i in 0..D, and the checkpoint stores
+        // `ssm_norm.weight` at `ssm_d_state`. `z` below genuinely IS NV*D
+        // (the gate is per value-stream element), so the two differ and the
+        // distinction is the point.
+        norm_w: linspace(D, 0.8, 1.2),
         z: linspace(NV * D, -0.7, 0.7),
     }
 }
@@ -200,7 +205,7 @@ fn rocm_kda_batched_matches_f64_over_a_state_chain() {
         let beta = upload(&dev, &c.beta, Shape::new(vec![NV]));
         let dt_bias = upload(&dev, &c.dt_bias, Shape::new(vec![NV]));
         let ssm_a = upload(&dev, &c.ssm_a, Shape::new(vec![NV]));
-        let norm_w = upload(&dev, &c.norm_w, Shape::new(vec![NV * D]));
+        let norm_w = upload(&dev, &c.norm_w, Shape::new(vec![D]));
         let z = upload(&dev, &c.z, Shape::new(vec![NV * D]));
 
         let want = reference_step(
@@ -294,7 +299,7 @@ fn rocm_kda_batched_without_z_keeps_the_branch_alive() {
     let beta = upload(&dev, &c.beta, Shape::new(vec![NV]));
     let dt_bias = upload(&dev, &c.dt_bias, Shape::new(vec![NV]));
     let ssm_a = upload(&dev, &c.ssm_a, Shape::new(vec![NV]));
-    let norm_w = upload(&dev, &c.norm_w, Shape::new(vec![NV * D]));
+    let norm_w = upload(&dev, &c.norm_w, Shape::new(vec![D]));
     let z = upload(&dev, &c.z, Shape::new(vec![NV * D]));
 
     let call = |st: &dyn grim_tensor::BackendStorage,

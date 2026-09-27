@@ -77,13 +77,22 @@ impl RecurrentOps for RocmDevice {
         };
 
         let mut k_size_i = k_size.max(1);
-        let need_state = (batch.max(0) as usize)
-            .saturating_mul(channels.max(0) as usize)
+        // The state ring covers 1 batch stream of `channels * (k_size - 1)` floats.
+        // If out_shape carries `seq_len > 1`, the state size needed is for 1 stream
+        // (the sequential history buffer), not `seq_len` times over-allocated.
+        let need_state = (channels.max(0) as usize)
             .saturating_mul((k_size_i - 1).max(0) as usize);
         if (st_s.bytes / 4) < need_state {
             return Err(Error::Backend(format!(
-                "short_conv1d: conv_state holds {} floats but kernel needs {need_state}",
-                st_s.bytes / 4
+                "short_conv1d: conv_state holds {} floats but kernel needs {need_state} \
+                 (channels={channels} k_size={k_size_i} taps_from_state={} \
+                 w_bytes={} w_dtype={:?} is_fp8={is_fp8} is_i8={is_i8} is_q4k={is_q4k} \
+                 is_iu4={is_iu4} st_bytes={})",
+                st_s.bytes / 4,
+                (st_s.bytes / 4) / (channels.max(1) as usize) + 1,
+                w_s.bytes,
+                w_s.dtype,
+                st_s.bytes,
             )));
         }
 
@@ -155,6 +164,23 @@ impl RecurrentOps for RocmDevice {
                     arg(&mut x_ptr),
                     arg(&mut w_ptr),
                     arg(&mut null_scale),
+                    arg(&mut b_ptr),
+                    arg(&mut st_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut batch),
+                    arg(&mut channels),
+                    arg(&mut k_size_i),
+                ],
+            )?;
+        } else if batch > 1 {
+            let (scan_grid, scan_block) = linear_launch(channels as usize);
+            self.launch_compute_kernel(
+                "grim_short_conv1d_scan",
+                scan_grid,
+                scan_block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_ptr),
                     arg(&mut b_ptr),
                     arg(&mut st_ptr),
                     arg(&mut out_ptr),
@@ -697,13 +723,12 @@ impl RocmDevice {
         // The state ring must cover `batch * channels * (k_size - 1)` floats,
         // or the offsets above leave it. The caller sizes conv_state from the
         // config's tap count, which need not equal the derived one.
-        let need_state = (batch.max(0) as usize)
-            .saturating_mul(channels.max(0) as usize)
+        let need_state = (channels.max(0) as usize)
             .saturating_mul((k_size - 1).max(0) as usize);
         if (st_s.bytes / 4) < need_state {
             return Err(Error::Backend(format!(
                 "short_conv1d: conv_state holds {} floats but the kernel indexes \
-                 batch({batch}) * channels({channels}) * (k_size-1={}) = {need_state}",
+                 channels({channels}) * (k_size-1={}) = {need_state}",
                 st_s.bytes / 4,
                 k_size - 1
             )));

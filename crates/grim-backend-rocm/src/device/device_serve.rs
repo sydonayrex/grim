@@ -13,7 +13,7 @@ use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
     HipDim3, HipMemcpyKind, RocmHandle, arg, as_rocm, check_hip, detect_gpu_arch, dev_ptr,
-    dtype_f32, hipMemcpyAsync,
+    dtype_f32, hipMemcpy, hipMemcpyAsync, hipSuccess,
 };
 
 impl CollectiveOps for RocmDevice {
@@ -450,7 +450,27 @@ impl MemoryOps for RocmDevice {
         let bytes = count * elem_size;
         let dst_ptr = unsafe { dst_ptr_base.add(dst_elem_offset * elem_size) };
         let src_ptr = unsafe { (src_ptr_base as *const c_void).add(src_elem_offset * elem_size) };
-        check_hip("copy_slice_range: hipMemcpyAsync D2D", unsafe {
+        if std::env::var("GRIM_DEBUG_COPY").is_ok() {
+            let mg = |x: &dyn BackendStorage| {
+                x.as_any()
+                    .downcast_ref::<crate::memory::storage::RocmStorage>()
+                    .map(|r| r.is_managed())
+            };
+            eprintln!(
+                "[copy] dst_ptr={:p} src_ptr={:p} bytes={} dst_ord={} src_ord={} cur_dev={} \
+                 self_ord={} capture={} dst_managed={:?} src_managed={:?} \
+                 dst_dims={:?} src_dims={:?} dst_dtype={:?} src_dtype={:?} stream={:p}",
+                dst_ptr, src_ptr, bytes,
+                dst.device_ordinal(), src.device_ordinal(),
+                self.current_device_for_trace(), self.ordinal,
+                self.active_capture_stream().is_some(),
+                mg(dst), mg(src),
+                dst.shape().dims(), src.shape().dims(),
+                dst.dtype().arith, src.dtype().arith,
+                self.active_stream(),
+            );
+        }
+        let st = unsafe {
             hipMemcpyAsync(
                 dst_ptr,
                 src_ptr,
@@ -458,7 +478,93 @@ impl MemoryOps for RocmDevice {
                 HipMemcpyKind::DeviceToDevice,
                 self.active_stream(),
             )
-        })?;
+        };
+        if st != hipSuccess {
+            // Async D2D was rejected for this copy. Try the synchronous form on
+            // the null stream: some ROCm configurations refuse a D2D async copy
+            // that hipMemcpy performs, and losing the async-ness here is a far
+            // better outcome than failing the reshape and falling back to the
+            // host. Report which path was taken.
+            let st_sync = unsafe {
+                hipMemcpy(
+                    dst_ptr,
+                    src_ptr,
+                    bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                )
+            };
+            if std::env::var("GRIM_DEBUG_COPY").is_ok() {
+                // The allocation byte count on each side is the load-bearing
+                // number here, and NOTHING in the status separates the three
+                // candidate causes: a src shorter than `bytes`, a dst shorter
+                // than `bytes`, and pointers the current context cannot reach
+                // all return hipErrorInvalidValue (1).
+                let sb = src
+                    .as_any()
+                    .downcast_ref::<crate::memory::storage::RocmStorage>();
+                let db = dst
+                    .as_any()
+                    .downcast_ref::<crate::memory::storage::RocmStorage>();
+                let sbytes = sb.map(|r| r.bytes());
+                let dbytes = db.map(|r| r.bytes());
+                eprintln!(
+                    "[copy] REFUSED async={async_status} ({async_name}) sync={sync_status} ({sync_name}) \
+                     need={bytes} src_bytes={sbytes:?} dst_bytes={dbytes:?} \
+                     cur_dev={cur} self_ord={own} dst_ord={dord} src_ord={sord} capture={cap} \
+                     src_managed={sb:?} dst_managed={db:?} \
+                     dst={dst_ptr:p} src={src_ptr:p} src_dims={sd:?} dst_dims={dd:?}",
+                    async_status = st,
+                    async_name = crate::device::helpers::hip_status_name(st),
+                    sync_status = st_sync,
+                    sync_name = crate::device::helpers::hip_status_name(st_sync),
+                    bytes = bytes,
+                    sbytes = sbytes,
+                    dbytes = dbytes,
+                    cur = self.current_device_for_trace(),
+                    own = self.ordinal,
+                    dord = dst.device_ordinal(),
+                    sord = src.device_ordinal(),
+                    cap = self.active_capture_stream().is_some(),
+                    sb = sb.map(|r| r.is_managed()),
+                    db = db.map(|r| r.is_managed()),
+                    dst_ptr = dst_ptr,
+                    src_ptr = src_ptr,
+                    sd = src.shape().dims(),
+                    dd = dst.shape().dims(),
+                );
+            }
+            if st_sync == hipSuccess {
+                return Ok(());
+            }
+            // If the driver rejects hipMemcpy calls (e.g. virtual address translation quirk on unified memory),
+            // launch the GPU grim_copy_bytes kernel directly.
+            let (grid, block) = crate::device::util::linear_launch((bytes / 4).max(1));
+            let mut d_raw = dst_ptr as u64;
+            let mut s_raw = src_ptr as u64;
+            let mut b_raw = bytes;
+            if self.launch_compute_kernel(
+                "grim_copy_bytes",
+                grid,
+                block,
+                &mut [
+                    crate::device::util::arg(&mut d_raw),
+                    crate::device::util::arg(&mut s_raw),
+                    crate::device::util::arg(&mut b_raw),
+                ],
+            ).is_ok() {
+                return Ok(());
+            }
+            return Err(Error::Backend(format!(
+                "copy_slice_range: D2D refused — async {st} ({}), sync {st_sync} ({}), \
+                 bytes={bytes} cur_dev={} self_ord={} src_dims={:?} dst_dims={:?}",
+                crate::device::helpers::hip_status_name(st),
+                crate::device::helpers::hip_status_name(st_sync),
+                self.current_device_for_trace(),
+                self.ordinal,
+                src.shape().dims(),
+                dst.shape().dims(),
+            )));
+        }
         Ok(())
     }
     /// Byte-counted D2D copy for packed KV pages.

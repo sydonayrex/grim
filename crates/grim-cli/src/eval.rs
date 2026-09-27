@@ -352,8 +352,8 @@ fn tensor_on_device(
     shape: &grim_tensor::Shape,
     device: &grim_tensor::Device,
 ) -> grim_tensor::Tensor {
-    use std::sync::Arc;
     use grim_tensor::CoreTensorOps;
+    use std::sync::Arc;
     let storage = match device {
         grim_tensor::Device::Cpu => grim_backend_cpu::CpuDevice::new()
             .from_cpu(&data, shape, grim_tensor::DType::F32)

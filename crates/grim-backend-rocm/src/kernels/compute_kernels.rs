@@ -2,6 +2,11 @@
 
 /// HIP source for the six non-QKV compute kernels. [see: `crate::compute_kernel_source`]
 pub const OTHER_KERNEL_SOURCE: &str = r#"
+// `uintptr_t` is used by the vectorised copy path below and hiprtc does not
+// pre-include it; without this the whole module fails to compile with
+// "use of undeclared identifier 'uintptr_t'".
+#include <stdint.h>
+
 extern "C" __global__ void grim_add(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -1420,6 +1425,27 @@ extern "C" __global__ void grim_short_conv1d_fused_step(
     }
 }
 
+// Universal GPU-side D2D copy kernel: bypasses driver hipMemcpy restrictions on virtual/unified memory
+extern "C" __global__ void grim_copy_bytes(void* dst, const void* src, size_t num_bytes) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+    // 8-byte transfers if aligned, else byte by byte
+    if ((((uintptr_t)dst | (uintptr_t)src | num_bytes) & 7) == 0) {
+        uint64_t* d64 = (uint64_t*)dst;
+        const uint64_t* s64 = (const uint64_t*)src;
+        size_t n64 = num_bytes / 8;
+        for (size_t i = idx; i < n64; i += stride) {
+            d64[i] = s64[i];
+        }
+    } else {
+        uint8_t* d8 = (uint8_t*)dst;
+        const uint8_t* s8 = (const uint8_t*)src;
+        for (size_t i = idx; i < num_bytes; i += stride) {
+            d8[i] = s8[i];
+        }
+    }
+}
+
 extern "C" __global__ void grim_short_conv1d_causal_step(
     const float* x, const float* weight, const float* bias,
     float* conv_state, float* out, int batch, int channels, int kernel_size
@@ -1447,6 +1473,38 @@ extern "C" __global__ void grim_short_conv1d_causal_step(
     }
     if (kernel_size > 1) {
         conv_state[state_offset + kernel_size - 2] = val;
+    }
+}
+
+// Causal short conv scan across time steps t in 0..seq_len for prefill / multi-token steps.
+// 1 thread per channel c. Correctly shifts and maintains conv_state across the sequence on GPU.
+extern "C" __global__ void grim_short_conv1d_scan(
+    const float* x_seq, const float* weight, const float* bias,
+    float* conv_state, float* out_seq, int seq_len, int channels, int kernel_size
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+
+    int state_offset = c * (kernel_size - 1);
+    float b_val = bias ? bias[c] : 0.0f;
+    float last_w = weight[c * kernel_size + (kernel_size - 1)];
+
+    for (int t = 0; t < seq_len; ++t) {
+        float val = x_seq[t * channels + c];
+        float sum = val * last_w;
+        for (int k = 0; k < kernel_size - 1; ++k) {
+            sum += conv_state[state_offset + k] * weight[c * kernel_size + k];
+        }
+        sum += b_val;
+        out_seq[t * channels + c] = sum;
+
+        // Shift conv_state and insert current token sample
+        for (int k = 0; k < kernel_size - 2; ++k) {
+            conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+        }
+        if (kernel_size > 1) {
+            conv_state[state_offset + kernel_size - 2] = val;
+        }
     }
 }
 

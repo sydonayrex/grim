@@ -1123,6 +1123,22 @@ impl RocmDevice {
         self.capture_enabled
     }
 
+    /// The device `hipGetDevice` reports for the CALLING thread right now.
+    ///
+    /// This is not `self.ordinal`. `DeviceGuard` skips its `hipSetDevice` when
+    /// its thread-local `CUR_DEV` cache already claims the target, so a stale
+    /// cache leaves the thread on a different device entirely — and a D2D copy
+    /// issued from the wrong context is rejected with `hipErrorInvalidValue`
+    /// (1), which is indistinguishable from a bad pointer. Debug probes print
+    /// both so they can be compared. `-1` means the query itself failed.
+    pub(crate) fn current_device_for_trace(&self) -> i32 {
+        let mut cur: i32 = -1;
+        unsafe {
+            let _ = crate::device::handles::hipGetDevice(&mut cur);
+        }
+        cur
+    }
+
     /// If a graph-capture session is active, returns the dedicated capture stream. [see: `None`]
     pub(crate) fn active_capture_stream(&self) -> Option<*mut c_void> {
         if self.capture_active.load(Ordering::SeqCst) {
