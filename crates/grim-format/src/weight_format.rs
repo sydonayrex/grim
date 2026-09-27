@@ -35,6 +35,27 @@ pub enum WeightFormat {
     /// effective grid inside each block. Costs an exact zero, which the
     /// packer maps to the block's special value.
     Nutcracker,
+    /// TreePie: FPE2M2 5-bit, table-free decode to native FP16. Exactly 5.0 bpw.
+    ///
+    /// **The first format in grim that satisfies the attention precision floor
+    /// natively.** `attention_min_bpw()` is 5 (Q5_K), and every sub-5 format
+    /// here -- Crow 4.5, Rook 4.1, Jay 4.1, Nutcracker 4.5 -- sits below it, so
+    /// `enforce_attention_precision` silently raises them to 5 for every
+    /// Q/K/V/O projection. A user who asks for Crow on attention gets 5 bits
+    /// and no error. That is intended behaviour, but it means those formats
+    /// cannot deliver their advertised density where it matters most.
+    ///
+    /// TreePie is exactly 5.0, so a request for it survives the floor
+    /// unchanged. That is the substantive argument for TreePie over yet
+    /// another 4-bit format, and the reason the packer had to hit 5.0 rather
+    /// than the 5.33 that interleaved 5-bit codes would cost.
+    ///
+    /// E2M2 = 1 sign + 2 exponent + 2 mantissa, exponent bias 0, no Inf/NaN
+    /// (those encodings are reclaimed as ordinary numbers). The decode is
+    /// shift/AND/OR into FP16 with no lookup table, so it feeds the existing
+    /// `V_DOT2_F32_F16` / `V_DOT2C_F32_F16` path rather than needing a new dot
+    /// instruction. See `grim_quant::tree_pie`.
+    TreePie,
 }
 
 impl WeightFormat {
@@ -51,6 +72,10 @@ impl WeightFormat {
             // 9 bytes per 16 values = 4.5 bits/weight, identical to Crow's
             // Q4_K super-block and to NVFP4's byte layout.
             WeightFormat::Nutcracker => 4.5,
+            // 160 bits per 32 values (4 payload + 1 sign i32), zero padding
+            // waste. Exact, and the exactness is load-bearing: this is the only
+            // value that clears `attention_min_bpw()` without being clamped.
+            WeightFormat::TreePie => 5.0,
         }
     }
 
@@ -66,6 +91,12 @@ impl WeightFormat {
             WeightFormat::Nutcracker => QuantModeHint::MxFp4Emulated,
             // Storage-only aliases — no runtime dispatch gate.
             WeightFormat::Crow | WeightFormat::Jay | WeightFormat::Magpie => {
+                return None;
+            }
+            // TreePie decodes to native FP16 and feeds the existing FP16 dot
+            // path, so it needs no gate of its own. A dispatch arm arrives with
+            // A7; until then it is a storage-only alias like Crow and Jay.
+            WeightFormat::TreePie => {
                 return None;
             }
         })
@@ -107,6 +138,7 @@ impl FromStr for WeightFormat {
             "jackdaw" | "Jackdaw" => Ok(WeightFormat::Jackdaw),
             "magpie" | "Magpie" => Ok(WeightFormat::Magpie),
             "nutcracker" | "Nutcracker" | "nut_fp4" | "NutFp4" => Ok(WeightFormat::Nutcracker),
+            "tree_pie" | "TreePie" | "treepie" | "TREE_PIE" => Ok(WeightFormat::TreePie),
             _ => Err(ParseWeightFormatError { raw: s.to_string() }),
         }
     }
