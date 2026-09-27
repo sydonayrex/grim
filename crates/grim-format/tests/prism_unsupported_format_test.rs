@@ -51,8 +51,19 @@ fn write_gguf(path: &std::path::Path, dtype: GgufDType, name: &str, params: u64)
 
 struct Scratch(std::path::PathBuf);
 impl Scratch {
+    /// One directory per TEST, not per process.
+    ///
+    /// It used to be keyed on `process::id()` alone, which is shared by every
+    /// test in the binary, and it deleted the directory on the way in. Under
+    /// cargo's parallel test threads that is a race: one test's `new()` removes
+    /// a file another test is about to `stat`, and whichever test finishes first
+    /// removes the directory out from under the rest. That produced
+    /// "cannot stat .../sz143.gguf: No such file or directory" on some runs
+    /// and a clean pass on others, with no product code involved.
     fn new() -> Self {
-        let p = std::env::temp_dir().join(format!("grim_prism_{}", std::process::id()));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("grim_prism_{}_{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("mkdir");
         Self(p)
@@ -129,9 +140,22 @@ fn upstream_tag_42_is_untouched_and_still_supported() {
     use grim_format::gguf::map_gguf_dtype_to_storage;
     use grim_tensor::dtype::{KQuantScheme, Storage};
 
+    // Tag 42 is UPSTREAM's Q2_0. `GsqRco3p5` used to squat it, which meant a
+    // checkpoint using the real Q2_0 would decode as a Prism format; upstream
+    // now wins and the Prism type lives on a private id.
+    assert_eq!(GgufDType::Q2_0.tag(), 42);
+    assert_ne!(
+        GgufDType::GsqRco3p5.tag(),
+        42,
+        "GsqRco3p5 must not occupy an upstream tag"
+    );
+    assert!(
+        GgufDType::GsqRco3p5.tag() > 42,
+        "the Prism type must sit above the standard range, got {}",
+        GgufDType::GsqRco3p5.tag()
+    );
     let s = map_gguf_dtype_to_storage(GgufDType::GsqRco3p5).storage;
     assert!(matches!(s, Storage::KQuant(KQuantScheme::GsqRco3p5)));
-    assert_eq!(GgufDType::GsqRco3p5.tag(), 42);
     assert_eq!(GgufDType::GsqRco3p5.block_size(), 64);
     assert_eq!(GgufDType::GsqRco3p5.type_size_per_block(), 18);
     // And the real checkpoint still opens and dequantizes.
