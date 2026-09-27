@@ -202,16 +202,30 @@ pub(crate) fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
     let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
     // Preferred: device-side reshape via a fresh arena + D2D copy, so the
     // data never leaves the GPU (decode-hot path on ROCm).
+    let mut fast_err: Option<String> = None;
     if let Ok(fresh) = dev.alloc_storage(shape, DType::F32) {
-        if dev
-            .copy_slice_into(
-                fresh.as_ref(),
-                x.storage().as_ref(),
-                0,
-                x.shape().elem_count(),
-            )
-            .is_ok()
-        {
+        let copied = dev.copy_slice_into(
+            fresh.as_ref(),
+            x.storage().as_ref(),
+            0,
+            x.shape().elem_count(),
+        );
+        if std::env::var("GRIM_DEBUG_RESHAPE").is_ok() {
+            fn fmt(d: &[usize]) -> String {
+                d.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("x")
+            }
+            eprintln!(
+                "[reshape] {} -> {} : {}",
+                fmt(&x.shape().dims().to_vec()),
+                fmt(&shape.dims().to_vec()),
+                match &copied {
+                    Ok(()) => "D2D ok".to_string(),
+                    Err(e) => format!("D2D FAILED: {e}"),
+                }
+            );
+        }
+        fast_err = copied.as_ref().err().map(|e| e.to_string());
+        if fast_err.is_none() {
             return Ok(Tensor::new(
                 std::sync::Arc::from(fresh),
                 shape.clone(),
@@ -222,7 +236,28 @@ pub(crate) fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
         }
     }
     // Last resort: host roundtrip (CPU and shape-strict backends).
-    let data = x.to_vec_f32()?;
+    //
+    // This path HIDES why the device-side reshape failed: the host copy raises
+    // its own error (typically "hipMemcpyDtoH failed: 1"), so a D2D bug
+    // surfaces as a misleading transfer error several lines away from its
+    // cause. Keep the original in the message.
+    if std::env::var("GRIM_DEBUG_RESHAPE").is_ok() {
+        if let Some(e) = &fast_err {
+            eprintln!("[reshape] falling back to host roundtrip: {e}");
+        }
+    }
+    let data = match x.to_vec_f32() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(match fast_err {
+                Some(orig) => Error::Backend(format!(
+                    "reshaped_view: device-side copy failed ({orig}) and the host \
+                     fallback also failed ({e})"
+                )),
+                None => e.into(),
+            });
+        }
+    };
     let st = dev.from_cpu(&data, shape, DType::F32)?;
     Ok(Tensor::new(
         std::sync::Arc::from(st),
