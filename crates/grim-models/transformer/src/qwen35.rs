@@ -667,6 +667,31 @@ impl Qwen35Block {
         }
 
         if self.is_full_attention && branch_dev.is_none() {
+            // TEMP probe: the attention branch aborts on a bad transfer at the
+            // first attention layer, on both the D2D and host routes. Print the
+            // geometry each step assumes so a wrong width is visible without
+            // re-deriving it.
+            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+                let shp = |t: &Option<Linear>| {
+                    t.as_ref()
+                        .map(|l| (l.weight().shape().dims().to_vec(), l.weight().to_vec_f32().map(|v| v.len()).unwrap_or(0)))
+                };
+                let nshp = |n: &Option<RmsNorm>| {
+                    n.as_ref().map(|x| (x.weight.shape().dims().to_vec(), x.weight.to_vec_f32().map(|v| v.len()).unwrap_or(0)))
+                };
+                eprintln!(
+                    "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
+                    self.layer_idx,
+                    seq_len,
+                    shp(&self.wq),
+                    shp(&self.wk),
+                    shp(&self.wv),
+                    shp(&self.wo),
+                    nshp(&self.attn_q_norm),
+                    nshp(&self.attn_k_norm),
+                    shp(&self.attn_gate),
+                );
+            }
             // Attention path with separated wq, wk, wv.
             // GPU-first: projections stay on-device; RoPE runs through the device kernel; K/V are appended into the.
             let dev = pick_device_for_storage_device(&device);
@@ -2004,6 +2029,51 @@ fn attention_layer_d2d(
     let device = x_normed.device().clone();
     let dev = pick_device_for_storage_device(&device);
 
+    // TEMP probe: this path is the default decode route and it aborts on a bad
+    // transfer at the first attention layer. Print the geometry each step
+    // assumes, and the real element counts, so a width mismatch is visible
+    // rather than re-derived.
+    if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+        let shp = |t: &Option<Linear>| {
+            t.as_ref().map(|l| {
+                (
+                    l.weight().shape().dims().to_vec(),
+                    l.weight().to_vec_f32().map(|v| v.len()).unwrap_or(usize::MAX),
+                )
+            })
+        };
+        let nshp = |n: &Option<RmsNorm>| {
+            n.as_ref().map(|x| {
+                (
+                    x.weight.shape().dims().to_vec(),
+                    x.weight.to_vec_f32().map(|v| v.len()).unwrap_or(usize::MAX),
+                )
+            })
+        };
+        eprintln!(
+            "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
+            blk.layer_idx,
+            seq_len,
+            shp(&blk.wq),
+            shp(&blk.wk),
+            shp(&blk.wv),
+            shp(&blk.wo),
+            nshp(&blk.attn_q_norm),
+            nshp(&blk.attn_k_norm),
+            shp(&blk.attn_gate),
+        );
+    }
+
+    // TEMP: bracket every stage so one run says which one aborts.
+    macro_rules! stage {
+        ($n:expr) => {
+            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+                eprintln!("[attn-stage] layer {} stage={}", blk.layer_idx, $n);
+            }
+        };
+    }
+    stage!("begin");
+
     // Some TP-sharded projections emit padded rows — cut to the exact
     // [seq, width] extent via a D2D staging copy when needed.
     let exact = |t: Tensor, rows: usize, width: usize| -> Result<Tensor> {
@@ -2031,8 +2101,17 @@ fn attention_layer_d2d(
     // A flat byte-range copy of the first q_dim elements is wrong for
     // seq_len > 1: it cuts across row boundaries. `narrow_cols` copies a
     // column RANGE out of every row, which is the row-aware split.
+    stage!("projections");
     let q_split = Shape::new(vec![seq_len, q_dim]);
     let (q_st, gate_st) = {
+        let mark = |tag: &str| {
+            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+                eprintln!("[attn-split] {tag} q_full ptr_ok={} dims={:?}",
+                    q_full.storage().device_ptr().is_some(),
+                    q_full.shape().dims().to_vec());
+            }
+        };
+        mark("before_lo");
         let (qs, _) = dev.narrow_cols(
             q_full.storage().as_ref(),
             2 * q_dim,
@@ -2041,6 +2120,7 @@ fn attention_layer_d2d(
             q_dim,
             &q_split,
         )?;
+        mark("after_lo");
         let (gs, _) = dev.narrow_cols(
             q_full.storage().as_ref(),
             2 * q_dim,
@@ -2049,8 +2129,10 @@ fn attention_layer_d2d(
             q_dim,
             &q_split,
         )?;
+        mark("after_hi");
         (qs, gs)
     };
+    stage!("split");
     let mk = |st: Box<dyn grim_tensor::BackendStorage>| -> Tensor {
         Tensor::new(
             Arc::from(st),
@@ -2069,16 +2151,34 @@ fn attention_layer_d2d(
     let head_norm = |t: &Tensor, heads: usize, n: Option<&RmsNorm>| -> Result<Tensor> {
         let Some(n) = n else { return Ok(t.clone()) };
         let three = Shape::new(vec![1, seq_len * heads, blk.head_dim]);
+        let mk2 = |tag: &str| {
+            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+                eprintln!("[attn-hn] {tag} in_dims={:?} three={:?}", t.shape().dims().to_vec(), three.dims().to_vec());
+            }
+        };
+        mk2("A_reshape_view_pre");
         let t3 = crate::block::reshaped_view(t, &three)?;
+        mk2("B_reshape_view_post");
         // The weight is [head_dim]; broadcast it across the (seq*heads) rows
         // the flattened view presents.
-        let w = n.weight.to_vec_f32()?;
-        let w_dev = dev.from_cpu(&w, &Shape::new(vec![blk.head_dim]), DType::F32)?;
-        let (out, _) = dev.rms_norm(t3.storage().as_ref(), w_dev.as_ref(), n.eps, &three)?;
+        // `n.weight` is ALREADY a device tensor. Copying it to the host and
+        // straight back was a per-layer, per-token D2H + H2D of a constant,
+        // and the synchronous D2H also acted as a sync point that could surface
+        // a PENDING error from an earlier launch as a misleading
+        // "hipMemcpyDtoH failed" here. Pass the device weight directly.
+        mk2("C_pre_rms_norm");
+        let (out, _) = dev.rms_norm(
+            t3.storage().as_ref(),
+            n.weight.storage().as_ref(),
+            n.eps,
+            &three,
+        )?;
+        mk2("D_post_rms_norm");
         // Back to [seq, heads*head_dim] — the tensor's OWN width, which is
         // kv_dim for K and q_dim for Q. Reshaping to a single shared width
         // would silently mis-slice the narrower K.
-        crate::block::reshaped_view(
+        mk2("E_pre_reshape_back");
+        let r = crate::block::reshaped_view(
             &Tensor::new(
                 out.into(),
                 three.clone(),
@@ -2087,11 +2187,13 @@ fn attention_layer_d2d(
                 t.device().clone(),
             ),
             &Shape::new(vec![seq_len, heads * blk.head_dim]),
-        )
+        );
+        r
     };
     q_dev = head_norm(&q_dev, blk.num_heads, blk.attn_q_norm.as_ref())?;
     let k_dev_t = head_norm(&k_dev_t, blk.num_kv_heads, blk.attn_k_norm.as_ref())?;
 
+    stage!("head_norm");
     // --- RoPE, on device ---------------------------------------------------
     let mut rope_cfg = grim_tensor::RopeConfig::new(blk.head_dim, blk.rope_theta);
     rope_cfg.rotary_dim = blk.rotary_dim;
@@ -2119,6 +2221,7 @@ fn attention_layer_d2d(
     let q_rope = rope_ext(&q_dev, blk.num_heads)?;
     let k_rope = rope_ext(&k_dev_t, blk.num_kv_heads)?;
 
+    stage!("rope");
     // --- append K/V to the device arena, then attend -----------------------
     let k_new_rows = seq_len * blk.num_kv_heads;
     let kv_elems = k_new_rows * blk.head_dim;
@@ -2194,6 +2297,7 @@ fn attention_layer_d2d(
         cache.v_device = Some(v_grown);
     }
 
+    stage!("arena_append");
     let total_kv = cache.current_pos + seq_len;
     let k_arena = cache
         .k_device
@@ -2203,6 +2307,34 @@ fn attention_layer_d2d(
         .v_device
         .as_ref()
         .ok_or_else(|| grim_core::error::Error::Backend("cache.v_device missing".into()))?;
+    // TEMP probe: the abort is a D2H inside the attention call's host fallback
+    // (the ROCm qkv_attention kernel is rejected for this geometry, so it
+    // downloads Q and the KV arena). Print shape AND pointer for every buffer
+    // that download reads, so the answer is binary rather than another round
+    // of setting up a test.
+    if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+        let d = |n: &str, st: Option<&dyn grim_tensor::BackendStorage>| match st {
+            None => format!("{n}=None"),
+            Some(x) => {
+                let has = x.device_ptr().is_some();
+                let nb = x.shape().dims().to_vec();
+                match has {
+                    true => format!("{n}=ptr@{:#x} dims={:?}", x.device_ptr().unwrap(), nb),
+                    false => format!("{n}=NULLPTR dims={:?}", nb),
+                }
+            }
+        };
+        eprintln!(
+            "[attn-arena] layer {} total_kv={} cur_pos={} | {} | {} | {}",
+            blk.layer_idx,
+            total_kv,
+            cache.current_pos,
+            d("q_rope", Some(q_rope.storage().as_ref())),
+            d("k_arena", Some(k_arena.as_ref())),
+            d("v_arena", Some(v_arena.as_ref())),
+        );
+    }
+
     let attn = crate::shared_attention::fused_or_scalar_attention_arena_device(
         q_rope.storage().as_ref(),
         k_arena.as_ref(),
