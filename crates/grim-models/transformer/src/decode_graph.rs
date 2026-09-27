@@ -79,6 +79,13 @@ fn dst_downcast(dst: &dyn grim_tensor::BackendStorage) -> Result<&grim_backend_r
         .ok_or_else(|| grim_core::error::Error::Backend("need RocmStorage".into()))
 }
 
+/// One decode GEMV into a preallocated graph buffer.
+///
+/// `what` and `layer` are not decoration: a shape mismatch here aborts the
+/// WHOLE capture, so the run silently drops to eager for every subsequent
+/// token. A bare "expected [1, 4096], got [1, 12288]" names neither the
+/// projection nor the layer, which is why this class of bug kept costing a
+/// full round of guessing — name them at the point of failure instead.
 fn linear_into(
     dev: &Dev,
     a: &Storage,
@@ -86,10 +93,31 @@ fn linear_into(
     out: &grim_backend_rocm::RocmStorage,
     act_q81: &grim_backend_rocm::RocmStorage,
 ) -> Result<()> {
+    linear_into_named(dev, a, w, out, act_q81, "?", usize::MAX)
+}
+
+fn linear_into_named(
+    dev: &Dev,
+    a: &Storage,
+    w: &grim_tensor::Tensor,
+    out: &grim_backend_rocm::RocmStorage,
+    act_q81: &grim_backend_rocm::RocmStorage,
+    what: &str,
+    layer: usize,
+) -> Result<()> {
     let ws = rocm_storage(w)?;
-    let _ = dev
-        .linear_decode_into(a, ws, out, act_q81)
-        .map_err(|e| grim_core::error::Error::Backend(format!("linear_decode: {e}")))?;
+    // Shapes up front: a failure below is almost always a buffer sized for a
+    // different projection, and having both ends makes that visible.
+    let w_dims = w.shape().dims().to_vec();
+    let a_dims = a.shape().dims().to_vec();
+    let o_dims = out.shape().dims().to_vec();
+    dev.linear_decode_into(a, ws, out, act_q81).map_err(|e| {
+        grim_core::error::Error::Backend(format!(
+            "linear_decode[{what} @ layer {layer}]: {e} \
+             (act {:?}, weight {:?}, out {:?})",
+            a_dims, w_dims, o_dims
+        ))
+    })?;
     Ok(())
 }
 
@@ -998,7 +1026,15 @@ impl Qwen35Block {
                 let wv = self.wv.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("missing wv in full attention block".into())
                 })?;
-                linear_into(dev, normed, wq.weight(), &buffers.q_buf[layer_idx], act)?;
+                linear_into_named(
+                    dev,
+                    normed,
+                    wq.weight(),
+                    &buffers.q_buf[layer_idx],
+                    act,
+                    "attn.q",
+                    layer_idx,
+                )?;
                 linear_into(dev, normed, wk.weight(), &buffers.k_buf[layer_idx], act)?;
                 linear_into(dev, normed, wv.weight(), &buffers.v_buf[layer_idx], act)?;
             }
@@ -1133,12 +1169,14 @@ impl Qwen35Block {
         } else {
             // Recurrent / ShortConv / SSM path
             if let Some(ref qkv_lin) = self.attn_qkv {
-                linear_into(
+                linear_into_named(
                     dev,
                     normed,
                     qkv_lin.weight(),
                     &buffers.q_buf[layer_idx],
                     act,
+                    "kda.attn_qkv",
+                    layer_idx,
                 )?;
 
                 // If conv weight is present and we have allocated sc_state, run causal conv step
@@ -1297,6 +1335,11 @@ impl DecodeGraphModel for Qwen35 {
         // (9B: 8192 vs 4096; 27B: 10240 vs 6144). Sizing it from n_q alone
         // tripped the graph's own shape check, so capture was abandoned and
         // every token decoded eagerly. Size for whichever is larger.
+        // The recurrent conv width. `q_buf` doubles as the conv scratch, and
+        // the Mamba short-conv staging below is sized from it, so it is
+        // derived here rather than inherited from the attention query width —
+        // coupling the two is what made the conv scratch 2048 rows too narrow
+        // on Qwen3.5-9B and aborted capture at step 1.
         let kda_conv = (self.cfg.ssm_dt_rank + 2 * self.cfg.ssm_n_group) * self.cfg.ssm_d_state;
         let n_q = (self.cfg.num_heads * self.cfg.head_dim).max(kda_conv);
         let n_k = self.cfg.num_kv_heads * self.cfg.head_dim;
@@ -1305,7 +1348,11 @@ impl DecodeGraphModel for Qwen35 {
         let vocab = self.cfg.vocab_size.max(1);
         let ctx = max_ctx.max(1);
         let nh = self.cfg.num_heads;
-        let sc_h_dim = n_q;
+        // Short-conv hidden width == the KDA conv width, NOT the attention
+        // query width. The allocator stages `3 * sc_h_dim` for it, so taking
+        // `n_q` here staged a buffer whose width tracked whatever the
+        // attention query happened to be.
+        let sc_h_dim = if kda_conv > 0 { kda_conv } else { n_q };
         let sc_l_cache = self.cfg.ssm_d_conv.max(4);
 
         let buffers = DecodeGraphBuffers::allocate(
