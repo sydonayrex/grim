@@ -365,12 +365,14 @@ impl LlamaBlock {
             .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
         // 7. Output projection (wo) + residual add
-        linear_into(
+        linear_into_named(
             dev,
             &buffers.attn_out_buf[layer_idx],
             self.wo.weight(),
             &buffers.norm_buf[layer_idx],
             act,
+            "attn.wo_out",
+            layer_idx,
         )?;
 
         add_graph(
@@ -431,19 +433,23 @@ impl LlamaBlock {
                     .w_up
                     .as_ref()
                     .ok_or_else(|| grim_core::error::Error::Backend("missing w_up".into()))?;
-                linear_into(
+                linear_into_named(
                     dev,
                     normed_ffn,
                     wg.weight(),
                     &buffers.gate_buf[layer_idx],
                     act,
+                    "ffn.gate",
+                    layer_idx,
                 )?;
-                linear_into(
+                linear_into_named(
                     dev,
                     normed_ffn,
                     wu.weight(),
                     &buffers.up_buf[layer_idx],
                     act,
+                    "ffn.up",
+                    layer_idx,
                 )?;
             }
 
@@ -458,12 +464,14 @@ impl LlamaBlock {
                 .w_down
                 .as_ref()
                 .ok_or_else(|| grim_core::error::Error::Backend("missing w_down".into()))?;
-            linear_into(
+            linear_into_named(
                 dev,
                 &buffers.activated_buf[layer_idx],
                 wd.weight(),
                 &buffers.norm_buf[layer_idx],
                 act,
+                "ffn.down",
+                layer_idx,
             )?;
 
             add_graph(
@@ -1035,8 +1043,8 @@ impl Qwen35Block {
                     "attn.q",
                     layer_idx,
                 )?;
-                linear_into(dev, normed, wk.weight(), &buffers.k_buf[layer_idx], act)?;
-                linear_into(dev, normed, wv.weight(), &buffers.v_buf[layer_idx], act)?;
+                linear_into_named(dev, normed, wk.weight(), &buffers.k_buf[layer_idx], act, "attn.k", layer_idx)?;
+                linear_into_named(dev, normed, wv.weight(), &buffers.v_buf[layer_idx], act, "attn.v", layer_idx)?;
             }
 
             // 3. Optional per-head Q/K norm
@@ -1167,7 +1175,32 @@ impl Qwen35Block {
                 act,
             )?;
         } else {
-            // Recurrent / ShortConv / SSM path
+            // Recurrent / ShortConv / SSM path.
+            //
+            // REFUSE rather than compute a different function. Everything below
+            // this point is conv -> SiLU -> gate -> ssm_out, and that is NOT the
+            // recurrent layer: the gated delta rule is never applied and
+            // `ssm_state` is never advanced, so for a KDA layer the graph
+            // produces conv-SiLU-gate-output where the model needs
+            // conv-SiLU-delta-rule-gate. It also gates with `sigmoid` on the
+            // attention side, where the reference gates a recurrent layer ONCE
+            // with `silu(z)` inside build_norm_gated (qwen35.cpp:454) — the
+            // eager path guards that with `is_full_attention` and this one
+            // never did.
+            //
+            // The graph would therefore run at full decode speed and emit
+            // confident nonsense for three quarters of the layers, with nothing
+            // failing. Every capture has been falling back to eager for other
+            // reasons, which is the only reason this has not shipped. Until the
+            // delta rule is in this path, decline and let eager — which does it
+            // correctly — run.
+            return Err(grim_core::error::Error::Backend(
+                "qwen35 decode graph: recurrent (KDA) layers are not implemented in the \
+                 captured graph — it omits the gated delta rule and gates with sigmoid \
+                 instead of silu(z). Refusing to capture so the correct eager path runs."
+                    .into(),
+            ));
+            #[allow(unreachable_code)]
             if let Some(ref qkv_lin) = self.attn_qkv {
                 linear_into_named(
                     dev,
@@ -1211,6 +1244,8 @@ impl Qwen35Block {
                     "recurrent block missing attn_qkv".into(),
                 ));
             }
+
+
 
             // Optional attn_gate (sigmoid gate)
             if let Some(ref gate_lin) = self.attn_gate {
