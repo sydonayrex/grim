@@ -147,35 +147,48 @@ pub enum GgufDType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
-    I8 = 16,
-    I16 = 17,
-    I32 = 18,
-    I64 = 19,
-    F64 = 20,
-    Q4_2 = 21,
-    Q8_1Hx = 22,
+    // Codes 16..30 are the ggml canonical values. They were previously
+    // shifted (IQ2_XXS sat at 23, F64 at 20, IQ4_NL at 35), which made every
+    // checkpoint using them unreadable: a Qwen3.8-27B with 7 IQ4_NL tensors
+    // was declared F64 and refused, while llama.cpp read it fine.
+    //   ggml/include/ggml.h GGML_TYPE_*
     #[allow(non_camel_case_types)]
-    IQ2_XXS = 23,
+    IQ2_XXS = 16,
     #[allow(non_camel_case_types)]
-    IQ2_XS = 24,
+    IQ2_XS = 17,
     #[allow(non_camel_case_types)]
-    IQ2_S = 25,
+    IQ3_XXS = 18,
     #[allow(non_camel_case_types)]
-    IQ3_XXS = 26,
+    IQ1_S = 19,
     #[allow(non_camel_case_types)]
-    IQ3_S = 27,
+    IQ4_NL = 20,
     #[allow(non_camel_case_types)]
-    IQ1_S = 28,
+    IQ3_S = 21,
+    #[allow(non_camel_case_types)]
+    IQ2_S = 22,
+    #[allow(non_camel_case_types)]
+    IQ4_XS = 23,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    I64 = 27,
+    F64 = 28,
     #[allow(non_camel_case_types)]
     IQ1_M = 29,
     #[allow(non_camel_case_types)]
     BF16 = 30,
     #[allow(non_camel_case_types)]
-    IQ4_NL = 35,
+    TQ1_0 = 34,
     #[allow(non_camel_case_types)]
-    IQ4_XS = 36,
+    TQ2_0 = 35,
     #[allow(non_camel_case_types)]
     MXFP4 = 39,
+    /// Removed upstream (`ggml.h`: "support has been removed"), so it has no
+    /// canonical tag. Parked on a private id alongside NVFP4/PQ2_0 rather than
+    /// squatting a standard one, which is what made this whole table unsafe.
+    Q4_2 = 79,
+    /// Same: removed upstream, private id, never written by a real file.
+    Q8_1Hx = 80,
     /// NVFP4: NVIDIA 4-bit floating point (E2M1 codebook) for Blackwell.
     /// Same OCP E2M1 encoding as MXFP4 but uses a different block-scaling convention (per-16-element block with.
     #[allow(non_camel_case_types)]
@@ -209,24 +222,26 @@ impl GgufDType {
             13 => Some(GgufDType::Q5K),
             14 => Some(GgufDType::Q6K),
             15 => Some(GgufDType::Q8K),
-            16 => Some(GgufDType::I8),
-            17 => Some(GgufDType::I16),
-            18 => Some(GgufDType::I32),
-            19 => Some(GgufDType::I64),
-            20 => Some(GgufDType::F64),
-            21 => Some(GgufDType::Q4_2),
-            22 => Some(GgufDType::Q8_1Hx),
-            23 => Some(GgufDType::IQ2_XXS),
-            24 => Some(GgufDType::IQ2_XS),
-            25 => Some(GgufDType::IQ2_S),
-            26 => Some(GgufDType::IQ3_XXS),
-            27 => Some(GgufDType::IQ3_S),
-            28 => Some(GgufDType::IQ1_S),
+            16 => Some(GgufDType::IQ2_XXS),
+            17 => Some(GgufDType::IQ2_XS),
+            18 => Some(GgufDType::IQ3_XXS),
+            19 => Some(GgufDType::IQ1_S),
+            20 => Some(GgufDType::IQ4_NL),
+            21 => Some(GgufDType::IQ3_S),
+            22 => Some(GgufDType::IQ2_S),
+            23 => Some(GgufDType::IQ4_XS),
+            24 => Some(GgufDType::I8),
+            25 => Some(GgufDType::I16),
+            26 => Some(GgufDType::I32),
+            27 => Some(GgufDType::I64),
+            28 => Some(GgufDType::F64),
             29 => Some(GgufDType::IQ1_M),
             30 => Some(GgufDType::BF16),
-            35 => Some(GgufDType::IQ4_NL),
-            36 => Some(GgufDType::IQ4_XS),
+            34 => Some(GgufDType::TQ1_0),
+            35 => Some(GgufDType::TQ2_0),
             39 => Some(GgufDType::MXFP4),
+            79 => Some(GgufDType::Q4_2),
+            80 => Some(GgufDType::Q8_1Hx),
             78 => Some(GgufDType::NVFP4),
             42 => Some(GgufDType::GsqRco3p5),
             142 => Some(GgufDType::PQ2_0),
@@ -252,24 +267,26 @@ impl GgufDType {
             GgufDType::Q5K => 13,
             GgufDType::Q6K => 14,
             GgufDType::Q8K => 15,
-            GgufDType::I8 => 16,
-            GgufDType::I16 => 17,
-            GgufDType::I32 => 18,
-            GgufDType::I64 => 19,
-            GgufDType::F64 => 20,
-            GgufDType::Q4_2 => 21,
-            GgufDType::Q8_1Hx => 22,
-            GgufDType::IQ2_XXS => 23,
-            GgufDType::IQ2_XS => 24,
-            GgufDType::IQ2_S => 25,
-            GgufDType::IQ3_XXS => 26,
-            GgufDType::IQ3_S => 27,
-            GgufDType::IQ1_S => 28,
+            GgufDType::IQ2_XXS => 16,
+            GgufDType::IQ2_XS => 17,
+            GgufDType::IQ3_XXS => 18,
+            GgufDType::IQ1_S => 19,
+            GgufDType::IQ4_NL => 20,
+            GgufDType::IQ3_S => 21,
+            GgufDType::IQ2_S => 22,
+            GgufDType::IQ4_XS => 23,
+            GgufDType::I8 => 24,
+            GgufDType::I16 => 25,
+            GgufDType::I32 => 26,
+            GgufDType::I64 => 27,
+            GgufDType::F64 => 28,
             GgufDType::IQ1_M => 29,
             GgufDType::BF16 => 30,
-            GgufDType::IQ4_NL => 35,
-            GgufDType::IQ4_XS => 36,
+            GgufDType::TQ1_0 => 34,
+            GgufDType::TQ2_0 => 35,
             GgufDType::MXFP4 => 39,
+            GgufDType::Q4_2 => 79,
+            GgufDType::Q8_1Hx => 80,
             GgufDType::NVFP4 => 78,
             GgufDType::GsqRco3p5 => 42,
             GgufDType::PQ2_0 => 142,
@@ -2033,7 +2050,7 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
         // format, rather than an unknown-tag parse failure here. They are
         // deliberately NOT given a KQuant scheme, so no existing fused kernel
         // can be selected for them by accident.
-        GgufDType::PQ2_0 | GgufDType::PTQ1_0 => DType {
+        GgufDType::PQ2_0 | GgufDType::PTQ1_0 | GgufDType::TQ1_0 | GgufDType::TQ2_0 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
                 name: gguf_dtype.display_name(),
@@ -2096,9 +2113,10 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::IQ2_S
         | GgufDType::GsqRco3p5
         | GgufDType::PQ2_0
-        | GgufDType::PTQ1_0 => Some(2),
+        | GgufDType::PTQ1_0
+        | GgufDType::TQ2_0 => Some(2),
         GgufDType::Q3K | GgufDType::IQ3_XXS | GgufDType::IQ3_S => Some(3),
-        GgufDType::IQ1_S | GgufDType::IQ1_M => Some(1),
+        GgufDType::IQ1_S | GgufDType::IQ1_M | GgufDType::TQ1_0 => Some(1),
         GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),
     };
     (dtype, bpw)
@@ -2135,8 +2153,8 @@ impl GgufDType {
                 | GgufDType::MXFP4
                 | GgufDType::NVFP4
                 | GgufDType::GsqRco3p5
-                | GgufDType::PQ2_0
-                | GgufDType::PTQ1_0
+                | GgufDType::TQ1_0
+                | GgufDType::TQ2_0
         )
     }
 
@@ -2174,6 +2192,8 @@ impl GgufDType {
             GgufDType::IQ2_S => "IQ2_S",
             GgufDType::IQ1_S => "IQ1_S",
             GgufDType::IQ1_M => "IQ1_M",
+            GgufDType::TQ1_0 => "TQ1_0",
+            GgufDType::TQ2_0 => "TQ2_0",
             GgufDType::MXFP4 => "MXFP4",
             GgufDType::NVFP4 => "NVFP4",
             GgufDType::GsqRco3p5 => "Q2_0",
