@@ -1426,21 +1426,21 @@ extern "C" __global__ void grim_short_conv1d_fused_step(
 }
 
 // Universal GPU-side D2D copy kernel: bypasses driver hipMemcpy restrictions on virtual/unified memory
-extern "C" __global__ void grim_copy_bytes(void* dst, const void* src, size_t num_bytes) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = blockDim.x * gridDim.x;
+extern "C" __global__ void grim_copy_bytes(void* dst, const void* src, unsigned long long num_bytes) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)blockDim.x * gridDim.x;
     // 8-byte transfers if aligned, else byte by byte
-    if ((((uintptr_t)dst | (uintptr_t)src | num_bytes) & 7) == 0) {
-        uint64_t* d64 = (uint64_t*)dst;
-        const uint64_t* s64 = (const uint64_t*)src;
-        size_t n64 = num_bytes / 8;
-        for (size_t i = idx; i < n64; i += stride) {
+    if ((((unsigned long long)dst | (unsigned long long)src | num_bytes) & 7ULL) == 0ULL) {
+        unsigned long long* d64 = (unsigned long long*)dst;
+        const unsigned long long* s64 = (const unsigned long long*)src;
+        unsigned long long n64 = num_bytes / 8ULL;
+        for (unsigned long long i = idx; i < n64; i += stride) {
             d64[i] = s64[i];
         }
     } else {
-        uint8_t* d8 = (uint8_t*)dst;
-        const uint8_t* s8 = (const uint8_t*)src;
-        for (size_t i = idx; i < num_bytes; i += stride) {
+        unsigned char* d8 = (unsigned char*)dst;
+        const unsigned char* s8 = (const unsigned char*)src;
+        for (unsigned long long i = idx; i < num_bytes; i += stride) {
             d8[i] = s8[i];
         }
     }
