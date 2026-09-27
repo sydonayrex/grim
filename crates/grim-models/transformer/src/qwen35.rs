@@ -15,6 +15,32 @@ use grim_tensor::{
 
 // Config
 
+/// Why a D2D decode path declined, for `GRIM_D2D_TRACE=1`.
+///
+/// The D2D functions return `Ok(None)` for a dozen different reasons and were
+/// silent about all of them, so a permanently-declining path looked exactly
+/// like a working one. `GRIM_D2D_TRACE=1` prints `site` + `why` per decline.
+///
+/// ponytail: a `OnceLock<bool>` read of the env var per site; if this ever
+/// needs per-run toggling at runtime, add a setter — a channel nobody uses
+/// today is not a feature.
+fn d2d_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GRIM_D2D_TRACE").is_ok())
+}
+
+/// Declare an `Ok(None)` decline site: `d2d_decline!("ssm_conv1d is Q4_K_M");`
+/// Takes the same arguments as [`format!`], so a site can print the value that
+/// made it decline rather than just its name.
+macro_rules! d2d_decline {
+    ($($arg:tt)*) => {{
+        if d2d_trace_enabled() {
+            eprintln!("[d2d-decline] {}: {}", line!(), format_args!($($arg)*));
+        }
+        return Ok(None);
+    }};
+}
+
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
     pub vocab_size: usize,
@@ -1551,18 +1577,20 @@ fn gated_delta_net_forward(
                 qkv.device().clone(),
             );
             let w = blk.ssm_conv1d.as_ref().unwrap().clone();
-            // `ssm_conv1d.weight` is stored [taps, conv_dim] — llama.cpp reads
-            // `conv_kernel->ne[0]` as the TAP COUNT, and the real tensors agree
-            // (9B: [4, 8192], 27B: [4, 10240]). It was being relabelled as
-            // [chans, taps] without transposing, so every tap was read from the
-            // wrong channel and the conv fed scrambled values into all three of
-            // q, k and v on every recurrent layer. Transpose for real.
+            // `ssm_conv1d.weight` is stored ggml-ne order, so ne[0] IS the tap
+            // count and ne[1] the channel count — llama.cpp `ggml_ssm_conv`:
+            //   const int64_t d_conv  = c->ne[0];
+            //   const int64_t d_inner = c->ne[1];
+            // Element (tap, channel) is therefore at `tap + d_conv*channel`,
+            // which is row-major [channel, tap] — exactly what the tensor here
+            // is shaped as. A transpose here is a REGRESSION, not a fix: the
+            // 9B file's ne0 is 4 and its ne1 is 8192.
             let w_raw = w.to_vec_f32()?;
             let mut w_chw = vec![0.0f32; chans * taps];
             if w_raw.len() >= chans * taps {
                 for k in 0..taps {
                     for ch in 0..chans {
-                        w_chw[ch * taps + k] = w_raw[k * chans + ch];
+                        w_chw[ch * taps + k] = w_raw[k + taps * ch];
                     }
                 }
             } else {
@@ -1745,68 +1773,72 @@ fn gated_delta_net_forward_d2d(
     branch_width: usize,
 ) -> Result<Option<Tensor>> {
     if seq_len != 1 {
-        return Ok(None);
+        d2d_decline!("kda: prefill (seq_len != 1) — host reference by design");
     }
     // Accelerators only. The batched op also exists on the CPU backend, but
     // that one is the numeric ORACLE for the GPU gate, not a production path:
     // running it here would silently move every CPU model off the reference
     // implementation it is checked against, for no gain.
     if x_normed.device().is_cpu() {
-        return Ok(None);
+        d2d_decline!("kda: CPU device — host reference is the oracle");
     }
     let n_val_heads = blk.cfg_ssm_num_value_heads();
     let n_key_heads = blk.cfg_ssm_num_key_heads();
     let head_dim = blk.cfg_ssm_head_dim();
     if n_val_heads == 0 || n_key_heads == 0 || head_dim == 0 {
-        return Ok(None);
+        d2d_decline!("kda: degenerate head config (v={n_val_heads} k={n_key_heads} d={head_dim})");
     }
     let Some(ref qkv_lin) = blk.attn_qkv else {
-        return Ok(None);
+        d2d_decline!("kda: attn_qkv is None");
     };
     // No conv weights means the stream is used un-convolved, which is a real
     // fallback case the host path supports; this one does not.
     let Some(ref conv_w) = blk.ssm_conv1d else {
-        return Ok(None);
+        d2d_decline!("kda: ssm_conv1d is None (un-convolved stream)");
     };
     let Some(ref alpha_lin) = blk.ssm_alpha else {
-        return Ok(None);
+        d2d_decline!("kda: ssm_alpha is None");
     };
     let Some(ref beta_lin) = blk.ssm_beta else {
-        return Ok(None);
+        d2d_decline!("kda: ssm_beta is None");
     };
     let Some(ref gate_lin) = blk.attn_gate else {
-        return Ok(None);
+        d2d_decline!("kda: attn_gate (z output gate) is None");
     };
     let Some(ref dt_bias) = blk.ssm_dt_bias else {
-        return Ok(None);
+        d2d_decline!("kda: ssm_dt_bias is None");
     };
     let Some(ref ssm_a) = blk.ssm_a else {
-        return Ok(None);
+        d2d_decline!("kda: ssm_a is None");
     };
     let Some(ref ssm_norm) = blk.ssm_norm else {
-        return Ok(None);
+        d2d_decline!("kda: ssm_norm is None");
     };
 
     let key_dim = n_key_heads * head_dim;
     let value_dim = n_val_heads * head_dim;
     let conv_dim = 2 * key_dim + value_dim;
     if branch_width != value_dim {
-        return Ok(None);
+        d2d_decline!("kda: branch_width {branch_width} != value_dim {value_dim}");
     }
-    if dt_bias.len() < n_val_heads || ssm_a.len() < n_val_heads || ssm_norm.len() < value_dim {
-        return Ok(None);
+    if dt_bias.len() < n_val_heads || ssm_a.len() < n_val_heads || ssm_norm.len() < head_dim {
+        d2d_decline!(
+            "kda: short per-head vectors undersized (dt_bias {} ssm_a {} ssm_norm {}, need {n_val_heads}/{n_val_heads}/{head_dim})",
+            dt_bias.len(),
+            ssm_a.len(),
+            ssm_norm.len(),
+        );
     }
 
     let taps = blk.cfg_ssm_d_conv().max(1);
     // The short conv weight must already be plain f32 of the right shape: the
     // op reads it directly and has no quantized path of its own.
-    // The checkpoint stores it [taps, conv_dim] (llama.cpp reads
-    // `conv_kernel->ne[0]` as the tap count; 9B is [4, 8192]). The device conv
-    // op indexes [channel, tap], so it is transposed on the way in, exactly as
-    // the host path now does.
+    // The conv weight arrives shaped [conv_dim, taps] (ggml ne0 is the tap
+    // count, so the tensor is row-major channel-major). The device conv op
+    // indexes [channel, tap] already, so it is passed through unchanged.
     let cw_dims = conv_w.shape().dims().to_vec();
-    if cw_dims.len() != 2 || cw_dims[0] != taps || cw_dims[1] != conv_dim {
-        d2d_decline!("kda: conv_w shape {cw_dims:?} != [{taps}, {conv_dim}]");
+    if cw_dims.len() != 2 || cw_dims[0] != conv_dim || cw_dims[1] != taps {
+        d2d_decline!("kda: conv_w shape {cw_dims:?} != [{conv_dim}, {taps}]");
     }
     if !matches!(conv_w.dtype().storage, Storage::Native) {
         d2d_decline!(
@@ -1820,7 +1852,7 @@ fn gated_delta_net_forward_d2d(
     // --- conv + projections, all on device ---------------------------------
     let qkv = qkv_lin.forward(x_normed)?;
     if qkv.device() != x_normed.device() {
-        return Ok(None);
+        d2d_decline!("kda: attn_qkv projection landed on a different device than its input");
     }
     let alpha = alpha_lin.forward(x_normed)?;
     let beta = beta_lin.forward(x_normed)?;
@@ -1841,7 +1873,14 @@ fn gated_delta_net_forward_d2d(
     > { dev.from_cpu(&v[..n], &shp, DType::F32) };
     let dt_bias_d = up(dt_bias, n_val_heads, Shape::new(vec![n_val_heads]))?;
     let ssm_a_d = up(ssm_a, n_val_heads, Shape::new(vec![n_val_heads]))?;
-    let ssm_norm_d = up(ssm_norm, value_dim, Shape::new(vec![value_dim]))?;
+    // `ssm_norm` is the per-HEAD norm weight, indexed by element within the
+    // head: both the host reference (`norm_vec.get(i)` over `head_dim`) and
+    // both backends' kernels (`norm_weight[i]`, `i in 0..head_dim`) read
+    // `head_dim` of it and no more. It is NOT value_dim wide — the checkpoint
+    // stores `ssm_norm.weight` at `ssm_d_state` (128), so demanding value_dim
+    // (6144) here declined on every recurrent layer of every token and sent
+    // the whole KDA branch to the host fallback forever.
+    let ssm_norm_d = up(ssm_norm, head_dim, Shape::new(vec![head_dim]))?;
 
     // --- short conv, state in place on device ------------------------------
     if cache.conv_state_dev.is_none() {
@@ -1851,17 +1890,9 @@ fn gated_delta_net_forward_d2d(
     let conv_state = cache.conv_state_dev.as_ref().ok_or_else(|| {
         grim_core::error::Error::Backend("conv_state_dev vanished after allocation".into())
     })?;
-    let cw_raw = conv_w.to_vec_f32()?;
-    let mut cw_chw = vec![0.0f32; conv_dim * taps];
-    for k in 0..taps {
-        for ch in 0..conv_dim {
-            cw_chw[ch * taps + k] = cw_raw[k * conv_dim + ch];
-        }
-    }
-    let cw_dev = dev.from_cpu(&cw_chw, &Shape::new(vec![conv_dim, taps]), DType::F32)?;
     let (conv_out, _) = dev.short_conv1d_causal_step(
         qkv.storage().as_ref(),
-        cw_dev.as_ref(),
+        conv_w.storage().as_ref(),
         None,
         conv_state.as_ref(),
         &Shape::new(vec![1, conv_dim]),
@@ -1932,13 +1963,13 @@ fn attention_layer_d2d(
 ) -> Result<Option<Tensor>> {
     // Accelerators only: the CPU reference stays the production path there.
     if x_normed.device().is_cpu() {
-        return Ok(None);
+        d2d_decline!("attn: CPU device — host reference is the oracle");
     }
     // Decode only. Prefill walks several query positions against a growing
     // arena and is not covered by the parity gate, which runs single-token
     // steps; the host reference still handles it.
     if seq_len != 1 {
-        return Ok(None);
+        d2d_decline!("attn: prefill (seq_len != 1) — host reference by design");
     }
     // The device attention kernel this path calls had a real defect: it staged
     // the query in 8 chunks (256 dims) but accumulated and wrote V in 4, so at
@@ -1955,12 +1986,17 @@ fn attention_layer_d2d(
         std::env::var("GRIM_QWEN_ATTN_D2D").as_deref(),
         Ok("0" | "false" | "off" | "no")
     ) {
-        return Ok(None);
+        d2d_decline!("attn: GRIM_QWEN_ATTN_D2D is set to a disabling value");
     }
     // `wo` is deliberately not required here: the caller applies it to whatever
     // this returns, and its own `Option` handling is unchanged by this path.
     let (Some(wq), Some(wk), Some(wv)) = (blk.wq.as_ref(), blk.wk.as_ref(), blk.wv.as_ref()) else {
-        return Ok(None);
+        d2d_decline!(
+            "attn: separated wq/wk/wv incomplete (q={} k={} v={})",
+            blk.wq.is_some(),
+            blk.wk.is_some(),
+            blk.wv.is_some(),
+        );
     };
 
     let q_dim = blk.num_heads * blk.head_dim;

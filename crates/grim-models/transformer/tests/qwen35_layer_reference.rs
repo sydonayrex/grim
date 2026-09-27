@@ -318,9 +318,9 @@ fn recurrent_layer_matches_hand_reference() {
     let mut state = cache.conv_state.clone();
     let mut conv = vec![0.0f32; conv_dim()];
     for ch in 0..conv_dim() {
-        let mut s = qkv[ch] * cw[(TAPS - 1) * conv_dim() + ch];
+        let mut s = qkv[ch] * cw[ch * TAPS + (TAPS - 1)];
         for k in 0..TAPS - 1 {
-            s += state[ch * (TAPS - 1) + k] * cw[k * conv_dim() + ch];
+            s += state[ch * (TAPS - 1) + k] * cw[ch * TAPS + k];
         }
         conv[ch] = s;
     }
@@ -445,9 +445,9 @@ fn recurrent_layer_state_bisect() {
     let mut ref_state = cache.conv_state.clone();
     let mut conv = vec![0.0f32; conv_dim()];
     for ch in 0..conv_dim() {
-        let mut sum = qkv[ch] * cw[(TAPS - 1) * conv_dim() + ch];
+        let mut sum = qkv[ch] * cw[ch * TAPS + (TAPS - 1)];
         for k in 0..TAPS - 1 {
-            sum += ref_state[ch * (TAPS - 1) + k] * cw[k * conv_dim() + ch];
+            sum += ref_state[ch * (TAPS - 1) + k] * cw[ch * TAPS + k];
         }
         conv[ch] = sum;
     }

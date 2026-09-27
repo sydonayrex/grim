@@ -109,9 +109,10 @@ fn build_block(device: &Device, dev: Option<&RocmDevice>) -> Qwen35Block {
             Shape::new(vec![HIDDEN, value_dim()]),
         )),
         // Present and f32, which is what the device path requires.
+        // ggml ne0 is the tap count, so the loaded tensor is [conv_dim, taps].
         ssm_conv1d: Some(mk(
             w(5, conv_dim() * TAPS),
-            Shape::new(vec![TAPS, conv_dim()]),
+            Shape::new(vec![conv_dim(), TAPS]),
         )),
         ssm_conv_vec: None,
         ssm_a: Some(w(6, NV)),
