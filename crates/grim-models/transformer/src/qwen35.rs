@@ -24,6 +24,7 @@ use grim_tensor::{
 /// ponytail: a `OnceLock<bool>` read of the env var per site; if this ever
 /// needs per-run toggling at runtime, add a setter — a channel nobody uses
 /// today is not a feature.
+#[allow(dead_code)]
 fn d2d_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GRIM_D2D_TRACE").is_ok())
