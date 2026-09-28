@@ -3196,6 +3196,58 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35 => {
+            // Qwen3.5/3.8 geometry comes from the CHECKPOINT, or the run fails
+            // here. It does not get a default.
+            //
+            // `ArchHyperparameters` resolves every one of these through
+            // `unwrap_or(<literal>)` (hyperparams.rs:243-331, 369-389). Two of
+            // those literals are already WRONG for this family:
+            // `rope_theta -> unwrap_or(10000.0)` where the checkpoint says
+            // 1e7, and `ssm_dt_rank -> unwrap_or(48)` where it says 32. They
+            // only bite when a key is MISSING, and then they do not crash — they
+            // silently produce a plausible model with the wrong geometry, which
+            // is the worst failure mode there is. `ssm_dt_rank` in particular
+            // sets num_v_heads, value_dim and conv_dim together, so a bad
+            // default corrupts every recurrent layer at once.
+            //
+            // Keys genuinely absent from these GGUFs are NOT listed here:
+            // `attention.key_length` is one (head_dim must be derived as
+            // embedding_length/head_count, which `hyperparams.rs:283-285`
+            // already does), and so are the norm epsilon and the FFN width,
+            // which the converter fills under other names. What is listed is
+            // what the forward genuinely cannot run without.
+            const QWEN35_REQUIRED: &[&str] = &[
+                "qwen35.embedding_length",
+                "qwen35.block_count",
+                "qwen35.attention.head_count",
+                "qwen35.attention.head_count_kv",
+                "qwen35.rope.freq_base",
+                "qwen35.rope.dimension_count",
+                "qwen35.ssm.inner_size",
+                "qwen35.ssm.conv_kernel",
+                "qwen35.ssm.time_step_rank",
+                "qwen35.ssm.group_count",
+                "qwen35.ssm.state_size",
+            ];
+            // Presence, not integer-ness: `qwen35.rope.freq_base` is a Float32,
+            // and probing it with `get_u32` reports a key that IS present as
+            // missing. That is the same failure mode as a hardcoded default —
+            // a correct value judged wrong because it was read the wrong way.
+            let missing: Vec<&str> = QWEN35_REQUIRED
+                .iter()
+                .copied()
+                .filter(|k| provider.metadata(k).is_none())
+                .collect();
+            if !missing.is_empty() {
+                return Err(grim_core::error::Error::Config(format!(
+                    "Qwen3.5/3.8 checkpoint is missing required geometry key(s) {missing:?}. \
+                     Refusing to fall back to hardcoded defaults: the arch's literals are \
+                     correct for one model size and silently wrong for another (rope_theta \
+                     defaults to 10000 where this family uses 1e7; ssm.time_step_rank defaults \
+                     to 48 where this family uses 32), and a wrong value there corrupts \
+                     every recurrent layer rather than failing."
+                )));
+            }
             let layer_split = qwen35_layer_split_enabled();
             let tp_active = !layer_split
                 && TensorParallelConfig::from_env()
