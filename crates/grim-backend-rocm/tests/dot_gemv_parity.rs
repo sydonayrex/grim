@@ -2072,3 +2072,91 @@ fn dot4_q80_q81_gemv_parity_on_rdna2_apu() {
         "RDNA2 Q8_0 dot4 diverges from CPU reference: {diff}"
     );
 }
+
+/// SPEED-DOT Phase 2 (9B perf plan): `grim_dot4_q4k_q81_gemv_fast` — the
+/// word-wide-mask nibble unpack variant. The probe (dot4_gemv_floor_probe)
+/// measured the stock kernel at 23 GB/s vs 304 GB/s for the q8_0 kernel with
+/// the SAME sdot4 loop: the per-byte select/shift/pack unpack chain is the
+/// bottleneck, not DRAM. The fast kernel unpacks both nibble sub-blocks of a
+/// 32-bit word with two AND/SHIFT masks and feeds them straight to sdot4.
+/// This gate pins the fast kernel to the CPU dequant-matmul reference at a
+/// multi-superblock shape before it is allowed near production dispatch.
+#[test]
+#[ignore]
+fn dot4_q4k_gemv_fast_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+        std::env::set_var("GRIM_DOT4_FAST", "1");
+    }
+
+    let m = 1usize;
+    let n = 512usize;
+    let k = 4096usize; // 16 Q4_K superblocks per row
+
+    let mut seed = 0xBEEFu64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q4k(&b_f32).expect("quant_q4k");
+
+    let q4k_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q4K),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![n, k]),
+        q4k_dtype,
+    )
+    .expect("upload q4k weights");
+
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let out_shape = Shape::new(vec![m, n]);
+
+    let (c_storage, handle) = dev
+        .quantized_matmul(
+            a_dev.as_ref(),
+            b_dev.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q4K,
+            &out_shape,
+        )
+        .expect("quantized_matmul dot4 q4k fast");
+    handle.synchronize().expect("sync handle");
+    let c_dev = c_storage.to_cpu_vec_f32().expect("d2h c");
+    assert_eq!(c_dev.len(), m * n);
+
+    let row_bytes = (k / 256) * 144;
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let brow = &b_bytes[col * row_bytes..(col + 1) * row_bytes];
+        let b_deq = grim_quant::dequant_q4k(brow, k).expect("dequant_q4k");
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a_f32[kk] * b_deq[kk];
+        }
+        c_cpu[col] = acc;
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[dot4-q4k-fast-parity] n={n} k={k} max_diff={diff:.6}");
+    assert!(
+        diff < 0.5,
+        "dot4 Q4_K FAST GEMV diverges from CPU reference: {diff}"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+        std::env::set_var("GRIM_DOT4_FAST", "0");
+    }
+}

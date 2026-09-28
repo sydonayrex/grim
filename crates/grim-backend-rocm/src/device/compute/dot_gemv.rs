@@ -1235,8 +1235,21 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
+        // SPEED-DOT Phase 2: GRIM_DOT4_FAST=1 selects the word-wide-mask
+        // unpack variant. The floor probe measured the stock kernel at
+        // 23 GB/s vs 304 GB/s for q8_0 with the same sdot4 loop — the
+        // per-byte unpack chain is the bottleneck. The parity gate
+        // (dot4_q4k_gemv_fast_parity) must be green before this goes default.
+        static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let kernel_name = if *FAST.get_or_init(|| {
+            matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("1" | "true"))
+        }) {
+            "grim_dot4_q4k_q81_gemv_fast"
+        } else {
+            "grim_dot4_q4k_q81_gemv"
+        };
         self.launch_compute_kernel(
-            "grim_dot4_q4k_q81_gemv",
+            kernel_name,
             grid_dim,
             block_dim,
             &mut [

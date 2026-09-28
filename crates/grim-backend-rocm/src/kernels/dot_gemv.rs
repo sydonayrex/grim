@@ -2522,6 +2522,140 @@ extern "C" __global__ void grim_sdot4_probe(
 #endif
     if (i == 0) out[n] = (float)warpSize; // wave-size report (buffer sized n+1)
 }
+
+// SPEED-DOT Phase 2 (9B perf plan Step 2): word-wide-mask variant of
+// grim_dot4_q4k_q81_gemv. The floor probe (tests/dot4_gemv_floor_probe.rs)
+// measured the stock kernel at ~23 GB/s vs ~304 GB/s for the q8_0 kernel
+// with the SAME sdot4 loop and grid mapping: the per-byte
+// select/shift/pack nibble unpack is an instruction-throughput bottleneck,
+// not DRAM. Here one 32-bit load of the packed nibbles yields BOTH
+// sub-block dot operands of a group via two masks
+//   lo = w & 0x0F0F0F0F   (sub-block 2g, low nibbles)
+//   hi = (w >> 4) & 0x0F0F0F0F (sub-block 2g+1, high nibbles)
+// fed straight to sdot4: ~10x fewer integer ops per element. Grid mapping,
+// block size and accumulation order per sub-block are identical to the
+// stock kernel; parity is gated in tests/dot_gemv_parity.rs
+// (dot4_q4k_gemv_fast_parity).
+__launch_bounds__(32, 3)
+extern "C" __global__ void grim_dot4_q4k_q81_gemv_fast(
+    const unsigned char* __restrict__ A_q81,
+    const unsigned char* __restrict__ B_q4k,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    // Register-pressure variant: 2 columns per workgroup, pair-wise nibble
+    // masks, bounded unroll. The stock 4-col kernel compiles to 192 VGPRs +
+    // 560 B scratch (rocprof kernel-symbol dump) -> 1 wave/SIMD plus
+    // local-memory spills; the 88-VGPR q8_0 sibling sustains 300 GB/s.
+    // Grid mapping changes (N/2 blocks), accumulation order per column does
+    // not. Parity: tests/dot_gemv_parity.rs dot4_q4k_gemv_fast_parity.
+    const int col_base = blockIdx.x * 2;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_q81_blocks = K / GRIM_Q8_1_BLOCK_SIZE;
+    const int n_q4k_superblocks = K / GRIM_Q4K_SUPERBLOCK_SIZE;
+    const unsigned char* a_row = A_q81 + (long long)row * n_q81_blocks * GRIM_Q8_1_BYTES;
+
+    const unsigned char* b_col[2];
+    const int active_cols = (col_base + 2 <= N) ? 2 : (N - col_base);
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q4k + (long long)(col_base + j) * n_q4k_superblocks * GRIM_Q4K_BYTES
+                 : nullptr;
+    }
+
+    float facc[2] = {0.0f, 0.0f};
+
+    for (int sb = lane; sb < n_q4k_superblocks; sb += 32) {
+        const unsigned char* a_sb = a_row + sb * 8 * GRIM_Q8_1_BYTES;
+
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_sb = b_col[j] + sb * GRIM_Q4K_BYTES;
+
+            const unsigned short* h_ptr = (const unsigned short*)b_sb;
+            float d    = fp16_to_float_device(h_ptr[0]);
+            float dmin = fp16_to_float_device(h_ptr[1]);
+
+            const unsigned char* scales = b_sb + 4;
+            const unsigned char* qs     = b_sb + 16;
+
+            // Pairs of sub-blocks (2g, 2g+1) share the same 32 packed bytes:
+            // low nibbles of word w are sub-block 2g's codes, high nibbles
+            // are 2g+1's. Two masks per word replace the stock kernel's
+            // per-byte select/shift/pack chain. Unroll by 2: full unroll
+            // bloated live ranges past the wave-residency cliff.
+            #pragma unroll 2
+            for (int g = 0; g < 4; ++g) {
+                int is0 = 2 * g;
+                int is1 = 2 * g + 1;
+                unsigned char sc0, m0, sc1, m1;
+                if (is0 < 4) {
+                    sc0 = scales[is0] & 63;
+                    m0  = scales[is0 + 4] & 63;
+                    sc1 = scales[is1] & 63;
+                    m1  = scales[is1 + 4] & 63;
+                } else {
+                    sc0 = (scales[is0 + 4] & 0x0F) | ((scales[is0 - 4] >> 6) << 4);
+                    m0  = (scales[is0 + 4] >> 4)  | ((scales[is0] >> 6) << 4);
+                    sc1 = (scales[is1 + 4] & 0x0F) | ((scales[is1 - 4] >> 6) << 4);
+                    m1  = (scales[is1 + 4] >> 4)  | ((scales[is1] >> 6) << 4);
+                }
+
+                const unsigned char* a_blk0 = a_sb + is0 * GRIM_Q8_1_BYTES;
+                const unsigned char* a_blk1 = a_sb + is1 * GRIM_Q8_1_BYTES;
+                float d_a0 = fp16_to_float_device(((const unsigned short*)a_blk0)[0]);
+                float sum_a0 = fp16_to_float_device(((const unsigned short*)a_blk0)[1]);
+                float d_a1 = fp16_to_float_device(((const unsigned short*)a_blk1)[0]);
+                float sum_a1 = fp16_to_float_device(((const unsigned short*)a_blk1)[1]);
+                const signed char* a_codes0 = (const signed char*)(a_blk0 + 4);
+                const signed char* a_codes1 = (const signed char*)(a_blk1 + 4);
+
+                const unsigned char* qs_sub = qs + g * 32;
+
+                int pos_lo = 0;
+                int pos_hi = 0;
+                #pragma unroll
+                for (int w8 = 0; w8 < 8; ++w8) {
+                    unsigned int word;
+                    __builtin_memcpy(&word, qs_sub + w8 * 4, 4);
+                    unsigned int lo = word & 0x0F0F0F0Fu;
+                    unsigned int hi = (word >> 4) & 0x0F0F0F0Fu;
+
+                    int a4lo, a4hi;
+                    __builtin_memcpy(&a4lo, a_codes0 + w8 * 4, 4);
+                    __builtin_memcpy(&a4hi, a_codes1 + w8 * 4, 4);
+
+                    pos_lo = grim_sdot4(a4lo, (int)lo, pos_lo);
+                    pos_hi = grim_sdot4(a4hi, (int)hi, pos_hi);
+                }
+
+                facc[j] += d * (float)sc0 * ((float)pos_lo * d_a0) - dmin * (float)m0 * sum_a0;
+                facc[j] += d * (float)sc1 * ((float)pos_hi * d_a1) - dmin * (float)m1 * sum_a1;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 "#;
 
 #[cfg(test)]
