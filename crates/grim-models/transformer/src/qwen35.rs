@@ -783,6 +783,23 @@ impl Qwen35Block {
 
             let mut rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
             rope_cfg.rotary_dim = self.rotary_dim;
+            // NeoX HALF-SPLIT pairing, not GPT-J interleaved.
+            //
+            // `RopeConfig::interleaved` defaults to `true` (x[2i], x[2i+1]) because
+            // that is what the LFM2 family uses. Qwen3.5/3.8 does NOT: llama.cpp
+            // runs it through `ggml_rope_multi`, whose NEOX/MROPE branch is
+            //   `rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst)`
+            // (ggml/src/ggml-cpu/ops.cpp:6212), and `rotate_pairs` reads
+            //   x0 = src[ic],  x1 = src[ic + n_offset]        (ops.cpp:6073-6074)
+            // i.e. dim i pairs with dim i + n_dims/2 — the half-split. With
+            // rotary_dim=64 that is (0,32),(1,33),...,(31,63), and dims 64..255
+            // pass through unrotated.
+            //
+            // Leaving the default silently rotated Q/K by the wrong pairs. It is
+            // invisible at position 0, where a RoPE is the identity, which is why
+            // every position-0 assertion and every one-token gate passed while
+            // the model was comprehensively wrong.
+            rope_cfg.interleaved = false;
             let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
                 let mut pos_ext = Vec::with_capacity(seq_len * heads);
                 for &pos in positions {
@@ -2362,6 +2379,7 @@ fn attention_layer_d2d(
     // --- RoPE, on device ---------------------------------------------------
     let mut rope_cfg = grim_tensor::RopeConfig::new(blk.head_dim, blk.rope_theta);
     rope_cfg.rotary_dim = blk.rotary_dim;
+    rope_cfg.interleaved = false; // NeoX half-split; see the D2D site above.
     let rope_ext = |t: &Tensor, heads: usize| -> Result<Tensor> {
         let mut pos_ext = Vec::with_capacity(seq_len * heads);
         for &pos in positions {
