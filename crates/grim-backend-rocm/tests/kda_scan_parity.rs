@@ -36,13 +36,6 @@ use grim_tensor::CoreTensorOps;
 use grim_tensor::{DType, Shape};
 use std::sync::Arc;
 
-
-
-
-
-
-
-
 const EPS: f32 = 1e-6;
 
 fn gpu_device() -> Option<Arc<RocmDevice>> {
@@ -51,8 +44,11 @@ fn gpu_device() -> Option<Arc<RocmDevice>> {
         return None;
     }
     let _lock = grim_backend_rocm::device::util::gpu_test_lock();
-    std::panic::catch_unwind(|| Arc::new(RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")))
-        .ok()
+    Some(Arc::new(RocmDevice::try_new(0).expect(
+        "GRIM_GPU_TEST=1 is set but RocmDevice::try_new(0) failed. Failing loudly rather \
+         than catch_unwind().ok(): a swallowed init failure turns this gate GREEN with \
+         zero assertions run, which is how a real defect hides behind a passing test.",
+    )))
 }
 
 fn linspace(n: usize, lo: f64, hi: f64) -> Vec<f32> {
@@ -74,7 +70,11 @@ fn softplus(x: f64) -> f64 {
     }
 }
 
-fn upload(dev: &Arc<RocmDevice>, data: &[f32], shape: Shape) -> Box<dyn grim_tensor::BackendStorage> {
+fn upload(
+    dev: &Arc<RocmDevice>,
+    data: &[f32],
+    shape: Shape,
+) -> Box<dyn grim_tensor::BackendStorage> {
     CoreTensorOps::from_cpu(dev.as_ref(), data, &shape, DType::F32).expect("from_cpu")
 }
 
@@ -135,7 +135,11 @@ fn check_geometry(dev: &Arc<RocmDevice>, nv: usize, nk: usize, d: usize, seq_len
         .expect("kda_gated_delta_rule_scan");
     handle.synchronize().expect("sync");
     let got = got.to_cpu_vec_f32().expect("read output");
-    assert_eq!(got.len(), seq_len * nv * d, "output must be [seq_len, nv*d]");
+    assert_eq!(
+        got.len(),
+        seq_len * nv * d,
+        "output must be [seq_len, nv*d]"
+    );
 
     // f64 oracle, token by token, threading the state.
     let mut want_state: Vec<f64> = seed.iter().map(|&v| v as f64).collect();
@@ -234,7 +238,11 @@ fn reference_step_head(
     let mut acc = vec![0.0f64; d];
     for j in 0..d {
         let row = &mut head[j * d..(j + 1) * d];
-        let pred: f64 = k_l2.iter().zip(row.iter()).map(|(k, s)| k * (decay * s)).sum();
+        let pred: f64 = k_l2
+            .iter()
+            .zip(row.iter())
+            .map(|(k, s)| k * (decay * s))
+            .sum();
         let delta = beta_val * (qv[j] - pred);
         for i in 0..d {
             row[i] = decay * row[i] + k_l2[i] * delta;
@@ -369,7 +377,9 @@ fn checkpoint() -> Option<std::path::PathBuf> {
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
         if p.exists() {
             return Some(p);
         }
@@ -394,7 +404,11 @@ fn q8_0_dequant_matches_llama_cpp_on_the_real_alpha_weight() {
     let bytes = read_tensor_bytes(&mut reader, &file, target).expect("read tensor");
     let (out_n, in_n) = (target.dims[0] as usize, target.dims[1] as usize);
     let elems = out_n * in_n;
-    assert_eq!(bytes.len(), (elems / QK8_0) * Q8_0_BLOCK_BYTES, "Q8_0 packed size");
+    assert_eq!(
+        bytes.len(),
+        (elems / QK8_0) * Q8_0_BLOCK_BYTES,
+        "Q8_0 packed size"
+    );
 
     let mut oracle = vec![0.0f32; elems];
     llama_cpp_dequantize_row_q8_0(&bytes, &mut oracle, elems);
@@ -424,7 +438,9 @@ fn q8_0_dequant_matches_llama_cpp_on_the_real_alpha_weight() {
             at = i;
         }
     }
-    eprintln!("[q8_0] ssm_alpha [{out_n},{in_n}]: storage decode vs llama.cpp worst {worst:.3e} at {at}");
+    eprintln!(
+        "[q8_0] ssm_alpha [{out_n},{in_n}]: storage decode vs llama.cpp worst {worst:.3e} at {at}"
+    );
     assert!(
         worst < 1e-5,
         "grim's Q8_0 DECODER disagrees with llama.cpp by {worst:.3e} at {at} on the real \
@@ -434,13 +450,23 @@ fn q8_0_dequant_matches_llama_cpp_on_the_real_alpha_weight() {
     eprintln!("[q8_0] decoder matches llama.cpp bit-for-bit on the real weight");
 }
 
-/// Does the Q8_0 GEMM depend on m? The dispatch sends every m <= 64 down the
-/// dot4 GEMV path, which its own comment describes as the M=1 decode kernel.
-/// If that kernel is only correct at one row, the prefill is silently wrong
-/// while decode is right.
+/// The Q8_0 GEMM, with `arith` as the last variable.
+///
+/// Two things this replaces a worse version of:
+///   * the previous sweep read `(out_n, in_n)` from `read_gguf`'s dims, which
+///     report this tensor as [4096, 32] while the BLOCK loads it as
+///     [out=32, in=4096]. That transposed the problem, and since the oracle was
+///     indexed the same way the two agreed and the sweep "passed" while
+///     testing a computation production never performs. The geometry is now
+///     asserted, not inferred.
+///   * `dtype().arith` is a free variable the loader does not fix: a quantized
+///     tensor is `arith = F32` with the K-quant in `storage`, while a hand
+///     upload often uses U8. If the Q8_0 dispatch branches on arith, one of
+///     them takes a different path — and `Linear::forward` passes the LOADER's
+///     arith, so this is the one input that differs from a hand-rolled call.
 #[test]
 #[ignore = "device-gated: run with GRIM_GPU_TEST=1"]
-fn q8_0_gemm_accuracy_vs_m() {
+fn q8_0_gemm_arith_and_m() {
     use grim_tensor::{CoreTensorOps, QuantFormat, Storage as DTypeStorage};
     if !grim_backend_rocm::gpu_test_enabled() {
         eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run");
@@ -456,61 +482,230 @@ fn q8_0_gemm_accuracy_vs_m() {
         .find(|t| t.name == "blk.0.ssm_alpha.weight" && t.dtype == GgufDType::Q8_0)
         .expect("ssm_alpha is Q8_0");
     let bytes = read_tensor_bytes(&mut reader, &file, target).expect("read tensor");
-    // GEOMETRY IS ASSERTED, NOT ASSUMED. `read_gguf` reports this tensor as
-    // [4096, 32]; the BLOCK loads it as [out=32, in=4096]. An earlier version of
-    // this sweep took (dims[0], dims[1]) as (out, in), which silently TRANSPOSED
-    // the problem: the GEMM and the oracle were then wrong in the same way and
-    // agreed, so the sweep "passed" while testing a computation production never
-    // performs. The element COUNT is order-independent, which is why the decoder
-    // gate was still valid.
-    let (out_n, in_n) = (32usize, 4096usize);
-    let elems = out_n * in_n;
+
+    // Asserted geometry: the block loads this as [out=32, in=4096].
+    const OUT_N: usize = 32;
+    const IN_N: usize = 4096;
+    let elems = OUT_N * IN_N;
     assert_eq!(
         elems,
         (target.dims[0] as usize) * (target.dims[1] as usize),
-        "element count must match the file regardless of dim order"
+        "element count is order-independent, so it still matches the file"
     );
-    // Decode in the BLOCK's [out, in] order: weight[j * in_n + t] is output j,
-    // input t. Q8_0 is elementwise, so the flat order is the file order; the
-    // (out, in) split only fixes how the flat stream is INTERPRETED below.
     let mut w = vec![0.0f32; elems];
     llama_cpp_dequantize_row_q8_0(&bytes, &mut w, elems);
 
     let dev = Arc::new(RocmDevice::try_new(0).expect("device"));
-    let b = grim_tensor::MemoryOps::from_cpu_bytes(
-        dev.as_ref(),
-        &bytes,
-        &Shape::new(vec![out_n, in_n]),
-        DType {
-            arith: grim_tensor::ArithType::U8,
-            storage: DTypeStorage::KQuant(KQuantScheme::Q80),
-        },
-    )
-    .expect("upload packed Q8_0");
-
-    // Distinct rows, so an m-dependent defect cannot hide behind symmetry.
-    for m in [1usize, 2, 4, 5, 8, 16] {
-        let a_src: Vec<f32> = (0..m * in_n).map(|i| (i as f32 * 0.013).sin()).collect();
-        let a = CoreTensorOps::from_cpu(dev.as_ref(), &a_src, &Shape::new(vec![m, in_n]), DType::F32)
+    for (tag, arith) in [
+        ("arith=U8 ", grim_tensor::ArithType::U8),
+        ("arith=F32", grim_tensor::ArithType::F32),
+    ] {
+        let b = grim_tensor::MemoryOps::from_cpu_bytes(
+            dev.as_ref(),
+            &bytes,
+            &Shape::new(vec![OUT_N, IN_N]),
+            DType {
+                arith,
+                storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+            },
+        )
+        .expect("upload packed Q8_0");
+        for m in [1usize, 5] {
+            let a_src: Vec<f32> = (0..m * IN_N).map(|i| (i as f32 * 0.013).sin()).collect();
+            let a = CoreTensorOps::from_cpu(
+                dev.as_ref(),
+                &a_src,
+                &Shape::new(vec![m, IN_N]),
+                DType::F32,
+            )
             .expect("A");
-        let (got, handle) = dev
-            .fused_quant_gemm(a.as_ref(), b.as_ref(), QuantFormat::Q8_0, &Shape::new(vec![m, out_n]))
-            .unwrap_or_else(|e| panic!("Q8_0 fused_quant_gemm m={m}: {e}"));
-        handle.synchronize().expect("sync");
-        let got = got.to_cpu_vec_f32().expect("read");
-        let mut worst = 0.0f32;
-        for i in 0..m {
-            for j in 0..out_n {
-                let mut acc = 0.0f64;
-                for t in 0..in_n {
-                    acc += a_src[i * in_n + t] as f64 * w[j * in_n + t] as f64;
-                }
-                let d = (got[i * out_n + j] - acc as f32).abs() / (acc as f32).abs().max(1.0);
-                if d > worst {
-                    worst = d;
+            let (got, handle) = dev
+                .fused_quant_gemm(
+                    a.as_ref(),
+                    b.as_ref(),
+                    QuantFormat::Q8_0,
+                    &Shape::new(vec![m, OUT_N]),
+                )
+                .unwrap_or_else(|e| panic!("{tag} m={m}: {e}"));
+            handle.synchronize().expect("sync");
+            let got = got.to_cpu_vec_f32().expect("read");
+            let mut worst = 0.0f32;
+            for i in 0..m {
+                for j in 0..OUT_N {
+                    let mut acc = 0.0f64;
+                    for t in 0..IN_N {
+                        acc += a_src[i * IN_N + t] as f64 * w[j * IN_N + t] as f64;
+                    }
+                    let d = (got[i * OUT_N + j] - acc as f32).abs() / (acc as f32).abs().max(1.0);
+                    if d > worst {
+                        worst = d;
+                    }
                 }
             }
+            eprintln!("[q8_0-gemm] {tag} m={m}: max rel err {worst:.3e}");
         }
-        eprintln!("[q8_0-gemm] ssm_alpha m={m}: max rel err {worst:.3e}");
     }
+}
+
+// ── THE PRODUCTION CHAIN: scan (prefill) then batched (decode) ──────────────
+//
+// Every per-kernel gate here was green while 9B decode diverged from eager
+// after exactly one token. The untested shape was the CHAIN: the 5-token
+// prefill runs `kda_gated_delta_rule_scan` against `ssm_state_dev`, then every
+// decode step runs `kda_gated_delta_rule_batched` against the state THE SCAN
+// LEFT. This test runs both orders on identical inputs and states, plus the
+// f64 oracle chain:
+//
+//   arm A: scan(t=0..5)  -> batched(t=5)   (production)
+//   arm B: batched(t=0..5)                  (batched-only chain)
+//   oracle: reference_step_head x 6
+//
+// A!=oracle localizes the break to whichever kernel wrote the state the other
+// misreads; A==B!=oracle indicts both; all-equal exonerates the kernels and
+// moves the search to the conv chain or the wrapper's per-token layouts.
+#[test]
+#[ignore]
+fn scan_then_batched_chain_matches_oracle_at_9b_geometry() {
+    let Some(dev) = gpu_device() else { return };
+    let (nv, nk, d) = (32usize, 16usize, 128usize);
+    let conv_dim = 2 * nk * d + nv * d;
+    let t_scan = 5usize;
+    let total = t_scan + 1usize;
+
+    // Distinct per-token streams (same generator style as check_geometry).
+    let mut conv = Vec::with_capacity(total * conv_dim);
+    let mut alpha = Vec::with_capacity(total * nv);
+    let mut beta = Vec::with_capacity(total * nv);
+    let mut z = Vec::with_capacity(total * nv * d);
+    for t in 0..total {
+        let s = t as f64;
+        conv.extend(linspace(conv_dim, -1.5 + 0.3 * s, 2.0 - 0.4 * s));
+        alpha.extend(linspace(nv, -0.4 + 0.1 * s, 0.6));
+        beta.extend(linspace(nv, -1.0, 1.0));
+        z.extend(linspace(nv * d, -0.7 + 0.05 * s, 0.7));
+    }
+    let dt_bias = linspace(nv, 0.1, 0.9);
+    let ssm_a = linspace(nv, 0.5, 1.5);
+    let norm_w = linspace(d, 0.8, 1.2);
+    let seed = linspace(nv * d * d, -0.3, 0.3);
+
+    // ── oracle ──
+    let mut oracle_state: Vec<f64> = seed.iter().map(|&v| v as f64).collect();
+    let mut oracle_last = vec![0.0f64; nv * d];
+    for t in 0..total {
+        for h in 0..nv {
+            let mut head_acc = vec![0.0f64; d];
+            reference_step_head(
+                &conv[t * conv_dim..(t + 1) * conv_dim],
+                alpha[t * nv + h],
+                beta[t * nv + h],
+                h,
+                &dt_bias,
+                &ssm_a,
+                &norm_w,
+                Some(&z[t * nv * d..(t + 1) * nv * d]),
+                nk,
+                d,
+                &mut oracle_state,
+                &mut head_acc,
+            );
+            oracle_last[h * d..(h + 1) * d].copy_from_slice(&head_acc);
+        }
+    }
+
+    // ── arm B: batched x 6 on a fresh copy of the seed ──
+    // Uploads happen ONCE (whole sequence) and are held for the arm's
+    // lifetime: an upload temporary dropped at statement end returns its block
+    // to the caching allocator while the async kernel may still be queued, and
+    // the next iteration's upload hands the same block out — a race the
+    // per-kernel gates never hit because they upload before a single launch.
+    let state_b = upload(&dev, &seed, Shape::new(vec![nv, d, d]));
+    let dt_b = upload(&dev, &dt_bias, Shape::new(vec![nv]));
+    let a_b = upload(&dev, &ssm_a, Shape::new(vec![nv]));
+    let nw_b = upload(&dev, &norm_w, Shape::new(vec![d]));
+    let mut b = vec![0.0f32; nv * d];
+    for t in 0..total {
+        let (out, h) = dev
+            .kda_gated_delta_rule_batched(
+                upload(&dev, &conv[t * conv_dim..(t + 1) * conv_dim], Shape::new(vec![conv_dim])).as_ref(),
+                upload(&dev, &alpha[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
+                upload(&dev, &beta[t * nv..(t + 1) * nv], Shape::new(vec![nv])).as_ref(),
+                dt_b.as_ref(),
+                a_b.as_ref(),
+                nw_b.as_ref(),
+                Some(upload(&dev, &z[t * nv * d..(t + 1) * nv * d], Shape::new(vec![nv * d])).as_ref()),
+                state_b.as_ref(),
+                nv,
+                nk,
+                d,
+                EPS,
+                &Shape::new(vec![nv * d]),
+            )
+            .expect("batched chain");
+        h.synchronize().unwrap();
+        b = out.to_cpu_vec_f32().expect("read B");
+    }
+
+    // ── arm A: scan(5) -> batched(1) on one device state ──
+    let state_a = upload(&dev, &seed, Shape::new(vec![nv, d, d]));
+    let out_shape_scan = Shape::new(vec![t_scan, nv * d]);
+    let (scan_out, h) = dev
+        .kda_gated_delta_rule_scan(
+            upload(&dev, &conv[..t_scan * conv_dim], Shape::new(vec![t_scan, conv_dim])).as_ref(),
+            upload(&dev, &alpha[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
+            upload(&dev, &beta[..t_scan * nv], Shape::new(vec![t_scan, nv])).as_ref(),
+            upload(&dev, &dt_bias, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &ssm_a, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &norm_w, Shape::new(vec![d])).as_ref(),
+            Some(upload(&dev, &z[..t_scan * nv * d], Shape::new(vec![t_scan, nv * d])).as_ref()),
+            state_a.as_ref(),
+            t_scan,
+            nv,
+            nk,
+            d,
+            EPS,
+            &out_shape_scan,
+        )
+        .expect("scan in chain");
+    h.synchronize().unwrap();
+    drop(scan_out);
+    let (a_out, h) = dev
+        .kda_gated_delta_rule_batched(
+            upload(&dev, &conv[t_scan * conv_dim..], Shape::new(vec![conv_dim])).as_ref(),
+            upload(&dev, &alpha[t_scan * nv..], Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &beta[t_scan * nv..], Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &dt_bias, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &ssm_a, Shape::new(vec![nv])).as_ref(),
+            upload(&dev, &norm_w, Shape::new(vec![d])).as_ref(),
+            Some(upload(&dev, &z[t_scan * nv * d..], Shape::new(vec![nv * d])).as_ref()),
+            state_a.as_ref(),
+            nv,
+            nk,
+            d,
+            EPS,
+            &Shape::new(vec![nv * d]),
+        )
+        .expect("batched after scan");
+    h.synchronize().unwrap();
+    let a = a_out.to_cpu_vec_f32().expect("read A");
+
+    let rel = |got: &[f32]| -> f32 {
+        got.iter()
+            .zip(&oracle_last)
+            .map(|(&g, &w)| ((g as f64 - w) / w.abs().max(1e-3)).abs() as f32)
+            .fold(0.0f32, f32::max)
+    };
+    let a_err = rel(&a);
+    let b_err = rel(&b);
+    eprintln!("[kda-chain] scan->batched vs oracle: {a_err:.3e}; batched-only vs oracle: {b_err:.3e}");
+    assert!(
+        b_err < 1e-3,
+        "batched-only chain diverges from the oracle ({b_err:.3e}) — the chain test's own baseline is broken"
+    );
+    assert!(
+        a_err < 1e-3,
+        "scan->batched chain diverges from the oracle ({a_err:.3e}) while batched-only matches \
+         ({b_err:.3e}): the scan leaves the state in a form the batched decode step misreads — \
+         this is the 9B decode divergence"
+    );
 }

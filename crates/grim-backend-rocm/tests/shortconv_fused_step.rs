@@ -102,3 +102,135 @@ fn fused_shortconv_step_matches_split() {
 fn rocm<'a>(s: &'a Box<dyn grim_tensor::BackendStorage>) -> &'a RocmStorage {
     as_rocm(s.as_ref()).unwrap()
 }
+
+// ── THE PRODUCTION CHAIN: scan (prefill) then step (decode) ────────────────
+// Same methodology as the KDA chain gate: every per-kernel conv gate was
+// green while eager device-KDA decode diverged after one token. The untested
+// shape is the chain — the 5-token prefill runs `grim_short_conv1d_scan`
+// against the device ring, then every decode step runs
+// `grim_short_conv1d_causal_step` against the ring THE SCAN LEFT. 9B dims:
+// channels 8192, taps 4.
+/// FOUND DEFECT (KDA graph fix session): `grim_short_conv1d_scan` computes
+/// wrong outputs from token 0 against a fresh ring (worst 0.92 on random data
+/// at the 9B's 8192x4 shape), while `grim_short_conv1d_causal_step` chained
+/// over the same tokens matches the CPU exactly. Ignored rather than deleted:
+/// this is the failing evidence for the D2D KDA decode divergence, and the
+/// first gate the scan fix has to turn green. diagnostics print per token.
+#[test]
+#[ignore = "documents a real grim_short_conv1d_scan defect; run to verify the fix"]
+fn conv_scan_then_step_chain_matches_step_only() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    let channels = 8192usize;
+    let ks = 4usize;
+    let seq = 6usize;
+    let x: Vec<f32> = rand_f32(seq * channels, 11);
+    let weight: Vec<f32> = rand_f32(channels * ks, 12);
+    let state0: Vec<f32> = rand_f32(channels * (ks - 1), 13);
+    let w_s = f32_tensor(&dev, &weight, &Shape::new(vec![channels, ks]));
+
+    // CPU reference: y[t][c] = sum_k ring[t][k]*w[c][k]; ring shifts per token.
+    let mut ring = state0.clone();
+    let mut cpu_out = vec![0.0f32; seq * channels];
+    for t in 0..seq {
+        for c in 0..channels {
+            let off = c * (ks - 1);
+            let mut sum = x[t * channels + c] * weight[c * ks + ks - 1];
+            for k in 0..ks - 1 {
+                sum += ring[off + k] * weight[c * ks + k];
+            }
+            cpu_out[t * channels + c] = sum;
+        }
+        for c in 0..channels {
+            let off = c * (ks - 1);
+            for k in 0..ks - 2 {
+                ring[off + k] = ring[off + k + 1];
+            }
+            ring[off + ks - 2] = x[t * channels + c];
+        }
+    }
+
+    // Arm B: six single-token steps (decode-only chain), state held on device.
+    let state_b = f32_tensor(&dev, &state0, &Shape::new(vec![channels * (ks - 1)]));
+    let mut b = vec![0.0f32; channels];
+    for t in 0..seq {
+        let x_s = f32_tensor(&dev, &x[t * channels..(t + 1) * channels], &Shape::new(vec![channels]));
+        let out_b = f32_tensor(&dev, &vec![0.0f32; channels], &Shape::new(vec![channels]));
+        dev.short_conv1d_causal_step_into(
+            x_s.as_ref(),
+            w_s.as_ref(),
+            None,
+            state_b.as_ref(),
+            rocm(&out_b),
+        )
+        .unwrap();
+        dev.synchronize();
+        b.copy_from_slice(&out_b.to_cpu_vec_f32().unwrap());
+        if t == seq - 1 {
+            let worst = b
+                .iter()
+                .zip(&cpu_out[t * channels..])
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 1e-2, "step-only chain diverges from CPU: {worst}");
+        }
+    }
+
+    // Arm A: one 5-token scan (prefill) + 1 step (decode) on a fresh ring.
+    let state_a = f32_tensor(&dev, &state0, &Shape::new(vec![channels * (ks - 1)]));
+    let x5 = f32_tensor(&dev, &x[..5 * channels], &Shape::new(vec![5, channels]));
+    let out5 = f32_tensor(&dev, &vec![0.0f32; 5 * channels], &Shape::new(vec![5, channels]));
+    dev.short_conv1d_causal_step_into(
+        x5.as_ref(),
+        w_s.as_ref(),
+        None,
+        state_a.as_ref(),
+        rocm(&out5),
+    )
+    .unwrap();
+    dev.synchronize();
+    let out5_v = out5.to_cpu_vec_f32().unwrap();
+    for t in 0..5 {
+        let worst = out5_v[t * channels..(t + 1) * channels]
+            .iter()
+            .zip(&cpu_out[t * channels..(t + 1) * channels])
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("[conv-chain] scan token {t}: worst {worst:.5}");
+    }
+    let state_a_v = state_a.to_cpu_vec_f32().unwrap();
+    let ring_v = f32_tensor(&dev, &ring, &Shape::new(vec![channels * (ks - 1)]))
+        .to_cpu_vec_f32()
+        .unwrap();
+    let ring_worst = state_a_v
+        .iter()
+        .zip(&ring_v)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("[conv-chain] ring after scan vs CPU ring: worst {ring_worst:.5}");
+    let x6 = f32_tensor(&dev, &x[5 * channels..], &Shape::new(vec![channels]));
+    let out6 = f32_tensor(&dev, &vec![0.0f32; channels], &Shape::new(vec![channels]));
+    dev.short_conv1d_causal_step_into(
+        x6.as_ref(),
+        w_s.as_ref(),
+        None,
+        state_a.as_ref(),
+        rocm(&out6),
+    )
+    .unwrap();
+    dev.synchronize();
+    let a = out6.to_cpu_vec_f32().unwrap();
+    let worst = a
+        .iter()
+        .zip(&cpu_out[5 * channels..])
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("[conv-chain] scan(5)+step(1) vs CPU: worst {worst:.5}");
+    assert!(
+        worst < 1e-2,
+        "conv scan->step chain diverges from CPU ({worst}) while step-only matches — \
+         the scan leaves the ring in a form the decode step misreads"
+    );
+}

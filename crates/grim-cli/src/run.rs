@@ -253,16 +253,28 @@ fn try_graph_decode_step(
                             $g.buffers
                                 .seed_gdl_state_from_eager(&dev, &srcs)
                                 .map_err(|e| format!("gdl seed: {e}"))?;
-                            // Recurrent (ShortConv) layers: upload the host conv rings
-                            // so replay doesn't run them against a zeroed ring after
-                            // prefill. Fail-closed like the KV seed on any mismatch.
-                            let conv_seeds = graph_model
-                                .eager_conv_seed_rings(sess)
-                                .map_err(|e| format!("conv export: {e}"))?;
-                            if !conv_seeds.is_empty() {
+                            // Recurrent (ShortConv) layers: seed the graph's conv
+                            // rings from wherever the eager prefill left the live
+                            // state. D2D prefill writes conv_state_dev and never
+                            // the host mirror — seeding from the mirror would
+                            // replay every recurrent layer against zeros. Prefer
+                            // the device rings; fall back to the host mirror.
+                            let conv_dev_seeds = graph_model
+                                .eager_conv_device_seed_sources(sess)
+                                .map_err(|e| format!("conv dev export: {e}"))?;
+                            if conv_dev_seeds.iter().any(|s| s.is_some()) {
                                 $g.buffers
-                                    .seed_conv_rings(&conv_seeds)
-                                    .map_err(|e| format!("conv seed: {e}"))?;
+                                    .seed_conv_rings_from_device(&dev, &conv_dev_seeds)
+                                    .map_err(|e| format!("conv dev seed: {e}"))?;
+                            } else {
+                                let conv_seeds = graph_model
+                                    .eager_conv_seed_rings(sess)
+                                    .map_err(|e| format!("conv export: {e}"))?;
+                                if !conv_seeds.is_empty() {
+                                    $g.buffers
+                                        .seed_conv_rings(&conv_seeds)
+                                        .map_err(|e| format!("conv seed: {e}"))?;
+                                }
                             }
                             let kda_seeds = graph_model
                                 .eager_kda_seed_sources(sess)
@@ -373,13 +385,24 @@ fn try_graph_decode_step(
                     $g.buffers
                         .seed_gdl_state_from_eager(&dev, &srcs)
                         .map_err(|e| format!("gdl seed: {e}"))?;
-                    let conv_seeds = graph_model
-                        .eager_conv_seed_rings(sess)
-                        .map_err(|e| format!("conv export: {e}"))?;
-                    if !conv_seeds.is_empty() {
+                    // Device-first conv seeding (see the capture-site macro):
+                    // D2D prefill leaves the live ring in conv_state_dev.
+                    let conv_dev_seeds = graph_model
+                        .eager_conv_device_seed_sources(sess)
+                        .map_err(|e| format!("conv dev export: {e}"))?;
+                    if conv_dev_seeds.iter().any(|s| s.is_some()) {
                         $g.buffers
-                            .seed_conv_rings(&conv_seeds)
-                            .map_err(|e| format!("conv seed: {e}"))?;
+                            .seed_conv_rings_from_device(&dev, &conv_dev_seeds)
+                            .map_err(|e| format!("conv dev seed: {e}"))?;
+                    } else {
+                        let conv_seeds = graph_model
+                            .eager_conv_seed_rings(sess)
+                            .map_err(|e| format!("conv export: {e}"))?;
+                        if !conv_seeds.is_empty() {
+                            $g.buffers
+                                .seed_conv_rings(&conv_seeds)
+                                .map_err(|e| format!("conv seed: {e}"))?;
+                        }
                     }
                     let kda_seeds = graph_model
                         .eager_kda_seed_sources(sess)

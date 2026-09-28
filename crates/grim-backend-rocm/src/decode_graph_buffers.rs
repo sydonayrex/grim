@@ -254,6 +254,17 @@ pub struct EagerKdaSource<'a> {
 /// mirror holds `kc` rows of `h_dim` (`host[t*h_dim + d]` = b·x from `t` steps
 /// ago); the device ring is the transposed column-major `[d, kc]` layout the
 /// `grim_short_conv1d_causal_step` kernel updates in place.
+/// Device conv-ring seed: the eager prefill ran the D2D conv, so the LIVE
+/// ring is `conv_state_dev` (kernel layout `[channel][tap]`, same layout the
+/// graph's `sc_state` uses) and the host mirror is stale. Seeding from the
+/// host mirror in that case uploads ZEROS and the graph replays every
+/// recurrent layer against a zeroed ring — greedy decode diverges from
+/// eager after one token. D2D from the live device ring instead.
+pub struct ConvDeviceSeed<'a> {
+    pub dev_ring: *const f32,
+    pub _anchor: std::marker::PhantomData<&'a ()>,
+}
+
 pub struct ConvRingSeed<'a> {
     pub host: &'a [f32],
     pub h_dim: usize,
@@ -1146,6 +1157,52 @@ impl DecodeGraphBuffers {
             if res != crate::hipSuccess {
                 return Err(Error::Backend(format!(
                     "seed_gdl_state: hipMemcpyAsync failed: {res}"
+                )));
+            }
+        }
+        dev.synchronize();
+        Ok(())
+    }
+
+    /// Device conv-ring seeding: D2D copy each layer's live `conv_state_dev`
+    /// ring into the graph's `sc_state` (identical `[channel][tap]` layout).
+    /// Use when the eager prefill ran the D2D conv — the host mirror is stale
+    /// in that case. Must run OUTSIDE a capture bracket.
+    pub fn seed_conv_rings_from_device(
+        &mut self,
+        dev: &RocmDevice,
+        per_layer: &[Option<ConvDeviceSeed<'_>>],
+    ) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+        let stream = dev.active_stream();
+        for (layer_idx, seed) in per_layer.iter().enumerate() {
+            let Some(sd) = seed else { continue };
+            if layer_idx >= self.sc_state.len() {
+                return Err(Error::Backend(format!(
+                    "seed_conv_rings_from_device: layer {layer_idx} >= {} sc rings",
+                    self.sc_state.len()
+                )));
+            }
+            let n_elem = self.sc_state[layer_idx].shape.elem_count();
+            if n_elem == 0 {
+                continue;
+            }
+            let dst = self.sc_state[layer_idx]
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("seed_conv_rings_from_device: no dst ptr".into()))?
+                as *mut c_void;
+            let res: crate::HipErrorT = unsafe {
+                crate::hipMemcpyAsync(
+                    dst,
+                    sd.dev_ring as *const c_void,
+                    n_elem * 4,
+                    HipMemcpyKind::DeviceToDevice,
+                    stream,
+                )
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!(
+                    "seed_conv_rings_from_device: hipMemcpyAsync failed: {res}"
                 )));
             }
         }

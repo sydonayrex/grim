@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
+    ConvDeviceSeed, ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
     check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
 };
 use grim_core::error::Result;
@@ -62,6 +62,18 @@ pub trait DecodeGraphModel: Send + Sync {
         &self,
         _session: &'a dyn grim_core::session::SessionT,
     ) -> Result<Vec<Option<ConvRingSeed<'a>>>> {
+        Ok(Vec::new())
+    }
+
+    /// Device conv rings for recurrent-layer seeding: when the eager prefill
+    /// ran the D2D conv, the LIVE ring is `conv_state_dev` and the host mirror
+    /// is stale — seeding from the mirror uploads zeros. Indexed by layer;
+    /// non-empty return means "seed rings D2D from these" and the host-ring
+    /// seed is skipped. Default: empty (host-ring seeding).
+    fn eager_conv_device_seed_sources<'a>(
+        &self,
+        _session: &'a dyn grim_core::session::SessionT,
+    ) -> Result<Vec<Option<ConvDeviceSeed<'a>>>> {
         Ok(Vec::new())
     }
 }
@@ -1762,6 +1774,47 @@ impl DecodeGraphModel for Qwen35 {
                 kc,
                 _anchor: std::marker::PhantomData,
             }));
+        }
+        Ok(out)
+    }
+
+    /// KDA-fix: when the eager prefill ran the D2D conv (the default), the
+    /// LIVE conv ring is `conv_state_dev`; the host `conv_state` mirror is
+    /// never written on that path, so seeding the graph from the mirror
+    /// replays every recurrent layer against zeros. Prefer the device ring
+    /// whenever it exists; the host-ring seed stays as the fallback for the
+    /// host-prefill path.
+    fn eager_conv_device_seed_sources<'a>(
+        &self,
+        session: &'a dyn grim_core::session::SessionT,
+    ) -> Result<Vec<Option<ConvDeviceSeed<'a>>>> {
+        let caches = match session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Qwen35LayerCache>>())
+        {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut out = Vec::with_capacity(caches.len());
+        for (i, cache) in caches.iter().enumerate() {
+            if self.blocks.get(i).map(|b| b.is_full_attention).unwrap_or(true) {
+                out.push(None);
+                continue;
+            }
+            let ring_ptr = cache
+                .conv_state_dev
+                .as_ref()
+                .and_then(|s| as_rocm(s.as_ref()).ok())
+                .and_then(|r| r.device_ptr_u64())
+                .map(|p| p as *const f32);
+            match ring_ptr {
+                Some(ptr) => out.push(Some(ConvDeviceSeed {
+                    dev_ring: ptr,
+                    _anchor: std::marker::PhantomData,
+                })),
+                None => out.push(None),
+            }
         }
         Ok(out)
     }
