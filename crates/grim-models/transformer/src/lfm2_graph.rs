@@ -134,6 +134,8 @@ impl Lfm2 {
             self.layers.len(),
             hidden,
             n_q,
+            // LFM2: the branch width IS n_q here.
+            n_q,
             n_k,
             n_k,
             inter,

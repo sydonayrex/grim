@@ -39,6 +39,28 @@ pub struct DecodeGraphBuffers {
     pub q_buf: Vec<RocmStorage>, // [batch, n_q]
     pub k_buf: Vec<RocmStorage>,        // [batch, n_k]
     pub v_buf: Vec<RocmStorage>,        // [batch, n_v]
+    /// Branch output before the output projection.
+    ///
+    /// `[batch, n_attn_out]` — and `n_attn_out` is the ATTENTION branch width
+    /// (`q_dim`), NOT the maxed `n_q` that `q_buf` uses. The two are different
+    /// quantities and conflating them is what broke capture:
+    ///
+    ///   * `q_buf` holds a PROJECTION OUTPUT, so it must fit whichever layer
+    ///     type is running: `conv_dim` for recurrent (the fused qkv), `2*q_dim`
+    ///     for attention (the fused Q|gate). Hence the max.
+    ///   * `attn_out_buf` holds a BRANCH OUTPUT, consumed by `wo` (attention,
+    ///     `q_dim` wide) or by `ssm_out` (recurrent, `value_dim` wide). It is
+    ///     NOT a projection output and must never be maxed.
+    ///
+    /// Recurrent layers write their branch to `KdaLayerBuffers::branch` at
+    /// `value_dim`; this buffer is then only read by attention layers.
+    ///
+    /// Both references agree and neither maxes: llama.cpp returns `q_dim` from
+    /// `build_layer_attn` (`qwen35.cpp:320-334`, gated then `wo`) and
+    /// `value_dim` from `build_layer_attn_linear` (`:462`); vLLM splits
+    /// `[q,k,v,z]` with `z_size = value_dim` and feeds `_output_projection`
+    /// `core_attn_out` of shape `[tokens, num_v_heads, head_v_dim]`
+    /// (`qwen_gdn_linear_attn.py:1033-1049`).
     pub attn_out_buf: Vec<RocmStorage>, // [batch, n_q]
     /// FFN-specific
     pub gate_up_buf: Vec<RocmStorage>, // [batch, 2*intermediate_size] (reserved: fused gate+up path)
@@ -125,6 +147,29 @@ pub struct KdaLayerBuffers {
     pub acc_scratch: RocmStorage,
     /// Short-conv output `[batch, conv_dim]` f32 before delta rule.
     pub conv_out: RocmStorage,
+    /// The recurrent BRANCH output `[batch, num_val_heads * head_dim]` f32 —
+    /// i.e. `value_dim`, what `ssm_out` consumes.
+    ///
+    /// Not `attn_out_buf`: that is sized `2 * q_dim` for the fused attention
+    /// Q|gate projection (8192 on the 9B), while the recurrent branch is
+    /// `value_dim` wide (4096). Feeding the 8192 buffer to `ssm_out`, whose
+    /// weight is `[hidden, value_dim]`, aborted capture with
+    ///   `act [1, 8192], weight [4096, 4096], out [1, 4096]`
+    pub branch: RocmStorage,
+    /// Projected z (the KDA output gate) `[batch, num_val_heads * head_dim]` f32.
+    ///
+    /// This CANNOT be the FFN's `gate_buf`, which is `[batch, intermediate_size]`.
+    /// On the 9B those are 4096 and 12288, so projecting the KDA z gate into the
+    /// FFN buffer made `linear_decode_into` refuse the shape and killed graph
+    /// capture at step 1 with
+    ///   `linear_decode[kda.attn_gate @ layer 0]: expected [1, 4096], got [1, 12288]`
+    /// The z gate is per VALUE-STREAM element, so its width is
+    /// `value_dim = num_val_heads * head_dim` — the same quantity `ssm_out`
+    /// consumes. (The same confusion in `qwen35.rs` is why `attn_gate` is
+    /// loaded at `q_dim.max(blk_value_dim(cfg))` there: the attention layers
+    /// need q_dim, the recurrent ones need value_dim, and one tensor serves
+    /// both.)
+    pub gate: RocmStorage,
     pub num_val_heads: usize,
     pub num_key_heads: usize,
     pub head_dim: usize,
@@ -212,6 +257,9 @@ impl DecodeGraphBuffers {
         num_layers: usize,
         hidden_size: usize,
         n_q: usize,
+        // Branch width for `attn_out_buf`: the ATTENTION branch (`q_dim`), which
+        // is NOT the maxed `n_q`. See the field doc.
+        n_attn_out: usize,
         n_k: usize,
         n_v: usize,
         intermediate_size: usize,
@@ -229,6 +277,7 @@ impl DecodeGraphBuffers {
             num_layers,
             hidden_size,
             n_q,
+            n_attn_out,
             n_k,
             n_v,
             intermediate_size,
@@ -251,6 +300,7 @@ impl DecodeGraphBuffers {
         num_layers: usize,
         hidden_size: usize,
         n_q: usize,
+        n_attn_out: usize,
         n_k: usize,
         n_v: usize,
         intermediate_size: usize,
@@ -347,7 +397,7 @@ impl DecodeGraphBuffers {
                 dev.ordinal,
             )?);
             attn_out_buf.push(RocmStorage::alloc_gpu(
-                &Shape::new(vec![batch, nqk]),
+                &Shape::new(vec![batch, n_attn_out]),
                 dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
@@ -693,6 +743,18 @@ impl DecodeGraphBuffers {
             &dev.allocator,
             dev.ordinal,
         )?;
+        let branch = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch, num_val_heads * head_dim]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
+        let gate = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch, num_val_heads * head_dim]),
+            dt.clone(),
+            &dev.allocator,
+            dev.ordinal,
+        )?;
         let alpha = RocmStorage::alloc_gpu(
             &Shape::new(vec![batch, num_val_heads]),
             dt.clone(),
@@ -724,6 +786,8 @@ impl DecodeGraphBuffers {
             beta,
             acc_scratch,
             conv_out,
+            branch,
+            gate,
             num_val_heads,
             num_key_heads,
             head_dim,
@@ -1309,6 +1373,9 @@ impl DecodeGraph {
             dev,
             num_layers,
             hidden_size,
+            n_q,
+            // The unit test exercises the attention path, so the branch width is
+            // the attention one.
             n_q,
             n_k,
             n_v,

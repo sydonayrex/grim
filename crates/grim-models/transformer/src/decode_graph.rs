@@ -538,6 +538,9 @@ impl DecodeGraphModel for Llama {
             &dev,
             self.layers.len(),
             hidden,
+            // Non-hybrid call site: the branch width IS n_q here, so
+            // behaviour is unchanged for it.
+            n_q,
             n_q,
             n_k,
             n_v,
@@ -552,6 +555,7 @@ impl DecodeGraphModel for Llama {
             0,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
 
         Ok(DecodeGraph::new(&dev, buffers, stream))
     }
@@ -1255,7 +1259,7 @@ impl Qwen35Block {
                 dev,
                 normed,
                 gate_lin.weight(),
-                &buffers.gate_buf[layer_idx],
+                &kda_buf.gate,
                 act,
                 "kda.attn_gate",
                 layer_idx,
@@ -1291,10 +1295,10 @@ impl Qwen35Block {
                 dt_bias_d.as_ref(),
                 ssm_a_d.as_ref(),
                 ssm_norm_d.as_ref(),
-                Some(&buffers.gate_buf[layer_idx]),
+                Some(&kda_buf.gate),
                 &kda_buf.state,
                 &kda_buf.acc_scratch,
-                &buffers.attn_out_buf[layer_idx],
+                &kda_buf.branch,
                 n_val_heads,
                 n_key_heads,
                 head_dim,
@@ -1308,13 +1312,7 @@ impl Qwen35Block {
             let out_proj = self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
                 grim_core::error::Error::Backend("missing ssm_out projection".into())
             })?;
-            linear_into(
-                dev,
-                &buffers.attn_out_buf[layer_idx],
-                out_proj.weight(),
-                &buffers.norm_buf[layer_idx],
-                act,
-            )?;
+            linear_into(dev, &kda_buf.branch, out_proj.weight(), &buffers.norm_buf[layer_idx], act)?;
         }
 
         // Residual 1 add: layer_input + branch_proj -> layer_output
@@ -1422,11 +1420,19 @@ impl DecodeGraphModel for Qwen35 {
         let sc_l_cache = self.cfg.ssm_d_conv.max(4);
         let hidden = self.cfg.hidden_size;
 
+        // `n_q` is `(q_dim).max(kda_conv)`: correct for `q_buf`, which holds a
+        // PROJECTION OUTPUT and must fit conv_dim (recurrent) or 2*q_dim
+        // (fused Q|gate, attention). It is NOT the branch width. `attn_out_buf`
+        // is consumed only by attention layers now — recurrent layers write
+        // their branch to `KdaLayerBuffers::branch` at value_dim — so it gets
+        // the true `q_dim`. See `attn_out_buf`'s doc for the two references.
+        let n_attn_out = self.cfg.num_heads * self.cfg.head_dim;
         let mut buffers = DecodeGraphBuffers::allocate(
             &dev,
             self.blocks.len(),
             hidden,
             n_q,
+            n_attn_out,
             n_k,
             n_v,
             inter,
@@ -1440,6 +1446,7 @@ impl DecodeGraphModel for Qwen35 {
             sc_l_cache,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
 
         if self.cfg.ssm_dt_rank > 0 {
             let n_val = self.cfg.ssm_dt_rank;
@@ -1991,6 +1998,9 @@ impl DecodeGraphModel for Gemma2 {
             &dev,
             self.layers.len(),
             hidden,
+            // Non-hybrid call site: the branch width IS n_q here, so
+            // behaviour is unchanged for it.
+            n_q,
             n_q,
             n_k,
             n_v,
@@ -2655,6 +2665,7 @@ impl DecodeGraphModel for MiniMaxM3 {
             self.layers.len(),
             hidden,
             n_q,
+            n_q,
             n_k,
             n_v,
             inter,
@@ -3115,6 +3126,7 @@ impl DecodeGraphModel for Glm4MoeLite {
             self.layers.len(),
             hidden,
             n_q,
+            n_q,
             n_k,
             n_v,
             inter,
@@ -3527,6 +3539,7 @@ impl DecodeGraphModel for GraniteMoeHybrid {
             &dev,
             self.layers.len(),
             hidden,
+            n_q,
             n_q,
             n_k,
             n_v,
@@ -3944,6 +3957,7 @@ impl DecodeGraphModel for HyV3 {
             &dev,
             self.layers.len(),
             hidden,
+            n_q,
             n_q,
             n_k,
             n_v,
@@ -4379,6 +4393,7 @@ impl DecodeGraphModel for Chameleon {
             self.layers.len(),
             hidden,
             n_q,
+            n_q,
             n_k,
             n_v,
             inter,
@@ -4605,6 +4620,7 @@ impl DecodeGraphModel for DeepSeek4 {
             &dev,
             self.layers.len(),
             hidden,
+            n_q,
             n_q,
             n_k,
             n_v,
@@ -4912,6 +4928,7 @@ impl DecodeGraphModel for DeepSeek2 {
             self.layers.len(),
             hidden,
             n_q,
+            n_q,
             n_k,
             n_v,
             inter,
@@ -5200,6 +5217,7 @@ impl DecodeGraphModel for DeepSeek32 {
             &dev,
             self.layers.len(),
             hidden,
+            n_q,
             n_q,
             n_k,
             n_v,
