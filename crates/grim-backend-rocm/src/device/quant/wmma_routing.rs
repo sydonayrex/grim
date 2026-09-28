@@ -74,7 +74,14 @@ impl RocmDevice {
         };
         *guard.entry(tag.to_string()).or_insert_with(|| {
             let var = format!("GRIM_{}_TILED", tag.to_uppercase());
-            matches!(std::env::var(&var).as_deref(), Ok("1" | "true" | "on"))
+            if let Ok(v) = std::env::var(&var) {
+                return matches!(v.as_str(), "1" | "true" | "on");
+            }
+            // 9B perf plan Step 3: default-ON for the measured k-quant
+            // formats. The scalar kernel re-reads every weight block M times;
+            // at the 9B prefill shape it ran at 0.2 GB/s (skinny_m gate).
+            // q2k/q3k stay opt-in until measured.
+            matches!(tag, "q4k" | "q5k" | "q6k")
         })
     }
 
@@ -226,8 +233,11 @@ impl RocmDevice {
     ) -> Result<*mut c_void> {
         // SPEED-ROC-8: opt-in LDS-tiled prefill path (per-format GRIM_*_TILED).
         if let Some((tag, blk)) = Self::tiled_quant_lookup(name) {
+            // m >= 2 (not 16): the tiled kernel is TILE_M=4 and covers the
+            // 9B prefill shape M=5 with one partial tile; the scalar fallback
+            // re-reads every weight block M times.
             if Self::tiled_quant_enabled(tag)
-                && m >= 16
+                && m >= 2
                 && n >= 64
                 && k % Self::tiled_k_multiple(blk) == 0
             {

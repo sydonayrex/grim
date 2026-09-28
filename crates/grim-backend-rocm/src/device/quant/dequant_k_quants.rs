@@ -57,12 +57,18 @@ impl RocmDevice {
         // and layouts the tiling cannot express stay on the scalar path.
         static TILED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let tiled_enabled = *TILED.get_or_init(|| {
-            matches!(
-                std::env::var("GRIM_Q4K_TILED").as_deref(),
-                Ok("1" | "true" | "on")
-            )
+            if let Ok(v) = std::env::var("GRIM_Q4K_TILED") {
+                return matches!(v.as_str(), "1" | "true" | "on");
+            }
+            // Default-ON, matching tiled_quant_enabled in wmma_routing.rs:
+            // the scalar kernel re-reads every weight block M times (9B perf
+            // plan Step 3).
+            true
         });
-        if tiled_enabled && m >= 16 && n >= 64 && k % 256 == 0 {
+        // m >= 2 (not 16): TILE_M=4 covers the 9B prefill shape M=5 with one
+        // partial tile; the scalar fallback re-reads every weight block M
+        // times (0.2 GB/s measured at M=5 in skinny_m_kquant gate).
+        if tiled_enabled && m >= 2 && n >= 64 && k % 256 == 0 {
             return self.launch_fused_dequant_gemm_q4k_tiled(
                 a_storage,
                 b_q4k_storage,
