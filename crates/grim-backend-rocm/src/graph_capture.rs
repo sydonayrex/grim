@@ -166,6 +166,16 @@ pub struct GraphCaptureManager {
     /// the cost of allocating a fresh stream per capture.
     capture_stream: Mutex<Option<*mut c_void>>,
     state: Mutex<GraphCacheState>,
+    /// The ordinal every capture-path FFI call must run against.
+    ///
+    /// `hipStreamCreate`, `hipGraphCreate`, `hipStreamBeginCapture`,
+    /// `hipStreamEndCapture`, `hipGraphInstantiate` and `hipGraphLaunch` all
+    /// act on the CALLING THREAD's current device, and the capture stream is
+    /// cached for the manager's whole lifetime. A thread that arrived drifted
+    /// would create the stream on the wrong ordinal and then capture a graph
+    /// there holding pointers into another device's memory — the
+    /// "Page not present" fault, reproduced by every later replay.
+    ordinal: i32,
     /// Cache capacity — bounded by `(shape_cardinality)` in practice
     /// but exposed so callers can tune without surgery.
     pub max_entries: usize,
@@ -178,15 +188,31 @@ impl GraphCaptureManager {
     }
 
     /// Bind the manager to a device with explicit capacity.
-    pub(crate) fn for_device_with_capacity(_dev: &RocmDevice, max_entries: usize) -> Self {
-        Self::with_capacity(max_entries)
-    }
-
-    /// Create a manager with explicit cache capacity (no device binding).
-    pub fn with_capacity(max_entries: usize) -> Self {
+    pub(crate) fn for_device_with_capacity(dev: &RocmDevice, max_entries: usize) -> Self {
         Self {
             capture_stream: Mutex::new(None),
             state: Mutex::new(GraphCacheState::default()),
+            ordinal: dev.ordinal as i32,
+            max_entries,
+        }
+    }
+
+    /// Create a manager with explicit cache capacity, bound to whichever
+    /// device the calling thread is on right now.
+    ///
+    /// Prefer [`Self::for_device`] wherever a `RocmDevice` is in hand: this
+    /// constructor can only observe the context as it happens to be, which is
+    /// the very thing that drifts.
+    pub fn with_capacity(max_entries: usize) -> Self {
+        let mut ordinal: i32 = 0;
+        // SAFETY: hipGetDevice only writes the out-pointer.
+        unsafe {
+            let _ = crate::device::handles::hipGetDevice(&mut ordinal);
+        }
+        Self {
+            capture_stream: Mutex::new(None),
+            state: Mutex::new(GraphCacheState::default()),
+            ordinal,
             max_entries,
         }
     }
@@ -202,6 +228,9 @@ impl GraphCaptureManager {
             return Ok(s);
         }
         let mut stream: *mut c_void = std::ptr::null_mut();
+        // The stream is cached and reused for every capture, so its ordinal is
+        // decided once, here, and must be this manager's.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal);
         let res: HipErrorT = unsafe { hipStreamCreate(&mut stream) };
         if res != hipSuccess {
             return Err(Error::Backend(format!(
@@ -238,6 +267,11 @@ impl GraphCaptureManager {
 
         // Slow path: capture. Snapshot the closure before locking so we
         // don't hold the cache mutex while we run the user's code.
+        //
+        // Hold the guard across the whole capture, including the user closure:
+        // every kernel it launches must be enqueued on a stream belonging to
+        // this manager's ordinal, and the closure is what does the enqueuing.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal);
         let stream = self.ensure_capture_stream()?;
         let mut graph: *mut c_void = std::ptr::null_mut();
         let mode = 2_u32; // hipStreamCaptureModeGlobal
@@ -363,6 +397,7 @@ impl GraphCaptureManager {
             .get(&key)
             .map(|g| g.exec)
             .ok_or_else(|| Error::Backend("no captured graph for key (replay)".into()))?;
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal);
         let stream = self.ensure_capture_stream()?;
         let launch_res: HipErrorT = unsafe { hipGraphLaunch(exec, stream) };
         if launch_res != hipSuccess {
@@ -467,6 +502,9 @@ impl DecodeBucketGraphPool {
         if self.graphs.contains_key(&bucket) {
             return Ok(());
         }
+        // The stream is cached in this pool's graph entry and reused for every
+        // capture and replay of this bucket, so it must belong to `dev`.
+        let _guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
         use std::ffi::c_void as RawVoid;
         let mut stream: *mut RawVoid = std::ptr::null_mut();
         let res: HipErrorT = unsafe { hipStreamCreate(&mut stream) };
@@ -658,13 +696,18 @@ pub struct HipGraphExecutor {
     graph: *mut c_void,
     exec: Option<*mut c_void>,
     stream: Option<*mut c_void>,
-    #[allow(dead_code)]
     device_ordinal: usize,
 }
 
 impl HipGraphExecutor {
-    /// Create a new graph executor. The graph is instantiated on the current device.
+    /// Create a new graph executor bound to `device_ordinal`.
+    ///
+    /// `hipGraphCreate` acts on the calling thread's current device, so the
+    /// context is pinned to `device_ordinal` for the call. Previously this ran
+    /// on whatever device the thread happened to be parked on, which is the
+    /// context-drift fault the ordinal argument exists to prevent.
     pub fn new(device_ordinal: usize) -> Result<Self> {
+        let _guard = crate::device::util::DeviceGuard::set(device_ordinal as i32);
         let mut graph: *mut c_void = std::ptr::null_mut();
         unsafe {
             let res = hipGraphCreate(&mut graph, 0);
@@ -683,6 +726,7 @@ impl HipGraphExecutor {
 
     /// Instantiate the graph for replay. Must be called after all nodes are added.
     pub fn instantiate(&mut self) -> Result<()> {
+        let _guard = crate::device::util::DeviceGuard::set(self.device_ordinal as i32);
         let mut exec: *mut c_void = std::ptr::null_mut();
         unsafe {
             let mut stream: *mut c_void = std::ptr::null_mut();

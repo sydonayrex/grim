@@ -449,7 +449,12 @@ fn try_graph_decode_step(
                 // sampler, fallback D2H) must be ordered after the replayed
                 // graph — one blocking sync, then fall through.
                 Ok(None) | Err(_) => {
-                    let _ = unsafe { grim_backend_rocm::hipStreamSynchronize(stream) };
+                    // `stream` belongs to the replayed graph's device, so pin
+                    // that ordinal before syncing it, and go through the
+                    // sanctioned wrapper rather than the raw FFI symbol.
+                    let _guard =
+                        grim_backend_rocm::device::util::DeviceGuard::set(dev.ordinal() as i32);
+                    let _ = grim_backend_rocm::hip_stream_synchronize(stream);
                 }
             }
         }

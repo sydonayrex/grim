@@ -715,6 +715,11 @@ impl ScytheRingExec {
             (cell.as_mut_ptr() as *mut c_void, dev_ptr as *const c_void)
         };
         let rc = unsafe {
+            // Same seam as `control_read_u32_into`, which pins it: this copy is
+            // enqueued on `self`'s control stream, so the calling thread's
+            // device must be this ring's ordinal.
+            let _guard =
+                grim_backend_rocm::device::util::DeviceGuard::set(self.device.ordinal() as i32);
             grim_backend_rocm::hipMemcpyAsync(dst, src, 4, kind, self.control_stream_ptr())
         };
         if diag {

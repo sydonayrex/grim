@@ -83,6 +83,31 @@ fn relative_to(file: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// The name of a free function or inherent-impl method declared on this line,
+/// or `None` if the line is not a declaration.
+///
+/// `unsafe fn` and `async fn` are matched too. They used to be missed, which
+/// meant a `hipMemcpyAsync` inside an `unsafe fn` was attributed to whatever
+/// function happened to be scanned before it — or to none at all, in which case
+/// the `if let Some((fname, _))` below skipped the check entirely and the gate
+/// reported green.
+fn fn_name(trimmed: &str) -> Option<String> {
+    const QUALIFIERS: &[&str] = &["pub(crate) ", "pub ", "unsafe ", "async ", "extern \"C\" "];
+    let mut rest = trimmed;
+    loop {
+        match QUALIFIERS.iter().find(|q| rest.starts_with(**q)) {
+            Some(q) => rest = &rest[q.len()..],
+            None => break,
+        }
+    }
+    let rest = rest.strip_prefix("fn ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 #[test]
 fn hip_set_device_has_no_bare_call_sites_outside_the_guard_module() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -177,6 +202,13 @@ fn peer_access_save_restore_pair_stays_balanced() {
 /// unless the function is on the by-design allowlist below.
 ///
 /// Purely host-side: parses this crate's own sources; no GPU needed.
+///
+/// SCOPE: this walks the WHOLE `src/` tree, as `hip_set_device_has_no_bare_call
+/// _sites_outside_the_guard_module` already does. It previously audited a
+/// hand-maintained list of 15 files; 32 files in this crate make raw
+/// device-bound FFI calls, so the other 17 were never checked at all — and
+/// three of them carried real, unguarded seams (`graph_capture.rs`'s capture
+/// stream, `dot_gemv.rs`'s cached q8_1 event, `optimizer_ops.rs`'s frees).
 #[test]
 fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
     // By-design exceptions (verified by hand, see scythe2 plan log 23e):
@@ -187,49 +219,29 @@ fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
     // - build: hsaco build path; context established by caller.
     const ALLOWED_UNGUARDED: &[&str] = &["try_new", "fallback", "build"];
 
-    let audited: &[(&str, &str)] = &[
-        (
-            "device/roc_device.rs",
-            include_str!("../src/device/roc_device.rs"),
-        ),
-        ("p2p_route.rs", include_str!("../src/p2p_route.rs")),
-        ("fsdp.rs", include_str!("../src/fsdp.rs")),
-        ("rccl.rs", include_str!("../src/rccl.rs")),
-        (
-            "kernels/batched_lora.rs",
-            include_str!("../src/kernels/batched_lora.rs"),
-        ),
-        (
-            "kernels/device_sampler.rs",
-            include_str!("../src/kernels/device_sampler.rs"),
-        ),
-        (
-            "device/compute/fused_ops.rs",
-            include_str!("../src/device/compute/fused_ops.rs"),
-        ),
-        (
-            "device/compute/kernel_infra.rs",
-            include_str!("../src/device/compute/kernel_infra.rs"),
-        ),
-        (
-            "device/device_serve.rs",
-            include_str!("../src/device/device_serve.rs"),
-        ),
-        (
-            "decode_graph_buffers.rs",
-            include_str!("../src/decode_graph_buffers.rs"),
-        ),
-        (
-            "memory/storage.rs",
-            include_str!("../src/memory/storage.rs"),
-        ),
-        ("memory/pinned.rs", include_str!("../src/memory/pinned.rs")),
-        ("memory/view.rs", include_str!("../src/memory/view.rs")),
-        (
-            "device/helpers.rs",
-            include_str!("../src/device/helpers.rs"),
-        ),
-    ];
+    /// The FFI declaration/shim layer. `handles.rs` wraps the raw symbols in
+    /// tracing shims (`hipMemcpyAsync` -> `raw_hipMemcpyAsync`) and does not
+    /// itself decide which device a call belongs to — that stays with the
+    /// caller. It is already the sanctioned exception in
+    /// `ALLOWED_FILES` above for the same reason.
+    const FFI_LAYER: &[&str] = &["device/handles.rs", "device/rocblas.rs"];
+
+    /// Pure FFI declaration blocks. `pub fn hipMemcpyAsync(` here DECLARES the
+    /// symbol; it is not a call site, and the old list-based gate sidestepped
+    /// the question by never including these files.
+    fn extern_block_lines(body: &str) -> Vec<bool> {
+        let mut out = Vec::with_capacity(body.lines().count());
+        let mut in_extern = false;
+        for line in body.lines() {
+            if line.contains("extern \"C\"") || line.contains("extern \"C-ABI\"") {
+                in_extern = true;
+            } else if in_extern && line.trim() == "}" {
+                in_extern = false;
+            }
+            out.push(in_extern);
+        }
+        out
+    }
 
     let risky = [
         "rocblas_sgemm(",
@@ -246,25 +258,35 @@ fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
         "hipStreamCreate(",
     ];
 
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut violations: Vec<String> = Vec::new();
-    for (rel, body) in audited {
+    let mut audited_files = 0usize;
+
+    for file in rust_sources(&root) {
+        let rel = relative_to(&file, &root);
+        let body = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !risky.iter().any(|r| body.contains(r)) {
+            continue;
+        }
+        // Breadth is counted BEFORE the FFI-layer exemption, so this number
+        // tracks what the sweep sees rather than how many it audits.
+        audited_files += 1;
+        if FFI_LAYER.contains(&rel.as_str()) {
+            continue;
+        }
+        let in_extern = extern_block_lines(&body);
+
         let mut current_fn: Option<(String, usize)> = None;
         let mut guarded = false;
         for (idx, line) in body.lines().enumerate() {
+            if in_extern[idx] {
+                continue;
+            }
             let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix("fn ").or_else(|| {
-                trimmed
-                    .strip_prefix("pub fn ")
-                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
-            }) {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if !name.is_empty() {
-                    current_fn = Some((name, idx + 1));
-                    guarded = false;
-                }
+            if let Some(name) = fn_name(trimmed) {
+                current_fn = Some((name, idx + 1));
+                guarded = false;
             }
             if line.contains("DeviceGuard::set") || line.contains("raw_set_device") {
                 guarded = true;
@@ -282,10 +304,110 @@ fn raw_device_bound_ffi_calls_sit_inside_guarded_functions() {
             }
         }
     }
+
+    assert!(
+        audited_files > 31,
+        "expected the whole-crate sweep to cover more files than the old \
+         hand-maintained 15-file list did; only {audited_files} carried raw FFI. \
+         A shrunken tree means the gate stopped seeing something.",
+    );
     assert!(
         violations.is_empty(),
         "P1-3 contract breached — raw device-context FFI outside a guard:\n{}\n\
          Route it through DeviceGuard::set (see matmul_op fix, 2026-08-23e).",
         violations.join("\n")
+    );
+}
+
+/// The cross-crate seam: raw HIP FFI called from OUTSIDE `grim-backend-rocm`.
+///
+/// Every seam check in this file used to be scoped to this crate, which is
+/// exactly where the discipline is easiest to keep and exactly where it is
+/// least likely to be the bug. The cross-card faults live in the callers: a
+/// `hipMemcpyAsync` issued from `grim-engine` against a stream it does not own
+/// acts on the CALLING THREAD's device, so a drifted thread transfers on the
+/// wrong ordinal. That is invisible from inside the backend crate.
+///
+/// Found by measurement: `scythe2.rs` guarded one of two control-stream copies
+/// and not the other, and `run.rs` reached for the raw `hipStreamSynchronize`
+/// symbol instead of the sanctioned wrapper. Both are now pinned.
+#[test]
+fn raw_hip_ffi_outside_the_backend_crate_is_guarded() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/grim-backend-rocm -> crates/")
+        .to_path_buf();
+    assert!(workspace.is_dir(), "expected crates dir at {}", workspace.display());
+
+    const RISKY: &[&str] = &[
+        "hipMemcpyAsync(",
+        "hipMemcpy(",
+        "hipMemsetAsync(",
+        "hipMalloc(",
+        "hipFree(",
+        "hipFreeAsync(",
+        "hipStreamCreate(",
+        "hipStreamSynchronize(",
+        "hipEventCreate(",
+        "hipModuleLaunchKernel(",
+        "rocblas_sgemm(",
+        "rocblas_gemm_ex(",
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut sites = 0usize;
+    for file in rust_sources(&workspace) {
+        let rel = relative_to(&file, &workspace);
+        // The backend crate has its own, wider gate above.
+        if rel.starts_with("grim-backend-rocm/") {
+            continue;
+        }
+        // `fn` declarations in an extern block are the backend's re-exports.
+        if rel.contains("/tests/") || rel.contains("/examples/") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !RISKY.iter().any(|r| body.contains(r)) {
+            continue;
+        }
+        let mut current_fn: Option<(String, usize)> = None;
+        let mut guarded = false;
+        for (idx, line) in body.lines().enumerate() {
+            if let Some(name) = fn_name(line.trim_start()) {
+                current_fn = Some((name, idx + 1));
+                guarded = false;
+            }
+            if line.contains("DeviceGuard::set") || line.contains("raw_set_device") {
+                guarded = true;
+            }
+            let code = code_only(line);
+            if let Some(hit) = RISKY.iter().find(|r| code.contains(**r)) {
+                sites += 1;
+                if let Some((fname, _)) = &current_fn {
+                    if !guarded {
+                        violations.push(format!(
+                            "{rel}:{}: `{fname}` calls `{hit}` with no DeviceGuard in scope \
+                             (raw HIP from outside the backend crate)",
+                            idx + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "cross-crate HIP seam breached — raw device-context FFI outside \
+         grim-backend-rocm with no guard:\n{}\n\
+         Either route the call through a guarded backend entry point, or pin \
+         the ordinal with DeviceGuard::set before it.",
+        violations.join("\n")
+    );
+    assert!(
+        sites > 0,
+        "expected at least one cross-crate raw HIP call site to police; found {sites}. \
+         If these were all removed, delete this gate rather than leaving it vacuous."
     );
 }

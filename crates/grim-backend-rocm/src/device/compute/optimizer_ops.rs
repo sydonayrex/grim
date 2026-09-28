@@ -6,7 +6,7 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, OptimizerOps};
 
 use crate::device::roc_device::RocmDevice;
-use crate::{arg, as_rocm, dev_ptr, linear_launch, RocmHandle};
+use crate::{RocmHandle, arg, as_rocm, dev_ptr, linear_launch};
 
 impl OptimizerOps for RocmDevice {
     fn fused_adamw_step(
@@ -303,6 +303,10 @@ impl RocmDevice {
 
         // Stream-ordered free of the transient index/pointer arrays.
         if self.active_capture_stream().is_none() {
+            // The buffers were uploaded against `self.ordinal` and the free
+            // stream is this device's, so the free must be enqueued with the
+            // same device current.
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             unsafe {
                 let free_stream = self.active_stream();
                 let _ = crate::hipFreeAsync(p_list, free_stream);

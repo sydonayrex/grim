@@ -3,12 +3,12 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::error::{Error, Result};
 use grim_tensor::BackendStorage;
+use grim_tensor::error::{Error, Result};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, HipDim3};
+use crate::{HipDim3, arg};
 
 impl RocmDevice {
     /// Launch grim_quantize_q8_1 activation quantizer.
@@ -56,6 +56,11 @@ impl RocmDevice {
         // the host-side stall entirely.
         let ev = self.q81_quant_event();
         if !ev.is_null() {
+            // `launch_compute_kernel` restores the caller's context on the way
+            // out, so the thread is back on whatever it was parked on here.
+            // `hipEventRecord` acts on the CURRENT device, and both the event
+            // and the stream belong to `self`.
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             // SAFETY: ev created via hipEventCreate; handle is a live stream.
             unsafe { crate::hipEventRecord(ev, handle) };
         }
@@ -68,6 +73,12 @@ impl RocmDevice {
     fn q81_quant_event(&self) -> *mut c_void {
         let mut guard = self.q81_event.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
+            // `hipEventCreate` allocates on the CALLING THREAD's current device,
+            // and the result is cached for this device's whole lifetime. A thread
+            // that arrives drifted would therefore create the event on the wrong
+            // ordinal and every later record/wait would order work on the wrong
+            // device — the context-drift page fault, cached and permanent.
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             let mut new_ev: *mut c_void = std::ptr::null_mut();
             let res = unsafe { crate::hipEventCreate(&mut new_ev) };
             if res != 0 {
@@ -91,6 +102,9 @@ impl RocmDevice {
         // P1-1: wait for the quantize producer's event (no-op once complete).
         let ev = self.q81_quant_event();
         if !ev.is_null() {
+            // The wait orders `self`'s stream against `self`'s event, so it must
+            // run with this device current — see the note in q81_quant_event.
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             // SAFETY: ev is a live event; active_stream is the device's stream.
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
         }
@@ -154,6 +168,8 @@ impl RocmDevice {
         }
         let ev = self.q81_quant_event();
         if !ev.is_null() {
+            // See the note in q81_quant_event: both operands belong to `self`.
+            let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             // SAFETY: ev is a live event; the active stream is graph-capture safe.
             unsafe { crate::hipStreamWaitEvent(self.active_stream(), ev, 0) };
         }
@@ -1046,9 +1062,6 @@ impl RocmDevice {
         )?;
         Ok(())
     }
-
-
-
 
     /// Public door for the §6 A/B (`tests/precision_kernel_ab.rs`), which times
     /// one codegen path at a time instead of letting `quantized_matmul` choose.
