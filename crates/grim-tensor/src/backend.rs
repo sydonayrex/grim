@@ -270,13 +270,22 @@ pub trait CoreTensorOps {
     /// a 7.1x blowup, plus a transient host buffer of the same size during the
     /// dequant. Gathering one row at a time is O(dim) instead of O(vocab * dim).
     ///
-    /// `weight` must be the raw Q4_K bytes (256 elements per 144-byte
-    /// super-block); `out` is `[n, dim]` f32. The row width must be a whole
-    /// number of super-blocks so every row is block-aligned.
+    /// `weight` must be the raw packed bytes of a quantized embedding table;
+    /// the backend picks the decoder from the storage's own scheme. `out` is
+    /// `[n, dim]` f32. The row width must be a whole number of that scheme's
+    /// super-blocks so every row is block-aligned.
     ///
-    /// `Unimplemented` by default; backends without an on-device Q4_K decoder
-    /// should fall back to dequantizing once on the host.
-    fn embedding_q4k(
+    /// Named for the CAPABILITY, not one format. This was `embedding_q4k`, and
+    /// a table in any other scheme silently fell back to a full f32
+    /// materialization at load — 5,085,593,600 B against 407,244,800 B packed
+    /// for Qwen3.8-27B's [248320, 5120] IQ2_S table. That 4.74 GiB stranded on
+    /// a 17.1 GB card is what exhausted VRAM and failed the first module load.
+    /// A backend advertises a format by accepting it here, not by having a
+    /// method named after it.
+    ///
+    /// `Unimplemented` by default; backends without an on-device decoder for
+    /// the table's scheme should fall back to dequantizing once on the host.
+    fn embedding_packed(
         &self,
         _weight: &dyn BackendStorage,
         _indices: &[u32],
@@ -284,7 +293,7 @@ pub trait CoreTensorOps {
         _dim: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         Err(crate::error::Error::Unimplemented(
-            "embedding_q4k not implemented for this backend".into(),
+            "embedding_packed not implemented for this backend".into(),
         ))
     }
 
@@ -2127,14 +2136,14 @@ impl<T: CoreTensorOps + ?Sized> CoreTensorOps for std::sync::Arc<T> {
         (**self).embedding(weight, indices, out)
     }
 
-    fn embedding_q4k(
+    fn embedding_packed(
         &self,
         weight: &dyn BackendStorage,
         indices: &[u32],
         out: &Shape,
         dim: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).embedding_q4k(weight, indices, out, dim)
+        (**self).embedding_packed(weight, indices, out, dim)
     }
 
     fn from_cpu(

@@ -1287,6 +1287,31 @@ pub struct Embedding {
     pub weight: Tensor,
 }
 
+/// Quantized embedding schemes a backend can gather from WITHOUT materializing
+/// the whole table as f32.
+///
+/// `load` keeps these packed and `forward` dispatches them to the packed
+/// gather, so the two MUST agree: a scheme kept packed here but not gathered
+/// there reads packed bytes as though they were f32. One predicate, used by
+/// both, so they cannot drift.
+///
+/// Membership additionally requires a VERIFIED decoder. IQ2_S has a
+/// `grim_embedding_iq2s_gather` kernel, but it is deliberately NOT listed:
+/// `dequant_iq2s_device` and `dequant_iq2s` disagree with llama.cpp's
+/// `dequantize_row_iq2_s` (`ggml-quants.c`, block = `d` + `qs[QK_K/4]` +
+/// `scales[QK_K/16]`) on the scale grouping and factor, on the grid (a
+/// `iq2s_grid` lookup table, not `(idx + i%8) % 4 - 1.5`), and on the sign
+/// packing (4 bits per byte via `kmask_iq2xs`, not 1 bit per element).
+/// Packing an unverified decoder over a 248320-row table would trade a loud
+/// 4.74 GiB over-allocation for a SILENT wrong embedding. Fix the decoder and
+/// gate it bit-exact against the reference first, then add IQ2_S here.
+fn embedding_has_packed_gather(storage: &Storage) -> bool {
+    matches!(
+        storage,
+        Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+    )
+}
+
 impl Embedding {
     /// Load an embedding table, accepting layout variations and token size discrepancies.
     /// Standard checkpoints store `[vocab, dim]` (row-major: tokens × hidden).
@@ -1297,12 +1322,11 @@ impl Embedding {
                 // Native (F32/BF16/F16) embedding: already on-device, pass through.
                 return Ok(Self { weight: t });
             }
-            // Packed Q4_K embedding on devices supporting on-the-fly dequant gather:
-            // keep the table packed in VRAM (715 MB instead of 5.09 GB for Qwen).
-            if matches!(
-                t.dtype().storage,
-                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
-            ) {
+            // A scheme the backend can gather from on read: keep the table
+            // packed in VRAM. Qwen's [248320, 5120] table is 715 MB as Q4_K and
+            // 407 MB as IQ2_S, against 5.09 GB dequantized — a 7.1x / 12.5x
+            // blowup that strands the card.
+            if embedding_has_packed_gather(&t.dtype().storage) {
                 return Ok(Self { weight: t });
             }
             // Other quantized embeddings: dequantize to f32.
@@ -1325,10 +1349,7 @@ impl Embedding {
 
         // Case 1: Row-major layout [actual_vocab, dim] where s1 == dim.
         if s1 == dim {
-            if matches!(
-                raw_tensor.dtype().storage,
-                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
-            ) {
+            if embedding_has_packed_gather(&raw_tensor.dtype().storage) {
                 return Ok(Self { weight: raw_tensor });
             }
             return Ok(Self {
@@ -1377,11 +1398,8 @@ impl Embedding {
     pub fn forward(&self, indices: &[u32], seq_len: usize, dim: usize) -> Result<Tensor> {
         let dev = pick_device_for_tensor(&self.weight);
         let out_shape = Shape::new(vec![seq_len, dim]);
-        let (s, h) = if matches!(
-            self.weight.dtype().storage,
-            Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
-        ) {
-            CoreTensorOps::embedding_q4k(
+        let (s, h) = if embedding_has_packed_gather(&self.weight.dtype().storage) {
+            CoreTensorOps::embedding_packed(
                 &*dev,
                 self.weight.storage().as_ref(),
                 indices,

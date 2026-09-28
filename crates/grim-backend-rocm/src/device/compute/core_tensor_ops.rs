@@ -12,11 +12,11 @@ use crate::device::gemm_tuning::lookup_gemm_config;
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, as_rocm, check_hip, dev_ptr, dtype_f32,
-    hipFree, hipFreeAsync, hipMemAdvise, hipMemsetAsync, hipSuccess, linear_launch,
-    rocblas_gemm_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success, select_gemm_algo,
-    upload_device_buffer, warp_rows_launch, RocblasInt, RocblasOperation, RocmHandle,
-    ROCBLAS_GEMM_FLAGS_NONE,
+    ROCBLAS_GEMM_FLAGS_NONE, RocblasInt, RocblasOperation, RocmHandle, arg, arith_to_compute_dtype,
+    arith_to_rocblas_dtype, as_rocm, check_hip, dev_ptr, dtype_f32, hipFree, hipFreeAsync,
+    hipMemAdvise, hipMemsetAsync, hipSuccess, linear_launch, rocblas_gemm_ex, rocblas_set_stream,
+    rocblas_sgemm, rocblas_status_success, select_gemm_algo, upload_device_buffer,
+    warp_rows_launch,
 };
 
 impl CoreTensorOps for RocmDevice {
@@ -598,41 +598,67 @@ impl CoreTensorOps for RocmDevice {
         ))
     }
 
-    /// Q4_K embedding gather: rows stay packed in VRAM and are dequantized on
-    /// read, so a 248320 x 5120 table costs 715 MB instead of 5.09 GB of f32
-    /// (and no 5 GB transient host buffer during load).
-    fn embedding_q4k(
+    /// Packed embedding gather: rows stay packed in VRAM and are dequantized
+    /// on read, so a 248320 x 5120 table costs 715 MB as Q4_K (or 407 MB as
+    /// IQ2_S) instead of 5.09 GB of f32 — and no 5 GB transient host buffer
+    /// during load.
+    ///
+    /// The scheme comes from the storage, not from the method name. Both
+    /// branches share the same validation; only the block geometry and the
+    /// entry point differ.
+    fn embedding_packed(
         &self,
         weight: &dyn BackendStorage,
         indices: &[u32],
         out: &Shape,
         dim: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // Q4_K geometry: 256 elements per 144-byte super-block.
-        const QK_BLOCK: usize = 256;
-        const QK_BLOCK_BYTES: usize = 144;
+        use grim_tensor::dtype::KQuantScheme;
+        let scheme = match as_rocm(weight)
+            .map_err(|_| Error::Backend("embedding_packed: weight is not RocmStorage".into()))?
+            .dtype()
+            .storage
+        {
+            grim_tensor::dtype::Storage::KQuant(s) => s,
+            other => {
+                return Err(Error::Backend(format!(
+                    "embedding_packed: weight storage is {other:?}, expected a K-quant scheme"
+                )))
+            }
+        };
+        // (elements per super-block, bytes per super-block, entry point)
+        let (qk_block, qk_block_bytes, entry): (usize, usize, &str) = match scheme {
+            KQuantScheme::Q4K => (256, 144, "grim_embedding_q4k"),
+            KQuantScheme::IQ2S => (256, 82, "grim_embedding_iq2s_gather"),
+            other => {
+                return Err(Error::Unimplemented(format!(
+                    "embedding_packed: no on-device gather for {other:?}"
+                )))
+            }
+        };
+        let what = entry;
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let w_s = as_rocm(weight)
             .map_err(|_| Error::Backend("embedding_q4k: weight is not RocmStorage".into()))?;
         if !w_s.device_ptr_is_valid() {
             return Err(Error::Backend(
-                "embedding_q4k: weight lacks a valid device pointer".into(),
+                "embedding_packed: weight lacks a valid device pointer".into(),
             ));
         }
         let out_dims = out.dims();
         if out_dims.len() != 2 {
-            return Err(Error::Shape("embedding_q4k: out must be [n, dim]".into()));
+            return Err(Error::Shape("embedding_packed: out must be [n, dim]".into()));
         }
         if out_dims[1] != dim {
             return Err(Error::Shape(format!(
-                "embedding_q4k: out width {} != dim {dim}",
+                "embedding_packed: out width {} != dim {dim}",
                 out_dims[1]
             )));
         }
         if out_dims[0] != indices.len() {
             return Err(Error::Shape(format!(
-                "embedding_q4k: indices len {} != out leading dim {}",
+                "embedding_packed: indices len {} != out leading dim {}",
                 indices.len(),
                 out_dims[0]
             )));
@@ -640,10 +666,10 @@ impl CoreTensorOps for RocmDevice {
         // The kernel's address math is `(row/256)*144`, which is only exact when
         // every row is a whole number of super-blocks. Reject rather than
         // silently reading misaligned bytes.
-        if dim == 0 || dim % QK_BLOCK != 0 {
+        if dim == 0 || dim % qk_block != 0 {
             return Err(Error::Shape(format!(
-                "embedding_q4k: dim {dim} must be a non-zero multiple of the \
-                 Q4_K super-block size {QK_BLOCK}"
+                "embedding_packed: dim {dim} must be a non-zero multiple of the \
+                 super-block size {qk_block} for {what}"
             )));
         }
         // Derive the row count from the packed byte length so an out-of-range
@@ -654,19 +680,19 @@ impl CoreTensorOps for RocmDevice {
         } else {
             let elem_count = w_s.shape().elem_count();
             // Q4_K is 144 bytes per 256 elements
-            (elem_count / QK_BLOCK) * QK_BLOCK_BYTES
+            (elem_count / qk_block) * qk_block_bytes
         };
-        let expected = (dim / QK_BLOCK) * QK_BLOCK_BYTES;
+        let expected = (dim / qk_block) * qk_block_bytes;
         if expected == 0 || packed_bytes % expected != 0 {
             return Err(Error::Shape(format!(
-                "embedding_q4k: packed table of {packed_bytes} B is not a whole \
-                 number of {expected}-B rows"
+                "embedding_packed: packed table of {packed_bytes} B is not a whole \
+                 number of {expected}-B rows for {what}"
             )));
         }
         let rows = packed_bytes / expected;
         if let Some(bad) = indices.iter().find(|&&t| t as usize >= rows) {
             return Err(Error::Backend(format!(
-                "embedding_q4k: token id {bad} is out of range for a {rows}-row table"
+                "embedding_packed: token id {bad} is out of range for a {rows}-row table"
             )));
         }
 
@@ -679,7 +705,7 @@ impl CoreTensorOps for RocmDevice {
         let mut total_i = total as i32;
         let (grid, block) = linear_launch(total);
         let stream = self.launch_compute_kernel(
-            "grim_embedding_q4k",
+            entry,
             grid,
             block,
             &mut [

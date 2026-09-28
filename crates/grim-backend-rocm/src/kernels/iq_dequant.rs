@@ -219,6 +219,41 @@ extern "C" {
         *reinterpret_cast<float4*>(dst + base) = v;
     }
 
+    /// Gather rows out of a packed IQ2_S embedding table, dequantizing on read.
+    ///
+    /// The alternative is materialising the whole table as f32 at load: for
+    /// Qwen3.8-27B's [248320, 5120] embedding that is 5,085,593,600 B against
+    /// 407,244,800 B packed — 4.74 GiB stranded on a 17.1 GB card, which is
+    /// what exhausted VRAM and failed the first module load.
+    ///
+    /// Mirrors `grim_embedding_q4k_gather` (compute_kernels.rs) element for
+    /// element; it lives HERE rather than there because this translation unit
+    /// is concatenated AFTER compute_kernels in `source_asm.rs`, so a call to
+    /// `dequant_iq2s_device` from that file would be a use-before-declaration.
+    ///
+    /// IQ2_S geometry: 256 elements per 82-byte block. Address math is
+    /// `(row*dim + j)`, so `dim` must be a whole number of super-blocks; the
+    /// host side rejects it otherwise rather than reading misaligned bytes.
+    extern "C" __global__ void grim_embedding_iq2s_gather(
+        const unsigned char* packed, float* out, const int* indices,
+        int dim, int total, int rows)
+    {
+        const int QK_BLOCK = 256;
+        const int QK_BLOCK_BYTES = 82;
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total) return;
+        int i = idx / dim;
+        int j = idx - i * dim;
+        int row = indices[i];
+        if (row < 0 || row >= rows) {
+            out[idx] = 0.0f;
+            return;
+        }
+        long long e = (long long)row * (long long)dim + (long long)j;
+        const unsigned char* blk = packed + (e / QK_BLOCK) * QK_BLOCK_BYTES;
+        out[idx] = dequant_iq2s_device(blk, (int)(e % QK_BLOCK));
+    }
+
     /// Dequantize IQ4_NL packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
     /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
     __global__ void __launch_bounds__(64)

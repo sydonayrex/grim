@@ -184,7 +184,7 @@ impl CoreTensorOps for ProbeDevice {
         })
     }
 
-    fn embedding_q4k(
+    fn embedding_packed(
         &self,
         _weight: &dyn BackendStorage,
         _indices: &[u32],
