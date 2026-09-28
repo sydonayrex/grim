@@ -664,10 +664,12 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 ///
 /// Transcribed from llama.cpp `dequantize_row_iq2_s`
 /// (`old/repo/llama.cpp-master/ggml/src/ggml-quants.c`), block layout from
-/// `ggml-common.h`:
+/// `ggml-common.h` (C, not Rust — hence the `text` fence):
 ///
-///     block_iq2_s { ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32];
-///                   uint8_t scales[QK_K/32]; }        // 2 + 64 + 8 + 8 = 82 B
+/// ```text
+/// block_iq2_s { ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32];
+///               uint8_t scales[QK_K/32]; }        // 2 + 64 + 8 + 8 = 82 B
+/// ```
 ///
 /// and `signs` is a VIEW into `qs` at `qs + QK_K/8`, not a separate field.
 /// The previous version here used a wholly different layout — a 16-element
@@ -3589,31 +3591,240 @@ pub fn quant_iq2xs(data: &[f32]) -> Result<Vec<u8>> {
 }
 
 /// Quantize f32 values to IQ2_S bytes (82 bytes per 256 weights).
+///
+/// Transcribed from llama.cpp `quantize_row_iq2_s_impl`
+/// (`old/repo/llama.cpp-master/ggml/src/ggml-quants.c`, the `quant_weights ==
+/// NULL` path), including its block layout from `ggml-common.h` (C, not Rust
+/// — hence the `text` fence):
+///
+/// ```text
+/// block_iq2_s { ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32];
+///               uint8_t scales[QK_K/32]; }        // 2 + 64 + 8 + 8 = 82 B
+/// ```
+///
+/// The previous version here stored a per-ELEMENT 2-bit code in `qs[i/8]`,
+/// left every sub-scale byte zero, and never touched `qh` — output that our
+/// own (correct) `dequant_iq2s` turned back into near-garbage. The real
+/// format stores one GRID INDEX per 8 elements (low 8 bits in `qs[i8]`, top 2
+/// in `qh`), a packed sign byte per 8 elements at `qs[32 + i8]`, and a
+/// weighted-least-squares-fitted sub-scale per 16 elements.
+///
+/// The final short block is zero-padded to 256 so the trailing weights
+/// quantize as zeros rather than being dropped (the reference asserts
+/// `n % QK_K == 0` instead).
 pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
-    const SUPER: usize = 256;
-    let num_blocks = data.len().div_ceil(SUPER);
-    let mut out = Vec::with_capacity(num_blocks * 82);
-    for chunk in data.chunks(SUPER) {
-        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let scale = if max_val > 0.0 { max_val / 1.5 } else { 1.0 };
-        let d_f16 = f32_to_f16(scale).to_le_bytes();
-        out.extend_from_slice(&d_f16);
+    use crate::iq_tables::{iq2s_quant_tables, KGRID_2BIT_1024};
 
-        let mut qs = vec![0u8; 48];
-        let scales = vec![0u8; 8];
-        let mut signs = vec![0u8; 24];
-        for (i, &val) in chunk.iter().enumerate() {
-            if val < 0.0 {
-                let sign_idx = (i / 8).min(signs.len() - 1);
-                signs[sign_idx] |= 1 << (i % 8);
+    const QK: usize = 256;
+    const KMAX_Q: i32 = 3;
+    const GROUP_MAX_EPS_IQ2_S: f32 = 1e-8;
+
+    // ggml `ggml_compute_fp32_to_fp16` (ggml-impl.h): round-to-nearest-even.
+    // The crate-wide `f32_to_f16` TRUNCATES the mantissa, which would perturb
+    // the f16 block scale off llama.cpp's value.
+    fn f32_to_f16_rne(v: f32) -> u16 {
+        let w = v.to_bits();
+        let shl1_w = w.wrapping_add(w);
+        let sign = (shl1_w >> 16) as u16 & 0x8000;
+        let mut bias = shl1_w & 0xFF00_0000;
+        if bias < 0x7100_0000 {
+            bias = 0x7100_0000;
+        }
+        let scale_to_inf = f32::from_bits(0x7780_0000); // 0x1.0p+112
+        let scale_to_zero = f32::from_bits(0x0880_0000); // 0x1.0p-110
+        let base = f32::from_bits((bias >> 1).wrapping_add(0x0780_0000))
+            + (v.abs() * scale_to_inf) * scale_to_zero;
+        let bits = base.to_bits();
+        let exp_bits = (bits >> 13) & 0x0000_7C00;
+        let mantissa_bits = bits & 0x0000_0FFF;
+        let nonsign = (exp_bits + mantissa_bits) as u16;
+        sign | if shl1_w > 0xFF00_0000 { 0x7E00 } else { nonsign }
+    }
+
+    // llama.cpp `nearest_int`: bit-trick round-to-nearest-even via the f32
+    // mantissa (ggml-quants.c:621).
+    fn nearest_int(fval: f32) -> i32 {
+        debug_assert!(fval.abs() <= 4194303.0f32);
+        let val = fval + 12582912.0f32;
+        (val.to_bits() & 0x007f_ffff) as i32 - 0x0040_0000
+    }
+
+    let tables = iq2s_quant_tables();
+    let num_blocks = data.len().div_ceil(QK);
+    let mut out = Vec::with_capacity(num_blocks * 82);
+    for chunk in data.chunks(QK) {
+        let mut xbl = [0.0f32; QK];
+        xbl[..chunk.len()].copy_from_slice(chunk);
+
+        let sumx2: f32 = xbl.iter().map(|&x| x * x).sum();
+        let sigma2 = 2.0f32 * sumx2 / QK as f32;
+
+        let mut qs = [0u8; QK / 4]; // grid indices at [0..32), signs at [32..64)
+        let mut qh = [0u8; QK / 32];
+        let mut scales_bytes = [0u8; QK / 32];
+        let mut scale = [0.0f32; QK / 16]; // per 16-element group
+        let mut max_scale = 0.0f32;
+
+        for ib in 0..QK / 16 {
+            let xb = &xbl[16 * ib..16 * ib + 16];
+            // No quant_weights: weight[i] = 0.25*sigma2 + x^2.
+            let mut weight = [0.0f32; 16];
+            let mut waux = [0.0f32; 16];
+            let mut xval = [0.0f32; 16];
+            for i in 0..16 {
+                weight[i] = 0.25f32 * sigma2 + xb[i] * xb[i];
+                waux[i] = weight[i].sqrt();
             }
-            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
-            let q_idx = (i / 8).min(qs.len() - 1);
-            qs[q_idx] = code;
+            let mut block_signs = [0u8; 2];
+            for k in 0..2 {
+                let mut s = 0u8;
+                for i in 0..8 {
+                    if xb[8 * k + i] >= 0.0 {
+                        xval[8 * k + i] = xb[8 * k + i];
+                    } else {
+                        xval[8 * k + i] = -xb[8 * k + i];
+                        s |= 1 << i;
+                    }
+                }
+                block_signs[k] = s;
+            }
+            let max = xval.iter().copied().fold(0.0f32, f32::max);
+            let mut l = [0i8; 16];
+            if max < GROUP_MAX_EPS_IQ2_S {
+                continue; // scale[ib] stays 0
+            }
+            let mut best = 0.0f32;
+            let mut group_scale = max / (2 * KMAX_Q - 1) as f32;
+            let mut is_on_grid = [true; 2];
+            for is in -9..=9 {
+                let id = ((2 * KMAX_Q - 1) as f32 + is as f32 * 0.1) / max;
+                let this_scale = 1.0 / id;
+                let mut laux = [0i8; 16];
+                let mut is_on_grid_aux = [false; 2];
+                for k in 0..2 {
+                    for i in 0..8 {
+                        let li = nearest_int(0.5f32 * (id * xval[8 * k + i] - 1.0));
+                        laux[8 * k + i] = li.clamp(0, KMAX_Q - 1) as i8;
+                    }
+                    let mut u = 0u16;
+                    for i in 0..8 {
+                        u |= (laux[8 * k + i] as u16) << (2 * i);
+                    }
+                    let mut grid_index = tables.map[u as usize];
+                    is_on_grid_aux[k] = true;
+                    if grid_index < 0 {
+                        is_on_grid_aux[k] = false;
+                        grid_index = tables
+                            .best_neighbour(
+                                u,
+                                &xval[8 * k..8 * k + 8],
+                                &waux[8 * k..8 * k + 8],
+                                this_scale,
+                            )
+                            .expect("off-grid code has a neighbour") as i32;
+                        let entry = KGRID_2BIT_1024[grid_index as usize];
+                        for i in 0..8 {
+                            laux[8 * k + i] = ((entry >> (2 * i)) & 0x3) as i8;
+                        }
+                    }
+                }
+                let mut sumqx = 0.0f32;
+                let mut sumq2 = 0.0f32;
+                for i in 0..16 {
+                    let w = weight[i];
+                    let q = (2 * laux[i] + 1) as f32;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if sumq2 > 0.0 && sumqx * sumqx > best * sumq2 {
+                    group_scale = sumqx / sumq2;
+                    best = group_scale * sumqx;
+                    l = laux;
+                    is_on_grid = is_on_grid_aux;
+                }
+            }
+            if is_on_grid.iter().any(|&g| !g) && group_scale > 0.0 {
+                let id = 1.0 / group_scale;
+                for k in 0..2 {
+                    if is_on_grid[k] {
+                        continue;
+                    }
+                    let mut u = 0u16;
+                    for i in 0..8 {
+                        let li = nearest_int(0.5f32 * (id * xval[8 * k + i] - 1.0));
+                        let li = li.clamp(0, KMAX_Q - 1) as i8;
+                        u |= (li as u16) << (2 * i);
+                        l[8 * k + i] = li;
+                    }
+                    let grid_index = match tables.map[u as usize] {
+                        g if g >= 0 => g,
+                        _ => tables
+                            .best_neighbour(u, &xval[8 * k..8 * k + 8], &waux[8 * k..8 * k + 8], group_scale)
+                            .expect("off-grid code has a neighbour") as i32,
+                    };
+                    let entry = KGRID_2BIT_1024[grid_index as usize];
+                    for i in 0..8 {
+                        l[8 * k + i] = ((entry >> (2 * i)) & 0x3) as i8;
+                    }
+                }
+                let mut sumqx = 0.0f32;
+                let mut sumq2 = 0.0f32;
+                for i in 0..16 {
+                    let w = weight[i];
+                    let q = (2 * l[i] + 1) as f32;
+                    sumqx += w * xval[i] * q;
+                    sumq2 += w * q * q;
+                }
+                if sumq2 > 0.0 {
+                    group_scale = sumqx / sumq2;
+                }
+            }
+            if group_scale < 0.0 {
+                group_scale = -group_scale;
+                for k in 0..2 {
+                    block_signs[k] = !block_signs[k];
+                }
+            }
+            for k in 0..2 {
+                let mut u = 0u16;
+                for i in 0..8 {
+                    u |= (l[8 * k + i] as u16) << (2 * i);
+                }
+                let grid_index = tables.map[u as usize];
+                assert!(
+                    grid_index >= 0,
+                    "IQ2_S quantize: final point {u} not on grid (L = {:?})",
+                    &l[8 * k..8 * k + 8]
+                );
+                let i8 = 2 * ib + k;
+                qs[i8] = (grid_index & 255) as u8;
+                qh[i8 / 4] |= ((grid_index >> 8) as u8) << (2 * (i8 % 4));
+                qs[QK / 8 + i8] = block_signs[k];
+            }
+            scale[ib] = group_scale;
+            max_scale = max_scale.max(group_scale);
+        }
+
+        if max_scale > 0.0 {
+            let d = max_scale / 31.0;
+            let d_f16 = f32_to_f16_rne(d * 0.9875f32);
+            out.extend_from_slice(&d_f16.to_le_bytes());
+            let id = 1.0 / d;
+            for ib in 0..QK / 16 {
+                let li = nearest_int(0.5f32 * (id * scale[ib] - 1.0));
+                let li = li.clamp(0, 15) as u8;
+                if ib % 2 == 0 {
+                    scales_bytes[ib / 2] = li;
+                } else {
+                    scales_bytes[ib / 2] |= li << 4;
+                }
+            }
+        } else {
+            out.extend_from_slice(&[0u8; 2]);
         }
         out.extend_from_slice(&qs);
-        out.extend_from_slice(&scales);
-        out.extend_from_slice(&signs);
+        out.extend_from_slice(&qh);
+        out.extend_from_slice(&scales_bytes);
     }
     Ok(out)
 }
