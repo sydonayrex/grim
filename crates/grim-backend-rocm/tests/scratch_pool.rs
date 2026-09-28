@@ -254,7 +254,7 @@ fn pool_peak_monotonic_under_concurrent_load() -> TestResult {
 /// usable pool, regardless of GPU presence.
 #[test]
 fn pool_new_is_infallible_and_zeroed() -> TestResult {
-    let pool = DeviceScratchPool::new();
+    let pool = DeviceScratchPool::new(0);
     assert_eq!(pool.current_bytes(), 0);
     assert_eq!(pool.peak_bytes(), 0);
     // Pool is Arc; clonable for shared use without disturbing counters.

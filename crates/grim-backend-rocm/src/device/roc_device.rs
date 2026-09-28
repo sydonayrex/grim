@@ -811,7 +811,7 @@ impl RocmDevice {
             bounce_staging: Mutex::new(None),
             blaslt_scratch: Mutex::new(None),
             retained_pins: Mutex::new(Vec::new()),
-            scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
+            scratch_pool: crate::memory::pool::DeviceScratchPool::new(ordinal),
             autotuner: Mutex::new(autotuner),
             // Tuning-mode + occupancy + tuning-solution store for this device.
             // [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning, tuning solution storage]

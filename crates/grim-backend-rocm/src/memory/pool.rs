@@ -65,17 +65,29 @@ pub struct DeviceScratchPool {
     buckets: Mutex<HashMap<PoolLayout, Vec<*mut std::ffi::c_void>>>,
     peak_bytes: AtomicUsize,
     current_bytes: AtomicUsize,
+    /// The device these cached pointers belong to.
+    ///
+    /// `hipMalloc` allocates in the *calling thread's* current device context,
+    /// not in "the device this pool belongs to". Without a guard around the
+    /// allocation, a thread sitting on device 0 that calls into device 1's pool
+    /// gets a device-0 pointer recorded in device 1's bucket list, and the next
+    /// kernel launched on device 1 writes to foreign memory -- the same
+    /// "Page not present / failed to write segment data" fault the launch path's
+    /// P1-3 discipline exists to prevent. See `RocmCachingAllocator::alloc`, which
+    /// carries the same guard and the same WI-M1 note.
+    ordinal: usize,
 }
 
 impl DeviceScratchPool {
     /// Build a new, empty pool. State lives in atomic counters and a [see: `get()`] Bucket entries are raw
     /// device pointers that only the pool mutex dereferences; the Arc is deliberately shared across threads despite the pointer type.
     #[allow(clippy::arc_with_non_send_sync)]
-    pub fn new() -> Arc<Self> {
+    pub fn new(ordinal: usize) -> Arc<Self> {
         Arc::new(Self {
             buckets: Mutex::new(HashMap::new()),
             peak_bytes: AtomicUsize::new(0),
             current_bytes: AtomicUsize::new(0),
+            ordinal,
         })
     }
 
@@ -94,6 +106,10 @@ impl DeviceScratchPool {
             Some(p) => p,
             None => {
                 let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                // Pin the device across the allocation. Scoped to this `None`
+                // arm: a recycled pointer needs no driver call, and holding a
+                // guard across the bucket pop would serialise every hit.
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 let mut status = unsafe { hipMalloc(&mut p, layout.size) };
                 if status != crate::hipSuccess {
                     // The scratch pool also serves temporary activations.
@@ -133,7 +149,13 @@ impl DeviceScratchPool {
         } else {
             // Mutex poisoned (e.g. from an earlier panic): free eagerly instead
             // of silently leaking VRAM. [P1-12 fix: hipFree on poison.]
+            //
+            // Pinned for the same reason as the allocation: hipFree releases on
+            // the calling thread's current device, so freeing a device-1 pointer
+            // from a thread sitting on device 0 leaks the allocation -- the
+            // failure P1-12 was fixing in the first place.
             if !ptr.is_null() {
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                 let _ = unsafe { hipFree(ptr) };
             }
         }
@@ -152,6 +174,11 @@ impl DeviceScratchPool {
     fn drain(&self) {
         // Synchronize before freeing — async kernels on pooled streams may
         // still be reading returned buffers. [P1-11 fix: add hipDeviceSynchronize.]
+        //
+        // Pinned: the synchronize and the frees below all act on the calling
+        // thread's current device, which need not be the device these pointers
+        // were allocated on.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let _ = unsafe { crate::hipDeviceSynchronize() };
         let mut buckets = match self.buckets.lock() {
             Ok(b) => b,
