@@ -39,6 +39,22 @@ pub struct DecodeGraphBuffers {
     pub q_buf: Vec<RocmStorage>, // [batch, n_q]
     pub k_buf: Vec<RocmStorage>,        // [batch, n_k]
     pub v_buf: Vec<RocmStorage>,        // [batch, n_v]
+    /// The two halves of the fused attention Q|gate projection, split.
+    ///
+    /// `q_buf` holds `[batch, 2*q_dim]` — the fused Q|gate — because that is
+    /// what the projection produces. But the per-head Q norm and the RoPE both
+    /// operate on Q ALONE at `[batch, q_dim]`, and the gate is needed separately
+    /// to multiply the attention output. Running either of them over the whole
+    /// fused buffer is a shape mismatch (and would norm the gate half too).
+    ///
+    /// llama.cpp splits with a view: `gate = ggml_view_3d(Qcur_full, ...)`
+    /// (qwen35.cpp:289-293) and norms/ropes `Qcur` on its own. vLLM keeps
+    /// `in_proj_qkv` and `in_proj_z` as separate parameters
+    /// (qwen_gdn_linear_attn.py:1033-1038). The graph has neither, so it gets
+    /// two real buffers and one copy each.
+    pub q_head_buf: Vec<RocmStorage>, // [batch, n_attn_out]
+    /// The gate half, consumed by `sigmoid` before `wo`.
+    pub q_gate_buf: Vec<RocmStorage>, // [batch, n_attn_out]
     /// Branch output before the output projection.
     ///
     /// `[batch, n_attn_out]` — and `n_attn_out` is the ATTENTION branch width
@@ -326,6 +342,8 @@ impl DecodeGraphBuffers {
         let mut k_buf = Vec::with_capacity(num_layers);
         let mut v_buf = Vec::with_capacity(num_layers);
         let mut attn_out_buf = Vec::with_capacity(num_layers);
+        let mut q_head_buf = Vec::with_capacity(num_layers);
+        let mut q_gate_buf = Vec::with_capacity(num_layers);
         let mut gate_up_buf = Vec::with_capacity(num_layers);
         let mut gate_buf = Vec::with_capacity(num_layers);
         let mut up_buf = Vec::with_capacity(num_layers);
@@ -392,6 +410,18 @@ impl DecodeGraphBuffers {
             )?);
             v_buf.push(RocmStorage::alloc_gpu(
                 &Shape::new(vec![batch, nvk]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            q_head_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, n_attn_out]),
+                dt.clone(),
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            q_gate_buf.push(RocmStorage::alloc_gpu(
+                &Shape::new(vec![batch, n_attn_out]),
                 dt.clone(),
                 &dev.allocator,
                 dev.ordinal,
@@ -675,6 +705,8 @@ impl DecodeGraphBuffers {
             k_buf,
             v_buf,
             attn_out_buf,
+            q_head_buf,
+            q_gate_buf,
             gate_up_buf,
             gate_buf,
             up_buf,

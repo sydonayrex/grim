@@ -372,6 +372,32 @@ impl LlamaBlock {
         grim_backend_rocm::launch_bump_i32_slots(dev, &buffers.pos_dev, steps, batch)
             .map_err(|e| grim_core::error::Error::Backend(format!("bump: {e}")))?;
 
+        // 6b. Attention OUTPUT GATE — `out = out * sigmoid(gate)`.
+        //
+        // This was MISSING: the graph went from the attention straight to `wo`,
+        // so the fused gate half was computed and then discarded. The reference
+        // applies it (qwen35.cpp:321-328):
+        //     gate_sigmoid = ggml_sigmoid(ctx0, gate);
+        //     cur          = ggml_mul(ctx0, cur, gate_sigmoid);
+        // and Qwen3.5/3.8 always has an output gate on its attention layers, so
+        // this silently changes every attention layer's output. It is a
+        // CORRECTNESS fix, not a shape fix: with the shapes right this would
+        // still be wrong.
+        //
+        // `q_head_buf` is dead after the RoPE, so the sigmoid lands there and no
+        // third buffer is needed.
+        dev.sigmoid_into(
+            &buffers.q_gate_buf[layer_idx],
+            &buffers.q_head_buf[layer_idx],
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 attn gate sigmoid: {e}")))?;
+        dev.mul_into(
+            &buffers.attn_out_buf[layer_idx],
+            &buffers.q_head_buf[layer_idx],
+            &buffers.attn_out_buf[layer_idx],
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 attn gate mul: {e}")))?;
+
         // 7. Output projection (wo) + residual add
         linear_into_named(
             dev,
@@ -1059,14 +1085,37 @@ impl Qwen35Block {
                 linear_into_named(dev, normed, wv.weight(), &buffers.v_buf[layer_idx], act, "attn.v", layer_idx)?;
             }
 
-            // 3. Optional per-head Q/K norm
+            // 3. Split the fused Q|gate. `q_buf` holds [Q | gate] at 2*q_dim;
+            // the norm and the RoPE below apply to Q alone, and the gate is
+            // needed later to scale the attention output. llama.cpp splits with
+            // a view (qwen35.cpp:289-293) and keeps the halves apart
+            // thereafter; nothing downstream here may read the fused buffer as
+            // if it were Q.
+            dev.copy_slice_range(
+                &buffers.q_head_buf[layer_idx],
+                0,
+                &buffers.q_buf[layer_idx],
+                0,
+                nh * hd,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 split Q: {e}")))?;
+            dev.copy_slice_range(
+                &buffers.q_gate_buf[layer_idx],
+                0,
+                &buffers.q_buf[layer_idx],
+                nh * hd,
+                nh * hd,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 split gate: {e}")))?;
+
+            // 3b. Optional per-head Q/K norm
             if let Some(qn) = &self.attn_q_norm {
                 let qn_shape = Shape::new(vec![batch * nh, hd]);
                 dev.rms_norm_into(
-                    &buffers.q_buf[layer_idx],
+                    &buffers.q_head_buf[layer_idx],
                     &**qn.weight.storage(),
                     qn.eps,
-                    &buffers.q_buf[layer_idx],
+                    &buffers.q_head_buf[layer_idx],
                     &qn_shape,
                 )
                 .map_err(grim_core::error::Error::Tensor)?;
@@ -1088,9 +1137,9 @@ impl Qwen35Block {
             let rope_cfg = RopeConfig::new(hd, self.rope_theta);
             let q3 = Shape::new(vec![batch, nh * steps, hd]);
             dev.rope_dev_base_into(
-                &buffers.q_buf[layer_idx],
+                &buffers.q_head_buf[layer_idx],
                 &buffers.pos_dev,
-                &buffers.q_buf[layer_idx],
+                &buffers.q_head_buf[layer_idx],
                 &rope_cfg,
                 &q3,
                 nh,
