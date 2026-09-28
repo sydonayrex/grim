@@ -289,6 +289,127 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         eprintln!("[floor-probe] g_small_W4A4_whitecrow       scheme=U4  n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
     }
 
+    // (h) TreePie GEMV (5.0 bpw, V_DOT2_F32_F16) — packed in-register decode,
+    // f16 activations. Weight bytes: 5 x i32 per 32 values = 0.625 B/elem.
+    {
+        let n = 16384usize;
+        let alloc = dev.allocator_handle();
+        let mut sseed: u64 = 71;
+        let mut nxt = move || {
+            sseed ^= sseed << 13;
+            sseed ^= sseed >> 17;
+            sseed ^= sseed << 5;
+            sseed
+        };
+        let vals: Vec<f32> = (0..n * k).map(|_| ((nxt() & 0xffff) as f32 / 32768.0) - 1.0).collect();
+        let packed_u32 = grim_quant::tree_pie::pack_tree_pie(&vals);
+        let packed_bytes: Vec<u8> = packed_u32.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &packed_bytes,
+            &Shape::new(vec![packed_bytes.len()]),
+            DType { arith: ArithType::U32, storage: Storage::Native }).unwrap();
+        let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let a_f16_bytes: Vec<u8> = a.iter()
+            .map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .flatten().collect();
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_f16_bytes,
+            &Shape::new(vec![a_f16_bytes.len()]),
+            DType { arith: ArithType::F16, storage: Storage::Native }).unwrap();
+        let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
+        let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        for _ in 0..3 {
+            dev.launch_tree_pie_gemv(a_rocm, b_rocm, &out, n, k).unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            dev.launch_tree_pie_gemv(a_rocm, b_rocm, &out, n, k).unwrap();
+        }
+        dev.synchronize();
+        let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+        let gb = n as f64 * k as f64 * 0.625 / 1e9;
+        let gbps = gb / (us * 1e-6);
+        eprintln!("[floor-probe] h_small_TREAPIE_dot2         scheme=TP  n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+    }
+
+    // (i) WhiteRaven FP8 E4M3 WMMA GEMM (RDNA4 V_WMMA_FP8) — 1.0 B/elem.
+    // M=1 needs the A operand padded to a 16-row tile (launcher contract);
+    // N=16384 is a whole 16-tile. m=1 output row only is stored.
+    {
+        let n = 16384usize;
+        let alloc = dev.allocator_handle();
+        let mut sseed: u64 = 73;
+        let mut nxt = move || {
+            sseed ^= sseed << 13;
+            sseed ^= sseed >> 17;
+            sseed ^= sseed << 5;
+            sseed
+        };
+        let b_fp8: Vec<u8> = (0..n * k).map(|_| (nxt() & 0xff) as u8).collect();
+        let a_row: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let mut a_fp8: Vec<u8> = vec![0u8; 16 * k]; // 16-row pad, row 0 = real
+        for (i, &v) in a_row.iter().enumerate() {
+            a_fp8[i] = grim_quant::quant_fp8(&[v]).unwrap()[0];
+        }
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![16, k]),
+            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_fp8, &Shape::new(vec![n, k]),
+            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let out = RocmStorage::alloc_gpu(&Shape::new(vec![1, n]), DType::F32, &alloc, 0).unwrap();
+        let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        for _ in 0..3 {
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+        }
+        dev.synchronize();
+        let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+        let gb = n as f64 * k as f64 * 1.0 / 1e9;
+        let gbps = gb / (us * 1e-6);
+        eprintln!("[floor-probe] i_small_WHITERAVEN_fp8_wmma  scheme=FP8 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+    }
+
+    // (j) WhiteRaven at M=16 — its native tile. Prefill-relevant: how many
+    // weight bytes/sec when the WMMA fragments are full.
+    {
+        let n = 16384usize;
+        let m = 16usize;
+        let alloc = dev.allocator_handle();
+        let mut sseed: u64 = 79;
+        let mut nxt = move || {
+            sseed ^= sseed << 13;
+            sseed ^= sseed >> 17;
+            sseed ^= sseed << 5;
+            sseed
+        };
+        let b_fp8: Vec<u8> = (0..n * k).map(|_| (nxt() & 0xff) as u8).collect();
+        let a_fp8: Vec<u8> = (0..m * k).map(|_| (nxt() & 0xff) as u8).collect();
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![m, k]),
+            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_fp8, &Shape::new(vec![n, k]),
+            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let out = RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &alloc, 0).unwrap();
+        let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        for _ in 0..3 {
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, m, n, k).unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            dev.launch_wmma_gemm_fp8_e4m3_for_ab(a_rocm, b_rocm, &out, m, n, k).unwrap();
+        }
+        dev.synchronize();
+        let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+        let gb = n as f64 * k as f64 * 1.0 / 1e9;
+        let gbps = gb / (us * 1e-6);
+        eprintln!("[floor-probe] j_m16_WHITERAVEN_fp8_wmma    scheme=FP8 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+    }
+
     // Verdict inputs, not a hard gate: this probe is evidence.
     let small_gb = 16384.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
     let big_gb = 248320.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
