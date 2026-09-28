@@ -128,6 +128,30 @@ fn gpu_device_locked() -> Option<(RocmDevice, std::sync::MutexGuard<'static, ()>
     Some((dev, lock))
 }
 
+/// Which arms to run, from `GRIM_AB_ARMS` (comma-separated substrings).
+///
+/// Exists because a GPU memory fault in any one kernel takes down the whole
+/// process, and a four-arm harness where three arms are innocent is
+/// undiagnosable without it. On gfx1200 the full sweep faults with
+/// "Memory access fault ... Page not present"; with this, each arm can be run
+/// alone to find the culprit.
+///
+/// Unset means all arms, so the default path is unchanged. The report labels an
+/// arm-filtered run, because a one-arm artifact must never be mistaken for a
+/// four-arm result.
+fn arm_selected(name: &str) -> bool {
+    let Some(spec) = std::env::var("GRIM_AB_ARMS").ok() else {
+        return true;
+    };
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "all" {
+        return true;
+    }
+    spec.split(',')
+        .map(str::trim)
+        .any(|want| !want.is_empty() && name.to_ascii_lowercase().contains(&want.to_ascii_lowercase()))
+}
+
 /// Deterministic LCG: a time- or address-dependent fixture would make the
 /// artifact incomparable between runs, and therefore useless.
 fn lcg(seed: u64) -> impl FnMut() -> f32 {
@@ -839,15 +863,18 @@ fn precision_kernel_ab() {
         // Arm every arm first, then time them together round-robin. Oracle work
         // is done during setup, never inside a timed region.
         let mut armed: Vec<Armed> = Vec::new();
-        for r in [
-            arm_raven(&dev, &a, &bdk, m, n, k),
-            arm_forest_raven(&dev, &a, &bdk, m, n, k),
-            arm_white_crow(&dev, &a_nonneg, &bdk, m, n, k),
-            arm_white_raven(&dev, &a, &bdk, m, n, k),
+        for (name, r) in [
+            ("Raven", arm_raven(&dev, &a, &bdk, m, n, k)),
+            ("ForestRaven", arm_forest_raven(&dev, &a, &bdk, m, n, k)),
+            ("WhiteCrow", arm_white_crow(&dev, &a_nonneg, &bdk, m, n, k)),
+            ("WhiteRaven", arm_white_raven(&dev, &a, &bdk, m, n, k)),
         ] {
+            if !arm_selected(name) {
+                continue;
+            }
             match r {
                 Ok(x) => armed.push(x),
-                Err(e) => eprintln!("arm setup failed at m={m} k={k}: {e}"),
+                Err(e) => eprintln!("arm setup failed at m={m} k={k} [{name}]: {e}"),
             }
         }
         if armed.is_empty() {
