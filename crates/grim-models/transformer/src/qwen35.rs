@@ -28,6 +28,31 @@ pub(crate) fn d2d_strict_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("GRIM_FORCE_D2D").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `GRIM_DEBUG_ATTN_SHAPES`, cached.
+///
+/// This flag was read with a bare `std::env::var` at five sites in
+/// `attention_layer_d2d`, one of them inside the `stage!` macro that expands
+/// once per stage per layer. That is ~40 environment lookups per decoded token
+/// on the 9B's 8 attention layers, paid whether or not the flag is set.
+/// `std::env::var` takes the process environment lock and walks the
+/// environ array; it does not belong on the decode hot path.
+fn attn_shapes_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok())
+}
+
+/// `GRIM_QWEN_ATTN_D2D` set to a disabling value, cached — see
+/// [`attn_shapes_debug`] for why.
+fn attn_d2d_disabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("GRIM_QWEN_ATTN_D2D").as_deref(),
+            Ok("0" | "false" | "off" | "no")
+        )
+    })
+}
+
 /// Declare a D2D fallback site.
 /// When D2D is default, falling back is an exceptional event: log warning and emit fallback event.
 /// If `GRIM_FORCE_D2D=1`, halts with error rather than silently degrading.
@@ -739,13 +764,13 @@ impl Qwen35Block {
             // first attention layer, on both the D2D and host routes. Print the
             // geometry each step assumes so a wrong width is visible without
             // re-deriving it.
-            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+            if attn_shapes_debug() {
                 let shp = |t: &Option<Linear>| {
                     t.as_ref()
-                        .map(|l| (l.weight().shape().dims().to_vec(), l.weight().to_vec_f32().map(|v| v.len()).unwrap_or(0)))
+                        .map(|l| (l.weight().shape().dims().to_vec(), l.weight().shape().elem_count()))
                 };
                 let nshp = |n: &Option<RmsNorm>| {
-                    n.as_ref().map(|x| (x.weight.shape().dims().to_vec(), x.weight.to_vec_f32().map(|v| v.len()).unwrap_or(0)))
+                    n.as_ref().map(|x| (x.weight.shape().dims().to_vec(), x.weight.shape().elem_count()))
                 };
                 eprintln!(
                     "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
@@ -2189,10 +2214,7 @@ fn attention_layer_d2d(
     // verified against the host reference over chained decode steps.
     //
     // Escape hatch: GRIM_QWEN_ATTN_D2D=0 forces the host reference.
-    if matches!(
-        std::env::var("GRIM_QWEN_ATTN_D2D").as_deref(),
-        Ok("0" | "false" | "off" | "no")
-    ) {
+    if attn_d2d_disabled() {
         d2d_decline!("attn: GRIM_QWEN_ATTN_D2D is set to a disabling value");
     }
     // `wo` is deliberately not required here: the caller applies it to whatever
@@ -2215,22 +2237,16 @@ fn attention_layer_d2d(
     // transfer at the first attention layer. Print the geometry each step
     // assumes, and the real element counts, so a width mismatch is visible
     // rather than re-derived.
-    if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+    if attn_shapes_debug() {
+        // Shape only. This used to call `to_vec_f32()` on each weight to print
+        // its element count, which drags every projection back to the host —
+        // 33.5 M floats for `attn_q` alone, per attention layer, per token.
+        // The count is `shape().elem_count()`; nothing about it needs the data.
         let shp = |t: &Option<Linear>| {
-            t.as_ref().map(|l| {
-                (
-                    l.weight().shape().dims().to_vec(),
-                    l.weight().to_vec_f32().map(|v| v.len()).unwrap_or(usize::MAX),
-                )
-            })
+            t.as_ref().map(|l| (l.weight().shape().dims().to_vec(), l.weight().shape().elem_count()))
         };
         let nshp = |n: &Option<RmsNorm>| {
-            n.as_ref().map(|x| {
-                (
-                    x.weight.shape().dims().to_vec(),
-                    x.weight.to_vec_f32().map(|v| v.len()).unwrap_or(usize::MAX),
-                )
-            })
+            n.as_ref().map(|x| (x.weight.shape().dims().to_vec(), x.weight.shape().elem_count()))
         };
         eprintln!(
             "[attn-debug] layer {} seq_len={} q_dim={q_dim} kv_dim={kv_dim} wq={:?} wk={:?} wv={:?} wo={:?} q_norm={:?} k_norm={:?} gate={:?}",
@@ -2249,7 +2265,7 @@ fn attention_layer_d2d(
     // TEMP: bracket every stage so one run says which one aborts.
     macro_rules! stage {
         ($n:expr) => {
-            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+            if attn_shapes_debug() {
                 eprintln!("[attn-stage] layer {} stage={}", blk.layer_idx, $n);
             }
         };
@@ -2287,7 +2303,7 @@ fn attention_layer_d2d(
     let q_split = Shape::new(vec![seq_len, q_dim]);
     let (q_st, gate_st) = {
         let mark = |tag: &str| {
-            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+            if attn_shapes_debug() {
                 eprintln!("[attn-split] {tag} q_full ptr_ok={} dims={:?}",
                     q_full.storage().device_ptr().is_some(),
                     q_full.shape().dims().to_vec());
@@ -2334,7 +2350,7 @@ fn attention_layer_d2d(
         let Some(n) = n else { return Ok(t.clone()) };
         let three = Shape::new(vec![1, seq_len * heads, blk.head_dim]);
         let mk2 = |tag: &str| {
-            if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+            if attn_shapes_debug() {
                 eprintln!("[attn-hn] {tag} in_dims={:?} three={:?}", t.shape().dims().to_vec(), three.dims().to_vec());
             }
         };
@@ -2495,7 +2511,7 @@ fn attention_layer_d2d(
     // downloads Q and the KV arena). Print shape AND pointer for every buffer
     // that download reads, so the answer is binary rather than another round
     // of setting up a test.
-    if std::env::var("GRIM_DEBUG_ATTN_SHAPES").is_ok() {
+    if attn_shapes_debug() {
         let d = |n: &str, st: Option<&dyn grim_tensor::BackendStorage>| match st {
             None => format!("{n}=None"),
             Some(x) => {
