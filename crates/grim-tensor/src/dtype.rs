@@ -201,6 +201,8 @@ pub enum FloatPackScheme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuantFormat {
     Q8_0,
+    Q2K,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
@@ -370,6 +372,8 @@ impl From<QuantFormat> for Storage {
     fn from(qf: QuantFormat) -> Self {
         match qf {
             QuantFormat::Q8_0 => Storage::KQuant(KQuantScheme::Q80),
+            QuantFormat::Q2K => Storage::KQuant(KQuantScheme::Q2K),
+            QuantFormat::Q3K => Storage::KQuant(KQuantScheme::Q3K),
             QuantFormat::Q4K => Storage::KQuant(KQuantScheme::Q4K),
             QuantFormat::Q5K => Storage::KQuant(KQuantScheme::Q5K),
             QuantFormat::Q6K => Storage::KQuant(KQuantScheme::Q6K),
@@ -397,6 +401,8 @@ impl TryFrom<&Storage> for QuantFormat {
         match s {
             Storage::KQuant(k) => match k {
                 KQuantScheme::Q80 => Ok(QuantFormat::Q8_0),
+                KQuantScheme::Q2K => Ok(QuantFormat::Q2K),
+                KQuantScheme::Q3K => Ok(QuantFormat::Q3K),
                 KQuantScheme::Q4K => Ok(QuantFormat::Q4K),
                 KQuantScheme::Q5K => Ok(QuantFormat::Q5K),
                 KQuantScheme::Q6K => Ok(QuantFormat::Q6K),
@@ -590,5 +596,66 @@ mod tests {
             desc_act: false,
         };
         assert!(qat.is_external_qat());
+    }
+
+    /// Every `KQuantScheme` must round-trip through `QuantFormat`.
+    ///
+    /// REGRESSION (Qwen3.8-27B Q4_K_M): `KQuantScheme::Q3K` existed in the
+    /// enum and in the GGUF tag map, and `dequant_q3k` existed in grim-quant,
+    /// but `TryFrom<&Storage> for QuantFormat` had no arm for it. Any Linear
+    /// whose weight resolved to Q3_K therefore failed at forward time with
+    /// `Unimplemented("Linear::forward: quantized storage KQuant(Q3K) has no
+    /// QuantFormat mapping")` — after every weight had loaded successfully.
+    ///
+    /// The previous coverage was a per-variant hand-written list, so it could
+    /// only ever cover the variants someone remembered. This walks the enum, so
+    /// adding a K-quant without a mapping fails here instead of at inference.
+    #[test]
+    fn every_kquant_scheme_maps_to_a_quant_format_and_back() {
+        /// K-quants deliberately WITHOUT a `QuantFormat`, with the reason.
+        ///
+        /// `GsqRco3p5` is GGUF tag 42 (`Q2_0`) as used by the Qwen3.8-Flash-Next
+        /// GSQ-RCO release for expert down-proj. It decodes fine
+        /// (`dequant_gsq_rco_3p5`, exercised by `CpuStorage::to_cpu_vec_f32`)
+        /// but has no `QuantFormat` variant yet, so it hits the same
+        /// `Linear::forward` error the Q3_K case did. It is called out here
+        /// rather than left implicit so the next person sees it as a known,
+        /// tracked gap instead of rediscovering it from a panic. Promote it to
+        /// a real mapping when a checkpoint actually needs it through the
+        /// quantized-matmul path.
+        const NO_QUANT_FORMAT: &[KQuantScheme] = &[KQuantScheme::GsqRco3p5];
+
+        const ALL: &[KQuantScheme] = &[
+            KQuantScheme::Q2K,
+            KQuantScheme::Q3K,
+            KQuantScheme::Q4K,
+            KQuantScheme::Q5K,
+            KQuantScheme::Q6K,
+            KQuantScheme::Q80,
+            KQuantScheme::IQ4NL,
+            KQuantScheme::IQ4XS,
+            KQuantScheme::IQ3XXS,
+            KQuantScheme::IQ3S,
+            KQuantScheme::IQ2XXS,
+            KQuantScheme::IQ2XS,
+            KQuantScheme::IQ2S,
+            KQuantScheme::GsqRco3p5,
+        ];
+        for &scheme in ALL {
+            let storage = Storage::KQuant(scheme);
+            let Ok(fmt) = QuantFormat::try_from(&storage) else {
+                assert!(
+                    NO_QUANT_FORMAT.contains(&scheme),
+                    "KQuantScheme::{scheme:?} has no QuantFormat mapping; if that is intended, \
+                     add it to NO_QUANT_FORMAT with a reason (Linear::forward will reject it)"
+                );
+                continue;
+            };
+            assert_eq!(
+                Storage::from(fmt),
+                storage,
+                "QuantFormat::{fmt:?} does not map back to KQuantScheme::{scheme:?}"
+            );
+        }
     }
 }

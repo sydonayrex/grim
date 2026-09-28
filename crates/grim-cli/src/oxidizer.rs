@@ -820,6 +820,8 @@ fn quant_format_for_bitwidth(bw: u32) -> Option<QuantFormat> {
 fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String> {
     match format {
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
+        QuantFormat::Q2K => Ok(GgufDType::Q2K),
+        QuantFormat::Q3K => Ok(GgufDType::Q3K),
         QuantFormat::Q4K => Ok(GgufDType::Q4K),
         QuantFormat::Q5K => Ok(GgufDType::Q5K),
         QuantFormat::Q6K => Ok(GgufDType::Q6K),

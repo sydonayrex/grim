@@ -60,6 +60,20 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.12,
                 max_delta_ppl: 0.10,
             },
+            // Q3_K is ~3.5 bpw with per-8-sub-block 6-bit scales; it sits
+            // between Q4_K and Q2_K in observed error, so its tolerances do too.
+            QuantFormat::Q3K => Self {
+                min_cosine_similarity: 0.9900,
+                max_relative_l2_error: 0.18,
+                max_delta_ppl: 0.15,
+            },
+            // Q2_K is 2.6 bpw with 2-bit codes and per-16-sub-block min/scale;
+            // the worst of the K-quants grim can decode.
+            QuantFormat::Q2K => Self {
+                min_cosine_similarity: 0.9800,
+                max_relative_l2_error: 0.30,
+                max_delta_ppl: 0.30,
+            },
             QuantFormat::Iq4Nl | QuantFormat::Iq4Xs => Self {
                 min_cosine_similarity: 0.9950,
                 max_relative_l2_error: 0.10,

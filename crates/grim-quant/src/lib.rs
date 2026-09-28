@@ -3278,6 +3278,18 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
                     .into(),
             ));
         }
+        // Q2_K/Q3_K are load-time formats for the same reason `Fp8Block128` is:
+        // grim *decodes* both (`dequant_q2k` / `dequant_q3k`, exercised by the
+        // CPU and CUDA quantized-matmul paths) but ships no f32 -> Q2_K/Q3_K
+        // encoder. Silently rewriting to a neighbouring K-quant would be wrong
+        // data wearing the right label, so this is a named error instead.
+        QuantFormat::Q2K | QuantFormat::Q3K => {
+            return Err(Error::Backend(format!(
+                "rewrite_tensor_data: {:?} is a load-time format, not a rewrite target \
+                 (grim has no Q2_K/Q3_K encoder)",
+                plan.target
+            )));
+        }
         QuantFormat::Iq4Nl => quant_iq4nl(data)?,
         QuantFormat::Iq4Xs => quant_iq4xs(data)?,
         QuantFormat::Iq3Xxs => quant_iq3xxs(data)?,

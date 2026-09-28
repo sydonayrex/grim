@@ -1345,6 +1345,10 @@ impl QuantOps for CudaDevice {
                 .map_err(|e| Error::Backend(format!("quantized_matmul Q5K dequant: {e}")))?,
             grim_tensor::QuantFormat::Q6K => grim_quant::dequant_q6k(&b_bytes, k * n)
                 .map_err(|e| Error::Backend(format!("quantized_matmul Q6K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Q2K => grim_quant::dequant_q2k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul Q2K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Q3K => grim_quant::dequant_q3k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul Q3K dequant: {e}")))?,
             grim_tensor::QuantFormat::Iq4Nl => grim_quant::dequant_iq4nl(&b_bytes, k * n)
                 .map_err(|e| Error::Backend(format!("quantized_matmul IQ4NL dequant: {e}")))?,
             grim_tensor::QuantFormat::Iq4Xs => grim_quant::dequant_iq4xs(&b_bytes, k * n)
