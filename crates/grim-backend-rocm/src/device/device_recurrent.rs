@@ -49,15 +49,24 @@ impl RecurrentOps for RocmDevice {
         let (grid, block) = linear_launch(total);
 
         // Check if weight is quantized: WhiteRaven (FP8 / FloatPack(Fp8) or 1 byte per tap) or WhiteCrow (W4A4OstQuant / 0.5 bytes per tap)
-        let is_fp8 = matches!(w_s.dtype.storage, grim_tensor::Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8))
-            || matches!(w_s.dtype.arith, grim_tensor::ArithType::U8)
+        let is_fp8 = matches!(
+            w_s.dtype.storage,
+            grim_tensor::Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8)
+        ) || matches!(w_s.dtype.arith, grim_tensor::ArithType::U8)
             || (w_s.bytes == (channels as usize) * 4); // when taps=4 in FP8 vs FP32
         let is_iu4 = matches!(w_s.dtype.storage, grim_tensor::Storage::W4A4OstQuant(_));
 
-        let is_q4k = matches!(w_s.dtype.storage, grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q4K));
-        let is_i8 = matches!(w_s.dtype.storage, grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80))
-            || matches!(w_s.dtype.storage, grim_tensor::Storage::CompressedTensorsW8A8Int8)
-            || (w_s.bytes == (channels as usize) * 4 && !is_fp8);
+        let is_q4k = matches!(
+            w_s.dtype.storage,
+            grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q4K)
+        );
+        let is_i8 = matches!(
+            w_s.dtype.storage,
+            grim_tensor::Storage::KQuant(grim_tensor::KQuantScheme::Q80)
+        ) || matches!(
+            w_s.dtype.storage,
+            grim_tensor::Storage::CompressedTensorsW8A8Int8
+        ) || (w_s.bytes == (channels as usize) * 4 && !is_fp8);
 
         let k_size = if is_iu4 || is_q4k {
             let row_bytes = (channels.max(0) as usize) / 2;
@@ -80,8 +89,7 @@ impl RecurrentOps for RocmDevice {
         // The state ring covers 1 batch stream of `channels * (k_size - 1)` floats.
         // If out_shape carries `seq_len > 1`, the state size needed is for 1 stream
         // (the sequential history buffer), not `seq_len` times over-allocated.
-        let need_state = (channels.max(0) as usize)
-            .saturating_mul((k_size_i - 1).max(0) as usize);
+        let need_state = (channels.max(0) as usize).saturating_mul((k_size_i - 1).max(0) as usize);
         if (st_s.bytes / 4) < need_state {
             return Err(Error::Backend(format!(
                 "short_conv1d: conv_state holds {} floats but kernel needs {need_state} \
@@ -174,7 +182,11 @@ impl RecurrentOps for RocmDevice {
             )?;
         } else if batch > 1 {
             let (scan_grid, scan_block) = linear_launch(channels as usize);
-            self.launch_compute_kernel(
+            // The scan stages each thread's ring in dynamic LDS (KDA-fix: the
+            // in-global overlapping shift miscompiled on the hipRTC gfx1201
+            // build). LDS = block threads x (ks-1) ring floats.
+            let scan_shared = (scan_block.x as usize) * ((k_size_i - 1).max(0) as usize) * 4;
+            self.launch_compute_kernel_with_solution(
                 "grim_short_conv1d_scan",
                 scan_grid,
                 scan_block,
@@ -188,6 +200,8 @@ impl RecurrentOps for RocmDevice {
                     arg(&mut channels),
                     arg(&mut k_size_i),
                 ],
+                None,
+                scan_shared,
             )?;
         } else {
             self.launch_compute_kernel(
@@ -723,8 +737,7 @@ impl RocmDevice {
         // The state ring must cover `batch * channels * (k_size - 1)` floats,
         // or the offsets above leave it. The caller sizes conv_state from the
         // config's tap count, which need not equal the derived one.
-        let need_state = (channels.max(0) as usize)
-            .saturating_mul((k_size - 1).max(0) as usize);
+        let need_state = (channels.max(0) as usize).saturating_mul((k_size - 1).max(0) as usize);
         if (st_s.bytes / 4) < need_state {
             return Err(Error::Backend(format!(
                 "short_conv1d: conv_state holds {} floats but the kernel indexes \
@@ -742,6 +755,42 @@ impl RocmDevice {
             None => 0u64,
         };
         let mut st_ptr = dev_ptr(st_s)?;
+        // KDA-fix: this variant had NO scan dispatch — for batch > 1 it ran
+        // the per-(b, c) step kernel whose ring offset is
+        // `(b*channels + c)*(ks-1)`, so threads with b > 0 indexed past the
+        // single-stream ring and scribbled adjacent memory: token 0 exact,
+        // token 1+ garbage (conv chain gate). Mirror the allocating variant's
+        // dispatch: multi-token goes to the scan kernel, single-token to the
+        // step kernel.
+        if batch > 1 {
+            let mut x_ptr = dev_ptr(x_s)?;
+            let mut w_ptr = dev_ptr(w_s)?;
+            let mut b_ptr = match bias {
+                Some(b) => dev_ptr(as_rocm(b)?)?,
+                None => 0u64,
+            };
+            let (scan_grid, scan_block) = linear_launch(channels as usize);
+            let mut k_size_i = k_size.max(1);
+            let scan_shared = (scan_block.x as usize) * ((k_size_i - 1).max(0) as usize) * 4;
+            self.launch_compute_kernel_with_solution(
+                "grim_short_conv1d_scan",
+                scan_grid,
+                scan_block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_ptr),
+                    arg(&mut b_ptr),
+                    arg(&mut st_ptr),
+                    arg(&mut out_ptr),
+                    arg(&mut batch),
+                    arg(&mut channels),
+                    arg(&mut k_size_i),
+                ],
+                None,
+                scan_shared,
+            )?;
+            return Ok(());
+        }
         let total = (batch * channels) as usize;
         let (grid, block) = linear_launch(total);
         self.launch_compute_kernel(
@@ -1273,4 +1322,3 @@ impl RocmDevice {
         Ok(())
     }
 }
-

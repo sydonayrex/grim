@@ -1480,26 +1480,40 @@ extern "C" __global__ void grim_short_conv1d_scan(
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
 
+    // KDA-fix: the previous version shifted the GLOBAL ring in place per
+    // token; the hipRTC gfx1201 build of that loop miscompiled — the ring
+    // after N tokens corresponded to N-1 tokens' updates with the newest
+    // sample dropped (conv chain gate: token 0 exact, token 1+ wrong, ring
+    // = [x_t, s_1, s_2] instead of [s_1, s_2, x_t]). Stage the ring in
+    // dynamic LDS, compute every token against the local copy, and write it
+    // back once: correctness no longer depends on the overlap order of a
+    // global shift loop.
+    extern __shared__ float ring_local[];
+    float* lring = ring_local + threadIdx.x * (kernel_size - 1);
     int state_offset = c * (kernel_size - 1);
     float b_val = bias ? bias[c] : 0.0f;
     float last_w = weight[c * kernel_size + (kernel_size - 1)];
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        lring[k] = conv_state[state_offset + k];
+    }
 
     for (int t = 0; t < seq_len; ++t) {
         float val = x_seq[t * channels + c];
         float sum = val * last_w;
         for (int k = 0; k < kernel_size - 1; ++k) {
-            sum += conv_state[state_offset + k] * weight[c * kernel_size + k];
+            sum += lring[k] * weight[c * kernel_size + k];
         }
         sum += b_val;
         out_seq[t * channels + c] = sum;
 
-        // Shift conv_state and insert current token sample
         for (int k = 0; k < kernel_size - 2; ++k) {
-            conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+            lring[k] = lring[k + 1];
         }
-        if (kernel_size > 1) {
-            conv_state[state_offset + kernel_size - 2] = val;
-        }
+        lring[kernel_size - 2] = val;
+    }
+
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        conv_state[state_offset + k] = lring[k];
     }
 }
 
