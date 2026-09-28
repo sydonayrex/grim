@@ -13,6 +13,24 @@ use crate::{HipDim3, arg};
 impl RocmDevice {
     /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
     #[allow(dead_code)] // kernel launcher, not yet wired into this build's call graph
+    /// Public A/B wrapper around [`Self::launch_fused_dequant_gemm_q4k`].
+    ///
+    /// B7 needs to time the Q4_K fused-dequant path against a candidate format
+    /// at decode shapes, from an integration test, and the launcher it wraps is
+    /// crate-private. Thin on purpose: no behaviour of its own, so the B7
+    /// measurement cannot drift from the production dispatch.
+    pub fn launch_fused_dequant_gemm_q4k_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_q4k_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_q4k(a_storage, b_q4k_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_q4k(
         &self,
         a_storage: &RocmStorage,

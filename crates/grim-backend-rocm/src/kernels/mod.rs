@@ -60,6 +60,8 @@ pub mod quant_tiled_gemm;
 pub mod rmsnorm_quant;
 /// TreePie (WS-A) 5.0 bpw decode + M=1 GEMV over V_DOT2_F32_F16.
 pub mod tree_pie;
+/// ScrubJay (WS-B) 5.5 bpw fused dequant + M=1 GEMV over a frozen codebook.
+pub mod scrub_jay;
 pub mod rwkv;
 pub mod sage_attention;
 pub mod scythe_persistent;

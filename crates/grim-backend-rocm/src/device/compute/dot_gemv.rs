@@ -1617,6 +1617,85 @@ impl RocmDevice {
         )
     }
 
+    /// ScrubJay (WS-B B6) 5.5 bpw fused dequant + GEMV at M=1.
+    ///
+    /// B stays in its packed form in VRAM (5.5 bpw) and the codebook lookup plus
+    /// scale/sign reconstruction happens in-register, so no dequantized copy is
+    /// uploaded. The frozen 16x16 codebook is compiled into the kernel.
+    ///
+    /// The five B planes are separate arrays (struct-of-arrays) rather than one
+    /// interleaved blob: the selector, sign mask and scale are per-block and
+    /// read once per 8 values, while the index is per-value, so AoS would make
+    /// the hot per-value load stride 12 bytes instead of 1.
+    ///
+    /// Requires K % 8 == 0 (the ScrubJay block granularity).
+    pub fn launch_scrub_jay_gemv(
+        &self,
+        a_storage: &RocmStorage,
+        b_sel: &RocmStorage,
+        b_idx: &RocmStorage,
+        b_sgn: &RocmStorage,
+        b_scl: &RocmStorage,
+        out_storage: &RocmStorage,
+        pre_scale: f32,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 8 != 0 {
+            return Err(Error::Backend(format!(
+                "scrub_jay_gemv: K={k} must be a multiple of 8 (ScrubJay blocks are 8 values)"
+            )));
+        }
+        if n == 0 {
+            return Err(Error::Backend("scrub_jay_gemv: N must be > 0".into()));
+        }
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: a has no device ptr".into()))?;
+        let sel_ptr = b_sel
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sel has no device ptr".into()))?;
+        let idx_ptr = b_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_idx has no device ptr".into()))?;
+        let sgn_ptr = b_sgn
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_sgn has no device ptr".into()))?;
+        let scl_ptr = b_scl
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: b_scl has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(n as u32, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut selp = sel_ptr;
+        let mut idxp = idx_ptr;
+        let mut sgnp = sgn_ptr;
+        let mut sclp = scl_ptr;
+        let mut pre = pre_scale;
+        let mut optr = out_ptr;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_scrub_jay_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut selp),
+                arg(&mut idxp),
+                arg(&mut sgnp),
+                arg(&mut sclp),
+                arg(&mut pre),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
     /// Phase 4.5d: BF16 × BF16 GEMV via V_DOT2_F32_BF16 (RDNA3/4 dot12-insts).
     /// A is BF16 [M, K], B is row-major/transposed BF16 weights [N, K].
     pub(crate) fn launch_dot2_bf16_gemv(

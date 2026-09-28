@@ -32,6 +32,8 @@ pub fn compute_kernel_source() -> String {
     // TreePie (WS-A): 5.0 bpw decode + M=1 GEMV. After dot_gemv -- reuses
     // grim_fdot2_f32_f16 from it.
     s.push_str(crate::kernels::tree_pie::KERNEL_SOURCE);
+    // ScrubJay (WS-B): 5.5 bpw fused dequant + M=1 GEMV, frozen codebook in-register.
+    s.push_str(crate::kernels::scrub_jay::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     // SPEED-ROC: All block-quantized WMMA GEMM kernels (Q8_0, Q4_K, Q5_K, Q2_K, Q3_K, Q6_K).
     // Consolidated cooperative-LDS source — generated, not a const (KERNEL_SOURCE is empty).
