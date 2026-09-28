@@ -157,9 +157,17 @@ fn arm_selected(name: &str) -> bool {
     if spec.is_empty() || spec == "all" {
         return true;
     }
+    // Exact, case-insensitive -- deliberately NOT substring.
+    //
+    // Substring matching is silently wrong here: "raven" is a substring of both
+    // "ForestRaven" and "WhiteRaven", so `GRIM_AB_ARMS=Raven` selected three
+    // arms. A traced run then showed `dot4_fp8`, `dot4_q80_q81` and `wmma_fp8`
+    // all launching and `dot8_w4a4` correctly absent -- exactly the signature of
+    // that bug -- which left the fault attributable only by elimination. An arm
+    // filter that cannot name a single arm is worse than no filter at all.
     spec.split(',')
         .map(str::trim)
-        .any(|want| !want.is_empty() && name.to_ascii_lowercase().contains(&want.to_ascii_lowercase()))
+        .any(|want| !want.is_empty() && want.eq_ignore_ascii_case(name))
 }
 
 /// Deterministic LCG: a time- or address-dependent fixture would make the
@@ -273,6 +281,11 @@ fn check_positions(n: usize) -> Vec<usize> {
 }
 /// Every packed form of B, resident on the device for one K.
 ///
+/// M/N tile height of `grim_wmma_gemm_fp8_e4m3`. Its A/B fragment loads are
+/// this tall and are not masked against M/N, so operands must be padded up to a
+/// whole multiple of it; see `launch_wmma_gemm_fp8_e4m3_for_ab`.
+const WMMA_TILE: usize = 16;
+
 /// Built once per K and shared by all arms and all M values. B does not depend
 /// on M, and the untiled and row-tiled twins consume byte-identical operands --
 /// they differ only in launch geometry -- so one upload serves all of them.
@@ -297,7 +310,24 @@ struct BOnDevice {
 
 impl BOnDevice {
     fn build(dev: &RocmDevice, b: &[f32], n: usize, k: usize) -> Result<Self, String> {
-        let fp8_host: Vec<u8> = b.iter().map(|&v| to_e4m3_rne(v)).collect();
+        // The FP8 form is consumed by a rocWMMA kernel whose A and B fragment
+        // loads are 16 rows tall and are *not* masked against M/N -- only the
+        // epilogue store is. With n not a multiple of 16 the final N tile reads
+        // up to 15 rows past the end of B, i.e. up to 15*k bytes past the
+        // allocation. That is a genuine out-of-bounds read. It happens to land
+        // in mapped memory under most layouts -- the over-read rows are dropped
+        // by the masked store, so results stay correct -- and faults with "Page
+        // not present" the moment the allocation ends next to an unmapped page.
+        // Pad to whole tiles so the load is always in bounds. The padding is
+        // zeros and is only ever read by rows the epilogue discards, so it
+        // cannot perturb a scored element.
+        let n_pad = n.div_ceil(WMMA_TILE) * WMMA_TILE;
+        let mut fp8_host = vec![0u8; n_pad * k];
+        for (j, row) in b.chunks_exact(k).take(n).enumerate() {
+            for (kk, &v) in row.iter().enumerate() {
+                fp8_host[j * k + kk] = to_e4m3_rne(v);
+            }
+        }
         let q80_host = pack_q8_0_host(b);
         let i4_host = w4a4::pack_b(b, n, k);
         let u8_dtype = DType { arith: ArithType::U8, storage: Storage::Native };
@@ -549,7 +579,13 @@ fn arm_white_raven(
         storage: Storage::Block(BlockDtype::Fp8),
     };
 
-    let a_t = MemoryOps::from_cpu_bytes(dev, &a_fp8, &Shape::new(vec![m * k]), fp8_dtype.clone())
+    // Same whole-tile padding as the FP8 B form: the kernel's 16-row A load is
+    // unmasked, so an m that is not a multiple of 16 over-reads the tail of A.
+    let m_pad = m.div_ceil(WMMA_TILE) * WMMA_TILE;
+    let mut a_pad = vec![0u8; m_pad * k];
+    a_pad[..a_fp8.len()].copy_from_slice(&a_fp8);
+
+    let a_t = MemoryOps::from_cpu_bytes(dev, &a_pad, &Shape::new(vec![m_pad * k]), fp8_dtype.clone())
         .map_err(|e| format!("a h2d: {e}"))?;
     let out_t = MemoryOps::alloc_storage(
         dev,
@@ -870,19 +906,32 @@ fn precision_kernel_ab() {
         // Arm every arm first, then time them together round-robin. Oracle work
         // is done during setup, never inside a timed region.
         let mut armed: Vec<Armed> = Vec::new();
-        for (name, r) in [
-            ("Raven", arm_raven(&dev, &a, &bdk, m, n, k)),
-            ("ForestRaven", arm_forest_raven(&dev, &a, &bdk, m, n, k)),
-            ("WhiteCrow", arm_white_crow(&dev, &a_nonneg, &bdk, m, n, k)),
-            ("WhiteRaven", arm_white_raven(&dev, &a, &bdk, m, n, k)),
-        ] {
+        // Held as closures and *invoked* only after the filter, rather than
+        // evaluated eagerly inside an array literal.
+        //
+        // An array literal evaluates all four `arm_*()` calls before the loop
+        // body ever runs, so `continue` skipped only the `push`: every arm's
+        // kernel was still set up and launched. That made `GRIM_AB_ARMS` useless
+        // for the one thing it is needed for -- isolating a faulting kernel --
+        // since a "single arm" run in fact exercised all four.
+        let candidates: [(&str, &dyn Fn() -> Result<Armed, String>); 4] = [
+            ("Raven", &|| arm_raven(&dev, &a, &bdk, m, n, k)),
+            ("ForestRaven", &|| arm_forest_raven(&dev, &a, &bdk, m, n, k)),
+            ("WhiteCrow", &|| arm_white_crow(&dev, &a_nonneg, &bdk, m, n, k)),
+            ("WhiteRaven", &|| arm_white_raven(&dev, &a, &bdk, m, n, k)),
+        ];
+        for (name, build) in candidates {
             if !arm_selected(name) {
                 continue;
             }
-            match r {
+            match build() {
                 Ok(x) => armed.push(x),
                 Err(e) => eprintln!("arm setup failed at m={m} k={k} [{name}]: {e}"),
             }
+        }
+        if armed.is_empty() {
+            eprintln!("no arms selected at m={m} k={k}; skipping shape");
+            continue;
         }
         if armed.is_empty() {
             continue;
@@ -1033,5 +1082,32 @@ fn precision_kernel_ab() {
     match std::fs::write(&path, &json) {
         Ok(()) => eprintln!("artifact: {}", path.display()),
         Err(e) => eprintln!("artifact write failed: {e}"),
+    }
+}
+
+/// `grim_wmma_gemm_fp8_e4m3` loads full 16-row A/B fragments and does not mask
+/// them against M/N -- only its epilogue store is masked. An operand not padded
+/// up to a whole number of tiles therefore makes the kernel read up to 15*k
+/// bytes past the allocation. Those bytes are discarded by the masked store, so
+/// accuracy stays correct and the defect is invisible until the allocation lands
+/// next to an unmapped page and the read faults. The launcher now rejects the
+/// unpadded shape, so keep the padding arithmetic itself pinned here.
+#[test]
+fn wmma_fp8_operands_are_padded_to_whole_tiles() {
+    // These are the shapes that faulted on gfx1200: every m below TILE forced a
+    // 16-row load over an operand that only had m rows.
+    for m in [1usize, 2, 4, 8] {
+        let padded = m.div_ceil(WMMA_TILE) * WMMA_TILE;
+        assert!(padded > m, "m={m} should have been padded up");
+        assert_eq!(padded % WMMA_TILE, 0, "padding must land on a tile boundary");
+    }
+    // Already-aligned shapes must not grow.
+    for m in [16usize, 32, 64, 128] {
+        assert_eq!(m.div_ceil(WMMA_TILE) * WMMA_TILE, m, "aligned m must not be padded");
+    }
+    // A non-multiple-of-16 n is the same hazard on the B operand.
+    for n in [13720usize, 294916, 1, 7] {
+        assert_eq!(n.div_ceil(WMMA_TILE) * WMMA_TILE % WMMA_TILE, 0);
+        assert!(n.div_ceil(WMMA_TILE) * WMMA_TILE >= n);
     }
 }

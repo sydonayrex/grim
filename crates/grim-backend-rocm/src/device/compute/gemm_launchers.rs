@@ -3,8 +3,8 @@
 
 use std::ffi::c_void;
 
-use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
@@ -15,9 +15,10 @@ use crate::device::gemm_tuning::{lookup_gemm_config_for_shape, lookup_solution_i
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, rocblas_gemm_ex,
+    HipDim3, ROCBLAS_GEMM_FLAGS_NONE, RocblasInt, RocblasOperation, RocmHandle, arg,
+    arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, rocblas_gemm_ex,
     rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success,
-    select_gemm_algo, HipDim3, RocblasInt, RocblasOperation, RocmHandle, ROCBLAS_GEMM_FLAGS_NONE,
+    select_gemm_algo,
 };
 
 impl RocmDevice {
@@ -730,17 +731,44 @@ impl RocmDevice {
         const N_TILES_PER_BLOCK: usize = 2;
         let n_per_block = TILE_N * N_TILES_PER_BLOCK;
 
-        let a_ptr = a.device_ptr
+        let a_ptr = a
+            .device_ptr
             .ok_or_else(|| Error::Backend("wmma_fp8_e4m3: a has no device ptr".into()))?;
-        let b_ptr = b.device_ptr
+        let b_ptr = b
+            .device_ptr
             .ok_or_else(|| Error::Backend("wmma_fp8_e4m3: b has no device ptr".into()))?;
-        let out_ptr = out.device_ptr
+        let out_ptr = out
+            .device_ptr
             .ok_or_else(|| Error::Backend("wmma_fp8_e4m3: out has no device ptr".into()))?;
 
         // rocwmma walks K in 16-element steps with no tail handling.
         if k % 16 != 0 {
             return Err(Error::Backend(format!(
                 "wmma_fp8_e4m3: K={k} must be divisible by 16"
+            )));
+        }
+
+        // A and B must be padded up to whole 16-row tiles. The kernel's
+        // `load_matrix_sync` calls fetch a full 16x16 fragment and are not masked
+        // against M/N -- only the epilogue store is. So an operand with
+        // m % 16 != 0 (or n % 16 != 0) makes the kernel read up to 15*k bytes
+        // past the end of the allocation. Those bytes are discarded by the
+        // masked store, so the result is still correct, but the read itself is
+        // out of bounds: it silently returns neighbouring memory when the
+        // allocation abuts other live buffers, and faults with "Page not
+        // present" when it abuts an unmapped page. Reject the unpadded case here
+        // rather than leaving a landmine that depends on heap layout.
+        let tile = 16usize;
+        if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_fp8_e4m3: A must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                a.bytes()
+            )));
+        }
+        if b.bytes() % (tile * k) != 0 || b.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_fp8_e4m3: B must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                b.bytes()
             )));
         }
 
@@ -1101,14 +1129,7 @@ impl RocmDevice {
                 crate::device::blaslt::select_blaslt_candidate(&probe, m, n, k, true),
                 crate::device::blaslt::BlasLtSelection::Eligible
             ) {
-                return self.launch_blaslt_prefill_into(
-                    a_storage,
-                    b_storage,
-                    out_storage,
-                    m,
-                    n,
-                    k,
-                );
+                return self.launch_blaslt_prefill_into(a_storage, b_storage, out_storage, m, n, k);
             }
             eprintln!(
                 "[blaslt-prefill] candidate not eligible for {m}x{n}x{k}: {}",
