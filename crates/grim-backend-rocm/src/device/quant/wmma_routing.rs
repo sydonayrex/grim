@@ -94,16 +94,27 @@ impl RocmDevice {
     /// super-block elements, bytes per block). The tiled entry names are
     /// derived from the tag: `grim_fused_dequant_gemm_{tag}_tiled` and
     /// `grim_fused_dequant_gemm_{tag}_backward_tiled`.
+    /// Sizes are the llama.cpp block layouts in
+    /// `old/repo/llama.cpp-master/ggml/src/ggml-common.h` with `QK_K = 256`,
+    /// `QK4_NL = 32` and `IQ3S_N_SCALE = QK_K/64 = 4`. Pinned by
+    /// `tiled_quant_block_sizes_match_llama_cpp`.
     const TILED_QUANT_TABLE: &[(&str, &str, u32, u32)] = &[
         ("grim_fused_dequant_gemm_q5k", "q5k", 256, 176),
         ("grim_fused_dequant_gemm_q6k", "q6k", 256, 210),
         ("grim_fused_dequant_gemm_iq2xxs", "iq2xxs", 256, 66),
         ("grim_fused_dequant_gemm_iq2xs", "iq2xs", 256, 74),
         ("grim_fused_dequant_gemm_iq2s", "iq2s", 256, 82),
-        ("grim_fused_dequant_gemm_iq3xxs", "iq3xxs", 256, 96),
+        ("grim_fused_dequant_gemm_iq3xxs", "iq3xxs", 256, 98),
         ("grim_fused_dequant_gemm_iq3s", "iq3s", 256, 110),
-        ("grim_fused_dequant_gemm_iq4nl", "iq4nl", 256, 170),
-        ("grim_fused_dequant_gemm_iq4xs", "iq4xs", 256, 136),
+        // iq4_nl is DELIBERATELY ABSENT. Its llama.cpp block is QK4_NL = 32
+        // elements in 18 bytes (ggml-common.h `#define QK4_NL 32`, and
+        // `crates/grim-tensor/src/dtype.rs:324` agrees), which cannot fill a
+        // 256-element WMMA tile. Listing it at (256, 170) imposed
+        // `k % tiled_k_multiple(256) == 0` on a 32-element-block format and
+        // named a block size matching no llama.cpp layout — Q4_K is 256/144.
+        // Absence routes it to the non-tiled `grim_fused_dequant_gemm_iq4nl`,
+        // which is the correct general path.
+        ("grim_fused_dequant_gemm_iq4xs", "iq4xs", 256, 134),
         ("grim_fused_dequant_gemm_q8_0", "q8_0", 32, 34),
     ];
 
@@ -506,5 +517,107 @@ mod wmma_route_tests {
             ..Default::default()
         };
         assert!(!wmma_route_decision(Some(&ext), ArithType::F16, true));
+    }
+}
+
+#[cfg(test)]
+mod block_size_tests {
+    use super::RocmDevice as T;
+    use std::path::PathBuf;
+
+    /// The table's block sizes must equal llama.cpp's block layouts in
+    /// `old/repo/llama.cpp-master/ggml/src/ggml-common.h`.
+    ///
+    /// It drifted in three places: `iq3xxs` 96 vs 98 and `iq4xs` 136 vs 134
+    /// (the 2-byte `ggml_half d`), and `iq4nl` at 256/170, which matches no
+    /// llama.cpp layout at all.
+    ///
+    /// The expectations are PARSED OUT OF THE REFERENCE HEADER at run time
+    /// rather than transcribed here. A hand-copied table is the same failure
+    /// mode as the bug: it can be wrong in a way that agrees with the code it
+    /// is checking. If the reference is absent the test panics rather than
+    /// passing vacuously — a gate that cannot fail is worse than no gate.
+    ///
+    /// Scope: this pins STRIDE only. `dequant_iq2s` has the correct 82-byte
+    /// size and is still wrong in three ways against `dequantize_row_iq2_s`.
+    fn header() -> String {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crate -> repo root")
+            .join("old/repo/llama.cpp-master/ggml/src/ggml-common.h");
+        std::fs::read_to_string(&p).unwrap_or_else(|e| {
+            panic!(
+                "cannot read the llama.cpp reference at {}: {e}\n\
+                 This gate compares grim against the REFERENCE; without it there \
+                 is nothing to compare to and the check must not pass.",
+                p.display()
+            )
+        })
+    }
+
+    fn qk_k(src: &str) -> u32 {
+        src.lines()
+            .find_map(|l| l.trim().strip_prefix("#define QK_K "))
+            .and_then(|r| r.trim().trim_end_matches('u').parse().ok())
+            .expect("ggml-common.h defines QK_K")
+    }
+
+    #[test]
+    fn tiled_quant_block_sizes_match_llama_cpp() {
+        let src = header();
+        let qk = qk_k(&src);
+        let iq3s_n_scale = src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("#define IQ3S_N_SCALE QK_K/"))
+            .and_then(|r| r.trim().parse::<u32>().ok())
+            .map(|d| qk / d)
+            .expect("ggml-common.h defines IQ3S_N_SCALE");
+
+        // (tag, elements per block, bytes per block) from the reference structs.
+        let expected: Vec<(&str, u32, u32)> = vec![
+            ("q8_0", 32, 34),
+            ("q5k", qk, 176),
+            ("q6k", qk, 210),
+            ("iq2xxs", qk, 2 + qk / 4),
+            ("iq2xs", qk, 2 + qk / 4 + qk / 32),
+            ("iq2s", qk, 2 + qk / 4 + qk / 32 + qk / 32),
+            ("iq3xxs", qk, 2 + 3 * (qk / 8)),
+            ("iq3s", qk, 2 + 13 * (qk / 32) + iq3s_n_scale),
+            ("iq4xs", qk, 2 + qk / 64 + qk / 2),
+        ];
+
+        let mut problems: Vec<String> = Vec::new();
+        for (tag, elems, bytes) in expected {
+            match T::tiled_quant_lookup(tag) {
+                None => problems.push(format!(
+                    "{tag}: absent from TILED_QUANT_TABLE, expected {elems} elements / {bytes} B"
+                )),
+                Some((got_tag, got_blk)) => {
+                    if got_tag != tag {
+                        problems.push(format!("{tag}: looked up as {got_tag}"));
+                    }
+                    if got_blk != elems {
+                        problems.push(format!(
+                            "{tag}: {got_blk} elements/block, reference says {elems}"
+                        ));
+                    }
+                }
+            }
+        }
+        // iq4_nl must NOT be tiled: QK4_NL = 32 cannot fill a 256-element tile.
+        if T::tiled_quant_lookup("iq4nl").is_some() {
+            problems.push(
+                "iq4nl: present in TILED_QUANT_TABLE, but its block is QK4_NL = 32 \
+                 elements and cannot fill a 256-element WMMA tile"
+                    .into(),
+            );
+        }
+        assert!(
+            problems.is_empty(),
+            "tiled-quant block geometry disagrees with ggml-common.h:\n{}\n\
+             A wrong stride is a wrong memory access, not just a wrong number.",
+            problems.join("\n")
+        );
     }
 }
