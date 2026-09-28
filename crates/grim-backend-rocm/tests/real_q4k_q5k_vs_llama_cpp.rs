@@ -307,8 +307,11 @@ fn gpu_device() -> Option<Arc<RocmDevice>> {
         return None;
     }
     let _lock = grim_backend_rocm::device::util::gpu_test_lock();
-    std::panic::catch_unwind(|| Arc::new(RocmDevice::try_new(0).expect("RocmDevice::try_new(0)")))
-        .ok()
+    Some(Arc::new(RocmDevice::try_new(0).expect(
+        "GRIM_GPU_TEST=1 is set but RocmDevice::try_new(0) failed. Failing loudly rather \
+         than catch_unwind().ok(): a swallowed init failure turns this gate GREEN with \
+         zero assertions run, which is how a real defect hides behind a passing test."
+    )))
 }
 
 fn checkpoint() -> Option<std::path::PathBuf> {
