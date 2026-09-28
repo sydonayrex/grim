@@ -238,6 +238,57 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         unsafe { std::env::set_var("GRIM_DOT4_FAST", "0"); }
     }
 
+    // (g) WhiteCrow W4A4 (OSTQuant u4 x u4, native v_dot8) at the small
+    // shape: same GEMM as (a) but weights in the 4-bit OSTQuant layout
+    // (0.5234 B/elem incl. scales+zeros) and activations quantized to u4 on
+    // device. If this sustains q8_0-class GB/s, WhiteCrow is the decode
+    // kernel candidate and the q4k dot4 kernel is the problem.
+    {
+        let n = 16384usize;
+        let n_groups = k / 128;
+        let words_per_col = k / 8;
+        let alloc = dev.allocator_handle();
+        let mut sseed: u64 = 61;
+        let mut nxt = move || {
+            sseed ^= sseed << 13;
+            sseed ^= sseed >> 17;
+            sseed ^= sseed << 5;
+            sseed
+        };
+        let b_qw: Vec<u32> = (0..n * words_per_col).map(|_| nxt() as u32).collect();
+        let b_sc: Vec<u16> = (0..n * n_groups).map(|_| (nxt() & 0x3fff) as u16 | 0x3800).collect(); // bf16 ~[0.5,1.0)
+        let b_zr: Vec<u8> = (0..n * n_groups).map(|_| (nxt() & 0x0f) as u8).collect();
+        let qw_bytes: Vec<u8> = b_qw.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sc_bytes: Vec<u8> = b_sc.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &qw_bytes, &Shape::new(vec![n, words_per_col]),
+            DType { arith: ArithType::U32, storage: Storage::Native }).unwrap();
+        let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &sc_bytes, &Shape::new(vec![n, n_groups]),
+            DType { arith: ArithType::BF16, storage: Storage::Native }).unwrap();
+        let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_zr, &Shape::new(vec![n, n_groups]),
+            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let a_st = CoreTensorOps::from_cpu(&dev, &a, &Shape::new(vec![1, k]), DType::F32).unwrap();
+        let out = RocmStorage::alloc_gpu(&Shape::new(vec![n]), DType::F32, &alloc, 0).unwrap();
+        let a_rocm = a_st.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let qw_rocm = b_qw_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let sc_rocm = b_sc_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let zr_rocm = b_zr_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        // Warmup (JIT + u4 scratch alloc).
+        for _ in 0..3 {
+            dev.launch_w4a4_ostquant_gemv(a_rocm, qw_rocm, sc_rocm, zr_rocm, &out, 1, n, k).unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            dev.launch_w4a4_ostquant_gemv(a_rocm, qw_rocm, sc_rocm, zr_rocm, &out, 1, n, k).unwrap();
+        }
+        dev.synchronize();
+        let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+        let gb = n as f64 * k as f64 * (0.5 + 2.0/128.0 + 1.0/128.0) / 1e9;
+        let gbps = gb / (us * 1e-6);
+        eprintln!("[floor-probe] g_small_W4A4_whitecrow       scheme=U4  n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+    }
+
     // Verdict inputs, not a hard gate: this probe is evidence.
     let small_gb = 16384.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
     let big_gb = 248320.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
