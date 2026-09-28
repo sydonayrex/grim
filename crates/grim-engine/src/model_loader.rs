@@ -985,6 +985,55 @@ pub fn extract_laguna_gguf_hybrid(
     )
 }
 
+/// How many Qwen3.5/3.8 blocks the FORWARD pass must run, excluding MTP.
+///
+/// The checkpoint ships a multi-token-prediction head as a trailing layer and
+/// `block_count` counts it, so the GGUF says 65 for a 64-layer transformer. The
+/// reference separates the two and the forward loop honours the separation:
+///
+///   * `llama-hparams.cpp:349` — `return n_layer_all - n_layer_nextn;`
+///   * `qwen35.cpp:154-155` — "MTP/NextN layers are loaded as extra decoder
+///     blocks but not executed in the main pass", then `for (il = 0; il < n_layer; ...)`
+///   * `qwen35.cpp:21` — `is_recr_impl[i] = (i < hparams.n_layer()) && ...`, so the
+///     recurrence-type array is bounded by `n_layer()` too.
+///
+/// Running that extra block corrupts the residual stream immediately before
+/// `output_norm`, which is the worst possible place for it: every weight is
+/// loaded correctly and the damage appears only at the head. On the 27B the
+/// block is `blk.64`, which carries `attn_q/k/v`, `attn_output`, `ffn_*` and the
+/// `nextn.*` heads but NO `ssm_*` weights at all — so a loader that classifies
+/// it by `(64+1) % 4 == 0` builds a *recurrent* layer with every recurrent
+/// weight `None`.
+///
+/// Detected structurally from the `nextn.*` tensors rather than hardcoded, so it
+/// follows the checkpoint instead of a magic 64. SHARED by the safetensors and
+/// GGUF paths on purpose: those two paths drifting apart is exactly the bug this
+/// function exists to prevent.
+fn qwen35_forward_layer_count<'a>(
+    tensor_names: impl Iterator<Item = &'a str>,
+    block_count: usize,
+) -> usize {
+    let first_nextn = tensor_names
+        .filter_map(|n| n.strip_prefix("blk."))
+        .filter(|n| n.contains(".nextn."))
+        .filter_map(|n| n.split('.').next())
+        .filter_map(|i| i.parse::<usize>().ok())
+        .min();
+    match first_nextn {
+        Some(first_nextn) if first_nextn < block_count => {
+            eprintln!(
+                "[qwen35] excluding {} MTP layer(s) from the forward: block_count={} but \
+                 blk.{} carries nextn.* tensors",
+                block_count - first_nextn,
+                block_count,
+                first_nextn
+            );
+            first_nextn
+        }
+        _ => block_count,
+    }
+}
+
 fn load_model_from_config(
     config: SafetensorsConfig,
     provider: &SafetensorsProvider,
@@ -1006,6 +1055,8 @@ fn load_model_from_config(
     let vocab_size = config.vocab_size;
     let hidden_size = config.hidden_size;
     let num_layers = config.num_hidden_layers;
+
+
     let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-5);
     // Qwen3.5/3.8 ships a multi-token-prediction head as a trailing layer and
     // `block_count` counts it, so the GGUF says 65 for a 64-layer transformer.
@@ -1018,27 +1069,8 @@ fn load_model_from_config(
     // the reference never applies, immediately before the output projection.
     // Detected structurally from the `nextn.*` tensors rather than hardcoded, so
     // it follows the checkpoint instead of a magic 64.
-    let num_layers = match provider
-        .tensor_names()
-        .iter()
-        .filter_map(|n| n.strip_prefix("blk."))
-        .filter(|n| n.contains(".nextn."))
-        .filter_map(|n| n.split('.').next())
-        .filter_map(|i| i.parse::<usize>().ok())
-        .min()
-    {
-        Some(first_nextn) if first_nextn < num_layers => {
-            eprintln!(
-                "[qwen35] excluding {} MTP layer(s) from the forward: block_count={} but \
-                 blk.{} carries nextn.* tensors",
-                num_layers - first_nextn,
-                num_layers,
-                first_nextn
-            );
-            first_nextn
-        }
-        _ => num_layers,
-    };
+    let num_layers =
+        qwen35_forward_layer_count(provider.tensor_names().iter().map(|s| s.as_str()), num_layers);
     let num_heads = config.num_attention_heads.unwrap_or(32);
     let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
     let head_dim = config
@@ -3185,7 +3217,14 @@ fn load_model_with_providers(
                 num_heads: hparams.num_heads,
                 num_kv_heads: hparams.num_kv_heads,
                 head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
+                // The GGUF path never applied the MTP exclusion the
+                // safetensors path did, so a 65-block 27B ran its MTP block as
+                // a transformer layer. Same helper, so the two cannot drift
+                // again. See `qwen35_forward_layer_count`.
+                num_layers: qwen35_forward_layer_count(
+                    provider.tensor_names().iter().map(|s| s.as_str()),
+                    hparams.num_layers,
+                ),
                 intermediate_size: hparams.intermediate_size,
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
