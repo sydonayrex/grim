@@ -1872,6 +1872,27 @@ fn gated_delta_net_forward(
     };
     // SiLU on the convolved stream, per the reference.
     let conv_mix: Vec<f32> = qkv_conv.iter().map(|v| v / (1.0 + (-v).exp())).collect();
+    // KDA-STEP-PROBE (host side): dump layer 0 step-1 conv stream + ring for
+    // the cross-process diff against the D2D run.
+    {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == 0
+            && seq_len == 1
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let dump = |vals: &[f32], name: &str| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("/tmp/kda_probe_host_{name}.bin");
+                if std::fs::write(&path, &bytes).is_ok() {
+                    eprintln!("[kda-probe-host] wrote {} ({} f32) -> {path}", name, vals.len());
+                }
+            };
+            dump(&conv_mix, "conv_mix");
+            dump(&cache.conv_state, "conv_ring");
+            dump(&cache.ssm_state, "ssm_state");
+        }
+    }
 
     let slice = |off: usize, len: usize| -> &[f32] {
         let end = (off + len).min(conv_mix.len());
@@ -2198,6 +2219,127 @@ fn gated_delta_net_forward_d2d(
 
     // No readback at all: the gated branch output and the recurrent state both
     // stay in VRAM, and `ssm_out` consumes the tensor directly.
+
+    // KDA-STEP-PROBE (GRIM_KDA_STEP_PROBE=1): layer 0's first decode step runs
+    // the ENTIRE host reference on the imported live device state and diffs
+    // the two branches. This is the composite check the chain gates cannot
+    // give: real production inputs, real state handoff, both paths.
+    {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let probe_on = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1");
+        if probe_on
+            && blk.layer_idx == 0
+            && seq_len == 1
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let taps = blk.cfg_ssm_d_conv().max(1);
+            let ring_elems = conv_dim * (taps - 1);
+            // Import the live device state.
+            let conv_dev_host: Vec<f32> = grim_backend_rocm::device::util::as_rocm(cache.conv_state_dev.as_ref().unwrap().as_ref())
+                .and_then(|r| r.copy_to_host())
+                .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                .unwrap_or_default();
+            let ssm_dev_host: Vec<f32> = grim_backend_rocm::device::util::as_rocm(cache.ssm_state_dev.as_ref().unwrap().as_ref())
+                .and_then(|r| r.copy_to_host())
+                .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                .unwrap_or_default();
+            eprintln!(
+                "[kda-step-probe] imported device ring {} floats (need {ring_elems}), ssm {} floats",
+                conv_dev_host.len(),
+                ssm_dev_host.len()
+            );
+            // The D2D kernels above are still queued; the host reference
+            // below interleaves its own device ops + readbacks.
+            if let Device::Rocm(ord) = x_normed.device() {
+                grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+            }
+            // Transpose the device ring [channel][tap] into the host mirror's
+            // [t * h_dim + d] layout the host loop expects.
+            let mut conv_host = vec![0.0f32; ring_elems];
+            for d in 0..conv_dim {
+                for t in 0..(taps - 1) {
+                    conv_host[t * conv_dim + d] = conv_dev_host[d * (taps - 1) + t];
+                }
+            }
+            // Run the host reference on the imported state.
+            let saved_conv = std::mem::take(&mut cache.conv_state);
+            let saved_ssm = std::mem::take(&mut cache.ssm_state);
+            cache.conv_state = conv_host;
+            cache.ssm_state = ssm_dev_host.clone();
+            let mut host_branch = vec![0.0f32; seq_len * branch_width];
+            let host_res = gated_delta_net_forward(
+                blk,
+                cache,
+                x_normed,
+                &mut host_branch,
+                seq_len,
+                branch_width,
+            );
+            // The host run advanced the host mirror by this token; hand the
+            // post-step mirrors back (device buffers stay authoritative for
+            // the D2D path; these mirrors now match them).
+            let _ = (saved_conv, saved_ssm);
+
+            let d2d_branch = grim_backend_rocm::device::util::as_rocm(branch.as_ref())
+                .and_then(|r| r.copy_to_host())
+                .map(|b| {
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect::<Vec<f32>>()
+                })
+                .unwrap_or_default();
+            match host_res {
+                Ok(()) => {
+                    let worst = d2d_branch
+                        .iter()
+                        .zip(&host_branch)
+                        .map(|(g, w)| (g - w).abs())
+                        .fold(0.0f32, f32::max);
+                    let at = d2d_branch
+                        .iter()
+                        .zip(&host_branch)
+                        .enumerate()
+                        .max_by(|(_, (g, w)), (_, (g2, w2))| {
+                            let a = (*g - *w).abs();
+                            let b = (*g2 - *w2).abs();
+                            a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(i, _)| i);
+                    eprintln!(
+                        "[kda-step-probe] branch: d2d vs host worst |diff| {worst:.6} at idx {at:?}; \
+                         d2d[0..4]={:?} host[0..4]={:?}",
+                        &d2d_branch[..4.min(d2d_branch.len())],
+                        &host_branch[..4.min(host_branch.len())]
+                    );
+                }
+                Err(e) => eprintln!("[kda-step-probe] host reference failed: {e}"),
+            }
+            // conv_out dump for the same step (device tensor -> host).
+            let conv_dump = grim_backend_rocm::device::util::as_rocm(conv_out.as_ref())
+                .and_then(|r| r.copy_to_host())
+                .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>())
+                .unwrap_or_default();
+            eprintln!(
+                "[kda-step-probe] conv_out[0..6]={:?} alpha[0..4]={:?} beta[0..4]={:?} z[0..4]={:?}",
+                &conv_dump[..6.min(conv_dump.len())],
+                &alpha.to_vec_f32().unwrap_or_default()[..4],
+                &beta.to_vec_f32().unwrap_or_default()[..4],
+                &z.to_vec_f32().unwrap_or_default()[..4],
+            );
+            let dump = |vals: &[f32], name: &str| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("/tmp/kda_probe_d2d_{name}.bin");
+                if std::fs::write(&path, &bytes).is_ok() {
+                    eprintln!("[kda-step-probe] wrote {} ({} f32) -> {path}", name, vals.len());
+                }
+            };
+            dump(&conv_dump, "conv_mix");
+            dump(&conv_dev_host, "conv_ring");
+            dump(&ssm_dev_host, "ssm_state");
+            dump(&d2d_branch, "branch");
+        }
+    }
+
     Ok(Some(Tensor::new(
         std::sync::Arc::from(branch),
         Shape::new(vec![seq_len, value_dim]),
