@@ -1689,6 +1689,49 @@ impl RocmDevice {
                 let a_s = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                     Error::Backend("linear_decode_into: a not RocmStorage".into())
                 })?;
+                // GRIM_DECODE_W4A4=1: q4k weights are requantized once, per
+                // tensor, to the WhiteCrow u4 group-128 layout and decode rides
+                // the native v_dot8 GEMV. Probe-measured 435 GB/s vs 23 GB/s
+                // for the q4k dot4 kernel (tests/dot4_gemv_floor_probe.rs).
+                // Conversion is cached per weight device pointer; it D2Hs the
+                // packed bytes on first use, so it must NOT run under graph
+                // capture (hipMemcpy sync + alloc poison capture) — eager path
+                // only, env-gated off by default.
+                static W4A4_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let w4a4_decode = *W4A4_DECODE.get_or_init(|| {
+                    matches!(std::env::var("GRIM_DECODE_W4A4").as_deref(), Ok("1" | "true"))
+                });
+                if matches!(scheme, KQuantScheme::Q4K | KQuantScheme::Q5K | KQuantScheme::Q6K)
+                    && w4a4_decode
+                    && k % 128 == 0
+                {
+                    static CONVERTED: std::sync::OnceLock<
+                        std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<WhiteCrowDecodedWeights>>>,
+                    > = std::sync::OnceLock::new();
+                    let cache = CONVERTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    let key = w.device_ptr.map(|p| p as usize).unwrap_or(0);
+                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    let conv = match guard.get(&key) {
+                        Some(c) => c.clone(),
+                        None => {
+                            let c = std::sync::Arc::new(self.requant_kquant_to_whitecrow(w, n, k, *scheme)?);
+                            guard.insert(key, c.clone());
+                            c
+                        }
+                    };
+                    drop(guard);
+                    self.launch_w4a4_ostquant_gemv(
+                        a_s,
+                        conv.qweight_rocm()?,
+                        conv.scales_rocm()?,
+                        conv.zeros_rocm()?,
+                        out,
+                        m,
+                        n,
+                        k,
+                    )?;
+                    return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                }
                 self.launch_quantize_q8_1(a_s, act_q81, m, k)?;
                 match scheme {
                     KQuantScheme::Q4K => self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?,
@@ -1725,3 +1768,93 @@ impl RocmDevice {
 /// total launch counter would still have moved, so "my kernel ran" could not be
 /// distinguished from "something ran".
 pub const BLASLT_ROUTE: &str = "blaslt_external";
+
+
+/// One q4k weight tensor requantized to the WhiteCrow u4 group-128 layout.
+/// The three storages must outlive every decode launch that reads them, so
+/// they live in the per-device conversion cache for the process lifetime.
+pub struct WhiteCrowDecodedWeights {
+    pub qweight: Box<dyn grim_tensor::backend::BackendStorage>,
+    pub scales: Box<dyn grim_tensor::backend::BackendStorage>,
+    pub zeros: Box<dyn grim_tensor::backend::BackendStorage>,
+}
+
+impl WhiteCrowDecodedWeights {
+    fn qweight_rocm(&self) -> Result<&RocmStorage> {
+        self.qweight
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("requant: qweight not RocmStorage".into()))
+    }
+    fn scales_rocm(&self) -> Result<&RocmStorage> {
+        self.scales
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("requant: scales not RocmStorage".into()))
+    }
+    fn zeros_rocm(&self) -> Result<&RocmStorage> {
+        self.zeros
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("requant: zeros not RocmStorage".into()))
+    }
+}
+
+impl RocmDevice {
+    /// Dequantize a packed Q4_K weight tensor on the host and re-encode it as
+    /// unsigned-4-bit group-128 OSTQuant (WhiteCrow). One-time cost per tensor
+    /// (~a few ms for a 9B FFN matrix); see GRIM_DECODE_W4A4 in
+    /// `linear_decode_into`.
+    fn requant_kquant_to_whitecrow(
+        &self,
+        w: &RocmStorage,
+        n: usize,
+        k: usize,
+        scheme: grim_tensor::KQuantScheme,
+    ) -> Result<WhiteCrowDecodedWeights> {
+        use grim_tensor::{BackendDevice, MemoryOps};
+        let packed = w.copy_to_host()?;
+        let dequantized = match scheme {
+            grim_tensor::KQuantScheme::Q4K => grim_quant::dequant_q4k(&packed, n * k)?,
+            grim_tensor::KQuantScheme::Q5K => grim_quant::dequant_q5k(&packed, n * k)?,
+            _ => grim_quant::dequant_q6k(&packed, n * k)?,
+        };
+        let (qw, sc, zr) = grim_quant::quant_ostquant_w4_group128(&dequantized, n, k)?;
+        let bf16_dtype = DType {
+            arith: ArithType::BF16,
+            storage: DTypeStorage::Native,
+        };
+        // qweight is u32 WORDS ([N, K/8] words, 4 B each) — the W4A4 kernel
+        // indexes it as `const unsigned int*`. Uploading as U8 truncated the
+        // buffer to a quarter and the kernel read garbage.
+        let qweight = MemoryOps::from_cpu_bytes(
+            self as &dyn BackendDevice,
+            &qw,
+            &Shape::new(vec![n, k / 8]),
+            DType {
+                arith: ArithType::U32,
+                storage: DTypeStorage::Native,
+            },
+        )?;
+        let scales = MemoryOps::from_cpu_bytes(
+            self as &dyn BackendDevice,
+            &sc,
+            &Shape::new(vec![n, k / 128]),
+            bf16_dtype,
+        )?;
+        let zeros = MemoryOps::from_cpu_bytes(
+            self as &dyn BackendDevice,
+            &zr,
+            &Shape::new(vec![n, k / 128]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+        )?;
+        Ok(WhiteCrowDecodedWeights {
+            qweight,
+            scales,
+            zeros,
+        })
+    }
+}

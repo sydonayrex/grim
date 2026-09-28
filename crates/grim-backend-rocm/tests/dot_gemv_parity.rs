@@ -1364,8 +1364,12 @@ fn dot8_w4a4_gemv_parity() {
         ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
 
-    // Synthesize activation vector A [1, K]
-    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 2.5).collect();
+    // Synthesize activation vector A [1, K]. ABS is load-bearing: this seed's
+    // LCG draws were all-negative, which u4-quantizes to all-zero codes and
+    // made this gate pass 0.0-vs-0.0 VACUOUSLY (max_diff 0.000000) — the
+    // kernel was never actually checked until the WhiteCrow requant work
+    // tripped over it.
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs() * 2.5).collect();
 
     // Synthesize weights B in OSTQuant layout:
     // qweight: [N, K / 8] uint32
@@ -2159,4 +2163,238 @@ fn dot4_q4k_gemv_fast_parity() {
         std::env::set_var("GRIM_DOT_GEMV", "0");
         std::env::set_var("GRIM_DOT4_FAST", "0");
     }
+}
+
+/// WhiteCrow requant-at-load decode path (GRIM_DECODE_W4A4=1): a packed Q4_K
+/// weight tensor goes through `linear_decode_into`, gets dequantized on the
+/// host and re-encoded to u4 group-128, and the native v_dot8 GEMV runs.
+/// Reference is the ORIGINAL f32 weights — this gate bounds the DOUBLE
+/// quantization error (Q4_K then u4 group-128) that decode would actually
+/// inherit, not just the requantizer's own round-trip.
+#[test]
+#[ignore]
+fn decode_w4a4_requant_parity_vs_original_f32() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "1");
+        std::env::set_var("GRIM_DECODE_W4A4", "1");
+    }
+
+    let m = 1usize;
+    let n = 256usize;
+    let k = 512usize; // 2 Q4_K superblocks per row
+
+    let mut seed = 0x5EED_0001u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    // ABS on activations is load-bearing: this seed's LCG draws are
+    // effectively all-negative, and u4 codes clamp negatives to 0 — an
+    // all-zero activation quantizes to an all-zero code vector and the gate
+    // would compare 0-vs-125 and 'fail' for a reason that has nothing to do
+    // with the requant path.
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs()).collect();
+    let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
+    let b_bytes = grim_quant::quant_q4k(&b_f32).expect("quant_q4k");
+
+    let q4k_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q4K),
+    };
+    let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![n, k]),
+        q4k_dtype,
+    )
+    .expect("upload q4k weights");
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType::F32).unwrap();
+
+    let b_rocm = b_dev
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .unwrap();
+    let q81_bytes = (k / 32) * 36;
+    let alloc = std::sync::Arc::new(
+        grim_backend_rocm::memory::allocator::RocmCachingAllocator::new(0, 1 << 30),
+    );
+    let act_q81 = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::new(vec![q81_bytes]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        &alloc,
+        0,
+    )
+    .expect("alloc scratch");
+    let out = grim_backend_rocm::RocmStorage::alloc_gpu(&Shape::new(vec![m, n]), DType::F32, &alloc, 0)
+        .expect("alloc out");
+
+    let h = dev
+        .linear_decode_into(a_dev.as_ref(), &b_rocm, &out, &act_q81)
+        .expect("linear_decode_into (W4A4 arm)");
+    h.synchronize().expect("sync");
+    dev.synchronize();
+    let c_dev = grim_tensor::BackendStorage::to_cpu_vec_f32(&out).expect("d2h");
+
+    // CPU reference on the ORIGINAL f32 weights.
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let mut acc = 0.0f32;
+        for p in 0..k {
+            acc += a_f32[p] * b_f32[col * k + p];
+        }
+        c_cpu[col] = acc;
+    }
+    // Also the Q4_K-only reference, to show the requant adds little on top.
+    let mut c_q4k = vec![0.0f32; m * n];
+    for col in 0..n {
+        let brow = &b_bytes[col * (k / 256) * 144..(col + 1) * (k / 256) * 144];
+        let b_deq = grim_quant::dequant_q4k(brow, k).expect("dequant_q4k");
+        let mut acc = 0.0f32;
+        for p in 0..k {
+            acc += a_f32[p] * b_deq[p];
+        }
+        c_q4k[col] = acc;
+    }
+
+    let d_orig = max_diff(&c_cpu, &c_dev);
+    let d_q4k = max_diff(&c_q4k, &c_dev);
+    eprintln!(
+        "[decode-w4a4-parity] vs original f32: {d_orig:.5}; vs q4k-only: {d_q4k:.5}"
+    );
+    // Double-quantization tolerance: u4 activations x u4 weights on top of
+    // Q4_K. Relative bound (5% of the reference magnitude) catches layout,
+    // nibble-order and zero-point regressions — those produce O(1)-vs-O(100)
+    // garbage — while tolerating genuine u4 rounding noise.
+    let scale = c_cpu.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    assert!(
+        d_orig < 0.05 * scale,
+        "WhiteCrow requant decode diverges from original f32: {d_orig} (scale {scale})"
+    );
+    assert!(
+        d_q4k < 0.05 * scale,
+        "WhiteCrow requant decode diverges from q4k reference: {d_q4k} (scale {scale})"
+    );
+
+    unsafe {
+        std::env::set_var("GRIM_DOT_GEMV", "0");
+        std::env::set_var("GRIM_DECODE_W4A4", "0");
+    }
+}
+
+/// Shape bisection for dot8_w4a4_gemv: the passing gate is n=32 k=256; the
+/// WhiteCrow requant path needs n=256 k=512 and produced exact zeros. Same
+/// synthetic packing as dot8_w4a4_gemv_parity, at the bigger shape.
+#[test]
+#[ignore]
+fn dot8_w4a4_gemv_parity_n256_k512() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] requires RDNA4");
+        return;
+    }
+    let m = 1usize;
+    let n = 256usize;
+    let k = 512usize;
+    let n_groups = k / 128;
+    let words_per_col = k / 8;
+
+    let mut seed = 0x8888_0001u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs() * 2.5).collect();
+    let mut b_qw = vec![0u32; n * words_per_col];
+    let mut b_sc = vec![0u16; n * n_groups];
+    let mut b_zr = vec![0u8; n * n_groups];
+    let bf16_bits = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
+    for col in 0..n {
+        for g in 0..n_groups {
+            let sc_val = 0.001f32 * (1.0 + rand().abs());
+            b_sc[col * n_groups + g] = bf16_bits(sc_val);
+            b_zr[col * n_groups + g] = ((seed % 16) as u8).min(15);
+        }
+        for w in 0..words_per_col {
+            let mut word = 0u32;
+            for i in 0..8 {
+                let nib = ((seed.wrapping_add(w as u64 * 8 + i as u64)) % 16) as u32;
+                word |= (nib & 0xF) << (i * 4);
+            }
+            b_qw[col * words_per_col + w] = word;
+        }
+    }
+    let a_dev = CoreTensorOps::from_cpu(&dev, &a_f32, &Shape::new(vec![m, k]), DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    })
+    .unwrap();
+    let to_bytes_u32 = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &to_bytes_u32(&b_qw),
+        &Shape::new(vec![n, words_per_col]), DType { arith: ArithType::U32, storage: Storage::Native }).unwrap();
+    let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev,
+        &b_sc.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>(),
+        &Shape::new(vec![n, n_groups]), DType { arith: ArithType::BF16, storage: Storage::Native }).unwrap();
+    let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_zr,
+        &Shape::new(vec![n, n_groups]), DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+    let out = grim_tensor::CoreTensorOps::zeros(&dev, &Shape::new(vec![m, n]), DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    })
+    .unwrap();
+    fn as_rocm(b: &Box<dyn grim_tensor::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+        b.as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .unwrap()
+    }
+    dev.launch_w4a4_ostquant_gemv(
+        as_rocm(&a_dev), as_rocm(&b_qw_dev), as_rocm(&b_sc_dev), as_rocm(&b_zr_dev),
+        as_rocm(&out), m, n, k,
+    )
+    .expect("launch");
+    dev.synchronize();
+    let c = grim_tensor::BackendStorage::to_cpu_vec_f32(out.as_ref()).unwrap();
+    // CPU reference (same as the n32 gate).
+    let mut a_deq = vec![0.0f32; k];
+    for g in 0..n_groups {
+        let grp = &a_f32[g * 128..(g + 1) * 128];
+        let max_val = grp.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let d = max_val / 15.0;
+        let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+        for i in 0..128 {
+            a_deq[g * 128 + i] = (grp[i] * inv_d).round().clamp(0.0, 15.0) * d;
+        }
+    }
+    let mut c_cpu = vec![0.0f32; m * n];
+    for col in 0..n {
+        let mut acc = 0.0f32;
+        for g in 0..n_groups {
+            let sc = f32::from_bits((b_sc[col * n_groups + g] as u32) << 16);
+            let zr = b_zr[col * n_groups + g] as f32;
+            for w in 0..16 {
+                let word = b_qw[col * words_per_col + g * 16 + w];
+                for i in 0..8 {
+                    let nib = ((word >> (i * 4)) & 0xF) as f32;
+                    acc += a_deq[g * 128 + w * 8 + i] * (sc * (nib - zr));
+                }
+            }
+        }
+        c_cpu[col] = acc;
+    }
+    eprintln!("[dot8-w4a4-dbg2] a_deq[0..4]={:?} a_deq sum={:.4} a_f32[0..4]={:?}", &a_deq[..4], a_deq.iter().sum::<f32>(), &a_f32[..4]);
+    let diff = max_diff(&c_cpu, &c);
+    eprintln!("[dot8-w4a4-n256k512] max_diff={diff:.6} c[0..4]={:?} c_cpu[0..4]={:?} sc[0..4]={:?} zr[0..4]={:?} qw[0..4]={:?}",
+        &c[..4], &c_cpu[..4], &b_sc[..4], &b_zr[..4], &b_qw[..4]);
+    assert!(diff < 0.05, "dot8 w4a4 n=256 k=512 diverges: {diff}");
 }

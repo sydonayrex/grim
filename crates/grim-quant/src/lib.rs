@@ -120,6 +120,83 @@ pub fn dequant_ostquant_w4a4(
     Ok(out)
 }
 
+/// Quantize f32 weights to the unsigned-4-bit group-128 OSTQuant layout that
+/// the WhiteCrow W4A4 GEMV (`launch_w4a4_ostquant_gemv` /
+/// `dequant_ostquant_w4a4`) consumes: `qweight` u32 words `[N, K/8]` (nibble i
+/// of word w at bit 4i), `scales` bf16-as-u16-LE `[N, K/128]`, `zeros` u8
+/// `[N, K/128]`; dequant is `scale * (nibble - zero)`.
+///
+/// Per (column, 128-group): asymmetric min/max fit — `d = (max-min)/15`,
+/// `zero = round(-min/d)` clamped to 0..15, `nib = clamp(round(v/d) + zero)`.
+/// The scale is rounded to bf16 BEFORE encoding nibbles so the stored codes
+/// are optimal for the scale the kernel will actually use.
+///
+/// Used by the q4k→WhiteCrow requant-at-load path (GRIM_DECODE_W4A4): the
+/// 9B's Q4_K weights are dequantized once and re-encoded in this layout so
+/// decode rides the native v_dot8 GEMV (435 GB/s measured) instead of the
+/// 23 GB/s q4k dot4 kernel.
+pub fn quant_ostquant_w4_group128(
+    w: &[f32],
+    n: usize,
+    k: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    if w.len() < n * k {
+        return Err(Error::Backend(format!(
+            "quant_ostquant_w4_group128: need {} weights, got {}",
+            n * k,
+            w.len()
+        )));
+    }
+    let n_groups = k / 128;
+    let words_per_col = k / 8;
+    let mut qw = vec![0u8; n * words_per_col * 4];
+    let mut sc = vec![0u8; n * n_groups * 2];
+    let mut zr = vec![0u8; n * n_groups];
+
+    // bf16 rounding helper: truncate-and-round via f32 bits.
+    let to_bf16 = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
+    let from_bf16 = |bits: u16| -> f32 { f32::from_bits((bits as u32) << 16) };
+
+    for col in 0..n {
+        let row = &w[col * k..col * k + k];
+        for g in 0..n_groups {
+            let grp = &row[g * 128..g * 128 + 128];
+            let mut min = f32::INFINITY;
+            let mut max = f32::NEG_INFINITY;
+            for &v in grp {
+                min = min.min(v);
+                max = max.max(v);
+            }
+            let d = ((max - min) / 15.0).max(1e-30);
+            // Encode with the scale the kernel will dequant with.
+            let d_bf16 = from_bf16(to_bf16(d));
+            let mut zero = (-min / d_bf16).round();
+            if zero < 0.0 {
+                zero = 0.0;
+            }
+            if zero > 15.0 {
+                zero = 15.0;
+            }
+            let zero = zero as u8;
+            let sc_bits = to_bf16(d_bf16);
+            sc[(col * n_groups + g) * 2..(col * n_groups + g) * 2 + 2]
+                .copy_from_slice(&sc_bits.to_le_bytes());
+            zr[col * n_groups + g] = zero;
+            let base = col * words_per_col + g * 16; // 128/8 words per group
+            for (i, &v) in grp.iter().enumerate() {
+                let nib = ((v / d_bf16).round() as i32 + zero as i32).clamp(0, 15) as u32;
+                let word_i = base + i / 8;
+                let shift = (i % 8) * 4;
+                let bits = &mut qw[word_i * 4..word_i * 4 + 4];
+                let cur = u32::from_le_bytes([bits[0], bits[1], bits[2], bits[3]]);
+                let next = cur | (nib << shift);
+                bits.copy_from_slice(&next.to_le_bytes());
+            }
+        }
+    }
+    Ok((qw, sc, zr))
+}
+
 /// Dequantize grouped INT weights (EfficientQAT/GPTQ format).
 /// # Layout - `qweight`: packed low-bit weights (strided) - `qzeros`: per-group zero-points (uint16 for 2/3/4-bit,.
 pub fn dequant_gptq_group_int(
@@ -439,11 +516,16 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 // The sign comes from bit 3 of the nibble; bits 0-2 index the codebook.
 
 /// Dequantize IQ4_XS (llama.cpp importance-matrix 4-bit Extra Small) bytes to f32.
-/// Per 256-weight super-block (136 bytes): - `d` : f16 global scale (2 bytes) - `scales`.
+/// Per 256-weight super-block (136 bytes):
+/// - `d`: f16 global scale (2 bytes)
+/// - `scales_h`: u16 high bits for scales (2 bytes)
+/// - `scales_l`: [u8; 4] low bits for scales (4 bytes)
+/// - `qs`: [u8; 128] quantized values (128 bytes)
 pub fn dequant_iq4xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
+    use crate::iq_tables::KVALUES_IQ4NL;
+    const QK: usize = 256;
     const BLOCK_BYTES: usize = 136;
-    let num_blocks = num_weights.div_ceil(SUPER);
+    let num_blocks = num_weights.div_ceil(QK);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
             "IQ4_XS: expected {} bytes for {num_weights} weights, got {}",
@@ -452,47 +534,47 @@ pub fn dequant_iq4xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
     let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
     let mut remaining = num_weights;
-    for _ in 0..num_blocks {
-        let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let scales_buf = &data[pos..pos + 6];
-        pos += 6;
-        let qs = &data[pos..pos + 128];
-        pos += 128;
+    for b in 0..num_blocks {
+        let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+        let d = f16_to_f32(blk[0], blk[1]);
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
 
-        let block_len = remaining.min(SUPER);
-        for sb in 0..8 {
-            let sc_val = (scales_buf[sb * 6 / 8] >> ((sb * 6) % 8)) & 0x3F;
-            let scale = d * (sc_val as f32 - 32.0) * (1.0 / 32.0);
-            let sb_start = sb * 32;
-            if sb_start >= block_len {
-                break;
+        let block_len = remaining.min(QK);
+        for ib in 0..(QK / 32) {
+            let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) as i32)
+                | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+            let dl = d * (ls - 32) as f32;
+            let qs_sub = &qs[ib * 16..(ib + 1) * 16];
+            let base_idx = ib * 32;
+
+            for j in 0..16 {
+                if base_idx + j < block_len {
+                    out.push(dl * KVALUES_IQ4NL[(qs_sub[j] & 0xf) as usize]);
+                }
             }
-            let sb_end = (sb_start + 32).min(block_len);
-            for i in sb_start..sb_end {
-                let nibble = if i % 2 == 0 {
-                    qs[i / 2] & 0x0F
-                } else {
-                    (qs[i / 2] >> 4) & 0x0F
-                };
-                let code_mag = IQ4_NL_CODEBOOK[(nibble & 0x07) as usize];
-                let sign = if (nibble & 0x08) != 0 { -1.0 } else { 1.0 };
-                out.push(code_mag * scale * sign);
+            for j in 0..16 {
+                if base_idx + 16 + j < block_len {
+                    out.push(dl * KVALUES_IQ4NL[(qs_sub[j] >> 4) as usize]);
+                }
             }
         }
-        remaining = remaining.saturating_sub(SUPER);
+        remaining = remaining.saturating_sub(QK);
     }
     Ok(out)
 }
 
 /// Dequantize IQ3_XXS (llama.cpp importance-matrix 3-bit Extra Extra Small) bytes to f32.
-/// Per 256-weight super-block (96 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
+/// Per 256-weight super-block (98 bytes):
+/// - `d`: f16 global scale (2 bytes)
+/// - `qs`: [u8; 96] where qs[0..64] are grid indices, qs[64..96] are scales and signs (32 bytes)
 pub fn dequant_iq3xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
-    const BLOCK_BYTES: usize = 96;
-    let num_blocks = num_weights.div_ceil(SUPER);
+    use crate::iq_tables::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+    const QK: usize = 256;
+    const BLOCK_BYTES: usize = 98;
+    let num_blocks = num_weights.div_ceil(QK);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
             "IQ3_XXS: expected {} bytes for {num_weights} weights, got {}",
@@ -501,37 +583,63 @@ pub fn dequant_iq3xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
     let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
     let mut remaining = num_weights;
-    for _ in 0..num_blocks {
-        let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let qs = &data[pos..pos + 64];
-        pos += 64;
-        let signs = &data[pos..pos + 30];
-        pos += 30;
+    for b in 0..num_blocks {
+        let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+        let d = f16_to_f32(blk[0], blk[1]);
+        let qs = &blk[2..66];
+        let scales_and_signs = &blk[66..98];
 
-        let block_len = remaining.min(SUPER);
-        for i in 0..block_len {
-            let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
-            let sub_idx = i % 8;
-            let base_val = ((grid_idx + sub_idx * 17) % 7) as f32 - 3.0;
-            let sign_byte_idx = (i / 8).min(signs.len() - 1);
-            let sign_bit = (signs[sign_byte_idx] >> (i % 8)) & 0x01;
-            let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
-            out.push(d * base_val * 0.25 * sign);
+        let block_len = remaining.min(QK);
+        for ib32 in 0..(QK / 32) {
+            let aux32 = u32::from_le_bytes([
+                scales_and_signs[4 * ib32],
+                scales_and_signs[4 * ib32 + 1],
+                scales_and_signs[4 * ib32 + 2],
+                scales_and_signs[4 * ib32 + 3],
+            ]);
+            let db = d * (0.5f32 + (aux32 >> 28) as f32) * 0.5f32;
+            let qs_sub = &qs[ib32 * 8..(ib32 + 1) * 8];
+
+            for l in 0..4 {
+                let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+                let grid1_val = IQ3XXS_GRID[qs_sub[2 * l + 0] as usize];
+                let grid2_val = IQ3XXS_GRID[qs_sub[2 * l + 1] as usize];
+                let grid1 = grid1_val.to_le_bytes();
+                let grid2 = grid2_val.to_le_bytes();
+
+                let base_idx = ib32 * 32 + l * 8;
+                for j in 0..4 {
+                    if base_idx + j < block_len {
+                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db * (grid1[j] as f32) * sign);
+                    }
+                }
+                for j in 0..4 {
+                    if base_idx + 4 + j < block_len {
+                        let sign = if (signs & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db * (grid2[j] as f32) * sign);
+                    }
+                }
+            }
         }
-        remaining = remaining.saturating_sub(SUPER);
+        remaining = remaining.saturating_sub(QK);
     }
     Ok(out)
 }
 
 /// Dequantize IQ3_S (llama.cpp importance-matrix 3-bit Small) bytes to f32.
-/// Per 256-weight super-block (110 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
+/// Per 256-weight super-block (110 bytes):
+/// - `d`: f16 global scale (2 bytes)
+/// - `qs`: [u8; 64]
+/// - `qh`: [u8; 8]
+/// - `signs`: [u8; 32]
+/// - `scales`: [u8; 4]
 pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
+    use crate::iq_tables::{IQ3S_GRID, KMASK_IQ2XS};
+    const QK: usize = 256;
     const BLOCK_BYTES: usize = 110;
-    let num_blocks = num_weights.div_ceil(SUPER);
+    let num_blocks = num_weights.div_ceil(QK);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
             "IQ3_S: expected {} bytes for {num_weights} weights, got {}",
@@ -540,45 +648,86 @@ pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
     let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
     let mut remaining = num_weights;
-    for _ in 0..num_blocks {
-        let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let qs = &data[pos..pos + 64];
-        pos += 64;
-        let scales = &data[pos..pos + 12];
-        pos += 12;
-        let signs = &data[pos..pos + 32];
-        pos += 32;
+    for b in 0..num_blocks {
+        let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+        let d = f16_to_f32(blk[0], blk[1]);
+        let qs = &blk[2..66];
+        let qh = &blk[66..74];
+        let signs = &blk[74..106];
+        let scales = &blk[106..110];
 
-        let block_len = remaining.min(SUPER);
-        for sb in 0..8 {
-            let sc = (scales[sb * 12 / 8] as f32 + 1.0) * 0.125;
-            let scale = d * sc;
-            let sb_start = sb * 32;
-            if sb_start >= block_len {
-                break;
+        let block_len = remaining.min(QK);
+        for ib32 in (0..(QK / 32)).step_by(2) {
+            let sc_byte = scales[ib32 / 2];
+            let db1 = d * (1.0f32 + 2.0f32 * (sc_byte & 0xf) as f32);
+            let db2 = d * (1.0f32 + 2.0f32 * (sc_byte >> 4) as f32);
+
+            let qh0 = qh[ib32] as usize;
+            let qh1 = qh[ib32 + 1] as usize;
+
+            // First 32 weights
+            let qs1 = &qs[ib32 * 8..(ib32 + 1) * 8];
+            let signs1 = &signs[ib32 * 4..(ib32 + 1) * 4];
+            for l in 0..4 {
+                let idx1 = (qs1[2 * l + 0] as usize) | (((qh0 << (8 - 2 * l)) & 256));
+                let idx2 = (qs1[2 * l + 1] as usize) | (((qh0 << (7 - 2 * l)) & 256));
+                let grid1 = IQ3S_GRID[idx1].to_le_bytes();
+                let grid2 = IQ3S_GRID[idx2].to_le_bytes();
+
+                let base_idx = ib32 * 32 + l * 8;
+                for j in 0..4 {
+                    if base_idx + j < block_len {
+                        let sign = if (signs1[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db1 * (grid1[j] as f32) * sign);
+                    }
+                }
+                for j in 0..4 {
+                    if base_idx + 4 + j < block_len {
+                        let sign = if (signs1[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db1 * (grid2[j] as f32) * sign);
+                    }
+                }
             }
-            let sb_end = (sb_start + 32).min(block_len);
-            for i in sb_start..sb_end {
-                let grid_val = ((qs[(i / 8).min(qs.len() - 1)] as usize + i) % 7) as f32 - 3.0;
-                let sign_bit = (signs[i / 8] >> (i % 8)) & 0x01;
-                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
-                out.push(scale * grid_val * sign);
+
+            // Second 32 weights
+            let qs2 = &qs[(ib32 + 1) * 8..(ib32 + 2) * 8];
+            let signs2 = &signs[(ib32 + 1) * 4..(ib32 + 2) * 4];
+            for l in 0..4 {
+                let idx1 = (qs2[2 * l + 0] as usize) | (((qh1 << (8 - 2 * l)) & 256));
+                let idx2 = (qs2[2 * l + 1] as usize) | (((qh1 << (7 - 2 * l)) & 256));
+                let grid1 = IQ3S_GRID[idx1].to_le_bytes();
+                let grid2 = IQ3S_GRID[idx2].to_le_bytes();
+
+                let base_idx = (ib32 + 1) * 32 + l * 8;
+                for j in 0..4 {
+                    if base_idx + j < block_len {
+                        let sign = if (signs2[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db2 * (grid1[j] as f32) * sign);
+                    }
+                }
+                for j in 0..4 {
+                    if base_idx + 4 + j < block_len {
+                        let sign = if (signs2[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db2 * (grid2[j] as f32) * sign);
+                    }
+                }
             }
         }
-        remaining = remaining.saturating_sub(SUPER);
+        remaining = remaining.saturating_sub(QK);
     }
     Ok(out)
 }
 
 /// Dequantize IQ2_XXS (llama.cpp importance-matrix 2-bit Extra Extra Small) bytes to f32.
-/// Per 256-weight super-block (66 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
+/// Per 256-weight super-block (66 bytes):
+/// - `d`: f16 global scale (2 bytes)
+/// - `qs`: [u8; 64] (interpreted as [u16; 32] or 8 uint32_t pairs: 4 bytes grid indices, 4 bytes scales/signs)
 pub fn dequant_iq2xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
+    use crate::iq_tables::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+    const QK: usize = 256;
     const BLOCK_BYTES: usize = 66;
-    let num_blocks = num_weights.div_ceil(SUPER);
+    let num_blocks = num_weights.div_ceil(QK);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
             "IQ2_XXS: expected {} bytes for {num_weights} weights, got {}",
@@ -587,35 +736,52 @@ pub fn dequant_iq2xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
     let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
     let mut remaining = num_weights;
-    for _ in 0..num_blocks {
-        let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let qs = &data[pos..pos + 32];
-        pos += 32;
-        let signs = &data[pos..pos + 32];
-        pos += 32;
+    for b in 0..num_blocks {
+        let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+        let d = f16_to_f32(blk[0], blk[1]);
+        let qs = &blk[2..66];
 
-        let block_len = remaining.min(SUPER);
-        for i in 0..block_len {
-            let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
-            let val = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
-            let sign_bit = (signs[i / 8] >> (i % 8)) & 0x01;
-            let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
-            out.push(d * val * sign);
+        let block_len = remaining.min(QK);
+        for ib32 in 0..(QK / 32) {
+            let aux8 = &qs[8 * ib32..8 * ib32 + 4];
+            let aux32_1 = u32::from_le_bytes([
+                qs[8 * ib32 + 4],
+                qs[8 * ib32 + 5],
+                qs[8 * ib32 + 6],
+                qs[8 * ib32 + 7],
+            ]);
+            let db = d * (0.5f32 + (aux32_1 >> 28) as f32) * 0.25f32;
+
+            for l in 0..4 {
+                let grid_val = IQ2XXS_GRID[aux8[l] as usize];
+                let signs = KSIGNS_IQ2XS[((aux32_1 >> (7 * l)) & 127) as usize];
+                let base_idx = ib32 * 32 + l * 8;
+
+                for j in 0..8 {
+                    if base_idx + j < block_len {
+                        let g = ((grid_val >> (8 * j)) & 0xff) as f32;
+                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db * g * sign);
+                    }
+                }
+            }
         }
-        remaining = remaining.saturating_sub(SUPER);
+        remaining = remaining.saturating_sub(QK);
     }
     Ok(out)
 }
 
 /// Dequantize IQ2_XS (llama.cpp importance-matrix 2-bit Extra Small) bytes to f32.
-/// Per 256-weight super-block (74 bytes): - `d` : f16 global scale (2 bytes) - `qs`.
+/// Per 256-weight super-block (74 bytes):
+/// - `d`: f16 global scale (2 bytes)
+/// - `qs`: [u8; 64] (interpreted as 32 little-endian uint16_t values)
+/// - `scales`: [u8; 8]
 pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
+    use crate::iq_tables::{IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+    const QK: usize = 256;
     const BLOCK_BYTES: usize = 74;
-    let num_blocks = num_weights.div_ceil(SUPER);
+    let num_blocks = num_weights.div_ceil(QK);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
             "IQ2_XS: expected {} bytes for {num_weights} weights, got {}",
@@ -624,36 +790,39 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
     let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
     let mut remaining = num_weights;
-    for _ in 0..num_blocks {
-        let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let qs = &data[pos..pos + 32];
-        pos += 32;
-        let scales = &data[pos..pos + 8];
-        pos += 8;
-        let signs = &data[pos..pos + 32];
-        pos += 32;
+    for b in 0..num_blocks {
+        let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+        let d = f16_to_f32(blk[0], blk[1]);
+        let qs = &blk[2..66];
+        let scales = &blk[66..74];
 
-        let block_len = remaining.min(SUPER);
-        for sb in 0..16 {
-            let sc = ((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F) as f32 * 0.125 + 0.5;
-            let scale = d * sc;
-            let sb_start = sb * 16;
-            if sb_start >= block_len {
-                break;
-            }
-            let sb_end = (sb_start + 16).min(block_len);
-            for i in sb_start..sb_end {
-                let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
-                let val = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
-                let sign_bit = (signs[i / 8] >> (i % 8)) & 0x01;
-                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
-                out.push(scale * val * sign);
+        let block_len = remaining.min(QK);
+        for ib32 in 0..(QK / 32) {
+            let sc_byte = scales[ib32];
+            let db = [
+                d * (0.5f32 + (sc_byte & 0xf) as f32) * 0.25f32,
+                d * (0.5f32 + (sc_byte >> 4) as f32) * 0.25f32,
+            ];
+
+            for l in 0..4 {
+                let q_offset = (ib32 * 4 + l) * 2;
+                let q_val = u16::from_le_bytes([qs[q_offset], qs[q_offset + 1]]);
+                let grid_idx = (q_val & 511) as usize;
+                let signs = KSIGNS_IQ2XS[(q_val >> 9) as usize];
+                let grid_val = IQ2XS_GRID[grid_idx];
+                let base_idx = ib32 * 32 + l * 8;
+
+                for j in 0..8 {
+                    if base_idx + j < block_len {
+                        let g = ((grid_val >> (8 * j)) & 0xff) as f32;
+                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        out.push(db[l / 2] * g * sign);
+                    }
+                }
             }
         }
-        remaining = remaining.saturating_sub(SUPER);
+        remaining = remaining.saturating_sub(QK);
     }
     Ok(out)
 }
@@ -7488,4 +7657,47 @@ pub fn dequant_ptq1_0(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod ostquant_w4_tests {
+    use super::*;
+
+    /// Round-trip through the WhiteCrow layout: quantize, dequant with the
+    /// REFERENCE decoder, error must stay inside u4 group-128 noise. This is
+    /// the layout the requant-at-load decode path feeds the native v_dot8
+    /// GEMV, so the two functions must agree on nibble order, scale and zero.
+    #[test]
+    fn quant_ostquant_w4_roundtrips_through_reference_dequant() {
+        let (n, k) = (16usize, 512usize);
+        let mut s: u32 = 0xC0FFEE;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        let w: Vec<f32> = (0..n * k)
+            .map(|_| ((next() & 0xffff) as f32 / 65535.0 - 0.5) * 0.08)
+            .collect();
+
+        let (qw, sc, zr) =
+            quant_ostquant_w4_group128(&w, n, k).expect("quant_ostquant_w4_group128");
+        let deq = dequant_ostquant_w4a4(&qw, &sc, &zr, &[n, k], 128).expect("reference dequant");
+        assert_eq!(deq.len(), n * k);
+
+        // Per-group u4 range is d = (max-min)/15; reconstruction error is
+        // bounded by d/2 plus bf16 scale rounding. Weight magnitudes here are
+        // ~0.04, group spread ~0.06 -> d ~ 0.004; allow a generous 2*d.
+        let mut worst = 0.0f32;
+        for (a, b) in w.iter().zip(&deq) {
+            worst = worst.max((a - b).abs());
+        }
+        assert!(worst < 0.004, "round-trip error {worst}");
+    }
+
+    #[test]
+    fn quant_ostquant_w4_rejects_short_input() {
+        assert!(quant_ostquant_w4_group128(&[0.0; 10], 4, 128).is_err());
+    }
 }
