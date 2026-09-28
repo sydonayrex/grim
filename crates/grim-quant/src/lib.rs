@@ -2,6 +2,7 @@
 
 use grim_tensor::error::{Error, Result};
 
+pub mod iq_tables;
 pub mod accuracy_gate;
 pub mod grey_raven;
 pub mod gsq;
@@ -654,10 +655,35 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 
 /// Dequantize IQ2_S (llama.cpp importance-matrix 2-bit Small) bytes to f32.
 /// Per 256-weight super-block (82 bytes): - `d` : f16 global scale (2 bytes at offset.
+/// Dequantize IQ2_S packed bytes to F32.
+///
+/// Transcribed from llama.cpp `dequantize_row_iq2_s`
+/// (`old/repo/llama.cpp-master/ggml/src/ggml-quants.c`), block layout from
+/// `ggml-common.h`:
+///
+///     block_iq2_s { ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32];
+///                   uint8_t scales[QK_K/32]; }        // 2 + 64 + 8 + 8 = 82 B
+///
+/// and `signs` is a VIEW into `qs` at `qs + QK_K/8`, not a separate field.
+/// The previous version here used a wholly different layout — a 16-element
+/// sub-scale with a `*0.125+0.5` factor, an arithmetic `(idx + i%8) % 4 - 1.5`
+/// grid, and one sign bit per element read as `signs[i/8] >> (i%8)`. All three
+/// were wrong, and the sign index ran to 31 in a 24-byte field, reading 8 bytes
+/// past the block.
+///
+/// Note `scales` is indexed per 32 elements here; the sub-scale is
+/// `d * (0.5 + nibble) * 0.25`, low nibble for `l` 0/1 and high for 2/3.
 pub fn dequant_iq2s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
+    use crate::iq_tables::{IQ2S_GRID, KMASK_IQ2XS};
+    const QK: usize = 256;
     const BLOCK_BYTES: usize = 82;
-    let num_blocks = num_weights.div_ceil(SUPER);
+    const D: usize = 0;
+    const QS: usize = 2;
+    const QH: usize = QS + QK / 4; // 66
+    const SCALES: usize = QH + QK / 32; // 74
+    const NB32: usize = QK / 32; // 8 groups of 32
+
+    let num_blocks = num_weights.div_ceil(QK);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
             "IQ2_S: expected {} bytes for {num_weights} weights, got {}",
@@ -666,38 +692,41 @@ pub fn dequant_iq2s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
     let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
     let mut remaining = num_weights;
-    for _ in 0..num_blocks {
-        let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let qs = &data[pos..pos + 48];
-        pos += 48;
-        let scales = &data[pos..pos + 8];
-        pos += 8;
-        let signs = &data[pos..pos + 24];
-        pos += 24;
-
-        let block_len = remaining.min(SUPER);
-        for sb in 0..16 {
-            let sc = ((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F) as f32 * 0.125 + 0.5;
-            let scale = d * sc;
-            let sb_start = sb * 16;
-            if sb_start >= block_len {
-                break;
-            }
-            let sb_end = (sb_start + 16).min(block_len);
-            for i in sb_start..sb_end {
-                let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
-                let val = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
-                let sign_byte_idx = (i / 8).min(signs.len() - 1);
-                let sign_bit = (signs[sign_byte_idx] >> (i % 8)) & 0x01;
-                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
-                out.push(scale * val * sign);
+    for b in 0..num_blocks {
+        let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+        let d = f16_to_f32(blk[D], blk[D + 1]);
+        let block_len = remaining.min(QK);
+        for ib32 in 0..NB32 {
+            let sc_byte = blk[SCALES + ib32];
+            let db = [
+                d * (0.5 + (sc_byte & 0x0f) as f32) * 0.25,
+                d * (0.5 + (sc_byte >> 4) as f32) * 0.25,
+            ];
+            // `signs` aliases qs + QK_K/8 and advances 4 per group, as does qs.
+            let signs_at = QS + QK / 8 + ib32 * 4;
+            for l in 0..4usize {
+                let dl = db[l / 2];
+                let idx = (blk[QS + ib32 * 4 + l] as usize)
+                    | (((blk[QH + ib32] as usize) << (8 - 2 * l)) & 0x300);
+                let packed = IQ2S_GRID[idx];
+                for j in 0..8usize {
+                    if ib32 * 32 + l * 8 + j >= block_len {
+                        break;
+                    }
+                    let g = ((packed >> (8 * j)) & 0xff) as f32;
+                    let s = if blk[signs_at + l] & KMASK_IQ2XS[j] != 0 {
+                        -1.0f32
+                    } else {
+                        1.0f32
+                    };
+                    out.push(dl * g * s);
+                }
             }
         }
-        remaining = remaining.saturating_sub(SUPER);
+        remaining = remaining.saturating_sub(QK);
     }
+    out.truncate(num_weights);
     Ok(out)
 }
 /// Dequantize Q4_K bytes to f32 per the ggml/llama.cpp super-block specification.
