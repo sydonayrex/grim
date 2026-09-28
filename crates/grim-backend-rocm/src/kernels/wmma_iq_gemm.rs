@@ -321,13 +321,11 @@ extern "C" __global__ void grim_wmma_fused_dequant_iq3s(
     }
 }
 
-// --- IQ4_NL (170 bytes / 256 weights) ---
-__device__ __forceinline__ void dequant_iq_iq4nl_chunk_fp16(
-    const unsigned char* block, int k_start, _Float16* out) {
-    for (int i = 0; i < 16; ++i) {
-        out[i] = (_Float16)dequant_iq4nl(block, k_start + i);
-    }
-}
+// --- IQ4_NL (18 bytes / 32 weights, QK4_NL = 32) ---
+// The per-tile `dequant_iq_iq4nl_chunk_fp16` helper is gone: a 16-wide k tile
+// can straddle a 32-weight block, so the kernel now decodes element by
+// element and a one-block-per-tile helper would silently read the wrong block
+// on every odd tile.
 
 extern "C" __global__ void grim_wmma_fused_dequant_iq4nl(
     const float* __restrict__ A,
@@ -343,7 +341,9 @@ extern "C" __global__ void grim_wmma_fused_dequant_iq4nl(
     fill_fragment(frag_c, 0.0f);
     const int row_base = tile_row * 16;
     const int col_base = tile_col * 16;
-    const int n_blocks_per_row = K / QK_K;
+    // IQ4_NL blocks hold 32 weights in 18 bytes, so a row of K weights is
+    // (K/32) blocks, not K/QK_K.
+    const int n_blocks_per_row = K / 32;
     _Float16 a_tile[16 * 16];
     _Float16 b_tile[16 * 16];
     for (int k0 = 0; k0 < K; k0 += 16) {
@@ -358,10 +358,16 @@ extern "C" __global__ void grim_wmma_fused_dequant_iq4nl(
         for (int j = 0; j < 16; ++j) {
             int col = col_base + j;
             if (col < N) {
-                const unsigned char* row_ptr = B_iq + (long long)col * n_blocks_per_row * 170;
-                int block_idx = k0 / QK_K;
-                int k_in_block = k0 % QK_K;
-                dequant_iq_iq4nl_chunk_fp16(row_ptr + (long long)block_idx * 170, k_in_block, &b_tile[j * 16]);
+                const unsigned char* row_ptr = B_iq + (long long)col * n_blocks_per_row * 18;
+                // A 16-wide k tile can straddle a 32-weight block, so decode
+                // per element rather than assuming one block per tile.
+                for (int e = 0; e < 16; ++e) {
+                    int kk = k0 + e;
+                    int block_idx = kk / 32;
+                    int k_in_block = kk % 32;
+                    b_tile[j * 16 + e] =
+                        (_Float16)dequant_iq4nl(row_ptr + (long long)block_idx * 18, k_in_block);
+                }
             } else {
                 for (int k = 0; k < 16; ++k) b_tile[j * 16 + k] = (_Float16)0;
             }

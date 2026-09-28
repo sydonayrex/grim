@@ -325,7 +325,11 @@ impl CudaDevice {
                 KQuantScheme::Q80 => ("grim_dequant_q8_0", 34, 32),
                 KQuantScheme::Q5K => ("grim_dequant_q5k", 176, 256),
                 KQuantScheme::Q6K => ("grim_dequant_q6k", 210, 256),
-                KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 144, 256),
+                // IQ4_NL: QK4_NL = 32 weights in 18 bytes. This said 144/256
+                // (Q4_K's geometry) while the kernel used 170/256 and the
+                // CPU decoder used 18/32 -- three different answers for one
+                // format inside one crate.
+                KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 18, 32),
                 KQuantScheme::IQ4XS => ("grim_dequant_iq4xs", 136, 256),
                 KQuantScheme::IQ3XXS => ("grim_dequant_iq3xxs", 96, 256),
                 KQuantScheme::IQ3S => ("grim_dequant_iq3s", 110, 256),

@@ -123,9 +123,12 @@ GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq3xxs_tiled,
 GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq3s_tiled,
                          grim_fused_dequant_gemm_iq3s_backward_tiled,
                          dequant_iq3s, 256, 110)
-GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq4nl_tiled,
-                         grim_fused_dequant_gemm_iq4nl_backward_tiled,
-                         dequant_iq4nl, 256, 170)
+// IQ4_NL has NO tiled entry. Its block is QK4_NL = 32 weights in 18 bytes,
+// which cannot fill a 256-element WMMA tile; listing it here also imposed
+// `k % tiled_k_multiple(256) == 0` on a 32-element-block format. The
+// untiled `grim_fused_dequant_gemm_iq4nl` is the correct path, and
+// `tiled_quant_block_sizes_match_llama_cpp` fails the build if iq4nl ever
+// reappears in the dispatch table.
 GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq4xs_tiled,
                          grim_fused_dequant_gemm_iq4xs_backward_tiled,
                          dequant_iq4xs, 256, 136)

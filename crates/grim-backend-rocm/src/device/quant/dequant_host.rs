@@ -88,14 +88,18 @@ impl RocmDevice {
     }
 
     /// Run any standalone IQ dequant kernel against `bytes` and return `elem_count` f32 values.
+    ///
+    /// `block_elems` is the format's weights-per-block, not a constant: every
+    /// IQ format except IQ4_NL packs 256, but IQ4_NL packs QK4_NL = 32. Using
+    /// 256 for IQ4_NL sizes the output 8x too large and strides the input wrong.
     fn dequantize_iq_host(
         &self,
         bytes: &[u8],
         elem_count: usize,
         block_bytes: usize,
+        block_elems: usize,
         kernel: &str,
     ) -> Result<Vec<f32>> {
-        const QK: usize = 256;
         let n_blocks = bytes.len() / block_bytes;
         let packed = RocmStorage::copy_from_host_raw_bytes(
             bytes,
@@ -108,7 +112,7 @@ impl RocmDevice {
             self.ordinal,
         )?;
         let out_storage = RocmStorage::alloc_gpu(
-            &Shape::new(vec![n_blocks * QK]),
+            &Shape::new(vec![n_blocks * block_elems]),
             DType {
                 arith: ArithType::F32,
                 storage: DTypeStorage::Native,
@@ -151,37 +155,40 @@ impl RocmDevice {
 
     /// Dequantize IQ2_XXS packed bytes via the ROCm kernel. 66 bytes / 256-elem super-block.
     pub fn dequantize_iq2xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 66, "grim_dequant_iq2xxs")
+        self.dequantize_iq_host(bytes, elem_count, 66, 256, "grim_dequant_iq2xxs")
     }
 
     /// Dequantize IQ2_XS packed bytes via the ROCm kernel. 74 bytes / 256-elem super-block.
     pub fn dequantize_iq2xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 74, "grim_dequant_iq2xs")
+        self.dequantize_iq_host(bytes, elem_count, 74, 256, "grim_dequant_iq2xs")
     }
 
     /// Dequantize IQ2_S packed bytes via the ROCm kernel. 82 bytes / 256-elem super-block.
     pub fn dequantize_iq2s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 82, "grim_dequant_iq2s")
+        self.dequantize_iq_host(bytes, elem_count, 82, 256, "grim_dequant_iq2s")
     }
 
     /// Dequantize IQ3_XXS packed bytes via the ROCm kernel. 96 bytes / 256-elem super-block.
     pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 96, "grim_dequant_iq3xxs")
+        self.dequantize_iq_host(bytes, elem_count, 96, 256, "grim_dequant_iq3xxs")
     }
 
     /// Dequantize IQ3_S packed bytes via the ROCm kernel. 110 bytes / 256-elem super-block.
     pub fn dequantize_iq3s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 110, "grim_dequant_iq3s")
+        self.dequantize_iq_host(bytes, elem_count, 110, 256, "grim_dequant_iq3s")
     }
 
-    /// Dequantize IQ4_NL packed bytes via the ROCm kernel. 170 bytes / 256-elem super-block.
+    /// Dequantize IQ4_NL packed bytes via the ROCm kernel. 18 bytes / 32-elem block
+    /// (llama.cpp `QK4_NL = 32`).
     pub fn dequantize_iq4nl_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 170, "grim_dequant_iq4nl")
+        self.dequantize_iq_host(bytes, elem_count, 18, 32, "grim_dequant_iq4nl")
     }
 
-    /// Dequantize IQ4_XS packed bytes via the ROCm kernel. 178 bytes / 256-elem super-block.
+    /// Dequantize IQ4_XS packed bytes via the ROCm kernel. 136 bytes / 256-elem
+    /// super-block (`2 + sizeof(uint16_t) + QK_K/64 + QK_K/2`; the 178 here
+    /// matched no llama.cpp layout and mis-strided the input).
     pub fn dequantize_iq4xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 178, "grim_dequant_iq4xs")
+        self.dequantize_iq_host(bytes, elem_count, 136, 256, "grim_dequant_iq4xs")
     }
 
     /// Dequantize packed FP8 bytes (4-byte f32 LE scale header, then one E4M3 code per element).

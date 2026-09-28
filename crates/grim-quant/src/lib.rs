@@ -2,6 +2,12 @@
 
 use grim_tensor::error::{Error, Result};
 
+/// The IQ4_NL signed codebook (llama.cpp `kvalues_iq4nl`). Defined once in
+/// `iq_tables` and pinned there against the reference header, so a
+/// mistranscription cannot recur in a second copy. It was previously wrong in
+/// the two largest entries (87.0/107.0 instead of 89.0/113.0).
+use iq_tables::KVALUES_IQ4NL as KVALUES_IQ4NL_REF;
+
 pub mod iq_tables;
 pub mod accuracy_gate;
 pub mod grey_raven;
@@ -356,12 +362,6 @@ pub fn dequant_q80(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 
 const BLOCK_Q8_WEIGHTS: usize = 32;
 
-/// Canonical IQ4_NL signed 16-entry codebook (ggml `kvalues_iq4nl`).
-const KVALUES_IQ4NL: [f32; 16] = [
-    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
-    87.0, 107.0,
-];
-
 /// Absolute-value 16-entry codebook table alias for IQ4_XS.
 const IQ4_NL_CODEBOOK: [f32; 16] = [
     0.0,
@@ -383,11 +383,23 @@ const IQ4_NL_CODEBOOK: [f32; 16] = [
 ];
 
 /// Dequantize IQ4_NL (ggml non-linear 4-bit) bytes to f32.
-/// Per 256-weight super-block (170 bytes), matching `quant_iq4nl`: - 2 bytes `d` : f16 global scale.
+///
+/// Faithful port of `dequantize_row_iq4_nl` (ggml-quants.c). The block is
+/// llama.cpp's `block_iq4_nl` -- a `ggml_half d` followed by `qs[QK4_NL/2]`
+/// with `QK4_NL = 32` -- so 18 bytes per 32 weights, NOT 170 bytes per 256.
+/// The previous layout (`d` + a 32-byte sign plane + 128 nibble bytes + 8
+/// sub-block scale bytes) matched no llama.cpp block and overran real GGUF
+/// tensors: on Qwen3.8-27B `blk.1.ffn_down.weight` the 170/256 stride
+/// addressed 59,187,200 bytes against a 50,135,040-byte tensor.
+///
+/// The sign is carried by the codebook entry itself (`kvalues_iq4nl` is a
+/// signed table), so there is no sign plane and no per-sub-block scale.
+/// Within a block, byte `j` supplies element `j` from its low nibble and
+/// element `j + 16` from its high nibble -- the halves are not interleaved.
 pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
-    const BLOCK_BYTES: usize = 170;
-    let num_blocks = num_weights.div_ceil(SUPER);
+    const QK4_NL: usize = 32;
+    const BLOCK_BYTES: usize = 2 + QK4_NL / 2;
+    let num_blocks = num_weights.div_ceil(QK4_NL);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
             "IQ4_NL: expected {} bytes for {num_weights} weights, got {}",
@@ -396,37 +408,30 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
     let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
-    let mut remaining = num_weights;
-    for _ in 0..num_blocks {
+    for b in 0..num_blocks {
+        let pos = b * BLOCK_BYTES;
         let d = f16_to_f32(data[pos], data[pos + 1]);
-        let q8 = &data[pos + 2..pos + 34];
-        let qs = &data[pos + 34..pos + 162];
-        let scales = &data[pos + 162..pos + 170];
-        let block_len = remaining.min(SUPER);
-        for i in 0..block_len {
-            let nibble = if i % 2 == 0 {
-                qs[i / 2] & 0x0F
-            } else {
-                (qs[i / 2] >> 4) & 0x0F
-            };
-            // Per-subblock scale (8 sub-blocks of 32 weights).
-            // The producer stores the raw scale so 0 maps to 1.0 (identity), keeping the round-trip.
-            let sb = i / 32;
-            let sb_scale = scales[sb] as f32 + 1.0;
-            let code = KVALUES_IQ4NL[nibble as usize];
-            let sign_bit = (q8[i / 8] >> (i % 8)) & 1;
-            let signed = if sign_bit != 0 {
-                -code.abs()
-            } else {
-                code.abs()
-            };
-            let val = d * sb_scale * signed;
-            out.push(val);
+        let qs = &data[pos + 2..pos + BLOCK_BYTES];
+        for j in 0..QK4_NL / 2 {
+            if out.len() >= num_weights {
+                break;
+            }
+            // Reference order (dequantize_row_iq4_nl):
+            //     y[j]        = d * k[qs[j] & 0xf]
+            //     y[j + QK4_NL/2] = d * k[qs[j] >> 4]
+            // The low nibble of byte j feeds element j and the high nibble
+            // feeds element j+16 -- the two halves of the block are NOT
+            // interleaved. Writing them adjacently transposes the block.
+            out.push(d * KVALUES_IQ4NL_REF[(qs[j] & 0x0F) as usize]);
         }
-        pos += BLOCK_BYTES;
-        remaining = remaining.saturating_sub(SUPER);
+        for j in 0..QK4_NL / 2 {
+            if out.len() >= num_weights {
+                break;
+            }
+            out.push(d * KVALUES_IQ4NL_REF[((qs[j] >> 4) & 0x0F) as usize]);
+        }
     }
+    out.truncate(num_weights);
     Ok(out)
 }
 
@@ -3336,46 +3341,95 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
     })
 }
 
-/// Quantize f32 values to IQ4_NL bytes (170 bytes per 256 weights).
+/// Quantize f32 values to IQ4_NL bytes (18 bytes per 32 weights).
+///
+/// Emits llama.cpp's `block_iq4_nl`, the inverse of
+/// [`dequant_iq4nl`]: `ggml_half d` followed by `qs[QK4_NL/2]`, low nibble
+/// first. The scale `d` is fitted the way `quantize_row_iq4_nl_impl` fits it
+/// for the single-block case: least-squares against the signed codebook,
+/// `d = sum(q*x) / sum(q*q)` with `weight[j] = x[j]^2`, then each element
+/// takes the codebook index nearest `x[j]/d`.
+///
+/// The previous 170-byte-per-256 layout is gone. It matched no llama.cpp
+/// block, so every artifact it produced was unreadable by llama.cpp and
+/// unaddressable by this crate's own decoder.
 pub fn quant_iq4nl(data: &[f32]) -> Result<Vec<u8>> {
-    const SUPER: usize = 256;
-    let num_blocks = data.len().div_ceil(SUPER);
-    let mut out = Vec::with_capacity(num_blocks * 170);
-    for chunk in data.chunks(SUPER) {
-        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let scale = if max_val > 0.0 { max_val / 127.0 } else { 1.0 };
-        let d_f16 = f32_to_f16(scale).to_le_bytes();
-        out.extend_from_slice(&d_f16);
-
-        let mut q8 = vec![0u8; 32];
-        let mut q4 = vec![0u8; 128];
-        let scales = vec![0u8; 8];
-
-        for (i, &val) in chunk.iter().enumerate() {
-            if val < 0.0 {
-                q8[i / 8] |= 1 << (i % 8);
-            }
-            let mag = val.abs() / scale;
-            let mut best_idx = 0;
-            let mut best_err = f32::MAX;
-            for (idx, &entry) in KVALUES_IQ4NL.iter().enumerate() {
-                let err = (mag - entry.abs()).abs();
-                if err < best_err {
-                    best_err = err;
-                    best_idx = idx;
-                }
-            }
-            if i % 2 == 0 {
-                q4[i / 2] |= (best_idx & 0x0F) as u8;
+    const QK4_NL: usize = 32;
+    const BLOCK_BYTES: usize = 2 + QK4_NL / 2;
+    if data.len() % QK4_NL != 0 {
+        return Err(Error::Backend(format!(
+            "quant_iq4nl: length {} must be a nonzero multiple of {QK4_NL}",
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(data.len() / QK4_NL * BLOCK_BYTES);
+    for chunk in data.chunks(QK4_NL) {
+        // Initial guess from the largest magnitude, as the reference does
+        // before its refinement loop: d = max / values[0].
+        let (amax, max_signed) = chunk.iter().fold((0.0f32, 0.0f32), |(a, m), &x| {
+            if x.abs() > a {
+                (x.abs(), x)
             } else {
-                q4[i / 2] |= ((best_idx & 0x0F) as u8) << 4;
+                (a, m)
+            }
+        });
+        let mut d = if amax > 0.0 { max_signed / KVALUES_IQ4NL_REF[0] } else { 0.0 };
+
+        // Least-squares refit: w[j] = x[j]^2, q = codebook[nearest(id*x)].
+        let mut sumqx = 0.0f32;
+        let mut sumq2 = 0.0f32;
+        let idx: Vec<usize> = if d != 0.0 {
+            let id = 1.0 / d;
+            chunk
+                .iter()
+                .map(|&x| best_index_iq4nl(id * x))
+                .collect()
+        } else {
+            vec![0; QK4_NL]
+        };
+        for (j, &l) in idx.iter().enumerate() {
+            let q = KVALUES_IQ4NL_REF[l];
+            let w = chunk[j] * chunk[j];
+            sumqx += w * q * chunk[j];
+            sumq2 += w * q * q;
+        }
+        d = if sumq2 > 0.0 { sumqx / sumq2 } else { 0.0 };
+
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        // Inverse of the decoder's element order: low nibble of byte j is
+        // element j, high nibble is element j+16.
+        let mut qs = [0u8; QK4_NL / 2];
+        for j in 0..QK4_NL {
+            let l = if d != 0.0 {
+                best_index_iq4nl(id * chunk[j])
+            } else {
+                0
+            };
+            if j < QK4_NL / 2 {
+                qs[j] = l as u8;
+            } else {
+                qs[j - QK4_NL / 2] |= (l as u8) << 4;
             }
         }
-        out.extend_from_slice(&q8);
-        out.extend_from_slice(&q4);
-        out.extend_from_slice(&scales);
+        out.extend_from_slice(&qs);
     }
     Ok(out)
+}
+
+/// Index of the `kvalues_iq4nl` entry nearest `al` -- the reference's
+/// `best_index_int8(16, values, al)`.
+fn best_index_iq4nl(al: f32) -> usize {
+    let mut best = 0usize;
+    let mut best_err = f32::MAX;
+    for (i, &v) in KVALUES_IQ4NL_REF.iter().enumerate() {
+        let err = (al - v).abs();
+        if err < best_err {
+            best_err = err;
+            best = i;
+        }
+    }
+    best
 }
 
 /// Quantize f32 values to IQ4_XS bytes (136 bytes per 256 weights).
@@ -5792,9 +5846,9 @@ mod tests {
 
     #[test]
     fn iq4nl_rejects_truncated_buffer() {
-        // IQ4_NL super-block is 170 bytes per 256 weights. A 50-byte buffer
-        // claiming 256 weights must error.
-        let short_buf = vec![0u8; 50];
+        // An IQ4_NL block is 18 bytes for 32 weights, so 256 weights need
+        // 144. A 143-byte buffer claiming 256 weights must error.
+        let short_buf = vec![0u8; 143];
         let res = dequant_iq4nl(&short_buf, 256);
         assert!(res.is_err(), "dequant_iq4nl must reject truncated buffer");
     }
@@ -6393,30 +6447,70 @@ mod tests {
         assert_eq!(byte_pos, 0x01);
     }
 
+    /// IQ4_NL must match `dequantize_row_iq4_nl` exactly.
+    ///
+    /// The previous version of this test asserted the 170-byte layout
+    /// (`d` + a 32-byte sign plane + 128 nibble bytes + 8 sub-block scale
+    /// bytes) that matched no llama.cpp block, and it passed a sign-plane bit
+    /// to produce a negative value -- a mechanism the real format does not
+    /// have. The expectations below are derived from the reference:
+    /// `block_iq4_nl { ggml_half d; uint8_t qs[QK4_NL/2]; }` with
+    /// `QK4_NL = 32`, so 18 bytes, `d * kvalues_iq4nl[nibble]`, low nibble to
+    /// element `j` and high nibble to element `j + 16`.
     #[test]
-    fn test_iq4nl_dequant_exact_block_size_and_codebook_values() {
-        // QNT-3 fix: IQ4_NL super-block is now 170 bytes - d(2) + q8 sign(32) + q4 nibbles(128) + scales(8).
-        // The old test used the broken 144-byte layout and conflated the sign byte with the.
-        let mut data = vec![0u8; 170];
-        // d = f16 1.0 = [0x00, 0x3c]
+    fn test_iq4nl_dequant_matches_reference_block() {
+        // d = 1.0f16, then 16 code bytes.
+        let mut data = vec![0u8; 18];
         data[0] = 0x00;
         data[1] = 0x3c;
-        // q4 nibble 0 (at data[34]) = 0x00 -> codebook index 0 = -127.0
-        data[34] = 0x00;
-        // sign byte for weight 0 (q8[0] bit 0) set so the result is negative
-        data[2] = 0x01;
+        // Every nibble 0x0F -> element j takes kvalues[15] = 113, element
+        // j+16 takes kvalues[0] = -127. Distinguishes the (j, j+16) pairing
+        // from a 2i/2i+1 interleave, which would put -127 at index 1.
+        for b in data[2..18].iter_mut() {
+            *b = 0x0F;
+        }
 
-        let res = dequant_iq4nl(&data, 256).expect("dequant_iq4nl");
-        assert_eq!(res.len(), 256);
-        // index 0 in KVALUES_IQ4NL is -127.0 (with sign bit applied)
-        assert!(
-            (res[0] - (-127.0)).abs() < 1e-5,
-            "res[0] = {}, want -127.0",
-            res[0]
-        );
+        let res = dequant_iq4nl(&data, 32).expect("dequant_iq4nl");
+        assert_eq!(res.len(), 32);
+        for j in 0..16 {
+            assert!(
+                (res[j] - 113.0).abs() < 1e-5,
+                "element {j} (low nibble of byte {j}) = {}, want 113",
+                res[j]
+            );
+            assert!(
+                (res[j + 16] - (-127.0)).abs() < 1e-5,
+                "element {} (high nibble of byte {j}) = {}, want -127",
+                j + 16,
+                res[j + 16]
+            );
+        }
 
-        // Error handling on truncated data
-        assert!(dequant_iq4nl(&data[..40], 256).is_err());
+        // A mixed-nibble byte pins both codebook signs together.
+        data[2] = 0x01; // low -> kvalues[1] = -104, high -> kvalues[0] = -127
+        for b in data[3..18].iter_mut() {
+            *b = 0x00;
+        }
+        let res = dequant_iq4nl(&data, 32).expect("dequant_iq4nl");
+        assert!((res[0] - (-104.0)).abs() < 1e-5, "res[0] = {}", res[0]);
+        assert!((res[16] - (-127.0)).abs() < 1e-5, "res[16] = {}", res[16]);
+
+        // The two largest codebook entries, which were 87/107 before.
+        for b in data[2..18].iter_mut() {
+            *b = 0xEE; // both nibbles -> kvalues[14] = 89
+        }
+        let res = dequant_iq4nl(&data, 32).expect("dequant_iq4nl");
+        assert!(res.iter().all(|v| (v - 89.0).abs() < 1e-5), "kvalues[14] != 89");
+
+        for b in data[2..18].iter_mut() {
+            *b = 0xFF; // both nibbles -> kvalues[15] = 113
+        }
+        let res = dequant_iq4nl(&data, 32).expect("dequant_iq4nl");
+        assert!(res.iter().all(|v| (v - 113.0).abs() < 1e-5), "kvalues[15] != 113");
+
+        // Layout: 18 bytes per 32 weights, so 256 weights need 144 bytes.
+        assert!(dequant_iq4nl(&vec![0u8; 144], 256).is_ok());
+        assert!(dequant_iq4nl(&vec![0u8; 143], 256).is_err());
     }
 
     #[test]

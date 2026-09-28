@@ -271,9 +271,63 @@ pub static IQ2S_GRID: [u64; 1024] = [
 /// One mask byte per element of the 8-wide grid; a set bit negates the value.
 pub static KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
+/// The IQ4_NL 16-entry codebook, VERBATIM from llama.cpp `kvalues_iq4nl`
+/// (ggml-common.h). Signed: the sign is carried BY the entry, not by a
+/// separate sign plane.
+///
+/// This table was previously mistranscribed in the two largest entries as
+/// 87.0 and 107.0. Both IQ4_NL and IQ4_XS index this table directly, so those
+/// two slots silently mis-decoded the two largest magnitudes in every weight
+/// of both formats while still producing plausible values. Pinned by
+/// `iq4nl_codebook_matches_llama_cpp` below.
+pub static KVALUES_IQ4NL: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0,
+];
+
 #[cfg(test)]
 mod tests {
-    use super::{IQ2S_GRID, KMASK_IQ2XS};
+    use super::{IQ2S_GRID, KMASK_IQ2XS, KVALUES_IQ4NL};
+
+    /// `kvalues_iq4nl` must equal the reference, entry for entry.
+    ///
+    /// Parsed out of `ggml-common.h` at run time rather than transcribed, so
+    /// this cannot pass by agreeing with a bad copy of itself. Panics if the
+    /// reference is absent: a gate that cannot fail is worse than no gate.
+    #[test]
+    fn iq4nl_codebook_matches_llama_cpp() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/grim-quant -> repo root")
+            .join("old/repo/llama.cpp-master/ggml/src/ggml-common.h");
+        let src = std::fs::read_to_string(&p).unwrap_or_else(|e| {
+            panic!("cannot read {}: {e}\nthis gate compares against the REFERENCE", p.display())
+        });
+        let at = src
+            .find(", kvalues_iq4nl,")
+            .and_then(|i| src[..i].rfind("GGML_TABLE_BEGIN("))
+            .unwrap_or_else(|| panic!("kvalues_iq4nl not declared in the reference header"));
+        let rest = &src[at..];
+        let body_start = rest.find(')').expect("closing paren") + 1;
+        let body_end = rest[body_start..]
+            .find("GGML_TABLE_END()")
+            .map(|i| i + body_start)
+            .expect("GGML_TABLE_END");
+        let vals: Vec<i32> = rest[body_start..body_end]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().expect("decimal entry"))
+            .collect();
+
+        assert_eq!(vals.len(), KVALUES_IQ4NL.len(), "kvalues_iq4nl length");
+        for (i, (want, got)) in vals.iter().zip(KVALUES_IQ4NL.iter()).enumerate() {
+            assert_eq!(
+                *want as f32, *got,
+                "kvalues_iq4nl[{i}]: reference {want}, ours {got}"
+            );
+        }
+    }
 
     /// The tables must equal llama.cpp's, entry for entry.
     ///

@@ -277,6 +277,6 @@ fn iq_kernels_run_and_report_deviation() {
     run_iq("iq2s", 82, &|b, n| dequant_iq2s(b, n));
     run_iq("iq3xxs", 96, &|b, n| dequant_iq3xxs(b, n));
     run_iq("iq3s", 110, &|b, n| dequant_iq3s(b, n));
-    run_iq("iq4nl", 170, &|b, n| dequant_iq4nl(b, n));
-    run_iq("iq4xs", 178, &|b, n| dequant_iq4xs(b, n));
+    run_iq("iq4nl", 18, &|b, n| dequant_iq4nl(b, n));
+    run_iq("iq4xs", 136, &|b, n| dequant_iq4xs(b, n));
 }

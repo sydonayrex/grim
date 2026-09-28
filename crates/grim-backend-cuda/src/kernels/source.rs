@@ -506,6 +506,15 @@ __device__ const float GRIM_IQ4_NL_CODEBOOK[16] = {
     3.23719119f, 5.50829601f, 10.4162559f, 34.5695092f
 };
 
+// The SIGNED IQ4_NL codebook (llama.cpp `kvalues_iq4nl`), verbatim. IQ4_NL
+// indexes this directly -- the sign is in the entry, so it needs no sign
+// plane and no abs(). `GRIM_IQ4_NL_CODEBOOK` above is the absolute-value
+// form the IQ4_XS paths use. The two largest entries were 87/107 here before.
+__device__ const float GRIM_KVALUES_IQ4NL[16] = {
+    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+      1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f
+};
+
 extern "C" __global__ void grim_fused_quant_gemm_q4_k(
     const float* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
@@ -924,33 +933,25 @@ extern "C" __global__ void grim_dequant_q6k(const unsigned char* __restrict__ pa
     }
 }
 
-// ---- IQ4_NL (170 B / 256 weights) — bit-accurate vs grim_quant::dequant_iq4nl ----
-// Layout: d:f16@0, q8:32B@2, q4:128B@34, scales:8B@162.
+// ---- IQ4_NL (18 B / 32 weights) — bit-accurate vs grim_quant::dequant_iq4nl ----
+// llama.cpp `block_iq4_nl`: ggml_half d@0, then qs[QK4_NL/2] = 16 bytes. The
+// sign is carried by the codebook entry, so there is no sign plane and no
+// per-group scale; the previous kernel read both from a 170-byte layout this
+// format does not have.
 extern "C" __global__ void grim_dequant_iq4nl(const unsigned char* __restrict__ packed,
                                                float* __restrict__ out, int n_blocks) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
-    const unsigned char* blk = packed + b * 170;
+    const unsigned char* blk = packed + b * 18;
     float d = grim_f16_to_f32(*((const unsigned short*)blk));
-    const unsigned char* q8     = blk + 2;
-    const unsigned char* q4     = blk + 34;
-    const unsigned char* scales = blk + 162;
-    float* o = out + b * 256;
+    float* o = out + b * 32;
 
-    #pragma unroll
-    for (int g = 0; g < 16; ++g) {
-        unsigned int group_scale = (scales[g / 2] >> ((g % 2) * 4)) & 0x0F;
-        float scale = d * (1.0f + 0.125f * (float)group_scale);
-        int group_start = g * 16;
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            int gi = group_start + i;
-            unsigned char nibble = (gi % 2 == 0) ? (q4[gi / 2] & 0x0F)
-                                                : ((q4[gi / 2] >> 4) & 0x0F);
-            unsigned char sign_bit = (q8[gi / 8] >> (gi % 8)) & 0x01;
-            float sign = sign_bit ? -1.0f : 1.0f;
-            o[gi] = GRIM_IQ4_NL_CODEBOOK[nibble] * scale * sign;
-        }
+    // Reference order: element j takes the low nibble of qs[j] and element
+    // j+16 the high nibble (dequantize_row_iq4_nl).
+    for (int j = 0; j < 16; ++j) {
+        unsigned char qb = blk[2 + j];
+        o[j]      = d * GRIM_KVALUES_IQ4NL[qb & 0x0F];
+        o[j + 16] = d * GRIM_KVALUES_IQ4NL[(qb >> 4) & 0x0F];
     }
 }
 

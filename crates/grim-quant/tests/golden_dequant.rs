@@ -267,25 +267,37 @@ fn gptq_3bit_cross_word_nonzero_codes_pack_and_unpack() {
 // `scales[g/2] >> ((g%2)*4) & 0x0F` gives the 4-bit group_scale for group g
 // (g in 0..16, each group = 16 weights).
 
+/// IQ4_NL must decode as llama.cpp's `block_iq4_nl`: `ggml_half d` then
+/// `qs[QK4_NL/2]`, `QK4_NL = 32`, so 18 bytes. Value is `d *
+/// kvalues_iq4nl[nibble]` with the sign carried by the codebook entry --
+/// there is no sign plane and no per-group scale multiplier, both of which
+/// this test previously invented.
 #[test]
-fn iq4nl_golden_codebook_with_group_scale_multiplier() {
-    // QNT-3 fix: IQ4_NL super-block is 170 bytes (d[2] + q8 sign[32] + q4
-    // nibbles[128] + scales[8]). The old test used the broken 144-byte layout
-    // and conflated the sign byte with the first quant nibble.
-    let mut buf = vec![0u8; 170];
-
+fn iq4nl_golden_reference_block_and_codebook() {
+    let mut buf = vec![0u8; 18];
     // d = 1.0 (f16 0x3C00).
     buf[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
-
-    // q4 nibble 0 (at byte 34) = 0 -> KVALUES_IQ4NL index 0 = -127.0
-    buf[34] = 0x00;
-    // sign byte for weight 0 (q8[0] bit 0) set so the result is negative
+    // Byte 0: low nibble 1 -> kvalues[1] = -104 at element 0;
+    //         high nibble 0 -> kvalues[0] = -127 at element 16.
     buf[2] = 0x01;
-    let want0 = -127.0 * 1.0;
 
-    let out = dequant_iq4nl(&buf, 256).expect("iq4nl dequant");
-    assert_eq!(out.len(), 256);
-    assert_close(out[0], want0, "iq4nl index 0");
+    let out = dequant_iq4nl(&buf, 32).expect("iq4nl dequant");
+    assert_eq!(out.len(), 32);
+    assert_close(out[0], -104.0, "iq4nl element 0 (low nibble of byte 0)");
+    assert_close(out[16], -127.0, "iq4nl element 16 (high nibble of byte 0)");
+
+    // A non-unit d scales the whole block, and only d.
+    buf[0..2].copy_from_slice(&0x4000u16.to_le_bytes()); // d = 2.0
+    let out = dequant_iq4nl(&buf, 32).expect("iq4nl dequant");
+    assert_close(out[0], -208.0, "iq4nl element 0 with d=2");
+    assert_close(out[16], -254.0, "iq4nl element 16 with d=2");
+
+    // The two largest codebook entries, 89 and 113.
+    for b in buf[2..18].iter_mut() {
+        *b = 0xEE;
+    }
+    let out = dequant_iq4nl(&buf, 32).expect("iq4nl dequant");
+    assert_close(out[0], 178.0, "kvalues[14] = 89, scaled by d=2");
 }
 
 // ===========================================================================

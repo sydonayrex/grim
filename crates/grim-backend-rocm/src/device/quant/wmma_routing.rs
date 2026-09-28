@@ -114,7 +114,10 @@ impl RocmDevice {
         // named a block size matching no llama.cpp layout — Q4_K is 256/144.
         // Absence routes it to the non-tiled `grim_fused_dequant_gemm_iq4nl`,
         // which is the correct general path.
-        ("grim_fused_dequant_gemm_iq4xs", "iq4xs", 256, 134),
+        // 136 = d(2) + scales_h(2) + scales_l[4] + qs[128]. The 134 here
+        // omitted the `sizeof(uint16_t) scales_h` term and matched no
+        // llama.cpp layout.
+        ("grim_fused_dequant_gemm_iq4xs", "iq4xs", 256, 136),
         ("grim_fused_dequant_gemm_q8_0", "q8_0", 32, 34),
     ];
 
@@ -528,15 +531,15 @@ mod block_size_tests {
     /// The table's block sizes must equal llama.cpp's block layouts in
     /// `old/repo/llama.cpp-master/ggml/src/ggml-common.h`.
     ///
-    /// It drifted in three places: `iq3xxs` 96 vs 98 and `iq4xs` 136 vs 134
-    /// (the 2-byte `ggml_half d`), and `iq4nl` at 256/170, which matches no
-    /// llama.cpp layout at all.
+    /// This gate previously missed three real defects because it computed its
+    /// own expectations with hand-written arithmetic instead of parsing them:
+    /// it omitted the `sizeof(uint16_t) scales_h` term, so it expected iq4xs
+    /// to be 134 (the table's wrong value) instead of the reference's 136 and
+    /// passed on a wrong table. The expectations are now derived from the
+    /// header's own member lists.
     ///
-    /// The expectations are PARSED OUT OF THE REFERENCE HEADER at run time
-    /// rather than transcribed here. A hand-copied table is the same failure
-    /// mode as the bug: it can be wrong in a way that agrees with the code it
-    /// is checking. If the reference is absent the test panics rather than
-    /// passing vacuously — a gate that cannot fail is worse than no gate.
+    /// If the reference is absent the test panics rather than passing
+    /// vacuously — a gate that cannot fail is worse than no gate.
     ///
     /// Scope: this pins STRIDE only. `dequant_iq2s` has the correct 82-byte
     /// size and is still wrong in three ways against `dequantize_row_iq2_s`.
@@ -574,17 +577,21 @@ mod block_size_tests {
             .map(|d| qk / d)
             .expect("ggml-common.h defines IQ3S_N_SCALE");
 
-        // (tag, elements per block, bytes per block) from the reference structs.
+        // (tag, elements per block, bytes per block), transcribed from each
+        // struct's own `static_assert` in ggml-common.h. The `2` in the
+        // iq4xs row is `sizeof(uint16_t) scales_h`; omitting it is what let
+        // the table's wrong 134 pass this gate.
         let expected: Vec<(&str, u32, u32)> = vec![
             ("q8_0", 32, 34),
             ("q5k", qk, 176),
             ("q6k", qk, 210),
-            ("iq2xxs", qk, 2 + qk / 4),
-            ("iq2xs", qk, 2 + qk / 4 + qk / 32),
-            ("iq2s", qk, 2 + qk / 4 + qk / 32 + qk / 32),
+            ("iq2xxs", qk, 2 + qk / 8 * 2),
+            ("iq2xs", qk, 2 + qk / 8 * 2 + qk / 32),
+            ("iq2s", qk, 2 + qk / 4 + qk / 16),
             ("iq3xxs", qk, 2 + 3 * (qk / 8)),
             ("iq3s", qk, 2 + 13 * (qk / 32) + iq3s_n_scale),
-            ("iq4xs", qk, 2 + qk / 64 + qk / 2),
+            // block_iq4_xs: d, scales_h(u16), scales_l[QK_K/64], qs[QK_K/2]
+            ("iq4xs", qk, 2 + 2 + qk / 64 + qk / 2),
         ];
 
         // Read the TABLE, not `tiled_quant_lookup`: that accessor returns

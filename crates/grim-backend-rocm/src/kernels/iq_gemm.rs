@@ -84,32 +84,25 @@ extern "C" {
 
     // ===================== IQ4 variants =====================
 
-    // block_q4_NL: 170 bytes per 256 weights, 4-bit codes + sign bits + group scales
-    // Uses KVALUES_IQ4NL codebook (same as iq_dequant.rs).
+    // block_iq4_nl: 18 bytes per 32 weights (QK4_NL = 32), 4-bit signed codes.
+    // Layout: ggml_half d, then qs[QK4_NL/2] = 16 bytes. The sign is carried by
+    // the codebook entry, so there is no sign plane and no per-group scale --
+    // the previous version read a 32-byte sign plane at blk+2 and 8 sub-block
+    // scales at blk+162, neither of which exists in this format.
     __device__ inline float dequant_iq4nl(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* signs = blk + 2;
-        const unsigned char* qs = blk + 34;
-        const unsigned char* sc = blk + 162;
+        // Reference order: element j takes the low nibble of qs[j] and
+        // element j+16 takes the high nibble (dequantize_row_iq4_nl).
+        int j = in_sb & 15;
+        unsigned char qb = blk[2 + j];
+        unsigned char q_code = (in_sb < 16) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
 
-        int group = in_sb / 16;
-        float group_scale = (float)(sc[group] & 3);
-        group_scale = 1.0f + 0.125f * group_scale;
-
-        int sign_byte_idx = (in_sb / 8);
-        int sign_bit = in_sb % 8;
-        float sign_val = ((signs[sign_byte_idx] >> sign_bit) & 1) ? -1.0f : 1.0f;
-
-        int q_byte = in_sb / 2;
-        unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
-
+        // Canonical signed codebook (ggml kvalues_iq4nl), verbatim.
         static const float kvalues_iq4nl[16] = {
             -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
-            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 87.0f, 107.0f
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
         };
-        float code_abs = kvalues_iq4nl[q_code];
-        code_abs = code_abs < 0.0f ? -code_abs : code_abs;
-        return d * group_scale * code_abs * sign_val;
+        return d * kvalues_iq4nl[q_code];
     }
 
     // block_q4_XS: 136 bytes per 256 weights, 4-bit codes + 6-bit sub-block scales
@@ -518,15 +511,16 @@ extern "C" {
         if (idx >= total) return;
         const int row = (int)(idx / N);
         const int col = (int)(idx % N);
-        const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 170;
+        // IQ4_NL blocks hold QK4_NL = 32 weights in 18 bytes.
+        const int blocks_per_row = K / 32;
+        const int row_bytes = blocks_per_row * 18;
         const unsigned char* row_b_ptr = B_iq4nl + col * row_bytes;
         float acc = 0.0f;
         for (int k = 0; k < K; ++k) {
             float a_val = A[row * K + k];
-            int sb_idx = k / 256;
-            int in_sb = k % 256;
-            float w_val = dequant_iq4nl(row_b_ptr + sb_idx * 170, in_sb);
+            int sb_idx = k / 32;
+            int in_sb = k % 32;
+            float w_val = dequant_iq4nl(row_b_ptr + sb_idx * 18, in_sb);
             acc += a_val * w_val;
         }
         C[row * N + col] = acc;
@@ -543,14 +537,15 @@ extern "C" {
         if (idx >= total) return;
         const int row = (int)(idx / K);
         const int k_idx = (int)(idx % K);
-        const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 170;
-        int sb_idx = k_idx / 256;
-        int in_sb = k_idx % 256;
+        // IQ4_NL blocks hold QK4_NL = 32 weights in 18 bytes.
+        const int blocks_per_row = K / 32;
+        const int row_bytes = blocks_per_row * 18;
+        int sb_idx = k_idx / 32;
+        int in_sb = k_idx % 32;
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
             float dy_val = dY[row * N + n];
-            float w_val = dequant_iq4nl(B_iq4nl + n * row_bytes + sb_idx * 170, in_sb);
+            float w_val = dequant_iq4nl(B_iq4nl + n * row_bytes + sb_idx * 18, in_sb);
             acc += dy_val * w_val;
         }
         dX[row * K + k_idx] = acc;

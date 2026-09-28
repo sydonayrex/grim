@@ -70,28 +70,22 @@ extern "C" {
         return scale * grid_val * sign_val;
     }
 
+    // block_iq4_nl: 18 bytes per 32 weights (QK4_NL = 32). ggml_half d then
+    // qs[16]. The sign is IN the codebook entry, so there is no sign plane
+    // and no group scale; the previous version read both from a layout this
+    // format does not have.
     __device__ inline float dequant_iq4nl_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* signs = blk + 2;
-        const unsigned char* qs = blk + 34;
-        const unsigned char* sc = blk + 162;
-        int group = in_sb / 16;
-        float group_scale = (float)(sc[group] & 3);
-        group_scale = 1.0f + 0.125f * group_scale;
-        int sign_byte_idx = (in_sb / 8);
-        int sign_bit = in_sb % 8;
-        float sign_val = ((signs[sign_byte_idx] >> sign_bit) & 1) ? -1.0f : 1.0f;
-        int q_byte = in_sb / 2;
-        unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
-        // Canonical signed codebook (ggml kvalues_iq4nl); CPU decoder takes abs()
-        // then applies the q8 sign bit — replicate exactly.
+        // Element j: low nibble of qs[j]; element j+16: high nibble.
+        int j = in_sb & 15;
+        unsigned char qb = blk[2 + j];
+        unsigned char q_code = (in_sb < 16) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
+        // Canonical signed codebook (ggml kvalues_iq4nl), verbatim.
         static const float kvalues_iq4nl[16] = {
             -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
-            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 87.0f, 107.0f
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
         };
-        float code_abs = kvalues_iq4nl[q_code];
-        code_abs = code_abs < 0.0f ? -code_abs : code_abs;
-        return d * group_scale * code_abs * sign_val;
+        return d * kvalues_iq4nl[q_code];
     }
 
     __device__ inline float dequant_iq4xs_device(const unsigned char* blk, int in_sb) {
@@ -254,9 +248,12 @@ extern "C" {
         out[idx] = dequant_iq2s_device(blk, (int)(e % QK_BLOCK));
     }
 
-    /// Dequantize IQ4_NL packed bytes to F32. One 64-thread block per 256-element quant block; each thread decodes four
-    /// consecutive elements with vectorized float4 stores (the previous one-thread-per-block form serialized 256 dependent dequants and wrote scalars).
-    __global__ void __launch_bounds__(64)
+    /// Dequantize IQ4_NL packed bytes to F32. An IQ4_NL block holds QK4_NL = 32
+    /// weights in 18 bytes, so one 8-thread block covers a quant block and each
+    /// thread emits four consecutive elements via a float4 store. (The previous
+    /// form used 64 threads per 256-element block, which does not exist in this
+    /// format and overran the block by 7x.)
+    __global__ void __launch_bounds__(8)
     grim_dequant_iq4nl(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
@@ -264,8 +261,8 @@ extern "C" {
     {
         const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + (size_t)b * 170;
-        float* dst = out + (size_t)b * 256;
+        const unsigned char* blk = packed + (size_t)b * 18;
+        float* dst = out + (size_t)b * 32;
         const int base = threadIdx.x * 4;
         float4 v;
         v.x = dequant_iq4nl_device(blk, base + 0);

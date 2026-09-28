@@ -13,8 +13,9 @@
 use grim_backend_metal::MetalDevice;
 use grim_quant::dequant_iq4nl;
 
-const BLOCK_BYTES: usize = 170;
-const SUPER: usize = 256;
+// llama.cpp `block_iq4_nl`: QK4_NL = 32 weights in 18 bytes.
+const BLOCK_BYTES: usize = 18;
+const SUPER: usize = 32;
 
 #[test]
 fn test_metal_iq4nl_dequant_parity_vs_cpu() {

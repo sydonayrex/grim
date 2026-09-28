@@ -897,6 +897,11 @@ impl MetalDevice {
         bytes: &[u8],
         elem_count: usize,
         _block_bytes: usize,
+        // Only read inside the `target_vendor = "apple"` block below, so it is
+        // unused on other hosts; the alias keeps `-D unused-variables` happy
+        // without silencing the check crate-wide.
+        #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+        block_elems: usize,
         kernel_name: &str,
     ) -> Result<Vec<f32>> {
         #[cfg(target_vendor = "apple")]
@@ -939,8 +944,16 @@ impl MetalDevice {
                         2,
                     );
                 }
-                let grid = objc2_metal::MTLSize::new(((n_blocks * 256 + 255) / 256) as u64, 1, 1);
-                let threads = objc2_metal::MTLSize::new(256, 1, 1);
+                // One threadgroup per `block_elems` weights: 256 threads for a
+                // 256-element IQ block, 32 for IQ4_NL (QK4_NL = 32). The hardcoded
+                // 256 made IQ4_NL dispatch 8x its real work.
+                let tpb = block_elems as u64;
+                let grid = objc2_metal::MTLSize::new(
+                    ((n_blocks as u64 * tpb).div_ceil(256)).max(1),
+                    1,
+                    1,
+                );
+                let threads = objc2_metal::MTLSize::new(tpb, 1, 1);
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
                 encoder.endEncoding();
                 cmd_buffer.commit();
@@ -967,25 +980,25 @@ impl MetalDevice {
     }
 
     pub fn dequantize_iq2xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 66, "iq2xxs")
+        self.dequantize_iq_host(bytes, elem_count, 66, 256, "iq2xxs")
     }
     pub fn dequantize_iq2xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 74, "iq2xs")
+        self.dequantize_iq_host(bytes, elem_count, 74, 256, "iq2xs")
     }
     pub fn dequantize_iq2s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 82, "iq2s")
+        self.dequantize_iq_host(bytes, elem_count, 82, 256, "iq2s")
     }
     pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 96, "iq3xxs")
+        self.dequantize_iq_host(bytes, elem_count, 96, 256, "iq3xxs")
     }
     pub fn dequantize_iq3s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 110, "iq3s")
+        self.dequantize_iq_host(bytes, elem_count, 110, 256, "iq3s")
     }
     pub fn dequantize_iq4nl_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 170, "iq4nl")
+        self.dequantize_iq_host(bytes, elem_count, 18, 32, "iq4nl")
     }
     pub fn dequantize_iq4xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
-        self.dequantize_iq_host(bytes, elem_count, 178, "iq4xs")
+        self.dequantize_iq_host(bytes, elem_count, 136, 256, "iq4xs")
     }
 
     /// Dequantize packed FP8 bytes (4-byte f32 LE scale header + E4M3 codes).

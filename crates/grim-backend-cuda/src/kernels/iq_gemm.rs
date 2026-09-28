@@ -87,26 +87,22 @@ __device__ __forceinline__ float dequant_iq3s(const unsigned char* blk, int in_s
     return scale * grid_val * sign_val;
 }
 
+// Canonical signed codebook (ggml kvalues_iq4nl), verbatim.
 __device__ __constant__ float KVALUES_IQ4NL[16] = {
     -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
-      1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  87.0f, 107.0f
+      1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f
 };
 
+// block_iq4_nl: 18 bytes per 32 weights (QK4_NL = 32) -- ggml_half d then
+// qs[16]. The sign is in the codebook entry, so there is no sign plane and no
+// group scale; the previous version read both from a layout this format lacks.
 __device__ __forceinline__ float dequant_iq4nl(const unsigned char* blk, int in_sb) {
     float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-    const unsigned char* signs = blk + 2;
-    const unsigned char* qs = blk + 34;
-    const unsigned char* sc = blk + 162;
-    int group = in_sb / 16;
-    float group_scale = 1.0f + 0.125f * (float)(sc[group] & 3);
-    int sign_byte_idx = in_sb / 8;
-    int sign_bit = in_sb % 8;
-    float sign_val = ((signs[sign_byte_idx] >> sign_bit) & 1) ? -1.0f : 1.0f;
-    int q_byte = in_sb / 2;
-    unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
-    float code_abs = KVALUES_IQ4NL[q_code];
-    code_abs = code_abs < 0.0f ? -code_abs : code_abs;
-    return d * group_scale * code_abs * sign_val;
+    // Element j takes the low nibble of qs[j], element j+16 the high nibble.
+    int j = in_sb & 15;
+    unsigned char qb = blk[2 + j];
+    unsigned char q_code = (in_sb < 16) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
+    return d * KVALUES_IQ4NL[q_code];
 }
 
 __device__ __forceinline__ float dequant_iq4xs(const unsigned char* blk, int in_sb) {
@@ -128,7 +124,7 @@ __device__ __forceinline__ float dequant_iq4xs(const unsigned char* blk, int in_
 
 // Macro to emit forward + backward GEMM for each IQ format
 
-#define GRIM_IQ_FWD_KERNEL(NAME, FMT, BLOCK_BYTES) \
+#define GRIM_IQ_FWD_KERNEL(NAME, FMT, BLOCK_BYTES, BLOCK_ELEMS) \
 __global__ void grim_fused_dequant_gemm_##NAME( \
     const float* __restrict__ A, \
     const unsigned char* __restrict__ B, \
@@ -138,17 +134,17 @@ __global__ void grim_fused_dequant_gemm_##NAME( \
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; \
     if (idx >= (unsigned long long)M * N) return; \
     int row = (int)(idx / N), col = (int)(idx % N); \
-    int bpr = K / 256; \
+    int bpr = K / BLOCK_ELEMS; \
     const unsigned char* rowB = B + col * bpr * BLOCK_BYTES; \
     float acc = 0.0f; \
     for (int k = 0; k < K; ++k) { \
-        int sb = k / 256, isb = k % 256; \
+        int sb = k / BLOCK_ELEMS, isb = k % BLOCK_ELEMS; \
         acc += A[row * K + k] * FMT(rowB + sb * BLOCK_BYTES, isb); \
     } \
     C[row * N + col] = acc; \
 }
 
-#define GRIM_IQ_BWD_KERNEL(NAME, FMT, BLOCK_BYTES) \
+#define GRIM_IQ_BWD_KERNEL(NAME, FMT, BLOCK_BYTES, BLOCK_ELEMS) \
 __global__ void grim_fused_dequant_backward_gemm_##NAME( \
     const float* __restrict__ dY, \
     const unsigned char* __restrict__ B, \
@@ -158,7 +154,7 @@ __global__ void grim_fused_dequant_backward_gemm_##NAME( \
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; \
     if (idx >= (unsigned long long)M * K) return; \
     int row = (int)(idx / K), k_idx = (int)(idx % K); \
-    int bpr = K / 256, sb = k_idx / 256, isb = k_idx % 256; \
+    int bpr = K / BLOCK_ELEMS, sb = k_idx / BLOCK_ELEMS, isb = k_idx % BLOCK_ELEMS; \
     float acc = 0.0f; \
     for (int n = 0; n < N; ++n) { \
         acc += dY[row * N + n] * FMT(B + n * bpr * BLOCK_BYTES + sb * BLOCK_BYTES, isb); \
@@ -166,26 +162,26 @@ __global__ void grim_fused_dequant_backward_gemm_##NAME( \
     dX[row * K + k_idx] = acc; \
 }
 
-GRIM_IQ_FWD_KERNEL(iq2xxs, dequant_iq2xxs, 66)
-GRIM_IQ_BWD_KERNEL(iq2xxs, dequant_iq2xxs, 66)
+GRIM_IQ_FWD_KERNEL(iq2xxs, dequant_iq2xxs, 66, 256)
+GRIM_IQ_BWD_KERNEL(iq2xxs, dequant_iq2xxs, 66, 256)
 
-GRIM_IQ_FWD_KERNEL(iq2xs, dequant_iq2xs, 74)
-GRIM_IQ_BWD_KERNEL(iq2xs, dequant_iq2xs, 74)
+GRIM_IQ_FWD_KERNEL(iq2xs, dequant_iq2xs, 74, 256)
+GRIM_IQ_BWD_KERNEL(iq2xs, dequant_iq2xs, 74, 256)
 
-GRIM_IQ_FWD_KERNEL(iq2s, dequant_iq2s, 82)
-GRIM_IQ_BWD_KERNEL(iq2s, dequant_iq2s, 82)
+GRIM_IQ_FWD_KERNEL(iq2s, dequant_iq2s, 82, 256)
+GRIM_IQ_BWD_KERNEL(iq2s, dequant_iq2s, 82, 256)
 
-GRIM_IQ_FWD_KERNEL(iq3xxs, dequant_iq3xxs, 96)
-GRIM_IQ_BWD_KERNEL(iq3xxs, dequant_iq3xxs, 96)
+GRIM_IQ_FWD_KERNEL(iq3xxs, dequant_iq3xxs, 96, 256)
+GRIM_IQ_BWD_KERNEL(iq3xxs, dequant_iq3xxs, 96, 256)
 
-GRIM_IQ_FWD_KERNEL(iq3s, dequant_iq3s, 110)
-GRIM_IQ_BWD_KERNEL(iq3s, dequant_iq3s, 110)
+GRIM_IQ_FWD_KERNEL(iq3s, dequant_iq3s, 110, 256)
+GRIM_IQ_BWD_KERNEL(iq3s, dequant_iq3s, 110, 256)
 
-GRIM_IQ_FWD_KERNEL(iq4nl, dequant_iq4nl, 170)
-GRIM_IQ_BWD_KERNEL(iq4nl, dequant_iq4nl, 170)
+GRIM_IQ_FWD_KERNEL(iq4nl, dequant_iq4nl, 18, 32)
+GRIM_IQ_BWD_KERNEL(iq4nl, dequant_iq4nl, 18, 32)
 
-GRIM_IQ_FWD_KERNEL(iq4xs, dequant_iq4xs, 136)
-GRIM_IQ_BWD_KERNEL(iq4xs, dequant_iq4xs, 136)
+GRIM_IQ_FWD_KERNEL(iq4xs, dequant_iq4xs, 136, 256)
+GRIM_IQ_BWD_KERNEL(iq4xs, dequant_iq4xs, 136, 256)
 
 }
 "#;
