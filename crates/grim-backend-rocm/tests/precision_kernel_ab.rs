@@ -105,27 +105,37 @@ const REPEATS: usize = 1;
 
 /// Take the process-wide GPU lock, then open the device.
 ///
-/// The order is the whole point. `RocmDevice::try_new` initialises HIP, which
-/// contends for `/dev/kfd` and for driver-internal state shared with every other
-/// process on the box. Doing it *before* the lock meant a run could block
-/// indefinitely in init with no lock held and no way to see who it was waiting
-/// for -- and if a previous run was killed while still holding that state, the
-/// next one waited on a holder that would never release.
+/// Acquire the device for the A/B run.
 ///
-/// Acquire first, initialise second, hold for the whole run. A killed run then
-/// drops the lock when its process dies, and the next one proceeds instead of
-/// queueing behind a corpse.
-fn gpu_device_locked() -> Option<(RocmDevice, std::sync::MutexGuard<'static, ()>)> {
+/// # No lock, and why the previous one was removed
+///
+/// This used to take `gpu_test_lock()` before HIP init, on the reasoning that
+/// `RocmDevice::try_new` "contends for /dev/kfd and for driver-internal state
+/// shared with every other process on the box", so a run could block in init
+/// with no lock held.
+///
+/// **That justification was unsound.** `gpu_test_lock()` is a process-local
+/// `static Mutex<()>` (`device/util.rs`). Another *process* running a grim GPU
+/// test never contends on it, so the lock could not have serialised against the
+/// very hazard it was installed for. It only ever serialised threads within this
+/// one binary -- and this binary contains exactly one `#[test]`, so there was
+/// nothing to serialise against. It was pure overhead guarding against a hazard
+/// it could not see.
+///
+/// The underlying concern is real and is *not* dismissed: two processes
+/// initialising HIP concurrently is a genuine possibility on a shared box. If
+/// that ever needs mutual exclusion it requires a file lock, which unlike a
+/// process-local mutex is visible across processes. `jit_cache.rs` already does
+/// exactly that with an advisory `flock` on `.write.lock`; that is the pattern
+/// to follow, and it is not needed here.
+///
+/// `catch_unwind` is kept: a panic inside HIP init must not abort the process,
+/// and the previous behaviour of reporting a skip is what the test relies on.
+fn gpu_device() -> Option<RocmDevice> {
     if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
-    let lock = grim_backend_rocm::device::util::gpu_test_lock();
-    // Keep catch_unwind: a panic here would poison the mutex for every later
-    // test in this binary. The guard is returned, so a panic mid-run still
-    // releases it on unwind.
-    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new"))
-        .ok()?;
-    Some((dev, lock))
+    std::panic::catch_unwind(|| RocmDevice::try_new(0).ok()).ok().flatten()
 }
 
 /// Which arms to run, from `GRIM_AB_ARMS` (comma-separated substrings).
@@ -784,10 +794,7 @@ fn arm_white_crow(
 #[test]
 #[ignore = "needs a gfx12 GPU; writes target/precision_ab_<arch>.json"]
 fn precision_kernel_ab() {
-    // The lock is taken inside gpu_device_locked, before any HIP init, and held
-    // for the whole run. Binding it to `_dev_and_lock` keeps it alive to the end
-    // of the test rather than to the end of this statement.
-    let Some((dev, _dev_and_lock)) = gpu_device_locked() else {
+    let Some(dev) = gpu_device() else {
         eprintln!("[SKIP] requires GRIM_GPU_TEST=1 + GPU");
         return;
     };
