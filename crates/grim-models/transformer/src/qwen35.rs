@@ -380,12 +380,28 @@ impl Qwen35Block {
                 // out-width is 2 * q_dim (12288 for 24 heads x 256), NOT a fixed
                 // literal. The previous `q_dim.max(12288)` happened to match this
                 // checkpoint while being wrong for any other head count.
-                let wq = Linear::load_column_parallel(
+                // The checkpoint packs attn_q rows PER-HEAD INTERLEAVED as
+                // [q_h | gate_h] (llama.cpp qwen35.cpp:274-293 views Q and the
+                // gate with row stride `2*n_embd_head`). Every grim runtime
+                // split — host, D2D, decode graph, fused QKV decode build —
+                // assumes [all Q | all gate]. Permute whole rows once at load;
+                // a row is a whole number of quant blocks, so packed formats
+                // survive intact.
+                let mut attn_q_perm = vec![0usize; 2 * q_dim];
+                let hd = q_dim / cfg.num_heads;
+                for h in 0..cfg.num_heads {
+                    for d in 0..hd {
+                        attn_q_perm[h * hd + d] = h * 2 * hd + d;
+                        attn_q_perm[q_dim + h * hd + d] = h * 2 * hd + hd + d;
+                    }
+                }
+                let wq = Linear::load_column_parallel_permuted_rows(
                     &ws.pp("attn_q"),
                     cfg.hidden_size,
                     2 * q_dim,
                     false,
                     tp,
+                    &attn_q_perm,
                 )
                 .ok();
                 let wk = Linear::load_column_parallel(
@@ -915,6 +931,9 @@ impl Qwen35Block {
                                 let wide = full.len() / seq_len.max(1);
                                 let mut q_rows = vec![0.0f32; seq_len * q_dim];
                                 let mut gate_rows = vec![0.0f32; seq_len * q_dim];
+                                // [all Q | all gate] per row: the checkpoint's
+                                // per-head interleave was permuted away at load
+                                // (see the attn_q_perm construction above).
                                 for t in 0..seq_len {
                                     let base = t * wide;
                                     if base + wide > full.len() {
@@ -1994,6 +2013,19 @@ fn gated_delta_net_forward_d2d(
     // Accelerators only.
     if x_normed.device().is_cpu() {
         return Ok(None);
+    }
+    // TEMP discriminator: `GRIM_QWEN_KDA_D2D=0` forces every recurrent layer
+    // down the host reference loop, exactly as `GRIM_QWEN_ATTN_D2D=0` does for
+    // attention. If step-0 logprobs change with this set, the device KDA path
+    // carries the prefill divergence; if byte-identical, it does not.
+    static KDA_D2D_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *KDA_D2D_DISABLED.get_or_init(|| {
+        matches!(
+            std::env::var("GRIM_QWEN_KDA_D2D").as_deref(),
+            Ok("0" | "false" | "off" | "no")
+        )
+    }) {
+        d2d_decline!("kda: GRIM_QWEN_KDA_D2D is set to a disabling value");
     }
     let n_val_heads = blk.cfg_ssm_num_value_heads();
     let n_key_heads = blk.cfg_ssm_num_key_heads();
@@ -3352,6 +3384,12 @@ mod tests {
         }
     }
 
+    fn det_weights(i: usize, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|j| (((i * 37 + j * 11) % 29) as f32) / 29.0 - 0.5)
+            .collect()
+    }
+
     #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_qwen35_shortconv_recurrent_state_advances() {
@@ -3377,13 +3415,14 @@ mod tests {
         // Create synthetic block with short-conv kernel
         let q_dim = cfg.num_heads * cfg.head_dim;
         let l_conv = 4;
-        let conv_w = vec![0.25f32; q_dim * l_conv];
+        let conv_w = det_weights(1, q_dim * l_conv);
 
+        let qkv_len = (q_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * cfg.hidden_size;
         let block = Qwen35Block {
             device: Device::Cpu,
             attn_norm: RmsNorm::new(
                 cpu_tensor(
-                    vec![1.0; cfg.hidden_size],
+                    det_weights(2, cfg.hidden_size),
                     Shape::new(vec![cfg.hidden_size]),
                 ),
                 1e-6,
@@ -3396,7 +3435,7 @@ mod tests {
             attn_k_norm: None,
             attn_qkv: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; (q_dim + 2 * cfg.num_kv_heads * cfg.head_dim) * cfg.hidden_size],
+                    det_weights(3, qkv_len),
                     Shape::new(vec![
                         q_dim + 2 * cfg.num_kv_heads * cfg.head_dim,
                         cfg.hidden_size,
@@ -3406,14 +3445,14 @@ mod tests {
             )),
             attn_gate: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; q_dim * cfg.hidden_size],
+                    det_weights(4, q_dim * cfg.hidden_size),
                     Shape::new(vec![q_dim, cfg.hidden_size]),
                 ),
                 None,
             )),
             ssm_out: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; cfg.hidden_size * q_dim],
+                    det_weights(5, cfg.hidden_size * q_dim),
                     Shape::new(vec![cfg.hidden_size, q_dim]),
                 ),
                 None,
@@ -3423,23 +3462,23 @@ mod tests {
             // Real KDA parameters: without alpha/beta the recurrence is
             // identically zero (beta=0 kills the delta term) and there is
             // nothing to observe.
-            ssm_a: Some(vec![0.5; cfg.ssm_dt_rank]),
+            ssm_a: Some(det_weights(6, cfg.ssm_dt_rank)),
             ssm_alpha: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.3; cfg.ssm_dt_rank * cfg.hidden_size],
+                    det_weights(7, cfg.ssm_dt_rank * cfg.hidden_size),
                     Shape::new(vec![cfg.ssm_dt_rank, cfg.hidden_size]),
                 ),
                 None,
             )),
             ssm_beta: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.4; cfg.ssm_dt_rank * cfg.hidden_size],
+                    det_weights(8, cfg.ssm_dt_rank * cfg.hidden_size),
                     Shape::new(vec![cfg.ssm_dt_rank, cfg.hidden_size]),
                 ),
                 None,
             )),
-            ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
-            ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_bias: Some(det_weights(9, cfg.ssm_dt_rank)),
+            ssm_norm: Some(det_weights(10, cfg.ssm_d_state)),
             ssm_dt_bias_dev: None,
             ssm_a_dev: None,
             ssm_norm_dev: None,
@@ -3449,28 +3488,28 @@ mod tests {
             ssm_d_conv_hint: cfg.ssm_d_conv,
             post_attention_norm: RmsNorm::new(
                 cpu_tensor(
-                    vec![1.0; cfg.hidden_size],
+                    det_weights(11, cfg.hidden_size),
                     Shape::new(vec![cfg.hidden_size]),
                 ),
                 1e-6,
             ),
             ffn_gate: Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; cfg.intermediate_size * cfg.hidden_size],
+                    det_weights(12, cfg.intermediate_size * cfg.hidden_size),
                     Shape::new(vec![cfg.intermediate_size, cfg.hidden_size]),
                 ),
                 None,
             ),
             ffn_up: Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; cfg.intermediate_size * cfg.hidden_size],
+                    det_weights(13, cfg.intermediate_size * cfg.hidden_size),
                     Shape::new(vec![cfg.intermediate_size, cfg.hidden_size]),
                 ),
                 None,
             ),
             ffn_down: Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; cfg.hidden_size * cfg.intermediate_size],
+                    det_weights(14, cfg.hidden_size * cfg.intermediate_size),
                     Shape::new(vec![cfg.hidden_size, cfg.intermediate_size]),
                 ),
                 None,
@@ -3489,7 +3528,7 @@ mod tests {
         };
 
         let x = cpu_tensor(
-            vec![1.0; 2 * cfg.hidden_size],
+            det_weights(15, 2 * cfg.hidden_size),
             Shape::new(vec![2, cfg.hidden_size]),
         );
         let out = block
@@ -3603,11 +3642,12 @@ mod tests {
             "state starts zeroed"
         );
 
-        // Build the recurrent block the way the real loader does, but with the
-        // tensors the toy test already builds.
+        // Build the recurrent block the way the real loader does, but with non-uniform
+        // deterministic weights rather than all-0.1 constants.
         let b =
-            |r: usize, c: usize| -> Tensor { cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c])) };
+            |seed: usize, r: usize, c: usize| -> Tensor { cpu_tensor(det_weights(seed, r * c), Shape::new(vec![r, c])) };
         let ssm_d_inner = cfg.ssm_d_inner;
+        let ssm_qkv_rows = (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state;
         let blk = Qwen35Block {
             device: Device::Cpu,
             layer_idx: 0,
@@ -3617,7 +3657,7 @@ mod tests {
             is_full_attention: false,
             attn_norm: RmsNorm::new(
                 cpu_tensor(
-                    vec![1.0; cfg.hidden_size],
+                    det_weights(101, cfg.hidden_size),
                     Shape::new(vec![cfg.hidden_size]),
                 ),
                 cfg.rms_norm_eps,
@@ -3628,16 +3668,11 @@ mod tests {
             wo: None,
             attn_q_norm: None,
             attn_k_norm: None,
-            // attn_qkv must be SSM width (q 48 + k 16 + v 16 = 80 heads of 128),
-            // NOT the attention width — the geometry declared above is the SSM's.
             attn_qkv: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![
-                        0.1;
-                        (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state * cfg.hidden_size
-                    ],
+                    det_weights(102, ssm_qkv_rows * cfg.hidden_size),
                     Shape::new(vec![
-                        (cfg.ssm_dt_rank + 2 * cfg.ssm_n_group) * cfg.ssm_d_state,
+                        ssm_qkv_rows,
                         cfg.hidden_size,
                     ]),
                 ),
@@ -3646,24 +3681,24 @@ mod tests {
             attn_gate: None,
             ssm_out: Some(Linear::from_tensor(
                 cpu_tensor(
-                    vec![0.1; cfg.hidden_size * ssm_d_inner],
+                    det_weights(103, cfg.hidden_size * ssm_d_inner),
                     Shape::new(vec![cfg.hidden_size, ssm_d_inner]),
                 ),
                 None,
             )),
             ssm_conv1d: None,
             ssm_conv_vec: None,
-            ssm_a: Some(vec![0.5; cfg.ssm_dt_rank]),
+            ssm_a: Some(det_weights(104, cfg.ssm_dt_rank)),
             ssm_alpha: Some(Linear::from_tensor(
-                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                b(105, cfg.ssm_dt_rank, cfg.hidden_size),
                 None,
             )),
             ssm_beta: Some(Linear::from_tensor(
-                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                b(106, cfg.ssm_dt_rank, cfg.hidden_size),
                 None,
             )),
-            ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
-            ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_bias: Some(det_weights(107, cfg.ssm_dt_rank)),
+            ssm_norm: Some(det_weights(108, cfg.ssm_d_state)),
             ssm_dt_bias_dev: None,
             ssm_a_dev: None,
             ssm_norm_dev: None,
@@ -3673,14 +3708,14 @@ mod tests {
             ssm_d_conv_hint: cfg.ssm_d_conv,
             post_attention_norm: RmsNorm::new(
                 cpu_tensor(
-                    vec![1.0; cfg.hidden_size],
+                    det_weights(109, cfg.hidden_size),
                     Shape::new(vec![cfg.hidden_size]),
                 ),
                 cfg.rms_norm_eps,
             ),
-            ffn_gate: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
-            ffn_up: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
-            ffn_down: Linear::from_tensor(b(cfg.hidden_size, cfg.intermediate_size), None),
+            ffn_gate: Linear::from_tensor(b(110, cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_up: Linear::from_tensor(b(111, cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_down: Linear::from_tensor(b(112, cfg.hidden_size, cfg.intermediate_size), None),
             rotary_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
             hidden_size: cfg.hidden_size,
@@ -3691,7 +3726,7 @@ mod tests {
         assert!(!blk.is_full_attention, "layer 0 is recurrent");
 
         let x = cpu_tensor(
-            vec![0.1; cfg.hidden_size],
+            det_weights(113, cfg.hidden_size),
             Shape::new(vec![1, cfg.hidden_size]),
         );
         let _ = blk
@@ -4138,6 +4173,35 @@ mod qk_norm_tests {
             let row = &out[t * head_dim..(t + 1) * head_dim];
             let ms = row.iter().map(|v| v * v).sum::<f32>() / 2.0;
             assert!((ms - 1.0).abs() < 1e-4, "token {t} rms^2 {ms}");
+        }
+    }
+
+    /// Multi-token and multi-head input: ensures flattening and per-head normalization
+    /// across sequence positions neither bleeds across heads nor across sequence steps.
+    #[test]
+    fn multi_head_multi_token_normalized_independently() {
+        let n_heads = 4usize;
+        let head_dim = 8usize;
+        let seq_len = 3usize;
+        let row_stride = n_heads * head_dim;
+        let mut x = vec![0.0f32; seq_len * row_stride];
+        for t in 0..seq_len {
+            for h in 0..n_heads {
+                let base = t * row_stride + h * head_dim;
+                for i in 0..head_dim {
+                    x[base + i] = ((t * 17 + h * 31 + i * 7 + 3) % 23) as f32 - 11.0;
+                }
+            }
+        }
+        let w = vec![1.0f32; head_dim];
+        let out = apply_head_rms_norm(&x, n_heads, head_dim, &w, 1e-6);
+        for t in 0..seq_len {
+            for h in 0..n_heads {
+                let base = t * row_stride + h * head_dim;
+                let row = &out[base..base + head_dim];
+                let ms = row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+                assert!((ms - 1.0).abs() < 1e-4, "t={t} h={h} rms^2 {ms}");
+            }
         }
     }
 

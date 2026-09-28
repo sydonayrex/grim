@@ -864,6 +864,84 @@ impl Linear {
         })
     }
 
+    /// Load a column-parallel Linear whose packed checkpoint rows are first
+    /// permuted: output row `i` comes from checkpoint row `row_perm[i]`.
+    ///
+    /// Used for fused projections whose checkpoint row order differs from the
+    /// runtime layout — e.g. Qwen3.5's `attn_q` packs `[q_h | gate_h]` per head
+    /// (llama.cpp `qwen35.cpp:274-293` views Q and the gate with row stride
+    /// `2*n_embd_head`), while every grim runtime split assumes
+    /// `[all Q | all gate]`. Permuting whole rows once at load corrects the
+    /// host split, the D2D split, the decode-graph split and the fused QKV
+    /// decode build simultaneously, and keeps quantized rows intact (a row is
+    /// a whole number of quant blocks for every supported block format).
+    ///
+    /// TP: only `world_size == 1` is supported — sharding row-permuted
+    /// checkpoint tensors across ranks needs provider support. Every current
+    /// qwen35 build runs world 1 (multi-GPU is device placement, not TP).
+    pub fn load_column_parallel_permuted_rows(
+        ws: &WeightSource<'_>,
+        in_dim: usize,
+        out_dim: usize,
+        has_bias: bool,
+        tp: TensorParallelConfig,
+        row_perm: &[usize],
+    ) -> Result<Self> {
+        if row_perm.len() != out_dim {
+            return Err(Error::ShapeMismatch {
+                expected: vec![out_dim],
+                got: vec![row_perm.len()],
+            });
+        }
+        if tp.world_size != 1 {
+            return Err(Error::Unimplemented(format!(
+                "load_column_parallel_permuted_rows: TP world_size {} unsupported",
+                tp.world_size
+            )));
+        }
+        let mut raw = ws.get_raw_packed("weight")?;
+        let rows = raw.shape[0];
+        if rows != out_dim || raw.shape.len() != 2 || raw.shape[1] != in_dim {
+            return Err(Error::ShapeMismatch {
+                expected: vec![out_dim, in_dim],
+                got: raw.shape.clone(),
+            });
+        }
+        let row_bytes = raw.bytes.len() / rows;
+        if row_bytes * rows != raw.bytes.len() {
+            return Err(Error::Shape(format!(
+                "permuted load: {} bytes not divisible by {} rows",
+                raw.bytes.len(),
+                rows
+            )));
+        }
+        let mut bytes = Vec::with_capacity(raw.bytes.len());
+        for &src in row_perm {
+            let o = src * row_bytes;
+            bytes.extend_from_slice(&raw.bytes[o..o + row_bytes]);
+        }
+        raw.bytes = bytes;
+        let shape = Shape::new(vec![out_dim, in_dim]);
+        let weight = ws.materialize_raw(raw, shape)?;
+        let w_t = transpose_last_two(&weight)?;
+        let quant_format = if weight.dtype().is_quantized() {
+            Some(weight.dtype().clone())
+        } else {
+            None
+        };
+        let bias = if has_bias {
+            Some(ws.get([out_dim], "bias")?)
+        } else {
+            None
+        };
+        Ok(Self {
+            weight,
+            bias,
+            w_t,
+            quant_format,
+        })
+    }
+
     /// Load a row-parallel shard (dim==1): each rank gets `in_dim / world_size`
     /// columns of the weight matrix. Bias is loaded unsharded.
     pub fn load_row_parallel(
@@ -1305,7 +1383,14 @@ pub struct Embedding {
 /// Packing an unverified decoder over a 248320-row table would trade a loud
 /// 4.74 GiB over-allocation for a SILENT wrong embedding. Fix the decoder and
 /// gate it bit-exact against the reference first, then add IQ2_S here.
-fn embedding_has_packed_gather(storage: &Storage) -> bool {
+fn embedding_has_packed_gather(storage: &Storage, device: &grim_tensor::Device) -> bool {
+    // The predicate is about the BACKEND, not just the dtype: only an
+    // accelerator has the on-device packed gather (`grim_embedding_q4k`).
+    // On the CPU device a K-quant table must be dequantized once on the host
+    // at load, exactly as the `embedding_packed` trait doc specifies.
+    if device.is_cpu() {
+        return false;
+    }
     matches!(
         storage,
         Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
@@ -1326,7 +1411,7 @@ impl Embedding {
             // packed in VRAM. Qwen's [248320, 5120] table is 715 MB as Q4_K and
             // 407 MB as IQ2_S, against 5.09 GB dequantized — a 7.1x / 12.5x
             // blowup that strands the card.
-            if embedding_has_packed_gather(&t.dtype().storage) {
+            if embedding_has_packed_gather(&t.dtype().storage, t.device()) {
                 return Ok(Self { weight: t });
             }
             // Other quantized embeddings: dequantize to f32.
@@ -1349,7 +1434,7 @@ impl Embedding {
 
         // Case 1: Row-major layout [actual_vocab, dim] where s1 == dim.
         if s1 == dim {
-            if embedding_has_packed_gather(&raw_tensor.dtype().storage) {
+            if embedding_has_packed_gather(&raw_tensor.dtype().storage, raw_tensor.device()) {
                 return Ok(Self { weight: raw_tensor });
             }
             return Ok(Self {
@@ -1398,7 +1483,7 @@ impl Embedding {
     pub fn forward(&self, indices: &[u32], seq_len: usize, dim: usize) -> Result<Tensor> {
         let dev = pick_device_for_tensor(&self.weight);
         let out_shape = Shape::new(vec![seq_len, dim]);
-        let (s, h) = if embedding_has_packed_gather(&self.weight.dtype().storage) {
+        let (s, h) = if embedding_has_packed_gather(&self.weight.dtype().storage, self.weight.device()) {
             CoreTensorOps::embedding_packed(
                 &*dev,
                 self.weight.storage().as_ref(),

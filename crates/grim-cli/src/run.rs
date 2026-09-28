@@ -1219,8 +1219,13 @@ pub async fn cmd_run(
         } else {
             // The ABSOLUTE position of the token being decoded, not its index
             // within this step — which is always 0 for a one-token step, and
-            // was the bug.
-            vec![(prefill_len + generated) as f32]
+            // was the bug. `generated` already counts the token sampled from
+            // the prefill pass, so the token fed back for the first decode
+            // step (the one after the last prompt token) must run at
+            // `prefill_len + generated - 1`. Without the -1 the first decode
+            // step runs at 6 after a 5-token prompt: RoPE desynchronises the
+            // token from the KV slot it was written to by exactly one.
+            vec![(prefill_len + generated - 1) as f32]
         };
         // SPEED-ROC: ROCm decode steps reuse preallocated [1]-shape tensors —
         // async in-place update, zero H2D allocs on the reuse path (old code
