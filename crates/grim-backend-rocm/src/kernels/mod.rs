@@ -58,6 +58,8 @@ pub mod qkv_attention;
 pub mod quant_standalone;
 pub mod quant_tiled_gemm;
 pub mod rmsnorm_quant;
+/// TreePie (WS-A) 5.0 bpw decode + M=1 GEMV over V_DOT2_F32_F16.
+pub mod tree_pie;
 pub mod rwkv;
 pub mod sage_attention;
 pub mod scythe_persistent;

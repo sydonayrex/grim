@@ -1566,6 +1566,57 @@ impl RocmDevice {
         )
     }
 
+    /// TreePie (WS-A A6) 5.0 bpw GEMV at M=1 over `V_DOT2_F32_F16`.
+    ///
+    /// B is the packed TreePie layout -- N columns, each `ceil(K/32)` groups of
+    /// 5 i32 (4 payload words + 1 sign plane) -- and is decoded in-register, so
+    /// no dequantized copy of B is uploaded. Activations arrive as packed f16,
+    /// the same precision the WMMA path casts to, and the two decoded halves
+    /// feed the dot2 operand word directly, so the decode is bit-exact rather
+    /// than tolerance-checked.
+    ///
+    /// Requires K % 32 == 0: the 5.0 bpw claim only holds at 32-value
+    /// granularity, and a ragged tail would silently overstate the density.
+    pub fn launch_tree_pie_gemv(
+        &self,
+        act_f16: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "tree_pie_gemv: K={k} must be a multiple of 32 (TreePie packs 32 values per 5 words)"
+            )));
+        }
+        if n == 0 {
+            return Err(Error::Backend("tree_pie_gemv: N must be > 0".into()));
+        }
+        let a_ptr = act_f16
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: act_f16 has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemv: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(n as u32, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_tree_pie_gemv",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut nn), arg(&mut kk)],
+        )
+    }
+
     /// Phase 4.5d: BF16 × BF16 GEMV via V_DOT2_F32_BF16 (RDNA3/4 dot12-insts).
     /// A is BF16 [M, K], B is row-major/transposed BF16 weights [N, K].
     pub(crate) fn launch_dot2_bf16_gemv(

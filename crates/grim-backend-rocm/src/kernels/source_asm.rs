@@ -29,6 +29,9 @@ pub fn compute_kernel_source() -> String {
     // fp16_to_float_device from shared_device_fns (pushed first). Arch-guarded
     // to RDNA3/4 inside the source itself.
     s.push_str(crate::kernels::dot_gemv::KERNEL_SOURCE);
+    // TreePie (WS-A): 5.0 bpw decode + M=1 GEMV. After dot_gemv -- reuses
+    // grim_fdot2_f32_f16 from it.
+    s.push_str(crate::kernels::tree_pie::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     // SPEED-ROC: All block-quantized WMMA GEMM kernels (Q8_0, Q4_K, Q5_K, Q2_K, Q3_K, Q6_K).
     // Consolidated cooperative-LDS source — generated, not a const (KERNEL_SOURCE is empty).
