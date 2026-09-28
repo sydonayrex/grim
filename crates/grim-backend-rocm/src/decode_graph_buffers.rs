@@ -765,7 +765,8 @@ impl DecodeGraphBuffers {
                 self.kda.len()
             )));
         }
-        if batch == 0 || num_val_heads == 0 || num_key_heads == 0 || head_dim == 0 || conv_dim == 0 {
+        if batch == 0 || num_val_heads == 0 || num_key_heads == 0 || head_dim == 0 || conv_dim == 0
+        {
             return Err(Error::Backend("allocate_kda_layer: zero dim".into()));
         }
         let dt = dtype_f32();
@@ -1498,9 +1499,7 @@ impl DecodeGraph {
                 let _ = hipGraphExecDestroy(exec);
                 let _ = hipGraphDestroy(graph);
             }
-            return Err(Error::Backend(format!(
-                "hipGraphUpload failed: {upload}"
-            )));
+            return Err(Error::Backend(format!("hipGraphUpload failed: {upload}")));
         }
         self.graph = graph;
         self.exec = exec;
@@ -1752,6 +1751,8 @@ mod tests {
         assert!(
             DecodeGraphBuffers::allocate(
                 &crate::device::roc_device::RocmDevice::shared(0),
+                // num_layers, hidden, n_q, n_attn_out, n_k, n_v, inter,
+                // max_ctx, vocab, then the zero the guard is meant to catch.
                 1,
                 64,
                 64,
@@ -1761,6 +1762,7 @@ mod tests {
                 8,
                 100,
                 8,
+                0,
                 0,
                 0,
                 0,

@@ -543,7 +543,7 @@ mod block_size_tests {
     fn header() -> String {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .and_then(Path::parent)
+            .and_then(|p| p.parent())
             .expect("crate -> repo root")
             .join("old/repo/llama.cpp-master/ggml/src/ggml-common.h");
         std::fs::read_to_string(&p).unwrap_or_else(|e| {
@@ -587,26 +587,38 @@ mod block_size_tests {
             ("iq4xs", qk, 2 + qk / 64 + qk / 2),
         ];
 
+        // Read the TABLE, not `tiled_quant_lookup`: that accessor returns
+        // only (tag, elements) and would make the bytes column vacuous. It
+        // demonstrably was — restoring iq3xxs 96 / iq4xs 136 left this test
+        // green, because nothing looked at those numbers.
         let mut problems: Vec<String> = Vec::new();
+        let row = |tag: &str| {
+            T::TILED_QUANT_TABLE.iter().find(|(_, t, _, _)| *t == tag).copied()
+        };
         for (tag, elems, bytes) in expected {
-            match T::tiled_quant_lookup(tag) {
+            match row(tag) {
                 None => problems.push(format!(
                     "{tag}: absent from TILED_QUANT_TABLE, expected {elems} elements / {bytes} B"
                 )),
-                Some((got_tag, got_blk)) => {
+                Some((_, got_tag, got_blk, got_bytes)) => {
                     if got_tag != tag {
-                        problems.push(format!("{tag}: looked up as {got_tag}"));
+                        problems.push(format!("{tag}: row is tagged {got_tag}"));
                     }
                     if got_blk != elems {
                         problems.push(format!(
                             "{tag}: {got_blk} elements/block, reference says {elems}"
                         ));
                     }
+                    if got_bytes != bytes {
+                        problems.push(format!(
+                            "{tag}: {got_bytes} B/block, reference says {bytes} B"
+                        ));
+                    }
                 }
             }
         }
         // iq4_nl must NOT be tiled: QK4_NL = 32 cannot fill a 256-element tile.
-        if T::tiled_quant_lookup("iq4nl").is_some() {
+        if row("iq4nl").is_some() {
             problems.push(
                 "iq4nl: present in TILED_QUANT_TABLE, but its block is QK4_NL = 32 \
                  elements and cannot fill a 256-element WMMA tile"
