@@ -1208,6 +1208,26 @@ impl RocmDevice {
     }
 
     /// SPEED-DOT: Q4_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
+    /// Public A/B wrapper around [`Self::launch_dot4_q4k_q81_gemv`].
+    ///
+    /// The B7 kill criterion compares a candidate format against "grim's
+    /// existing Q4_K fused-dequant path". On gfx1200 that path is currently the
+    /// scalar kernel, because the dispatch gates this dot4 GEMV to RDNA2 on the
+    /// belief that it mis-computes on RDNA3/4. Testing that belief needs the
+    /// launcher reachable from an integration test, hence this wrapper. It adds
+    /// no behaviour, so the test measures the production kernel.
+    pub fn launch_dot4_q4k_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q4k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_dot4_q4k_q81_gemv(
         &self,
         act_q81: &RocmStorage,

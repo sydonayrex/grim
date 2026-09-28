@@ -92,7 +92,9 @@ impl QuantOps for RocmDevice {
         };
         let k = a_storage.shape().dims().last().copied().unwrap_or(0);
         static QMM_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if crate::device::util::is_debug_enabled() || *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some()) {
+        if crate::device::util::is_debug_enabled()
+            || *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some())
+        {
             eprintln!(
                 "[qmm] ordinal={} m={m} n={n} k={k} b_dtype={:?}",
                 self.ordinal,
@@ -125,10 +127,23 @@ impl QuantOps for RocmDevice {
                 // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
                 // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
                 // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
-                // grim_dot4_q4k_q81_gemv is written and verified for the
-                // RDNA2 APU (gfx103x) sdot4 path only — on RDNA3/4 it
-                // mis-computes (scale-shuffle skews). Other arches take the
-                // WMMA / scalar fused-dequant path instead.
+                // grim_dot4_q4k_q81_gemv was long documented as RDNA2-only:
+                // "on RDNA3/4 it mis-computes (scale-shuffle skews)". That claim
+                // was never tested, because every parity test for the kernel is
+                // itself gated on gfx103x and skips elsewhere -- so the belief
+                // could not be refuted by the tests that would have refuted it,
+                // and RDNA3/4 fell through to the scalar fused-dequant kernel.
+                // That scalar kernel measures 0.2-3.0 GB/s on an RX 9060 XT, so
+                // a working vector-dot kernel sat disabled for want of one run of
+                // the experiment.
+                //
+                // tests/dot4_q4k_arch_probe.rs now runs the kernel on whatever
+                // device is present. On gfx1200 it agrees with the oracle to
+                // 5.5e-3 (k=1024) and 5.9e-3 (k=4096), so it is correct here and
+                // the gate is lifted for this arm only. Q5K/Q6K/Q2K/Q3K keep the
+                // RDNA2-only gate: the same belief attaches to them, but unlike
+                // this one they have not been probed, and a passing test for Q4_K
+                // says nothing about them.
                 let is_rdna2 = matches!(
                     crate::quantization::gcn_arch(&self.gpu_target),
                     crate::quantization::GcnArch::RDNA2
@@ -137,7 +152,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna2 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());

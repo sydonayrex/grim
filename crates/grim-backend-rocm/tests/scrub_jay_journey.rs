@@ -75,7 +75,7 @@ fn scrub_jay_vs_q4k_at_decode_shapes() -> TestResult {
     let pre_scale = 1.0f32 / 14.0;
 
     println!("--- B7: ScrubJay vs Q4_K fused dequant, decode (M=1) ---");
-    println!("{:>6}  {:>12}  {:>12}  {:>8}  {:>10}  {:>10}", "N", "scrubjay ms", "q4k ms", "ratio", "SJ GB/s", "Q4K GB/s");
+    println!("{:>6}  {:>11}  {:>11}  {:>13}  {:>8}  {:>9}  {:>9}", "N", "scrubjay", "q4k(dot4)", "q4k(scalar)", "ratio", "SJ GB/s", "Q4K GB/s");
 
     let mut worst_ratio = f64::INFINITY;
     for &n in &[256usize, 1024, 4096] {
@@ -136,22 +136,46 @@ fn scrub_jay_vs_q4k_at_decode_shapes() -> TestResult {
                 .map_err(|e| format!("sj launch: {e}").into())
         }, ITERS)?;
 
-        let q4k_ms = timed_ms(&dev, || {
+        // The Q4_K baseline is now the vector-dot GEMV the dispatch actually
+        // reaches on gfx1200 (the RDNA2-only gate was lifted once
+        // dot4_q4k_arch_probe showed the kernel is correct here), not the
+        // scalar fallback. Both are timed, so the comparison shows what the
+        // dispatch change was worth and keeps the old number on record.
+        let q81_bytes = (K / 32) * 36;
+        let q81_t = MemoryOps::alloc_storage(
+            &dev,
+            &Shape::new(vec![q81_bytes]),
+            DType { arith: ArithType::U8, storage: Storage::Native },
+        )
+        .map_err(|e| format!("q81 alloc: {e}"))?;
+        dev.launch_quantize_q8_1(r(&a_t), r(&q81_t), 1, K)
+            .map_err(|e| format!("q8_1 quantize: {e}"))?;
+        dev.synchronize();
+
+        let q4k_dot_ms = timed_ms(&dev, || {
+            dev.launch_dot4_q4k_q81_gemv_for_ab(r(&q81_t), r(&q4k_t), r(&out_t), 1, n, K)
+                .map(|_| ())
+                .map_err(|e| format!("q4k dot launch: {e}").into())
+        }, ITERS)?;
+
+        let q4k_scalar_ms = timed_ms(&dev, || {
             dev.launch_fused_dequant_gemm_q4k_for_ab(r(&a_t), r(&q4k_t), r(&out_t), 1, n, K)
                 .map(|_| ())
-                .map_err(|e| format!("q4k launch: {e}").into())
+                .map_err(|e| format!("q4k scalar launch: {e}").into())
         }, ITERS)?;
+        let q4k_ms = q4k_dot_ms;
 
         // Weight-stream bandwidth: the decode GEMV is bandwidth-bound, so the
         // resident weight bytes over wall-clock is the figure that says whether
         // either kernel is leaving the memory system on the table.
         let sj_gbs = sj_bytes as f64 / (sj_ms * 1e-3) / 1e9;
         let q4k_gbs = q4k_bytes as f64 / (q4k_ms * 1e-3) / 1e9;
+        eprintln!("  [n={n}] q4k scalar fallback was {q4k_scalar_ms:.4} ms");
         let ratio = sj_ms / q4k_ms;
         worst_ratio = worst_ratio.min(ratio);
 
         println!(
-            "{n:>6}  {sj_ms:>12.4}  {q4k_ms:>12.4}  {ratio:>7.2}x  {sj_gbs:>10.1}  {q4k_gbs:>10.1}",
+            "{n:>6}  {sj_ms:>11.4}  {q4k_ms:>11.4}  {q4k_scalar_ms:>13.4}  {ratio:>7.2}x  {sj_gbs:>9.1}  {q4k_gbs:>9.1}",
         );
     }
 
