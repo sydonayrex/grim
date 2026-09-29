@@ -15,7 +15,7 @@
 
 use grim_backend_rocm::RecurrentOps;
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{CoreTensorOps, DType, Shape};
+use grim_tensor::{CoreTensorOps, DType, Shape, Storage};
 
 fn load_f32(path: &str) -> Vec<f32> {
     let bytes = std::fs::read(path).expect(path);
@@ -207,5 +207,75 @@ fn step_kernel_coefficient_extraction() {
         w[0 * ks + 2],
         pre_r2[1] / 0.001,
         w[1 * ks + 2]
+    );
+}
+
+/// Gather arbitration: run grim's own device packed gather on the EXACT
+/// device table + the production token id 11751, and compare against the
+/// file row. If the gather is wrong at seq_len 1, this reproduces the
+/// production interleave signature ([A,B,A,B] stride-2) seen in the x dumps.
+#[test]
+#[ignore = "device-gated: run with GRIM_RUN_GPU_TEST=1"]
+fn embedding_gather_arbitration_row_11751() {
+    let dev = RocmDevice::try_new(0).expect("RocmDevice::try_new(0)");
+    // Real device table: reuse the probe dump (2304 B row 11751) embedded in a
+    // [248320, 4096]-shaped storage is impossible cheaply; instead build a
+    // minimal [vocab=3, 4096] table of rows (11750, 11751, 11752) from the
+    // file and gather index 1 with an offset map… but the production kernel
+    // derives the row offset as index * row_bytes internally, so the minimal
+    // table must place row 11751's bytes at offset 11751 * 2304. Allocate
+    // 11752 * 2304 + 2304 bytes (sparse, but fine) and write the real row at
+    // its production offset; zero elsewhere.
+    let row_bytes = 2304usize;
+    let file_row = std::fs::read("/tmp/kda_probe_file_row11751.bin").expect("file row dump");
+    let vocab_rows = 11753usize;
+    let mut table = vec![0u8; vocab_rows * row_bytes];
+    table[11751 * row_bytes..11752 * row_bytes].copy_from_slice(&file_row);
+    let table_s = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &table,
+        &Shape::new(vec![table.len()]),
+        DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(grim_tensor::KQuantScheme::Q4K),
+        },
+    )
+    .expect("upload table");
+    let out_s = CoreTensorOps::from_cpu(
+        &dev,
+        &vec![0.0f32; 4096],
+        &Shape::new(vec![4096]),
+        DType::F32,
+    )
+    .unwrap();
+    let _ = out_s;
+    // Gather through the production entry: embedding_packed.
+    let (out, _h) = grim_tensor::CoreTensorOps::embedding_packed(
+        &dev,
+        table_s.as_ref(),
+        &[11751],
+        &Shape::new(vec![1, 4096]),
+        4096,
+    )
+    .expect("embedding_packed");
+    // read back
+    let r = grim_backend_rocm::as_rocm(out.as_ref()).expect("rocm out");
+    let bytes = r.copy_to_host().expect("read back gather");
+    let got: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let file_row_deq = grim_quant::dequant_q4k(&file_row, 4096).unwrap();
+    let d = got
+        .iter()
+        .zip(&file_row_deq)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "[gather-arb] gathered row vs file row: max|diff| {d:.6}; got[0..4]={:?}",
+        &got[..4]
+    );
+    eprintln!(
+        "[gather-arb] production x (block input) was interleaved [A,B,A,B]; compare shape here"
     );
 }

@@ -1575,6 +1575,14 @@ impl CausalLm for Qwen35 {
             }
             _ => return Err(grim_tensor::Error::Unimplemented("non-F32 inputs".into()).into()),
         };
+        // KDA-STEP-PROBE: which token id did the embedding actually gather?
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && ids.len() == 1 {
+            static TOK_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !TOK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[kda-tok] decode step 1 ids = {ids:?} (expect [11751] = ' Paris')");
+            }
+        }
         let positions_vec: Vec<u32> = match positions.dtype() {
             d if d == DType::F32 => {
                 let v = positions.to_vec_f32()?;
@@ -1602,6 +1610,33 @@ impl CausalLm for Qwen35 {
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
 
+        // KDA-STEP-PROBE: embedding output at decode step 1 — against the
+        // raw file row dequant (/tmp/emb_row_11751.bin, built by /tmp/qdbg).
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && seq_len == 1 {
+            static EMB_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !EMB_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                    if let Device::Rocm(ord) = h.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    if let Ok(b) = r.copy_to_host() {
+                        let vals: Vec<f32> = b
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let _ = std::fs::write("/tmp/kda_probe_EMB_out.bin", &bytes);
+                        eprintln!(
+                            "[kda-emb-probe] wrote embedding output ({} f32) [0:4]={:?}",
+                            vals.len(),
+                            &vals[..4]
+                        );
+                    }
+                }
+            }
+        }
+
         if session.model_state().is_none() {
             let fresh: Vec<Qwen35LayerCache> = (0..self.blocks.len())
                 .map(|_| Qwen35LayerCache::new(&self.cfg))
@@ -1628,6 +1663,38 @@ impl CausalLm for Qwen35 {
                 self.blocks.len(),
                 h.device()
             );
+        }
+        // KDA-STEP-PROBE: raw packed table bytes for row 11751 at the first
+        // decode step — is the DEVICE table corrupted, or is the gather
+        // stride wrong?
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") {
+            static TABLE_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if seq_len == 1 && !TABLE_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if let Storage::KQuant(grim_tensor::KQuantScheme::Q4K) =
+                    self.tok_embeddings.weight.dtype().storage
+                {
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(
+                        self.tok_embeddings.weight.storage().as_ref(),
+                    ) {
+                        // Whole-table readback once (545 MB): the storage has
+                        // no partial-read API on the host path.
+                        if let Ok(all) = r.copy_to_host() {
+                            let row_bytes = 4096 / 256 * 144;
+                            let off = 11751 * row_bytes;
+                            let row = &all[off..off + row_bytes];
+                            let _ = std::fs::write("/tmp/kda_probe_d2d_table_row11751.bin", row);
+                            eprintln!(
+                                "[kda-table-probe] wrote device table bytes row 11751 ({} B), table total {} B",
+                                row.len(),
+                                all.len()
+                            );
+                        } else {
+                            eprintln!("[kda-table-probe] device read failed");
+                        }
+                    }
+                }
+            }
         }
         for (i, block) in self.blocks.iter().enumerate() {
             if h.device() != &block.device {
