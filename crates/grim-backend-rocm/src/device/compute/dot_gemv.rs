@@ -1122,6 +1122,24 @@ impl RocmDevice {
     }
 
     /// Phase 4.5f: Q2_K x Q8_1 GEMV via sudot4 + two-dot decomposition (RDNA3/4).
+    /// Public A/B wrapper around [`Self::launch_dot4_q2k_q81_gemv`] -- Q2_K (84 B / 256 weights).
+    ///
+    /// The dispatch gates this kernel to RDNA2 on a claim that was never
+    /// tested, and the parity tests that could refute it are themselves
+    /// gfx103x-gated. `dot4_q4k_arch_probe` needs the launcher reachable to
+    /// settle the same question for this scheme. Adds no behaviour.
+    pub fn launch_dot4_q2k_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_dot4_q2k_q81_gemv(
         &self,
         act_q81: &RocmStorage,
@@ -1165,6 +1183,24 @@ impl RocmDevice {
     }
 
     /// Phase 4.5f: Q3_K x Q8_1 GEMV via sudot4 + two-dot + sign correction (RDNA3/4).
+    /// Public A/B wrapper around [`Self::launch_dot4_q3k_q81_gemv`] -- Q3_K (110 B / 256 weights).
+    ///
+    /// The dispatch gates this kernel to RDNA2 on a claim that was never
+    /// tested, and the parity tests that could refute it are themselves
+    /// gfx103x-gated. `dot4_q4k_arch_probe` needs the launcher reachable to
+    /// settle the same question for this scheme. Adds no behaviour.
+    pub fn launch_dot4_q3k_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_dot4_q3k_q81_gemv(
         &self,
         act_q81: &RocmStorage,
@@ -1284,6 +1320,24 @@ impl RocmDevice {
     }
 
     /// SPEED-DOT: Q5_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
+    /// Public A/B wrapper around [`Self::launch_dot4_q5k_q81_gemv`] -- Q5_K (176 B / 256 weights).
+    ///
+    /// The dispatch gates this kernel to RDNA2 on a claim that was never
+    /// tested, and the parity tests that could refute it are themselves
+    /// gfx103x-gated. `dot4_q4k_arch_probe` needs the launcher reachable to
+    /// settle the same question for this scheme. Adds no behaviour.
+    pub fn launch_dot4_q5k_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_dot4_q5k_q81_gemv(
         &self,
         act_q81: &RocmStorage,
@@ -1327,6 +1381,24 @@ impl RocmDevice {
     }
 
     /// SPEED-DOT: Q6_K x Q8_1 GEMV via V_DOT4_I32_IU8 (RDNA3/4).
+    /// Public A/B wrapper around [`Self::launch_dot4_q6k_q81_gemv`] -- Q6_K (210 B / 256 weights).
+    ///
+    /// The dispatch gates this kernel to RDNA2 on a claim that was never
+    /// tested, and the parity tests that could refute it are themselves
+    /// gfx103x-gated. `dot4_q4k_arch_probe` needs the launcher reachable to
+    /// settle the same question for this scheme. Adds no behaviour.
+    pub fn launch_dot4_q6k_q81_gemv_for_ab(
+        &self,
+        act_q81: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_dot4_q6k_q81_gemv(
         &self,
         act_q81: &RocmStorage,

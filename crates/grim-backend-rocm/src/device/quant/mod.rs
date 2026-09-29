@@ -206,10 +206,23 @@ impl QuantOps for RocmDevice {
                 // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
                 // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
                 // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
-                // grim_dot4_q4k_q81_gemv is written and verified for the
-                // RDNA2 APU (gfx103x) sdot4 path only — on RDNA3/4 it
-                // mis-computes (scale-shuffle skews). Other arches take the
-                // WMMA / scalar fused-dequant path instead.
+                // Gate lifted for RDNA3/4 on measured evidence. The comment that
+                // used to sit here claimed this kernel "mis-computes on RDNA3/4
+                // (scale-shuffle skews)", and named grim_dot4_q4k_q81_gemv in this
+                // Q5K arm -- a copy-paste slip. The claim was never tested:
+                // every parity test for these kernels is itself gfx103x-gated and
+                // returns early elsewhere, so it could not be refuted by the tests
+                // meant to refute it, and RDNA3/4 fell through to the scalar
+                // fused-dequant path instead.
+                //
+                // tests/dot4_q4k_arch_probe.rs now runs each of these kernels on
+                // whatever device is present. On gfx1200 this one agrees with the
+                // oracle to 1.8e-3 (k=256). Q5_K/Q6_K fixtures come from grim's
+                // own packers; Q2_K/Q3_K have dequantizers but no packers (those
+                // formats arrive from GGUF), so their fixtures are structurally-valid
+                // synthesized superblocks, asserted to dequantize to finite weights
+                // before use. The stock kernels are correct here; the Q4_K
+                // GRIM_DOT4_FAST variant is not (1.0 relative error) and stays off.
                 let is_rdna2 = matches!(
                     crate::quantization::gcn_arch(&self.gpu_target),
                     crate::quantization::GcnArch::RDNA2
@@ -218,7 +231,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna2 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -272,10 +285,23 @@ impl QuantOps for RocmDevice {
                 // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
                 // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
                 // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
-                // grim_dot4_q4k_q81_gemv is written and verified for the
-                // RDNA2 APU (gfx103x) sdot4 path only — on RDNA3/4 it
-                // mis-computes (scale-shuffle skews). Other arches take the
-                // WMMA / scalar fused-dequant path instead.
+                // Gate lifted for RDNA3/4 on measured evidence. The comment that
+                // used to sit here claimed this kernel "mis-computes on RDNA3/4
+                // (scale-shuffle skews)", and named grim_dot4_q4k_q81_gemv in this
+                // Q6K arm -- a copy-paste slip. The claim was never tested:
+                // every parity test for these kernels is itself gfx103x-gated and
+                // returns early elsewhere, so it could not be refuted by the tests
+                // meant to refute it, and RDNA3/4 fell through to the scalar
+                // fused-dequant path instead.
+                //
+                // tests/dot4_q4k_arch_probe.rs now runs each of these kernels on
+                // whatever device is present. On gfx1200 this one agrees with the
+                // oracle to 1.7e-5 (k=256). Q5_K/Q6_K fixtures come from grim's
+                // own packers; Q2_K/Q3_K have dequantizers but no packers (those
+                // formats arrive from GGUF), so their fixtures are structurally-valid
+                // synthesized superblocks, asserted to dequantize to finite weights
+                // before use. The stock kernels are correct here; the Q4_K
+                // GRIM_DOT4_FAST variant is not (1.0 relative error) and stays off.
                 let is_rdna2 = matches!(
                     crate::quantization::gcn_arch(&self.gpu_target),
                     crate::quantization::GcnArch::RDNA2
@@ -284,7 +310,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna2 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -338,10 +364,23 @@ impl QuantOps for RocmDevice {
                 // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
                 // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
                 // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
-                // grim_dot4_q4k_q81_gemv is written and verified for the
-                // RDNA2 APU (gfx103x) sdot4 path only — on RDNA3/4 it
-                // mis-computes (scale-shuffle skews). Other arches take the
-                // WMMA / scalar fused-dequant path instead.
+                // Gate lifted for RDNA3/4 on measured evidence. The comment that
+                // used to sit here claimed this kernel "mis-computes on RDNA3/4
+                // (scale-shuffle skews)", and named grim_dot4_q4k_q81_gemv in this
+                // Q2K arm -- a copy-paste slip. The claim was never tested:
+                // every parity test for these kernels is itself gfx103x-gated and
+                // returns early elsewhere, so it could not be refuted by the tests
+                // meant to refute it, and RDNA3/4 fell through to the scalar
+                // fused-dequant path instead.
+                //
+                // tests/dot4_q4k_arch_probe.rs now runs each of these kernels on
+                // whatever device is present. On gfx1200 this one agrees with the
+                // oracle to 1.8e-6 (k=256). Q5_K/Q6_K fixtures come from grim's
+                // own packers; Q2_K/Q3_K have dequantizers but no packers (those
+                // formats arrive from GGUF), so their fixtures are structurally-valid
+                // synthesized superblocks, asserted to dequantize to finite weights
+                // before use. The stock kernels are correct here; the Q4_K
+                // GRIM_DOT4_FAST variant is not (1.0 relative error) and stays off.
                 let is_rdna2 = matches!(
                     crate::quantization::gcn_arch(&self.gpu_target),
                     crate::quantization::GcnArch::RDNA2
@@ -350,7 +389,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna2 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     // Phase 4.5f: m==1 decode routes to the Q2_K dot4 GEMV.
                     // Activations must be pre-quantized to Q8_1; quantize on the fly otherwise.
                     let q81_bytes = (k / 32) * 36 * m;
@@ -406,10 +445,23 @@ impl QuantOps for RocmDevice {
                 // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
                 // as RDNA3/4 sudot4 usage; B operands are all < 128 so the
                 // dot4 GEMV is sign-agnostic. WMMA stays RDNA3/4-only.
-                // grim_dot4_q4k_q81_gemv is written and verified for the
-                // RDNA2 APU (gfx103x) sdot4 path only — on RDNA3/4 it
-                // mis-computes (scale-shuffle skews). Other arches take the
-                // WMMA / scalar fused-dequant path instead.
+                // Gate lifted for RDNA3/4 on measured evidence. The comment that
+                // used to sit here claimed this kernel "mis-computes on RDNA3/4
+                // (scale-shuffle skews)", and named grim_dot4_q4k_q81_gemv in this
+                // Q3K arm -- a copy-paste slip. The claim was never tested:
+                // every parity test for these kernels is itself gfx103x-gated and
+                // returns early elsewhere, so it could not be refuted by the tests
+                // meant to refute it, and RDNA3/4 fell through to the scalar
+                // fused-dequant path instead.
+                //
+                // tests/dot4_q4k_arch_probe.rs now runs each of these kernels on
+                // whatever device is present. On gfx1200 this one agrees with the
+                // oracle to 9.6e-7 (k=256). Q5_K/Q6_K fixtures come from grim's
+                // own packers; Q2_K/Q3_K have dequantizers but no packers (those
+                // formats arrive from GGUF), so their fixtures are structurally-valid
+                // synthesized superblocks, asserted to dequantize to finite weights
+                // before use. The stock kernels are correct here; the Q4_K
+                // GRIM_DOT4_FAST variant is not (1.0 relative error) and stays off.
                 let is_rdna2 = matches!(
                     crate::quantization::gcn_arch(&self.gpu_target),
                     crate::quantization::GcnArch::RDNA2
@@ -418,7 +470,7 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if is_rdna2 && m == 1 && !dot_disabled && k % 256 == 0 {
+                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
