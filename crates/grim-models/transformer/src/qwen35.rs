@@ -1294,6 +1294,10 @@ impl Qwen35Block {
                     if let Device::Rocm(ord) = t.device() {
                         grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
                     }
+                    let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                    if let Device::Rocm(ord) = t.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
                     match grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()) {
                         Ok(r) => match r.copy_to_host() {
                             Ok(b) => {
@@ -1307,6 +1311,7 @@ impl Qwen35Block {
                     }
                 };
                 dump(&branch_tensor, "branch");
+                dump(x, "block_x");
             }
         }
         let proj_out = if let Some(ref wo) = self.wo {
