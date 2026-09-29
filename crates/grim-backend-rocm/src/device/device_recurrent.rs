@@ -502,12 +502,18 @@ impl RecurrentOps for RocmDevice {
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
                     let nz = vals.iter().filter(|&&v| v != 0.0).count();
+                    let sum = vals.iter().sum::<f32>();
                     eprintln!(
-                        "[kda-out-probe] out after kernel2: {} floats, nonzero {nz}, sum {:.6}, max {:.6}",
+                        "[kda-out-probe] out after kernel2: {} floats, nonzero {nz}, sum {sum:.6}, max {:.6}",
                         vals.len(),
-                        vals.iter().sum::<f32>(),
                         vals.iter().fold(0.0f32, |m, &v| m.max(v.abs()))
                     );
+                    // Full elementwise dump for the layer-0 arbitration (the
+                    // d2d branch): sum -6.6325 identifies layer 0 step 1.
+                    if (sum - (-6.632535)).abs() < 0.01 {
+                        let _ = std::fs::write("/tmp/kda_probe_d2d_branch_full.bin", &b);
+                        eprintln!("[kda-out-probe] wrote layer-0 branch dump");
+                    }
                 }
                 Err(e) => eprintln!("[kda-out-probe] read FAILED: {e}"),
             }
