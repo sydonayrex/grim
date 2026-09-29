@@ -8,7 +8,7 @@ use grim_tensor::{BackendStorage, RecurrentOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, hipFreeAsync, linear_launch};
+use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch};
 
 impl RecurrentOps for RocmDevice {
     fn short_conv1d_causal_step(
@@ -481,15 +481,15 @@ impl RecurrentOps for RocmDevice {
             ],
         )?;
 
-        // The scratch is read by the kernel just enqueued, so release it
-        // stream-ordered rather than eagerly. This stays graph-capturable.
-        unsafe {
-            let free_stream = stream2
-                .as_ref()
-                .map(|_| self.active_stream())
-                .unwrap_or(std::ptr::null_mut());
-            let _ = hipFreeAsync(acc_ptr2 as *mut c_void, free_stream);
-        }
+        // The scratch is read by the kernel just enqueued. Do NOT
+        // hipFreeAsync it here: `acc_s` is an allocator-owned RocmStorage, and
+        // freeing its pointer through HIP's stream-ordered pool behind the
+        // allocator's back made Drop pool an already-freed address — the
+        // driver then re-issued that address to a fresh hipMalloc while the
+        // pool still held it, handing one block to two live owners. That was
+        // the d2d decode gibberish (only this path allocates acc; prefill's
+        // scan and the host loop never did). Drop owns the release.
+        let _ = stream2;
 
         // KDA-STEP-PROBE: read `storage` right after kernel 2 — did the
         // head-norm kernel write the output? (sync first: the launch is async)

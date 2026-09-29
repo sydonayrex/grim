@@ -66,6 +66,8 @@ impl RocmCachingAllocator {
     }
 
     /// Round a byte size up to the next power of two. Class 0 is treated as 1 to [see: `hipMalloc`]
+    pub fn size_class_of(bytes: usize) -> usize { Self::size_class(bytes) }
+
     fn size_class(bytes: usize) -> usize {
         if bytes <= 1 {
             1
@@ -151,7 +153,15 @@ impl RocmCachingAllocator {
         if !self.audit_on() { return; }
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         match live.remove(&ptr) {
-            None => eprintln!("[alloc-audit] FREE OF UNKNOWN: {ptr:#x} class {cls} not live"),
+            None => {
+                eprintln!("[alloc-audit] FREE OF UNKNOWN: {ptr:#x} class {cls} not live");
+                // One-shot backtrace names the duplicate-free caller.
+                static ONCE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
+                }
+            }
             Some(c) if c != cls => eprintln!("[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))", self.id),
             _ => {}
         }

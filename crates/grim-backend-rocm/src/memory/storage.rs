@@ -502,6 +502,24 @@ impl RocmStorage {
 impl Drop for RocmStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
+            // GRIM_ALLOC_AUDIT=1: per-drop provenance for the duplicate-owner
+            // hunt — every drop of a 16 KB-class block prints a backtrace so
+            // the two owners of a double-freed pointer can be diffed.
+            if std::env::var("GRIM_ALLOC_AUDIT").as_deref() == Ok("1")
+                && RocmCachingAllocator::size_class_of(self.bytes) == 16384
+            {
+                static N: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 400 {
+                    eprintln!(
+                        "[drop-trace] #{n} ptr={ptr_val:#x} bytes={} managed={}",
+                        self.bytes,
+                        self.managed
+                    );
+                    eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
+                }
+            }
             // Pool returns (managed == false) do no HIP work, and real driver releases are pinned inside `RocmCachingAllocator::free` / `empty_cache` - so that branch stays guard-free to avoid an extra hipGetDevice+hipSetDevice pair per drop (which once widened a host-timing window in fused stream pipelines: mxfp4 rmsnorm→gemm→rope_kv parity flaked to all-zero outputs).
             // The managed branch issues a real `hipFree` and MUST pin the owning ordinal - a.
             if self.managed {
