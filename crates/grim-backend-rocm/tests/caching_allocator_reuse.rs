@@ -43,7 +43,11 @@ fn copy_from_host_async_does_not_grow_malloc_count_per_call() {
         eprintln!("[skipped: GRIM_GPU_TEST not set]");
         return;
     }
-
+    // Pooling is opt-in since a6900918 (the free list double-booked blocks);
+    // this test is specifically about pool recycling, so turn it on.
+    // SAFETY: single-threaded GPU-gated test process; no other threads read env.
+    // SAFETY: single-threaded GPU-gated test; no other thread reads env.
+    unsafe { std::env::set_var("GRIM_ALLOC_POOL", "1"); }
     let dev = Arc::new(
         RocmDevice::try_new(0)
             .expect("RocmDevice::try_new(0) should succeed on a system with ROCm"),
