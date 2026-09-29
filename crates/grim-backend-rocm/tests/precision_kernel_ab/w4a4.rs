@@ -179,7 +179,12 @@ pub fn pack_a(a: &[f32], m: usize, k: usize) -> PackedA {
             sums.push(sum);
         }
     }
-    PackedA { codes, scales, sums, groups }
+    PackedA {
+        codes,
+        scales,
+        sums,
+        groups,
+    }
 }
 
 /// B packed for `launch_dot8_w4a4_gemv`: codes, bf16 scales, u8 zeros.
@@ -208,7 +213,12 @@ pub fn pack_b(b: &[f32], n: usize, k: usize) -> PackedB {
             zeros.push(z);
         }
     }
-    PackedB { codes, scales, zeros, groups }
+    PackedB {
+        codes,
+        scales,
+        zeros,
+        groups,
+    }
 }
 
 /// The kernel's arithmetic, in f64, for one output element.
@@ -218,13 +228,7 @@ pub fn pack_b(b: &[f32], n: usize, k: usize) -> PackedB {
 /// against the packed form rather than the original f32 on purpose: scoring
 /// against the source values would charge the kernel for the quantizer, which
 /// is the mistake that made the first Raven run report 1e3 of phantom error.
-pub fn dot_packed(
-    pa: &PackedA,
-    pb: &PackedB,
-    i: usize,
-    j: usize,
-    k: usize,
-) -> f64 {
+pub fn dot_packed(pa: &PackedA, pb: &PackedB, i: usize, j: usize, k: usize) -> f64 {
     let groups = k / GROUP;
     let words_per_col = k / 8;
     let a_row = i * groups * WORDS_PER_GROUP;
@@ -257,7 +261,6 @@ pub fn dot_packed(
 mod tests {
     use super::*;
 
-
     /// Element 0 must be the low nibble: 0x21 -> [1, 2, ...], matching
     /// dequant_mxfp4, the only other nibble packer in the tree.
     #[test]
@@ -276,7 +279,10 @@ mod tests {
         let codes = vec![0xF0u8, 0x0F, 0xFF, 0x00, 0xF0, 0x0F, 0xFF, 0x00];
         let w = pack_nibbles(&codes);
         assert_eq!(w[0], 0x0FF0_0FF0, "high bits must be masked off");
-        assert_eq!(unpack_nibbles(&w, 8), vec![0x0, 0xF, 0xF, 0x0, 0x0, 0xF, 0xF, 0x0]);
+        assert_eq!(
+            unpack_nibbles(&w, 8),
+            vec![0x0, 0xF, 0xF, 0x0, 0x0, 0xF, 0xF, 0x0]
+        );
     }
 
     #[test]
@@ -295,7 +301,9 @@ mod tests {
         let k = 256usize;
         let mut s = 0x1234_5678u64;
         let mut rng = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as f32 / 2147483648.0 - 1.0
         };
         // A non-negative by construction; B spans both signs.
@@ -314,11 +322,11 @@ mod tests {
                     let d_b = from_bf16(pb.scales[j * (k / GROUP) + g]) as f64;
                     let z = pb.zeros[j * (k / GROUP) + g] as f64;
                     for e in 0..GROUP {
-                        let ac =
-                            ((pa.codes[i * (k / GROUP) * 16 + g * 16 + e / 8] >> (4 * (e % 8)))
-                                & 0xF) as f64;
-                        let bc = ((pb.codes[j * (k / 8) + g * 16 + e / 8] >> (4 * (e % 8)))
+                        let ac = ((pa.codes[i * (k / GROUP) * 16 + g * 16 + e / 8]
+                            >> (4 * (e % 8)))
                             & 0xF) as f64;
+                        let bc = ((pb.codes[j * (k / 8) + g * 16 + e / 8] >> (4 * (e % 8))) & 0xF)
+                            as f64;
                         want += (d_a * ac) * (d_b * (bc - z));
                     }
                 }
@@ -382,7 +390,9 @@ mod tests {
         let k = 1024usize;
         let mut s = 0x5EED_1234u64;
         let mut rng = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as f32 / 2147483648.0 - 1.0
         };
         // All-positive B: no cancellation, so the sum is O(sqrt(K)) and the
@@ -394,7 +404,10 @@ mod tests {
         let got = dot_packed(&pa, &pb, 0, 0, k);
         let want: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
         let rel = ((got - want) / want).abs();
-        assert!(rel < 0.25, "non-cancelling int4 dot rel={rel} (got {got}, want {want})");
+        assert!(
+            rel < 0.25,
+            "non-cancelling int4 dot rel={rel} (got {got}, want {want})"
+        );
     }
 
     /// The stored scale is bf16, so the oracle must use the bf16 value. Using
@@ -422,7 +435,10 @@ mod tests {
         let f32_max = f32::MAX;
         assert_eq!(to_bf16(f32_max), 0x7F7F, "f32::MAX must clamp, not wrap");
         assert!(!from_bf16(to_bf16(f32_max)).is_nan());
-        assert!(!from_bf16(0x7F7F).is_nan(), "0x7F7F must be finite, not NaN");
+        assert!(
+            !from_bf16(0x7F7F).is_nan(),
+            "0x7F7F must be finite, not NaN"
+        );
         // Just under bf16's max must survive as a normal number.
         let under = 3.0e38f32;
         assert!(from_bf16(to_bf16(under)).is_finite() && from_bf16(to_bf16(under)) > 2.0e38);
@@ -523,7 +539,9 @@ mod tests {
         let k = 2048usize;
         let mut s = 0xDEAD_BEEFu64;
         let mut rng = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as f32 / 2147483648.0 - 1.0
         };
         let a: Vec<f32> = (0..m * k).map(|_| rng().abs()).collect();
@@ -546,4 +564,3 @@ mod tests {
         );
     }
 }
-

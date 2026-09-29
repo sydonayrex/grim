@@ -61,13 +61,21 @@ fn q4k_embedding_gather_matches_host_reference() {
     // per row, which is the alignment the gather relies on.
     let vocab = 64usize;
     let dim = 5120usize;
-    assert_eq!(dim % Q4K_BLOCK, 0, "row must be a whole number of super-blocks");
+    assert_eq!(
+        dim % Q4K_BLOCK,
+        0,
+        "row must be a whole number of super-blocks"
+    );
     assert_eq!(dim / Q4K_BLOCK, 20);
 
     let host = synth_table(vocab, dim);
     let packed = grim_quant::quant_q4k(&host).expect("quant_q4k");
     let expected_bytes = (vocab * dim / Q4K_BLOCK) * Q4K_BLOCK_BYTES;
-    assert_eq!(packed.len(), expected_bytes, "packed size must match the Q4_K layout");
+    assert_eq!(
+        packed.len(),
+        expected_bytes,
+        "packed size must match the Q4_K layout"
+    );
 
     // The tokens a decode step actually asks for: first row, a mid row, and the
     // last row, so an off-by-one in the row-to-block math is caught at both ends.

@@ -66,7 +66,10 @@ fn accurate_but_slower_is_eligible_yet_below_bar() {
     // is how a 0.9x result gets presented as a win.
     let slow = r("slow", 128, 4096, &[2.0], 0.0, TOL_F32);
     assert_eq!(judge(&slow, 1.0), Verdict::Eligible);
-    assert!(!clears_ship_bar(&slow, 1.0), "2x slower must not clear the bar");
+    assert!(
+        !clears_ship_bar(&slow, 1.0),
+        "2x slower must not clear the bar"
+    );
 }
 
 #[test]
@@ -85,16 +88,32 @@ fn decode_and_prefill_bars_differ() {
     // end-to-end time so a smaller kernel win matters more, but decode shapes
     // are noisier so the bar is set against the same measurement discipline.
     let decode = r("d", 1, 4096, &[1.0 / DECODE_BAR as f32], 0.0, TOL_F32);
-    assert!(clears_ship_bar(&decode, 1.0), "exactly at the decode bar passes");
+    assert!(
+        clears_ship_bar(&decode, 1.0),
+        "exactly at the decode bar passes"
+    );
     // NB: to sit BELOW a bar of B the median must be SLOWER than 1.0/B, i.e.
     // 1.0/(B*0.95) -> ratio 0.95*B. Using 1.0/(B+0.05) would give a ratio of
     // B+0.05, which is above the bar - the first draft of this test got that
     // backwards and asserted the opposite of what it meant.
-    let decode_short = r("d", 1, 4096, &[1.0 / (DECODE_BAR * 0.95) as f32], 0.0, TOL_F32);
-    assert!(!clears_ship_bar(&decode_short, 1.0), "0.95x the decode bar is short");
+    let decode_short = r(
+        "d",
+        1,
+        4096,
+        &[1.0 / (DECODE_BAR * 0.95) as f32],
+        0.0,
+        TOL_F32,
+    );
+    assert!(
+        !clears_ship_bar(&decode_short, 1.0),
+        "0.95x the decode bar is short"
+    );
     // A prefill arm is held to the higher bar at the same ratio.
     let prefill = r("p", 512, 4096, &[1.0 / DECODE_BAR as f32], 0.0, TOL_F32);
-    assert!(!clears_ship_bar(&prefill, 1.0), "prefill needs the higher bar");
+    assert!(
+        !clears_ship_bar(&prefill, 1.0),
+        "prefill needs the higher bar"
+    );
 }
 
 #[test]
@@ -181,8 +200,14 @@ fn artifact_records_the_ship_decision_not_just_eligibility() {
         r("ForestRaven", 1, 1024, &[0.8], 1e-4, TOL_I32),
     ];
     let j = to_artifact_json(&results, "gfx1201");
-    assert!(j.contains("\"vs_control\": 1.2500"), "ratio not emitted: {j}");
-    assert!(j.contains("\"ship\": \"control\""), "control mislabelled: {j}");
+    assert!(
+        j.contains("\"vs_control\": 1.2500"),
+        "ratio not emitted: {j}"
+    );
+    assert!(
+        j.contains("\"ship\": \"control\""),
+        "control mislabelled: {j}"
+    );
     assert!(
         j.contains("\"ship\": \"ship\""),
         "a 1.25x eligible arm must record ship: {j}"
@@ -258,11 +283,26 @@ fn artifact_json_is_well_formed_on_every_branch() {
             "case {i} produced malformed JSON:\n{j}"
         );
         // Sanity: the guard must actually reject broken input, or it is decoration.
-        assert!(!json_is_well_formed("{\"a\": 1\"}"), "guard missed stray quote");
-        assert!(!json_is_well_formed("{\"a\": 1,}"), "guard missed trailing comma");
-        assert!(!json_is_well_formed("{\"a\": 1"), "guard missed unclosed brace");
-        assert!(!json_is_well_formed("[1, 2"), "guard missed unclosed bracket");
-        assert!(!json_is_well_formed("{\"a\": 1}x"), "guard missed junk after close");
+        assert!(
+            !json_is_well_formed("{\"a\": 1\"}"),
+            "guard missed stray quote"
+        );
+        assert!(
+            !json_is_well_formed("{\"a\": 1,}"),
+            "guard missed trailing comma"
+        );
+        assert!(
+            !json_is_well_formed("{\"a\": 1"),
+            "guard missed unclosed brace"
+        );
+        assert!(
+            !json_is_well_formed("[1, 2"),
+            "guard missed unclosed bracket"
+        );
+        assert!(
+            !json_is_well_formed("{\"a\": 1}x"),
+            "guard missed junk after close"
+        );
     }
 }
 
@@ -275,7 +315,10 @@ fn a_numeric_field_never_ends_in_a_quote() {
         r("ForestRaven", 1, 1024, &[0.8], 1e-4, TOL_I32),
     ];
     let j = to_artifact_json(&results, "gfx1201");
-    assert!(!j.contains("0.8000\""), "numeric field closed as a string: {j}");
+    assert!(
+        !j.contains("0.8000\""),
+        "numeric field closed as a string: {j}"
+    );
     assert!(j.contains("\"vs_control_max\": 1.2500"), "{j}");
 }
 

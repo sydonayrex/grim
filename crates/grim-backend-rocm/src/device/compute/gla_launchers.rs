@@ -18,7 +18,7 @@ use grim_tensor::{BackendStorage, Shape};
 use crate::device::roc_device::RocmDevice;
 use crate::kernels::gla_kernels::{gla_fused_enabled, gla_state_fp8_enabled};
 use crate::memory::storage::RocmStorage;
-use crate::{arg, as_rocm, dev_ptr, dtype_f32, HipDim3, RocmHandle};
+use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32};
 
 /// All device pointers for one fused GDN-2 launch. Layouts: q/k/alpha/b
 /// `[batch, heads, dk]`, v/w/norm_w `[batch, heads, dv]`, gate

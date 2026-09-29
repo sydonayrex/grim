@@ -39,12 +39,17 @@ fn gpu_device() -> Option<Arc<RocmDevice>> {
 
 fn block_table(dev: &RocmDevice) -> Box<dyn grim_tensor::BackendStorage> {
     let entries = [
-        BlockTableEntry { block_id: 0, page_size: 4 },
-        BlockTableEntry { block_id: 1, page_size: 4 },
+        BlockTableEntry {
+            block_id: 0,
+            page_size: 4,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: 4,
+        },
     ];
-    let table_f32: &[f32] = unsafe {
-        std::slice::from_raw_parts(entries.as_ptr() as *const f32, entries.len() * 2)
-    };
+    let table_f32: &[f32] =
+        unsafe { std::slice::from_raw_parts(entries.as_ptr() as *const f32, entries.len() * 2) };
     dev.from_cpu(
         table_f32,
         &Shape::new(vec![BATCH as usize, MAX_BLOCKS as usize, 2]),
@@ -113,11 +118,7 @@ fn int8_quant_paged_attention_matches_f32_reference() {
         NUM_KV_HEADS as usize,
         HEAD_DIM as usize,
     ]);
-    let q_shape = Shape::new(vec![
-        BATCH as usize,
-        NUM_HEADS as usize,
-        HEAD_DIM as usize,
-    ]);
+    let q_shape = Shape::new(vec![BATCH as usize, NUM_HEADS as usize, HEAD_DIM as usize]);
 
     let q_cpu: Vec<f32> = (0..(BATCH * NUM_HEADS * HEAD_DIM) as usize)
         .map(|x| ((x as f32) * 0.1).sin())
@@ -132,8 +133,14 @@ fn int8_quant_paged_attention_matches_f32_reference() {
     // Flatten pages into the [seq, kv_heads, head_dim] reference layout, going
     // through each block's physical `block_id` exactly as the kernel does.
     let entries = [
-        BlockTableEntry { block_id: 0, page_size: 4 },
-        BlockTableEntry { block_id: 1, page_size: 4 },
+        BlockTableEntry {
+            block_id: 0,
+            page_size: 4,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: 4,
+        },
     ];
     let mut k_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
     let mut v_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
@@ -200,12 +207,8 @@ fn int8_quant_paged_attention_matches_f32_reference() {
     let k_bytes: Vec<u8> = k_q8.iter().map(|&x| x as u8).collect();
     let v_bytes: Vec<u8> = v_q8.iter().map(|&x| x as u8).collect();
     let q8_shape = Shape::new(vec![k_bytes.len()]);
-    let kq_storage = dev
-        .from_cpu_bytes(&k_bytes, &q8_shape, DType::F32)
-        .unwrap();
-    let vq_storage = dev
-        .from_cpu_bytes(&v_bytes, &q8_shape, DType::F32)
-        .unwrap();
+    let kq_storage = dev.from_cpu_bytes(&k_bytes, &q8_shape, DType::F32).unwrap();
+    let vq_storage = dev.from_cpu_bytes(&v_bytes, &q8_shape, DType::F32).unwrap();
     let mut out_q8 = dev.zeros(&q_shape, DType::F32).unwrap();
 
     launch_paged_attention_quant(
@@ -335,8 +338,14 @@ fn fp8_e4m3_quant_paged_attention_matches_f32_reference() {
 
     // Same page flattening as the int8 test, via each block's physical id.
     let entries = [
-        BlockTableEntry { block_id: 0, page_size: 4 },
-        BlockTableEntry { block_id: 1, page_size: 4 },
+        BlockTableEntry {
+            block_id: 0,
+            page_size: 4,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: 4,
+        },
     ];
     let mut k_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
     let mut v_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
@@ -364,8 +373,12 @@ fn fp8_e4m3_quant_paged_attention_matches_f32_reference() {
     let (v_bytes, v_scale) = quantize_e4m3(&v_cpu);
     // Raw byte upload: the kernel indexes the page pointer bytewise.
     let byte_shape = Shape::new(vec![k_bytes.len()]);
-    let kq = dev.from_cpu_bytes(&k_bytes, &byte_shape, DType::F32).unwrap();
-    let vq = dev.from_cpu_bytes(&v_bytes, &byte_shape, DType::F32).unwrap();
+    let kq = dev
+        .from_cpu_bytes(&k_bytes, &byte_shape, DType::F32)
+        .unwrap();
+    let vq = dev
+        .from_cpu_bytes(&v_bytes, &byte_shape, DType::F32)
+        .unwrap();
 
     launch_paged_attention_quant(
         &dev,
@@ -422,7 +435,10 @@ fn fp8_e4m3_quant_paged_attention_matches_f32_reference() {
     eprintln!(
         "[quant-paged] fp8 e4m3 KV matches f32 reference within {tol} \
          (max err {:.4})",
-        got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0f64, f64::max)
+        got.iter()
+            .zip(&want)
+            .map(|(g, w)| (*g as f64 - w).abs())
+            .fold(0.0f64, f64::max)
     );
 }
 
@@ -456,8 +472,14 @@ fn nutcracker_quant_paged_attention_matches_f32_reference() {
         .collect();
 
     let entries = [
-        BlockTableEntry { block_id: 0, page_size: 4 },
-        BlockTableEntry { block_id: 1, page_size: 4 },
+        BlockTableEntry {
+            block_id: 0,
+            page_size: 4,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: 4,
+        },
     ];
     let mut k_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
     let mut v_flat = vec![0.0f32; (KV_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM) as usize];
@@ -480,7 +502,11 @@ fn nutcracker_quant_paged_attention_matches_f32_reference() {
     // Production encoder: 9 bytes per 16 values.
     let k_packed = grim_quant::quant_nutcracker(&k_cpu).expect("quantize K");
     let v_packed = grim_quant::quant_nutcracker(&v_cpu).expect("quantize V");
-    assert_eq!(k_packed.len(), k_cpu.len() / 16 * 9, "9 bytes per 16 values");
+    assert_eq!(
+        k_packed.len(),
+        k_cpu.len() / 16 * 9,
+        "9 bytes per 16 values"
+    );
 
     let q_storage = dev.from_cpu(&q_cpu, &q_shape, DType::F32).unwrap();
     let table = block_table(&dev);
@@ -554,6 +580,9 @@ fn nutcracker_quant_paged_attention_matches_f32_reference() {
     eprintln!(
         "[quant-paged] nutcracker KV matches f32 reference within {tol} \
          (max err {:.4})",
-        got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0f64, f64::max)
+        got.iter()
+            .zip(&want)
+            .map(|(g, w)| (*g as f64 - w).abs())
+            .fold(0.0f64, f64::max)
     );
 }

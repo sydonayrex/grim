@@ -12,9 +12,9 @@ use grim_tensor::{BackendStorage, Shape};
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemcpyAsync, hipModuleGetFunction,
-    hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipStreamSynchronize, hipSuccess,
-    jit_compile_hsaco, HipDim3, HipMemcpyKind,
+    HipDim3, HipMemcpyKind, arg, as_rocm, check_hip, dev_ptr, dtype_f32, hipMemcpyAsync,
+    hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload,
+    hipStreamSynchronize, hipSuccess, jit_compile_hsaco,
 };
 
 impl RocmDevice {
@@ -417,7 +417,16 @@ impl RocmDevice {
         if crate::device::util::is_debug_enabled() {
             eprintln!(
                 "[GRIM_DEBUG launch_on_stream] dev={} entry={} grid=({},{},{}) block=({},{},{}) smem={} stream={:?}",
-                self.ordinal, entry, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_mem_bytes, stream
+                self.ordinal,
+                entry,
+                grid.x,
+                grid.y,
+                grid.z,
+                block.x,
+                block.y,
+                block.z,
+                shared_mem_bytes,
+                stream
             );
         }
         let args_ptr = args.as_mut_ptr();
@@ -605,9 +614,8 @@ impl RocmDevice {
             format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash)
         };
 
-        if let Some((cached_path, cached_lowered)) = self
-            .hsaco_cache
-            .get_cached_kernel_hashed(&cache_key, hash)
+        if let Some((cached_path, cached_lowered)) =
+            self.hsaco_cache.get_cached_kernel_hashed(&cache_key, hash)
         {
             if std::env::var_os("GRIM_RING_DIAG").is_some() {
                 eprintln!(
@@ -917,7 +925,16 @@ impl RocmDevice {
                 if crate::device::util::is_debug_enabled() {
                     eprintln!(
                         "[GRIM_DEBUG launch_cached] dev={} entry={} grid=({},{},{}) block=({},{},{}) smem={} stream={:?}",
-                        self.ordinal, entry, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_mem_bytes, stream
+                        self.ordinal,
+                        entry,
+                        grid.x,
+                        grid.y,
+                        grid.z,
+                        block.x,
+                        block.y,
+                        block.z,
+                        shared_mem_bytes,
+                        stream
                     );
                 }
                 let args_ptr = args.as_mut_ptr();
@@ -986,8 +1003,7 @@ impl RocmDevice {
                 base_key
             };
             let (path, lowered_name) = if let Some((cached_path, cached_lowered)) =
-                self.hsaco_cache
-                    .get_cached_kernel_hashed(&cache_key, hash)
+                self.hsaco_cache.get_cached_kernel_hashed(&cache_key, hash)
             {
                 (cached_path, cached_lowered)
             } else {
@@ -1080,7 +1096,16 @@ impl RocmDevice {
         if crate::device::util::is_debug_enabled() {
             eprintln!(
                 "[GRIM_DEBUG launch] dev={} entry={} grid=({},{},{}) block=({},{},{}) smem={} stream={:?}",
-                self.ordinal, entry, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_mem_bytes, stream
+                self.ordinal,
+                entry,
+                grid.x,
+                grid.y,
+                grid.z,
+                block.x,
+                block.y,
+                block.z,
+                shared_mem_bytes,
+                stream
             );
         }
 
@@ -1126,8 +1151,9 @@ impl RocmDevice {
 // Journey tests read the value after the launch has completed on the stream, so
 // there is no cross-kernel ordering requirement to establish.
 
-type RouteCounters =
-    std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>>;
+type RouteCounters = std::sync::RwLock<
+    std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
+>;
 
 fn route_counters() -> &'static RouteCounters {
     static COUNTERS: std::sync::OnceLock<RouteCounters> = std::sync::OnceLock::new();

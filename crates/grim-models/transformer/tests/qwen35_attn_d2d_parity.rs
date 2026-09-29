@@ -337,7 +337,7 @@ fn qwen35_attention_device_path_engages_and_matches_host() {
         }
         let (e, at) = worst_rel(&cpu_out, &gpu_out);
         assert!(
-            e <= 3e-3,
+            e <= 5e-4,
             "step {step}: host/device attention layer diverges: worst {e:.3e} at {at} \
              (host {}, device {})",
             cpu_out[at],

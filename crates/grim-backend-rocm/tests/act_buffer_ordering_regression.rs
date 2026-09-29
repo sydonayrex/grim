@@ -70,21 +70,39 @@ fn test_act_buffer_ordering_regression_gpu() {
     let act1 = f32_tensor(&dev, &act_vals1, &Shape::new(vec![m, k]));
     let act2 = f32_tensor(&dev, &act_vals2, &Shape::new(vec![m, k]));
 
-    let weight_f32: Vec<f32> = (0..n * k).map(|i| ((i * 13) % 97) as f32 / 97.0 - 0.5).collect();
+    let weight_f32: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 13) % 97) as f32 / 97.0 - 0.5)
+        .collect();
     let weight_packed = pack_q80(&weight_f32, n, k);
     let weight = upload_q80(&dev, &weight_packed, n, k);
 
     let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
 
-    let act_q81 = f32_tensor(&dev, &vec![0.0f32; (k / 32) * 9], &Shape::new(vec![(k / 32) * 36]));
+    let act_q81 = f32_tensor(
+        &dev,
+        &vec![0.0f32; (k / 32) * 9],
+        &Shape::new(vec![(k / 32) * 36]),
+    );
 
     // Step 1: linear_decode_into with act1
-    dev.linear_decode_into(act1.as_ref(), as_rocm(weight.as_ref()).unwrap(), as_rocm(out.as_ref()).unwrap(), as_rocm(act_q81.as_ref()).unwrap()).expect("step 1");
+    dev.linear_decode_into(
+        act1.as_ref(),
+        as_rocm(weight.as_ref()).unwrap(),
+        as_rocm(out.as_ref()).unwrap(),
+        as_rocm(act_q81.as_ref()).unwrap(),
+    )
+    .expect("step 1");
     dev.synchronize();
     let out1 = out.to_cpu_vec_f32().unwrap();
 
     // Step 2: linear_decode_into with act2 reusing out buffer
-    dev.linear_decode_into(act2.as_ref(), as_rocm(weight.as_ref()).unwrap(), as_rocm(out.as_ref()).unwrap(), as_rocm(act_q81.as_ref()).unwrap()).expect("step 2");
+    dev.linear_decode_into(
+        act2.as_ref(),
+        as_rocm(weight.as_ref()).unwrap(),
+        as_rocm(out.as_ref()).unwrap(),
+        as_rocm(act_q81.as_ref()).unwrap(),
+    )
+    .expect("step 2");
     dev.synchronize();
     let out2 = out.to_cpu_vec_f32().unwrap();
 

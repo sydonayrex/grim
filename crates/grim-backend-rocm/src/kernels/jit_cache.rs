@@ -143,7 +143,10 @@ impl HsacoKernelCache {
         self.entries
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.to_string(), (cache_path.clone(), modified, lowered.clone()));
+            .insert(
+                key.to_string(),
+                (cache_path.clone(), modified, lowered.clone()),
+            );
         Some((cache_path, lowered))
     }
 
@@ -363,10 +366,7 @@ mod tests {
         // (its in-memory map dies with it); a fresh reader with an empty map
         // must still hit via the on-disk sidecar. This is the W1 cold-start
         // contract — without it every process recompiles every kernel.
-        let dir = std::env::temp_dir().join(format!(
-            "grim_hsaco_xproc_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("grim_hsaco_xproc_{}", std::process::id()));
         let prev = std::env::var("GRIM_HSACO_CACHE_DIR").ok();
         unsafe {
             std::env::set_var("GRIM_HSACO_CACHE_DIR", &dir);

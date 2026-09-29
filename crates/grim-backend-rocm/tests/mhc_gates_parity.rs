@@ -5,9 +5,9 @@
 //! the Xing4.0 hyper-connection, so they are checked against host references
 //! rather than trusted.
 
-use grim_backend_rocm::device::compute::layer_elementwise::MhcGateTensors;
 use grim_backend_rocm::CoreTensorOps;
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::device::compute::layer_elementwise::MhcGateTensors;
 use grim_tensor::dtype::DType;
 use grim_tensor::{ElementwiseOps, Shape};
 
@@ -43,8 +43,7 @@ fn ref_gates(
         let row = &proj[s * mix..(s + 1) * mix];
         for h in 0..hc {
             pre[h * seq + s] = 1.0 / (1.0 + (-(row[h] * scale[0] + base[h])).exp());
-            post[h * seq + s] =
-                2.0 / (1.0 + (-(row[hc + h] * scale[1] + base[hc + h])).exp());
+            post[h * seq + s] = 2.0 / (1.0 + (-(row[hc + h] * scale[1] + base[hc + h])).exp());
         }
         let off = 2 * hc;
         let mut m = f32::MIN;
@@ -115,8 +114,12 @@ fn mhc_gates_gpu_matches_host() {
     let base = pseudo_random(mix, 11);
     let scale = vec![1.0f32, 1.0f32, 2.0f32];
 
-    let proj_s = dev.from_cpu(&proj, &Shape::new(vec![seq, mix]), DType::F32).unwrap();
-    let base_s = dev.from_cpu(&base, &Shape::new(vec![mix]), DType::F32).unwrap();
+    let proj_s = dev
+        .from_cpu(&proj, &Shape::new(vec![seq, mix]), DType::F32)
+        .unwrap();
+    let base_s = dev
+        .from_cpu(&base, &Shape::new(vec![mix]), DType::F32)
+        .unwrap();
     let scale_s = dev
         .from_cpu(&scale, &Shape::new(vec![3]), DType::F32)
         .unwrap();
@@ -135,27 +138,11 @@ fn mhc_gates_gpu_matches_host() {
         )
         .unwrap();
 
-    let (rpre, rpost, rcomb) =
-        ref_gates(&proj, &base, &scale, seq, hc, iters, eps, cmin, cmax);
+    let (rpre, rpost, rcomb) = ref_gates(&proj, &base, &scale, seq, hc, iters, eps, cmin, cmax);
 
-    close(
-        &pre.to_cpu_vec_f32().unwrap(),
-        &rpre,
-        1e-5,
-        "mhc pre",
-    );
-    close(
-        &post.to_cpu_vec_f32().unwrap(),
-        &rpost,
-        1e-5,
-        "mhc post",
-    );
-    close(
-        &comb.to_cpu_vec_f32().unwrap(),
-        &rcomb,
-        1e-5,
-        "mhc comb",
-    );
+    close(&pre.to_cpu_vec_f32().unwrap(), &rpre, 1e-5, "mhc pre");
+    close(&post.to_cpu_vec_f32().unwrap(), &rpost, 1e-5, "mhc post");
+    close(&comb.to_cpu_vec_f32().unwrap(), &rcomb, 1e-5, "mhc comb");
 }
 
 #[test]
@@ -169,7 +156,9 @@ fn row_scale_gpu_matches_host() {
     let x_s = dev
         .from_cpu(&x, &Shape::new(vec![rows, cols]), DType::F32)
         .unwrap();
-    let s_s = dev.from_cpu(&s, &Shape::new(vec![rows]), DType::F32).unwrap();
+    let s_s = dev
+        .from_cpu(&s, &Shape::new(vec![rows]), DType::F32)
+        .unwrap();
 
     let (out, handle) = dev
         .row_scale(
@@ -230,7 +219,12 @@ fn row_copy_primitives_gpu_match_host() {
         .write_rows(dst.as_mut(), 8, patch_s.as_ref(), 2, cols)
         .unwrap();
     h2.synchronize().unwrap();
-    close(&dst.to_cpu_vec_f32().unwrap(), &expected, 1e-7, "write_rows");
+    close(
+        &dst.to_cpu_vec_f32().unwrap(),
+        &expected,
+        1e-7,
+        "write_rows",
+    );
 }
 
 #[test]
@@ -282,5 +276,10 @@ fn col_copy_primitives_gpu_match_host() {
         .write_cols(dst.as_mut(), total_cols, 3, patch_s.as_ref(), rows, cols)
         .unwrap();
     h2.synchronize().unwrap();
-    close(&dst.to_cpu_vec_f32().unwrap(), &expected, 1e-7, "write_cols");
+    close(
+        &dst.to_cpu_vec_f32().unwrap(),
+        &expected,
+        1e-7,
+        "write_cols",
+    );
 }

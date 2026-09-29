@@ -1,8 +1,8 @@
 //! Runtime capability evidence for the optional hipBLASLt/rocBLASLt path.
 
 use grim_backend_rocm::{
-    as_rocm, gpu_test_enabled, hipStreamSynchronize, launch_col_major_to_row_major,
-    matmul_col_major_f32, probe_blaslt, select_blaslt_candidate, BlasLtSelection, RocmDevice,
+    BlasLtSelection, RocmDevice, as_rocm, gpu_test_enabled, hipStreamSynchronize,
+    launch_col_major_to_row_major, matmul_col_major_f32, probe_blaslt, select_blaslt_candidate,
 };
 use grim_tensor::{CoreTensorOps, DType, Shape};
 

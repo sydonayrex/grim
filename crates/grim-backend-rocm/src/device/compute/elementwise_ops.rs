@@ -7,9 +7,9 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, ElementwiseOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
-use crate::memory::storage::RocmStorage;
 use crate::device::util::ROCM_COMPUTE_BLOCK;
-use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, RocmHandle};
+use crate::memory::storage::RocmStorage;
+use crate::{RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch};
 
 impl ElementwiseOps for RocmDevice {
     fn row_scale(
@@ -92,7 +92,10 @@ impl ElementwiseOps for RocmDevice {
         let mut start = start_row as i32;
         let mut r = rows as i32;
         let mut c = cols as i32;
-        let (grid, block) = (crate::HipDim3::new(rows as u32, 1, 1), crate::HipDim3::new(ROCM_COMPUTE_BLOCK as u32, 1, 1));
+        let (grid, block) = (
+            crate::HipDim3::new(rows as u32, 1, 1),
+            crate::HipDim3::new(ROCM_COMPUTE_BLOCK as u32, 1, 1),
+        );
         self.launch_compute_kernel(
             "grim_row_copy",
             grid,
@@ -144,7 +147,10 @@ impl ElementwiseOps for RocmDevice {
         let mut start = start_row as i32;
         let mut r = rows as i32;
         let mut c = cols as i32;
-        let (grid, block) = (crate::HipDim3::new(rows as u32, 1, 1), crate::HipDim3::new(ROCM_COMPUTE_BLOCK as u32, 1, 1));
+        let (grid, block) = (
+            crate::HipDim3::new(rows as u32, 1, 1),
+            crate::HipDim3::new(ROCM_COMPUTE_BLOCK as u32, 1, 1),
+        );
         self.launch_compute_kernel(
             "grim_row_copy_into",
             grid,

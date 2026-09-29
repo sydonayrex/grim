@@ -278,7 +278,6 @@ fn sampler_block_size() -> u32 {
     }
 }
 
-
 /// Largest vocabulary accepted by the device sampler.
 /// Beyond this the LDS / register budget of the single-block design degrades and callers should.
 pub const MAX_DEVICE_SAMPLER_VOCAB: usize = 1 << 18; // 262144

@@ -80,7 +80,11 @@ fn device_guard_pins_thread_after_a_raw_switch_moved_it() {
 
     // Step 2: an unguarded switch to the other GPU (constructor / P2P probe).
     let status = raw_set_device(1);
-    assert_eq!(status, grim_backend_rocm::hipSuccess, "raw_set_device(1) failed");
+    assert_eq!(
+        status,
+        grim_backend_rocm::hipSuccess,
+        "raw_set_device(1) failed"
+    );
     assert_eq!(real_current_device(), 1);
 
     // Step 3: ask for ordinal 0 again. This must actually move the thread back.

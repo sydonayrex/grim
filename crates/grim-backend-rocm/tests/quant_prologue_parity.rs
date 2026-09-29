@@ -67,7 +67,9 @@ fn test_quant_prologue_parity_gpu() {
     let act_tensor = f32_tensor(&dev, &act_vals, &Shape::new(vec![m, k]));
     let act_rocm = as_rocm(act_tensor.as_ref()).unwrap();
 
-    let weight_f32: Vec<f32> = (0..n * k).map(|i| ((i * 7) % 113) as f32 / 113.0 - 0.5).collect();
+    let weight_f32: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 7) % 113) as f32 / 113.0 - 0.5)
+        .collect();
     let weight_packed = pack_q80(&weight_f32, n, k);
     let weight_tensor = upload_q80(&dev, &weight_packed, n, k);
     let weight_rocm = as_rocm(weight_tensor.as_ref()).unwrap();
@@ -78,15 +80,22 @@ fn test_quant_prologue_parity_gpu() {
     let out_fused_tensor = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
     let out_fused_rocm = as_rocm(out_fused_tensor.as_ref()).unwrap();
 
-    let act_q81_tensor = f32_tensor(&dev, &vec![0.0f32; (k / 32) * 9], &Shape::new(vec![(k / 32) * 36]));
+    let act_q81_tensor = f32_tensor(
+        &dev,
+        &vec![0.0f32; (k / 32) * 9],
+        &Shape::new(vec![(k / 32) * 36]),
+    );
     let act_q81_rocm = as_rocm(act_q81_tensor.as_ref()).unwrap();
 
     // 1. Reference path: launch_quantize_q8_1 + launch_dot4_q80_q81_gemv
-    dev.launch_quantize_q8_1(act_rocm, act_q81_rocm, m, k).expect("ref quantize");
-    dev.launch_dot4_q80_q81_gemv(act_q81_rocm, weight_rocm, out_ref_rocm, m, n, k).expect("ref gemv");
+    dev.launch_quantize_q8_1(act_rocm, act_q81_rocm, m, k)
+        .expect("ref quantize");
+    dev.launch_dot4_q80_q81_gemv(act_q81_rocm, weight_rocm, out_ref_rocm, m, n, k)
+        .expect("ref gemv");
 
     // 2. Fused path: launch_dot4_q80_f32act_gemv
-    dev.launch_dot4_q80_f32act_gemv(act_rocm, weight_rocm, out_fused_rocm, m, n, k).expect("fused gemv");
+    dev.launch_dot4_q80_f32act_gemv(act_rocm, weight_rocm, out_fused_rocm, m, n, k)
+        .expect("fused gemv");
 
     dev.synchronize();
 

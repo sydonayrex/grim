@@ -93,8 +93,8 @@ pub use crate::device::handles::{
 };
 
 pub use crate::device::blaslt::{
-    blaslt_prefill_enabled, launch_col_major_to_row_major, matmul_col_major_f32, probe_blaslt,
-    select_blaslt_candidate, BlasLtProbe, BlasLtSelection,
+    BlasLtProbe, BlasLtSelection, blaslt_prefill_enabled, launch_col_major_to_row_major,
+    matmul_col_major_f32, probe_blaslt, select_blaslt_candidate,
 };
 pub use crate::device::rocblas::{
     ROCBLAS_GEMM_FLAGS_NONE,
@@ -138,9 +138,7 @@ pub use crate::kernels::jit_cache::HsacoKernelCache;
 pub use crate::kernels::qkv_attention::kv_f16_enabled;
 pub use crate::kernels::source_asm::compute_kernel_source;
 
-pub use crate::device::compute::{
-    FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvWeights,
-};
+pub use crate::device::compute::{FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvWeights};
 pub use crate::memory::allocator::RocmCachingAllocator;
 pub use crate::memory::hugepage::HugePagePinnedBuffer;
 pub use crate::memory::pinned::RocmPinnedBuffer;
@@ -154,9 +152,9 @@ pub use crate::device::helpers::{
 pub use crate::device::probe::{probe_host_gpu, probe_system_rocm, probe_xnack};
 
 pub use crate::device::util::{
-    ROCM_COMPUTE_BLOCK, DeviceGuard, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size,
-    dtype_f32, gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch, prefill_in_flight,
-    raw_set_device, set_prefill_in_flight, warp_rows_launch,
+    DeviceGuard, ROCM_COMPUTE_BLOCK, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size,
+    dtype_f32, gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch,
+    prefill_in_flight, raw_set_device, set_prefill_in_flight, warp_rows_launch,
 };
 pub use crate::peer_access::enumerate_devices;
 

@@ -8,11 +8,9 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
-use crate::memory::storage::RocmStorage;
 use crate::device::util::dev_ptr_dyn;
-use crate::{
-    arg, as_rocm, dev_ptr, dtype_f32, linear_launch, warp_rows_launch, RocmHandle,
-};
+use crate::memory::storage::RocmStorage;
+use crate::{RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch, warp_rows_launch};
 
 impl RocmDevice {
     /// S2 (PLAN-kernel-fusion): elementwise `out = a * b` into

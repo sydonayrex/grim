@@ -33,17 +33,9 @@ fn test_sampler_edge_cases_regression() {
     let seed = 12345u64;
 
     // Edge Case 1: top_k = 0 (unmasked top-k path)
-    let tok_k0 = sample_logits_on_device_at(
-        &dev,
-        logits_gpu,
-        vocab,
-        temperature,
-        0,
-        0.9f32,
-        seed,
-        1,
-    )
-    .unwrap();
+    let tok_k0 =
+        sample_logits_on_device_at(&dev, logits_gpu, vocab, temperature, 0, 0.9f32, seed, 1)
+            .unwrap();
     assert!(tok_k0.is_some());
     assert!((tok_k0.unwrap() as usize) < vocab);
 
@@ -63,17 +55,9 @@ fn test_sampler_edge_cases_regression() {
     assert!((tok_k_huge.unwrap() as usize) < vocab);
 
     // Edge Case 3: top_p = 1.0 (unmasked top-p path)
-    let tok_p1 = sample_logits_on_device_at(
-        &dev,
-        logits_gpu,
-        vocab,
-        temperature,
-        10,
-        1.0f32,
-        seed,
-        3,
-    )
-    .unwrap();
+    let tok_p1 =
+        sample_logits_on_device_at(&dev, logits_gpu, vocab, temperature, 10, 1.0f32, seed, 3)
+            .unwrap();
     assert!(tok_p1.is_some());
     assert!((tok_p1.unwrap() as usize) < vocab);
 }

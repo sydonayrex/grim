@@ -310,7 +310,7 @@ fn gpu_device() -> Option<Arc<RocmDevice>> {
     Some(Arc::new(RocmDevice::try_new(0).expect(
         "GRIM_GPU_TEST=1 is set but RocmDevice::try_new(0) failed. Failing loudly rather \
          than catch_unwind().ok(): a swallowed init failure turns this gate GREEN with \
-         zero assertions run, which is how a real defect hides behind a passing test."
+         zero assertions run, which is how a real defect hides behind a passing test.",
     )))
 }
 
@@ -323,7 +323,9 @@ fn checkpoint() -> Option<std::path::PathBuf> {
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
         if p.exists() {
             return Some(p);
         }
@@ -394,7 +396,10 @@ fn device_q4k_q5k_element_decoders_match_llama_cpp() {
                 f.name()
             );
         }
-        eprintln!("[{}elem] all 256 weights of one super-block match on device", f.name());
+        eprintln!(
+            "[{}elem] all 256 weights of one super-block match on device",
+            f.name()
+        );
 
         // ---- gate 3: 128 rows x 512 weights ------------------------------
         let Some(path) = checkpoint() else { return };
@@ -424,7 +429,12 @@ fn device_q4k_q5k_element_decoders_match_llama_cpp() {
                 .from_cpu(&a, &Shape::new(vec![1usize, K]), DType::F32)
                 .expect("A");
             let (out, h) = dev
-                .fused_quant_gemm(a.as_ref(), b.as_ref(), f.qformat(), &Shape::new(vec![1usize, N]))
+                .fused_quant_gemm(
+                    a.as_ref(),
+                    b.as_ref(),
+                    f.qformat(),
+                    &Shape::new(vec![1usize, N]),
+                )
                 .unwrap_or_else(|e| panic!("{}: gemm failed: {e}", f.name()));
             h.synchronize().expect("sync");
             let got = out.to_cpu_vec_f32().expect("readback");
@@ -440,7 +450,10 @@ fn device_q4k_q5k_element_decoders_match_llama_cpp() {
                 );
             }
         }
-        eprintln!("[{}rows] all {N}x{K} weights across {N} rows match on device", f.name());
+        eprintln!(
+            "[{}rows] all {N}x{K} weights across {N} rows match on device",
+            f.name()
+        );
     }
 }
 

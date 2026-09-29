@@ -180,7 +180,11 @@ fn long_similar_names_do_not_collide() {
     crate::device::compute::kernel_infra::record_kernel_route(b);
 
     assert_eq!(rocm_kernel_route_counter(a), 2);
-    assert_eq!(rocm_kernel_route_counter(b), 1, "prefix-sharing names must not merge");
+    assert_eq!(
+        rocm_kernel_route_counter(b),
+        1,
+        "prefix-sharing names must not merge"
+    );
     reset_kernel_route_counters();
 }
 
@@ -205,5 +209,10 @@ fn repeated_names_reuse_one_entry() {
 // Keep the imports honest: the test asserts on the concrete types the
 // implementation uses, so a change of representation has to be deliberate.
 #[allow(dead_code)]
-fn _type_anchors(_: &AtomicU64, _: &Arc<AtomicU64>, _: &RwLock<std::collections::HashMap<String, Arc<AtomicU64>>>, _: Ordering) {
+fn _type_anchors(
+    _: &AtomicU64,
+    _: &Arc<AtomicU64>,
+    _: &RwLock<std::collections::HashMap<String, Arc<AtomicU64>>>,
+    _: Ordering,
+) {
 }

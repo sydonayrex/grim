@@ -91,16 +91,30 @@ fn rocm_kda_step_matches_published_recurrence() {
     let a_gate = -0.4f32;
     // Non-zero initial state: a zero state would hide the decay-before-dot
     // error entirely, because pred would be 0 either way.
-    let state: Vec<f32> = (0..D_V * D_K).map(|i| (i as f32 * 0.017).sin() * 0.3).collect();
+    let state: Vec<f32> = (0..D_V * D_K)
+        .map(|i| (i as f32 * 0.017).sin() * 0.3)
+        .collect();
 
     let (want_out, _want_state) = reference_step(&q, &k, &v, beta, a_gate, &state);
 
-    let q_s = dev.from_cpu(&q, &Shape::new(vec![D_K]), DType::F32).unwrap();
-    let k_s = dev.from_cpu(&k, &Shape::new(vec![D_K]), DType::F32).unwrap();
-    let v_s = dev.from_cpu(&v, &Shape::new(vec![D_V]), DType::F32).unwrap();
-    let beta_s = dev.from_cpu(&[beta], &Shape::new(vec![1]), DType::F32).unwrap();
-    let gate_s = dev.from_cpu(&[a_gate], &Shape::new(vec![1]), DType::F32).unwrap();
-    let state_s = dev.from_cpu(&state, &Shape::new(vec![D_V, D_K]), DType::F32).unwrap();
+    let q_s = dev
+        .from_cpu(&q, &Shape::new(vec![D_K]), DType::F32)
+        .unwrap();
+    let k_s = dev
+        .from_cpu(&k, &Shape::new(vec![D_K]), DType::F32)
+        .unwrap();
+    let v_s = dev
+        .from_cpu(&v, &Shape::new(vec![D_V]), DType::F32)
+        .unwrap();
+    let beta_s = dev
+        .from_cpu(&[beta], &Shape::new(vec![1]), DType::F32)
+        .unwrap();
+    let gate_s = dev
+        .from_cpu(&[a_gate], &Shape::new(vec![1]), DType::F32)
+        .unwrap();
+    let state_s = dev
+        .from_cpu(&state, &Shape::new(vec![D_V, D_K]), DType::F32)
+        .unwrap();
 
     let out_shape = Shape::new(vec![D_V]);
     let (out, _handle) = dev
@@ -146,16 +160,30 @@ fn decay_is_applied_before_the_key_dot() {
     let v: Vec<f32> = vec![0.25; D_V];
     let beta = 0.5f32;
     let a_gate = 0.2f32;
-    let state: Vec<f32> = (0..D_V * D_K).map(|i| (i as f32 * 0.023).cos() * 0.4).collect();
+    let state: Vec<f32> = (0..D_V * D_K)
+        .map(|i| (i as f32 * 0.023).cos() * 0.4)
+        .collect();
 
     let (want, _) = reference_step(&q, &k, &v, beta, a_gate, &state);
 
-    let q_s = dev.from_cpu(&q, &Shape::new(vec![D_K]), DType::F32).unwrap();
-    let k_s = dev.from_cpu(&k, &Shape::new(vec![D_K]), DType::F32).unwrap();
-    let v_s = dev.from_cpu(&v, &Shape::new(vec![D_V]), DType::F32).unwrap();
-    let beta_s = dev.from_cpu(&[beta], &Shape::new(vec![1]), DType::F32).unwrap();
-    let gate_s = dev.from_cpu(&[a_gate], &Shape::new(vec![1]), DType::F32).unwrap();
-    let state_s = dev.from_cpu(&state, &Shape::new(vec![D_V, D_K]), DType::F32).unwrap();
+    let q_s = dev
+        .from_cpu(&q, &Shape::new(vec![D_K]), DType::F32)
+        .unwrap();
+    let k_s = dev
+        .from_cpu(&k, &Shape::new(vec![D_K]), DType::F32)
+        .unwrap();
+    let v_s = dev
+        .from_cpu(&v, &Shape::new(vec![D_V]), DType::F32)
+        .unwrap();
+    let beta_s = dev
+        .from_cpu(&[beta], &Shape::new(vec![1]), DType::F32)
+        .unwrap();
+    let gate_s = dev
+        .from_cpu(&[a_gate], &Shape::new(vec![1]), DType::F32)
+        .unwrap();
+    let state_s = dev
+        .from_cpu(&state, &Shape::new(vec![D_V, D_K]), DType::F32)
+        .unwrap();
 
     let (out, _h) = dev
         .kda_gated_delta_rule_step(

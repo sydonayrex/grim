@@ -137,9 +137,21 @@ fn fused_qkv_f32act_matches_quantized_oracle() {
     .unwrap();
 
     for (name, got_t, ref_t) in [
-        ("q", q_got.to_cpu_vec_f32().unwrap(), q_ref.to_cpu_vec_f32().unwrap()),
-        ("k", k_got.to_cpu_vec_f32().unwrap(), k_ref.to_cpu_vec_f32().unwrap()),
-        ("v", v_got.to_cpu_vec_f32().unwrap(), v_ref.to_cpu_vec_f32().unwrap()),
+        (
+            "q",
+            q_got.to_cpu_vec_f32().unwrap(),
+            q_ref.to_cpu_vec_f32().unwrap(),
+        ),
+        (
+            "k",
+            k_got.to_cpu_vec_f32().unwrap(),
+            k_ref.to_cpu_vec_f32().unwrap(),
+        ),
+        (
+            "v",
+            v_got.to_cpu_vec_f32().unwrap(),
+            v_ref.to_cpu_vec_f32().unwrap(),
+        ),
     ] {
         for (i, (g, r)) in got_t.iter().zip(ref_t.iter()).enumerate() {
             let diff = (g - r).abs();

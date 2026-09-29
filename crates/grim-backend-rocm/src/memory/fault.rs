@@ -81,14 +81,16 @@ impl FaultReport {
                     "owned by {} on device {} at offset {offset}",
                     record.owner, record.ordinal
                 ),
-                Attribution::WrongDevice { record, fault_ordinal, .. } => format!(
+                Attribution::WrongDevice {
+                    record,
+                    fault_ordinal,
+                    ..
+                } => format!(
                     "CROSS-DEVICE: {} lives on device {} but the fault came from device {}",
                     record.owner, record.ordinal, fault_ordinal
                 ),
-                Attribution::Ambiguous { candidates, .. } => format!(
-                    "ambiguous: {} overlapping allocations",
-                    candidates.len()
-                ),
+                Attribution::Ambiguous { candidates, .. } =>
+                    format!("ambiguous: {} overlapping allocations", candidates.len()),
             }
         )
     }
@@ -134,16 +136,22 @@ pub fn resolve(
     // address as unowned rather than inventing a device.
     let attribution = match ordinal {
         Some(o) => ledger::attribute(raw.virtual_address, o),
-        None => Attribution::Unowned { addr: raw.virtual_address },
+        None => Attribution::Unowned {
+            addr: raw.virtual_address,
+        },
     };
-    FaultReport { raw, reasons: reasons(raw.failure), ordinal, attribution }
+    FaultReport {
+        raw,
+        reasons: reasons(raw.failure),
+        ordinal,
+        attribution,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::ledger;
-
 
     /// The C struct is `{u32; u64; u32; u32}` with 8-byte alignment, so it is
     /// 24 bytes with 4 bytes of padding after `NodeId`. If this ever fails, the
@@ -159,7 +167,9 @@ mod tests {
     /// reported as such rather than as a clean hit.
     #[test]
     fn cross_device_fault_is_reported_as_such() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         ledger::register(0x1000, 4096, 0, false, "layer 12 attn_q");
 
@@ -176,7 +186,10 @@ mod tests {
             1 => Some(1),
             _ => None,
         });
-        assert!(matches!(report.attribution, Attribution::WrongDevice { .. }));
+        assert!(matches!(
+            report.attribution,
+            Attribution::WrongDevice { .. }
+        ));
         assert!(report.summary().contains("CROSS-DEVICE"));
         assert_eq!(report.ordinal, Some(1));
     }
@@ -185,7 +198,9 @@ mod tests {
     /// lifetime problem, not a placement one, and the two must not be confused.
     #[test]
     fn same_device_fault_is_not_reported_as_cross_device() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         ledger::register(0x2000, 1024, 1, false, "kv_k");
         let raw = HsaMemoryAccessFault {
@@ -207,7 +222,9 @@ mod tests {
     /// card.
     #[test]
     fn unmapped_node_is_not_guessed() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         ledger::register(0x3000, 256, 0, false, "x");
         let raw = HsaMemoryAccessFault {
@@ -226,7 +243,9 @@ mod tests {
     /// address is not ours at all. Either way it is not a placement bug.
     #[test]
     fn unowned_address_is_reported_as_such() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         let raw = HsaMemoryAccessFault {
             node_id: 0,
@@ -243,7 +262,9 @@ mod tests {
     /// report will be over-trusted.
     #[test]
     fn imprecise_address_is_flagged() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         let raw = HsaMemoryAccessFault {
             node_id: 0,

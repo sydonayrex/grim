@@ -128,18 +128,17 @@ fn gdn_l2(x: &[f32], eps: f32) -> Vec<f32> {
     x.iter().map(|v| v / d).collect()
 }
 
-/// rope.c:5975-6000 — theta walks as a running product over `i0`, halved
-/// pairs, at index `i0/2`.
+/// NeoX half-split pairing matching Qwen3.5 production: dim i pairs with i + half.
 fn rope_inplace(v: &mut [f32], pos: u32, base: f32) {
     let hd = v.len();
-    let mut theta = 1.0f64;
-    let scale = 1.0f64 / (base as f64).powf(2.0 / hd as f64);
-    for i0 in (0..hd).step_by(2) {
-        let (x0, x1) = (v[i0] as f64, v[i0 + 1] as f64);
-        let (s, c) = (pos as f64 * theta).sin_cos();
-        v[i0] = (x0 * c - x1 * s) as f32;
-        v[i0 + 1] = (x0 * s + x1 * c) as f32;
-        theta *= scale;
+    let half = hd / 2;
+    for i in 0..half {
+        let freq = 1.0f64 / (base as f64).powf((2 * i) as f64 / hd as f64);
+        let theta = pos as f64 * freq;
+        let (s, c) = theta.sin_cos();
+        let (x0, x1) = (v[i] as f64, v[i + half] as f64);
+        v[i] = (x0 * c - x1 * s) as f32;
+        v[i + half] = (x0 * s + x1 * c) as f32;
     }
 }
 
@@ -604,4 +603,204 @@ fn attention_layer_matches_hand_reference() {
         .expect("read");
 
     compare("attention layer", &got, &want);
+}
+
+/// Assert that the attention layer matches the hand reference at a non-zero sequence position.
+/// At pos > 0, RoPE is active with non-trivial sin/cos rotations that exercise the NeoX half-split schedule.
+#[test]
+fn attention_layer_matches_hand_reference_nonzero_pos() {
+    let blk = attention_block();
+    let c = cfg();
+    let mut cache = Qwen35LayerCache::new(&c);
+    let x = w(42, HIDDEN);
+    let eps = 1e-6f32;
+    let pos: u32 = 17;
+
+    let an = blk.attn_norm.weight.to_vec_f32().expect("attn_norm");
+    let xn = rms(&x, &an, eps);
+
+    let (qw, qin, qout) = lin_w(blk.wq.as_ref().unwrap());
+    let qfull = matvec(&xn, &qw, qin, qout);
+    let mut q = qfull[..q_dim()].to_vec();
+    let gate = &qfull[q_dim()..2 * q_dim()];
+
+    let (kw, kin, kout) = lin_w(blk.wk.as_ref().unwrap());
+    let (vw, vin, vout) = lin_w(blk.wv.as_ref().unwrap());
+    let mut k = matvec(&xn, &kw, kin, kout);
+    let v = matvec(&xn, &vw, vin, vout);
+
+    let qn = blk.attn_q_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
+    let kn = blk.attn_k_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
+    for h in 0..AH {
+        let s = h * AHD;
+        let n = rms(&q[s..s + AHD], &qn, eps);
+        q[s..s + AHD].copy_from_slice(&n);
+    }
+    for h in 0..AKV {
+        let s = h * AHD;
+        let n = rms(&k[s..s + AHD], &kn, eps);
+        k[s..s + AHD].copy_from_slice(&n);
+    }
+    for h in 0..AH {
+        let s = h * AHD;
+        let mut seg = q[s..s + AHD].to_vec();
+        rope_inplace(&mut seg, pos, 10000.0);
+        q[s..s + AHD].copy_from_slice(&seg);
+    }
+    for h in 0..AKV {
+        let s = h * AHD;
+        let mut seg = k[s..s + AHD].to_vec();
+        rope_inplace(&mut seg, pos, 10000.0);
+        k[s..s + AHD].copy_from_slice(&seg);
+    }
+
+    let mut attn = vec![0.0f32; q_dim()];
+    for h in 0..AH {
+        let kvh = (h * AKV) / AH;
+        attn[h * AHD..(h + 1) * AHD].copy_from_slice(&v[kvh * AHD..(kvh + 1) * AHD]);
+    }
+    let mut branch = vec![0.0f32; q_dim()];
+    for i in 0..q_dim() {
+        branch[i] = attn[i] / (1.0 + (-gate[i]).exp());
+    }
+
+    let (ow, oin, oout) = lin_w(blk.wo.as_ref().unwrap());
+    let proj = matvec(&branch, &ow, oin, oout);
+    let h1: Vec<f32> = (0..HIDDEN).map(|i| x[i] + proj[i]).collect();
+    let pan = blk.post_attention_norm.weight.to_vec_f32().expect("post norm");
+    let h2 = rms(&h1, &pan, eps);
+    let (gw, gi, go) = lin_w(&blk.ffn_gate);
+    let (uw, ui, uo) = lin_w(&blk.ffn_up);
+    let (dw, di, doo) = lin_w(&blk.ffn_down);
+    let fg = matvec(&h2, &gw, gi, go);
+    let fu = matvec(&h2, &uw, ui, uo);
+    let act: Vec<f32> = (0..INTER).map(|i| silu(fg[i]) * fu[i]).collect();
+    let dn = matvec(&act, &dw, di, doo);
+    let want: Vec<f32> = (0..HIDDEN).map(|i| h1[i] + dn[i]).collect();
+
+    let got = blk
+        .forward(&cpu(x.clone(), Shape::new(vec![1, HIDDEN])), &[pos], &mut cache)
+        .expect("attention forward non-zero pos")
+        .to_vec_f32()
+        .expect("read");
+
+    compare("attention layer (pos=17)", &got, &want);
+}
+
+/// Attention with kv_len > 1 (chained steps): verifies non-trivial softmax attention
+/// over multiple keys/values in the arena, checking temperature scaling 1/sqrt(head_dim).
+#[test]
+fn attention_layer_matches_hand_reference_multi_step() {
+    let blk = attention_block();
+    let c = cfg();
+    let mut cache = Qwen35LayerCache::new(&c);
+    let eps = 1e-6f32;
+    let inv_sqrt_d = 1.0f32 / (AHD as f32).sqrt();
+
+    // Run 3 sequential decode steps to accumulate 3 tokens in the KV arena
+    let mut k_history: Vec<Vec<f32>> = Vec::new(); // [step][kv_dim]
+    let mut v_history: Vec<Vec<f32>> = Vec::new(); // [step][kv_dim]
+
+    for step in 0..3u32 {
+        let x = w(50 + step as usize, HIDDEN);
+        let an = blk.attn_norm.weight.to_vec_f32().expect("attn_norm");
+        let xn = rms(&x, &an, eps);
+
+        let (qw, qin, qout) = lin_w(blk.wq.as_ref().unwrap());
+        let qfull = matvec(&xn, &qw, qin, qout);
+        let mut q = qfull[..q_dim()].to_vec();
+        let gate = &qfull[q_dim()..2 * q_dim()];
+
+        let (kw, kin, kout) = lin_w(blk.wk.as_ref().unwrap());
+        let (vw, vin, vout) = lin_w(blk.wv.as_ref().unwrap());
+        let mut k = matvec(&xn, &kw, kin, kout);
+        let v = matvec(&xn, &vw, vin, vout);
+
+        let qn = blk.attn_q_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
+        let kn = blk.attn_k_norm.as_ref().unwrap().weight.to_vec_f32().unwrap();
+        for h in 0..AH {
+            let s = h * AHD;
+            let n = rms(&q[s..s + AHD], &qn, eps);
+            q[s..s + AHD].copy_from_slice(&n);
+        }
+        for h in 0..AKV {
+            let s = h * AHD;
+            let n = rms(&k[s..s + AHD], &kn, eps);
+            k[s..s + AHD].copy_from_slice(&n);
+        }
+        for h in 0..AH {
+            let s = h * AHD;
+            let mut seg = q[s..s + AHD].to_vec();
+            rope_inplace(&mut seg, step, 10000.0);
+            q[s..s + AHD].copy_from_slice(&seg);
+        }
+        for h in 0..AKV {
+            let s = h * AHD;
+            let mut seg = k[s..s + AHD].to_vec();
+            rope_inplace(&mut seg, step, 10000.0);
+            k[s..s + AHD].copy_from_slice(&seg);
+        }
+
+        k_history.push(k.clone());
+        v_history.push(v.clone());
+
+        // Full softmax attention over all historical keys/values accumulated so far
+        let num_keys = (step + 1) as usize;
+        let mut attn = vec![0.0f32; q_dim()];
+        for h in 0..AH {
+            let kvh = (h * AKV) / AH;
+            let q_head = &q[h * AHD..(h + 1) * AHD];
+
+            // Compute logits for each key
+            let mut logits = Vec::with_capacity(num_keys);
+            for t in 0..num_keys {
+                let k_head = &k_history[t][kvh * AHD..(kvh + 1) * AHD];
+                let dot: f32 = q_head.iter().zip(k_head.iter()).map(|(a, b)| a * b).sum();
+                logits.push(dot * inv_sqrt_d);
+            }
+            // Softmax
+            let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
+            let sum_exp: f32 = exps.iter().sum();
+            let weights: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+            // Weighted sum of values
+            let mut head_out = vec![0.0f32; AHD];
+            for t in 0..num_keys {
+                let v_head = &v_history[t][kvh * AHD..(kvh + 1) * AHD];
+                for d in 0..AHD {
+                    head_out[d] += weights[t] * v_head[d];
+                }
+            }
+            attn[h * AHD..(h + 1) * AHD].copy_from_slice(&head_out);
+        }
+
+        let mut branch = vec![0.0f32; q_dim()];
+        for i in 0..q_dim() {
+            branch[i] = attn[i] / (1.0 + (-gate[i]).exp());
+        }
+
+        let (ow, oin, oout) = lin_w(blk.wo.as_ref().unwrap());
+        let proj = matvec(&branch, &ow, oin, oout);
+        let h1: Vec<f32> = (0..HIDDEN).map(|i| x[i] + proj[i]).collect();
+        let pan = blk.post_attention_norm.weight.to_vec_f32().expect("post norm");
+        let h2 = rms(&h1, &pan, eps);
+        let (gw, gi, go) = lin_w(&blk.ffn_gate);
+        let (uw, ui, uo) = lin_w(&blk.ffn_up);
+        let (dw, di, doo) = lin_w(&blk.ffn_down);
+        let fg = matvec(&h2, &gw, gi, go);
+        let fu = matvec(&h2, &uw, ui, uo);
+        let act: Vec<f32> = (0..INTER).map(|i| silu(fg[i]) * fu[i]).collect();
+        let dn = matvec(&act, &dw, di, doo);
+        let want: Vec<f32> = (0..HIDDEN).map(|i| h1[i] + dn[i]).collect();
+
+        let got = blk
+            .forward(&cpu(x.clone(), Shape::new(vec![1, HIDDEN])), &[step], &mut cache)
+            .expect("attention forward chained step")
+            .to_vec_f32()
+            .expect("read");
+
+        compare(&format!("attention layer chained step {step} (kv_len={num_keys})"), &got, &want);
+        cache.current_pos += 1;
+    }
 }

@@ -147,21 +147,25 @@ fn fused_launchers_cost_exactly_one_launch_each() {
     let k_shape = Shape::new(vec![1, nkv, hd]);
     let k_t = f32_tensor(&dev, &rand_f32(nkv * hd, 68), &k_shape);
     let v_t = f32_tensor(&dev, &rand_f32(nkv * hd, 69), &k_shape);
-    let pos_t = CoreTensorOps::from_cpu(
-        &dev,
-        &[f32::from_bits(3)],
-        &Shape::new(vec![1]),
-        DType::U32,
-    )
-    .unwrap();
+    let pos_t =
+        CoreTensorOps::from_cpu(&dev, &[f32::from_bits(3)], &Shape::new(vec![1]), DType::U32)
+            .unwrap();
     let gamma_k = f32_tensor(
         &dev,
         &rand_f32(hd, 70).iter().map(|g| g + 1.0).collect::<Vec<_>>(),
         &Shape::new(vec![hd]),
     );
     let k_rot = f32_tensor(&dev, &vec![0.0; nkv * hd], &k_shape);
-    let arena_k = f32_tensor(&dev, &vec![0.0; slot_stride], &Shape::new(vec![slot_stride]));
-    let arena_v = f32_tensor(&dev, &vec![0.0; slot_stride], &Shape::new(vec![slot_stride]));
+    let arena_k = f32_tensor(
+        &dev,
+        &vec![0.0; slot_stride],
+        &Shape::new(vec![slot_stride]),
+    );
+    let arena_v = f32_tensor(
+        &dev,
+        &vec![0.0; slot_stride],
+        &Shape::new(vec![slot_stride]),
+    );
     let mut rope_cfg = grim_tensor::RopeConfig::new(hd, 10000.0f32);
     rope_cfg.interleaved = false;
     dev.reset_launch_count();

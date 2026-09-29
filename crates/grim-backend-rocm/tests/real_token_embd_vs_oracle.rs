@@ -49,7 +49,9 @@ fn checkpoint() -> Option<std::path::PathBuf> {
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
         if p.exists() {
             return Some(p);
         }
@@ -67,7 +69,7 @@ fn gpu_device() -> Option<Arc<RocmDevice>> {
     Some(Arc::new(RocmDevice::try_new(0).expect(
         "GRIM_GPU_TEST=1 is set but RocmDevice::try_new(0) failed. Failing loudly rather \
          than catch_unwind().ok(): a swallowed init failure turns this gate GREEN with \
-         zero assertions run, which is how a real defect hides behind a passing test."
+         zero assertions run, which is how a real defect hides behind a passing test.",
     )))
 }
 
@@ -146,7 +148,12 @@ fn oracle_row(table: &[u8], row: usize, dim: usize) -> Vec<f32> {
     out
 }
 
-fn upload_table(dev: &RocmDevice, bytes: &[u8], rows: usize, dim: usize) -> Box<dyn grim_tensor::BackendStorage> {
+fn upload_table(
+    dev: &RocmDevice,
+    bytes: &[u8],
+    rows: usize,
+    dim: usize,
+) -> Box<dyn grim_tensor::BackendStorage> {
     dev.from_cpu_bytes(
         bytes,
         &Shape::new(vec![rows, dim]),
@@ -185,7 +192,11 @@ fn oracle_agrees_with_the_already_verified_host_decoder_on_real_rows() {
     let bytes = read_tensor_bytes(&mut reader, &file, target).expect("read tensor");
     let (dim, rows) = (target.dims[0] as usize, target.dims[1] as usize);
     let row_bytes = (dim / QK_K) * Q4K_BLOCK_BYTES;
-    assert_eq!(bytes.len(), rows * row_bytes, "table size must be rows * row_bytes");
+    assert_eq!(
+        bytes.len(),
+        rows * row_bytes,
+        "table size must be rows * row_bytes"
+    );
 
     let probes: Vec<usize> = vec![0, 1, 561, 314, rows / 2, rows - 2, rows - 1];
     for row in &probes {
@@ -238,7 +249,10 @@ fn real_token_embd_rows_match_llama_cpp_oracle() {
         rows * row_bytes,
         "table must be exactly rows * {row_bytes} B"
     );
-    eprintln!("[embd] {rows} rows x {dim} dims, row stride {row_bytes} B, {} MB packed", bytes.len() / 1_048_576);
+    eprintln!(
+        "[embd] {rows} rows x {dim} dims, row stride {row_bytes} B, {} MB packed",
+        bytes.len() / 1_048_576
+    );
 
     // The 9B run's own prompt tokens, plus both ends of the table.
     let ids: Vec<u32> = vec![561, 6511, 314, 9338, 369, 0, 1, (rows - 1) as u32];
@@ -246,8 +260,8 @@ fn real_token_embd_rows_match_llama_cpp_oracle() {
     let table = upload_table(&dev, &bytes, rows, dim);
     let out_shape = Shape::new(vec![ids.len(), dim]);
     let (got, handle) = dev
-        .embedding_q4k(table.as_ref(), &ids, &out_shape, dim)
-        .unwrap_or_else(|e| panic!("embedding_q4k on the real table failed: {e}"));
+        .embedding_packed(table.as_ref(), &ids, &out_shape, dim)
+        .unwrap_or_else(|e| panic!("embedding_packed on the real table failed: {e}"));
     handle.synchronize().expect("sync");
     let got = got.to_cpu_vec_f32().expect("readback");
     assert_eq!(got.len(), ids.len() * dim, "one row per id");
@@ -282,7 +296,10 @@ fn real_token_embd_rows_match_llama_cpp_oracle() {
             want[at]
         );
     }
-    eprintln!("[embd] all {} probed rows of the real 248320-row table match the oracle", ids.len());
+    eprintln!(
+        "[embd] all {} probed rows of the real 248320-row table match the oracle",
+        ids.len()
+    );
 }
 
 /// The same rows, but every id in a contiguous window plus one at each end, so a
@@ -311,7 +328,7 @@ fn real_token_embd_contiguous_rows_expose_a_stride_error() {
 
     let table = upload_table(&dev, &bytes, rows, dim);
     let (got, handle) = dev
-        .embedding_q4k(table.as_ref(), &ids, &Shape::new(vec![ids.len(), dim]), dim)
+        .embedding_packed(table.as_ref(), &ids, &Shape::new(vec![ids.len(), dim]), dim)
         .expect("embedding_q4k");
     handle.synchronize().expect("sync");
     let got = got.to_cpu_vec_f32().expect("readback");

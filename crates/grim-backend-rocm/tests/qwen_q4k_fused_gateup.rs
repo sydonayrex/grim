@@ -1,6 +1,6 @@
 //! Q4_K fused GateUp projection parity for the Qwen hybrid model path.
 
-use grim_backend_rocm::{as_rocm, RocmDevice};
+use grim_backend_rocm::{RocmDevice, as_rocm};
 use grim_tensor::{
     ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantFormat, QuantOps, Shape, Storage,
 };
@@ -32,11 +32,7 @@ fn q4k_fused_gateup_matches_separate_q4k_projections() {
         storage: Storage::KQuant(KQuantScheme::Q4K),
     };
     let gate_q4 = dev
-        .from_cpu_bytes(
-            &gate_q4_bytes,
-            &Shape::new(vec![n, k]),
-            q4_dtype.clone(),
-        )
+        .from_cpu_bytes(&gate_q4_bytes, &Shape::new(vec![n, k]), q4_dtype.clone())
         .unwrap();
     let up_q4 = dev
         .from_cpu_bytes(&up_q4_bytes, &Shape::new(vec![n, k]), q4_dtype)

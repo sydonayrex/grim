@@ -85,8 +85,17 @@ static TRACKED: AtomicU64 = AtomicU64::new(0);
 /// pointer replaces the previous record.
 pub fn register(ptr: u64, bytes: u64, ordinal: usize, managed: bool, owner: &str) {
     let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
-    if t.insert(ptr, AllocRecord { ptr, bytes, ordinal, managed, owner: owner.to_string() })
-        .is_none()
+    if t.insert(
+        ptr,
+        AllocRecord {
+            ptr,
+            bytes,
+            ordinal,
+            managed,
+            owner: owner.to_string(),
+        },
+    )
+    .is_none()
     {
         TRACKED.fetch_add(1, Ordering::Relaxed);
     }
@@ -122,7 +131,11 @@ pub fn attribute(addr: u64, fault_ordinal: usize) -> Attribution {
         [only] => {
             let offset = only.offset(addr);
             if only.ordinal == fault_ordinal {
-                Attribution::Owned { record: only.clone(), offset, fault_ordinal }
+                Attribution::Owned {
+                    record: only.clone(),
+                    offset,
+                    fault_ordinal,
+                }
             } else {
                 Attribution::WrongDevice {
                     record: only.clone(),
@@ -131,7 +144,10 @@ pub fn attribute(addr: u64, fault_ordinal: usize) -> Attribution {
                 }
             }
         }
-        many => Attribution::Ambiguous { addr, candidates: many.to_vec() },
+        many => Attribution::Ambiguous {
+            addr,
+            candidates: many.to_vec(),
+        },
     }
 }
 
@@ -159,7 +175,11 @@ pub fn dump_to_file(path: &str) -> std::io::Result<usize> {
     let mut f = std::fs::File::create(path)?;
     writeln!(f, "# ptr\tbytes\tordinal\tmanaged\towner")?;
     for r in &all {
-        writeln!(f, "0x{:x}\t{}\t{}\t{}\t{}", r.ptr, r.bytes, r.ordinal, r.managed, r.owner)?;
+        writeln!(
+            f,
+            "0x{:x}\t{}\t{}\t{}\t{}",
+            r.ptr, r.bytes, r.ordinal, r.managed, r.owner
+        )?;
     }
     Ok(all.len())
 }
@@ -170,7 +190,6 @@ pub fn reset() {
     t.clear();
     TRACKED.store(0, Ordering::Relaxed);
 }
-
 
 /// Shared by every module whose tests touch the global ledger. One lock, not
 /// one per module: separate per-module locks do not serialize against each
@@ -183,12 +202,13 @@ pub(crate) static LEDGER_TEST_LOCK: Mutex<()> = Mutex::new(());
 mod tests {
     use super::*;
 
-
     /// The whole point of the ledger: a raw faulting address, the only thing the
     /// KMD gives us, must resolve to a named allocation.
     #[test]
     fn address_resolves_to_its_allocation() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x1000, 4096, 1, false, "layer 12 attn_q");
         match attribute(0x1000 + 17, 1) {
@@ -205,20 +225,30 @@ mod tests {
     /// The fault address is the start of the access, so offset 0 must resolve.
     #[test]
     fn base_address_resolves() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x2000, 512, 0, false, "ssm_state");
-        assert!(matches!(attribute(0x2000, 0), Attribution::Owned { offset: 0, .. }));
+        assert!(matches!(
+            attribute(0x2000, 0),
+            Attribution::Owned { offset: 0, .. }
+        ));
     }
 
     /// Half-open range: the byte one past the end is not ours. An off-by-one
     /// here would attribute a neighbouring allocation's fault to us.
     #[test]
     fn address_past_the_end_does_not_resolve() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x3000, 256, 0, false, "a");
-        assert!(matches!(attribute(0x3000 + 256, 0), Attribution::Unowned { .. }));
+        assert!(matches!(
+            attribute(0x3000 + 256, 0),
+            Attribution::Unowned { .. }
+        ));
         assert!(matches!(attribute(0x2fff, 0), Attribution::Unowned { .. }));
     }
 
@@ -227,11 +257,17 @@ mod tests {
     /// distinguishable from a clean hit.
     #[test]
     fn fault_on_the_wrong_device_is_flagged() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x4000, 1024, 0, false, "layer 3 k");
         match attribute(0x4000, 1) {
-            Attribution::WrongDevice { record, fault_ordinal, .. } => {
+            Attribution::WrongDevice {
+                record,
+                fault_ordinal,
+                ..
+            } => {
                 assert_eq!(record.ordinal, 0);
                 assert_eq!(fault_ordinal, 1);
             }
@@ -243,7 +279,9 @@ mod tests {
     /// live allocation and the ledger cannot tell lifetime from placement.
     #[test]
     fn deregistered_memory_stops_resolving() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x5000, 256, 1, false, "kv_k");
         assert!(matches!(attribute(0x5000, 1), Attribution::Owned { .. }));
@@ -256,7 +294,9 @@ mod tests {
     /// VRAM, because they fail differently.
     #[test]
     fn managed_allocations_are_distinguishable() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x6000, 144, 1, true, "attn_q (spilled)");
         match attribute(0x6070, 1) {
@@ -270,7 +310,9 @@ mod tests {
     /// Nested ranges should report the specific owner rather than picking one.
     #[test]
     fn overlapping_ranges_are_reported_not_guessed() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x7000, 8192, 0, false, "outer");
         register(0x7100, 512, 0, false, "inner");
@@ -288,7 +330,9 @@ mod tests {
     /// would silently under-count.
     #[test]
     fn snapshot_lists_every_live_allocation() {
-        let _g = super::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = super::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset();
         register(0x9000, 16, 0, false, "one");
         register(0x8000, 16, 1, false, "two");

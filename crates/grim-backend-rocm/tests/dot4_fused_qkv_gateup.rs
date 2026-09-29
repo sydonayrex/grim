@@ -7,7 +7,7 @@
 //! Gated: GRIM_GPU_TEST=1 + ROCm device.
 
 use grim_backend_rocm::RocmStorage;
-use grim_backend_rocm::{as_rocm, gpu_test_enabled, RocmDevice};
+use grim_backend_rocm::{RocmDevice, as_rocm, gpu_test_enabled};
 use grim_tensor::{ArithType, CoreTensorOps, DType, MemoryOps, Shape, Storage};
 
 fn gpu_device() -> Option<RocmDevice> {
@@ -308,24 +308,10 @@ fn dot4_gate_up_microbench_uses_real_arguments() {
     let iters = 8usize;
     let a = f32_tensor(&dev, &rand_f32(k, 41), &Shape::new(vec![1, k]));
     let wg_layers: Vec<_> = (0..layers)
-        .map(|layer| {
-            upload_q80(
-                &dev,
-                &pack_q80(&rand_f32(n * k, 42 + layer), n, k),
-                n,
-                k,
-            )
-        })
+        .map(|layer| upload_q80(&dev, &pack_q80(&rand_f32(n * k, 42 + layer), n, k), n, k))
         .collect();
     let wu_layers: Vec<_> = (0..layers)
-        .map(|layer| {
-            upload_q80(
-                &dev,
-                &pack_q80(&rand_f32(n * k, 100 + layer), n, k),
-                n,
-                k,
-            )
-        })
+        .map(|layer| upload_q80(&dev, &pack_q80(&rand_f32(n * k, 100 + layer), n, k), n, k))
         .collect();
     let out = f32_tensor(&dev, &vec![0.0f32; n], &Shape::new(vec![n]));
     let act = f32_tensor(

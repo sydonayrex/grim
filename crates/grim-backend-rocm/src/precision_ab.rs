@@ -56,7 +56,10 @@ impl ArmResult {
     }
 
     pub fn min_ms(&self) -> f32 {
-        self.samples_ms.iter().copied().fold(f32::INFINITY, f32::min)
+        self.samples_ms
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
     }
 
     pub fn p90_ms(&self) -> f32 {
@@ -244,9 +247,7 @@ fn ship_label(results: &[ArmResult], r: &ArmResult) -> String {
     }
     match vs_control(results, r) {
         None => "no_control".into(),
-        Some(_) if clears_ship_bar(r, control_for(results, r).unwrap_or(f32::NAN)) => {
-            "ship".into()
-        }
+        Some(_) if clears_ship_bar(r, control_for(results, r).unwrap_or(f32::NAN)) => "ship".into(),
         Some(_) => "below_bar".into(),
     }
 }
@@ -271,7 +272,12 @@ pub fn to_artifact_json(results: &[ArmResult], arch: &str) -> String {
             Some(v) => s.push_str(&format!("\"vs_control\": {v:.4}, ")),
             None => s.push_str("\"vs_control\": null, "),
         }
-        s.push_str(&format!("\"verdict\": \"{}\", ", r.accuracy_ok().then_some("eligible").unwrap_or("disqualified_accuracy")));
+        s.push_str(&format!(
+            "\"verdict\": \"{}\", ",
+            r.accuracy_ok()
+                .then_some("eligible")
+                .unwrap_or("disqualified_accuracy")
+        ));
         s.push_str(&format!("\"ship\": \"{}\"", ship_label(results, r)));
         s.push('}');
         if i + 1 < results.len() {
@@ -287,7 +293,10 @@ pub fn to_artifact_json(results: &[ArmResult], arch: &str) -> String {
     let arms: Vec<&str> = by_arm(results).keys().copied().collect();
     for (i, arm) in arms.iter().enumerate() {
         let rows: Vec<&ArmResult> = results.iter().filter(|r| r.arm == *arm).collect();
-        let ships = rows.iter().filter(|r| ship_label(results, r) == "ship").count();
+        let ships = rows
+            .iter()
+            .filter(|r| ship_label(results, r) == "ship")
+            .count();
         let disq = rows.iter().filter(|r| !r.accuracy_ok()).count();
 
         // Build the row as a field list joined by ", " rather than by appending
@@ -304,8 +313,14 @@ pub fn to_artifact_json(results: &[ArmResult], arch: &str) -> String {
         ];
         let ratios: Vec<f64> = rows.iter().filter_map(|r| vs_control(results, r)).collect();
         if let (Some(lo), Some(hi)) = (
-            ratios.iter().cloned().fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.min(b)))),
-            ratios.iter().cloned().fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.max(b)))),
+            ratios
+                .iter()
+                .cloned()
+                .fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.min(b)))),
+            ratios
+                .iter()
+                .cloned()
+                .fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.max(b)))),
         ) {
             f.push(format!("\"vs_control_min\": {lo:.4}"));
             f.push(format!("\"vs_control_max\": {hi:.4}"));
@@ -340,8 +355,10 @@ pub fn json_is_well_formed(s: &str) -> bool {
     let mut esc = false;
     let mut after_colon = false;
 
-    let next_sig = |from: usize| -> Option<char> { b[from..].iter().find(|c| !c.is_whitespace()).copied() };
-    let prev_sig = |i: usize| -> Option<char> { b[..i].iter().rev().find(|c| !c.is_whitespace()).copied() };
+    let next_sig =
+        |from: usize| -> Option<char> { b[from..].iter().find(|c| !c.is_whitespace()).copied() };
+    let prev_sig =
+        |i: usize| -> Option<char> { b[..i].iter().rev().find(|c| !c.is_whitespace()).copied() };
 
     for (i, &c) in b.iter().enumerate() {
         if in_str {

@@ -119,9 +119,7 @@ pub fn w4a4_ostquant_supported(arch: GcnArch, k: usize) -> Result<(), String> {
         ));
     }
     if k % 128 != 0 {
-        return Err(format!(
-            "w4a4_ostquant: K={k} must be divisible by 128"
-        ));
+        return Err(format!("w4a4_ostquant: K={k} must be divisible by 128"));
     }
     Ok(())
 }
@@ -652,7 +650,10 @@ mod self_tests {
             GcnArch::UDNA,
         ] {
             let cap = arch_capability(arch);
-            assert!(cap.nutcracker_emulated, "{arch:?} should support NutFp4Emulated");
+            assert!(
+                cap.nutcracker_emulated,
+                "{arch:?} should support NutFp4Emulated"
+            );
             assert!(cap.supports(QuantMode::NutFp4Emulated));
         }
 

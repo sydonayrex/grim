@@ -12,7 +12,7 @@
 //! skipped rather than treated as an error. A parser that panics on a kernel
 //! version bump would be worse than one that reports nothing.
 
-use super::fault::{self, HsaMemoryAccessFault, FAILURE_NOT_PRESENT};
+use super::fault::{self, FAILURE_NOT_PRESENT, HsaMemoryAccessFault};
 use super::ledger::Attribution;
 
 /// One `amdgpu` page fault, as far as the kernel record exposes it. Every field
@@ -68,7 +68,10 @@ fn split_pci(rest: &str) -> Option<(&str, &str)> {
 /// Read `address 0x<hex>` out of an `in page starting at address ...` line.
 fn parse_address(msg: &str) -> Option<u64> {
     let after = msg.split_once("address 0x")?.1;
-    let hex: String = after.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    let hex: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
     u64::from_str_radix(&hex, 16).ok()
 }
 
@@ -110,7 +113,10 @@ pub fn parse(text: &str) -> Vec<GpuPageFault> {
             continue;
         };
         if msg.contains("page fault") {
-            out.push(GpuPageFault { pci: pci.to_string(), ..Default::default() });
+            out.push(GpuPageFault {
+                pci: pci.to_string(),
+                ..Default::default()
+            });
             continue;
         }
         // Continuation lines attach to the newest open record for this device.
@@ -158,13 +164,12 @@ pub fn resolve_all(
             // PERMISSION_FAULTS and MAPPING_ERROR are the two counters the
             // record exposes, and both mean the page was not present. There is
             // no separate mapping bit in the HSA failure bitfield.
-            let failure = if f.permission_faults.unwrap_or(0) != 0
-                || f.mapping_error.unwrap_or(0) != 0
-            {
-                FAILURE_NOT_PRESENT
-            } else {
-                0
-            };
+            let failure =
+                if f.permission_faults.unwrap_or(0) != 0 || f.mapping_error.unwrap_or(0) != 0 {
+                    FAILURE_NOT_PRESENT
+                } else {
+                    0
+                };
             let raw = HsaMemoryAccessFault {
                 node_id: 0,
                 virtual_address: f.address.unwrap_or(0),
@@ -174,9 +179,17 @@ pub fn resolve_all(
             let report = fault::resolve(raw, &|_| ordinal);
             let summary = format!(
                 "amdgpu {} pid={:?} thread={:?} -> {}",
-                f.pci, f.pid, f.thread, report.summary()
+                f.pci,
+                f.pid,
+                f.thread,
+                report.summary()
             );
-            ResolvedFault { fault: f.clone(), ordinal, attribution: report.attribution, summary }
+            ResolvedFault {
+                fault: f.clone(),
+                ordinal,
+                attribution: report.attribution,
+                summary,
+            }
         })
         .collect()
 }
@@ -217,7 +230,13 @@ pub fn load_dump(path: &str) -> Result<Vec<DumpRecord>, String> {
             .ok_or_else(|| format!("{path}:{}: bad ordinal", n + 1))?;
         let managed = f.next().unwrap_or("false").trim() == "true";
         let owner = f.next().unwrap_or("").to_string();
-        out.push(DumpRecord { ptr, bytes, ordinal, managed, owner });
+        out.push(DumpRecord {
+            ptr,
+            bytes,
+            ordinal,
+            managed,
+            owner,
+        });
     }
     Ok(out)
 }
@@ -239,8 +258,10 @@ pub fn resolve_against_dump(
             fault.pci, fault.pid
         );
     };
-    let mut hits: Vec<&DumpRecord> =
-        records.iter().filter(|r| addr >= r.ptr && addr < r.ptr.saturating_add(r.bytes)).collect();
+    let mut hits: Vec<&DumpRecord> = records
+        .iter()
+        .filter(|r| addr >= r.ptr && addr < r.ptr.saturating_add(r.bytes))
+        .collect();
     hits.sort_by_key(|r| r.bytes);
     match (hits.first(), ordinal) {
         (None, _) => format!(
@@ -251,16 +272,25 @@ pub fn resolve_against_dump(
         (Some(r), Some(o)) if r.ordinal != o => format!(
             "CROSS-DEVICE: amdgpu {} (device {o}) faulted at 0x{addr:x}, 0x{:x} bytes 
              into the allocation named [{}] - but that allocation lives on device {}",
-            fault.pci, addr - r.ptr, r.owner, r.ordinal
+            fault.pci,
+            addr - r.ptr,
+            r.owner,
+            r.ordinal
         ),
         (Some(r), Some(_)) => format!(
             "amdgpu {}: addr 0x{addr:x} is {} bytes into \"{}\" on its own device {} - buffer \
              lifetime, not placement",
-            fault.pci, addr - r.ptr, r.owner, r.ordinal
+            fault.pci,
+            addr - r.ptr,
+            r.owner,
+            r.ordinal
         ),
         (Some(r), None) => format!(
             "amdgpu {} (device UNKNOWN): addr 0x{addr:x} is {} bytes into \"{}\" on device {}",
-            fault.pci, addr - r.ptr, r.owner, r.ordinal
+            fault.pci,
+            addr - r.ptr,
+            r.owner,
+            r.ordinal
         ),
     }
 }
@@ -269,7 +299,6 @@ pub fn resolve_against_dump(
 mod tests {
     use super::*;
     use crate::memory::ledger;
-
 
     /// Verbatim capture from the deliberate OOB probe, `dmesg` form.
     const REAL_DMESG: &str = "\
@@ -360,7 +389,9 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
     /// kernel text.
     #[test]
     fn parsed_fault_resolves_to_a_cross_device_allocation() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         // The buffer lives on ordinal 0; the fault came from PCI 0000:0a:00.0,
         // which this box maps to ordinal 1.
@@ -380,7 +411,9 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
     /// problem. The two must never be reported the same way.
     #[test]
     fn parsed_fault_on_the_owning_device_is_not_cross_device() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         ledger::register(0x0000_7fea_8800_0000, 4096, 1, false, "kv_k");
         let faults = parse(REAL_DMESG);
@@ -401,7 +434,9 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
     /// than defaulting to ordinal 0 and blaming the wrong card.
     #[test]
     fn unknown_pci_is_not_guessed() {
-        let _g = crate::memory::ledger::LEDGER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::memory::ledger::LEDGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ledger::reset();
         ledger::register(0x0000_7fea_8800_0000, 4096, 0, false, "x");
         let faults = parse(REAL_DMESG);
@@ -411,54 +446,61 @@ Sep 26 12:39:54 host kernel: amdgpu 0000:0a:00.0:   in page starting at address 
     }
 }
 
-    /// End-to-end against the live kernel ring buffer rather than a captured
-    /// copy: the log contains thousands of unrelated lines from every device,
-    /// and the parser has to find the fault inside that noise without inventing
-    /// one. Diagnostic only - the log is empty on a machine that never faulted.
-    #[test]
-    fn live_kernel_log_parses_without_inventing_faults() {
-        if std::env::var("GRIM_FAULTLOG_LIVE").as_deref() != Ok("1") {
-            return;
-        }
-        // `dmesg` itself is gated by kernel.dmesg_restrict on this host, so it
-        // returns nothing without privileges. `journalctl -k` reads the same
-        // ring buffer and is world-readable, so it is the source that works.
-        let mut text = String::new();
-        for cmd in ["journalctl -k --no-pager", "dmesg"] {
-            let parts: Vec<&str> = cmd.split_whitespace().collect();
-            if let Ok(out) = std::process::Command::new(parts[0]).args(&parts[1..]).output() {
-                let t = String::from_utf8_lossy(&out.stdout).to_string();
-                if t.contains("amdgpu") {
-                    text = t;
-                    eprintln!("[faultlog] reading kernel log via `{cmd}`");
-                    break;
-                }
+/// End-to-end against the live kernel ring buffer rather than a captured
+/// copy: the log contains thousands of unrelated lines from every device,
+/// and the parser has to find the fault inside that noise without inventing
+/// one. Diagnostic only - the log is empty on a machine that never faulted.
+#[test]
+fn live_kernel_log_parses_without_inventing_faults() {
+    if std::env::var("GRIM_FAULTLOG_LIVE").as_deref() != Ok("1") {
+        return;
+    }
+    // `dmesg` itself is gated by kernel.dmesg_restrict on this host, so it
+    // returns nothing without privileges. `journalctl -k` reads the same
+    // ring buffer and is world-readable, so it is the source that works.
+    let mut text = String::new();
+    for cmd in ["journalctl -k --no-pager", "dmesg"] {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if let Ok(out) = std::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .output()
+        {
+            let t = String::from_utf8_lossy(&out.stdout).to_string();
+            if t.contains("amdgpu") {
+                text = t;
+                eprintln!("[faultlog] reading kernel log via `{cmd}`");
+                break;
             }
         }
-        let faults = parse(&text);
-        eprintln!("[faultlog] {} kernel lines -> {} page fault(s)", text.lines().count(), faults.len());
-        for f in &faults {
-            eprintln!(
-                "[faultlog] pci={} addr={:?} proc={:?} pid={:?} perm_faults={:?}",
-                f.pci, f.address, f.process, f.pid, f.permission_faults
-            );
-        }
-        let resolved = resolve_all(&faults, &|pci| match pci {
-            "0000:03:00.0" => Some(0),
-            "0000:0a:00.0" => Some(1),
-            "0000:78:00.0" => Some(2),
-            _ => None,
-        });
-        for r in &resolved {
-            eprintln!("[faultlog] {}", r.summary);
-        }
-        // The probe faults at a pointer outside every allocation, so the only
-        // correct verdict is that nothing owns it.
-        assert!(
-            resolved.iter().any(|r| r.fault.address.is_some()),
-            "the deliberate OOB fault from GRIM_FAULT_PROBE should be in the log"
+    }
+    let faults = parse(&text);
+    eprintln!(
+        "[faultlog] {} kernel lines -> {} page fault(s)",
+        text.lines().count(),
+        faults.len()
+    );
+    for f in &faults {
+        eprintln!(
+            "[faultlog] pci={} addr={:?} proc={:?} pid={:?} perm_faults={:?}",
+            f.pci, f.address, f.process, f.pid, f.permission_faults
         );
     }
+    let resolved = resolve_all(&faults, &|pci| match pci {
+        "0000:03:00.0" => Some(0),
+        "0000:0a:00.0" => Some(1),
+        "0000:78:00.0" => Some(2),
+        _ => None,
+    });
+    for r in &resolved {
+        eprintln!("[faultlog] {}", r.summary);
+    }
+    // The probe faults at a pointer outside every allocation, so the only
+    // correct verdict is that nothing owns it.
+    assert!(
+        resolved.iter().any(|r| r.fault.address.is_some()),
+        "the deliberate OOB fault from GRIM_FAULT_PROBE should be in the log"
+    );
+}
 
 #[cfg(test)]
 mod dump_tests {
@@ -487,8 +529,10 @@ Sep 26 12:39:54 syd-beasty kernel: amdgpu 0000:0a:00.0:        PERMISSION_FAULTS
         assert!(n >= 1, "the registered allocation must be dumped");
 
         let records = load_dump(p).expect("load");
-        let mine: Vec<&DumpRecord> =
-            records.iter().filter(|r| r.owner == "layer 12 attn_q").collect();
+        let mine: Vec<&DumpRecord> = records
+            .iter()
+            .filter(|r| r.owner == "layer 12 attn_q")
+            .collect();
         assert_eq!(mine.len(), 1, "the registered allocation must round-trip");
         assert_eq!(mine[0].ordinal, 0);
         assert_eq!(mine[0].bytes, 4096);
@@ -525,6 +569,9 @@ Sep 26 12:39:54 syd-beasty kernel: amdgpu 0000:0a:00.0:        PERMISSION_FAULTS
     #[test]
     fn a_missing_dump_is_an_error_not_an_empty_ledger() {
         let err = load_dump("/tmp/definitely_not_a_ledger_9f2a.tsv").unwrap_err();
-        assert!(err.contains("definitely_not_a_ledger_9f2a.tsv"), "got: {err}");
+        assert!(
+            err.contains("definitely_not_a_ledger_9f2a.tsv"),
+            "got: {err}"
+        );
     }
 }

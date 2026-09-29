@@ -95,18 +95,8 @@ fn norm_fused_qkv_matches_separate_norm_path() {
     let res_t = f32_tensor(&dev, &res, &Shape::new(vec![m, k]));
     let gamma_t = f32_tensor(&dev, &gamma, &Shape::new(vec![k]));
     let wq = upload_q80(&dev, &pack_q80(&rand_f32(n_q * k, 2), n_q, k), n_q, k);
-    let wk = upload_q80(
-        &dev,
-        &pack_q80(&rand_f32(n_kv * k, 3), n_kv, k),
-        n_kv,
-        k,
-    );
-    let wv = upload_q80(
-        &dev,
-        &pack_q80(&rand_f32(n_kv * k, 4), n_kv, k),
-        n_kv,
-        k,
-    );
+    let wk = upload_q80(&dev, &pack_q80(&rand_f32(n_kv * k, 3), n_kv, k), n_kv, k);
+    let wv = upload_q80(&dev, &pack_q80(&rand_f32(n_kv * k, 4), n_kv, k), n_kv, k);
 
     // Reference: standalone rms_norm_into, then the f32act QKV wrapper.
     let normed = f32_tensor(&dev, &vec![0.0f32; m * k], &Shape::new(vec![m, k]));
@@ -134,7 +124,11 @@ fn norm_fused_qkv_matches_separate_norm_path() {
         n_q,
         n_kv,
         k,
-        rocm(&f32_tensor(&dev, &vec![0.0f32; 9 * (k / 32)], &Shape::new(vec![(k / 32) * 9]))),
+        rocm(&f32_tensor(
+            &dev,
+            &vec![0.0f32; 9 * (k / 32)],
+            &Shape::new(vec![(k / 32) * 9]),
+        )),
     )
     .unwrap();
 
@@ -185,7 +179,11 @@ fn norm_fused_gemv_matches_separate_norm_path_generic() {
     let _guard = grim_backend_rocm::device::util::gpu_test_lock();
     let k = 1024usize;
     let eps = 1e-5f32;
-    for (tag, n, seed) in [("in_proj", 384usize, 21usize), ("head", 256, 22), ("tail", 258, 23)] {
+    for (tag, n, seed) in [
+        ("in_proj", 384usize, 21usize),
+        ("head", 256, 22),
+        ("tail", 258, 23),
+    ] {
         let m = 1usize;
         let res = rand_f32(m * k, seed);
         let gamma: Vec<f32> = rand_f32(k, seed + 100).iter().map(|g| g + 1.0).collect();

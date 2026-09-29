@@ -104,15 +104,14 @@ fn mla_absorbed_prefill_gpu_matches_host() {
     // The first entry is Xing4.0's real per-layer geometry (32 heads, rank 512,
     // rope 64) at a modest query block; the rest vary the causal geometry.
     let cases: [(usize, usize, usize, usize, usize, usize); 5] = [
-        (7, 32, 512, 64, 0, 7),    // cold prefill, full causal triangle
-        (3, 4, 512, 64, 0, 3),     // small head count
-        (5, 4, 128, 16, 4, 9),     // warm cache: queries sit mid-cache
-        (1, 8, 64, 8, 6, 7),       // single query against a warm cache
-        (4, 2, 256, 32, 0, 11),    // query block shorter than the cache
+        (7, 32, 512, 64, 0, 7), // cold prefill, full causal triangle
+        (3, 4, 512, 64, 0, 3),  // small head count
+        (5, 4, 128, 16, 4, 9),  // warm cache: queries sit mid-cache
+        (1, 8, 64, 8, 6, 7),    // single query against a warm cache
+        (4, 2, 256, 32, 0, 11), // query block shorter than the cache
     ];
 
-    for (case, &(q_len, num_heads, rank, rope_d, q_abs_offset, kv_len)) in
-        cases.iter().enumerate()
+    for (case, &(q_len, num_heads, rank, rope_d, q_abs_offset, kv_len)) in cases.iter().enumerate()
     {
         let q_absorbed = pseudo_random(q_len * num_heads * rank, 11 + case as u32);
         let q_rope = pseudo_random(q_len * num_heads * rope_d, 23 + case as u32);
@@ -120,13 +119,25 @@ fn mla_absorbed_prefill_gpu_matches_host() {
         let inv_sqrt_d = 1.0f32 / ((rank + rope_d) as f32).sqrt();
 
         let qa = dev
-            .from_cpu(&q_absorbed, &Shape::new(vec![q_len, num_heads, rank]), DType::F32)
+            .from_cpu(
+                &q_absorbed,
+                &Shape::new(vec![q_len, num_heads, rank]),
+                DType::F32,
+            )
             .unwrap();
         let qr = dev
-            .from_cpu(&q_rope, &Shape::new(vec![q_len, num_heads, rope_d]), DType::F32)
+            .from_cpu(
+                &q_rope,
+                &Shape::new(vec![q_len, num_heads, rope_d]),
+                DType::F32,
+            )
             .unwrap();
         let kv = dev
-            .from_cpu(&kv_cache, &Shape::new(vec![kv_len, rank + rope_d]), DType::F32)
+            .from_cpu(
+                &kv_cache,
+                &Shape::new(vec![kv_len, rank + rope_d]),
+                DType::F32,
+            )
             .unwrap();
         let mut out = dev
             .zeros(&Shape::new(vec![q_len, num_heads, rank]), DType::F32)
@@ -195,13 +206,25 @@ fn prefill_respects_the_causal_bound() {
         kv_cache[q_len * (rank + rope_d)..].copy_from_slice(&tail);
 
         let qa = dev
-            .from_cpu(&q_absorbed, &Shape::new(vec![q_len, num_heads, rank]), DType::F32)
+            .from_cpu(
+                &q_absorbed,
+                &Shape::new(vec![q_len, num_heads, rank]),
+                DType::F32,
+            )
             .unwrap();
         let qr = dev
-            .from_cpu(&q_rope, &Shape::new(vec![q_len, num_heads, rope_d]), DType::F32)
+            .from_cpu(
+                &q_rope,
+                &Shape::new(vec![q_len, num_heads, rope_d]),
+                DType::F32,
+            )
             .unwrap();
         let kv = dev
-            .from_cpu(&kv_cache, &Shape::new(vec![kv_len, rank + rope_d]), DType::F32)
+            .from_cpu(
+                &kv_cache,
+                &Shape::new(vec![kv_len, rank + rope_d]),
+                DType::F32,
+            )
             .unwrap();
         let mut out = dev
             .zeros(&Shape::new(vec![q_len, num_heads, rank]), DType::F32)
@@ -232,5 +255,10 @@ fn prefill_respects_the_causal_bound() {
     let b = run(9002);
     // Every query here sits at or before the shared prefix, so both runs must
     // agree exactly; the tolerance only absorbs a potential FMA reassociation.
-    close(&a, &b, 1e-7, "causal: future cache rows must not affect any query");
+    close(
+        &a,
+        &b,
+        1e-7,
+        "causal: future cache rows must not affect any query",
+    );
 }

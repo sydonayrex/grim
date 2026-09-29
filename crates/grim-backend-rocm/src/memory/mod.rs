@@ -2,10 +2,10 @@
 
 pub mod allocator;
 pub mod budget;
-pub mod ledger;
 pub mod fault;
 pub mod faultlog;
 pub mod hugepage;
+pub mod ledger;
 pub mod pinned;
 pub mod pool;
 pub mod storage;

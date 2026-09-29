@@ -32,10 +32,7 @@ fn payload() -> Vec<f32> {
 #[test]
 #[ignore = "device-gated: run with GRIM_GPU_TEST=1 GRIM_CAPTURE_GRAPH=1"]
 fn d2d_copy_succeeds_inside_graph_capture() {
-    assert!(
-        grim_backend_rocm::gpu_test_enabled(),
-        "set GRIM_GPU_TEST=1"
-    );
+    assert!(grim_backend_rocm::gpu_test_enabled(), "set GRIM_GPU_TEST=1");
     let _lock = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::try_new(0).expect("RocmDevice::try_new(0)");
     assert!(
@@ -55,7 +52,8 @@ fn d2d_copy_succeeds_inside_graph_capture() {
         .alloc_storage(&Shape::new(DST_DIMS.to_vec()), DType::F32)
         .expect("alloc dst");
 
-    dev.begin_graph_capture("d2d_probe_a").expect("begin capture A");
+    dev.begin_graph_capture("d2d_probe_a")
+        .expect("begin capture A");
     let copy_a = dev.copy_slice_into(dst_a.as_ref(), src_a.as_ref(), 0, COUNT);
     // End the capture even on failure, or the stream stays mid-capture and every
     // later HIP call in this process inherits the state under test.
@@ -80,10 +78,7 @@ fn d2d_copy_succeeds_inside_graph_capture() {
 #[test]
 #[ignore = "device-gated: run with GRIM_GPU_TEST=1 GRIM_CAPTURE_GRAPH=1"]
 fn d2d_copy_with_destination_allocated_inside_capture_succeeds() {
-    assert!(
-        grim_backend_rocm::gpu_test_enabled(),
-        "set GRIM_GPU_TEST=1"
-    );
+    assert!(grim_backend_rocm::gpu_test_enabled(), "set GRIM_GPU_TEST=1");
     let _lock = grim_backend_rocm::device::util::gpu_test_lock();
     let dev = RocmDevice::try_new(0).expect("RocmDevice::try_new(0)");
     assert!(
@@ -97,7 +92,8 @@ fn d2d_copy_with_destination_allocated_inside_capture_succeeds() {
         .expect("upload src");
 
     // This is `reshaped_view`'s exact sequence: alloc_storage, then copy.
-    dev.begin_graph_capture("d2d_probe_b").expect("begin capture B");
+    dev.begin_graph_capture("d2d_probe_b")
+        .expect("begin capture B");
     let alloc = dev.alloc_storage(&Shape::new(DST_DIMS.to_vec()), DType::F32);
     let dst = match alloc {
         Ok(d) => d,

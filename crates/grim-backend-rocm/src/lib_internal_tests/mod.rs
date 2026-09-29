@@ -8,24 +8,16 @@ mod builtin_name_oracle_tests;
 #[cfg(test)]
 mod common;
 #[cfg(test)]
-mod fp8_gemv_hoist_tests;
-#[cfg(test)]
-mod precision_ab_tests;
-#[cfg(test)]
-mod w4a4_arch_gate_tests;
-#[cfg(test)]
-mod white_raven_purity_tests;
-mod route_counter_tests;
-mod white_raven_launcher_tests;
-#[cfg(test)]
 mod device_lifecycle_tests;
 #[cfg(test)]
 mod elementwise_norm_tests;
 #[cfg(test)]
-mod gemm_matmul_tests;
-#[cfg(test)]
 #[cfg(test)]
 mod fault_probe_tests;
+#[cfg(test)]
+mod fp8_gemv_hoist_tests;
+#[cfg(test)]
+mod gemm_matmul_tests;
 mod graph_capture_tests;
 #[cfg(test)]
 mod layout_tests;
@@ -34,4 +26,12 @@ mod memory_cache_tests;
 #[cfg(test)]
 mod native_epilogue_tests;
 #[cfg(test)]
+mod precision_ab_tests;
+#[cfg(test)]
 mod quant_kernel_compile_tests;
+mod route_counter_tests;
+#[cfg(test)]
+mod w4a4_arch_gate_tests;
+mod white_raven_launcher_tests;
+#[cfg(test)]
+mod white_raven_purity_tests;

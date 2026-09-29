@@ -231,7 +231,7 @@ fn qwen35_kda_device_path_engages_and_matches_host() {
         }
     }
     assert!(
-        worst <= 2e-3,
+        worst <= 5e-4,
         "host/device KDA layer output diverges: worst |err| {worst:.3e} at {worst_at} \
          (host {}, device {})",
         cpu_out[worst_at],
@@ -278,7 +278,7 @@ fn qwen35_kda_device_path_engages_and_matches_host() {
         }
     }
     assert!(
-        worst2 <= 2e-3,
+        worst2 <= 5e-4,
         "second step diverges: worst |err| {worst2:.3e} at {worst2_at} \
          (host {}, device {})",
         cpu_out2[worst2_at],

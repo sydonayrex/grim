@@ -5,9 +5,9 @@
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, dev_ptr, HipDim3};
-use grim_tensor::error::{Error, Result};
+use crate::{HipDim3, arg, dev_ptr};
 use grim_tensor::MemoryOps;
+use grim_tensor::error::{Error, Result};
 use std::ffi::c_void;
 
 #[repr(C)]

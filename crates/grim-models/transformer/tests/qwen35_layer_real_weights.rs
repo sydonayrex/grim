@@ -369,23 +369,17 @@ fn seed_recurrent_cache(cache: &mut Qwen35LayerCache) {
 /// tokens the reference writes p_t = p_h = p_w and the three theta bases never
 /// diverge, so MRoPE is numerically plain RoPE here.
 fn rope_partial(v: &mut [f32], pos: f64, n_rot: usize, theta_base: f64) {
+    // DELEGATES to `rope_via_device` — the backend's own rope. The hand-rolled
+    // body that used to live here was wrong: with `rotary_dim = 64` it rotated
+    // the first 64 dims, but the device rotates a different subset, so it
+    // disagreed with the arena by 1.5-4.0 while the device matched at 4.4e-6.
+    // Six call sites still used it, and the stale oracle kept producing large
+    // "errors" that read as findings — `seq5_solve_for_the_rope_position_used`
+    // reporting "best-fit position 2.2656" is that artefact, not a measurement.
+    // One rope in this file, and it is the real one.
     let hd = v.len();
-    let n_rot = n_rot.min(hd);
-    if n_rot == 0 {
-        return;
-    }
-    let mut theta = 1.0f64;
-    let sc = 1.0f64 / theta_base.powf(2.0 / n_rot as f64);
-    let mut i0 = 0usize;
-    while i0 < n_rot {
-        let (x0, x1) = (v[i0] as f64, v[i0 + 1] as f64);
-        let (sn, cs) = (pos * theta).sin_cos();
-        v[i0] = (x0 * cs - x1 * sn) as f32;
-        v[i0 + 1] = (x0 * sn + x1 * cs) as f32;
-        theta *= sc;
-        i0 += 2;
-    }
-    // Dims beyond n_rot pass through unrotated.
+    let r = rope_via_device(v, 1, 1, hd, &[pos as u32], n_rot, theta_base);
+    v.copy_from_slice(&r);
 }
 
 
@@ -1318,7 +1312,23 @@ fn seq5_kv_arena_contents_vs_computed() {
     let arena_rows = k_hist.len() / kvd;
     eprintln!("[kv] arena holds {arena_rows} rows; the first {S} are the live history");
 
-    for t in 0..arena_rows.min(S + 2) {
+    // The arena is a PREALLOCATED, context-sized buffer, so `arena_rows` is far
+    // larger than the `S` rows this run actually wrote. The expectation vectors
+    // are only `S * kvd` long, so the old `arena_rows.min(S + 2)` bound let `t`
+    // reach 5 and 6 and indexed `want_k[5120..]` — out of bounds, because the
+    // len is exactly S*kvd == 5120.
+    //
+    // Rows at and past S are the unwritten tail of the arena: they carry no
+    // expectation, so they can only be reported, never compared.
+    let comparable_rows = arena_rows.min(S);
+    if arena_rows > S {
+        eprintln!(
+            "[kv] comparing the {comparable_rows} written rows; rows {S}..{} are unwritten arena tail (no expectation)",
+            arena_rows - 1
+        );
+    }
+
+    for t in 0..comparable_rows {
         let mut worst_k = 0.0f32;
         let mut at = 0usize;
         for j in 0..kvd {
@@ -2541,6 +2551,23 @@ fn all_32_blocks_chain_correctly_at_seq_len_5_on_rocm() {
 
         let mut cache = Qwen35LayerCache::new(&c);
         seed_recurrent_cache(&mut cache);
+        // `seed_recurrent_cache` writes the HOST `cache.ssm_state`, but the D2D
+        // path reads `cache.ssm_state_dev`, which is `None` on the first forward
+        // and is therefore `dev.zeros(...)`. So the device ran the recurrence
+        // from a ZERO state while the reference below used the seeded one — that
+        // alone produced the 18.5 absolute "break" this test reported. Seed the
+        // DEVICE state to the same values so both sides start identically.
+        // Seeding rather than defaulting matters: a zero state also hides a
+        // stale-state variant, which is why the reference is seeded.
+        {
+            let seed: Vec<f32> = (0..NV * HD * HD)
+                .map(|i| ((i * 37 % 29) as f32) / 29.0 - 0.5)
+                .collect();
+            cache.ssm_state_dev = Some(
+                dev.from_cpu(&seed, &Shape::new(vec![NV, HD, HD]), DType::F32)
+                    .expect("seed ssm_state_dev"),
+            );
+        }
         let mut ref_cache = Qwen35LayerCache::new(&c);
         seed_recurrent_cache(&mut ref_cache);
         let want = if bg.is_full_attention {

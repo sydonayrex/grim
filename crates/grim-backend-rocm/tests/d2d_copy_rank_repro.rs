@@ -31,10 +31,10 @@ fn gpu_device() -> Option<Arc<RocmDevice>> {
         }
         let _lock = grim_backend_rocm::device::util::gpu_test_lock();
         Some(Arc::new(RocmDevice::try_new(0).expect(
-        "GRIM_GPU_TEST=1 is set but RocmDevice::try_new(0) failed. Failing loudly rather \
+            "GRIM_GPU_TEST=1 is set but RocmDevice::try_new(0) failed. Failing loudly rather \
          than catch_unwind().ok(): a swallowed init failure turns this gate GREEN with \
-         zero assertions run, which is how a real defect hides behind a passing test."
-    )))
+         zero assertions run, which is how a real defect hides behind a passing test.",
+        )))
     })
     .clone()
 }
@@ -67,16 +67,22 @@ fn copy_and_check(
         .alloc_storage(&Shape::new(dst_dims.clone()), DType::F32)
         .map_err(|e| format!("{label}: alloc dst {dst_dims:?}: {e}"))?;
 
-    dev.copy_slice_into(dst.as_ref(), src.as_ref(), 0, count).map_err(|e| {
-        format!("{label}: copy_slice_into REFUSED {src_dims:?} -> {dst_dims:?} ({count} elems): {e}")
-    })?;
+    dev.copy_slice_into(dst.as_ref(), src.as_ref(), 0, count)
+        .map_err(|e| {
+            format!(
+                "{label}: copy_slice_into REFUSED {src_dims:?} -> {dst_dims:?} ({count} elems): {e}"
+            )
+        })?;
     dev.synchronize();
 
     let got = dst
         .to_cpu_vec_f32()
         .map_err(|e| format!("{label}: read back: {e}"))?;
     if got.len() != count {
-        return Err(format!("{label}: read back {} elems, want {count}", got.len()));
+        return Err(format!(
+            "{label}: read back {} elems, want {count}",
+            got.len()
+        ));
     }
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         if g != w {
@@ -86,9 +92,7 @@ fn copy_and_check(
             ));
         }
     }
-    eprintln!(
-        "[d2d] {label}: {src_dims:?} -> {dst_dims:?} ({count} elems) OK, bytes verified"
-    );
+    eprintln!("[d2d] {label}: {src_dims:?} -> {dst_dims:?} ({count} elems) OK, bytes verified");
     Ok(())
 }
 

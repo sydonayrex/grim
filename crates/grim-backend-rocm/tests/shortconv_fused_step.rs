@@ -310,3 +310,40 @@ fn conv_scan_then_step_chain_matches_step_only() {
          the scan leaves the ring in a form the decode step misreads"
     );
 }
+
+/// Cross-binary coefficient check (see kda_conv_input_diff.rs): is the step
+/// kernel 2x in THIS binary too, or only in the other test's JIT aggregate?
+#[test]
+fn step_kernel_2x_check_in_this_binary() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("skipping: GPU test gate off");
+        return;
+    };
+    let ch = 256usize;
+    let ks = 4usize;
+    let mut seed: u64 = 7;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (((seed >> 33) & 0xffffffff) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let w: Vec<f32> = (0..ch * ks).map(|_| rand()).collect();
+    let w_s = f32_tensor(&dev, &w, &Shape::new(vec![ch, ks]));
+    let zeros = vec![0.0f32; ch];
+    let zero_ring = vec![0.0f32; ch * (ks - 1)];
+    let x1: Vec<f32> = vec![0.001; ch];
+    let x_s = f32_tensor(&dev, &x1, &Shape::new(vec![ch]));
+    let r_s = f32_tensor(&dev, &zero_ring, &Shape::new(vec![ch * (ks - 1)]));
+    let out = f32_tensor(&dev, &zeros, &Shape::new(vec![ch]));
+    dev.synchronize();
+    dev.short_conv1d_causal_step_into(x_s.as_ref(), w_s.as_ref(), None, r_s.as_ref(), rocm(&out))
+        .unwrap();
+    dev.synchronize();
+    let o = out.to_cpu_vec_f32().unwrap();
+    // pre-silu ≈ 2*out for tiny args; expect w3
+    let got = o[0] * 2.0 / 0.001;
+    eprintln!(
+        "[2x-check] this binary: pre/0.001 c0={got:.5} vs w3={:.5} ratio={:.3}",
+        w[0 * ks + 3],
+        got / w[0 * ks + 3]
+    );
+}

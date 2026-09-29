@@ -6910,7 +6910,7 @@ mod tests {
 
     #[test]
     fn test_iq3xxs_dequant_exact_layout_and_math() {
-        let mut data = vec![0u8; 96];
+        let mut data = vec![0u8; 98];
         data[0] = 0x00;
         data[1] = 0x3c; // d = 1.0f16
 

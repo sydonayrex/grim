@@ -16,8 +16,8 @@
 //! Needs `GRIM_GPU_TEST=1` and `GRIM_FAULT_PROBE=1`.
 
 use crate::device::util::DeviceGuard;
-use grim_tensor::CoreTensorOps;
 use crate::memory::ledger;
+use grim_tensor::CoreTensorOps;
 
 /// Far enough past the end of any real allocation to be unmapped, but still a
 /// plausible device virtual address.
@@ -57,7 +57,10 @@ fn deliberate_oob_launch_surfaces_attributable_evidence() {
     )
     .expect("real allocation");
     let real_ptr = real.device_ptr_u64().expect("real ptr");
-    eprintln!("[fault-probe] real allocation at 0x{real_ptr:x} ({} bytes)", real.bytes);
+    eprintln!(
+        "[fault-probe] real allocation at 0x{real_ptr:x} ({} bytes)",
+        real.bytes
+    );
 
     // Fabricate a storage whose pointer is outside every live allocation.
     let mut bad = unsafe { std::ptr::read(&real) };
@@ -78,9 +81,9 @@ fn deliberate_oob_launch_surfaces_attributable_evidence() {
     let launch = dev.rms_norm(&bad, &w, 1e-5, &shape);
     match launch {
         Ok((_out, handle)) => match handle.synchronize() {
-            Ok(()) => eprintln!(
-                "[fault-probe] UNEXPECTED: out-of-bounds kernel completed without error"
-            ),
+            Ok(()) => {
+                eprintln!("[fault-probe] UNEXPECTED: out-of-bounds kernel completed without error")
+            }
             Err(e) => eprintln!("[fault-probe] surfaced at sync: {e}"),
         },
         Err(e) => eprintln!("[fault-probe] surfaced at launch: {e}"),
@@ -89,10 +92,7 @@ fn deliberate_oob_launch_surfaces_attributable_evidence() {
     // Whatever the driver said, report the live allocations so an out-of-band
     // address from dmesg can be checked against them.
     let all = ledger::snapshot();
-    eprintln!(
-        "[fault-probe] ledger holds {} allocation(s):",
-        all.len()
-    );
+    eprintln!("[fault-probe] ledger holds {} allocation(s):", all.len());
     for r in all {
         eprintln!(
             "[fault-probe]   0x{:x}..0x{:x} device {} managed={} {}",

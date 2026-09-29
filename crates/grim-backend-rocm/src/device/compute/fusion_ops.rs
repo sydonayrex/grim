@@ -9,7 +9,7 @@ use grim_tensor::{BackendStorage, FusionOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, RocmHandle};
+use crate::{RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch};
 
 impl FusionOps for RocmDevice {
     fn fused_mxfp4_gemm_qk_norm_rope_kv(

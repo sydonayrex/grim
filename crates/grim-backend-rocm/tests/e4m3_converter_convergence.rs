@@ -181,7 +181,10 @@ fn every_grid_point_and_every_midpoint_agree() {
             }
         }
     }
-    assert!(checked > 700, "expected to check the whole grid, got {checked}");
+    assert!(
+        checked > 700,
+        "expected to check the whole grid, got {checked}"
+    );
 }
 
 /// The device source and the CUDA mirror both claim to implement this rule.

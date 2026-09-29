@@ -191,8 +191,7 @@ fn test_hip_graph_poison_then_eager_then_recapture() -> TestResult {
     let a_dev = CoreTensorOps::from_cpu(&dev, &a_data, &a_shape, DType::F32)?;
 
     // Warmup eager matmul (kernels compiled, rocBLAS tables live).
-    let (warm, warm_h) =
-        CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    let (warm, warm_h) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     warm_h.synchronize()?;
     let warm_out = warm.to_cpu_vec_f32()?;
     assert!(warm_out.iter().all(|x| x.is_finite()));
@@ -233,18 +232,14 @@ fn test_hip_graph_poison_then_eager_then_recapture() -> TestResult {
 
     // 3. Clean recapture: device-only work captures, replays, matches eager.
     dev.begin_graph_capture("poison-recapture")?;
-    let (cap_mm, _cap_h) =
-        CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
+    let (cap_mm, _cap_h) = CoreTensorOps::matmul(&dev, a_dev.as_ref(), b_dev.as_ref(), &out_shape)?;
     dev.end_graph_capture("poison-recapture")?;
     assert!(dev.has_captured_graph("poison-recapture"));
     assert!(dev.replay_graph("poison-recapture")?);
     dev.synchronize();
     let replay_out = cap_mm.to_cpu_vec_f32()?;
     for (i, (a, b)) in replay_out.iter().zip(&eager_out).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-4,
-            "replay mismatch at {i}: {a} vs {b}"
-        );
+        assert!((a - b).abs() < 1e-4, "replay mismatch at {i}: {a} vs {b}");
     }
     dev.drop_captured_graph("poison-recapture")?;
     assert!(!dev.has_captured_graph("poison-recapture"));

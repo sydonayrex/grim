@@ -7,8 +7,8 @@
 use std::ptr::null_mut;
 
 use grim_backend_rocm::{
-    as_rocm, gpu_test_enabled, hipEventCreate, hipEventDestroy, hipEventRecord,
-    hipStreamSynchronize, hipStreamWaitEvent, BackendStorage, RocmDevice,
+    BackendStorage, RocmDevice, as_rocm, gpu_test_enabled, hipEventCreate, hipEventDestroy,
+    hipEventRecord, hipStreamSynchronize, hipStreamWaitEvent,
 };
 use grim_tensor::{CoreTensorOps, DType, Shape};
 

@@ -7,7 +7,7 @@
 //! Gated: canonical `gpu_test_enabled()`.
 
 use grim_backend_rocm::RocmStorage;
-use grim_backend_rocm::{as_rocm, gpu_test_enabled, RocmDevice};
+use grim_backend_rocm::{RocmDevice, as_rocm, gpu_test_enabled};
 use grim_tensor::{ArithType, CoreTensorOps, DType, MemoryOps, Shape, Storage};
 
 fn gpu_device() -> Option<RocmDevice> {

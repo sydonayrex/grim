@@ -23,8 +23,7 @@ fn f32_tensor(
 }
 
 fn u32_tensor(dev: &RocmDevice, v: u32) -> Box<dyn grim_tensor::BackendStorage> {
-    CoreTensorOps::from_cpu(dev, &[f32::from_bits(v)], &Shape::new(vec![1]), DType::U32)
-        .unwrap()
+    CoreTensorOps::from_cpu(dev, &[f32::from_bits(v)], &Shape::new(vec![1]), DType::U32).unwrap()
 }
 
 fn rand_f32(n: usize, seed: usize) -> Vec<f32> {
@@ -75,11 +74,7 @@ fn rope_append_kv_matches_separate_rope_plus_appends() {
         let pos_t = u32_tensor(&dev, *pos);
 
         // Reference path: qk_rope(k) then two separate appends.
-        let k_rot = f32_tensor(
-            &dev,
-            &vec![0.0f32; batch * nkv * steps * hd],
-            &k_shape,
-        );
+        let k_rot = f32_tensor(&dev, &vec![0.0f32; batch * nkv * steps * hd], &k_shape);
         let arena_k_ref = f32_tensor(&dev, &vec![0.0f32; slot_stride], &arena_shape);
         let arena_v_ref = f32_tensor(&dev, &vec![0.0f32; slot_stride], &arena_shape);
         dev.qk_rope_dev_base_into(
@@ -118,11 +113,7 @@ fn rope_append_kv_matches_separate_rope_plus_appends() {
         .unwrap();
 
         // Candidate: single fused launch into its own arenas.
-        let k_rot2 = f32_tensor(
-            &dev,
-            &vec![0.0f32; batch * nkv * steps * hd],
-            &k_shape,
-        );
+        let k_rot2 = f32_tensor(&dev, &vec![0.0f32; batch * nkv * steps * hd], &k_shape);
         let arena_k_new = f32_tensor(&dev, &vec![0.0f32; slot_stride], &arena_shape);
         let arena_v_new = f32_tensor(&dev, &vec![0.0f32; slot_stride], &arena_shape);
         dev.qk_rope_append_kv_into(

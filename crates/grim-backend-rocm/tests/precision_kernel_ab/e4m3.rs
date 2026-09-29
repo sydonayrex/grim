@@ -137,7 +137,9 @@ mod tests {
     /// value in [464.01,480) encoded to NaN instead of saturating.
     #[test]
     fn the_band_just_below_480_saturates_instead_of_becoming_nan() {
-        for x in [448.0f32, 450.0, 460.0, 464.0, 464.01, 470.0, 478.53, 479.0, 479.99] {
+        for x in [
+            448.0f32, 450.0, 460.0, 464.0, 464.01, 470.0, 478.53, 479.0, 479.99,
+        ] {
             for s in [1.0f32, -1.0] {
                 let b = to_e4m3_rne(x * s);
                 assert_eq!(b & 0x7F, 0x7E, "{x} must saturate to 0x7E, got {b:#04x}");
@@ -153,7 +155,9 @@ mod tests {
     fn no_finite_input_encodes_to_nan() {
         let mut s = 0x0BAD_C0DE_1234_5678u64;
         let mut rng = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             // Deliberately centred on the old guard's neighbourhood.
             ((s >> 40) as f32 / 8388608.0 - 1.0) * 500.0
         };
@@ -163,7 +167,11 @@ mod tests {
                 continue;
             }
             let b = to_e4m3_rne(x);
-            assert_ne!(b & 0x7F, 0x7F, "finite {x} encoded to the NaN slot {b:#04x}");
+            assert_ne!(
+                b & 0x7F,
+                0x7F,
+                "finite {x} encoded to the NaN slot {b:#04x}"
+            );
             assert!(!from_e4m3(b).is_nan(), "finite {x} round-tripped to NaN");
         }
         // And the exact endpoints of the old broken window.
@@ -183,7 +191,10 @@ mod tests {
         assert!(from_e4m3(0x7F).is_nan());
         assert!(from_e4m3(0xFF).is_nan());
         // 447.9 must NOT saturate: it is representable as 0x7E's predecessor.
-        assert!(from_e4m3(to_e4m3_rne(447.9)) > 400.0, "447.9 should stay near 448");
+        assert!(
+            from_e4m3(to_e4m3_rne(447.9)) > 400.0,
+            "447.9 should stay near 448"
+        );
     }
 
     /// The sh >= 25 guard. Below the min subnormal (2^-9) everything rounds to
@@ -196,7 +207,11 @@ mod tests {
             let v = (2f32).powi(e);
             let b = to_e4m3_rne(v);
             if v < min_sub * 0.5 {
-                assert_eq!(b & 0x7F, 0x00, "2^{e}={v} should flush to zero, got {b:#04x}");
+                assert_eq!(
+                    b & 0x7F,
+                    0x00,
+                    "2^{e}={v} should flush to zero, got {b:#04x}"
+                );
             } else {
                 assert_eq!(b & 0x7F, 0x01, "2^{e}={v} should reach min subnormal");
             }
@@ -220,7 +235,9 @@ mod tests {
     fn round_trip_error_is_bounded_and_never_nan() {
         let mut s = 0x1234_5678_9abc_def0u64;
         let mut rng = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / 8388608.0 - 1.0) * 500.0
         };
         for _ in 0..200_000 {
@@ -239,11 +256,7 @@ mod tests {
             // saturation threshold is a clipping decision, not a rounding one.
             // Check clipping first, then the ulp bound on what remains.
             if x.abs() >= 448.0 {
-                assert_eq!(
-                    y.abs(),
-                    448.0,
-                    "x={x} must saturate to 448, got {y}"
-                );
+                assert_eq!(y.abs(), 448.0, "x={x} must saturate to 448, got {y}");
                 continue;
             }
             // Relative error is only bounded by half an ulp once the value is
@@ -269,7 +282,10 @@ mod tests {
         for i in 0..4096 {
             let v = i as f32 * 0.01;
             let b = to_e4m3_rne(v) & 0x7F;
-            assert!(b >= last, "non-monotonic at {v}: {b:#04x} after {last:#04x}");
+            assert!(
+                b >= last,
+                "non-monotonic at {v}: {b:#04x} after {last:#04x}"
+            );
             last = b;
         }
     }

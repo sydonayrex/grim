@@ -220,10 +220,7 @@ fn emit_ctx_trace(site: &str, target: i32, prev: i32) {
     ) else {
         return;
     };
-    eprintln!(
-        "{line} tid={:?}",
-        std::thread::current().id()
-    );
+    eprintln!("{line} tid={:?}", std::thread::current().id());
     eprintln!("{}", std::backtrace::Backtrace::force_capture());
 }
 

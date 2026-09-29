@@ -3,8 +3,8 @@
 pub mod accel_features;
 pub(crate) mod accel_ffi;
 pub mod attention;
-pub mod blaslt;
 pub mod batch_orchestrator;
+pub mod blaslt;
 /// SCYTHE-2 WI-2: live GPU capability profiler.
 pub mod capability_profiler;
 pub mod compute;

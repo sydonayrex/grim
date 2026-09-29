@@ -77,7 +77,10 @@ fn jit_aggregate_emits_native_fp8_dot() {
     .map(|p| p.to_string());
 
     let Some(objdump) = objdump else {
-        eprintln!("skip: no llvm-objdump; code object left at {}", path.display());
+        eprintln!(
+            "skip: no llvm-objdump; code object left at {}",
+            path.display()
+        );
         return;
     };
 

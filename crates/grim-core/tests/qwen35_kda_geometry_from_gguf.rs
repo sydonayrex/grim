@@ -170,7 +170,48 @@ fn check(path: &str) {
         "ssm_a width disagrees with ssm_dt_rank"
     );
 
-    println!("   OK: all KDA dims file-derived and cross-checked\n");
+    // Cross-check attention layer geometry against full-attention tensors (e.g. blk.3)
+    let num_heads = hp.num_heads;
+    let num_kv_heads = hp.num_kv_heads;
+    let attn_head_dim = hp.head_dim;
+    let q_dim = num_heads * attn_head_dim;
+    let kv_dim = num_kv_heads * attn_head_dim;
+
+    println!("   attn num_heads           = {num_heads}");
+    println!("   attn num_kv_heads        = {num_kv_heads}");
+    println!("   attn head_dim            = {attn_head_dim}");
+    println!("   derived q_dim={q_dim} kv_dim={kv_dim}");
+
+    // attn_q on attention layers is fused [Q | gate] at 2 * q_dim
+    let attn_q = tensor_shape(&provider, "blk.3.attn_q.weight");
+    println!("   blk.3.attn_q.weight      = {attn_q:?}");
+    assert_eq!(
+        attn_q[0], 2 * q_dim,
+        "blk.3.attn_q width != 2 * q_dim"
+    );
+
+    // attn_k, attn_v are kv_dim wide
+    let attn_k = tensor_shape(&provider, "blk.3.attn_k.weight");
+    let attn_v = tensor_shape(&provider, "blk.3.attn_v.weight");
+    println!("   blk.3.attn_k.weight      = {attn_k:?}");
+    println!("   blk.3.attn_v.weight      = {attn_v:?}");
+    assert_eq!(attn_k[0], kv_dim, "blk.3.attn_k width != kv_dim");
+    assert_eq!(attn_v[0], kv_dim, "blk.3.attn_v width != kv_dim");
+
+    // attn_output in-width is q_dim
+    let attn_out = tensor_shape(&provider, "blk.3.attn_output.weight");
+    println!("   blk.3.attn_output.weight = {attn_out:?}");
+    assert_eq!(attn_out[1], q_dim, "blk.3.attn_output in-width != q_dim");
+
+    // attn_q_norm and attn_k_norm are head_dim wide
+    let q_norm = tensor_shape(&provider, "blk.3.attn_q_norm.weight");
+    let k_norm = tensor_shape(&provider, "blk.3.attn_k_norm.weight");
+    println!("   blk.3.attn_q_norm.weight = {q_norm:?}");
+    println!("   blk.3.attn_k_norm.weight = {k_norm:?}");
+    assert_eq!(q_norm[0], attn_head_dim, "blk.3.attn_q_norm width != attn_head_dim");
+    assert_eq!(k_norm[0], attn_head_dim, "blk.3.attn_k_norm width != attn_head_dim");
+
+    println!("   OK: all KDA and attention dims file-derived and cross-checked\n");
 }
 
 #[test]

@@ -35,7 +35,10 @@ fn block_table_stride_is_two_u32_words_per_page() {
     for page in 0..n_pages {
         let block_id = bits_of(table_f32[page * 2]);
         let page_size = bits_of(table_f32[page * 2 + 1]);
-        assert_eq!(block_id as usize, page, "page {page} block_id must be {page}");
+        assert_eq!(
+            block_id as usize, page,
+            "page {page} block_id must be {page}"
+        );
         assert_eq!(page_size, 1, "page {page} page_size must be 1");
     }
 }

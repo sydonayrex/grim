@@ -171,8 +171,7 @@ impl ConsumerFsdpGroup {
         // P1-3: the single-rank D2D copy below binds to the CALLING THREAD's
         // current device. Pin the destination's ordinal for the whole call so a
         // drifted thread cannot copy into another card's context.
-        let _dev_guard =
-            crate::device::util::DeviceGuard::set(full_dst.device_ordinal() as i32);
+        let _dev_guard = crate::device::util::DeviceGuard::set(full_dst.device_ordinal() as i32);
         let expected_shard_len = full_dst.shape.elem_count() / self.config.world_size;
         if local_shard.shape.elem_count() != expected_shard_len {
             return Err(Error::Shape(format!(
@@ -220,8 +219,7 @@ impl ConsumerFsdpGroup {
         }
 
         // P1-3: see `execute_all_gather_storage` — pin the destination ordinal.
-        let _dev_guard =
-            crate::device::util::DeviceGuard::set(sharded_dst.device_ordinal() as i32);
+        let _dev_guard = crate::device::util::DeviceGuard::set(sharded_dst.device_ordinal() as i32);
         if let Some(comm) = &self.comm {
             comm.reduce_scatter_storage(local_full_grad, sharded_dst, stream)?;
         } else {

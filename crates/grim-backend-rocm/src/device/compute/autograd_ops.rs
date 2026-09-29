@@ -8,7 +8,7 @@ use grim_tensor::{AutogradOps, BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, warp_rows_launch, RocmHandle};
+use crate::{RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch, warp_rows_launch};
 
 impl AutogradOps for RocmDevice {
     /// SwiGLU backward: `(df, de) = silu_mul_backward(e, g, dw)`.

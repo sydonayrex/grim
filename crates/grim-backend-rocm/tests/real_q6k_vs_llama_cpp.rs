@@ -31,8 +31,8 @@
 use grim_backend_rocm::RocmDevice;
 use grim_format::gguf::{GgufDType, read_gguf, read_tensor_bytes};
 use grim_tensor::{
-    ArithType, CoreTensorOps, DType, MemoryOps, QuantFormat, QuantOps, Shape,
-    Storage as DTypeStorage, KQuantScheme,
+    ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, QuantFormat, QuantOps, Shape,
+    Storage as DTypeStorage,
 };
 use std::sync::Arc;
 
@@ -80,7 +80,11 @@ fn fp16_to_f32(lo: u8, hi: u8) -> f32 {
 /// Written from the reference on purpose. An oracle derived from the kernel
 /// under test certifies the kernel's own reading of itself.
 fn llama_cpp_dequantize_row_q6k(x: &[u8], y: &mut [f32], k: usize) {
-    assert_eq!(k % QK_K, 0, "Q6_K row must be a whole number of super-blocks");
+    assert_eq!(
+        k % QK_K,
+        0,
+        "Q6_K row must be a whole number of super-blocks"
+    );
     assert_eq!(
         x.len(),
         (k / QK_K) * Q6K_BLOCK_BYTES,
@@ -96,9 +100,11 @@ fn llama_cpp_dequantize_row_q6k(x: &[u8], y: &mut [f32], k: usize) {
             for l in 0..32usize {
                 let is = l / 16;
                 let q1 = ((ql[l + n / 2] & 0xF) | (((qh[l + n / 4] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[l + n / 2 + 32] & 0xF) | (((qh[l + n / 4] >> 2) & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[l + n / 2 + 32] & 0xF) | (((qh[l + n / 4] >> 2) & 3) << 4)) as i32 - 32;
                 let q3 = ((ql[l + n / 2] >> 4) | (((qh[l + n / 4] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[l + n / 2 + 32] >> 4) | (((qh[l + n / 4] >> 6) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[l + n / 2 + 32] >> 4) | (((qh[l + n / 4] >> 6) & 3) << 4)) as i32 - 32;
                 let base = i * QK_K + n + l;
                 y[base] = d * sc[is + n / 16] as i8 as f32 * q1 as f32;
                 y[base + 32] = d * sc[is + 2 + n / 16] as i8 as f32 * q2 as f32;
@@ -174,7 +180,7 @@ fn gpu_device() -> Option<Arc<RocmDevice>> {
     Some(Arc::new(RocmDevice::try_new(0).expect(
         "GRIM_GPU_TEST=1 is set but RocmDevice::try_new(0) failed. Failing loudly rather \
          than catch_unwind().ok(): a swallowed init failure turns this gate GREEN with \
-         zero assertions run, which is how a real defect hides behind a passing test."
+         zero assertions run, which is how a real defect hides behind a passing test.",
     )))
 }
 
@@ -187,7 +193,9 @@ fn checkpoint() -> Option<std::path::PathBuf> {
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for up in ["../../..", "../..", ".."] {
-        let p = root.join(up).join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
+        let p = root
+            .join(up)
+            .join("models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf");
         if p.exists() {
             return Some(p);
         }
@@ -196,7 +204,11 @@ fn checkpoint() -> Option<std::path::PathBuf> {
     None
 }
 
-fn upload_packed(dev: &RocmDevice, bytes: &[u8], shape: &Shape) -> Box<dyn grim_tensor::BackendStorage> {
+fn upload_packed(
+    dev: &RocmDevice,
+    bytes: &[u8],
+    shape: &Shape,
+) -> Box<dyn grim_tensor::BackendStorage> {
     dev.from_cpu_bytes(
         bytes,
         shape,
@@ -249,12 +261,11 @@ fn real_q6k_gemm_matches_llama_cpp_reference_at_decode_shape() {
         eprintln!("[q6k-gemm] {name}: ggml dims {d0}x{d1} (ne0=in, ne1=out)");
 
         let mut best: Option<(&str, f64)> = None;
-        for (label, n, k) in [
-            ("ne1=out (A*W)", d1, d0),
-            ("ne0=out (A*W^T)", d0, d1),
-        ] {
+        for (label, n, k) in [("ne1=out (A*W)", d1, d0), ("ne0=out (A*W^T)", d0, d1)] {
             if k % QK_K != 0 {
-                eprintln!("[q6k-gemm] {name} {label}: k={k} is not a whole number of super-blocks, skipped");
+                eprintln!(
+                    "[q6k-gemm] {name} {label}: k={k} is not a whole number of super-blocks, skipped"
+                );
                 continue;
             }
             let e = run_case(&dev, name, label, &bytes, n, k);
@@ -269,7 +280,9 @@ fn real_q6k_gemm_matches_llama_cpp_reference_at_decode_shape() {
              {label} at relative {err:.3e}. The Q6_K path is the lm_head on this checkpoint, \
              so this is a wrong-logits bug, not a rounding difference."
         );
-        eprintln!("[q6k-gemm] {name}: MATCHES llama.cpp under orientation {label} (rel err {err:.3e})");
+        eprintln!(
+            "[q6k-gemm] {name}: MATCHES llama.cpp under orientation {label} (rel err {err:.3e})"
+        );
     }
 }
 
@@ -277,70 +290,74 @@ fn real_q6k_gemm_matches_llama_cpp_reference_at_decode_shape() {
 /// relative error rather than asserting, so BOTH orientations get measured —
 /// an assert on the first would abort before the second ever runs.
 fn run_case(dev: &RocmDevice, name: &str, label: &str, bytes: &[u8], n: usize, k: usize) -> f64 {
-        assert_eq!(k % QK_K, 0, "{name} {label}: k={k} must be whole super-blocks");
+    assert_eq!(
+        k % QK_K,
+        0,
+        "{name} {label}: k={k} must be whole super-blocks"
+    );
 
-        // ORACLE, straight from the reference transcription — not grim's host
-        // decoder, so the device is checked against llama.cpp and not against
-        // another of grim's implementations.
-        let mut b_oracle = vec![0.0f32; n * k];
-        llama_cpp_dequantize_row_q6k(bytes, &mut b_oracle, n * k);
+    // ORACLE, straight from the reference transcription — not grim's host
+    // decoder, so the device is checked against llama.cpp and not against
+    // another of grim's implementations.
+    let mut b_oracle = vec![0.0f32; n * k];
+    llama_cpp_dequantize_row_q6k(bytes, &mut b_oracle, n * k);
 
-        let b = upload_packed(dev, bytes, &Shape::new(vec![n, k]));
+    let b = upload_packed(dev, bytes, &Shape::new(vec![n, k]));
 
-        // m=1 always, plus m=8 and m=16 when the scalar host reference is
-        // affordable. m=16 is the point of the wider cases: the Q6_K launcher is
-        // chosen from m (`wmma_quant_tile_ok` requires m % 16 == 0), so m=1 and
-        // m=16 take DIFFERENT kernels. If they disagree, the bug is in whichever
-        // one decode does not use — and decode is m=1.
-        let mut ms = vec![1usize];
-        if n * k <= 8_000_000 {
-            ms.push(8);
-            ms.push(16);
-        }
+    // m=1 always, plus m=8 and m=16 when the scalar host reference is
+    // affordable. m=16 is the point of the wider cases: the Q6_K launcher is
+    // chosen from m (`wmma_quant_tile_ok` requires m % 16 == 0), so m=1 and
+    // m=16 take DIFFERENT kernels. If they disagree, the bug is in whichever
+    // one decode does not use — and decode is m=1.
+    let mut ms = vec![1usize];
+    if n * k <= 8_000_000 {
+        ms.push(8);
+        ms.push(16);
+    }
 
-        let mut overall = 0.0f64;
-        for m in ms {
-            let a_src: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.013).sin()).collect();
-            let a = dev
-                .from_cpu(&a_src, &Shape::new(vec![m, k]), DType::F32)
-                .expect("upload A");
-            let out_shape = Shape::new(vec![m, n]);
-            let (out, handle) = dev
-                .fused_quant_gemm(a.as_ref(), b.as_ref(), QuantFormat::Q6K, &out_shape)
-                .unwrap_or_else(|e| panic!("{name} {label} m={m}: fused_quant_gemm failed: {e}"));
-            handle.synchronize().expect("sync");
-            let got = out.to_cpu_vec_f32().expect("readback");
+    let mut overall = 0.0f64;
+    for m in ms {
+        let a_src: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.013).sin()).collect();
+        let a = dev
+            .from_cpu(&a_src, &Shape::new(vec![m, k]), DType::F32)
+            .expect("upload A");
+        let out_shape = Shape::new(vec![m, n]);
+        let (out, handle) = dev
+            .fused_quant_gemm(a.as_ref(), b.as_ref(), QuantFormat::Q6K, &out_shape)
+            .unwrap_or_else(|e| panic!("{name} {label} m={m}: fused_quant_gemm failed: {e}"));
+        handle.synchronize().expect("sync");
+        let got = out.to_cpu_vec_f32().expect("readback");
 
-            // Host reference: A[m,k] . deq(B)[n,k]^T, accumulated in f64 so the
-            // comparison is not measuring f32 summation order.
-            let mut worst = 0.0f64;
-            let mut at = 0usize;
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0f64;
-                    for t in 0..k {
-                        acc += a_src[i * k + t] as f64 * b_oracle[j * k + t] as f64;
-                    }
-                    let want = acc as f32;
-                    let err = (got[i * n + j] - want).abs() as f64 / want.abs().max(1.0) as f64;
-                    if err > worst {
-                        worst = err;
-                        at = i * n + j;
-                    }
+        // Host reference: A[m,k] . deq(B)[n,k]^T, accumulated in f64 so the
+        // comparison is not measuring f32 summation order.
+        let mut worst = 0.0f64;
+        let mut at = 0usize;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for t in 0..k {
+                    acc += a_src[i * k + t] as f64 * b_oracle[j * k + t] as f64;
+                }
+                let want = acc as f32;
+                let err = (got[i * n + j] - want).abs() as f64 / want.abs().max(1.0) as f64;
+                if err > worst {
+                    worst = err;
+                    at = i * n + j;
                 }
             }
-            let (ai, aj) = (at / n, at % n);
-            let mut acc0 = 0.0f64;
-            for t in 0..k {
-                acc0 += a_src[ai * k + t] as f64 * b_oracle[aj * k + t] as f64;
-            }
-            eprintln!(
-                "[q6k-gemm] {name} {label} [{n},{k}] m={m}: max rel err {worst:.3e} at {at} \
-                 (got {}, want {})",
-                got[at], acc0 as f32
-            );
-            overall = overall.max(worst);
         }
+        let (ai, aj) = (at / n, at % n);
+        let mut acc0 = 0.0f64;
+        for t in 0..k {
+            acc0 += a_src[ai * k + t] as f64 * b_oracle[aj * k + t] as f64;
+        }
+        eprintln!(
+            "[q6k-gemm] {name} {label} [{n},{k}] m={m}: max rel err {worst:.3e} at {at} \
+                 (got {}, want {})",
+            got[at], acc0 as f32
+        );
+        overall = overall.max(worst);
+    }
     overall
 }
 
@@ -366,7 +383,11 @@ fn device_q6k_element_decoder_matches_llama_cpp_per_weight() {
     // the same bytes, not against the original floats.
     let src: Vec<f32> = (0..QK_K).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
     let packed = grim_quant::quant_q6k(&src).expect("quant_q6k");
-    assert_eq!(packed.len(), Q6K_BLOCK_BYTES, "one super-block is 210 bytes");
+    assert_eq!(
+        packed.len(),
+        Q6K_BLOCK_BYTES,
+        "one super-block is 210 bytes"
+    );
 
     let mut oracle = vec![0.0f32; QK_K];
     llama_cpp_dequantize_row_q6k(&packed, &mut oracle, QK_K);
@@ -394,9 +415,18 @@ fn device_q6k_element_decoder_matches_llama_cpp_per_weight() {
 
     if !bad.is_empty() {
         let first = bad[0];
-        eprintln!("[q6k-elem] {}/{} weights WRONG; first at index {}: device {} vs llama.cpp {}",
-            bad.len(), QK_K, first.0, first.1, first.2);
-        eprintln!("[q6k-elem] wrong indices (first 32): {:?}", bad.iter().take(32).map(|x| x.0).collect::<Vec<_>>());
+        eprintln!(
+            "[q6k-elem] {}/{} weights WRONG; first at index {}: device {} vs llama.cpp {}",
+            bad.len(),
+            QK_K,
+            first.0,
+            first.1,
+            first.2
+        );
+        eprintln!(
+            "[q6k-elem] wrong indices (first 32): {:?}",
+            bad.iter().take(32).map(|x| x.0).collect::<Vec<_>>()
+        );
     }
     assert!(
         bad.is_empty(),
@@ -478,14 +508,29 @@ fn device_q6k_multirow_multiblock_matches_llama_cpp() {
             let blk = &slice[0..Q6K_BLOCK_BYTES];
             let d = fp16_to_f32(blk[208], blk[209]);
             let sc = blk[192..208].iter().map(|b| *b as i8).collect::<Vec<_>>();
-            eprintln!("[q6k-rows] block0 d(fp16@208)={d}  d_bits=0x{:04x}", u16::from_le_bytes([blk[208], blk[209]]));
+            eprintln!(
+                "[q6k-rows] block0 d(fp16@208)={d}  d_bits=0x{:04x}",
+                u16::from_le_bytes([blk[208], blk[209]])
+            );
             eprintln!("[q6k-rows] block0 scales(192..208) as i8 = {sc:?}");
-            eprintln!("[q6k-rows] block0 ql[0]={} qh[0]={}  ->  q_code(t=0)={}",
-                blk[0], blk[128], ((blk[0] & 0x0F) as i32) | ((((blk[128] >> 0) & 3) as i32) << 4));
-            eprintln!("[q6k-rows] block0 d*sc[0]*(q-32) = {}",
-                d * sc[0] as f32 * (((blk[0] & 0x0F) as i32 | ((((blk[128] >> 0) & 3) as i32) << 4)) - 32) as f32);
-            eprintln!("[q6k-rows] block0 NEGATED that   = {}",
-                -(d * sc[0] as f32 * (((blk[0] & 0x0F) as i32 | ((((blk[128] >> 0) & 3) as i32) << 4)) - 32) as f32));
+            eprintln!(
+                "[q6k-rows] block0 ql[0]={} qh[0]={}  ->  q_code(t=0)={}",
+                blk[0],
+                blk[128],
+                ((blk[0] & 0x0F) as i32) | ((((blk[128] >> 0) & 3) as i32) << 4)
+            );
+            eprintln!(
+                "[q6k-rows] block0 d*sc[0]*(q-32) = {}",
+                d * sc[0] as f32
+                    * (((blk[0] & 0x0F) as i32 | ((((blk[128] >> 0) & 3) as i32) << 4)) - 32)
+                        as f32
+            );
+            eprintln!(
+                "[q6k-rows] block0 NEGATED that   = {}",
+                -(d * sc[0] as f32
+                    * (((blk[0] & 0x0F) as i32 | ((((blk[128] >> 0) & 3) as i32) << 4)) - 32)
+                        as f32)
+            );
         }
         eprintln!(
             "[q6k-rows] wrong (t, col, device, reference) samples: {:?}",

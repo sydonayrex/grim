@@ -35,11 +35,7 @@ use std::process::Command;
 /// support fails loudly instead of silently falling back to a scalar path.
 const PINNED: &[(&str, &str, &str)] = &[
     // Raven — V_DOT4_F32_FP8_FP8. NOTE: `dot4`, not `fdot4`.
-    (
-        "Raven",
-        "__builtin_amdgcn_dot4_f32_fp8_fp8",
-        "dot11-insts",
-    ),
+    ("Raven", "__builtin_amdgcn_dot4_f32_fp8_fp8", "dot11-insts"),
     // WhiteRaven — V_WMMA_F32_16X16X16_FP8_FP8. `_w32` + `_gfx12` are both required.
     (
         "WhiteRaven",
@@ -164,7 +160,10 @@ fn verdict(text: &str, tag: &str, index: usize) -> Option<bool> {
         let Some(pos) = toks.iter().position(|t| *t == tag) else {
             continue;
         };
-        return toks.get(pos + 2).and_then(|v| v.parse::<u32>().ok()).map(|v| v != 0);
+        return toks
+            .get(pos + 2)
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v != 0);
     }
     None
 }

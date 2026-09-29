@@ -460,13 +460,20 @@ impl MemoryOps for RocmDevice {
                 "[copy] dst_ptr={:p} src_ptr={:p} bytes={} dst_ord={} src_ord={} cur_dev={} \
                  self_ord={} capture={} dst_managed={:?} src_managed={:?} \
                  dst_dims={:?} src_dims={:?} dst_dtype={:?} src_dtype={:?} stream={:p}",
-                dst_ptr, src_ptr, bytes,
-                dst.device_ordinal(), src.device_ordinal(),
-                self.current_device_for_trace(), self.ordinal,
+                dst_ptr,
+                src_ptr,
+                bytes,
+                dst.device_ordinal(),
+                src.device_ordinal(),
+                self.current_device_for_trace(),
+                self.ordinal,
                 self.active_capture_stream().is_some(),
-                mg(dst), mg(src),
-                dst.shape().dims(), src.shape().dims(),
-                dst.dtype().arith, src.dtype().arith,
+                mg(dst),
+                mg(src),
+                dst.shape().dims(),
+                src.shape().dims(),
+                dst.dtype().arith,
+                src.dtype().arith,
                 self.active_stream(),
             );
         }
@@ -485,14 +492,8 @@ impl MemoryOps for RocmDevice {
             // that hipMemcpy performs, and losing the async-ness here is a far
             // better outcome than failing the reshape and falling back to the
             // host. Report which path was taken.
-            let st_sync = unsafe {
-                hipMemcpy(
-                    dst_ptr,
-                    src_ptr,
-                    bytes,
-                    HipMemcpyKind::DeviceToDevice,
-                )
-            };
+            let st_sync =
+                unsafe { hipMemcpy(dst_ptr, src_ptr, bytes, HipMemcpyKind::DeviceToDevice) };
             if std::env::var("GRIM_DEBUG_COPY").is_ok() {
                 // The allocation byte count on each side is the load-bearing
                 // number here, and NOTHING in the status separates the three
@@ -562,7 +563,9 @@ impl MemoryOps for RocmDevice {
                     }
                 }
                 Err(e) => {
-                    if std::env::var("GRIM_DEBUG_COPY").is_ok() || crate::device::util::is_debug_enabled() {
+                    if std::env::var("GRIM_DEBUG_COPY").is_ok()
+                        || crate::device::util::is_debug_enabled()
+                    {
                         eprintln!("[copy] grim_copy_bytes launch failed: {e}");
                     }
                 }
@@ -621,14 +624,8 @@ impl MemoryOps for RocmDevice {
             )
         };
         if st != hipSuccess {
-            let st_sync = unsafe {
-                hipMemcpy(
-                    dst_ptr,
-                    src_ptr,
-                    count,
-                    HipMemcpyKind::DeviceToDevice,
-                )
-            };
+            let st_sync =
+                unsafe { hipMemcpy(dst_ptr, src_ptr, count, HipMemcpyKind::DeviceToDevice) };
             if st_sync == hipSuccess {
                 return Ok(());
             }
@@ -655,7 +652,9 @@ impl MemoryOps for RocmDevice {
                     }
                 }
                 Err(e) => {
-                    if std::env::var("GRIM_DEBUG_COPY").is_ok() || crate::device::util::is_debug_enabled() {
+                    if std::env::var("GRIM_DEBUG_COPY").is_ok()
+                        || crate::device::util::is_debug_enabled()
+                    {
                         eprintln!("[copy_bytes_into] grim_copy_bytes launch failed: {e}");
                     }
                 }
@@ -666,7 +665,6 @@ impl MemoryOps for RocmDevice {
         }
         Ok(())
     }
-
 }
 
 impl GraphCaptureOps for RocmDevice {

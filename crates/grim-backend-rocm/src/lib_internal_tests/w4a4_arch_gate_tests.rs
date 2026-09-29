@@ -23,7 +23,7 @@
 //! admit or reject? Extracting it as a predicate makes that testable on CPU and
 //! makes the gate readable at the call site.
 
-use crate::quantization::{w4a4_ostquant_supported, GcnArch};
+use crate::quantization::{GcnArch, w4a4_ostquant_supported};
 
 /// Whether the current device implements `V_DOT8_I32_IU4` in a form grim ships.
 ///
@@ -61,8 +61,7 @@ fn ws_c2_w4a4_is_rejected_off_gfx12() {
 /// misleading diagnostic.
 #[test]
 fn ws_c2_arch_gate_precedes_the_k_gate() {
-    let err = w4a4_ostquant_supported(GcnArch::RDNA3, 100)
-        .expect_err("must reject");
+    let err = w4a4_ostquant_supported(GcnArch::RDNA3, 100).expect_err("must reject");
     assert!(
         err.contains("gfx12"),
         "on a non-gfx12 arch the arch error must win over the K error: {err}"

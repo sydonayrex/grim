@@ -12,7 +12,9 @@ use grim_tensor::dtype::DType;
 #[ignore]
 fn test_stochastic_sampler_determinism_and_distribution() {
     if !grim_backend_rocm::gpu_test_enabled() {
-        eprintln!("ROCm device tests disabled: skipping test_stochastic_sampler_determinism_and_distribution");
+        eprintln!(
+            "ROCm device tests disabled: skipping test_stochastic_sampler_determinism_and_distribution"
+        );
         return;
     }
     let dev = RocmDevice::new(0);
@@ -64,7 +66,10 @@ fn test_stochastic_sampler_determinism_and_distribution() {
     .unwrap()
     .expect("Device sampler should succeed");
 
-    assert_eq!(tok1, tok2, "Sampling with identical seed and position must be deterministic");
+    assert_eq!(
+        tok1, tok2,
+        "Sampling with identical seed and position must be deterministic"
+    );
 
     // Test 2: Distribution verification over 2,000 draws
     let mut counts = vec![0usize; vocab];
@@ -87,7 +92,11 @@ fn test_stochastic_sampler_determinism_and_distribution() {
 
     // Top-k is 4, so tokens >= 4 must have 0 draws
     for v in 4..vocab {
-        assert_eq!(counts[v], 0, "Token {v} exceeds top_k=4 but received {} draws", counts[v]);
+        assert_eq!(
+            counts[v], 0,
+            "Token {v} exceeds top_k=4 but received {} draws",
+            counts[v]
+        );
     }
 
     // Token 0 (logit 3.0) should have the highest share of draws
