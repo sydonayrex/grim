@@ -12,6 +12,8 @@ use crate::{check_hip, hipFree, hipMalloc};
 /// Size-bucketed caching allocator for device memory. [see: `hipMalloc`, `hipFree`, `Drop for RocmStorage`, `Arc`]
 #[derive(Debug)]
 pub struct RocmCachingAllocator {
+    /// Unique instance id (audit diagnosis: instance address reuse lies).
+    id: usize,
     /// Free-list: size class -> available device pointers (stored as `u64` so the [see: `Send + Sync`]
     /// P0-1: each entry carries an event recorded on the stream that was
     /// current at free() time; a later `alloc` reusing the block waits on
@@ -29,6 +31,11 @@ pub struct RocmCachingAllocator {
     malloc_count: AtomicUsize,
     /// Count of real `hipFree` calls (evictions / cap overflow). Always incremented.
     free_count: AtomicUsize,
+    /// GRIM_ALLOC_AUDIT=1: live-set integrity audit. Maps every handed-out
+    /// pointer to its size class; a pointer handed out twice while live, or
+    /// freed twice, is the deterministic aliasing that produced the d2d
+    /// decode gibberish.
+    live: Mutex<std::collections::HashMap<u64, usize>>,
 }
 
 /// A pooled device block plus the fence event recorded when it was freed.
@@ -40,15 +47,21 @@ struct PoolEntry {
 
 unsafe impl Send for PoolEntry {}
 
+static NEXT_ALLOCATOR_ID: AtomicUsize = AtomicUsize::new(1);
+
 impl RocmCachingAllocator {
     pub fn new(ordinal: usize, cap_bytes: usize) -> Self {
+        let id = NEXT_ALLOCATOR_ID.fetch_add(1, Ordering::Relaxed);
         Self {
+            id,
+
             pool: Mutex::new(HashMap::new()),
             cached_bytes: Mutex::new(0),
             cap_bytes,
             ordinal,
             malloc_count: AtomicUsize::new(0),
             free_count: AtomicUsize::new(0),
+            live: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -70,18 +83,32 @@ impl RocmCachingAllocator {
         };
         if let Some(entry) = reused {
             // Buffer leaves the pool: adjust cached accounting, and order the
-            // new owner's stream after whatever last used this block.
+            // new owner's writes after EVERY in-flight consumer of this block.
+            //
+            // The recorded event only fences the stream that was current at
+            // `free()` time. The d2d decode path runs kernels on capture
+            // streams that are not current when their output buffers are
+            // dropped, so a stream-ordered wait let the new owner overwrite a
+            // block a consumer on another stream was still reading/writing —
+            // the Qwen3.5-9B d2d decode gibberish (h_normed [1024..4096)
+            // garbage, GRIM_ALLOC_NO_POOL=1 clean). A device-wide
+            // synchronize is correct for any stream; at decode's ~600
+            // ms/token it is unmeasurable.
+            self.audit_trace("POP ", entry.ptr, cls);
+            self.audit_insert(entry.ptr, cls);
             if let Ok(mut cached) = self.cached_bytes.lock() {
                 *cached = cached.saturating_sub(cls);
             }
+            {
+                let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                unsafe {
+                    let _ = crate::hipDeviceSynchronize();
+                }
+            }
             if !entry.event.is_null() {
-                let stream =
-                    crate::device::roc_device::RocmDevice::shared(self.ordinal).active_stream();
-                if !stream.is_null() {
-                    // SAFETY: event owned by this entry; stream is live.
-                    unsafe {
-                        let _ = crate::hipStreamWaitEvent(stream, entry.event, 0);
-                    }
+                // The event fence is superseded by the synchronize above.
+                unsafe {
+                    let _ = crate::hipEventDestroy(entry.event);
                 }
             }
             return Ok(entry.ptr as *mut c_void);
@@ -98,15 +125,54 @@ impl RocmCachingAllocator {
         }
         drop(_guard);
         self.malloc_count.fetch_add(1, Ordering::Relaxed);
+        self.audit_trace("MALLOC", dev_ptr_void as u64, cls);
+        self.audit_insert(dev_ptr_void as u64, cls);
         Ok(dev_ptr_void)
     }
 
+    fn audit_on(&self) -> bool {
+        std::env::var("GRIM_ALLOC_AUDIT").as_deref() == Ok("1")
+    }
+
+    fn audit_trace(&self, what: &str, ptr: u64, cls: usize) {
+        if !self.audit_on() || cls != 16384 { return; }
+        eprintln!("[alloc-trace] {} {ptr:#x} c{cls} id{}", what, self.id);
+    }
+
+    fn audit_insert(&self, ptr: u64, cls: usize) {
+        if !self.audit_on() { return; }
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = live.insert(ptr, cls) {
+            eprintln!("[alloc-audit] DOUBLE-BOOKING: {ptr:#x} id{} handed out while live (class {old}, now {cls})", self.id);
+        }
+    }
+
+    fn audit_remove(&self, ptr: u64, cls: usize) {
+        if !self.audit_on() { return; }
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        match live.remove(&ptr) {
+            None => eprintln!("[alloc-audit] FREE OF UNKNOWN: {ptr:#x} class {cls} not live"),
+            Some(c) if c != cls => eprintln!("[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))", self.id),
+            _ => {}
+        }
+    }
+
     /// Return a buffer to the pool (or actually free it if over cap).
+    ///
+    /// DEFAULT IS NO POOL. The size-classed free list has a broken ownership
+    /// invariant: a block can be pooled while a duplicate owner still holds
+    /// it, and the driver can then hand the same address to a fresh
+    /// `hipMalloc` — two live owners, deterministic memory corruption. This
+    /// was the Qwen3.5-9B d2d decode gibberish (arbitration: pool on ->
+    /// h_normed[1024..4096) garbage and step-1 logprobs "&lt" -1.93; pool
+    /// off -> byte-equal to the host reference). GRIM_ALLOC_AUDIT=1 traces
+    /// the violations ([alloc-audit]/[alloc-trace]); GRIM_ALLOC_POOL=1 opts
+    /// back into reuse for perf work once the duplicate-owner site is fixed.
     pub fn free(&self, ptr: *mut c_void, bytes: usize) {
-        // TEMP-DIAG (GGUF fault hunt): GRIM_ALLOC_NO_POOL=1 makes every free a synchronized real release, ruling
-        // pool reuse in/out as the cause of the "Page not present" GPU fault.
-        if std::env::var("GRIM_ALLOC_NO_POOL").is_ok() {
-            // WI-M1: pin the owning ordinal for the real release (see below).
+        if std::env::var("GRIM_ALLOC_POOL").as_deref() != Ok("1") {
+            // Correct-by-default path: device-wide synchronize (any stream's
+            // in-flight consumer is done) then a real driver release.
+            // WI-M1: pin the owning ordinal for the real release.
             let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
             unsafe {
                 let _ = crate::hipDeviceSynchronize();
@@ -116,6 +182,8 @@ impl RocmCachingAllocator {
             return;
         }
         let cls = Self::size_class(bytes);
+        self.audit_trace("FREE ", ptr as u64, cls);
+        self.audit_remove(ptr as u64, cls);
         let over_cap = {
             let cached = self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner());
             *cached + cls > self.cap_bytes

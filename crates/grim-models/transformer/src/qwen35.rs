@@ -1451,9 +1451,79 @@ impl Qwen35Block {
         }
         // Residual 1
         let h = grim_nn::modules::add_on_device(x, &proj_out)?;
+        // KDA-STEP-PROBE: layer-0 decode — where does the [1024..4096) garbage
+        // start? Dump h and a fresh proj_out readback (synced).
+        if kda_probe_layer0 {
+            static H_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !H_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if let Device::Rocm(ord) = x.device() {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
+                for (t, name) in [(&proj_out, "resid_proj_out"), (&h, "resid_h")] {
+                    match grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()) {
+                        Ok(r) => match r.copy_to_host() {
+                            Ok(b) => {
+                                let vals: Vec<f32> = b.chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                let s8: f32 = vals.iter().take(8).sum();
+                                if vals.len() >= 1027 {
+                                    eprintln!("[resid-fp] {name} len {} sum8={s8:+.6} [1024:1027]={:?}", vals.len(), &vals[1024..1027]);
+                                } else {
+                                    eprintln!("[resid-fp] {name} len {} sum8={s8:+.6}", vals.len());
+                                }
+                                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                                let _ = std::fs::write(format!("/tmp/kda_probe_{name}.bin"), &bytes);
+                            }
+                            Err(e) => eprintln!("[resid-fp] {name} read FAILED: {e}"),
+                        },
+                        Err(e) => eprintln!("[resid-fp] {name} not rocm: {e}"),
+                    }
+                }
+            }
+        }
 
         // 3. Post-attention norm
         let h_normed = self.post_attention_norm.forward(&h)?;
+        // KDA-STEP-PROBE: ONE point, ONE sync — dump the whole residual chain
+        // before any buffer can be recycled by later ops.
+        if kda_probe_layer0 {
+            static CHAIN_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !CHAIN_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if let Device::Rocm(ord) = x.device() {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
+                // Overlap check: print every device pointer involved. If the
+                // allocator handed `h` memory that aliases a live d2d buffer,
+                // the pointers will say so.
+                {
+                    let ptr = |t: &Tensor| grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()).ok().and_then(|r| r.device_ptr_u64()).unwrap_or(0);
+                    eprintln!(
+                        "[chain-ptr] x={:#x} proj_out={:#x} h={:#x} h_normed={:#x} conv_ring={:#x} ssm_state={:#x}",
+                        ptr(x), ptr(&proj_out), ptr(&h), ptr(&h_normed),
+                        cache.conv_state_dev.as_ref().map(|c| grim_backend_rocm::device::util::as_rocm(c.as_ref()).ok().and_then(|r| r.device_ptr_u64()).unwrap_or(0)).unwrap_or(0),
+                        cache.ssm_state_dev.as_ref().map(|c| grim_backend_rocm::device::util::as_rocm(c.as_ref()).ok().and_then(|r| r.device_ptr_u64()).unwrap_or(0)).unwrap_or(0),
+                    );
+                }
+                for (t, name) in [
+                    (x, "chain_x"),
+                    (&proj_out, "chain_proj_out"),
+                    (&h, "chain_h"),
+                    (&h_normed, "chain_h_normed"),
+                ] {
+                    match grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()) {
+                        Ok(r) => match r.copy_to_host() {
+                            Ok(b) => {
+                                let _ = std::fs::write(format!("/tmp/kda_probe_{name}.bin"), &b);
+                                eprintln!("[chain-fp] wrote {name} ({} B)", b.len());
+                            }
+                            Err(e) => eprintln!("[chain-fp] {name} read FAILED: {e}"),
+                        },
+                        Err(e) => eprintln!("[chain-fp] {name} not rocm: {e}"),
+                    }
+                }
+            }
+        }
 
         // 4. SwiGLU FFN
         let (gate, up) = match self.w_gate_up_q4k_fused.as_ref() {
@@ -1513,13 +1583,27 @@ impl Qwen35Block {
                 dump(&gate, "gate");
                 dump(&up, "up");
                 dump(&ffn_out, "ffn_out");
-                // The fused Q4K weight storage: identical across runs unless
-                // something corrupted it (e.g. a prefill overrun).
                 let mode = if std::env::var("GRIM_QWEN_KDA_D2D").as_deref() == Ok("0") {
                     "host"
                 } else {
                     "d2d"
                 };
+                // Raw ffn_gate weight bytes: identical across runs unless a
+                // d2d kernel wrote out of bounds into the weight pool.
+                { let wg = &self.ffn_gate;
+                    match grim_backend_rocm::device::util::as_rocm(wg.weight().storage().as_ref()) {
+                        Ok(r) => match r.copy_to_host() {
+                            Ok(b) => {
+                                let _ = std::fs::write(format!("/tmp/kda_probe_ffn_{mode}_w_gate_raw.bin"), &b);
+                                eprintln!("[ffn-fp] w_gate raw ({} B) dumped", b.len());
+                            }
+                            Err(e) => eprintln!("[ffn-fp] w_gate raw read FAILED: {e}"),
+                        },
+                        Err(e) => eprintln!("[ffn-fp] w_gate raw not rocm: {e}"),
+                    }
+                }
+                // The fused Q4K weight storage: identical across runs unless
+                // something corrupted it (e.g. a prefill overrun).
                 match self
                     .w_gate_up_q4k_fused
                     .as_ref()
@@ -1565,6 +1649,9 @@ impl Qwen35Block {
             static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if call <= 8 {
+                if let Device::Rocm(ord) = out.device() {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
                 let vals: Vec<f32> = match grim_backend_rocm::device::util::as_rocm(out.storage().as_ref())
                     .and_then(|r| {
                         let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
@@ -1579,6 +1666,8 @@ impl Qwen35Block {
                 if vals.is_empty() {
                     eprintln!("[blk-fp] call {call} layer {} READBACK FAILED", self.layer_idx);
                 } else {
+                    let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = std::fs::write(format!("/tmp/kda_probe_blkfp_call{call}.bin"), &bytes);
                     let s8: f32 = vals.iter().take(8).sum();
                     let s: f32 = vals.iter().sum();
                     eprintln!(
@@ -2300,10 +2389,38 @@ fn gated_delta_net_forward(
     };
     // SiLU on the convolved stream, per the reference.
     let conv_mix: Vec<f32> = qkv_conv.iter().map(|v| v / (1.0 + (-v).exp())).collect();
+    // KDA-STEP-PROBE (prefill arm): dump the layer-0 prefill conv stream in
+    // both raw and post-SiLU form, plus the post-prefill conv ring, so the
+    // device scan can be arbitrated op by op with REAL distributions.
     {
         static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-            && blk.layer_idx == 0
+            && blk.layer_idx == kda_probe_prefill_layer()
+            && seq_len > 1
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let dump = |vals: &[f32], name: &str| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("/tmp/kda_probe_host_{name}.bin");
+                if std::fs::write(&path, &bytes).is_ok() {
+                    eprintln!("[kda-probe-host] prefill wrote {} ({} f32) -> {path}", name, vals.len());
+                }
+            };
+            dump(&qkv_vec, "prefill_conv_x");
+            dump(&qkv_conv, "prefill_conv_raw");
+            dump(&conv_mix, "prefill_conv_mix");
+            dump(&alpha, "prefill_alpha");
+            dump(&beta, "prefill_beta");
+            dump(&z_vec, "prefill_z");
+            let taps = blk.cfg_ssm_d_conv().max(1);
+            let ring_elems = (taps - 1) * qkv_vec.len();
+            dump(&cache.conv_state[..ring_elems.min(cache.conv_state.len())], "prefill_ring_post");
+        }
+    }
+    {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == kda_probe_prefill_layer()
             && seq_len == 1
             && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -2320,7 +2437,7 @@ fn gated_delta_net_forward(
     {
         static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-            && blk.layer_idx == 0
+            && blk.layer_idx == kda_probe_prefill_layer()
             && seq_len == 1
             && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -2461,7 +2578,7 @@ fn gated_delta_net_forward(
             }
         }
     }
-    if blk.layer_idx == 0 {
+    if blk.layer_idx == 0 || blk.layer_idx == kda_probe_prefill_layer() {
         kda_probe_host_post(&cache.ssm_state, seq_len);
     }
     if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && seq_len == 1 {
@@ -2477,13 +2594,21 @@ fn gated_delta_net_forward(
         }
         // host branch dump at decode step 1 (call 1 of seq==1 = layer 0):
         // elementwise arbitration against the D2D branch dump.
-        if blk.layer_idx == 0 && CALLS.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        if blk.layer_idx == kda_probe_prefill_layer() && CALLS.load(std::sync::atomic::Ordering::Relaxed) == 1 {
             let bytes: Vec<u8> = out_branch.iter().flat_map(|v| v.to_le_bytes()).collect();
             let _ = std::fs::write("/tmp/kda_probe_host_branch.bin", &bytes);
             eprintln!("[kda-probe-host] wrote branch ({} f32)", out_branch.len());
         }
     }
     Ok(())
+}
+
+// KDA-STEP-PROBE: which layer the prefill arbitration dumps (default 0).
+fn kda_probe_prefill_layer() -> usize {
+    std::env::var("GRIM_KDA_PROBE_LAYER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 // KDA-STEP-PROBE (host side): post-recurrence state dump for layer 0 step 1.
@@ -2685,7 +2810,7 @@ fn gated_delta_net_forward_d2d(
     {
         static PRE_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
-            && blk.layer_idx == 0
+            && blk.layer_idx == kda_probe_prefill_layer()
             && seq_len == 1
             && !PRE_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -2703,7 +2828,75 @@ fn gated_delta_net_forward_d2d(
         }
     }
 
+    // KDA-STEP-PROBE (decode arm, device side, synchronized reads): dump the
+    // projection input, RAW step-conv output, and pre-step ring for the
+    // decode-step arbitration. Unlike the composite probe below, every read
+    // is preceded by a device synchronize, so the bytes are not stale.
+    if seq_len == 1 {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == kda_probe_prefill_layer()
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
+                grim_backend_rocm::device::util::as_rocm(st)
+                    .and_then(|r| r.copy_to_host())
+                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .unwrap_or_default()
+            };
+            let dump = |vals: &[f32], name: &str| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("/tmp/kda_probe_d2d_{name}.bin");
+                if std::fs::write(&path, &bytes).is_ok() {
+                    eprintln!("[kda-step-probe] decode wrote {} ({} f32) -> {path}", name, vals.len());
+                }
+            };
+            if let Device::Rocm(ord) = x_normed.device() {
+                grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+            }
+            dump(&read(qkv.storage().as_ref()), "dec_conv_x");
+            dump(&read(conv_state.as_ref()), "dec_ring_pre");
+            dump(&read(ssm_state.as_ref()), "dec_ssm_pre");
+            dump(&read(conv_out.as_ref()), "dec_conv_raw");
+        }
+    }
+
     let eps = blk.attn_norm.eps;
+    // KDA-STEP-PROBE (prefill arm, device side): dump the layer-0 prefill
+    // conv projection input and RAW conv output before the scan, and the
+    // post-prefill conv ring + ssm state after it, for the host-vs-device
+    // op-by-op arbitration at real distributions.
+    {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == kda_probe_prefill_layer()
+            && seq_len > 1
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
+                grim_backend_rocm::device::util::as_rocm(st)
+                    .and_then(|r| r.copy_to_host())
+                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .unwrap_or_default()
+            };
+            let dump = |vals: &[f32], name: &str| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("/tmp/kda_probe_d2d_{name}.bin");
+                if std::fs::write(&path, &bytes).is_ok() {
+                    eprintln!("[kda-step-probe] prefill wrote {} ({} f32) -> {path}", name, vals.len());
+                }
+            };
+            if let Device::Rocm(ord) = x_normed.device() {
+                grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+            }
+            dump(&read(qkv.storage().as_ref()), "prefill_conv_x");
+            dump(&read(conv_out.as_ref()), "prefill_conv_raw");
+            dump(&read(conv_state.as_ref()), "prefill_ring_pre");
+            dump(&read(alpha.storage().as_ref()), "prefill_alpha");
+            dump(&read(beta.storage().as_ref()), "prefill_beta");
+            dump(&read(z.storage().as_ref()), "prefill_z");
+        }
+    }
     let (branch, _) = if seq_len == 1 {
         dev.kda_gated_delta_rule_batched(
             conv_out.as_ref(),
@@ -2739,6 +2932,66 @@ fn gated_delta_net_forward_d2d(
         )?
     };
 
+    // Post-step decode dumps (device, synchronized): ssm state, ring, branch.
+    if seq_len == 1 {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == kda_probe_prefill_layer()
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
+                grim_backend_rocm::device::util::as_rocm(st)
+                    .and_then(|r| r.copy_to_host())
+                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .unwrap_or_default()
+            };
+            let dump = |vals: &[f32], name: &str| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("/tmp/kda_probe_d2d_{name}.bin");
+                if std::fs::write(&path, &bytes).is_ok() {
+                    eprintln!("[kda-step-probe] decode wrote {} ({} f32) -> {path}", name, vals.len());
+                }
+            };
+            if let Device::Rocm(ord) = x_normed.device() {
+                grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+            }
+            dump(&read(ssm_state.as_ref()), "dec_ssm_post");
+            dump(&read(conv_state.as_ref()), "dec_ring_post");
+            dump(&read(branch.as_ref()), "dec_branch");
+        }
+    }
+
+    // Post-prefill state dumps (device): ssm state after the scan, conv ring
+    // after the scan's own ring update.
+    {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == kda_probe_prefill_layer()
+            && seq_len > 1
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let read = |st: &dyn grim_tensor::BackendStorage| -> Vec<f32> {
+                grim_backend_rocm::device::util::as_rocm(st)
+                    .and_then(|r| r.copy_to_host())
+                    .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                    .unwrap_or_default()
+            };
+            let dump = |vals: &[f32], name: &str| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("/tmp/kda_probe_d2d_{name}.bin");
+                if std::fs::write(&path, &bytes).is_ok() {
+                    eprintln!("[kda-step-probe] prefill wrote {} ({} f32) -> {path}", name, vals.len());
+                }
+            };
+            if let Device::Rocm(ord) = x_normed.device() {
+                grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+            }
+            dump(&read(ssm_state.as_ref()), "prefill_ssm_post");
+            dump(&read(conv_state.as_ref()), "prefill_ring_post");
+            dump(&read(branch.as_ref()), "prefill_branch");
+        }
+    }
+
     // No readback at all: the gated branch output and the recurrent state both
     // stay in VRAM, and `ssm_out` consumes the tensor directly.
 
@@ -2750,7 +3003,7 @@ fn gated_delta_net_forward_d2d(
         static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let probe_on = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1");
         if probe_on
-            && blk.layer_idx == 0
+            && blk.layer_idx == kda_probe_prefill_layer()
             && seq_len == 1
             && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
