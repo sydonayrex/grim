@@ -1306,6 +1306,37 @@ impl Qwen35Block {
 
         // Residual 2
         let out = grim_nn::modules::add_on_device(&h, &ffn_out)?;
+        // KDA-STEP-PROBE: block-output fingerprint + device at the first
+        // decode step, per layer — the first divergent element hunt.
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && out.shape().dims().first() == Some(&1) {
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if call <= 8 {
+                let vals: Vec<f32> = match grim_backend_rocm::device::util::as_rocm(out.storage().as_ref())
+                    .and_then(|r| {
+                        let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                        r.copy_to_host()
+                    }) {
+                    Ok(b) => b
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                if vals.is_empty() {
+                    eprintln!("[blk-fp] call {call} layer {} READBACK FAILED", self.layer_idx);
+                } else {
+                    let s8: f32 = vals.iter().take(8).sum();
+                    let s: f32 = vals.iter().sum();
+                    eprintln!(
+                        "[blk-fp] call {call} layer {} out.device={} len {} sum8={s8:+.6} sum={s:+.6}",
+                        self.layer_idx,
+                        out.device(),
+                        vals.len()
+                    );
+                }
+            }
+        }
         Ok(out)
     }
 }
