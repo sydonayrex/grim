@@ -200,3 +200,114 @@ fn download_f32(t: &Box<dyn BackendStorage>) -> TestResult<Vec<f32>> {
     let bytes = grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
     Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
+
+/// The activation quantizer, against a host reference using the same frozen
+/// codebook and the same nearest-entry rule.
+///
+/// This is the second half of B6 and it is checked separately from the weight
+/// GEMV because it fails differently: the GEMV reads planes the host produced,
+/// so a wrong kernel shows up as a numeric mismatch, whereas this kernel
+/// *produces* the planes. A bug here would corrupt both sides of a round trip
+/// consistently and could hide -- which is why the oracle here re-derives the
+/// expected selector, indices, scale and sign plane from the source f32 using
+/// only host code, and compares plane by plane.
+#[test]
+fn activation_quantizer_matches_cpu() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+
+    const K: usize = 1024;
+    const ROWS: usize = 4;
+    let mut rng = Lcg(0xAC7_1A70);
+    let a: Vec<f32> = (0..ROWS * K).map(|_| rng.next_f32() * 4.0).collect();
+
+    let n_blocks = K / SCRUB_JAY_BLOCK;
+    let idx_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * K]), DType { arith: ArithType::U8, storage: Storage::Native })
+        .map_err(|e| format!("idx: {e}"))?;
+    let sel_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * n_blocks]), DType { arith: ArithType::U8, storage: Storage::Native })
+        .map_err(|e| format!("sel: {e}"))?;
+    let scl_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * n_blocks]), DType { arith: ArithType::F32, storage: Storage::Native })
+        .map_err(|e| format!("scl: {e}"))?;
+    let sgn_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![ROWS * n_blocks]), DType { arith: ArithType::U8, storage: Storage::Native })
+        .map_err(|e| format!("sgn: {e}"))?;
+    let a_t = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![ROWS * K]), DType { arith: ArithType::F32, storage: Storage::Native })
+        .map_err(|e| format!("a: {e}"))?;
+
+    fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+        grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
+    }
+    dev.launch_scrub_jay_quantize_u8(r(&a_t), r(&idx_t), r(&sel_t), r(&scl_t), r(&sgn_t), K, ROWS)
+        .map_err(|e| format!("quantize: {e}"))?;
+    dev.synchronize();
+    let got_idx = bytes_of(&idx_t)?;
+    let got_sel = bytes_of(&sel_t)?;
+    let got_scl: Vec<f32> = got_scl_bytes(&scl_t)?;
+    let got_sgn = bytes_of(&sgn_t)?;
+
+    let cb = grim_quant::scrub_jay::SCRUB_JAY_CODEBOOK;
+    let mut bad = 0usize;
+    for row in 0..ROWS {
+        for blk in 0..n_blocks {
+            let mut block = [0f32; SCRUB_JAY_BLOCK];
+            for (i, slot) in block.iter_mut().enumerate() {
+                *slot = a[row * K + blk * SCRUB_JAY_BLOCK + i];
+            }
+            // Host reference: same convention as the kernel, derived from the
+            // block alone -- peak maps to 31, argmin over books by squared
+            // distance to each book's nearest entry.
+            let bmax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let d = bmax / 31.0;
+            let inv_d = if bmax > 1e-9 { 31.0 / bmax } else { 0.0 };
+            let mut best_c = 0usize;
+            let mut best_err = f32::INFINITY;
+            for (c, book) in cb.iter().enumerate() {
+                let mut err = 0.0f32;
+                for &v in block.iter() {
+                    let mag = v.abs() * inv_d;
+                    let bd = book.iter().map(|&l| (l as f32 - mag).powi(2)).fold(f32::INFINITY, f32::min);
+                    err += bd;
+                }
+                if err < best_err { best_err = err; best_c = c; }
+            }
+            let bi = row * n_blocks + blk;
+            if got_sel[bi] as usize != best_c {
+                bad += 1;
+                if bad <= 3 { eprintln!("sel mismatch row={row} blk={blk}: got {} want {best_c}", got_sel[bi]); }
+                continue;
+            }
+            if (got_scl[bi] - d).abs() > 1e-5 * d.abs().max(1e-6) {
+                bad += 1;
+                if bad <= 3 { eprintln!("scl mismatch row={row} blk={blk}: got {} want {d}", got_scl[bi]); }
+                continue;
+            }
+            let mut want_sgn = 0u8;
+            for i in 0..SCRUB_JAY_BLOCK {
+                if block[i] < 0.0 { want_sgn |= 1 << i; }
+                let mag = block[i].abs() * inv_d;
+                let mut bd = f32::INFINITY;
+                let mut bj = 0usize;
+                for (j, &l) in cb[best_c].iter().enumerate() {
+                    let e = (l as f32 - mag).powi(2);
+                    if e < bd { bd = e; bj = j; }
+                }
+                if got_idx[row * K + blk * SCRUB_JAY_BLOCK + i] as usize != bj {
+                    bad += 1;
+                    if bad <= 3 { eprintln!("idx mismatch row={row} blk={blk} i={i}"); }
+                }
+            }
+            if got_sgn[bi] != want_sgn { bad += 1; }
+        }
+    }
+    assert_eq!(bad, 0, "{bad} plane mismatches between GPU and host quantizer");
+    eprintln!("activation quantizer: all {} blocks agree with the host reference", ROWS * n_blocks);
+    Ok(())
+}
+
+fn bytes_of(t: &Box<dyn BackendStorage>) -> TestResult<Vec<u8>> {
+    Ok(grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?)
+}
+fn got_scl_bytes(t: &Box<dyn BackendStorage>) -> TestResult<Vec<f32>> {
+    Ok(bytes_of(t)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}

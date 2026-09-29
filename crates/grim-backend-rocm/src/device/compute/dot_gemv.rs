@@ -1698,6 +1698,62 @@ impl RocmDevice {
     ///
     /// Requires K % 32 == 0: the 5.0 bpw claim only holds at 32-value
     /// granularity, and a ragged tail would silently overstate the density.
+    /// ScrubJay (WS-B B6) activation quantizer: f32 activations -> the five
+    /// ScrubJay B-planes, so the decode GEMV can consume them.
+    ///
+    /// Mirrors [`Self::launch_quantize_u4_group128`]'s shape (max-reduce, then
+    /// codebook assignment, then write) but per 8-value ScrubJay block rather
+    /// than per 128-value group, since each block carries its own selector and
+    /// E4M3 scale.
+    ///
+    /// Requires K % 128 == 0: one launch group is one wave of 32 lanes x 4
+    /// values, and a group is 16 whole ScrubJay blocks.
+    pub fn launch_scrub_jay_quantize_u8(
+        &self,
+        src: &RocmStorage,
+        idx: &RocmStorage,
+        sel: &RocmStorage,
+        scl: &RocmStorage,
+        sgn: &RocmStorage,
+        k: usize,
+        n_rows: usize,
+    ) -> Result<*mut c_void> {
+        if k % 128 != 0 {
+            return Err(Error::Backend(format!(
+                "scrub_jay_quantize_u8: K={k} must be a multiple of 128 (one wave x 4 values)"
+            )));
+        }
+        let n_groups = (k / 128) * n_rows;
+        let grid_dim = HipDim3::new(n_groups as u32, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        fn p(t: &RocmStorage, what: &str) -> Result<u64> {
+            t.device_ptr.ok_or_else(|| {
+                Error::Backend(format!("scrub_jay_quantize_u8: {what} has no device ptr"))
+            })
+        }
+        let mut srcp = p(src, "src")?;
+        let mut idxp = p(idx, "idx")?;
+        let mut selp = p(sel, "sel")?;
+        let mut sclr = p(scl, "scl")?;
+        let mut sgnp = p(sgn, "sgn")?;
+        let mut kk = k as i32;
+        let mut nr = n_rows as i32;
+        self.launch_compute_kernel(
+            "grim_scrub_jay_quantize_u8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut srcp),
+                arg(&mut idxp),
+                arg(&mut selp),
+                arg(&mut sclr),
+                arg(&mut sgnp),
+                arg(&mut kk),
+                arg(&mut nr),
+            ],
+        )
+    }
+
     pub fn launch_tree_pie_gemv(
         &self,
         act_f16: &RocmStorage,

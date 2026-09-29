@@ -99,5 +99,131 @@ extern "C" __global__ void grim_scrub_jay_gemv(
         facc += __shfl_xor(facc, off);
     if (lane == 0) C[col] = facc;
 }
+
+// Values per ScrubJay block.
+#define GRIM_SJ_BLOCK 8
+/// Values per launch group: one wave (32 lanes) x 4 values.
+#define GRIM_SJ_GROUP 128
+
+// Activation quantizer for the ScrubJay plan. Mirrors grim_quantize_u4_group128
+// in structure -- max-reduce, then argmin over the codebooks, then pack -- with
+// two differences forced by ScrubJay's shape:
+//
+//   * Per block of 8, not per group of 128. A group of 128 is 16 ScrubJay
+//     blocks, each with its own selector and its own E4M3 scale, so the
+//     max-reduce is over 8 values held by a lane pair, not over 128 held by a
+//     wave. Lane `tid` owns values [4t, 4t+4), so block `tid/2` is owned by
+//     lanes 2i and 2i+1 together and the 8 values are this lane's four plus
+//     its partner's four, obtained with a single __shfl_xor.
+//
+//   * The codebook choice is an argmin over 16 books x 8 values, not a
+//     uniform quantisation. Only the even lane of each pair evaluates it, and
+//     broadcasts, so the 16x8x16 search runs once per block rather than twice.
+//
+// The scale is chosen so the block's peak magnitude lands on the codebook's top
+// entry (31), which is the same convention quantize_block uses, so a
+// quantize-then-dequantize round trip through this kernel is consistent with the
+// weight-side codec.
+extern "C" __global__ void grim_scrub_jay_quantize_u8(
+    const float* __restrict__ src,
+    unsigned char* __restrict__ dst_idx,   // [n_rows, K]      one byte per value, 0..15
+    unsigned char* __restrict__ dst_sel,   // [n_rows, K/8]    codebook selector
+    float* __restrict__ dst_scl,           // [n_rows, K/8]    E4M3 block scale (f32 here)
+    unsigned char* __restrict__ dst_sgn,   // [n_rows, K/8]    sign bitmask
+    int K, int n_rows)
+{
+    const int n_groups = K / GRIM_SJ_GROUP;
+    const int group = blockIdx.x;
+    const int row  = group / n_groups;
+    const int g    = group % n_groups;
+    if (row >= n_rows) return;
+
+    const int tid  = threadIdx.x;              // 0..31
+    const int base = g * GRIM_SJ_GROUP + tid * 4;
+    const long long src_row = (long long)row * K;
+
+    const float v0 = src[src_row + base + 0];
+    const float v1 = src[src_row + base + 1];
+    const float v2 = src[src_row + base + 2];
+    const float v3 = src[src_row + base + 3];
+
+    // Partner lane's four values complete this block's 8.
+    const float p0 = __shfl_xor(v0, 1);
+    const float p1 = __shfl_xor(v1, 1);
+    const float p2 = __shfl_xor(v2, 1);
+    const float p3 = __shfl_xor(v3, 1);
+
+    float bmax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+    bmax = fmaxf(bmax, fmaxf(fmaxf(fabsf(p0), fabsf(p1)), fmaxf(fabsf(p2), fabsf(p3))));
+
+    const float d     = bmax / 31.0f;
+    const float inv_d = (bmax > 1e-9f) ? (31.0f / bmax) : 0.0f;
+
+    // Codebook selection: argmin over the 16 books of the squared distance
+    // from each value's scaled magnitude to that book's nearest entry. Done
+    // once per block on the even lane, then broadcast.
+    unsigned int sel = 0u;
+    if ((tid & 1) == 0) {
+        const float mag[8] = { fabsf(v0)*inv_d, fabsf(v1)*inv_d,
+                               fabsf(v2)*inv_d, fabsf(v3)*inv_d,
+                               fabsf(p0)*inv_d, fabsf(p1)*inv_d,
+                               fabsf(p2)*inv_d, fabsf(p3)*inv_d };
+        float best_err = 3.4e38f;
+        for (int c = 0; c < 16; c++) {
+            const signed char* book = GRIM_SCRUB_JAY_CB + c * 16;
+            float err = 0.0f;
+            for (int i = 0; i < 8; i++) {
+                // nearest_level: min over entries of (entry - mag)^2
+                float bd = 3.4e38f;
+                for (int j = 0; j < 16; j++) {
+                    const float t = (float)book[j] - mag[i];
+                    bd = fminf(bd, t * t);
+                }
+                err += bd;
+            }
+            if (err < best_err) { best_err = err; sel = (unsigned)c; }
+        }
+    }
+    // Broadcast from the even lane of the pair, NOT __shfl_xor.
+    //
+    // __shfl_xor(sel, 1) swaps: lane 0 ends up holding lane 1's value and vice
+    // versa, and since only the even lane computed the selection, both lanes
+    // kept the odd lane's zero. Every block then selected book 0 -- which
+    // still dequantizes to finite weights and still produces plausible
+    // numbers, so the GEMV parity test passed while the quantizer was silently
+    // ignoring 15 of the 16 codebooks.
+    sel = __shfl(sel, tid & ~1, 32);
+    const signed char* book = GRIM_SCRUB_JAY_CB + (int)sel * 16;
+
+    const int blk = g * (GRIM_SJ_GROUP / GRIM_SJ_BLOCK) + (tid >> 1);
+    const long long blk_i = (long long)row * (K / GRIM_SJ_BLOCK) + blk;
+
+    if ((tid & 1) == 0) {
+        dst_sel[blk_i] = (unsigned char)sel;
+        dst_scl[blk_i] = d;
+        // Sign plane covers the whole 8-value block, so both lanes must agree
+        // and both must write. Computed from the same eight magnitudes.
+        unsigned int sgn = 0u;
+        const float raw[8] = { v0, v1, v2, v3, p0, p1, p2, p3 };
+        #pragma unroll
+        for (int i = 0; i < 8; i++) if (raw[i] < 0.0f) sgn |= (1u << i);
+        dst_sgn[blk_i] = (unsigned char)sgn;
+    }
+
+    // Map this lane's four values onto the selected book.
+    const float mine[4] = { v0, v1, v2, v3 };
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float scaled = fabsf(mine[i]) * inv_d;
+        float bd = 3.4e38f;
+        unsigned int best = 0u;
+        for (int j = 0; j < 16; j++) {
+            const float t = (float)book[j] - scaled;
+            const float e = t * t;
+            if (e < bd) { bd = e; best = (unsigned)j; }
+        }
+        dst_idx[src_row + base + i] = (unsigned char)best;
+    }
+}
 #endif
 "#;
