@@ -1288,8 +1288,22 @@ impl RocmDevice {
         // per-byte unpack chain is the bottleneck. The parity gate
         // (dot4_q4k_gemv_fast_parity) must be green before this goes default.
         static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        //
+        // Now the default. It was opt-in because dot4_q4k_gemv_fast_parity was
+        // a gate that had to be green first -- and that gate called the kernel
+        // directly with its own grid, so it validated the unpack math (always
+        // right) while the launcher fed the kernel a grid covering half the
+        // columns. The parity gate was green *because* it could not see the bug.
+        // With the grid fixed, dot4_q4k_arch_probe covers what the gate missed:
+        // it goes through the launcher, checks every column against an oracle,
+        // sentinel-fills the output so an uncovered column is detectable, and
+        // sweeps N over 1, 2, 3, 5, 7, 63, 65 so the div_ceil remainder path is
+        // exercised rather than only powers of two. Both variants agree to
+        // 4e-4 scale-normalised at every one of those, and the fast one is 3.7x
+        // faster (86.4 vs 23.1 GB/s at N=K=4096). GRIM_DOT4_FAST=0 keeps the
+        // stock kernel reachable as an escape hatch.
         let fast = *FAST.get_or_init(|| {
-            matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("1" | "true"))
+            !matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("0" | "false" | "off"))
         });
         let kernel_name = if fast {
             "grim_dot4_q4k_q81_gemv_fast"

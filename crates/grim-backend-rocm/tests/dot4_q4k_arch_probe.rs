@@ -468,3 +468,109 @@ where
     dev.synchronize();
     Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
 }
+
+/// Boundary coverage for the grid fix in `launch_dot4_q4k_q81_gemv`.
+///
+/// The fast variant covers 2 output columns per block and the stock one 4, so
+/// the grid is `n.div_ceil(cols_per_block)` and each kernel's own `active_cols`
+/// has to mop up the remainder. N values that are not multiples of 4 exercise
+/// both: an odd N leaves a block with a single live column, and N below one
+/// block's width leaves a single block. Those are exactly the cases a
+/// power-of-two N would never expose.
+///
+/// The launcher reads GRIM_DOT4_FAST once per process, so the two variants
+/// cannot be compared inside one run -- a second loop iteration would just
+/// re-launch the first one's kernel. Run this test twice, once per setting;
+/// it reports which variant was live.
+///
+/// The error metric is scale-normalised, not per-element relative. A dot
+/// product over random signs lands near zero for some outputs, and dividing a
+/// small absolute error by a small denominator manufactures an enormous ratio
+/// that says nothing about the kernel -- the trap documented in
+/// `qwen35_q8_0_abs_error.rs`, where a 5.4e-1 "relative" error turned out to
+/// be a benign absolute one. Both figures are printed; only the normalised one
+/// gates.
+#[test]
+fn dot4_q4k_fast_grid_boundaries() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    // Must mirror the launcher's own rule, which flipped when the fast variant
+    // became the default: fast unless explicitly disabled. Reading only "1"
+    // would report "stock" for an unset variable while the launcher was
+    // actually running the fast kernel -- a test that lies about which code
+    // path it exercised.
+    let fast = !matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("0" | "false" | "off"));
+    let variant = if fast { "fast" } else { "stock" };
+    println!("target: {}  variant: {variant}", dev.gpu_target_str());
+
+    const M: usize = 1;
+    const K: usize = 512;
+    let mut rng = Lcg(0x6DDE);
+
+    for &n in &[1usize, 2, 3, 5, 7, 63, 65] {
+        let a: Vec<f32> = (0..M * K).map(|_| rng.next_f32()).collect();
+        let b: Vec<f32> = (0..n * K).map(|_| rng.next_f32()).collect();
+        let row_bytes = (K / 256) * 144;
+        let mut bq = vec![0u8; n * row_bytes];
+        for col in 0..n {
+            let packed = grim_quant::quant_q4k(&b[col * K..(col + 1) * K])
+                .map_err(|e| format!("q4k: {e}"))?;
+            bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
+        }
+        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let a_t = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * K]), f32ty)
+            .map_err(|e| format!("a: {e}"))?;
+        let q81 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![(K / 32) * 36]), u8ty.clone())
+            .map_err(|e| format!("q81: {e}"))?;
+        dev.launch_quantize_q8_1(r(&a_t), r(&q81), M, K).map_err(|e| format!("quant: {e}"))?;
+        dev.synchronize();
+        let a_deq = dequant_q81(&bytes_of(&q81)?, M * K);
+        let b_t = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
+            .map_err(|e| format!("b: {e}"))?;
+
+        // Sentinel-fill so a column the grid failed to cover is detectable
+        // rather than looking like a plausible zero.
+        let sentinel = vec![-1.0e30f32; M * n];
+        let out = MemoryOps::from_cpu_bytes(
+            &dev, &f32_bytes(&sentinel), &Shape::new(vec![M * n]),
+            DType { arith: ArithType::F32, storage: Storage::Native })
+            .map_err(|e| format!("out: {e}"))?;
+        dev.launch_dot4_q4k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out), M, n, K)
+            .map_err(|e| format!("{variant}: {e}"))?;
+        dev.synchronize();
+        let got = f32_vec(&out)?;
+
+        let mut want = vec![0.0f32; n];
+        for col in 0..n {
+            let w = grim_quant::dequant_q4k(&bq[col * row_bytes..(col + 1) * row_bytes], K)
+                .map_err(|e| e.to_string())?;
+            let mut acc = 0.0f32;
+            for kk in 0..K {
+                acc += a_deq[kk] * w[kk];
+            }
+            want[col] = acc;
+        }
+
+        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let mut worst_abs = 0.0f32;
+        let mut worst_rel = 0.0f32;
+        for col in 0..n {
+            if got[col] == -1.0e30 {
+                return Err(format!("{variant}: n={n} column {col} was never written").into());
+            }
+            let d = (got[col] - want[col]).abs();
+            worst_abs = worst_abs.max(d);
+            worst_rel = worst_rel.max(d / want[col].abs().max(1e-3));
+        }
+        let normed = worst_abs / scale;
+        println!("n={:<4} {variant:<5} normed {normed:.3e}  worst_rel {worst_rel:.3e}", n);
+        assert!(
+            normed <= 2e-2,
+            "n={n}: {variant} scale-normalised error {normed:.3e} exceeds 2e-2 (worst_rel {worst_rel:.3e})"
+        );
+    }
+    Ok(())
+}
