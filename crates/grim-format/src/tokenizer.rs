@@ -247,10 +247,35 @@ impl GgufTokenizer {
         let bos_token_id = metadata
             .get("tokenizer.ggml.bos_token_id")
             .and_then(|v| v.as_u32());
-        let add_bos_token = metadata
+        let add_bos_token = match metadata
             .get("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        {
+            Some(b) => b,
+            None => {
+                // Key absent: mirror llama.cpp's per-pre-type default
+                // (llama-vocab.cpp:2177-2186) — the llama3-BPE family,
+                // which includes `lfm2`, gets add_bos = true. The previous
+                // hardcoded `false` silently starved every LFM2.5
+                // checkpoint of its `<|startoftext|>`: the model then ran
+                // off-distribution and answered "The capital of France
+                // is" with a confident " is" (reference: " Paris.", PPL
+                // 11.2 vs ours 3839). `qwen35` (llama-vocab.cpp:2266) has
+                // no add_bos in its branch and stays false.
+                matches!(
+                    metadata.get("tokenizer.ggml.pre").and_then(|v| v.as_str()),
+                    Some("llama3")
+                        | Some("llama-v3")
+                        | Some("llama-bpe")
+                        | Some("falcon3")
+                        | Some("falcon-h1")
+                        | Some("pixtral")
+                        | Some("midm-2.0")
+                        | Some("lfm2")
+                        | Some("jina-v5-nano")
+                )
+            }
+        };
 
         // Extract UNK token ID from metadata (typically tokenizer.ggml.unknown_token_id)
         let unk_token_id = metadata

@@ -43,10 +43,16 @@ enum GraphDecodeResult {
 /// to go in verbatim. Feeding an undeclared special token at position 0 pushes
 /// the model off-distribution and it emits well-formed garbage.
 ///
-/// Now: nothing in raw mode, and otherwise prepend only when the checkpoint
-/// says to, using the id it declares.
+/// Now: prepend only when the CHECKPOINT says to, using the id it declares —
+/// in every mode, including --raw. Raw means "no chat template", not "no
+/// BOS": llama.cpp adds the BOS to verbatim prompts too (its --no-bos is a
+/// separate switch), and LFM2.5 runs off-distribution without it (its
+/// tokenizer pre-type "lfm2" defaults add_bos on; see tokenizer.rs). A
+/// checkpoint that does not ask for a BOS (qwen35, or an explicit
+/// add_bos_token = false) still gets none.
 fn bos_token_to_prepend(tok: &GgufTokenizer, raw_mode: bool) -> Option<u32> {
-    if raw_mode || !tok.add_bos_token {
+    let _ = raw_mode;
+    if !tok.add_bos_token {
         return None;
     }
     tok.bos_token_id
