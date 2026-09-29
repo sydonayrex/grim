@@ -1282,7 +1282,36 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_q4k_q81_gemv: out has no device ptr".into()))?;
-        let grid_x = (n as u32).div_ceil(4);
+        // SPEED-DOT Phase 2: GRIM_DOT4_FAST=1 selects the word-wide-mask
+        // unpack variant. The floor probe measured the stock kernel at
+        // 23 GB/s vs 304 GB/s for q8_0 with the same sdot4 loop — the
+        // per-byte unpack chain is the bottleneck. The parity gate
+        // (dot4_q4k_gemv_fast_parity) must be green before this goes default.
+        static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fast = *FAST.get_or_init(|| {
+            matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("1" | "true"))
+        });
+        let kernel_name = if fast {
+            "grim_dot4_q4k_q81_gemv_fast"
+        } else {
+            "grim_dot4_q4k_q81_gemv"
+        };
+        // The grid must follow the kernel that is actually launched. The two
+        // variants cover a different number of output columns per block --
+        // the stock kernel does `col_base = blockIdx.x * 4`, the fast one
+        // `blockIdx.x * 2` -- so a grid sized for the stock kernel launched
+        // against the fast one covers only half the columns and leaves the
+        // rest of C never written.
+        //
+        // That is not a subtle numerical bug, it is why the fast variant
+        // measured 1.0 relative error on gfx1200: the unwritten half of the
+        // output reads as whatever was in the buffer, not as a slightly wrong
+        // number. The grid used to be computed as `n.div_ceil(4)` before the
+        // kernel was chosen, so GRIM_DOT4_FAST=1 silently halved the output.
+        // A test that only checked the columns the kernel did write would
+        // never have seen it; dot4_q4k_arch_probe checks all of them.
+        let cols_per_block: u32 = if fast { 2 } else { 4 };
+        let grid_x = (n as u32).div_ceil(cols_per_block);
         let grid_dim = HipDim3::new(grid_x, m as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
         let mut aptr = a_ptr;
@@ -1291,19 +1320,6 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
-        // SPEED-DOT Phase 2: GRIM_DOT4_FAST=1 selects the word-wide-mask
-        // unpack variant. The floor probe measured the stock kernel at
-        // 23 GB/s vs 304 GB/s for q8_0 with the same sdot4 loop — the
-        // per-byte unpack chain is the bottleneck. The parity gate
-        // (dot4_q4k_gemv_fast_parity) must be green before this goes default.
-        static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let kernel_name = if *FAST.get_or_init(|| {
-            matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("1" | "true"))
-        }) {
-            "grim_dot4_q4k_q81_gemv_fast"
-        } else {
-            "grim_dot4_q4k_q81_gemv"
-        };
         self.launch_compute_kernel(
             kernel_name,
             grid_dim,
