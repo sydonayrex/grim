@@ -1905,8 +1905,19 @@ fn gated_delta_net_forward(
             };
             dump(&conv_mix, "conv_mix");
             dump(&cache.conv_state, "conv_ring");
-            dump(&cache.ssm_state, "ssm_state");
+            dump(&cache.ssm_state, "ssm_pre");
             dump(&qkv_vec, "conv_x");
+            if let Some(ref al) = blk.ssm_alpha {
+                dump(&al.forward(x_normed)?.to_vec_f32()?, "alpha_full");
+            }
+            if let Some(ref bl) = blk.ssm_beta {
+                let raw = bl.forward(x_normed)?.to_vec_f32()?;
+                dump(&raw, "beta_raw_full");
+                dump(&beta, "beta_full"); // host: sigmoided at fill
+            }
+            if let Some(ref gl) = blk.attn_gate {
+                dump(&gl.forward(x_normed)?.to_vec_f32()?, "z_full");
+            }
         }
     }
 
@@ -2022,7 +2033,33 @@ fn gated_delta_net_forward(
             }
         }
     }
+    if blk.layer_idx == 0 {
+        kda_probe_host_post(&cache.ssm_state, seq_len);
+    }
+    if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && seq_len == 1 {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if call <= 6 {
+            let s8: f32 = out_branch.iter().take(8).sum();
+            let s: f32 = out_branch.iter().sum();
+            eprintln!(
+                "[kda-branch-fp] host decode-call {call} layer {} branch_sum8={s8:+.6} branch_sum={s:+.6}",
+                blk.layer_idx
+            );
+        }
+    }
     Ok(())
+}
+
+// KDA-STEP-PROBE (host side): post-recurrence state dump for layer 0 step 1.
+fn kda_probe_host_post(ssm_state: &[f32], seq_len: usize) {
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && call <= 4 {
+        let bytes: Vec<u8> = ssm_state.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("/tmp/kda_probe_host_ssm_call{call}_seq{seq_len}.bin"), &bytes);
+        eprintln!("[kda-probe-host] call {call} seq_len {seq_len}: dumped state ({} f32)", ssm_state.len());
+    }
 }
 
 /// KDA decode step with the short-conv and recurrent state left on the device.
@@ -2196,6 +2233,27 @@ fn gated_delta_net_forward_d2d(
     let ssm_state = cache.ssm_state_dev.as_ref().ok_or_else(|| {
         grim_core::error::Error::Backend("ssm_state_dev vanished after allocation".into())
     })?;
+    // KDA-STEP-PROBE: PRE-step ssm state (end-of-prefill handoff check).
+    {
+        static PRE_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == 0
+            && seq_len == 1
+            && !PRE_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Ok(r) = grim_backend_rocm::device::util::as_rocm(ssm_state.as_ref()) {
+                if let Ok(b) = r.copy_to_host() {
+                    let vals: Vec<f32> = b
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = std::fs::write("/tmp/kda_probe_d2d_ssm_pre.bin", &bytes);
+                    eprintln!("[kda-step-probe] wrote ssm PRE state ({} f32)", vals.len());
+                }
+            }
+        }
+    }
 
     let eps = blk.attn_norm.eps;
     let (branch, _) = if seq_len == 1 {
@@ -2362,6 +2420,31 @@ fn gated_delta_net_forward_d2d(
                 })
                 .unwrap_or_default();
             dump(&x_dump, "conv_x");
+            // The load-time device constants: never verified against the host
+            // vectors the host loop reads.
+            for (name, st) in [
+                ("dt_bias_dev", blk.ssm_dt_bias_dev.as_ref()),
+                ("ssm_a_dev", blk.ssm_a_dev.as_ref()),
+                ("ssm_norm_dev", blk.ssm_norm_dev.as_ref()),
+            ] {
+                if let Some(st) = st {
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(st.as_ref()) {
+                        if let Ok(b) = r.copy_to_host() {
+                            let vals: Vec<f32> = b
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect();
+                            dump(&vals, name);
+                        }
+                    }
+                }
+            }
+            dump(&blk.ssm_dt_bias.as_deref().unwrap_or(&[]), "dt_bias_host");
+            dump(&blk.ssm_a.as_deref().unwrap_or(&[]), "ssm_a_host");
+            dump(&blk.ssm_norm.as_deref().unwrap_or(&[]), "ssm_norm_host");
+            dump(&alpha.to_vec_f32().unwrap_or_default(), "alpha_full");
+            dump(&beta.to_vec_f32().unwrap_or_default(), "beta_full");
+            dump(&z.to_vec_f32().unwrap_or_default(), "z_full");
             if let Some(ref cw) = blk.ssm_conv1d {
                 let cw_dump = grim_backend_rocm::device::util::as_rocm(cw.storage().as_ref())
                     .and_then(|r| r.copy_to_host())
@@ -2374,6 +2457,32 @@ fn gated_delta_net_forward_d2d(
                 dump(&cw_dump, "conv_w");
                 eprintln!("[kda-step-probe] conv_w dims {:?}", cw.shape().dims());
             }
+        }
+    }
+
+    // KDA-STEP-PROBE: per-layer branch fingerprint at the first decode step,
+    // to find the first layer where the D2D and host runs diverge.
+    if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && seq_len == 1 {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if call <= 6 {
+            let fp = grim_backend_rocm::device::util::as_rocm(branch.as_ref())
+                .and_then(|r| r.copy_to_host())
+                .map(|b| {
+                    let vals: Vec<f32> = b
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    (
+                        vals.iter().take(8).sum::<f32>(),
+                        vals.iter().sum::<f32>(),
+                    )
+                })
+                .unwrap_or((0.0, 0.0));
+            eprintln!(
+                "[kda-branch-fp] d2d decode-call {call} layer {} branch_sum8={:+.6} branch_sum={:+.6}",
+                blk.layer_idx, fp.0, fp.1
+            );
         }
     }
 
@@ -3724,6 +3833,15 @@ mod tests {
             cache.ssm_state.iter().any(|v| *v != 0.0),
             "ssm_state must be updated across steps by the Gated DeltaNet recurrence"
         );
+        // State update must be non-uniform across distinct value heads, proving
+        // head differentiation (e.g. head 0 state != head 1 state).
+        let head_size = cfg.ssm_d_state * cfg.ssm_d_state;
+        let head0 = &cache.ssm_state[0..head_size];
+        let head1 = &cache.ssm_state[head_size..2 * head_size];
+        assert_ne!(
+            head0, head1,
+            "recurrent state must differ across distinct value heads under non-uniform weights"
+        );
         // The conv ring is no longer part of the recurrent path, so it must
         // stay untouched rather than drifting.
         assert_eq!(
@@ -3918,6 +4036,13 @@ mod tests {
             "Gated DeltaNet must advance ssm_state; all-zero means the branch \
              did not run, or ran with beta/alpha = 0, or the state is too small"
         );
+        let head_size = cfg.ssm_d_state * cfg.ssm_d_state;
+        let head0 = &cache.ssm_state[0..head_size];
+        let head1 = &cache.ssm_state[head_size..2 * head_size];
+        assert_ne!(
+            head0, head1,
+            "recurrent state must be head-differentiated across distinct value heads"
+        );
         eprintln!("[kda-reach] ssm_state advanced in {nonzero} elements");
     }
 
@@ -4037,7 +4162,7 @@ mod tests {
         cfg.ssm_n_group = 16;
 
         let b =
-            |r: usize, c: usize| -> Tensor { cpu_tensor(vec![0.1; r * c], Shape::new(vec![r, c])) };
+            |seed: usize, r: usize, c: usize| -> Tensor { cpu_tensor(det_weights(seed, r * c), Shape::new(vec![r, c])) };
         let value_dim = cfg.ssm_dt_rank * cfg.ssm_d_state;
         let key_dim = cfg.ssm_n_group * cfg.ssm_d_state;
         let ssm_qkv_dim = 2 * key_dim + value_dim;
@@ -4055,7 +4180,7 @@ mod tests {
             is_full_attention: false,
             attn_norm: RmsNorm::new(
                 cpu_tensor(
-                    vec![1.0; cfg.hidden_size],
+                    det_weights(201, cfg.hidden_size),
                     Shape::new(vec![cfg.hidden_size]),
                 ),
                 cfg.rms_norm_eps,
@@ -4066,22 +4191,22 @@ mod tests {
             wo: None,
             attn_q_norm: None,
             attn_k_norm: None,
-            attn_qkv: Some(Linear::from_tensor(b(ssm_qkv_dim, cfg.hidden_size), None)),
+            attn_qkv: Some(Linear::from_tensor(b(202, ssm_qkv_dim, cfg.hidden_size), None)),
             attn_gate: None,
-            ssm_out: Some(Linear::from_tensor(b(cfg.hidden_size, value_dim), None)),
+            ssm_out: Some(Linear::from_tensor(b(203, cfg.hidden_size, value_dim), None)),
             ssm_conv1d: None,
             ssm_conv_vec: None,
-            ssm_a: Some(vec![0.5; cfg.ssm_dt_rank]),
+            ssm_a: Some(det_weights(204, cfg.ssm_dt_rank)),
             ssm_alpha: Some(Linear::from_tensor(
-                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                b(205, cfg.ssm_dt_rank, cfg.hidden_size),
                 None,
             )),
             ssm_beta: Some(Linear::from_tensor(
-                b(cfg.ssm_dt_rank, cfg.hidden_size),
+                b(206, cfg.ssm_dt_rank, cfg.hidden_size),
                 None,
             )),
-            ssm_dt_bias: Some(vec![0.1; cfg.ssm_dt_rank]),
-            ssm_norm: Some(vec![1.0; cfg.ssm_d_state]),
+            ssm_dt_bias: Some(det_weights(207, cfg.ssm_dt_rank)),
+            ssm_norm: Some(det_weights(208, cfg.ssm_d_state)),
             ssm_dt_bias_dev: None,
             ssm_a_dev: None,
             ssm_norm_dev: None,
@@ -4093,18 +4218,18 @@ mod tests {
             w_gate_up_q4k_fused: None,
             post_attention_norm: RmsNorm::new(
                 cpu_tensor(
-                    vec![1.0; cfg.hidden_size],
+                    det_weights(209, cfg.hidden_size),
                     Shape::new(vec![cfg.hidden_size]),
                 ),
                 cfg.rms_norm_eps,
             ),
-            ffn_gate: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
-            ffn_up: Linear::from_tensor(b(cfg.intermediate_size, cfg.hidden_size), None),
-            ffn_down: Linear::from_tensor(b(cfg.hidden_size, cfg.intermediate_size), None),
+            ffn_gate: Linear::from_tensor(b(210, cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_up: Linear::from_tensor(b(211, cfg.intermediate_size, cfg.hidden_size), None),
+            ffn_down: Linear::from_tensor(b(212, cfg.hidden_size, cfg.intermediate_size), None),
         };
 
         let x = cpu_tensor(
-            vec![0.1; cfg.hidden_size],
+            det_weights(213, cfg.hidden_size),
             Shape::new(vec![1, cfg.hidden_size]),
         );
 
@@ -4391,3 +4516,74 @@ mod qk_norm_tests {
         assert!(out.iter().all(|v| v.is_finite()), "got {out:?}");
     }
 }
+
+#[cfg(test)]
+mod rope_tests {
+    use super::apply_rope_neox;
+
+    #[test]
+    fn rope_at_pos_zero_is_identity() {
+        let n_heads = 2usize;
+        let head_dim = 4usize;
+        let positions = [0u32];
+        let original = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut v = original.clone();
+        apply_rope_neox(&mut v, &positions, n_heads, head_dim, 10000.0);
+        for (a, b) in original.iter().zip(&v) {
+            assert!((a - b).abs() < 1e-6, "pos=0 must be identity");
+        }
+    }
+
+    #[test]
+    fn rope_at_nonzero_pos_rotates_and_preserves_norm() {
+        let n_heads = 2usize;
+        let head_dim = 4usize;
+        let half = head_dim / 2;
+        let positions = [17u32];
+        let original = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut v = original.clone();
+        apply_rope_neox(&mut v, &positions, n_heads, head_dim, 10000.0);
+
+        // Position 17 must rotate the vector (not identity)
+        assert_ne!(v, original, "pos=17 must rotate coordinates");
+
+        // NeoX RoPE rotates (x[i], x[i+half]) pairs in 2D planes, so per-head L2 norm is preserved
+        for h in 0..n_heads {
+            let base = h * head_dim;
+            let norm_orig: f32 = original[base..base + head_dim].iter().map(|x| x * x).sum();
+            let norm_rot: f32 = v[base..base + head_dim].iter().map(|x| x * x).sum();
+            assert!(
+                (norm_orig - norm_rot).abs() < 1e-5,
+                "head {h}: RoPE must preserve L2 norm (orig {norm_orig} vs rot {norm_rot})"
+            );
+
+            // Verify exact formula for pair (x0, x1)
+            for i in 0..half {
+                let freq = 1.0 / 10000.0f32.powf((2 * i) as f32 / head_dim as f32);
+                let (sin, cos) = (17.0f32 * freq).sin_cos();
+                let x0 = original[base + i];
+                let x1 = original[base + i + half];
+                let exp0 = x0 * cos - x1 * sin;
+                let exp1 = x0 * sin + x1 * cos;
+                assert!((v[base + i] - exp0).abs() < 1e-5);
+                assert!((v[base + i + half] - exp1).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn rope_multi_token_positions_rotate_independently() {
+        let n_heads = 1usize;
+        let head_dim = 4usize;
+        let positions = [0u32, 5u32];
+        let original = vec![1.0f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+        let mut v = original.clone();
+        apply_rope_neox(&mut v, &positions, n_heads, head_dim, 10000.0);
+
+        // Token 0 at pos 0 must be unchanged
+        assert_eq!(&v[0..4], &original[0..4]);
+        // Token 1 at pos 5 must be rotated
+        assert_ne!(&v[4..8], &original[4..8]);
+    }
+}
+
