@@ -413,6 +413,45 @@ impl RecurrentOps for RocmDevice {
             ],
         )?;
 
+        // KDA-STEP-PROBE: after kernel 1, read acc back. If acc is zero, the
+        // FIRST kernel (batched) didn't write; if acc is nonzero but the
+        // final branch is zero, the head-norm kernel is the zero site.
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") {
+            if let Ok(acc_host) = acc_s.copy_to_host() {
+                let vals: Vec<f32> = acc_host
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let nz = vals.iter().filter(|&&v| v != 0.0).count();
+                eprintln!(
+                    "[kda-acc-probe] acc after kernel1: {} floats, nonzero {nz}, sum {:.6}, max {:.6}",
+                    vals.len(),
+                    vals.iter().sum::<f32>(),
+                    vals.iter().fold(0.0f32, |m, &v| m.max(v.abs()))
+                );
+            }
+        }
+        // KDA-STEP-PROBE: the z bytes AS THE KERNEL WILL SEE THEM.
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") {
+            if let Some(zz) = z_s.as_ref() {
+                match zz.copy_to_host() {
+                    Ok(b) => {
+                        let vals: Vec<f32> = b
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        eprintln!(
+                            "[kda-z-probe] z device read: {} floats, nonzero {}, sum {:.4}, [0..4]={:?}",
+                            vals.len(),
+                            vals.iter().filter(|&&v| v != 0.0).count(),
+                            vals.iter().sum::<f32>(),
+                            &vals[..4.min(vals.len())]
+                        );
+                    }
+                    Err(e) => eprintln!("[kda-z-probe] z device read FAILED: {e}"),
+                }
+            }
+        }
         let mut acc_ptr2 = dev_ptr(&acc_s)?;
         let mut nw_ptr = dev_ptr(nw_s)?;
         let mut z_ptr = match z_s {
@@ -450,6 +489,28 @@ impl RecurrentOps for RocmDevice {
                 .map(|_| self.active_stream())
                 .unwrap_or(std::ptr::null_mut());
             let _ = hipFreeAsync(acc_ptr2 as *mut c_void, free_stream);
+        }
+
+        // KDA-STEP-PROBE: read `storage` right after kernel 2 — did the
+        // head-norm kernel write the output? (sync first: the launch is async)
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") {
+            self.synchronize();
+            match storage.copy_to_host() {
+                Ok(b) => {
+                    let vals: Vec<f32> = b
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let nz = vals.iter().filter(|&&v| v != 0.0).count();
+                    eprintln!(
+                        "[kda-out-probe] out after kernel2: {} floats, nonzero {nz}, sum {:.6}, max {:.6}",
+                        vals.len(),
+                        vals.iter().sum::<f32>(),
+                        vals.iter().fold(0.0f32, |m, &v| m.max(v.abs()))
+                    );
+                }
+                Err(e) => eprintln!("[kda-out-probe] read FAILED: {e}"),
+            }
         }
 
         Ok((
