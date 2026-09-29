@@ -16,6 +16,8 @@
 use grim_backend_rocm::RecurrentOps;
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{CoreTensorOps, DType, Shape, Storage};
+use std::io::{Read, Seek};
+// RocmDevice already imported below.
 
 fn load_f32(path: &str) -> Vec<f32> {
     let bytes = std::fs::read(path).expect(path);
@@ -210,72 +212,82 @@ fn step_kernel_coefficient_extraction() {
     );
 }
 
-/// Gather arbitration: run grim's own device packed gather on the EXACT
-/// device table + the production token id 11751, and compare against the
-/// file row. If the gather is wrong at seq_len 1, this reproduces the
-/// production interleave signature ([A,B,A,B] stride-2) seen in the x dumps.
+/// Gather arbitration on the REAL 545 MB production table: load the actual
+/// token_embd.weight from the 9B checkpoint onto the device (packed Q4_K,
+/// 248320 rows), gather index 11751 through the production embedding_packed
+/// entry, and compare against the GGUF-file row dequant. The synthetic-table
+/// version passed at 0.0 while the production decode embedding came out
+/// stride-2 interleaved — this test decides whether the gather breaks at
+/// production size.
 #[test]
 #[ignore = "device-gated: run with GRIM_RUN_GPU_TEST=1"]
-fn embedding_gather_arbitration_row_11751() {
+fn embedding_gather_arbitration_real_table() {
     let dev = RocmDevice::try_new(0).expect("RocmDevice::try_new(0)");
-    // Real device table: reuse the probe dump (2304 B row 11751) embedded in a
-    // [248320, 4096]-shaped storage is impossible cheaply; instead build a
-    // minimal [vocab=3, 4096] table of rows (11750, 11751, 11752) from the
-    // file and gather index 1 with an offset map… but the production kernel
-    // derives the row offset as index * row_bytes internally, so the minimal
-    // table must place row 11751's bytes at offset 11751 * 2304. Allocate
-    // 11752 * 2304 + 2304 bytes (sparse, but fine) and write the real row at
-    // its production offset; zero elsewhere.
-    let row_bytes = 2304usize;
-    let file_row = std::fs::read("/tmp/kda_probe_file_row11751.bin").expect("file row dump");
-    let vocab_rows = 11753usize;
-    let mut table = vec![0u8; vocab_rows * row_bytes];
-    table[11751 * row_bytes..11752 * row_bytes].copy_from_slice(&file_row);
+    let path = "/D/rex/projects/grim/grim/models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf";
+    let file = std::fs::File::open(path).expect("open gguf");
+    let gg = grim_format::gguf::read_gguf(&file).expect("read_gguf");
+    let t = gg
+        .tensors
+        .iter()
+        .find(|t| t.name == "token_embd.weight")
+        .expect("token_embd.weight");
+    let dim = 4096usize;
+    let total_bytes = t.size_bytes as usize;
+
+    // Full packed table, device-resident, exactly as production loads it.
+    let mut f = std::fs::File::open(path).unwrap();
+    f.seek(std::io::SeekFrom::Start(gg.data_start + t.offset)).unwrap();
+    let mut table = vec![0u8; total_bytes];
+    f.read_exact(&mut table).unwrap();
     let table_s = grim_tensor::MemoryOps::from_cpu_bytes(
         &dev,
         &table,
-        &Shape::new(vec![table.len()]),
+        &Shape::new(vec![total_bytes]),
         DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(grim_tensor::KQuantScheme::Q4K),
         },
     )
-    .expect("upload table");
-    let out_s = CoreTensorOps::from_cpu(
-        &dev,
-        &vec![0.0f32; 4096],
-        &Shape::new(vec![4096]),
-        DType::F32,
-    )
-    .unwrap();
-    let _ = out_s;
-    // Gather through the production entry: embedding_packed.
+    .expect("upload real table");
+
+    // Production gather of index 11751.
     let (out, _h) = grim_tensor::CoreTensorOps::embedding_packed(
         &dev,
         table_s.as_ref(),
         &[11751],
-        &Shape::new(vec![1, 4096]),
-        4096,
+        &Shape::new(vec![1, dim]),
+        dim,
     )
-    .expect("embedding_packed");
-    // read back
+    .expect("embedding_packed on the REAL table");
+
     let r = grim_backend_rocm::as_rocm(out.as_ref()).expect("rocm out");
     let bytes = r.copy_to_host().expect("read back gather");
     let got: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    let file_row_deq = grim_quant::dequant_q4k(&file_row, 4096).unwrap();
+
+    // File row dequant (verified earlier: device table == file bytes bitwise).
+    let file_row_bytes = std::fs::read("/tmp/kda_probe_file_row11751.bin")
+        .expect("file row dump — run tools/gen_iq2s_oracle or the qdbg helper first");
+    let want = grim_quant::dequant_q4k(&file_row_bytes, dim).unwrap();
+
     let d = got
         .iter()
-        .zip(&file_row_deq)
+        .zip(&want)
         .map(|(g, w)| (g - w).abs())
         .fold(0.0f32, f32::max);
     eprintln!(
-        "[gather-arb] gathered row vs file row: max|diff| {d:.6}; got[0..4]={:?}",
-        &got[..4]
+        "[gather-arb-real] gathered row vs file row: max|diff| {d:.6}; got[0:4]={:?} want[0:4]={:?}",
+        &got[..4],
+        &want[..4]
     );
-    eprintln!(
-        "[gather-arb] production x (block input) was interleaved [A,B,A,B]; compare shape here"
+    // The stride-2 interleave signature: got[0] == want[?]. If the gather
+    // interleaves two rows, got[0] and got[1] come from different source
+    // positions and the max diff is large.
+    assert!(
+        d < 1e-4,
+        "REAL-table embedding gather diverges from the file row (max {d:.6}) — \
+         the gather breaks at production size (248320 rows)"
     );
 }
