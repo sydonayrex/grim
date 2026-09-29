@@ -349,3 +349,122 @@ fn dequant_scheme(name: &str, bytes: &[u8], k: usize) -> TestResult<Vec<f32>> {
         _ => grim_quant::dequant_q6k(bytes, k).map_err(|e| e.to_string())?,
     })
 }
+
+/// What lifting the vector-dot gate was actually worth, per scheme.
+///
+/// The previous commit lifted the RDNA2-only gate on Q2_K/Q3_K/Q5_K/Q6_K and
+/// explicitly declined to claim a speedup, because only correctness had been
+/// measured. This closes that gap: each scheme is timed on the vector-dot GEMV
+/// and on the scalar fused-dequant kernel it displaces, at the decode shape the
+/// gate governs (M=1), with the same weights and the same K/N.
+///
+/// The scalar kernel is one thread per output element running a scalar K loop
+/// with a per-element dequant call, so it is expected to be far off memory
+/// bandwidth. The question is how far off, per scheme, and whether any scheme
+/// is still leaving an order of magnitude on the table -- which would say its
+/// vector-dot kernel wants the same treatment Q4_K's `_fast` variant was meant
+/// to give it.
+#[test]
+fn kquant_gate_lift_worth_timing() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    println!("target: {}", dev.gpu_target_str());
+
+    const M: usize = 1;
+    const N: usize = 4096;
+    const K: usize = 4096;
+    const ITERS: u32 = 20;
+    let mut rng = Lcg(0x7113_1CE);
+
+    let schemes: [(&str, usize, PackKind); 4] = [
+        ("Q2_K", 84, PackKind::Synth(0x2A)),
+        ("Q3_K", 110, PackKind::Synth(0x3A)),
+        ("Q5_K", 176, PackKind::Real(quant_q5k)),
+        ("Q6_K", 210, PackKind::Real(quant_q6k)),
+    ];
+
+    let a: Vec<f32> = (0..M * K).map(|_| rng.next_f32()).collect();
+    let b: Vec<f32> = (0..N * K).map(|_| rng.next_f32()).collect();
+
+    println!("{:>6} {:>11} {:>13} {:>9} {:>9} {:>9} {:>9}",
+        "scheme", "dot4 ms", "scalar ms", "speedup", "dot GB/s", "scl GB/s", "bpw");
+    for (name, sb_bytes, kind) in schemes {
+        let row_bytes = (K / 256) * sb_bytes;
+        let mut bq = vec![0u8; N * row_bytes];
+        for col in 0..N {
+            let packed = match kind {
+                PackKind::Real(f) => f(&b[col * K..(col + 1) * K]).map_err(|e| format!("{name}: {e}"))?,
+                PackKind::Synth(seed) => {
+                    let row = &b[col * K..(col + 1) * K];
+                    let mut out = Vec::with_capacity(row_bytes);
+                    for sb_i in 0..K / 256 {
+                        let lo = sb_i * 256;
+                        out.extend_from_slice(&synth_superblock(
+                            &row[lo..lo + 256], sb_bytes,
+                            seed ^ (sb_i as u32).wrapping_mul(0x9E37_79B9)));
+                    }
+                    out
+                }
+            };
+            assert_eq!(packed.len(), row_bytes);
+            bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
+        }
+        let weight_bytes = bq.len() as f64;
+        let bpw = weight_bytes * 8.0 / (N * K) as f64;
+
+        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let a_t = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * K]), f32ty)
+            .map_err(|e| format!("a: {e}"))?;
+        let q81 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![(K / 32) * 36]), u8ty.clone())
+            .map_err(|e| format!("q81: {e}"))?;
+        dev.launch_quantize_q8_1(
+            grim_backend_rocm::as_rocm(a_t.as_ref()).unwrap(),
+            grim_backend_rocm::as_rocm(q81.as_ref()).unwrap(), M, K)
+            .map_err(|e| format!("quant: {e}"))?;
+        dev.synchronize();
+        let b_t = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
+            .map_err(|e| format!("b: {e}"))?;
+        let out_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![M * N]),
+            DType { arith: ArithType::F32, storage: Storage::Native })
+            .map_err(|e| format!("out: {e}"))?;
+
+        let dot4_ms = time_it(&dev, ITERS, || match name {
+            "Q2_K" => dev.launch_dot4_q2k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out_t), M, N, K),
+            "Q3_K" => dev.launch_dot4_q3k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out_t), M, N, K),
+            "Q5_K" => dev.launch_dot4_q5k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out_t), M, N, K),
+            _ => dev.launch_dot4_q6k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out_t), M, N, K),
+        })?;
+        let scalar_ms = time_it(&dev, ITERS, || match name {
+            "Q2_K" => dev.launch_fused_dequant_gemm_q2k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
+            "Q3_K" => dev.launch_fused_dequant_gemm_q3k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
+            "Q5_K" => dev.launch_fused_dequant_gemm_q5k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
+            _ => dev.launch_fused_dequant_gemm_q6k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
+        })?;
+
+        let dgbs = weight_bytes / (dot4_ms * 1e-3) / 1e9;
+        let sgbs = weight_bytes / (scalar_ms * 1e-3) / 1e9;
+        println!("{name:>6} {dot4_ms:>11.4} {scalar_ms:>13.4} {:>8.1}x {dgbs:>9.1} {sgbs:>9.1} {bpw:>9.2}",
+            scalar_ms / dot4_ms);
+    }
+    Ok(())
+}
+
+fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+    grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
+}
+
+fn time_it<F>(dev: &RocmDevice, iters: u32, mut f: F) -> TestResult<f64>
+where
+    F: FnMut() -> Result<*mut std::ffi::c_void, grim_backend_rocm::Error>,
+{
+    use std::time::Instant;
+    for _ in 0..3 { f().map_err(|e| e.to_string())?; }
+    dev.synchronize();
+    let t0 = Instant::now();
+    for _ in 0..iters { f().map_err(|e| e.to_string())?; }
+    dev.synchronize();
+    Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
+}

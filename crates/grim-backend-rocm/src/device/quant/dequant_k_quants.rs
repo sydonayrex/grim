@@ -317,6 +317,23 @@ impl RocmDevice {
         )
     }
 
+    /// Public A/B wrapper around [`Self::launch_fused_dequant_gemm_q5k`].
+    ///
+    /// The scalar fused-dequant path for this scheme is what RDNA3/4 used
+    /// before the vector-dot gate was lifted, so it is the only way to
+    /// quantify what lifting it was worth. No behaviour of its own.
+    pub fn launch_fused_dequant_gemm_q5k_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_q5k(a_storage, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_q5k(
         &self,
         a: &RocmStorage,
@@ -347,6 +364,23 @@ impl RocmDevice {
             n,
             k,
         )
+    }
+
+    /// Public A/B wrapper around [`Self::launch_fused_dequant_gemm_q6k`].
+    ///
+    /// The scalar fused-dequant path for this scheme is what RDNA3/4 used
+    /// before the vector-dot gate was lifted, so it is the only way to
+    /// quantify what lifting it was worth. No behaviour of its own.
+    pub fn launch_fused_dequant_gemm_q6k_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_q6k(a_storage, b_storage, out_storage, m, n, k)
     }
 
     pub(crate) fn launch_fused_dequant_gemm_q6k(
@@ -381,6 +415,23 @@ impl RocmDevice {
         )
     }
 
+    /// Public A/B wrapper around [`Self::launch_fused_dequant_gemm_q2k`].
+    ///
+    /// The scalar fused-dequant path for this scheme is what RDNA3/4 used
+    /// before the vector-dot gate was lifted, so it is the only way to
+    /// quantify what lifting it was worth. No behaviour of its own.
+    pub fn launch_fused_dequant_gemm_q2k_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_q2k(a_storage, b_storage, out_storage, m, n, k)
+    }
+
     pub(crate) fn launch_fused_dequant_gemm_q2k(
         &self,
         a: &RocmStorage,
@@ -411,6 +462,23 @@ impl RocmDevice {
             n,
             k,
         )
+    }
+
+    /// Public A/B wrapper around [`Self::launch_fused_dequant_gemm_q3k`].
+    ///
+    /// The scalar fused-dequant path for this scheme is what RDNA3/4 used
+    /// before the vector-dot gate was lifted, so it is the only way to
+    /// quantify what lifting it was worth. No behaviour of its own.
+    pub fn launch_fused_dequant_gemm_q3k_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_dequant_gemm_q3k(a_storage, b_storage, out_storage, m, n, k)
     }
 
     pub(crate) fn launch_fused_dequant_gemm_q3k(
