@@ -114,6 +114,22 @@ impl Lfm2 {
                 "decode graph disabled by env".into(),
             ));
         }
+        // LFM2 decode-graph is OPT-IN. The captured attention leg page-faults
+        // deterministically on LFM2.5-230M (Q4_K_M): the first decode replay
+        // dies in `grim_qkv_attention_dev` ("Page not present"), prefill and
+        // step-0 fine, CPU path clean and coherent (" Paris. It is"). The
+        // 350M/VL-3B ran the graph cleanly, but with one known-faulting
+        // configuration in the family and these small models losing little
+        // to eager (~48 ms/token at 350M), default OFF until the
+        // attention_dev replay fault is root-caused. The refusal lands in
+        // the caller's existing capture-failed → eager fallback.
+        if std::env::var("GRIM_LFM2_GRAPH").as_deref() != Ok("1") {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled for Lfm2 by default (230M replay page fault); \
+                 GRIM_LFM2_GRAPH=1 opts in"
+                    .into(),
+            ));
+        }
         let dev = dev_for(self)?;
         crate::lfm2::validate_native_mxfp4_kv_compatibility(
             self.layers.iter().any(|layer| layer.wqkv_codes.is_some()),
@@ -129,6 +145,12 @@ impl Lfm2 {
             .get_stream_from_pool(0)
             .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
         let (hidden, n_q, n_k, inter, vocab, ctx, nh) = graph_dims(self, max_ctx);
+        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() {
+            eprintln!(
+                "[lfm2-graph] dims hidden={hidden} n_q={n_q} n_k={n_k} inter={inter} vocab={vocab} ctx={ctx} nh={nh} layers={} batch={batch} n_expert={} n_sc_l_cache={}",
+                self.layers.len(), self.cfg.n_expert, self.cfg.n_shortconv_l_cache
+            );
+        }
         let mut buffers = DecodeGraphBuffers::allocate(
             &dev,
             self.layers.len(),

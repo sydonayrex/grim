@@ -3708,6 +3708,7 @@ impl CausalLm for Lfm2 {
         _positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
+        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() { eprintln!("[fwd-trace] forward enter: input_ids dtype={:?} len={}", input_ids.dtype(), input_ids.shape().dims().len()); }
         let ids: Vec<u32> = match input_ids.dtype() {
             d if d == DType::F32 => {
                 let v = input_ids.to_vec_f32()?;
@@ -3716,7 +3717,7 @@ impl CausalLm for Lfm2 {
             _ => return Err(grim_tensor::Error::Unimplemented("non-F32 inputs".into()).into()),
         };
         let seq_len = ids.len();
-        let mut h = self
+        if std::env::var_os("GRIM_FORWARD_TRACE").is_some() { eprintln!("[fwd-trace] ids={:?}", &ids[..ids.len().min(8)]); }        let mut h = self
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?;
         fwd_trace_stage("embed", &h);

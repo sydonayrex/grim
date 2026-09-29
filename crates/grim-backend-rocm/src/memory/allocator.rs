@@ -179,6 +179,13 @@ impl RocmCachingAllocator {
     /// the violations ([alloc-audit]/[alloc-trace]); GRIM_ALLOC_POOL=1 opts
     /// back into reuse for perf work once the duplicate-owner site is fixed.
     pub fn free(&self, ptr: *mut c_void, bytes: usize) {
+        // Audit BEFORE any branch: the no-pool path returns below and the
+        // live-set must still see the release, or every later handout of a
+        // legitimately recycled driver address prints as phantom
+        // double-booking.
+        let cls = Self::size_class(bytes);
+        self.audit_trace("FREE ", ptr as u64, cls);
+        self.audit_remove(ptr as u64, cls);
         if std::env::var("GRIM_ALLOC_POOL").as_deref() != Ok("1") {
             // Correct-by-default path: device-wide synchronize (any stream's
             // in-flight consumer is done) then a real driver release.
@@ -191,9 +198,6 @@ impl RocmCachingAllocator {
             self.free_count.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let cls = Self::size_class(bytes);
-        self.audit_trace("FREE ", ptr as u64, cls);
-        self.audit_remove(ptr as u64, cls);
         let over_cap = {
             let cached = self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner());
             *cached + cls > self.cap_bytes

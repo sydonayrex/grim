@@ -506,7 +506,7 @@ impl Drop for RocmStorage {
             // hunt — every drop of a 16 KB-class block prints a backtrace so
             // the two owners of a double-freed pointer can be diffed.
             if std::env::var("GRIM_ALLOC_AUDIT").as_deref() == Ok("1")
-                && RocmCachingAllocator::size_class_of(self.bytes) == 16384
+                && RocmCachingAllocator::size_class_of(self.bytes) >= 16384
             {
                 static N: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
