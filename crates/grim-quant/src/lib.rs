@@ -3474,6 +3474,19 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         QuantFormat::Fp8 => quant_fp8(data)?,
         QuantFormat::Fp4Block16 => quant_fp4_block16(data, 16)?,
         QuantFormat::Fp8Block16 => quant_fp8_block16(data, 16)?,
+        // GreyRaven is 2:4-pruned: pruning is a lossy, signal-dependent step
+        // (Fisher-guided), not a function of the f32 data alone, so it cannot be
+        // produced by a pure f32 -> bytes rewrite the way dense formats can.
+        // E10 adds the path once the pruned format has a packer; until then
+        // refusing is correct, and refusing loudly beats emitting a dense
+        // tensor under a sparse format's name.
+        QuantFormat::Fp8Sparse24 => {
+            return Err(Error::Backend(
+                "GreyRaven 2:4 requires a Fisher-guided prune before packing; \
+                 a plain f32 rewrite cannot produce it"
+                    .to_string(),
+            ))
+        }
         // 128x128 block FP8 is a *load-time* format for checkpoints that already
         // ship it (DeepSeek-style `weight_scale_inv`). There is no f32 -> packed
         // rewriter: producing one would need a source-side scale grid.

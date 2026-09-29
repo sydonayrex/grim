@@ -838,6 +838,12 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp4Block16 => dequant_fp4_block16(&raw.bytes, n),
             BlockDtype::Fp8Block16 => dequant_fp8_block16(&raw.bytes, n),
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&raw.bytes),
+            // GreyRaven 2:4: no packed byte format exists yet, so there is
+            // nothing to decode. Refusing beats reinterpreting compacted
+            // survivors plus packed metadata as a dense code plane.
+            BlockDtype::Fp8Sparse24 => {
+                Err(Error::Unimplemented("GreyRaven 2:4 has no packed format yet".to_string()))
+            }
         },
         Storage::ResidualPacked(_) => Err(Error::Unimplemented(
             "dequant_to_f32: ResidualPacked not yet supported".into(),

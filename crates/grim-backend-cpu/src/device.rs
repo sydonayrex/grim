@@ -1558,6 +1558,14 @@ impl QuantOps for CpuDevice {
                     out
                 }
                 _ => match format {
+                    // GreyRaven 2:4: 2:4 pruning is Fisher-guided and lossy, and
+                    // its packed form does not exist yet, so a dense-rewrite
+                    // matmul cannot serve it. Refuse rather than decode as dense.
+                    grim_tensor::QuantFormat::Fp8Sparse24 => {
+                        return Err(Error::Backend(
+                            "GreyRaven 2:4 has no packed format yet".to_string(),
+                        ))
+                    }
                     // GGUF Q8_0 weights are resident as the native 34-byte block stream (2-byte f16 scale + 32 int8 quants per block), and `Linear::forward` passes an empty `b_scales` (scales live in the block headers).
                     // Decoding with the canonical `dequant_q80` - the hand-rolled loop below read stride-32 with a 1.0.
                     grim_tensor::QuantFormat::Q8_0 => grim_quant::dequant_q80(b_bytes, k * n)
@@ -2447,6 +2455,14 @@ impl BackendStorage for CpuStorage {
                 }
                 grim_tensor::dtype::BlockDtype::Fp4Block16 => {
                     grim_quant::dequant_fp4_block16(raw, n)
+                }
+                // GreyRaven 2:4: no packed byte format exists yet (E4's
+                // pack_grey_raven is unwritten; the host sparsifier holds f32
+                // survivors, not E4M3 bytes). Refusing beats reinterpreting
+                // compacted survivors plus packed metadata as a dense code
+                // plane, which would return finite, plausible, wrong weights.
+                grim_tensor::dtype::BlockDtype::Fp8Sparse24 => {
+                    Err(Error::Backend("GreyRaven 2:4 has no packed format yet".to_string()))
                 }
                 grim_tensor::dtype::BlockDtype::Fp8Block16 => {
                     grim_quant::dequant_fp8_block16(raw, n)

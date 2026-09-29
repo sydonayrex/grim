@@ -179,6 +179,17 @@ impl QuantOps for VulkanDevice {
                     BlockDtype::Fp4Block16 => grim_quant::dequant_fp4_block16(&b_bytes_cpu, k * n)?,
                     BlockDtype::Fp8Block16 => grim_quant::dequant_fp8_block16(&b_bytes_cpu, k * n)?,
                     BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&b_bytes_cpu)?,
+                    // GreyRaven 2:4: no packed byte format exists yet (E4's
+                    // pack_grey_raven is unwritten; the host sparsifier holds f32
+                    // survivors, not E4M3 bytes), so there is nothing to decode.
+                    // Refusing is the honest answer -- misreading compacted
+                    // survivors as a dense code plane returns finite, plausible,
+                    // wrong weights, which is worse than an error.
+                    BlockDtype::Fp8Sparse24 => {
+                        return Err(grim_tensor::error::Error::Backend(
+                            "GreyRaven 2:4 has no packed format yet".into(),
+                        ))
+                    }
                 })
             }
             Storage::CompressedTensorsW8A8Fp8 => {

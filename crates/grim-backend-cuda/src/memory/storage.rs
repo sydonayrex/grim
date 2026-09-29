@@ -109,6 +109,14 @@ pub(crate) fn cuda_dequant_quantized_storage(
             }
             // Self-describing blob: the 128x128 scale grid rides with the codes.
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(b_bytes),
+            // GreyRaven 2:4: no packed byte format exists yet (E4's
+            // pack_grey_raven is unwritten; the host sparsifier holds f32
+            // survivors, not E4M3 bytes). Unimplemented rather than a dense
+            // fallback: compacted survivors plus packed metadata reinterpreted
+            // as a dense code plane yields finite, plausible, wrong weights.
+            BlockDtype::Fp8Sparse24 => Err(Error::Unimplemented(
+                "GreyRaven 2:4 has no packed format yet".to_string(),
+            )),
         },
         DTypeStorage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(
             "quantized_matmul_backward_dx: ResidualPacked (bpw {}) host dequant not implemented; \

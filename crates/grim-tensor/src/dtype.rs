@@ -143,6 +143,22 @@ pub enum BlockDtype {
     /// takes no separate scale argument, so a two-tensor representation would
     /// force a host round-trip to pair them.
     Fp8Block128,
+    /// GreyRaven (WS-E): E4M3 codes, 2:4 structured sparse, with per-group
+    /// survivor-position metadata.
+    ///
+    /// **A distinct format from [`Self::Fp8`], not a tuning knob.** The operand
+    /// geometry differs (16x32 against 16x16), the weight layout is compacted
+    /// survivors plus metadata rather than a dense code plane, and the
+    /// arithmetic is sparse (SWMMAC) rather than dense (WMMA). A kernel claiming
+    /// both geometries is wrong, so `e0_grey_raven_is_distinct_from_white_raven`
+    /// pins the separation.
+    ///
+    /// Density is **4.75 bpw**: 2 survivors x 8 bits of E4M3 plus 3 metadata bits
+    /// per group of 4, i.e. 19 bits per 4 original weights. The plan's "6.0 bpw"
+    /// assumed 2 metadata bits, which cannot encode the C(4,2) = 6 survivor
+    /// patterns. `expected_bytes` below implements 4.75 and
+    /// `e3_effective_bpw_is_4_75` names the number so it cannot drift silently.
+    Fp8Sparse24,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -213,6 +229,10 @@ pub enum QuantFormat {
     Fp8Block16,
     /// E4M3 with a 128x128 block scale grid; scales are embedded in the blob.
     Fp8Block128,
+    /// GreyRaven 2:4: E4M3 survivors plus per-group position metadata, 4.75 bpw.
+    /// A separate variant from [`Self::Fp8`] so a GreyRaven tensor cannot be
+    /// mistaken for a dense one on the way to a kernel with the wrong geometry.
+    Fp8Sparse24,
     Iq4Nl,
     Iq4Xs,
     Iq3Xxs,
@@ -349,6 +369,14 @@ impl DType {
                 // codes + 128x128 scale grid; the grid extent is in the blob
                 // header, so the caller must supply the real byte length.
                 BlockDtype::Fp8Block128 => elem_count,
+                // GreyRaven 2:4: half the weights survive as one E4M3 byte each,
+                // plus 3 metadata bits per group of 4 originals:
+                //   survivors = groups * 2 bytes, metadata = ceil(groups*3/8)
+                // = 19/4 = 4.75 bits per original weight.
+                BlockDtype::Fp8Sparse24 => {
+                    let groups = elem_count.div_ceil(4);
+                    groups * 2 + (groups * 3).div_ceil(8)
+                }
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
             Storage::Unsupported(f) => match (f.block_size, f.bytes_per_block) {
@@ -383,6 +411,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
             QuantFormat::Fp8Block128 => Storage::Block(BlockDtype::Fp8Block128),
+            QuantFormat::Fp8Sparse24 => Storage::Block(BlockDtype::Fp8Sparse24),
             QuantFormat::Iq4Nl => Storage::KQuant(KQuantScheme::IQ4NL),
             QuantFormat::Iq4Xs => Storage::KQuant(KQuantScheme::IQ4XS),
             QuantFormat::Iq3Xxs => Storage::KQuant(KQuantScheme::IQ3XXS),
@@ -428,6 +457,7 @@ impl TryFrom<&Storage> for QuantFormat {
                 BlockDtype::Fp4 => Ok(QuantFormat::Fp4),
                 BlockDtype::Nf4 => Ok(QuantFormat::Nf4),
                 BlockDtype::Fp8 => Ok(QuantFormat::Fp8),
+                BlockDtype::Fp8Sparse24 => Ok(QuantFormat::Fp8Sparse24),
             },
             _ => Err(()),
         }

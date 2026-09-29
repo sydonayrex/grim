@@ -1404,6 +1404,10 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 // codes only; the 128x128 scale grid adds a small header the
                 // size estimate cannot know without the shape.
                 BlockDtype::Fp8Block128 => 8,
+                // GreyRaven 2:4: survivors are whole E4M3 bytes, so 8 bits of
+                // code width. See the autograd arm for why 4.75 is the wrong
+                // number to report at this denominator.
+                BlockDtype::Fp8Sparse24 => 8,
             };
             (elem_count * bits).div_ceil(8)
         }

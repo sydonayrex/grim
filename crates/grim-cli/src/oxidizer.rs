@@ -819,6 +819,13 @@ fn quant_format_for_bitwidth(bw: u32) -> Option<QuantFormat> {
 
 fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String> {
     match format {
+        // GreyRaven 2:4 has no GGUF type tag. It is also not representable as
+        // one: a GGUF k-quant type cannot express per-group survivor metadata.
+        // Refusing here keeps the failure at the point the user named a format,
+        // rather than later as a mis-typed checkpoint.
+        QuantFormat::Fp8Sparse24 => {
+            Err("GreyRaven 2:4 has no GGUF type tag and cannot be written by the oxidizer".into())
+        }
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
         QuantFormat::Q2K => Ok(GgufDType::Q2K),
         QuantFormat::Q3K => Ok(GgufDType::Q3K),

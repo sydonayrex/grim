@@ -399,6 +399,12 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             BlockDtype::Fp4 | BlockDtype::Fp4Block16 => 4,
             BlockDtype::Nf4 => 4,
             BlockDtype::Fp8 | BlockDtype::Fp8Block16 | BlockDtype::Fp8Block128 => 8,
+            // GreyRaven 2:4 stores survivors as whole E4M3 bytes, so the code
+            // width is 8. The format's 4.75 bits-per-original-weight figure is a
+            // density over a different denominator (all 4 slots, including the
+            // two pruned ones) and must not be reported here, or every size
+            // estimate downstream would under-count by 8/4.75.
+            BlockDtype::Fp8Sparse24 => 8,
         },
         Storage::FloatPack(scheme) => match scheme {
             FloatPackScheme::Fp4 => 4,

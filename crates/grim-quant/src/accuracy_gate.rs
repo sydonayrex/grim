@@ -28,6 +28,17 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.04,
                 max_delta_ppl: 0.02,
             },
+            // GreyRaven 2:4 keeps half the weights and zeroes the rest, so it is
+            // strictly coarser than dense Fp8 and cannot inherit its tolerance.
+            // Provisional and deliberately LOOSER than Fp8: a placeholder that
+            // keeps the gate honest (an unmeasured format must not be judged
+            // against a tolerance it was never sized for). E9's
+            // matched-tolerance measurement is what should replace these.
+            QuantFormat::Fp8Sparse24 => Self {
+                min_cosine_similarity: 0.995,
+                max_relative_l2_error: 0.12,
+                max_delta_ppl: 0.08,
+            },
             // Same E4M3 element format as `Fp8`; only the scale granularity
             // differs (128x128 grid vs per-tensor), so the same tolerances apply.
             QuantFormat::Fp8Block128 => Self {

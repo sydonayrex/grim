@@ -272,3 +272,134 @@ pub fn densify(s: &Sparsified) -> [f32; GROUP] {
     out.copy_from_slice(&flat[..GROUP]);
     out
 }
+
+/// Which slots survived each 2:4 group, in ascending slot order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneMask {
+    /// Two surviving slot indices per group, ascending within the pair.
+    pub pairs: Vec<[u8; 2]>,
+    /// Number of 2:4 groups covered.
+    pub groups: usize,
+}
+
+/// Rank the slots of one 2:4 group and return the surviving pair, ascending.
+///
+/// Importance is `fisher * w^2`, not `|w|`. Magnitude alone answers "which
+/// weight is largest", which is not the question when Fisher information is
+/// available: a large weight carrying almost no gradient is worth less than a
+/// modest one that does. The `w^2` is not incidental -- one weight's
+/// contribution to a dot product's output variance scales with the square of the
+/// weight, so Fisher times squared weight is the quantity that predicts output
+/// error.
+///
+/// Ties break by ascending slot, so the mask is a deterministic function of its
+/// inputs.
+pub fn prune_group_2of4(group: &[f32; GROUP], fisher: &[f32; GROUP]) -> [u8; 2] {
+    let mut order = [0usize; GROUP];
+    for (i, slot) in order.iter_mut().enumerate() {
+        *slot = i;
+    }
+    for i in 0..GROUP {
+        for j in (i + 1)..GROUP {
+            let (a, b) = (order[i], order[j]);
+            let ia = fisher[a] * group[a] * group[a];
+            let ib = fisher[b] * group[b] * group[b];
+            if ib > ia || (ib == ia && b < a) {
+                order[i] = b;
+                order[j] = a;
+            }
+        }
+    }
+    if order[0] < order[1] {
+        [order[0] as u8, order[1] as u8]
+    } else {
+        [order[1] as u8, order[0] as u8]
+    }
+}
+
+/// Prune a 2-D weight matrix to 2:4, **grouping along `cols` (the K axis)**.
+///
+/// Grouping along K is not a detail: a 2:4 group's contract is that the kernel
+/// will hold four K-contiguous values and keep two, which is what lets the
+/// surviving pairs be addressed as a contiguous K-window. Groups formed along
+/// rows would have no such property and could not be handed to a sparse GEMM.
+///
+/// `fisher` is a per-element importance signal the same length as `weights`;
+/// pass all ones for magnitude-only pruning, which is what
+/// [`sparsify_2_4_flat`] does.
+///
+/// `cols % 4 != 0` is rejected rather than padded: padding would invent weights
+/// that do not exist and would silently change the density.
+pub fn prune_2of4(
+    weights: &[f32],
+    fisher: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<PruneMask, &'static str> {
+    if cols % GROUP != 0 {
+        return Err("cols must be a multiple of 4: 2:4 groups run along K");
+    }
+    if rows.checked_mul(cols) != Some(weights.len()) {
+        return Err("rows * cols must equal weights.len()");
+    }
+    if fisher.len() != weights.len() {
+        return Err("fisher must be the same length as weights");
+    }
+    let groups_per_row = cols / GROUP;
+    let mut pairs = Vec::with_capacity(rows * groups_per_row);
+    for r in 0..rows {
+        for g in 0..groups_per_row {
+            let base = r * cols + g * GROUP;
+            let mut grp = [0f32; GROUP];
+            let mut fis = [0f32; GROUP];
+            grp.copy_from_slice(&weights[base..base + GROUP]);
+            fis.copy_from_slice(&fisher[base..base + GROUP]);
+            pairs.push(prune_group_2of4(&grp, &fis));
+        }
+    }
+    Ok(PruneMask { pairs, groups: rows * groups_per_row })
+}
+
+/// Flat Fisher-aware sparsify, producing the same [`Sparsified`] as
+/// [`sparsify_2_4_flat`] but ranking by `fisher * w^2`.
+///
+/// Survivors are held as `f32` here, not E4M3 bytes: this is the host-side
+/// prune/metadata stage, and packing survivors to E4M3 is the
+/// `pack_grey_raven` step where the format's 4.75 bpw is actually realised.
+/// Storing f32 keeps the intermediate honest about what it costs, so a "4.75
+/// bpw" claim is never read off a `Vec<f32>`.
+pub fn sparsify_2_4_flat_with_fisher(
+    values: &[f32],
+    fisher: &[f32],
+) -> Result<Sparsified, &'static str> {
+    if values.len() % GROUP != 0 {
+        return Err("length must be a multiple of 4 for 2:4");
+    }
+    if fisher.len() != values.len() {
+        return Err("fisher must be the same length as values");
+    }
+    let groups = values.len() / GROUP;
+    let mut out = Sparsified {
+        values: Vec::with_capacity(groups * GROUP_SURVIVORS),
+        metadata: vec![0u8; (groups * METADATA_BITS_PER_GROUP as usize).div_ceil(8)],
+    };
+    for g in 0..groups {
+        let base = g * GROUP;
+        let mut grp = [0f32; GROUP];
+        let mut fis = [0f32; GROUP];
+        grp.copy_from_slice(&values[base..base + GROUP]);
+        fis.copy_from_slice(&fisher[base..base + GROUP]);
+        let pair = prune_group_2of4(&grp, &fis);
+        let (a, b) = (pair[0] as usize, pair[1] as usize);
+        out.values.push(grp[a]);
+        out.values.push(grp[b]);
+        let bit = g * METADATA_BITS_PER_GROUP as usize;
+        let code = pair_code(a, b) as u32;
+        for k in 0..METADATA_BITS_PER_GROUP as usize {
+            if code & (1 << k) != 0 {
+                out.metadata[(bit + k) / 8] |= 1 << ((bit + k) % 8);
+            }
+        }
+    }
+    Ok(out)
+}
