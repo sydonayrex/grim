@@ -1872,6 +1872,21 @@ fn gated_delta_net_forward(
     };
     // SiLU on the convolved stream, per the reference.
     let conv_mix: Vec<f32> = qkv_conv.iter().map(|v| v / (1.0 + (-v).exp())).collect();
+    {
+        static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && blk.layer_idx == 0
+            && seq_len == 1
+            && !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(ref wt) = blk.ssm_conv1d {
+                let wv = wt.to_vec_f32().unwrap_or_default();
+                let bytes: Vec<u8> = wv.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write("/tmp/kda_probe_host_conv_w.bin", &bytes);
+                eprintln!("[kda-probe-host] conv_w dims {:?} wrote", wt.shape().dims());
+            }
+        }
+    }
     // KDA-STEP-PROBE (host side): dump layer 0 step-1 conv stream + ring for
     // the cross-process diff against the D2D run.
     {
@@ -1891,6 +1906,7 @@ fn gated_delta_net_forward(
             dump(&conv_mix, "conv_mix");
             dump(&cache.conv_state, "conv_ring");
             dump(&cache.ssm_state, "ssm_state");
+            dump(&qkv_vec, "conv_x");
         }
     }
 
@@ -2337,6 +2353,27 @@ fn gated_delta_net_forward_d2d(
             dump(&conv_dev_host, "conv_ring");
             dump(&ssm_dev_host, "ssm_state");
             dump(&d2d_branch, "branch");
+            let x_dump = grim_backend_rocm::device::util::as_rocm(qkv.storage().as_ref())
+                .and_then(|r| r.copy_to_host())
+                .map(|b| {
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect::<Vec<f32>>()
+                })
+                .unwrap_or_default();
+            dump(&x_dump, "conv_x");
+            if let Some(ref cw) = blk.ssm_conv1d {
+                let cw_dump = grim_backend_rocm::device::util::as_rocm(cw.storage().as_ref())
+                    .and_then(|r| r.copy_to_host())
+                    .map(|b| {
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect::<Vec<f32>>()
+                    })
+                    .unwrap_or_default();
+                dump(&cw_dump, "conv_w");
+                eprintln!("[kda-step-probe] conv_w dims {:?}", cw.shape().dims());
+            }
         }
     }
 
