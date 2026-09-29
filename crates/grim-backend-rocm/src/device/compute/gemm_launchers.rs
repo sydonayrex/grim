@@ -1705,11 +1705,26 @@ impl RocmDevice {
                     && w4a4_decode
                     && k % 128 == 0
                 {
+                    // KDA-FIX: the cache key was the RAW DEVICE POINTER. The
+                    // caching allocator recycles blocks — a freed weight
+                    // storage's pointer can be handed to a DIFFERENT tensor,
+                    // and the cache then serves that tensor the first one's
+                    // converted weights (silent wrong weights). Key on
+                    // (pointer, bytes, shape) — three recycled-pointer
+                    // collisions in a row with matching bytes AND shape are
+                    // not a realistic hazard, and the true fix (keyed on the
+                    // allocator generation) needs an allocator API this does
+                    // not have. Better still: weights are static for the
+                    // process lifetime, so entries never evict.
                     static CONVERTED: std::sync::OnceLock<
-                        std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<WhiteCrowDecodedWeights>>>,
+                        std::sync::Mutex<std::collections::HashMap<(usize, usize, [usize; 2]), std::sync::Arc<WhiteCrowDecodedWeights>>>,
                     > = std::sync::OnceLock::new();
                     let cache = CONVERTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-                    let key = w.device_ptr.map(|p| p as usize).unwrap_or(0);
+                    let key = (
+                        w.device_ptr.map(|p| p as usize).unwrap_or(0),
+                        w.bytes,
+                        [n, k],
+                    );
                     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                     let conv = match guard.get(&key) {
                         Some(c) => c.clone(),

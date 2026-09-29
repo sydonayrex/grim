@@ -1279,6 +1279,36 @@ impl Qwen35Block {
             }
         };
 
+        // KDA-STEP-PROBE: layer-0 decode — dump branch + proj_out elementwise
+        // (first divergence hunt between D2D and host runs).
+        let kda_probe_layer0 = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && self.layer_idx == 0
+            && seq_len == 1;
+        if kda_probe_layer0 {
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if call == 2 {
+                // call 1 = prefill, call 2 = decode step 1
+                let dump = |t: &Tensor, name: &str| {
+                    let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                    if let Device::Rocm(ord) = t.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    match grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()) {
+                        Ok(r) => match r.copy_to_host() {
+                            Ok(b) => {
+                                let bytes: Vec<u8> = b;
+                                let _ = std::fs::write(format!("/tmp/kda_probe_d2d_{name}.bin"), &bytes);
+                                eprintln!("[kda-probe-d2d] wrote {name} ({} B)", bytes.len());
+                            }
+                            Err(e) => eprintln!("[kda-probe-d2d] {name} read FAILED: {e}"),
+                        },
+                        Err(e) => eprintln!("[kda-probe-d2d] {name} not rocm: {e}"),
+                    }
+                };
+                dump(&branch_tensor, "branch");
+            }
+        }
         let proj_out = if let Some(ref wo) = self.wo {
             wo.forward(&branch_tensor)?
         } else if let Some(ref out_proj) = self.ssm_out {
@@ -1287,6 +1317,27 @@ impl Qwen35Block {
             branch_tensor
         };
 
+        // KDA-STEP-PROBE: proj_out dump (after ssm_out/ssm_out projection).
+        if kda_probe_layer0 {
+            static PCALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let pcall = PCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if pcall == 2 {
+                let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                if let Device::Rocm(ord) = x_normed.device() {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
+                match grim_backend_rocm::device::util::as_rocm(proj_out.storage().as_ref()) {
+                    Ok(r) => match r.copy_to_host() {
+                        Ok(b) => {
+                            let _ = std::fs::write("/tmp/kda_probe_d2d_proj_out.bin", &b);
+                            eprintln!("[kda-probe-d2d] wrote proj_out ({} B)", b.len());
+                        }
+                        Err(e) => eprintln!("[kda-probe-d2d] proj_out read FAILED: {e}"),
+                    },
+                    Err(e) => eprintln!("[kda-probe-d2d] proj_out not rocm: {e}"),
+                }
+            }
+        }
         // Residual 1
         let h = grim_nn::modules::add_on_device(x, &proj_out)?;
 
@@ -2077,6 +2128,13 @@ fn gated_delta_net_forward(
                 "[kda-branch-fp] host decode-call {call} layer {} branch_sum8={s8:+.6} branch_sum={s:+.6}",
                 blk.layer_idx
             );
+        }
+        // host branch dump at decode step 1 (call 1 of seq==1 = layer 0):
+        // elementwise arbitration against the D2D branch dump.
+        if blk.layer_idx == 0 && CALLS.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            let bytes: Vec<u8> = out_branch.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write("/tmp/kda_probe_host_branch.bin", &bytes);
+            eprintln!("[kda-probe-host] wrote branch ({} f32)", out_branch.len());
         }
     }
     Ok(())
