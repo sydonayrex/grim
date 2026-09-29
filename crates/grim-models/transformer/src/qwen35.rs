@@ -2088,6 +2088,19 @@ fn gated_delta_net_forward_d2d(
     if x_normed.device().is_cpu() {
         return Ok(None);
     }
+    // KDA-STEP-PROBE: where does x_normed live, per layer, per call?
+    if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if call <= 32 {
+            eprintln!(
+                "[kda-dev] call {call} layer {} seq_len {} x_normed.device() = {}",
+                blk.layer_idx,
+                seq_len,
+                x_normed.device()
+            );
+        }
+    }
     // TEMP discriminator: `GRIM_QWEN_KDA_D2D=0` forces every recurrent layer
     // down the host reference loop, exactly as `GRIM_QWEN_ATTN_D2D=0` does for
     // attention. If step-0 logprobs change with this set, the device KDA path
@@ -2479,9 +2492,32 @@ fn gated_delta_net_forward_d2d(
                     )
                 })
                 .unwrap_or((0.0, 0.0));
+            // Which input died? z gate, conv stream, alpha, beta sums.
+            let z_sum = z.to_vec_f32().map(|v| v.iter().sum::<f32>()).unwrap_or(f32::NAN);
+            let conv_sum = grim_backend_rocm::device::util::as_rocm(conv_out.as_ref())
+                .and_then(|r| r.copy_to_host())
+                .map(|b| {
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .sum::<f32>()
+                })
+                .unwrap_or(f32::NAN);
+            let a_sum = alpha.to_vec_f32().map(|v| v.iter().sum::<f32>()).unwrap_or(f32::NAN);
+            let b_sum = beta.to_vec_f32().map(|v| v.iter().sum::<f32>()).unwrap_or(f32::NAN);
+            let nw_sum = blk
+                .ssm_norm_dev
+                .as_ref()
+                .and_then(|st| grim_backend_rocm::device::util::as_rocm(st.as_ref()).ok())
+                .and_then(|r| r.copy_to_host().ok())
+                .map(|b| {
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .sum::<f32>()
+                })
+                .unwrap_or(f32::NAN);
             eprintln!(
-                "[kda-branch-fp] d2d decode-call {call} layer {} branch_sum8={:+.6} branch_sum={:+.6}",
-                blk.layer_idx, fp.0, fp.1
+                "[kda-branch-fp] d2d decode-call {call} layer {} branch_sum={:+.6} z_sum={z_sum:+.4} conv_sum={conv_sum:+.4} alpha_sum={a_sum:+.4} beta_sum={b_sum:+.4} nw_sum={nw_sum:+.4}",
+                blk.layer_idx, fp.1
             );
         }
     }
