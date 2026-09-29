@@ -750,6 +750,53 @@ impl Qwen35Block {
         let seq_len = positions.len();
         let device = x.device().clone();
 
+        // KDA-STEP-PROBE: x AT BLOCK ENTRY (before any op can alias it).
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && seq_len == 1
+            && self.layer_idx == 0
+        {
+            static ENTRY: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let call = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if call == 2 {
+                // call 1 = prefill, call 2 = decode step 1. Read x TWICE
+                // back-to-back (sync + read, sync + read): differing bytes =>
+                // concurrent writer; identical => earlier interleaved reads
+                // raced the async gather.
+                for round in 0..2 {
+                    let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                    if let Device::Rocm(ord) = x.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    match grim_backend_rocm::device::util::as_rocm(x.storage().as_ref()) {
+                        Ok(r) => match r.copy_to_host() {
+                            Ok(b) => {
+                                let vals: Vec<f32> = b
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect();
+                                eprintln!(
+                                    "[x-entry] round {round} x[0:4]={:?} sum8={:+.6}",
+                                    &vals[..4],
+                                    vals.iter().take(8).sum::<f32>()
+                                );
+                                if round == 1 {
+                                    let bytes: Vec<u8> =
+                                        vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                                    let _ = std::fs::write(
+                                        "/tmp/kda_probe_x_entry.bin",
+                                        &bytes,
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!("[x-entry] round {round} read FAILED: {e}"),
+                        },
+                        Err(e) => eprintln!("[x-entry] round {round} not rocm: {e}"),
+                    }
+                }
+            }
+        }
+
         // 1. Pre-norm
         let x_normed = self.attn_norm.forward(x)?;
 
@@ -1284,6 +1331,33 @@ impl Qwen35Block {
         let kda_probe_layer0 = std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
             && self.layer_idx == 0
             && seq_len == 1;
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+            && seq_len == 1
+            && self.layer_idx <= 2
+        {
+            static X_FP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = X_FP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 3 {
+                if let Ok(r) = grim_backend_rocm::device::util::as_rocm(x.storage().as_ref()) {
+                    if let Device::Rocm(ord) = x.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    if let Ok(b) = r.copy_to_host() {
+                        let vals: Vec<f32> = b
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let s: f32 = vals.iter().take(8).sum();
+                        eprintln!(
+                            "[x-fp] layer {} pre-branch x[0:4]={:?} sum8={s:+.6} shape={:?}",
+                            self.layer_idx,
+                            &vals[..4],
+                            x.shape().dims()
+                        );
+                    }
+                }
+            }
+        }
         if kda_probe_layer0 {
             static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1343,6 +1417,38 @@ impl Qwen35Block {
                 }
             }
         }
+        // KDA-STEP-PROBE: proj_out (ssm_out/ssm_out output) right after the
+        // branch — with the branch proven identical, this names the explosion.
+        if kda_probe_layer0 {
+            static PROJ_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !PROJ_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                if let Device::Rocm(ord) = x.device() {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
+                match grim_backend_rocm::device::util::as_rocm(proj_out.storage().as_ref()) {
+                    Ok(r) => match r.copy_to_host() {
+                        Ok(b) => {
+                            let vals: Vec<f32> = b
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect();
+                            let s8: f32 = vals.iter().take(8).sum();
+                            let s: f32 = vals.iter().sum();
+                            eprintln!(
+                                "[proj-fp] layer 0 decode proj_out[0:4]={:?} sum8={s8:+.6} sum={s:+.6}",
+                                &vals[..4]
+                            );
+                            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            let _ = std::fs::write("/tmp/kda_probe_proj_out.bin", &bytes);
+                        }
+                        Err(e) => eprintln!("[proj-fp] read FAILED: {e}"),
+                    },
+                    Err(e) => eprintln!("[proj-fp] not rocm: {e}"),
+                }
+            }
+        }
         // Residual 1
         let h = grim_nn::modules::add_on_device(x, &proj_out)?;
 
@@ -1359,6 +1465,97 @@ impl Qwen35Block {
         };
         let act = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&act)?;
+        // KDA-STEP-PROBE: layer-0 decode FFN stage dumps.
+        if kda_probe_layer0 {
+            static FF_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FF_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                if let Device::Rocm(ord) = x.device() {
+                    grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                }
+                let mode = if std::env::var("GRIM_QWEN_KDA_D2D").as_deref() == Ok("0") {
+                    "host"
+                } else {
+                    "d2d"
+                };
+                let dump = |t: &Tensor, name: &str| {
+                    let _g = grim_backend_rocm::device::util::DeviceGuard::set(0);
+                    if let Device::Rocm(ord) = t.device() {
+                        grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                    }
+                    match grim_backend_rocm::device::util::as_rocm(t.storage().as_ref()) {
+                        Ok(r) => match r.copy_to_host() {
+                            Ok(b) => {
+                                let vals: Vec<f32> = b
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect();
+                                let s8: f32 = vals.iter().take(8).sum();
+                                eprintln!(
+                                    "[ffn-fp] layer 0 decode {name}: len {} sum8={s8:+.6} [0:3]={:?}",
+                                    vals.len(),
+                                    &vals[..3]
+                                );
+                                let bytes: Vec<u8> =
+                                    vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                                let _ = std::fs::write(
+                                    format!("/tmp/kda_probe_ffn_{mode}_{name}.bin"),
+                                    &bytes,
+                                );
+                            }
+                            Err(e) => eprintln!("[ffn-fp] {name} read FAILED: {e}"),
+                        },
+                        Err(e) => eprintln!("[ffn-fp] {name} not rocm: {e}"),
+                    }
+                };
+                dump(&h_normed, "h_normed");
+                dump(&gate, "gate");
+                dump(&up, "up");
+                dump(&ffn_out, "ffn_out");
+                // The fused Q4K weight storage: identical across runs unless
+                // something corrupted it (e.g. a prefill overrun).
+                let mode = if std::env::var("GRIM_QWEN_KDA_D2D").as_deref() == Ok("0") {
+                    "host"
+                } else {
+                    "d2d"
+                };
+                match self
+                    .w_gate_up_q4k_fused
+                    .as_ref()
+                    .ok_or_else(|| {
+                        grim_core::error::Error::Backend(String::from(
+                            "layer has no fused gate_up weights (KDA layer)",
+                        ))
+                    })
+                    .and_then(|f| grim_backend_rocm::device::util::as_rocm(&f.storage).map_err(|e| grim_core::error::Error::Backend(format!("{e}"))))
+                {
+                    Ok(r) => match r.copy_to_host() {
+                        Ok(b) => {
+                            let _ = std::fs::write(
+                                format!("/tmp/kda_probe_ffn_{mode}_fused_w.bin"),
+                                &b,
+                            );
+                            let vals: Vec<f32> = std::fs::read(
+                                format!("/tmp/kda_probe_ffn_{mode}_fused_w.bin"),
+                            )
+                            .unwrap_or_default()
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                            eprintln!(
+                                "[ffn-fp] fused_w ({} B) sum8={:+.6} [0:3]={:?}",
+                                b.len(),
+                                vals.iter().take(8).sum::<f32>(),
+                                &vals[..3]
+                            );
+                        }
+                        Err(e) => eprintln!("[ffn-fp] fused_w read FAILED: {e}"),
+                    },
+                    Err(e) => eprintln!("[ffn-fp] fused_w not rocm: {e}"),
+                }
+            }
+        }
 
         // Residual 2
         let out = grim_nn::modules::add_on_device(&h, &ffn_out)?;
@@ -1696,9 +1893,86 @@ impl CausalLm for Qwen35 {
                 }
             }
         }
+        // KDA-STEP-PROBE: read h twice back-to-back right before the block
+        // loop. Two reads of the same storage differing => concurrent writer.
+        if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1") && seq_len == 1 {
+            static RE_READS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if RE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                let read0 = (|| {
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                        if let Device::Rocm(ord) = h.device() {
+                            grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                        }
+                        if let Ok(b) = r.copy_to_host() {
+                            return Some(b);
+                        }
+                    }
+                    None
+                })();
+                let read1 = (|| {
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                        if let Ok(b) = r.copy_to_host() {
+                            return Some(b);
+                        }
+                    }
+                    None
+                })();
+                match (read0, read1) {
+                    (Some(b0), Some(b1)) => {
+                        let v0: Vec<f32> = b0
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let v1: Vec<f32> = b1
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        eprintln!(
+                            "[h-rewatch] read0[0:4]={:?} sum8={:+.6} | read1[0:4]={:?} sum8={:+.6} | stable={}",
+                            &v0[..4],
+                            v0.iter().take(8).sum::<f32>(),
+                            &v1[..4],
+                            v1.iter().take(8).sum::<f32>(),
+                            b0 == b1
+                        );
+                    }
+                    _ => eprintln!("[h-rewatch] readback failed"),
+                }
+            }
+        }
         for (i, block) in self.blocks.iter().enumerate() {
             if h.device() != &block.device {
                 h = grim_nn::modules::move_to_device(&h, &block.device)?;
+            }
+            // KDA-STEP-PROBE: in-process h fingerprint at decode step 1,
+            // per layer — h vs the block's view of x, no cross-run dumps.
+            if std::env::var("GRIM_KDA_STEP_PROBE").as_deref() == Ok("1")
+                && seq_len == 1
+                && i <= 2
+            {
+                static H_FP: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = H_FP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 3 {
+                    if let Ok(r) = grim_backend_rocm::device::util::as_rocm(h.storage().as_ref()) {
+                        if let Device::Rocm(ord) = h.device() {
+                            grim_backend_rocm::RocmDevice::shared(*ord).synchronize();
+                        }
+                        if let Ok(b) = r.copy_to_host() {
+                            let vals: Vec<f32> = b
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect();
+                            let s: f32 = vals.iter().take(8).sum();
+                            eprintln!(
+                                "[h-fp] layer {i} pre-block h[0:4]={:?} sum8={s:+.6} shape={:?}",
+                                &vals[..4],
+                                h.shape().dims()
+                            );
+                        }
+                    }
+                }
             }
             if trace {
                 let kind = if block.is_full_attention {
