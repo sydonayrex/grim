@@ -403,3 +403,88 @@ pub fn sparsify_2_4_flat_with_fisher(
     }
     Ok(out)
 }
+
+/// Bytes of packed GreyRaven per `GROUP` original weights.
+///
+/// 2 survivors as E4M3 bytes + 3 metadata bits: 19 bits per 4 originals, i.e.
+/// 4.75 bpw. Kept as a named function so `pack_grey_raven`, `dequant_grey_raven`
+/// and `DType::expected_bytes` cannot drift apart on the layout.
+pub const fn packed_bytes_for(num_values: usize) -> usize {
+    let groups = num_values.div_ceil(GROUP);
+    groups * GROUP_SURVIVORS + (groups * METADATA_BITS_PER_GROUP as usize).div_ceil(8)
+}
+
+/// Pack a [`Sparsified`] into GreyRaven's byte layout.
+///
+/// Layout: `[survivor E4M3 bytes][metadata bitstream]`, survivors first and
+/// metadata last, both contiguous. That ordering is what makes the density
+/// arithmetic in [`packed_bytes_for`] fall out of one expression, and it keeps
+/// the metadata a single contiguous run the kernel can address per superblock.
+///
+/// Survivors are encoded with the same RNE E4M3 encoder WhiteRaven uses, so a
+/// GreyRaven tensor and a dense FP8 tensor of the same values carry identical
+/// codes. That is deliberate: it means the decode below is WhiteRaven's decode
+/// plus metadata expansion, with no second FP8 implementation to disagree with
+/// the first.
+pub fn pack_grey_raven(s: &Sparsified) -> Vec<u8> {
+    let n_survivors = s.values.len();
+    let mut out = Vec::with_capacity(n_survivors + s.metadata.len());
+    for &v in &s.values {
+        out.push(crate::f32_to_fp8_e4m3(v));
+    }
+    out.extend_from_slice(&s.metadata);
+    out
+}
+
+/// Decode a GreyRaven buffer back to a dense tensor: survivors at their recorded
+/// positions, zero elsewhere.
+///
+/// This reconstructs the **pruned** model, not the original dense one, and that
+/// distinction is the format's semantics rather than an implementation detail --
+/// `e4_dequant_reconstructs_the_pruned_model_not_the_dense_one` pins it.
+///
+/// Validation is total: a buffer whose length disagrees with `num_values`, whose
+/// metadata is short, or whose 3-bit codes name a slot pair outside the group is
+/// rejected rather than clamped. A format whose decoder can be made to panic or
+/// to read out of bounds on a bad buffer is a denial of service on untrusted
+/// input, and one that silently clamps produces a *different model* with no
+/// signal that anything went wrong.
+pub fn dequant_grey_raven(data: &[u8], num_values: usize) -> Result<Vec<f32>, &'static str> {
+    if num_values % GROUP != 0 {
+        return Err("num_values must be a multiple of 4 for 2:4");
+    }
+    let groups = num_values / GROUP;
+    let survivor_bytes = groups * GROUP_SURVIVORS;
+    let meta_bytes = (groups * METADATA_BITS_PER_GROUP as usize).div_ceil(8);
+    if data.len() != survivor_bytes + meta_bytes {
+        return Err("buffer length does not match the 2:4 layout for num_values");
+    }
+    let (survivors, meta) = data.split_at(survivor_bytes);
+
+    let mut out = vec![0.0f32; num_values];
+    for g in 0..groups {
+        let bit = g * METADATA_BITS_PER_GROUP as usize;
+        let mut code = 0u32;
+        for k in 0..METADATA_BITS_PER_GROUP as usize {
+            if meta[(bit + k) / 8] & (1 << ((bit + k) % 8)) != 0 {
+                code |= 1 << k;
+            }
+        }
+        let (a, b) = code_to_pair(code).ok_or("metadata code does not name a valid slot pair")?;
+        let base = g * GROUP;
+        out[base + a] = crate::fp8_e4m3_to_f32(survivors[g * GROUP_SURVIVORS]);
+        out[base + b] = crate::fp8_e4m3_to_f32(survivors[g * GROUP_SURVIVORS + 1]);
+    }
+    Ok(out)
+}
+
+/// Invert [`pair_code`]. Returns `None` for a 3-bit code outside 0..=5, which is
+/// the only way a malformed buffer can name a pair that does not exist.
+///
+/// Uses the same module-level `PAIRS` table `pair_code` encodes against rather
+/// than a local copy. A second table here would be a second source of truth for
+/// the same bijection, and the two disagreeing would decode to a different model
+/// with no error -- the silent-failure class this format is most exposed to.
+fn code_to_pair(code: u32) -> Option<(usize, usize)> {
+    PAIRS.get(code as usize).map(|p| (p[0], p[1]))
+}

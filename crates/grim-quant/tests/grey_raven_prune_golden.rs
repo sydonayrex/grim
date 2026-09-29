@@ -17,8 +17,9 @@
 //! opposite of what E3 exists to do.
 
 use grim_quant::grey_raven::{
-    densify_flat, prune_2of4, prune_group_2of4, sparsify_2_4_flat_with_fisher, GROUP,
-    GROUP_SURVIVORS, METADATA_BITS_PER_GROUP,
+    densify_flat, dequant_grey_raven, pack_grey_raven, packed_bytes_for, prune_2of4,
+    prune_group_2of4, sparsify_2_4_flat_with_fisher, GROUP, GROUP_SURVIVORS,
+    METADATA_BITS_PER_GROUP,
 };
 use grim_tensor::{ArithType, BlockDtype, DType, FloatPackScheme, QuantFormat, Storage};
 
@@ -197,6 +198,19 @@ fn e3_effective_bpw_is_4_75() {
         "DType::expected_bytes must agree with the hand-computed GreyRaven layout"
     );
 
+    // The dtype's size model and the packer's real output must agree, at several
+    // shapes including one that is not a whole number of metadata bytes' worth.
+    // E3 pins the arithmetic and E4 pins the buffer; neither would notice if the
+    // other drifted, and a size model that disagrees with the packer is how a
+    // VRAM estimate silently under-counts a whole checkpoint.
+    for &n2 in &[4usize, 8, 12, 64, 1024, 4096, 12_288] {
+        assert_eq!(
+            grey.expected_bytes(n2),
+            packed_bytes_for(n2),
+            "DType::expected_bytes and pack_grey_raven disagree at {n2} elements"
+        );
+    }
+
     // The density itself, as bits per original weight, so the number is named
     // rather than left implicit in a byte count that a future metadata change
     // could alter.
@@ -213,4 +227,147 @@ fn e3_effective_bpw_is_4_75() {
     let survivor_bytes = s.values.len(); // one E4M3 byte each
     let real_bytes = survivor_bytes + s.metadata.len();
     assert_eq!(real_bytes, expected_bytes, "sparsifier output must match the cost model");
+}
+
+/// E4 — dequant reconstructs the *pruned* model, not the dense one.
+///
+/// This is the step that turns 4.75 bpw from an accounting figure into a real
+/// buffer: survivors become actual E4M3 bytes and the metadata a real bitstream.
+///
+/// The assertion is deliberately two-sided. Against the pruned reference the
+/// decode must be tight; against the *original* dense weights it must NOT be,
+/// because half of them are gone by construction. The second half is what stops
+/// a later "improvement" from quietly densifying the buffer to make the
+/// comparison against the dense model pass -- which would restore accuracy and
+/// simultaneously destroy the format.
+#[test]
+fn e4_dequant_reconstructs_the_pruned_model_not_the_dense_one() {
+    let n = 512usize;
+    let dense: Vec<f32> = (0..n)
+        .map(|i| (((i * 2654435761usize) % 977) as f32) * 0.011 - 5.0)
+        .collect();
+    let fisher: Vec<f32> = (0..n).map(|i| if i % 7 == 0 { 0.01 } else { 1.0 }).collect();
+
+    let s = sparsify_2_4_flat_with_fisher(&dense, &fisher).expect("n is a multiple of 4");
+    let packed = pack_grey_raven(&s);
+
+    // The buffer is exactly the predicted size: survivors as E4M3 bytes, then
+    // the metadata bitstream.
+    assert_eq!(
+        packed.len(),
+        packed_bytes_for(n),
+        "packed buffer must match the layout cost model exactly"
+    );
+    assert_eq!(packed.len() * 8, n * 19 / 4, "19 bits per 4 originals = 4.75 bpw");
+
+    let decoded = dequant_grey_raven(&packed, n).expect("well-formed buffer");
+
+    // Pruned reference: survivors at their positions, zeros elsewhere. This is
+    // what densify_flat already computes, computed independently here from the
+    // E4M3 round trip so the test is not just asserting the decoder equals the
+    // encoder it was written beside.
+    let pruned = densify_flat(&s);
+    let e4m3_pruned: Vec<f32> = pruned
+        .iter()
+        .map(|&v| if v == 0.0 { 0.0 } else { round_e4m3(v) })
+        .collect();
+
+    let mut worst_vs_pruned = 0.0f32;
+    for i in 0..n {
+        worst_vs_pruned = worst_vs_pruned.max((decoded[i] - e4m3_pruned[i]).abs());
+    }
+    assert!(
+        worst_vs_pruned < 1e-6,
+        "decode must match the pruned reference, worst abs {worst_vs_pruned:.3e}"
+    );
+
+    // Half the weights are structurally zero, so the decode cannot be close to
+    // the dense original.
+    let zeros = decoded.iter().filter(|&&v| v == 0.0).count();
+    assert!(
+        zeros >= n / 2,
+        "a 2:4 decode must have at least half its weights structurally zero, found {zeros}/{n}"
+    );
+    let dense_err: f32 = decoded
+        .iter()
+        .zip(&dense)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let dense_scale = dense.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(
+        dense_err > 0.5 * dense_scale,
+        "decode must NOT approximate the original dense weights \
+         (err {dense_err:.3} vs scale {dense_scale:.3}); if it does, the buffer is not sparse"
+    );
+
+    // Round trip through the byte format is stable.
+    let repacked = dequant_grey_raven(&pack_grey_raven(&s), n).expect("repack");
+    assert_eq!(repacked, decoded, "pack/unpack must be idempotent");
+}
+
+fn round_e4m3(v: f32) -> f32 {
+    grim_quant::fp8_e4m3_to_f32(grim_quant::f32_to_fp8_e4m3(v))
+}
+
+/// E5 — malformed buffers are rejected loudly.
+///
+/// A decoder that clamps an out-of-range metadata code does not crash; it
+/// returns a *different model* with no indication anything was wrong. That is
+/// worse than a refusal, so every malformed shape gets an error and no value.
+#[test]
+fn e5_malformed_buffers_are_rejected_loudly() {
+    let n = 64usize;
+    let dense: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 3.0).collect();
+    let s = sparsify_2_4_flat_with_fisher(&dense, &vec![1.0; n]).expect("multiple of 4");
+    let good = pack_grey_raven(&s);
+    assert!(dequant_grey_raven(&good, n).is_ok(), "control must decode");
+
+    // Truncated buffer.
+    for cut in [0usize, 1, good.len() / 2, good.len() - 1] {
+        assert!(
+            dequant_grey_raven(&good[..cut], n).is_err(),
+            "truncated buffer ({cut} of {} bytes) must be rejected",
+            good.len()
+        );
+    }
+    // Over-long buffer.
+    let mut long = good.clone();
+    long.push(0);
+    assert!(dequant_grey_raven(&long, n).is_err(), "over-long buffer must be rejected");
+
+    // num_values not a multiple of 4.
+    for bad_n in [1usize, 2, 3, 5, 63] {
+        assert!(
+            dequant_grey_raven(&good, bad_n).is_err(),
+            "num_values={bad_n} must be rejected rather than padded"
+        );
+    }
+    // num_values inconsistent with a buffer sized for another shape.
+    assert!(
+        dequant_grey_raven(&good, n * 2).is_err(),
+        "a buffer sized for {n} must not decode as {n} values"
+    );
+
+    // Metadata code 6 and 7 name no valid slot pair (only 0..=5 exist). These
+    // must error, not clamp to 0 and silently reconstruct a different model.
+    for bad_code in [6u32, 7] {
+        let mut buf = good.clone();
+        let meta_start = n / 4 * 2;
+        // Code lives in 3 bits at metadata bit 0 for group 0.
+        for k in 0..3 {
+            let bit = k;
+            let byte = meta_start + bit / 8;
+            if bad_code & (1 << k) != 0 {
+                buf[byte] |= 1 << (bit % 8);
+            } else {
+                buf[byte] &= !(1 << (bit % 8));
+            }
+        }
+        let err = dequant_grey_raven(&buf, n);
+        assert!(
+            err.is_err(),
+            "metadata code {bad_code} names no valid pair and must be rejected, got {:?}",
+            err.ok()
+        );
+    }
 }
