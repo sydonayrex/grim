@@ -2189,10 +2189,10 @@ fn grey_raven_offset_is_per_group_or_shared() -> TestResult {
 //
 // This is the answer to the question the previous note raised, and it removes the
 // density concern: offsets are per-group, so **arbitrary per-group position
-/// selection is expressible and GreyRaven's 3-bit-per-group metadata maps across
-/// directly**, each group's field naming which of its four positions is kept. The
+// selection is expressible and GreyRaven's 3-bit-per-group metadata maps across
+// directly**, each group's field naming which of its four positions is kept. The
 // "1:4 not 2:4" reading was a consequence of varying only the low field and
-/// reading a shared offset into it; per-group, the format's own structure is
+// reading a shared offset into it; per-group, the format's own structure is
 // representable.
 //
 // The open item that remains is only the density itself -- how many of A's 8 bytes
