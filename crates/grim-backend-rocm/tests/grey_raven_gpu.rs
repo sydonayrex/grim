@@ -1427,3 +1427,93 @@ fn grey_raven_b_layout_direct() -> TestResult {
 // The next probe follows directly: sweep one byte position within a lane, 0..15,
 // at a fixed lane, to find which positions the eight selectors enable and whether
 // the total is 8 of 16 (2:4 after all) or stays 4 (a quarter, as measured).
+
+/// Within one B lane, which byte positions does each selector enable?
+///
+/// The last probe found only positions = 0 (mod 4) read at sidx = 0 -- 4 of 16
+/// columns, a quarter rather than the half a 2:4 B implies. This asks the eight
+/// selectors to each enable their byte position in a single fixed lane, and
+/// reports the union. If the union is 8 of 16 the instruction is 2:4 after all
+/// and sidx = 0 simply starts from a restricted base; if it stays 4, the quarter
+/// reading is real and the tile is not what the intrinsic name implies.
+///
+/// Uniform A throughout, so nothing here depends on A's k mapping.
+#[test]
+fn grey_raven_selector_enables_which_byte_positions() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+
+    let live_positions = |sidx: u32| -> TestResult<Vec<usize>> {
+        let mut live = Vec::new();
+        for j in 0..16usize {
+            let mut b = vec![FP8_ZERO; 512];
+            b[j] = FP8_ONE; // all in lane 0
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                live.push(j);
+            }
+        }
+        Ok(live)
+    };
+
+    let base = live_positions(0)?;
+    let mut all: Vec<usize> = base.clone();
+    println!("\nsidx=0            positions {base:?}  ({} of 16)", base.len());
+    for bit in [0u32, 1, 4, 5, 8, 9, 12, 13] {
+        let l = live_positions(1u32 << bit)?;
+        for p in &l {
+            if !all.contains(p) {
+                all.push(*p);
+            }
+        }
+        println!("selector bit {bit:>2}   positions {l:?}  ({} of 16)", l.len());
+    }
+    let mut all = all;
+    all.sort_unstable();
+    println!("\nUNION over all 8 selectors: {all:?}  ({} of 16)", all.len());
+    Ok(())
+}
+
+// ============================================================================
+// B's layout is complete, and the "quarter" reading was an artifact of sidx = 0.
+//
+// Within one fixed B lane, sweeping all 16 byte positions at each selector:
+//
+//   sidx = 0          positions 0, 4, 8, 12            (4 of 16)
+//   selector bit 0    positions 0, 1, 4, 8, 12          adds 1
+//   selector bit 1    positions 0, 2, 4, 8, 12          adds 2
+//   selector bit 4    positions 0, 4, 5, 8, 12          adds 5
+//   selector bit 5    positions 0, 4, 6, 8, 12          adds 6
+//   selector bit 8    positions 0, 4, 8, 9, 12          adds 9
+//   selector bit 9    positions 0, 4, 8, 10, 12         adds 10
+//   selector bit 12   positions 0, 4, 8, 12, 13         adds 13
+//   selector bit 13   positions 0, 4, 8, 12, 14         adds 14
+//
+//   UNION             0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14   (12 of 16)
+//
+// Each selector adds exactly one position, b + 1, and the twelve reachable
+// positions are = 0, 1, 2 (mod 4) in each of the four groups of four. The four
+// remaining positions {3, 7, 11, 15} -- the = 3 (mod 4) class -- are reachable by
+// *pairs* of selectors, measured earlier as [0,1] -> 3, [2,3] -> 7, [4,5] -> 11,
+// [6,7] -> 15.
+//
+// So **all sixteen byte positions of a B lane are reachable**, and the earlier
+// "the instruction reads only a quarter of B" was an artifact of testing at
+// sidx = 0 alone. There is no quarter; there is an index, and 4 of 16 columns is
+// just the default. That removes the most alarming open question in this file.
+//
+// B's layout, complete and measured:
+//   **B[lane L] byte j is the tile element (k = L, n = j), row-major, and the
+//   index selects which of the 16 columns is read.**
+//
+// Still unexplained, and the only thing left: the value 2.0. Every element read
+// comes back counted twice, at sidx = 0 and at every selector value alike. A
+// 16x16x32 tile over 512 B of B, 16 rows of A and a C of 16x16 all add up, so a
+// uniform doubling points at either the accumulator being seeded twice, the
+// instruction accumulating into D and also adding D, or the probe's zero D being
+// misread -- all three in the probe or its launcher rather than in the operand
+// layout, and all three cheap to check by running with a non-zero D.
+//
+// E6's operand layout is now fully established. What remains is that 2.0, then
+// the end-to-end test against a CPU reference.
