@@ -1338,3 +1338,92 @@ fn grey_raven_combinations_reach_missing_residues() -> TestResult {
 // whole residue table, is not. A single B-layout probe -- one-hot B with a
 // *non-uniform* A, so the answer does not depend on A's k mapping -- settles it,
 // and that is the next step rather than the end-to-end test.
+
+/// B's lane-to-element layout, with A uniform so the answer cannot depend on A's
+/// k mapping.
+///
+/// Every earlier reading of B assumed a packing -- first row-major (lane = 16
+/// contiguous bytes of one k), then that the index acted on k. Both are
+/// assumptions, and the column-shaped deltas say at least one is wrong. This
+/// makes none: A is uniform, so every k is covered regardless of where the index
+/// places anything, and a single hot B byte can be attributed by elimination. The
+/// C elements it lights up *are* the (row, column) it occupies.
+///
+/// Read straight off: for each hot offset, the set of (output lane, slot) is
+/// exactly that B element's position in the tile. No inference required.
+#[test]
+fn grey_raven_b_layout_direct() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+
+    for g in [0usize, 1, 2, 3, 4, 5, 8, 16, 17, 32, 64, 128] {
+        let mut b = vec![FP8_ZERO; 512];
+        b[g] = FP8_ONE;
+        let c = run_mma(&dev, &a, &b, 0)?;
+        let mut hits: Vec<(usize, usize, f32)> = Vec::new();
+        for (l, lane) in c.iter().enumerate() {
+            for (s, &v) in lane.iter().enumerate() {
+                if v != 0.0 {
+                    hits.push((l, s, v));
+                }
+            }
+        }
+        // Summarise: the distinct values, and the lane/slot shape.
+        let vals: Vec<String> = { let mut v: Vec<String> = hits.iter().map(|(_, _, x)| format!("{x}")).collect(); v.sort(); v.dedup(); v };
+        let lanes: Vec<usize> = { let mut v: Vec<usize> = hits.iter().map(|(l, _, _)| *l).collect(); v.sort_unstable(); v.dedup(); v };
+        let slots: Vec<usize> = { let mut v: Vec<usize> = hits.iter().map(|(_, s, _)| *s).collect(); v.sort_unstable(); v.dedup(); v };
+        println!(
+            "B[{g:>3}] (lane {}, byte {}): {:>2} hits, values {vals:?}, lanes {lanes:?}, slots {slots:?}",
+            g / 16,
+            g % 16,
+            hits.len()
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
+// B's layout, measured. It replaces the assumption in the spec above.
+//
+// One-hot B, uniform A, sidx = 0, no packing assumed -- the C elements a byte
+// lights up *are* its position in the tile:
+//
+//   B[  0] (lane 0, byte 0): 16 hits, value 2, lanes [0, 16], slots [0..7]
+//   B[  1] (lane 0, byte 1):  0 hits
+//   B[  2] (lane 0, byte 2):  0 hits
+//   B[  4] (lane 0, byte 4): 16 hits, value 2, lanes [0, 16], slots [0..7]
+//   B[  8] (lane 0, byte 8): 16 hits, value 2, lanes [0, 16], slots [0..7]
+//   B[ 16] (lane 1, byte 0): 16 hits, value 2, lanes [1, 17], slots [0..7]
+//   B[ 32] (lane 2, byte 0): 16 hits, value 2, lanes [2, 18], slots [0..7]
+//   B[ 64] (lane 4, byte 0): 16 hits, value 2, lanes [4, 20], slots [0..7]
+//   B[128] (lane 8, byte 0): 16 hits, value 2, lanes [8, 24], slots [0..7]
+//
+// Two facts, both read off rather than inferred:
+//
+//   - **The lane is the k.** Lane L's bytes all land in output lane L (and L+16),
+//     so B is row-major after all: B[lane] is one k, and byte j within the lane is
+//     column j. The spec's "lane = 16 contiguous bytes of one k" was right; its
+//     claim that offset mod 16 is therefore *k* was the inversion, and that is now
+//     corrected -- offset mod 16 is the column, as this shows.
+//   - **Only byte positions = 0 (mod 4) are read at sidx = 0** -- 4 of a lane's
+//     16 columns, not 8. So the instruction reads a *quarter* of B, not half. A
+//     hot byte lights all 8 slots in lanes L and L+16 at value 2.0: every one of
+//     the 16 rows of one column, counted twice.
+//
+// The count does not reconcile yet, and saying so is the point. A 2:4 B would
+// read 8 of 16 columns; this reads 4 of 16. The residual 2.0 says the same element
+// is accumulated twice. Both are unexplained, and either could mean the effective
+// tile is not the 16x16x32 the intrinsic name implies -- which would matter a great
+// deal to GreyRaven, whose whole premise is that this is a 2:4 primitive.
+//
+// What is now solid, and what is not:
+//
+//   solid  intrinsic signature; C layout (lane = column, lane+16 = same column's
+//          upper row half, slot = row); A row mapping (lane L -> row L mod 16);
+//          bits 16..31 inert; B is row-major with byte j = column j
+//   open   why only 4 of 16 B columns are read; what the 2.0 is
+//
+// The next probe follows directly: sweep one byte position within a lane, 0..15,
+// at a fixed lane, to find which positions the eight selectors enable and whether
+// the total is 8 of 16 (2:4 after all) or stays 4 (a quarter, as measured).
