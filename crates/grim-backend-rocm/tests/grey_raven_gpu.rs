@@ -1070,3 +1070,84 @@ fn grey_raven_index_bit_parity_across_u32() -> TestResult {
 // 8 measurements rather than a search. Nothing here establishes what the *values*
 // mean yet -- only which bits matter -- so the map is still unproven, but the
 // space to search just collapsed from 2^32 to 2^8, and the high half is settled.
+
+/// The eight selectors, each set alone, differenced against sidx = 0.
+///
+/// The parity sweep settled *which* bits matter. This reads what each one does:
+/// with A uniform, a B byte is live iff some A survivor sits on that byte's k, so
+/// setting a single selector and diffing the live set against the all-zero
+/// baseline isolates exactly the k's that selector governs. Eight measurements,
+/// no search.
+#[test]
+fn grey_raven_each_selector_k_delta() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+
+    let live_at = |sidx: u32| -> TestResult<Vec<usize>> {
+        let mut live = Vec::new();
+        for g in 0..512usize {
+            let mut b = vec![FP8_ZERO; 512];
+            b[g] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                live.push(g);
+            }
+        }
+        Ok(live)
+    };
+
+    let base = live_at(0)?;
+    println!("\nbaseline sidx=0: {} live", base.len());
+
+    // One representative bit from each of the eight equivalence classes.
+    for bit in [0u32, 1, 4, 5, 8, 9, 12, 13] {
+        let l = live_at(1u32 << bit)?;
+        let added: Vec<usize> = l.iter().copied().filter(|x| !base.contains(x)).collect();
+        let gone: Vec<usize> = base.iter().copied().filter(|x| !l.contains(x)).collect();
+        // Which B bytes gained a partner = which k's this selector now covers.
+        println!(
+            "selector bit {bit:>2} (sidx={:#x}): +{} -{}  added={added:?} removed={gone:?}",
+            1u32 << bit,
+            added.len(),
+            gone.len()
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
+// The selector -> k map, measured. residue = b + 1.
+//
+// Each of the eight selectors, set alone, adds exactly 32 B byte offsets, and
+// they are perfectly regular: each set is one residue class mod 16, walking in
+// steps of 16, and the residue is **b + 1** for the selector bit b.
+//
+//   bit  0 -> {1, 17, 33, ... 497}   residue  1 mod 16
+//   bit  1 -> {2, 18, 34, ... 498}   residue  2 mod 16
+//   bit  4 -> {5, 21, 37, ... 501}   residue  5 mod 16
+//   bit  5 -> {6, 22, 38, ... 502}   residue  6 mod 16
+//   bit  8 -> {9, 25, 41, ... 505}   residue  9 mod 16
+//   bit  9 -> {10, 26, 42, ... 506}  residue 10 mod 16
+//   bit 12 -> {13, 29, 45, ... 509}  residue 13 mod 16
+//   bit 13 -> {14, 30, 46, ... 510}  residue 14 mod 16
+//
+// The baseline (sidx = 0, 128 live) is the four residues {0, 4, 8, 12} mod 16 --
+// i.e. residue 0 mod 4. Union the baseline with all eight selectors and 12 of the
+// 16 residues are live; the missing four are {3, 7, 11, 15}, the = 3 (mod 4)
+// class, which is exactly the class the very first index probe showed being
+// selected. 128 + 8*32 = 384 = 512 - 128, so the accounting closes exactly and
+// those four residues are reachable only by combining bits, not by any single one.
+//
+// Read as a fragment, this is the whole picture: a B byte's offset mod 16
+// identifies its k within a 16-wide group, selector bit b owns residue b+1, and
+// the index's high half is inert. Sixteen k per group times 32 positions is the
+// 512-byte B tile, and sixteen owned residues is the 16x32 A -- the counts agree,
+// which is the cross-check that the map is right rather than merely regular.
+//
+// The remaining piece is small and concrete: combine bits to reach residues
+// {3, 7, 11, 15}, confirm the residue -> k assignment against the C mapping
+// already pinned, and E6 has the index. The k-quant format GreyRaven already
+// produces needs no change: this index is the compact 2:4 description the
+// hardware expects, just in eight single-bit selectors rather than the sixteen
+// 2-bit fields the first notes assumed.
