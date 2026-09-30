@@ -889,6 +889,66 @@ impl RocmDevice {
         }
     }
 
+    /// Compile `source` as a **standalone** module and launch `entry` from it.
+    ///
+    /// Deliberately independent of `compute_kernel_source()`. A diagnostic
+    /// kernel that needs a few dozen lines should not be hostage to a compile
+    /// error somewhere else in the ~30k-line aggregate -- and while a
+    /// neighbouring kernel is mid-edit, the aggregate fails to compile and
+    /// takes *every* launch with it, including ones that share no code. A
+    /// module containing exactly the code under test is also easier to reason
+    /// about when the answer is surprising: there is nothing else in the binary
+    /// that could be responsible.
+    ///
+    /// Results are still cached by source hash, so repeated launches of the same
+    /// source compile once. The route counter is recorded under `entry` exactly
+    /// as the aggregate path does, so route assertions behave the same.
+    pub fn launch_from_source(
+        &self,
+        source: &str,
+        entry: &str,
+        grid: HipDim3,
+        block: HipDim3,
+        args: &mut [*mut c_void],
+    ) -> Result<*mut c_void> {
+        use std::ffi::CString;
+        let (path, _lowered) = self.jit_compile_or_cache(source, entry, None)?;
+        let path_c = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| Error::Backend(format!("launch_from_source: bad path: {e}")))?;
+        let mut module: *mut c_void = std::ptr::null_mut();
+        let load_res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
+        if load_res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "launch_from_source: hipModuleLoad failed ({load_res}) for {entry}"
+            )));
+        }
+        let entry_c = CString::new(entry)
+            .map_err(|e| Error::Backend(format!("launch_from_source: bad entry: {e}")))?;
+        let mut func: *mut c_void = std::ptr::null_mut();
+        let res = unsafe { hipModuleGetFunction(&mut func, module, entry_c.as_ptr()) };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "launch_from_source: hipModuleGetFunction failed ({res}) for {entry}; \
+                 is the entry point guarded out by an #if for this target?"
+            )));
+        }
+        let stream = self.default_stream;
+        let res = unsafe {
+            hipModuleLaunchKernel(
+                func,
+                grid.x, grid.y, grid.z,
+                block.x, block.y, block.z,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        check_hip("launch_from_source: hipModuleLaunchKernel", res)?;
+        record_kernel_route(entry);
+        Ok(func)
+    }
+
     pub(crate) fn launch_compute_kernel_with_solution(
         &self,
         entry: &str,

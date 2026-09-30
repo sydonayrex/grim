@@ -723,12 +723,16 @@ impl RocmDevice {
     /// and the sparsity-index correspondence are exactly what E6 has to
     /// discover, so any layout helper applied here would encode a guess into the
     /// kernel -- and a wrong guess still returns finite, plausible numbers. With
-    /// the packing left to the host, a wrong layout hypothesis is a test
-    /// failure rather than a plausible-looking kernel.
+    /// the packing left to the host, a wrong hypothesis is a test failure rather
+    /// than a plausible-looking kernel.
     ///
-    /// `sidx` is the per-lane sparsity index for A, applied uniformly to all 32
-    /// lanes because the mapping from index bits to 2:4 groups is one of the
-    /// things being measured.
+    /// Compiles as a **standalone module** rather than through the aggregate
+    /// JIT source. The probe shares no code with the rest of the tree, so
+    /// making it depend on a ~30k-line aggregate means a compile error in any
+    /// unrelated kernel blocks it -- which is exactly what happened while this
+    /// was being written. A module holding only the probe is also easier to
+    /// reason about when the result is surprising: nothing else is in the binary
+    /// that could be responsible.
     pub fn launch_grey_raven_probe(
         &self,
         a: &RocmStorage,
@@ -745,16 +749,15 @@ impl RocmDevice {
         let cp = c_out
             .device_ptr
             .ok_or_else(|| Error::Backend("grey_raven_probe: c has no device ptr".into()))?;
-        let grid_dim = HipDim3::new(1, 1, 1);
-        let block_dim = HipDim3::new(32, 1, 1);
         let mut aptr = ap;
         let mut bptr = bp;
         let mut cptr = cp;
         let mut s = sidx;
-        self.launch_compute_kernel(
+        self.launch_from_source(
+            crate::kernels::grey_raven::PROBE_SOURCE,
             "grim_grey_raven_probe",
-            grid_dim,
-            block_dim,
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(32, 1, 1),
             &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut s), arg(&mut cptr)],
         )
     }
