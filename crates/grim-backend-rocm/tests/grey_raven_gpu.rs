@@ -2376,3 +2376,15 @@ fn grey_raven_all_group_field_combinations() -> TestResult {
 // byte-pairs, emit each group's 2-bit field, and compare against a CPU
 // dequantise-then-matmul reference, with the anchor-at-position-0 constraint
 // applied on both sides so the comparison is like-for-like.
+
+// Operational note: this suite is 24 tests and about 24 seconds, with the
+// 16-combination sweep alone taking ~19. A run of it during which another agent
+// was using the same GPU reported 17 passed / 5 failed; an immediate re-run with no
+// other change reported 22/22. The failures are contention, not layout -- the
+// per-byte sweep had just been extended to 4096 launches, which is enough to
+// collide with a concurrent process on one device.
+//
+// Worth recording because the commit that added that test was written while that
+// failing run's output was on screen, and its "2:4 confirmed" claim was not
+// re-checked before committing. The claim does hold -- 22/22 on a clean run -- but
+// it should not have been asserted from a result line that said FAILED.
