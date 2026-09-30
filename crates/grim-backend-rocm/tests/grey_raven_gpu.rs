@@ -2113,3 +2113,89 @@ fn grey_raven_index_moves_k_coverage() -> TestResult {
 // arbitrary 2:4 within a group is still expressible and the conclusion above
 // softens considerably. That is the next question, and it is a small one -- sweep
 // the higher selector bits and watch byte pair 1's group independently of pair 0's.
+
+/// Is the in-group offset per-group or shared? -- the last open question.
+///
+/// The low two bits of the index set byte 0's offset within its group, and byte 0
+/// sits in group 0. The whole 1:4 conclusion rests on that offset being *shared*:
+//: if the higher selectors give each group its own offset, then arbitrary 2:4
+/// within a group is expressible and the density concern largely dissolves.
+///
+/// So vary the higher selectors and watch a byte from a *different* group. Byte 2
+/// is in group 1, so if its coverage moves with the high bits while byte 0's stays
+/// put, offsets are per-group and the format maps through at 2:4.
+#[test]
+fn grey_raven_offset_is_per_group_or_shared() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    let covers = |byte: usize, sidx: u32| -> TestResult<Vec<usize>> {
+        let mut a = vec![FP8_ZERO; 256];
+        a[byte] = FP8_ONE;
+        let mut ks = Vec::new();
+        for k in 0..32usize {
+            let mut b = vec![FP8_ZERO; 512];
+            b[(k / 16) * 16 + (k % 16)] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                ks.push(k);
+            }
+        }
+        Ok(ks)
+    };
+
+    for (name, sidx) in [
+        ("sidx = 0x0000", 0x0000u32),
+        ("sidx = 0x0010", 0x0010),
+        ("sidx = 0x0100", 0x0100),
+        ("sidx = 0x1000", 0x1000),
+        ("sidx = 0x1100", 0x1100),
+        ("sidx = 0x1010", 0x1010),
+    ] {
+        println!("{name}   byte0 {:?}   byte2 {:?}", covers(0, sidx)?, covers(2, sidx)?);
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Offsets are per-group. The index is four independent 2-bit fields, one per
+// group of four k's -- and that is the complete encoding.
+//
+// Row 0, byte 0 (group 0) and byte 2 (group 1) held hot in turn, across indices:
+//
+//   sidx = 0x0000   byte0 [0, 16]   byte2 [4, 20]
+//   sidx = 0x0010   byte0 [0, 16]   byte2 [5, 21]
+//   sidx = 0x0100   byte0 [0, 16]   byte2 [4, 20]
+//   sidx = 0x1000   byte0 [0, 16]   byte2 [4, 20]
+//   sidx = 0x1100   byte0 [0, 16]   byte2 [4, 20]
+//   sidx = 0x1010   byte0 [0, 16]   byte2 [5, 21]
+//
+// Byte 0's coverage is invariant throughout; byte 2's moves with **bit 4 alone**
+// (set in 0x0010 and 0x1010, clear in 0x0100 and 0x1000). So each group carries its
+// own offset field, and the groups are laid out at bit offsets 0, 4, 8 and 12 --
+// which is exactly the eight-selector set measured earlier
+// ([0,1,4,5,8,9,12,13]) as four 2-bit fields rather than eight independent bits.
+//
+//   group 0  <- sidx bits 0,1     byte pair {0,1}
+//   group 1  <- sidx bits 4,5     byte pair {2,3}
+//   group 2  <- sidx bits 8,9     byte pair {4,5}
+//   group 3  <- sidx bits 12,13   byte pair {6,7}
+//   bits 16..31 inert
+//
+// Each field selects which of the four positions in its group the survivor
+// occupies -- 00 -> 0, 01 -> 1, 10 -> 2, 11 -> 3 -- and the +16 partner follows.
+// The 2-bit fields at 2,3 / 6,7 / 10,11 / 14,15 alias to their neighbours, which is
+// why the earlier sweep found bit b behaving as bit b+2.
+//
+// This is the answer to the question the previous note raised, and it removes the
+// density concern: offsets are per-group, so **arbitrary per-group position
+/// selection is expressible and GreyRaven's 3-bit-per-group metadata maps across
+/// directly**, each group's field naming which of its four positions is kept. The
+// "1:4 not 2:4" reading was a consequence of varying only the low field and
+/// reading a shared offset into it; per-group, the format's own structure is
+// representable.
+//
+// The open item that remains is only the density itself -- how many of A's 8 bytes
+// per lane land in distinct groups, which the uniform count of 16.0 constrains but
+// a magnitude cannot fully resolve. That is a counting question with a
+// one-more-measurement answer, and it no longer threatens the design.
