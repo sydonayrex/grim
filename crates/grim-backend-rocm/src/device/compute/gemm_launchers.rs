@@ -716,6 +716,49 @@ impl RocmDevice {
     /// in rocwmma, so extra waves recompute the same tile and race on the same
     /// shared `c_out`. The `256` in the kernel's store loop is the size of the
     /// 16x16 output tile, not the block width.
+    /// GreyRaven (WS-E E6) layout probe: one 16x16x32 sparse FP8 SWMMAC with
+    /// every operand forwarded verbatim from device buffers.
+    ///
+    /// Deliberately does no fragment packing. The A/B lane-to-element mapping
+    /// and the sparsity-index correspondence are exactly what E6 has to
+    /// discover, so any layout helper applied here would encode a guess into the
+    /// kernel -- and a wrong guess still returns finite, plausible numbers. With
+    /// the packing left to the host, a wrong layout hypothesis is a test
+    /// failure rather than a plausible-looking kernel.
+    ///
+    /// `sidx` is the per-lane sparsity index for A, applied uniformly to all 32
+    /// lanes because the mapping from index bits to 2:4 groups is one of the
+    /// things being measured.
+    pub fn launch_grey_raven_probe(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        sidx: u32,
+        c_out: &RocmStorage,
+    ) -> Result<*mut c_void> {
+        let ap = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_probe: a has no device ptr".into()))?;
+        let bp = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_probe: b has no device ptr".into()))?;
+        let cp = c_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_probe: c has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(1, 1, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = ap;
+        let mut bptr = bp;
+        let mut cptr = cp;
+        let mut s = sidx;
+        self.launch_compute_kernel(
+            "grim_grey_raven_probe",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut s), arg(&mut cptr)],
+        )
+    }
+
     pub fn launch_wmma_gemm_fp8_e4m3_for_ab(
         &self,
         a: &RocmStorage,

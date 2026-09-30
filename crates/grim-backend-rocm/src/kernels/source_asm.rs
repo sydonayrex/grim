@@ -34,6 +34,8 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::tree_pie::KERNEL_SOURCE);
     // ScrubJay (WS-B): 5.5 bpw fused dequant + M=1 GEMV, frozen codebook in-register.
     s.push_str(crate::kernels::scrub_jay::KERNEL_SOURCE);
+    // GreyRaven (WS-E): sparse FP8 SWMMAC layout probe, gfx1200/gfx1201 only.
+    s.push_str(crate::kernels::grey_raven::PROBE_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     // SPEED-ROC: All block-quantized WMMA GEMM kernels (Q8_0, Q4_K, Q5_K, Q2_K, Q3_K, Q6_K).
     // Consolidated cooperative-LDS source — generated, not a const (KERNEL_SOURCE is empty).

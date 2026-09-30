@@ -62,6 +62,9 @@ pub mod rmsnorm_quant;
 pub mod tree_pie;
 /// ScrubJay (WS-B) 5.5 bpw fused dequant + M=1 GEMV over a frozen codebook.
 pub mod scrub_jay;
+/// GreyRaven (WS-E) probe for the sparse FP8 SWMMAC fragment layout. Not yet a
+/// GEMM: the layout is what E6 has to discover first.
+pub mod grey_raven;
 pub mod rwkv;
 pub mod sage_attention;
 pub mod scythe_persistent;
