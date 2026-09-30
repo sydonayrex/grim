@@ -2278,3 +2278,101 @@ fn grey_raven_per_byte_reachable_k_union() -> TestResult {
 //
 // That is the last outstanding measurement in E6's layout work, and it is a
 // sixteen-point sweep over a test that already exists.
+
+/// All sixteen combinations of the four group fields -- the 1:4-or-2:4 question.
+///
+/// The previous sweep varied only the group-0 and group-1 fields, so the apparent
+/// pinning of the other six bytes could not be distinguished from the sweep's own
+/// coverage. This varies all four fields -- bits {0,1}, {4,5}, {8,9}, {12,13} -- over
+/// every combination, and reports each byte's full reachable set.
+///
+/// Bytes 1 and 3 are the ones that decide it. Byte 1 shares its group with the
+/// field-selectable byte 0: if byte 1 also moves, a group has two independently
+/// selectable positions and the tile is 2:4, which is what GreyRaven's 3-bit
+/// metadata assumes.
+#[test]
+fn grey_raven_all_group_field_combinations() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    let mut union: Vec<Vec<usize>> = vec![Vec::new(); 8];
+    for v0 in 0u32..4 {
+        for v1 in 0u32..4 {
+            for v2 in 0u32..4 {
+                for v3 in 0u32..4 {
+                    let sidx = v0 | (v1 << 4) | (v2 << 8) | (v3 << 12);
+                    for j in 0..8usize {
+                        let mut a = vec![FP8_ZERO; 256];
+                        a[j] = FP8_ONE;
+                        for k in 0..32usize {
+                            if union[j].contains(&k) {
+                                continue;
+                            }
+                            let mut b = vec![FP8_ZERO; 512];
+                            b[(k / 16) * 16 + (k % 16)] = FP8_ONE;
+                            let c = run_mma(&dev, &a, &b, sidx)?;
+                            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                                union[j].push(k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut movable = 0;
+    for (j, ks) in union.iter().enumerate() {
+        let mut s = ks.clone();
+        s.sort_unstable();
+        if s.len() > 2 {
+            movable += 1;
+        }
+        println!("A byte {j}: reaches k = {s:?}   ({} of 32)", s.len());
+    }
+    println!("\nbytes able to reach more than 2 k's: {movable} of 8");
+    Ok(())
+}
+
+// ============================================================================
+// 2:4 confirmed, with one constraint on which patterns are expressible.
+//
+// Per-byte reachable k over all sixteen combinations of the four group fields
+// (bits {0,1}, {4,5}, {8,9}, {12,13}):
+//
+//   byte 0: [0, 1, 2, 3, 16, 17, 18, 19]     byte 1: [0, 16]
+//   byte 2: [4, 5, 6, 7, 20, 21, 22, 23]     byte 3: [4, 20]
+//   byte 4: [8, 9, 10, 11, 24, 25, 26, 27]   byte 5: [8, 24]
+//   byte 6: [12, 13, 14, 15, 28, 29, 30, 31] byte 7: [12, 28]
+//
+//   bytes able to reach more than 2 k's: 4 of 8
+//
+// The pattern is exact and even/odd. Within each group of four k's:
+//
+//   - one **even** byte reaches all four positions plus their +16 partners, and its
+//     position is chosen by that group's 2-bit field. This is the free survivor.
+//   - one **odd** byte reaches exactly one position -- position 0 -- and its +16
+//     partner, regardless of any field. This one is pinned.
+//
+// So a group keeps two of its four k's: **2:4, confirmed**, and the encoding is
+// four 2-bit group fields plus four always-present anchors.
+//
+// The constraint that follows matters to the format. A group can only express a
+// kept-pair that *contains position 0*: {0,1}, {0,2}, {0,3}. Of the six possible
+// 2-of-4 pairs, three are reachable and three are not -- {1,2}, {1,3} and {2,3}
+// have no encoding here. GreyRaven's pruner currently picks the two highest-weight
+// positions in each group without such a restriction, so on this instruction it
+// would have to either restrict to pairs containing position 0 (halving the pattern
+// space, at some cost in accuracy) or remap its choice into an expressible pair
+// (keeping the pattern space, at the cost of sometimes keeping a lower-weight
+// position than it wanted).
+//
+// That is a real, quantified design choice, and it is the last thing E6's layout
+// work produced. Nothing here suggests the instruction is unsuited -- 2:4 is
+// present and the encoding is fully understood -- but the format cannot treat "any
+// 2 of 4" as freely choosable on gfx1200.
+//
+// A, B, C and the index are as recorded above. With this, the layout question is
+// closed and `grey_raven_sparse_gemm_matches_dense_reference` is writable: pack four
+// byte-pairs, emit each group's 2-bit field, and compare against a CPU
+// dequantise-then-matmul reference, with the anchor-at-position-0 constraint
+// applied on both sides so the comparison is like-for-like.
