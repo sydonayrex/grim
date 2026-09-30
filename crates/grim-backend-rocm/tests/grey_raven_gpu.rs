@@ -1151,3 +1151,109 @@ fn grey_raven_each_selector_k_delta() -> TestResult {
 // produces needs no change: this index is the compact 2:4 description the
 // hardware expects, just in eight single-bit selectors rather than the sixteen
 // 2-bit fields the first notes assumed.
+
+/// Reach the four residues no single selector owns: {3, 7, 11, 15} mod 16.
+///
+/// The per-selector map leaves these out, and the count says they must take bit
+/// combinations (12 of 16 residues come from baseline + 8 singles; 4 remain, and
+/// 128 + 8*32 = 384 = 512 - 128 exactly). This enumerates all 2^8 combinations
+/// of the eight selectors and asks, for each missing residue, which combinations
+/// bring it to life -- the minimum being the useful answer, since a 2:4 pattern
+/// only ever needs the smallest selector that covers each k.
+///
+/// Restricted to offsets in those four residues (128 of 512) to keep the sweep
+/// cheap; the residues are disjoint so restricting loses nothing.
+#[test]
+fn grey_raven_combinations_reach_missing_residues() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+    let sel = [0u32, 1, 4, 5, 8, 9, 12, 13];
+
+    // For each target residue, the smallest selector combination that lights it.
+    let targets = [3usize, 7, 11, 15];
+    let mut first_hit: std::collections::BTreeMap<usize, (u32, usize)> = Default::default();
+
+    for combo in 0u32..256 {
+        let mut sidx = 0u32;
+        for (i, b) in sel.iter().enumerate() {
+            if combo >> i & 1 == 1 {
+                sidx |= 1u32 << b;
+            }
+        }
+        let bits = combo.count_ones() as usize;
+        for &r in &targets {
+            if first_hit.contains_key(&r) {
+                continue;
+            }
+            // Any offset in this residue will do; all 32 behave alike.
+            let g = r;
+            let mut b_vec = vec![FP8_ZERO; 512];
+            b_vec[g] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b_vec, sidx)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                first_hit.insert(r, (sidx, bits));
+            }
+        }
+        if first_hit.len() == targets.len() {
+            break;
+        }
+    }
+
+    println!("\n=== minimal selector reaching each missing residue (mod 16) ===");
+    for r in targets {
+        match first_hit.get(&r) {
+            Some((sidx, bits)) => {
+                // Name which of the eight selectors were set.
+                let set: Vec<usize> = sel
+                    .iter()
+                    .enumerate()
+                    .filter(|(_i, b)| sidx >> *b & 1 == 1)
+                    .map(|(i, _)| i)
+                    .collect();
+                println!("  residue {r:>2}: sidx={sidx:#07x}  {bits} selector(s)  {set:?}");
+            }
+            None => println!("  residue {r:>2}: NOT REACHED by any 2^8 combination"),
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// The index is fully mapped, and it is a 2:4 pattern.
+//
+// The four residues no single selector owns turn out to need *pairs*, and the
+// pairing is exactly the 2:4 structure:
+//
+//   residue  3: selectors [0, 1]     sidx=0x00003
+//   residue  7: selectors [2, 3]     sidx=0x00030
+//   residue 11: selectors [4, 5]     sidx=0x00300
+//   residue 15: selectors [6, 7]     sidx=0x03000
+//
+// (selector index, not bit position: index j is bit sel[j] for
+// sel = [0, 1, 4, 5, 8, 9, 12, 13].)
+//
+// Read the whole thing as one table, per group g of four k's:
+//
+//   group g  selectors 2g, 2g+1   ->  residues 4g+1, 4g+2
+//             selectors 2g,2g+1    ->  residue  4g+3
+//             baseline (sidx = 0)  ->  residue  4g
+//
+// So each group of four k's has its three non-zero positions reachable by
+// individual selectors, their union, or neither -- and the fourth position comes
+// free from the baseline. That is 2:4 sparsity, written out: within every group of
+// four, the index chooses which sub-position a survivor occupies, and the
+// residues a 2:4 pattern can name are exactly these.
+//
+// The index is therefore complete. For GreyRaven's 16 k per row, 4 groups of 4,
+// each survivor's k-position is emitted as:
+//
+//   group 0 -> bit pair  sel[0], sel[1]   (bits 0, 1;  bits 0+1 for the 3rd)
+//   group 1 -> bit pair  sel[2], sel[3]   (bits 4, 5;  bits 4+5)
+//   group 2 -> bit pair  sel[4], sel[5]   (bits 8, 9;  bits 8+9)
+//   group 3 -> bit pair  sel[6], sel[7]   (bits 12, 13; bits 12+13)
+//
+// with bits 16..31 unused. That is the whole encoding, and it is what E6 needed.
+// The three-bit-per-group metadata GreyRaven's pack already produces maps onto it
+// directly: a survivor's position within its group of four selects one of the two
+// bits or their union, and no k-quant change is required.
