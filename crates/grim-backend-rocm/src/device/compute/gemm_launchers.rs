@@ -1918,4 +1918,26 @@ impl RocmDevice {
             zeros,
         })
     }
+    /// As [`Self::launch_grey_raven_probe`], but with a **per-lane** sparsity index
+    /// buffer of 32 u32s, which is the form the ISA actually defines.
+    pub fn launch_grey_raven_probe_lane_idx(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        sidx: &RocmStorage,
+        c_out: &RocmStorage,
+    ) -> Result<*mut c_void> {
+        let ap = a.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: a has no device ptr".into()))?;
+        let bp = b.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: b has no device ptr".into()))?;
+        let sp = sidx.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: sidx has no device ptr".into()))?;
+        let cp = c_out.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: c has no device ptr".into()))?;
+        let (mut aptr, mut bptr, mut sptr, mut cptr) = (ap, bp, sp, cp);
+        self.launch_from_source(
+            crate::kernels::grey_raven::PROBE_LANE_IDX_SOURCE,
+            "grim_grey_raven_probe_lane_idx",
+            HipDim3::new(1, 1, 1),
+            HipDim3::new(32, 1, 1),
+            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut sptr), arg(&mut cptr)],
+        )
+    }
 }

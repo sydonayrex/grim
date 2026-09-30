@@ -68,3 +68,36 @@ extern "C" __global__ void grim_grey_raven_probe(
 }
 #endif
 "#;
+
+/// Same as [`PROBE_SOURCE`]'s kernel, but the sparsity index is read per lane.
+///
+/// The ISA is explicit that the index is per lane: "each lane has 8 index values per
+/// lane", and group c's word for row r lives in lane (c>>2)*16 + r. A scalar index
+/// therefore cannot express a real 2:4 pattern -- it would apply one lane's index to
+/// all 32, and every row would collapse onto the same group selection. The scalar
+/// form is kept because the layout probes that use it are about A and B, but the
+/// end-to-end product test needs the real per-lane form.
+pub const PROBE_LANE_IDX_SOURCE: &str = r#"
+#if (defined(__gfx1200__) || defined(__gfx1201__)) && defined(__HIP__)
+typedef int   gr_v2i __attribute__((vector_size(8)));
+typedef int   gr_v4i __attribute__((vector_size(16)));
+typedef float gr_v8f __attribute__((vector_size(32)));
+extern "C" __global__ void grim_grey_raven_probe_lane_idx(
+    const gr_v2i* __restrict__ A,
+    const gr_v4i* __restrict__ B,
+    const unsigned int* __restrict__ sidx,   // one u32 per lane
+    float* __restrict__ C_out)
+{
+    const int lane = threadIdx.x;
+    const gr_v2i a = A[lane];
+    const gr_v4i b = B[lane];
+    const unsigned int s = sidx[lane];
+    const gr_v8f d = __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(
+        a, b, (gr_v8f){0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f}, s);
+    C_out[lane * 8 + 0] = d[0]; C_out[lane * 8 + 1] = d[1];
+    C_out[lane * 8 + 2] = d[2]; C_out[lane * 8 + 3] = d[3];
+    C_out[lane * 8 + 4] = d[4]; C_out[lane * 8 + 5] = d[5];
+    C_out[lane * 8 + 6] = d[6]; C_out[lane * 8 + 7] = d[7];
+}
+#endif
+"#;
