@@ -2057,6 +2057,7 @@ fn load_model_from_config(
                 qk_nope_head_dim: 128,
                 qk_rope_head_dim: 64,
                 v_head_dim: 128,
+                rope_yarn: None,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
@@ -4191,6 +4192,41 @@ fn load_model_with_providers(
             // conversion notes). The trunk is block_count minus nextn layers.
             let nextn = lookup.get_u32("xing4_0.nextn_predict_layers").unwrap_or(0) as usize;
             let trunk_layers = hparams.num_layers.saturating_sub(nextn);
+            // YaRN rope scaling (`xing4_0.rope.scaling.*`): factor 64,
+            // original context 4096, beta 32/1. The reference folds
+            // 0.1*ln(factor)+1 into kq_scale as mscale^2 - without it every
+            // attention logit is ~2x off.
+            let rope_yarn = match lookup.get_str("xing4_0.rope.scaling.type") {
+                Some(t) if t.eq_ignore_ascii_case("yarn") => {
+                    let factor = lookup
+                        .get_f32("xing4_0.rope.scaling.factor")
+                        .unwrap_or(8.0);
+                    if factor > 0.0 {
+                        let original_max_pos = lookup
+                            .get_u32("xing4_0.rope.scaling.original_context_length")
+                            .unwrap_or(4096) as usize;
+                        let beta_fast = lookup
+                            .get_f32("xing4_0.rope.scaling.yarn_beta_fast")
+                            .unwrap_or(32.0);
+                        let beta_slow = lookup
+                            .get_f32("xing4_0.rope.scaling.yarn_beta_slow")
+                            .unwrap_or(1.0);
+                        let attention_factor = lookup
+                            .get_f32("xing4_0.rope.scaling.yarn_attn_factor")
+                            .unwrap_or_else(|| 0.1 * (factor as f64).ln() as f32 + 1.0);
+                        Some(grim_tensor::YaRNParams {
+                            factor,
+                            original_max_pos,
+                            beta_fast,
+                            beta_slow,
+                            attention_factor,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
             let shared_experts =
                 lookup.get_u32("xing4_0.expert_shared_count").unwrap_or(1) as usize;
 
@@ -4207,6 +4243,7 @@ fn load_model_with_providers(
                 qk_nope_head_dim,
                 qk_rope_head_dim: rope_dim,
                 v_head_dim,
+                rope_yarn,
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
