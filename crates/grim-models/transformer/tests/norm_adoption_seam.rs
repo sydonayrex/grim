@@ -78,6 +78,8 @@ impl TensorProvider for StubProvider {
             (c.hidden_size, c.num_heads * c.head_dim)
         } else if name.contains("wk") || name.contains("wv") {
             (c.num_kv_heads * c.head_dim, c.hidden_size)
+        } else if name.contains("tok_embeddings") || name.contains("output") {
+            (c.vocab_size, c.hidden_size)
         } else {
             (c.hidden_size, 1)
         };
@@ -185,5 +187,68 @@ fn a_declared_bias_that_the_checkpoint_lacks_is_an_error() {
     assert!(
         r.is_err(),
         "a declared norm bias that the checkpoint lacks must fail the load"
+    );
+}
+
+/// `Llama::load_tp_moe` with an all-`None` moe_spec must load a dense model,
+/// and must carry the spec's norm kind into every layer.
+///
+/// This path had no dense caller before: the only three `load_tp_moe_specs`
+/// call sites are laguna, maple and mellum, all MoE. The eleven LayerNorm
+/// models cannot adopt `LayerNorm` through `Llama::load_tp`, which builds its
+/// own spec via `default_full`, so this all-`None` path is the only way in --
+/// and it was untested.
+#[test]
+fn a_dense_model_can_adopt_layer_norm_through_the_moe_entry_point() {
+    let c = cfg();
+    let provider = StubProvider { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let none: Vec<Option<grim_models_transformer::moe_block::MoESpec>> =
+        vec![None; c.num_layers];
+    let m = grim_models_transformer::Llama::load_tp_moe(
+        Device::Cpu,
+        &ws,
+        c.clone(),
+        &none,
+        Default::default(),
+    )
+    .expect("a dense model must load through load_tp_moe");
+    assert_eq!(m.layers.len(), c.num_layers);
+    // The default spec is RMS; this asserts the dense path is reachable, not
+    // that it adopts LayerNorm, which needs a per-layer spec.
+    assert!(m.layers.iter().all(|l| l.attn_norm.kind == NormKind::Rms));
+}
+
+#[test]
+fn a_dense_layer_norm_model_loads_through_load_tp_moe_specs() {
+    let c = cfg();
+    let provider = StubProvider { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let none: Vec<Option<grim_models_transformer::moe_block::MoESpec>> =
+        vec![None; c.num_layers];
+    let specs: Vec<LayerAttentionSpec> = (0..c.num_layers)
+        .map(|_| {
+            let mut s = LayerAttentionSpec::default_full(
+                c.num_heads,
+                c.num_kv_heads,
+                c.head_dim,
+                c.rope_theta,
+            );
+            s.norm_kind = NormKind::LayerNorm;
+            s
+        })
+        .collect();
+    let m = grim_models_transformer::Llama::load_tp_moe_specs(
+        Device::Cpu,
+        &ws,
+        c.clone(),
+        &none,
+        &specs,
+        Default::default(),
+    )
+    .expect("a dense LayerNorm model must load");
+    assert!(
+        m.layers.iter().all(|l| l.attn_norm.kind == NormKind::LayerNorm),
+        "every layer must adopt the spec's norm kind"
     );
 }
