@@ -1302,3 +1302,39 @@ fn grey_raven_combinations_reach_missing_residues() -> TestResult {
 //   - all 8 bytes of an A lane agree under a uniform B, since C[r][n] sums the row
 //   - a probe that assumes the layout it measures returns plausible garbage;
 //     `identity_32x16` in this file is that mistake, kept and labelled
+
+// ============================================================================
+// CORRECTION to the consolidated spec above, on the strength of data already in
+// this file. Read this before using that spec.
+//
+// The spec says "a B byte's offset mod 16 identifies its k within a 16-wide
+// group". That is wrong, and the per-selector deltas refute it directly. Selector
+// 0 added {1, 17, 33, ... 497} -- every offset = 1 (mod 16), which spans
+// offset/16 = 0..31, i.e. **every k**. A single selector cannot enable one k
+// across 32 positions; it enables one **column**, at every k.
+//
+// So with B[lane] = the 16 columns of k = lane, offset = k*16 + n gives
+// offset mod 16 = **n**, the column, and offset / 16 = k. The index selects
+// columns, not k. Everything in the spec keyed on "residue = k" is therefore
+// keyed on the wrong axis, and the residue table is a table over columns.
+//
+// That is a bigger problem than a mislabelled axis, because it inverts what the
+// index does. It is documented as "Sparsity index for A" and 2:4 sparsity on A
+// should select which **k** survive. A selector that turns on a B **column** is
+// not that. Either the B packing assumed here is wrong, or the index is not doing
+// what its name says on this part, and the two possibilities have very different
+// consequences for GreyRaven -- one is a routine encoding detail, the other means
+// the instruction is not the 2:4 primitive the format was designed around.
+//
+// Not resolvable from the data in this file. The B packing was never independently
+// established: it rests on reading the 512-byte tile as lane = 16 contiguous
+// bytes, which is an assumption, not a measurement. Establishing B's actual
+// lane-to-element layout is now the prerequisite, ahead of the A byte-to-k
+// mapping that the spec lists as the last gap. The order of the two unknowns was
+// got wrong there too.
+//
+// So: the intrinsic, the C layout, the A row mapping, and the inertness of bits
+// 16..31 are solid. The B layout, and everything derived from it including the
+// whole residue table, is not. A single B-layout probe -- one-hot B with a
+// *non-uniform* A, so the answer does not depend on A's k mapping -- settles it,
+// and that is the next step rather than the end-to-end test.
