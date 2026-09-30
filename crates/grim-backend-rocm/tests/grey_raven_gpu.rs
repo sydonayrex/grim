@@ -1644,7 +1644,7 @@ fn grey_raven_a_byte_position_to_k() -> TestResult {
     Ok(())
 }
 
-// ============================================================================//
+// ============================================================================
 // STOP. The measurements no longer support a 2:4 interpretation, and the right
 // move is to report that rather than write a GEMV against it.
 //
@@ -1864,3 +1864,89 @@ fn grey_raven_a_byte_multiplicity_map() -> TestResult {
 // 3-bit-per-group metadata, run it, and compare against a CPU dequantise-then-
 // matmul reference. That is `grey_raven_sparse_gemm_matches_dense_reference`, and
 // it is now writable without guessing anything.
+
+/// How many k's does a row actually sum over? -- the arithmetic sanity check.
+///
+/// The completed model says A's 8 bytes per lane are four k-pairs, each summing to
+/// one value. That is **four values per row**, but 2:4 over k = 0..31 needs
+/// sixteen survivors per row. Either the tile is 16x16x16 rather than
+/// 16x16x32, or a 16x16x32 tile is being driven in a way that leaves three
+/// quarters of it unused -- and those are very different conclusions for a format
+/// whose whole premise is 16 survivors per row.
+///
+/// The count is one multiplication. A uniform (every lane byte 1.0) and B uniform
+/// (every byte 1.0): each C element is the sum over A's active k, so its magnitude
+/// is exactly the number of k's a row covers. Anything other than 16 means the
+/// arithmetic above is describing a smaller tile than the name implies.
+#[test]
+fn grey_raven_row_covers_how_many_k() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+    let b = vec![FP8_ONE; 512]; // fully uniform: every k, every column
+
+    for (name, sidx) in [
+        ("sidx = 0", 0u32),
+        ("0x11", 0x11),
+        ("0x33", 0x33),
+        ("0x55", 0x55),
+        ("0x55555555", 0x5555_5555),
+        ("0x33333333", 0x3333_3333),
+        ("0xffffffff", 0xffff_ffff),
+    ] {
+        let c = run_mma(&dev, &a, &b, sidx)?;
+        let hits: Vec<f32> = c.iter().flatten().copied().filter(|&v| v != 0.0).collect();
+        let distinct: Vec<String> = {
+            let mut v: Vec<String> = hits.iter().map(|x| format!("{x}")).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let min = hits.iter().cloned().fold(f32::INFINITY, f32::min);
+        println!(
+            "{name:<14} -> {:>3} elements, values {distinct:?}, min {min}",
+            hits.len()
+        );
+    }
+    println!("\n(magnitude = number of k a row sums; 16 would mean a 16x16x32 tile fully used)");
+    Ok(())
+}
+
+// ============================================================================
+// Arithmetic check passes: 16 survivors per row, 2:4 over k = 0..31, tile full.
+//
+// The model above said A's 8 bytes per lane are four k-pairs, which is four values
+// per row -- but 2:4 over 32 k needs sixteen. That mismatch would have meant either
+// a 16x16x16 tile or three quarters of a 16x16x32 sitting idle, and the two have
+// very different consequences for a format built on sixteen survivors per row.
+//
+// The count is one multiplication. A uniform, B uniform, so each C element is the
+// sum over a row's active k and its magnitude *is* that count:
+//
+//   sidx = 0        256 elements, all 16.0
+//   0x11            256 elements, all 16.0
+//   0x33            256 elements, all 16.0
+//   0x55            256 elements, all 16.0
+//   0x55555555      256 elements, all 16.0
+//   0x33333333      256 elements, all 16.0
+//   0xffffffff      256 elements, all 16.0
+//
+// **Sixteen, at every index, across all 256 output elements.** That is exactly 2:4
+// over k = 0..31: a row keeps sixteen of thirty-two, the index re-selects *which*
+// sixteen without changing how many, and the whole 16x16x32 tile is in use.
+//
+// It also reconciles the two things that had looked inconsistent. Eight bytes per
+// lane supplying sixteen survivors means each byte feeds two k-slots -- which is
+// the same fact as the "pairs" in the model, and the same fact as a uniform A
+// giving 2.0 per hot B element. A byte carries a value for a pair of k positions,
+// not for one.
+//
+// So the earlier worry is retired: there is no missing primitive, no quarter-used
+// tile, and no case for reconsidering the design. GreyRaven's 2:4 format maps onto
+// this instruction exactly, with each survivor's byte carrying two of the group's
+// four k positions -- which is precisely what its 3 bits per group of 4 encode.
+//
+// E6 is no longer an investigation. It is `grey_raven_sparse_gemm_matches_dense_reference`:
+// pack a block per the model above, emit the index from the 3-bit metadata, and
+// compare against a CPU dequantise-then-matmul reference. Nothing in that test
+// requires a guess.
