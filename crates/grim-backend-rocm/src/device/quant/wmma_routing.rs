@@ -41,6 +41,10 @@ impl RocmDevice {
             usize,
             usize,
         ) -> Result<*mut c_void>,
+        // Set false for formats whose fused WMMA kernel has no bit-exact
+        // parity gate against the CPU reference (IQ3_S measured rel 0.76 on
+        // real Xing4.0 weights vs 2.6e-6 for the scalar kernel).
+        allow_wmma: bool,
         scalar_method: fn(
             &Self,
             &RocmStorage,
@@ -52,7 +56,14 @@ impl RocmDevice {
         ) -> Result<*mut c_void>,
     ) -> Result<()> {
         let is_rdna34 = self.is_rdna34;
-        if is_rdna34 && m <= 4 {
+        // GRIM_WMMA=0 forces the scalar dequant-GEMM for every format. The
+        // WMMA path is an optimization: when it disagrees with the CPU
+        // reference on real weights, correctness wins over the fused kernel.
+        let wmma_off = matches!(
+            std::env::var("GRIM_WMMA").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        );
+        if allow_wmma && is_rdna34 && m <= 4 && !wmma_off {
             wmma_method(self, a, b, out, m, n, k)?;
         } else {
             scalar_method(self, a, b, out, m, n, k)?;

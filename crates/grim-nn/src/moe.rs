@@ -2542,6 +2542,7 @@ impl MoeFfn {
             num_experts,
             top_k,
             route_mode,
+            false, // norm_weights: softmax mode already normalizes
         )?;
 
         // 2. Fully device-resident dispatch (no routing-table upload).

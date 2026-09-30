@@ -204,6 +204,7 @@ impl RocmDevice {
         num_experts: usize,
         top_k: usize,
         route_mode: i32,
+        norm_weights: bool,
     ) -> Result<*mut c_void> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let l_ptr = logits
@@ -229,6 +230,7 @@ impl RocmDevice {
         let mut nexp_i = num_experts as i32;
         let mut topk_i = top_k as i32;
         let mut mode_i = route_mode;
+        let mut normw_i = i32::from(norm_weights);
 
         self.launch_compute_kernel(
             "grim_moe_route_topk",
@@ -244,6 +246,7 @@ impl RocmDevice {
                 arg(&mut nexp_i),
                 arg(&mut topk_i),
                 arg(&mut mode_i),
+                arg(&mut normw_i),
             ],
         )
     }

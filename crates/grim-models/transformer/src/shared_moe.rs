@@ -463,6 +463,7 @@ pub fn fused_moe_dispatch_from_logits(
         top_k,
         routed_scaling_factor,
         route_mode,
+        false, // no bias path: caller decides normalization
         cache,
     )
 }
@@ -486,6 +487,9 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
     top_k: usize,
     routed_scaling_factor: f32,
     route_mode: i32,
+    // Reference `norm_w`: normalize the top-k combine weights to sum 1
+    // (llama.cpp build_moe_ffn). Xing4.0 declares expert_weights_norm = true.
+    norm_weights: bool,
     cache: &CharonCache,
 ) -> Result<Option<Tensor>> {
     if !charon_enabled() {
@@ -601,6 +605,7 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
         num_experts,
         top_k,
         route_mode,
+        norm_weights,
     )?;
 
     // WI-gpu-native-moe Phase 2: native W8A8-int8 arm. When every expert

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use grim_backend_rocm::as_rocm;
 use grim_backend_rocm::decode_graph_buffers::{
-    ConvDeviceSeed, ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
-    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
+    check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv, ConvDeviceSeed,
+    ConvRingSeed, DecodeGraph, DecodeGraphBuffers, EagerKdaSource, EagerKvSource,
 };
 use grim_core::error::Result;
 use grim_nn::NormKind;
@@ -17,8 +17,8 @@ use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 use crate::block::LlamaBlock;
 use crate::chameleon::{Chameleon, ChameleonBlock};
 use crate::deepseek2::DeepSeek2;
-use crate::deepseek4::DeepSeek4;
 use crate::deepseek32::DeepSeek32;
+use crate::deepseek4::DeepSeek4;
 use crate::gemma2::{Gemma2, Gemma2Block};
 use crate::glm4_moe_lite::Glm4MoeLite;
 use crate::granite_moe_hybrid::GraniteMoeHybrid;
@@ -641,7 +641,6 @@ impl DecodeGraphModel for Llama {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
-
         Ok(DecodeGraph::new(&dev, buffers, stream))
     }
 
@@ -728,7 +727,8 @@ impl DecodeGraphModel for Llama {
                     num_experts,
                     top_k,
                     route_mode,
-                )
+                false, // softmax mode already normalizes
+            )
                 .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
                 // 4. Resident scratch + stacked weights (cache hit after warmup)
@@ -806,16 +806,38 @@ impl DecodeGraphModel for Llama {
             }
         }
 
-        // Final norm + output head
+        // Final norm + output head. Dispatch on kind exactly as the per-layer
+        // norms do: picking rms where the reference needs layer is the phi2
+        // bug, and the final norm is a second place it can happen.
         let h_shape = graph.buffers.head_input.shape().clone();
-        dev.rms_norm_into(
-            &graph.buffers.head_input,
-            &**self.norm.weight.storage(),
-            self.norm.eps,
-            &graph.buffers.head_input,
-            &h_shape,
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        let head_w = self
+            .norm
+            .device_weight(self.cfg.hidden_size)
+            .map_err(grim_core::error::Error::Tensor)?;
+        match self.norm.kind {
+            NormKind::Rms => {
+                dev.rms_norm_into(
+                    &graph.buffers.head_input,
+                    &**head_w.storage(),
+                    self.norm.eps,
+                    &graph.buffers.head_input,
+                    &h_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+            NormKind::LayerNorm => {
+                let b = self.norm.bias.as_ref().map(|x| x.storage());
+                dev.layer_norm_into(
+                    &graph.buffers.head_input,
+                    &**head_w.storage(),
+                    b.as_deref().map(|s| s.as_ref()),
+                    self.norm.eps,
+                    &graph.buffers.head_input,
+                    &h_shape,
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+        }
 
         linear_into(
             &dev,
@@ -1140,8 +1162,24 @@ impl Qwen35Block {
                     "attn.q",
                     layer_idx,
                 )?;
-                linear_into_named(dev, normed, wk.weight(), &buffers.k_buf[layer_idx], act, "attn.k", layer_idx)?;
-                linear_into_named(dev, normed, wv.weight(), &buffers.v_buf[layer_idx], act, "attn.v", layer_idx)?;
+                linear_into_named(
+                    dev,
+                    normed,
+                    wk.weight(),
+                    &buffers.k_buf[layer_idx],
+                    act,
+                    "attn.k",
+                    layer_idx,
+                )?;
+                linear_into_named(
+                    dev,
+                    normed,
+                    wv.weight(),
+                    &buffers.v_buf[layer_idx],
+                    act,
+                    "attn.v",
+                    layer_idx,
+                )?;
             }
 
             // 3. Split the fused Q|gate. `q_buf` holds [Q | gate] at 2*q_dim;
@@ -1387,9 +1425,7 @@ impl Qwen35Block {
                 &buffers.sc_state[layer_idx],
                 &kda_buf.conv_out,
             )
-            .map_err(|e| {
-                grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}"))
-            })?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("qwen35 sc conv: {e}")))?;
 
             // 3. Batched KDA gated delta rule + head norm gate into attn_out_buf
             let n_val_heads = self.cfg_ssm_num_value_heads();
@@ -1412,15 +1448,19 @@ impl Qwen35Block {
                 head_dim,
                 eps,
             )
-            .map_err(|e| {
-                grim_core::error::Error::Backend(format!("kda gated delta rule: {e}"))
-            })?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("kda gated delta rule: {e}")))?;
 
             // 4. Output projection (ssm_out)
             let out_proj = self.ssm_out.as_ref().or(self.wo.as_ref()).ok_or_else(|| {
                 grim_core::error::Error::Backend("missing ssm_out projection".into())
             })?;
-            linear_into(dev, &kda_buf.branch, out_proj.weight(), &buffers.norm_buf[layer_idx], act)?;
+            linear_into(
+                dev,
+                &kda_buf.branch,
+                out_proj.weight(),
+                &buffers.norm_buf[layer_idx],
+                act,
+            )?;
         }
 
         // Residual 1 add: layer_input + branch_proj -> layer_output
@@ -1555,7 +1595,6 @@ impl DecodeGraphModel for Qwen35 {
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
 
-
         if self.cfg.ssm_dt_rank > 0 {
             let n_val = self.cfg.ssm_dt_rank;
             let n_key = self.cfg.ssm_n_group;
@@ -1563,13 +1602,7 @@ impl DecodeGraphModel for Qwen35 {
             for (layer_idx, block) in self.blocks.iter().enumerate() {
                 if !block.is_full_attention {
                     buffers.allocate_kda_layer(
-                        &dev,
-                        layer_idx,
-                        batch,
-                        n_val,
-                        n_key,
-                        d_state,
-                        kda_conv,
+                        &dev, layer_idx, batch, n_val, n_key, d_state, kda_conv,
                     )?;
                 }
             }
@@ -1768,7 +1801,12 @@ impl DecodeGraphModel for Qwen35 {
 
         let mut out = Vec::with_capacity(caches.len());
         for (i, cache) in caches.iter().enumerate() {
-            if self.blocks.get(i).map(|b| b.is_full_attention).unwrap_or(true) {
+            if self
+                .blocks
+                .get(i)
+                .map(|b| b.is_full_attention)
+                .unwrap_or(true)
+            {
                 out.push(None);
                 continue;
             }
@@ -1807,7 +1845,12 @@ impl DecodeGraphModel for Qwen35 {
         let kda_conv = (self.cfg.ssm_dt_rank + 2 * self.cfg.ssm_n_group) * self.cfg.ssm_d_state;
 
         for (i, cache) in caches.iter().enumerate() {
-            if self.blocks.get(i).map(|b| b.is_full_attention).unwrap_or(true) {
+            if self
+                .blocks
+                .get(i)
+                .map(|b| b.is_full_attention)
+                .unwrap_or(true)
+            {
                 out.push(None);
                 continue;
             }
@@ -1845,7 +1888,12 @@ impl DecodeGraphModel for Qwen35 {
 
         let mut out = Vec::with_capacity(caches.len());
         for (i, cache) in caches.iter().enumerate() {
-            if self.blocks.get(i).map(|b| b.is_full_attention).unwrap_or(true) {
+            if self
+                .blocks
+                .get(i)
+                .map(|b| b.is_full_attention)
+                .unwrap_or(true)
+            {
                 out.push(None);
                 continue;
             }
@@ -3043,7 +3091,8 @@ impl DecodeGraphModel for MiniMaxM3 {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k
+                3, // mode 3: softmax renormalized over top-k,
+                false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
@@ -3504,7 +3553,8 @@ impl DecodeGraphModel for Glm4MoeLite {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k
+                3, // mode 3: softmax renormalized over top-k,
+                false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
@@ -3920,7 +3970,8 @@ impl DecodeGraphModel for GraniteMoeHybrid {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k
+                3, // mode 3: softmax renormalized over top-k,
+                false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
@@ -4357,7 +4408,8 @@ impl DecodeGraphModel for HyV3 {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k
+                3, // mode 3: softmax renormalized over top-k,
+                false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
@@ -5829,6 +5881,9 @@ mod tests {
             max_seq_len: 512,
             partial_rotary_factor: 1.0,
             yarn: None,
+            norm_kind: grim_nn::NormKind::Rms,
+            has_norm_bias: false,
+            has_attn_post_norm: false,
         };
 
         let embed = rocm_tensor(
@@ -5921,7 +5976,8 @@ mod tests {
             });
         }
 
-        let norm = test_norm(dev, ordinal, hidden_size);
+        // The final norm is a `Norm` now, unlike the per-layer RmsNorm.
+        let norm = test_llama_norm(dev, ordinal, hidden_size);
         let output = mk_lin(vocab_size, hidden_size, 1001);
 
         let mut moe_blocks = Vec::with_capacity(num_layers);

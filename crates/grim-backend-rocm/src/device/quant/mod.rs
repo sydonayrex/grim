@@ -528,6 +528,7 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                     Self::launch_wmma_fused_dequant_iq2xxs,
+                    true,
                     Self::launch_fused_dequant_gemm_iq2xxs,
                 )?;
             }
@@ -540,6 +541,7 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                     Self::launch_wmma_fused_dequant_iq2xs,
+                    true,
                     Self::launch_fused_dequant_gemm_iq2xs,
                 )?;
             }
@@ -552,6 +554,7 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                     Self::launch_wmma_fused_dequant_iq2s,
+                    true,
                     Self::launch_fused_dequant_gemm_iq2s,
                 )?;
             }
@@ -564,10 +567,15 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                     Self::launch_wmma_fused_dequant_iq3xxs,
+                    true,
                     Self::launch_fused_dequant_gemm_iq3xxs,
                 )?;
             }
             DTypeStorage::KQuant(KQuantScheme::IQ3S) => {
+                // The fused WMMA IQ3_S GEMM does NOT match the CPU reference
+                // on real weights (Xing4.0 oracle: rel 0.76 vs 2.6e-6 with
+                // the scalar kernel) - no bit-exact gate covered the IQ
+                // family, and this kernel reads garbage. Scalar until it does.
                 self.launch_iq_wmma_fallback(
                     a_storage,
                     b_storage,
@@ -576,6 +584,7 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                     Self::launch_wmma_fused_dequant_iq3s,
+                    false,
                     Self::launch_fused_dequant_gemm_iq3s,
                 )?;
             }
@@ -588,6 +597,7 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                     Self::launch_wmma_fused_dequant_iq4nl,
+                    true,
                     Self::launch_fused_dequant_gemm_iq4nl,
                 )?;
             }
@@ -600,6 +610,7 @@ impl QuantOps for RocmDevice {
                     n,
                     k,
                     Self::launch_wmma_fused_dequant_iq4xs,
+                    true,
                     Self::launch_fused_dequant_gemm_iq4xs,
                 )?;
             }
@@ -883,6 +894,68 @@ impl QuantOps for RocmDevice {
                         k,
                     )?;
                 }
+            }
+            DTypeStorage::FloatPack(FloatPackScheme::TreePie) => {
+                // TreePie (WS-A) routes M=1 decode to the in-register E2M2 GEMV
+                // over V_DOT2_F32_F16. Two hard preconditions, both enforced by the
+                // launcher as well: M must be 1 (there is no TreePie GEMM kernel, so
+                // prefill has nothing to route to) and K must be a multiple of 32,
+                // since the 5.0 bpw claim only holds at 32-value granularity and a
+                // ragged tail would silently overstate the density.
+                //
+                // Refusing prefill loudly is deliberate. Silently falling through to
+                // a dense dequant would produce a *correct* answer at a different
+                // format's cost, which is exactly the kind of quiet substitution
+                // that makes an A/B irreproducible.
+                if m != 1 {
+                    return Err(Error::Backend(format!(
+                        "TreePie has a GEMV kernel only; m = {m} (prefill) has no route"
+                    )));
+                }
+                if k % 32 != 0 {
+                    return Err(Error::Backend(format!(
+                        "TreePie requires k % 32 == 0 for the 5.0 bpw claim; got k = {k}"
+                    )));
+                }
+                // Activations arrive as whatever the caller had; the kernel wants
+                // packed f16 so the two decoded halves can feed the dot2 operand word
+                // directly. An f16 activation tensor is passed through untouched --
+                // that is the case a real decode loop hits, since TreePie's payoff is
+                // that B never gets dequantized. Anything else is converted through
+                // the host, which is correct but not fast; it is a fallback, not the
+                // intended path, and the comment is here so nobody reads it as one.
+                // `RocmStorage` is not Clone, so the converted buffer is bound
+                // out here and borrowed in both branches.
+                let converted;
+                let act_storage = if a_storage.dtype().arith == ArithType::F16 {
+                    a_storage
+                } else {
+                    let raw = a_storage.copy_to_host().map_err(|e| {
+                        Error::Backend(format!("TreePie act readback: {e}"))
+                    })?;
+                    let src = a_storage.dtype();
+                    let mut bits: Vec<u8> = Vec::with_capacity(k * 2);
+                    if src.arith == ArithType::F32 {
+                        for v in raw.chunks_exact(4) {
+                            let f = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+                            bits.extend_from_slice(&half::f16::from_f32(f).to_bits().to_le_bytes());
+                        }
+                    } else {
+                        // Already a 16-bit activation dtype; reinterpret rather
+                        // than round-trip through f32, so an f16 tensor of f16
+                        // values is bit-preserved.
+                        bits.extend_from_slice(&raw[..(k * 2).min(raw.len())]);
+                    }
+                    converted = RocmStorage::copy_from_host_raw_bytes(
+                        &bits,
+                        &Shape::new(vec![k]),
+                        DType { arith: ArithType::F16, storage: DTypeStorage::Native },
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
+                    &converted
+                };
+                self.launch_tree_pie_gemv(act_storage, b_storage, &out_storage, n, k)?;
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
                 // The MXFP4 kernel reads one E8M0 exponent per 32-element block (block_idx = (col*K+k)/32) and expects B_codes / B_exps as separate device buffers.

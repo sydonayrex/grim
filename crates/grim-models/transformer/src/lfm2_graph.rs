@@ -1385,7 +1385,8 @@ impl Lfm2Block {
             batch,
             self.n_expert,
             top_k,
-            0, // softmax routing (matches eager path)
+            0, // softmax routing (matches eager path),
+            false, // softmax mode already normalizes
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 

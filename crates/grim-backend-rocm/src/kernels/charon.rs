@@ -230,7 +230,8 @@ extern "C" {
         unsigned int* __restrict__ out_experts, // [seq_len * top_k]
         float* __restrict__ out_weights,        // [seq_len * top_k]
         int seq_len, int num_experts, int top_k,
-        int route_mode)                         // 0 = softmax, 1 = sqrt-softplus, 2 = sigmoid+bias
+        int route_mode,                        // 0 = softmax, 1 = sqrt-softplus, 2 = sigmoid+bias
+        int norm_weights)                      // 1 = normalize top-k combine weights to sum 1
     {
         const int tok = blockIdx.x;
         if (tok >= seq_len) return;
@@ -263,12 +264,22 @@ extern "C" {
                     chosen[pos] = v;
                     chosen_v[pos] = score;
                 }
+                // Reference (llama.cpp build_moe_ffn with norm_w): the
+                // combine weights are the gathered sigmoid probs NORMALIZED to
+                // sum 1 before expert_weights_scale is applied. Without this
+                // the grouped GEMM scales by raw probs - Xing4.0 measured a
+                // 0.76 relative divergence against the CPU reference.
+                float wsum = 0.0f;
+                for (int i = 0; i < k; ++i) {
+                    if (chosen[i] >= 0) wsum += 1.0f / (1.0f + __expf(-row[chosen[i]]));
+                }
+                const float wden = norm_weights ? fmaxf(wsum, 6.103515625e-5f) : 1.0f;
                 const long long base = (long long)tok * top_k;
                 for (int i = 0; i < top_k; ++i) {
                     if (i < k && chosen[i] >= 0) {
                         out_tokens[base + i]  = (unsigned int)tok;
                         out_experts[base + i] = (unsigned int)chosen[i];
-                        out_weights[base + i] = 1.0f / (1.0f + __expf(-row[chosen[i]]));
+                        out_weights[base + i] = (1.0f / (1.0f + __expf(-row[chosen[i]]))) / wden;
                     } else {
                         out_tokens[base + i]  = (unsigned int)tok;
                         out_experts[base + i] = 0u;

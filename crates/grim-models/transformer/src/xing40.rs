@@ -208,6 +208,20 @@ fn seed_streams_device(
 /// Mean the `hc` hyper-connection streams into the single `[seq, hidden]` model
 /// output, on device. Each stream is scaled by `1/hc` and accumulated, so the
 /// streams never leave the device.
+
+/// Env-gated stage fingerprints inside the MLA module (GRIM_XING_TRACE=1):
+/// rms + first values per named tensor, so a host/device divergence can be
+/// bisected to one stage instead of the module's final output.
+fn xing_trace_stage(name: &str, t: &Tensor) {
+    if std::env::var_os("GRIM_XING_TRACE").is_none() {
+        return;
+    }
+    if let Ok(v) = t.to_vec_f32() {
+        let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+        eprintln!("[xing-mla] {name}: len {} rms {rms:.5e} head {:?}", v.len(), &v[..v.len().min(4)]);
+    }
+}
+
 fn mean_collapse(
     streams: &Tensor,
     hc: usize,
@@ -1041,6 +1055,7 @@ impl Xing40Mla {
         positions: &[u32],
         kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
+
         let seq_len = x.shape().dims()[0];
 
         // On a device the whole MLA forward is device-resident: the host path below
@@ -1109,8 +1124,22 @@ impl Xing40Mla {
         let vd = self.v_head_dim;
         let nh = self.num_heads;
 
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let qn = cpu_tensor(
+                q_nope_v.clone(),
+                Shape::new(vec![seq_len, nh * nope]),
+            );
+            xing_trace_stage("host q_nope", &qn);
+        }
         let q_absorbed =
             crate::mla_common::absorb_query_wkc(&q_nope_v, &self.w_kc, seq_len, nh, nope, rank);
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let qa = cpu_tensor(
+                q_absorbed.clone(),
+                Shape::new(vec![seq_len, nh * rank]),
+            );
+            xing_trace_stage("host q_absorbed", &qa);
+        }
 
         // 4. Packed latent rows: [normed c_kv || roped k_pe].
         let latent_new =
@@ -1135,6 +1164,7 @@ impl Xing40Mla {
             None => new_latent,
         };
         let total_kv_len = latent_all.shape().dims()[0];
+        xing_trace_stage("d2d latent_all", &latent_all);
         *kv_cache = Some((
             latent_all.clone(),
             cpu_tensor(Vec::new(), Shape::new(vec![0, 0])),
@@ -1292,11 +1322,14 @@ impl Xing40Mla {
             let Some(roped) = or_host_fallback(dev.rope(
                 src.as_ref(),
                 positions,
+                // The checkpoint's OWN rope: base and the YaRN scaling, or the
+                // device path rotates different frequencies than the host
+                // reference (Xing4.0 ships YaRN factor 64).
                 &RopeConfig {
                     dim: rope_d,
-                    base: 10000.0,
+                    base: self.rope.config.base,
                     rotary_dim: rope_d,
-                    yarn: None,
+                    yarn: self.rope.config.yarn,
                     // matches the host `apply_rope_neox` pairing
                     interleaved: false,
                 },
@@ -1336,6 +1369,22 @@ impl Xing40Mla {
                     &Shape::new(vec![seq_len, nope]),
                 )?
                 .0;
+            if h == 0 && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let probe = dev
+                    .narrow_cols(
+                        q_full.storage().as_ref(),
+                        nh * q_stride,
+                        0,
+                        seq_len,
+                        nope,
+                        &Shape::new(vec![seq_len, nope]),
+                    )?
+                    .0;
+                xing_trace_stage(
+                    "d2d q_nope_h0",
+                    &wrap_like(x, probe, Shape::new(vec![seq_len, nope])),
+                );
+            }
             let w_h = dev
                 .narrow_rows(
                     w_kc_dev,
@@ -1362,6 +1411,7 @@ impl Xing40Mla {
             )?;
         }
         let q_absorbed = wrap_like(x, q_absorbed, q_abs_shape.clone());
+        xing_trace_stage("d2d q_absorbed", &q_absorbed);
 
         // 4. KV latent projection: norm c_kv, rope k_pe, pack [c_kv || k_pe].
         let kv_latent = self.kv_a_proj.forward(x)?;
@@ -1391,11 +1441,12 @@ impl Xing40Mla {
         let Some((k_pe, _k_pe_handle)) = or_host_fallback(dev.rope(
             k_pe.as_ref(),
             positions,
+            // Checkpoint rope (base + YaRN), matching the host reference.
             &RopeConfig {
                 dim: rope_d,
-                base: 10000.0,
+                base: self.rope.config.base,
                 rotary_dim: rope_d,
-                yarn: None,
+                yarn: self.rope.config.yarn,
                 interleaved: false,
             },
             &Shape::new(vec![1, seq_len, rope_d]),
@@ -1432,6 +1483,7 @@ impl Xing40Mla {
             None => latent_new,
         };
         let total_kv_len = latent_all.shape().dims()[0];
+        xing_trace_stage("host latent_all", &latent_all);
         let cache_offset = total_kv_len - seq_len;
         *kv_cache = Some((
             latent_all.clone(),
@@ -1446,7 +1498,16 @@ impl Xing40Mla {
         //    1/sqrt(rank + rope_d) as the softmax scale, so pre-scale the query by
         //    the ratio that reconciles it with the model's 1/sqrt(nope + rope_d) —
         //    the same correction the host decode path applies.
-        let scale = 1.0 / ((nope + rope_d) as f32).sqrt();
+        // Same scale the host path uses: kq_scale = mscale^2 / sqrt(nope +
+        // rope_d), with mscale folding the YaRN attention factor (1.415 for
+        // Xing4.0's factor 64). Dropping mscale here rescales every logit.
+        let mscale = self
+            .rope
+            .config
+            .yarn
+            .map(|y| y.attention_factor)
+            .unwrap_or(1.0f32);
+        let scale = mscale * mscale / ((nope + rope_d) as f32).sqrt();
         if seq_len == 1 && rank <= 512 && !self.kv_b_proj.weight.dtype().is_quantized() {
             let kernel_scale = 1.0f32 / ((rank + rope_d) as f32).sqrt();
             let ratio = scale / kernel_scale;
@@ -1938,6 +1999,7 @@ impl Xing40Moe {
                 self.num_experts_per_tok,
                 self.routed_scaling_factor,
                 2, // route_mode: sigmoid + e_score_correction_bias
+                true, // norm_weights: xing4_0.expert_weights_norm = true
                 &self.charon_cache,
             ) {
                 return Ok(out);
@@ -2108,6 +2170,26 @@ impl Xing40Block {
             Device::Rocm(_) => self.forward_d2d(x, positions, kv_cache),
             _ => self.forward_host(x, positions, kv_cache),
         }
+    }
+
+    /// Oracle entry points: `forward` dispatches on the input's device, but a
+    /// parity gate must run BOTH paths on the same input. These expose them.
+    pub fn forward_device_for_oracle(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        self.forward_d2d(x, positions, kv_cache)
+    }
+
+    pub fn forward_host_for_oracle(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        self.forward_host(x, positions, kv_cache)
     }
 
     /// Device-resident block forward. Requires the device hyper-connection
