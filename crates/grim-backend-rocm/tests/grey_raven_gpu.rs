@@ -1610,3 +1610,89 @@ fn grey_raven_a_lane_pair_is_the_doubling() -> TestResult {
 // positions 0..7 one at a time, which attributes each position to a k with no
 // assumption left to violate. That is the next probe, and unlike everything before
 // it, every input to it is measured rather than assumed.
+
+/// Attribute each of A's 8 byte positions to the k's it addresses.
+///
+/// Every input is measured at this point, so this makes no assumption: A lane L
+/// is row L and B lane L is k = L are both read off the hardware, so a one-hot A
+/// byte at (row 0, position j) times a one-hot B byte at (k, column 0) lights C
+/// [0][0] exactly when that A position maps to that k. Walking j against k gives
+/// the map directly, including any position that addresses more than one k --
+/// which is what the residual 2.0 has been pointing at.
+#[test]
+fn grey_raven_a_byte_position_to_k() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    for j in 0..8usize {
+        let mut a = vec![FP8_ZERO; 256];
+        a[j] = FP8_ONE; // row 0, byte position j
+        let mut ks: Vec<usize> = Vec::new();
+        let mut vals: Vec<f32> = Vec::new();
+        for k in 0..16usize {
+            let mut b = vec![FP8_ZERO; 512];
+            b[k * 16] = FP8_ONE; // k = lane k, column 0
+            let c = run_mma(&dev, &a, &b, 0)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                ks.push(k);
+                let v = c.iter().flatten().copied().find(|&v| v != 0.0).unwrap_or(0.0);
+                vals.push(v);
+            }
+        }
+        println!("A row0 byte {j}: k = {ks:?}   values {vals:?}");
+    }
+    Ok(())
+}
+
+// ============================================================================//
+// STOP. The measurements no longer support a 2:4 interpretation, and the right
+// move is to report that rather than write a GEMV against it.
+//
+// Every input to this probe is measured -- A lane L is row L, B lane L is k = L --
+// so it assumes nothing. A one-hot A byte at (row 0, position j), against a one-hot
+// B byte at (k, column 0), for every k in 0..15:
+//
+//   A row0 byte 0: k = [0..15]  values all 1.0
+//   A row0 byte 1: k = [0..15]  values all 1.0
+//   A row0 byte 2: k = []       values []
+//   A row0 byte 3: k = []       values []
+//   A row0 byte 4..7: k = []    values []
+//
+// **Only bytes 0 and 1 of A's lane are read, and each one contributes 1.0 to every
+// one of the 16 k simultaneously.** A single A byte is not an element of the
+// matrix; it is an addend broadcast across the whole contraction. Bytes 2..7 are
+// ignored entirely.
+//
+// That also explains the residual 2.0 at last: a uniform A sets bytes 0 and 1
+// alike, so two broadcast addends sum to 2.0. It was never a layout fact.
+//
+// None of this is a 2:4 sparse operand. A GEMM A fragment maps bytes to distinct
+// (row, k) positions; here one byte feeds every k, and six of eight are dead. B is
+// closer to behaving like a matrix -- a hot B byte lights one column across all 16
+// rows -- but A is not participating as a matrix at all.
+//
+// Two readings remain, and they are not equivalent in consequence:
+//
+//   1. The A operand is being *supplied* wrongly. The probe loads A as
+//      `gr_v2i = __attribute__((vector_size(8)))` and passes it straight through.
+//      If the real fragment wants 16 B/lane -- a dense A, sparsified by the index
+//      rather than pre-compacted -- then only 2 of 8 supplied bytes carry meaning
+//      and the rest are read past, and the whole "compacted A" model is an artefact
+//      of packing into v2i32. This is the more likely of the two, and it is cheap
+//      to test: re-run this same probe with a 16 B/lane A and 16 B/lane loads.
+//
+//   2. The sparse FP8 SWMMAC fragment layout on gfx1200 genuinely differs from the
+//      dense WMMA convention, in a way where a lane carries 2 broadcast addends per
+//      row rather than 8 matrix elements. If so, GreyRaven's 2:4 design -- which
+//      assumes a compacted A whose survivor bytes land on distinct k -- does not
+//      have a hardware primitive to map onto, and E6's answer is a report rather
+//      than a kernel.
+//
+// Reading 1 is a half-day of work and would invalidate most of the layout notes
+// above. Reading 2 would invalidate the design. Both are decided by one experiment:
+// vary the bytes-per-lane that A is loaded with, holding everything else fixed.
+//
+// Recommended: run that experiment before any further layout work, and do not
+// build `grey_raven_sparse_gemm` until it is done. Every attempt to build it
+// against the current model would be encoding an assumption that this probe has
+// just contradicted.
