@@ -869,7 +869,16 @@ fn grey_raven_index_moves_live_b_set() -> TestResult {
     let a = vec![FP8_ONE; 256];
 
     let mut prev: Option<Vec<usize>> = None;
-    for sidx in [0u32, 1, 2, 3, 0x5555_5555, 0xaaaa_aaaa, 0xffff_ffff, 0xf0f0_f0f0] {
+    // The 0x55/0xaa/0xff family turned out to be parameterised by v = sidx & 3, and
+    // the sidx=0 set follows x -> 4x + 4. Both are cheap to falsify, so probe
+    // them: single-field indices isolate one 2-bit group, and the v-family is
+    // extended to v = 0..3 across whole-pattern indices to confirm the linearity.
+    for sidx in [
+        0u32, 1, 2, 3,                  // low field only
+        0x5555_5555, 0xaaaa_aaaa, 0xffff_ffff,   // v repeated over all 16 groups
+        0x0000_0004, 0x0000_0008,       // group 1 and 2, value 1
+        0xffff_fffc,                    // only the top group varied
+    ] {
         let mut live: Vec<usize> = Vec::new();
         for g in 0..512usize {
             let mut b = vec![FP8_ZERO; 512];
@@ -942,3 +951,34 @@ fn grey_raven_index_moves_live_b_set() -> TestResult {
 // differing only in which 2-bit groups they select, swapping 128 B bytes with a
 // clear low-bits signature. Sweeping that family densely should recover the
 // bit -> k map directly, which then unblocks B's layout by subtraction.
+
+// ============================================================================
+// The index collapses to bit-position parity.
+//
+// Extending the joint fit with single-group indices isolates each 2-bit field,
+// and the result is much lower-dimensional than a per-group map:
+//
+//   sidx=0x00000001  160 live: 0-1, 4, 16, 52, 168
+//   sidx=0x00000004  160 live: 0-1, 4, 16, 52, 168      <- identical to bit 0
+//   sidx=0x00000002  160 live: 0, 2, 8, 28, 92, 296
+//   sidx=0x00000008  160 live: 0, 2, 8, 28, 92, 296    <- identical to bit 1
+//
+// **Bits 0 and 2 produce the same live set; bits 1 and 3 produce the same live
+// set.** Only the *parity* of a bit's position changes the outcome. Two distinct
+// behaviours exist where a 2:4 index with sixteen groups would have sixteen, and
+// the 0x55/0xaa/0xff family lines up with that: 0x55555555 is every even bit and
+// leads with B offset 1, 0xaaaaaaaa every odd bit and leads with 2, 0xffffffff
+// all bits and leads with 3 -- sidx & 3 appearing directly as a B byte offset.
+//
+// So the k-placement is not read from sixteen independent 2-bit fields. It is
+// derived from a low-dimensional reduction of the index, which is a far more
+// tractable object to invert than the sixteen-group map this file assumed from
+// the start. The leading offsets also fall out of a single recurrence:
+// 0 -> 4 -> 20 -> 84 -> 340 is x -> 4x + 4, the sidx = 0 set exactly, and the
+// v-family offsets are 4 + 5v, 20 + 21v, 84 + 85v -- linear in v = sidx & 3.
+//
+// The full bit -> k map is not yet recovered, and the parity finding is only
+// established over bits 0..3; bits 4..31 have not been swept individually. But
+// the direction is clear and it contradicts the sixteen-group model, so the
+// assumption baked into the earliest notes here is wrong and the search should
+// be re-aimed at this reduction rather than at per-group decoding.
