@@ -850,3 +850,95 @@ fn grey_raven_sparse_index_selects_k() -> TestResult {
 // solvable jointly -- A uniform and B one-hot already constrain both, since the
 // live B bytes are precisely those whose k the index places -- and that joint fit
 // is the remaining work for E6.
+
+/// The joint fit: does the set of live B bytes depend on the index?
+///
+/// A's k mapping and B's layout are coupled -- each is visible only through the
+/// other -- but jointly they are constrained, and this is the constraint. A is
+/// uniform, so A's own mapping cannot affect *which* B bytes are live: a B byte
+/// at k is live iff some A survivor lands on that k. Each A row covers 16 of 32
+/// k, and the index says which 16, so sweeping the index must move the live set
+/// if and only if the index really is placing k.
+///
+/// That makes the live set per index a fingerprint of the covered k's, and
+/// differences between two indices localize exactly which k's changed hands.
+#[test]
+fn grey_raven_index_moves_live_b_set() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+
+    let mut prev: Option<Vec<usize>> = None;
+    for sidx in [0u32, 1, 2, 3, 0x5555_5555, 0xaaaa_aaaa, 0xffff_ffff, 0xf0f0_f0f0] {
+        let mut live: Vec<usize> = Vec::new();
+        for g in 0..512usize {
+            let mut b = vec![FP8_ZERO; 512];
+            b[g] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                live.push(g);
+            }
+        }
+        // Compress to ranges.
+        let mut ranges: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < live.len() {
+            let s = live[i];
+            let mut e = s;
+            while e + 1 < live.len() && live[e + 1] == e + 1 { e += 1; }
+            ranges.push(if s == e { format!("{s}") } else { format!("{s}-{e}") });
+            i = e + 1;
+        }
+        let delta = match &prev {
+            None => String::from("(baseline)"),
+            Some(p) => {
+                let added: Vec<usize> = live.iter().copied().filter(|x| !p.contains(x)).collect();
+                let gone: Vec<usize> = p.iter().copied().filter(|x| !live.contains(x)).collect();
+                format!("  +{} -{}", added.len(), gone.len())
+            }
+        };
+        println!("sidx={sidx:#010x}  {:>3} live: {}{delta}", live.len(), ranges.join(", "));
+        prev = Some(live);
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Joint fit: the index does move the live B set. And an unresolved discrepancy.
+//
+// A's k mapping and B's layout cannot be solved separately -- A's k is visible
+// only through B, and B's only through A -- but jointly they are constrained,
+// and this is the constraint. With A uniform, a B byte at k is live iff some A
+// survivor lands on that k. Each A row covers 16 of 32 k and the index says
+// which 16, so **the index must move the live set if and only if it is placing
+// k**. It does, decisively:
+//
+//   sidx=0x00000000  128 live: 0, 4, 20, 84, 340                     (baseline)
+//   sidx=0x00000001  160 live: 0-1, 4, 16, 52, 168            +32   -0
+//   sidx=0x00000002  160 live: 0, 2, 8, 28, 92, 296          +32  -32
+//   sidx=0x00000003  160 live: 0, 3, 12, 40, 131, 420        +32  -32
+//   sidx=0x55555555  128 live: 1, 9, 41, 169               +128 -160
+//   sidx=0xaaaaaaaa  128 live: 2, 14, 62, 254              +128 -128
+//   sidx=0xffffffff  128 live: 3, 19, 83, 339              +128 -128
+//   sidx=0xf0f0f0f0  128 live: 0, 7, 32, 135              +64   -64
+//
+// Adjacent single-bit indices move 32 bytes in and 32 out; the 0x55/0xaa/0xff
+// family swaps 128 at a time and each family leads with 1, 2, 3 -- the index's
+// low two bits appearing directly as a B byte offset. The placement-map model
+// is confirmed, and the covered-k set is now observable as a fingerprint.
+//
+// UNRESOLVED, and it should not be glossed: at sidx = 0 this test reports 5 live
+// offsets (0, 4, 20, 84, 340) where `grey_raven_b_byte_onehot_sweep` reported 128
+// for the same A, the same one-hot B, and the same sidx = 0. Both are all-ones A
+// and a single hot B byte, so they should agree exactly, and they do not. The
+// five offsets found here are all = 0 (mod 4), which is the *class* the earlier
+// sweep found -- so the earlier sweep may have lumped every member of that class
+// in as live when only some are. Until that is resolved, the earlier sweep's
+// "128 of 512 live" should be read as "128 in the = 0 (mod 4) class, of which at
+// least 5 are live", and the rest of this note is unaffected because every
+// conclusion drawn from it is a *difference* between indices, not an absolute.
+//
+// Next: the 0x55/0xaa/0xff family is the cleanest signal here -- three indices
+// differing only in which 2-bit groups they select, swapping 128 B bytes with a
+// clear low-bits signature. Sweeping that family densely should recover the
+// bit -> k map directly, which then unblocks B's layout by subtraction.
