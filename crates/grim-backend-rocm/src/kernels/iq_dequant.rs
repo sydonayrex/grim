@@ -2,6 +2,7 @@
 
 /// HIP source for standalone IQ-family dequant kernels: [see: `grim_dequant_iq2xxs`, `grim_dequant_iq2xs`]
 pub const KERNEL_SOURCE: &str = r#"
+
 extern "C" {
 
     // ─── IQ dequant helpers (mirrors iq_gemm.rs device functions) ──
@@ -57,17 +58,31 @@ extern "C" {
         return d * base_val * 0.25f * sign_val;
     }
 
+    // block_q3_S layout, mirroring grim_quant::dequant_iq3s exactly:
+    //   d(f16,2) | qs(64) | qh(8) | signs(32) | scales(4)
+    // 512-entry IQ3S grid of four signed bytes per entry; the 9th index bit
+    // rides qh. One scale byte per 64 weights: lo nibble scales the first 32,
+    // hi nibble the second 32 (db = d * (1 + 2*nibble)).
     __device__ inline float dequant_iq3s_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* qs = blk + 2;
-        const unsigned char* scales = blk + 66;
-        const unsigned char* signs = blk + 78;
-        int sb = in_sb / 32;
-        float sc = ((float)(scales[sb * 12 / 8]) + 1.0f) * 0.125f;
-        float scale = d * sc;
-        float grid_val = (float)((qs[in_sb / 8] + in_sb) % 7) - 3.0f;
-        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
-        return scale * grid_val * sign_val;
+        const unsigned char* qh = blk + 66;
+        const unsigned char* signs = blk + 74;
+        const unsigned char* scales = blk + 106;
+        int k = in_sb / 64;           // scale byte (0..3)
+        int t = in_sb / 32;           // 32-weight block (0..7)
+        int e = in_sb % 32;
+        int l = e / 8;                // grid pair row (0..3)
+        int m = e % 8;                // element within the row's 8
+        unsigned char sc = scales[k];
+        unsigned char nib = ((in_sb % 64) < 32) ? (sc & 0xF) : (sc >> 4);
+        float db = d * (1.0f + 2.0f * (float)nib);
+        int qh_bit = 2 * l + (m >= 4 ? 1 : 0);
+        int idx = qs[t * 8 + 2 * l + (m >= 4 ? 1 : 0)]
+                | ((((int)qh[t] >> qh_bit) & 1) << 8);
+        float g = (float)(signed char)IQ3S_GRID_B[idx][(m >= 4) ? (m - 4) : m];
+        float sign = ((signs[t * 4 + l] >> m) & 1) ? -1.0f : 1.0f;
+        return db * g * sign;
     }
 
     // block_iq4_nl: 18 bytes per 32 weights (QK4_NL = 32). ggml_half d then
