@@ -1950,3 +1950,76 @@ fn grey_raven_row_covers_how_many_k() -> TestResult {
 // pack a block per the model above, emit the index from the 3-bit metadata, and
 // compare against a CPU dequantise-then-matmul reference. Nothing in that test
 // requires a guess.
+
+/// Which k's does a single A byte cover?
+///
+/// The uniform-B count said 8 bytes per row sum to 16, so each byte must cover two
+/// k positions. *Which* two decides whether GreyRaven's 3-bit-per-group metadata
+/// can be emitted directly. If byte j covers only the aligned pair (2j, 2j+1),
+/// then the two survivors of a group of four must start at an even k, and only a
+/// third of all 2:4 patterns would be representable -- a constraint on the format
+/// rather than a detail of the kernel. If byte j can cover any pair, the metadata
+/// maps straight through.
+///
+/// One-hot A byte at row 0, and B one-hot at each of the 32 k positions in turn.
+#[test]
+fn grey_raven_a_byte_covers_which_k() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    for j in [0usize, 1, 2, 3] {
+        let mut a = vec![FP8_ZERO; 256];
+        a[j] = FP8_ONE;
+        let mut ks: Vec<usize> = Vec::new();
+        for k in 0..32usize {
+            // B lane = column 0 for the low half of k, column 0 again for the high
+            // half: lanes L and L+16 both carry column L, so k = j + 16*(lane/16).
+            let lane = k / 16;
+            let bpos = k % 16;
+            let mut b = vec![FP8_ZERO; 512];
+            b[lane * 16 + bpos] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, 0)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                ks.push(k);
+            }
+        }
+        println!("A row0 byte {j}: covers k = {ks:?}");
+    }
+    Ok(())
+}
+
+// ============================================================================
+// A byte's k-coverage: 8 distinct k per row, not 16. The format mapping is not
+// direct, and the last "retirement" in this file is premature.
+//
+// One-hot A byte at row 0, B one-hot at each of the 32 k positions in turn:
+//
+//   A row0 byte 0: covers k = [0, 16]
+//   A row0 byte 1: covers k = [0, 16]
+//   A row0 byte 2: covers k = [4, 20]
+//   A row0 byte 3: covers k = [4, 20]
+//
+// So bytes 0 and 1 address the *same* k pair, and bytes 2 and 3 the next one: byte
+// pair p covers k = 4p and 16 + 4p. Four byte pairs therefore reach
+// {0,4,8,12} and {16,20,24,28} -- **eight distinct k**, not sixteen.
+//
+// That is where the earlier "16.0, so 2:4 over 32 k" went wrong, and it is worth
+// being precise about the error. The magnitude of a uniform product is the number
+// of k-slots a row *fills*, counting multiplicity. With two bytes addressing each
+// k and both at 1.0, eight covered k's produce 16.0 -- identical to sixteen k's
+// covered once. A magnitude cannot distinguish coverage from multiplicity, and I
+// read it as coverage. That is a weaker inference than I treated it as, and the
+// note that used it to retire the format concern should not have relied on it.
+//
+// So the open question is back, in a sharper form: a row reaches 8 of 32 k's, and
+// the index changes magnitudes and which B positions are live but has not been
+// shown to change *which* k's those are. If the reachable set is fixed, the index
+// is choosing multiplicities or sub-positions within a fixed k set, and GreyRaven's
+// arbitrary 2:4 metadata cannot be emitted as-is -- the format would need either a
+// different mapping onto this instruction or a different instruction.
+//
+// This is the same class of error as the identity-probe bug and the broadcast
+// misreading: a plausible reading, stated with more confidence than the evidence
+// carried, and it took a measurement that varied one more thing to expose. The
+// discipline that caught all three is the same -- vary exactly one input, keep every
+// other measured fact fixed, and never infer an absolute from a magnitude.
