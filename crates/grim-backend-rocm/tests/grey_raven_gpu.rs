@@ -982,3 +982,91 @@ fn grey_raven_index_moves_live_b_set() -> TestResult {
 // the direction is clear and it contradicts the sixteen-group model, so the
 // assumption baked into the earliest notes here is wrong and the search should
 // be re-aimed at this reduction rather than at per-group decoding.
+
+/// Sweep every single-bit index across the full u32 and group the live sets.
+///
+/// The parity result was only established over bits 0..3, which is the weakest
+/// possible basis for claiming a rule that spans the whole register. This closes
+/// that: 32 indices, one per bit position, grouped by the live set they produce.
+/// If parity is real, the 32 bits must fall into exactly two classes -- even
+/// positions one, odd positions the other -- and the two classes must differ. If
+/// instead the sets drift with position, the parity reading is wrong and the index
+/// is positional after all.
+#[test]
+fn grey_raven_index_bit_parity_across_u32() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+
+    // bit position -> (live count, first few live offsets, full set)
+    let mut by_set: std::collections::BTreeMap<Vec<usize>, Vec<u32>> = Default::default();
+    for bit in 0..32u32 {
+        let mut live: Vec<usize> = Vec::new();
+        for g in 0..512usize {
+            let mut b = vec![FP8_ZERO; 512];
+            b[g] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, 1u32 << bit)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                live.push(g);
+            }
+        }
+        by_set.entry(live).or_default().push(bit);
+    }
+
+    println!("\n=== 32 single-bit indices -> {} distinct live sets ===", by_set.len());
+    let mut classes: Vec<(Vec<usize>, Vec<u32>)> = by_set.into_iter().collect();
+    classes.sort_by_key(|(set, _)| set.len());
+    for (set, bits) in &classes {
+        let parity: Vec<&str> =
+            bits.iter().map(|b| if b % 2 == 0 { "even" } else { "odd" }).collect();
+        let head: Vec<usize> = set.iter().take(8).copied().collect();
+        println!("  bits {bits:?}  ({:?})", {
+            let mut p = parity.clone();
+            p.dedup();
+            p
+        });
+        println!("      {:>3} live, first 8: {head:?}", set.len());
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Full-register structure of the sparsity index: 9 live-set classes, and the
+// top half of the register does nothing.
+//
+// Sweeping all 32 single-bit indices partitions them into 9 distinct live sets:
+//
+//   bits 16..31 (all sixteen)   128 live: 0, 4, 8, 12, 16, 20, 24, 28 ...
+//   bits [0, 2]                 160 live: 0, 1, 4, 8, 12, 16, 17, 20 ...
+//   bits [1, 3]                 160 live: 0, 2, 4, 8, 12, 16, 18, 20 ...
+//   bits [4, 6]                 160 live: 0, 4, 5, 8, 12, 16, 20, 21 ...
+//   bits [5, 7]                 160 live: 0, 4, 6, 8, 12, 16, 20, 22 ...
+//   bits [8, 10]                160 live: 0, 4, 8, 9, 12, 16, 20, 24 ...
+//   bits [9, 11]                160 live: 0, 4, 8, 10, 12, 16, 20, 24 ...
+//   bits [12, 14]               160 live: 0, 4, 8, 12, 13, 16, 20, 24 ...
+//   bits [13, 15]               160 live: 0, 4, 8, 12, 14, 16, 20, 24 ...
+//
+// Three things fall out, and together they are enough to invert the index:
+//
+//   1. **Bits 16..31 are a no-op.** All sixteen produce one identical set -- the
+//      "every 4th byte" baseline, which is what sidx = 0 gives. Half the register
+//      is dead weight, so any 2:4 pattern encoded in it is being ignored.
+//   2. Bit b has the same effect as bit b+2 throughout the low half, so bits
+//      0..15 collapse to **eight** independent selectors:
+//      [0,2] [1,3] [4,6] [5,7] [8,10] [9,11] [12,14] [13,15].
+//   3. So the index is not sixteen 2-bit fields, nor eight, nor four. It is
+//      **eight single-bit selectors occupying the low 16 bits in interleaved
+//      pairs**, with the high 16 bits unused.
+//
+// Eight selectors matches the fragment exactly: A carries 8 compacted bytes per
+// lane, two lanes per row, and each byte's k-position is chosen by one selector.
+// That is a far better fit to the operand than any of the models this file has
+// tried, and it is consistent with the earlier "all 8 bytes of an A lane give the
+// same result under uniform B" -- they are eight different k of one row, placed
+// by eight independent selectors.
+//
+// The next probe is then narrow and mechanical: for each of the 8 selectors, set
+// it alone and read which k's change hands, which yields the full bit -> k map in
+// 8 measurements rather than a search. Nothing here establishes what the *values*
+// mean yet -- only which bits matter -- so the map is still unproven, but the
+// space to search just collapsed from 2^32 to 2^8, and the high half is settled.
