@@ -11,6 +11,7 @@ use grim_backend_rocm::decode_graph_buffers::{
     check_layer_topology, decode_graph_enabled, launch_attention, launch_qkv_gemv,
 };
 use grim_core::error::Result;
+use grim_nn::NormKind;
 use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
 
 use crate::block::LlamaBlock;
@@ -193,15 +194,40 @@ impl LlamaBlock {
         check_layer_topology(buffers, layer_idx)
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
-        // 1. Attention RMS norm into norm_buf
-        dev.rms_norm_into(
-            &buffers.layer_input[layer_idx],
-            &**self.attn_norm.weight.storage(),
-            self.attn_norm.eps,
-            &buffers.norm_buf[layer_idx],
-            &buffers.layer_input[layer_idx].shape().clone(),
-        )
-        .map_err(grim_core::error::Error::Tensor)?;
+        // 1. Attention norm into norm_buf. Dispatch on kind: the fused decode
+        // graph has a `rms_norm` and a `layer_norm` kernel, and picking the
+        // wrong one is the phi2 bug (rms where the reference needs layer).
+        // `device_weight` supplies a ones vector when the checkpoint has no
+        // norm weight, which `olmo.cpp:65-67` does.
+        let attn_in = &buffers.layer_input[layer_idx];
+        let attn_w = self
+            .attn_norm
+            .device_weight(self._cfg.hidden_size)
+            .map_err(grim_core::error::Error::Tensor)?;
+        match self.attn_norm.kind {
+            NormKind::Rms => {
+                dev.rms_norm_into(
+                    attn_in,
+                    &**attn_w.storage(),
+                    self.attn_norm.eps,
+                    &buffers.norm_buf[layer_idx],
+                    &attn_in.shape().clone(),
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+            NormKind::LayerNorm => {
+                let b = self.attn_norm.bias.as_ref().map(|t| t.storage());
+                dev.layer_norm_into(
+                    attn_in,
+                    &**attn_w.storage(),
+                    b.as_deref().map(|s| s.as_ref()),
+                    self.attn_norm.eps,
+                    &buffers.norm_buf[layer_idx],
+                    &attn_in.shape().clone(),
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
+        }
         let normed: &Storage = &buffers.norm_buf[layer_idx];
         let act = &buffers.act_q81_buf[layer_idx];
         let hidden = normed.shape().dims().last().copied().unwrap_or(0);
@@ -431,14 +457,35 @@ impl LlamaBlock {
         // 8. FFN sublayer
         if !self.ffn_disabled {
             let ffn_shape = buffers.layer_output[layer_idx].shape().clone();
-            dev.rms_norm_into(
-                &buffers.layer_output[layer_idx],
-                &**self.ffn_norm.weight.storage(),
-                self.ffn_norm.eps,
-                &buffers.norm_buf[layer_idx],
-                &ffn_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+            // Same kind dispatch as the attention norm above.
+            let ffn_w = self
+                .ffn_norm
+                .device_weight(self._cfg.hidden_size)
+                .map_err(grim_core::error::Error::Tensor)?;
+            match self.ffn_norm.kind {
+                NormKind::Rms => {
+                    dev.rms_norm_into(
+                        &buffers.layer_output[layer_idx],
+                        &**ffn_w.storage(),
+                        self.ffn_norm.eps,
+                        &buffers.norm_buf[layer_idx],
+                        &ffn_shape,
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                }
+                NormKind::LayerNorm => {
+                    let b = self.ffn_norm.bias.as_ref().map(|t| t.storage());
+                    dev.layer_norm_into(
+                        &buffers.layer_output[layer_idx],
+                        &**ffn_w.storage(),
+                        b.as_deref().map(|s| s.as_ref()),
+                        self.ffn_norm.eps,
+                        &buffers.norm_buf[layer_idx],
+                        &ffn_shape,
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                }
+            }
 
             let normed_ffn: &Storage = &buffers.norm_buf[layer_idx];
 
@@ -5602,7 +5649,7 @@ mod tests {
     use grim_core::session::Inner as SessionInner;
     use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
     use grim_nn::{
-        ColumnParallelLinear, Embedding, Linear, RmsNorm, Rope, RowParallelLinear,
+        ColumnParallelLinear, Embedding, Linear, Norm, RmsNorm, Rope, RowParallelLinear,
         TensorParallelConfig,
     };
     use grim_tensor::{ArithType, CoreTensorOps, DType, QuantProvenance, Shape, Storage, Tensor};
@@ -5680,6 +5727,9 @@ mod tests {
         }
     }
 
+    /// An `RmsNorm` on the ROCm device, for block types that still hold one
+    /// (`Qwen35Block`, and `Llama`'s final `norm`). Only the per-layer
+    /// `LlamaBlock` norms became `Norm`; see `test_llama_norm`.
     fn test_norm(dev: &RocmDevice, ordinal: usize, dim: usize) -> RmsNorm {
         let ones = vec![1.0f32; dim];
         let w = rocm_tensor(dev, ordinal, ones, Shape::new(vec![dim]));
@@ -5687,6 +5737,15 @@ mod tests {
             weight: w,
             eps: 1e-5,
         }
+    }
+
+    /// The `Norm` form of [`test_norm`], for `LlamaBlock`'s per-layer norms.
+    fn test_llama_norm(dev: &RocmDevice, ordinal: usize, dim: usize) -> Norm {
+        let ones = vec![1.0f32; dim];
+        let w = rocm_tensor(dev, ordinal, ones, Shape::new(vec![dim]));
+        let mut n = Norm::new(NormKind::Rms, 1e-5);
+        n.weight = Some(w);
+        n
     }
 
     fn assert_graph_matches_eager_single_token<M: DecodeGraphModel>(
@@ -5837,7 +5896,8 @@ mod tests {
             };
 
             layers.push(LlamaBlock {
-                attn_norm: test_norm(dev, ordinal, hidden_size),
+                attn_post_norm: None,
+                attn_norm: test_llama_norm(dev, ordinal, hidden_size),
                 wq: ColumnParallelLinear::new(wq, tp),
                 wk: ColumnParallelLinear::new(wk, tp),
                 wv: ColumnParallelLinear::new(wv, tp),
@@ -5845,7 +5905,7 @@ mod tests {
                 g_proj: None,
                 q_norm: None,
                 k_norm: None,
-                ffn_norm: test_norm(dev, ordinal, hidden_size),
+                ffn_norm: test_llama_norm(dev, ordinal, hidden_size),
                 w_gate: Some(ColumnParallelLinear::new(w_gate, tp)),
                 w_up: Some(ColumnParallelLinear::new(w_up, tp)),
                 w_down: Some(RowParallelLinear::new(w_down, tp)),

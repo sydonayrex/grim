@@ -11,7 +11,9 @@ use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::RmsNorm;
 use grim_nn::Rope;
-use grim_nn::{ColumnParallelLinear, Embedding, Linear, RowParallelLinear, TensorParallelConfig};
+use grim_nn::{
+    ColumnParallelLinear, Embedding, Linear, Norm, NormKind, RowParallelLinear, TensorParallelConfig,
+};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 use crate::block::{LlamaBlock, LlamaConfigRefs};
@@ -36,6 +38,7 @@ pub struct LlamaConfig {
     /// YaRN RoPE scaling parameters. `None` ⇒ plain RoPE.
     pub yarn: Option<grim_tensor::YaRNParams>,
 }
+
 
 impl LlamaConfig {
     /// Derived rotary dim: `round(head_dim * partial_rotary_factor)`, clamped to `head_dim`.
@@ -134,8 +137,14 @@ impl Llama {
         check_not_zeroed("norm", &norm.weight)?;
         check_not_zeroed("output", output.weight())?;
         for (i, layer) in layers.iter().enumerate() {
-            check_not_zeroed(&format!("layer.{i}.attn_norm"), &layer.attn_norm.weight)?;
-            check_not_zeroed(&format!("layer.{i}.ffn_norm"), &layer.ffn_norm.weight)?;
+            // A norm weight may legitimately be absent -- `olmo.cpp:65-67`
+            // passes `NULL, NULL` -- so only check one when there is one.
+            if let Some(w) = &layer.attn_norm.weight {
+                check_not_zeroed(&format!("layer.{i}.attn_norm"), w)?;
+            }
+            if let Some(w) = &layer.ffn_norm.weight {
+                check_not_zeroed(&format!("layer.{i}.ffn_norm"), w)?;
+            }
             check_not_zeroed(&format!("layer.{i}.wq"), layer.wq.weight())?;
             check_not_zeroed(&format!("layer.{i}.wk"), layer.wk.weight())?;
             check_not_zeroed(&format!("layer.{i}.wv"), layer.wv.weight())?;
@@ -319,16 +328,19 @@ impl Llama {
                 .collect();
             Linear::from_tensor(cpu_tensor(data, Shape::new(vec![out, in_])), None)
         };
-        let rms = |dim: usize| RmsNorm {
-            weight: cpu_tensor(vec![1.0; dim], Shape::new(vec![dim])),
-            eps: cfg.rms_norm_eps,
+        // Per-layer norm for the synthetic block below. An explicit weight of
+        // ones keeps it on the fused rms_norm path.
+        let rms_with_w = |dim: usize| {
+            let mut n = Norm::new(NormKind::Rms, cfg.rms_norm_eps);
+            n.weight = Some(cpu_tensor(vec![1.0; dim], Shape::new(vec![dim])));
+            n
         };
 
         let tp = TensorParallelConfig::default();
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for _ in 0..cfg.num_layers {
             layers.push(LlamaBlock {
-                attn_norm: rms(cfg.hidden_size),
+                attn_norm: rms_with_w(cfg.hidden_size),
                 wq: ColumnParallelLinear::new(
                     linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size),
                     tp,
@@ -348,7 +360,8 @@ impl Llama {
                 g_proj: None,
                 q_norm: None,
                 k_norm: None,
-                ffn_norm: rms(cfg.hidden_size),
+                ffn_norm: rms_with_w(cfg.hidden_size),
+                attn_post_norm: None,
                 w_gate: Some(ColumnParallelLinear::new(
                     linear(cfg.intermediate_size, cfg.hidden_size),
                     tp,
@@ -390,7 +403,10 @@ impl Llama {
             });
         }
 
-        let norm = rms(cfg.hidden_size);
+        let norm = RmsNorm {
+            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            eps: cfg.rms_norm_eps,
+        };
         let output = linear(cfg.vocab_size, cfg.hidden_size);
         Self {
             cfg: cfg.clone(),

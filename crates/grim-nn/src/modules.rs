@@ -1358,6 +1358,195 @@ impl LayerNorm {
     }
 }
 
+// ---------- Norm (kind-selectable) ----------
+
+/// Which normalisation a block applies.
+///
+/// Maps 1:1 onto llama.cpp's `llm_norm_type`
+/// (`old/repo/llama.cpp-master/src/llama-model.h`) and the two branches of
+/// `llm_graph_context::build_norm` (`llama-graph.cpp:1599-1600`):
+///
+/// ```text
+/// case LLM_NORM:     cur = ggml_norm(ctx0, cur, f_norm_eps);     break;
+/// case LLM_NORM_RMS: cur = ggml_rms_norm(ctx0, cur, f_norm_rms_eps); break;
+/// ```
+///
+/// `ggml_norm` subtracts the mean; `ggml_rms_norm` does not. On any input
+/// with a non-zero mean the two disagree, so a model that needs one cannot be
+/// served by the other -- which is why this is a compile-time choice per
+/// block rather than a runtime heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormKind {
+    /// `LLM_NORM` / `ggml_norm`: mean-subtracted. Phi-2, GPT-NeoX, OLMo,
+    /// StarCoder, CodeGLM and ten others in the plan audit.
+    LayerNorm,
+    /// `LLM_NORM_RMS` / `ggml_rms_norm`: sum-of-squares only. Llama, Qwen,
+    /// Mistral and most of the corpus.
+    Rms,
+}
+
+/// A normalisation whose kind is chosen by the model, with an OPTIONAL
+/// weight and an OPTIONAL bias.
+///
+/// The optionality is not decoration: `build_norm` applies the weight and
+/// the bias only when the pointer is non-null
+/// (`llama-graph.cpp:1613-1622`), and `olmo.cpp:65-67` passes `NULL, NULL`
+/// -- a bare `ggml_norm` with neither. `RmsNorm` and `LayerNorm` both
+/// require a weight, so neither can express that; this type can.
+///
+/// [`Self::apply`] is the CPU path and is what the tests pin against
+/// hand-computed reference values; [`Self::forward`] dispatches the same
+/// arithmetic on a device tensor.
+#[derive(Clone)]
+pub struct Norm {
+    pub kind: NormKind,
+    pub weight: Option<Tensor>,
+    pub bias: Option<Tensor>,
+    pub eps: f32,
+    /// A vector of ones, synthesised on first use when `weight` is absent.
+    ///
+    /// The device `grim_layer_norm` kernel dereferences its `w` pointer
+    /// unconditionally (`compute_kernels.rs:1166`) while null-checking `b`
+    /// (`:1167`), so a bias-free LayerNorm still needs a weight pointer. A
+    /// ones vector is exactly equivalent here: multiplying by one is the
+    /// identity, and with no bias there is nothing to reorder. `olmo.cpp:65-67`
+    /// is the model that needs this.
+    ones_weight: std::sync::Arc<std::sync::Mutex<Option<Tensor>>>,
+}
+
+impl Norm {
+    /// A norm with neither weight nor bias -- `build_norm(.., NULL, NULL, ..)`.
+    pub fn new(kind: NormKind, eps: f32) -> Self {
+        Self {
+            kind,
+            weight: None,
+            bias: None,
+            eps,
+            ones_weight: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Load from a `WeightSource`. A missing weight or bias stays `None` and
+    /// is skipped, exactly as `build_norm` skips a null pointer
+    /// (`llama-graph.cpp:1613-1622`).
+    pub fn load(ws: &WeightSource<'_>, dim: usize, kind: NormKind, eps: f32) -> Result<Self> {
+        Ok(Self {
+            kind,
+            weight: ws.get([dim], "weight").ok(),
+            bias: ws.get([dim], "bias").ok(),
+            eps,
+            ones_weight: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    pub fn has_weight(&self) -> bool {
+        self.weight.is_some()
+    }
+
+    pub fn has_bias(&self) -> bool {
+        self.bias.is_some()
+    }
+
+    /// The weight a device norm kernel should be handed.
+    ///
+    /// Returns the real weight when there is one, and a cached vector of ones
+    /// when there is not. See [`Self::ones_weight`] for why a ones vector is
+    /// the correct stand-in rather than a null pointer.
+    pub fn device_weight(&self, dim: usize) -> Result<Tensor> {
+        if let Some(w) = &self.weight {
+            return Ok(w.clone());
+        }
+        let mut guard = self
+            .ones_weight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let need = match guard.as_ref() {
+            Some(t) => t.shape().elem_count() != dim,
+            None => true,
+        };
+        if need {
+            *guard = Some(grim_backend_cpu::cpu_tensor(
+                vec![1.0f32; dim],
+                Shape::new(vec![dim]),
+            ));
+        }
+        Ok(guard.as_ref().expect("just set").clone())
+    }
+
+    /// Normalise `x`, then `* weight`, then `+ bias`, each only if present.
+    ///
+    /// Step order is load-bearing: `build_norm` multiplies before it adds, so
+    /// a bias cannot be folded into the mean. Mirrors that arithmetic.
+    pub fn apply(&self, x: &[f32], weight: Option<&[f32]>, bias: Option<&[f32]>) -> Vec<f32> {
+        let n = x.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let nf = n as f32;
+        let mut out: Vec<f32> = match self.kind {
+            NormKind::Rms => {
+                let inv = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / nf + self.eps).sqrt();
+                x.iter().map(|v| v * inv).collect()
+            }
+            NormKind::LayerNorm => {
+                let mean = x.iter().sum::<f32>() / nf;
+                let inv = 1.0 / (x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / nf
+                    + self.eps)
+                    .sqrt();
+                x.iter().map(|v| (v - mean) * inv).collect()
+            }
+        };
+        if let Some(w) = weight {
+            out.iter_mut().zip(w).for_each(|(o, &s)| *o *= s);
+        }
+        if let Some(b) = bias {
+            out.iter_mut().zip(b).for_each(|(o, &s)| *o += s);
+        }
+        out
+    }
+
+    /// Forward on a device tensor.
+    ///
+    /// Takes the fused `rms_norm` kernel only for `Rms` with a weight and no
+    /// bias -- the one shape the backends implement. Everything else round-trips
+    /// through the host: a fused mean-subtracting norm does not exist in the
+    /// backend yet, and dispatching it as if it did would be the same
+    /// silent-wrong-numerics bug this type exists to fix.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.kind == NormKind::Rms && self.bias.is_none() {
+            if let Some(w) = &self.weight {
+                let dev = pick_device_for_tensor(x);
+                let dim = x.shape().dims().last().copied().unwrap_or(0);
+                let out_shape = Shape::new(vec![x.shape().elem_count() / dim, dim]);
+                let (s, h) = CoreTensorOps::rms_norm(
+                    &*dev,
+                    x.storage().as_ref(),
+                    w.storage().as_ref(),
+                    self.eps,
+                    &out_shape,
+                )?;
+                let _ = h;
+                return Ok(Tensor::new(
+                    Arc::from(s),
+                    out_shape,
+                    DType::F32,
+                    x.provenance().clone(),
+                    x.device().clone(),
+                ));
+            }
+        }
+        let w = self.weight.as_ref().map(|t| t.to_vec_f32()).transpose()?;
+        let b = self.bias.as_ref().map(|t| t.to_vec_f32()).transpose()?;
+        let values = self.apply(&x.to_vec_f32()?, w.as_deref(), b.as_deref());
+        let host = grim_backend_cpu::cpu_tensor(values, x.shape().clone());
+        // Put the result back on the input's device. `cpu_tensor` alone would
+        // silently move a ROCm activation to the host, and callers read
+        // `tensor.device()` afterwards to choose a kernel -- so the device has
+        // to survive the round-trip.
+        move_to_device(&host, x.device())
+    }
+}
+
 // ---------- Embedding ----------
 
 #[derive(Clone)]

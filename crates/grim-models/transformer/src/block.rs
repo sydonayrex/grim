@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use grim_core::error::{Error, Result};
 use grim_nn::{
-    ColumnParallelLinear, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
-    WeightSource,
+    ColumnParallelLinear, Linear, Norm, NormKind, RmsNorm, Rope, RowParallelLinear,
+    TensorParallelConfig, WeightSource,
 };
 use grim_tensor::{CoreTensorOps, DType, Device, MemoryOps, Shape, Tensor};
 
@@ -51,6 +51,23 @@ pub struct LayerAttentionSpec {
     pub rope: grim_tensor::RopeConfig,
     pub sliding_window: Option<usize>,
     pub has_attn_gate: bool,
+    /// Which normalisation this model applies.
+    ///
+    /// `ggml_norm` subtracts the mean, `ggml_rms_norm` does not
+    /// (`llama-graph.cpp:1599-1600`), so on any input with a non-zero mean the
+    /// two give different results. Defaults to `Rms` through the constructors
+    /// below, which is correct for every model that predates this field;
+    /// `LayerNorm` has to be requested.
+    pub norm_kind: grim_nn::NormKind,
+    /// Whether `attn_norm_b` and `ffn_norm_b` exist in the checkpoint.
+    ///
+    /// Ten models create them (`gptneox.cpp:105-107` and `:149-151`, plus
+    /// nine peers); most do not. `build_norm` adds a bias only when the
+    /// pointer is non-null, so this is a decision, not an assumption.
+    pub has_norm_bias: bool,
+    /// Whether `attn_post_norm` exists, applied after the attention output.
+    /// Fifteen references create `ATTN_POST_NORM`.
+    pub has_attn_post_norm: bool,
 }
 
 impl LayerAttentionSpec {
@@ -67,6 +84,9 @@ impl LayerAttentionSpec {
             rope: grim_tensor::RopeConfig::new(head_dim, rope_theta),
             sliding_window: None,
             has_attn_gate: false,
+            norm_kind: grim_nn::NormKind::Rms,
+            has_norm_bias: false,
+            has_attn_post_norm: false,
         }
     }
 
@@ -90,6 +110,9 @@ impl LayerAttentionSpec {
             rope,
             sliding_window: None,
             has_attn_gate: false,
+            norm_kind: grim_nn::NormKind::Rms,
+            has_norm_bias: false,
+            has_attn_post_norm: false,
         }
     }
 }
@@ -112,6 +135,7 @@ pub struct LlamaConfigRefs {
     pub kv_head_replica_factor: usize,
     pub sliding_window: Option<usize>,
 }
+
 
 /// Compute the per-rank TP sharding plan for attention heads.
 /// Returns `(local_num_heads, local_num_kv_heads, kv_head_replica_factor)`: - If `num_kv_heads % world_size == 0`: KV heads are sharded,.
@@ -341,7 +365,9 @@ pub(crate) fn cache_append_kv<'a>(
 
 #[derive(Clone)]
 pub struct LlamaBlock {
-    pub attn_norm: RmsNorm,
+    /// Pre-attention norm. Kind, weight and bias come from
+    /// `LayerAttentionSpec::norm_kind` / `has_norm_bias`.
+    pub attn_norm: Norm,
     pub wq: ColumnParallelLinear,
     pub wk: ColumnParallelLinear,
     pub wv: ColumnParallelLinear,
@@ -352,7 +378,18 @@ pub struct LlamaBlock {
     pub q_norm: Option<RmsNorm>,
     /// Per-head K RMS-norm over `head_dim` (`attn_k_norm`).
     pub k_norm: Option<RmsNorm>,
-    pub ffn_norm: RmsNorm,
+    /// Pre-FFN norm, same configuration as `attn_norm`.
+    pub ffn_norm: Norm,
+    /// `attn_post_norm`, applied to the attention output *before* the residual
+    /// add. Present only when the checkpoint has it.
+    ///
+    /// The reference always builds it as `LLM_NORM_RMS` with a NULL bias, even
+    /// in LayerNorm models -- checked across all ten references that create
+    /// `ATTN_POST_NORM` (`olmo2.cpp:157-159`, `gemma3.cpp:163`, and eight
+    /// others), every one `LLM_NORM_RMS`. So this is deliberately fixed to
+    /// [`NormKind::Rms`] rather than following `norm_kind`; making it follow
+    /// would be an unverified deviation from every observed checkpoint.
+    pub attn_post_norm: Option<Norm>,
     pub w_gate: Option<ColumnParallelLinear>,
     pub w_up: Option<ColumnParallelLinear>,
     pub w_down: Option<RowParallelLinear>,
@@ -421,7 +458,17 @@ impl LlamaBlock {
         let num_heads = spec.num_heads;
         let num_kv_heads = spec.num_kv_heads;
 
-        let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        // `build_norm` applies the weight and the bias only when present, so
+        // `Norm::load` tolerates either being absent. `eps` is
+        // `rms_norm_eps` for both kinds: the reference has separate
+        // `f_norm_eps` and `f_norm_rms_eps`, and this codebase carries one
+        // field, so LayerNorm models share the value (see plan section 5).
+        let attn_norm = Norm::load(
+            &ws.pp("attn_norm"),
+            cfg.hidden_size,
+            spec.norm_kind,
+            cfg.rms_norm_eps,
+        )?;
         // Optional per-head QK-norm (Qwen3/Mellum2 `attn_q_norm` /
         // `attn_k_norm`, [head_dim]). Absent in classic Llama checkpoints.
         let q_norm = RmsNorm::load(&ws.pp("attn_q_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
@@ -469,7 +516,25 @@ impl LlamaBlock {
             None
         };
 
-        let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let ffn_norm = Norm::load(
+            &ws.pp("ffn_norm"),
+            cfg.hidden_size,
+            spec.norm_kind,
+            cfg.rms_norm_eps,
+        )?;
+
+        // `attn_post_norm` is RMS in every reference that has it, regardless of
+        // the model's own norm kind -- see the field's doc comment.
+        let attn_post_norm = if spec.has_attn_post_norm {
+            Some(Norm::load(
+                &ws.pp("attn_post_norm"),
+                cfg.hidden_size,
+                NormKind::Rms,
+                cfg.rms_norm_eps,
+            )?)
+        } else {
+            None
+        };
         let (w_gate, w_up, w_down) = if load_dense_ffn {
             let wg = Linear::load_column_parallel(
                 &ws.pp("ffn").pp("w_gate"),
@@ -624,6 +689,7 @@ impl LlamaBlock {
                 kv_head_replica_factor,
                 sliding_window: spec.sliding_window,
             },
+            attn_post_norm,
             ffn_disabled: !load_dense_ffn,
             silu_q81_scratch: std::sync::Arc::new(std::sync::Mutex::new(None)),
             alibi_slopes: None,
@@ -849,7 +915,17 @@ impl LlamaBlock {
             self.wo.forward(&attn_out)?
         };
 
-        let added = grim_nn::modules::add_on_device(x_2d, &attn_out)?;
+        // `attn_post_norm` goes on the attention output BEFORE the residual
+        // add: `olmo2.cpp:157-162` normalises `cur`, then
+        // `ggml_add(ctx0, cur, inpSA)` at `:162`. Applying it after the add
+        // would normalise the residual too and change every downstream value.
+        let added = match &self.attn_post_norm {
+            Some(n) => {
+                let normed = n.forward(&attn_out)?;
+                grim_nn::modules::add_on_device(x_2d, &normed)?
+            }
+            None => grim_nn::modules::add_on_device(x_2d, &attn_out)?,
+        };
 
         // MoE layers: the dense SwiGLU triple is disabled; the caller routes `added` (post-attention residual) through a `MoeBlock`.
         // Return it directly so `Llama::decode_paged` can apply the router + experts.
@@ -2105,15 +2181,16 @@ mod tests {
         Linear::from_tensor(w, None)
     }
 
-    fn make_rmsnorm(dim: usize) -> RmsNorm {
+    /// An `RmsNorm`-kind `Norm` for the synthetic blocks below. The kind is
+    /// fixed here because these are RMS test fixtures, not model specs.
+    fn make_norm(dim: usize) -> Norm {
         let w = cpu_tensor(
             (0..dim).map(|_| 1.0f32).collect::<Vec<f32>>(),
             Shape::new(vec![dim]),
         );
-        RmsNorm {
-            weight: w,
-            eps: 1e-5,
-        }
+        let mut n = Norm::new(NormKind::Rms, 1e-5);
+        n.weight = Some(w);
+        n
     }
 
     fn small_block() -> LlamaBlock {
@@ -2142,8 +2219,10 @@ mod tests {
             ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.intermediate_size), tp);
         let w_down =
             RowParallelLinear::new(make_linear(cfg.intermediate_size, cfg.hidden_size), tp);
-        let attn_norm = make_rmsnorm(cfg.hidden_size);
-        let ffn_norm = make_rmsnorm(cfg.hidden_size);
+        // `make_rmsnorm` returns an `RmsNorm`; the block now holds a `Norm`
+        // so the norm kind is per-spec. Same arithmetic for this default.
+        let attn_norm = make_norm(cfg.hidden_size);
+        let ffn_norm = make_norm(cfg.hidden_size);
         let rope = Rope::new(cfg.head_dim, 10000.0);
         LlamaBlock {
             attn_norm,
@@ -2155,6 +2234,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             ffn_norm,
+            attn_post_norm: None,
             w_gate: Some(w_gate),
             w_up: Some(w_up),
             w_down: Some(w_down),

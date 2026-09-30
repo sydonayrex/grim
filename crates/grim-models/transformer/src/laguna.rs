@@ -219,6 +219,11 @@ impl Laguna {
                     rope,
                     sliding_window,
                     has_attn_gate,
+                    // Verified against the reference: LLM_NORM_RMS only, no
+                    // ATTN_POST_NORM, no *_b norms.
+                    norm_kind: grim_nn::NormKind::Rms,
+                    has_norm_bias: false,
+                    has_attn_post_norm: false,
                 }
             })
             .collect();
@@ -348,6 +353,11 @@ mod tests {
                     rope,
                     sliding_window,
                     has_attn_gate,
+                    // Same as the production spec above: RMS, no *_b, no
+                    // attn_post_norm (laguna.cpp has none of the three).
+                    norm_kind: grim_nn::NormKind::Rms,
+                    has_norm_bias: false,
+                    has_attn_post_norm: false,
                 }
             })
             .collect();
