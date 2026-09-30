@@ -91,16 +91,46 @@ remains valid; no equivalent figure exists for activations.
 Stated plainly, because the confident-sounding conclusion above outruns what was
 actually verified:
 
-1. **The exact builtin signature was not determined.** The operand types are
-   baked into the intrinsic and the compiler's error messages did not yield a
-   clean signature; the per-operand-type and per-operand-count searches over
-   inline-asm forms did not converge. The *existence and shape* of the builtins
-   is solid — that is what answers the question. The register layout is not.
-2. **The zero-fill argument is reasoned, not compiled.** It follows from the
-   shape analysis above and from zero being a legal pruned value, but no
-   probe was built that assembles a dense-A-in-expanded-form SWMMAC and inspects
-   the emitted instruction. **E8 should treat this as the hypothesis to test
-   first**, not as established fact.
+1. **RESOLVED — the builtin signature is now determined.** The earlier searches
+   used inline-asm forms and did not converge. Letting the type checker drive it
+   converges immediately, because the diagnostics name the expected type. For
+   ROCm clang 22.0.0git, verified by compiling and reading the emitted IR:
+
+   ```c
+   // v8f32 __builtin_amdgcn_swmmac_f32_16x16x32_fp8_fp8_w32(
+   //     v2i32 d, v4i32 a, v8f32 b, u32 c);
+   typedef int  v2i __attribute__((vector_size( 8)));  // d
+   typedef int  v4i __attribute__((vector_size(16)));  // a
+   typedef float v8f __attribute__((vector_size(32))); // b, and the return
+   ```
+
+   The `d` operand is `__vector_size__(2 * sizeof(int)) int`, `a` is
+   `__vector_size__(4 * sizeof(int)) int`, `b` is
+   `__vector_size__(8 * sizeof(float)) float`, and `c` is a plain `int` — it is
+   *not* a vector, which the "all four are vectors" assumption in the original
+   search space is what made the search diverge. `b` accepts either a v8 of int
+   or a v8 of float, so the FP8 payload is passed as raw bits and the element
+   type is not the discriminator.
+
+   The builtin requires target features `gfx12-insts` and `wavefrontsize32`, and
+   lowers to `llvm.amdgcn.swmmac` on **both** gfx1200 and gfx1201 (verified by
+   `-S -emit-llvm`). The 2× MAC-rate claim is still a vendor table entry until
+   E7 measures it; that part of this investigation is unchanged.
+
+   **One asymmetry is not yet explained and E6 must settle it on hardware:** `d`
+   is a 2×i32 input but the result is 8×f32. A 16×16 f32 accumulator over a
+   32-lane wave is 8 floats per lane, so the *result* width is the expected one
+   and the *`d`* width is not. Either `d` is not the accumulator seed, or the
+   intrinsic has a quirk where the accumulator-in operand is narrower than the
+   accumulator-out. The type is known; the role of `d` is not, and guessing it
+   would produce a kernel that compiles and returns plausible numbers.
+2. **The zero-fill argument is still reasoned, not compiled.** The signature is
+   now known, so this is finally a writable experiment rather than a shape
+   argument, but it has not been run: no probe yet assembles a
+   dense-A-in-expanded-form SWMMAC and checks the result against a dense-A
+   dense-B reference. **E6 and E8 should treat this as the hypothesis to test
+   first.** It is now a one-kernel experiment with a known-good signature, which
+   is a materially different position from where this document was written.
 3. **No GPU was involved.** Compiler only: `clang++ --target=amdgcn-amd-amdhsa
    -mcpu=gfx1201` and `llvm-mc`. Nothing was executed on hardware, and E7's 2×
    claim remains a vendor table entry until measured.
