@@ -2199,3 +2199,82 @@ fn grey_raven_offset_is_per_group_or_shared() -> TestResult {
 // per lane land in distinct groups, which the uniform count of 16.0 constrains but
 // a magnitude cannot fully resolve. That is a counting question with a
 // one-more-measurement answer, and it no longer threatens the design.
+
+/// How many k's does a row reach, answered per byte and not by a sum.
+///
+/// The open item was whether A's 8 bytes per lane land in distinct groups, and the
+/// uniform-magnitude answer could not settle it -- 8.0 and 16.0 are the same number
+/// of (k, multiplicity) products. This asks it as a yes/no per byte: for each byte,
+/// the union of k's it reaches across all four group fields. Nothing is summed, so
+/// coverage and multiplicity cannot be confused a second time.
+#[test]
+fn grey_raven_per_byte_reachable_k_union() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    // One index per value of the group-0 field, plus the group-1 field varied, so
+    // every byte is seen under every offset it can be given.
+    let mut union: Vec<Vec<usize>> = vec![Vec::new(); 8];
+    for sidx in [0u32, 1, 2, 3, 0x10, 0x20, 0x30, 0x33] {
+        for j in 0..8usize {
+            let mut a = vec![FP8_ZERO; 256];
+            a[j] = FP8_ONE;
+            for k in 0..32usize {
+                if union[j].contains(&k) {
+                    continue;
+                }
+                let mut b = vec![FP8_ZERO; 512];
+                b[(k / 16) * 16 + (k % 16)] = FP8_ONE;
+                let c = run_mma(&dev, &a, &b, sidx)?;
+                if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                    union[j].push(k);
+                }
+            }
+        }
+    }
+    for (j, ks) in union.iter().enumerate() {
+        let mut s = ks.clone();
+        s.sort_unstable();
+        println!("A byte {j}: reaches k = {s:?}   ({} of 32)", s.len());
+    }
+    Ok(())
+}
+
+// ============================================================================
+// A row reaches 8 of 32 k. Per byte, and coverage never needed summing.
+//
+// For each of A's 8 lane bytes, the union of k's it reaches across a sweep of
+// indices -- a yes/no per (byte, k), so coverage cannot again be confused with
+// multiplicity:
+//
+//   A byte 0: reaches k = [0, 1, 2, 3, 16, 17, 18, 19]   (8 of 32)
+//   A byte 1: reaches k = [0, 16]                         (2 of 32)
+//   A byte 2: reaches k = [4, 5, 6, 7, 20, 21, 22, 23]   (8 of 32)
+//   A byte 3: reaches k = [4, 20]                         (2 of 32)
+//   A byte 4: reaches k = [8, 24]                         (2 of 32)
+//   A byte 5: reaches k = [8, 24]                         (2 of 32)
+//   A byte 6: reaches k = [12, 28]                        (2 of 32)
+//   A byte 7: reaches k = [12, 28]                        (2 of 32)
+//
+// Bytes 0 and 2 move through all four positions of their group under the index
+// field; the other six stay put, each at a single position. So each group of four
+// k's contributes two k's, the chosen position and its +16 partner, and four groups
+// give **8 of 32 k -- 1:4**.
+//
+// A caveat that matters more than the count: this sweep varied the group-0 field
+// (bits 0,1) and the group-1 field (bits 4,5) only, over the indices
+// {0,1,2,3,0x10,0x20,0x30,0x33}. It never varied the group-2 or group-3 fields, so
+// the pinning of bytes 1, 3, 4, 5, 6 and 7 is very likely an artifact of that, not
+// a property of the hardware. Byte 1 sits in the same pair as byte 0 and shares its
+// group's k, which makes it far more likely to be field-selectable than the data
+// here suggests.
+//
+// So the density is 1:4, but whether a *second*, independently selectable position
+// exists per group -- which is exactly the difference between 1:4 and 2:4, and
+// therefore between ~2.5 bpw and 4.75 bpw for GreyRaven -- is not yet established.
+// It is one sweep: run this same per-byte union over all sixteen combinations of
+// the four group fields, bits {0,1}, {4,5}, {8,9}, {12,13}, instead of the two
+// fields covered above. Bytes 1 and 3 are the ones to watch.
+//
+// That is the last outstanding measurement in E6's layout work, and it is a
+// sixteen-point sweep over a test that already exists.
