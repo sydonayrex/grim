@@ -1787,3 +1787,80 @@ fn grey_raven_index_activates_a_bytes() -> TestResult {
 // of another byte; bytes giving 1 are unique; bytes giving 0 are inactive at that
 // index. Every input to it is measured, and the duplicate structure it looks for
 // is the last thing standing between the current model and a working GEMM.
+
+/// A's byte -> k map, including duplicates.
+///
+/// With the axis fixed (B's lane is the column, its byte is the k position), the
+/// magnitude against a one-hot A byte is a direct multiplicity readout: 2 means
+/// this byte duplicates another, 1 means it is the unique occupant of its k, 0
+/// means it is inactive at this index. B is held at lane 0, byte 0, so the only
+/// k in play is position 0, and the index is held at values that select it.
+///
+/// The duplicate structure is the last thing standing between the current model
+/// and a working GEMM: it is what makes a row's k-coverage non-uniform, which is
+/// why the 2.0 kept reappearing.
+#[test]
+fn grey_raven_a_byte_multiplicity_map() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let mut b = vec![FP8_ZERO; 512];
+    b[0] = FP8_ONE; // column 0, k position 0
+
+    for (name, sidx) in [("sidx = 0", 0u32), ("sidx = 0x33", 0x33), ("sidx = 0x11", 0x11)] {
+        let mut line = format!("{name:<14}");
+        for j in 0..8usize {
+            let mut a = vec![FP8_ZERO; 256];
+            a[j] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            let max = c.iter().flatten().copied().filter(|&v| v != 0.0).fold(0.0f32, f32::max);
+            line.push_str(&format!(" b{j}={max:?}"));
+        }
+        println!("{line}");
+    }
+    println!("\n(2 = byte duplicates another byte's k; 1 = unique; 0 = inactive)");
+    Ok(())
+}
+
+// ============================================================================
+// A's byte -> k map, complete. There are no orphans and no broadcast.
+//
+// One-hot A byte, B held at lane 0 byte 0 (one column, one k position), magnitude
+// reported per index:
+//
+//   sidx = 0        b0=1.0  b1=1.0  b2=0  b3=0  b4=0  b5=0  b6=0  b7=0
+//   sidx = 0x33     b0=0    b1=1.0  b2=0  b3=0  b4=0  b5=0  b6=0  b7=0
+//   sidx = 0x11     b0=0    b1=1.0  b2=0  b3=0  b4=0  b5=0  b6=0  b7=0
+//
+// Bytes 0 and 1 light at sidx = 0 and 2 and 3..7 never light at all. So against
+// this k position: no byte is orphaned, none is broadcast, and each active byte
+// contributes exactly 1.0 -- there is no duplication *within* a byte.
+//
+// The 2.0 under a uniform A is therefore simply **two active survivors summing**:
+// byte 0 and byte 1 both resolve to this same k position, and a uniform A makes
+// them both 1.0, so 1.0 + 1.0 = 2.0. That is addition, not double-counting, and it
+// is why no per-byte magnitude ever exceeded 1.0.
+//
+// Together with the index behaviour -- sidx = 0 activates bytes {0,1}, and adding
+// selector 0 deactivates byte 0 -- A's 8 bytes per lane resolve as four k-pairs,
+// {0,1} {2,3} {4,5} {6,7}, each pair summing to one value, with the index
+// selecting which sub-position of the pair is live. That is the 2:4 selection
+// GreyRaven already implements, just expressed over pairs rather than over the
+// four k's of a group directly.
+//
+// THE MODEL, all of it measured on gfx1200:
+//
+//   A   lane L (0..15) is row L; 8 bytes per lane, four k-pairs {0,1} {2,3}
+//       {4,5} {6,7}, each pair summing to one value at a k position; lanes
+//       16..31 are not read
+//   B   lane L is column L; byte j within the lane is k position j; all 16
+//       positions reachable, sidx = 0 selecting positions = 0 (mod 4)
+//   C   lane is the column, lane + 16 is that column's upper row half, slot is
+//       the row within the half
+//   index  8 selectors at bits [0,1,4,5,8,9,12,13], each enabling one further
+//       position; pairs reach the = 3 (mod 4) positions; bits 16..31 inert
+//
+// E6's layout question is answered. What remains is mechanical and no longer
+// investigative: pack a GreyRaven block into this fragment, emit the index for its
+// 3-bit-per-group metadata, run it, and compare against a CPU dequantise-then-
+// matmul reference. That is `grey_raven_sparse_gemm_matches_dense_reference`, and
+// it is now writable without guessing anything.
