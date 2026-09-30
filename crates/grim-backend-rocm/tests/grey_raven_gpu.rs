@@ -264,3 +264,122 @@ fn grey_raven_swmmac_layout_probe() -> TestResult {
 // the product come out as the identity. That is a joint search over (A compaction
 // order, sparsity-index encoding, B packing), and the 3-bit metadata the host
 // already emits is the natural starting candidate.
+
+/// Read the 2:4 slot selection straight out of the hardware.
+///
+/// The first probe showed A is consumed at 8 B/lane = 256 B, i.e. a 2:4
+/// *compacted* operand, and that permuting the dense input changed nothing. So
+/// supply the compacted operand and make the answer self-describing:
+///
+///   A (compacted) = all ones        -> 16 survivors per row, every one 1.0
+///   B              = identity 32x16 -> B[k][n] = 1 iff k == n
+///
+/// then C[r][n] = sum over row r's survivors of B[k][n] = 1 exactly when n is
+/// one of the k-slots the hardware says row r occupies. The nonzero *columns* of
+/// C are therefore the slot set itself, read directly rather than inferred.
+///
+/// This is the probe the dense identity could not be: there, the answer
+/// depended on a layout guess and every guess gave the same count. Here the
+/// compacted buffer's contents do not depend on the row-to-lane mapping at all,
+/// because every byte is the same value -- so the output isolates the one thing
+/// being measured, the index encoding, with the layout question set aside.
+#[test]
+fn grey_raven_sparse_index_slot_selection() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+    println!("target: {}", dev.gpu_target_str());
+
+    // A: the whole compacted operand is ones. 256 B = 8 B/lane over 32 lanes.
+    let a_all_ones = vec![FP8_ONE; WAVE * 8];
+
+    // B: identity 32x16 under the row-major-in-lane packing -- B is K x N, so
+    // row k occupies lane k and its 16 columns are the 16 bytes of that lane.
+    // Only n < 16 exists in the output, so the two halves of k are identical.
+    let mut b = vec![FP8_ZERO; WAVE * 16];
+    for k in 0..16usize {
+        b[k * 16 + k] = FP8_ONE;
+    }
+
+    for sidx in [0u32, 0xFFFFFFFFu32, 0x55555555u32, 0xAAAAAAAAu32] {
+        let c = run_mma(&dev, &a_all_ones, &b, sidx)?;
+        // Collapse to a 16x16 reading: the pattern of nonzero lanes/slots.
+        let mut col_hist = [0usize; 8];
+        let mut lanes_with_data = 0usize;
+        for lane in c.iter() {
+            let nz = lane.iter().filter(|&&v| v != 0.0).count();
+            if nz > 0 {
+                lanes_with_data += 1;
+            }
+            for &v in lane.iter() {
+                if v != 0.0 {
+                    col_hist[0] += 1;
+                }
+            }
+        }
+        let total: usize = c.iter().map(|l| l.iter().filter(|&&v| v != 0.0).count()).sum();
+        println!(
+            "sidx=0x{sidx:08x}  nonzero C elements = {total:<5} lanes with data = {lanes_with_data}",
+        );
+        // Print the per-lane nonzero slot pattern for the first lanes that have
+        // any, which is where the slot rule is visible.
+        // Direct readout of the index's low 2 bits. All eight lanes in one
+        // residue class mod 4 are active, and the class is selected by the
+        // index:  00 -> lane = 0 mod 4,  01 -> 1 mod 4,  10 -> 2 mod 4,
+        //         11 -> 3 mod 4.
+        //
+        // (An earlier reading of this data said "lane pair {j, j+4}". It is
+        // wrong: the active set is the whole residue class, 8 lanes, not 2.)
+        let pairs: Vec<usize> =
+            c.iter().enumerate().filter(|(_, l)| l.iter().any(|&v| v != 0.0)).map(|(i, _)| i).collect();
+        println!("   active lanes {pairs:?}  (index bits0,1 = {:02b})", sidx & 0b11);
+        for (l, lane) in c.iter().enumerate().take(8) {
+            let nz: Vec<(usize, f32)> = lane
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v != 0.0)
+                .map(|(i, v)| (i, *v))
+                .collect();
+            println!("   lane {l:>2}: {nz:?}");
+        }
+    }
+    Ok(())
+}
+
+// What this probe established, and what it did not.
+//
+// Established, on hardware:
+//
+//   - The instruction runs on gfx1200 and its output is stable and finite.
+//   - C is 8 f32 per lane; a zero D is a valid accumulator-in.
+//   - **Bits 0,1 of the sparsity index select one of four lane residue classes**:
+//     00 -> lane = 0 mod 4, 01 -> 1 mod 4, 10 -> 2 mod 4, 11 -> 3 mod 4. All eight
+//     lanes of the chosen class are active, so this is a 2-bit field choosing
+//     1 of 4 over a stride-4 lane distribution -- the same shape as a 2:4 choice.
+//     Whether that is the per-group slot selector, a row-group selector, or
+//     something else is not yet distinguishable, and "per-group" is the
+//     problem anyway: one 2-bit field is not eight, and a 16x32 A has eight
+//     groups of four along k.
+//
+// Not established:
+//
+//   - The B fragment layout. This is now the blocker. With B set to the
+//     32x16 identity, the product came back as 64 nonzeros, all exactly 2.0, in
+//     whole lanes -- every one of an active lane's 8 C slots held the same
+//     value. A correct A x B cannot do that: C[r][n] must vary with n, because
+//     B[k][n] is 1 only at n == k. Identical values across all 8 slots mean the
+//     16 B bytes of a lane are not being read as 16 distinct n values for one
+//     k, so the lane/k and byte/n roles are transposed or interleaved relative
+//     to the assumption in `pack_b`.
+//
+// The 2.0 is consistent with that: two contributions landing on each output,
+// which is what a mis-strided B produces rather than a 1.0 that one survivor
+// would give.
+//
+// So the remaining search is over B's byte-to-(k,n) mapping, jointly with how
+// the index's eight per-group 2-bit fields are packed into the u32 (only the
+// low one is located so far). That is a wider search than trial-and-error
+// should keep driving: the honest next step is to enumerate the B layout space
+// exhaustively against the identity probe, the same way the A side was ruled
+// out, rather than continuing to guess one arrangement per run.
