@@ -2884,6 +2884,9 @@ fn load_model_with_providers(
     })?;
 
     let lookup = GgufMetadataLookup(provider);
+    if std::env::var_os("GRIM_LOADER_TRACE").is_some() {
+        eprintln!("[loader-trace] arch_str={arch_str:?} -> {:?}", ModelArchitecture::from_str(arch_str));
+    }
     let mut model_arch = ModelArchitecture::from_str(arch_str);
     if model_arch == ModelArchitecture::Llama {
         let name_lower = lookup
@@ -3443,7 +3446,10 @@ fn load_model_with_providers(
             let m = Qwen3Moe::load_tp(device.clone(), &ws, qwen_moe_cfg, tp)?;
             Ok(Box::new(m))
         }
-        arch if arch.is_moe() => {
+        // Xing40 is MoE but has its own arm below (MLA + MHC, not a Qwen3Moe layout);
+        // this guard must not shadow it — it dispatched Qwen3Moe::load_tp, which died on
+        // `blk.0.attn_q.weight` because Xing4.0 stores MLA tensors instead.
+        arch if arch.is_moe() && arch != ModelArchitecture::Xing40 => {
             let moe_cfg = Qwen3MoeConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -4180,6 +4186,11 @@ fn load_model_with_providers(
             let leading_dense = lookup
                 .get_u32("xing4_0.leading_dense_block_count")
                 .unwrap_or(2) as usize;
+            // `block_count` includes the MTP (NextN) block(s): blk.40 carries the
+            // standard MLA/MoE tensors but NO mHC tensors (reference: PR #29012
+            // conversion notes). The trunk is block_count minus nextn layers.
+            let nextn = lookup.get_u32("xing4_0.nextn_predict_layers").unwrap_or(0) as usize;
+            let trunk_layers = hparams.num_layers.saturating_sub(nextn);
             let shared_experts =
                 lookup.get_u32("xing4_0.expert_shared_count").unwrap_or(1) as usize;
 
@@ -4189,7 +4200,7 @@ fn load_model_with_providers(
                 num_heads: hparams.num_heads,
                 num_kv_heads: hparams.num_kv_heads,
                 head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
+                num_layers: trunk_layers,
                 intermediate_size: hparams.intermediate_size,
                 kv_lora_rank,
                 q_lora_rank,

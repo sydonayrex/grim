@@ -849,6 +849,10 @@ pub async fn cmd_run(
         match load_model_from_gguf(&model_path_str, device.clone()) {
             Ok(m) => {
                 eprintln!("[grim] GGUF model loaded successfully.");
+                    if let Device::Rocm(o) = &device {
+                        let (free, total) = grim_backend_rocm::vram_info(*o);
+                        eprintln!("[vram] after load: free {:.2} GiB / total {:.2} GiB", free as f64 / (1 << 30) as f64, total as f64 / (1 << 30) as f64);
+                    }
                 m
             }
             Err(e) => {

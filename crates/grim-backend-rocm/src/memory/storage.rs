@@ -572,7 +572,20 @@ impl BackendStorage for RocmStorage {
         // overrun, which is the signature of a size derived from a wrong shape
         // rather than a loop bound being off by one.
         let need = (elem_count as u64).saturating_mul(crate::dtype_byte_size(&self.dtype) as u64);
-        if need > self.bytes as u64 {
+        // Packed storages (KQuant/FloatPack/…) hold ~bits-per-weight bytes, so
+        // elem_count × arith-size (IQ4_NL carries arith F32 → 4 B/elem) is NOT
+        // the resident size, and this guard rejected every packed readback whose
+        // arith exceeds the packing. Their DtoH copies exactly `self.bytes`
+        // below, which cannot exceed the allocation. Enforce the elementwise
+        // bound only for linear (non-packed) storages.
+        let packed = matches!(
+            &self.dtype.storage,
+            DTypeStorage::KQuant(_)
+                | DTypeStorage::FloatPack(_)
+                | DTypeStorage::ResidualPacked(_)
+                | DTypeStorage::GroupInt(_)
+        );
+        if !packed && need > self.bytes as u64 {
             return Err(Error::Backend(format!(
                 "DtoH shape exceeds allocation: shape {:?} at {} bytes/elem needs {need} bytes, \
                  but only {} are allocated",
