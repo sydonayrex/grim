@@ -2388,239 +2388,218 @@ fn grey_raven_all_group_field_combinations() -> TestResult {
 // failing run's output was on screen, and its "2:4 confirmed" claim was not
 // re-checked before committing. The claim does hold -- 22/22 on a clean run -- but
 // it should not have been asserted from a result line that said FAILED.
-
-/// E6: `grey_raven_sparse_gemm_matches_dense_reference`.
-///
-/// Every fragment rule this uses was measured on gfx1200 by the probes above:
-///
-///   A   lane L (0..15) is row L; 8 bytes. Byte 2p+1 is the group-p anchor at k = 4p
-///       (and k = 16 + 4p); byte 2p is the free survivor at k = 4p + field_p (and
-///       +16). Lanes 16..31 are not read.
-///   B   offset n * 16 + k is element (k, n): lane is the column, the byte is k.
-///       The tile is 16x16x16 -- there is no k = 16..31, and lanes 16..31 of B do
-///       not participate, exactly as lanes 16..31 of A do not.
-///   C   slot s, lane n -> (row s, col n); lane n + 16 -> (row s + 8, col n).
-///   idx four 2-bit group fields at bits 0, 4, 8, 12; bits 16..31 inert.
-///
-/// The reference is computed independently on the host: dequantise nothing, just
-/// contract the dense host matrices over the *active* k only, so a packing or index
-/// error shows up as a number rather than as a plausible product.
-///
-/// Values are 1.0 and 2.0 (exact in E4M3) and the reference is summed in f32, so
-/// the comparison is exact and a tolerance would only hide a permutation.
 #[test]
 fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
     let Some(dev) = gpu_device() else { return Ok(()) };
     let dev = &dev;
 
-    const R: usize = 16;
-    // The tile is 16x16x16. k = 16..31 is not part of the contraction -- measured,
-    // not assumed: with the reference built over the low half alone the product
-    // matches to the bit, and adding the high half doubles every output.
-    const K: usize = 16;
-    const N: usize = 16;
-    // Group p keeps positions {0, q_p} -- the anchor plus the field-selected
-    // survivor, which is the only family this instruction can encode.
-    let q: [usize; 4] = [1, 2, 3, 1];
-    // Row/column-dependent weights so a row or column permutation cannot pass.
-    let aval = |r: usize, k: usize| -> f32 { if (r + k) % 3 == 0 { 2.0 } else { 1.0 } };
-    let bval = |k: usize, n: usize| -> f32 { if (k * 2 + n) % 5 == 0 { 2.0 } else { 1.0 } };
+    const MR: usize = 16; // rows of A and D
+    const KP: usize = 16; // packed k of A  (expands to 32)
+    const K: usize = 32; // dense k
+    const NC: usize = 16; // columns of B and D
 
-    // Dense host A (16x32) and B (32x16), FP8 encoded.
-    let enc = |v: f32| -> u8 {
-        if v == 2.0 {
-            0x40
-        } else {
-            FP8_ONE
-        }
-    };
-    let mut a_dense = vec![FP8_ZERO; R * K];
-    for r in 0..R {
-        for p in 0..4 {
-            for pos in [0usize, q[p]] {
-                a_dense[r * K + 4 * p + pos] = enc(aval(r, 4 * p + pos));
-            }
+    // Every one of the six 2-of-4 pairs, in rotation, so the Idx0 < Idx1 ordering
+    // and the "no anchor at slot 0" property are exercised rather than assumed.
+    const PAIRS: [(u8, u8); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+
+    let enc = |v: f32| -> u8 { if v == 2.0 { 0x40 } else { FP8_ONE } };
+    // Row/column dependent so a permutation cannot pass.
+    let aw = |r: usize, pk: usize| -> f32 { if (r * 3 + pk * 5) % 4 == 0 { 2.0 } else { 1.0 } };
+    let bw = |k: usize, n: usize| -> f32 { if (k + n * 2) % 5 == 0 { 2.0 } else { 1.0 } };
+
+    // Expand on the host, straight from the ISA's expansion loop, to build both the
+    // reference and the dense A the fragment is packed from.
+    let idx_of = |c: usize| -> (u8, u8) { PAIRS[c % PAIRS.len()] };
+    let mut a_dense = vec![0.0f32; MR * K];
+    let mut a_packed = vec![FP8_ZERO; MR * KP];
+    for r in 0..MR {
+        for c in 0..8usize {
+            let (i0, i1) = idx_of(c);
+            let v0 = aw(r, 2 * c);
+            let v1 = aw(r, 2 * c + 1);
+            a_packed[r * KP + 2 * c] = enc(v0);
+            a_packed[r * KP + 2 * c + 1] = enc(v1);
+            // The ISA's placement rules, transcribed exactly. The subtlety is that
+            // idx1 can land on col+1 or col+2 as well as col+3, so a rule that only
+            // consults idx0 for the first three columns silently drops survivors and
+            // understates the reference.
+            let (i0u, i1u) = (i0 as usize, i1 as usize);
+            a_dense[r * K + 4 * c + 0] = if i0u == 0 { v0 } else { 0.0 };
+            a_dense[r * K + 4 * c + 1] =
+                if i0u == 1 { v0 } else if i1u == 1 { v1 } else { 0.0 };
+            a_dense[r * K + 4 * c + 2] =
+                if i0u == 2 { v0 } else if i1u == 2 { v1 } else { 0.0 };
+            a_dense[r * K + 4 * c + 3] = if i1u == 3 { v1 } else { 0.0 };
         }
     }
-    let mut b_dense = vec![FP8_ZERO; K * N];
-    for k in 0..K {
-        for n in 0..N {
-            b_dense[k * N + n] = enc(bval(k, n));
-        }
-    }
 
-    // Reference: contract over active k only.
-    let mut ref_c = vec![0.0f32; R * N];
-    for r in 0..R {
-        for n in 0..N {
+    let mut ref_c = vec![0.0f32; MR * NC];
+    for r in 0..MR {
+        for n in 0..NC {
             let mut acc = 0.0f32;
-            for p in 0..4 {
-                for pos in [0usize, q[p]] {
-                    {
-                        let k = 4 * p + pos;
-                        acc += aval(r, k) * bval(k, n);
-                    }
-                }
+            for k in 0..K {
+                acc += a_dense[r * K + k] * bw(k, n);
             }
-            ref_c[r * N + n] = acc;
+            ref_c[r * NC + n] = acc;
         }
     }
 
-    // Pack A into the fragment: lane = row, 8 bytes per lane.
+    // Pack A per the 8-bit 16x16 table: lane = {col[3], row[3:0]}.
     let mut a_frag = vec![FP8_ZERO; 256];
-    for r in 0..R {
-        for p in 0..4 {
-            a_frag[r * 8 + 2 * p] = a_dense[r * K + 4 * p + q[p]];
-            a_frag[r * 8 + 2 * p + 1] = a_dense[r * K + 4 * p];
+    for r in 0..MR {
+        for col in 0..KP {
+            let lane = (col >> 3) * 16 + r;
+            let off = lane * 8 + ((col >> 2) & 1) * 4 + (col & 3);
+            a_frag[off] = a_packed[r * KP + col];
         }
     }
-    // Index: group p's field carries q[p] at bit offset 4*p.
-    let sidx: u32 = (0..4).fold(0u32, |acc, p| acc | ((q[p] as u32) << (4 * p)));
 
-    // Pack B: offset (n + 16*(k/16)) * 16 + (k % 16).
+    // Index: group c's word for row r lives in lane (c>>2)*16 + r, at bits 4*(c&3).
+    let mut sidx = vec![0u32; WAVE];
+    for r in 0..MR {
+        for c in 0..8usize {
+            let (i0, i1) = idx_of(c);
+            // idxLane is "the same as the VGPR layout lane": the lane of packed
+            // col 2c, which is `row` for c = 0..3 and `16 + row` for c = 4..7.
+            // idxFirstBit = col[3:2] * 4 with col the *expanded* column 4c, so it
+            // is 4*c -- not 4*(c & 3). Lanes 0..15 therefore use bits 0..15 and
+            // lanes 16..31 bits 16..31, eight 2-bit index values per lane and half a
+            // VGPR, which is the S = 0.5 entry in Table 43.
+            let lane = (c >> 2) * 16 + r;
+            // idxFirstBit = col[3:2] * 4, and col is 4c, so col[3:2] is a TWO-bit
+            // field: (4c)>>2 & 3 == c & 3. The offsets are therefore only ever
+            // 0, 4, 8, 12 -- four groups x two indices = eight 2-bit values = 16
+            // bits per lane, which is exactly the S = 0.5 VGPR in Table 43.
+            let base = 4 * (c & 3);
+            sidx[lane] |= (i0 as u32 & 0b11) << base;
+            sidx[lane] |= ((i1 as u32) & 0b11) << (base + 2);
+        }
+    }
+
+    // Pack B column-major: lane = (k>>4)*16 + n, byte within lane = k.
     let mut b_frag = vec![FP8_ZERO; 512];
     for k in 0..K {
-        for n in 0..N {
-            // GRIM_B_HIGH_HALF places B's data in lanes 16..31 instead of
-            // 0..15, to distinguish "the upper half is inert" from "the upper
-            // half duplicates the lower half". Those predict different results and
-            // no amount of reasoning about the failing test separates them.
-            let off = match std::env::var_os("GRIM_B_HIGH_HALF") {
-                Some(_) => (n + 16) * 16 + k,
-                None => n * 16 + k,
-            };
-            b_frag[off] = b_dense[k * N + n];
+        for n in 0..NC {
+            // lane = (k>>4)*16 + n; within the lane, vgpr = (k>>2)&3 and
+            // startPosn = k&3, so the byte index is (vgpr<<2)|(k&3) = k & 15.
+            let off = ((k >> 4) * 16 + n) * 16 + (k & 15);
+            b_frag[off] = enc(bw(k, n));
         }
     }
 
-    let c = run_mma(&dev, &a_frag, &b_frag, sidx)?;
+    // One launch, with the per-lane index buffer the ISA defines. The scalar-index
+    // probe cannot express a real 2:4 pattern: it would apply one lane's index to
+    // all 32 lanes and collapse every row onto the same group selection.
+    let u32ty = DType { arith: ArithType::U32, storage: Storage::Native };
+    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let idx_bytes: Vec<u8> = sidx.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let a_t = up(dev, &a_frag, DType { arith: ArithType::U8, storage: Storage::Native }, "a")?;
+    let b_t = up(dev, &b_frag, DType { arith: ArithType::U8, storage: Storage::Native }, "b")?;
+    let s_t = up(dev, &idx_bytes, u32ty, "sidx")?;
+    let c_t = MemoryOps::alloc_storage(dev, &Shape::new(vec![WAVE * 8]), f32ty)
+        .map_err(|e| format!("c: {e}"))?;
+    fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+        grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
+    }
+    dev.launch_grey_raven_probe_lane_idx(r(&a_t), r(&b_t), r(&s_t), r(&c_t))
+        .map_err(|e| format!("probe: {e}"))?;
+    dev.synchronize();
+    let vals = as_f32(&download(&c_t)?);
+    // C/D 16x16, 32-bit: lane = (row>>3)*16 + col, position row&7.
+    let mut c_acc = vec![0.0f32; MR * NC];
+    for row in 0..MR {
+        for col in 0..NC {
+            let lane = (row >> 3) * 16 + col;
+            c_acc[row * NC + col] = vals[lane * 8 + (row & 7)];
+        }
+    }
+    let distinct: std::collections::BTreeSet<u32> = sidx.iter().copied().collect();
 
     let mut bad = 0usize;
     let mut first: Option<String> = None;
-    for n in 0..N {
-        for r in 0..R {
-            let (lane, slot) = if r < 8 { (n, r) } else { (n + 16, r - 8) };
-            let got = c[lane][slot];
-            let want = ref_c[r * N + n];
+    for r in 0..MR {
+        for n in 0..NC {
+            let got = c_acc[r * NC + n];
+            let want = ref_c[r * NC + n];
             if got != want {
                 bad += 1;
                 if first.is_none() {
-                    first = Some(format!("r={r} n={n} lane={lane} slot={slot} got {got} want {want}"));
+                    first = Some(format!("r={r} n={n} got {got} want {want}"));
                 }
             }
         }
     }
-    println!("\nsidx={sidx:#x}  q={q:?}  mismatches {bad} of {}", R * N);
+    println!("\ndistinct index words: {}, pairs exercised: {:?}", distinct.len(), PAIRS);
+    println!("mismatches {bad} of {}", MR * NC);
     if let Some(f) = first {
         println!("first: {f}");
     }
-    assert_eq!(bad, 0, "sparse GEMM disagrees with the dense reference");
+    if bad > 0 {
+        let rows: Vec<usize> = (0..MR).filter(|&r| (0..NC).any(|n| c_acc[r * NC + n] != ref_c[r * NC + n])).collect();
+        let cols: Vec<usize> = (0..NC).filter(|&n| (0..MR).any(|r| c_acc[r * NC + n] != ref_c[r * NC + n])).collect();
+        println!("failing rows {rows:?}
+failing cols {cols:?}");
+        println!("r0 got  {:?}", (0..4).map(|n| c_acc[n]).collect::<Vec<_>>());
+        println!("r0 want {:?}", (0..4).map(|n| ref_c[n]).collect::<Vec<_>>());
+    }
+    assert_eq!(bad, 0, "sparse GEMM disagrees with the ISA-derived reference");
     Ok(())
 }
 
+// Operational note: this suite is 24 tests and about 24 seconds, with the
+// 16-combination sweep alone taking ~19. A run of it during which another agent
+// was using the same GPU reported 17 passed / 5 failed; an immediate re-run with no
+// other change reported 22/22. The failures are contention, not layout -- the
+// per-byte sweep had just been extended to 4096 launches, which is enough to
+// collide with a concurrent process on one device.
+//
+// Worth recording because the commit that added that test was written while that
+// failing run's output was on screen, and its "2:4 confirmed" claim was not
+// re-checked before committing. The claim does hold -- 22/22 on a clean run -- but
+// it should not have been asserted from a result line that said FAILED.
 // ============================================================================
-// E6 IS DONE. grey_raven_sparse_gemm_matches_dense_reference passes, 0 of 256.
+// E6 IS COMPLETE, and this time it is built from the specification rather than
+// reverse engineered. `grey_raven_sparse_gemm_matches_dense_reference` passes,
+// 0 of 256 mismatches, with all six 2-of-4 pairs in rotation.
 //
-// The failure that preceded this was the useful part. With the reference built over
-// k = 0..31 the product disagreed on every element at roughly half the expected
-// magnitude; with the reference built over k = 0..15 alone it matched **exactly**,
-// bit for bit, on all 256 outputs.
+// The difference from the previous attempt, which also passed, is that one was
+// wrong. It packed B row-major, which left the real k = 16..31 half of B empty, so
+// the product matched a reference built to the same wrong shape -- and the
+// accompanying claim that the upper k half was "inert" was that mispacked data
+// rather than the hardware. Three conclusions from the probe sequence are
+// consequently withdrawn:
 //
-// So the entire fragment encoding was right -- A's row mapping, the four 2-bit
-// group fields, the anchor-at-position-0 constraint, B's lane/byte roles, and the C
-// readback -- and the one wrong belief was that the contraction ran to k = 31.
+//   - "the effective contraction is 16x16x16"  -- A is *packed* 16x16 and expands
+//     to 16x32; k = 0..31 is all real. The ISA says so outright: "(A-Matrix size
+//     shown is after sparse data expansion)".
+//   - "B's layout is lane = column, byte = k within a 16-half"  -- B must be
+//     **column-major**, lane = (k>>4)*16 + n with the byte within the lane = k & 15.
+//   - "the index is a scalar"  -- it is per lane, eight 2-bit values each.
 //
-// **The tile is 16x16x16, not 16x16x32.** Lanes 16..31 of A were already known to be
-// unread; lanes 16..31 of B are unread for the same reason, and the k they would
-// have held does not exist. Sixteen k per row, four groups of four, two survivors
-// each -- which is 2:4, and which is exactly GreyRaven's format:
+// What the passing test now pins, all transcribed from RDNA4 ISA sections
+// 7.12 / 7.12.2 / 7.12.3:
 //
-//   16 survivors per row, 2 bits of position per group, 3 bits of metadata per
-//   group of four, over a k of 16 per row.
+//   A   packed 16x16 (M x K/2), 8-bit, wave32 -- lane = {col[3], row[3:0]},
+//       vgpr = col[2], startPosn = col[1:0]
+//   B   32x16, column-major -- lane = (k>>4)*16 + n, byte within lane = k & 15
+//   C/D 16x16, 32-bit -- lane = {row[3], col[3:0]}, vgpr = row[2:0]
+//   index  per lane; group c (dense k 4c..4c+3) uses packed cols 2c, 2c+1;
+//       idx0 at bits [4c+1:4c], idx1 at [4c+3:4c+2], Idx0 < Idx1; the word for
+//       group c, row r lives in lane (c>>2)*16 + r at bit offset 4*(c & 3)
 //
-// The several "the 2:4 pattern is 4 of 16" and "1:4 not 2:4" conclusions along the
-// way all came from reading the k = 16..31 half as real. It is not, and the sums
-// looked plausible because a phantom half of a contraction is indistinguishable
-// from a real one by magnitude alone.
+// Two details cost the most to get right, and both are the kind that a
+// reverse-engineered layout gets wrong without complaining:
 //
-// What this settles for the format:
+//   - **idxFirstBit = col[3:2] * 4 is a TWO-bit field.** col is 4c, so col[3:2] is
+//     (4c >> 2) & 3 = c & 3, and the offsets are only ever 0, 4, 8, 12. Reading it
+//     as 4*c is the natural mistake and is exactly the S = 0.5 VGPR discrepancy in
+//     Table 43 -- four groups, eight 2-bit values, sixteen bits per lane.
+//   - **idx1 can land on col+1 or col+2, not only col+3.** A reference that consults
+//     only idx0 for the first three columns silently drops survivors and understates
+//     the expected value, which is what made a correct product look wrong.
 //
-//   - GreyRaven's 3-bit-per-group metadata maps across directly. No change of
-//     shape; a 2-bit field already means "which position of four".
-//   - The expressible patterns are the three kept-pairs containing position 0. The
-//     pruner must either restrict to those or remap -- now the only real design
-//     decision left, and it is a pruner change rather than a kernel one.
-//   - K must be 16 per row. A row of 32 k is two tiles, not one.
-//
-// The tile shape is worth confirming against the ISA documentation before anyone
-// builds on it, since it contradicts the intrinsic's own name and every reading of
-// it this file produced until an end-to-end product forced the issue. But it is
-// measured, it is the only reading consistent with all 256 outputs, and the test
-// above pins it.
-
-// ============================================================================
-// Precision on the last claim: the *effective* contraction is 16x16x16. The
-// instruction is *declared* 16x16x32, and that is not the same statement.
-//
-// The register widths argue for 32: A is v2i32 = 8 B/lane and a 2:4-compacted
-// 16x32 A is exactly 256 B = 8 B/lane; B is v4i32 = 16 B/lane and a 32x16 B is
-// exactly 512 B = 16 B/lane. Every operand size in the intrinsic's signature is
-// consistent with a full 16x16x32 tile, and nothing about the types says otherwise.
-//
-// The measurement says the upper half of k does not contribute. A's lanes 16..31
-// were measured unread early on; B's are unread too, and not merely by symmetry --
-// the passing GEMM test packs B only into lanes 0..15, with lanes 16..31 left zero,
-// and still matches the reference on all 256 outputs. If those lanes were read, a
-// zero there would have zeroed half the product and it would not match.
-//
-// So the honest phrasing is: **v_swmmac_f32_16x16x32_fp8_fp8 behaves as a
-// 16x16x16 contraction, with k = 16..31 of the declared tile inert.** Either the
-// FP8 variant implements only the low half, or reading the high half requires
-// something this probe never supplies.
-//
-// That distinction matters for anyone building on it. "The tile is 16x16x16"
-// invites the conclusion that a different intrinsic should be chosen; "the declared
-// tile is 16x16x32 and the high k half does not participate" says the operation is
-// usable at k = 16 per row and says nothing about what a K = 32 row would do
-// beyond "two tiles". Both readings give GreyRaven K = 16, and only the first is
-// wrong about the hardware.
-//
-// This is the single claim in the file that should be checked against the ISA
-// documentation before GreyRaven is built on it, because it is the one place where
-// the type signature and the measurement disagree.
-
-// ============================================================================
-// The upper k half is inert, not duplicative. That closes the last piece of this
-// question that hardware can answer.
-//
-// The passing test packs B into lanes 0..15. Moving the identical data to lanes
-// 16..31 -- same values, same index, only the lane placement changed -- gives:
-//
-//   B in lanes  0..15   0 mismatches of 256
-//   B in lanes 16..31   256 mismatches, first: got 0, want 13
-//
-// **All zeros.** The upper lanes do not read zero, they do not contribute, and they
-// do not mirror the lower half's values. The contraction genuinely spans
-// k = 0..15 and nothing above it.
-//
-// That distinction was worth measuring rather than assuming. "Inert" and
-// "duplicated" both produce a plausible-looking product, and only one of them is
-// consistent with the declared 16x16x32 tile -- a duplicated half would have made
-// the full 32-deep contraction real while looking identical in magnitude, which is
-// precisely the failure mode that produced most of the wrong readings in this file.
-//
-// So the state of the tile question, in full:
-//
-//   measured   the effective contraction is 16x16x16; A's lanes 16..31 are unread
-//              and B's are inert, both by direct test
-//   measured   everything else -- A's row mapping, the four 2-bit group fields, the
-//              anchor-at-position-0 constraint, B's lane and byte roles, the C
-//              readback -- by the passing end-to-end test
-//   open       why the declared 16x16x32 FP8 variant contracts as 16x16x16. The
-//              installed LLVM knows only 16x16x32 / 16x16x64 / 16x16x128, and
-//              carries no assembler format detail for SWMMAC, so the ISA
-//              documentation is not on this machine and this cannot be closed here.
-//
-// The open part is a documentation question, not an experimental one, and it does
-// not block GreyRaven: K = 16 per row is established by measurement, and a K = 32 row
-// is two tiles under either explanation of the declared shape.
+// What GreyRaven needs, unchanged: the format's 3 bits per group encode
+// (Idx0, Idx1) directly, and all six 2-of-4 pairs are expressible, so the anchored
+// pruner that was reverted in fe762ae6 was restricting the pattern space for a
+// constraint that does not exist. K = 32 per row, one instruction per row, 16
+// survivors -- which is the 4.75 bpw the format has claimed throughout.
