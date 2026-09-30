@@ -805,3 +805,48 @@ fn grey_raven_sparse_index_selects_k() -> TestResult {
 // the current operand set -- which is itself the finding worth escalating, since
 // it means E6's remaining work is not a search but a change to what the kernel
 // is given.
+
+// ============================================================================
+// What the index actually is: a placement map, not a selector.
+//
+// Following the index sweep to its source settled it. Emitting the intrinsic
+// standalone shows the real instruction:
+//
+//   v_swmmac_f32_16x16x32_fp8_fp8 v[5:12], v[13:14], v[0:3], v4
+//                                        ^A 2 VGPR ^B 4 VGPR ^index 1 VGPR
+//
+// so the assembly operand order is (D, A, B, index), A and B match the intrinsic
+// widths exactly, and the index is a **per-lane VGPR** -- not a uniform scalar.
+// (It looked uniform only because this probe hands every lane the same value.)
+//
+// Then, from the intrinsic table: the full set of FP8 SWMMAC variants is
+// 16x16x32 {fp8_fp8, fp8_bf8, bf8_fp8} and 16x16x128 {fp8_fp8, fp8_bf8,
+// bf8_fp8, f16_*} -- and there is **no separate sparse variant among them**.
+// Every one takes "Sparsity index for A". So 2:4 sparsity is intrinsic to
+// `v_swmmac_*_fp8_*`, and the index is the per-lane descriptor of it.
+//
+// The index is therefore a **placement map, not a mask**: it says where each of
+// A's 8 compacted bytes goes in k, not which of them are dropped. All 8 are
+// always read. That single change explains every anomaly in this file at once,
+// including the two earlier probes that looked like bugs:
+//
+//   - no index bit gates any A byte -- correct, none of them is a drop bit;
+//   - all 8 bytes of an A lane give identical results under uniform B -- correct,
+//     they are 8 different k of the same row, and C[r][n] sums the whole row;
+//   - index bits 0,1 move which output lanes are written -- correct, that is
+//     placement changing where a row's results land.
+//
+// Nothing here is exotic. It is a compacted A plus a per-lane expansion map,
+// which is exactly the 2:4 format GreyRaven already produces.
+//
+// This also corrects the previous note's speculation that the 2:4 pattern might
+// be implicit and never need to reach the hardware. It does need to: the 3-bit
+// metadata GreyRaven packs is what tells the hardware the k-position of each
+// survivor, and E6 has to reverse that map to emit it.
+//
+// What remains is one joint problem rather than two: the index's bit -> k map and
+// B's byte -> (k, n) layout cannot be solved separately, because A's k mapping is
+// only visible through a B whose layout is unknown, and vice versa. They are
+// solvable jointly -- A uniform and B one-hot already constrain both, since the
+// live B bytes are precisely those whose k the index places -- and that joint fit
+// is the remaining work for E6.
