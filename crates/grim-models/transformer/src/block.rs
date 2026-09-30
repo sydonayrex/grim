@@ -468,6 +468,7 @@ impl LlamaBlock {
             cfg.hidden_size,
             spec.norm_kind,
             cfg.rms_norm_eps,
+            spec.has_norm_bias,
         )?;
         // Optional per-head QK-norm (Qwen3/Mellum2 `attn_q_norm` /
         // `attn_k_norm`, [head_dim]). Absent in classic Llama checkpoints.
@@ -521,6 +522,7 @@ impl LlamaBlock {
             cfg.hidden_size,
             spec.norm_kind,
             cfg.rms_norm_eps,
+            spec.has_norm_bias,
         )?;
 
         // `attn_post_norm` is RMS in every reference that has it, regardless of
@@ -531,6 +533,7 @@ impl LlamaBlock {
                 cfg.hidden_size,
                 NormKind::Rms,
                 cfg.rms_norm_eps,
+                /*has_bias=*/ false,
             )?)
         } else {
             None

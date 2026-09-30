@@ -1426,14 +1426,32 @@ impl Norm {
         }
     }
 
-    /// Load from a `WeightSource`. A missing weight or bias stays `None` and
-    /// is skipped, exactly as `build_norm` skips a null pointer
-    /// (`llama-graph.cpp:1613-1622`).
-    pub fn load(ws: &WeightSource<'_>, dim: usize, kind: NormKind, eps: f32) -> Result<Self> {
+    /// Load from a `WeightSource`.
+    ///
+    /// `has_bias` is the spec's decision, not a guess: ten models ship
+    /// `attn_norm_b` / `ffn_norm_b` and `olmo` ships neither. Taking whatever
+    /// `bias` happens to be present would apply a normalisation the model does
+    /// not use, and a *declared* bias that is missing is an error, as it is for
+    /// `Linear::load`.
+    ///
+    /// A missing *weight* is not an error: a null weight is legal in the
+    /// reference, and `olmo.cpp:65-67` passes `NULL, NULL`.
+    pub fn load(
+        ws: &WeightSource<'_>,
+        dim: usize,
+        kind: NormKind,
+        eps: f32,
+        has_bias: bool,
+    ) -> Result<Self> {
+        let bias = if has_bias {
+            Some(ws.get([dim], "bias")?)
+        } else {
+            None
+        };
         Ok(Self {
             kind,
             weight: ws.get([dim], "weight").ok(),
-            bias: ws.get([dim], "bias").ok(),
+            bias,
             eps,
             ones_weight: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })

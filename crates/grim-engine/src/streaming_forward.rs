@@ -6,7 +6,7 @@ use grim_autograd::AutogradScope;
 use grim_backend_rocm::RocmDevice;
 use grim_core::error::{Error, Result};
 use grim_models_transformer::{LlamaBlock, LlamaConfig};
-use grim_nn::WeightSource;
+use grim_nn::{ColumnParallelLinear, WeightSource};
 use grim_nn::modules::{pick_device_for_storage_device, pick_device_for_tensor};
 use grim_tensor::MemoryOps;
 use grim_tensor::{DType, Device, Shape, Tensor, TensorProvider};
@@ -27,25 +27,42 @@ pub struct GradientCheckpointBuffer {
     checkpoints: HashMap<usize, LayerActivationCheckpoint>,
 }
 
-fn prefetch_block_weights(block: &LlamaBlock) -> Result<()> {
-    let mut tensors: Vec<&Tensor> = vec![
-        &block.attn_norm.weight,
+/// Every weight a block must warm before its forward, in one list.
+///
+/// A norm's weight is optional -- `olmo.cpp:65-67` passes `NULL, NULL` -- so
+/// norms are collected only when they have one. The projections below are
+/// unconditionally present, so they are collected without a check. Extracted
+/// from `prefetch_block_weights` so the selection is testable: when this was
+/// inlined, dropping the norms from it compiled and passed every test.
+fn block_weights_to_prefetch(block: &LlamaBlock) -> Vec<&Tensor> {
+    let mut t = vec![
         block.wq.weight(),
         block.wk.weight(),
         block.wv.weight(),
         block.wo.weight(),
-        &block.ffn_norm.weight,
     ];
-    if let Some(ref wg) = block.w_gate {
-        tensors.push(wg.weight());
+    t.extend(
+        [&block.attn_norm, &block.ffn_norm]
+            .into_iter()
+            .chain(block.attn_post_norm.iter())
+            .filter_map(|n| n.weight.as_ref()),
+    );
+    // `w_down` is a `RowParallelLinear`, so it cannot share an array with the
+    // two `ColumnParallelLinear`s.
+    t.extend(
+        [block.w_gate.as_ref(), block.w_up.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(ColumnParallelLinear::weight),
+    );
+    if let Some(wd) = &block.w_down {
+        t.push(wd.weight());
     }
-    if let Some(ref wu) = block.w_up {
-        tensors.push(wu.weight());
-    }
-    if let Some(ref wd) = block.w_down {
-        tensors.push(wd.weight());
-    }
-    for tensor in tensors {
+    t
+}
+
+fn prefetch_block_weights(block: &LlamaBlock) -> Result<()> {
+    for tensor in block_weights_to_prefetch(block) {
         tensor
             .storage()
             .prefetch_to_device()
@@ -1037,6 +1054,68 @@ mod tests {
             Some(1),
             "untrained MLP must fall back to the WaveTune latency estimate \
              (argmin) and land on the 80-TFLOPS card, not sticky rank 0"
+        );
+    }
+
+    /// The prefetch list must include every norm that HAS a weight, and must
+    /// not be fooled by one that does not.
+    ///
+    /// This exists because the selection used to be inlined in
+    /// `prefetch_block_weights`, where dropping the norms compiled cleanly and
+    /// passed every test in this file. A count pins it: 4 projections + 2 norms
+    /// (+1 post-norm when present) + 3 ffn projections.
+    #[test]
+    fn prefetch_list_covers_every_present_norm_and_projection() {
+        let cfg = StubProvider::new().cfg;
+        let provider = StubProvider::new();
+        let ws = WeightSource::root(&provider, Device::Cpu);
+        let block = LlamaBlock::load(&ws, &cfg).expect("block loads");
+        let n = block_weights_to_prefetch(&block).len();
+        assert_eq!(
+            n,
+            4 + 2 + 3,
+            "expected 4 attention projections + 2 norms + 3 ffn projections, got {n}"
+        );
+    }
+
+    /// A norm with no weight -- `olmo.cpp:65-67` passes `NULL, NULL` -- must
+    /// be skipped rather than panic or emit a null pointer.
+    #[test]
+    fn prefetch_list_skips_a_weightless_norm() {
+        let mut block = LlamaBlock::load(
+            &WeightSource::root(&StubProvider::new(), Device::Cpu),
+            &StubProvider::new().cfg,
+        )
+        .expect("block loads");
+        let with = block_weights_to_prefetch(&block).len();
+        block.attn_norm.weight = None;
+        assert_eq!(
+            block_weights_to_prefetch(&block).len(),
+            with - 1,
+            "a weightless norm must drop out of the list, not be counted or panic"
+        );
+    }
+
+    /// `attn_post_norm` is optional independently of the other two.
+    #[test]
+    fn prefetch_list_follows_attn_post_norm_presence() {
+        let cfg = StubProvider::new().cfg;
+        let mut block =
+            LlamaBlock::load(&WeightSource::root(&StubProvider::new(), Device::Cpu), &cfg)
+                .expect("block loads");
+        // The stub provider serves no attn_post_norm, so it is already absent.
+        assert!(block.attn_post_norm.is_none());
+        let base = block_weights_to_prefetch(&block).len();
+        let mut n = grim_nn::Norm::new(grim_nn::NormKind::Rms, 1e-5);
+        n.weight = Some(cpu_tensor(
+            vec![1.0f32; cfg.hidden_size],
+            Shape::new(vec![cfg.hidden_size]),
+        ));
+        block.attn_post_norm = Some(n);
+        assert_eq!(
+            block_weights_to_prefetch(&block).len(),
+            base + 1,
+            "adding attn_post_norm must add exactly one entry"
         );
     }
 }
