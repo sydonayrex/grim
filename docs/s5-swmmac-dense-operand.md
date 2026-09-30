@@ -117,7 +117,65 @@ actually verified:
    `-S -emit-llvm`). The 2× MAC-rate claim is still a vendor table entry until
    E7 measures it; that part of this investigation is unchanged.
 
-   **One asymmetry is not yet explained and E6 must settle it on hardware:** `d`
+   **RESOLVED, and it inverts a design assumption.** The asymmetry above is not an
+oddity once the intrinsic's own definition is read. ROCm LLVM ships the
+tablegen class in `llvm/IR/IntrinsicsAMDGPU.td`:
+
+```
+def int_amdgcn_swmmac_f32_16x16x32_fp8_fp8
+  : AMDGPUSWmmacIntrinsicIdx<llvm_anyint_ty, llvm_anyint_ty,
+                             llvm_anyfloat_ty, llvm_anyint_ty>;
+
+class AMDGPUSWmmacIntrinsicIdx<LLVMType A, LLVMType B, LLVMType CD, LLVMType Index>
+  : Intrinsic<[CD], [ A /*%A*/, B /*%B*/,
+                      LLVMMatchType<0> /*%C*/, Index /*Sparsity index for A*/ ], ...>;
+```
+
+Aligning the IR operand list with the measured clang signature gives a
+self-consistent reading, and the byte sizes cross-check it:
+
+| param | type  | bytes/lane | total  | meaning                                       |
+|-------|-------|-----------|--------|-----------------------------------------------|
+| arg0  | v2i32 | 8         | 256 B  | **A** — 16x32 FP8, *sparse* (512 B, half stored) |
+| arg1  | v4i32 | 16        | 512 B  | **B** — 32x16 FP8, dense                       |
+| arg2  | v8f32 | 32        | 1024 B | **C/D** — 16x16 f32 accumulator (256/32 = 8)   |
+| arg3  | u32   | —         | —      | **sparsity index for A**                       |
+
+A 16x32 FP8 operand is 512 B; stored 2:4-sparse that is 256 B = v2i. B at
+32x16 is 512 B = v4i. A 16x16 f32 tile is 1024 B = v8f, which is why the
+*return* is 8 floats per lane and arg0 is not the accumulator at all.
+
+**The consequence: this intrinsic takes its sparse operand on A, and the
+sparsity index is explicitly "for A".** GreyRaven is specified the other way
+round — sparse *weights*, dense *activations* — and the plan says so itself
+(`activations are dynamic and cannot be 2:4-pruned`). So the one available
+sparse FP8 intrinsic has its sparsity on the wrong operand for this format.
+
+This inverts the earlier conclusion in this document, which reasoned that
+sparse-B/dense-A was legal via zero-fill into an expanded A. That reasoning
+assumed the expansion happened on the sparse side. On this intrinsic the
+sparse side is A, so zero-filling *B* would buy nothing and zero-filling *A*
+would mean pruning the activations, which the format forbids.
+
+This is inference from the intrinsic definition plus the measured signature,
+not from execution -- E6 still has to run it. But it is strong enough to
+change the plan before E6 is written rather than after, because the work E6
+would otherwise build is a kernel for the wrong sparsity placement.
+
+Two ways forward, both needing a decision rather than more investigation:
+
+  1. **Transpose the problem.** Feed the *weights* as A and *activations* as B,
+     computing C^T = B^T x A^T. That puts the sparse operand on A as the
+     hardware wants, at the cost of a transposed output layout and an
+     activation operand that is the *narrow* side of the tile.
+  2. **Abandon the sparse FP8 path** and reconsider GreyRaven as a
+     weight-pruned format that reconstructs dense B and uses dense WMMA -- which
+     is at 8 bpw for FP8, worse than MXFP4's 4.25, and would need the
+     activation side to carry the density instead. On the evidence so far this
+     is the weaker option, and E9's matched-tolerance comparison is what should
+     decide it.
+
+**One asymmetry is not yet explained and E6 must settle it on hardware:** `d`
    is a 2×i32 input but the result is 8×f32. A 16×16 f32 accumulator over a
    32-lane wave is 8 floats per lane, so the *result* width is the expected one
    and the *`d`* width is not. Either `d` is not the accumulator seed, or the
