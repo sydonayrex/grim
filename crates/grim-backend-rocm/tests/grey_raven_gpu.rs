@@ -383,3 +383,198 @@ fn grey_raven_sparse_index_slot_selection() -> TestResult {
 // should keep driving: the honest next step is to enumerate the B layout space
 // exhaustively against the identity probe, the same way the A side was ruled
 // out, rather than continuing to guess one arrangement per run.
+
+/// One-hot sweep over B: exactly one B byte is 1.0, everything else is 0.
+///
+/// This measures B's byte -> (k,n) assignment instead of testing a hypothesis
+/// about it. The identity probe could only say "wrong": a mis-strided B yields
+/// finite plausible numbers, so every candidate arrangement had to be guessed
+/// and checked one at a time. A single hot byte removes the ambiguity -- there
+/// is only one possible contributor to C, so the C elements that light up are
+/// exactly the rows whose 2:4 slot set contains that byte's k, addressed at the
+/// column that byte's n maps to.
+///
+/// The two coordinates separate, which is what makes this decodable:
+///
+///   - the **slot** within a lane depends only on the byte's column n, and
+///   - the **lane set** depends on the byte's row k (which rows kept that k).
+///
+/// So grouping all 512 offsets by their (lane, slot) signature recovers the
+/// column mapping directly and the row mapping up to the per-row 2:4 pattern.
+#[test]
+fn grey_raven_b_byte_onehot_sweep() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    let a = vec![FP8_ONE; 256];
+    let mut b = vec![FP8_ZERO; 512];
+    let mut groups: std::collections::BTreeMap<Vec<(usize, usize)>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut values_seen: std::collections::BTreeSet<String> = Default::default();
+
+    for g in 0..512usize {
+        b[g] = FP8_ONE;
+        let c = run_mma(&dev, &a, &b, 0)?;
+        b[g] = FP8_ZERO;
+
+        let mut sig: Vec<(usize, usize)> = Vec::new();
+        for (l, lane) in c.iter().enumerate() {
+            for (s, &v) in lane.iter().enumerate() {
+                if v != 0.0 {
+                    values_seen.insert(format!("{v}"));
+                    sig.push((l, s));
+                }
+            }
+        }
+        groups.entry(sig).or_default().push(g);
+    }
+
+    println!("\n=== B one-hot sweep: 512 offsets -> {} distinct C signatures ===", groups.len());
+    println!("nonzero values seen across the whole sweep: {:?}", values_seen);
+
+    for (sig, offs) in &groups {
+        let lanes: Vec<usize> = sig.iter().map(|(l, _)| *l).collect();
+        let slots: Vec<usize> = sig.iter().map(|(_, s)| *s).collect();
+        // Reduce offsets to their byte-position within a lane, to expose whether
+        // the signature is a function of position or of the whole offset.
+        let in_lane: Vec<usize> = offs.iter().map(|o| o % 16).collect();
+        let uniq_in_lane: Vec<usize> = {
+            let mut v = in_lane.clone();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        println!("\n  signature: {} elems  lanes={lanes:?}  slots={slots:?}", sig.len());
+        println!("    {} offsets, e.g. {offs:?}", offs.len());
+        println!("    distinct byte-in-lane: {uniq_in_lane:?}");
+        let distinct_lanes = {
+            let mut v = lanes.clone();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let distinct_slots = {
+            let mut v = slots.clone();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        println!("    distinct lanes: {distinct_lanes:?}   distinct slots: {distinct_slots:?}");
+    }
+    Ok(())
+}
+
+/// One-hot sweep over A, symmetric to the B sweep, to read off A's byte -> (row, k)
+/// mapping and its read granularity.
+///
+/// The B sweep showed only bytes at offset = 0 (mod 4) are live, and that each
+/// live byte contributes exactly 2.0. Both facts are about how many bytes the
+/// hardware actually consumes per 32-bit group, so the same two questions are
+/// worth asking of A. With B set to the 32x16 identity, a single hot A byte at
+/// (r, k) must light up C[r][n] for the columns n where B[k][n] = 1, i.e. n = k,
+/// which pins the A byte to a single output row.
+#[test]
+fn grey_raven_a_byte_onehot_sweep() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    let b = identity_32x16();
+    let mut a = vec![FP8_ZERO; 256];
+    let mut groups: std::collections::BTreeMap<Vec<(usize, usize)>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut values: std::collections::BTreeSet<String> = Default::default();
+
+    for g in 0..256usize {
+        a[g] = FP8_ONE;
+        let c = run_mma(&dev, &a, &b, 0)?;
+        a[g] = FP8_ZERO;
+        let mut sig: Vec<(usize, usize)> = Vec::new();
+        for (l, lane) in c.iter().enumerate() {
+            for (s, &v) in lane.iter().enumerate() {
+                if v != 0.0 {
+                    values.insert(format!("{v}"));
+                    sig.push((l, s));
+                }
+            }
+        }
+        groups.entry(sig).or_default().push(g);
+    }
+
+    println!("\n=== A one-hot sweep: 256 offsets -> {} distinct C signatures ===", groups.len());
+    println!("nonzero values seen: {values:?}");
+    for (sig, offs) in &groups {
+        let lanes: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(l, _)| *l).collect(); v.sort_unstable(); v.dedup(); v };
+        let slots: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(_, s)| *s).collect(); v.sort_unstable(); v.dedup(); v };
+        let in_lane: Vec<usize> = { let mut v: Vec<usize> = offs.iter().map(|o| o % 8).collect(); v.sort_unstable(); v.dedup(); v };
+        println!(
+            "  {:>6} elems  lanes={lanes:?} slots={slots:?}  byte-in-lane={in_lane:?}  \
+             {} offs e.g. {offs:?}", sig.len(),
+            offs.len()
+        );
+    }
+    Ok(())
+}
+
+/// B[k][n] = 1 iff k == n, for a 32x16 tile, row-major (16 bytes per lane).
+fn identity_32x16() -> Vec<u8> {
+    let mut v = vec![FP8_ZERO; 512];
+    for k in 0..32usize {
+        for n in 0..16usize {
+            if k == n {
+                v[k * 16 + n] = FP8_ONE;
+            }
+        }
+    }
+    v
+}
+
+// ============================================================================
+// What the one-hot sweeps established, and what they refute.
+//
+// The sweeps above supersede two earlier readings of this file, both of which
+// were wrong and are withdrawn here rather than left to mislead the next
+// reader.
+//
+//   Withdrawn: "A is consumed as 8 B/lane = 256 B, a 2:4-compacted operand."
+//   Withdrawn: "B's byte -> (k,n) mapping is the only thing left to find."
+//
+// Both came from permuting dense 256/512-byte inputs, which cannot separate
+// "the hardware ignored this byte" from "this byte feeds the same element as
+// its neighbour". A one-hot sweep separates them, because a single hot byte has
+// exactly one possible contributor to C.
+//
+// Measured, A side (B = 32x16 identity):
+//
+//   - Nonzero values are exactly 1.0. Correct: one hot A element times an
+//     identity B is 1.0.
+//   - **Offsets 128..255 produce nothing at all.** Half the supplied A buffer
+//     is dead.
+//   - The live 128 bytes act in **adjacent pairs**: {0,1}, {2,3}, {4,5}, ... A hot
+//     byte at either member of a pair gives the identical result, at value 1.0,
+//     which is what pairwise summing into one value predicts.
+//
+// Measured, B side (A = 256 compacted bytes of 1.0):
+//
+//   - **Only offsets = 0 (mod 4) are live** -- 128 of 512. The other 384 bytes
+//     change nothing.
+//   - Each live byte lights 16 C elements: all 8 slots of lane j and all 8 slots
+//     of lane j+16, j in 0..16, so the 32 lanes pair as {j, j+16}.
+//   - Nonzero values are exactly 2.0, never 1.0, for any single hot byte.
+//
+// Both operands are therefore consumed at **four values per lane**, not the 8
+// and 16 supplied, and 4 x 32 = 128 elements is neither the 256 of a 2:4-
+// compacted 16x32 A nor the 512 of a 32x16 B. The 2.0 on the B side is the
+// same fact seen from the other side: a hot B value is being accumulated twice.
+//
+// The most likely explanation is not a lane permutation at all, but that the
+// intrinsic's operand roles or tile shape are not what this file assumes. The
+// note in docs/s5-swmmac-dense-operand.md records a hand-written prototype
+// signature; the leading underscore and the role assignment there have never
+// been checked against the installed AMD headers, and the measurements now
+// contradict them.
+//
+// So the next step is *not* another search over fragment layouts. It is to read
+// the real declaration of this intrinsic out of the ROCm headers, confirm the
+// operand order and the tile shape, and re-derive what the sweeps say against
+// that. A layout search under a mis-stated signature cannot converge, and these
+// sweeps show the signature is the thing in doubt.
