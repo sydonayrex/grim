@@ -310,7 +310,25 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                // Q6_K's dot4 GEMV is not bit-exact at production shapes: the
+                // Xing4.0-29B lm_head oracle (real output.weight, k=3584)
+                // measures rel 3.2e-3 / max_abs 1.5 at m=1, while the WMMA /
+                // fused-dequant path agrees with the host dequant at 3.9e-7.
+                // The k=256 arch probes use synthetic fixtures and cannot see
+                // this (the skew grows with k), so Q6_K skips the dot4 leg
+                // here. Same treatment as the IQ3_S fused WMMA GEMM.
+                //
+                // Env-toggleable, because "the oracle got better" is not the
+                // same claim as "the model got better". GRIM_Q6K_DOT4=1
+                // restores the leg so both can be A/B'd in ONE binary. That
+                // A/B is what decides whether this is a production fix: step 0
+                // of the Xing4.0 run is a PREFILL at m=46, which never took
+                // this leg (it is gated on m == 1), so only decode steps can
+                // move — and an unchanged decode step means the head was
+                // never the remaining defect.
+                let q6k_dot4_ok =
+                    matches!(std::env::var("GRIM_Q6K_DOT4").as_deref(), Ok("1" | "true" | "on"));
+                if q6k_dot4_ok && (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
