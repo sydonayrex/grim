@@ -2550,3 +2550,34 @@ fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
 // it this file produced until an end-to-end product forced the issue. But it is
 // measured, it is the only reading consistent with all 256 outputs, and the test
 // above pins it.
+
+// ============================================================================
+// Precision on the last claim: the *effective* contraction is 16x16x16. The
+// instruction is *declared* 16x16x32, and that is not the same statement.
+//
+// The register widths argue for 32: A is v2i32 = 8 B/lane and a 2:4-compacted
+// 16x32 A is exactly 256 B = 8 B/lane; B is v4i32 = 16 B/lane and a 32x16 B is
+// exactly 512 B = 16 B/lane. Every operand size in the intrinsic's signature is
+// consistent with a full 16x16x32 tile, and nothing about the types says otherwise.
+//
+// The measurement says the upper half of k does not contribute. A's lanes 16..31
+// were measured unread early on; B's are unread too, and not merely by symmetry --
+// the passing GEMM test packs B only into lanes 0..15, with lanes 16..31 left zero,
+// and still matches the reference on all 256 outputs. If those lanes were read, a
+// zero there would have zeroed half the product and it would not match.
+//
+// So the honest phrasing is: **v_swmmac_f32_16x16x32_fp8_fp8 behaves as a
+// 16x16x16 contraction, with k = 16..31 of the declared tile inert.** Either the
+// FP8 variant implements only the low half, or reading the high half requires
+// something this probe never supplies.
+//
+// That distinction matters for anyone building on it. "The tile is 16x16x16"
+// invites the conclusion that a different intrinsic should be chosen; "the declared
+// tile is 16x16x32 and the high k half does not participate" says the operation is
+// usable at k = 16 per row and says nothing about what a K = 32 row would do
+// beyond "two tiles". Both readings give GreyRaven K = 16, and only the first is
+// wrong about the hardware.
+//
+// This is the single claim in the file that should be checked against the ISA
+// documentation before GreyRaven is built on it, because it is the one place where
+// the type signature and the measurement disagree.
