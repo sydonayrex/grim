@@ -1696,3 +1696,94 @@ fn grey_raven_a_byte_position_to_k() -> TestResult {
 // build `grey_raven_sparse_gemm` until it is done. Every attempt to build it
 // against the current model would be encoding an assumption that this probe has
 // just contradicted.
+
+/// Does the index activate A's bytes? -- the test the "broadcast" reading fails.
+///
+/// The previous probe concluded that an A byte feeds every k, which would mean A
+/// is not a matrix operand. But it also assumed B's lane is k, and the B-layout
+/// measurement says B's lane is the *column* (a hot byte in lane L lights output
+/// lane L, the column). Under that, "all 16 k give 1.0" is not broadcast at all --
+/// it just means A byte 0's k is active for every column. So the conclusion rested
+/// on an axis assumption, and the 2.0 is still unexplained.
+//
+// This separates them. A uniform (all 8 lane bytes = 1.0), one hot B element, and
+// the magnitude reported as the index varies. If the index activates A's bytes --
+// i.e. it is the 2:4 selector -- then the sum grows as bytes are enabled, and 2.0
+// is just "two survivors active". If A really is broadcast, the magnitude is flat
+// at 2.0 no matter what the index does.
+#[test]
+fn grey_raven_index_activates_a_bytes() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let a = vec![FP8_ONE; 256];
+    let mut b = vec![FP8_ZERO; 512];
+    b[0] = FP8_ONE;
+
+    for (name, sidx) in [
+        ("sidx = 0", 0u32),
+        ("+ selector 0", 1),
+        ("+ selectors 0,1", 3),
+        ("+ selector 4", 0x10),
+        ("+ selectors 0,1,4,5", 0x33),
+        ("0x55555555", 0x5555_5555),
+        ("0xffffffff", 0xffff_ffff),
+    ] {
+        let c = run_mma(&dev, &a, &b, sidx)?;
+        let hits: Vec<f32> = c.iter().flatten().copied().filter(|&v| v != 0.0).collect();
+        let max = hits.iter().cloned().fold(0.0f32, f32::max);
+        let distinct: Vec<String> = {
+            let mut v: Vec<String> = hits.iter().map(|x| format!("{x}")).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        println!("{name:<20} -> {} hits, max {max}, distinct {distinct:?}", hits.len());
+    }
+    Ok(())
+}
+
+// ============================================================================
+// RETRACTION of the "A is broadcast, stop here" conclusion two notes up.
+//
+// That conclusion was wrong, and it was wrong for a reason worth recording: it
+// assumed B's lane is k, while the B-layout measurement had already established
+// that B's lane is the *column*. Under the correct reading, "an A byte lights
+// every k" was not broadcast at all -- it just meant the byte's k was active at
+// every column, because k varies *within* a lane and column varies *between*
+// lanes. I varied B's lane, believing it was k, so I was actually varying
+// columns.
+//
+// The test that settles it: a uniform A, one hot B element, magnitude as the index
+// varies.
+//
+//   sidx = 0             16 hits, max 2
+//   + selector 0         16 hits, max 1
+//   + selectors 0,1      16 hits, max 1
+//   + selector 4         16 hits, max 2
+//   + selectors 0,1,4,5  16 hits, max 1
+//   0x55555555            0 hits
+//   0xffffffff            0 hits
+//
+// A broadcast A would be flat at 2.0 for every index. It is not: the magnitude
+// moves 2 -> 1 -> 0, so the index genuinely gates the contribution, and the two
+// readings are distinguishable after all.
+//
+// What the numbers mean, now that the axis is fixed:
+//
+//   - The magnitude is a **multiplicity**, not a broadcast: 2.0 means A covers the
+//     selected k twice, 1.0 once. So A's 8 bytes per lane address fewer than 8
+//     distinct k, and at sidx = 0 the two that are active both land on the same k.
+//     That finally accounts for the 2.0 without any duplicate-lane story.
+//   - The index selects which k is read out of B's byte positions, and 0x55 / 0xff
+//     select none of position 0 -- consistent with the earlier finding that the
+//     reachable B positions are 0, 1, 2 (mod 4) plus pairs for 3.
+//
+// So the "stop and reconsider the design" recommendation does not hold. There is
+// no evidence GreyRaven's 2:4 format lacks a primitive; what is still missing is
+// narrower and more mundane: A's byte -> k map, including which bytes are
+// duplicates, which is what makes a row's coverage non-uniform. That is the next
+// probe -- hold the index at a value that selects position 0, walk A's byte
+// positions 0..7, and record the magnitude of each. Bytes giving 2 are duplicates
+// of another byte; bytes giving 1 are unique; bytes giving 0 are inactive at that
+// index. Every input to it is measured, and the duplicate structure it looks for
+// is the last thing standing between the current model and a working GEMM.
