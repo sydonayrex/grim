@@ -1002,7 +1002,19 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
             }
             _ => {
                 let (gate_flat, up_flat, down_flat) =
-                    stack_expert_weights(experts, num_experts, hidden, inter)?;
+                    match stack_expert_weights(experts, num_experts, hidden, inter) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Cannot materialize the f32 expert stacks (e.g. Xing4.0-29B
+                            // needs 2.8 GiB on a 17.1 GB card). Degrade to the
+                            // per-expert reference path instead of faulting inside
+                            // the kernel.
+                            if std::env::var_os("GRIM_MOE_TRACE").is_some() {
+                                eprintln!("[moe] grouped dispatch declined: {e}");
+                            }
+                            return Ok(None);
+                        }
+                    };
                 let gate = Arc::from(rocm.from_cpu(
                     &gate_flat,
                     &Shape::new(vec![gate_flat.len()]),
@@ -1163,7 +1175,19 @@ fn charon_grouped_dispatch(
             }
             _ => {
                 let (gate_flat, up_flat, down_flat) =
-                    stack_expert_weights(experts, num_experts, hidden, inter)?;
+                    match stack_expert_weights(experts, num_experts, hidden, inter) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Cannot materialize the f32 expert stacks (e.g. Xing4.0-29B
+                            // needs 2.8 GiB on a 17.1 GB card). Degrade to the
+                            // per-expert reference path instead of faulting inside
+                            // the kernel.
+                            if std::env::var_os("GRIM_MOE_TRACE").is_some() {
+                                eprintln!("[moe] grouped dispatch declined: {e}");
+                            }
+                            return Ok(None);
+                        }
+                    };
                 let gate = Arc::from(rocm.from_cpu(
                     &gate_flat,
                     &Shape::new(vec![gate_flat.len()]),
@@ -1718,6 +1742,29 @@ fn stack_expert_weights(
     hidden: usize,
     inter: usize,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    // The f32 stacks are 3 x num_experts x inter x hidden x 4 B: 2.8 GiB for
+    // Xing4.0-29B (64 experts, 1024 x 3584) on top of a 12.9 GiB packed model.
+    // On a 17.1 GB card that overcommits and the dispatch dies in the kernel
+    // with "Page not present" instead of falling back. Refuse here so the
+    // caller takes the per-expert reference path, which is correct (slow).
+    let need = (3 * num_experts * inter * hidden * 4) as u64;
+    if let Some(ord) = experts.first().map(|e| match e.gate.weight.device() {
+        Device::Rocm(o) => Some(*o),
+        _ => None,
+    }) {
+        if let Some(o) = ord {
+            let (free, _total) = grim_backend_rocm::vram_info(o);
+            let headroom = (free as f64) * 0.85;
+            if need as f64 > headroom {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "expert f32 stacks need {:.2} GiB, only {:.2} GiB free on ordinal {o}; \
+                     falling back to the per-expert reference path",
+                    need as f64 / (1u64 << 30) as f64,
+                    free as f64 / (1u64 << 30) as f64
+                )));
+            }
+        }
+    }
     let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
     let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
     let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
