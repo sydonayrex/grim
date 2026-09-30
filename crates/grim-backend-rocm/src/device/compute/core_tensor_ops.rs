@@ -562,6 +562,15 @@ impl CoreTensorOps for RocmDevice {
             )));
         }
 
+        // A packed K-quant table must be gathered with its format's kernel.
+        // The generic row-copy below (`grim_embedding`) reads the table as
+        // f32 rows, so an IQ3_S/Q4_K table returns its raw block bytes as
+        // floats - logits full of 3.4e38 and NaN from the first token. Only
+        // Native (f32) tables belong on that path.
+        if matches!(w_s.dtype().storage, DTypeStorage::KQuant(_)) {
+            return self.embedding_packed(weight, indices, out, dim);
+        }
+
         // materialize() already dequantizes Q8_0 to F32 before returning
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
@@ -630,6 +639,7 @@ impl CoreTensorOps for RocmDevice {
         let (qk_block, qk_block_bytes, entry): (usize, usize, &str) = match scheme {
             KQuantScheme::Q4K => (256, 144, "grim_embedding_q4k"),
             KQuantScheme::IQ2S => (256, 82, "grim_embedding_iq2s_gather"),
+            KQuantScheme::IQ3S => (256, 110, "grim_embedding_iq3s_gather"),
             other => {
                 return Err(Error::Unimplemented(format!(
                     "embedding_packed: no on-device gather for {other:?}"
@@ -640,7 +650,7 @@ impl CoreTensorOps for RocmDevice {
 
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let w_s = as_rocm(weight)
-            .map_err(|_| Error::Backend("embedding_q4k: weight is not RocmStorage".into()))?;
+            .map_err(|_| Error::Backend("embedding_packed: weight is not RocmStorage".into()))?;
         if !w_s.device_ptr_is_valid() {
             return Err(Error::Backend(
                 "embedding_packed: weight lacks a valid device pointer".into(),
@@ -703,6 +713,12 @@ impl CoreTensorOps for RocmDevice {
         let mut idx_ptr = upload_device_buffer(self.ordinal, indices)?;
         let mut dim_i = dim as i32;
         let mut total_i = total as i32;
+        // The gather kernels take SIX parameters (packed, out, indices, dim,
+        // total, rows). Passing five read one slot past the argument array:
+        // the in-kernel bounds check compared against garbage, which survived
+        // by luck on Qwen's Q4_K path and segfaulted inside libamdhip on
+        // Xing4.0's IQ3_S gather.
+        let mut rows_i = rows as i32;
         let (grid, block) = linear_launch(total);
         let stream = self.launch_compute_kernel(
             entry,
@@ -714,6 +730,7 @@ impl CoreTensorOps for RocmDevice {
                 arg(&mut idx_ptr),
                 arg(&mut dim_i),
                 arg(&mut total_i),
+                arg(&mut rows_i),
             ],
         )?;
         unsafe {

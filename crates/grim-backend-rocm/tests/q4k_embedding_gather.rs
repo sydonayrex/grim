@@ -87,7 +87,7 @@ fn q4k_embedding_gather_matches_host_reference() {
             &Shape::new(vec![packed.len()]),
             DType {
                 arith: grim_tensor::ArithType::U8,
-                storage: Storage::Native,
+                storage: Storage::KQuant(grim_tensor::KQuantScheme::Q4K),
             },
         )
         .expect("upload packed Q4_K table");
@@ -95,8 +95,8 @@ fn q4k_embedding_gather_matches_host_reference() {
     // The gather under test.
     let out_shape = Shape::new(vec![indices.len(), dim]);
     let (storage, _handle) = dev
-        .embedding_q4k(packed_dev.as_ref(), &indices, &out_shape, dim)
-        .expect("embedding_q4k gather");
+        .embedding_packed(packed_dev.as_ref(), &indices, &out_shape, dim)
+        .expect("embedding_packed gather");
     let got = storage.to_cpu_vec_f32().expect("read gather output");
     assert_eq!(got.len(), indices.len() * dim);
 
@@ -142,7 +142,7 @@ fn q4k_embedding_gather_single_token_matches_batch() {
             &Shape::new(vec![packed.len()]),
             DType {
                 arith: grim_tensor::ArithType::U8,
-                storage: Storage::Native,
+                storage: Storage::KQuant(grim_tensor::KQuantScheme::Q4K),
             },
         )
         .expect("upload packed");
@@ -151,7 +151,7 @@ fn q4k_embedding_gather_single_token_matches_batch() {
 
     for tok in [0usize, 7, vocab - 1] {
         let (storage, _h) = dev
-            .embedding_q4k(
+            .embedding_packed(
                 packed_dev.as_ref(),
                 &[tok as u32],
                 &Shape::new(vec![1, dim]),
@@ -188,12 +188,12 @@ fn q4k_embedding_gather_rejects_out_of_range_token() {
             &Shape::new(vec![packed.len()]),
             DType {
                 arith: grim_tensor::ArithType::U8,
-                storage: Storage::Native,
+                storage: Storage::KQuant(grim_tensor::KQuantScheme::Q4K),
             },
         )
         .expect("upload");
 
-    let res = dev.embedding_q4k(
+    let res = dev.embedding_packed(
         packed_dev.as_ref(),
         &[vocab as u32], // one past the end
         &Shape::new(vec![1, dim]),

@@ -190,7 +190,12 @@ mod tests {
         let exp: u32 = ((bits >> 10) & 0x1F) as u32;
         let mant: u32 = (bits & 0x3FF) as u32;
         if exp == 0 {
-            (mant as f32) * 2f32.powi(-24)
+            // Subnormal: the sign bit still applies, matching the device fn
+            // `fp16_to_float_device` which does `return sign ? -res : res;`.
+            // Every golden in this file uses a normal d, which is why this
+            // stayed green: a wrong oracle that its own fixtures cannot reach.
+            let v = (mant as f32) * 2f32.powi(-24);
+            if sign == 1 { -v } else { v }
         } else if exp == 31 {
             f32::from_bits((sign << 31) | 0x7F800000 | (mant << 13))
         } else {

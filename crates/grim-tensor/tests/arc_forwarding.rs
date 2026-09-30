@@ -191,7 +191,7 @@ impl CoreTensorOps for ProbeDevice {
         _out: &Shape,
         _dim: usize,
     ) -> grim_tensor::Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        probe_err("embedding_q4k").map(|()| {
+        probe_err("embedding_packed").map(|()| {
             (
                 Box::new(ProbeStorage {
                     shape: Shape::new(vec![0]),
@@ -626,8 +626,8 @@ fn arc_blanket_impl_forwards_all_overridable_methods() {
         "write_rows"
     );
     assert_probe!(
-        dev.embedding_q4k(s.as_ref(), &[0], &shape, 4),
-        "embedding_q4k"
+        dev.embedding_packed(s.as_ref(), &[0], &shape, 4),
+        "embedding_packed"
     );
     // The KDA recurrence family. A backend override added to `RecurrentOps`
     // without a matching forwarder in the blanket `Arc<T>` impl is silently
