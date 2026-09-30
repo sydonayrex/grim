@@ -618,3 +618,98 @@ fn identity_32x16() -> Vec<u8> {
 // against an unknown A-fragment mapping would look like. The next probe must
 // therefore vary A across fragment lanes while holding B uniform, the mirror
 // image of the sweep that worked.
+
+/// Mirror of the B sweep: **uniform B, one-hot A**.
+///
+/// This is the last unknown -- how A's 8 bytes per lane map onto rows and k --
+/// and it has to be measured this way round. B cannot be interpreted until A is
+/// pinned, because "4 live B bytes, each counted twice" is exactly what a
+/// uniform A against an unknown A-fragment mapping would produce. So this probe
+/// makes A the only varied operand and holds B at all ones.
+///
+/// With B uniform, C[r][n] = sum of the A values contracted into (r, n), so a
+/// hot A byte lights **every column n of every row that owns that k**. The
+/// result is therefore self-describing in a way the identity probe never was:
+///
+///   - the *set of slots* is the C lane->row / slot->column mapping,
+///   - the *value* is how many times the hot element is accumulated,
+///   - and how many of A's 256 bytes are live at all is answerable, which the
+///     retracted A sweep could not report because its B was nearly all zero.
+#[test]
+fn grey_raven_a_fragment_sweep_uniform_b() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    let b = vec![FP8_ONE; 512]; // uniform: removes B's layout from the problem
+    let mut a = vec![FP8_ZERO; 256];
+    let mut groups: std::collections::BTreeMap<Vec<(usize, usize)>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut values: std::collections::BTreeSet<String> = Default::default();
+
+    for g in 0..256usize {
+        a[g] = FP8_ONE;
+        let c = run_mma(&dev, &a, &b, 0)?;
+        a[g] = FP8_ZERO;
+        let mut sig: Vec<(usize, usize)> = Vec::new();
+        for (l, lane) in c.iter().enumerate() {
+            for (s, &v) in lane.iter().enumerate() {
+                if v != 0.0 {
+                    values.insert(format!("{v}"));
+                    sig.push((l, s));
+                }
+            }
+        }
+        groups.entry(sig).or_default().push(g);
+    }
+
+    let live: usize = groups.iter().filter(|(s, _)| !s.is_empty()).map(|(_, o)| o.len()).sum();
+    println!("\n=== A sweep, uniform B: 256 offsets -> {} signatures; {live} live ===", groups.len());
+    println!("nonzero values: {values:?}");
+    for (sig, offs) in &groups {
+        if sig.is_empty() {
+            println!("  DEAD: {} offsets", offs.len());
+            continue;
+        }
+        let lanes: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(l, _)| *l).collect(); v.sort_unstable(); v.dedup(); v };
+        let slots: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(_, s)| *s).collect(); v.sort_unstable(); v.dedup(); v };
+        println!("  {:>3} elems  lanes={lanes:?}  slots={slots:?}  {} offs e.g. {offs:?}",
+                 sig.len(), offs.len());
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Result of the A-fragment sweep, and a correction to the B sweep's reading.
+//
+// 256 offsets, **all 256 live**, 16 signatures, every value exactly 1.0. Fully
+// regular, and it decodes without any assumption:
+//
+//   - **A lane (0..31) maps to C row = lane mod 16.** Lanes l and l+16 are
+//     equivalent: offsets 0..7 and 128..135 land in the same signature. So the
+//     32 A lanes carry 16 rows, two lanes per row.
+//   - **The C fragment is transposed from the usual mental picture**: the output
+//     lane is the *column* (16 lanes cover the 16 columns, in two halves chosen
+//     by bit 3 of the A lane), and the 8 slots are the *rows*, slot s covering
+//     rows {2s, 2s+1}. With B uniform a hot A byte lights one slot in each of
+//     the 16 lanes -- one row, every column, which is exactly the right shape
+//     for C[r][n] = sum over all k of A[r][k].
+//   - All 8 bytes of an A lane give the *identical* result. With B uniform that
+//     is forced: C[r][n] sums the whole row, so a hot byte at any k lands in the
+//     same place. It says the bytes are the row's survivors, and nothing more.
+//
+// So this pins A's **row** mapping, cleanly, and pins nothing about **k**.
+//
+// The k mapping is not measurable this way, and that is a property of the probe
+// rather than a fixable defect of it: with B uniform every k in a row collapses
+// onto the same output, so all 8 survivors are indistinguishable. Which also
+// means the B sweep's "only offsets = 0 (mod 4) are live, each counted twice"
+// cannot be read as a statement about B's layout. It was measured against an A
+// whose k mapping was unknown, so those 384 dead bytes may be B bytes whose k
+// had no partner in A rather than bytes the hardware ignores.
+//
+// That couples the two unknowns. A's k mapping and B's layout are not separately
+// measurable, because pinning either one requires the other to be known. The
+// handle that *is* independent is the sparsity index: `sidx` changes which k are
+// active without perturbing either fragment layout, so sweeping it against a
+// one-hot A and a uniform B can separate the k mapping from the layout question.
+// That is the next probe.
