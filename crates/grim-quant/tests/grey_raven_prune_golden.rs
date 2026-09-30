@@ -371,3 +371,97 @@ fn e5_malformed_buffers_are_rejected_loudly() {
         );
     }
 }
+
+/// The SWMMAC constraint: only pairs containing slot 0 can be emitted.
+///
+/// Measured on gfx1200, a 2:4 group is a fixed anchor at slot 0 plus a free
+/// survivor placed by a 2-bit field. That leaves {0,1}, {0,2}, {0,3} expressible
+/// and {1,2}, {1,3}, {2,3} not, so an unconstrained mask can describe a pattern the
+/// hardware cannot express. These pin the encoding and the anchored pruner that
+/// respects it.
+#[test]
+fn swmmac_index_field_covers_only_anchored_pairs() {
+    use grim_quant::grey_raven::{index_field_for_pair, mask_is_expressible};
+
+    // The three expressible pairs, in both orders, give the non-anchor slot.
+    for (a, b, want) in [(0u8, 1u8, 1u8), (1, 0, 1), (0, 2, 2), (2, 0, 2), (0, 3, 3), (3, 0, 3)] {
+        assert_eq!(
+            index_field_for_pair(a, b),
+            Some(want),
+            "pair {{{a},{b}}} should encode as field {want}"
+        );
+    }
+    // The other three of the six have no encoding.
+    for (a, b) in [(1u8, 2u8), (1, 3), (2, 3), (2, 1), (3, 1), (3, 2)] {
+        assert_eq!(
+            index_field_for_pair(a, b),
+            None,
+            "pair {{{a},{b}}} must be reported unexpressible"
+        );
+    }
+    assert!(mask_is_expressible(&[[0, 1], [0, 2], [0, 3]]));
+    assert!(!mask_is_expressible(&[[1, 2]]));
+    assert!(!mask_is_expressible(&[[0, 1], [2, 3]]));
+}
+
+/// The anchored pruner always emits an expressible pair, and picks the best
+/// available companion.
+#[test]
+fn anchored_pruner_is_expressible_and_picks_best_companion() {
+    use grim_quant::grey_raven::{
+        mask_is_expressible, prune_2of4, prune_2of4_anchored, prune_group_2of4_anchored,
+    };
+
+    // Slot 0 is worthless; the choice is entirely among {1,2,3}.
+    let fisher = [1.0f32; 4];
+    let grp = [0.0, 1.0, 5.0, 2.0];
+    assert_eq!(prune_group_2of4_anchored(&grp, &fisher), [0, 2]);
+
+    // Fisher can overturn magnitude: slot 1 wins despite a smaller weight.
+    let fisher2 = [1.0f32, 100.0, 1.0, 1.0];
+    assert_eq!(prune_group_2of4_anchored(&grp, &fisher2), [0, 1]);
+
+    // Across a matrix, every group is anchored and the whole mask is emittable.
+    let w: Vec<f32> = (0..64).map(|i| ((i * 7) % 11) as f32 * 0.25).collect();
+    let f = vec![1.0f32; w.len()];
+    let anchored = prune_2of4_anchored(&w, &f, 4, 16).expect("anchored prune");
+    let free = prune_2of4(&w, &f, 4, 16).expect("free prune");
+    assert!(mask_is_expressible(&anchored.pairs), "anchored mask must be emittable");
+    assert!(
+        anchored.pairs.iter().all(|p| p[0] == 0),
+        "every anchored pair keeps slot 0"
+    );
+    // The unconstrained pruner is free to pick a non-anchored pair, which is
+    // exactly the gap the anchored variant closes.
+    let free_expressible = free.pairs.iter().all(|p| p[0] == 0);
+    assert!(
+        !free_expressible || mask_is_expressible(&free.pairs),
+        "sanity: free mask is either expressible or has a non-anchored pair"
+    );
+}
+
+/// Anchored pruning costs accuracy when the two best slots exclude slot 0 -- that
+/// cost is the price of being emittable, and it should be visible rather than
+/// hidden.
+#[test]
+fn anchored_pruning_costs_importance_when_best_pair_excludes_anchor() {
+    use grim_quant::grey_raven::{prune_2of4, prune_2of4_anchored};
+
+    let w: Vec<f32> = (0..8).map(|i| [0.0, 0.0, 9.0, 8.0, 0.0, 0.0, 7.0, 6.0][i]).collect();
+    let f = vec![1.0f32; w.len()];
+    let anchored = prune_2of4_anchored(&w, &f, 2, 4).expect("anchored");
+    let free = prune_2of4(&w, &f, 2, 4).expect("free");
+
+    // First group: weights are [0,0,9,8]. Free keeps slots 2 and 3 (9 and 8);
+    // anchored must keep slot 0 and the best of the rest, which is slot 2.
+    assert_eq!(free.pairs[0], [2, 3], "free pruner should take the two heaviest");
+    assert_eq!(anchored.pairs[0], [0, 2], "anchored must keep slot 0 plus the best companion");
+
+    // The retained magnitude differs exactly by the anchor, which is the measured
+    // cost: 17.0 kept versus 9.0, so the constrained variant drops slot 3.
+    let kept_anchored = w[0] + w[2];
+    let kept_free = w[2] + w[3];
+    assert_eq!(kept_anchored, 9.0);
+    assert_eq!(kept_free, 17.0);
+    assert!(kept_anchored < kept_free, "anchoring can only cost, never gain");
+}

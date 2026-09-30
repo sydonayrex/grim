@@ -488,3 +488,119 @@ pub fn dequant_grey_raven(data: &[u8], num_values: usize) -> Result<Vec<f32>, &'
 fn code_to_pair(code: u32) -> Option<(usize, usize)> {
     PAIRS.get(code as usize).map(|p| (p[0], p[1]))
 }
+
+/// The SWMMAC index field for a kept pair, or `None` if the pair is unexpressible.
+///
+/// Measured on gfx1200: a 2:4 group is encoded as a fixed anchor at slot 0 plus a
+/// free survivor whose position a 2-bit field chooses -- 00 -> 0, 01 -> 1, 10 -> 2,
+/// 11 -> 3 -- and the paired odd byte is pinned to slot 0. So only pairs *containing
+/// slot 0* have an encoding: {0,1}, {0,2}, {0,3}. The other three ({1,2}, {1,3},
+/// {2,3}) do not, and a mask containing one cannot be emitted to this hardware.
+///
+/// Returns the field value, which is the non-anchor slot, so {0, q} -> `q`.
+pub const fn index_field_for_pair(a: u8, b: u8) -> Option<u8> {
+    match (a, b) {
+        (0, q) => Some(q),
+        (q, 0) => Some(q),
+        _ => None,
+    }
+}
+
+/// Whether every kept pair in a mask is expressible on SWMMAC FP8.
+///
+/// Cheap enough to assert before packing, so a mask that cannot be emitted is
+/// caught at the boundary rather than as a wrong product on the GPU.
+pub fn mask_is_expressible(pairs: &[[u8; 2]]) -> bool {
+    pairs.iter().all(|p| index_field_for_pair(p[0], p[1]).is_some())
+}
+
+/// [`prune_group_2of4`] restricted to the pairs SWMMAC can encode.
+///
+/// Always keeps slot 0 and picks the best companion from {1, 2, 3} by the same
+/// `fisher * w^2` ranking. Costs a little accuracy against the unconstrained
+/// version, which may keep two high-weight non-zero slots, and buys an exact fit
+/// with the hardware: the alternative is to remap an arbitrary pair into an
+/// expressible one, which keeps the pattern space but sometimes keeps a
+/// lower-weight position than the pruner chose.
+pub fn prune_group_2of4_anchored(group: &[f32; GROUP], fisher: &[f32; GROUP]) -> [u8; 2] {
+    let imp = |i: usize| fisher[i] * group[i] * group[i];
+    // Slot 0 is the anchor and is kept unconditionally; choose among the rest.
+    let (mut best, mut best_i) = (f32::NEG_INFINITY, 1usize);
+    for i in 1..GROUP {
+        let v = imp(i);
+        if v > best || (v == best && i < best_i) {
+            best = v;
+            best_i = i;
+        }
+    }
+    [0, best_i as u8]
+}
+
+/// [`prune_2of4`] with the SWMMAC-anchored group rule.
+pub fn prune_2of4_anchored(
+    weights: &[f32],
+    fisher: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<PruneMask, &'static str> {
+    if cols % GROUP != 0 {
+        return Err("cols must be a multiple of 4: 2:4 groups run along K");
+    }
+    if rows.checked_mul(cols) != Some(weights.len()) {
+        return Err("rows * cols must equal weights.len()");
+    }
+    if fisher.len() != weights.len() {
+        return Err("fisher must be the same length as weights");
+    }
+    let groups_per_row = cols / GROUP;
+    let mut pairs = Vec::with_capacity(rows * groups_per_row);
+    for r in 0..rows {
+        for g in 0..groups_per_row {
+            let base = r * cols + g * GROUP;
+            let mut grp = [0f32; GROUP];
+            let mut fis = [0f32; GROUP];
+            grp.copy_from_slice(&weights[base..base + GROUP]);
+            fis.copy_from_slice(&fisher[base..base + GROUP]);
+            pairs.push(prune_group_2of4_anchored(&grp, &fis));
+        }
+    }
+    Ok(PruneMask { pairs, groups: rows * groups_per_row })
+}
+
+/// [`sparsify_2_4_flat_with_fisher`] using the anchored group rule, so the
+/// resulting mask is emittable to SWMMAC without remapping.
+pub fn sparsify_2_4_flat_anchored_with_fisher(
+    values: &[f32],
+    fisher: &[f32],
+) -> Result<Sparsified, &'static str> {
+    if values.len() % GROUP != 0 {
+        return Err("length must be a multiple of 4 for 2:4");
+    }
+    if fisher.len() != values.len() {
+        return Err("fisher must be the same length as values");
+    }
+    let groups = values.len() / GROUP;
+    let mut out = Sparsified {
+        values: Vec::with_capacity(groups * GROUP_SURVIVORS),
+        metadata: vec![0u8; (groups * METADATA_BITS_PER_GROUP as usize).div_ceil(8)],
+    };
+    for g in 0..groups {
+        let base = g * GROUP;
+        let mut grp = [0f32; GROUP];
+        let mut fis = [0f32; GROUP];
+        grp.copy_from_slice(&values[base..base + GROUP]);
+        fis.copy_from_slice(&fisher[base..base + GROUP]);
+        let pair = prune_group_2of4_anchored(&grp, &fis);
+        let (a, b) = (pair[0] as usize, pair[1] as usize);
+        out.values.push(grp[a]);
+        out.values.push(grp[b]);
+        let bit = g * METADATA_BITS_PER_GROUP as usize;
+        let code = pair_code(a, b) as u32;
+        for k in 0..METADATA_BITS_PER_GROUP as usize {
+            if code & (1 << k) != 0 {
+                out.metadata[(bit + k) / 8] |= 1 << ((bit + k) % 8);
+            }
+        }
+    }
+    Ok(out)
+}
