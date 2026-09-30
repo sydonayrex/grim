@@ -67,6 +67,9 @@ pub struct Xing40Config {
     pub q_lora_rank: Option<usize>,
     pub qk_nope_head_dim: usize,
     pub qk_rope_head_dim: usize,
+    /// YaRN rope scaling declared by the checkpoint
+    /// (`xing4_0.rope.scaling.*`).
+    pub rope_yarn: Option<grim_tensor::YaRNParams>,
     pub v_head_dim: usize,
     // MoE
     pub moe_intermediate_size: usize,
@@ -104,6 +107,7 @@ impl Default for Xing40Config {
             qk_nope_head_dim: 128,
             qk_rope_head_dim: 64,
             v_head_dim: 128,
+            rope_yarn: None,
             moe_intermediate_size: 1024,
             n_routed_experts: 64,
             n_shared_experts: 1,
@@ -842,7 +846,16 @@ impl Xing40Mla {
         let q_dim = cfg.num_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim);
         let kv_lora_out = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
 
-        let rope = Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
+        // RopeConfig defaults to GPT-J INTERLEAVED pairing; Xing4.0's MLA is a
+        // DeepSeek-V3-style family, which the reference rotates NeoX half-split
+        // (same defect c1352622 fixed for Qwen3.5). YaRN from the checkpoint
+        // (`rope.scaling.type = yarn`) rides along.
+        let rope = {
+            let mut rc = grim_tensor::RopeConfig::new(cfg.qk_rope_head_dim, cfg.rope_theta);
+            rc.interleaved = false;
+            rc.yarn = cfg.rope_yarn;
+            Rope::from_config(rc)
+        };
         let mut out = if ws.has_tensor("attn_k_b.weight") {
             // ---- GGUF container ----
             let q_a_proj = Linear::load_shape(
@@ -1127,7 +1140,17 @@ impl Xing40Mla {
             cpu_tensor(Vec::new(), Shape::new(vec![0, 0])),
         ));
 
-        let scale = 1.0 / ((nope + rope_d) as f32).sqrt();
+        // llama.cpp: kq_scale = mscale^2 / sqrt(n_embd_head_k), where
+        // mscale folds the YaRN attention factor (0.1*ln(factor)+1 = 1.415 for
+        // factor 64, so the squared factor is ~2x). Ignoring it scales every
+        // attention logit wrong.
+        let mscale = self
+            .rope
+            .config
+            .yarn
+            .map(|y| y.attention_factor)
+            .unwrap_or(1.0f32);
+        let scale = mscale * mscale / ((nope + rope_d) as f32).sqrt();
 
         // 6a. GPU decode fast path (decode-only kernel: one launch per head).
         if seq_len == 1 && x.device() != &Device::Cpu {
@@ -2095,23 +2118,33 @@ impl Xing40Block {
         positions: &[u32],
         kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
+        let trace_nan = std::env::var_os("GRIM_XING_TRACE").is_some();
+        let nan_stage = |name: &str, t: &Tensor| {
+            if !trace_nan { return; }
+            if let Ok(v) = t.to_vec_f32() {
+                let nan = v.iter().filter(|x| x.is_nan()).count();
+                eprintln!("[xing-trace] {name}: len {} nan {nan} head {:?}", v.len(), &v[..v.len().min(4)]);
+            }
+        };
+        nan_stage("block_in", x);
         // 1. attn_hc: collapse the multi-stream state into the single attention input.
         let attn_gates = self.attn_hc.gates_d2d(x)?;
         let collapsed = self.attn_hc.collapse_d2d(x, &attn_gates)?;
         let collapsed = self.attn_norm.forward(&collapsed)?;
 
+        nan_stage("attn_in", &collapsed);
         // 2. Self-attention on the collapsed stream.
         let attn_out = self.self_attn.forward(&collapsed, positions, kv_cache)?;
-
+        nan_stage("attn_out", &attn_out);
         // 3. Write the attention result back into the streams:
         //    streams = post ⊗ attn_out + comb @ streams.
         let streams = self.attn_hc.update_d2d(x, &attn_out, &attn_gates)?;
-
+        nan_stage("streams_after_attn", &streams);
         // 4. ffn_hc: collapse for the feed-forward.
         let ffn_gates = self.ffn_hc.gates_d2d(&streams)?;
         let collapsed = self.ffn_hc.collapse_d2d(&streams, &ffn_gates)?;
         let collapsed = self.ffn_norm.forward(&collapsed)?;
-
+        nan_stage("ffn_in", &collapsed);
         // 5. Dense SwiGLU or sparse MoE.
         let ffn_out = if let Some(ref mlp) = self.mlp {
             mlp.forward(&collapsed)?
@@ -2120,9 +2153,12 @@ impl Xing40Block {
         } else {
             collapsed.clone()
         };
+        nan_stage("ffn_out", &ffn_out);
 
         // 6. Write the FFN result back into the streams.
-        self.ffn_hc.update_d2d(&streams, &ffn_out, &ffn_gates)
+        let out = self.ffn_hc.update_d2d(&streams, &ffn_out, &ffn_gates)?;
+        nan_stage("block_out", &out);
+        Ok(out)
     }
 
     /// Host reference block forward (CPU backend).
@@ -2235,8 +2271,20 @@ impl Xing40 {
         // Both containers store the embedding row-major as `[vocab, hidden]`
         // (the GGUF `token_embd.weight` is `[131072, 3584]`), which is
         // `load_shape`'s `[in_dim, out_dim] = [hidden, vocab]`.
-        let tok_embeddings =
-            Linear::load_shape(&root.scoped(tok_leaf), [cfg.hidden_size, cfg.vocab_size])?;
+        //
+        // `Embedding::load` applies the format contract: keep the table packed
+        // when the backend has a gather kernel for the scheme (Q4_K, IQ3_S),
+        // materialize f32 otherwise. Loading through `Linear::load_shape` kept
+        // the table packed unconditionally, and the gather then read IQ3_S
+        // block bytes as f32 (logits full of 3.4e38, NaN from token 0).
+        let emb_ws = root.scoped(tok_leaf);
+        let emb = grim_nn::modules::Embedding::load(&emb_ws, cfg.vocab_size, cfg.hidden_size)?;
+        let tok_embeddings = Linear {
+            weight: emb.weight.clone(),
+            bias: None,
+            w_t: emb.weight.clone(),
+            quant_format: None,
+        };
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -2306,6 +2354,19 @@ impl CausalLm for Xing40 {
             seq_len,
             self.cfg.hidden_size,
         )?;
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            if let Ok(v) = x0.to_vec_f32() {
+                let nan = v.iter().filter(|x| x.is_nan()).count();
+                let max = v.iter().cloned().fold(0f32, f32::max);
+                let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                eprintln!("[xing-trace] x0 embedding: len {} nan {nan} rms {rms:.4e} max {max:.4e} head {:?}", v.len(), &v[..v.len().min(4)]);
+                let r0: Vec<f32> = v[..v.len().min(3584)].to_vec();
+                let m0 = r0.iter().cloned().fold(0f32, f32::max);
+                let r0r = (r0.iter().map(|x| x * x).sum::<f32>() / r0.len() as f32).sqrt();
+                eprintln!("[xing-trace] x0 token0 row: rms {r0r:.4e} max {m0:.4e} head {:?}", &r0[..4]);
+            }
+            eprintln!("[xing-trace] tok_emb dtype {:?} shape {:?} device {:?}", self.tok_embeddings.weight.dtype(), self.tok_embeddings.weight.shape(), self.tok_embeddings.weight.device());
+        }
 
         // Seed the hc_mult streams with the embedding (all streams start equal).
         let hc = self.cfg.hc_mult;

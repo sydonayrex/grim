@@ -1601,6 +1601,7 @@ fn embedding_has_packed_gather(storage: &Storage, device: &grim_tensor::Device) 
     matches!(
         storage,
         Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+            | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S)
     )
 }
 

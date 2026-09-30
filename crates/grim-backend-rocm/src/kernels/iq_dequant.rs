@@ -263,6 +263,30 @@ extern "C" {
         out[idx] = dequant_iq2s_device(blk, (int)(e % QK_BLOCK));
     }
 
+    /// Gather rows out of a packed IQ3_S embedding table, dequantizing on read
+    /// (110 bytes / 256 weights). Mirrors `grim_embedding_iq2s_gather`; without
+    /// it a 29B-scale IQ3_S table would have to be materialized f32 in VRAM
+    /// (1.79 GiB for [131072, 3584]) and the card runs out.
+    extern "C" __global__ void grim_embedding_iq3s_gather(
+        const unsigned char* packed, float* out, const int* indices,
+        int dim, int total, int rows)
+    {
+        const int QK_BLOCK = 256;
+        const int QK_BLOCK_BYTES = 110;
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total) return;
+        int i = idx / dim;
+        int j = idx - i * dim;
+        int row = indices[i];
+        if (row < 0 || row >= rows) {
+            out[idx] = 0.0f;
+            return;
+        }
+        long long e = (long long)row * (long long)dim + (long long)j;
+        const unsigned char* blk = packed + (e / QK_BLOCK) * QK_BLOCK_BYTES;
+        out[idx] = dequant_iq3s_device(blk, (int)(e % QK_BLOCK));
+    }
+
     /// Dequantize IQ4_NL packed bytes to F32. An IQ4_NL block holds QK4_NL = 32
     /// weights in 18 bytes, so one 8-thread block covers a quant block and each
     /// thread emits four consecutive elements via a float4 store. (The previous
