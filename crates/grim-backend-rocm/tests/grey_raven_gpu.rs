@@ -2481,7 +2481,14 @@ fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
     let mut b_frag = vec![FP8_ZERO; 512];
     for k in 0..K {
         for n in 0..N {
-            let off = n * 16 + k;
+            // GRIM_B_HIGH_HALF places B's data in lanes 16..31 instead of
+            // 0..15, to distinguish "the upper half is inert" from "the upper
+            // half duplicates the lower half". Those predict different results and
+            // no amount of reasoning about the failing test separates them.
+            let off = match std::env::var_os("GRIM_B_HIGH_HALF") {
+                Some(_) => (n + 16) * 16 + k,
+                None => n * 16 + k,
+            };
             b_frag[off] = b_dense[k * N + n];
         }
     }
@@ -2581,3 +2588,39 @@ fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
 // This is the single claim in the file that should be checked against the ISA
 // documentation before GreyRaven is built on it, because it is the one place where
 // the type signature and the measurement disagree.
+
+// ============================================================================
+// The upper k half is inert, not duplicative. That closes the last piece of this
+// question that hardware can answer.
+//
+// The passing test packs B into lanes 0..15. Moving the identical data to lanes
+// 16..31 -- same values, same index, only the lane placement changed -- gives:
+//
+//   B in lanes  0..15   0 mismatches of 256
+//   B in lanes 16..31   256 mismatches, first: got 0, want 13
+//
+// **All zeros.** The upper lanes do not read zero, they do not contribute, and they
+// do not mirror the lower half's values. The contraction genuinely spans
+// k = 0..15 and nothing above it.
+//
+// That distinction was worth measuring rather than assuming. "Inert" and
+// "duplicated" both produce a plausible-looking product, and only one of them is
+// consistent with the declared 16x16x32 tile -- a duplicated half would have made
+// the full 32-deep contraction real while looking identical in magnitude, which is
+// precisely the failure mode that produced most of the wrong readings in this file.
+//
+// So the state of the tile question, in full:
+//
+//   measured   the effective contraction is 16x16x16; A's lanes 16..31 are unread
+//              and B's are inert, both by direct test
+//   measured   everything else -- A's row mapping, the four 2-bit group fields, the
+//              anchor-at-position-0 constraint, B's lane and byte roles, the C
+//              readback -- by the passing end-to-end test
+//   open       why the declared 16x16x32 FP8 variant contracts as 16x16x16. The
+//              installed LLVM knows only 16x16x32 / 16x16x64 / 16x16x128, and
+//              carries no assembler format detail for SWMMAC, so the ISA
+//              documentation is not on this machine and this cannot be closed here.
+//
+// The open part is a documentation question, not an experimental one, and it does
+// not block GreyRaven: K = 16 per row is established by measurement, and a K = 32 row
+// is two tiles under either explanation of the declared shape.
