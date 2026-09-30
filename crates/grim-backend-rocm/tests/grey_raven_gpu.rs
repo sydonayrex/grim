@@ -1517,3 +1517,96 @@ fn grey_raven_selector_enables_which_byte_positions() -> TestResult {
 //
 // E6's operand layout is now fully established. What remains is that 2.0, then
 // the end-to-end test against a CPU reference.
+
+/// Is the 2.0 A's two-lanes-per-row duplication?
+///
+/// Every probe so far used a uniform A, which put identical 1.0 bytes in lanes L
+/// and L+16 alike. If both lanes of a row feed the same k, a single hot B element
+/// sums two 1.0s and lands on 2.0 -- which is exactly the residual no layout
+/// explained. It would also make the count *correct*: a 2:4 row has 16 survivors,
+/// 8 per lane, and reading both halves is the point.
+///
+/// The test isolates it by making A non-uniform in exactly one lane. If the 2.0
+/// drops to 1.0, lanes L and L+16 were double-counting and the A packing rule is
+/// "split the row across both lanes", not "replicate it". If it stays 2.0, the
+/// doubling is inside the instruction and not in the packing.
+#[test]
+fn grey_raven_a_lane_pair_is_the_doubling() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+
+    // One hot B element at (k = 0, n = 0), the sidx = 0 default column.
+    let mut b = vec![FP8_ZERO; 512];
+    b[0] = FP8_ONE;
+
+    let mut rows: Vec<(String, Vec<u8>, f32)> = Vec::new();
+
+    // Uniform A: both lanes of every row are 1.0.
+    let uniform = vec![FP8_ONE; 256];
+    rows.push(("uniform (both lanes 1.0)".into(), uniform, 0.0));
+
+    // Only lane 0 hot, its row partner (lane 16) zero.
+    let mut only_low = vec![FP8_ZERO; 256];
+    only_low[..8].fill(FP8_ONE);
+    rows.push(("lane 0 only (lane 16 zero)".into(), only_low, 0.0));
+
+    // Only lane 16 hot.
+    let mut only_high = vec![FP8_ZERO; 256];
+    only_high[16 * 8..16 * 8 + 8].fill(FP8_ONE);
+    rows.push(("lane 16 only (lane 0 zero)".into(), only_high, 0.0));
+
+    // Both lanes hot -- the split case, 8 survivors in each.
+    let mut both = vec![FP8_ZERO; 256];
+    both[..8].fill(FP8_ONE);
+    both[16 * 8..16 * 8 + 8].fill(FP8_ONE);
+    rows.push(("both lanes of the row (split)".into(), both, 0.0));
+
+    for (name, a, _) in &rows {
+        let c = run_mma(&dev, a, &b, 0)?;
+        let vals: Vec<f32> = c.iter().flatten().copied().filter(|&v| v != 0.0).collect();
+        let max = vals.iter().cloned().fold(0.0f32, f32::max);
+        let sum: f32 = vals.iter().sum();
+        println!(
+            "{name:<30} -> {} nonzero, max {max}, sum {sum}",
+            vals.len()
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Two corrections, both measured: half of A is ignored, and the 2.0 is internal.
+//
+// Making A non-uniform in exactly one lane, against a single hot B element at
+// (k = 0, n = 0):
+//
+//   uniform (both lanes 1.0)       16 nonzero, max 2, sum 32
+//   lane 0 only (lane 16 zero)      1 nonzero, max 2, sum  2
+//   lane 16 only (lane 0 zero)      0 nonzero
+//   both lanes of the row (split)   1 nonzero, max 2, sum  2
+//
+// **Only A lanes 0..15 are read.** A lane 16 on its own produces nothing, and
+// "split" is identical to "lane 0 only" because the second lane is not there as
+// far as the instruction is concerned. So of the 256 bytes handed in, 128 are
+// live. The earlier reading -- "lane L carries row L mod 16, so lanes L and L+16
+// are the two halves of one row" -- is wrong. It should have been "lane L is row
+// L, and lanes 16..31 do not participate", which the very first identity probe
+// hinted at and the later notes talked themselves out of.
+//
+// **The 2.0 is not lane duplication.** A single hot lane still yields 2.0, so the
+// doubling happens inside one lane's 8 bytes: they cover fewer than 8 distinct k,
+// with at least one k addressed twice. That is consistent with the lane supplying
+// 8 bytes for a quarter of a 16-column row rather than 8 distinct columns.
+//
+// Both facts change the packing rule rather than the operand model:
+//
+//   A  lane L is row L, lanes 0..15 only, 8 bytes per row
+//   B  lane L is k = L, 16 bytes per k, all 16 columns reachable via the index
+//   C  lane = column, lane + 16 = same column's upper row half, slot = row
+//
+// and they are what the end-to-end test now has to satisfy. The remaining
+// question -- exactly how a lane's 8 bytes map to k -- is answerable now that A
+// is known to be one lane per row: hold B at a single hot (k, n) and walk A's byte
+// positions 0..7 one at a time, which attributes each position to a k with no
+// assumption left to violate. That is the next probe, and unlike everything before
+// it, every input to it is measured rather than assumed.
