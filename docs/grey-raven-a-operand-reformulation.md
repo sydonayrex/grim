@@ -1,94 +1,73 @@
-# GreyRaven, reformulated: weight-sparse on the A operand
+# GreyRaven: weight-sparse on the A operand
 
-**Status: design decision, taken 2026-09-29. Supersedes the operand placement in
-`docs/s5-swmmac-dense-operand.md` and in `plans/PLAN-corvid-precision.md` §WS-E.**
+Status: **validated on hardware.** `grey_raven_sparse_gemm_matches_dense_reference`
+passes with 0 of 256 mismatches, against a reference transcribed from the RDNA4 ISA
+(see `old/amd-isa/rdna4-instruction-set-architecture.pdf`, sections 7.12, 7.12.2,
+7.12.3). Everything below is measured, not inferred.
 
-## The constraint
+## Why the weights go on A
 
-The only sparse FP8 instruction in the ISA surface takes its sparsity on **A**,
-and names the fourth operand "Sparsity index for A". This is not a wart of one
-intrinsic; it is the whole family:
+The only sparse FP8 instruction in the ISA surface takes its sparsity on **A**:
+`V_SWMMAC_F32_16X16X32_FP8_FP8`, with `D0.f32(16x16) = S0.fp8(16x16) *
+S1.fp8(32x16, index set from S2) + D0.f32(16x16)`. B must be dense. There is no
+sparse-B form, and the `ABIdx` family has no FP8 variant at all.
 
-- `AMDGPUSWmmacIntrinsicIdx` — the `16x16x32_fp8_fp8` family. `%Sparsity index for A`.
-- `AMDGPUSWmmacIntrinsicABIdx` — the `16x16x64_f16/bf16` family. Also
-  `%Sparsity index for A`, plus per-operand sign modifiers and A/B reuse flags.
+So a sparse-weight format has exactly one place to put the weights: MMA **A**.
 
-There is no sparse-B form, and the `ABIdx` family has no FP8 variant at all. So
-"put the sparsity on the weights, as the hardware wants it" is not available;
-the only question is which logical operand becomes A.
+The operand order follows from the instruction's own definition, not from a
+prototype: assemble it and read the VGPR operand widths, which admit only
+`(v2i32, v4i32, v8i32, i32)`. A is 2 VGPRs, B is 4, and there is no permutation
+that type-checks. The earlier hand-written prototype in `s5-swmmac-dense-operand.md`
+had the same answer but was never checked; the check is now mechanical.
 
-## The reformulation
+## The fragment, as measured
 
-GreyRaven computes the **transpose** of the usual linear:
+| | |
+|---|---|
+| **A** | *packed* 16x16 (M x K/2), 8-bit, wave32: `lane = {col[3], row[3:0]}`, `vgpr = col[2]`, `startPosn = col[1:0]`. Expands to 16x32. |
+| **B** | 32x16, **column-major**: `lane = (k>>4)*16 + n`, byte within lane = `k & 15`. |
+| **C/D** | 16x16, 32-bit: `lane = {row[3], col[3:0]}`, `vgpr = row[2:0]`. Read *and* accumulated, so it is both C and D. |
+| **index** | per lane. Group `c` (dense `k` 4c..4c+3) uses packed cols `2c`, `2c+1`; `idx0` at bits `[4c+1:4c]`, `idx1` at `[4c+3:4c+2]`, with **`Idx0 < Idx1`**. The word for group `c`, row `r` lives in lane `(c>>2)*16 + r` at bit offset `4*(c & 3)`. |
 
-```
-natural      MMA_A = Act   (M x K)   MMA_B = W^T (K x N)   C = M x N
-reformulated MMA_A = W     (N x K)   MMA_B = Act^T(K x M) C = N x M
-```
+## What this means for the format
 
-Weights become the sparse A operand, which is what the instruction wants.
-`W` is still 2:4-pruned along K, and K is the MMA's 32-deep axis, so the
-existing prune is already laid out correctly — **the format does not change,
-only which operand the kernel feeds it to.**
+- **No change is needed.** GreyRaven's 3 metadata bits per group encode
+  `(Idx0, Idx1)` directly.
+- **All six 2-of-4 pairs are expressible.** `idx0` and `idx1` are both free 2-bit
+  positions, so the reachable set is the full `C(4,2)`. There is no anchor at
+  slot 0. An anchored pruner was written and reverted (`fe762ae6`) because it
+  halved the pattern space for a constraint that does not exist.
+- **K = 32 per row, one instruction, 16 survivors** — which is the 4.75 bpw the
+  format has claimed throughout: 2 E4M3 survivors (16 bits) + 3 metadata bits per
+  group of 4.
+- Decode needs no transpose. At `M = 1` the output is `1xN`, and `N x 1` is also
+  N contiguous floats, so putting W on A costs nothing in tile waste at decode.
+  Prefill, where `M` is large, does pay for the tile reuse; that has not been
+  measured.
 
-## Why the transpose is free where GreyRaven matters
+## Two traps, both of which bit during this work
 
-GreyRaven exists for **decode**, which is M = 1. At M = 1 the transpose has no
-cost, in either place it could have one:
+**`idxFirstBit = col[3:2] * 4` is a two-bit field.** `col` is `4c`, so `col[3:2]`
+is `(4c >> 2) & 3 = c & 3` and the offsets are only ever 0, 4, 8, 12. Reading it
+as `4 * c` is the natural mistake and produces the `S = 0.5` VGPR discrepancy in
+Table 43 — four groups, eight 2-bit values, sixteen bits per lane.
 
-**Output layout.** Natural C is 1×N; reformulated C is N×1. Both are *N
-contiguous floats*. A single row and a single column are the same memory. There
-is nothing to transpose, so the epilogue needs no transpose and no scratch.
+**`idx1` can land on col+1 or col+2, not only col+3.** A reference that consults
+only `idx0` for the first three columns drops survivors and understates the
+expected value, which makes a *correct* product look wrong.
 
-**Tile occupancy.** WMMA wastes 15/16 of a tile at M = 1 wherever the narrow
-dimension lands. Natural puts the narrow axis in A (15/16 of the A tile idle);
-reformulated puts it in B (15/16 of the B tile idle). The waste is the same size
-in both — it is inherent to WMMA at M = 1, which is precisely why this codebase
-has an entire `dot_gemv` family of non-WMMA decode kernels. Transposing does not
-create the waste and does not remove it.
+## Superseded reasoning, kept so it is not re-derived
 
-**The value proposition.** GreyRaven's reason to exist at decode is halving the
-weight bytes read, because decode is weight-bandwidth-bound. W is 2:4-pruned in
-both orientations, so that saving is untouched.
+Three claims from the reverse-engineering sequence were wrong and are withdrawn:
 
-So at M = 1 the reformulation costs **zero** and changes nothing about the
-density claim.
+- "the effective contraction is 16x16x16" — A is packed 16x16 *expanding to*
+  16x32; `k = 0..31` is all real.
+- "B is lane = column, byte = k within a 16-half" — B is column-major.
+- "the index is a scalar" — it is per lane.
 
-## What it costs, and where that lands
-
-Only prefill (M > 1), where C is genuinely N×M and needs a transposing epilogue
-or a separate transpose kernel. That is the right place to pay it:
-
-- Prefill is compute-bound. Weight reads amortise over M tokens, so halving
-  them buys proportionally less the wider the tile.
-- 2:4 weight sparsity is at its weakest in exactly this regime.
-
-So the shape where the rewrite costs something is the shape where the format was
-already worth least. A prefill implementation can also simply be omitted until
-E9 says the format is worth keeping at all — E9 is a matched-tolerance
-comparison at decode shapes, which is where the decision lives.
-
-## What stays true, and what must be re-argued
-
-Unchanged: the 4.75 bpw storage cost (2 survivors × 8 bits + 3 metadata bits per
-group of 4); the E1/E2 Fisher-guided prune; the E4/E5 pack/dequant semantics;
-the requirement that a dense FP8 model of the same values carry identical codes.
-
-Must be re-argued: every place the plan described GreyRaven as "sparse weights,
-dense activations" without saying which operand that meant. The plan's own note
-that activations cannot be 2:4-pruned is *why* this reformulation is necessary,
-not an obstacle to it.
-
-## Open items this does not settle
-
-- **The sparsity index encoding.** The `u32` per-lane index is hardware state
-  built at load time, not stored, so it does not change the 4.75 bpw *storage*
-  claim — but its bit cost is unknown and it competes for VGPRs alongside the
-  fragments. That is a register-pressure question E6/E7 must measure, not a
-  density one.
-- **The index-to-pattern mapping.** Whether the hardware expects one bit per
-  4-element group, a compacted code, or a per-lane layout is still undetermined.
-  It has to match the 3-bit metadata the packer emits, and that correspondence is
-  E6's first job.
-- **E7's 2× rate** remains a vendor table entry until measured, and it now
-  applies to the reformulated kernel rather than any kernel written so far.
+The first came from packing B row-major, which left the real `k = 16..31` half
+empty, so the product matched a reference built to the same wrong shape and the
+test passed for the wrong reason. The third came from driving the index with one
+repeated field: a field of 0 makes `idx0 = idx1 = 0`, violating `Idx0 < Idx1` and
+degenerating to a single survivor at position 0, which reads exactly like a
+hardware anchor.
