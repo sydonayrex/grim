@@ -1012,7 +1012,11 @@ pub async fn cmd_run(
                 tool_call_id: None,
                 name: None,
             });
-            grim_format::render_messages_or_last(tok, &messages)
+            let rendered = grim_format::render_messages_or_last(tok, &messages);
+            if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                eprintln!("[xing-prompt] rendered={rendered:?}");
+            }
+            rendered
         } else {
             // BOS only when the checkpoint says to, using the id it declares.
             if let Some(bos) = bos_token_to_prepend(tok, raw) {
@@ -2061,7 +2065,11 @@ pub async fn cmd_run_interactive(
                         ids.push(bos_id);
                     }
                 }
-                grim_format::render_messages_or_last(tok, &messages)
+                let rendered = grim_format::render_messages_or_last(tok, &messages);
+                if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                    eprintln!("[xing-prompt] rendered={rendered:?}");
+                }
+                rendered
             } else {
                 // BOS only when the checkpoint says to, using the id it declares.
                 if let Some(bos) = bos_token_to_prepend(tok, raw_mode) {

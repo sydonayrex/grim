@@ -2489,6 +2489,163 @@ impl CausalLm for Xing40 {
 mod tests {
     use super::*;
 
+    fn full_shape(hc: usize, hidden: usize, seq: usize) -> Shape {
+        Shape::new(vec![seq, hc * hidden])
+    }
+
+    /// Model-level gate 1: the D2D stream seed must equal a CPU broadcast of
+    /// the embedding (the reference's
+    /// `inputs_embeds.unsqueeze(2).expand(-1, -1, hc, -1)`). No layer gate
+    /// reaches this function, and a wrong seed corrupts the first forward pass
+    /// while every block still agrees host-vs-device.
+    #[test]
+    #[ignore = "needs a ROCm device; GRIM_RUN_GPU_TESTS=1 -- --ignored"]
+    fn seed_streams_matches_a_cpu_broadcast() {
+        if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let (hc, hidden, seq) = (4usize, 64usize, 5usize);
+        let mut x0 = vec![0f32; seq * hidden];
+        let mut s = 0x1234_5678_9abc_def0u64;
+        for v in x0.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *v = ((s >> 33) as f32 / 8388608.0 - 1.0) * 0.03;
+        }
+        // In production x0 is device-resident (the embedding gather lands
+        // there) and the seed's column writes are a D2D op; mirror that.
+        let x0_shape = Shape::new(vec![seq, hidden]);
+        let dev0 = grim_backend_rocm::RocmDevice::shared(0);
+        use grim_tensor::CoreTensorOps;
+        let x0_st = dev0.from_cpu(&x0, &x0_shape, DType::F32).expect("upload x0");
+        let x0_t = Tensor::new(
+            Arc::from(x0_st),
+            x0_shape,
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Rocm(0),
+        );
+        let full = Shape::new(vec![seq, hc * hidden]);
+        let seeded =
+            seed_streams_device(&x0_t, hc, hidden, seq, &full, &Device::Rocm(0)).expect("seed");
+        let got = seeded.to_vec_f32().expect("read seeded");
+        let mut expect = vec![0f32; seq * hc * hidden];
+        for si in 0..seq {
+            for h in 0..hc {
+                let src = si * hidden;
+                let dst = (si * hc + h) * hidden;
+                expect[dst..dst + hidden].copy_from_slice(&x0[src..src + hidden]);
+            }
+        }
+        let diff: f32 = got
+            .iter()
+            .zip(&expect)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        eprintln!("[xing-oracle] seed broadcast: max|dev-broadcast| = {diff:.3e}");
+        assert!(diff == 0.0, "seed broadcast diverges: {diff}");
+    }
+
+    /// Model-level gate 2: `mean_collapse` must equal a plain per-(token,
+    /// channel) mean over the hc streams (the reference's
+    /// `hidden_states.mean(dim=2)`). Nothing in the block oracle reaches it.
+    #[test]
+    #[ignore = "needs a ROCm device; GRIM_RUN_GPU_TESTS=1 -- --ignored"]
+    fn mean_collapse_matches_a_plain_mean() {
+        if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let (hc, hidden, seq) = (4usize, 128usize, 6usize);
+        let mut streams = vec![0f32; seq * hc * hidden];
+        let mut s = 0xDEAD_BEEF_1234_5678u64;
+        for v in streams.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *v = ((s >> 33) as f32 / 8388608.0 - 1.0) * 0.05;
+        }
+        let plane = Shape::new(vec![seq, hidden]);
+        let got = mean_collapse(
+            &cpu_tensor(streams.clone(), full_shape(hc, hidden, seq)),
+            hc,
+            hidden,
+            seq,
+            &plane,
+        )
+        .expect("collapse");
+        let got = got.to_vec_f32().expect("read");
+        let mut expect = vec![0f32; seq * hidden];
+        for si in 0..seq {
+            for h in 0..hc {
+                let src = (si * hc + h) * hidden;
+                for d in 0..hidden {
+                    expect[si * hidden + d] += streams[src + d] / hc as f32;
+                }
+            }
+        }
+        let diff: f32 = got
+            .iter()
+            .zip(&expect)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        eprintln!("[xing-oracle] mean collapse: max|dev-mean| = {diff:.3e}");
+        assert!(diff < 1e-6, "mean collapse diverges: {diff}");
+    }
+
+    /// Model-level gate 3: the head's Q6_K `lm_head` (n = 131072) on device
+    /// against a host dequantized matmul on the same hidden state. The block
+    /// oracle never touches the head, and the IQ3_S WMMA GEMM was wrong at
+    /// real shapes - the output projection deserves the same treatment.
+    #[test]
+    #[ignore = "needs XING_GGUF + a ROCm device; GRIM_RUN_GPU_TESTS=1 -- --ignored"]
+    fn lm_head_device_matches_a_host_dequant_matmul() {
+        if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let Ok(path) = std::env::var("XING_GGUF") else {
+            return;
+        };
+        use grim_format::tprov::GgufProvider;
+        let prov = GgufProvider::open(path.as_str()).expect("open gguf");
+        // Two copies: the host reference dequantizes on CPU, the device arm
+        // needs a ROCm-resident weight (a CPU weight cannot feed a matmul).
+        let ws_cpu = grim_nn::WeightSource::root(&prov, Device::Cpu);
+        let head = Linear::load_shape(&ws_cpu.pp("output"), [3584, 131072]).expect("load lm_head cpu");
+        let ws_dev = grim_nn::WeightSource::root(&prov, Device::Rocm(0));
+        let head_dev =
+            Linear::load_shape(&ws_dev.pp("output"), [3584, 131072]).expect("load lm_head dev");
+        let hidden = 3584usize;
+        let mut x = vec![0f32; hidden];
+        let mut s = 0x5A17_9E37u64;
+        for v in x.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *v = ((s >> 33) as f32 / 8388608.0 - 1.0) * 0.5;
+        }
+        let x_cpu = cpu_tensor(x.clone(), Shape::new(vec![1, hidden]));
+        let want = head.forward(&x_cpu).expect("host lm_head").to_vec_f32().expect("read host");
+
+        let x_shape = Shape::new(vec![1, hidden]);
+        use grim_tensor::{CoreTensorOps, DType, QuantProvenance};
+        let dev = grim_backend_rocm::RocmDevice::shared(0);
+        let x_dev = Tensor::new(
+            Arc::from(dev.from_cpu(&x, &x_shape, DType::F32).expect("upload")),
+            x_shape,
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Rocm(0),
+        );
+        let got = head_dev.forward(&x_dev).expect("device lm_head").to_vec_f32().expect("read dev");
+        assert_eq!(got.len(), want.len(), "logits length mismatch");
+        let scale = want
+            .iter()
+            .fold(0f32, |m, v| m.max(v.abs()))
+            .max(1e-6);
+        let mut max_abs = 0f32;
+        for (g, w) in got.iter().zip(&want) {
+            max_abs = max_abs.max((g - w).abs());
+        }
+        let rel = max_abs / scale;
+        eprintln!("[xing-oracle] lm_head: max_abs {max_abs:.3e} rel {rel:.3e}");
+        assert!(rel < 1e-3, "lm_head device vs host diverges (rel {rel:.3e})");
+    }
+
     /// The GGUF split-bank reassembly must produce the same matrix the
     /// safetensors container ships as one `kv_b_proj.weight`, because the
     /// latent-absorbed decode kernel indexes both identically.

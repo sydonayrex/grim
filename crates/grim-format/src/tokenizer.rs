@@ -1277,7 +1277,12 @@ pub fn render_chat_template(
         add_generation_prompt => add_generation_prompt,
         bos_token => bos_token,
         eos_token => eos_token,
-        tools => tools,
+        // A template that guards its tools block with `tools | length` fails on
+        // an ABSENT variable under Lenient undefined ("cannot calculate length
+        // of value of type none"), so a caller that passes no tools still
+        // breaks Xing4.0's template. Default it to an empty list; a template
+        // that never references tools is unaffected.
+        tools => tools.map(minijinja::Value::from_serialize).unwrap_or_else(|| minijinja::Value::from_serialize(&Vec::<u8>::new())),
         tool_choice => tool_choice,
         system_prompt => empty_str,
         system_message => empty_str,
