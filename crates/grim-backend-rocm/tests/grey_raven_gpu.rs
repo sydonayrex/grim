@@ -2023,3 +2023,93 @@ fn grey_raven_a_byte_covers_which_k() -> TestResult {
 // carried, and it took a measurement that varied one more thing to expose. The
 // discipline that caught all three is the same -- vary exactly one input, keep every
 // other measured fact fixed, and never infer an absolute from a magnitude.
+
+/// Does the index change *which* k's a byte covers, or only multiplicity?
+///
+/// This is the question the last probe left open, and it is decidable directly. A
+/// row 0 byte 0 held hot, B one-hot at each of the 32 k positions, repeated across
+/// a spread of indices. If the covered k-set is invariant, the index selects
+/// multiplicities or sub-positions inside a fixed k set, and GreyRaven's arbitrary
+/// 2:4 metadata cannot be emitted as-is. If it moves, coverage really is what the
+/// index chooses and the format maps through.
+///
+/// Nothing here relies on a magnitude, which is the inference that was wrong
+/// before: every entry is a yes/no on a single k at a single index.
+#[test]
+fn grey_raven_index_moves_k_coverage() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let mut a = vec![FP8_ZERO; 256];
+    a[0] = FP8_ONE; // row 0, byte 0
+
+    for (name, sidx) in [
+        ("sidx = 0", 0u32),
+        ("selector 0", 1),
+        ("selector 1", 2),
+        ("0x11", 0x11),
+        ("0x33", 0x33),
+        ("0x55", 0x55),
+        ("0x55555555", 0x5555_5555),
+        ("0x33333333", 0x3333_3333),
+        ("0xffffffff", 0xffff_ffff),
+    ] {
+        let mut ks: Vec<usize> = Vec::new();
+        for k in 0..32usize {
+            let mut b = vec![FP8_ZERO; 512];
+            b[(k / 16) * 16 + (k % 16)] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                ks.push(k);
+            }
+        }
+        println!("{name:<12} byte 0 covers k = {ks:?}");
+    }
+    Ok(())
+}
+
+// ============================================================================
+// The index moves k coverage -- and the tile is 1:4, not 2:4.
+//
+// Row 0 byte 0 held hot, B one-hot at each of the 32 k, across a spread of
+// indices. Every entry is a yes/no on one k at one index; no magnitudes involved:
+//
+//   sidx = 0        covers k = [0, 16]
+//   selector 0      covers k = [1, 17]
+//   selector 1      covers k = [2, 18]
+//   0x11            covers k = [1, 17]
+//   0x33            covers k = [3, 19]
+//   0x55            covers k = [1, 17]
+//   0x55555555      covers k = [1, 17]
+//   0x33333333      covers k = [3, 19]
+//   0xffffffff      covers k = [3, 19]
+//
+// The index's low two bits select **which position within a group of four** the
+// byte occupies: 00 -> 0, 01 -> 1, 10 -> 2, 11 -> 3, and the +16 partner moves
+// with it. So coverage is real, and the earlier "fixed k set" worry is wrong.
+//
+// But count what the hardware keeps. Byte pair p covers group p, at one position
+// chosen by the index -- **one k per group of four, not two**. Four byte pairs
+// reach 4 of 32 k directly, and each is carried by two bytes, so a row settles 8
+// of 32 k: **1:4 sparsity with 8 survivors per row.**
+//
+// That is half the density GreyRaven was designed around. 2:4 keeps 16 of 32 and
+// lands at 4.75 bpw with 3 metadata bits per group; 1:4 keeps 8 of 32 and lands
+// near 2.5 bpw with 2 bits per group. So:
+//
+//   - the *mechanism* GreyRaven needs exists and is understood -- the format's
+//     metadata does not have to change shape, since "which position of four" is
+//     already what a 2-bit field means;
+//   - the *density* does change, and with it the accuracy story, the bit budget,
+//     and any claim that GreyRaven is a 4.75 bpw format on this instruction.
+//
+// That is a design decision, not a kernel bug, and it should be made explicitly
+// rather than discovered later: either GreyRaven targets 1:4 at ~2.5 bpw on
+// gfx1200, or it keeps 2:4 and this instruction is the wrong primitive and the
+// search continues.
+//
+// Worth noting what is *not* established: whether the offset is shared across all
+// groups or per-group. The data above only varies the low two bits, which govern
+// byte 0's group. If the remaining selectors give independent offsets per group,
+// arbitrary 2:4 within a group is still expressible and the conclusion above
+// softens considerably. That is the next question, and it is a small one -- sweep
+// the higher selector bits and watch byte pair 1's group independently of pair 0's.
