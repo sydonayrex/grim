@@ -1257,3 +1257,48 @@ fn grey_raven_combinations_reach_missing_residues() -> TestResult {
 // The three-bit-per-group metadata GreyRaven's pack already produces maps onto it
 // directly: a survivor's position within its group of four selects one of the two
 // bits or their union, and no k-quant change is required.
+
+// ============================================================================
+// CONSOLIDATED SPEC -- everything E6 has established, in one place.
+//
+//   intrinsic   v_swmmac_f32_16x16x32_fp8_fp8  (D, A, B, index)
+//               D = v8f (8 f32/lane), A = v2i32 (8 B/lane), B = v4i32 (16 B/lane),
+//               index = 1 u32 **per lane** (a VGPR, not a uniform scalar).
+//               Confirmed against clang: 4 args, only (v2i32,v4i32,v8i32,i32) accepted.
+//
+//   B layout    lane L holds the 16 columns of k = L, i.e. B[k][n] is byte
+//               k*16 + n, so a B byte's offset mod 16 is its n (column) and
+//               offset / 16 is its k. 16 k per group over 32 positions = 512 B.
+//
+//   C layout    output lane = **column**; the 8 slots are **rows**, slot s
+//               covering rows {2s, 2s+1}. Transposed from the usual WMMA picture.
+//
+//   A layout    lane L carries **row L mod 16**, 8 bytes per lane, so lanes L and
+//               L+16 are the two halves of row L. 16 rows, 2 lanes each = 256 B.
+//
+//   index       8 selectors at bit positions sel = [0,1,4,5,8,9,12,13] (index j
+//               is bit sel[j]); bits 16..31 are inert.
+//                 selector j        -> residue 2j+1  mod 16
+//                 selectors 2j,2j+1 -> residue 2j+3  mod 16
+//                 baseline sidx = 0 -> residues 0,4,8,12 mod 16
+//               Equivalently, per group g of four k's, the index picks which
+//               sub-position a survivor occupies -- i.e. it is a 2:4 selector.
+//               16 owned residues against a 16x32 A and 16 k per B group: the
+//               counts agree, which is what makes this a map rather than a
+//               pattern.
+//
+// THE ONE GAP. Everything above is measured except how A's 8 bytes per lane are
+// assigned to k *given* an index -- the index says which k each byte lands on,
+// and the residue table says which k each B column corresponds to, but no probe
+// run here has joined the two. Closing it is a single end-to-end measurement:
+// build a known dense A and B on the host, run them through the MMA with a chosen
+// index, and compare against a CPU reference. That comparison is simultaneously
+// the last discovery step and E6's actual acceptance test
+// (`grey_raven_sparse_gemm_matches_dense_reference`), so it is the next thing to
+// write rather than a separate investigation.
+//
+// NEGATIVE RESULTS worth not rediscovering, all measured on gfx1200:
+//   - no index bit gates an A byte; the index is a k-placement map, not a mask
+//   - all 8 bytes of an A lane agree under a uniform B, since C[r][n] sums the row
+//   - a probe that assumes the layout it measures returns plausible garbage;
+//     `identity_32x16` in this file is that mistake, kept and labelled
