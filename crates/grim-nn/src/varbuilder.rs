@@ -826,6 +826,12 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             FloatPackScheme::Fp4 => dequant_fp4(&raw.bytes, n),
             FloatPackScheme::Nf4 => dequant_nf4(&raw.bytes, n),
             FloatPackScheme::Fp8 => dequant_fp8(&raw.bytes, n),
+            // This is the arm that makes TreePie *loadable*: a checkpoint can
+            // declare the scheme and the weights decode, rather than the format
+            // existing only as a kernel plus a direct-call test.
+            FloatPackScheme::TreePie => {
+                Ok(grim_quant::tree_pie::dequant_tree_pie_bytes(&raw.bytes, n))
+            }
             FloatPackScheme::MxFp4 => dequant_mxfp4(&raw.bytes, n),
             FloatPackScheme::MxFp8 => dequant_mxfp8(&raw.bytes, n),
             FloatPackScheme::NvFp4 => dequant_nvfp4(&raw.bytes, n),

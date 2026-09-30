@@ -94,6 +94,9 @@ pub(crate) fn cuda_dequant_quantized_storage(
             FloatPackScheme::Fp4 => grim_quant::dequant_fp4(b_bytes, elem_count),
             FloatPackScheme::Nf4 => grim_quant::dequant_nf4(b_bytes, elem_count),
             FloatPackScheme::Fp8 => grim_quant::dequant_fp8(b_bytes, elem_count),
+            FloatPackScheme::TreePie => {
+                Ok(grim_quant::tree_pie::dequant_tree_pie_bytes(b_bytes, elem_count))
+            }
             FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(b_bytes, elem_count),
             FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(b_bytes, elem_count),
             FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(b_bytes, elem_count),

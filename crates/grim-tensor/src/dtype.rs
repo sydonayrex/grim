@@ -190,6 +190,14 @@ pub enum FloatPackScheme {
     Nf4,
     /// FP8 (E4M3 by default; E5M2 recognized).
     Fp8,
+    /// TreePie (WS-A): 5-bit E2M2 with a separate sign plane, 5.0 bpw.
+    ///
+    /// 32 values per 5 i32 — four payload words holding `exp|mant` and one sign
+    /// plane — so the 5.0 bpw figure holds only at 32-value granularity. The
+    /// dequantized value is native FP16, which is what lets the ROCm GEMV decode
+    /// in-register and feed `V_DOT2_F32_F16` directly instead of uploading a
+    /// dequantized copy. Requires `elem_count % 32 == 0`.
+    TreePie,
     /// MXFP4: 4-bit float with shared E8M0 scale per 32 elements.
     /// Packed as length-prefixed codes and exponents.
     MxFp4,
@@ -219,6 +227,8 @@ pub enum QuantFormat {
     Q8_0,
     Q2K,
     Q3K,
+    /// TreePie (WS-A): 5-bit E2M2 with a sign plane, 5.0 bpw, 32 values per group.
+    TreePie,
     Q4K,
     Q5K,
     Q6K,
@@ -352,6 +362,10 @@ impl DType {
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => elem_count.div_ceil(2),
                 FloatPackScheme::Fp8 => elem_count,
+                // 5 i32 = 20 bytes per 32 values. Ragged tails are rejected at
+                // the boundaries rather than rounded up here, because a partial
+                // group would silently overstate the density the format claims.
+                FloatPackScheme::TreePie => elem_count.div_ceil(32) * 5 * 4,
                 FloatPackScheme::MxFp4 => elem_count.div_ceil(2) + (elem_count.div_ceil(32)),
                 FloatPackScheme::MxFp8 => elem_count + (elem_count.div_ceil(32)),
                 // NVFP4 and Nutcracker: 1 scale byte per 16-elem sub-block +
@@ -408,6 +422,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Fp4 => Storage::FloatPack(FloatPackScheme::Fp4),
             QuantFormat::Nf4 => Storage::FloatPack(FloatPackScheme::Nf4),
             QuantFormat::Fp8 => Storage::FloatPack(FloatPackScheme::Fp8),
+            QuantFormat::TreePie => Storage::FloatPack(FloatPackScheme::TreePie),
             QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
             QuantFormat::Fp8Block128 => Storage::Block(BlockDtype::Fp8Block128),
@@ -448,6 +463,7 @@ impl TryFrom<&Storage> for QuantFormat {
                 FloatPackScheme::Fp4 => Ok(QuantFormat::Fp4),
                 FloatPackScheme::Nf4 => Ok(QuantFormat::Nf4),
                 FloatPackScheme::Fp8 => Ok(QuantFormat::Fp8),
+                FloatPackScheme::TreePie => Ok(QuantFormat::TreePie),
                 _ => Err(()),
             },
             Storage::Block(b) => match b {

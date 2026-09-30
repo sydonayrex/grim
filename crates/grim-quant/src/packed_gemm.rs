@@ -168,6 +168,78 @@ pub(crate) mod x86 {
             c
         }
     }
+
+    /// AVX2 kernel for [`crate::gemm_iq4nl_packed`].
+    ///
+    /// IQ4_NL decodes each 16-byte `qs[]` row to 32 weights via a 16-entry
+    /// codebook (`KVALUES_IQ4NL`): `w[i] = d * codebook[qs[j] nibble]`. The
+    /// codebook is tiny (64 B, L1-resident) so the scalar lookup is not the
+    /// bottleneck — the A-side dot product is, and that part is vectorized with
+    /// four 8-lane AVX2 multiply-accumulate lanes per 32-weight block.
+    ///
+    /// # Safety The caller must have verified AVX2 support at runtime, and the inputs must
+    /// satisfy the validation contract of the public function (`k % 32 == 0`).
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn gemm_iq4nl_packed_avx2(
+        a: &[f32],
+        b_bytes: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        unsafe {
+            use crate::IQ4_NL_BLOCK_BYTES;
+            use crate::IQ4_NL_QK;
+
+            let blocks_per_row = k / IQ4_NL_QK;
+            let stride_b = blocks_per_row * IQ4_NL_BLOCK_BYTES;
+            let mut c = vec![0.0f32; m * n];
+
+            for row_m in 0..m {
+                for col_n in 0..n {
+                    let b_row = &b_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+                    let mut dot = 0.0f32;
+                    let mut b_pos = 0usize;
+                    let mut a_pos = row_m * k;
+
+                    for _blk in 0..blocks_per_row {
+                        let d = crate::f16_to_f32(b_row[b_pos], b_row[b_pos + 1]);
+                        let qs = &b_row[b_pos + 2..b_pos + IQ4_NL_BLOCK_BYTES];
+
+                        // Decode 32 nibbles to 32 f32 weight values.
+                        // Low nibble of qs[j] → weight[j] (j in 0..16),
+                        // high nibble of qs[j] → weight[j+16].
+                        // Codebook lookup: W[i] = d * KVALUES_IQ4NL[nibble[i]].
+                        let mut w = [0.0f32; IQ4_NL_QK];
+                        for j in 0..IQ4_NL_QK / 2 {
+                            let lo = (qs[j] & 0x0F) as usize;
+                            let hi = ((qs[j] >> 4) & 0x0F) as usize;
+                            w[j] = d * crate::KVALUES_IQ4NL_REF[lo];
+                            w[j + IQ4_NL_QK / 2] = d * crate::KVALUES_IQ4NL_REF[hi];
+                        }
+
+                        // Vectorized dot product: 4 x 8-lane MAC over the 32 weights.
+                        let w_ptr = w.as_ptr();
+                        let a_ptr = a.as_ptr().add(a_pos);
+                        let mut acc = _mm256_setzero_ps();
+                        for lane in 0..4 {
+                            let wv = _mm256_loadu_ps(w_ptr.add(lane * 8));
+                            let av = _mm256_loadu_ps(a_ptr.add(lane * 8));
+                            acc = _mm256_add_ps(acc, _mm256_mul_ps(av, wv));
+                        }
+                        dot += hsum256!(acc);
+
+                        b_pos += IQ4_NL_BLOCK_BYTES;
+                        a_pos += IQ4_NL_QK;
+                    }
+
+                    c[row_m * n + col_n] = dot;
+                }
+            }
+
+            c
+        }
+    }
 }
 
 // aarch64 / NEON (NEON is baseline
@@ -218,6 +290,73 @@ pub(crate) mod neon {
                         dot += scale * vaddvq_f32(acc);
                         b_pos += 34;
                         a_pos += 32;
+                    }
+
+                    c[row_m * n + col_n] = dot;
+                }
+            }
+
+            c
+        }
+    }
+
+    /// NEON kernel for [`crate::gemm_iq4nl_packed`].
+    ///
+    /// Same algorithm as the AVX2 kernel: scalar codebook lookup (16-entry
+    /// table, L1-resident) to decode 32 nibbles → 32 f32 weights, then
+    /// vectorized dot-product against A using four 4-lane NEON multiply-add
+    /// pairs (4 × vmlaq_f32 covering all 32 weights per block).
+    ///
+    /// # Safety Inputs must satisfy the validation contract of the public function (`k % 32 == 0`).
+    pub(crate) unsafe fn gemm_iq4nl_packed_neon(
+        a: &[f32],
+        b_bytes: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        unsafe {
+            use crate::IQ4_NL_BLOCK_BYTES;
+            use crate::IQ4_NL_QK;
+
+            let blocks_per_row = k / IQ4_NL_QK;
+            let stride_b = blocks_per_row * IQ4_NL_BLOCK_BYTES;
+            let mut c = vec![0.0f32; m * n];
+
+            for row_m in 0..m {
+                for col_n in 0..n {
+                    let b_row = &b_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+                    let mut dot = 0.0f32;
+                    let mut b_pos = 0usize;
+                    let mut a_pos = row_m * k;
+
+                    for _blk in 0..blocks_per_row {
+                        let d = crate::f16_to_f32(b_row[b_pos], b_row[b_pos + 1]);
+                        let qs = &b_row[b_pos + 2..b_pos + IQ4_NL_BLOCK_BYTES];
+
+                        // Decode 32 nibbles to 32 f32 weight values.
+                        // Low nibble of qs[j] → weight[j], high nibble → weight[j+16].
+                        let mut w = [0.0f32; IQ4_NL_QK];
+                        for j in 0..IQ4_NL_QK / 2 {
+                            let lo = (qs[j] & 0x0F) as usize;
+                            let hi = ((qs[j] >> 4) & 0x0F) as usize;
+                            w[j] = d * crate::KVALUES_IQ4NL_REF[lo];
+                            w[j + IQ4_NL_QK / 2] = d * crate::KVALUES_IQ4NL_REF[hi];
+                        }
+
+                        // Vectorized dot product: 8 × 4-lane MAC over the 32 weights.
+                        let w_ptr = w.as_ptr();
+                        let a_ptr = a.as_ptr().add(a_pos);
+                        let mut acc = vdupq_n_f32(0.0);
+                        for lane in 0..8 {
+                            let wv = vld1q_f32(w_ptr.add(lane * 4));
+                            let av = vld1q_f32(a_ptr.add(lane * 4));
+                            acc = vmlaq_f32(acc, av, wv);
+                        }
+                        dot += vaddvq_f32(acc);
+
+                        b_pos += IQ4_NL_BLOCK_BYTES;
+                        a_pos += IQ4_NL_QK;
                     }
 
                     c[row_m * n + col_n] = dot;

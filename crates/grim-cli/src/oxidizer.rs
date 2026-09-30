@@ -826,6 +826,13 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         QuantFormat::Fp8Sparse24 => {
             Err("GreyRaven 2:4 has no GGUF type tag and cannot be written by the oxidizer".into())
         }
+        // TreePie is grim-internal for now, like GreyRaven: it can be loaded and
+        // run, but there is no GGUF type tag to write it under, so the oxidizer
+        // refuses at the point the user named the format rather than emitting a
+        // checkpoint no reader would interpret correctly.
+        QuantFormat::TreePie => {
+            Err("TreePie has no GGUF type tag and cannot be written by the oxidizer".into())
+        }
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
         QuantFormat::Q2K => Ok(GgufDType::Q2K),
         QuantFormat::Q3K => Ok(GgufDType::Q3K),

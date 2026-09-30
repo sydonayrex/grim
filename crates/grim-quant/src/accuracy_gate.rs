@@ -105,6 +105,17 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.10,
                 max_delta_ppl: 0.08,
             },
+            // TreePie is E2M2 -- one exponent bit, two mantissa bits -- so it sits
+            // between NF4 and FP8 on precision. These thresholds are inherited from
+            // NF4, the nearest measured format, and are deliberately NOT presented
+            // as tuned for TreePie: no accuracy sweep has been run against it. They
+            // are a starting bound that will fail loudly if TreePie is worse than
+            // NF4, which is the property worth having until a real sweep replaces them.
+            QuantFormat::TreePie => Self {
+                min_cosine_similarity: 0.9950,
+                max_relative_l2_error: 0.10,
+                max_delta_ppl: 0.08,
+            },
         }
     }
 }

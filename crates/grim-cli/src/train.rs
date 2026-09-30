@@ -1,8 +1,8 @@
 //! `grim train` — SFT training loop: dataset loading, streaming forward, cross-entropy loss, autograd backward, AdamW step, sidecar persistence. F4: real model loading via GrimProvider.
 
 use grim_autograd::{
-    AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionRegistry, Tape, backward,
-    cross_entropy_loss,
+    backward, cross_entropy_loss, AutogradRegistry, AutogradScope, InjectionConfig,
+    LoRAInjectionRegistry, Tape,
 };
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
@@ -310,6 +310,10 @@ fn llama_config_from_metadata(provider: &GgufProvider) -> Result<LlamaConfig> {
 
         partial_rotary_factor: 1.0,
         yarn: None,
+
+        norm_kind: grim_nn::NormKind::Rms,
+        has_norm_bias: false,
+        has_attn_post_norm: false,
     })
 }
 
@@ -1849,8 +1853,8 @@ mod tests {
         let seq_len = input_ids.len();
 
         use grim_autograd::{
-            AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint,
-            LoRAInjectionRegistry, Tape, apply_and_record_lora,
+            apply_and_record_lora, AdamW, AdamWConfig, AutogradRegistry, InjectionConfig,
+            LoRAInjectionPoint, LoRAInjectionRegistry, Tape,
         };
 
         let inj_cfg = InjectionConfig {
@@ -1928,8 +1932,8 @@ mod tests {
         use grim_backend_cpu::cpu_tensor;
         use grim_engine::streaming_forward::StreamingBlockForward;
         use grim_models_transformer::LlamaConfig;
-        use grim_nn::WeightSource;
         use grim_nn::modules::Embedding;
+        use grim_nn::WeightSource;
         use grim_tensor::Shape;
 
         let vocab = 16usize;
@@ -1949,6 +1953,10 @@ mod tests {
             max_seq_len: 64,
             partial_rotary_factor: 1.0,
             yarn: None,
+
+            norm_kind: grim_nn::NormKind::Rms,
+            has_norm_bias: false,
+            has_attn_post_norm: false,
         };
 
         let inj_cfg = InjectionConfig {

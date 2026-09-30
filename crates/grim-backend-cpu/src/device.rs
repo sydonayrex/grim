@@ -1528,6 +1528,17 @@ impl QuantOps for CpuDevice {
             ));
         }
 
+        // WI-E7 fast path: IQ4_NL GEMM directly on the packed bytes, same guard pattern as Q8_0.
+        // IQ4_NL covers 32 weights per 18-byte block, so whole-block GEMM requires k % 32 == 0.
+        // This bypasses the ~240 MB f32 dequant materialization of the output head.
+        if matches!(format, grim_tensor::QuantFormat::Iq4Nl) && k % 32 == 0 {
+            let c = grim_quant::gemm_iq4nl_packed(a_data, b_bytes, m, n, k)?;
+            return Ok((
+                Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
+                Box::new(ReadyHandle),
+            ));
+        }
+
         let b_dequant_transposed: Vec<f32> =
             match &b_packed.dtype().storage {
                 grim_tensor::dtype::Storage::ResidualPacked(cfg) => {
@@ -1565,6 +1576,11 @@ impl QuantOps for CpuDevice {
                         return Err(Error::Backend(
                             "GreyRaven 2:4 has no packed format yet".to_string(),
                         ))
+                    }
+                    // TreePie is dense E2M2, so the plain dequant serves a matmul
+                    // here. `k * n` must be a multiple of 32; the packer asserts.
+                    grim_tensor::QuantFormat::TreePie => {
+                        grim_quant::tree_pie::dequant_tree_pie_bytes(&b_bytes, k * n)
                     }
                     // GGUF Q8_0 weights are resident as the native 34-byte block stream (2-byte f16 scale + 32 int8 quants per block), and `Linear::forward` passes an empty `b_scales` (scales live in the block headers).
                     // Decoding with the canonical `dequant_q80` - the hand-rolled loop below read stride-32 with a 1.0.
@@ -2439,6 +2455,9 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::FloatPackScheme::Fp4 => grim_quant::dequant_fp4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::Nf4 => grim_quant::dequant_nf4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::Fp8 => grim_quant::dequant_fp8(raw, n),
+                grim_tensor::dtype::FloatPackScheme::TreePie => {
+                    Ok(grim_quant::tree_pie::dequant_tree_pie_bytes(raw, n))
+                }
                 grim_tensor::dtype::FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(raw, n),
                 grim_tensor::dtype::FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(raw, n),

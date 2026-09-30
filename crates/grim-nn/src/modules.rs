@@ -1375,13 +1375,15 @@ impl LayerNorm {
 /// with a non-zero mean the two disagree, so a model that needs one cannot be
 /// served by the other -- which is why this is a compile-time choice per
 /// block rather than a runtime heuristic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NormKind {
     /// `LLM_NORM` / `ggml_norm`: mean-subtracted. Phi-2, GPT-NeoX, OLMo,
     /// StarCoder, CodeGLM and ten others in the plan audit.
     LayerNorm,
     /// `LLM_NORM_RMS` / `ggml_rms_norm`: sum-of-squares only. Llama, Qwen,
-    /// Mistral and most of the corpus.
+    /// Mistral and most of the corpus. The `Default`, because every model that
+    /// predates this type is RMS and a wrong default would change all of them.
+    #[default]
     Rms,
 }
 
@@ -1474,10 +1476,7 @@ impl Norm {
         if let Some(w) = &self.weight {
             return Ok(w.clone());
         }
-        let mut guard = self
-            .ones_weight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.ones_weight.lock().unwrap_or_else(|e| e.into_inner());
         let need = match guard.as_ref() {
             Some(t) => t.shape().elem_count() != dim,
             None => true,
@@ -1508,9 +1507,9 @@ impl Norm {
             }
             NormKind::LayerNorm => {
                 let mean = x.iter().sum::<f32>() / nf;
-                let inv = 1.0 / (x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / nf
-                    + self.eps)
-                    .sqrt();
+                let inv = 1.0
+                    / (x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / nf + self.eps)
+                        .sqrt();
                 x.iter().map(|v| (v - mean) * inv).collect()
             }
         };
@@ -1691,17 +1690,23 @@ impl Embedding {
     pub fn forward(&self, indices: &[u32], seq_len: usize, dim: usize) -> Result<Tensor> {
         let dev = pick_device_for_tensor(&self.weight);
         let out_shape = Shape::new(vec![seq_len, dim]);
-        let (s, h) = if embedding_has_packed_gather(&self.weight.dtype().storage, self.weight.device()) {
-            CoreTensorOps::embedding_packed(
-                &*dev,
-                self.weight.storage().as_ref(),
-                indices,
-                &out_shape,
-                dim,
-            )?
-        } else {
-            CoreTensorOps::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?
-        };
+        let (s, h) =
+            if embedding_has_packed_gather(&self.weight.dtype().storage, self.weight.device()) {
+                CoreTensorOps::embedding_packed(
+                    &*dev,
+                    self.weight.storage().as_ref(),
+                    indices,
+                    &out_shape,
+                    dim,
+                )?
+            } else {
+                CoreTensorOps::embedding(
+                    &*dev,
+                    self.weight.storage().as_ref(),
+                    indices,
+                    &out_shape,
+                )?
+            };
         // WI-Host-1 #3: dropped `h.synchronize()?` here.
         let _ = h;
         Ok(Tensor::new(

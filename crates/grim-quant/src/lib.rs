@@ -3470,6 +3470,11 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         QuantFormat::Q5K => quant_q5k(data)?,
         QuantFormat::Q6K => quant_q6k(data)?,
         QuantFormat::Fp4 => quant_fp4(data)?,
+        // TreePie is dense (E2M2, no pruning), so unlike GreyRaven it *is* a pure
+        // f32 -> bytes rewrite and belongs in this match. Length must be a multiple
+        // of 32 for the 5.0 bpw claim; the packer asserts rather than padding,
+        // because a padded tail would change the element count silently.
+        QuantFormat::TreePie => tree_pie::pack_tree_pie_bytes(data),
         QuantFormat::Nf4 => quant_nf4(data)?,
         QuantFormat::Fp8 => quant_fp8(data)?,
         QuantFormat::Fp4Block16 => quant_fp4_block16(data, 16)?,
@@ -7067,6 +7072,30 @@ mod tests {
                     );
                 }
             }
+
+            // IQ4_NL test
+            let mut b_iq4nl_bytes = Vec::new();
+            for col in 0..n {
+                let row = &b_f32[col * k..(col + 1) * k];
+                let q = quant_iq4nl(row).expect("quant_iq4nl");
+                b_iq4nl_bytes.extend_from_slice(&q);
+            }
+            let packed_c_iq4nl =
+                gemm_iq4nl_packed(&a, &b_iq4nl_bytes, m, n, k).expect("gemm_iq4nl_packed");
+            let dequant_b_iq4nl = dequant_iq4nl(&b_iq4nl_bytes, n * k).expect("dequant_iq4nl");
+            for row in 0..m {
+                for col in 0..n {
+                    let mut expected = 0.0f32;
+                    for l in 0..k {
+                        expected += a[row * k + l] * dequant_b_iq4nl[col * k + l];
+                    }
+                    let actual = packed_c_iq4nl[row * n + col];
+                    assert!(
+                        (actual - expected).abs() < 1e-3,
+                        "IQ4_NL k={k} mismatch: actual={actual}, expected={expected}"
+                    );
+                }
+            }
         }
     }
 }
@@ -7249,6 +7278,112 @@ fn gemm_q4k_packed_scalar(a: &[f32], b_q4k_bytes: &[u8], m: usize, n: usize, k: 
                     is += 2;
                 }
                 pos += 144;
+            }
+            c[row_m * n + col_n] = dot;
+        }
+    }
+
+    c
+}
+
+// IQ4_NL block constants (llama.cpp `block_iq4_nl`, `QK4_NL = 32`).
+/// Weights per IQ4_NL block.
+pub const IQ4_NL_QK: usize = 32;
+/// Bytes per IQ4_NL block: 2-byte f16 scale + 16 byte-packed 32 nibbles.
+pub const IQ4_NL_BLOCK_BYTES: usize = 2 + IQ4_NL_QK / 2; // 18
+
+/// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed IQ4_NL weights.
+///
+/// A has shape `[m, k]`, B has shape `[n, k]` (in packed IQ4_NL bytes: 18 bytes
+/// per 32 weights — 2-byte f16 scale `d` followed by 16 nibble bytes).
+///
+/// This is the CPU-native fused dequant+GEMM path that bypasses the full f32
+/// materialization of B. It mirrors `gemm_q8_0_packed` / `gemm_q4k_packed`:
+/// the inner loop looks up each nibble in `KVALUES_IQ4NL` and multiplies by `d`,
+/// then accumulates the dot product against A.
+///
+/// # Errors
+/// Returns [`Error::Backend`] when `k` is not a multiple of 32, when `b_bytes`
+/// is shorter than `n * (k/32) * 18`, or when `a` is shorter than `m * k`.
+pub fn gemm_iq4nl_packed(
+    a: &[f32],
+    b_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    if k % IQ4_NL_QK != 0 {
+        return Err(Error::Backend(format!(
+            "gemm_iq4nl_packed: k ({k}) must be a multiple of {IQ4_NL_QK}"
+        )));
+    }
+    let blocks_per_row = k / IQ4_NL_QK;
+    let stride_b = blocks_per_row * IQ4_NL_BLOCK_BYTES;
+    if b_bytes.len() < n * stride_b {
+        return Err(Error::Backend(format!(
+            "gemm_iq4nl_packed: buffer too short: expected {}, got {}",
+            n * stride_b,
+            b_bytes.len()
+        )));
+    }
+    if a.len() < m * k {
+        return Err(Error::Backend(format!(
+            "gemm_iq4nl_packed: input a too short: expected {}, got {}",
+            m * k,
+            a.len()
+        )));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if packed_gemm::avx2_detected() {
+        // SAFETY: AVX2 presence was just verified at runtime, and all shape /
+        // buffer-length validation above has passed.
+        return Ok(unsafe { packed_gemm::x86::gemm_iq4nl_packed_avx2(a, b_bytes, m, n, k) });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: shape / buffer-length validation above has passed. NEON is
+    // baseline on aarch64, so no runtime feature check is needed.
+    return Ok(unsafe { packed_gemm::neon::gemm_iq4nl_packed_neon(a, b_bytes, m, n, k) });
+
+    #[cfg(not(target_arch = "aarch64"))]
+    Ok(gemm_iq4nl_packed_scalar(a, b_bytes, m, n, k))
+}
+
+/// Scalar reference implementation of [`gemm_iq4nl_packed`] (inputs already validated).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn gemm_iq4nl_packed_scalar(
+    a: &[f32],
+    b_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    let blocks_per_row = k / IQ4_NL_QK;
+    let stride_b = blocks_per_row * IQ4_NL_BLOCK_BYTES;
+
+    let mut c = vec![0.0f32; m * n];
+
+    for row_m in 0..m {
+        let a_row = &a[row_m * k..(row_m + 1) * k];
+        for col_n in 0..n {
+            let b_row = &b_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+            let mut dot = 0.0f32;
+            let mut b_pos = 0;
+            for blk in 0..blocks_per_row {
+                let d = f16_to_f32(b_row[b_pos], b_row[b_pos + 1]);
+                let qs = &b_row[b_pos + 2..b_pos + IQ4_NL_BLOCK_BYTES];
+                let a_sub = &a_row[blk * IQ4_NL_QK..(blk + 1) * IQ4_NL_QK];
+
+                // Low nibble of qs[j] → weight[j] (j in 0..16),
+                // high nibble of qs[j] → weight[j+16].
+                for j in 0..IQ4_NL_QK / 2 {
+                    let lo = (qs[j] & 0x0F) as usize;
+                    let hi = ((qs[j] >> 4) & 0x0F) as usize;
+                    dot += a_sub[j] * d * KVALUES_IQ4NL_REF[lo];
+                    dot += a_sub[j + IQ4_NL_QK / 2] * d * KVALUES_IQ4NL_REF[hi];
+                }
+                b_pos += IQ4_NL_BLOCK_BYTES;
             }
             c[row_m * n + col_n] = dot;
         }

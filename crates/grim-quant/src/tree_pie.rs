@@ -262,3 +262,55 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
         sign * (1.0 + mant / 1024.0) * (2f32).powi(exp - 15)
     }
 }
+
+/// Dequantize TreePie from its **byte** storage form.
+///
+/// The codec is defined over `[i32; 5]` per 32 values, but a `Storage::FloatPack`
+/// tensor hands back bytes, so this is the boundary the backends call. Rejects a
+/// length that is not a whole number of groups and one whose groups are not
+/// 5 i32 each, rather than truncating: a partial group would silently change the
+/// element count, and TreePie's 5.0 bpw only holds at 32-value granularity.
+///
+/// Little-endian, matching the host: the ROCm kernel reads the same words as
+/// 32-bit lanes, so host and device must agree on the byte order or the decode
+/// diverges silently rather than loudly.
+pub fn dequant_tree_pie_bytes(raw: &[u8], n: usize) -> Vec<f32> {
+    assert!(
+        n % 32 == 0,
+        "TreePie needs n % 32 == 0 for the 5.0 bpw claim; got n = {n}"
+    );
+    let groups = n / 32;
+    assert_eq!(
+        raw.len(),
+        groups * TREE_PIE_WORDS_PER_32 * 4,
+        "TreePie storage must be {groups} groups of 5 i32 = {} bytes; got {}",
+        groups * TREE_PIE_WORDS_PER_32 * 4,
+        raw.len()
+    );
+    let mut out = Vec::with_capacity(n);
+    let mut words = [0i32; TREE_PIE_WORDS_PER_32];
+    for g in 0..groups {
+        for (w, slot) in words.iter_mut().enumerate() {
+            let o = (g * TREE_PIE_WORDS_PER_32 + w) * 4;
+            *slot = i32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+        }
+        out.extend_from_slice(&unpack_tree_pie_32(&words));
+    }
+    out
+}
+
+/// Pack `[f32]` into TreePie's byte storage form, the inverse of
+/// [`dequant_tree_pie_bytes`].
+pub fn pack_tree_pie_bytes(values: &[f32]) -> Vec<u8> {
+    assert!(values.len() % 32 == 0, "TreePie needs len % 32 == 0; got {}", values.len());
+    let groups = values.len() / 32;
+    let mut out = Vec::with_capacity(groups * TREE_PIE_WORDS_PER_32 * 4);
+    for g in 0..groups {
+        let mut block = [0f32; 32];
+        block.copy_from_slice(&values[g * 32..g * 32 + 32]);
+        for w in pack_tree_pie_32(&block) {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    out
+}

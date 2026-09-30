@@ -91,7 +91,11 @@ pub async fn cmd_bench(
 
             partial_rotary_factor: 1.0,
             yarn: None,
-        };
+        
+            norm_kind: Default::default(),
+            has_norm_bias: false,
+            has_attn_post_norm: false,
+};
         Box::new(grim_models_transformer::Llama::random(device.clone(), cfg))
     };
     let start = std::time::Instant::now();
