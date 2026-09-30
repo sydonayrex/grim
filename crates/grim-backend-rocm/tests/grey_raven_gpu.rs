@@ -713,3 +713,95 @@ fn grey_raven_a_fragment_sweep_uniform_b() -> TestResult {
 // active without perturbing either fragment layout, so sweeping it against a
 // one-hot A and a uniform B can separate the k mapping from the layout question.
 // That is the next probe.
+
+/// Sweep the sparsity index against one-hot A and uniform B.
+///
+/// This is the only handle that changes *which k is active* without perturbing
+/// either fragment layout, which is what the previous two sweeps could not do.
+/// A's row mapping is known (lane mod 16) but its k mapping is not, and B's
+/// layout is not either; the two are coupled, so varying an operand to learn
+/// about the other is circular. The index is external to both.
+///
+/// With B uniform, C[r][n] = sum over *active* k of A[r][k], so a one-hot A
+/// byte gives 1.0 exactly when its k is selected by sidx and 0.0 when it is not.
+/// The live set for each index is therefore a direct readout of the index ->
+/// (A lane, A byte) selection, which is the k mapping with B's layout factored
+/// out entirely.
+#[test]
+fn grey_raven_sparse_index_selects_k() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    let dev = &dev;
+    let b = vec![FP8_ONE; 512];
+
+    // Every one-bit pattern, across the whole u32, not just the low nibble: the
+    // low 4 bits turned out to be inert here, and it is cheaper to check all 32
+    // positions than to assume which half the encoding lives in.
+    for sidx in (0u32..32).map(|i| 1u32 << i) {
+        let mut live: Vec<usize> = Vec::new();
+        for g in 0..256usize {
+            let mut a = vec![FP8_ZERO; 256];
+            a[g] = FP8_ONE;
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
+                live.push(g);
+            }
+        }
+        // Compress to ranges so the pattern is readable rather than 256 numbers.
+        let mut ranges: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < live.len() {
+            let s = live[i];
+            let mut e = s;
+            while e + 1 < live.len() && live[e + 1] == e + 1 { e += 1; }
+            ranges.push(if s == e { format!("{s}") } else { format!("{s}-{e}") });
+            i = e + 1;
+        }
+        println!("sidx={sidx:#04x}  {:>3} live A byte offsets: {}", live.len(), ranges.join(", "));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Result of the index sweep, and the retraction it forces.
+//
+// Sweeping one-hot A against uniform B over **every one-bit pattern in the
+// u32**, all 256 A bytes stay live in all 32 cases -- and at sidx = 0 all 256
+// are live too. Not one bit of the sparsity index gates a single A element.
+//
+// That retracts the reading this file gave the index twice. The first note said
+// bits 0,1 "are almost certainly the per-group slot selector" and that the
+// 2:4 choice was being read out directly. The measurement is real -- those bits
+// do change which 8 of 32 output lanes receive data -- but the *interpretation*
+// is wrong. The index is not selecting among k. If it were, a one-hot A would go
+// dark for the index values that deselect its byte, and none ever does.
+//
+// The two observations are consistent under a different reading: the index
+// **routes output** rather than selecting input. With A all-ones, changing bits
+// 0,1 moves which lane class is written; with A one-hot, every byte still
+// produces output under every index, just routed to a different lane class.
+//
+// So the 2:4 pattern is not something this operand asks for. It is either fixed
+// by the instruction, or carried somewhere this sweep cannot see -- a companion
+// VGPR, or a convention on how the 8 bytes per lane are interpreted.
+//
+// Where E6 stands, stated without optimism:
+//
+//   settled    the instruction's signature (v2i32, v4i32, v8i32, i32), against
+//              clang rather than a hand-written note
+//   settled    A lane (0..31) -> C row = lane mod 16, two lanes per row
+//   settled    the C fragment: output lane = column, slot = row pair {2s, 2s+1}
+//   settled    bits 0,1 of the index route output to a lane class mod 4
+//   open       A's 8 bytes/lane -> k, unreadable with B uniform because C[r][n]
+//              sums the whole row
+//   open       B's 16 bytes/lane -> (k, n), coupled to the above
+//   refuted    the index as a 2:4 slot selector
+//   refuted    "half of A is dead", "bytes act in pairs", "4 values/lane" --
+//              artifacts of the retracted identity-B sweep
+//
+// The coupled pair is the real obstacle. With B uniform only A's rows are
+// visible; with A uniform only A's rows are visible from A, and B reads out
+// against an A of unknown k mapping. Separating them needs a probe that fixes
+// one operand's k mapping *without* assuming it, and no such handle is left in
+// the current operand set -- which is itself the finding worth escalating, since
+// it means E6's remaining work is not a search but a change to what the kernel
+// is given.
