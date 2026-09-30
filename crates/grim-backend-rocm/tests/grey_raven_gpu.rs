@@ -464,8 +464,12 @@ fn grey_raven_b_byte_onehot_sweep() -> TestResult {
     Ok(())
 }
 
-/// One-hot sweep over A, symmetric to the B sweep, to read off A's byte -> (row, k)
-/// mapping and its read granularity.
+/// One-hot sweep over A.
+///
+/// KNOWN INVALID -- retained for the record, not as a source of truth. Its B
+/// operand is built by `identity_32x16`, which assumes B's fragment layout is
+/// memory row-major; it is not, so lanes 1..31 read zeros. See the retraction
+/// note at the foot of this file. The B sweep is the valid one.
 ///
 /// The B sweep showed only bytes at offset = 0 (mod 4) are live, and that each
 /// live byte contributes exactly 2.0. Both facts are about how many bytes the
@@ -543,15 +547,50 @@ fn identity_32x16() -> Vec<u8> {
 // its neighbour". A one-hot sweep separates them, because a single hot byte has
 // exactly one possible contributor to C.
 //
-// Measured, A side (B = 32x16 identity):
+// RETRACTED -- the A-side measurements below are invalid, and are kept only so
+// the mistake is not repeated. The B operand was built by `identity_32x16()`,
+// which lays B out row-major in memory (16 bytes per k-row). But the kernel
+// reads `B[lane]` as a *fragment*, not as row `lane`. So lane 0 received the
+// row containing B[0][0] = 1 and lanes 1..31 received all-zero rows, and the
+// sweep was multiplying a one-hot A by a B that was almost entirely zero.
+//
+// Every A-side observation -- "offsets 128..255 are dead", "bytes act in
+// adjacent pairs", "four values per lane" -- is an artifact of that. The 1.0
+// values are what a one-hot A times a near-zero B should produce, which is
+// exactly why the result looked clean enough to be believed.
+//
+// The general trap, worth stating plainly: a probe that assumes the layout it is
+// trying to measure cannot measure it. Building the identity in memory and
+// reading the product back is circular -- it returns a plausible answer for any
+// layout, and a *correct-looking* one only when memory order happens to match
+// the fragment order. The B sweep below avoids this because it never assumes
+// B's layout: A is uniform, so any hot B byte can be attributed by elimination.
+//
+// Original, now-withdrawn A-side text:
 //
 //   - Nonzero values are exactly 1.0. Correct: one hot A element times an
 //     identity B is 1.0.
-//   - **Offsets 128..255 produce nothing at all.** Half the supplied A buffer
-//     is dead.
-//   - The live 128 bytes act in **adjacent pairs**: {0,1}, {2,3}, {4,5}, ... A hot
+//   - Offsets 128..255 produce nothing at all. Half the supplied A buffer is
+//     dead.
+//   - The live 128 bytes act in adjacent pairs: {0,1}, {2,3}, {4,5}, ... A hot
 //     byte at either member of a pair gives the identical result, at value 1.0,
 //     which is what pairwise summing into one value predicts.
+//
+// Measured, B side (A = 256 compacted bytes of 1.0) -- these stand, because the
+// uniform A makes the sweep independent of B's layout:
+//
+//   - Only offsets = 0 (mod 4) are live: 128 of 512. The other 384 bytes change
+//     nothing.
+//   - Each live byte lights 16 C elements: all 8 slots of lane j and all 8 slots
+//     of lane j+16, j in 0..16, so the 32 lanes pair as {j, j+16}.
+//   - Nonzero values are exactly 2.0, never 1.0, for any single hot byte.
+//
+// The intrinsic's signature has since been confirmed against clang directly --
+// (v2i32 A, v4i32 B, v8i32 C/D, i32 index), 4 args, no permissibility -- so the
+// operand roles here are right and the A/B-swap theory is dead. That leaves the
+// B-side numbers to explain: 4 of 16 B bytes live per lane, each contributing
+// twice. Those are the next thing to chase, with a probe that varies A only
+// across its *fragment* lanes, which is now the one unknown left to pin down.
 //
 // Measured, B side (A = 256 compacted bytes of 1.0):
 //
@@ -561,20 +600,21 @@ fn identity_32x16() -> Vec<u8> {
 //     of lane j+16, j in 0..16, so the 32 lanes pair as {j, j+16}.
 //   - Nonzero values are exactly 2.0, never 1.0, for any single hot byte.
 //
-// Both operands are therefore consumed at **four values per lane**, not the 8
-// and 16 supplied, and 4 x 32 = 128 elements is neither the 256 of a 2:4-
-// compacted 16x32 A nor the 512 of a 32x16 B. The 2.0 on the B side is the
-// same fact seen from the other side: a hot B value is being accumulated twice.
+// On the B side, 4 of the 16 supplied bytes per lane are live, and a live byte
+// is accumulated twice. Whether that is a 32x16 B genuinely laid out that way, or
+// a fragment whose layout still has to be discovered, is unresolved -- the sweep
+// locates the live bytes but does not say which (k, n) they are.
 //
-// The most likely explanation is not a lane permutation at all, but that the
-// intrinsic's operand roles or tile shape are not what this file assumes. The
-// note in docs/s5-swmmac-dense-operand.md records a hand-written prototype
-// signature; the leading underscore and the role assignment there have never
-// been checked against the installed AMD headers, and the measurements now
-// contradict them.
+// The signature *was* then checked against clang itself -- 4 arguments, strictly
+// (v2i32, v4i32, v8i32, i32), with no other permutation accepted -- so the
+// operand roles and the 8/16/32 bytes-per-lane widths in this file are correct,
+// and the earlier theory that A and B were swapped is dead. Clang is the oracle
+// here rather than a hand-written note in docs/, which is what should have been
+// done before the first probe ran.
 //
-// So the next step is *not* another search over fragment layouts. It is to read
-// the real declaration of this intrinsic out of the ROCm headers, confirm the
-// operand order and the tile shape, and re-derive what the sweeps say against
-// that. A layout search under a mis-stated signature cannot converge, and these
-// sweeps show the signature is the thing in doubt.
+// That leaves exactly one unknown: how A's 8 bytes per lane map onto rows and
+// k. It is the last one, because B is only interpretable once A is pinned -- the
+// B sweep's "4 live bytes, each counted twice" is exactly what a uniform A
+// against an unknown A-fragment mapping would look like. The next probe must
+// therefore vary A across fragment lanes while holding B uniform, the mirror
+// image of the sweep that worked.
