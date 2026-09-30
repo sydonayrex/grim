@@ -1873,14 +1873,165 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::KQuantScheme,
     ) -> Result<WhiteCrowDecodedWeights> {
-        use grim_tensor::{BackendDevice, MemoryOps};
+        
         let packed = w.copy_to_host()?;
-        let dequantized = match scheme {
-            grim_tensor::KQuantScheme::Q4K => grim_quant::dequant_q4k(&packed, n * k)?,
-            grim_tensor::KQuantScheme::Q5K => grim_quant::dequant_q5k(&packed, n * k)?,
-            _ => grim_quant::dequant_q6k(&packed, n * k)?,
+
+        // On-disk cache (GRIM_OSTQUANT_CACHE_DIR, default ~/.cache/grim/ostquant;
+        // GRIM_OSTQUANT_CACHE=0 disables). The key mixes the encoder version,
+        // the geometry and a hash of the PACKED source bytes, so a stale
+        // converter can never be served for a different weight.
+        let disk_enabled = !matches!(
+            std::env::var("GRIM_OSTQUANT_CACHE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        );
+        let cache_key: Option<u64> = disk_enabled.then(|| {
+            let mut h = seahash::hash(&packed);
+            h ^= (n as u64) << 1;
+            h ^= (k as u64) << 17;
+            h ^= (scheme as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            h ^= (grim_quant::OSTQUANT_ENCODER_VERSION as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+            h
+        });
+        let cache_dir = || {
+            std::env::var("GRIM_OSTQUANT_CACHE_DIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    let base = std::env::var("XDG_CACHE_HOME")
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            std::env::var("HOME")
+                                .ok()
+                                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                        })?;
+                    Some(base.join("grim").join("ostquant"))
+                })
         };
-        let (qw, sc, zr) = grim_quant::quant_ostquant_w4_group128(&dequantized, n, k)?;
+        if let (Some(key), Some(dir)) = (cache_key, cache_dir()) {
+            let path = dir.join(format!("{key:016x}.wc"));
+            // Header: magic, encoder version, n, k, three lengths.
+            if let Ok(meta) = std::fs::read(&path) {
+                if meta.len() >= 28 {
+                    let rd = |o: usize| {
+                        u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]]) as usize
+                    };
+                    if rd(0) == 0x57_43_00_01
+                        && rd(4) == grim_quant::OSTQUANT_ENCODER_VERSION as usize
+                        && rd(8) == n
+                        && rd(12) == k
+                        && meta.len() == 28 + rd(16) + rd(20) + rd(24)
+                    {
+                        let (lq, ls, lz) = (rd(16), rd(20), rd(24));
+                        let qw = meta[28..28 + lq].to_vec();
+                        let sc = meta[28 + lq..28 + lq + ls].to_vec();
+                        let zr = meta[28 + lq + ls..28 + lq + ls + lz].to_vec();
+                        return self.whitecrow_from_host_bytes(qw, sc, zr, n, k);
+                    }
+                }
+            }
+        }
+
+        // Convert row-block-parallel: both stages are row-separable (a Q4_K
+        // super-block and an OSTQuant group-128 never cross a row, and
+        // linear_decode_into already requires k % 128 == 0, k % 256 == 0), and
+        // every output buffer is row-major, so chunking rows and concatenating
+        // in order is byte-identical to the serial path.
+        let (block_bytes, per_256): (usize, usize) = match scheme {
+            grim_tensor::KQuantScheme::Q4K => (144, 256),
+            grim_tensor::KQuantScheme::Q5K => (176, 256),
+            _ => (210, 256),
+        };
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(8)
+            .max(1);
+        let row_bytes = (k / per_256) * block_bytes;
+        let (qw, sc, zr) = if threads > 1 && n >= 2 && k % per_256 == 0 {
+            let rows_per = n.div_ceil(threads);
+            let chunks: Vec<(usize, usize)> = (0..n)
+                .step_by(rows_per)
+                .map(|r0| (r0, (r0 + rows_per).min(n)))
+                .collect();
+            let parts: Vec<Result<(Vec<u8>, Vec<u8>, Vec<u8>)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|&(r0, r1)| {
+                        let packed = &packed;
+                        let scheme = scheme;
+                        scope.spawn(move || {
+                            let slice = &packed[r0 * row_bytes..r1 * row_bytes];
+                            let rows = r1 - r0;
+                            let dq = match scheme {
+                                grim_tensor::KQuantScheme::Q4K => {
+                                    grim_quant::dequant_q4k(slice, rows * k)?
+                                }
+                                grim_tensor::KQuantScheme::Q5K => {
+                                    grim_quant::dequant_q5k(slice, rows * k)?
+                                }
+                                _ => grim_quant::dequant_q6k(slice, rows * k)?,
+                            };
+                            grim_quant::quant_ostquant_w4_group128(&dq, rows, k)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error::Backend("requant worker panicked".into())))).collect()
+            });
+            let mut qw_all = Vec::new();
+            let mut sc_all = Vec::new();
+            let mut zr_all = Vec::new();
+            for part in parts {
+                let (a, b, c) = part?;
+                qw_all.extend_from_slice(&a);
+                sc_all.extend_from_slice(&b);
+                zr_all.extend_from_slice(&c);
+            }
+            (qw_all, sc_all, zr_all)
+        } else {
+            let dequantized = match scheme {
+                grim_tensor::KQuantScheme::Q4K => grim_quant::dequant_q4k(&packed, n * k)?,
+                grim_tensor::KQuantScheme::Q5K => grim_quant::dequant_q5k(&packed, n * k)?,
+                _ => grim_quant::dequant_q6k(&packed, n * k)?,
+            };
+            grim_quant::quant_ostquant_w4_group128(&dequantized, n, k)?
+        };
+        // Persist for the next run (best-effort; a failed write only costs
+        // the conversion next time).
+        if let (Some(key), Some(dir)) = (cache_key, cache_dir()) {
+            let mut blob: Vec<u8> = Vec::with_capacity(28 + qw.len() + sc.len() + zr.len());
+            let push_u = |v: &mut Vec<u8>, x: usize| {
+                v.extend_from_slice(&(x as u32).to_le_bytes());
+            };
+            push_u(&mut blob, 0x57_43_00_01);
+            push_u(&mut blob, grim_quant::OSTQUANT_ENCODER_VERSION as usize);
+            push_u(&mut blob, n);
+            push_u(&mut blob, k);
+            push_u(&mut blob, qw.len());
+            push_u(&mut blob, sc.len());
+            push_u(&mut blob, zr.len());
+            blob.extend_from_slice(&qw);
+            blob.extend_from_slice(&sc);
+            blob.extend_from_slice(&zr);
+            let tmp = dir.join(format!("{key:016x}.wc.tmp"));
+            if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&tmp, &blob).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join(format!("{key:016x}.wc")));
+            }
+        }
+        self.whitecrow_from_host_bytes(qw, sc, zr, n, k)
+    }
+
+    /// Upload already-converted WhiteCrow bytes (qweight as u32 words,
+    /// group-128 bf16 scales, u8 zeros).
+    fn whitecrow_from_host_bytes(
+        &self,
+        qw: Vec<u8>,
+        sc: Vec<u8>,
+        zr: Vec<u8>,
+        n: usize,
+        k: usize,
+    ) -> Result<WhiteCrowDecodedWeights> {
+        use grim_tensor::{BackendDevice, MemoryOps};
         let bf16_dtype = DType {
             arith: ArithType::BF16,
             storage: DTypeStorage::Native,

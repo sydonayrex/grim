@@ -135,6 +135,11 @@ pub fn dequant_ostquant_w4a4(
 /// 9B's Q4_K weights are dequantized once and re-encoded in this layout so
 /// decode rides the native v_dot8 GEMV (435 GB/s measured) instead of the
 /// 23 GB/s q4k dot4 kernel.
+/// Bumped whenever the u4 group-128 byte layout changes. It is mixed into the
+/// on-disk WhiteCrow cache key, so a format change can never serve tensors
+/// converted by an older encoder.
+pub const OSTQUANT_ENCODER_VERSION: u32 = 1;
+
 pub fn quant_ostquant_w4_group128(
     w: &[f32],
     n: usize,
