@@ -1959,7 +1959,8 @@ mod tests {
             norm_kind: grim_nn::NormKind::Rms,
             has_norm_bias: false,
             has_attn_post_norm: false,
-        use_parallel_residual: false,
+            use_parallel_residual: false,
+            has_output_bias: false,
         };
 
         let inj_cfg = InjectionConfig {
