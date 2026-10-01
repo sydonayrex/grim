@@ -390,6 +390,9 @@ pub struct LlamaBlock {
     /// [`NormKind::Rms`] rather than following `norm_kind`; making it follow
     /// would be an unverified deviation from every observed checkpoint.
     pub attn_post_norm: Option<Norm>,
+    /// Feed the FFN the layer input rather than the post-attention value.
+    /// `gptneox.cpp:143`; see `LlamaConfig::use_parallel_residual`.
+    pub use_parallel_residual: bool,
     pub w_gate: Option<ColumnParallelLinear>,
     pub w_up: Option<ColumnParallelLinear>,
     pub w_down: Option<RowParallelLinear>,
@@ -693,6 +696,7 @@ impl LlamaBlock {
                 sliding_window: spec.sliding_window,
             },
             attn_post_norm,
+            use_parallel_residual: cfg.use_parallel_residual,
             ffn_disabled: !load_dense_ffn,
             silu_q81_scratch: std::sync::Arc::new(std::sync::Mutex::new(None)),
             alibi_slopes: None,
@@ -705,6 +709,16 @@ impl LlamaBlock {
     /// Computes per-head slopes via [`alibi_slopes_for`] for the block's head count.
     pub fn with_alibi(mut self) -> Self {
         self.alibi_slopes = Some(alibi_slopes_for(self._cfg.num_heads));
+        self
+    }
+
+    /// Feed the FFN the layer input rather than the post-attention value.
+    ///
+    /// `gptneox.cpp:143` branches on `hparams.use_par_res`; the GGUF key is
+    /// `use_parallel_residual` (`llama-arch.cpp:208`). Set only when the
+    /// metadata carries it, since gptneox is the sole reference that does.
+    pub fn with_parallel_residual(mut self) -> Self {
+        self.use_parallel_residual = true;
         self
     }
 
@@ -938,7 +952,19 @@ impl LlamaBlock {
 
         // FFN: standard Llama uses a single shared expert for all tokens.
         // Process the full batch in one forward pass on-device (zero CPU roundtrips).
-        let x_norm = self.ffn_norm.forward(&added)?;
+        //
+        // `use_parallel_residual` changes ONLY where the FFN is fed, not the
+        // order of the adds: addition associates, so the three-term sum is the
+        // same either way. What differs is the input:
+        //
+        // * sequential (default) -- `ffn(ln2(x + attn(ln1(x))))`, so `added`.
+        // * parallel -- `ffn(ln2(x))`, the layer input, matching
+        //   `gptneox.cpp:149` where `build_norm` is applied to `inpL`.
+        let x_norm = if self.use_parallel_residual {
+            self.ffn_norm.forward(&x_2d)?
+        } else {
+            self.ffn_norm.forward(&added)?
+        };
         let (gate, up) = if seq_tokens == 1 && self.w_gate_up_q80_fused.is_some() {
             if let Some(ref fused) = self.w_gate_up_q80_fused {
                 self.fused_gate_up_dot4_decode(&x_norm, fused)?
@@ -2238,6 +2264,7 @@ mod tests {
             k_norm: None,
             ffn_norm,
             attn_post_norm: None,
+            use_parallel_residual: false,
             w_gate: Some(w_gate),
             w_up: Some(w_up),
             w_down: Some(w_down),
@@ -2255,6 +2282,97 @@ mod tests {
 
     fn make_tensor(data: Vec<f32>, shape: &[usize]) -> Tensor {
         cpu_tensor(data, Shape::new(shape.to_vec()))
+    }
+
+    /// `gptneox` parallel residual. Reference, `gptneox.cpp:143-168`:
+    ///
+    /// ```text
+    /// if (hparams.use_par_res) {
+    ///     // x = x + attn(ln1(x)) + ffn(ln2(x))
+    ///     ggml_tensor * attn_out = cur;
+    ///     cur = build_norm(inpL, ffn_norm, ffn_norm_b, LLM_NORM, il);   // :149
+    ///     cur = build_ffn(cur, ...);                                     // :156
+    ///     cur = ggml_add(ctx0, cur, inpL);
+    ///     cur = ggml_add(ctx0, cur, attn_out);
+    /// }
+    /// ```
+    ///
+    /// ## What actually differs
+    ///
+    /// NOT the order of the adds. Floating-point addition associates, so
+    /// `x + a + f` and `(x + a) + f` are the same value, and a test comparing
+    /// them is a tautology. Two earlier versions of this test did exactly that
+    /// and failed for the right reason: they were checking arithmetic, not the
+    /// graph.
+    ///
+    /// The difference is WHAT THE FFN IS FED:
+    ///
+    /// * parallel  -- `ffn(ln2(x))`, the layer input;
+    /// * sequential -- `ffn(ln2(x + attn(ln1(x))))`, the post-attention value.
+    ///
+    /// That is observable because the FFN is non-linear. Note that
+    /// `ffn_disabled` is NOT an observable here: `forward` returns before the
+    /// FFN when it is set (`block.rs` returns `added` early for MoE layers),
+    /// so a test that sets it observes nothing about this branch. A first
+    /// version of this test did exactly that and failed with
+    /// "the branch is dead code" against a live branch.
+    ///
+    /// `gptneox.cpp` is the only reference that branches this
+    /// (`grep -rl use_par_res src/models/` returns one file), so the default
+    /// is sequential and the flag is read from GGUF, never guessed.
+    #[test]
+    fn parallel_residual_feeds_the_ffn_the_layer_input() {
+        // The arithmetic, in both orders, on this block's own intermediates.
+        let cfg = small_cfg();
+        let hidden = cfg.hidden_size;
+        let x = make_tensor(
+            (0..hidden).map(|i| i as f32 * 0.1 - 0.5).collect::<Vec<f32>>(),
+            &[1, hidden],
+        );
+        let positions = [0u32];
+
+        let block = small_block();
+        let x_norm = block.attn_norm.forward(&x).unwrap();
+        let q = block.wq.forward(&x_norm).unwrap();
+        let k = block.wk.forward(&x_norm).unwrap();
+        let v = block.wv.forward(&x_norm).unwrap();
+        let q = block.apply_rope_multi_head(&q, &positions, 2).unwrap();
+        let k = block.apply_rope_multi_head(&k, &positions, 1).unwrap();
+        let (ctx, _) = block
+            .prefilled_self_attention(&q, &k, &v, &positions, None, &mut false)
+            .unwrap();
+        let attn_out = block.wo.forward(&ctx).unwrap();
+
+        let xv = x.to_vec_f32().unwrap();
+        let post_attn: Vec<f32> = attn_out
+            .to_vec_f32()
+            .unwrap()
+            .iter()
+            .zip(&xv)
+            .map(|(a, b)| a + b)
+            .collect();
+
+        // Sequential feeds the FFN the post-attention value; parallel feeds it
+        // the layer input. Both norms are then applied by ffn_norm, so compare
+        // the FFN INPUT the block chooses.
+        let on_layer_input = block.ffn_norm.apply(&xv, None, None);
+        let on_post_attn = block.ffn_norm.apply(&post_attn, None, None);
+        assert_ne!(
+            on_layer_input, on_post_attn,
+            "the two FFN inputs agree, so this probe cannot detect the topology"
+        );
+
+        // Now the block, with the real FFN enabled so the branch is reached.
+        let mut block = small_block();
+        block.use_parallel_residual = false;
+        let sequential = block.forward(&x, &positions).unwrap().to_vec_f32().unwrap();
+        block.use_parallel_residual = true;
+        let parallel = block.forward(&x, &positions).unwrap().to_vec_f32().unwrap();
+
+        assert_ne!(
+            sequential, parallel,
+            "use_parallel_residual changed nothing, so the branch is dead code"
+        );
     }
 
     /// `attn_post_norm` is applied to the attention output BEFORE the residual

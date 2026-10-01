@@ -253,3 +253,35 @@ fn a_dense_layer_norm_model_loads_through_load_tp_moe_specs() {
         "every layer must adopt the spec's norm kind"
     );
 }
+
+#[test]
+fn use_parallel_residual_reaches_the_block_through_load_tp() {
+    // The branch is only reachable if `LlamaConfig::use_parallel_residual`
+    // survives `LlamaBlock::load_tp`. A test that sets the field on an
+    // already-built block proves the branch works but NOT that the flag is
+    // plumbed, and hardcoding `false` at the load site survived the whole 283
+    // test library suite. This closes that: load a block through the real
+    // `load_tp` with the flag set, and read it back off the block.
+    let mut c = cfg();
+    assert!(
+        !c.use_parallel_residual,
+        "the test fixture must start sequential, or this proves nothing"
+    );
+    let provider = StubProvider { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let sequential = LlamaBlock::load_tp(&ws, &c, Default::default()).expect("loads");
+    assert!(
+        !sequential.use_parallel_residual,
+        "load_tp must default a sequential config to sequential"
+    );
+
+    c.use_parallel_residual = true;
+    let provider = StubProvider { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let parallel = LlamaBlock::load_tp(&ws, &c, Default::default()).expect("loads");
+    assert!(
+        parallel.use_parallel_residual,
+        "load_tp dropped use_parallel_residual, so the GGUF key cannot reach the \
+         block and every gptneox checkpoint computes ffn(attn(x) + x)"
+    );
+}

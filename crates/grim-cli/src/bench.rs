@@ -95,6 +95,7 @@ pub async fn cmd_bench(
             norm_kind: Default::default(),
             has_norm_bias: false,
             has_attn_post_norm: false,
+            use_parallel_residual: false,
 };
         Box::new(grim_models_transformer::Llama::random(device.clone(), cfg))
     };

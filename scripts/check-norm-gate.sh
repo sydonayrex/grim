@@ -17,6 +17,12 @@
 #   B. LlamaConfig::default claiming LayerNorm. Scoped to output_norm_spec and
 #      not to --lib: integration tests are not part of --lib, so running it
 #      against --lib reports a false survivor.
+#   C. the parallel-residual branch deleted, i.e. every model computes
+#      ffn(attn(x) + x). This is what a gptneox checkpoint with
+#      use_parallel_residual set would silently get.
+#   D. LlamaBlock::load_tp ignoring the config flag. A test that sets the flag
+#      on an already-built block proves the branch but not the plumbing; this
+#      survived the whole 283-test library suite before it was added.
 #
 # Usage: scripts/check-norm-gate.sh
 # Exits non-zero on any failure. Does not mutate the tree; both mutations are
@@ -78,6 +84,8 @@ echo "=== MUTATION A: attn_post_norm after the residual add"
 # "anchor not found", which reads exactly like a pass.
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+cp "$block" "$tmp/block.start"
+cp "$model" "$tmp/model.start"
 cp "$block" "$tmp/block.orig"
 python3 - "$block" <<'PY'
 import re, sys
@@ -135,11 +143,71 @@ r="$(cargo test -p grim-models-transformer --test output_norm_spec -j 1 2>&1 | r
 case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
 
 echo
-echo "=== the tree is unchanged by this script"
-if git diff --quiet -- "$block" "$model"; then
-    pass "block.rs and model.rs match HEAD"
+echo "=== MUTATION C: the FFN branch deleted (always sequential)"
+cp "$block" "$tmp/block.c.orig"
+python3 - "$block" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = ("        let x_norm = if self.use_parallel_residual {\n"
+       "            self.ffn_norm.forward(&x_2d)?\n"
+       "        } else {\n"
+       "            self.ffn_norm.forward(&added)?\n"
+       "        };")
+if old not in s:
+    sys.exit("anchor not found")
+open(p, "w").write(s.replace(old, "        let x_norm = self.ffn_norm.forward(&added)?;", 1))
+PY
+if [ $? -ne 0 ]; then
+    fail "C: could not locate the parallel-residual branch"
 else
-    fail "this script left the tree modified"
+    r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
+    case "$r" in
+        *" 0 failed"*) fail "C SURVIVED -- the parallel-residual branch is unpinned: $r" ;;
+        *)             pass "C killed: $r" ;;
+    esac
+fi
+cp "$tmp/block.c.orig" "$block"
+r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
+case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+
+echo
+echo "=== MUTATION D: load_tp ignores the config flag"
+# A test that sets the flag on an already-built block proves the branch works
+# but not that the flag is plumbed. This survived the whole library suite.
+cp "$block" "$tmp/block.d.orig"
+python3 - "$block" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "            use_parallel_residual: cfg.use_parallel_residual,"
+if old not in s:
+    sys.exit("anchor not found")
+open(p, "w").write(s.replace(old, "            use_parallel_residual: false,", 1))
+PY
+if [ $? -ne 0 ]; then
+    fail "D: could not locate the load_tp wiring"
+else
+    r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
+    case "$r" in
+        *" 0 failed"*) fail "D SURVIVED -- the config flag is not plumbed to the block: $r" ;;
+        *)             pass "D killed: $r" ;;
+    esac
+fi
+cp "$tmp/block.d.orig" "$block"
+r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
+case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+
+echo
+echo "=== the tree is unchanged by THIS RUN"
+# Compared against a snapshot taken when the script started, not against HEAD.
+# `git diff --quiet` would report a legitimate uncommitted change as if the
+# script had caused it, which is how the first version of this gate failed on a
+# clean tree: the parallel-residual work was simply not committed yet.
+if cmp -s "$block" "$tmp/block.start" && cmp -s "$model" "$tmp/model.start"; then
+    pass "block.rs and model.rs are byte-identical to the pre-run snapshot"
+else
+    fail "this script modified a file and did not restore it"
 fi
 
 echo

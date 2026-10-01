@@ -385,6 +385,7 @@ mod tests {
             norm_kind: grim_nn::NormKind::Rms,
             has_norm_bias: false,
             has_attn_post_norm: false,
+            use_parallel_residual: false,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok = grim_backend_cpu::cpu_tensor(vec![1.0f32], grim_tensor::Shape::new(vec![1]));
@@ -419,6 +420,7 @@ mod tests {
             norm_kind: grim_nn::NormKind::Rms,
             has_norm_bias: false,
             has_attn_post_norm: false,
+            use_parallel_residual: false,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok =

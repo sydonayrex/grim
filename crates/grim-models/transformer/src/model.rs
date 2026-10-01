@@ -46,6 +46,13 @@ pub struct LlamaConfig {
     pub has_norm_bias: bool,
     /// Whether `attn_post_norm` exists. Fifteen references create it.
     pub has_attn_post_norm: bool,
+    /// Feed the FFN the layer input rather than the post-attention value.
+    ///
+    /// GGUF key `use_parallel_residual` (`llama-arch.cpp:208`), read at
+    /// `gptneox.cpp:5` and branched at `:143`. `gptneox.cpp` is the only
+    /// reference that does this -- `grep -rl use_par_res src/models/` returns
+    /// one file -- so sequential is the correct default everywhere else.
+    pub use_parallel_residual: bool,
 }
 
 /// Sequential residual unless a checkpoint says otherwise. See
@@ -76,6 +83,7 @@ impl Default for LlamaConfig {
             norm_kind: NormKind::Rms,
             has_norm_bias: false,
             has_attn_post_norm: false,
+            use_parallel_residual: false,
         }
     }
 }
@@ -403,6 +411,7 @@ impl Llama {
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for _ in 0..cfg.num_layers {
             layers.push(LlamaBlock {
+                use_parallel_residual: cfg.use_parallel_residual,
                 attn_norm: rms_with_w(cfg.hidden_size),
                 wq: ColumnParallelLinear::new(
                     linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size),

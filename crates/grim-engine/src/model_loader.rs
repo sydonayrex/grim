@@ -5000,6 +5000,25 @@ fn load_model_with_providers(
                 llama_cfg
             );
             let mut m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            // Parallel residual (gptneox.cpp:143): the FFN is fed the layer
+            // input rather than the post-attention value. GGUF key
+            // `use_parallel_residual` (llama-arch.cpp:208). gptneox is the only
+            // reference that sets it, so this reads the key rather than
+            // keying on the architecture, and defaults off everywhere else.
+            if lookup
+                .get_bool("gptneox.use_parallel_residual")
+                .or_else(|| lookup.get_bool("use_parallel_residual"))
+                .unwrap_or(false)
+            {
+                log::info!(
+                    "[grim] enabling parallel residual on {} blocks",
+                    m.layers.len()
+                );
+                for layer in m.layers.iter_mut() {
+                    *layer =
+                        std::mem::replace(layer, layer.clone()).with_parallel_residual();
+                }
+            }
             // ALiBi position bias (baichuan/mpt/jais/gptneox class): enabled
             // when the GGUF carries the metadata key. ALiBi replaces RoPE.
             if lookup

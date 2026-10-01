@@ -5862,6 +5862,7 @@ mod tests {
             norm_kind: grim_nn::NormKind::Rms,
             has_norm_bias: false,
             has_attn_post_norm: false,
+            use_parallel_residual: false,
         };
 
         let embed = rocm_tensor(
@@ -5951,6 +5952,7 @@ mod tests {
                 w_gate_up_q80_fused,
                 ffn_disabled: false,
                 silu_q81_scratch: Arc::new(std::sync::Mutex::new(None)),
+                use_parallel_residual: false,
             });
         }
 
