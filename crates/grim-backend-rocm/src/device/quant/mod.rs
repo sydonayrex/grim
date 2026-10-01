@@ -971,13 +971,22 @@ impl QuantOps for RocmDevice {
                     )?;
                     &converted
                 };
-                // Prefill is still refused: `grim_tree_pie_gemm` faults the GPU
-                // (memory access fault, page not present) and is undiagnosed. An
-                // unroutable kernel that faults is far better than a routed one that
-                // takes the device down mid-run.
+                let trace = *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some());
+                if trace {
+                    eprintln!(
+                        "[tp] m={m} n={n} k={k} act={:?} b={:?} out={:?} converted={}",
+                        act_storage.device_ptr.map(|p| p as u64),
+                        b_storage.device_ptr_u64(),
+                        out_storage.device_ptr.map(|p| p as u64),
+                        act_storage.dtype().arith == ArithType::F16,
+                    );
+                }
+                // Prefill still refused: the GEMM's fault is now localised to the
+                // converted activation buffer, but not root-caused. See the note in
+                // tests/tree_pie_dispatch.rs.
                 if m != 1 {
                     return Err(Error::Backend(format!(
-                        "TreePie prefill kernel exists but faults; m = {m} has no working route"
+                        "TreePie prefill kernel faults on the activation buffer; m = {m} has no working route"
                     )));
                 }
                 self.launch_tree_pie_gemv(act_storage, b_storage, &out_storage, n, k)?;

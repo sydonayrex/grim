@@ -232,6 +232,26 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
 // faults; and the original all-zero output remains unexplained. Treat the cause of
 // the first failure as open rather than closed, since the explanation that seemed to
 // fit did not survive a re-run.
+//
+// Pointer tracing then localised the fault. With `GRIM_QMM_TRACE`, the working `m = 1`
+// and the faulting `m = 2` report **identical** device pointers for act, b and out --
+// so the pointers are not the variable, and the GEMM is simply reading further than
+// the GEMV does. Two facts fit that:
+//
+//   - the fault address is `0x7f59...`, i.e. in the *host* mmap range, not a device
+//     VA. The converted activation is not reliably device-resident.
+//   - the `m * k` sizing fix **is** live (`Shape::new(vec![m * k])`, mod.rs:967), and
+//     the kernel's act index tops out at `(1*128 + 3*32 + 30) >> 1 == 127` u32 = 254
+//     halves, inside the 256-half buffer. So the *arithmetic* is in bounds; the buffer
+//     behind it is not as large as the arithmetic assumes.
+//
+// Reading: the host-side conversion path is the suspect, not the kernel. The GEMV
+// reads `k` halves and so never notices; the GEMM reads `m*k` and falls off the end.
+// That makes the host round-trip that this arm uses for non-f16 activations the thing
+// to fix -- either by keeping the converted buffer device-resident, or by refusing
+// prefill for converted activations specifically rather than for prefill wholesale.
+// Not root-caused: "host-backed and too small" and "device-backed but a stale
+// pointer" both fit, and they need different fixes.
 #[test]
 #[ignore = "m=2 faults the GPU; m=1 passes under both 1-D and 2-D shapes"]
 fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {

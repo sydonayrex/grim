@@ -68,7 +68,14 @@ impl RocmDevice {
                 }
             })
             .collect();
-        let mscale = yarn.map(|y| y.attention_factor).unwrap_or(1.0_f32);
+        // The rope multiplier is NOT the kq-scale mscale: llama.cpp feeds
+        // `cparams.yarn_attn_factor` to ggml_rope_ext and builds a separate
+        // mscale for kq_scale, and for some checkpoints (Xing4.0) the two are
+        // reciprocals. `rope_mscale: None` keeps every pre-existing checkpoint
+        // on `attention_factor`.
+        let mscale = yarn
+            .map(|y| y.rope_mscale.unwrap_or(y.attention_factor))
+            .unwrap_or(1.0_f32);
 
         // Upload positions and inv_freq to device-resident scratch buffers.
         // These are temporary allocations freed after the stream synchronises.
