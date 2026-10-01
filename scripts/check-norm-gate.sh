@@ -94,6 +94,7 @@ for spec in \
     "grim-nn norm_kind" \
     "grim-core norm_kind_by_architecture" \
     "grim-core norm_bias_names" \
+    "grim-core layer_out_norm" \
     "grim-engine norm_kind_wiring" \
     "grim-models-transformer attn_post_norm" \
     "grim-models-transformer output_norm_spec" \
