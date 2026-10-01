@@ -1478,6 +1478,30 @@ impl TensorNamingRegistry {
             }
         }
 
+        // Norm-bias counterparts, derived rather than written out.
+        //
+        // Eighteen references create `attn_norm_b` or `ffn_norm_b` and twenty
+        // create `output_norm_b`. Deriving the keys from the weight mappings
+        // that are already above means a norm added later cannot arrive
+        // without its bias, which is the failure this replaces: 21 norm
+        // weight mappings and zero bias mappings.
+        let mut norm_bias: Vec<(String, String)> = map
+            .iter()
+            .filter(|(_, gg)| gg.contains("norm") && gg.ends_with(".weight"))
+            .map(|(hf, gg)| {
+                (
+                    format!("{}.bias", hf.trim_end_matches(".weight")),
+                    format!("{}.bias", gg.trim_end_matches(".weight")),
+                )
+            })
+            .collect();
+        norm_bias.sort();
+        for (hf, gg) in norm_bias {
+            // An explicit mapping wins: some architectures name the bias
+            // differently from the weight.
+            map.entry(hf).or_insert(gg);
+        }
+
         map
     }
 }
