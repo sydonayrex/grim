@@ -168,7 +168,7 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     }
 
     let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
-    let a_shape = if m == 1 { Shape::new(vec![k]) } else { Shape::new(vec![m, k]) };
+    let a_shape = Shape::new(vec![m, k]);
     let x_t = MemoryOps::from_cpu_bytes(
         dev,
         &xb,
@@ -189,7 +189,7 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     )
     .map_err(|e| format!("b h2d: {e}"))?;
 
-    let o_shape = if m == 1 { Shape::new(vec![n]) } else { Shape::new(vec![m, n]) };
+    let o_shape = Shape::new(vec![m, n]);
     let (out, _) = dev
         .quantized_matmul(&*x_t, &*b_t, &[], grim_tensor::QuantFormat::TreePie, &o_shape)
         .map_err(|e| format!("prefill m={m}: {e}"))?;
@@ -209,28 +209,31 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     Ok(worst)
 }
 
-// Bisection so far, and it changed the diagnosis twice:
+// Diagnosis history, kept because two of the three steps were wrong and the record
+// is more useful than a conclusion would be.
 //
-//   1. Originally the output was all zeros -- including at `m = 1`, which routes to
-//      the *unchanged* GEMV path that `tree_pie_scheme_reaches_the_gemv_through
-//      _quantized_matmul` passes. So the fault was in the test, not the kernel.
-//   2. Making `m = 1` use the passing test's exact 1-D shapes and weight fixture
-//      fixed it: 4.497e-2, inside tolerance. **A 2-D `[1, K]` activation shape
-//      makes the GEMV return zeros** -- a separate, still-unexplained bug in the
-//      dispatch's activation handling, and worth more than the prefill kernel.
-//   3. With prefill wired, `m = 1` passes and **`m = 2` faults the GPU** (memory
-//      access fault, page not present). Diagnosing that found a real
-//      out-of-bounds in my dispatch code: the converted activation was allocated
-//      with `Shape::new(vec![k])` -- correct for the GEMV's single row, but an
-//      `m`x under-allocation for prefill, so the GEMM read `m*k` halves out of a
-//      `k`-half buffer. Fixed, commented, and the fault persists, so there is at
-//      least one more cause not yet found.
+//   1. The first failure was an all-zero output, including at `m = 1`, which routes
+//      to the unchanged GEMV path. I concluded the fault was in the test's fixtures.
+//      **That part held**: with the passing test's exact shapes and fixture the
+//      case runs clean. But I could not reproduce the all-zeros afterwards, so I do
+//      not actually know what caused it.
+//   2. I then concluded, and committed, that "a 2-D `[1, K]` activation shape makes
+//      the GEMV return zeros". **That was wrong.** Re-run with 2-D `[1, K]` and
+//      `[1, N]` and `m = 1` passes at 4.497e-2, with `GRIM_QMM_TRACE` reporting
+//      `m=1 n=64 k=128`. The shape is not the variable.
+//   3. With prefill wired, `m = 1` passes and `m = 2` faults the GPU. Diagnosing the
+//      fault did find a genuine out-of-bounds in my dispatch code: the converted
+//      activation was allocated `Shape::new(vec![k])` -- right for the GEMV's single
+//      row, an `m`x under-allocation for prefill, so the GEMM read `m*k` halves out of
+//      a `k`-half buffer. Fixed and commented. **The fault persists**, so at least one
+//      further cause is unknown.
 //
-// The kernel's own indexing is consistent with the layouts as measured: B at
-// `col * (K/32)*5 + g*5` and activations at `(t*K + g*32 + j) >> 1` both stay inside
-// their buffers for the sizes tested. That is an argument, not a proof.
+// So: the decode path is healthy under both 1-D and 2-D shapes; the prefill kernel
+// faults; and the original all-zero output remains unexplained. Treat the cause of
+// the first failure as open rather than closed, since the explanation that seemed to
+// fit did not survive a re-run.
 #[test]
-#[ignore = "m=2 faults the GPU after the m*k under-allocation fix; second cause unknown"]
+#[ignore = "m=2 faults the GPU; m=1 passes under both 1-D and 2-D shapes"]
 fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {
     let Some(dev) = gpu_device() else { return Ok(()) };
 
