@@ -66,6 +66,26 @@ extern "C" {
         return dl * (float)q_biased;
     }
 
+    // Latent-cache embedding gather for Q3_K tables (xing4.0 token_embd):
+    // mirrors grim_embedding_q4k_gather with the 110-byte Q3_K super-block.
+    extern "C" __global__ void grim_embedding_q3k_gather(
+        const unsigned char* packed, float* out, int* indices, int dim, int total, int rows) {
+        const int QK_BLOCK = 256;
+        const int QK_BLOCK_BYTES = 110;
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total) return;
+        int i = idx / dim;
+        int j = idx % dim;
+        int row = indices[i];
+        if (row < 0 || row >= rows) {
+            out[idx] = 0.0f;
+            return;
+        }
+        long long e = (long long)row * (long long)dim + (long long)j;
+        const unsigned char* blk = packed + (e / QK_BLOCK) * QK_BLOCK_BYTES;
+        out[idx] = dequant_q3k_element(blk, (int)(e % QK_BLOCK));
+    }
+
     __global__ void grim_fused_dequant_gemm_q3k(
         const float* __restrict__ A,
         const unsigned char* __restrict__ B_q3k,

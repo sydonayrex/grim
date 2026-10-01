@@ -40,9 +40,13 @@ impl RocmDevice {
         // graph capture and decode eagerly on every token.
         let is_q4k = dt.arith == ArithType::F32
             && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::Q4K));
-        if !is_f32_native && !is_q4k {
+        let is_q3k = dt.arith == ArithType::F32
+            && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::Q3K));
+        let is_iq3s = dt.arith == ArithType::F32
+            && matches!(dt.storage, crate::DTypeStorage::KQuant(KQuantScheme::IQ3S));
+        if !is_f32_native && !is_q4k && !is_q3k && !is_iq3s {
             return Err(Error::Unimplemented(
-                "embedding_gather_dev_idx: F32 native or Q4_K tables only".into(),
+                "embedding_gather_dev_idx: F32 native, Q4_K or Q3_K tables only".into(),
             ));
         }
         let w_ptr = weight
@@ -60,6 +64,39 @@ impl RocmDevice {
         let mut i = i_ptr;
         let mut d = dim as i32;
         let mut t = total as i32;
+        if is_iq3s {
+            // IQ3_S: same 256/110 geometry as Q3_K; the packed-gather kernel
+            // already exists (grim_embedding_iq3s_gather, iq_dequant.rs).
+            const IQ3S_BLOCK: usize = 256;
+            const IQ3S_BLOCK_BYTES: usize = 110;
+            if dim == 0 || dim % IQ3S_BLOCK != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: IQ3_S dim {dim} must be a non-zero multiple of {IQ3S_BLOCK}"
+                )));
+            }
+            let iq3s_row_bytes = (dim / IQ3S_BLOCK) * IQ3S_BLOCK_BYTES;
+            if iq3s_row_bytes == 0 || weight.bytes % iq3s_row_bytes != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: IQ3_S table of {} B is not a whole number of \
+                     {iq3s_row_bytes}-B rows",
+                    weight.bytes
+                )));
+            }
+            let mut iq3s_rows = (weight.bytes / iq3s_row_bytes) as i32;
+            return self.launch_compute_kernel(
+                "grim_embedding_iq3s_gather",
+                grid,
+                block,
+                &mut [
+                    arg(&mut w),
+                    arg(&mut o),
+                    arg(&mut i),
+                    arg(&mut d),
+                    arg(&mut t),
+                    arg(&mut iq3s_rows),
+                ],
+            );
+        }
         if is_f32_native {
             return self.launch_compute_kernel(
                 "grim_embedding",
@@ -98,6 +135,37 @@ impl RocmDevice {
         // The kernel bounds-checks in-gpu instead, so the graph path keeps the
         // safety the eager `embedding_q4k` gets from its host-side check.
         let mut rows = (weight.bytes / row_bytes) as i32;
+        if is_q3k {
+            const Q3K_BLOCK: usize = 256;
+            const Q3K_BLOCK_BYTES: usize = 110;
+            if dim == 0 || dim % Q3K_BLOCK != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: Q3_K dim {dim} must be a non-zero multiple of {Q3K_BLOCK}"
+                )));
+            }
+            let q3k_row_bytes = (dim / Q3K_BLOCK) * Q3K_BLOCK_BYTES;
+            if q3k_row_bytes == 0 || weight.bytes % q3k_row_bytes != 0 {
+                return Err(Error::Shape(format!(
+                    "embedding_gather_dev_idx: Q3_K table of {} B is not a whole number of \
+                     {q3k_row_bytes}-B rows",
+                    weight.bytes
+                )));
+            }
+            let mut q3k_rows = (weight.bytes / q3k_row_bytes) as i32;
+            return self.launch_compute_kernel(
+                "grim_embedding_q3k_gather",
+                grid,
+                block,
+                &mut [
+                    arg(&mut w),
+                    arg(&mut o),
+                    arg(&mut i),
+                    arg(&mut d),
+                    arg(&mut t),
+                    arg(&mut q3k_rows),
+                ],
+            );
+        }
         self.launch_compute_kernel(
             "grim_embedding_q4k_gather",
             grid,

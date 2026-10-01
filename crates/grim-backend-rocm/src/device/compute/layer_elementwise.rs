@@ -855,4 +855,89 @@ impl RocmDevice {
             comb: Box::new(comb),
         })
     }
+
+    /// Same gate math as [`Self::mhc_gates_into`], writing into CALLER-provided
+    /// storages so the decode-graph capture allocates nothing. `seq` must be 1
+    /// for the graph step; the kernel itself is seq-generic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mhc_gates_launch_into(
+        &self,
+        proj: &dyn BackendStorage,
+        base: &dyn BackendStorage,
+        scale: &dyn BackendStorage,
+        pre_out: &RocmStorage,
+        post_out: &RocmStorage,
+        comb_out: &RocmStorage,
+        seq: usize,
+        hc: usize,
+        iters: usize,
+        hc_eps: f32,
+        clamp_min: f32,
+        clamp_max: f32,
+    ) -> Result<()> {
+        if seq == 0 {
+            return Err(Error::Backend("mhc_gates_launch_into: empty sequence".into()));
+        }
+        if hc == 0 || hc > 8 {
+            return Err(Error::Backend(format!(
+                "mhc_gates_launch_into: hc must be 1..=8, got {hc}"
+            )));
+        }
+        let proj_s = as_rocm(proj)?;
+        let base_s = as_rocm(base)?;
+        let scale_s = as_rocm(scale)?;
+        let mix = (2 + hc) * hc;
+        if proj_s.shape().elem_count() != seq * mix {
+            return Err(Error::Shape(format!(
+                "mhc_gates_launch_into: proj holds {} elements, expected {seq}x{mix}",
+                proj_s.shape().elem_count()
+            )));
+        }
+        if pre_out.shape().elem_count() != hc * seq
+            || post_out.shape().elem_count() != hc * seq
+            || comb_out.shape().elem_count() != hc * hc * seq
+        {
+            return Err(Error::Shape(format!(
+                "mhc_gates_launch_into: gate buffers sized pre={} post={} comb={}, expected {}/{}/{}",
+                pre_out.shape().elem_count(),
+                post_out.shape().elem_count(),
+                comb_out.shape().elem_count(),
+                hc * seq,
+                hc * seq,
+                hc * hc * seq
+            )));
+        }
+        let mut proj_ptr = dev_ptr(proj_s)?;
+        let mut base_ptr = dev_ptr(base_s)?;
+        let mut scale_ptr = dev_ptr(scale_s)?;
+        let mut pre_ptr = dev_ptr(pre_out)?;
+        let mut post_ptr = dev_ptr(post_out)?;
+        let mut comb_ptr = dev_ptr(comb_out)?;
+        let mut s = seq as i32;
+        let mut h = hc as i32;
+        let mut it = iters as i32;
+        let mut eps = hc_eps;
+        let mut cmin = clamp_min;
+        let mut cmax = clamp_max;
+        self.launch_compute_kernel(
+            "grim_mhc_gates",
+            crate::HipDim3::new(seq as u32, 1, 1),
+            crate::HipDim3::new(64, 1, 1),
+            &mut [
+                arg(&mut proj_ptr),
+                arg(&mut base_ptr),
+                arg(&mut scale_ptr),
+                arg(&mut pre_ptr),
+                arg(&mut post_ptr),
+                arg(&mut comb_ptr),
+                arg(&mut s),
+                arg(&mut h),
+                arg(&mut it),
+                arg(&mut eps),
+                arg(&mut cmin),
+                arg(&mut cmax),
+            ],
+        )?;
+        Ok(())
+    }
 }

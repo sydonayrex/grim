@@ -132,6 +132,7 @@ impl RocmDevice {
         seq_len: usize,
         w_uv_offset_words: usize,
         w_uv_head_stride_words: usize,
+        live_len: Option<&RocmStorage>,
     ) -> Result<*mut c_void> {
         let q_abs_ptr = q_absorbed.device_ptr.ok_or_else(|| {
             Error::Backend("mla_absorbed_decode: q_absorbed has no device ptr".into())
@@ -165,6 +166,12 @@ impl RocmDevice {
         let mut has_w = has_w_uv;
         let mut w_off = w_uv_offset_words as i32;
         let mut w_stride = w_uv_head_stride_words as i32;
+        let mut live_ptr: *mut c_void = match live_len {
+            Some(st) => st.device_ptr.ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode: live_len has no device ptr".into())
+            })? as *mut c_void,
+            None => std::ptr::null_mut(),
+        };
 
         let lds_bytes = 256 * std::mem::size_of::<f32>();
         self.launch_compute_kernel_with_solution(
@@ -186,6 +193,7 @@ impl RocmDevice {
                 arg(&mut has_w),
                 arg(&mut w_off),
                 arg(&mut w_stride),
+                arg(&mut live_ptr),
             ],
             None,
             lds_bytes,

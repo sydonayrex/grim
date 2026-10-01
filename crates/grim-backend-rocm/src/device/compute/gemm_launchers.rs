@@ -1719,7 +1719,14 @@ impl RocmDevice {
                 | KQuantScheme::Q5K
                 | KQuantScheme::Q6K
                 | KQuantScheme::Q2K
-                | KQuantScheme::Q3K),
+                | KQuantScheme::Q3K
+                | KQuantScheme::IQ3S
+                | KQuantScheme::IQ4NL
+                | KQuantScheme::IQ4XS
+                | KQuantScheme::IQ2S
+                | KQuantScheme::IQ2XS
+                | KQuantScheme::IQ2XXS
+                | KQuantScheme::IQ3XXS),
             ) => {
                 if act_q81.bytes < need_q81 {
                     return Err(Error::Backend(format!(
@@ -1727,14 +1734,59 @@ impl RocmDevice {
                         act_q81.bytes
                     )));
                 }
-                if !(self.is_dot4_arch && !dot_disabled && k % 256 == 0) {
-                    return Err(Error::Unimplemented(
-                        "linear_decode_into: K-quant needs dot4 arch + k%256==0 (else WMMA leg needs its own scratch)".into(),
-                    ));
-                }
                 let a_s = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                     Error::Backend("linear_decode_into: a not RocmStorage".into())
                 })?;
+                if !(self.is_dot4_arch && !dot_disabled && k % 256 == 0) {
+                    // No dot4 GEMV on this arch (or k not 256-aligned): the
+                    // WMMA fused-dequant leg is the capture-safe fallback —
+                    // the same launch shape the Q8_0 arm uses.
+                    self.launch_quantize_q8_1(a_s, act_q81, m, k)?;
+                    match scheme {
+                        KQuantScheme::Q4K => {
+                            self.launch_wmma_fused_dequant_q4k(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::Q5K => {
+                            self.launch_wmma_fused_dequant_q5k(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::Q6K => {
+                            self.launch_wmma_fused_dequant_q6k(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::Q3K => {
+                            self.launch_wmma_fused_dequant_q3k(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::Q2K => {
+                            self.launch_wmma_fused_dequant_q2k(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::IQ3S => {
+                            self.launch_wmma_fused_dequant_iq3s(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::IQ4NL => {
+                            self.launch_wmma_fused_dequant_iq4nl(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::IQ4XS => {
+                            self.launch_wmma_fused_dequant_iq4xs(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::IQ2S => {
+                            self.launch_wmma_fused_dequant_iq2s(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::IQ2XS => {
+                            self.launch_wmma_fused_dequant_iq2xs(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::IQ2XXS => {
+                            self.launch_wmma_fused_dequant_iq2xxs(act_q81, w, out, m, n, k)?;
+                        }
+                        KQuantScheme::IQ3XXS => {
+                            self.launch_wmma_fused_dequant_iq3xxs(act_q81, w, out, m, n, k)?;
+                        }
+                        other => {
+                            return Err(Error::Backend(format!(
+                                "linear_decode_into: no WMMA leg for K-quant {other:?}"
+                            )))
+                        }
+                    }
+                    return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                }
                 // GRIM_DECODE_W4A4=1: q4k weights are requantized once, per
                 // tensor, to the WhiteCrow u4 group-128 layout and decode rides
                 // the native v_dot8 GEMV. Probe-measured 435 GB/s vs 23 GB/s
@@ -1823,9 +1875,10 @@ impl RocmDevice {
                 };
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
             }
-            _ => Err(Error::Unimplemented(
-                "linear_decode_into: unsupported weight dtype for graph decode".into(),
-            )),
+            _ => Err(Error::Unimplemented(format!(
+                "linear_decode_into: unsupported weight dtype for graph decode: {:?}",
+                w.dtype()
+            ))),
         }
     }
 

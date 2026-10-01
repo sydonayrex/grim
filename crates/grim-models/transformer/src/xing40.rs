@@ -559,6 +559,12 @@ impl Xing40HyperConnection {
         &self.hc_fn.weight
     }
 
+    /// Sinkhorn iteration count, gate eps, and the comb clamp bounds — the
+    /// decode-graph step needs them without reaching into private fields.
+    pub fn gate_consts(&self) -> (usize, f32, f32, f32) {
+        (self.sinkhorn_iters, self.eps, self.clamp_min, self.clamp_max)
+    }
+
     /// Reference gate math: sigmoid gates + clamped Sinkhorn combiner.
     /// Operates on the `[seq, mix]` projection produced by [`Self::project`].
     pub fn gates_from_projection(&self, proj: &[f32], seq_len: usize) -> Xing40HcGates {
@@ -1664,7 +1670,7 @@ impl Xing40Mla {
     }
 
     /// Device-resident `w_kc` as `[num_heads, nope, rank]`, built once per ordinal.
-    fn w_kc_device(&self, ordinal: usize) -> Result<Option<&dyn BackendStorage>> {
+    pub fn w_kc_device(&self, ordinal: usize) -> Result<Option<&dyn BackendStorage>> {
         let slot = self.w_kc_dev.get_or_init(|| {
             let nh = self.num_heads;
             let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
@@ -1691,7 +1697,7 @@ impl Xing40Mla {
 
     /// Device-resident `w_vc` as `[num_heads, v_head_dim, kv_lora_rank]` — the
     /// natural weight layout `matmul` already wants, so no transpose.
-    fn w_vc_device(&self, ordinal: usize) -> Result<Option<&dyn BackendStorage>> {
+    pub fn w_vc_device(&self, ordinal: usize) -> Result<Option<&dyn BackendStorage>> {
         let slot = self.w_vc_t_dev.get_or_init(|| {
             let nh = self.num_heads;
             let vd = self.v_head_dim;
@@ -2382,6 +2388,9 @@ pub struct Xing40 {
     pub layers: Vec<Xing40Block>,
     pub norm: RmsNorm,
     pub output: Linear,
+    /// Capture-safe per-step scratch for the decode graph; built once at
+    /// `get_or_create_decode_graph`, never during capture.
+    pub graph_scratch: std::sync::OnceLock<std::sync::Mutex<crate::decode_graph::Xing40GraphScratch>>,
 }
 
 impl Xing40 {
@@ -2457,6 +2466,7 @@ impl Xing40 {
             layers,
             norm,
             output,
+            graph_scratch: std::sync::OnceLock::new(),
         })
     }
 }

@@ -142,6 +142,11 @@ pub(crate) fn resolve_graph_model<'a>(model: &'a dyn CausalLm) -> Option<&'a dyn
         Some(m)
     } else if let Some(m) = target.as_any().downcast_ref::<DeepSeek4>() {
         Some(m)
+    } else if let Some(m) = target
+        .as_any()
+        .downcast_ref::<grim_models_transformer::Xing40>()
+    {
+        Some(m)
     } else if let Some(m) = target.as_any().downcast_ref::<Chameleon>() {
         Some(m)
     } else if let Some(m) = target

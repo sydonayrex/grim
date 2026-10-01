@@ -12,7 +12,8 @@ use grim_backend_rocm::decode_graph_buffers::{
 };
 use grim_core::error::Result;
 use grim_nn::NormKind;
-use grim_tensor::{BackendStorage, Device, MemoryOps, RopeConfig, Shape};
+use grim_tensor::backend::ElementwiseOps;
+use grim_tensor::{BackendStorage, CoreTensorOps, Device, MemoryOps, RopeConfig, Shape};
 
 use crate::block::LlamaBlock;
 use crate::chameleon::{Chameleon, ChameleonBlock};
@@ -4940,6 +4941,7 @@ impl DecodeGraphModel for DeepSeek4 {
                 graph.buffers.max_ctx.max(1),
                 nope * rank,
                 (nope + vd) * rank,
+                None,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
 
@@ -5230,6 +5232,7 @@ impl DecodeGraphModel for DeepSeek2 {
                 graph.buffers.max_ctx.max(1),
                 nope * rank,
                 (nope + vd) * rank,
+                None,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
 
@@ -5537,6 +5540,7 @@ impl DecodeGraphModel for DeepSeek32 {
                 graph.buffers.max_ctx.max(1),
                 nope * rank,
                 (nope + vd) * rank,
+                None,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
 
@@ -6785,5 +6789,769 @@ mod tests {
                 "MoE decode graph logit {i} is not finite: {val}"
             );
         }
+    }
+}
+
+// ─── Xing40 decode-graph support (appended) ───
+use crate::xing40::Xing40;
+
+type GBox = Box<dyn BackendStorage>;
+
+fn dev_for_xing40(m: &Xing40) -> Result<Arc<Dev>> {
+    match &m.device {
+        Device::Rocm(o) => Ok(Dev::shared(*o)),
+        _ => Err(grim_core::error::Error::Unimplemented(
+            "decode graph needs ROCm device".into(),
+        )),
+    }
+}
+
+/// Per-layer capture-safe scratch for one Xing40 decode step. All buffers are
+/// allocated once at `get_or_create_decode_graph` (never inside capture);
+/// the hc gate vectors live here so `grim_mhc_gates` writes them for the
+/// collapse / write-back kernels to read in the same captured stream.
+pub struct Xing40GraphScratch {
+    /// Stream state: layer i reads `sin[i]` (layer 0's is the seed) and
+    /// writes `sout[i]`, which feeds layer i+1.
+    pub sin: Vec<GBox>,
+    pub sout: Vec<GBox>,
+    /// hc input_norm output (`[1, flat]`).
+    pub hcn: Vec<GBox>,
+    /// hc_fn projection `[1, mix]`.
+    pub proj: Vec<GBox>,
+    /// Gate vectors, token 0 of the `[*, seq]` token-last layout.
+    pub pre: Vec<GBox>,
+    pub post: Vec<GBox>,
+    pub comb: Vec<GBox>,
+    /// Collapse scratch `[1, hidden]`.
+    pub col: Vec<GBox>,
+    /// q_a LoRA output `[1, q_lora_rank]`.
+    pub qlora: Vec<GBox>,
+    /// q_b output `[1, nh*(nope+rope_d)]`.
+    pub qf: Vec<GBox>,
+    /// Split planes: q_nope `[1, nh*nope]`, q_pe `[1, nh*rope_d]`.
+    pub qn: Vec<GBox>,
+    pub qp: Vec<GBox>,
+    /// Absorbed query `[1, nh*rank]` (reused for the decode kernel's
+    /// normalized-latent output when W_UV runs as the per-head GEMV).
+    pub qabs: Vec<GBox>,
+    /// Latent staging: kv_a output `[1, rank+rope_d]`, then the split
+    /// c_kv / k_pe planes, then the packed row.
+    pub kvstage: Vec<GBox>,
+    pub ckv: Vec<GBox>,
+    pub kpe: Vec<GBox>,
+    pub latent: Vec<GBox>,
+    /// Attention output `[1, nh*vd]`.
+    pub attn: Vec<GBox>,
+    /// Shared-expert scratch (MoE layers): `[1, moe_inter]` x3 + `[1, hidden]`.
+    pub shg: Vec<GBox>,
+    pub shu: Vec<GBox>,
+    pub sha: Vec<GBox>,
+    pub sho: Vec<GBox>,
+    /// Head mean `[1, hidden]`.
+    pub meaned: GBox,
+    /// Pre-dequantized F32 hc_fn weights (attn, ffn) — hc_fn ships F16 and
+    /// the graph GEMV path wants F32; dequantized once, outside capture.
+    pub hc_fn_attn: Vec<grim_tensor::Tensor>,
+    pub hc_fn_ffn: Vec<grim_tensor::Tensor>,
+    /// Gate bias + scales on device.
+    pub hc_base: Vec<GBox>,
+    pub hc_scale: Vec<GBox>,
+    /// The checkpoint's rope (base + YaRN), interleaved pairing.
+    pub rope_cfg: RopeConfig,
+    pub mix: usize,
+    pub flat: usize,
+    pub rank: usize,
+    pub rope_d: usize,
+    pub nope: usize,
+    pub vd: usize,
+    pub nh: usize,
+    pub hc: usize,
+}
+
+/// Build the scratch on `dev` (called once, outside capture).
+fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40GraphScratch> {
+    let cfg = &model.cfg;
+    let hc = cfg.hc_mult;
+    let hidden = cfg.hidden_size;
+    let flat = hc * hidden;
+    let rank = cfg.kv_lora_rank;
+    let rope_d = cfg.qk_rope_head_dim;
+    let nope = cfg.qk_nope_head_dim;
+    let vd = cfg.v_head_dim;
+    let nh = cfg.num_heads;
+    let mix = (2 + hc) * hc;
+    let n_layers = model.layers.len();
+    let moe_inter = cfg.moe_intermediate_size;
+    let mut s = Xing40GraphScratch {
+        sin: Vec::with_capacity(n_layers),
+        sout: Vec::with_capacity(n_layers),
+        hcn: Vec::with_capacity(n_layers),
+        proj: Vec::with_capacity(n_layers),
+        pre: Vec::with_capacity(n_layers),
+        post: Vec::with_capacity(n_layers),
+        comb: Vec::with_capacity(n_layers),
+        col: Vec::with_capacity(n_layers),
+        qlora: Vec::with_capacity(n_layers),
+        qf: Vec::with_capacity(n_layers),
+        qn: Vec::with_capacity(n_layers),
+        qp: Vec::with_capacity(n_layers),
+        qabs: Vec::with_capacity(n_layers),
+        kvstage: Vec::with_capacity(n_layers),
+        ckv: Vec::with_capacity(n_layers),
+        kpe: Vec::with_capacity(n_layers),
+        latent: Vec::with_capacity(n_layers),
+        attn: Vec::with_capacity(n_layers),
+        shg: Vec::with_capacity(n_layers),
+        shu: Vec::with_capacity(n_layers),
+        sha: Vec::with_capacity(n_layers),
+        sho: Vec::with_capacity(n_layers),
+        meaned: dev.zeros(&Shape::new(vec![batch, hidden]), grim_tensor::DType::F32)?,
+        hc_fn_attn: Vec::with_capacity(n_layers),
+        hc_fn_ffn: Vec::with_capacity(n_layers),
+        hc_base: Vec::with_capacity(n_layers),
+        hc_scale: Vec::with_capacity(n_layers),
+        rope_cfg: {
+            let mut rc = RopeConfig::new(rope_d, model.layers[0].self_attn.rope.config.base);
+            rc.yarn = model.layers[0].self_attn.rope.config.yarn;
+            // INTERLEAVED — the pairing every verified path uses (the d2d
+            // k_pe NeoX defect is exactly what this must not reintroduce).
+            rc.interleaved = true;
+            rc
+        },
+        mix,
+        flat,
+        rank,
+        rope_d,
+        nope,
+        vd,
+        nh,
+        hc,
+    };
+    for layer in &model.layers {
+        s.sin.push(dev.zeros(&Shape::new(vec![batch, flat]), grim_tensor::DType::F32)?);
+        s.sout.push(dev.zeros(&Shape::new(vec![batch, flat]), grim_tensor::DType::F32)?);
+        s.hcn.push(dev.zeros(&Shape::new(vec![batch, flat]), grim_tensor::DType::F32)?);
+        s.proj.push(dev.zeros(&Shape::new(vec![batch, mix]), grim_tensor::DType::F32)?);
+        s.pre.push(dev.zeros(&Shape::new(vec![hc, batch]), grim_tensor::DType::F32)?);
+        s.post.push(dev.zeros(&Shape::new(vec![hc, batch]), grim_tensor::DType::F32)?);
+        s.comb.push(dev.zeros(&Shape::new(vec![hc * hc, batch]), grim_tensor::DType::F32)?);
+        s.col.push(dev.zeros(&Shape::new(vec![batch, hidden]), grim_tensor::DType::F32)?);
+        let qlora_w = layer
+            .self_attn
+            .q_a_proj
+            .as_ref()
+            .map(|p| p.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or(0);
+        s.qlora.push(dev.zeros(&Shape::new(vec![batch, qlora_w.max(1)]), grim_tensor::DType::F32)?);
+        s.qf.push(dev.zeros(&Shape::new(vec![batch, nh * (nope + rope_d)]), grim_tensor::DType::F32)?);
+        s.qn.push(dev.zeros(&Shape::new(vec![batch, nh * nope]), grim_tensor::DType::F32)?);
+        s.qp.push(dev.zeros(&Shape::new(vec![batch, nh * rope_d]), grim_tensor::DType::F32)?);
+        s.qabs.push(dev.zeros(&Shape::new(vec![batch, nh * rank]), grim_tensor::DType::F32)?);
+        s.kvstage.push(dev.zeros(&Shape::new(vec![batch, rank + rope_d]), grim_tensor::DType::F32)?);
+        s.ckv.push(dev.zeros(&Shape::new(vec![batch, rank]), grim_tensor::DType::F32)?);
+        s.kpe.push(dev.zeros(&Shape::new(vec![batch, rope_d]), grim_tensor::DType::F32)?);
+        s.latent.push(dev.zeros(&Shape::new(vec![batch, rank + rope_d]), grim_tensor::DType::F32)?);
+        s.attn.push(dev.zeros(&Shape::new(vec![batch, nh * vd]), grim_tensor::DType::F32)?);
+        s.shg.push(dev.zeros(&Shape::new(vec![batch, moe_inter]), grim_tensor::DType::F32)?);
+        s.shu.push(dev.zeros(&Shape::new(vec![batch, moe_inter]), grim_tensor::DType::F32)?);
+        s.sha.push(dev.zeros(&Shape::new(vec![batch, moe_inter]), grim_tensor::DType::F32)?);
+        s.sho.push(dev.zeros(&Shape::new(vec![batch, hidden]), grim_tensor::DType::F32)?);
+        // Pre-dequant the F16 hc_fn weights to F32 device tensors (once).
+        for (hc_mod, sink) in [(&layer.attn_hc, &mut s.hc_fn_attn), (&layer.ffn_hc, &mut s.hc_fn_ffn)] {
+            let w = hc_mod.hc_fn_weight();
+            let v = w.to_vec_f32()?;
+            let st = dev.from_cpu(&v, w.shape(), grim_tensor::DType::F32)?;
+            sink.push(grim_tensor::Tensor::new(
+                Arc::from(st),
+                w.shape().clone(),
+                grim_tensor::DType::F32,
+                w.provenance().clone(),
+                w.device().clone(),
+            ));
+        }
+        let (base, scale) = layer.attn_hc.gate_params();
+        s.hc_base.push(dev.from_cpu(base, &Shape::new(vec![base.len()]), grim_tensor::DType::F32)?);
+        s.hc_scale.push(dev.from_cpu(scale, &Shape::new(vec![3]), grim_tensor::DType::F32)?);
+    }
+    Ok(s)
+}
+
+impl DecodeGraphModel for Xing40 {
+    fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph disabled by env".into(),
+            ));
+        }
+        let dev = dev_for_xing40(self)?;
+        let stream = dev
+            .get_stream_from_pool(0)
+            .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
+        let cfg = &self.cfg;
+        let latent_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
+        // The latent cache rides the k_arena slot (width = latent_dim) so the
+        // generic eager-kv seeding works unmodified; v_arena is dead weight.
+        let buffers = DecodeGraphBuffers::allocate_with_mla(
+            &dev,
+            self.layers.len(),
+            cfg.hidden_size,
+            cfg.num_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim),
+            cfg.num_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim),
+            latent_dim,
+            latent_dim,
+            cfg.intermediate_size,
+            max_ctx.max(1),
+            cfg.vocab_size.max(1),
+            cfg.num_heads,
+            batch,
+            cfg.n_routed_experts,
+            cfg.num_experts_per_tok,
+            0,
+            0,
+            latent_dim,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+        // Capture retries call this again; the scratch is reusable as-is.
+        if self.graph_scratch.get().is_none() {
+            let built = std::sync::Mutex::new(build_xing_scratch(self, &dev, batch)?);
+            let _ = self.graph_scratch.set(built);
+        }
+        Ok(DecodeGraph::new(&dev, buffers, stream))
+    }
+
+    fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !decode_graph_enabled() {
+            return Err(grim_core::error::Error::Backend("decode graph disabled".into()));
+        }
+        let dev = dev_for_xing40(self)?;
+        if !graph.capturing {
+            crate::lfm2_graph::write_embedding_to_buffer(
+                &dev,
+                &graph.buffers.token_ids_dev,
+                token_id,
+            )?;
+        }
+        let mut scratch_guard = self
+            .graph_scratch
+            .get()
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("xing40 graph scratch missing".into())
+            })?
+            .lock()
+            .map_err(|_| {
+                grim_core::error::Error::Backend("xing40 graph scratch poisoned".into())
+            })?;
+        let scratch = &mut *scratch_guard;
+        let buffers = &mut graph.buffers;
+        let batch = buffers.batch.max(1);
+        let hidden = self.cfg.hidden_size;
+        let hc = scratch.hc;
+        let flat = scratch.flat;
+        let cfg = &self.cfg;
+
+        // Embedding gather → seed streams of layer 0.
+        let w_emb = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
+        dev.launch_embedding_gather_dev_idx(
+            w_emb,
+            &buffers.layer_input[0],
+            &buffers.token_ids_dev,
+            hidden,
+            batch * hidden,
+        )
+        .map_err(|e| grim_core::error::Error::Backend(format!("embedding gather: {e}")))?;
+        // Broadcast the gathered row across the hc streams (the same column
+        // writes seed_streams_device performs; write_cols is a pure kernel).
+        for h in 0..hc {
+            dev.write_cols(
+                scratch.sin[0].as_mut(),
+                flat,
+                h * hidden,
+                &buffers.layer_input[0],
+                batch,
+                hidden,
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("hc seed: {e}")))?;
+        }
+
+        let h_shape = Shape::new(vec![batch, hidden]);
+        let n_layers = self.layers.len();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let act = &buffers.act_q81_buf[i];
+            let sin: &GBox = if i == 0 { &scratch.sin[0] } else { &scratch.sout[i - 1] };
+            let sout = &scratch.sout[i];
+
+            // ── attn hc: gates over the raw stream state ──
+            dev.rms_norm_into(
+                sin.as_ref(),
+                &**layer.attn_hc.input_norm.weight.storage(),
+                layer.attn_hc.input_norm.eps,
+                as_rocm(scratch.hcn[i].as_ref())?,
+                &Shape::new(vec![batch, flat]),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            linear_into(&dev, as_rocm(scratch.hcn[i].as_ref())?, &scratch.hc_fn_attn[i], as_rocm(scratch.proj[i].as_ref())?, act)?;
+            let (iters, geps, cmin, cmax) = layer.attn_hc.gate_consts();
+            dev.mhc_gates_launch_into(
+                as_rocm(scratch.proj[i].as_ref())?,
+                scratch.hc_base[i].as_ref(),
+                scratch.hc_scale[i].as_ref(),
+                as_rocm(scratch.pre[i].as_ref())?,
+                as_rocm(scratch.post[i].as_ref())?,
+                as_rocm(scratch.comb[i].as_ref())?,
+                batch,
+                hc,
+                iters,
+                geps,
+                cmin,
+                cmax,
+            )?;
+            dev.launch_hc_collapse_step(
+                sin.as_ref(),
+                as_rocm(scratch.pre[i].as_ref())?, as_rocm(scratch.col[i].as_ref())?, hc, hidden)?;
+            dev.rms_norm_into(
+                as_rocm(scratch.col[i].as_ref())?,
+                &**layer.attn_norm.weight.storage(),
+                layer.attn_norm.eps,
+                as_rocm(scratch.col[i].as_ref())?,
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            // ── MLA ──
+            let sa = &layer.self_attn;
+            let rank = cfg.kv_lora_rank;
+            let nope = cfg.qk_nope_head_dim;
+            let rope_d = cfg.qk_rope_head_dim;
+            let vd = cfg.v_head_dim;
+            let nh = cfg.num_heads;
+            if let (Some(qa), Some(qn_norm), Some(qb)) =
+                (&sa.q_a_proj, &sa.q_a_layernorm, &sa.q_b_proj)
+            {
+                linear_into(
+    &dev,
+                    scratch.col[i].as_ref(),
+                    qa.weight(),
+                    as_rocm(scratch.qlora[i].as_ref())?,
+                    act,
+                )?;
+                dev.rms_norm_into(
+                    as_rocm(scratch.qlora[i].as_ref())?,
+                    &**qn_norm.weight.storage(),
+                    qn_norm.eps,
+                    as_rocm(scratch.qlora[i].as_ref())?,
+                    &Shape::new(vec![batch, scratch.qlora[i].shape().dims()[1]]),
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    scratch.qlora[i].as_ref(),
+                    qb.weight(),
+                    as_rocm(scratch.qf[i].as_ref())?,
+                    act,
+                )?;
+            } else if let Some(ref q_direct) = sa.q_proj_direct {
+                linear_into(
+                    &dev,
+                    scratch.col[i].as_ref(),
+                    q_direct.weight(),
+                    as_rocm(scratch.qf[i].as_ref())?,
+                    act,
+                )?;
+            }
+            dev.launch_xing_q_split(
+                scratch.qf[i].as_ref(),
+                as_rocm(scratch.qn[i].as_ref())?,
+                as_rocm(scratch.qp[i].as_ref())?,
+                nh,
+                nope,
+                rope_d,
+            )?;
+            dev.rope_dev_base_into(
+                as_rocm(scratch.qp[i].as_ref())?,
+                &buffers.pos_dev,
+                as_rocm(scratch.qp[i].as_ref())?,
+                &scratch.rope_cfg,
+                &Shape::new(vec![batch, nh, rope_d]),
+                nh,
+                1,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            // Absorb W_UK into the nope plane (F32 bank cache, [nh*rank, nope]).
+            if let Some(w_uk) = sa.w_kc_device(0)? {
+                dev.launch_xing_q_absorb(as_rocm(scratch.qn[i].as_ref())?, w_uk, as_rocm(scratch.qabs[i].as_ref())?, nh, rank, nope)?;
+            } else {
+                return Err(grim_core::error::Error::Backend(
+                    "xing40 graph: no device W_UK cache".into(),
+                ));
+            }
+            // KV latent: project, norm c_kv, rope k_pe, pack, append.
+            linear_into(
+                    &dev,
+                    scratch.col[i].as_ref(),
+                    sa.kv_a_proj.weight(),
+                    as_rocm(scratch.kvstage[i].as_ref())?,
+                    act,
+                )?;
+            dev.launch_xing_q_split(
+                scratch.kvstage[i].as_ref(),
+                as_rocm(scratch.ckv[i].as_ref())?,
+                as_rocm(scratch.kpe[i].as_ref())?,
+                1,
+                rank,
+                rope_d,
+            )?;
+            dev.rms_norm_into(
+                as_rocm(scratch.ckv[i].as_ref())?,
+                &**sa.kv_a_layernorm.weight.storage(),
+                sa.kv_a_layernorm.eps,
+                as_rocm(scratch.ckv[i].as_ref())?,
+                &Shape::new(vec![batch, rank]),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            dev.rope_dev_base_into(
+                as_rocm(scratch.kpe[i].as_ref())?,
+                &buffers.pos_dev,
+                as_rocm(scratch.kpe[i].as_ref())?,
+                &scratch.rope_cfg,
+                &Shape::new(vec![batch, 1, rope_d]),
+                1,
+                1,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            dev.launch_xing_pack_latent(
+                as_rocm(scratch.ckv[i].as_ref())?,
+                as_rocm(scratch.kpe[i].as_ref())?,
+                as_rocm(scratch.latent[i].as_ref())?,
+                rank,
+                rope_d,
+            )?;
+            grim_backend_rocm::launch_kv_append_batch(
+                &dev,
+                &buffers.k_arena[i],
+                as_rocm(scratch.latent[i].as_ref())?,
+                &buffers.pos_dev,
+                rank + rope_d,
+                1,
+                batch,
+                buffers.max_ctx * (rank + rope_d),
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("latent kv_append: {e}")))?;
+            // Latent-space attention over the LIVE length (pos_dev + 1); the
+            // normalized latent lands in qabs and W_UV runs as the per-head
+            // GEMV into attn.
+            dev.launch_mla_absorbed_decode(
+                as_rocm(scratch.qabs[i].as_ref())?,
+                as_rocm(scratch.qp[i].as_ref())?,
+                &buffers.k_arena[i],
+                None,
+                as_rocm(scratch.qabs[i].as_ref())?,
+                nh,
+                rank,
+                rope_d,
+                vd,
+                buffers.max_ctx.max(1),
+                0,
+                0,
+                Some(&buffers.pos_dev),
+            )
+            .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
+            if let Some(w_vc) = sa.w_vc_device(0)? {
+                dev.launch_xing_q_absorb(as_rocm(scratch.qabs[i].as_ref())?, w_vc, as_rocm(scratch.attn[i].as_ref())?, nh, vd, rank)?;
+            } else {
+                return Err(grim_core::error::Error::Backend(
+                    "xing40 graph: no device W_VC cache".into(),
+                ));
+            }
+            linear_into(
+                &dev,
+                scratch.attn[i].as_ref(),
+                sa.o_proj.weight(),
+                &buffers.norm_buf[i],
+                act,
+            )?;
+            dev.launch_hc_write_back_step(
+                &buffers.norm_buf[i],
+                as_rocm(scratch.post[i].as_ref())?,
+                as_rocm(scratch.comb[i].as_ref())?,
+                sin.as_ref(),
+                as_rocm(sout.as_ref())?,
+                hc,
+                hidden,
+            )?;
+
+            // ── ffn hc ──
+            dev.rms_norm_into(
+                sout.as_ref(),
+                &**layer.ffn_hc.input_norm.weight.storage(),
+                layer.ffn_hc.input_norm.eps,
+                as_rocm(scratch.hcn[i].as_ref())?,
+                &Shape::new(vec![batch, flat]),
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+            linear_into(
+                &dev,
+                scratch.hcn[i].as_ref(),
+                &scratch.hc_fn_ffn[i],
+                as_rocm(scratch.proj[i].as_ref())?,
+                act,
+            )?;
+            let (iters, geps, cmin, cmax) = layer.ffn_hc.gate_consts();
+            dev.mhc_gates_launch_into(
+                as_rocm(scratch.proj[i].as_ref())?,
+                scratch.hc_base[i].as_ref(),
+                scratch.hc_scale[i].as_ref(),
+                as_rocm(scratch.pre[i].as_ref())?,
+                as_rocm(scratch.post[i].as_ref())?,
+                as_rocm(scratch.comb[i].as_ref())?,
+                batch,
+                hc,
+                iters,
+                geps,
+                cmin,
+                cmax,
+            )?;
+            dev.launch_hc_collapse_step(
+                sout.as_ref(),
+                as_rocm(scratch.pre[i].as_ref())?, as_rocm(scratch.col[i].as_ref())?, hc, hidden)?;
+            dev.rms_norm_into(
+                as_rocm(scratch.col[i].as_ref())?,
+                &**layer.ffn_norm.weight.storage(),
+                layer.ffn_norm.eps,
+                as_rocm(scratch.col[i].as_ref())?,
+                &h_shape,
+            )
+            .map_err(grim_core::error::Error::Tensor)?;
+
+            // ── FFN branch: dense SwiGLU or noaux_tc MoE ──
+            if let Some(ref mlp) = layer.mlp {
+                linear_into(
+    &dev,
+                scratch.col[i].as_ref(),
+                mlp.w1.weight(), &buffers.gate_buf[i], act)?;
+                linear_into(
+    &dev,
+                scratch.col[i].as_ref(),
+                mlp.w3.weight(), &buffers.up_buf[i], act)?;
+                dev.silu_mul_into(
+                    &buffers.gate_buf[i],
+                    &buffers.up_buf[i],
+                    &buffers.activated_buf[i],
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+                linear_into(
+                    &dev,
+                    &buffers.activated_buf[i],
+                    mlp.w2.weight(),
+                    &buffers.norm_buf[i],
+                    act,
+                )?;
+            } else if let Some(ref moe) = layer.moe {
+                linear_into(
+                    &dev,
+                    as_rocm(scratch.col[i].as_ref())?,
+                    moe.gate.weight(),
+                    &buffers.moe_gate_logits[i],
+                    act,
+                )?;
+                let bias = moe.correction_bias_dev.as_ref().and_then(|b| {
+                    b.storage()
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                });
+                dev.moe_route_topk_on_device(
+                    &buffers.moe_gate_logits[i],
+                    bias,
+                    &buffers.moe_route_tokens,
+                    &buffers.moe_route_experts,
+                    &buffers.moe_route_weights,
+                    batch,
+                    cfg.n_routed_experts,
+                    moe.num_experts_per_tok,
+                    2,     // sigmoid + e_score_correction_bias (noaux_tc)
+                    true,  // xing4_0.expert_weights_norm
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+                let experts: Vec<crate::shared_moe::MoeExpert> = moe
+                    .experts
+                    .iter()
+                    .map(|e| crate::shared_moe::MoeExpert {
+                        gate: e.w1.clone(),
+                        up: e.w3.clone(),
+                        down: e.w2.clone(),
+                    })
+                    .collect();
+                let (_, _, _, g, u, d) = crate::shared_moe::ensure_charon_scratch(
+                    dev.ordinal(),
+                    batch,
+                    moe.num_experts_per_tok,
+                    &experts,
+                    &moe.charon_cache,
+                )?;
+                let col_r = as_rocm(scratch.col[i].as_ref())?;
+                dev.moe_fused_dispatch_resident_routing_into(
+                    col_r,
+                    g.as_ref(),
+                    u.as_ref(),
+                    d.as_ref(),
+                    &buffers.moe_route_tokens,
+                    &buffers.moe_route_experts,
+                    &buffers.moe_route_weights,
+                    batch * moe.num_experts_per_tok,
+                    &buffers.moe_out[i],
+                    hidden,
+                    cfg.moe_intermediate_size,
+                    moe.routed_scaling_factor,
+                )?;
+                // Shared expert (dense SwiGLU at the shared width) added on top.
+                if let Some(ref shared) = moe.shared_experts {
+                    linear_into(
+                        &dev,
+                        scratch.col[i].as_ref(),
+                        shared.w1.weight(),
+                        as_rocm(scratch.shg[i].as_ref())?,
+                        act,
+                    )?;
+                    linear_into(
+                        &dev,
+                        scratch.col[i].as_ref(),
+                        shared.w3.weight(),
+                        as_rocm(scratch.shu[i].as_ref())?,
+                        act,
+                    )?;
+                    dev.silu_mul_into(
+                        scratch.shg[i].as_ref(),
+                        scratch.shu[i].as_ref(),
+                        as_rocm(scratch.sha[i].as_ref())?,
+                    )
+                    .map_err(grim_core::error::Error::Tensor)?;
+                    linear_into(
+                        &dev,
+                        scratch.sha[i].as_ref(),
+                        shared.w2.weight(),
+                        as_rocm(scratch.sho[i].as_ref())?,
+                        act,
+                    )?;
+                    add_graph(
+                        &buffers.moe_out[i],
+                        scratch.sho[i].as_ref(),
+                        &buffers.norm_buf[i],
+                        &dev,
+                    )?;
+                } else {
+                    publish_into(&dev, &buffers.norm_buf[i], &buffers.moe_out[i])?;
+                }
+            } else {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "xing40 graph: layer {i} has neither mlp nor moe"
+                )));
+            }
+
+            // ── ffn write-back: streams carry to the next layer ──
+            let dst: &mut GBox = if i + 1 < n_layers {
+                &mut scratch.sin[i + 1]
+            } else {
+                &mut scratch.sin[0] // last layer publishes into the seed slot
+            };
+            dev.launch_hc_write_back_step(
+                &buffers.norm_buf[i],
+                as_rocm(scratch.post[i].as_ref())?,
+                as_rocm(scratch.comb[i].as_ref())?,
+                sout.as_ref(),
+                as_rocm(dst.as_ref())?,
+                hc,
+                hidden,
+            )?;
+        }
+
+        // Head: mean the final streams, output_norm, lm_head.
+        dev.launch_hc_mean_step(
+            scratch.sin[0].as_ref(),
+            as_rocm(scratch.meaned.as_ref())?,
+            hc,
+            hidden,
+        )?;
+        dev.rms_norm_into(
+            scratch.meaned.as_ref(),
+            &**self.norm.weight.storage(),
+            self.norm.eps,
+            as_rocm(scratch.meaned.as_ref())?,
+            &h_shape,
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+        linear_into(
+            &dev,
+            scratch.meaned.as_ref(),
+            self.output.weight(),
+            &buffers.head_output,
+            &buffers.act_q81_buf[0],
+        )?;
+        Ok(())
+    }
+
+    fn forward_replay(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
+        if !graph.is_captured {
+            return Err(grim_core::error::Error::Backend(
+                "forward_replay before capture".into(),
+            ));
+        }
+        let dev = dev_for_xing40(self)?;
+        crate::lfm2_graph::write_embedding_to_buffer(
+            &dev,
+            &graph.buffers.token_ids_dev,
+            token_id,
+        )?;
+        let pos = graph.buffers.current_pos;
+        graph
+            .buffers
+            .write_pos_async(&dev, pos, graph.stream)
+            .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
+        graph
+            .replay()
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+        Ok(())
+    }
+
+    fn eager_kv_seed_sources<'a>(
+        &self,
+        session: &'a dyn grim_core::session::SessionT,
+        valid_rows: u32,
+    ) -> Result<Vec<Option<EagerKvSource<'a>>>> {
+        let caches = session
+            .model_state()
+            .and_then(|s| s.downcast_ref::<Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>>>())
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend(
+                    "xing40 seed: session state must be the per-layer latent kv vec".into(),
+                )
+            })?;
+        let latent_dim = self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
+        let mut out: Vec<Option<EagerKvSource<'a>>> = Vec::with_capacity(self.layers.len());
+        for c in caches.iter() {
+            match c {
+                Some((latent, _)) => {
+                    let storage = latent.storage().as_ref();
+                    let k_dev = storage
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .and_then(|r| r.device_ptr())
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend(
+                                "xing40 seed: latent cache has no device ptr".into(),
+                            )
+                        })? as *const f32;
+                    out.push(Some(EagerKvSource {
+                        k_dev,
+                        v_dev: k_dev,
+                        prefill_len: valid_rows,
+                        kv_stride: latent_dim,
+                        gdl_state: None,
+                        _anchor: std::marker::PhantomData,
+                    }));
+                }
+                None => out.push(None),
+            }
+        }
+        Ok(out)
     }
 }

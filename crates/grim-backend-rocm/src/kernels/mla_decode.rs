@@ -20,8 +20,18 @@ __global__ void grim_mla_absorbed_decode(
     float inv_sqrt_d,
     int has_w_uv,
     int w_uv_offset_words,
-    int w_uv_head_stride_words
+    int w_uv_head_stride_words,
+    const int* __restrict__ live_len // device u32; NULL -> use seq_len. When
+                                     // set the kernel attends rows
+                                     // [0, min(seq_len, *live_len + 1)) so a
+                                     // captured graph can grow its view with
+                                     // the position without patching args.
 ) {
+    int slen = seq_len;
+    if (live_len != nullptr) {
+        slen = *live_len + 1;
+        if (slen > seq_len) slen = seq_len;
+    }
     const int h = blockIdx.x; // query head index
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
@@ -47,7 +57,7 @@ __global__ void grim_mla_absorbed_decode(
         acc_local[i] = 0.0f;
     }
 
-    for (int j = 0; j < seq_len; ++j) {
+    for (int j = 0; j < slen; ++j) {
         const int token_base = j * total_kv_dim;
 
         // 1. Partial dot product Q_C . c_kv

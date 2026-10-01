@@ -214,7 +214,8 @@ impl AttentionOps for RocmDevice {
             seq_len,
             w_uv_offset_words,
             w_uv_head_stride_words,
-        )?;
+                None,
+            )?;
         Ok(Box::new(crate::device::handles::RocmHandle::new(Some(
             self.active_stream(),
         ))))

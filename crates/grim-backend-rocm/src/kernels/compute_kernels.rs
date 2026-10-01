@@ -2119,6 +2119,100 @@ grim_embedding_backward(const float* __restrict__ out_grad,
     if (tok >= (unsigned int)vocab_size) return; // mirror CPU bounds check
     atomicAdd(&dweight[(size_t)tok * hidden_dim + d], out_grad[idx]);
 }
+// ─── Xing4.0 MHC graph-step kernels (seq = 1, decode-graph capture-safe) ───
+// All gate vectors are read from DEVICE memory (written by grim_mhc_gates in
+// the same captured stream), so no host round-trip and no frozen scalars.
+
+// collapse = Σ_h pre[h] * streams[h*hidden + d]. pre is the [hc, seq] gate at
+// token 0 → pre[h].
+extern "C" __global__ void grim_hc_collapse_step(
+    const float* __restrict__ streams, // [hc * hidden]
+    const float* __restrict__ pre,     // [hc]
+    float* __restrict__ out,           // [hidden]
+    int hc, int hidden) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= hidden) return;
+    float acc = 0.0f;
+    for (int h = 0; h < hc; ++h) acc += pre[h] * streams[h * hidden + d];
+    out[d] = acc;
+}
+
+// Uniform stream mean for the model head: out[d] = (1/hc) Σ_h streams[h*hidden+d].
+extern "C" __global__ void grim_hc_mean_step(
+    const float* __restrict__ streams, // [hc * hidden]
+    float* __restrict__ out,           // [hidden]
+    int hc, int hidden) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= hidden) return;
+    float acc = 0.0f;
+    for (int h = 0; h < hc; ++h) acc += streams[h * hidden + d];
+    out[d] = acc / (float)hc;
+}
+
+// Write-back at seq=1: out[h*hidden+d] = post[h]*y[d] + Σ_i comb[h*hc+i]*streams[i*hidden+d].
+// comb is the [hc*hc, seq] token-last gate at token 0, k = dst*hc + src — the
+// same order the host write_back reads (comb_row reads h*hc + i).
+extern "C" __global__ void grim_hc_write_back_step(
+    const float* __restrict__ y,       // [hidden]
+    const float* __restrict__ post,    // [hc]
+    const float* __restrict__ comb,    // [hc*hc]
+    const float* __restrict__ streams, // [hc*hidden]
+    float* __restrict__ out,           // [hc*hidden]
+    int hc, int hidden) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hc * hidden) return;
+    const int h = idx / hidden;
+    const int d = idx % hidden;
+    float acc = post[h] * y[d];
+    for (int i = 0; i < hc; ++i) acc += comb[h * hc + i] * streams[i * hidden + d];
+    out[idx] = acc;
+}
+
+// Split q_full [nh * (nope + rope_d)] into the per-head q_nope [nh*nope] and
+// q_pe [nh*rope_d] planes the rope and absorb kernels consume.
+extern "C" __global__ void grim_xing_q_split(
+    const float* __restrict__ q_full,
+    float* __restrict__ q_nope,
+    float* __restrict__ q_pe,
+    int nh, int nope, int rope_d) {
+    const int stride = nope + rope_d;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nh * stride) return;
+    const int h = idx / stride;
+    const int c = idx % stride;
+    const float v = q_full[idx];
+    if (c < nope) q_nope[h * nope + c] = v;
+    else q_pe[h * rope_d + (c - nope)] = v;
+}
+
+// Pack the latent KV row: out[0..rank] = c_kv, out[rank..rank+rope_d] = k_pe.
+extern "C" __global__ void grim_xing_pack_latent(
+    const float* __restrict__ c_kv,   // [rank]
+    const float* __restrict__ k_pe,   // [rope_d]
+    float* __restrict__ out,          // [rank + rope_d]
+    int rank, int rope_d) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rank + rope_d) return;
+    out[idx] = (idx < rank) ? c_kv[idx] : k_pe[idx - rank];
+}
+
+// Per-head latent absorb: q_abs[h*rank + r] = Σ_d q_nope[h*nope + d] * w_uk[(h*rank + r)*nope + d].
+// w_uk is the F32 device cache of the dequantized W_UK banks ([nh*rank, nope]).
+extern "C" __global__ void grim_xing_q_absorb(
+    const float* __restrict__ q_nope, // [nh * nope]
+    const float* __restrict__ w_uk,   // [nh * rank, nope]
+    float* __restrict__ q_abs,        // [nh * rank]
+    int nh, int rank, int nope) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nh * rank) return;
+    const int h = idx / rank;
+    const int r = idx % rank;
+    const float* w = w_uk + ((size_t)h * rank + r) * nope;
+    const float* q = q_nope + (size_t)h * nope;
+    float acc = 0.0f;
+    for (int d = 0; d < nope; ++d) acc += q[d] * w[d];
+    q_abs[idx] = acc;
+}
 "#;
 
 #[cfg(test)]
@@ -2247,3 +2341,4 @@ mod tests {
         assert!(OTHER_KERNEL_SOURCE.contains("grim_argmax_stage2"));
     }
 }
+
