@@ -1914,19 +1914,19 @@ pub struct WhiteCrowDecodedWeights {
 }
 
 impl WhiteCrowDecodedWeights {
-    fn qweight_rocm(&self) -> Result<&RocmStorage> {
+    pub fn qweight_rocm(&self) -> Result<&RocmStorage> {
         self.qweight
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("requant: qweight not RocmStorage".into()))
     }
-    fn scales_rocm(&self) -> Result<&RocmStorage> {
+    pub fn scales_rocm(&self) -> Result<&RocmStorage> {
         self.scales
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("requant: scales not RocmStorage".into()))
     }
-    fn zeros_rocm(&self) -> Result<&RocmStorage> {
+    pub fn zeros_rocm(&self) -> Result<&RocmStorage> {
         self.zeros
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -1939,7 +1939,7 @@ impl RocmDevice {
     /// unsigned-4-bit group-128 OSTQuant (WhiteCrow). One-time cost per tensor
     /// (~a few ms for a 9B FFN matrix); see GRIM_DECODE_W4A4 in
     /// `linear_decode_into`.
-    fn requant_kquant_to_whitecrow(
+    pub fn requant_kquant_to_whitecrow(
         &self,
         w: &RocmStorage,
         n: usize,
@@ -2013,7 +2013,18 @@ impl RocmDevice {
         let (block_bytes, per_256): (usize, usize) = match scheme {
             grim_tensor::KQuantScheme::Q4K => (144, 256),
             grim_tensor::KQuantScheme::Q5K => (176, 256),
-            _ => (210, 256),
+            grim_tensor::KQuantScheme::Q6K => (210, 256),
+            grim_tensor::KQuantScheme::Q3K => (110, 256),
+            // IQ3_S: same 256/110 super-block geometry as Q3_K.
+            grim_tensor::KQuantScheme::IQ3S => (110, 256),
+            grim_tensor::KQuantScheme::Q2K => (84, 256),
+            // IQ4_NL: 18 B per 32 weights => 8 blocks x 18 B per 256.
+            grim_tensor::KQuantScheme::IQ4NL => (144, 256),
+            _ => {
+                return Err(Error::Backend(format!(
+                    "requant_kquant_to_whitecrow: unsupported scheme {scheme:?}"
+                )))
+            }
         };
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
@@ -2043,7 +2054,26 @@ impl RocmDevice {
                                 grim_tensor::KQuantScheme::Q5K => {
                                     grim_quant::dequant_q5k(slice, rows * k)?
                                 }
-                                _ => grim_quant::dequant_q6k(slice, rows * k)?,
+                                grim_tensor::KQuantScheme::Q6K => {
+                                    grim_quant::dequant_q6k(slice, rows * k)?
+                                }
+                                grim_tensor::KQuantScheme::Q3K => {
+                                    grim_quant::dequant_q3k(slice, rows * k)?
+                                }
+                                grim_tensor::KQuantScheme::IQ3S => {
+                                    grim_quant::dequant_iq3s(slice, rows * k)?
+                                }
+                                grim_tensor::KQuantScheme::Q2K => {
+                                    grim_quant::dequant_q2k(slice, rows * k)?
+                                }
+                                grim_tensor::KQuantScheme::IQ4NL => {
+                                    grim_quant::dequant_iq4nl(slice, rows * k)?
+                                }
+                                _ => {
+                                    return Err(Error::Backend(format!(
+                                        "requant_kquant_to_whitecrow: no dequant for {scheme:?}"
+                                    )))
+                                }
                             };
                             grim_quant::quant_ostquant_w4_group128(&dq, rows, k)
                         })
@@ -2065,7 +2095,16 @@ impl RocmDevice {
             let dequantized = match scheme {
                 grim_tensor::KQuantScheme::Q4K => grim_quant::dequant_q4k(&packed, n * k)?,
                 grim_tensor::KQuantScheme::Q5K => grim_quant::dequant_q5k(&packed, n * k)?,
-                _ => grim_quant::dequant_q6k(&packed, n * k)?,
+                grim_tensor::KQuantScheme::Q6K => grim_quant::dequant_q6k(&packed, n * k)?,
+                grim_tensor::KQuantScheme::Q3K => grim_quant::dequant_q3k(&packed, n * k)?,
+                grim_tensor::KQuantScheme::IQ3S => grim_quant::dequant_iq3s(&packed, n * k)?,
+                grim_tensor::KQuantScheme::Q2K => grim_quant::dequant_q2k(&packed, n * k)?,
+                grim_tensor::KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(&packed, n * k)?,
+                _ => {
+                    return Err(Error::Backend(format!(
+                        "requant_kquant_to_whitecrow: no dequant for {scheme:?}"
+                    )))
+                }
             };
             grim_quant::quant_ostquant_w4_group128(&dequantized, n, k)?
         };

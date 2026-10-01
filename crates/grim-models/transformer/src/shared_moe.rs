@@ -60,6 +60,14 @@ pub struct CharonCache {
     /// Resident MXFP4 codes + shared-exponent stacks (separate buffers —
     /// the kernel takes 6 weight pointers, not 3 packed blobs).
     mxfp4: Mutex<Option<Mxfp4Resident>>,
+    /// Resident WhiteCrow u4-group128 expert blobs (gate/up/down, expert-
+    /// strided, one blob per projection). Built on demand behind
+    /// `GRIM_MOE_NATIVE_WHITECROW`; ~0.5 B/param vs 4 B/param for the f32
+    /// stacks, which is what lets the decode graph's MoE leg fit in VRAM.
+    whitecrow: Mutex<Option<WhiteCrowResident>>,
+    /// Set when a build was refused (budget/scheme); refused builds stay
+    /// refused for this cache's lifetime so per-call retries stay cheap.
+    whitecrow_refused: Mutex<bool>,
     /// Which dispatch arm the last `fused_moe_dispatch_from_logits` call took.
     /// Tests assert this to prove the NATIVE quantized arm ran (a numeric
     /// match alone cannot distinguish it from the dequant fallback — both
@@ -89,6 +97,23 @@ pub enum DispatchKind {
     /// dequant arm cannot serve MXFP4 (no device dequant exists), so MXFP4
     /// is native-or-error, never silent fallback.
     Mxfp4Native,
+    /// WhiteCrow u4-group128 grouped dispatch
+    /// (`grim_moe_fused_dispatch_whitecrow`): K-quant expert banks requantized
+    /// once to OSTQuant u4 group-128 blobs, decoded in-register with f32
+    /// activations. ~0.5 B/param resident vs the f32 stacks' 4 B/param.
+    WhiteCrowNative,
+}
+
+/// Resident WhiteCrow u4-group128 expert blobs. One blob per projection;
+/// expert `e` occupies `e * stride` bytes. Blob layout per expert mirrors
+/// `ostquant_segment_offsets`: `[u64 qw_len][qweight u32 words N*K/8]
+/// [u64 sc_len][scales bf16 N*K/128][u64 zr_len][zeros u8 N*K/128]`.
+pub(crate) struct WhiteCrowResident {
+    pub gate: Arc<dyn grim_tensor::backend::BackendStorage>,
+    pub up: Arc<dyn grim_tensor::backend::BackendStorage>,
+    pub down: Arc<dyn grim_tensor::backend::BackendStorage>,
+    pub gate_stride: u64,
+    pub down_stride: u64,
 }
 
 struct ResidentWeights {
@@ -150,6 +175,8 @@ impl CharonCache {
             w8a8fp8: Mutex::new(None),
             awq: Mutex::new(None),
             mxfp4: Mutex::new(None),
+            whitecrow: Mutex::new(None),
+            whitecrow_refused: Mutex::new(false),
             last_dispatch: Mutex::new(DispatchKind::F32Dequant),
         }
     }
@@ -158,6 +185,8 @@ impl CharonCache {
     /// reloaded or replaced).
     pub fn invalidate(&self) {
         *self.resident.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.whitecrow.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.whitecrow_refused.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *self.routing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.w8a8.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.w8a8fp8.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -227,6 +256,222 @@ pub type CharonScratchBuffers = (
     Arc<dyn grim_tensor::BackendStorage>,
     Arc<dyn grim_tensor::BackendStorage>,
 );
+
+/// Build (once) the WhiteCrow u4-group128 resident expert blobs behind
+/// `GRIM_MOE_NATIVE_WHITECROW`. Each expert weight (any K-quant scheme the
+/// requantizer covers: Q4K/Q5K/Q6K/Q3K/Q2K/IQ4NL) is converted through the
+/// proven `requant_kquant_to_whitecrow` path — D2H, host dequant, OSTQuant
+/// group-128 re-encode, disk cache — then the three per-expert device
+/// buffers are read back and concatenated into expert-strided blobs.
+///
+/// The conversion D2Hs, so this MUST run outside any graph-capture bracket:
+/// call it from the eager dispatch or at decode-graph pool-build time; a
+/// capture-time build poisons the capture.
+/// Cache-only peek: returns the resident WhiteCrow stacks if built, WITHOUT
+/// attempting a conversion. The capture step must use this (never `ensure_`),
+/// because a miss would D2H inside the capture bracket and poison it.
+pub(crate) fn peek_whitecrow_stacks(cache: &CharonCache) -> Option<WhiteCrowResident> {
+    let guard = cache.whitecrow.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|r| WhiteCrowResident {
+        gate: Arc::clone(&r.gate),
+        up: Arc::clone(&r.up),
+        down: Arc::clone(&r.down),
+        gate_stride: r.gate_stride,
+        down_stride: r.down_stride,
+    })
+}
+
+pub(crate) fn ensure_whitecrow_scratch(
+    ordinal: usize,
+    experts: &[MoeExpert],
+    cache: &CharonCache,
+) -> Result<WhiteCrowResident> {
+    {
+        let guard = cache.whitecrow.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = guard.as_ref() {
+            return Ok(WhiteCrowResident {
+                gate: Arc::clone(&r.gate),
+                up: Arc::clone(&r.up),
+                down: Arc::clone(&r.down),
+                gate_stride: r.gate_stride,
+                down_stride: r.down_stride,
+            });
+        }
+    }
+    if !matches!(
+        std::env::var("GRIM_MOE_NATIVE_WHITECROW").as_deref(),
+        Ok("1" | "true" | "on")
+    ) {
+        return Err(grim_core::error::Error::Backend(
+            "whitecrow stacks: GRIM_MOE_NATIVE_WHITECROW not enabled".into(),
+        ));
+    }
+    let num_experts = experts.len();
+    if num_experts == 0 {
+        return Err(grim_core::error::Error::Backend(
+            "whitecrow stacks: no experts".into(),
+        ));
+    }
+    let hidden = experts[0].gate.weight.shape().dim(1).unwrap_or(0);
+    let inter = experts[0].gate.weight.shape().dim(0).unwrap_or(0);
+    let down_rows = experts[0].down.weight.shape().dim(0).unwrap_or(0);
+    if hidden == 0 || inter == 0 || down_rows != hidden || hidden % 128 != 0 || inter % 128 != 0 {
+        return Err(grim_core::error::Error::Backend(format!(
+            "whitecrow stacks: geometry hidden={hidden} inter={inter} down_rows={down_rows}              not group-128 aligned"
+        )));
+    }
+    {
+        let refused = cache
+            .whitecrow_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *refused {
+            return Err(grim_core::error::Error::Backend(
+                "whitecrow stacks: previously refused (budget/scheme)".into(),
+            ));
+        }
+    }
+    let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+    let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+
+    // VRAM budget: the stacks are PER LAYER and every layer's set must stay
+    // resident for as long as its cache lives (a decode-graph replay touches
+    // all layers in one pass). Building layer by layer until the allocator
+    // dies produced a GPU page fault, so the total committed bytes are
+    // bounded here: GRIM_MOE_WHITECROW_BUDGET_MB (default 1024 MiB process-
+    // wide). A refusal is latched per cache and degrades to the arms below.
+    let per_layer_bytes =
+        ((inter * hidden / 2 + inter * (hidden / 128) * 3 + 24)
+            + (inter * hidden / 2 + inter * (hidden / 128) * 3 + 24)
+            + (hidden * inter / 2 + hidden * (inter / 128) * 3 + 24))
+            * num_experts;
+    static WC_COMMITTED: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    // Default 0 = the arm stays OFF unless the operator sized the budget for
+    // the WHOLE model (layers x per-layer bytes). A partial build — some
+    // layers on WhiteCrow stacks, some on the fallback — strands the built
+    // bytes and mixes numeric paths mid-model, so engagement is all-or-
+    // nothing by construction: the budget must cover every MoE layer's
+    // stacks, and `ensure` has no global layer count, so the operator (or a
+    // model-level prewarm that measured one layer) sets it.
+    let budget_bytes: u64 = std::env::var("GRIM_MOE_WHITECROW_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|m| m.saturating_mul(1048576))
+        .unwrap_or(0);
+    if WC_COMMITTED.load(std::sync::atomic::Ordering::Relaxed) as u64 + per_layer_bytes as u64
+        > budget_bytes
+    {
+        *cache
+            .whitecrow_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        return Err(grim_core::error::Error::Backend(format!(
+            "whitecrow stacks: per-layer {per_layer_bytes} B exceeds the committed budget              (GRIM_MOE_WHITECROW_BUDGET_MB, {budget_bytes} B); resident stacks do not fit"
+        )));
+    }
+
+    // Requantize one packed K-quant weight tensor into host blob bytes.
+    let to_blob = |w: &grim_tensor::Tensor,
+                   n: usize,
+                   k: usize,
+                   scheme: grim_tensor::KQuantScheme|
+     -> Result<Vec<u8>> {
+        let rocm_s = w
+            .storage()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| {
+                grim_core::error::Error::Backend("whitecrow: weight not RocmStorage".into())
+            })?;
+        let conv = rocm.requant_kquant_to_whitecrow(rocm_s, n, k, scheme)?;
+        let qw_s = conv.qweight_rocm()?;
+        let sc_s = conv.scales_rocm()?;
+        let zr_s = conv.zeros_rocm()?;
+        let qw = qw_s.copy_to_host()?;
+        let sc = sc_s.copy_to_host()?;
+        let zr = zr_s.copy_to_host()?;
+        let mut blob = Vec::with_capacity(qw.len() + sc.len() + zr.len() + 24);
+        blob.extend_from_slice(&(qw.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&qw);
+        blob.extend_from_slice(&(sc.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&sc);
+        blob.extend_from_slice(&(zr.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&zr);
+        Ok(blob)
+    };
+
+    // Per-projection scheme, read off the packed storage dtype.
+    let scheme_of = |w: &grim_tensor::Tensor| -> Result<grim_tensor::KQuantScheme> {
+        match &w.dtype().storage {
+            grim_tensor::Storage::KQuant(sch) => Ok(*sch),
+            other => Err(grim_core::error::Error::Backend(format!(
+                "whitecrow stacks: unsupported expert weight storage {other:?}"
+            ))),
+        }
+    };
+
+    let stack = |pick: fn(&MoeExpert) -> &grim_tensor::Tensor,
+                 n: usize,
+                 k: usize|
+     -> Result<(std::sync::Arc<dyn grim_tensor::backend::BackendStorage>, u64)> {
+        let mut blob: Vec<u8> = Vec::new();
+        for e in experts {
+            let w = pick(e);
+            blob.extend_from_slice(&to_blob(w, n, k, scheme_of(w)?)?);
+        }
+        let stride = (blob.len() / num_experts) as u64;
+        let shape = grim_tensor::Shape::new(vec![blob.len()]);
+        let st = grim_backend_rocm::RocmDevice::shared(ordinal).from_cpu_bytes(
+            &blob,
+            &shape,
+            grim_tensor::DType {
+                arith: grim_tensor::ArithType::U8,
+                storage: grim_tensor::Storage::Native,
+            },
+        )?;
+        Ok((std::sync::Arc::from(st), stride))
+    };
+
+    let (gate, gate_stride) = stack(|e| &e.gate.weight, inter, hidden)?;
+    let (up, up_stride) = stack(|e| &e.up.weight, inter, hidden)?;
+    if up_stride != gate_stride {
+        return Err(grim_core::error::Error::Backend(
+            "whitecrow stacks: gate/up stride mismatch".into(),
+        ));
+    }
+    let (down, down_stride) = stack(|e| &e.down.weight, hidden, inter)?;
+
+    let f32_mib = (inter * hidden * 2 + hidden * inter) * num_experts * 4;
+    eprintln!(
+        "[charon] whitecrow stacks: {num_experts} experts, gate/up blob {:.1} MiB, down blob {:.1} MiB (f32 stacks would be {:.1} MiB)",
+        (gate_stride * num_experts as u64) as f64 / 1048576.0,
+        (down_stride * num_experts as u64) as f64 / 1048576.0,
+        f32_mib as f64 / 1048576.0,
+    );
+
+    let resident = WhiteCrowResident {
+        gate,
+        up,
+        down,
+        gate_stride,
+        down_stride,
+    };
+    WC_COMMITTED.fetch_add(
+        per_layer_bytes as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    *cache.whitecrow.lock().unwrap_or_else(|e| e.into_inner()) = Some(WhiteCrowResident {
+        gate: Arc::clone(&resident.gate),
+        up: Arc::clone(&resident.up),
+        down: Arc::clone(&resident.down),
+        gate_stride: resident.gate_stride,
+        down_stride: resident.down_stride,
+    });
+    let _ = dev;
+    Ok(resident)
+}
 
 pub fn ensure_charon_scratch(
     ordinal: usize,
@@ -607,6 +852,57 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
         route_mode,
         norm_weights,
     )?;
+
+    // WhiteCrow u4-group128 arm (GRIM_MOE_NATIVE_WHITECROW=1): K-quant
+    // expert banks requantized once to OSTQuant blobs (~0.5 B/param vs the
+    // f32 stacks' 4 B/param) and dispatched by the grouped in-register-decode
+    // kernel. Env-gated because the requant is lossy relative to the
+    // checkpoint's own quantization; a build failure here degrades to the
+    // arms below (printed, not silent — the Q6K lm_head lesson).
+    if let Ok(wc) = ensure_whitecrow_scratch(ordinal, experts, cache) {
+        cache.record_dispatch(DispatchKind::WhiteCrowNative);
+        let out_shape = Shape::new(vec![seq_len, hidden]);
+        let out_storage_b = rocm.zeros(&out_shape, DType::F32)?;
+        let out_storage = out_storage_b
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| grim_tensor::Error::Backend("wc out not RocmStorage".into()))?;
+        if num_pairs > 0 {
+            rocm.moe_fused_dispatch_whitecrow_grouped_into(
+                x_rocm,
+                wc.gate
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("wc gate not RocmStorage".into()))?,
+                wc.up
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("wc up not RocmStorage".into()))?,
+                wc.down
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("wc down not RocmStorage".into()))?,
+                tokens_rocm,
+                experts_rocm,
+                weights_rocm,
+                num_pairs,
+                &out_storage,
+                hidden,
+                inter,
+                routed_scaling_factor,
+                wc.gate_stride,
+                wc.down_stride,
+            )?;
+        }
+        let out_t = Tensor::new(
+            Arc::from(out_storage_b),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+    }
 
     // WI-gpu-native-moe Phase 2: native W8A8-int8 arm. When every expert
     // projection is a ROCm-resident CompressedTensorsW8A8Int8 packed blob,

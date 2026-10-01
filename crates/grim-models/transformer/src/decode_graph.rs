@@ -7017,6 +7017,74 @@ impl DecodeGraphModel for Xing40 {
             let built = std::sync::Mutex::new(build_xing_scratch(self, &dev, batch)?);
             let _ = self.graph_scratch.set(built);
         }
+        // Prewarm the MoE WhiteCrow stacks (GRIM_MOE_NATIVE_WHITECROW) OUTSIDE
+        // any capture bracket: the conversion D2Hs, which would poison a
+        // capture. The stacks are PER LAYER and must ALL be resident during a
+        // replay, so the whole batch has to fit in free VRAM — measure the
+        // first build, extrapolate over the MoE layer count, and refuse (fail
+        // closed to the f32 path / eager) when it cannot. Building all 38
+        // xing40 layers needs ~12.9 GiB beside a 13.3 GiB model: it does not
+        // fit on this card, and half-building would fault mid-replay.
+        let mut moe_layers: Vec<&crate::xing40::Xing40Block> =
+            self.layers.iter().filter(|l| l.moe.is_some()).collect();
+        let n_moe = moe_layers.len();
+        if n_moe > 0 {
+            let first = moe_layers.remove(0);
+            if let Some(ref moe) = first.moe {
+                let experts: Vec<crate::shared_moe::MoeExpert> = moe
+                    .experts
+                    .iter()
+                    .map(|e| crate::shared_moe::MoeExpert {
+                        gate: e.w1.clone(),
+                        up: e.w3.clone(),
+                        down: e.w2.clone(),
+                    })
+                    .collect();
+                match crate::shared_moe::ensure_whitecrow_scratch(
+                    dev.ordinal(),
+                    &experts,
+                    &moe.charon_cache,
+                ) {
+                    Ok(first_stacks) => {
+                        // Per-layer resident bytes: (gate + up + down) blobs,
+                        // each (stride x n_routed_experts); gate and up share
+                        // a stride.
+                        let per_layer = (first_stacks.gate_stride * 2
+                            + first_stacks.down_stride)
+                            * self.cfg.n_routed_experts as u64;
+                        let projected = per_layer * n_moe as u64;
+                        let free = grim_backend_rocm::device::capability_profiler::free_device_memory(dev.ordinal()).unwrap_or(0);
+                        if projected > free {
+                            eprintln!(
+                                "[xing40-graph] whitecrow stacks need {projected:.0} B across {n_moe} MoE layers, {free} B free; skipping prewarm (fail closed)"
+                            );
+                        } else {
+                            for layer in moe_layers {
+                                if let Some(ref moe) = layer.moe {
+                                    let experts: Vec<crate::shared_moe::MoeExpert> = moe
+                                        .experts
+                                        .iter()
+                                        .map(|e| crate::shared_moe::MoeExpert {
+                                            gate: e.w1.clone(),
+                                            up: e.w3.clone(),
+                                            down: e.w2.clone(),
+                                        })
+                                        .collect();
+                                    let _ = crate::shared_moe::ensure_whitecrow_scratch(
+                                        dev.ordinal(),
+                                        &experts,
+                                        &moe.charon_cache,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[xing40-graph] whitecrow prewarm unavailable ({e}); capture will use the f32 path or fail closed"
+                    ),
+                }
+            }
+        }
         Ok(DecodeGraph::new(&dev, buffers, stream))
     }
 
@@ -7372,37 +7440,85 @@ impl DecodeGraphModel for Xing40 {
                     true,  // xing4_0.expert_weights_norm
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
-                let experts: Vec<crate::shared_moe::MoeExpert> = moe
-                    .experts
-                    .iter()
-                    .map(|e| crate::shared_moe::MoeExpert {
-                        gate: e.w1.clone(),
-                        up: e.w3.clone(),
-                        down: e.w2.clone(),
-                    })
-                    .collect();
-                let (_, _, _, g, u, d) = crate::shared_moe::ensure_charon_scratch(
-                    dev.ordinal(),
-                    batch,
-                    moe.num_experts_per_tok,
-                    &experts,
-                    &moe.charon_cache,
-                )?;
-                let col_r = as_rocm(scratch.col[i].as_ref())?;
-                dev.moe_fused_dispatch_resident_routing_into(
-                    col_r,
-                    g.as_ref(),
-                    u.as_ref(),
-                    d.as_ref(),
-                    &buffers.moe_route_tokens,
-                    &buffers.moe_route_experts,
-                    &buffers.moe_route_weights,
-                    batch * moe.num_experts_per_tok,
-                    &buffers.moe_out[i],
-                    hidden,
-                    cfg.moe_intermediate_size,
-                    moe.routed_scaling_factor,
-                )?;
+                // WhiteCrow arm first: the stacks were prewarmed at pool
+                // build (outside capture), so this call is a cache hit — no
+                // D2H inside the bracket.
+                // PEEK, never ensure: a miss here must not convert (D2H
+                // inside the capture bracket poisons it). The pool-build
+                // prewarm populated the cache when the env gate is on.
+                let wc = crate::shared_moe::peek_whitecrow_stacks(&moe.charon_cache);
+                if let Some(wc) = wc {
+                    let g_wc = wc
+                        .gate
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend("wc gate not RocmStorage".into())
+                        })?;
+                    let u_wc = wc
+                        .up
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend("wc up not RocmStorage".into())
+                        })?;
+                    let d_wc = wc
+                        .down
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend("wc down not RocmStorage".into())
+                        })?;
+                    let col_r = as_rocm(scratch.col[i].as_ref())?;
+                    dev.moe_fused_dispatch_whitecrow_grouped_into(
+                        col_r,
+                        g_wc,
+                        u_wc,
+                        d_wc,
+                        &buffers.moe_route_tokens,
+                        &buffers.moe_route_experts,
+                        &buffers.moe_route_weights,
+                        batch * moe.num_experts_per_tok,
+                        &buffers.moe_out[i],
+                        hidden,
+                        cfg.moe_intermediate_size,
+                        moe.routed_scaling_factor,
+                        wc.gate_stride,
+                        wc.down_stride,
+                    )?;
+                } else {
+                    let experts: Vec<crate::shared_moe::MoeExpert> = moe
+                        .experts
+                        .iter()
+                        .map(|e| crate::shared_moe::MoeExpert {
+                            gate: e.w1.clone(),
+                            up: e.w3.clone(),
+                            down: e.w2.clone(),
+                        })
+                        .collect();
+                    let (_, _, _, g, u, d) = crate::shared_moe::ensure_charon_scratch(
+                        dev.ordinal(),
+                        batch,
+                        moe.num_experts_per_tok,
+                        &experts,
+                        &moe.charon_cache,
+                    )?;
+                    let col_r = as_rocm(scratch.col[i].as_ref())?;
+                    dev.moe_fused_dispatch_resident_routing_into(
+                        col_r,
+                        g.as_ref(),
+                        u.as_ref(),
+                        d.as_ref(),
+                        &buffers.moe_route_tokens,
+                        &buffers.moe_route_experts,
+                        &buffers.moe_route_weights,
+                        batch * moe.num_experts_per_tok,
+                        &buffers.moe_out[i],
+                        hidden,
+                        cfg.moe_intermediate_size,
+                        moe.routed_scaling_factor,
+                    )?;
+                }
                 // Shared expert (dense SwiGLU at the shared width) added on top.
                 if let Some(ref shared) = moe.shared_experts {
                     linear_into(

@@ -2190,6 +2190,108 @@ extern "C" __global__ void grim_moe_fused_dispatch_w8a8_int8_dot4(
 
 #endif // RDNA dot4 arch guard
 
+
+// --- WhiteCrow u4-group128 grouped dispatch (xing4.0 MoE) ------------------
+// One block per (token, expert) pair; 256 threads. Weights ride expert-
+// strided WhiteCrow blobs — [u64 qw_len][qweight u32 words][u64 sc_len]
+// [scales bf16][u64 zr_len][zeros u8] per expert — decoded in-register with
+// f32 activations (W4A16-style math; the group dot uses the zero-point
+// algebra d*(sum(a*q) - z*sum(a)), no arch-specific intrinsics, so the
+// kernel compiles everywhere). Routing comes from device buffers, so the
+// kernel is decode-graph capture-safe.
+__device__ __forceinline__ float grim_charon_wc_bf16(unsigned short v) {
+    return __int_as_float(((unsigned int)v) << 16);
+}
+
+// Dot one WhiteCrow weight column over k elements of `src`.
+// qw_col: [k/8] u32 words; sc_col/zr_col: [k/128].
+__device__ __forceinline__ float grim_charon_wc_col_dot(
+    const float* __restrict__ src,
+    const unsigned int* __restrict__ qw_col,
+    const unsigned short* __restrict__ sc_col,
+    const unsigned char* __restrict__ zr_col,
+    int k, int n_groups) {
+    float acc = 0.0f;
+    for (int g = 0; g < n_groups; ++g) {
+        const float d = grim_charon_wc_bf16(sc_col[g]);
+        const int z = (int)zr_col[g];
+        const unsigned int* w = qw_col + g * 16;
+        float sq = 0.0f;
+        float sa = 0.0f;
+        #pragma unroll 4
+        for (int wi = 0; wi < 16; ++wi) {
+            const unsigned int word = w[wi];
+            const int kbase = g * 128 + wi * 8;
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const float av = src[kbase + t];
+                const float q = (float)((word >> (4 * t)) & 0xF);
+                sq = fmaf(av, q, sq);
+                sa += av;
+            }
+        }
+        acc = fmaf(d, sq - (float)z * sa, acc);
+    }
+    return acc;
+}
+
+extern "C" __global__ void grim_moe_fused_dispatch_whitecrow(
+    const float* __restrict__ activations,       // [batch, hidden]
+    const unsigned char* __restrict__ gate_blob, // expert-strided WC blobs
+    const unsigned char* __restrict__ up_blob,
+    const unsigned char* __restrict__ down_blob,
+    const unsigned int* __restrict__ router_tokens,   // [num_pairs]
+    const unsigned int* __restrict__ router_experts,  // [num_pairs]
+    const float* __restrict__ router_weights,         // [num_pairs]
+    float* __restrict__ out,                          // [batch, hidden]
+    int hidden, int inter, int num_pairs,
+    float routed_scaling_factor,
+    unsigned long long gate_stride,   // bytes per expert in gate/up blobs
+    unsigned long long down_stride)   // bytes per expert in down blob
+{
+    const int pair = blockIdx.x;
+    if (pair >= num_pairs) return;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int tok = (int)router_tokens[pair];
+    const int exp = (int)router_experts[pair];
+    const float w = router_weights[pair];
+
+    extern __shared__ float s_act[]; // [inter]
+
+    const unsigned char* gb = gate_blob + (unsigned long long)exp * gate_stride;
+    const unsigned char* ub = up_blob   + (unsigned long long)exp * gate_stride;
+    const unsigned char* db = down_blob + (unsigned long long)exp * down_stride;
+    // Per-expert segment layout: [u64][qw][u64][sc bf16][u64][zr u8].
+    const unsigned int* g_qw = (const unsigned int*)(gb + 8);
+    const unsigned short* g_sc = (const unsigned short*)(gb + 8 + (unsigned long long)inter * (hidden / 8) * 4 + 8);
+    const unsigned char* g_zr = gb + 8 + (unsigned long long)inter * (hidden / 8) * 4 + 8 + (unsigned long long)inter * (hidden / 128) * 2 + 8;
+    const unsigned int* u_qw = (const unsigned int*)(ub + 8);
+    const unsigned short* u_sc = (const unsigned short*)(ub + 8 + (unsigned long long)inter * (hidden / 8) * 4 + 8);
+    const unsigned char* u_zr = ub + 8 + (unsigned long long)inter * (hidden / 8) * 4 + 8 + (unsigned long long)inter * (hidden / 128) * 2 + 8;
+    const unsigned int* d_qw = (const unsigned int*)(db + 8);
+    const unsigned short* d_sc = (const unsigned short*)(db + 8 + (unsigned long long)hidden * (inter / 8) * 4 + 8);
+    const unsigned char* d_zr = db + 8 + (unsigned long long)hidden * (inter / 8) * 4 + 8 + (unsigned long long)hidden * (inter / 128) * 2 + 8;
+
+    const float* a = activations + (unsigned long long)tok * hidden;
+    const int hg = hidden / 128;
+    const int ig = inter / 128;
+
+    // Phase 1: fused gate|up with in-register SiLU combine -> shared act.
+    for (int j = tid; j < inter; j += nthreads) {
+        const float g = grim_charon_wc_col_dot(a, g_qw + (unsigned long long)j * (hidden / 8), g_sc + (unsigned long long)j * ig, g_zr + (unsigned long long)j * ig, hidden, hg);
+        const float u = grim_charon_wc_col_dot(a, u_qw + (unsigned long long)j * (hidden / 8), u_sc + (unsigned long long)j * ig, u_zr + (unsigned long long)j * ig, hidden, hg);
+        s_act[j] = (g / (1.0f + expf(-g))) * u;
+    }
+    __syncthreads();
+
+    // Phase 2: down projection, atomicAdd accumulation with the routing weight.
+    for (int h = tid; h < hidden; h += nthreads) {
+        const float acc = grim_charon_wc_col_dot(s_act, d_qw + (unsigned long long)h * (inter / 8), d_sc + (unsigned long long)h * hg, d_zr + (unsigned long long)h * hg, inter, ig);
+        atomicAdd(out + (unsigned long long)tok * hidden + h, routed_scaling_factor * w * acc);
+    }
+}
 "#;
 
 // Host launcher (parameter marshalling - pure, unit-testable without GPU)

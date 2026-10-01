@@ -1464,3 +1464,95 @@ impl RocmDevice {
         Ok((out_storage, RocmHandle::new(Some(stream))))
     }
 }
+
+impl RocmDevice {
+    /// WhiteCrow u4-group128 grouped dispatch (`grim_moe_fused_dispatch_whitecrow`):
+    /// expert weights ride stacked per-expert WhiteCrow blobs (one blob per
+    /// projection, expert `e` at `e * stride`, each blob
+    /// `[u64][qweight u32][u64][scales bf16][u64][zeros u8]`); activations are
+    /// f32 and the kernel decodes u4 weights in-register. One block per
+    /// (token, expert) pair; routing is read from device buffers, so the
+    /// launch is decode-graph capture-safe. Writes `routing_scaling * w`
+    /// -accumulated results into `out` (zeroed here via stream memset).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_fused_dispatch_whitecrow_grouped_into(
+        &self,
+        activations: &RocmStorage,
+        gate_blob: &RocmStorage,
+        up_blob: &RocmStorage,
+        down_blob: &RocmStorage,
+        routing_tokens: &RocmStorage,
+        routing_experts: &RocmStorage,
+        routing_weights: &RocmStorage,
+        num_pairs: usize,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        gate_stride: u64,
+        down_stride: u64,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let a_ptr = activations
+            .device_ptr
+            .ok_or_else(|| Error::Backend("whitecrow dispatch: activations has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("whitecrow dispatch: out has no device ptr".into()))?;
+
+        // atomicAdd accumulation requires a zeroed destination; a stream
+        // memset is a capture-safe graph node.
+        check_hip("whitecrow dispatch hipMemsetAsync(out, 0)", unsafe {
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
+        })?;
+
+        if num_pairs == 0 {
+            return Ok(self.active_stream());
+        }
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = gate_blob.device_ptr_checked()? as *mut c_void;
+        let mut uw = up_blob.device_ptr_checked()? as *mut c_void;
+        let mut dw = down_blob.device_ptr_checked()? as *mut c_void;
+        let mut tok_ptr = routing_tokens.device_ptr_checked()? as *mut c_void;
+        let mut exp_ptr = routing_experts.device_ptr_checked()? as *mut c_void;
+        let mut w_ptr = routing_weights.device_ptr_checked()? as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_pairs_i = num_pairs as i32;
+        let mut rsf = routed_scaling_factor;
+        let mut gs = gate_stride;
+        let mut ds = down_stride;
+
+        // One 256-thread block per pair; shared staging holds `inter` f32.
+        let stream = self.launch_compute_kernel_with_solution(
+            "grim_moe_fused_dispatch_whitecrow",
+            HipDim3::new(num_pairs as u32, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_pairs_i),
+                arg(&mut rsf),
+                arg(&mut gs),
+                arg(&mut ds),
+            ],
+            None,
+            inter * std::mem::size_of::<f32>(),
+        )?;
+        Ok(stream)
+    }
+}

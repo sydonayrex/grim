@@ -335,8 +335,9 @@ fn test_mla_head_stride_multi_head_parity() -> TestResult {
         v_dim,
         seq_len,
         w_offset_words,
-        w_stride_words,,
-                None)?;
+        w_stride_words,
+        None,
+    )?;
     dev.synchronize();
 
     let actual = out_s.to_cpu_vec_f32()?;
@@ -449,8 +450,9 @@ fn test_mla_absorbed_decode_parity() -> TestResult {
         v_dim,
         seq_len,
         0,
-        0,,
-                None)?;
+        0,
+        None,
+    )?;
     dev.synchronize();
 
     let actual_out = out_dev.to_cpu_vec_f32()?;
