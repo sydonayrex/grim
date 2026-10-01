@@ -35,6 +35,7 @@ cd "$root"
 block="crates/grim-models/transformer/src/block.rs"
 model="crates/grim-models/transformer/src/model.rs"
 nn="crates/grim-nn/src/modules.rs"
+loader="crates/grim-engine/src/model_loader.rs"
 fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; fail=1; }
@@ -91,6 +92,8 @@ echo
 echo "=== norm suites"
 for spec in \
     "grim-nn norm_kind" \
+    "grim-core norm_kind_by_architecture" \
+    "grim-engine norm_kind_wiring" \
     "grim-models-transformer attn_post_norm" \
     "grim-models-transformer output_norm_spec" \
     "grim-models-transformer block_norm_spec" \
@@ -116,6 +119,7 @@ trap 'rm -rf "$tmp"' EXIT
 cp "$block" "$tmp/block.start"
 cp "$model" "$tmp/model.start"
 cp "$nn" "$tmp/nn.start"
+cp "$loader" "$tmp/loader.start"
 cp "$block" "$tmp/block.orig"
 python3 - "$block" <<'PY'
 import re, sys
@@ -143,8 +147,12 @@ else
     esac
 fi
 cp "$tmp/block.orig" "$block"
-r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
-case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+out="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
+r="$(printf '%s' "$out" | result_of)"
+case "$r" in
+    *" 0 failed"*) pass "green after restore" ;;
+    *) report "not green after restore: $r" "$out" ;;
+esac
 
 echo
 echo "=== MUTATION B: LlamaConfig::default claims LayerNorm"
@@ -169,8 +177,12 @@ else
     esac
 fi
 cp "$tmp/model.orig" "$model"
-r="$(cargo test -p grim-models-transformer --test output_norm_spec -j 1 2>&1 | result_of)"
-case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+out="$(cargo test -p grim-models-transformer --test output_norm_spec -j 1 2>&1 | result_of)"
+r="$(printf '%s' "$out" | result_of)"
+case "$r" in
+    *" 0 failed"*) pass "green after restore" ;;
+    *) report "not green after restore: $r" "$out" ;;
+esac
 
 echo
 echo "=== MUTATION C: the FFN branch deleted (always sequential)"
@@ -198,8 +210,12 @@ else
     esac
 fi
 cp "$tmp/block.c.orig" "$block"
-r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
-case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+out="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
+r="$(printf '%s' "$out" | result_of)"
+case "$r" in
+    *" 0 failed"*) pass "green after restore" ;;
+    *) report "not green after restore: $r" "$out" ;;
+esac
 
 echo
 echo "=== MUTATION D: load_tp ignores the config flag"
@@ -225,8 +241,12 @@ else
     esac
 fi
 cp "$tmp/block.d.orig" "$block"
-r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
-case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+out="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
+r="$(printf '%s' "$out" | result_of)"
+case "$r" in
+    *" 0 failed"*) pass "green after restore" ;;
+    *) report "not green after restore: $r" "$out" ;;
+esac
 
 echo
 echo "=== MUTATION E: norm bias gated on the flag again"
@@ -254,8 +274,44 @@ else
     esac
 fi
 cp "$tmp/nn.e.orig" "$nn"
-r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
-case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+out="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
+r="$(printf '%s' "$out" | result_of)"
+case "$r" in
+    *" 0 failed"*) pass "green after restore" ;;
+    *) report "not green after restore: $r" "$out" ;;
+esac
+
+echo
+echo "=== MUTATION F: the loader maps every architecture to RMS"
+# `uses_layernorm` can be correct while `norm_kind_for` ignores it, which is
+# what shipped: the table existed and twenty LayerNorm models were still served
+# as RMS. The core test cannot catch this -- it only reads the table.
+cp "$loader" "$tmp/loader.f.orig"
+python3 - "$loader" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "    if arch.uses_layernorm() {"
+if old not in s:
+    sys.exit("anchor not found")
+open(p, "w").write(s.replace(old, "    if !arch.uses_layernorm() {", 1))
+PY
+if [ $? -ne 0 ]; then
+    fail "F: could not locate norm_kind_for"
+else
+    r="$(cargo test -p grim-engine --test norm_kind_wiring -j 1 2>&1 | result_of)"
+    case "$r" in
+        *" 0 failed"*) fail "F SURVIVED -- the loader ignores the norm kind: $r" ;;
+        *)             pass "F killed: $r" ;;
+    esac
+fi
+cp "$tmp/loader.f.orig" "$loader"
+out="$(cargo test -p grim-engine --test norm_kind_wiring -j 1 2>&1)"
+r="$(printf '%s' "$out" | result_of)"
+case "$r" in
+    *" 0 failed"*) pass "green after restore" ;;
+    *) report "not green after restore: $r" "$out" ;;
+esac
 
 echo
 echo "=== the tree is unchanged by THIS RUN"
@@ -264,8 +320,9 @@ echo "=== the tree is unchanged by THIS RUN"
 # script had caused it, which is how the first version of this gate failed on a
 # clean tree: the parallel-residual work was simply not committed yet.
 if cmp -s "$block" "$tmp/block.start" && cmp -s "$model" "$tmp/model.start" \
-   && cmp -s "$nn" "$tmp/nn.start"; then
-    pass "block.rs, model.rs and modules.rs are byte-identical to the pre-run snapshot"
+   && cmp -s "$nn" "$tmp/nn.start" \
+   && cmp -s "$loader" "$tmp/loader.start"; then
+    pass "block.rs, model.rs, modules.rs and model_loader.rs are byte-identical to the pre-run snapshot"
 else
     fail "this script modified a file and did not restore it"
 fi

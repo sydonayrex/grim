@@ -541,6 +541,47 @@ impl ModelArchitecture {
     }
 
     /// Returns `true` if architecture uses Mixture of Experts (MoE).
+    /// Whether this architecture's layer norms are LayerNorm rather than RMSNorm.
+    ///
+    /// `build_norm` takes exactly two kinds and each reference passes one as a
+    /// literal -- `LLM_NORM` or `LLM_NORM_RMS`. There is no norm-type
+    /// hyperparameter: `llama-arch.cpp` has `attention.layer_norm_epsilon` and
+    /// `attention.layer_norm_rms_epsilon`, but nothing that says which. So the
+    /// kind is a property of the architecture, and this is where it belongs.
+    ///
+    /// The list is derived from the references by
+    /// `tests/norm_kind_by_architecture.rs`, which re-reads
+    /// `old/repo/llama.cpp-master/src/models/` so the two cannot drift apart.
+    ///
+    /// LayerNorm subtracts the mean; RMSNorm does not. On any input with a
+    /// non-zero mean the two disagree, so serving the wrong one is a silent
+    /// wrong-numerics bug, not a rounding difference.
+    pub fn uses_layernorm(&self) -> bool {
+        matches!(
+            self,
+            Self::Bert
+                | Self::Bloom
+                | Self::Codeshell
+                | Self::Cohere2
+                | Self::Dbrx
+                | Self::Falcon
+                | Self::Gpt2
+                | Self::GptNeoX
+                | Self::Jais
+                | Self::Jais2
+                | Self::Mpt
+                | Self::Nemotron
+                | Self::Olmo
+                | Self::Orion
+                | Self::Phi2
+                | Self::Rwkv6
+                | Self::Rwkv7
+                | Self::StableLm
+                | Self::Starcoder
+                | Self::Starcoder2
+        )
+    }
+
     pub fn is_moe(&self) -> bool {
         matches!(
             self,
