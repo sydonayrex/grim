@@ -1808,6 +1808,53 @@ impl RocmDevice {
         )
     }
 
+    /// TreePie prefill GEMM for `M > 1`: `TP_M_TILE` rows of A per block, sharing
+    /// one B decode across them.
+    ///
+    /// Same B layout and the same decode as [`Self::launch_tree_pie_gemv`], so the
+    /// two cannot disagree about the format; only the accumulator count differs.
+    /// `K % 32 == 0` is required for the same reason it is on the GEMV path: the
+    /// 5.0 bpw claim only holds at 32-value granularity.
+    pub fn launch_tree_pie_gemm(
+        &self,
+        act_f16: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "tree_pie_gemm: K={k} must be a multiple of 32 (TreePie packs 32 values per 5 words)"
+            )));
+        }
+        if m == 0 || n == 0 {
+            return Err(Error::Backend("tree_pie_gemm: m and n must be non-zero".to_string()));
+        }
+        const TP_M_TILE: usize = 8;
+        let b_ptr = b_storage
+            .device_ptr_u64()
+            .ok_or_else(|| Error::Backend("tree_pie_gemm: b has no device ptr".into()))? as u64;
+        let b_ptr = b_ptr as *mut c_void;
+        let a_ptr = act_f16.device_ptr.ok_or_else(|| {
+            Error::Backend("tree_pie_gemm: activations have no device ptr".into())
+        })?;
+        let o_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("tree_pie_gemm: out has no device ptr".into())
+        })?;
+
+        let (mut ap, mut bp, mut op) = (a_ptr, b_ptr, o_ptr);
+        let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
+        let tiles = m.div_ceil(TP_M_TILE).max(1) as u32;
+        self.launch_compute_kernel(
+            "grim_tree_pie_gemm",
+            HipDim3::new(n as u32, tiles, 1),
+            HipDim3::new(32, 1, 1),
+            &mut [arg(&mut ap), arg(&mut bp), arg(&mut mm), arg(&mut nn), arg(&mut kk), arg(&mut op)],
+        )
+    }
+
     /// ScrubJay (WS-B B6) 5.5 bpw fused dequant + GEMV at M=1.
     ///
     /// B stays in its packed form in VRAM (5.5 bpw) and the codebook lookup plus
@@ -1881,6 +1928,80 @@ impl RocmDevice {
                 arg(&mut sclp),
                 arg(&mut pre),
                 arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Prefill/batched tiled ScrubJay GEMM (M > 1).
+    pub fn launch_scrub_jay_gemm_tiled(
+        &self,
+        a_storage: &RocmStorage,
+        b_sel: &RocmStorage,
+        b_idx: &RocmStorage,
+        b_sgn: &RocmStorage,
+        b_scl: &RocmStorage,
+        out_storage: &RocmStorage,
+        pre_scale: f32,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 8 != 0 {
+            return Err(Error::Backend(format!(
+                "scrub_jay_gemm_tiled: K={k} must be a multiple of 8 (ScrubJay blocks are 8 values)"
+            )));
+        }
+        if m == 0 || n == 0 {
+            return Err(Error::Backend("scrub_jay_gemm_tiled: M and N must be > 0".into()));
+        }
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: a has no device ptr".into()))?;
+        let sel_ptr = b_sel
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_sel has no device ptr".into()))?;
+        let idx_ptr = b_idx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_idx has no device ptr".into()))?;
+        let sgn_ptr = b_sgn
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_sgn has no device ptr".into()))?;
+        let scl_ptr = b_scl
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_scl has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_dim = HipDim3::new(n.div_ceil(16) as u32, m.div_ceil(16) as u32, 1);
+
+        let mut aptr = a_ptr;
+        let mut selp = sel_ptr;
+        let mut idxp = idx_ptr;
+        let mut sgnp = sgn_ptr;
+        let mut sclp = scl_ptr;
+        let mut pre = pre_scale;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_scrub_jay_gemm_tiled",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut selp),
+                arg(&mut idxp),
+                arg(&mut sgnp),
+                arg(&mut sclp),
+                arg(&mut pre),
+                arg(&mut optr),
+                arg(&mut mm),
                 arg(&mut nn),
                 arg(&mut kk),
             ],

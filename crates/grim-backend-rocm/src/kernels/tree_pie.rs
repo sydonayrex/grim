@@ -107,6 +107,71 @@ extern "C" __global__ void grim_tree_pie_gemv(
         facc += __shfl_xor(facc, off);
     if (lane == 0) C[col] = facc;
 }
+
+// Rows of A handled per block. The decode of a B group is amortised across all of
+// them, which is the point: TreePie stores 5 i32 per 32 values and decoding it
+// once for 8 output rows is 8x cheaper per row than decoding per row. Kept a
+// compile-time constant so `acc` lives in registers; 8 costs 8 floats plus the
+// existing decode temporaries, which is comfortable for a wave32 kernel.
+#define TP_M_TILE 8
+
+// Prefill GEMM: C[m][col] = sum_k A[m][k] * B_tree[col, k]
+//   A      : f16 [M, K], row-major
+//   B_tree : N columns x (K/32) groups of 5 i32 (4 payload + 1 sign plane)
+//   C      : f32 [M, N]
+//
+// grid = (N columns, ceil(M / TP_M_TILE)), block = (32,1,1). One block owns one
+// output column and a tile of rows, exactly as the GEMV owns one column: the B
+// decode is the expensive part and it is shared by every row in the tile.
+//
+// The reduction is the same 32-lane `__shfl_xor` butterfly the GEMV uses, so the
+// two agree on summation order for M = 1 and a decode regression cannot hide as a
+// prefill-only difference.
+extern "C" __global__ void grim_tree_pie_gemm(
+    const unsigned short* __restrict__ act_f16,
+    const int*             __restrict__ B_tree,
+    float*                 __restrict__ C,
+    int M, int N, int K)
+{
+    const int col  = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (col >= N) return;
+
+    const int m0    = tile * TP_M_TILE;
+    const int rows  = min(TP_M_TILE, M - m0);
+    if (rows <= 0) return;
+
+    const int groups   = K / 32;              // K % 32 == 0, checked host-side
+    const int row_words = groups * 5;
+    const int* __restrict__ row = B_tree + (long long)col * row_words;
+    const unsigned* act2 = (const unsigned*)act_f16;
+
+    float acc[TP_M_TILE] = { 0.0f };
+
+    for (int g = lane; g < groups; g += 32) {
+        const int* __restrict__ gp = row + (long long)g * 5;
+        unsigned payload[4] = { (unsigned)gp[0], (unsigned)gp[1],
+                                (unsigned)gp[2], (unsigned)gp[3] };
+        unsigned signs = (unsigned)gp[4];
+
+        for (int j = 0; j < 32; j += 2) {
+            // Decode once, use for every row in the tile.
+            unsigned w01 = (unsigned)grim_tree_pie_f16(payload, signs, j)
+                         | ((unsigned)grim_tree_pie_f16(payload, signs, j + 1) << 16);
+            for (int t = 0; t < rows; ++t) {
+                unsigned a01 = act2[(((size_t)t * K) + (g * 32 + j)) >> 1];
+                acc[t] = grim_fdot2_f32_f16(a01, w01, acc[t]);
+            }
+        }
+    }
+
+    for (int t = 0; t < rows; ++t) {
+        float v = acc[t];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+        if (lane == 0) C[(size_t)(m0 + t) * N + col] = v;
+    }
+}
 #endif
 "#;
 
