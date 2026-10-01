@@ -89,11 +89,11 @@ pub mod apertus;
 pub mod arcee;
 pub mod arctic;
 pub mod attention_dispatcher;
+pub mod llama_shaped;
 
 pub use attention_dispatcher::{
     AttentionDispatcher, AttentionRequest, AttentionTier, AttentionTopology,
 };
-pub mod baichuan;
 pub mod bailingmoe;
 pub mod bailingmoe2;
 pub mod bailingmoe3;
@@ -101,7 +101,6 @@ pub mod bitnet;
 pub mod block;
 pub mod bloom;
 pub mod chameleon;
-pub mod chatglm;
 pub mod codeshell;
 pub mod cogvlm;
 pub mod cohere2;
@@ -111,7 +110,7 @@ pub mod configs;
 pub mod dbrx;
 pub mod deci;
 pub mod decode_graph;
-pub use decode_graph::{DecodeGraphModel, llama_wrapper_graph_model};
+pub use decode_graph::{llama_wrapper_graph_model, DecodeGraphModel};
 pub mod deepseek;
 pub mod deepseek2;
 pub mod deepseek2ocr;
@@ -122,11 +121,9 @@ pub mod dflash;
 pub mod diffusion_gemma;
 pub mod dots1;
 pub mod dots3_note;
-pub mod dream;
 pub mod eagle3;
 pub mod ernie45;
 pub mod ernie4_5_moe;
-pub mod eurobert;
 pub mod exaone;
 pub mod exaone4;
 pub mod exaone4_5;
@@ -156,7 +153,6 @@ pub mod granite_moe;
 pub mod granite_moe_hybrid;
 pub mod grok;
 pub mod grovemoe;
-pub mod hunyuan_dense;
 pub mod hunyuan_moe;
 pub mod hunyuan_vl;
 pub mod hy_v4;
@@ -175,7 +171,6 @@ pub mod lfm2_graph;
 pub mod llada;
 pub mod lladamoe;
 pub mod llama4;
-pub mod llama_embed;
 pub mod longcat_flash;
 pub mod lora;
 pub mod maincoder;
@@ -186,7 +181,6 @@ pub mod minicpm;
 pub mod minimax_m2;
 pub mod minimax_m3;
 pub mod mistral3;
-pub mod mistral4;
 pub mod mla_common;
 pub mod model;
 /// Shared MoE block (router + expert bank + optional shared expert).
@@ -203,10 +197,8 @@ pub mod olmoe;
 pub mod openai_moe;
 pub mod openelm;
 pub mod orion;
-pub mod paddle_ocr;
 pub mod pangu_embed;
 pub mod phi2;
-pub mod plamo;
 pub mod plamo2;
 pub mod plamo3;
 pub mod plm;
@@ -233,7 +225,6 @@ pub mod shared_attention;
 pub mod shared_moe;
 pub mod smallthinker;
 pub mod smollm2;
-pub mod smollm3;
 pub mod stablelm;
 pub mod starcoder;
 pub mod starcoder2;
@@ -242,7 +233,6 @@ pub mod t5;
 pub mod talkie;
 pub mod wav_tokenizer_dec;
 pub mod xing40;
-pub mod xverse;
 
 pub use arcee::{Arcee, ArceeConfig};
 pub use block::{LlamaBlock, LlamaConfigRefs, LlamaLayerCache};
@@ -252,8 +242,8 @@ pub use codeshell::{Codeshell, CodeshellConfig};
 pub use configs::{MoeConfig, PhiConfig, QwenConfig};
 pub use deepseek::{DeepSeek, DeepSeekConfig};
 pub use deepseek2::{DeepSeek2, DeepSeek2Config};
-pub use deepseek4::{DeepSeek4, DeepSeek4Config};
 pub use deepseek32::{DeepSeek32, DeepSeek32Config};
+pub use deepseek4::{DeepSeek4, DeepSeek4Config};
 pub use delta_net_base::{DeltaNetBase, DeltaNetBaseConfig};
 pub use diffusion_gemma::{DiffusionGemma, DiffusionGemmaConfig};
 pub use falcon::{Falcon, FalconConfig};
@@ -280,7 +270,6 @@ pub use dflash::{DFlash, DFlashConfig};
 pub use dots1::{Dots1, Dots1Config};
 pub use dots3_note::{Dots3Note, Dots3NoteConfig};
 pub use eagle3::{Eagle3, Eagle3Config};
-pub use eurobert::{Eurobert, EurobertConfig};
 pub use granite_moe::{GraniteMoe, GraniteMoeConfig};
 pub use granite_moe_hybrid::{GraniteMoeHybrid, GraniteMoeHybridConfig};
 pub use grovemoe::{GroveMoe, GroveMoeConfig};
@@ -294,35 +283,31 @@ pub mod solar_open2;
 pub use afmoe::{AfMoe, AfMoeConfig};
 pub use apertus::{Apertus, ApertusConfig};
 pub use arctic::{Arctic, ArcticConfig};
-pub use baichuan::{Baichuan, BaichuanConfig};
 pub use bitnet::{BitNet, BitNetConfig};
-pub use chatglm::{ChatGlm, ChatGlmConfig};
 pub use cohere2::{Cohere2, Cohere2Config};
 pub use cohere2moe::{Cohere2Moe, Cohere2MoeConfig};
-pub use dream::{Dream, DreamConfig};
-pub use ernie4_5_moe::{Ernie45Moe, Ernie45MoeConfig};
 pub use ernie45::{Ernie45, Ernie45Config};
+pub use ernie4_5_moe::{Ernie45Moe, Ernie45MoeConfig};
 pub use exaone::{Exaone, ExaoneConfig};
-pub use exaone_moe::{ExaoneMoe, ExaoneMoeConfig};
 pub use exaone4::{Exaone4, Exaone4Config};
 pub use exaone4_5::{Exaone45, Exaone45Config};
+pub use exaone_moe::{ExaoneMoe, ExaoneMoeConfig};
 pub use falcon_h1::{FalconH1Config, FalconH1LayerCache, FalconH1Model};
 pub use gemma::{Gemma, GemmaConfig};
-pub use gemma_embedding::{GemmaEmbedding, GemmaEmbeddingConfig};
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use gemma3n::{Gemma3n, Gemma3nConfig};
 pub use gemma4_assistant::{Gemma4Assistant, Gemma4AssistantConfig};
+pub use gemma_embedding::{GemmaEmbedding, GemmaEmbeddingConfig};
 pub use glm4::{Glm4, Glm4Config};
 pub use glm4_moe_lite::{Glm4MoeLite, Glm4MoeLiteConfig};
 pub use glm4moe::{Glm4Moe, Glm4MoeConfig};
 pub use glmdsa::{GlmDsa, GlmDsaConfig};
-pub use gpt_oss::{GptOss, GptOssConfig};
 pub use gpt2::{Gpt2, Gpt2Config};
+pub use gpt_oss::{GptOss, GptOssConfig};
 pub use gptj::{GptJ, GptJConfig};
 pub use gptneox::{GptNeoX, GptNeoXConfig};
 pub use granite::{Granite, GraniteConfig};
 pub use grok::{Grok, GrokConfig};
-pub use hunyuan_dense::{HunyuanDense, HunyuanDenseConfig};
 pub use hunyuan_moe::{HunyuanMoe, HunyuanMoeConfig};
 pub use internlm2::{InternLm2, InternLm2Config};
 pub use jais::{Jais, JaisConfig};
@@ -331,7 +316,6 @@ pub use kimi_linear::{KimiLinear, KimiLinearConfig};
 pub use lfm2::{Lfm2, Lfm2AttentionMode, Lfm2Config, Lfm2LayerCache};
 pub use llada::{Llada, LladaConfig};
 pub use lladamoe::{LladaMoe, LladaMoeConfig};
-pub use llama_embed::{LlamaEmbed, LlamaEmbedConfig};
 pub use llama4::{Llama4, Llama4Config};
 pub use longcat_flash::{LongCatFlash, LongCatFlashConfig};
 pub use maincoder::{MainCoder, MainCoderConfig};
@@ -340,7 +324,6 @@ pub use mimo2::{Mimo2, Mimo2Config};
 pub use minicpm::{MiniCpmConfig, MiniCpmModel};
 pub use minimax_m2::{MiniMaxM2, MiniMaxM2Config};
 pub use mistral3::{Mistral3, Mistral3Config};
-pub use mistral4::{Mistral4, Mistral4Config};
 pub use model::{Llama, LlamaConfig};
 pub use mpt::{Mpt, MptConfig};
 pub use multimodal::*;
@@ -352,35 +335,31 @@ pub use olmo2::{Olmo2, Olmo2Config};
 pub use olmoe::{Olmoe, OlmoeConfig};
 pub use openai_moe::{OpenAiMoe, OpenAiMoeConfig};
 pub use openelm::{OpenElm, OpenElmConfig};
-pub use paddle_ocr::{PaddleOcr, PaddleOcrConfig};
 pub use pangu_embed::{PanguEmbed, PanguEmbedConfig};
-pub use plamo::{Plamo, PlamoConfig};
 pub use plamo2::{Plamo2, Plamo2Config};
 pub use plamo3::{Plamo3, Plamo3Config};
 pub use plm::{Plm, PlmConfig};
 pub use qwen2moe::{Qwen2Moe, Qwen2MoeConfig};
 pub use qwen2vl::{Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig};
 pub use qwen3::{Qwen3, Qwen3Config};
+pub use qwen35::{Qwen35, Qwen35Config};
+pub use qwen35moe::{Qwen35Moe, Qwen35MoeConfig};
 pub use qwen3next::{Qwen3Next, Qwen3NextConfig};
 pub use qwen3vl::{Qwen3Vl, Qwen3VlConfig, Qwen3VlVisionConfig};
 pub use qwen4exp_flash_next::{Qwen38FlashNext, Qwen38FlashNextConfig};
-pub use qwen35::{Qwen35, Qwen35Config};
-pub use qwen35moe::{Qwen35Moe, Qwen35MoeConfig};
 pub use refact::{Refact, RefactConfig};
 pub use rnd1::{Rnd1, Rnd1Config};
 pub use seed_oss::{SeedOss, SeedOssConfig};
 pub use smallthinker::{SmallThinker, SmallThinkerConfig};
 pub use smollm2::{SmolLm2, SmolLm2Config};
-pub use smollm3::{SmolLm3, SmolLm3Config};
 pub use solar_open2::{SolarLayerType, SolarOpen2, SolarOpen2Block, SolarOpen2Config};
 pub use stablelm::{StableLm, StableLmConfig};
 pub use starcoder::{Starcoder, StarcoderConfig};
 pub use step35::{Step35, Step35Config};
-pub use t5::{T5, T5Config};
+pub use t5::{T5Config, T5};
 pub use talkie::{Talkie, TalkieConfig};
 pub use wav_tokenizer_dec::{WavTokenizerDec, WavTokenizerDecConfig};
 pub use xing40::{Xing40, Xing40Config, Xing40HcGates, Xing40HyperConnection};
-pub use xverse::{Xverse, XverseConfig};
 
 #[cfg(test)]
 mod tests {
@@ -403,11 +382,14 @@ mod tests {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            norm_kind: grim_nn::NormKind::Rms,
+            has_norm_bias: false,
+            has_attn_post_norm: false,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok = grim_backend_cpu::cpu_tensor(vec![1.0f32], grim_tensor::Shape::new(vec![1]));
-        use grim_core::CausalLm;
         use grim_core::session::Inner;
+        use grim_core::CausalLm;
         let mut sess = Inner::new(model.device.clone());
         let logits = CausalLm::forward(&model, &mut sess, &tok, &tok, &[]).unwrap();
         assert_eq!(logits.shape().dims(), &[1, 32000]);
@@ -434,6 +416,9 @@ mod tests {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            norm_kind: grim_nn::NormKind::Rms,
+            has_norm_bias: false,
+            has_attn_post_norm: false,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok =
@@ -545,7 +530,7 @@ mod tests {
     /// latents, and SSM states must never route into a GDL recurrence.
     #[test]
     fn gdl_eligibility_classification() {
-        use crate::{GdlEligibility, gdl_eligibility};
+        use crate::{gdl_eligibility, GdlEligibility};
         assert_eq!(gdl_eligibility("lfm2"), GdlEligibility::EligibleNative);
         for arch in ["solar_open2", "delta-net-base"] {
             assert_eq!(

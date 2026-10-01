@@ -14,13 +14,13 @@ use grim_core::model::CausalLm;
 use grim_core::sampler::{Sampler, SamplingParams};
 use grim_core::session::Inner as SessionInner;
 use grim_engine::{
-    Engine, EngineConfig,
     model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
+    Engine, EngineConfig,
 };
 use grim_format::GgufTokenizer;
 use grim_models_transformer::{
-    Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek4, DeepSeek32, Gemma2, Lfm2, Lfm2Config, Llama,
-    LlamaConfig, Mistral3, Mistral4, Qwen35,
+    Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek32, DeepSeek4, Gemma2, Lfm2, Lfm2Config, Llama,
+    LlamaConfig, Mistral3, Qwen35,
 };
 use grim_tensor::{CoreTensorOps, Device};
 use std::sync::Arc;
@@ -131,8 +131,6 @@ pub(crate) fn resolve_graph_model<'a>(model: &'a dyn CausalLm) -> Option<&'a dyn
     } else if let Some(m) = target.as_any().downcast_ref::<Llama>() {
         Some(m)
     } else if let Some(m) = target.as_any().downcast_ref::<Mistral3>() {
-        Some(m)
-    } else if let Some(m) = target.as_any().downcast_ref::<Mistral4>() {
         Some(m)
     } else if let Some(m) = target.as_any().downcast_ref::<Qwen35>() {
         Some(m)
@@ -849,10 +847,14 @@ pub async fn cmd_run(
         match load_model_from_gguf(&model_path_str, device.clone()) {
             Ok(m) => {
                 eprintln!("[grim] GGUF model loaded successfully.");
-                    if let Device::Rocm(o) = &device {
-                        let (free, total) = grim_backend_rocm::vram_info(*o);
-                        eprintln!("[vram] after load: free {:.2} GiB / total {:.2} GiB", free as f64 / (1 << 30) as f64, total as f64 / (1 << 30) as f64);
-                    }
+                if let Device::Rocm(o) = &device {
+                    let (free, total) = grim_backend_rocm::vram_info(*o);
+                    eprintln!(
+                        "[vram] after load: free {:.2} GiB / total {:.2} GiB",
+                        free as f64 / (1 << 30) as f64,
+                        total as f64 / (1 << 30) as f64
+                    );
+                }
                 m
             }
             Err(e) => {

@@ -727,8 +727,8 @@ impl DecodeGraphModel for Llama {
                     num_experts,
                     top_k,
                     route_mode,
-                false, // softmax mode already normalizes
-            )
+                    false, // softmax mode already normalizes
+                )
                 .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
 
                 // 4. Resident scratch + stacked weights (cache hit after warmup)
@@ -2642,7 +2642,6 @@ impl_llama_wrapper_graph!(
     afmoe::AfMoe,
     arcee::Arcee,
     apertus::Apertus,
-    chatglm::ChatGlm,
     arctic::Arctic,
     codeshell::Codeshell,
     gemma4_assistant::Gemma4Assistant,
@@ -2654,8 +2653,6 @@ impl_llama_wrapper_graph!(
     bailingmoe2::BailingMoe2,
     ernie45::Ernie45,
     plamo2::Plamo2,
-    baichuan::Baichuan,
-    eurobert::Eurobert,
     granite::Granite,
     gemma_embedding::GemmaEmbedding,
     exaone4::Exaone4,
@@ -2664,18 +2661,14 @@ impl_llama_wrapper_graph!(
     granite_moe::GraniteMoe,
     cohere2::Cohere2,
     grok::Grok,
-    smollm3::SmolLm3,
     bitnet::BitNet,
-    llama_embed::LlamaEmbed,
     deci::Deci,
     dflash::DFlash,
     jais2::Jais2,
-    mistral4::Mistral4,
     llada::Llada,
     bailingmoe::BailingMoe,
     exaone_moe::ExaoneMoe,
     llama4::Llama4,
-    dream::Dream,
     dots1::Dots1,
     olmo::Olmo,
     mistral3::Mistral3,
@@ -2685,9 +2678,7 @@ impl_llama_wrapper_graph!(
     olmoe::Olmoe,
     deepseek2ocr::DeepSeek2Ocr,
     olmo2::Olmo2,
-    hunyuan_dense::HunyuanDense,
     openai_moe::OpenAiMoe,
-    plamo::Plamo,
     ernie4_5_moe::Ernie45Moe,
     plamo3::Plamo3,
     qwen2moe::Qwen2Moe,
@@ -2706,7 +2697,6 @@ impl_llama_wrapper_graph!(
     mimo2::Mimo2,
     mpt::Mpt,
     grovemoe::GroveMoe,
-    paddle_ocr::PaddleOcr,
     mellum::Mellum,
     orion::Orion,
     openelm::OpenElm,
@@ -2717,7 +2707,6 @@ impl_llama_wrapper_graph!(
     rnd1::Rnd1,
     refact::Refact,
     qwen3moe::Qwen3Moe,
-    xverse::Xverse,
     smallthinker::SmallThinker,
     smollm2::SmolLm2,
     glm4moe::Glm4Moe,
@@ -2741,7 +2730,6 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         afmoe::AfMoe,
         arcee::Arcee,
         apertus::Apertus,
-        chatglm::ChatGlm,
         arctic::Arctic,
         codeshell::Codeshell,
         gemma4_assistant::Gemma4Assistant,
@@ -2753,8 +2741,6 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         bailingmoe2::BailingMoe2,
         ernie45::Ernie45,
         plamo2::Plamo2,
-        baichuan::Baichuan,
-        eurobert::Eurobert,
         granite::Granite,
         gemma_embedding::GemmaEmbedding,
         exaone4::Exaone4,
@@ -2763,18 +2749,14 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         granite_moe::GraniteMoe,
         cohere2::Cohere2,
         grok::Grok,
-        smollm3::SmolLm3,
         bitnet::BitNet,
-        llama_embed::LlamaEmbed,
         deci::Deci,
         dflash::DFlash,
         jais2::Jais2,
-        mistral4::Mistral4,
         llada::Llada,
         bailingmoe::BailingMoe,
         exaone_moe::ExaoneMoe,
         llama4::Llama4,
-        dream::Dream,
         dots1::Dots1,
         olmo::Olmo,
         mistral3::Mistral3,
@@ -2784,9 +2766,7 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         olmoe::Olmoe,
         deepseek2ocr::DeepSeek2Ocr,
         olmo2::Olmo2,
-        hunyuan_dense::HunyuanDense,
         openai_moe::OpenAiMoe,
-        plamo::Plamo,
         ernie4_5_moe::Ernie45Moe,
         plamo3::Plamo3,
         qwen2moe::Qwen2Moe,
@@ -2805,7 +2785,6 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         mimo2::Mimo2,
         mpt::Mpt,
         grovemoe::GroveMoe,
-        paddle_ocr::PaddleOcr,
         mellum::Mellum,
         orion::Orion,
         openelm::OpenElm,
@@ -2816,7 +2795,6 @@ pub fn llama_wrapper_graph_model(model: &dyn std::any::Any) -> Option<&dyn Decod
         rnd1::Rnd1,
         refact::Refact,
         qwen3moe::Qwen3Moe,
-        xverse::Xverse,
         smallthinker::SmallThinker,
         smollm2::SmolLm2,
         glm4moe::Glm4Moe,
@@ -3091,7 +3069,7 @@ impl DecodeGraphModel for MiniMaxM3 {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k,
+                3,     // mode 3: softmax renormalized over top-k,
                 false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
@@ -3553,7 +3531,7 @@ impl DecodeGraphModel for Glm4MoeLite {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k,
+                3,     // mode 3: softmax renormalized over top-k,
                 false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
@@ -3970,7 +3948,7 @@ impl DecodeGraphModel for GraniteMoeHybrid {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k,
+                3,     // mode 3: softmax renormalized over top-k,
                 false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
@@ -4408,7 +4386,7 @@ impl DecodeGraphModel for HyV3 {
                 batch,
                 num_exp,
                 top_k,
-                3, // mode 3: softmax renormalized over top-k,
+                3,     // mode 3: softmax renormalized over top-k,
                 false, // softmax mode already normalizes
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
