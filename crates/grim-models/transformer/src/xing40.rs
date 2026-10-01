@@ -2478,7 +2478,12 @@ impl Model for Xing40 {
 
 impl CausalLm for Xing40 {
     fn new_session(&self) -> Box<dyn SessionT> {
-        Box::new(grim_core::session::Session::new(self.device.clone()))
+        let mut session = grim_core::session::Inner::new(self.device.clone());
+        // The per-layer LATENT kv caches must persist across decode steps;
+        // the generation-state gate caught them being rebuilt per call,
+        // which made every decode step attend only itself.
+        session.set_model_state(Box::new(Vec::<Option<(Tensor, Tensor)>>::new()));
+        Box::new(session)
     }
 
     fn forward(
@@ -2538,7 +2543,25 @@ impl CausalLm for Xing40 {
             seed_streams_device(&x0, hc, hidden, seq_len, &shape, &self.device)?
         };
 
-        let mut kv_caches = vec![None; self.layers.len()];
+        // The caches live in the SESSION so decode steps attend the whole
+        // history; a fresh vec here would drop the prefill state between
+        // engine calls (caught by full_model_generation_state_consistency:
+        // incremental-vs-teacher-forced rel ~1.0 at every generated position).
+        if session.model_state().is_none() {
+            session.set_model_state(Box::new(Vec::<Option<(Tensor, Tensor)>>::new()));
+        }
+        let kv_caches = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<Option<(Tensor, Tensor)>>>())
+            .ok_or_else(|| {
+                Error::Backend(
+                    "Xing40::forward: session.model_state must be Vec<Option<(Tensor, Tensor)>>"
+                        .into(),
+                )
+            })?;
+        if kv_caches.len() != self.layers.len() {
+            *kv_caches = vec![None; self.layers.len()];
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_v, &mut kv_caches[i])?;
         }
