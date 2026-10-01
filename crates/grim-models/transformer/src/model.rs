@@ -46,6 +46,17 @@ pub struct LlamaConfig {
     pub has_norm_bias: bool,
     /// Whether `attn_post_norm` exists. Fifteen references create it.
     pub has_attn_post_norm: bool,
+    /// Whether the output projection carries a bias.
+    ///
+    /// Three references add it to the logits -- `phi2.cpp:136`, `qwen2.cpp`
+    /// and `wavtokenizer-dec.cpp`, each `ggml_add(ctx0, cur, model.output_b)`.
+    /// `phimoe.cpp:23` creates the tensor and never reads it; `dream.cpp` and
+    /// `qwen2vl.cpp` create it `TENSOR_NOT_REQUIRED`. So the flag covers three
+    /// models, not the six a tensor-table grep finds.
+    ///
+    /// Separate from [`Self::has_norm_bias`] on purpose: phi2 ships both, so
+    /// they cannot be one boolean.
+    pub has_output_bias: bool,
     /// Feed the FFN the layer input rather than the post-attention value.
     ///
     /// GGUF key `use_parallel_residual` (`llama-arch.cpp:208`), read at
@@ -84,6 +95,7 @@ impl Default for LlamaConfig {
             has_norm_bias: false,
             has_attn_post_norm: false,
             use_parallel_residual: false,
+            has_output_bias: false,
         }
     }
 }
@@ -172,7 +184,7 @@ impl Llama {
             &ws.pp("output"),
             cfg.hidden_size,
             cfg.vocab_size,
-            /*has_bias=*/ false,
+            /*has_bias=*/ cfg.has_output_bias,
             tp,
         ) {
             Ok(o) => o,
@@ -310,7 +322,7 @@ impl Llama {
             &ws.pp("output"),
             cfg.hidden_size,
             cfg.vocab_size,
-            /*has_bias=*/ false,
+            /*has_bias=*/ cfg.has_output_bias,
             tp,
         ) {
             Ok(o) => o,

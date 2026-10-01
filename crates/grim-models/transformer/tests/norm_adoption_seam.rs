@@ -159,14 +159,38 @@ fn a_loaded_block_honours_an_explicit_layer_norm_spec() {
 fn a_weightless_layer_norm_still_loads() {
     // `olmo.cpp:65-67` passes NULL, NULL. A spec asking for LayerNorm with no
     // bias must load rather than erroring on a missing *_b tensor.
+    //
+    // This uses `NoBiasProvider`, because the bias is now gated on PRESENCE:
+    // `StubProvider` answers every name, so presence-gating finds a
+    // `attn_norm.bias` there and correctly attaches it. That is the behaviour
+    // `output_bias_spec.rs` pins; here the point is the absent case.
     let c = cfg();
-    let provider = StubProvider { cfg: c.clone() };
+    let provider = NoBiasProvider { cfg: c.clone() };
     let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
     let mut spec = LayerAttentionSpec::default_full(2, 1, 4, 10000.0);
     spec.norm_kind = NormKind::LayerNorm;
     spec.has_norm_bias = false;
     let b = LlamaBlock::load_tp_spec(&ws, &c, &spec, Default::default()).expect("block loads");
     assert!(!b.attn_norm.has_bias());
+}
+
+#[test]
+fn a_checkpoint_that_ships_a_bias_gets_it_without_a_flag() {
+    // The companion to the test above: `StubProvider` answers every name, so
+    // `attn_norm.bias` exists, and the block must attach it even though
+    // `has_norm_bias` is false. llama.cpp has no bias hparam -- `build_norm`
+    // applies whatever tensor the loader created, so presence is the signal.
+    let c = cfg();
+    let provider = StubProvider { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let mut spec = LayerAttentionSpec::default_full(2, 1, 4, 10000.0);
+    spec.norm_kind = NormKind::Rms;
+    spec.has_norm_bias = false;
+    let b = LlamaBlock::load_tp_spec(&ws, &c, &spec, Default::default()).expect("block loads");
+    assert!(
+        b.attn_norm.has_bias(),
+        "the checkpoint has attn_norm.bias and the block dropped it"
+    );
 }
 
 #[test]

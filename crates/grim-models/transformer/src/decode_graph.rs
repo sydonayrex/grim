@@ -5863,6 +5863,7 @@ mod tests {
             has_norm_bias: false,
             has_attn_post_norm: false,
             use_parallel_residual: false,
+        has_output_bias: false,
         };
 
         let embed = rocm_tensor(

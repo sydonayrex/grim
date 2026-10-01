@@ -34,6 +34,7 @@ cd "$root"
 
 block="crates/grim-models/transformer/src/block.rs"
 model="crates/grim-models/transformer/src/model.rs"
+nn="crates/grim-nn/src/modules.rs"
 fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; fail=1; }
@@ -64,6 +65,7 @@ for spec in \
     "grim-nn norm_kind" \
     "grim-models-transformer attn_post_norm" \
     "grim-models-transformer output_norm_spec" \
+    "grim-models-transformer output_bias_spec" \
     "grim-models-transformer block_norm_spec" \
     "grim-models-transformer norm_adoption_seam" \
     "grim-models-transformer llama_shaped_table" \
@@ -86,6 +88,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 cp "$block" "$tmp/block.start"
 cp "$model" "$tmp/model.start"
+cp "$nn" "$tmp/nn.start"
 cp "$block" "$tmp/block.orig"
 python3 - "$block" <<'PY'
 import re, sys
@@ -199,13 +202,43 @@ r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 |
 case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
 
 echo
+echo "=== MUTATION E: norm bias gated on the flag again"
+# Presence-gating is the fix. Reverting it means the eighteen models that ship
+# attn_norm_b (gptneox, phi2, mpt, jais, orion, codeshell, starcoder,
+# starcoder2, nemotron, bloom, gpt2, falcon, jais2, phimoe, pockettts, rwkv6,
+# rwkv7, stablelm) compute a normalisation they were not trained with.
+cp "$nn" "$tmp/nn.e.orig"
+python3 - "$nn" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "        let loaded = ws.get([dim], \"bias\").ok();"
+if old not in s:
+    sys.exit("anchor not found")
+open(p, "w").write(s.replace(old, "        let loaded = if declared_bias { ws.get([dim], \"bias\").ok() } else { None };", 1))
+PY
+if [ $? -ne 0 ]; then
+    fail "E: could not locate Norm::load's bias probe"
+else
+    r="$(cargo test -p grim-models-transformer --test output_bias_spec -j 1 2>&1 | result_of)"
+    case "$r" in
+        *" 0 failed"*) fail "E SURVIVED -- the norm bias is flag-gated again: $r" ;;
+        *)             pass "E killed: $r" ;;
+    esac
+fi
+cp "$tmp/nn.e.orig" "$nn"
+r="$(cargo test -p grim-models-transformer --test output_bias_spec -j 1 2>&1 | result_of)"
+case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
+
+echo
 echo "=== the tree is unchanged by THIS RUN"
 # Compared against a snapshot taken when the script started, not against HEAD.
 # `git diff --quiet` would report a legitimate uncommitted change as if the
 # script had caused it, which is how the first version of this gate failed on a
 # clean tree: the parallel-residual work was simply not committed yet.
-if cmp -s "$block" "$tmp/block.start" && cmp -s "$model" "$tmp/model.start"; then
-    pass "block.rs and model.rs are byte-identical to the pre-run snapshot"
+if cmp -s "$block" "$tmp/block.start" && cmp -s "$model" "$tmp/model.start" \
+   && cmp -s "$nn" "$tmp/nn.start"; then
+    pass "block.rs, model.rs and modules.rs are byte-identical to the pre-run snapshot"
 else
     fail "this script modified a file and did not restore it"
 fi

@@ -1430,23 +1430,49 @@ impl Norm {
 
     /// Load from a `WeightSource`.
     ///
-    /// `has_bias` is the spec's decision, not a guess: ten models ship
-    /// `attn_norm_b` / `ffn_norm_b` and `olmo` ships neither. Taking whatever
-    /// `bias` happens to be present would apply a normalisation the model does
-    /// not use, and a *declared* bias that is missing is an error, as it is for
-    /// `Linear::load`.
+    /// ## The bias is gated on PRESENCE, not on a flag
     ///
-    /// A missing *weight* is not an error: a null weight is legal in the
-    /// reference, and `olmo.cpp:65-67` passes `NULL, NULL`.
+    /// llama.cpp has no bias hyperparameter. `build_norm` receives whatever
+    /// tensor the loader created and applies it if it is non-null:
+    ///
+    /// ```text
+    /// if (mw || mb) { ... }
+    /// if (mb) { cur = ggml_add(ctx0, cur, mb); }
+    /// ```
+    ///
+    /// So presence in the checkpoint is the whole signal. Eighteen references
+    /// create `attn_norm_b` or `ffn_norm_b` -- gptneox, phi2, mpt, jais, orion,
+    /// codeshell, starcoder, starcoder2, nemotron, bloom, gpt2, falcon,
+    /// jais2, phimoe, pockettts, rwkv6, rwkv7, stablelm -- and a
+    /// config-flag design has to be told about every one of them. It was told
+    /// about none, so all eighteen computed a normalisation they were not
+    /// trained with.
+    ///
+    /// `declared_bias` is retained as an assertion, not as the gate: if the
+    /// caller says a bias exists and the checkpoint does not have one, that is
+    /// a corrupt or wrong-architecture checkpoint and must fail loudly rather
+    /// than silently normalise without it.
+    ///
+    /// A missing *weight* is not an error and never was: a null weight is legal
+    /// in the reference, and `olmo.cpp:65-67` passes `NULL, NULL`.
     pub fn load(
         ws: &WeightSource<'_>,
         dim: usize,
         kind: NormKind,
         eps: f32,
-        has_bias: bool,
+        declared_bias: bool,
     ) -> Result<Self> {
-        let bias = if has_bias {
-            Some(ws.get([dim], "bias")?)
+        // `ws.get(..).ok()`, not `has_tensor(..)` followed by `get(..)`: a
+        // provider whose `meta` and `get` disagree would make the probe
+        // report a bias that then fails to load. Asking once and tolerating
+        // absence is exactly `build_norm`'s `if (mb)`.
+        let loaded = ws.get([dim], "bias").ok();
+        let bias = if loaded.is_some() {
+            loaded
+        } else if declared_bias {
+            return Err(Error::Backend(
+                "norm declares a bias but the checkpoint has no `bias` tensor".into(),
+            ));
         } else {
             None
         };

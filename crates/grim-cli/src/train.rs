@@ -314,6 +314,7 @@ fn llama_config_from_metadata(provider: &GgufProvider) -> Result<LlamaConfig> {
         norm_kind: grim_nn::NormKind::Rms,
         has_norm_bias: false,
         has_attn_post_norm: false,
+        has_output_bias: false,
         use_parallel_residual: false,
     })
 }
