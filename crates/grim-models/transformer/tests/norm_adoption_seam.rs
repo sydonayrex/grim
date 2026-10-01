@@ -63,6 +63,21 @@ impl TensorProvider for NoBiasProvider {
 impl TensorProvider for StubProvider {
     fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
         let c = &self.cfg;
+        // A `*bias` leaf is 1-D [out] whatever the weight's rank. Must come
+        // first: "output.bias" contains "output", so the weight arm below would
+        // otherwise answer it with a 2-D [vocab, hidden].
+        if name.ends_with("bias") {
+            let n = if name.contains("output") {
+                c.vocab_size
+            } else if name.contains("wq") || name.contains("wk") || name.contains("wv") {
+                c.num_heads * c.head_dim
+            } else if name.contains("wo") {
+                c.hidden_size
+            } else {
+                c.hidden_size
+            };
+            return Ok(raw_from_shape(vec![n]));
+        }
         // Norms are 1-D [hidden]; the sharded projections must be 2-D, since
         // `shard_raw_tensor` requires it.
         let (rows, cols) = if name.contains("attn_q_norm") || name.contains("attn_k_norm") {
@@ -89,13 +104,7 @@ impl TensorProvider for StubProvider {
         } else {
             vec![rows, cols]
         };
-        let n: usize = shape.iter().product();
-        Ok(RawTensor {
-            bytes: vec![0u8; n * 4],
-            shape,
-            dtype: DType::F32,
-            provenance: QuantProvenance::GrimNative,
-        })
+        Ok(raw_from_shape(shape))
     }
 
     fn meta(&self, _name: &str) -> grim_tensor::error::Result<TensorMeta> {
@@ -105,6 +114,24 @@ impl TensorProvider for StubProvider {
             shape: vec![],
             fusion_mask: 0,
         })
+    }
+}
+
+/// A deterministic non-zero F32 tensor of `shape`.
+///
+/// Non-zero because `Llama::load_tp` rejects a structurally-broken model whose
+/// weights are all zero (`weights_look_broken`), which is a correct guard and
+/// not something a stub should trip.
+fn raw_from_shape(shape: Vec<usize>) -> RawTensor {
+    let n: usize = shape.iter().product();
+    let bytes: Vec<u8> = (0..n)
+        .flat_map(|i| ((i % 7) as f32 * 0.125 + 0.0625).to_le_bytes())
+        .collect();
+    RawTensor {
+        bytes,
+        shape,
+        dtype: DType::F32,
+        provenance: QuantProvenance::GrimNative,
     }
 }
 
@@ -307,5 +334,36 @@ fn use_parallel_residual_reaches_the_block_through_load_tp() {
         parallel.use_parallel_residual,
         "load_tp dropped use_parallel_residual, so the GGUF key cannot reach the \
          block and every gptneox checkpoint computes ffn(attn(x) + x)"
+    );
+}
+
+/// The output head must honour `cfg.has_output_bias`.
+///
+/// Reverting both `Linear::load_column_parallel` call sites in `model.rs` to
+/// `/*has_bias=*/ false` passes every test that inspects a `Linear` directly,
+/// because the flag is read in `model.rs` and nowhere else. Only a load through
+/// `Llama` can see it.
+///
+/// phi2, qwen2 and wavtokenizer-dec each do
+/// `ggml_add(ctx0, cur, model.output_b)` on the logits, so a silent `false`
+/// here drops a term from the output of three models.
+#[test]
+fn the_output_head_honours_has_output_bias() {
+    let mut c = cfg();
+    c.has_output_bias = true;
+    let provider = StubProvider { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let m = grim_models_transformer::Llama::load_tp(
+        Device::Cpu,
+        &ws,
+        c.clone(),
+        Default::default(),
+    )
+    .expect("Llama loads");
+    assert_eq!(c.has_output_bias, m.cfg.has_output_bias);
+    assert!(
+        m.output.bias.is_some(),
+        "has_output_bias = true but Llama.output has no bias, so phi2, qwen2 \
+         and wavtokenizer-dec drop `output_b` from the logits"
     );
 }

@@ -65,7 +65,6 @@ for spec in \
     "grim-nn norm_kind" \
     "grim-models-transformer attn_post_norm" \
     "grim-models-transformer output_norm_spec" \
-    "grim-models-transformer output_bias_spec" \
     "grim-models-transformer block_norm_spec" \
     "grim-models-transformer norm_adoption_seam" \
     "grim-models-transformer llama_shaped_table" \
@@ -220,14 +219,14 @@ PY
 if [ $? -ne 0 ]; then
     fail "E: could not locate Norm::load's bias probe"
 else
-    r="$(cargo test -p grim-models-transformer --test output_bias_spec -j 1 2>&1 | result_of)"
+    r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "E SURVIVED -- the norm bias is flag-gated again: $r" ;;
         *)             pass "E killed: $r" ;;
     esac
 fi
 cp "$tmp/nn.e.orig" "$nn"
-r="$(cargo test -p grim-models-transformer --test output_bias_spec -j 1 2>&1 | result_of)"
+r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
 case "$r" in *" 0 failed"*) pass "green after restore" ;; *) fail "not green after restore: $r" ;; esac
 
 echo
