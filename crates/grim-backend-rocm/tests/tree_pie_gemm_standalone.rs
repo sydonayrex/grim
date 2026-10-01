@@ -112,7 +112,23 @@ fn tree_pie_gemv_standalone_control() -> TestResult {
     let (a, b, o) = (ptr(&act_t), ptr(&b_t), ptr(&out_t));
     let (mut a, mut b, mut nn, mut kk, mut o) = (a, b, n as i32, k as i32, o);
 
-    let src = format!("{DOT2_HELPER}\n{}", grim_backend_rocm::kernels::tree_pie::KERNEL_SOURCE);
+    // Two candidate sources, because "standalone" has meant two different things and
+    // I never checked which one the dispatched path actually runs:
+    //   RAW      - just the caller module's own source, with the one missing
+    //              dependency (grim_fdot2_f32_f16) hand-copied in. This is what the
+    //              earlier experiments used, and it faults.
+    //   AGGREGATE- compute_kernel_source(): exactly what launch_compute_kernel
+    //              compiles. If the known-good GEMV flies here, the harness was the
+    //              problem; if it faults here too, launch_from_source cannot host
+    //              these kernels and this whole route is a dead end.
+    let raw_src = format!("{DOT2_HELPER}\n{}", grim_backend_rocm::kernels::tree_pie::KERNEL_SOURCE);
+    let which = std::env::var("TP_STANDALONE_SRC").unwrap_or_else(|_| "aggregate".to_string());
+    let src = if which == "raw" {
+        raw_src
+    } else {
+        grim_backend_rocm::kernels::source_asm::compute_kernel_source()
+    };
+    println!("standalone GEMV control via {which} source ({} bytes)", src.len());
     dev.launch_from_source(
         &src,
         "grim_tree_pie_gemv",

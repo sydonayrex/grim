@@ -679,6 +679,10 @@ fn tp_probe_7p() -> TestResult {
 }
 
 fn launch_bisect(dev: &RocmDevice, src: &str, entry: &str) -> TestResult<Vec<f32>> {
+    // Guard-theory probe: what device is current at launch time?
+    let mut cur: i32 = -99;
+    unsafe { grim_backend_rocm::device::handles::hipGetDevice(&mut cur); }
+    eprintln!("[bisect:{entry}] current-device={cur}");
     let n = 64usize;
     let k = 128usize;
     let act_t = MemoryOps::alloc_storage(
