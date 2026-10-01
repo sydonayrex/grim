@@ -1,4 +1,4 @@
-//! SIMD fast paths for the packed quantized GEMMs (`gemm_q8_0_packed`, `gemm_q4k_packed`) defined in the crate root.
+//! SIMD fast paths for the packed quantized GEMMs (`gemm_q8_0_packed`, `gemm_q4k_packed`, `gemm_iq4nl_packed`, `gemm_iq3s_packed`) defined in the crate root.
 //! Block layouts (authoritative source: the scalar reference implementations in `lib.rs`, which these kernels mirror instruction-for-instruction.
 
 // x86-64 / AVX2
@@ -240,6 +240,66 @@ pub(crate) mod x86 {
             c
         }
     }
+
+    /// AVX2 kernel for [`crate::gemm_iq3s_packed`].
+    ///
+    /// IQ3_S decodes each 110-byte super-block to 256 weights via grid
+    /// lookups (`IQ3S_GRID`) plus sign/scale math. The lookup table is small
+    /// and data-dependent, so decoding stays scalar through the shared
+    /// [`crate::dequant_iq3s_block`] oracle (guaranteeing Pattern-A agreement
+    /// with the reference); the A-side dot product over the 256 decoded
+    /// weights is vectorized with 8-lane AVX2 multiply-accumulate lanes.
+    ///
+    /// # Safety The caller must have verified AVX2 support at runtime, and the inputs must
+    /// satisfy the validation contract of the public function (`k % 256 == 0`).
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn gemm_iq3s_packed_avx2(
+        a: &[f32],
+        b_bytes: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        unsafe {
+            use crate::{IQ3S_BLOCK_BYTES, IQ3S_QK};
+
+            let blocks_per_row = k / IQ3S_QK;
+            let stride_b = blocks_per_row * IQ3S_BLOCK_BYTES;
+            let mut c = vec![0.0f32; m * n];
+
+            for row_m in 0..m {
+                for col_n in 0..n {
+                    let b_row = &b_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+                    let mut dot = 0.0f32;
+                    let mut b_pos = 0usize;
+                    let mut a_pos = row_m * k;
+
+                    for _blk in 0..blocks_per_row {
+                        let w =
+                            crate::dequant_iq3s_block(&b_row[b_pos..b_pos + IQ3S_BLOCK_BYTES]);
+
+                        // Vectorized dot product: 32 x 8-lane MAC over the 256 weights.
+                        let w_ptr = w.as_ptr();
+                        let a_ptr = a.as_ptr().add(a_pos);
+                        let mut acc = _mm256_setzero_ps();
+                        for lane in 0..(IQ3S_QK / 8) {
+                            let wv = _mm256_loadu_ps(w_ptr.add(lane * 8));
+                            let av = _mm256_loadu_ps(a_ptr.add(lane * 8));
+                            acc = _mm256_add_ps(acc, _mm256_mul_ps(av, wv));
+                        }
+                        dot += hsum256!(acc);
+
+                        b_pos += IQ3S_BLOCK_BYTES;
+                        a_pos += IQ3S_QK;
+                    }
+
+                    c[row_m * n + col_n] = dot;
+                }
+            }
+
+            c
+        }
+    }
 }
 
 // aarch64 / NEON (NEON is baseline
@@ -357,6 +417,62 @@ pub(crate) mod neon {
 
                         b_pos += IQ4_NL_BLOCK_BYTES;
                         a_pos += IQ4_NL_QK;
+                    }
+
+                    c[row_m * n + col_n] = dot;
+                }
+            }
+
+            c
+        }
+    }
+
+    /// NEON kernel for [`crate::gemm_iq3s_packed`].
+    ///
+    /// Same algorithm as the AVX2 kernel: scalar grid-lookup decode through
+    /// the shared [`crate::dequant_iq3s_block`] oracle, then vectorized
+    /// dot-product against A using 4-lane NEON multiply-add pairs over the
+    /// 256 decoded weights.
+    ///
+    /// # Safety Inputs must satisfy the validation contract of the public function (`k % 256 == 0`).
+    pub(crate) unsafe fn gemm_iq3s_packed_neon(
+        a: &[f32],
+        b_bytes: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        unsafe {
+            use crate::{IQ3S_BLOCK_BYTES, IQ3S_QK};
+
+            let blocks_per_row = k / IQ3S_QK;
+            let stride_b = blocks_per_row * IQ3S_BLOCK_BYTES;
+            let mut c = vec![0.0f32; m * n];
+
+            for row_m in 0..m {
+                for col_n in 0..n {
+                    let b_row = &b_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+                    let mut dot = 0.0f32;
+                    let mut b_pos = 0usize;
+                    let mut a_pos = row_m * k;
+
+                    for _blk in 0..blocks_per_row {
+                        let w =
+                            crate::dequant_iq3s_block(&b_row[b_pos..b_pos + IQ3S_BLOCK_BYTES]);
+
+                        // Vectorized dot product: 64 × 4-lane MAC over the 256 weights.
+                        let w_ptr = w.as_ptr();
+                        let a_ptr = a.as_ptr().add(a_pos);
+                        let mut acc = vdupq_n_f32(0.0);
+                        for lane in 0..(IQ3S_QK / 4) {
+                            let wv = vld1q_f32(w_ptr.add(lane * 4));
+                            let av = vld1q_f32(a_ptr.add(lane * 4));
+                            acc = vmlaq_f32(acc, av, wv);
+                        }
+                        dot += vaddvq_f32(acc);
+
+                        b_pos += IQ3S_BLOCK_BYTES;
+                        a_pos += IQ3S_QK;
                     }
 
                     c[row_m * n + col_n] = dot;

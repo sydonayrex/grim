@@ -640,8 +640,70 @@ pub fn dequant_iq3xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 /// - `qh`: [u8; 8]
 /// - `signs`: [u8; 32]
 /// - `scales`: [u8; 4]
-pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+/// Decode one 110-byte IQ3_S super-block to 256 f32 weights.
+///
+/// Shared by [`dequant_iq3s`] (oracle) and [`gemm_iq3s_packed`] (fused GEMM)
+/// so the two can never drift (Pattern A: oracle + fused kernel bit-identical).
+pub(crate) fn dequant_iq3s_block(blk: &[u8]) -> [f32; 256] {
     use crate::iq_tables::{IQ3S_GRID, KMASK_IQ2XS};
+    debug_assert_eq!(blk.len(), IQ3S_BLOCK_BYTES);
+    let mut w = [0.0f32; IQ3S_QK];
+    let d = f16_to_f32(blk[0], blk[1]);
+    let qs = &blk[2..66];
+    let qh = &blk[66..74];
+    let signs = &blk[74..106];
+    let scales = &blk[106..110];
+
+    for ib32 in (0..(IQ3S_QK / 32)).step_by(2) {
+        let sc_byte = scales[ib32 / 2];
+        let db1 = d * (1.0f32 + 2.0f32 * (sc_byte & 0xf) as f32);
+        let db2 = d * (1.0f32 + 2.0f32 * (sc_byte >> 4) as f32);
+
+        let qh0 = qh[ib32] as usize;
+        let qh1 = qh[ib32 + 1] as usize;
+
+        // First 32 weights — same grid/qh/sign math as the oracle.
+        let qs1 = &qs[ib32 * 8..(ib32 + 1) * 8];
+        let signs1 = &signs[ib32 * 4..(ib32 + 1) * 4];
+        for l in 0..4 {
+            let idx1 = (qs1[2 * l] as usize) | ((qh0 << (8 - 2 * l)) & 256);
+            let idx2 = (qs1[2 * l + 1] as usize) | ((qh0 << (7 - 2 * l)) & 256);
+            let grid1 = IQ3S_GRID[idx1].to_le_bytes();
+            let grid2 = IQ3S_GRID[idx2].to_le_bytes();
+
+            for j in 0..4 {
+                let sign = if (signs1[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                w[ib32 * 32 + l * 8 + j] = db1 * (grid1[j] as f32) * sign;
+            }
+            for j in 0..4 {
+                let sign = if (signs1[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                w[ib32 * 32 + l * 8 + 4 + j] = db1 * (grid2[j] as f32) * sign;
+            }
+        }
+
+        // Second 32 weights.
+        let qs2 = &qs[(ib32 + 1) * 8..(ib32 + 2) * 8];
+        let signs2 = &signs[(ib32 + 1) * 4..(ib32 + 2) * 4];
+        for l in 0..4 {
+            let idx1 = (qs2[2 * l] as usize) | ((qh1 << (8 - 2 * l)) & 256);
+            let idx2 = (qs2[2 * l + 1] as usize) | ((qh1 << (7 - 2 * l)) & 256);
+            let grid1 = IQ3S_GRID[idx1].to_le_bytes();
+            let grid2 = IQ3S_GRID[idx2].to_le_bytes();
+
+            for j in 0..4 {
+                let sign = if (signs2[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                w[(ib32 + 1) * 32 + l * 8 + j] = db2 * (grid1[j] as f32) * sign;
+            }
+            for j in 0..4 {
+                let sign = if (signs2[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                w[(ib32 + 1) * 32 + l * 8 + 4 + j] = db2 * (grid2[j] as f32) * sign;
+            }
+        }
+    }
+    w
+}
+
+pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const QK: usize = 256;
     const BLOCK_BYTES: usize = 110;
     let num_blocks = num_weights.div_ceil(QK);
@@ -656,69 +718,9 @@ pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     let mut remaining = num_weights;
     for b in 0..num_blocks {
         let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
-        let d = f16_to_f32(blk[0], blk[1]);
-        let qs = &blk[2..66];
-        let qh = &blk[66..74];
-        let signs = &blk[74..106];
-        let scales = &blk[106..110];
-
+        let w = dequant_iq3s_block(blk);
         let block_len = remaining.min(QK);
-        for ib32 in (0..(QK / 32)).step_by(2) {
-            let sc_byte = scales[ib32 / 2];
-            let db1 = d * (1.0f32 + 2.0f32 * (sc_byte & 0xf) as f32);
-            let db2 = d * (1.0f32 + 2.0f32 * (sc_byte >> 4) as f32);
-
-            let qh0 = qh[ib32] as usize;
-            let qh1 = qh[ib32 + 1] as usize;
-
-            // First 32 weights
-            let qs1 = &qs[ib32 * 8..(ib32 + 1) * 8];
-            let signs1 = &signs[ib32 * 4..(ib32 + 1) * 4];
-            for l in 0..4 {
-                let idx1 = (qs1[2 * l + 0] as usize) | (((qh0 << (8 - 2 * l)) & 256));
-                let idx2 = (qs1[2 * l + 1] as usize) | (((qh0 << (7 - 2 * l)) & 256));
-                let grid1 = IQ3S_GRID[idx1].to_le_bytes();
-                let grid2 = IQ3S_GRID[idx2].to_le_bytes();
-
-                let base_idx = ib32 * 32 + l * 8;
-                for j in 0..4 {
-                    if base_idx + j < block_len {
-                        let sign = if (signs1[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
-                        out.push(db1 * (grid1[j] as f32) * sign);
-                    }
-                }
-                for j in 0..4 {
-                    if base_idx + 4 + j < block_len {
-                        let sign = if (signs1[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
-                        out.push(db1 * (grid2[j] as f32) * sign);
-                    }
-                }
-            }
-
-            // Second 32 weights
-            let qs2 = &qs[(ib32 + 1) * 8..(ib32 + 2) * 8];
-            let signs2 = &signs[(ib32 + 1) * 4..(ib32 + 2) * 4];
-            for l in 0..4 {
-                let idx1 = (qs2[2 * l + 0] as usize) | (((qh1 << (8 - 2 * l)) & 256));
-                let idx2 = (qs2[2 * l + 1] as usize) | (((qh1 << (7 - 2 * l)) & 256));
-                let grid1 = IQ3S_GRID[idx1].to_le_bytes();
-                let grid2 = IQ3S_GRID[idx2].to_le_bytes();
-
-                let base_idx = (ib32 + 1) * 32 + l * 8;
-                for j in 0..4 {
-                    if base_idx + j < block_len {
-                        let sign = if (signs2[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
-                        out.push(db2 * (grid1[j] as f32) * sign);
-                    }
-                }
-                for j in 0..4 {
-                    if base_idx + 4 + j < block_len {
-                        let sign = if (signs2[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
-                        out.push(db2 * (grid2[j] as f32) * sign);
-                    }
-                }
-            }
-        }
+        out.extend_from_slice(&w[..block_len]);
         remaining = remaining.saturating_sub(QK);
     }
     Ok(out)
@@ -7101,6 +7103,30 @@ mod tests {
                     );
                 }
             }
+
+            // IQ3_S test (A3: fused path must match dequant-then-GEMM)
+            let mut b_iq3s_bytes = Vec::new();
+            for col in 0..n {
+                let row = &b_f32[col * k..(col + 1) * k];
+                let q = quant_iq3s(row).expect("quant_iq3s");
+                b_iq3s_bytes.extend_from_slice(&q);
+            }
+            let packed_c_iq3s =
+                gemm_iq3s_packed(&a, &b_iq3s_bytes, m, n, k).expect("gemm_iq3s_packed");
+            let dequant_b_iq3s = dequant_iq3s(&b_iq3s_bytes, n * k).expect("dequant_iq3s");
+            for row in 0..m {
+                for col in 0..n {
+                    let mut expected = 0.0f32;
+                    for l in 0..k {
+                        expected += a[row * k + l] * dequant_b_iq3s[col * k + l];
+                    }
+                    let actual = packed_c_iq3s[row * n + col];
+                    assert!(
+                        (actual - expected).abs() < 1e-3,
+                        "IQ3_S k={k} mismatch: actual={actual}, expected={expected}"
+                    );
+                }
+            }
         }
     }
 }
@@ -7389,6 +7415,101 @@ fn gemm_iq4nl_packed_scalar(
                     dot += a_sub[j + IQ4_NL_QK / 2] * d * KVALUES_IQ4NL_REF[hi];
                 }
                 b_pos += IQ4_NL_BLOCK_BYTES;
+            }
+            c[row_m * n + col_n] = dot;
+        }
+    }
+
+    c
+}
+
+// IQ3_S block constants (llama.cpp `block_iq3_s`, QK_K = 256).
+/// Weights per IQ3_S super-block.
+pub const IQ3S_QK: usize = 256;
+/// Bytes per IQ3_S super-block: 2-byte f16 `d` + 64 `qs` + 8 `qh` + 32 `signs` + 4 `scales`.
+pub const IQ3S_BLOCK_BYTES: usize = 110;
+
+/// Packed matrix multiplication: `C[m, n] = sum_k A[m, k] * B[n, k]` where B is packed IQ3_S weights.
+///
+/// A has shape `[m, k]`, B has shape `[n, k]` (in packed IQ3_S bytes: 110 bytes
+/// per 256 weights). CPU-native fused dequant+GEMM path that bypasses the full
+/// f32 materialization of B. Mirrors `gemm_q4k_packed` (same 256-weight
+/// super-block loop): each block decodes via the shared [`dequant_iq3s_block`]
+/// oracle, then accumulates the dot product against A.
+///
+/// # Errors
+/// Returns [`Error::Backend`] when `k` is not a multiple of 256, when `b_bytes`
+/// is shorter than `n * (k/256) * 110`, or when `a` is shorter than `m * k`.
+pub fn gemm_iq3s_packed(
+    a: &[f32],
+    b_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    if k % IQ3S_QK != 0 {
+        return Err(Error::Backend(format!(
+            "gemm_iq3s_packed: k ({k}) must be a multiple of {IQ3S_QK}"
+        )));
+    }
+    let blocks_per_row = k / IQ3S_QK;
+    let stride_b = blocks_per_row * IQ3S_BLOCK_BYTES;
+    if b_bytes.len() < n * stride_b {
+        return Err(Error::Backend(format!(
+            "gemm_iq3s_packed: buffer too short: expected {}, got {}",
+            n * stride_b,
+            b_bytes.len()
+        )));
+    }
+    if a.len() < m * k {
+        return Err(Error::Backend(format!(
+            "gemm_iq3s_packed: input a too short: expected {}, got {}",
+            m * k,
+            a.len()
+        )));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if packed_gemm::avx2_detected() {
+        // SAFETY: AVX2 presence was just verified at runtime, and all shape /
+        // buffer-length validation above has passed.
+        return Ok(unsafe { packed_gemm::x86::gemm_iq3s_packed_avx2(a, b_bytes, m, n, k) });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: shape / buffer-length validation above has passed. NEON is
+    // baseline on aarch64, so no runtime feature check is needed.
+    return Ok(unsafe { packed_gemm::neon::gemm_iq3s_packed_neon(a, b_bytes, m, n, k) });
+
+    #[cfg(not(target_arch = "aarch64"))]
+    Ok(gemm_iq3s_packed_scalar(a, b_bytes, m, n, k))
+}
+
+/// Scalar reference implementation of [`gemm_iq3s_packed`] (inputs already validated).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn gemm_iq3s_packed_scalar(
+    a: &[f32],
+    b_bytes: &[u8],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    let blocks_per_row = k / IQ3S_QK;
+    let stride_b = blocks_per_row * IQ3S_BLOCK_BYTES;
+
+    let mut c = vec![0.0f32; m * n];
+
+    for row_m in 0..m {
+        let a_row = &a[row_m * k..(row_m + 1) * k];
+        for col_n in 0..n {
+            let b_row = &b_bytes[col_n * stride_b..(col_n + 1) * stride_b];
+            let mut dot = 0.0f32;
+            for blk in 0..blocks_per_row {
+                let w = dequant_iq3s_block(&b_row[blk * IQ3S_BLOCK_BYTES..(blk + 1) * IQ3S_BLOCK_BYTES]);
+                let a_sub = &a_row[blk * IQ3S_QK..(blk + 1) * IQ3S_QK];
+                for j in 0..IQ3S_QK {
+                    dot += a_sub[j] * w[j];
+                }
             }
             c[row_m * n + col_n] = dot;
         }
