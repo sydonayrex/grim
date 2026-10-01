@@ -367,3 +367,93 @@ fn the_output_head_honours_has_output_bias() {
          and wavtokenizer-dec drop `output_b` from the logits"
     );
 }
+
+/// The FINAL norm's bias must reach `Llama.norm`.
+///
+/// Twenty references create `LLM_TENSOR_OUTPUT_NORM, "bias"` and pass it to
+/// `build_norm`:
+///
+/// ```text
+/// phi2.cpp:127          build_norm(cur, model.output_norm, model.output_norm_b, ...)
+/// wavtokenizer-dec.cpp:252
+/// rwkv6qwen2.cpp:156    cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, ...);
+/// ```
+///
+/// `StubProvider` answers every name, so `norm.bias` exists here, and
+/// `Norm::load` is presence-gated, so it must be attached without a flag.
+/// `Llama.norm` is the only norm whose bias nothing asserts: `attn_norm`'s
+/// half is covered by the two tests above, this is the final norm's.
+#[test]
+fn the_final_norm_gets_its_bias_when_the_checkpoint_ships_one() {
+    let c = cfg();
+    let provider = StubProvider { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let m = grim_models_transformer::Llama::load_tp(
+        Device::Cpu,
+        &ws,
+        c.clone(),
+        Default::default(),
+    )
+    .expect("Llama loads");
+    assert!(
+        m.norm.has_bias(),
+        "the checkpoint ships norm.bias and the final norm dropped it, so the \
+         logits are missing `ggml_add(ctx0, cur, model.output_norm_b)` for \
+         twenty references"
+    );
+}
+
+/// The final norm's bias and the layer norms' bias are independent facts.
+///
+/// `rwkv6qwen2` and `wavtokenizer-dec` create `output_norm_b` with NO
+/// `attn_norm_b` / `ffn_norm_b`, so one flag cannot express both. Presence
+/// gating is what makes that work; a flag would have to be told about the
+/// difference for each of the twenty.
+#[test]
+fn a_model_with_an_output_norm_bias_and_no_layer_bias_loads() {
+    // A provider that serves `norm.bias` but rejects `attn_norm.bias` and
+    // `ffn_norm.bias`. That is the rwkv6qwen2 / wavtokenizer-dec shape.
+    struct OutputBiasOnly {
+        cfg: LlamaConfig,
+    }
+    impl TensorProvider for OutputBiasOnly {
+        fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+            if is_layer_norm_bias(name) {
+                return Err(grim_tensor::error::Error::Backend(format!(
+                    "tensor '{name}' not found"
+                )));
+            }
+            StubProvider { cfg: self.cfg.clone() }.get(name)
+        }
+        fn meta(&self, name: &str) -> grim_tensor::error::Result<TensorMeta> {
+            if is_layer_norm_bias(name) {
+                return Err(grim_tensor::error::Error::Backend(format!(
+                    "tensor '{name}' not found"
+                )));
+            }
+            StubProvider { cfg: self.cfg.clone() }.meta(name)
+        }
+    }
+
+    /// True for `attn_norm.bias` / `ffn_norm.bias`, but NOT `norm.bias` --
+    /// the final norm's bias is exactly what this provider keeps.
+    fn is_layer_norm_bias(name: &str) -> bool {
+        name.ends_with("bias") && (name.contains("attn_norm") || name.contains("ffn_norm"))
+    }
+
+    let c = cfg();
+    let provider = OutputBiasOnly { cfg: c.clone() };
+    let ws = grim_nn::WeightSource::root(&provider, Device::Cpu);
+    let m = grim_models_transformer::Llama::load_tp(
+        Device::Cpu,
+        &ws,
+        c.clone(),
+        Default::default(),
+    )
+    .expect("a checkpoint with output_norm_b and no layer *_norm_b must load");
+    assert!(m.norm.has_bias(), "the final norm lost its bias");
+    assert!(
+        !m.layers[0].attn_norm.has_bias(),
+        "the layer norm picked up a bias the checkpoint does not have"
+    );
+}
