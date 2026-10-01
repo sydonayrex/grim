@@ -603,6 +603,14 @@ impl RocmDevice {
         entry: &str,
         spec: Option<&crate::device::hardware_spec::HardwareSpec>,
     ) -> Result<(std::path::PathBuf, String)> {
+        // Set the device before compiling or loading, exactly as every other launch
+        // path in this file does (see launch_compute_kernel_on_stream,
+        // launch_madam_update_f32, launch_compute_kernel_with_solution). Without it
+        // the module is loaded and launched against whatever device happens to be
+        // ambient, and on a device where these buffers are not mapped that surfaces
+        // as a "page not present" memory access fault at launch -- not as a launch
+        // error, which is what made this so expensive to diagnose.
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if std::env::var("GRIM_ALLOC_TRACE").is_ok() {
             eprintln!("[jit-trace] compiling entry={}", entry);
         }
