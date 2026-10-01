@@ -126,49 +126,72 @@ fn bertblocks_norms_are_rms_which_the_reference_is_not() {
 }
 
 #[test]
-fn the_reference_op_order_is_encoded_here_so_it_cannot_drift() {
-    // A literal transcription of bert.cpp's per-layer order, so the target is
-    // written down rather than inferred from grim's shape. The two additions
-    // of inpL and the three norms are the parts most likely to be
-    // "simplified", so both are counted explicitly.
-    const REFERENCE_ORDER: &[&str] = &[
-        "attn(inpL)",                 // :139
-        "add(attn_out, inpL)",         // :151
-        "norm(attn_out_norm)",         // :154  LLM_NORM
-        "add(attn_out_norm_out, inpL)", // :157  only if attn_norm_2
-        "norm(attn_norm_2)",           // :158  LLM_NORM
-        "ffn",                         // :164
-        "add(ffn_out, ffn_inp)",       // :206
-        "norm(layer_out_norm)",        // :209  LLM_NORM
+fn the_reference_order_is_read_from_bert_cpp() {
+    // An earlier version compared a local const to itself and so could not
+    // fail; it did fail the first time, because the transcription was wrong.
+    // The needles are now read out of bert.cpp, and the sequence is walked
+    // positionally so a repeated needle cannot collapse onto its first match.
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../old/repo/llama.cpp-master/src/models/bert.cpp"
+    ))
+    .expect("the reference must be readable; a test that skips it proves nothing");
+    let flat = src.replace('\n', " ");
+
+    // In source order: :151 add, :154 norm, :156 guard, :157 add, :181 ffn,
+    // :206 add, :209 norm. The add comes BEFORE the norm it feeds -- that is
+    // what makes this post-norm, and getting it backwards is the defect.
+    let seq = [
+        ("first inpL add", "ggml_add(ctx0, cur, inpL)"),
+        ("attn_out_norm applied", "attn_out_norm_b, LLM_NORM"),
+        ("attn_norm_2 guard", "attn_norm_2 != nullptr"),
+        ("second inpL add", "inpL);  // re-add the layer input"),
+        ("ffn", "build_ffn(cur"),
+        ("bypass add", "ggml_add(ctx0, cur, ffn_inp)"),
+        ("layer_out_norm applied", "layer_out_norm_b, LLM_NORM"),
     ];
-    assert_eq!(REFERENCE_ORDER.len(), 8);
+    // Positional: each step must be found AFTER the previous one, so a
+    // repeated needle cannot collapse onto its first match.
+    let after = |needle: &str, from: usize| {
+        flat[from..]
+            .find(needle)
+            .map(|i| from + i)
+            .unwrap_or_else(|| panic!("bert.cpp has no {needle:?} after offset {from}"))
+    };
+    let mut prev = 0;
+    for (what, needle) in seq {
+        let i = after(needle, prev);
+        assert!(
+            i > prev,
+            "{what} ({needle:?}) must come after the previous step in bert.cpp"
+        );
+        prev = i;
+    }
+
+    // Both adds of inpL are real, and the second is the guarded one.
     assert_eq!(
-        REFERENCE_ORDER
-            .iter()
-            .filter(|s| s.starts_with("add(") && s.contains("inpL"))
-            .count(),
+        flat.matches("ggml_add(ctx0, cur, inpL)").count(),
         2,
-        "bert.cpp adds inpL twice: :151 for attn_out_norm and :157 for \\
-         attn_norm_2. If that changes upstream, this and the reference \\
-         disagree and a human must resolve it."
+        "bert.cpp adds inpL twice: once before attn_out_norm and once inside \
+         the attn_norm_2 branch"
     );
-    assert_eq!(
-        REFERENCE_ORDER
-            .iter()
-            .filter(|s| s.starts_with("norm("))
-            .count(),
-        3,
-        "three norms per layer upstream"
-    );
-    // The FFN's input is the SECOND norm's output, not the first's. That is
-    // the load-bearing detail for anyone porting this.
-    let ffn_at = REFERENCE_ORDER.iter().position(|s| *s == "ffn").unwrap();
-    assert!(
-        REFERENCE_ORDER[..ffn_at]
-            .iter()
-            .filter(|s| s.starts_with("norm("))
-            .count()
-            == 2,
-        "the FFN sees attn_norm_2's output, so two norms precede it"
-    );
+    // Every norm in the file is LayerNorm.
+    let calls: Vec<&str> = {
+        let mut v = Vec::new();
+        let mut rest = flat.as_str();
+        while let Some(i) = rest.find("build_norm(") {
+            let end = rest[i..].find(");").map_or(rest.len(), |e| i + e + 2);
+            v.push(&rest[i..end]);
+            rest = &rest[end..];
+        }
+        v
+    };
+    assert!(!calls.is_empty(), "bert.cpp has build_norm calls");
+    for c in &calls {
+        assert!(
+            !c.contains("LLM_NORM_RMS"),
+            "a bert norm uses LLM_NORM_RMS, which LayerNorm-matched tests \
+             would miss: {c}"
+        );
+    }
 }
