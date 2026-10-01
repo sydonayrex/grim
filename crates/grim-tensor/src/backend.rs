@@ -87,6 +87,17 @@ pub struct YaRNParams {
     pub beta_fast: f32,
     pub beta_slow: f32,
     pub attention_factor: f32,
+    /// Multiplier the RoPE kernel applies to the extrapolated (low-frequency)
+    /// cos/sin — llama.cpp's `ggml_rope_ext` `attn_factor` argument.
+    ///
+    /// This is NOT the same number as `attention_factor`: llama.cpp splits them
+    /// (`cparams.yarn_attn_factor` feeds the rope; the model builds a separate
+    /// `mscale` for `kq_scale`), and for the Xing4.0 metadata they are
+    /// RECIPROCALSM of each other (0.70626 vs 1.41589), so one field cannot
+    /// carry both. `None` means "use `attention_factor`", which is every
+    /// pre-existing checkpoint's behaviour and keeps them identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_mscale: Option<f32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -285,6 +285,7 @@ mod tests {
                 beta_fast: 32.0,
                 beta_slow: 1.0,
                 attention_factor: 1.485_203,
+            rope_mscale: None,
             }),
             ..Default::default()
         };

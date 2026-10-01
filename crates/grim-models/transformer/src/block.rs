@@ -2157,6 +2157,7 @@ mod tests {
             beta_fast: 32.0,
             beta_slow: 1.0,
             attention_factor: 0.1,
+            rope_mscale: None,
         };
         let spec = LayerAttentionSpec::full_with_rope(8, 2, 16, 1_000_000.0, 8, Some(yarn));
         assert_eq!(spec.attn_type, AttentionType::Full);

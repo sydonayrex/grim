@@ -124,6 +124,7 @@ impl MellumConfig {
                         beta_fast,
                         beta_slow,
                         attention_factor,
+                        rope_mscale: None,
                     })
                 } else {
                     None

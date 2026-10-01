@@ -821,6 +821,7 @@ fn parse_full_yarn(rope_parameters: &Option<serde_json::Value>) -> Option<YaRNPa
             .get("attention_factor")
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32,
+        rope_mscale: None,
     })
 }
 
@@ -902,6 +903,7 @@ pub fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<Ya
             .or_else(|| rs.get("attn_factor"))
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32,
+        rope_mscale: None,
     })
 }
 
@@ -953,6 +955,7 @@ pub fn parse_yarn_scaling_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams
         beta_fast,
         beta_slow,
         attention_factor,
+        rope_mscale: None,
     })
 }
 
@@ -1425,6 +1428,7 @@ fn load_model_from_config(
                     beta_fast: 32.0,
                     beta_slow: 1.0,
                     attention_factor: 1.277_258_9,
+            rope_mscale: None,
                 }),
             };
             log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -3438,6 +3442,7 @@ fn load_model_with_providers(
                     beta_fast: 32.0,
                     beta_slow: 1.0,
                     attention_factor: 1.277_258_9,
+            rope_mscale: None,
                 }),
             };
             log::info!("[grim] Loading Mellum model with config: {:?}", mellum_cfg);
@@ -4233,15 +4238,29 @@ fn load_model_with_providers(
                         let beta_slow = lookup
                             .get_f32("xing4_0.rope.scaling.yarn_beta_slow")
                             .unwrap_or(1.0);
+                        // kq mscale: llama.cpp's get_mscale(factor, log_mul),
+                        // log_mul = metadata/0.1 (xing4_0.cpp divides by 0.1
+                        // after reading). For this checkpoint
+                        // 1 + 0.1*ln(64) = 1.41589, squared into kq_scale.
                         let attention_factor = lookup
                             .get_f32("xing4_0.rope.scaling.yarn_attn_factor")
                             .unwrap_or_else(|| 0.1 * (factor as f64).ln() as f32 + 1.0);
+                        // The ROPE multiplier is a DIFFERENT number. llama.cpp
+                        // feeds cparams.yarn_attn_factor to ggml_rope_ext,
+                        // which for this metadata is
+                        //   get_mscale(f,1)/get_mscale(f,log_mul) * 1/(1+0.1*ln f)
+                        //   = 1 / get_mscale(f, log_mul)
+                        // = exactly the reciprocal of attention_factor here
+                        // (0.70626). Using attention_factor for both made every
+                        // extrapolated cos/sin 2x too large.
+                        let rope_mscale = Some(1.0 / attention_factor);
                         Some(grim_tensor::YaRNParams {
                             factor,
                             original_max_pos,
                             beta_fast,
                             beta_slow,
                             attention_factor,
+                            rope_mscale,
                         })
                     } else {
                         None

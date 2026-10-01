@@ -528,6 +528,99 @@ impl CoreTensorOps for CpuDevice {
         ))
     }
 
+    /// Packed embedding gather (A2): rows stay packed (`raw_bytes`) and are
+    /// dequantized on read — O(dim) per token instead of O(vocab*dim) at load.
+    /// Same oracle as `quantized_matmul` (`grim_quant::dequant_*`), so gather
+    /// agrees with matmul by construction. Schemes mirror
+    /// `embedding_has_packed_gather`: Q4K + IQ3S only; IQ2S stays excluded
+    /// (unverified decoder — see modules.rs note).
+    fn embedding_packed(
+        &self,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out_shape: &Shape,
+        dim: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        use grim_tensor::dtype::KQuantScheme;
+        let w = a_storage(weight)?;
+        if w.shape().rank() != 2 {
+            return Err(Error::Shape("embedding_packed: weight must be 2-D".into()));
+        }
+        let vocab = w.shape().dim(0)?;
+        let wdim = w.shape().dim(1)?;
+        if wdim != dim {
+            return Err(Error::Shape(format!(
+                "embedding_packed: weight width {wdim} != dim {dim}"
+            )));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 2 || out_dims[1] != dim || out_dims[0] != indices.len() {
+            return Err(Error::Shape("embedding_packed: out must be [n, dim]".into()));
+        }
+        let scheme = match &w.dtype().storage {
+            Storage::KQuant(s) => *s,
+            other => {
+                return Err(Error::Backend(format!(
+                    "embedding_packed: weight storage is {other:?}, expected a K-quant scheme"
+                )))
+            }
+        };
+        match scheme {
+            KQuantScheme::Q4K | KQuantScheme::IQ3S => {}
+            other => {
+                return Err(Error::Unimplemented(format!(
+                    "embedding_packed: no CPU gather for {other:?}"
+                )))
+            }
+        }
+        // Rows must be whole super-blocks (256 for Q4K/IQ3S); reject rather
+        // than read misaligned bytes.
+        if dim == 0 || dim % 256 != 0 {
+            return Err(Error::Shape(format!(
+                "embedding_packed: dim {dim} must be a non-zero multiple of 256 for {scheme:?}"
+            )));
+        }
+        let raw = w.raw_bytes.as_deref().ok_or_else(|| {
+            Error::Backend("embedding_packed: packed table has no raw_bytes".into())
+        })?;
+        let row_bytes = w.dtype().expected_bytes(dim);
+        if raw.len() % row_bytes != 0 {
+            return Err(Error::Shape(format!(
+                "embedding_packed: packed table of {} B is not a whole number of {row_bytes}-B rows",
+                raw.len()
+            )));
+        }
+        let rows = raw.len() / row_bytes;
+        if rows != vocab {
+            return Err(Error::Shape(format!(
+                "embedding_packed: {rows} packed rows != vocab {vocab}"
+            )));
+        }
+        if let Some(bad) = indices.iter().find(|&&t| (t as usize) >= rows) {
+            return Err(Error::IndexOutOfBounds(format!(
+                "token {bad} >= vocab {rows}"
+            )));
+        }
+        let mut out = vec![0.0f32; indices.len() * dim];
+        for (i, &tok) in indices.iter().enumerate() {
+            let row = &raw[(tok as usize) * row_bytes..(tok as usize + 1) * row_bytes];
+            let deq = match scheme {
+                KQuantScheme::Q4K => grim_quant::dequant_q4k(row, dim).map_err(|e| {
+                    Error::Backend(format!("embedding_packed Q4K dequant: {e}"))
+                })?,
+                KQuantScheme::IQ3S => grim_quant::dequant_iq3s(row, dim).map_err(|e| {
+                    Error::Backend(format!("embedding_packed IQ3S dequant: {e}"))
+                })?,
+                _ => unreachable!("scheme gate above"),
+            };
+            out[i * dim..(i + 1) * dim].copy_from_slice(&deq[..dim]);
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn from_cpu(
         &self,
         data: &[f32],
@@ -812,25 +905,34 @@ impl AttentionOps for CpuDevice {
             .map(|i| {
                 let freq = 1.0 / cfg.base.powf((2 * i) as f32 / d as f32);
                 if let Some(yarn) = &cfg.yarn {
-                    let wavelength = 2.0 * std::f32::consts::PI / freq;
-                    let low = (yarn.original_max_pos as f32) / yarn.beta_slow;
-                    let high = (yarn.original_max_pos as f32) / yarn.beta_fast;
-                    if wavelength < high {
-                        freq
-                    } else if wavelength > low {
-                        freq / yarn.factor
-                    } else {
-                        let ramp = (yarn.original_max_pos as f32 / wavelength - yarn.beta_slow)
-                            / (yarn.beta_fast - yarn.beta_slow);
-                        (1.0 - ramp) * (freq / yarn.factor) + ramp * freq
-                    }
+                    // llama.cpp's YaRN ramp (ggml-cpu/ops.cpp `rope_yarn`) — a
+                    // ramp over the DIMENSION INDEX with bounds from
+                    // ggml_rope_yarn_corr_dims, not the HF wavelength form.
+                    // The two disagree by ~29% on the rotated components for
+                    // Xing4.0 (measured against the reference's own dumps).
+                    let corr = |n_rot: f32| {
+                        (d as f32)
+                            * ((yarn.original_max_pos as f32
+                                / (n_rot * 2.0 * std::f32::consts::PI))
+                                .ln())
+                            / (2.0 * cfg.base.ln())
+                    };
+                    let low = corr(yarn.beta_fast).floor().max(0.0);
+                    let high = corr(yarn.beta_slow)
+                        .ceil()
+                        .min((d.saturating_sub(1)) as f32);
+                    let t = (i as f32 - low) / (high - low).max(0.001);
+                    let ramp = 1.0 - t.clamp(0.0, 1.0);
+                    (freq / yarn.factor) * (1.0 - ramp) + freq * ramp
                 } else {
                     freq
                 }
             })
             .collect();
 
-        let mscale = cfg.yarn.as_ref().map_or(1.0, |y| y.attention_factor);
+        let mscale = cfg.yarn.as_ref().map_or(1.0, |y| {
+            y.rope_mscale.unwrap_or(y.attention_factor) * (1.0 + 0.1 * (y.factor).ln())
+        });
         let mut src = x_st.data().to_vec();
 
         for bi in 0..b {
@@ -910,7 +1012,9 @@ impl AttentionOps for CpuDevice {
             })
             .collect();
 
-        let mscale = cfg.yarn.as_ref().map_or(1.0, |y| y.attention_factor);
+        let mscale = cfg.yarn.as_ref().map_or(1.0, |y| {
+            y.rope_mscale.unwrap_or(y.attention_factor) * (1.0 + 0.1 * (y.factor).ln())
+        });
         let mut src = k_st.data().to_vec();
 
         for bi in 0..b {
@@ -1533,6 +1637,18 @@ impl QuantOps for CpuDevice {
         // This bypasses the ~240 MB f32 dequant materialization of the output head.
         if matches!(format, grim_tensor::QuantFormat::Iq4Nl) && k % 32 == 0 {
             let c = grim_quant::gemm_iq4nl_packed(a_data, b_bytes, m, n, k)?;
+            return Ok((
+                Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
+                Box::new(ReadyHandle),
+            ));
+        }
+
+        // A3 fast path: IQ3_S GEMM directly on the packed bytes, same guard pattern.
+        // IQ3_S covers 256 weights per 110-byte super-block, so whole-block GEMM
+        // requires k % 256 == 0. Bypasses the f32 dequant materialization just
+        // like the Q4K/IQ4_NL paths above.
+        if matches!(format, grim_tensor::QuantFormat::Iq3S) && k % 256 == 0 {
+            let c = grim_quant::gemm_iq3s_packed(a_data, b_bytes, m, n, k)?;
             return Ok((
                 Box::new(CpuStorage::new(c, out_shape.clone(), DType::F32)),
                 Box::new(ReadyHandle),
@@ -3231,6 +3347,80 @@ mod tests {
             approx_eq(&actual, &actual, 1e-3),
             "actual={actual:?} expected={expected:?}"
         );
+    }
+
+    // ── A2: CPU packed embedding gather matches the row oracle ──
+    // `embedding_packed` must return exactly what full-table `dequant_*`
+    // yields for the gathered rows; otherwise packed residency silently
+    // corrupts every downstream block (xing oracle gate rationale).
+    #[test]
+    fn embedding_packed_gather_matches_row_oracle() {
+        use grim_tensor::dtype::{ArithType, KQuantScheme};
+        let dev = CpuDevice::new();
+        let vocab = 4usize;
+        let dim = 256usize;
+        let w_shape = Shape::new(vec![vocab, dim]);
+
+        // Deterministic rows in [-1, 1].
+        let rows: Vec<Vec<f32>> = (0..vocab)
+            .map(|r| {
+                (0..dim)
+                    .map(|i| ((r * dim + i) as f32 * 0.013).sin())
+                    .collect()
+            })
+            .collect();
+
+        for (scheme, quant, dequant) in [
+            (
+                KQuantScheme::Q4K,
+                grim_quant::quant_q4k as fn(&[f32]) -> grim_tensor::error::Result<Vec<u8>>,
+                grim_quant::dequant_q4k as fn(&[u8], usize) -> grim_tensor::error::Result<Vec<f32>>,
+            ),
+            (
+                KQuantScheme::IQ3S,
+                grim_quant::quant_iq3s as fn(&[f32]) -> grim_tensor::error::Result<Vec<u8>>,
+                grim_quant::dequant_iq3s as fn(&[u8], usize) -> grim_tensor::error::Result<Vec<f32>>,
+            ),
+        ] {
+            let mut packed = Vec::new();
+            for row in &rows {
+                packed.extend_from_slice(&quant(row).unwrap());
+            }
+            let row_bytes = packed.len() / vocab;
+            let storage = dev
+                .from_cpu_bytes(
+                    &packed,
+                    &w_shape,
+                    DType {
+                        arith: ArithType::F32,
+                        storage: Storage::KQuant(scheme),
+                    },
+                )
+                .unwrap();
+
+            let indices = vec![3u32, 0, 2, 3, 1];
+            let out_shape = Shape::new(vec![indices.len(), dim]);
+            let (out_s, _) = dev
+                .embedding_packed(storage.as_ref(), &indices, &out_shape, dim)
+                .unwrap();
+            let got = out_s.to_cpu_vec_f32().unwrap();
+
+            for (i, &tok) in indices.iter().enumerate() {
+                let want =
+                    dequant(&packed[(tok as usize) * row_bytes..(tok as usize + 1) * row_bytes], dim)
+                        .unwrap();
+                let got_row = &got[i * dim..(i + 1) * dim];
+                let max_diff = got_row
+                    .iter()
+                    .zip(want.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_diff < 1e-6,
+                    "{scheme:?} row {tok}: max_diff={max_diff}"
+                );
+            }
+        }
     }
 
     // ── 9. kv_dequant_attention CPU reference matches independent dequant+attn ── The CPU backend is

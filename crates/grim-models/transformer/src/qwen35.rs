@@ -4145,6 +4145,94 @@ pub(crate) fn apply_rope_neox(
     }
 }
 
+/// NeoX half-split RoPE with optional YaRN scaling — the yarn-aware counterpart
+/// to [`apply_rope_neox`].
+///
+/// [`apply_rope_neox`] takes only a theta, so every caller through it gets PLAIN
+/// RoPE even when the checkpoint ships `rope.scaling.*`. That is exactly what
+/// bit Xing4.0: its GGUF carries YaRN (factor 64, original context 4096), the
+/// loader parsed it, and the host attention path still rotated with raw
+/// frequencies — the D2D path rotated correctly, so host-vs-device parity could
+/// not see it (the device arm falls back to this same host code when the
+/// launcher declines).
+///
+/// The inv_freq ramp and the mscale are the same math the CPU backend's `rope`
+/// uses, and `rope_mscale` — not `attention_factor` — is the multiplier, because
+/// llama.cpp feeds a different number to ggml_rope_ext than it folds into
+/// kq_scale (for Xing4.0 they are reciprocals).
+/// RoPE with optional YaRN scaling, using llama.cpp's EXACT conventions for
+/// Xing4.0 — both of which were established by measurement against the
+/// reference's own dumped tensors, not by reading:
+///
+///   * INTERLEAVED pairs (2i, 2i+1). The reference logs `rope type = 0`, which
+///     is ggml's ROPE_TYPE_NORM. The earlier "NeoX half-split" reading paired
+///     (i, i+half) and disagreed with the reference by 29% on the rotated
+///     components; interleaved agrees to the arithmetic noise floor.
+///   * llama.cpp's YaRN ramp (ops.cpp `rope_yarn`): theta = freq_scale*theta_e
+///     mixed toward theta_e by a ramp over the DIMENSION INDEX with bounds from
+///     `ggml_rope_yarn_corr_dims` — not the HF-transformers wavelength ramp.
+///   * magnitude: `rope_mscale * (1 + 0.1*ln(1/freq_scale))`, which for
+///     Xing4.0's metadata is 0.70626 * 1.41589 = 1.0. The loader must supply
+///     both factors; they are reciprocals by design.
+///
+/// Verified: k_pe tok0 5.4e-4, tok1 1.2e-3 against `llama-tokenize`-dumped
+/// reference tensors.
+pub fn apply_rope_yarn_interleaved(
+    v: &mut [f32],
+    positions: &[u32],
+    num_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    yarn: Option<&grim_tensor::YaRNParams>,
+) {
+    let half = head_dim / 2;
+    let (freq_scale, ext_factor, corr_dims, mscale_base) = match yarn {
+        None => (1.0f32, 0.0f32, [0.0f32, 0.0f32], 1.0f32),
+        Some(y) => {
+            let freq_scale = 1.0 / y.factor;
+            let corr = |n_rot: f32| {
+                (head_dim as f32)
+                    * ((y.original_max_pos as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln())
+                    / (2.0 * rope_theta.ln())
+            };
+            let start = corr(y.beta_fast).floor().max(0.0);
+            let end = corr(y.beta_slow)
+                .ceil()
+                .min((head_dim.saturating_sub(1)) as f32);
+            let mscale = y.rope_mscale.unwrap_or(y.attention_factor);
+            (freq_scale, 1.0f32, [start, end], mscale)
+        }
+    };
+    let mscale_boost = 1.0 + 0.1 * (1.0f32 / freq_scale).ln();
+
+    for (t, &pos_raw) in positions.iter().enumerate() {
+        let pos = pos_raw as f32;
+        for h in 0..num_heads {
+            let base = (t * num_heads + h) * head_dim;
+            for i in 0..half {
+                let theta_extrap = pos * rope_theta.powf(-((2 * i) as f32) / head_dim as f32);
+                let theta_interp = freq_scale * theta_extrap;
+                let mut theta = theta_interp;
+                let mut ms = mscale_base;
+                if ext_factor != 0.0 {
+                    let y = (i as f32 - corr_dims[0])
+                        / (corr_dims[1] - corr_dims[0]).max(0.001);
+                    let ramp_mix = (1.0 - y.clamp(0.0, 1.0)) * ext_factor;
+                    theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+                    ms *= mscale_boost;
+                }
+
+                // INTERLEAVED: the pair is (2i, 2i+1), not (i, i+half).
+                let x0 = v[base + 2 * i];
+                let x1 = v[base + 2 * i + 1];
+                let (sin, cos) = (theta.sin() * ms, theta.cos() * ms);
+                v[base + 2 * i] = x0 * cos - x1 * sin;
+                v[base + 2 * i + 1] = x0 * sin + x1 * cos;
+            }
+        }
+    }
+}
+
 /// Bound the KV arenas by the VRAM that can actually hold them.
 ///
 /// The arena is sized from the model's context, which for this 27B is 232k and
