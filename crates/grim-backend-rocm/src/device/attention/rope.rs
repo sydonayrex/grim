@@ -52,18 +52,28 @@ impl RocmDevice {
                 match yarn {
                     None => freq,
                     Some(y) => {
-                        let wavelength = 2.0 * std::f32::consts::PI / freq;
-                        let low = y.original_max_pos as f32 / y.beta_slow;
-                        let high = y.original_max_pos as f32 / y.beta_fast;
-                        if wavelength < high {
-                            freq
-                        } else if wavelength > low {
-                            freq / y.factor
-                        } else {
-                            let ramp = (y.original_max_pos as f32 / wavelength - y.beta_slow)
-                                / (y.beta_fast - y.beta_slow);
-                            (1.0 - ramp) * (freq / y.factor) + ramp * freq
-                        }
+                        // llama.cpp's YaRN ramp (ggml-cpu/ops.cpp `rope_yarn`),
+                        // NOT the HF-transformers wavelength formulation that
+                        // used to sit here. The two disagree by ~29% on the
+                        // rotated components for Xing4.0; llama.cpp's is the
+                        // ground truth every checkpoint is validated against.
+                        // The ramp is over the DIMENSION INDEX with bounds
+                        // from ggml_rope_yarn_corr_dims, and mixes the
+                        // interpolated angle with the extrapolated one.
+                        let corr = |n_rot: f32| {
+                            (d as f32)
+                                * ((y.original_max_pos as f32
+                                    / (n_rot * 2.0 * std::f32::consts::PI))
+                                    .ln())
+                                / (2.0 * cfg.base.ln())
+                        };
+                        let low = corr(y.beta_fast).floor().max(0.0);
+                        let high = corr(y.beta_slow)
+                            .ceil()
+                            .min((d.saturating_sub(1)) as f32);
+                        let t = (i as f32 - low) / (high - low).max(0.001);
+                        let ramp = 1.0 - t.clamp(0.0, 1.0);
+                        (freq / y.factor) * (1.0 - ramp) + freq * ramp
                     }
                 }
             })
@@ -73,8 +83,16 @@ impl RocmDevice {
         // mscale for kq_scale, and for some checkpoints (Xing4.0) the two are
         // reciprocals. `rope_mscale: None` keeps every pre-existing checkpoint
         // on `attention_factor`.
+        //
+        // llama.cpp then multiplies by (1 + 0.1*ln(1/freq_scale)) inside
+        // rope_yarn whenever YaRN is active — for Xing4.0 the two factors
+        // cancel to exactly 1.0. The kernel applies `mscale` to cos/sin, so
+        // the boost belongs here with the ramp that gates it.
         let mscale = yarn
-            .map(|y| y.rope_mscale.unwrap_or(y.attention_factor))
+            .map(|y| {
+                y.rope_mscale.unwrap_or(y.attention_factor)
+                    * (1.0 + 0.1 * (y.factor).ln())
+            })
             .unwrap_or(1.0_f32);
 
         // Upload positions and inv_freq to device-resident scratch buffers.

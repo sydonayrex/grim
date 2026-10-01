@@ -159,17 +159,29 @@ extern "C" __global__ void grim_tree_pie_gemm(
             // Decode once, use for every row in the tile.
             unsigned w01 = (unsigned)grim_tree_pie_f16(payload, signs, j)
                          | ((unsigned)grim_tree_pie_f16(payload, signs, j + 1) << 16);
-            for (int t = 0; t < rows; ++t) {
-                unsigned a01 = act2[(((size_t)t * K) + (g * 32 + j)) >> 1];
-                acc[t] = grim_fdot2_f32_f16(a01, w01, acc[t]);
+            // Loop to TP_M_TILE, not to `rows`, and guard inside. `acc` is indexed
+            // by a *compile-time* constant on every iteration, so it stays in
+            // registers. The previous form looped to `rows`, which made the index
+            // runtime-dependent, forced the array into scratch memory, and faulted
+            // the GPU with a page-not-present on every launch -- including from a
+            // standalone module, so it was never the aggregate source.
+            #pragma unroll
+            for (int t = 0; t < TP_M_TILE; ++t) {
+                if (t < rows) {
+                    unsigned a01 = act2[(((size_t)t * K) + (g * 32 + j)) >> 1];
+                    acc[t] = grim_fdot2_f32_f16(a01, w01, acc[t]);
+                }
             }
         }
     }
 
-    for (int t = 0; t < rows; ++t) {
-        float v = acc[t];
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
-        if (lane == 0) C[(size_t)(m0 + t) * N + col] = v;
+    #pragma unroll
+    for (int t = 0; t < TP_M_TILE; ++t) {
+        if (t < rows) {
+            float v = acc[t];
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+            if (lane == 0) C[(size_t)(m0 + t) * N + col] = v;
+        }
     }
 }
 #endif
