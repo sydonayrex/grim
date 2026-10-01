@@ -176,7 +176,7 @@ fn const_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor>
 
 /// Seed the `hc` hyper-connection streams from a device-resident embedding by
 /// writing the same `[seq, hidden]` block into each stream's column range.
-fn seed_streams_device(
+pub fn seed_streams_device(
     x0: &Tensor,
     hc: usize,
     hidden: usize,
@@ -341,6 +341,15 @@ impl Xing40HcGatesD2D {
         h: usize,
         i: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        // The kernel emits comb_out[k*seq + t] with k in the projection's flat
+        // comb order — the same k the host path indexes as comb[t*hc*hc +
+        // dst*hc + src] (see `write_back`, which the reference-dump bisect
+        // pinned at 4.5e-3). So the weight (dst=h <- src=i) lives at row
+        // h*hc + i. The previous i*hc + h reading here was the transposition:
+        // a Sinkhorn output is doubly stochastic, so its transpose normalizes
+        // equally well and row sums CANNOT distinguish the two — the direct
+        // write-back comparison with identical inputs did (1.46e-1 vs 8.5e-7
+        // for the exact post gate).
         Self::weight_row(dev, self.comb.as_ref(), h * self.hc + i, self.seq)
     }
 }
@@ -416,11 +425,14 @@ pub(crate) fn assemble_split_mla_banks(
 /// * `hc_base` `[(2 + hc) * hc]` — per-output bias
 /// * `hc_scale` `[3]` — pre / post / comb logit scales
 pub struct Xing40HyperConnection {
-    hc_fn: Linear,
+    /// Pub for the stage-isolation oracle (`mhc_device_stage_probe_binary`):
+    /// it must run norm and projection separately to split a device divergence.
+    pub hc_fn: Linear,
     hc_base: Vec<f32>,
     hc_scale: [f32; 3],
     /// Unweighted RMSNorm over the flattened stream vector (`hidden * hc_mult`).
-    input_norm: RmsNorm,
+    /// Pub for the same oracle.
+    pub input_norm: RmsNorm,
     hc_mult: usize,
     hidden_size: usize,
     sinkhorn_iters: usize,
@@ -529,9 +541,22 @@ impl Xing40HyperConnection {
 
     /// Unweighted RMSNorm + the gate projection, kept on-device (the big matmul),
     /// returning the `[seq, (2+hc)*hc]` projection for the tiny host-side gate math.
-    fn project(&self, streams: &Tensor) -> Result<Vec<f32>> {
+    /// Pub for the stage-isolation oracle (`mhc_device_stage_probe_binary`).
+    pub fn project(&self, streams: &Tensor) -> Result<Vec<f32>> {
         let normed = self.input_norm.forward(streams)?;
         Ok(self.hc_fn.forward(&normed)?.to_vec_f32()?)
+    }
+
+    /// Gate bias and logit scales, for the oracle that checks the LOADED
+    /// wiring against the reference's own dumped `hc_attn_base` / `hc_scale`.
+    pub fn gate_params(&self) -> (&[f32], &[f32; 3]) {
+        (&self.hc_base, &self.hc_scale)
+    }
+
+    /// The loaded `hc_fn` weight, for the oracle that pins WHICH matrix
+    /// (attn or ffn) actually landed in this module.
+    pub fn hc_fn_weight(&self) -> &Tensor {
+        &self.hc_fn.weight
     }
 
     /// Reference gate math: sigmoid gates + clamped Sinkhorn combiner.
@@ -660,6 +685,14 @@ impl Xing40HyperConnection {
     /// flattened stream vector, the `hc_fn` projection, and the fused
     /// sigmoid + Sinkhorn gate math (`grim_mhc_gates`) all stay on device.
     pub fn gates_d2d(&self, streams: &Tensor) -> Result<Xing40HcGatesD2D> {
+        self.gates_d2d_with_proj(streams).map(|(g, _)| g)
+    }
+
+    /// Oracle entry point: [`Self::gates_d2d`] plus the raw `hc_fn` projection
+    /// that produced the gates. A parity gate has to compare the LOGITS the
+    /// kernel consumed against the reference's own `hc_mixes`, and this is the
+    /// alternative to making the module's fields public.
+    pub fn gates_d2d_with_proj(&self, streams: &Tensor) -> Result<(Xing40HcGatesD2D, Vec<f32>)> {
         let ordinal = rocm_ordinal(streams)?;
         let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
         let hc = self.hc_mult;
@@ -680,13 +713,14 @@ impl Xing40HyperConnection {
             self.clamp_min,
             self.clamp_max,
         )?;
-        Ok(Xing40HcGatesD2D {
+        let proj_host = proj.to_vec_f32()?;
+        Ok((Xing40HcGatesD2D {
             pre: gates.pre,
             post: gates.post,
             comb: gates.comb,
             hc,
             seq,
-        })
+        }, proj_host))
     }
 
     /// Collapse the `hc_mult` streams into the single block input:
@@ -865,12 +899,17 @@ impl Xing40Mla {
         // (same defect c1352622 fixed for Qwen3.5). YaRN from the checkpoint
         // (`rope.scaling.type = yarn`) rides along.
         let rope = {
+            // INTERLEAVED (ggml ROPE_TYPE_NORM = 0 — the reference logs exactly
+            // this). An earlier `rc.interleaved = false` here claimed
+            // DeepSeek-style NeoX half-split and was refuted by measurement:
+            // the reference's own k_pe tensors agree with interleaved to ~1e-3
+            // and disagree with NeoX by 29%.
             let mut rc = grim_tensor::RopeConfig::new(cfg.qk_rope_head_dim, cfg.rope_theta);
-            rc.interleaved = false;
+            rc.interleaved = true;
             rc.yarn = cfg.rope_yarn;
             Rope::from_config(rc)
         };
-        let mut out = if ws.has_tensor("attn_k_b.weight") {
+        let out = if ws.has_tensor("attn_k_b.weight") {
             // ---- GGUF container ----
             let q_a_proj = Linear::load_shape(
                 &ws.scoped("attn_q_a"),
@@ -1006,7 +1045,16 @@ impl Xing40Mla {
                 w_vc_t_dev: OnceLock::new(),
             }
         };
-        out.rope = Rope::new(cfg.qk_rope_head_dim, cfg.rope_theta);
+        // NOTE: deliberately NOT rebuilt here. An earlier version re-assigned
+        // `out.rope = Rope::new(...)` "to be sure", which threw away the YaRN
+        // config built above and replaced it with a fresh default (yarn: None).
+        // Every consumer of `self.rope.config` — the host rope, the D2D rope,
+        // AND the kq_scale mscale — then ran plain RoPE with mscale 1.0 no
+        // matter what the loader parsed, while host and device agreed with each
+        // other (both got None) and every internal parity gate stayed green.
+        // The reference comparison caught it: attention diverged 60x above the
+        // arithmetic noise floor at blk.0 and compounded to ~100% by layer 9.
+        // The checkpoint's own `rope` (base, theta, YaRN) is the one built above.
         Ok(out)
     }
 
@@ -1091,12 +1139,16 @@ impl Xing40Mla {
             self.qk_rope_head_dim,
         );
 
-        crate::qwen35::apply_rope_neox(
+        // The checkpoint's OWN rope — base and YaRN — not a hardcoded theta.
+        // Plain RoPE here while the D2D path rotated with YaRN is what made the
+        // host reference disagree with llama.cpp from blk.0 onward.
+        crate::qwen35::apply_rope_yarn_interleaved(
             &mut q_rope_v,
             positions,
             self.num_heads,
             self.qk_rope_head_dim,
-            10000.0,
+            self.rope.config.base,
+            self.rope.config.yarn.as_ref(),
         );
 
         // 2. KV latent projection.
@@ -1114,7 +1166,14 @@ impl Xing40Mla {
         let kv_a_t = cpu_tensor(kv_a_v, Shape::new(vec![seq_len, kv_rank]));
         let kv_a_normed = self.kv_a_layernorm.forward(&kv_a_t)?;
 
-        crate::qwen35::apply_rope_neox(&mut k_rope_v, positions, 1, self.qk_rope_head_dim, 10000.0);
+        crate::qwen35::apply_rope_yarn_interleaved(
+            &mut k_rope_v,
+            positions,
+            1,
+            self.qk_rope_head_dim,
+            self.rope.config.base,
+            self.rope.config.yarn.as_ref(),
+        );
 
         // 3. Absorb w_kc into the query so attention runs in latent space.
         let kv_a_normed_v = kv_a_normed.to_vec_f32()?;
@@ -1330,8 +1389,8 @@ impl Xing40Mla {
                     base: self.rope.config.base,
                     rotary_dim: rope_d,
                     yarn: self.rope.config.yarn,
-                    // matches the host `apply_rope_neox` pairing
-                    interleaved: false,
+                    // INTERLEAVED — see the note at rope construction.
+                    interleaved: true,
                 },
                 &Shape::new(vec![1, seq_len, rope_d]),
             ))?
@@ -1442,12 +1501,19 @@ impl Xing40Mla {
             k_pe.as_ref(),
             positions,
             // Checkpoint rope (base + YaRN), matching the host reference.
+            // INTERLEAVED — same pairing as the q_pe rotation above and the
+            // host path; the reference logs rope type 0 (ggml ROPE_TYPE_NORM).
+            // This site alone read `interleaved: false` (NeoX half-split),
+            // which is invisible at position 0 — no rotation — and grew with
+            // position and input magnitude: the real-prompt chain read
+            // dev-vs-host 1.8e-1 at blk.0 while the random-input repro read
+            // 1.2e-2, both localized here by the stage bisect.
             &RopeConfig {
                 dim: rope_d,
                 base: self.rope.config.base,
                 rotary_dim: rope_d,
                 yarn: self.rope.config.yarn,
-                interleaved: false,
+                interleaved: true,
             },
             &Shape::new(vec![1, seq_len, rope_d]),
         ))?
