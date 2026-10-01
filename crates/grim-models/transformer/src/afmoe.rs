@@ -69,6 +69,7 @@ impl AfMoe {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
         let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
         Ok(Self {

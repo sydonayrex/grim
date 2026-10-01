@@ -722,6 +722,7 @@ mod tests {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
         let target = Box::new(MockCausalLm {
             cfg: cfg.clone(),
@@ -809,6 +810,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
         let target = Box::new(MockCausalLm {
             cfg: cfg.clone(),
@@ -899,6 +901,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
         let target = Box::new(MockCausalLm {
             cfg: cfg.clone(),
@@ -996,6 +999,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
         let target = Box::new(MockCausalLm {
             cfg: cfg.clone(),

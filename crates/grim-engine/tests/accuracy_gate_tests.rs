@@ -134,6 +134,7 @@ fn golden_llama_activations() -> Vec<f32> {
             partial_rotary_factor: 1.0,
             yarn: None,
             max_seq_len: 256,
+            ..Default::default()
         },
     );
     let mut session = Inner::new(Device::Cpu);

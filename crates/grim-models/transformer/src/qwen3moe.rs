@@ -80,6 +80,7 @@ impl Qwen3Moe {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
 
         // Qwen3-MoE routes every layer through the MoE block: softmax router,

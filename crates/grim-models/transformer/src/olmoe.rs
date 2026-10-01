@@ -74,6 +74,7 @@ impl Olmoe {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
 
         // If num_experts > 0, wire through MoE blocks (OLMoE: 64 experts, 8 active, top-k softmax)

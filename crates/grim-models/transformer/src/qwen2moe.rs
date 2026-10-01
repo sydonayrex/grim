@@ -79,6 +79,7 @@ impl Qwen2Moe {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
 
         // If num_experts > 0, wire through MoE blocks (Qwen2-MoE: 60 routed experts, 4 active, optional shared expert)

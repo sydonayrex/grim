@@ -2257,6 +2257,93 @@ mod tests {
         cpu_tensor(data, Shape::new(shape.to_vec()))
     }
 
+    /// `attn_post_norm` is applied to the attention output BEFORE the residual
+    /// add, per `olmo2.cpp:157-162`:
+    ///
+    /// ```text
+    /// cur = build_norm(cur, attn_post_norm, NULL, LLM_NORM_RMS, il);  // :157
+    /// ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);              // :162
+    /// ```
+    ///
+    /// This drives the REAL block and reads the residual term back, by setting
+    /// `ffn_disabled` so `forward` returns `added` instead of running the FFN.
+    ///
+    /// Two earlier attempts at this test failed to catch the bug they were
+    /// written for:
+    ///
+    /// * `tests/attn_post_norm.rs` re-implemented the arithmetic inside the
+    ///   test, so it verified itself. Moving the post-norm after the add -- the
+    ///   exact ordering the reference rules out -- passed all 281 library
+    ///   tests.
+    /// * A first version of this test used the same helper and only proved
+    ///   that the two orders differ in the abstract, which is still true no
+    ///   matter which one the block picks. It asserted a property of
+    ///   arithmetic, not of the block.
+    ///
+    /// So the assertion here is exact: the block's residual term equals
+    /// `norm(attn_out) + x`, and does NOT equal `norm(attn_out + x)`.
+    #[test]
+    fn attn_post_norm_runs_before_the_residual_add() {
+        let mut block = small_block();
+        let hidden = small_cfg().hidden_size;
+        // Return the post-attention residual instead of running the FFN, so
+        // the value under test is exactly the one the ordering decides.
+        block.ffn_disabled = true;
+        block.attn_post_norm = Some(make_norm(hidden));
+
+        let x = make_tensor(
+            (0..hidden).map(|i| i as f32 * 0.1 - 0.5).collect::<Vec<f32>>(),
+            &[1, hidden],
+        );
+        let positions = [0u32];
+        let got = block.forward(&x, &positions).unwrap().to_vec_f32().unwrap();
+
+        // Recompute the block's own intermediate values.
+        let x_norm = block.attn_norm.forward(&x).unwrap();
+        let q = block.wq.forward(&x_norm).unwrap();
+        let k = block.wk.forward(&x_norm).unwrap();
+        let v = block.wv.forward(&x_norm).unwrap();
+        let q = block.apply_rope_multi_head(&q, &positions, 2).unwrap();
+        let k = block.apply_rope_multi_head(&k, &positions, 1).unwrap();
+        let (ctx, _) = block
+            .prefilled_self_attention(&q, &k, &v, &positions, None, &mut false)
+            .unwrap();
+        let attn_out = block.wo.forward(&ctx).unwrap();
+        let post = block.attn_post_norm.as_ref().unwrap().forward(&attn_out).unwrap();
+
+        let xv = x.to_vec_f32().unwrap();
+        let postv = post.to_vec_f32().unwrap();
+        let want_before: Vec<f32> = postv.iter().zip(&xv).map(|(a, b)| a + b).collect();
+        let summed: Vec<f32> = attn_out
+            .to_vec_f32()
+            .unwrap()
+            .iter()
+            .zip(&xv)
+            .map(|(a, b)| a + b)
+            .collect();
+        let want_after = block
+            .attn_post_norm
+            .as_ref()
+            .unwrap()
+            .apply(&summed, None, None);
+
+        let close = |a: &[f32], b: &[f32]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(u, w)| (u - w).abs() < 1e-4 * (1.0 + u.abs().max(w.abs())))
+        };
+        assert!(
+            close(&got, &want_before),
+            "block did not apply the post-norm before the residual add"
+        );
+        assert!(
+            !close(&got, &want_after),
+            "block output matches norming AFTER the add, which is the \
+             olmo2.cpp:162 ordering the reference rules out"
+        );
+    }
+
     /// Phase-1 correctness proof at the block level: a `LlamaBlock` driven through the paged-KV path (session-backed page tensors + block table) must produce byte-identical attention output to the same block driven through the classic per-layer `LlamaLayerCache` path, for both prefill (multi-token) and decode (single-token) shapes.
     /// This is the invariant that lets the engine re-enable prefix-cache/tiering wiring on top of the.
     #[test]
@@ -2754,6 +2841,7 @@ mod tests {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
         let provider = FullProvider { tensors };
         let ws = WeightSource::root(&provider, Device::Cpu);
@@ -2836,6 +2924,7 @@ mod tests {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
 
         // (name, out_dim, in_dim) for every weight the block loads.

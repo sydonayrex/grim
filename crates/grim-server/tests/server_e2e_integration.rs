@@ -36,6 +36,7 @@ fn create_test_state() -> Arc<AppState> {
             max_seq_len: 512,
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);

@@ -30,6 +30,7 @@ fn test_llama_forward_and_kv_evolution() {
         max_seq_len: 128,
         partial_rotary_factor: 1.0,
         yarn: None,
+        ..Default::default()
     };
     let model = Llama::random(Device::Cpu, config);
     let mut session = Inner::new(Device::Cpu);

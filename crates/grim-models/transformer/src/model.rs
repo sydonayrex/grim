@@ -9,10 +9,10 @@ use grim_core::hyperparams::ArchHyperparameters;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::RmsNorm;
 use grim_nn::Rope;
 use grim_nn::{
-    ColumnParallelLinear, Embedding, Linear, Norm, NormKind, RowParallelLinear, TensorParallelConfig,
+    ColumnParallelLinear, Embedding, Linear, Norm, NormKind, RowParallelLinear,
+    TensorParallelConfig,
 };
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
@@ -37,8 +37,48 @@ pub struct LlamaConfig {
     pub partial_rotary_factor: f32,
     /// YaRN RoPE scaling parameters. `None` ⇒ plain RoPE.
     pub yarn: Option<grim_tensor::YaRNParams>,
+    /// Which normalisation the per-layer and final norms apply. RMS is the
+    /// default because it is what every architecture used before `Norm`
+    /// existed, so `..Default::default()` reproduces the old behaviour.
+    pub norm_kind: NormKind,
+    /// Whether the norms carry a bias (`attn_norm_b` / `ffn_norm_b` /
+    /// `output_norm_b`). Ten references create them; `olmo` creates none.
+    pub has_norm_bias: bool,
+    /// Whether `attn_post_norm` exists. Fifteen references create it.
+    pub has_attn_post_norm: bool,
 }
 
+/// Sequential residual unless a checkpoint says otherwise. See
+/// `gptneox.cpp:143`, the only reference that branches it.
+pub const DEFAULT_PARALLEL_RESIDUAL: bool = false;
+
+impl Default for LlamaConfig {
+    /// Every field that `LlamaConfig` needs but has no natural zero.
+    ///
+    /// This exists so the ~110 `LlamaConfig` literals can say
+    /// `..Default::default()` instead of each repeating the norm defaults.
+    /// Without it every call site has to track every new field, which is how
+    /// adding one field became a 110-file change.
+    fn default() -> Self {
+        Self {
+            vocab_size: 0,
+            hidden_size: 0,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 0,
+            num_layers: 1,
+            intermediate_size: 0,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            max_seq_len: 2048,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+            norm_kind: NormKind::Rms,
+            has_norm_bias: false,
+            has_attn_post_norm: false,
+        }
+    }
+}
 
 impl LlamaConfig {
     /// Derived rotary dim: `round(head_dim * partial_rotary_factor)`, clamped to `head_dim`.
@@ -74,7 +114,10 @@ pub struct Llama {
     /// Per-layer optional MoE routing block. `Some` for MoE layers (the corresponding `LlamaBlock.ffn_disabled` is
     /// set, so the dense FFN is skipped and this router+expert bank runs instead).
     pub moe_blocks: Vec<Option<MoeBlock>>,
-    pub norm: RmsNorm,
+    /// Final norm before the output projection. A `Norm` rather than an
+    /// `RmsNorm`: eleven references apply `LLM_NORM` here, and twenty create
+    /// `output_norm_b` -- see `Norm::load`.
+    pub norm: Norm,
     pub output: Linear,
     /// Device assignment for each transformer layer. Defaults to the model
     /// device; farm/pipeline callers may replace it with contiguous segments.
@@ -108,7 +151,15 @@ impl Llama {
                 tp,
             )?);
         }
-        let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        // Kind and bias come from the config, not from a guess: the final
+        // norm is `LLM_NORM` with `output_norm_b` in eleven references.
+        let norm = Norm::load(
+            &ws.pp("norm"),
+            cfg.hidden_size,
+            cfg.norm_kind,
+            cfg.rms_norm_eps,
+            cfg.has_norm_bias,
+        )?;
         let output = match Linear::load_column_parallel(
             &ws.pp("output"),
             cfg.hidden_size,
@@ -134,7 +185,11 @@ impl Llama {
         let check_not_zeroed =
             |name: &str, tensor: &grim_tensor::Tensor| weights_look_broken(name, tensor);
         check_not_zeroed("tok_embeddings", &tok_embeddings.weight)?;
-        check_not_zeroed("norm", &norm.weight)?;
+        // A norm weight may legitimately be absent (`olmo.cpp:65-67` passes
+        // NULL), so only a present one can be checked for zero-init.
+        if let Some(w) = norm.weight.as_ref() {
+            check_not_zeroed("norm", w)?;
+        }
         check_not_zeroed("output", output.weight())?;
         for (i, layer) in layers.iter().enumerate() {
             // A norm weight may legitimately be absent -- `olmo.cpp:65-67`
@@ -234,7 +289,15 @@ impl Llama {
             }
             layers.push(block);
         }
-        let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        // Kind and bias come from the config, not from a guess: the final
+        // norm is `LLM_NORM` with `output_norm_b` in eleven references.
+        let norm = Norm::load(
+            &ws.pp("norm"),
+            cfg.hidden_size,
+            cfg.norm_kind,
+            cfg.rms_norm_eps,
+            cfg.has_norm_bias,
+        )?;
         let output = match Linear::load_column_parallel(
             &ws.pp("output"),
             cfg.hidden_size,
@@ -403,10 +466,13 @@ impl Llama {
             });
         }
 
-        let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
-            eps: cfg.rms_norm_eps,
-        };
+        // A `Norm` final norm, on the fused rms path: a weight of ones keeps
+        // RMSNorm and LayerNorm numerically identical for random input.
+        let mut norm = Norm::new(NormKind::Rms, cfg.rms_norm_eps);
+        norm.weight = Some(cpu_tensor(
+            vec![1.0; cfg.hidden_size],
+            Shape::new(vec![cfg.hidden_size]),
+        ));
         let output = linear(cfg.vocab_size, cfg.hidden_size);
         Self {
             cfg: cfg.clone(),
@@ -692,6 +758,7 @@ mod tests {
             max_seq_len: 512,
             partial_rotary_factor: prf,
             yarn: None,
+        ..Default::default()
         }
     }
 
@@ -737,6 +804,7 @@ mod tests {
             max_seq_len: 512,
             partial_rotary_factor: 1.0,
             yarn: None,
+        ..Default::default()
         };
         let model = Llama::random(Device::Cpu, cfg.clone());
         let seq = 3usize;

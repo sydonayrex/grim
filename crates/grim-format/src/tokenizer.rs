@@ -27,6 +27,16 @@ pub struct GgufTokenizer {
     pub chat_template: Option<String>,
     /// Model architecture name (e.g. "lfm2", "qwen2", "llama").
     pub architecture: Option<String>,
+    /// Tokens the GGUF marks as added / control through `tokenizer.ggml.token_type`
+    /// (llama.cpp `llama_token_type`: CONTROL, USER_DEFINED, UNKNOWN, BYTE).
+    ///
+    /// These must be matched as WHOLE tokens and never merged with their
+    /// neighbours. Many GGUFs — Xing4.0 among them — carry neither a
+    /// `tokenizer.ggml.added_tokens` array nor a `merges` array, so the token
+    /// type is the ONLY place the control vocabulary is recorded. Without it
+    /// `<_system>` shatters into `<` `_` `system` `>`, and the model is fed a
+    /// structurally different prompt than the one it was trained on.
+    pub added_tokens: Vec<String>,
 }
 
 impl Default for GgufTokenizer {
@@ -44,11 +54,48 @@ impl Default for GgufTokenizer {
             unk_token_id: None,
             chat_template: None,
             architecture: None,
+            added_tokens: Vec::new(),
         }
     }
 }
 
 impl GgufTokenizer {
+    /// Collect the control / added vocabulary from `tokenizer.ggml.token_type`.
+    ///
+    /// llama.cpp's `llama_token_type` (llama.h):
+    /// `UNDEFINED = 0, NORMAL = 1, UNKNOWN = 2, CONTROL = 3, USER_DEFINED = 4,
+    /// UNUSED = 5, BYTE = 6`. Its `special_tokens_cache` — the set the
+    /// tokenizer partitions text on before any BPE or SPM work — is built from
+    /// everything that is not `NORMAL`/`UNDEFINED`/`UNUSED`. `BYTE` is excluded
+    /// here because it names raw byte pieces, not a control surface, and
+    /// admitting it would let a single byte swallow real text.
+    fn added_tokens_from_types(
+        metadata: &HashMap<String, GgufValue>,
+        tokens: &[String],
+    ) -> Vec<String> {
+        let Some(types) = metadata
+            .get("tokenizer.ggml.token_type")
+            .and_then(|v| v.as_array())
+        else {
+            return Vec::new();
+        };
+        if types.len() != tokens.len() {
+            // A length mismatch means the two arrays do not describe the same
+            // vocabulary. Guessing here would silently mis-slice every id
+            // after the divergence, so take nothing.
+            return Vec::new();
+        }
+        tokens
+            .iter()
+            .zip(types)
+            .filter(|(_, ty)| {
+                let t = ty.as_i32().or_else(|| ty.as_u32().map(|v| v as i32)).unwrap_or(1);
+                matches!(t, 2 | 3 | 4)
+            })
+            .map(|(tok, _)| tok.clone())
+            .collect()
+    }
+
     /// Return pad token ID if found, otherwise default to 0.
     pub fn pad_token_id(&self) -> u32 {
         self.token_to_id
@@ -104,7 +151,11 @@ impl GgufTokenizer {
             token_to_id.insert(token.clone(), id as u32);
         }
 
-        // Merge added_tokens (special tokens) that may not be in model.vocab
+        // Merge added_tokens (special tokens) that may not be in model.vocab.
+        // Their contents are ALSO the control surface this tokenizer must
+        // partition text on before any BPE work — a HF container declares them
+        // inline here, where a GGUF only records them via `token_type`.
+        let mut hf_added: Vec<String> = Vec::new();
         if let Some(added) = root.get("added_tokens").and_then(|v| v.as_array()) {
             for entry in added {
                 let content = entry.get("content").and_then(|v| v.as_str());
@@ -116,6 +167,7 @@ impl GgufTokenizer {
                     }
                     id_to_token[id] = t.to_string();
                     token_to_id.insert(t.to_string(), id as u32);
+                    hf_added.push(t.to_string());
                 }
             }
         }
@@ -197,6 +249,7 @@ impl GgufTokenizer {
             unk_token_id,
             chat_template: None,
             architecture: None,
+            added_tokens: hf_added,
         })
     }
 
@@ -331,6 +384,8 @@ impl GgufTokenizer {
             None
         };
 
+        let added_tokens = Self::added_tokens_from_types(metadata, &tokens);
+
         Ok(Self {
             tokens,
             token_to_id,
@@ -344,6 +399,7 @@ impl GgufTokenizer {
             unk_token_id,
             chat_template,
             architecture,
+            added_tokens,
         })
     }
 
@@ -395,8 +451,22 @@ impl GgufTokenizer {
             return out;
         }
 
-        // Special tokens that should pass through directly
-        let special_tokens = [
+        // Special tokens that should pass through directly.
+        //
+        // The GGUF's OWN control vocabulary comes first: `tokenizer.ggml.token_type`
+        // is the only record of it for GGUFs that ship no `added_tokens` array
+        // (Xing4.0 among them), and a hardcoded list alone silently shredded
+        // `<_system>` / `<_user>` / `<_bot>` / `<think>` into sub-word pieces —
+        // a structurally different prompt, which is what made the whole model
+        // output gibberish while every math gate stayed green. The generic list
+        // stays as a fallback for GGUFs that declare no token types at all.
+        let mut special_tokens: Vec<&str> = self
+            .added_tokens
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| self.token_to_id.contains_key(*s))
+            .collect();
+        special_tokens.extend([
             "<|startoftext|>",
             "<|endoftext|>",
             "<|pad|>",
@@ -407,7 +477,7 @@ impl GgufTokenizer {
             "<|assistant|>",
             "<s>",
             "</s>",
-        ];
+        ]);
 
         // For byte-level BPE tokenizers (model_type == "bpe"), use the GPT-2 byte encoder
         // to map text → byte-level unicode chars, then apply BPE merges rank-by-rank.
@@ -415,7 +485,53 @@ impl GgufTokenizer {
             return self.encode_bpe(text, &special_tokens);
         }
 
-        // Legacy path: SentencePiece / llama-style tokenizers
+        // Legacy path: SentencePiece / llama-style tokenizers. Added tokens are
+        // partitioned out FIRST (leftmost-longest), exactly as llama.cpp's
+        // `tokenizer_st_partition` does, and each remaining segment goes
+        // through the character + score-merge encoder below.
+        //
+        // Partitioning first is not optional: the merge loop rebuilds a merged
+        // token by concatenating two ADJACENT ids and looking the result up.
+        // Once `<_system>` has been split into `<`, `_`, `system`, `>` no
+        // sequence of merges can get back to the single vocab entry — the id
+        // only exists whole. That is why the control tokens used to reach the
+        // model shredded.
+        let mut out: Vec<u32> = Vec::new();
+        let mut rest = text;
+        loop {
+            let mut found: Option<(&str, usize)> = None;
+            for st in &special_tokens {
+                if let Some(pos) = rest.find(st) {
+                    match found {
+                        None => found = Some((st, pos)),
+                        Some((cur, cur_pos)) => {
+                            if pos < cur_pos || (pos == cur_pos && st.len() > cur.len()) {
+                                found = Some((st, pos));
+                            }
+                        }
+                    }
+                }
+            }
+            let Some((st, pos)) = found else {
+                if !rest.is_empty() {
+                    out.extend(self.encode_legacy_chunk(rest));
+                }
+                break;
+            };
+            let (before, after) = rest.split_at(pos);
+            if !before.is_empty() {
+                out.extend(self.encode_legacy_chunk(before));
+            }
+            out.push(self.token_to_id[st]);
+            rest = &after[st.len()..];
+        }
+        return out;
+    }
+
+    /// SentencePiece / llama-style encoding of one segment that contains no
+    /// added tokens: map to the `▁` space convention, emit per-character ids
+    /// (with byte fallback), then greedily merge adjacent pairs by score.
+    fn encode_legacy_chunk(&self, text: &str) -> Vec<u32> {
         let uses_gpt2_bpe = self.token_to_id.keys().any(|k| k.contains('\u{0120}'));
         let uses_sentencepiece = self.token_to_id.keys().any(|k| k.contains('\u{2581}'));
 
@@ -558,12 +674,22 @@ impl GgufTokenizer {
         let mut remaining = text;
 
         loop {
-            // Try to match the longest special token at the current position
+            // Leftmost-longest, matching llama.cpp's added-token partition: the
+            // earliest match wins, and TIES at the same offset go to the longer
+            // token. Earliest-only is wrong now that the real control vocabulary
+            // is in play — `<s>` and `<|startoftext|>`-style families put a
+            // short token at the same offset as a long one, and taking the
+            // short one leaves a tail that no longer parses.
             let mut found_special: Option<(&str, usize)> = None;
             for st in special_tokens {
                 if let Some(pos) = remaining.find(st) {
-                    if found_special.is_none() || pos < found_special.unwrap().1 {
-                        found_special = Some((st, pos));
+                    match found_special {
+                        None => found_special = Some((st, pos)),
+                        Some((cur, cur_pos)) => {
+                            if pos < cur_pos || (pos == cur_pos && st.len() > cur.len()) {
+                                found_special = Some((st, pos));
+                            }
+                        }
                     }
                 }
             }
@@ -2031,6 +2157,7 @@ mod leading_space_tests {
             unk_token_id: None,
             chat_template: None,
             architecture: None,
+            added_tokens: Vec::new(),
         }
     }
 
@@ -2098,5 +2225,92 @@ mod leading_space_tests {
             ids[0], ids[1],
             "the two words must not collapse onto one token"
         );
+    }
+}
+
+#[cfg(test)]
+mod xing_added_token_tests {
+
+    /// Xing4.0's control tokens must survive tokenization as SINGLE ids.
+    ///
+    /// The reference (llama.cpp `llama-tokenize`, same GGUF) turns the chat
+    /// template's `<_system>`, `<_user>`, `<_bot>` and `<think>` into ids
+    /// 6 / 4 / 5 / 9. A tokenizer that does not know those are added tokens
+    /// runs them through ordinary BPE and shreds them into `<`, `_`,
+    /// `system`, `>` — 4 tokens instead of 1, with a spurious `▁` prefix.
+    ///
+    /// This is not a cosmetic difference. The model is fed a structurally
+    /// different prompt than it was trained on, which is why the whole
+    /// Xing4.0 output was gibberish while every math gate stayed green: the
+    /// gates compare device against host, and both were fed the same wrong
+    /// token sequence.
+    ///
+    /// The full expected id list is the reference's, verbatim.
+    #[test]
+    fn xing40_control_tokens_encode_as_single_added_tokens() {
+        let Ok(path) = std::env::var("XING_GGUF") else {
+            eprintln!("skipped: XING_GGUF not set");
+            return;
+        };
+        let system = "<_system>你是中国电信星辰语义大模型，英文名是Xing，你是由中电信人工智能科技有限公司研发的人工智能助手。";
+        let text_suffix = "<_user>The capital of France is<_bot><think>";
+        let text = format!("{system}\n{text_suffix}");
+        let expected: Vec<u32> = vec![
+            6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
+            124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
+            124395, 35, 4, 511, 5756, 435, 8062, 468, 5, 9,
+        ];
+
+        let prov = crate::tprov::GgufProvider::open(&path).expect("open gguf");
+        let tok = prov.tokenizer().expect("build tokenizer");
+        let got = tok.encode(&text);
+
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "token count {} != reference {} — added tokens are being split.\n  got:      {got:?}\n  expected: {expected:?}",
+            got.len(),
+            expected.len()
+        );
+        assert_eq!(got, expected, "token ids differ from the reference");
+
+        // The FULL chat-template render, not just the hand-written string: the
+        // template's trailing "\n" must survive the segment split intact. The
+        // reference (llama-tokenize, same GGUF) gives 38 ids here, ending
+        // `<think>`(9), `▁`(124361), `\n`(35) — the lone space token before the
+        // newline is what the reference produces too, so the SentencePiece
+        // dummy prefix on a trailing newline is NOT a bug and must not be
+        // "cleaned up".
+        let rendered = format!("{system}\n\n\n{text_suffix}\n");
+        let want_tail: Vec<u32> = vec![
+            6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
+            124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
+            124395, 35, 35, 35, 4, 511, 5756, 435, 8062, 468, 5, 9, 124361, 35,
+        ];
+        let got_tail = tok.encode(&rendered);
+        assert_eq!(
+            got_tail, want_tail,
+            "the template-rendered prompt must encode to the reference's 38 ids"
+        );
+    }
+
+    /// The added-token set must come from the GGUF's own
+    /// `tokenizer.ggml.token_type`, not from a hardcoded list. This GGUF has NO
+    /// `added_tokens` and NO `merges` array — the only place the control tokens
+    /// are identified is their token type.
+    #[test]
+    fn xing40_added_tokens_come_from_token_type_metadata() {
+        let Ok(path) = std::env::var("XING_GGUF") else {
+            eprintln!("skipped: XING_GGUF not set");
+            return;
+        };
+        let prov = crate::tprov::GgufProvider::open(&path).expect("open gguf");
+        let added = prov.tokenizer().expect("build tokenizer").added_tokens;
+        for want in ["<_system>", "<_user>", "<_bot>", "<think>"] {
+            assert!(
+                added.iter().any(|t| t == want),
+                "`{want}` must be recognised as an added token; got {added:?}"
+            );
+        }
     }
 }

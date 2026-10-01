@@ -145,6 +145,7 @@ async fn test_adapter_load_endpoint() {
             max_seq_len: 2048,
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -247,6 +248,7 @@ async fn test_get_and_delete_model_endpoints() {
             max_seq_len: 2048,
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("llama-3", mock_model);
@@ -457,6 +459,7 @@ async fn test_completions_endpoint() {
             max_seq_len: 2048,
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -631,6 +634,7 @@ async fn chat_completions_accepts_session_field() {
             max_seq_len: 2048,
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -690,6 +694,7 @@ async fn chat_completions_accepts_x_grim_session_header() {
             max_seq_len: 2048,
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -749,6 +754,7 @@ async fn test_server_engine_end_to_end_non_streaming() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -817,6 +823,7 @@ fn test_state_with_model(name: &str) -> Arc<AppState> {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model(name, mock_model);
@@ -1283,6 +1290,7 @@ async fn test_chat_completions_routes_through_named_plugin_sampler() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1355,6 +1363,7 @@ async fn test_chat_completions_missing_sampler_name_falls_back() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1418,6 +1427,7 @@ async fn test_server_engine_end_to_end_streaming() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1478,6 +1488,7 @@ async fn test_server_strict_unknown_field_rejection() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1550,6 +1561,7 @@ async fn test_server_determinism_mismatch_strict() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1609,6 +1621,7 @@ async fn test_server_unknown_adapter_rejection() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1674,6 +1687,7 @@ async fn test_empty_messages_returns_structured_error() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1732,6 +1746,7 @@ async fn test_grim_compatibility_shims() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -1839,6 +1854,7 @@ async fn test_chat_completions_honors_max_tokens() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2073,6 +2089,7 @@ fn test_app_state() -> Arc<AppState> {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2106,6 +2123,7 @@ async fn test_chat_completions_honors_stop_sequence() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2181,6 +2199,7 @@ async fn test_chat_completions_streaming_honors_stop_sequence() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2262,6 +2281,7 @@ async fn test_server_accepts_tools_field() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2340,6 +2360,7 @@ async fn test_server_tool_choice_none_accepted() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2468,6 +2489,7 @@ async fn test_messages_len_cap_rejects_before_generation() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2542,6 +2564,7 @@ async fn test_messages_len_at_cap_passes() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);
@@ -2746,6 +2769,7 @@ async fn test_non_streaming_finish_request_called() {
 
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         },
     ));
     engine.register_model("default", mock_model);

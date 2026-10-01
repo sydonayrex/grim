@@ -35,6 +35,7 @@ fn cfg() -> LlamaConfig {
         max_seq_len: 32,
         partial_rotary_factor: 1.0,
         yarn: None,
+    ..Default::default()
     }
 }
 

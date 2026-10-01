@@ -23,6 +23,7 @@ fn test_engine_speculative_eagle3_registration() {
         max_seq_len: 256,
         partial_rotary_factor: 1.0,
         yarn: None,
+    ..Default::default()
     };
 
     let base_lm = Llama::random(Device::Cpu, base_cfg.clone());
@@ -74,6 +75,7 @@ fn test_engine_decode_sampling_interaction_pipeline() {
         max_seq_len: 256,
         partial_rotary_factor: 1.0,
         yarn: None,
+    ..Default::default()
     };
 
     let base_lm = Llama::random(Device::Cpu, base_cfg);

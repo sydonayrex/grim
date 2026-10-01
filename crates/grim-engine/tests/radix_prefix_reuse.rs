@@ -26,6 +26,7 @@ fn small_llama() -> Box<dyn CausalLm> {
             partial_rotary_factor: 1.0,
             yarn: None,
             max_seq_len: 256,
+            ..Default::default()
         },
     ))
 }

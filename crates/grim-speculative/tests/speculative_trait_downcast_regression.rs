@@ -18,6 +18,7 @@ fn test_speculative_as_any_and_strategy_guard() {
         max_seq_len: 256,
         partial_rotary_factor: 1.0,
         yarn: None,
+    ..Default::default()
     };
     let target = Box::new(Llama::random(Device::Cpu, llama_cfg));
     let spec_model = SpeculativeCausalLm::plain(target);

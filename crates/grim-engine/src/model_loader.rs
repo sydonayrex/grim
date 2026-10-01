@@ -2748,6 +2748,7 @@ fn load_model_from_config(
                 // This arm is the safetensors/config.json path - yarn comes from the HF `rope_scaling` block (mirrors qwen35moe arms above).
                 // The GGUF path reads the dotted metadata keys via `parse_yarn_scaling_gguf` instead.
                 yarn: parse_yarn_scaling(&config.rope_scaling),
+            ..Default::default()
             };
             log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
@@ -2835,6 +2836,7 @@ fn load_model_from_config(
                         // Plugin compat-spec fallback: ArchCompatSpec carries
                         // no rope_scaling block, so YaRN can't be derived here.
                         yarn: None,
+                    ..Default::default()
                     };
                     let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     return Ok(Box::new(m));
@@ -2859,6 +2861,7 @@ fn load_model_from_config(
 
                 partial_rotary_factor: 1.0,
                 yarn: None,
+            ..Default::default()
             };
             let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
@@ -4989,6 +4992,7 @@ fn load_model_with_providers(
 
                 partial_rotary_factor: 1.0,
                 yarn: parse_yarn_scaling_gguf(&lookup),
+            ..Default::default()
             };
             log::info!(
                 "[grim] Loading Llama-family model ({:?}) with config: {:?}",
@@ -5081,6 +5085,7 @@ fn load_model_with_providers(
                         // Plugin compat-spec fallback: ArchCompatSpec carries
                         // no rope_scaling block, so YaRN can't be derived here.
                         yarn: None,
+                    ..Default::default()
                     };
                     let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     Ok(Box::new(m))

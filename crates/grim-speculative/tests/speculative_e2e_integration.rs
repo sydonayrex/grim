@@ -31,6 +31,7 @@ fn test_speculative_causal_lm_plain_forward_and_telemetry() {
         max_seq_len: 256,
         partial_rotary_factor: 1.0,
         yarn: None,
+    ..Default::default()
     };
     let target = Box::new(Llama::random(Device::Cpu, llama_cfg));
     let spec_model = SpeculativeCausalLm::plain(target);

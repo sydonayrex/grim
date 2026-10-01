@@ -866,6 +866,7 @@ mod tests {
 
                     partial_rotary_factor: 1.0,
                     yarn: None,
+                    ..Default::default()
                 },
             }
         }

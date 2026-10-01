@@ -617,6 +617,7 @@ mod tests {
 
                 partial_rotary_factor: 1.0,
                 yarn: None,
+                ..Default::default()
             },
         ))
     }
@@ -1284,6 +1285,7 @@ mod tests {
             max_seq_len: 64,
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         };
         let model = Llama::random(Device::Cpu, cfg);
 
@@ -1391,6 +1393,7 @@ mod tests {
             max_seq_len: 64,
             partial_rotary_factor: 1.0,
             yarn: None,
+            ..Default::default()
         };
         let model = Llama::random(Device::Cpu, cfg);
 
@@ -1529,6 +1532,7 @@ mod tests {
                 max_seq_len: 64,
                 partial_rotary_factor: 1.0,
                 yarn: None,
+                ..Default::default()
             },
         );
         let mtp = Arc::new(grim_models_transformer::LlamaMtp::new_random(llama, 2));
@@ -1548,6 +1552,7 @@ mod tests {
             rope_theta: 10000.0,
             max_seq_len: 64,
             num_target_fusion_layers: 3,
+            ..Default::default()
         };
         let eagle3 = Arc::new(grim_models_transformer::Eagle3::random(
             Device::Cpu,
@@ -2076,6 +2081,7 @@ mod tests {
                     max_seq_len: 64,
                     partial_rotary_factor: 1.0,
                     yarn: None,
+                    ..Default::default()
                 },
             ));
             engine.register_model("tiny", model);
