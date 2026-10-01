@@ -984,9 +984,13 @@ impl QuantOps for RocmDevice {
                 // Prefill still refused: the GEMM's fault is now localised to the
                 // converted activation buffer, but not root-caused. See the note in
                 // tests/tree_pie_dispatch.rs.
+                // Prefill refused: the GEMM faults on every activation path tried,
+                // including f16 activations that bypass the host conversion
+                // entirely. The conversion is exonerated; the fault is in the kernel
+                // or its launch and is undiagnosed. See tree_pie_dispatch.rs.
                 if m != 1 {
                     return Err(Error::Backend(format!(
-                        "TreePie prefill kernel faults on the activation buffer; m = {m} has no working route"
+                        "TreePie prefill kernel faults; m = {m} has no working route"
                     )));
                 }
                 self.launch_tree_pie_gemv(act_storage, b_storage, &out_storage, n, k)?;

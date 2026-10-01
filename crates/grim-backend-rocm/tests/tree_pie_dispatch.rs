@@ -169,13 +169,30 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
 
     let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
     let a_shape = Shape::new(vec![m, k]);
-    let x_t = MemoryOps::from_cpu_bytes(
-        dev,
-        &xb,
-        &a_shape,
-        DType { arith: ArithType::F32, storage: Storage::Native },
-    )
-    .map_err(|e| format!("act h2d: {e}"))?;
+    // GRIM_TP_F16_ACT uploads activations already in f16, which takes the dispatch's
+    // "already f16, pass through untouched" branch and bypasses the host conversion
+    // entirely. If the GEMM works there and faults with f32 activations, the
+    // conversion path is confirmed as the cause rather than the kernel.
+    let x_t = if std::env::var_os("GRIM_TP_F16_ACT").is_some() {
+        let bits: Vec<u8> = x.iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes().to_vec())
+            .collect();
+        MemoryOps::from_cpu_bytes(
+            dev,
+            &bits,
+            &a_shape,
+            DType { arith: ArithType::F16, storage: Storage::Native },
+        )
+        .map_err(|e| format!("act f16 h2d: {e}"))?
+    } else {
+        MemoryOps::from_cpu_bytes(
+            dev,
+            &xb,
+            &a_shape,
+            DType { arith: ArithType::F32, storage: Storage::Native },
+        )
+        .map_err(|e| format!("act h2d: {e}"))?
+    };
     let packed = pack_columns(&w, n, k);
     let b_bytes: Vec<u8> = packed.iter().flat_map(|w| w.to_le_bytes().to_vec()).collect();
     let b_t = MemoryOps::from_cpu_bytes(
