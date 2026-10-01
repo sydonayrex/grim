@@ -145,8 +145,10 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
         s ^= s << 17;
         ((s >> 40) as f32 / 8_388_608.0) - 1.0
     };
-    for v in w.iter_mut() {
-        *v = next() * 0.25;
+    for (i, v) in w.iter_mut().enumerate() {
+        // Identical construction to the passing GEMV test, so a failure at m=1
+        // cannot be blamed on the fixture.
+        *v = if m == 1 { ((i as f32 * 37.0) % 61.0) * 0.03125 - 0.9 } else { next() * 0.25 };
     }
     let mut x = vec![0.0f32; m * k];
     for v in x.iter_mut() {
@@ -166,10 +168,11 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     }
 
     let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
+    let a_shape = if m == 1 { Shape::new(vec![k]) } else { Shape::new(vec![m, k]) };
     let x_t = MemoryOps::from_cpu_bytes(
         dev,
         &xb,
-        &Shape::new(vec![m, k]),
+        &a_shape,
         DType { arith: ArithType::F32, storage: Storage::Native },
     )
     .map_err(|e| format!("act h2d: {e}"))?;
@@ -186,8 +189,9 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     )
     .map_err(|e| format!("b h2d: {e}"))?;
 
+    let o_shape = if m == 1 { Shape::new(vec![n]) } else { Shape::new(vec![m, n]) };
     let (out, _) = dev
-        .quantized_matmul(&*x_t, &*b_t, &[], grim_tensor::QuantFormat::TreePie, &Shape::new(vec![m, n]))
+        .quantized_matmul(&*x_t, &*b_t, &[], grim_tensor::QuantFormat::TreePie, &o_shape)
         .map_err(|e| format!("prefill m={m}: {e}"))?;
     dev.synchronize();
     let raw = grim_backend_rocm::as_rocm(out.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
@@ -205,18 +209,28 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     Ok(worst)
 }
 
-// FAILS: the output is all zeros. The `m = 1` case in this same test fails too,
-// and that routes to the *unchanged* GEMV path, which `tree_pie_scheme_reaches_the
-// _gemv_through_quantized_matmul` exercises successfully. So the fault is in how
-// this test differs from that one -- the only structural differences are the
-// activation shape ([1, K] vs [K]), the output shape ([1, N] vs [N]) and the weight
-// fixture -- and not in the new GEMM kernel, which this test never reaches.
+// Bisection so far, and it changed the diagnosis twice:
 //
-// Not diagnosed. Left `#[ignore]`d and the dispatch left unrouted rather than
-// guessing at a fix: an unrouted kernel that produces zeros if wired is much easier
-// to spot than a routed one that quietly returns zeros.
+//   1. Originally the output was all zeros -- including at `m = 1`, which routes to
+//      the *unchanged* GEMV path that `tree_pie_scheme_reaches_the_gemv_through
+//      _quantized_matmul` passes. So the fault was in the test, not the kernel.
+//   2. Making `m = 1` use the passing test's exact 1-D shapes and weight fixture
+//      fixed it: 4.497e-2, inside tolerance. **A 2-D `[1, K]` activation shape
+//      makes the GEMV return zeros** -- a separate, still-unexplained bug in the
+//      dispatch's activation handling, and worth more than the prefill kernel.
+//   3. With prefill wired, `m = 1` passes and **`m = 2` faults the GPU** (memory
+//      access fault, page not present). Diagnosing that found a real
+//      out-of-bounds in my dispatch code: the converted activation was allocated
+//      with `Shape::new(vec![k])` -- correct for the GEMV's single row, but an
+//      `m`x under-allocation for prefill, so the GEMM read `m*k` halves out of a
+//      `k`-half buffer. Fixed, commented, and the fault persists, so there is at
+//      least one more cause not yet found.
+//
+// The kernel's own indexing is consistent with the layouts as measured: B at
+// `col * (K/32)*5 + g*5` and activations at `(t*K + g*32 + j) >> 1` both stay inside
+// their buffers for the sizes tested. That is an argument, not a proof.
 #[test]
-#[ignore = "all-zero output; difference from the passing GEMV test not yet isolated"]
+#[ignore = "m=2 faults the GPU after the m*k under-allocation fix; second cause unknown"]
 fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {
     let Some(dev) = gpu_device() else { return Ok(()) };
 

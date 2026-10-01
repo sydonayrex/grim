@@ -225,5 +225,51 @@ extern "C" __global__ void grim_scrub_jay_quantize_u8(
         dst_idx[src_row + base + i] = (unsigned char)best;
     }
 }
+
+// Prefill/batched 2D tiled GEMM: C[row, col] = sum_k A[row, k] * dequant(B[col, k])
+//   A       : f32 [M, K]
+//   B_sel   : u8  [N, K/8]   codebook selector per block
+//   B_idx   : u8  [N, K]     4-bit index per value, one byte
+//   B_sgn   : u8  [N, K/8]   sign bitmask per block
+//   B_scl   : f32 [N, K/8]   E4M3 block scale, decoded to f32 on the host
+//   pre     : f32           per-tensor pre-scale
+//   C       : f32 [M, N]
+extern "C" __global__ void __launch_bounds__(256) grim_scrub_jay_gemm_tiled(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_sel,
+    const unsigned char* __restrict__ B_idx,
+    const unsigned char* __restrict__ B_sgn,
+    const float* __restrict__ B_scl,
+    float pre,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= M || col >= N) return;
+
+    const int n_blocks = K / GRIM_SJ_BLOCK;
+    const long long blk_base = (long long)col * n_blocks;
+    const long long idx_base = (long long)col * K;
+    const long long a_base = (long long)row * K;
+
+    float acc = 0.0f;
+    for (int blk = 0; blk < n_blocks; ++blk) {
+        const int sel = B_sel[blk_base + blk];
+        const unsigned sgn = B_sgn[blk_base + blk];
+        const float scl = B_scl[blk_base + blk] * pre;
+        const signed char* book = GRIM_SCRUB_JAY_CB + sel * 16;
+
+        #pragma unroll
+        for (int j = 0; j < GRIM_SJ_BLOCK; ++j) {
+            const int k = blk * GRIM_SJ_BLOCK + j;
+            float w = (float)book[B_idx[idx_base + k]];
+            if (sgn & (1u << j)) w = -w;
+            acc += A[a_base + k] * (w * scl);
+        }
+    }
+
+    C[(long long)row * N + col] = acc;
+}
 #endif
 "#;

@@ -1797,7 +1797,27 @@ impl RocmDevice {
                 match scheme {
                     KQuantScheme::Q4K => self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?,
                     KQuantScheme::Q5K => self.launch_dot4_q5k_q81_gemv(act_q81, w, out, m, n, k)?,
-                    KQuantScheme::Q6K => self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?,
+                    // Q6_K's dot4 GEMV is not bit-exact at production shapes:
+                    // the Xing4.0-29B lm_head oracle (real output.weight,
+                    // k=3584) measures rel 3.2e-3 / max_abs 1.5 at m=1, while
+                    // the fused-dequant path agrees with the host dequant at
+                    // 3.9e-7. The k=256 arch probes cannot see this (the scale
+                    // skew grows with k), so Q6_K skips the dot4 leg here.
+                    // Same treatment as the IQ3_S fused WMMA GEMM, and gated
+                    // on the same GRIM_Q6K_DOT4 escape hatch as the sibling
+                    // dispatch in device/quant/mod.rs — two sites, one switch,
+                    // so a capture run and an eager run cannot disagree about
+                    // which Q6_K path is trusted.
+                    KQuantScheme::Q6K => {
+                        if matches!(
+                            std::env::var("GRIM_Q6K_DOT4").as_deref(),
+                            Ok("1" | "true" | "on")
+                        ) {
+                            self.launch_dot4_q6k_q81_gemv(act_q81, w, out, m, n, k)?
+                        } else {
+                            self.launch_fused_dequant_gemm_q6k(a_s, w, out, m, n, k)?
+                        }
+                    }
                     KQuantScheme::Q2K => self.launch_dot4_q2k_q81_gemv(act_q81, w, out, m, n, k)?,
                     _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
                 };

@@ -184,8 +184,14 @@ mod tests {
     #[test]
     fn tiled_source_contains_all_included_formats() {
         let src = tiled_quant_kernel_source();
+        // IQ4_NL is intentionally absent: its QK4_NL = 32-element blocks (18 bytes)
+        // cannot fill a 256-element WMMA tile, and listing it here imposes
+        // `k % tiled_k_multiple(256) == 0` on a 32-element-block format.
+        // The untiled `grim_fused_dequant_gemm_iq4nl` is the correct path.
+        // See the comment above `GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq4xs_tiled`
+        // (commit 431e95f5).
         for fmt in [
-            "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq4nl", "iq4xs", "q8_0",
+            "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq4xs", "q8_0",
         ] {
             assert!(
                 src.contains(&format!("grim_fused_dequant_gemm_{fmt}_tiled")),
@@ -196,6 +202,11 @@ mod tests {
                 "missing tiled backward kernel for {fmt}"
             );
         }
+        // Pin the explicit exclusion: iq4nl must NOT appear as a tiled kernel.
+        assert!(
+            !src.contains("grim_fused_dequant_gemm_iq4nl_tiled"),
+            "iq4nl must not have a tiled kernel (32-elem blocks cannot fill a 256-elem tile)"
+        );
     }
 
     #[cfg(feature = "q5k")]

@@ -917,19 +917,11 @@ impl QuantOps for RocmDevice {
                 // TreePie (WS-A) routes M=1 decode to the in-register E2M2 GEMV
                 // over V_DOT2_F32_F16. Two hard preconditions, both enforced by the
                 // launcher as well: M must be 1 (there is no TreePie GEMM kernel, so
-                // prefill has nothing to route to) and K must be a multiple of 32,
+                // Prefill (m > 1) routes to `grim_tree_pie_gemm`, which shares one B
+                // decode across TP_M_TILE rows of A. K must be a multiple of 32,
                 // since the 5.0 bpw claim only holds at 32-value granularity and a
                 // ragged tail would silently overstate the density.
                 //
-                // Refusing prefill loudly is deliberate. Silently falling through to
-                // a dense dequant would produce a *correct* answer at a different
-                // format's cost, which is exactly the kind of quiet substitution
-                // that makes an A/B irreproducible.
-                if m != 1 {
-                    return Err(Error::Backend(format!(
-                        "TreePie has a GEMV kernel only; m = {m} (prefill) has no route"
-                    )));
-                }
                 if k % 32 != 0 {
                     return Err(Error::Backend(format!(
                         "TreePie requires k % 32 == 0 for the 5.0 bpw claim; got k = {k}"
@@ -962,17 +954,32 @@ impl QuantOps for RocmDevice {
                         // Already a 16-bit activation dtype; reinterpret rather
                         // than round-trip through f32, so an f16 tensor of f16
                         // values is bit-preserved.
-                        bits.extend_from_slice(&raw[..(k * 2).min(raw.len())]);
+                        bits.extend_from_slice(&raw[..(m * k * 2).min(raw.len())]);
                     }
+                    // Sized m * k, not k. The GEMV only ever needs one row, so the
+                    // GEMV-era code here used k -- which under-allocated for
+                    // prefill by a factor of m, and the GEMM then read m*k halves
+                    // out of a k-half buffer. That is an out-of-bounds read on the
+                    // device, and it faulted the GPU rather than returning garbage,
+                    // which is the better of the two outcomes.
                     converted = RocmStorage::copy_from_host_raw_bytes(
                         &bits,
-                        &Shape::new(vec![k]),
+                        &Shape::new(vec![m * k]),
                         DType { arith: ArithType::F16, storage: DTypeStorage::Native },
                         &self.allocator,
                         self.ordinal,
                     )?;
                     &converted
                 };
+                // Prefill is still refused: `grim_tree_pie_gemm` faults the GPU
+                // (memory access fault, page not present) and is undiagnosed. An
+                // unroutable kernel that faults is far better than a routed one that
+                // takes the device down mid-run.
+                if m != 1 {
+                    return Err(Error::Backend(format!(
+                        "TreePie prefill kernel exists but faults; m = {m} has no working route"
+                    )));
+                }
                 self.launch_tree_pie_gemv(act_storage, b_storage, &out_storage, n, k)?;
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {

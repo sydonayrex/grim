@@ -180,6 +180,96 @@ fn fused_dequant_gemm_matches_cpu() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn fused_dequant_gemm_tiled_matches_cpu() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        eprintln!("SKIP: GRIM_GPU_TEST unset");
+        return Ok(());
+    };
+
+    const K: usize = 512;
+    const M: usize = 8;
+    const N: usize = 64;
+    let mut rng = Lcg(0x5711_ED);
+    let pre_scale = 1.0f32 / 14.0;
+
+    let a: Vec<f32> = (0..M * K).map(|_| rng.next_f32()).collect();
+    let b: Vec<f32> = (0..N * K).map(|_| rng.next_f32()).collect();
+
+    let n_blocks_per_col = K / SCRUB_JAY_BLOCK;
+    let mut sel = vec![0u8; N * n_blocks_per_col];
+    let mut idx = vec![0u8; N * K];
+    let mut sgn = vec![0u8; N * n_blocks_per_col];
+    let mut scl = vec![0f32; N * n_blocks_per_col];
+    for col in 0..N {
+        for blk in 0..n_blocks_per_col {
+            let mut block = [0f32; SCRUB_JAY_BLOCK];
+            for (j, slot) in block.iter_mut().enumerate() {
+                *slot = b[col * K + blk * SCRUB_JAY_BLOCK + j];
+            }
+            let (s, indices, sign_plane, scale) = quantize_block(&block, pre_scale);
+            sel[col * n_blocks_per_col + blk] = s;
+            sgn[col * n_blocks_per_col + blk] = sign_plane;
+            scl[col * n_blocks_per_col + blk] = scale;
+            for j in 0..SCRUB_JAY_BLOCK {
+                idx[col * K + blk * SCRUB_JAY_BLOCK + j] = indices[j];
+            }
+        }
+    }
+
+    let a_t = up(&dev, f32_bytes(&a), M * K, DType { arith: ArithType::F32, storage: Storage::Native }, "a")?;
+    let sel_t = up(&dev, u8_bytes(&sel), sel.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sel")?;
+    let idx_t = up(&dev, u8_bytes(&idx), idx.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "idx")?;
+    let sgn_t = up(&dev, u8_bytes(&sgn), sgn.len(), DType { arith: ArithType::U8, storage: Storage::Native }, "sgn")?;
+    let scl_t = up(&dev, f32_bytes(&scl), scl.len(), DType { arith: ArithType::F32, storage: Storage::Native }, "scl")?;
+    let out_t = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![M * N]),
+        DType { arith: ArithType::F32, storage: Storage::Native },
+    )
+    .map_err(|e| format!("out alloc: {e}"))?;
+
+    fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+        grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
+    }
+    dev.launch_scrub_jay_gemm_tiled(r(&a_t), r(&sel_t), r(&idx_t), r(&sgn_t), r(&scl_t), r(&out_t), pre_scale, M, N, K)
+        .map_err(|e| format!("launch tiled: {e}"))?;
+    dev.synchronize();
+    let got = download_f32(&out_t)?;
+
+    let cb = grim_quant::scrub_jay::SCRUB_JAY_CODEBOOK;
+    let mut worst_rel = 0.0f32;
+    for row in 0..M {
+        for col in 0..N {
+            let mut acc = 0.0f32;
+            for blk in 0..n_blocks_per_col {
+                let s = sel[col * n_blocks_per_col + blk] as usize;
+                let sign_plane = sgn[col * n_blocks_per_col + blk];
+                let scale = scl[col * n_blocks_per_col + blk] * pre_scale;
+                for j in 0..SCRUB_JAY_BLOCK {
+                    let k = blk * SCRUB_JAY_BLOCK + j;
+                    let mut w = cb[s][idx[col * K + k] as usize] as f32;
+                    if sign_plane & (1 << j) != 0 {
+                        w = -w;
+                    }
+                    acc += a[row * K + k] * (w * scale);
+                }
+            }
+            let want = acc;
+            let d = (got[row * N + col] - want).abs();
+            worst_rel = worst_rel.max(d / want.abs().max(1e-3));
+        }
+    }
+
+    assert!(
+        worst_rel <= 2e-2,
+        "M={M}, N={N}: worst relative error {worst_rel:.3e} exceeds 2e-2"
+    );
+    eprintln!("tiled GEMM: M={M} N={N} worst_rel={worst_rel:.3e}");
+    Ok(())
+}
+
+
 fn up(
     d: &RocmDevice,
     bytes: &[u8],
