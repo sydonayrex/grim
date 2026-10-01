@@ -2413,3 +2413,249 @@ fn full_model_logits_vs_reference() {
     );
     assert!(r < 5e-2, "full-model logits diverge from the reference (rel {r:.3e})");
 }
+
+/// Generation-state consistency for the FULL model: greedy-generate 12 tokens
+/// incrementally (seq=1 decode steps through the live latent kv), then run
+/// the SAME tokens teacher-forced as one prefill and compare the logits at
+/// every generated position. If incremental and teacher-forced agree, the
+/// decode machinery computes the same function the verified prefill does, and
+/// generation quality is a model/quant/sampling question — not a grim state
+/// bug. Divergence names the step where decode state goes wrong.
+#[test]
+#[ignore = "needs XING_GGUF + a ROCm device; run with GRIM_RUN_GPU_TESTS=1"]
+fn full_model_generation_state_consistency() {
+    if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(_path) = gguf_path() else { return };
+    let cfg = xing40_config();
+    let (hc, hidden) = (cfg.hc_mult, cfg.hidden_size);
+    let flat = hc * hidden;
+    // The e2e chat prompt (system + user question + <_bot><think> + newline).
+    let prompt: Vec<u32> = vec![
+        6, 4318, 14524, 20182, 45871, 83323, 124453, 10075, 124386, 11895, 124661, 124415,
+        124621, 424, 124386, 8557, 124779, 124457, 20182, 15147, 21607, 6732, 108982, 31395,
+        124395, 35, 35, 35, 4, 1144, 468, 407, 5756, 435, 8062, 124497, 42420, 26444, 124379,
+        5, 9, 124361, 35,
+    ];
+    let n_prompt = prompt.len();
+    let n_gen = 12;
+
+    use grim_format::tprov::GgufProvider;
+    let prov = GgufProvider::open(gguf_path().unwrap().as_str()).expect("open gguf");
+    let ws = grim_nn::WeightSource::root(&prov, grim_tensor::Device::Rocm(0));
+    let model = grim_models_transformer::Xing40::load(grim_tensor::Device::Rocm(0), &ws, cfg.clone())
+        .expect("load full model");
+    let emb = grim_nn::modules::Embedding::load(&ws.scoped("token_embd"), cfg.vocab_size, hidden)
+        .expect("emb");
+    let rocm = grim_backend_rocm::RocmDevice::shared(0);
+    let seed_up = |tok: u32| -> grim_tensor::Tensor {
+        let xv = emb
+            .forward(&[tok], 1, hidden)
+            .expect("row")
+            .to_vec_f32()
+            .expect("read");
+        let mut s = vec![0f32; flat];
+        for h in 0..hc {
+            s[h * hidden..(h + 1) * hidden].copy_from_slice(&xv);
+        }
+        let shape = grim_tensor::Shape::new(vec![1, flat]);
+        grim_tensor::Tensor::new(
+            std::sync::Arc::from(
+                rocm.from_cpu(&s, &shape, grim_tensor::DType::F32).expect("up"),
+            ),
+            shape,
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            grim_tensor::Device::Rocm(0),
+        )
+    };
+
+    let head = |streams: &grim_tensor::Tensor| -> Vec<f32> {
+        let sv = streams.to_vec_f32().expect("read streams");
+        let mut meaned = vec![0.0f32; hidden];
+        for h in 0..hc {
+            let src = h * hidden;
+            for d in 0..hidden {
+                meaned[d] += sv[src + d] / hc as f32;
+            }
+        }
+        let shape = grim_tensor::Shape::new(vec![1, hidden]);
+        let m = grim_tensor::Tensor::new(
+            std::sync::Arc::from(
+                rocm.from_cpu(&meaned, &shape, grim_tensor::DType::F32).expect("up"),
+            ),
+            shape,
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            grim_tensor::Device::Rocm(0),
+        );
+        let normed = model.norm.forward(&m).expect("norm");
+        model
+            .output
+            .forward(&normed)
+            .expect("head")
+            .to_vec_f32()
+            .expect("read logits")
+    };
+    let argmax = |lg: &[f32]| lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap().0;
+
+    // Per-layer stream states after the FIRST decode step, for the layer
+    // bisect against the teacher-forced arm.
+    let mut inc_layer_states: Vec<Vec<f32>> = Vec::new();
+    let mut tf_layer_states: Vec<Vec<f32>> = Vec::new();
+
+    // Incremental greedy generation.
+    let mut kvs: Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>> =
+        (0..cfg.num_layers).map(|_| None).collect();
+    let positions: Vec<u32> = (0..n_prompt as u32).collect();
+    let x0 = emb.forward(&prompt, n_prompt, hidden).expect("rows");
+    let mut x = grim_models_transformer::xing40::seed_streams_device(
+        &x0,
+        hc,
+        hidden,
+        n_prompt,
+        &grim_tensor::Shape::new(vec![n_prompt, flat]),
+        &grim_tensor::Device::Rocm(0),
+    )
+    .expect("seed");
+    for i in 0..cfg.num_layers {
+        x = model.layers[i]
+            .forward_device_for_oracle(&x, &positions, &mut kvs[i])
+            .expect("prefill layer");
+    }
+    let lg = head(&x);
+    let mut gen_tokens: Vec<(u32, Vec<f32>)> = vec![(argmax(&lg) as u32, lg)];
+    for step in 0..n_gen - 1 {
+        let pos = n_prompt + step;
+        let tok = gen_tokens.last().unwrap().0;
+        // Layer states for the first decode step only.
+        if step == 0 {
+            let mut x = seed_up(tok);
+            inc_layer_states.clear();
+            for i in 0..cfg.num_layers {
+                x = model.layers[i]
+                    .forward_device_for_oracle(&x, &[pos as u32], &mut kvs[i])
+                    .expect("bisect decode layer");
+                inc_layer_states.push(x.to_vec_f32().expect("read"));
+            }
+        } else {
+            let out = blk_step_full(&model, &seed_up(tok), pos, &mut kvs).expect("decode step");
+            let out_v = out.to_vec_f32().expect("read step");
+            gen_tokens.push((argmax(&out_v) as u32, out_v));
+            continue;
+        }
+        let out_v = inc_layer_states.last().unwrap().clone();
+        gen_tokens.push((argmax(&out_v) as u32, out_v));
+    }
+    eprintln!(
+        "[gen-consistency] greedy ids: {:?}",
+        gen_tokens.iter().map(|g| g.0).collect::<Vec<_>>()
+    );
+
+    // Teacher-forced re-prefill over prompt + generated.
+    let mut all = prompt.clone();
+    all.extend(gen_tokens.iter().map(|g| g.0));
+    let total = all.len();
+    let mut kvs2: Vec<Option<(grim_tensor::Tensor, grim_tensor::Tensor)>> =
+        (0..cfg.num_layers).map(|_| None).collect();
+    let positions2: Vec<u32> = (0..total as u32).collect();
+    let x0b = emb.forward(&all, total, hidden).expect("rows2");
+    let mut xb = grim_models_transformer::xing40::seed_streams_device(
+        &x0b,
+        hc,
+        hidden,
+        total,
+        &grim_tensor::Shape::new(vec![total, flat]),
+        &grim_tensor::Device::Rocm(0),
+    )
+    .expect("seed2");
+    for i in 0..cfg.num_layers {
+        xb = model.layers[i]
+            .forward_device_for_oracle(&xb, &positions2, &mut kvs2[i])
+            .expect("reprefill layer");
+        tf_layer_states.push(xb.to_vec_f32().expect("read tf layer"));
+    }
+    // Layer bisect at the FIRST generated position.
+    {
+        let pos = n_prompt;
+        let mut first_bad: Option<(usize, f32)> = None;
+        for (i, tf) in tf_layer_states.iter().enumerate() {
+            let row = &tf[pos * flat..(pos + 1) * flat];
+            let inc = &inc_layer_states[i][0..flat];
+            let (_, r) = rel_err(row, inc);
+            eprintln!(
+                "[gen-consistency]   blk.{i} ({}): rel {r:.3e}",
+                if i < cfg.first_k_dense_replace { "DENSE" } else { "MoE" }
+            );
+            if r > 1e-2 && first_bad.is_none() {
+                first_bad = Some((i, r));
+            }
+        }
+        match first_bad {
+            Some((layer, r)) => eprintln!(
+                "[gen-consistency] FIRST diverging layer at gen pos {pos}: blk.{layer} rel {r:.3e} ({})",
+                if layer < cfg.first_k_dense_replace { "DENSE" } else { "MoE" }
+            ),
+            None => eprintln!("[gen-consistency] no per-layer divergence at gen pos {pos}"),
+        }
+    }
+    let xb_v = xb.to_vec_f32().expect("read streams2");
+    let mut worst = (0usize, 0f32);
+    for (k, (_, lg_inc)) in gen_tokens.iter().enumerate() {
+        let pos = n_prompt + k;
+        let sv = &xb_v[pos * flat..(pos + 1) * flat];
+        let mut meaned = vec![0.0f32; hidden];
+        for h in 0..hc {
+            let src = h * hidden;
+            for d in 0..hidden {
+                meaned[d] += sv[src + d] / hc as f32;
+            }
+        }
+        let shape = grim_tensor::Shape::new(vec![1, hidden]);
+        let m = grim_tensor::Tensor::new(
+            std::sync::Arc::from(
+                rocm.from_cpu(&meaned, &shape, grim_tensor::DType::F32).expect("up"),
+            ),
+            shape,
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            grim_tensor::Device::Rocm(0),
+        );
+        let normed = model.norm.forward(&m).expect("norm2");
+        let lg_tf = model
+            .output
+            .forward(&normed)
+            .expect("head2")
+            .to_vec_f32()
+            .expect("read");
+        let (a, r) = rel_err(lg_inc, &lg_tf);
+        let agree = argmax(lg_inc) == argmax(&lg_tf);
+        eprintln!(
+            "[gen-consistency] step {k}: inc-vs-tf rel {r:.3e} max_abs {a:.3e} argmax agree {agree}"
+        );
+        if r > worst.1 {
+            worst = (k, r);
+        }
+    }
+    assert!(
+        worst.1 < 5e-3,
+        "incremental decode diverges from teacher-forced at step {} (rel {:.3e}) — decode state bug",
+        worst.0,
+        worst.1
+    );
+}
+
+/// One full-model decode step at `pos` with the shared per-layer kv caches.
+fn blk_step_full(
+    model: &grim_models_transformer::Xing40,
+    seed: &grim_tensor::Tensor,
+    pos: usize,
+    kvs: &mut [Option<(grim_tensor::Tensor, grim_tensor::Tensor)>],
+) -> grim_core::error::Result<grim_tensor::Tensor> {
+    let mut x = seed.clone();
+    for i in 0..model.cfg.num_layers {
+        x = model.layers[i].forward_device_for_oracle(&x, &[pos as u32], &mut kvs[i])?;
+    }
+    Ok(x)
+}
