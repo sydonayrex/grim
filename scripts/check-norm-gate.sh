@@ -58,6 +58,9 @@ result_of() { grep -m1 '^test result' || true; }
 # Returns 0 for "the peer's" and 1 for "ours".
 is_peer_error() {
     case "$1" in
+        # rustc writes "unreachable pattern" with a SPACE, so this cannot be a
+        # `|` alternative -- a space ends the pattern list. It gets its own arm.
+        *"unreachable pattern"*) return 0 ;;
         # (1) The error names something the peer is adding, so it is theirs
         # wherever it lands -- including in a file we also edit. There is no
         # way to infer "they are adding a field called `expert_stage`" from
@@ -67,7 +70,7 @@ is_peer_error() {
         *act_fp8_pad_buf*|*layer_geoms*|*WhiteRaven*|*WhiteCrow*|*KqNative*|\
         *moe_route_topk*|*tree_pie*|*TreePie*|*charon*|*latent_dim*|*kv_stride*|\
         *GgufDType*|*PQ2_0*|*PTQ1_0*|*TQ1_0*|*TQ2_0*|*Q1_0*|*Q2_0*|\
-        *unreachable_pattern*|*from_storage*|*Spillable*|*Greycrow*|*greycrow*|\
+        *from_storage*|*Spillable*|*Greycrow*|*greycrow*|\
         *CityCrow*|*citycrow*|*CCProbe*|*cc_probe*|*kq_native*|*from_u8_bytes*)
             return 0 ;;
     esac

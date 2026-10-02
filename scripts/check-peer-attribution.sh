@@ -111,6 +111,19 @@ case_is_peer "DeepSeek32Config index fields"      PEER \
 case_is_peer "a peer backend crate"               PEER \
     'crates/grim-backend-rocm/tests/whiteraven_journey.rs:94:16: error[E0599]: no associated function named `from_storage` found for struct `Tensor`'
 
+printf '\n=== 2b. a multi-word alternative, which `|` cannot carry\n'
+# rustc writes "unreachable pattern" with a SPACE. That cannot be one arm of a
+# `|` list -- a space ends the pattern list -- so it needs its own arm. The
+# first version spelled it `*unreachable_pattern*`, which matched nothing and
+# looked like coverage. Caught by section 4, which tests every pattern against
+# a line naming its own subject.
+case_is_peer "unreachable pattern (two words)"    PEER \
+    'crates/grim-format/src/gguf.rs:2097:11: error: unreachable pattern: no value can reach this'
+case_is_peer "E0004 unreachable pattern"          PEER \
+    'crates/grim-format/src/gguf.rs:2097:11: error[E0004]: unreachable pattern: `GgufDType::Q2_0` not covered'
+case_is_peer "unreachable, but not a pattern"     OURS \
+    'crates/grim-nn/src/modules.rs:88:9: error: unreachable code after a return'
+
 printf '\n=== 3. ours: a norm symbol, in a norm file\n'
 case_is_peer "missing added_tokens (mine, 9295cb40)" OURS \
     'crates/grim-cli/src/train.rs:1590:25: error[E0063]: missing field `added_tokens` in initializer of `grim_format::GgufTokenizer`'
@@ -156,7 +169,99 @@ done <<< "$(git -C "$REPO" status --porcelain | awk '{print $2}' | grep '\.rs$' 
                    fi
                done)"
 
-printf '\n=== 6. the classifier is not a filename list\n'
+printf '\n=== 6. every pattern matches a line that names its subject\n'
+# A pattern that cannot match the text it exists for is dead weight that looks
+# like coverage. Read the WHOLE function, not just the `|` list: a standalone
+# `*"..."*)` arm sits outside it, and reading only the list made a dead
+# standalone pattern invisible -- the same defect class this section exists to
+# catch. `*unreachable_pattern*` sat in the list for a session and matched
+# nothing, because rustc writes "unreachable pattern" with a space.
+fn="$(classifier)"
+in_list="$(printf '%s\n' "$fn" | sed -n '/case "\$1" in/,/^    esac/p')"
+subject_of() {
+    case "$1" in
+        f32)                 echo "value is f32 in a shape mismatch" ;;
+        Fp8Blocked)          echo "FloatPackScheme::Fp8Blocked16 not covered" ;;
+        QuantFormat)         echo "QuantFormat::Fp8Blocked16 not covered" ;;
+        expert_stage)        echo "missing field \`expert_stage\` in initializer" ;;
+        index_head_dim)      echo "missing fields \`index_head_dim\`, \`index_n_heads\`" ;;
+        index_n_heads)       echo "missing fields \`index_head_dim\`, \`index_n_heads\`" ;;
+        index_source_layer_ids)
+                            echo "missing fields \`index_head_dim\`, \`index_n_heads\`, \`index_source_layer_ids\`" ;;
+        Xing40GraphScratch)  echo "no field \`inter\` on type \`&mut Xing40GraphScratch\`" ;;
+        k_norm)              echo 'idx_ws.scoped("k_norm")' ;;
+        act_fp8_pad_buf)     echo "no field \`act_fp8_pad_buf\` on struct" ;;
+        layer_geoms)         echo "field \`layer_geoms\` is never read" ;;
+        WhiteRaven)          echo "WhiteRaven dispatch: no such arm" ;;
+        WhiteCrow)           echo "WhiteCrow dispatch: no such arm" ;;
+        KqNative)            echo "no field \`KqNativeResident\` on struct" ;;
+        moe_route_topk)      echo "no associated function \`moe_route_topk_on_device\`" ;;
+        tree_pie)            echo "tree_pie_dispatch: no such arm" ;;
+        TreePie)             echo "TreePie: no such arm" ;;
+        charon)              echo "charon_kq_native_grouped_parity.rs: error" ;;
+        latent_dim)          echo "cannot find value \`latent_dim\` in this scope" ;;
+        kv_stride)           echo "cannot find value \`kv_stride\` in this scope" ;;
+        GgufDType)           echo "GgufDType::Q2_0 not covered" ;;
+        PQ2_0)               echo "GgufDType::PQ2_0 not covered" ;;
+        PTQ1_0)              echo "GgufDType::PTQ1_0 not covered" ;;
+        TQ1_0)               echo "GgufDType::TQ1_0 not covered" ;;
+        TQ2_0)               echo "GgufDType::TQ2_0 not covered" ;;
+        Q1_0)                echo "GgufDType::Q1_0 not covered" ;;
+        Q2_0)                echo "GgufDType::Q2_0 not covered" ;;
+        from_storage)        echo "no associated function named \`from_storage\` found" ;;
+        Spillable)           echo "the trait bound \`Spillable\` is not satisfied" ;;
+        Greycrow)            echo "Greycrow: no such arm" ;;
+        greycrow)            echo "greycrow_geometry: no such arm" ;;
+        CityCrow)            echo "CityCrow: no such arm" ;;
+        citycrow)            echo "citycrow.rs: no such arm" ;;
+        CCProbe)             echo "CCProbe: no such arm" ;;
+        cc_probe)            echo "cc_probe.rs: no such arm" ;;
+        kq_native)           echo "no field \`kq_native\` on struct" ;;
+        from_u8_bytes)       echo "no method named \`from_u8_bytes\` found" ;;
+        *)                   echo "" ;;     # no known subject -> tested below
+    esac
+}
+dead=0; unknown=0; n=0
+# Both forms: `*name*` tokens in the `|` list, and `*"...")` standalone arms.
+list_pats="$(printf '%s\n' "$fn" | grep -oE '\*[A-Za-z0-9_]+\*' | tr -d '*' | sort -u)"
+arm_pats="$(printf '%s\n' "$fn" | grep -oE '\*"[^"]+"\*\)' | sed 's/^\*"//; s/"\*)$//')"
+for pat in $list_pats; do
+    n=$((n + 1))
+    subject="$(subject_of "$pat")"
+    if [ -z "$subject" ]; then
+        unknown=$((unknown + 1))
+        continue
+    fi
+    if ! case "$subject" in *$pat*) true ;; *) false ;; esac; then
+        fail "pattern $pat cannot match: $subject"
+        dead=$((dead + 1))
+    fi
+done
+if [ "$dead" -eq 0 ]; then
+    pass "every known pattern matches a line naming its subject ($n scanned)"
+fi
+# A pattern with no subject here is not proven dead, but it is also not proven
+# live, and silently skipping it is how `unreachable_pattern*` hid. Require the
+# list to be explicit.
+if [ "$unknown" -eq 0 ]; then
+    pass "no list pattern is unscanned"
+else
+    fail "$unknown list pattern(s) have no subject: add one or remove it"
+fi
+# A standalone arm must match the text it exists for. `*"unreachable pattern"*`
+# is the case: as `*unreachable_pattern*` it sat in the list for a session and
+# matched nothing, because rustc writes the two words with a space.
+for arm in $arm_pats; do
+    if ! case "error: $arm: no value can reach this" in *"$arm"*) true ;; *) false ;; esac; then
+        fail "standalone arm cannot match its own text: $arm"
+        dead=$((dead + 1))
+    fi
+done
+if [ "$dead" -eq 0 ]; then
+    pass "every standalone arm matches the text it exists for ($(printf '%s\n' $arm_pats | wc -l) scanned)"
+fi
+
+printf '\n=== 7. the classifier is not a filename list\n'
 # If it is one, the two copies can drift again. It must consult git.
 if grep -q 'ls-files\|status --porcelain' <<< "$(classifier)"; then
     pass "it consults git, so a committed break cannot be excused"
