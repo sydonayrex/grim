@@ -29,3 +29,6 @@ rocprof_trace_opt/
 rocprof_hip_out/
 /target-rel-bisect/
 plans/
+
+# ad-hoc verification harnesses (Hermes)
+.hermes-verify-*/
