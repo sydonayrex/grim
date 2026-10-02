@@ -8951,51 +8951,75 @@ dev.launch_hc_collapse_step(
                             }
                         }
                     }
-                    // FFN WRITE-BACK ORACLE, POST-REPLAY. Every input
-                    // survives the replay: sout[0] (post-attention stream),
-                    // norm_buf[0] (the FFN output - the FFN gate call is the
-                    // last writer), post[0]/comb[0] (the FFN's own gates) and
-                    // sin[1] (the result). The warmup version of this check
-                    // only ever saw slen=1.
-                    if let (Some(sb), Some(nbb), Some(pb), Some(cb), Some(ob)) = (
-                        g.sout.first(),
-                        graph.buffers.norm_buf.first(),
-                        g.post.first(),
-                        g.comb.first(),
-                        g.sin.get(1),
-                    ) {
-                        let got = (
-                            as_rocm(sb.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
-                            as_rocm(nbb).and_then(|x| x.to_cpu_vec_f32()),
-                            as_rocm(pb.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
-                            as_rocm(cb.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
-                            as_rocm(ob.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
-                        );
-                        if let (Ok(sinv), Ok(nbv), Ok(pv), Ok(cv), Ok(outv)) = got {
-                            let hid = self.cfg.hidden_size;
-                            let hc4 = self.cfg.hc_mult;
-                            let (mut md, mut rr) = (0.0f32, 0.0f64);
-                            for d in 0..hid {
-                                for h in 0..hc4 {
-                                    let mut acc = pv[h] * nbv[d];
-                                    for k in 0..hc4 {
-                                        acc += cv[h * hc4 + k] * sinv[k * hid + d];
+                    // FFN WRITE-BACK ORACLE ACROSS DEPTH, post-replay. Every
+                    // input survives the replay for EVERY layer (sout[i] is
+                    // written once by the attention branch, norm_buf[i] by the
+                    // FFN, post[i]/comb[i] by the FFN's gate call, and the
+                    // result lands in sin[i+1]). Running it per layer turns it
+                    // into a depth scan: the first layer whose oracles fail
+                    // localises the residual, which layer 0 alone cannot do.
+                    {
+                        let hid = self.cfg.hidden_size;
+                        let hc4 = self.cfg.hc_mult;
+                        let n_l = self.layers.len();
+                        let mut bad: Vec<String> = Vec::new();
+                        for li in 0..n_l {
+                            let dst = if li + 1 < n_l { g.sin.get(li + 1) } else { g.sin.first() };
+                            let (Some(sv), Some(nv), Some(pv), Some(cv), Some(ov)) = (
+                                g.sout.get(li),
+                                graph.buffers.norm_buf.get(li),
+                                g.post.get(li),
+                                g.comb.get(li),
+                                dst,
+                            ) else {
+                                continue;
+                            };
+                            fn rd<E>(r: std::result::Result<&grim_backend_rocm::RocmStorage, E>) -> Option<Vec<f32>> {
+                                r.ok().and_then(|x| x.to_cpu_vec_f32().ok())
+                            }
+                            let got = (
+                                rd(as_rocm(sv.as_ref())),
+                                rd(as_rocm(nv)),
+                                rd(as_rocm(pv.as_ref())),
+                                rd(as_rocm(cv.as_ref())),
+                                rd(as_rocm(ov.as_ref())),
+                            );
+                            if let (Some(sinv), Some(nbv), Some(postv), Some(combv), Some(outv)) = got {
+                                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                                for d in 0..hid {
+                                    for h in 0..hc4 {
+                                        let mut acc = postv[h] * nbv[d];
+                                        for k in 0..hc4 {
+                                            acc += combv[h * hc4 + k] * sinv[k * hid + d];
+                                        }
+                                        let diff = (acc - outv[h * hid + d]).abs();
+                                        if diff > md {
+                                            md = diff;
+                                        }
+                                        rr += (acc as f64) * (acc as f64);
                                     }
-                                    let diff = (acc - outv[h * hid + d]).abs();
-                                    if diff > md {
-                                        md = diff;
-                                    }
-                                    rr += (acc as f64) * (acc as f64);
+                                }
+                                rr = (rr / (hc4 * hid) as f64).sqrt();
+                                let rg = (outv.iter().map(|x| x * x).sum::<f32>()
+                                    / outv.len().max(1) as f32)
+                                    .sqrt();
+                                let rel = md as f64 / rr.max(1e-12);
+                                if rel > 1e-5 {
+                                    bad.push(format!(
+                                        "L{li} rel {rel:.3e} (max_abs {md:.3e}, rms {rg:.3e})"
+                                    ));
                                 }
                             }
-                            rr = (rr / (hc4 * hid) as f64).sqrt();
-                            let rg = (outv.iter().map(|x| x * x).sum::<f32>()
-                                / outv.len().max(1) as f32)
-                                .sqrt();
+                        }
+                        if bad.is_empty() {
                             eprintln!(
-                                "[xing-graph] FFWB pos {} vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
-                                graph.buffers.current_pos,
-                                md as f64 / rr.max(1e-12)
+                                "[xing-graph] FFWB-DEPTH: all {n_l} layers pass (<1e-5)"
+                            );
+                        } else {
+                            eprintln!(
+                                "[xing-graph] FFWB-DEPTH: {} of {n_l} layers FAIL: {}",
+                                bad.len(),
+                                bad.iter().take(6).cloned().collect::<Vec<_>>().join(" | ")
                             );
                         }
                     }
