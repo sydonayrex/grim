@@ -40,6 +40,11 @@ model="crates/grim-models/transformer/src/model.rs"
 nn="crates/grim-nn/src/modules.rs"
 loader="crates/grim-engine/src/model_loader.rs"
 fail=0
+# Six mutations, and every one must have been judged. A mutation that is
+# deleted, renamed or made inert contributes no `fail`, so `exit "$fail"` alone
+# reports "green" having judged five of six. The restore check pins this.
+mutations_expected=6
+mutations_judged=0
 pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; fail=1; }
 # report: neither pass nor fail -- the thing ran, and the detail decides.
@@ -309,7 +314,7 @@ else
     r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "A SURVIVED -- the post-norm order is unpinned: $r" ;;
-        *)             pass "A killed: $r" ;;
+        *)             pass "A killed: $r"; mutations_judged=$((mutations_judged + 1)) ;;
     esac
 fi
 
@@ -353,7 +358,7 @@ PY
     r="$(cargo test -p grim-models-transformer --test output_norm_spec -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "B SURVIVED -- the default is unpinned: $r" ;;
-        *)             pass "B killed: $r" ;;
+        *)             pass "B killed: $r"; mutations_judged=$((mutations_judged + 1)) ;;
     esac
     return 0
 }
@@ -397,7 +402,7 @@ PY
     r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "C SURVIVED -- the parallel-residual branch is unpinned: $r" ;;
-        *)             pass "C killed: $r" ;;
+        *)             pass "C killed: $r"; mutations_judged=$((mutations_judged + 1)) ;;
     esac
     return 0
 }
@@ -434,7 +439,7 @@ else
     r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "D SURVIVED -- the config flag is not plumbed to the block: $r" ;;
-        *)             pass "D killed: $r" ;;
+        *)             pass "D killed: $r"; mutations_judged=$((mutations_judged + 1)) ;;
     esac
 fi
 
@@ -475,7 +480,7 @@ else
     r="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "E SURVIVED -- the norm bias is flag-gated again: $r" ;;
-        *)             pass "E killed: $r" ;;
+        *)             pass "E killed: $r"; mutations_judged=$((mutations_judged + 1)) ;;
     esac
 fi
 
@@ -515,7 +520,7 @@ else
     r="$(cargo test -p grim-engine --test norm_kind_wiring -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "F SURVIVED -- the loader ignores the norm kind: $r" ;;
-        *)             pass "F killed: $r" ;;
+        *)             pass "F killed: $r"; mutations_judged=$((mutations_judged + 1)) ;;
     esac
 fi
 
@@ -549,6 +554,11 @@ fi
 
 echo
 echo "---"
+if [ "$mutations_judged" -ne "$mutations_expected" ]; then
+    fail "only $mutations_judged of $mutations_expected mutations were judged -- \
+one is missing, renamed or made inert, and its property is unpinned"
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "norm gate green"
 else

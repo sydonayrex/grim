@@ -390,6 +390,40 @@ fi
 
 
 ###############################################################################
+printf '\n=== 5c. the gate must COUNT its mutations, not just not-fail\n'
+###############################################################################
+# The gate's verdict is `exit "$fail"`. A mutation that is deleted, renamed or
+# made inert contributes no `fail`, so the gate still prints "norm gate green"
+# having judged five of six. That is the same shape as the restore leak: the
+# thing that is supposed to catch a silent loss is itself silent.
+#
+# Section 2 already showed what a missing anchor looks like -- a `fail` line --
+# so an anchor that still matches is needed to make a mutation vanish quietly.
+# Removing a whole mutation does not go through that path at all.
+g0="$REPO/scripts/check-norm-gate.sh"
+if ! grep -q 'mutations_judged\|MUTATION_COUNT\|killed.*-eq 6' "$g0"; then
+    fail "the gate never asserts how many mutations it judged, so a deleted or \
+inert mutation leaves it reporting green"
+else
+    pass "the gate asserts its mutation count"
+fi
+# The six slots must be present AND distinct, or the count is a tautology.
+n_slots="$(grep -c '^echo "=== MUTATION [A-F]:' "$g0")"
+if [ "$n_slots" -eq 6 ]; then
+    pass "six distinct mutation slots"
+else
+    fail "the gate has $n_slots mutation slots, want 6"
+fi
+# A duplicated slot: same anchor, same suite -- two names, one check.
+dups="$(grep -o '^echo "=== MUTATION [A-F]:' "$g0" | sort | uniq -d)"
+if [ -z "$dups" ]; then
+    pass "no duplicated mutation slot"
+else
+    fail "duplicated mutation slots: $dups"
+fi
+
+
+###############################################################################
 printf '\n=== 5. this script and the real gate are untouched\n'
 ###############################################################################
 if bash -n "$GATE" 2>/dev/null; then
