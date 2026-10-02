@@ -6930,6 +6930,22 @@ pub struct Xing40GraphScratch {
     /// branch's (what this did before) rescales every ffn gate; layer 0 hid it
     /// because its `post` gate is ~1e-7, so only the layers with a larger
     /// `post` showed the error.
+    /// Snapshot of the ATTENTION branch's gates, taken inside the capture by a
+    /// device-to-device copy. `post`/`comb` are overwritten by the FFN's gate
+    /// call moments later and cannot be read post-replay, while the warmup
+    /// computes its gates from a stale stream - so the attention gates were
+    /// the one layer-0 quantity with no observable value at a real prefix.
+    /// Snapshot of the attention branch's `o_proj` output, taken before the
+    /// FFN reuses `norm_buf`. With the absorb and both gate sets verified,
+    /// this is the last unverified input to the attention write-back.
+    /// Snapshot of `sin[0]` as layer 0 sees it. Post-replay sin[0] holds the
+    /// LAST layer's output, so any oracle needing layer 0's input stream must
+    /// read this instead - reading sin[0] late silently produces a reference
+    /// ~1900x too large.
+    pub sin0_snap: Vec<GBox>,
+    pub attn_out_snap: Vec<GBox>,
+    pub attn_post_snap: Vec<GBox>,
+    pub attn_comb_snap: Vec<GBox>,
     pub hc_base_ffn: Vec<GBox>,
     pub hc_scale_ffn: Vec<GBox>,
     /// The checkpoint's rope (base + YaRN), interleaved pairing.
@@ -6987,6 +7003,10 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
         hc_fn_ffn: Vec::with_capacity(n_layers),
         hc_base: Vec::with_capacity(n_layers),
         hc_scale: Vec::with_capacity(n_layers),
+        sin0_snap: Vec::with_capacity(1),
+        attn_out_snap: Vec::with_capacity(n_layers),
+        attn_post_snap: Vec::with_capacity(n_layers),
+        attn_comb_snap: Vec::with_capacity(n_layers),
         hc_base_ffn: Vec::with_capacity(n_layers),
         hc_scale_ffn: Vec::with_capacity(n_layers),
         rope_cfg: {
@@ -7019,6 +7039,14 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
             .push(dev.zeros(&Shape::new(vec![hc, batch]), grim_tensor::DType::F32)?);
         s.post
             .push(dev.zeros(&Shape::new(vec![hc, batch]), grim_tensor::DType::F32)?);
+        s.sin0_snap
+            .push(dev.zeros(&Shape::new(vec![batch, flat]), grim_tensor::DType::F32)?);
+        s.attn_out_snap
+            .push(dev.zeros(&Shape::new(vec![batch, hidden]), grim_tensor::DType::F32)?);
+        s.attn_post_snap
+            .push(dev.zeros(&Shape::new(vec![hc, batch]), grim_tensor::DType::F32)?);
+        s.attn_comb_snap
+            .push(dev.zeros(&Shape::new(vec![hc * hc, batch]), grim_tensor::DType::F32)?);
         s.comb
             .push(dev.zeros(&Shape::new(vec![hc * hc, batch]), grim_tensor::DType::F32)?);
         s.col
@@ -7371,6 +7399,11 @@ impl DecodeGraphModel for Xing40 {
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("hc seed: {e}")))?;
         }
+        // Snapshot layer 0's input stream before the last layer overwrites it.
+        {
+            let dst = as_rocm(scratch.sin0_snap[0].as_ref())?;
+            dev.copy_slice_into(dst, scratch.sin[0].as_ref(), 0, flat)?;
+        }
         let h_shape = Shape::new(vec![batch, hidden]);
         let n_layers = self.layers.len();
         // Fault bisection: capture only the first N layers (default: all).
@@ -7426,6 +7459,15 @@ impl DecodeGraphModel for Xing40 {
                 cmin,
                 cmax,
             )?;
+            // Snapshot the attention gates before the FFN overwrites them.
+            // Capture-safe: a device-to-device copy on the capturing stream,
+            // no allocation and no sync.
+            {
+                let pdst = as_rocm(scratch.attn_post_snap[i].as_ref())?;
+                dev.copy_slice_into(pdst, scratch.post[i].as_ref(), 0, hc * batch)?;
+                let cdst = as_rocm(scratch.attn_comb_snap[i].as_ref())?;
+                dev.copy_slice_into(cdst, scratch.comb[i].as_ref(), 0, hc * hc * batch)?;
+            }
                         // CAVEAT: this is a WARMUP pass. run.rs runs warmups on UNSEEDED
             // buffers and then re-seeds, so only values UPSTREAM of the
             // attention (embedding, collapse, attn gates, q path) are
@@ -7825,6 +7867,11 @@ dev.launch_hc_collapse_step(
                 &buffers.norm_buf[i],
                 act,
             )?;
+            // Snapshot o_proj's output before the FFN reuses norm_buf.
+            {
+                let dst = as_rocm(scratch.attn_out_snap[i].as_ref())?;
+                dev.copy_slice_into(dst, &buffers.norm_buf[i], 0, hidden)?;
+            }
             // Host oracle for the Q4_K o_proj. `fused_quant_gemm` cannot be
             // A/B'd in-process (it deadlocks the warmup), so dequantize the
             // weight on the host and compute the GEMV directly: that is ground
@@ -8592,6 +8639,134 @@ dev.launch_hc_collapse_step(
                             })
                             .collect();
                         eprintln!("[xing-graph] sin rms {}", parts.join(" "));
+                    // ATTENTION WRITE-BACK oracle at the real prefix. Every
+                    // input is now individually verified (absorb exact, attn
+                    // gates exact, o_proj exact) and all three survive the
+                    // replay via the snapshots, so this checks the write-back
+                    // itself: sout[h*hidden+d] = post[h]*y[d] +
+                    // sum_k comb[h*hc+k]*sin[k*hidden+d].
+                    {
+                        let sv = g.sin0_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let nb = g.attn_out_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let pv = g.attn_post_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let cv = g.attn_comb_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let ov = g.sout
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        if let (Some(sinv), Some(nbv), Some(pv), Some(cv), Some(ov)) =
+                            (sv, nb, pv, cv, ov)
+                        {
+                            let hid = self.cfg.hidden_size;
+                            let hc4 = self.cfg.hc_mult;
+                            let (mut md, mut rr) = (0.0f32, 0.0f64);
+                            for d in 0..hid {
+                                for h in 0..hc4 {
+                                    let mut acc = pv[h] * nbv[d];
+                                    for k in 0..hc4 {
+                                        acc += cv[h * hc4 + k] * sinv[k * hid + d];
+                                    }
+                                    let diff = (acc - ov[h * hid + d]).abs();
+                                    if diff > md {
+                                        md = diff;
+                                    }
+                                    rr += (acc as f64) * (acc as f64);
+                                }
+                            }
+                            rr = (rr / (hc4 * hid) as f64).sqrt();
+                            let rg = (ov.iter().map(|x| x * x).sum::<f32>()
+                                / ov.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] ATTNWB post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                md as f64 / rr.max(1e-12)
+                            );
+                        }
+                    }
+
+                    // OPROJ oracle against the SNAPSHOT taken in-graph at the
+                    // real prefix: attn[0] x o_proj^T. attn[0] is exact, the
+                    // attention gates are exact, so if this fails the whole
+                    // attention write-back is explained.
+                    {
+                        let a = g.attn
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let nb = g.attn_out_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let w = self.layers[0]
+                            .self_attn
+                            .o_proj
+                            .weight()
+                            .to_vec_f32()
+                            .ok();
+                        if let (Some(a), Some(nb), Some(w)) = (a, nb, w) {
+                            let k = a.len();
+                            let n_out = 512.min(nb.len());
+                            let (mut md, mut rr) = (0.0f32, 0.0f64);
+                            for j in 0..n_out {
+                                let mut acc = 0.0f32;
+                                for c in 0..k {
+                                    acc += a[c] * w[j * k + c];
+                                }
+                                let d = (acc - nb[j]).abs();
+                                if d > md {
+                                    md = d;
+                                }
+                                rr += (acc as f64) * (acc as f64);
+                            }
+                            rr = (rr / n_out as f64).sqrt();
+                            let rg = (nb[..n_out].iter().map(|x| x * x).sum::<f32>()
+                                / n_out as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] OPROJ post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                md as f64 / rr.max(1e-12)
+                            );
+                        }
+                    }
+
+                    // The ATTENTION branch's gates, snapshotted in-graph at a
+                    // real prefix. Directly comparable with eager's
+                    // position-tagged ATTNGATES line.
+                    {
+                        let hc4 = self.cfg.hc_mult;
+                        let pv = g.attn_post_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let cv = g.attn_comb_snap
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        if let (Some(pv), Some(cv)) = (pv, cv) {
+                            let rows: Vec<f32> = (0..hc4)
+                                .map(|h| (0..hc4).map(|k| cv[h * hc4 + k]).sum())
+                                .collect();
+                            eprintln!(
+                                "[xing-graph] ATTNGATES pos {} comb_rowsums {:?} post {:?}",
+                                graph.buffers.current_pos,
+                                rows,
+                                &pv[..hc4.min(pv.len())]
+                            );
+                        }
+                    }
+
                     // Value-absorb ORACLE, post-replay: attn[h,v] =
                     // sum_c qattn_latent[h,c] * w_vc[h,v,c]. Both inputs
                     // survive the replay, so this checks the absorb at the

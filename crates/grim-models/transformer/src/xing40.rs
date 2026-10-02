@@ -2389,6 +2389,25 @@ impl Xing40Block {
         let collapsed = self.attn_norm.forward(&collapsed)?;
 
         nan_stage("attn_in", &collapsed);
+        // Attention hc gates, position-tagged: the graph snapshots these
+        // in-graph (post/comb are overwritten by the FFN before they can be
+        // read post-replay), so this is the one layer-0 quantity that can be
+        // compared at a matched kv_pos.
+        if trace_nan {
+            if let Ok(c) = attn_gates.comb.to_cpu_vec_f32() {
+                let hc = self.attn_hc.hc_mult;
+                let rows: Vec<f32> = (0..hc)
+                    .map(|h| (0..hc).map(|k| c[h * hc + k]).sum())
+                    .collect();
+                let p = attn_gates.post.to_cpu_vec_f32().unwrap_or_default();
+                eprintln!(
+                    "[xing-trace] ATTNGATES pos {} comb_rowsums {:?} post {:?}",
+                    positions.last().copied().unwrap_or(u32::MAX),
+                    rows,
+                    &p[..hc.min(p.len())]
+                );
+            }
+        }
         // 2. Self-attention on the collapsed stream.
         let attn_out = self.self_attn.forward(&collapsed, positions, kv_cache)?;
         nan_stage("attn_out", &attn_out);
