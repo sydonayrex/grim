@@ -7919,6 +7919,51 @@ dev.launch_hc_collapse_step(
             if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("attn") {
                 return Ok(());
             }
+            // HOST ORACLE for the attention write-back. Placed HERE on purpose:
+            // `post`/`comb` are overwritten by the FFN's gate call moments
+            // later, so an oracle further down compares the attention
+            // write-back against the FFN's gates and reports garbage (it
+            // reported rel 4.5 that way before this note existed).
+            //   out[h*hidden+d] = post[h]*y[d] + sum_i comb[h*hc+i]*s[i*hidden+d]
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                let sv = as_rocm(scratch.sin[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+                let pv = as_rocm(scratch.post[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                let cv = as_rocm(scratch.comb[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                let ov = as_rocm(scratch.sout[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                if let (Ok(sinv), Ok(nb), Ok(postv), Ok(combv), Ok(soutv)) = (sv, nb, pv, cv, ov) {
+                    let (mut md, mut rr) = (0.0f32, 0.0f64);
+                    for d in 0..hidden {
+                        for h in 0..hc {
+                            let mut acc = postv[h] * nb[d];
+                            for k in 0..hc {
+                                acc += combv[h * hc + k] * sinv[k * hidden + d];
+                            }
+                            let diff = (acc - soutv[h * hidden + d]).abs();
+                            if diff > md {
+                                md = diff;
+                            }
+                            rr += (acc as f64) * (acc as f64);
+                        }
+                    }
+                    rr = (rr / (hc * hidden) as f64).sqrt();
+                    let rg = (soutv.iter().map(|x| x * x).sum::<f32>()
+                        / soutv.len().max(1) as f32)
+                        .sqrt();
+                    let rms = |v: &Vec<f32>| {
+                        (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+                    };
+                    eprintln!(
+                        "[xing-graph] WB inputs rms: sin {:.4e} nb {:.4e} post {:?} comb {:.4e} sout {:.4e}",
+                        rms(&sinv), rms(&nb), &postv[..hc.min(postv.len())], rms(&combv), rg
+                    );
+                    eprintln!(
+                        "[xing-graph] ATTN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                        md as f64 / rr.max(1e-12)
+                    );
+                }
+            }
             // ── ffn hc ──
             // Reads the stream the attention write-back just produced.
             dev.rms_norm_into(
@@ -8231,6 +8276,43 @@ dev.launch_hc_collapse_step(
             if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("ffn") {
                 return Ok(());
             }
+            // HOST ORACLE for the dense FFN's w2 GEMV — the last unverified
+            // link in layer 0. Every other stage is now either bit-identical
+            // to eager or checked against a host oracle, but this one feeds
+            // norm_buf straight into the FFN write-back.
+            //   out[j] = sum_c activated[c] * w2[j, c]
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                if let Some(mlp) = &layer.mlp {
+                    let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                    let act = as_rocm(&buffers.activated_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+                    let w = mlp.w2.weight().to_vec_f32();
+                    let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+                    if let (Ok(act), Ok(w), Ok(nb)) = (act, w, nb) {
+                        let k = act.len();
+                        let n_out = 512.min(hidden);
+                        let (mut md, mut rr) = (0.0f32, 0.0f64);
+                        for jx in 0..n_out {
+                            let mut acc = 0.0f32;
+                            for c in 0..k {
+                                acc += act[c] * w[jx * k + c];
+                            }
+                            let d = (acc - nb[jx]).abs();
+                            if d > md {
+                                md = d;
+                            }
+                            rr += (acc as f64) * (acc as f64);
+                        }
+                        rr = (rr / n_out as f64).sqrt();
+                        let rg = (nb[..n_out].iter().map(|x| x * x).sum::<f32>()
+                            / n_out as f32)
+                            .sqrt();
+                        eprintln!(
+                            "[xing-graph] DENSE W2 vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                            md as f64 / rr.max(1e-12)
+                        );
+                    }
+                }
+            }
             // ── ffn write-back: streams carry to the next layer ──
             let dst: &GBox = if i + 1 < n_layers {
                 &scratch.sin[i + 1]
@@ -8246,6 +8328,48 @@ dev.launch_hc_collapse_step(
                 hc,
                 hidden,
             )?;
+            // HOST ORACLE for the FFN write-back, i.e. sin[1] — the value the
+            // per-layer ratio table has tracked since the first session (graph
+            // 3.9997e-3 vs eager 4.03218e-3). Same formula as the attention
+            // write-back, over sout[i] and the FFN's own gates.
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                let sv = as_rocm(scratch.sout[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                let nb = as_rocm(&buffers.norm_buf[i]).and_then(|s| s.to_cpu_vec_f32());
+                let pv = as_rocm(scratch.post[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                let cv = as_rocm(scratch.comb[i].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                let ov = as_rocm(scratch.sin[1].as_ref()).and_then(|s| s.to_cpu_vec_f32());
+                if let (Ok(sinv), Ok(nb), Ok(postv), Ok(combv), Ok(outv)) = (sv, nb, pv, cv, ov) {
+                    let (mut md, mut rr) = (0.0f32, 0.0f64);
+                    for d in 0..hidden {
+                        for h in 0..hc {
+                            let mut acc = postv[h] * nb[d];
+                            for k2 in 0..hc {
+                                acc += combv[h * hc + k2] * sinv[k2 * hidden + d];
+                            }
+                            let diff = (acc - outv[h * hidden + d]).abs();
+                            if diff > md {
+                                md = diff;
+                            }
+                            rr += (acc as f64) * (acc as f64);
+                        }
+                    }
+                    rr = (rr / (hc * hidden) as f64).sqrt();
+                    let rg =
+                        (outv.iter().map(|x| x * x).sum::<f32>() / outv.len().max(1) as f32).sqrt();
+                    let rms = |v: &Vec<f32>| {
+                        (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+                    };
+                    eprintln!(
+                        "[xing-graph] FFNWB inputs rms: sout {:.4e} nb {:.4e} post {:?} comb {:.4e} sin1 {:.4e}",
+                        rms(&sinv), rms(&nb), &postv[..hc.min(postv.len())], rms(&combv), rg
+                    );
+                    eprintln!(
+                        "[xing-graph] FFN WRITEBACK vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                        md as f64 / rr.max(1e-12)
+                    );
+                }
+            }
         }
         if cap_layers < self.layers.len() {
             return Ok(());
