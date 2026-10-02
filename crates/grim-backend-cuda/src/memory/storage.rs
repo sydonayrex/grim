@@ -120,6 +120,9 @@ pub(crate) fn cuda_dequant_quantized_storage(
             }
             // Self-describing blob: the 128x128 scale grid rides with the codes.
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(b_bytes),
+            // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale) — same
+            // host decode the vulkan quant_ops arm uses.
+            BlockDtype::Q4_0 => grim_quant::dequant_q4_0(b_bytes, elem_count),
             // GreyRaven 2:4: no packed byte format exists yet (E4's
             // pack_grey_raven is unwritten; the host sparsifier holds f32
             // survivors, not E4M3 bytes). Unimplemented rather than a dense

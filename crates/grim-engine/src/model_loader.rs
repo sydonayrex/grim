@@ -2026,6 +2026,13 @@ fn load_model_from_config(
                 num_experts_per_tok: 8,
                 first_k_dense_replace: 1,
                 routed_scaling_factor: 2.5,
+                // Flash-Next sparse indexer: disabled until the loader reads
+                // the checkpoint's indexer keys (deepseek32.rs owns the
+                // Option-based contract; None = dense attention).
+                index_n_heads: None,
+                index_head_dim: None,
+                index_topk: None,
+                index_source_layer_ids: None,
             };
             let m = DeepSeek32::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
@@ -4146,6 +4153,13 @@ fn load_model_with_providers(
                 num_experts_per_tok: hparams.expert_used_count.unwrap_or(8),
                 first_k_dense_replace: 1,
                 routed_scaling_factor: 2.5,
+                // Flash-Next sparse indexer: disabled until the loader reads
+                // the checkpoint's indexer keys (deepseek32.rs owns the
+                // Option-based contract; None = dense attention).
+                index_n_heads: None,
+                index_head_dim: None,
+                index_topk: None,
+                index_source_layer_ids: None,
             };
             let m = DeepSeek32::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))

@@ -1994,15 +1994,36 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q4K),
         },
-        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
+        // Legacy block quants. Q4_0 gets its own storage: it is 18 B per 32
+        // weights (f16 scale, bias 8), NOT the 144 B per 256 super-block of
+        // Q4_K, so typing it as KQuant(Q4K) sliced and decoded every payload
+        // with the wrong geometry. Q4_1/Q4_2 (20 B) and Q5_0/Q5_1 (22/24 B)
+        // have their own zero conventions and no decoder here, so they carry
+        // correct geometry and refuse to decode rather than masquerading as
+        // K-quant.
+        GgufDType::Q4_0 => DType {
             arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q4K),
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Q4_0),
+        },
+        GgufDType::Q4_1 | GgufDType::Q4_2 | GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
+                name: match gguf_dtype {
+                    GgufDType::Q4_1 => "Q4_1",
+                    GgufDType::Q4_2 => "Q4_2",
+                    GgufDType::Q5_0 => "Q5_0",
+                    _ => "Q5_1",
+                },
+                block_size: Some(32),
+                bytes_per_block: Some(match gguf_dtype {
+                    GgufDType::Q4_1 | GgufDType::Q4_2 => 20,
+                    GgufDType::Q5_0 => 22,
+                    _ => 24,
+                }),
+                reason: format!("{gguf_dtype:?} has no decoder in grim"),
+            }),
         },
         GgufDType::Q5K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q5K),
-        },
-        GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q5K),
         },

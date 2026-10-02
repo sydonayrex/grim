@@ -205,7 +205,7 @@ impl ModelFootprint {
             .or_else(|| {
                 gguf.tensors.first().and_then(|t| match t.dtype {
                     crate::gguf::GgufDType::BF16 => Some(WeightFormat::Bf16),
-                    crate::gguf::GgufDType::Q4K | crate::gguf::GgufDType::Q4_0 => {
+                    crate::gguf::GgufDType::Q4_0 | crate::gguf::GgufDType::IQ4_NL => {
                         Some(WeightFormat::Crow)
                     }
                     crate::gguf::GgufDType::MXFP4 => Some(WeightFormat::Rook),

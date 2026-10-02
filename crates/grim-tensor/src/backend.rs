@@ -712,6 +712,9 @@ pub enum PagedKvQuantFormat {
     /// stolen as a special-value selector. Reads its scale from the buffer, so
     /// the caller's per-tensor scale is ignored.
     NutFp4 = 8,
+    /// WhiteCrow: RDNA 3/4 native unsigned 4-bit group-128 OSTQuant layout
+    /// (`[N, K/8]` qweight u32 LE, `[N, K/128]` bf16 scales, `[N, K/128]` u8 zeros).
+    WhiteCrow = 9,
 }
 
 pub trait AttentionOps {

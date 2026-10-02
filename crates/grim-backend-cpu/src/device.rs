@@ -2602,6 +2602,7 @@ impl BackendStorage for CpuStorage {
                 }
             },
             Storage::Block(block_type) => match block_type {
+                grim_tensor::dtype::BlockDtype::Q4_0 => grim_quant::dequant_q4_0(raw, n),
                 grim_tensor::dtype::BlockDtype::Fp4 => grim_quant::dequant_fp4(raw, n),
                 grim_tensor::dtype::BlockDtype::Nf4 => grim_quant::dequant_nf4(raw, n),
                 grim_tensor::dtype::BlockDtype::Fp8 => grim_quant::dequant_fp8(raw, n),

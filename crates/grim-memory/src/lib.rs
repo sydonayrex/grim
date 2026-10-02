@@ -125,6 +125,13 @@ impl grim_kvtransport::KvBlockStore for KvBlockPool {
     }
 }
 
+/// Physical layer storage for a block: either raw f32 or packed quantized bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerStorage {
+    DenseF32 { keys: Vec<f32>, values: Vec<f32> },
+    Packed { format: grim_tensor::PagedKvQuantFormat, bytes: Vec<u8> },
+}
+
 /// One physical KV block in the pool.
 struct KvBlock {
     _id: BlockId,
@@ -136,6 +143,8 @@ struct KvBlock {
     layer_keys: Vec<Vec<f32>>,
     /// Per-layer value storage for multi-layer handoffs.
     layer_values: Vec<Vec<f32>>,
+    /// Optional packed storage per layer (WhiteCrow or NVFP4) behind GRIM_PACKED_POOL=1.
+    layer_packed: Vec<Option<LayerStorage>>,
     num_tokens: usize,
     /// Whether this block has received real KV data (via `store_kv`, network ingestion, or explicit `write_keys`).
     /// Replaces the fragile non-zero-content sniff in the decode fetch loop: a genuinely all-zero KV block.
@@ -244,6 +253,7 @@ impl KvBlockPool {
                 value_data: vec![0.0; block_elem],
                 layer_keys: Vec::new(),
                 layer_values: Vec::new(),
+                layer_packed: Vec::new(),
                 num_tokens: 0,
                 received: false,
                 location: CacheTier::Gpu,
@@ -620,23 +630,46 @@ impl KvBlockPool {
         // retention mechanism; the prefix-tree entry survives demotion.)
         if let Some(spill) = self.spill.as_ref() {
             let mut demoted = false;
-            // 1. Compressed path: the compressor's serialized block IS the spilled bytes
-            // - closes the compression-to-spill loop instead of recording compression as metadata only.
-            if let Some(_c) = self.compressor.as_ref() {
-                if let Ok(Some(compressed)) = self.compress_block(id) {
-                    match spill.demote_compressed(id, compressed.to_bytes()) {
+            // 0. Packed path (GRIM_PACKED_POOL=1): if block carries packed layers (WhiteCrow/NVFP4)
+            let use_packed = std::env::var("GRIM_PACKED_POOL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if use_packed {
+                if let Some(Some(LayerStorage::Packed { format, bytes })) = self.blocks[id].layer_packed.first() {
+                    match spill.demote_packed(id, *format as u16, bytes.clone()) {
                         Ok(()) => {
-                            if let Err(e) = spill.demote_compressed_to_nvme(id) {
+                            if let Err(e) = spill.demote_packed_to_nvme(id) {
                                 eprintln!(
-                                    "[BlockPool] compressed demote_to_nvme failed for block {id} (host copy retained): {e}"
+                                    "[BlockPool] packed demote_to_nvme failed for block {id}: {e}"
                                 );
                             }
                             demoted = true;
                         }
                         Err(e) => {
-                            eprintln!(
-                                "[BlockPool] compressed demote_to_host failed for block {id}, falling back to raw: {e}"
-                            );
+                            eprintln!("[BlockPool] packed demote_to_host failed for block {id}: {e}");
+                        }
+                    }
+                }
+            }
+            // 1. Compressed path: the compressor's serialized block IS the spilled bytes
+            // - closes the compression-to-spill loop instead of recording compression as metadata only.
+            if !demoted {
+                if let Some(_c) = self.compressor.as_ref() {
+                    if let Ok(Some(compressed)) = self.compress_block(id) {
+                        match spill.demote_compressed(id, compressed.to_bytes()) {
+                            Ok(()) => {
+                                if let Err(e) = spill.demote_compressed_to_nvme(id) {
+                                    eprintln!(
+                                        "[BlockPool] compressed demote_to_nvme failed for block {id} (host copy retained): {e}"
+                                    );
+                                }
+                                demoted = true;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[BlockPool] compressed demote_to_host failed for block {id}, falling back to raw: {e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -929,6 +962,7 @@ impl KvBlockPool {
                     value_data: vec![0.0; block_elem],
                     layer_keys: Vec::new(),
                     layer_values: Vec::new(),
+                    layer_packed: Vec::new(),
                     num_tokens: 0,
                     received: false,
                     location: CacheTier::Gpu,
@@ -1093,6 +1127,43 @@ impl KvBlockPool {
 
     pub fn write_layer_values(&mut self, id: BlockId, layer: usize, values: &[f32]) {
         let _ = self.try_write_layer_values(id, layer, values);
+    }
+
+    /// Write packed quantized bytes (WhiteCrow / NVFP4) for a layer into block `id`.
+    /// Sizing reduces KV storage by up to 7x compared to dense f32.
+    pub fn try_write_layer_packed(
+        &mut self,
+        id: BlockId,
+        layer: usize,
+        format: grim_tensor::PagedKvQuantFormat,
+        bytes: Vec<u8>,
+        num_tokens: usize,
+    ) -> Result<()> {
+        if id >= self.blocks.len() {
+            return Err(Error::KvCache(format!(
+                "write_layer_packed: block id {id} out of bounds (capacity {})",
+                self.blocks.len()
+            )));
+        }
+        if self.blocks[id].layer_packed.len() <= layer {
+            let old_len = self.blocks[id].layer_packed.len();
+            for _ in old_len..=layer {
+                self.blocks[id].layer_packed.push(None);
+            }
+        }
+        self.blocks[id].layer_packed[layer] = Some(LayerStorage::Packed { format, bytes });
+        self.blocks[id].num_tokens = num_tokens.min(BLOCK_SIZE);
+        self.blocks[id].received = true;
+        self.dirty_blocks.insert(id);
+        Ok(())
+    }
+
+    /// Read packed storage for a layer if available.
+    pub fn read_layer_packed(&self, id: BlockId, layer: usize) -> Option<&LayerStorage> {
+        if id >= self.blocks.len() {
+            return None;
+        }
+        self.blocks[id].layer_packed.get(layer).and_then(|opt| opt.as_ref())
     }
 
     pub fn read_layer_keys(&self, id: BlockId, layer: usize) -> Option<&[f32]> {
@@ -1810,6 +1881,52 @@ impl KvCache for PagedKvCache {
                         .copy_from_slice(&v_flat[tok_start..tok_start + (k_end - within_block)]);
                     pool.blocks[physical].num_tokens = ((pos % self.page_size) + 1).min(BLOCK_SIZE);
                     pool.blocks[physical].received = true;
+                }
+
+                // Producer path: when GRIM_PACKED_POOL=1, quantize and store packed layer
+                let use_packed = std::env::var("GRIM_PACKED_POOL")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if use_packed {
+                    let k_src: &[f32] = if layer == 0 {
+                        &pool.blocks[physical].key_data
+                    } else if layer < pool.blocks[physical].layer_keys.len() {
+                        &pool.blocks[physical].layer_keys[layer]
+                    } else {
+                        &[]
+                    };
+                    if !k_src.is_empty() && k_src.len() % 128 == 0 {
+                        // WhiteCrow native RDNA 3/4 format: unsigned 4-bit group-128
+                        if let Ok((qw, sc, zr)) = grim_quant::quant_ostquant_w4_group128(k_src, 1, k_src.len()) {
+                            let mut packed = Vec::with_capacity(qw.len() + sc.len() + zr.len() + 12);
+                            packed.extend_from_slice(&(qw.len() as u32).to_le_bytes());
+                            packed.extend_from_slice(&(sc.len() as u32).to_le_bytes());
+                            packed.extend_from_slice(&(zr.len() as u32).to_le_bytes());
+                            packed.extend_from_slice(&qw);
+                            packed.extend_from_slice(&sc);
+                            packed.extend_from_slice(&zr);
+                            let nt = pool.blocks[physical].num_tokens;
+                            let _ = pool.try_write_layer_packed(
+                                physical,
+                                layer,
+                                grim_tensor::PagedKvQuantFormat::WhiteCrow,
+                                packed,
+                                nt,
+                            );
+                        }
+                    } else if !k_src.is_empty() {
+                        // Fallback to NVFP4 (16-elem sub-blocks) when not group-128 aligned
+                        if let Ok(packed) = grim_quant::quant_nvfp4(k_src) {
+                            let nt = pool.blocks[physical].num_tokens;
+                            let _ = pool.try_write_layer_packed(
+                                physical,
+                                layer,
+                                grim_tensor::PagedKvQuantFormat::NvFp4,
+                                packed,
+                                nt,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -2997,4 +3114,49 @@ mod f10_mirror_tests {
         assert!(pool.try_write_layer_keys(0, 0, &oversized, 16).is_err());
         assert!(pool.try_write_layer_values(0, 1, &oversized).is_err());
     }
+
+    #[test]
+    fn test_packed_pool_whitecrow_and_nvfp4() {
+        // Test WhiteCrow packed storage in KvBlockPool
+        let mut pool = KvBlockPool::new(4, 8, 128); // 16 * 8 * 128 = 16384 elems (multiple of 128)
+        let block_elem = BLOCK_SIZE * 8 * 128;
+        let k_data = vec![0.5f32; block_elem];
+
+        let (qw, sc, zr) = grim_quant::quant_ostquant_w4_group128(&k_data, 1, block_elem).unwrap();
+        let mut packed = Vec::with_capacity(qw.len() + sc.len() + zr.len() + 12);
+        packed.extend_from_slice(&(qw.len() as u32).to_le_bytes());
+        packed.extend_from_slice(&(sc.len() as u32).to_le_bytes());
+        packed.extend_from_slice(&(zr.len() as u32).to_le_bytes());
+        packed.extend_from_slice(&qw);
+        packed.extend_from_slice(&sc);
+        packed.extend_from_slice(&zr);
+
+        // Dense f32 bytes would be 16384 * 4 = 65,536 B
+        // Packed WhiteCrow bytes is ~8,460 B (~7.7x reduction)
+        let dense_bytes = block_elem * 4;
+        let packed_bytes = packed.len();
+        assert!(
+            (dense_bytes as f32) / (packed_bytes as f32) > 7.0,
+            "WhiteCrow should provide > 7x reduction (got {:.2}x)",
+            (dense_bytes as f32) / (packed_bytes as f32)
+        );
+
+        pool.try_write_layer_packed(
+            0,
+            0,
+            grim_tensor::PagedKvQuantFormat::WhiteCrow,
+            packed.clone(),
+            16,
+        )
+        .unwrap();
+
+        match pool.read_layer_packed(0, 0) {
+            Some(LayerStorage::Packed { format, bytes }) => {
+                assert_eq!(*format, grim_tensor::PagedKvQuantFormat::WhiteCrow);
+                assert_eq!(bytes, &packed);
+            }
+            other => panic!("expected WhiteCrow packed storage, got {other:?}"),
+        }
+    }
 }
+

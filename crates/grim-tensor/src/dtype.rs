@@ -133,6 +133,13 @@ pub enum BlockDtype {
     Fp4,
     Nf4,
     Fp8,
+    /// Legacy GGUF Q4_0 (type 2): 18-byte blocks of `[f16 scale][32 nibbles]`,
+    /// one block per 32 weights, `w = (q - 8) * scale`.
+    ///
+    /// Its own variant rather than `KQuant(Q4K)`, which is 144-byte
+    /// super-blocks: typing Q4_0 as Q4_K made every consumer slice and decode
+    /// the payload with the wrong geometry. This is the format GreyCrow repacks.
+    Q4_0,
     Fp4Block16,
     Fp8Block16,
     /// E4M3 codes with a 128x128 (row x col) grid of `f32` inverse scales —
@@ -391,6 +398,9 @@ impl DType {
             Storage::Block(b) => match b {
                 BlockDtype::Fp4 | BlockDtype::Nf4 => elem_count.div_ceil(2),
                 BlockDtype::Fp8 => elem_count,
+                // 18 B per 32 weights = 0.5625 B/elem, the same density as
+                // IQ4_NL but a different block (f16 scale, bias 8).
+                BlockDtype::Q4_0 => elem_count.div_ceil(32) * 18,
                 BlockDtype::Fp4Block16 => elem_count.div_ceil(2) + (elem_count.div_ceil(16)) * 2,
                 BlockDtype::Fp8Block16 => elem_count + (elem_count.div_ceil(16)) * 2,
                 // codes + 128x128 scale grid; the grid extent is in the blob
@@ -489,6 +499,10 @@ impl TryFrom<&Storage> for QuantFormat {
                 BlockDtype::Nf4 => Ok(QuantFormat::Nf4),
                 BlockDtype::Fp8 => Ok(QuantFormat::Fp8),
                 BlockDtype::Fp8Sparse24 => Ok(QuantFormat::Fp8Sparse24),
+                // Legacy Q4_0 shares IQ4_NL's density but not its block, and no
+                // canonical QuantFormat names it yet; refuse rather than
+                // report a format a decoder would not honour.
+                BlockDtype::Q4_0 => Err(()),
             },
             _ => Err(()),
         }

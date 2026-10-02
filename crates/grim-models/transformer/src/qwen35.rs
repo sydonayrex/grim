@@ -3840,6 +3840,11 @@ pub(crate) fn packed_kv_bytes(n_values: usize, fmt: grim_tensor::PagedKvQuantFor
         F::Fp4E2M1 | F::Int4 => n_values.div_ceil(2),
         F::MxFp4 => n_values.div_ceil(32) * 17,
         F::MxFp8 => n_values.div_ceil(32) * 33,
+        // WhiteCrow: per 128 values - 64 B u4 codes + 2 B bf16 scale + 1 B zero.
+        // The packed pool has no WhiteCrow KV decode leg yet, so the arena
+        // selection arm above refuses it before this size is ever needed; the
+        // arm exists so the enum stays exhaustively matched.
+        F::WhiteCrow => n_values.div_ceil(128) * 67,
     }
 }
 

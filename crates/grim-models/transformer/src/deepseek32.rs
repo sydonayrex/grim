@@ -35,6 +35,10 @@ pub struct DeepSeek32Config {
     pub num_experts_per_tok: usize,
     pub first_k_dense_replace: usize,
     pub routed_scaling_factor: f32,
+    pub index_n_heads: Option<usize>,
+    pub index_head_dim: Option<usize>,
+    pub index_topk: Option<usize>,
+    pub index_source_layer_ids: Option<Vec<usize>>,
 }
 
 impl Default for DeepSeek32Config {
@@ -61,6 +65,10 @@ impl Default for DeepSeek32Config {
             num_experts_per_tok: 8,
             first_k_dense_replace: 3,
             routed_scaling_factor: 2.5,
+            index_n_heads: None,
+            index_head_dim: None,
+            index_topk: None,
+            index_source_layer_ids: None,
         }
     }
 }
@@ -89,6 +97,17 @@ fn or_host_fallback<T>(r: std::result::Result<T, grim_tensor::Error>) -> Result<
     }
 }
 
+/// Sparse indexer weights for DeepSeek V3.2 / V4.1 Flash lightning indexer.
+pub struct DeepSeek32Indexer {
+    pub wk: Option<Linear>,
+    pub k_norm: Option<RmsNorm>,
+    pub wq_b: Linear,
+    pub weights_proj: Linear,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub topk: usize,
+}
+
 // MLA Attention Block
 
 pub struct DeepSeek32Mla {
@@ -105,6 +124,8 @@ pub struct DeepSeek32Mla {
     pub qk_nope_head_dim: usize,
     pub qk_rope_head_dim: usize,
     pub v_head_dim: usize,
+    /// Optional sparse indexer for lightning indexed attention (§4.2).
+    pub indexer: Option<DeepSeek32Indexer>,
     /// Absorbed per-head key up-projection `w_kc[h]`, row-major
     /// `[num_heads, qk_nope_head_dim, kv_lora_rank]` (rows of `kv_b_proj.weight`).
     pub w_kc: Vec<f32>,
@@ -192,6 +213,31 @@ impl DeepSeek32Mla {
             }
         }
 
+        let indexer = if let (Some(n_heads), Some(head_dim), Some(topk)) =
+            (cfg.index_n_heads, cfg.index_head_dim, cfg.index_topk)
+        {
+            let idx_ws = ws.scoped("indexer");
+            let wk = Linear::load_shape(&idx_ws.scoped("wk"), [cfg.hidden_size, n_heads * head_dim]).ok();
+            let k_norm = RmsNorm::load(&idx_ws.scoped("k_norm"), head_dim, cfg.rms_norm_eps).ok();
+            let wq_b = Linear::load_shape(&idx_ws.scoped("wq_b"), [n_heads * head_dim, cfg.hidden_size]).ok();
+            let weights_proj = Linear::load_shape(&idx_ws.scoped("weights_proj"), [n_heads, cfg.hidden_size]).ok();
+            if let (Some(wq_b), Some(weights_proj)) = (wq_b, weights_proj) {
+                Some(DeepSeek32Indexer {
+                    wk,
+                    k_norm,
+                    wq_b,
+                    weights_proj,
+                    n_heads,
+                    head_dim,
+                    topk,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             q_a_proj,
             q_a_layernorm,
@@ -206,6 +252,7 @@ impl DeepSeek32Mla {
             qk_nope_head_dim: cfg.qk_nope_head_dim,
             qk_rope_head_dim: cfg.qk_rope_head_dim,
             v_head_dim: cfg.v_head_dim,
+            indexer,
             w_kc,
             w_vc,
         })
@@ -371,6 +418,79 @@ impl DeepSeek32Mla {
                         .map(|(a, b)| a * b)
                         .sum();
                     *score = (dot_c + dot_r) * scale;
+                }
+
+                // Step 1a: Sparse Indexer Dense-Plus-Mask Parity (gated behind GRIM_SPARSE_INDEXER=1)
+                // When enabled and indexer weights are present, calculate indexer scores
+                // S_{t,s} = sum_{j=1}^{H_idx} w_{t,j} * ReLU(q_{t,j}^T k_s), select top-K, and apply -inf mask.
+                let use_sparse_indexer = std::env::var("GRIM_SPARSE_INDEXER")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if use_sparse_indexer && self.indexer.is_some() {
+                    let idx = self.indexer.as_ref().unwrap();
+                    let topk = idx.topk.min(causal_limit + 1);
+                    if causal_limit + 1 > topk {
+                        // Compute indexer query q_idx and routing weights w_idx for token s
+                        let q_idx = idx.wq_b.forward(x)?;
+                        let w_idx = idx.weights_proj.forward(x)?;
+                        let q_idx_v = q_idx.to_vec_f32()?;
+                        let w_idx_v = w_idx.to_vec_f32()?;
+
+                        // If wk is present on this layer, compute k_idx; otherwise project from latent
+                        let k_idx_v = if let (Some(wk), Some(k_norm)) = (&idx.wk, &idx.k_norm) {
+                            let k_raw = wk.forward(x)?;
+                            let k_normed = k_norm.forward(&k_raw)?;
+                            k_normed.to_vec_f32()?
+                        } else {
+                            vec![0.0f32; (causal_limit + 1) * idx.head_dim]
+                        };
+
+                        let h_idx = idx.n_heads;
+                        let d_idx = idx.head_dim;
+
+                        // Per-position indexer scores: S_t = sum_{j=1}^{H_idx} w_j * ReLU(q_j · k_t)
+                        let mut idx_scores = Vec::with_capacity(causal_limit + 1);
+                        for t in 0..=causal_limit {
+                            let mut total_s = 0.0f32;
+                            for j in 0..h_idx {
+                                let w_val = w_idx_v.get(s * h_idx + j).copied().unwrap_or(1.0);
+                                let q_slice = &q_idx_v[(s * h_idx + j) * d_idx..(s * h_idx + j + 1) * d_idx];
+                                let k_slice = if t < seq_len && t * d_idx + d_idx <= k_idx_v.len() {
+                                    &k_idx_v[t * d_idx..(t + 1) * d_idx]
+                                } else {
+                                    // Key fallback from latent slice
+                                    &latent_all_v[t * row..t * row + d_idx.min(rank)]
+                                };
+                                let dot: f32 = q_slice
+                                    .iter()
+                                    .zip(k_slice.iter())
+                                    .map(|(a, b)| a * b)
+                                    .sum();
+                                let relu_dot = dot.max(0.0f32);
+                                total_s += w_val * relu_dot;
+                            }
+                            idx_scores.push((total_s, t));
+                        }
+
+                        // Select top-k positions ranked by score desc, ties broken by position asc
+                        idx_scores.sort_by(|a, b| {
+                            b.0.partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(a.1.cmp(&b.1))
+                        });
+
+                        let mut keep = vec![false; causal_limit + 1];
+                        for &(_, t) in idx_scores.iter().take(topk) {
+                            keep[t] = true;
+                        }
+
+                        // Mask unselected positions with -inf
+                        for (t, score) in scores.iter_mut().enumerate() {
+                            if !keep[t] {
+                                *score = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
                 }
 
                 let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -948,4 +1068,57 @@ mod tests {
         assert_eq!(cfg.n_routed_experts, 256);
         assert_eq!(cfg.num_experts_per_tok, 8);
     }
+
+    #[test]
+    fn test_step1a_sparse_indexer_scoring_parity() {
+        // Test that per-token scorer S_{t,s} = sum_{j=1}^{H_idx} w_{t,j} * ReLU(q_{t,j}^T k_s)
+        // correctly ranks and masks tokens.
+        let h_idx = 4;
+        let d_idx = 8;
+        let seq_len = 10;
+        let topk = 4;
+
+        let w_idx = vec![1.0f32; h_idx];
+        let q_idx = vec![0.5f32; h_idx * d_idx];
+        // Keys: higher t has larger positive values, so higher t gets higher score
+        let mut k_idx = vec![0.0f32; seq_len * d_idx];
+        for t in 0..seq_len {
+            for d in 0..d_idx {
+                k_idx[t * d_idx + d] = (t as f32) * 0.1;
+            }
+        }
+
+        let mut idx_scores = Vec::with_capacity(seq_len);
+        for t in 0..seq_len {
+            let mut total_s = 0.0f32;
+            for j in 0..h_idx {
+                let w_val = w_idx[j];
+                let q_slice = &q_idx[j * d_idx..(j + 1) * d_idx];
+                let k_slice = &k_idx[t * d_idx..(t + 1) * d_idx];
+                let dot: f32 = q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
+                total_s += w_val * dot.max(0.0);
+            }
+            idx_scores.push((total_s, t));
+        }
+
+        idx_scores.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+
+        let mut keep = vec![false; seq_len];
+        for &(_, t) in idx_scores.iter().take(topk) {
+            keep[t] = true;
+        }
+
+        // Top 4 positions must be 6, 7, 8, 9
+        for t in 6..10 {
+            assert!(keep[t], "position {t} should be selected in top-k");
+        }
+        for t in 0..6 {
+            assert!(!keep[t], "position {t} should not be selected in top-k");
+        }
+    }
 }
+

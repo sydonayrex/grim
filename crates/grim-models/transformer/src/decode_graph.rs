@@ -7106,6 +7106,29 @@ impl DecodeGraphModel for Xing40 {
             let built = std::sync::Mutex::new(build_xing_scratch(self, &dev, batch)?);
             let _ = self.graph_scratch.set(built);
         }
+        // Prewarm the MoE native K-quant pointer arrays (zero weight VRAM;
+        // the per-expert banks ARE the model's own weights). Tiny H2D of
+        // host-owned data — done here, outside capture.
+        for layer in &self.layers {
+            if let Some(ref moe) = layer.moe {
+                let experts: Vec<crate::shared_moe::MoeExpert> = moe
+                    .experts
+                    .iter()
+                    .map(|e| crate::shared_moe::MoeExpert {
+                        gate: e.w1.clone(),
+                        up: e.w3.clone(),
+                        down: e.w2.clone(),
+                    })
+                    .collect();
+                if let Err(e) = crate::shared_moe::ensure_kq_native(
+                    dev.ordinal(),
+                    &experts,
+                    &moe.charon_cache,
+                ) {
+                    eprintln!("[xing40-graph] kq-native prewarm failed: {e}");
+                }
+            }
+        }
         // Prewarm the MoE WhiteCrow stacks (GRIM_MOE_NATIVE_WHITECROW) OUTSIDE
         // any capture bracket: the conversion D2Hs, which would poison a
         // capture. The stacks are PER LAYER and must ALL be resident during a
@@ -7567,14 +7590,54 @@ impl DecodeGraphModel for Xing40 {
                     true, // xing4_0.expert_weights_norm
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
-                // WhiteCrow arm first: the stacks were prewarmed at pool
-                // build (outside capture), so this call is a cache hit — no
-                // D2H inside the bracket.
-                // PEEK, never ensure: a miss here must not convert (D2H
-                // inside the capture bracket poisons it). The pool-build
-                // prewarm populated the cache when the env gate is on.
+                // Arm 1 — native K-quant (zero extra VRAM): PEEK the pointer
+                // arrays prewarmed at pool build; a miss must not upload
+                // inside the capture bracket.
+                let kq = crate::shared_moe::peek_kq_native(&moe.charon_cache);
+                // Arm 2 — WhiteCrow stacks (budget-gated). PEEK, never ensure:
+                // a miss here must not convert (D2H inside the capture
+                // bracket poisons it).
                 let wc = crate::shared_moe::peek_whitecrow_stacks(&moe.charon_cache);
-                if let Some(wc) = wc {
+                if let Some(kq) = kq {
+                    let g_ptrs = kq
+                        .gate_ptrs
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend("kq gate ptrs not RocmStorage".into())
+                        })?;
+                    let u_ptrs = kq
+                        .up_ptrs
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend("kq up ptrs not RocmStorage".into())
+                        })?;
+                    let d_ptrs = kq
+                        .down_ptrs
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .ok_or_else(|| {
+                            grim_core::error::Error::Backend("kq down ptrs not RocmStorage".into())
+                        })?;
+                    let col_r = as_rocm(scratch.col[i].as_ref())?;
+                    dev.moe_fused_dispatch_kq_native_into(
+                        col_r,
+                        g_ptrs,
+                        u_ptrs,
+                        d_ptrs,
+                        &buffers.moe_route_tokens,
+                        &buffers.moe_route_experts,
+                        &buffers.moe_route_weights,
+                        batch * moe.num_experts_per_tok,
+                        &buffers.moe_out[i],
+                        hidden,
+                        cfg.moe_intermediate_size,
+                        moe.routed_scaling_factor,
+                        kq.gate_bytes / cfg.moe_intermediate_size as u64,
+                        kq.down_bytes / hidden as u64,
+                    )?;
+                } else if let Some(wc) = wc {
                     let g_wc = wc
                         .gate
                         .as_any()

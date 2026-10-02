@@ -862,6 +862,8 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp4Block16 => dequant_fp4_block16(&raw.bytes, n),
             BlockDtype::Fp8Block16 => dequant_fp8_block16(&raw.bytes, n),
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&raw.bytes),
+            // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale).
+            BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&raw.bytes, n),
             // GreyRaven 2:4: no packed byte format exists yet, so there is
             // nothing to decode. Refusing beats reinterpreting compacted
             // survivors plus packed metadata as a dense code plane.

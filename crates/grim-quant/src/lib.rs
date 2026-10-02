@@ -202,6 +202,156 @@ pub fn quant_ostquant_w4_group128(
     Ok((qw, sc, zr))
 }
 
+/// GreyCrow u4 group-32 layout version.
+///
+/// Bumped whenever the GreyCrow byte layout changes, and mixed into the
+/// on-disk cache key of any GreyCrow tensor cache, for the same reason as
+/// [`OSTQUANT_ENCODER_VERSION`]: a layout change must never be served from a
+/// cache written by an older encoder.
+pub const GREYCROW_ENCODER_VERSION: u32 = 1;
+
+/// Dequantize legacy GGUF Q4_0 (type 2): 18-byte blocks of
+/// `[f16 scale][16 bytes of nibbles]`, one block per 32 weights,
+/// `w = (nibble - 8) * scale`.
+///
+/// This is the format GreyCrow is built on. It exists because GGUF's
+/// Q4_0/Q4_1/Q4_2 used to be typed as `KQuant(Q4K)` (144-byte super-blocks),
+/// so a Q4_0 payload was sliced and decoded with the wrong geometry.
+pub fn dequant_q4_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    let blocks = n.div_ceil(32);
+    if bytes.len() < blocks * 18 {
+        return Err(Error::Backend(format!(
+            "dequant_q4_0: need {} bytes for {n} weights, got {}",
+            blocks * 18,
+            bytes.len()
+        )));
+    }
+    let mut out = vec![0.0f32; n];
+    for b in 0..blocks {
+        let blk = &bytes[b * 18..b * 18 + 18];
+        let d = f16_to_f32(blk[0], blk[1]);
+        let base = b * 32;
+        let count = (n - base).min(32);
+        for i in 0..count {
+            let byte = blk[2 + i / 2];
+            let nib = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            out[base + i] = (nib as f32 - 8.0) * d;
+        }
+    }
+    Ok(out)
+}
+
+/// Repack legacy Q4_0 into the GreyCrow u4 group-32 layout, **bit-exactly**.
+///
+/// Q4_0 already stores what GreyCrow decodes: a per-32 f16 scale and nibbles
+/// biased by 8. So this is a byte shuffle, not a requantization — no f32
+/// anywhere, and the round trip through [`dequant_greycrow_g32`] reproduces
+/// [`dequant_q4_0`] exactly. Contrast WhiteCrow's q4k path, which expands to
+/// f32 and re-derives group-128 scales.
+///
+/// Layout, per column-major weight `[n, k]`, matching WhiteCrow's framing so
+/// one blob reader serves both:
+/// - `qw`: u32 words `[n, k/8]`, 8 codes per word, low nibble first.
+/// - `sc`: f16 scales `[n, k/32]`, carried over from Q4_0 verbatim.
+/// - `zr`: u8 `[n, k/32]`, all `8` — the bias is already folded into the
+///   nibble, so a kernel reads `w = (q - z) * scale` with `z == 8`.
+///
+/// 4.5 bpw, identical to Q4_0. Requires `k % 32 == 0`.
+pub fn repack_q40_to_greycrow_g32(bytes: &[u8], n: usize, k: usize) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    if k % 32 != 0 {
+        return Err(Error::Backend(format!(
+            "repack_q40_to_greycrow_g32: k={k} must be divisible by 32"
+        )));
+    }
+    let blocks = k / 32;
+    let src_blocks = n * blocks;
+    if bytes.len() < src_blocks * 18 {
+        return Err(Error::Backend(format!(
+            "repack_q40_to_greycrow_g32: need {} bytes for [{n},{k}], got {}",
+            src_blocks * 18,
+            bytes.len()
+        )));
+    }
+    let words_per_col = k / 8;
+    let mut qw = vec![0u8; n * words_per_col * 4];
+    let mut sc = vec![0u8; n * blocks * 2];
+    // The bias is already folded into the Q4_0 nibble, so every group reads
+    // back with zero point 8. Row-separable, and per-tensor sizes here are
+    // small enough that a serial pass beats thread fan-out.
+    let zr = vec![8u8; n * blocks];
+    for col in 0..n {
+        for g in 0..blocks {
+            let blk = &bytes[(col * blocks + g) * 18..(col * blocks + g) * 18 + 18];
+            sc[(col * blocks + g) * 2..(col * blocks + g) * 2 + 2].copy_from_slice(&blk[0..2]);
+            let base = col * words_per_col + g * 4; // 32/8 words per group
+            for w in 0..4 {
+                // 32 weights = 16 bytes = 4 u32 words, consecutive, low
+                // nibble first -- the same order Q4_0 stores.
+                let word = u32::from_le_bytes([
+                    blk[2 + w * 4],
+                    blk[2 + w * 4 + 1],
+                    blk[2 + w * 4 + 2],
+                    blk[2 + w * 4 + 3],
+                ]);
+                qw[(base + w) * 4..(base + w) * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+    }
+    Ok((qw, sc, zr))
+}
+
+/// Host reference decoder for the GreyCrow u4 group-32 layout: `w = (q - z) * scale`.
+///
+/// The GPU kernel this mirrors is not written yet; this is the oracle a parity
+/// test must match, and the only decoder the CPU path uses.
+pub fn dequant_greycrow_g32(
+    qw: &[u8],
+    sc: &[u8],
+    zr: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    if k % 32 != 0 {
+        return Err(Error::Backend(format!(
+            "dequant_greycrow_g32: k={k} must be divisible by 32"
+        )));
+    }
+    let groups = k / 32;
+    let words_per_col = k / 8;
+    if qw.len() < n * words_per_col * 4 || sc.len() < n * groups * 2 || zr.len() < n * groups {
+        return Err(Error::Backend(format!(
+            "dequant_greycrow_g32: buffers too small for [{n},{k}]"
+        )));
+    }
+    let mut out = vec![0.0f32; n * k];
+    for col in 0..n {
+        for g in 0..groups {
+            let d = f16_to_f32(
+                sc[(col * groups + g) * 2],
+                sc[(col * groups + g) * 2 + 1],
+            );
+            let z = zr[col * groups + g] as f32;
+            let base = col * words_per_col + g * 4;
+            for w in 0..4 {
+                let word = u32::from_le_bytes([
+                    qw[(base + w) * 4],
+                    qw[(base + w) * 4 + 1],
+                    qw[(base + w) * 4 + 2],
+                    qw[(base + w) * 4 + 3],
+                ]);
+                for i in 0..8 {
+                    let nib = ((word >> ((i % 8) * 4)) & 0x0F) as f32;
+                    let idx = (col * k) + g * 32 + (w * 8 + i);
+                    if idx < n * k {
+                        out[idx] = (nib - z) * d;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Dequantize grouped INT weights (EfficientQAT/GPTQ format).
 /// # Layout - `qweight`: packed low-bit weights (strided) - `qzeros`: per-group zero-points (uint16 for 2/3/4-bit,.
 pub fn dequant_gptq_group_int(
@@ -5495,6 +5645,123 @@ mod pre_quantize_transform_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a Q4_0 block: fp16 scale (from an f32 scale) + 32 nibbles.
+    fn q40_block(scale: f32, nibbles: [u8; 32]) -> [u8; 18] {
+        let bits = f32_to_f16_bits(scale);
+        let mut blk = [0u8; 18];
+        blk[0..2].copy_from_slice(&bits.to_le_bytes());
+        for (i, &q) in nibbles.iter().enumerate() {
+            if i % 2 == 0 {
+                blk[2 + i / 2] = q & 0x0F;
+            } else {
+                blk[2 + i / 2] |= (q & 0x0F) << 4;
+            }
+        }
+        blk
+    }
+
+    /// Round-to-nearest-even f32 -> f16 bit pattern (host reference encoder).
+    fn f32_to_f16_bits(v: f32) -> u16 {
+        let x = v.to_bits();
+        let sign = ((x >> 16) & 0x8000) as u16;
+        let mut exp = ((x >> 23) & 0xFF) as i32 - 127 + 15;
+        let mant = x & 0x007F_FFFF;
+        if exp <= 0 {
+            return sign;
+        }
+        if exp >= 0x1F {
+            return sign | 0x7C00;
+        }
+        // round to nearest even on the 13 dropped mantissa bits
+        let round = 0x0FFF + ((mant >> 12) & 1);
+        let mut m = mant + round;
+        if m > 0x007F_FFFF {
+            m = 0;
+            exp += 1;
+            if exp >= 0x1F {
+                return sign | 0x7C00;
+            }
+        }
+        sign | ((exp as u16) << 10) | ((m >> 13) as u16)
+    }
+
+    #[test]
+    fn dequant_q4_0_matches_hand_computed_block() {
+        // One block, scale 0.5, nibbles 8..=39 in order -> (q-8)*0.5 = 0..15.5 step 0.5
+        let mut nibs = [0u8; 32];
+        for (i, n) in nibs.iter_mut().enumerate() {
+            *n = (i as u8) % 16;
+        }
+        let blk = q40_block(0.5, nibs);
+        let out = dequant_q4_0(&blk, 32).unwrap();
+        assert_eq!(out.len(), 32);
+        for (i, &v) in out.iter().enumerate() {
+            let expect = (i as f32 % 16.0 - 8.0) * 0.5;
+            assert_eq!(v, expect, "elem {i}");
+        }
+    }
+
+    #[test]
+    fn greycrow_g32_repack_is_bit_exact_against_q4_0() {
+        // Column-major [n, k]: two columns, 64 weights each, mixed scales.
+        let (n, k) = (2usize, 64usize);
+        let blocks = k / 32;
+        let mut packed = Vec::new();
+        let mut nibs = [0u8; 32];
+        for col in 0..n {
+            for b in 0..blocks {
+                for (i, x) in nibs.iter_mut().enumerate() {
+                    *x = ((col * 5 + b * 7 + i * 3 + 1) % 16) as u8;
+                }
+                packed.extend_from_slice(&q40_block(0.125 + (col + b) as f32 * 0.5, nibs));
+            }
+        }
+        let reference = dequant_q4_0(&packed, n * k).unwrap();
+        let (qw, sc, zr) = repack_q40_to_greycrow_g32(&packed, n, k).unwrap();
+
+        // Geometry: 4.5 bpw in, 4.5 bpw out, same as Q4_0.
+        assert_eq!(qw.len(), n * (k / 8) * 4);
+        assert_eq!(sc.len(), n * blocks * 2);
+        assert_eq!(zr.len(), n * blocks);
+        assert!(
+            zr.iter().all(|&z| z == 8),
+            "Q4_0's bias is already folded into the nibble, so every zero point is 8"
+        );
+
+        let got = dequant_greycrow_g32(&qw, &sc, &zr, n, k).unwrap();
+        assert_eq!(got.len(), reference.len());
+        for (i, (a, b)) in got.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "GreyCrow must be bit-exact vs Q4_0, diverged at {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn greycrow_g32_rejects_k_not_divisible_by_32() {
+        let packed = vec![0u8; 18];
+        assert!(repack_q40_to_greycrow_g32(&packed, 1, 30).is_err());
+        assert!(repack_q40_to_greycrow_g32(&packed, 1, 32).is_ok());
+    }
+
+    #[test]
+    fn q4_0_roundtrip_through_quant_dequant_is_lossless_for_representable_values() {
+        // Values a Q4_0 block can hold exactly: (q-8)*d.
+        let d = 0.25f32;
+        let mut nibs = [0u8; 32];
+        for (i, n) in nibs.iter_mut().enumerate() {
+            *n = i as u8 % 16;
+        }
+        let blk = q40_block(d, nibs);
+        let back = dequant_q4_0(&blk, 32).unwrap();
+        for (i, &v) in back.iter().enumerate() {
+            let expect = ((i % 16) as f32 - 8.0) * d;
+            assert_eq!(v, expect, "elem {i}");
+        }
+    }
 
     #[test]
     fn roundtrip_q80() {

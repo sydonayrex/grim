@@ -405,6 +405,8 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             // two pruned ones) and must not be reported here, or every size
             // estimate downstream would under-count by 8/4.75.
             BlockDtype::Fp8Sparse24 => 8,
+            // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
+            BlockDtype::Q4_0 => 4,
         },
         Storage::FloatPack(scheme) => match scheme {
             FloatPackScheme::Fp4 => 4,

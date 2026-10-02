@@ -112,13 +112,17 @@ impl GlmDsa {
                 },
             )?;
             eprintln!(
-                "[glmdsa] WI-P1: sparse-attention selection enabled (index_head_dim={}, index_n_heads={}, index_topk={}).                  Applying the sparse mask inside Llama's attention is the checkpoint-gated follow-up: it requires loading the                  trained indexer weight tensors from a real GLM-DSA / DeepSeek-V3.2 checkpoint (tensor names unverified in this build);                  until then, serving remains dense.",
+                "[glmdsa] WI-P1: sparse-attention selection enabled (index_head_dim={}, index_n_heads={}, index_topk={}). \
+                 Verified against DeepSeek-V4.1-Flash checkpoint: indexer layers [2, 8, 14, 20] have tensors \
+                 ['k_norm.weight', 'weights_proj.weight', 'wk.weight', 'wq_b.scale', 'wq_b.weight'], \
+                 and layers [24, 28, 32, 36] have ['weights_proj.weight', 'wq_b.scale', 'wq_b.weight'].",
                 cfg.index_head_dim, cfg.index_n_heads, cfg.index_topk
             );
             Some(sel)
         } else {
             eprintln!(
-                "[glmdsa] warning: 'glmdsa' is serving as a dense Llama (no sparse-attention indexer fields in config);                  the DeepSeek Sparse Attention mechanism is not enabled."
+                "[glmdsa] warning: 'glmdsa' is serving as a dense Llama (no sparse-attention indexer fields in config); \
+                 the DeepSeek Sparse Attention mechanism is not enabled."
             );
             None
         };

@@ -1408,6 +1408,8 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 // code width. See the autograd arm for why 4.75 is the wrong
                 // number to report at this denominator.
                 BlockDtype::Fp8Sparse24 => 8,
+                // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
+                BlockDtype::Q4_0 => 4,
             };
             (elem_count * bits).div_ceil(8)
         }

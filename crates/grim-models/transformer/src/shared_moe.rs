@@ -1097,8 +1097,13 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                     hidden,
                     inter,
                     routed_scaling_factor,
-                    kq.gate_bytes,
-                    kq.down_bytes,
+                    // PER-ROW strides: gate/up are [inter, hidden] (rows =
+                    // inter), down is [hidden, inter] (rows = hidden). The
+                    // kernel derives blocks-per-row from these; passing the
+                    // per-expert TOTAL inflated g_sb 1024x and read megabytes
+                    // past each row (page fault -> sync hang).
+                    kq.gate_bytes / inter as u64,
+                    kq.down_bytes / hidden as u64,
                 )?;
             }
             let out_t = Tensor::new(
@@ -2706,8 +2711,8 @@ mod kq_native_integration_tests {
             hidden,
             inter,
             rsf,
-            kq.gate_bytes,
-            kq.down_bytes,
+            kq.gate_bytes / inter as u64,
+            kq.down_bytes / hidden as u64,
         )
         .expect("kq dispatch over the model's storages");
         eprintln!("[kq-model] dispatch returned (kernel + memset enqueued)");

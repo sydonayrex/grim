@@ -32,10 +32,14 @@ pub struct LocalSpillManager {
     /// Compressed-blob host tier: serialized `CompressedKvBlock` bytes for blocks spilled through the pool's compressor path (closed compression-to-spill loop).
     /// Raw `host_ram_cache` and this map are mutually exclusive per block id.
     compressed_host: HashMap<BlockId, Vec<u8>>,
+    /// Packed quantized block host tier (Item 2b: WhiteCrow/NVFP4). Format tag + raw packed bytes.
+    packed_host: HashMap<BlockId, (u16, Vec<u8>)>,
     /// File path tracking for NVMe disk tier.
     nvme_cache: HashMap<BlockId, PathBuf>,
     /// Compressed-blob NVMe tier.
     nvme_compressed: HashMap<BlockId, PathBuf>,
+    /// Packed quantized block NVMe tier (kv_block_p_{id}.bin with [magic: 0x4B50, format_u16] header).
+    nvme_packed: HashMap<BlockId, PathBuf>,
     /// Size of each block in floats.
     block_elems: usize,
 }
@@ -51,8 +55,10 @@ impl LocalSpillManager {
             block_tiers: HashMap::new(),
             host_ram_cache: HashMap::new(),
             compressed_host: HashMap::new(),
+            packed_host: HashMap::new(),
             nvme_cache: HashMap::new(),
             nvme_compressed: HashMap::new(),
+            nvme_packed: HashMap::new(),
             block_elems,
         })
     }
@@ -248,15 +254,105 @@ impl LocalSpillManager {
         Ok(None)
     }
 
+    /// Demote a packed quantized block (format + bytes) into the Host RAM tier.
+    pub fn demote_packed(&mut self, block_id: BlockId, format: u16, bytes: Vec<u8>) -> Result<()> {
+        if bytes.is_empty() {
+            return Err(Error::KvCache("demote_packed: empty bytes".into()));
+        }
+        self.host_ram_cache.remove(&block_id);
+        self.compressed_host.remove(&block_id);
+        self.nvme_cache.remove(&block_id);
+        self.nvme_compressed.remove(&block_id);
+        self.packed_host.insert(block_id, (format, bytes));
+        self.block_tiers.insert(block_id, CacheTier::HostRam);
+        Ok(())
+    }
+
+    /// Demote a packed quantized block to NVMe with 4-byte header `[magic: 0x4B50, format_u16]`.
+    pub fn demote_packed_to_nvme(&mut self, block_id: BlockId) -> Result<()> {
+        let Some((format, bytes)) = self.packed_host.remove(&block_id) else {
+            return Ok(());
+        };
+        let temp_path = self.scratch_dir.join(format!("tmp_kv_block_p_{block_id}.bin"));
+        let file_path = self.scratch_dir.join(format!("kv_block_p_{block_id}.bin"));
+        let write_res = (|| -> Result<()> {
+            let mut file = File::create(&temp_path).map_err(|e| Error::KvCache(e.to_string()))?;
+            // 4-byte header: 0x4B50 magic (u16 LE), format (u16 LE)
+            let magic = 0x4B50u16;
+            file.write_all(&magic.to_le_bytes())
+                .map_err(|e| Error::KvCache(e.to_string()))?;
+            file.write_all(&format.to_le_bytes())
+                .map_err(|e| Error::KvCache(e.to_string()))?;
+            file.write_all(&bytes)
+                .map_err(|e| Error::KvCache(e.to_string()))?;
+            file.sync_all().map_err(|e| Error::KvCache(e.to_string()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&temp_path);
+            self.packed_host.insert(block_id, (format, bytes));
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&temp_path, &file_path) {
+            let _ = fs::remove_file(&temp_path);
+            self.packed_host.insert(block_id, (format, bytes));
+            return Err(Error::KvCache(format!("atomic rename failed: {e}")));
+        }
+        self.nvme_packed.insert(block_id, file_path);
+        self.block_tiers.insert(block_id, CacheTier::NvMe);
+        Ok(())
+    }
+
+    /// Retrieve a packed quantized block (format, bytes).
+    pub fn retrieve_packed(&mut self, block_id: BlockId) -> Result<Option<(u16, Vec<u8>)>> {
+        if let Some(entry) = self.packed_host.get(&block_id).cloned() {
+            return Ok(Some(entry));
+        }
+        if let Some(path) = self.nvme_packed.remove(&block_id) {
+            let read_res = (|| -> Result<(u16, Vec<u8>)> {
+                let mut data = Vec::new();
+                File::open(&path)
+                    .and_then(|mut f| f.read_to_end(&mut data))
+                    .map_err(|e| Error::KvCache(e.to_string()))?;
+                if data.len() < 4 {
+                    return Err(Error::KvCache("packed spill file missing header".into()));
+                }
+                let magic = u16::from_le_bytes([data[0], data[1]]);
+                if magic != 0x4B50 {
+                    return Err(Error::KvCache(format!("packed spill magic mismatch: 0x{magic:04x}")));
+                }
+                let format = u16::from_le_bytes([data[2], data[3]]);
+                Ok((format, data[4..].to_vec()))
+            })();
+            return match read_res {
+                Ok((fmt, bytes)) => {
+                    let _ = fs::remove_file(&path);
+                    self.packed_host.insert(block_id, (fmt, bytes.clone()));
+                    self.block_tiers.insert(block_id, CacheTier::HostRam);
+                    Ok(Some((fmt, bytes)))
+                }
+                Err(e) => {
+                    self.nvme_packed.insert(block_id, path);
+                    Err(e)
+                }
+            };
+        }
+        Ok(None)
+    }
+
     /// Evicts / deletes a block entirely from tiered caches.
     pub fn evict(&mut self, block_id: BlockId) {
         self.block_tiers.remove(&block_id);
         self.host_ram_cache.remove(&block_id);
         self.compressed_host.remove(&block_id);
+        self.packed_host.remove(&block_id);
         if let Some(path) = self.nvme_cache.remove(&block_id) {
             let _ = fs::remove_file(path);
         }
         if let Some(path) = self.nvme_compressed.remove(&block_id) {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = self.nvme_packed.remove(&block_id) {
             let _ = fs::remove_file(path);
         }
     }
@@ -271,6 +367,12 @@ impl Drop for LocalSpillManager {
     fn drop(&mut self) {
         // Clean up all temporary files on exit
         for path in self.nvme_cache.values() {
+            let _ = fs::remove_file(path);
+        }
+        for path in self.nvme_compressed.values() {
+            let _ = fs::remove_file(path);
+        }
+        for path in self.nvme_packed.values() {
             let _ = fs::remove_file(path);
         }
     }
@@ -310,6 +412,18 @@ impl SharedSpillManager {
 
     pub fn retrieve_compressed(&self, block_id: BlockId) -> Result<Option<Vec<u8>>> {
         self.inner.write().retrieve_compressed(block_id)
+    }
+
+    pub fn demote_packed(&self, block_id: BlockId, format: u16, bytes: Vec<u8>) -> Result<()> {
+        self.inner.write().demote_packed(block_id, format, bytes)
+    }
+
+    pub fn demote_packed_to_nvme(&self, block_id: BlockId) -> Result<()> {
+        self.inner.write().demote_packed_to_nvme(block_id)
+    }
+
+    pub fn retrieve_packed(&self, block_id: BlockId) -> Result<Option<(u16, Vec<u8>)>> {
+        self.inner.write().retrieve_packed(block_id)
     }
 
     pub fn evict(&self, block_id: BlockId) {
@@ -1995,6 +2109,33 @@ mod tests {
         manager.evict(42);
         assert_eq!(manager.get_tier(42), None);
     }
+
+    #[test]
+    fn test_packed_spill_roundtrip() {
+        let dir = tempdir().unwrap();
+        let manager = SharedSpillManager::new(dir.path().to_path_buf(), 8).unwrap();
+        let bytes = vec![0xABu8; 128];
+        let format_tag = 9u16; // WhiteCrow tag
+
+        // 1. Demote packed to Host RAM
+        manager.demote_packed(77, format_tag, bytes.clone()).unwrap();
+        assert_eq!(manager.get_tier(77), Some(CacheTier::HostRam));
+
+        // 2. Demote packed to NVMe (creates kv_block_p_77.bin with 4-byte header)
+        manager.demote_packed_to_nvme(77).unwrap();
+        assert_eq!(manager.get_tier(77), Some(CacheTier::NvMe));
+
+        // 3. Retrieve packed (promotes back to Host RAM)
+        let (ret_fmt, ret_bytes) = manager.retrieve_packed(77).unwrap().unwrap();
+        assert_eq!(ret_fmt, format_tag);
+        assert_eq!(ret_bytes, bytes);
+        assert_eq!(manager.get_tier(77), Some(CacheTier::HostRam));
+
+        // 4. Evict
+        manager.evict(77);
+        assert_eq!(manager.get_tier(77), None);
+    }
+
 
     #[test]
     fn test_network_kv_client() {

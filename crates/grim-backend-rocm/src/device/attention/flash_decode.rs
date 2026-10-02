@@ -200,6 +200,126 @@ impl RocmDevice {
         )
     }
 
+    /// Launch DeepSeek V3.2 / V4.1 Flash sparse indexer scoring kernel.
+    pub fn launch_sparse_index_score(
+        &self,
+        q_idx: &RocmStorage,
+        w_idx: &RocmStorage,
+        k_idx: &RocmStorage,
+        scores: &RocmStorage,
+        seq_len: usize,
+        h_idx: usize,
+        d_idx: usize,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_idx.device_ptr.ok_or_else(|| {
+            Error::Backend("sparse_index_score: q_idx has no device ptr".into())
+        })?;
+        let w_ptr = w_idx.device_ptr.ok_or_else(|| {
+            Error::Backend("sparse_index_score: w_idx has no device ptr".into())
+        })?;
+        let k_ptr = k_idx.device_ptr.ok_or_else(|| {
+            Error::Backend("sparse_index_score: k_idx has no device ptr".into())
+        })?;
+        let s_ptr = scores.device_ptr.ok_or_else(|| {
+            Error::Backend("sparse_index_score: scores has no device ptr".into())
+        })?;
+
+        let block_threads = 256u32;
+        let grid_blocks = ((seq_len as u32) + block_threads - 1) / block_threads;
+        let block_dim = HipDim3::new(block_threads, 1, 1);
+        let grid_dim = HipDim3::new(grid_blocks.max(1), 1, 1);
+
+        let mut qptr = q_ptr;
+        let mut wptr = w_ptr;
+        let mut kptr = k_ptr;
+        let mut sptr = s_ptr;
+        let mut slen = seq_len as i32;
+        let mut h = h_idx as i32;
+        let mut d = d_idx as i32;
+
+        self.launch_compute_kernel_with_solution(
+            "grim_sparse_index_score",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut wptr),
+                arg(&mut kptr),
+                arg(&mut sptr),
+                arg(&mut slen),
+                arg(&mut h),
+                arg(&mut d),
+            ],
+            None,
+            0,
+        )
+    }
+
+    /// Launch DeepSeek MLA Matrix-Absorbed Indexed Decode kernel.
+    pub fn launch_mla_absorbed_indexed_decode(
+        &self,
+        q_absorbed: &RocmStorage,
+        q_rope: &RocmStorage,
+        kv_cache: &RocmStorage,
+        indices: &RocmStorage,
+        out: &RocmStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        top_k: usize,
+    ) -> Result<*mut c_void> {
+        let q_abs_ptr = q_absorbed.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_indexed_decode: q_absorbed has no device ptr".into())
+        })?;
+        let q_rope_ptr = q_rope.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_indexed_decode: q_rope has no device ptr".into())
+        })?;
+        let kv_ptr = kv_cache.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_indexed_decode: kv_cache has no device ptr".into())
+        })?;
+        let idx_ptr = indices.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_indexed_decode: indices has no device ptr".into())
+        })?;
+        let out_ptr = out.device_ptr.ok_or_else(|| {
+            Error::Backend("mla_absorbed_indexed_decode: out has no device ptr".into())
+        })?;
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new(num_heads as u32, 1, 1);
+
+        let mut qabsptr = q_abs_ptr;
+        let mut qropeptr = q_rope_ptr;
+        let mut kvptr = kv_ptr;
+        let mut idxptr = idx_ptr;
+        let mut optr = out_ptr;
+        let mut nh = num_heads as i32;
+        let mut lora_r = kv_lora_rank as i32;
+        let mut rope_d = qk_rope_dim as i32;
+        let mut k = top_k as i32;
+        let mut inv_sqrt = 1.0f32 / ((kv_lora_rank + qk_rope_dim) as f32).sqrt();
+
+        let lds_bytes = 256 * std::mem::size_of::<f32>();
+        self.launch_compute_kernel_with_solution(
+            "grim_mla_absorbed_indexed_decode",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qabsptr),
+                arg(&mut qropeptr),
+                arg(&mut kvptr),
+                arg(&mut idxptr),
+                arg(&mut optr),
+                arg(&mut nh),
+                arg(&mut lora_r),
+                arg(&mut rope_d),
+                arg(&mut k),
+                arg(&mut inv_sqrt),
+            ],
+            None,
+            lds_bytes,
+        )
+    }
+
     /// Minimum KV sequence length to trigger Split-KV FlashDecoding.
     /// Can be overridden via `GRIM_FLASH_DECODE_MIN_KV`.
     /// Defaults to 256 for RDNA3/4 (gfx11/gfx12) and 512 for other architectures.

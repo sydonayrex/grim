@@ -1655,6 +1655,11 @@ pub enum KvCacheQuantFormat {
     /// Unlike every other variant here, this one reads its scale out of the
     /// buffer and ignores the caller's per-tensor `k_scale`/`v_scale`.
     NutFp4 = 8,
+    /// WhiteCrow: RDNA 3/4 native unsigned 4-bit group-128 OSTQuant layout
+    /// (discriminant matches `grim_tensor::PagedKvQuantFormat::WhiteCrow`).
+    /// The paged-attention kernel has no WhiteCrow decode leg yet, so the
+    /// launcher refuses it loudly rather than misreading packed pages.
+    WhiteCrow = 9,
 }
 
 impl KvCacheQuantFormat {
@@ -1676,6 +1681,10 @@ impl KvCacheQuantFormat {
             // Per-32 microscale groups with one inline E8M0 scale byte.
             Self::MxFp4 | Self::MxFp8 => (num_values + 31) / 32,
             Self::Int8 | Self::Int4 | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::Fp4E2M1 => 0,
+            // WhiteCrow: per 128 values - 64 B codes + 2 B scale + 1 B zero
+            // (the codes ride u32 words, so the arithmetic below collapses to
+            // num_values/2 + num_values/128*2 + num_values/128).
+            Self::WhiteCrow => (num_values + 127) / 128,
         };
         let payload = (num_values * bits).div_ceil(8);
         payload + groups
@@ -1686,6 +1695,8 @@ impl KvCacheQuantFormat {
         match self {
             Self::Int8 | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::MxFp8 => 8,
             Self::Int4 | Self::Fp4E2M1 | Self::MxFp4 | Self::NvFp4 | Self::NutFp4 => 4,
+            // WhiteCrow codes are unsigned 4-bit group-128.
+            Self::WhiteCrow => 4,
         }
     }
 }
@@ -1705,6 +1716,7 @@ impl From<grim_tensor::PagedKvQuantFormat> for KvCacheQuantFormat {
             grim_tensor::PagedKvQuantFormat::MxFp8 => KvCacheQuantFormat::MxFp8,
             grim_tensor::PagedKvQuantFormat::NvFp4 => KvCacheQuantFormat::NvFp4,
             grim_tensor::PagedKvQuantFormat::NutFp4 => KvCacheQuantFormat::NutFp4,
+            grim_tensor::PagedKvQuantFormat::WhiteCrow => KvCacheQuantFormat::WhiteCrow,
         }
     }
 }
@@ -1788,6 +1800,17 @@ pub fn launch_paged_attention_quant(
     let mut co = cache_offset as i32;
     let mut isd = inv_sqrt_d;
     let mut wl = window_lo;
+    // WhiteCrow pages have no kernel decode leg yet (the format exists so
+    // grim-memory's packed-pool producer can round-trip through the neutral
+    // enum). Refuse loudly: a silent fallthrough would make the kernel read
+    // OSTQuant u4 group-128 pages as whichever dense layout shares the
+    // discriminant - finite, plausible, wrong attention.
+    if quant_format == KvCacheQuantFormat::WhiteCrow {
+        return Err(crate::Error::Backend(
+            "launch_paged_attention_quant: WhiteCrow KV pages have no kernel decode leg yet; \
+             run with GRIM_PACKED_POOL=0 (dense KV) until the WhiteCrow leg lands".into(),
+        ));
+    }
     let mut qf = quant_format as i32;
     let mut ks = k_scale;
     let mut kb = k_bias;
