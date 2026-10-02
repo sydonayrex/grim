@@ -1820,6 +1820,33 @@ impl Qwen35 {
             output,
         })
     }
+
+    /// Construct a `LayerGroupRegistry` representing the model's heterogeneous layer layouts.
+    pub fn layer_registry(&self) -> grim_memory::LayerGroupRegistry {
+        let mut reg = grim_memory::LayerGroupRegistry::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if block.is_full_attention {
+                reg.register_layer(
+                    i,
+                    grim_memory::LayerGroupIdentity::standard_gqa(
+                        self.cfg.num_kv_heads,
+                        self.cfg.head_dim,
+                        grim_memory::BLOCK_SIZE,
+                        DType::F32,
+                    ),
+                );
+            } else {
+                reg.register_layer(
+                    i,
+                    grim_memory::LayerGroupIdentity::linear_attention(
+                        self.cfg.hidden_size,
+                        DType::F32,
+                    ),
+                );
+            }
+        }
+        reg
+    }
 }
 
 impl Model for Qwen35 {
@@ -3749,6 +3776,12 @@ pub(crate) fn quantize_kv_block(
             })?;
             Ok((bytes, 1.0))
         }
+        F::NvFp4 => {
+            let bytes = grim_quant::quant_nvfp4(data).map_err(|e| {
+                grim_core::error::Error::Backend(format!("quant_nvfp4 failed: {e}"))
+            })?;
+            Ok((bytes, 1.0))
+        }
         other => Err(grim_core::error::Error::Backend(format!(
             "kv_quant_format: {other:?} has no host packer wired for Qwen35 KV"
         ))),
@@ -3778,13 +3811,14 @@ fn kv_quant_format() -> Option<grim_tensor::PagedKvQuantFormat> {
         Ok("int8" | "q8_0" | "q8") => Some(grim_tensor::PagedKvQuantFormat::Int8),
         Ok("fp8" | "fp8_e4m3") => Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3),
         Ok("nutcracker" | "nutfp4" | "nut_fp4") => Some(grim_tensor::PagedKvQuantFormat::NutFp4),
+        Ok("nvfp4" | "nv_fp4" | "fp4") => Some(grim_tensor::PagedKvQuantFormat::NvFp4),
         Ok(other) => {
             // Fail loud rather than silently falling back to f32: a user who
             // asked for quantized KV and got a 32 GB arena would otherwise see
             // an OOM with no indication the setting was ignored.
             eprintln!(
                 "[qwen35] GRIM_KV_QUANT={other:?} is not a supported paged KV format \
-                 (int8 | fp8 | nutcracker); using the dense f32 arena"
+                 (int8 | fp8 | nutcracker | nvfp4); using the dense f32 arena"
             );
             None
         }
@@ -4419,6 +4453,7 @@ mod tests {
             ("int8", Some(grim_tensor::PagedKvQuantFormat::Int8)),
             ("fp8", Some(grim_tensor::PagedKvQuantFormat::Fp8E4M3)),
             ("nutcracker", Some(grim_tensor::PagedKvQuantFormat::NutFp4)),
+            ("nvfp4", Some(grim_tensor::PagedKvQuantFormat::NvFp4)),
         ] {
             unsafe { std::env::set_var("GRIM_KV_QUANT", val) };
             assert_eq!(kv_quant_format(), expect, "GRIM_KV_QUANT={val}");
@@ -4488,6 +4523,74 @@ mod tests {
         (0..n)
             .map(|j| (((i * 37 + j * 11) % 29) as f32) / 29.0 - 0.5)
             .collect()
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn test_qwen35_layer_registry() {
+        let mut cfg = Qwen35Config::default();
+        cfg.num_layers = 8;
+        cfg.full_attention_interval = 4;
+        let mut blocks = Vec::with_capacity(8);
+        for i in 0..8 {
+            let is_full_attention = (i + 1) % cfg.full_attention_interval == 0;
+            blocks.push(Qwen35Block {
+                device: Device::Cpu,
+                layer_idx: i,
+                is_full_attention,
+                attn_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
+                wq: None,
+                wk: None,
+                wv: None,
+                wo: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                attn_qkv: None,
+                attn_gate: None,
+                ssm_out: None,
+                ssm_conv1d: None,
+                ssm_conv_vec: None,
+                ssm_a: None,
+                ssm_alpha: None,
+                ssm_beta: None,
+                ssm_dt_bias: None,
+                ssm_norm: None,
+                ssm_dt_bias_dev: None,
+                ssm_a_dev: None,
+                ssm_norm_dev: None,
+                ssm_dt_rank_hint: cfg.ssm_dt_rank,
+                ssm_n_group_hint: cfg.ssm_n_group,
+                ssm_d_state_hint: cfg.ssm_d_state,
+                ssm_d_conv_hint: cfg.ssm_d_conv,
+                post_attention_norm: RmsNorm::new(cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])), 1e-6),
+                ffn_gate: Linear::from_tensor(cpu_tensor(vec![1.0; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
+                ffn_up: Linear::from_tensor(cpu_tensor(vec![1.0; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.intermediate_size, cfg.hidden_size])), None),
+                ffn_down: Linear::from_tensor(cpu_tensor(vec![1.0; cfg.hidden_size * cfg.intermediate_size], Shape::new(vec![cfg.hidden_size, cfg.intermediate_size])), None),
+                num_heads: cfg.num_heads,
+                num_kv_heads: cfg.num_kv_heads,
+                head_dim: cfg.head_dim,
+                rotary_dim: cfg.head_dim,
+                rope_theta: 10000.0,
+                hidden_size: cfg.hidden_size,
+                intermediate_size: cfg.intermediate_size,
+                wqkv_q80_fused: None,
+                w_gate_up_q4k_fused: None,
+            });
+        }
+        let dummy = cpu_tensor(vec![0.0f32; 1], Shape::new(vec![1]));
+        let qwen = Qwen35 {
+            cfg: cfg.clone(),
+            device: Device::Cpu,
+            tok_embeddings: Embedding { weight: dummy.clone() },
+            blocks,
+            output_norm: RmsNorm::new(dummy.clone(), 1e-6),
+            output: Linear::from_tensor(dummy, None),
+        };
+        let reg = qwen.layer_registry();
+        let kv_layers_count = (0..8)
+            .filter(|&i| reg.get_group(i).map(|g| g.has_kv).unwrap_or(false))
+            .count();
+        assert_eq!(kv_layers_count, cfg.num_layers / cfg.full_attention_interval);
     }
 
     #[allow(clippy::field_reassign_with_default)]

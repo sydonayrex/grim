@@ -15,6 +15,8 @@ pub struct LayerGroupIdentity {
     pub sliding_window: usize,
     /// Low-rank compression dimension if MLA / latent-KV (0 for standard MHA/GQA)
     pub latent_dim: usize,
+    /// Whether this layer group materializes a KV cache (`false` for linear attention / GDN / SSM).
+    pub has_kv: bool,
 }
 
 impl LayerGroupIdentity {
@@ -31,6 +33,7 @@ impl LayerGroupIdentity {
             dtype,
             sliding_window: 0,
             latent_dim: 0,
+            has_kv: true,
         }
     }
 
@@ -48,6 +51,7 @@ impl LayerGroupIdentity {
             dtype,
             sliding_window,
             latent_dim: 0,
+            has_kv: true,
         }
     }
 
@@ -65,11 +69,28 @@ impl LayerGroupIdentity {
             dtype,
             sliding_window: 0,
             latent_dim,
+            has_kv: true,
+        }
+    }
+
+    /// Linear attention / SSM layer group (e.g. Qwen3.8 GDN / KDA) which does not materialize a KV cache.
+    pub fn linear_attention(dim: usize, dtype: DType) -> Self {
+        Self {
+            num_kv_heads: 0,
+            head_dim: dim,
+            block_size: 0,
+            dtype,
+            sliding_window: 0,
+            latent_dim: 0,
+            has_kv: false,
         }
     }
 
     /// Size in bytes of a single block for this layer group.
     pub fn block_bytes(&self) -> usize {
+        if !self.has_kv {
+            return 0;
+        }
         let effective_dim = if self.latent_dim > 0 {
             self.latent_dim
         } else {

@@ -106,6 +106,23 @@ impl grim_kvtransport::KvBlockStore for KvBlockPool {
     fn write_layer_values(&mut self, id: BlockId, layer_idx: u32, values: &[f32]) {
         self.write_layer_values(id, layer_idx as usize, values);
     }
+    fn try_write_layer_keys(
+        &mut self,
+        id: BlockId,
+        layer_idx: u32,
+        keys: &[f32],
+        num_tokens: usize,
+    ) -> Result<()> {
+        self.try_write_layer_keys(id, layer_idx as usize, keys, num_tokens)
+    }
+    fn try_write_layer_values(
+        &mut self,
+        id: BlockId,
+        layer_idx: u32,
+        values: &[f32],
+    ) -> Result<()> {
+        self.try_write_layer_values(id, layer_idx as usize, values)
+    }
 }
 
 /// One physical KV block in the pool.
@@ -159,9 +176,17 @@ pub struct SpillTelemetry {
     pub reclaimed_for_alloc: u64,
 }
 
+/// Per-layer KV geometry configuration (e.g. for heterogeneous topologies and indexer-K caches).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerGeom {
+    pub elem: usize,
+}
+
 pub struct KvBlockPool {
     blocks: Vec<KvBlock>,
     free_list: VecDeque<BlockId>,
+    /// Optional per-layer element count; falls back to uniform `BLOCK_SIZE * num_heads * head_dim`.
+    layer_geoms: HashMap<usize, LayerGeom>,
     /// Block id → refcount; 0 means released and eligible for tiering.
     ref_counts: HashMap<BlockId, u32>,
     /// Prefix caching: block-granular radix tree (§5.1).
@@ -235,6 +260,7 @@ impl KvBlockPool {
         Self {
             blocks,
             free_list,
+            layer_geoms: HashMap::new(),
             ref_counts: HashMap::new(),
             prefix_tree: RadixTree::new(BLOCK_SIZE),
             ssm_states: HashMap::new(),
@@ -258,6 +284,12 @@ impl KvBlockPool {
     /// Pin this KV block pool to a specific pipeline stage layer range [start_layer, end_layer).
     pub fn with_layer_range(mut self, start_layer: usize, end_layer: usize) -> Self {
         self.layer_range = Some((start_layer, end_layer));
+        self
+    }
+
+    /// Set a custom KV geometry for a specific layer.
+    pub fn with_layer_geom(mut self, layer: usize, geom: LayerGeom) -> Self {
+        self.layer_geoms.insert(layer, geom);
         self
     }
 
@@ -948,54 +980,130 @@ impl KvBlockPool {
         self.dirty_blocks.insert(id);
     }
 
-    pub fn write_layer_keys(&mut self, id: BlockId, layer: usize, keys: &[f32], num_tokens: usize) {
+    pub fn try_write_layer_keys(
+        &mut self,
+        id: BlockId,
+        layer: usize,
+        keys: &[f32],
+        num_tokens: usize,
+    ) -> Result<()> {
         if id >= self.blocks.len() {
-            return;
+            return Err(Error::KvCache(format!(
+                "write_layer_keys: block id {id} out of bounds (capacity {})",
+                self.blocks.len()
+            )));
         }
-        let block_elem = BLOCK_SIZE * self.num_heads * self.head_dim;
-        if self.blocks[id].layer_keys.len() <= layer {
-            self.blocks[id]
-                .layer_keys
-                .resize_with(layer + 1, || vec![0.0; block_elem]);
+        let block_elem = self
+            .layer_geoms
+            .get(&layer)
+            .map(|g| g.elem)
+            .unwrap_or(BLOCK_SIZE * self.num_heads * self.head_dim);
+        if keys.len() > block_elem {
+            return Err(Error::KvCache(format!(
+                "write_layer_keys: payload length {} exceeds block elem capacity {block_elem} for layer {layer}",
+                keys.len()
+            )));
         }
-        let len = keys.len().min(block_elem);
-        self.blocks[id].layer_keys[layer][..len].copy_from_slice(&keys[..len]);
         if layer == 0 {
+            let len = keys.len().min(block_elem);
             self.blocks[id].key_data[..len].copy_from_slice(&keys[..len]);
             self.blocks[id].num_tokens = num_tokens.min(BLOCK_SIZE);
             if len > 0 {
                 self.blocks[id].received = true;
             }
+            self.dirty_blocks.insert(id);
+            return Ok(());
         }
+        if self.blocks[id].layer_keys.len() <= layer {
+            let old_len = self.blocks[id].layer_keys.len();
+            self.blocks[id].layer_keys.reserve(layer + 1 - old_len);
+            for i in old_len..=layer {
+                if i == 0 {
+                    self.blocks[id].layer_keys.push(Vec::new());
+                } else {
+                    let elem = self
+                        .layer_geoms
+                        .get(&i)
+                        .map(|g| g.elem)
+                        .unwrap_or(BLOCK_SIZE * self.num_heads * self.head_dim);
+                    self.blocks[id].layer_keys.push(vec![0.0; elem]);
+                }
+            }
+        }
+        let len = keys.len().min(block_elem);
+        self.blocks[id].layer_keys[layer][..len].copy_from_slice(&keys[..len]);
         self.dirty_blocks.insert(id);
+        Ok(())
     }
 
-    pub fn write_layer_values(&mut self, id: BlockId, layer: usize, values: &[f32]) {
+    pub fn write_layer_keys(&mut self, id: BlockId, layer: usize, keys: &[f32], num_tokens: usize) {
+        let _ = self.try_write_layer_keys(id, layer, keys, num_tokens);
+    }
+
+    pub fn try_write_layer_values(
+        &mut self,
+        id: BlockId,
+        layer: usize,
+        values: &[f32],
+    ) -> Result<()> {
         if id >= self.blocks.len() {
-            return;
+            return Err(Error::KvCache(format!(
+                "write_layer_values: block id {id} out of bounds (capacity {})",
+                self.blocks.len()
+            )));
         }
-        let block_elem = BLOCK_SIZE * self.num_heads * self.head_dim;
+        let block_elem = self
+            .layer_geoms
+            .get(&layer)
+            .map(|g| g.elem)
+            .unwrap_or(BLOCK_SIZE * self.num_heads * self.head_dim);
+        if values.len() > block_elem {
+            return Err(Error::KvCache(format!(
+                "write_layer_values: payload length {} exceeds block elem capacity {block_elem} for layer {layer}",
+                values.len()
+            )));
+        }
+        if layer == 0 {
+            let len = values.len().min(block_elem);
+            self.blocks[id].value_data[..len].copy_from_slice(&values[..len]);
+            self.dirty_blocks.insert(id);
+            return Ok(());
+        }
         if self.blocks[id].layer_values.len() <= layer {
-            self.blocks[id]
-                .layer_values
-                .resize_with(layer + 1, || vec![0.0; block_elem]);
+            let old_len = self.blocks[id].layer_values.len();
+            self.blocks[id].layer_values.reserve(layer + 1 - old_len);
+            for i in old_len..=layer {
+                if i == 0 {
+                    self.blocks[id].layer_values.push(Vec::new());
+                } else {
+                    let elem = self
+                        .layer_geoms
+                        .get(&i)
+                        .map(|g| g.elem)
+                        .unwrap_or(BLOCK_SIZE * self.num_heads * self.head_dim);
+                    self.blocks[id].layer_values.push(vec![0.0; elem]);
+                }
+            }
         }
         let len = values.len().min(block_elem);
         self.blocks[id].layer_values[layer][..len].copy_from_slice(&values[..len]);
-        if layer == 0 {
-            self.blocks[id].value_data[..len].copy_from_slice(&values[..len]);
-        }
         self.dirty_blocks.insert(id);
+        Ok(())
+    }
+
+    pub fn write_layer_values(&mut self, id: BlockId, layer: usize, values: &[f32]) {
+        let _ = self.try_write_layer_values(id, layer, values);
     }
 
     pub fn read_layer_keys(&self, id: BlockId, layer: usize) -> Option<&[f32]> {
         if id >= self.blocks.len() {
             return None;
         }
+        if layer == 0 {
+            return Some(&self.blocks[id].key_data);
+        }
         if layer < self.blocks[id].layer_keys.len() {
             Some(&self.blocks[id].layer_keys[layer])
-        } else if layer == 0 {
-            Some(&self.blocks[id].key_data)
         } else {
             None
         }
@@ -1005,10 +1113,11 @@ impl KvBlockPool {
         if id >= self.blocks.len() {
             return None;
         }
+        if layer == 0 {
+            return Some(&self.blocks[id].value_data);
+        }
         if layer < self.blocks[id].layer_values.len() {
             Some(&self.blocks[id].layer_values[layer])
-        } else if layer == 0 {
-            Some(&self.blocks[id].value_data)
         } else {
             None
         }
@@ -1664,22 +1773,34 @@ impl KvCache for PagedKvCache {
                 let within_block = (pos % self.page_size) * stride;
                 let elem = stride;
                 let b_elem = BLOCK_SIZE * pool.num_heads * pool.head_dim;
-                if pool.blocks[physical].layer_keys.len() <= layer {
-                    pool.blocks[physical]
-                        .layer_keys
-                        .resize_with(layer + 1, || vec![0.0; b_elem]);
-                }
-                if pool.blocks[physical].layer_values.len() <= layer {
-                    pool.blocks[physical]
-                        .layer_values
-                        .resize_with(layer + 1, || vec![0.0; b_elem]);
-                }
-                let end = (within_block + elem).min(b_elem);
-                if within_block < b_elem {
-                    pool.blocks[physical].layer_keys[layer][within_block..end]
-                        .copy_from_slice(&k_flat[tok_start..tok_start + (end - within_block)]);
-                    pool.blocks[physical].layer_values[layer][within_block..end]
-                        .copy_from_slice(&v_flat[tok_start..tok_start + (end - within_block)]);
+                if layer > 0 {
+                    if pool.blocks[physical].layer_keys.len() <= layer {
+                        let old_len = pool.blocks[physical].layer_keys.len();
+                        for i in old_len..=layer {
+                            if i == 0 {
+                                pool.blocks[physical].layer_keys.push(Vec::new());
+                            } else {
+                                pool.blocks[physical].layer_keys.push(vec![0.0; b_elem]);
+                            }
+                        }
+                    }
+                    if pool.blocks[physical].layer_values.len() <= layer {
+                        let old_len = pool.blocks[physical].layer_values.len();
+                        for i in old_len..=layer {
+                            if i == 0 {
+                                pool.blocks[physical].layer_values.push(Vec::new());
+                            } else {
+                                pool.blocks[physical].layer_values.push(vec![0.0; b_elem]);
+                            }
+                        }
+                    }
+                    let end = (within_block + elem).min(b_elem);
+                    if within_block < b_elem {
+                        pool.blocks[physical].layer_keys[layer][within_block..end]
+                            .copy_from_slice(&k_flat[tok_start..tok_start + (end - within_block)]);
+                        pool.blocks[physical].layer_values[layer][within_block..end]
+                            .copy_from_slice(&v_flat[tok_start..tok_start + (end - within_block)]);
+                    }
                 }
                 if layer == 0 && within_block < pool.blocks[physical].key_data.len() {
                     let k_end = (within_block + elem).min(pool.blocks[physical].key_data.len());
@@ -2845,5 +2966,35 @@ mod f10_mirror_tests {
             .layer_block_slice(0, cache.table.logical_to_physical[0])
             .unwrap();
         assert_eq!(k_slice[0], 1.0);
+    }
+
+    #[test]
+    fn test_layer_zero_dedup_and_fail_loud() {
+        let mut pool = KvBlockPool::new(4, 2, 4);
+        let block_elem = BLOCK_SIZE * 2 * 4;
+
+        // Writing to layer 1: layer 0 must not allocate full backing in layer_keys[0]
+        let layer1_k = vec![1.5f32; block_elem];
+        let layer1_v = vec![2.5f32; block_elem];
+        pool.try_write_layer_keys(0, 1, &layer1_k, 16).unwrap();
+        pool.try_write_layer_values(0, 1, &layer1_v).unwrap();
+
+        assert_eq!(pool.blocks[0].layer_keys[0].capacity(), 0);
+        assert_eq!(pool.blocks[0].layer_values[0].capacity(), 0);
+
+        // Layer 0 reads route to key_data / value_data
+        let layer0_k = vec![0.5f32; block_elem];
+        pool.try_write_layer_keys(0, 0, &layer0_k, 16).unwrap();
+        assert_eq!(pool.read_layer_keys(0, 0).unwrap(), &layer0_k[..]);
+        assert_eq!(pool.read_layer_keys(0, 1).unwrap(), &layer1_k[..]);
+
+        // Fail-loud: out of bounds block id
+        assert!(pool.try_write_layer_keys(99, 0, &layer0_k, 16).is_err());
+        assert!(pool.try_write_layer_values(99, 0, &layer1_v).is_err());
+
+        // Fail-loud: oversized payload
+        let oversized = vec![1.0f32; block_elem + 1];
+        assert!(pool.try_write_layer_keys(0, 0, &oversized, 16).is_err());
+        assert!(pool.try_write_layer_values(0, 1, &oversized).is_err());
     }
 }

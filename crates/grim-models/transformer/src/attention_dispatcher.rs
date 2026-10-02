@@ -153,6 +153,44 @@ impl AttentionDispatcher {
 
         vec![seq_len, num_heads, head_dim]
     }
+
+    /// Whether SWA bounded replay is enabled via `GRIM_SWA_BOUNDED_REPLAY=1`.
+    pub fn swa_bounded_replay_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GRIM_SWA_BOUNDED_REPLAY").as_deref() == Ok("1"))
+    }
+
+    /// Compute the SWA replay window `[replay_start, total_tokens)`.
+    /// On a prefix match of length `matched_len`, if SWA is missing,
+    /// replays at most `window` tokens of the cached prefix together with the uncached suffix.
+    pub fn compute_swa_replay_range(
+        matched_len: usize,
+        total_tokens: usize,
+        window: usize,
+    ) -> std::ops::Range<usize> {
+        let replay_start = matched_len.saturating_sub(window);
+        replay_start..total_tokens
+    }
+
+    /// Construct a causal attention mask truncated to the replay segment:
+    /// Query at absolute position `i` attends only over `[max(replay_start, i - window + 1), i]`.
+    pub fn build_swa_truncated_mask(
+        replay_start: usize,
+        total_tokens: usize,
+        window: usize,
+    ) -> Vec<Vec<bool>> {
+        let seq_len = total_tokens.saturating_sub(replay_start);
+        let mut mask = vec![vec![false; seq_len]; seq_len];
+        for (row, i) in (replay_start..total_tokens).enumerate() {
+            let win_start = i.saturating_sub(window.saturating_sub(1)).max(replay_start);
+            for (col, j) in (replay_start..total_tokens).enumerate() {
+                if j >= win_start && j <= i {
+                    mask[row][col] = true;
+                }
+            }
+        }
+        mask
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +237,33 @@ mod tests {
         };
         let tier_sage = AttentionDispatcher::select_tier(&sage, true, true);
         assert_eq!(tier_sage, AttentionTier::Tier2UniversalCompute);
+    }
+
+    #[test]
+    fn test_swa_bounded_replay_mechanics() {
+        let n_win = 512;
+        let matched = 3584; // Radix match length
+        let total = 4096;   // Prefill length
+
+        let range = AttentionDispatcher::compute_swa_replay_range(matched, total, n_win);
+        assert_eq!(range.start, 3584 - 512); // exactly matched - n_win
+        assert_eq!(range.end, 4096);
+        assert_eq!(range.len(), 512 + (4096 - 3584)); // 512 + 512 = 1024 replay tokens
+
+        // Build truncated mask for a small synthetic window:
+        // total=8, matched=6, win=3 -> replay_start = 6 - 3 = 3 -> replay tokens 3..8 (len 5)
+        let mask = AttentionDispatcher::build_swa_truncated_mask(3, 8, 3);
+        assert_eq!(mask.len(), 5);
+        for row in 0..5usize {
+            let abs_i: usize = 3 + row;
+            for col in 0..5usize {
+                let abs_j: usize = 3 + col;
+                let expected = abs_j <= abs_i && abs_j >= abs_i.saturating_sub(2);
+                assert_eq!(
+                    mask[row][col], expected,
+                    "mismatch at row={row} (abs {abs_i}), col={col} (abs {abs_j})"
+                );
+            }
+        }
     }
 }

@@ -467,15 +467,46 @@ pub trait KvBlockStore: Send + Sync {
 
     /// Write key data into `id`'s block for a specific layer.
     fn write_layer_keys(&mut self, id: BlockId, layer_idx: u32, keys: &[f32], num_tokens: usize) {
-        if layer_idx == 0 {
-            self.write_keys(id, keys, num_tokens);
-        }
+        let _ = self.try_write_layer_keys(id, layer_idx, keys, num_tokens);
     }
 
     /// Write value data into `id`'s block for a specific layer.
     fn write_layer_values(&mut self, id: BlockId, layer_idx: u32, values: &[f32]) {
+        let _ = self.try_write_layer_values(id, layer_idx, values);
+    }
+
+    /// Try to write key data into `id`'s block for a specific layer, returning an error on failure.
+    fn try_write_layer_keys(
+        &mut self,
+        id: BlockId,
+        layer_idx: u32,
+        keys: &[f32],
+        num_tokens: usize,
+    ) -> Result<()> {
+        if layer_idx == 0 {
+            self.write_keys(id, keys, num_tokens);
+            Ok(())
+        } else {
+            Err(Error::KvCache(format!(
+                "layer {layer_idx} not supported by default KvBlockStore impl"
+            )))
+        }
+    }
+
+    /// Try to write value data into `id`'s block for a specific layer, returning an error on failure.
+    fn try_write_layer_values(
+        &mut self,
+        id: BlockId,
+        layer_idx: u32,
+        values: &[f32],
+    ) -> Result<()> {
         if layer_idx == 0 {
             self.write_values(id, values);
+            Ok(())
+        } else {
+            Err(Error::KvCache(format!(
+                "layer {layer_idx} not supported by default KvBlockStore impl"
+            )))
         }
     }
 }
@@ -1762,8 +1793,20 @@ fn store_push_payload<T: KvBlockStore>(
     } else {
         derived
     };
-    guard.write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens);
-    guard.write_layer_values(block_id, header.layer_idx, &v_data);
+    if let Err(e) = guard.try_write_layer_keys(block_id, header.layer_idx, &k_data, num_tokens) {
+        eprintln!(
+            "[grim-kvtransport] KV receiver: store failed writing keys for block {}: {e} — rejecting write",
+            header.block_id
+        );
+        return Err(PushRejection::Rejected);
+    }
+    if let Err(e) = guard.try_write_layer_values(block_id, header.layer_idx, &v_data) {
+        eprintln!(
+            "[grim-kvtransport] KV receiver: store failed writing values for block {}: {e} — rejecting write",
+            header.block_id
+        );
+        return Err(PushRejection::Rejected);
+    }
     Ok(num_tokens)
 }
 
