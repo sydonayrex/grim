@@ -134,6 +134,14 @@ fn linear_into_named(
     let a_dims = a.shape().dims().to_vec();
     let o_dims = out.shape().dims().to_vec();
 
+    if std::env::var_os("GRIM_XING_TRACE").is_some() {
+        eprintln!(
+            "[xing-linear] L{layer} {what}: {:?} {:?}",
+            w.dtype().storage,
+            w_dims
+        );
+    }
+
 
     // WhiteRaven blocked FP8 (16x16-blocked E4M3) cannot use
     // `linear_decode_into` here: its act path does a D2H readback plus an
@@ -6918,6 +6926,12 @@ pub struct Xing40GraphScratch {
     /// Gate bias + scales on device.
     pub hc_base: Vec<GBox>,
     pub hc_scale: Vec<GBox>,
+    /// The FFN branch carries its OWN gate bias/scale. Feeding it the attn
+    /// branch's (what this did before) rescales every ffn gate; layer 0 hid it
+    /// because its `post` gate is ~1e-7, so only the layers with a larger
+    /// `post` showed the error.
+    pub hc_base_ffn: Vec<GBox>,
+    pub hc_scale_ffn: Vec<GBox>,
     /// The checkpoint's rope (base + YaRN), interleaved pairing.
     pub rope_cfg: RopeConfig,
     pub mix: usize,
@@ -6973,6 +6987,8 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
         hc_fn_ffn: Vec::with_capacity(n_layers),
         hc_base: Vec::with_capacity(n_layers),
         hc_scale: Vec::with_capacity(n_layers),
+        hc_base_ffn: Vec::with_capacity(n_layers),
+        hc_scale_ffn: Vec::with_capacity(n_layers),
         rope_cfg: {
             let mut rc = RopeConfig::new(rope_d, model.layers[0].self_attn.rope.config.base);
             rc.yarn = model.layers[0].self_attn.rope.config.yarn;
@@ -7076,6 +7092,14 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
         )?);
         s.hc_scale
             .push(dev.from_cpu(scale, &Shape::new(vec![3]), grim_tensor::DType::F32)?);
+        let (fbase, fscale) = layer.ffn_hc.gate_params();
+        s.hc_base_ffn.push(dev.from_cpu(
+            fbase,
+            &Shape::new(vec![fbase.len()]),
+            grim_tensor::DType::F32,
+        )?);
+        s.hc_scale_ffn
+            .push(dev.from_cpu(fscale, &Shape::new(vec![3]), grim_tensor::DType::F32)?);
     }
     Ok(s)
 }
@@ -7119,6 +7143,22 @@ impl DecodeGraphModel for Xing40 {
         if self.graph_scratch.get().is_none() {
             let built = std::sync::Mutex::new(build_xing_scratch(self, &dev, batch)?);
             let _ = self.graph_scratch.set(built);
+        }
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let kinds: Vec<String> = self
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let k = if l.mlp.is_some() {
+                        "dense"
+                    } else if l.moe.is_some() {
+                        if l.moe.as_ref().unwrap().shared_experts.is_some() { "moe+shared" } else { "moe" }
+                    } else { "none" };
+                    format!("{i}:{k}")
+                })
+                .collect();
+            eprintln!("[xing-graph] layer kinds {}", kinds.join(" "));
         }
         // Prewarm the MoE native K-quant pointer arrays (zero weight VRAM;
         // the per-expert banks ARE the model's own weights). Tiny H2D of
@@ -7330,6 +7370,27 @@ impl DecodeGraphModel for Xing40 {
                 hidden,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("hc seed: {e}")))?;
+        }
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+            if let Ok(st) = as_rocm(&buffers.layer_input[0]) {
+                if let Ok(v) = st.to_cpu_vec_f32() {
+                    let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                    eprintln!("[xing-graph] CAPTURE layer_input[0]: rms {r:.4e} head {:?} capturing={}", &v[..4], graph.capturing);
+                }
+            }
+            if let Ok(st) = as_rocm(scratch.sin[0].as_ref()) {
+                if let Ok(v) = st.to_cpu_vec_f32() {
+                    let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                    eprintln!(
+                        "[xing-graph] CAPTURE sin[0]: n {} rms {r:.4e} h0 {:?} h3584 {:?} capturing={}",
+                        v.len(),
+                        &v[..4],
+                        &v[3584..3588],
+                        graph.capturing
+                    );
+                }
+            }
         }
 
         let h_shape = Shape::new(vec![batch, hidden]);
@@ -7639,8 +7700,10 @@ impl DecodeGraphModel for Xing40 {
             let (iters, geps, cmin, cmax) = layer.ffn_hc.gate_consts();
             dev.mhc_gates_launch_into(
                 as_rocm(scratch.proj[i].as_ref())?,
-                scratch.hc_base[i].as_ref(),
-                scratch.hc_scale[i].as_ref(),
+                // The FFN branch's OWN bias/scale, matching eager's
+                // `self.ffn_hc.gates_d2d` — not the attention branch's.
+                scratch.hc_base_ffn[i].as_ref(),
+                scratch.hc_scale_ffn[i].as_ref(),
                 as_rocm(scratch.pre[i].as_ref())?,
                 as_rocm(scratch.post[i].as_ref())?,
                 as_rocm(scratch.comb[i].as_ref())?,
@@ -7651,8 +7714,12 @@ impl DecodeGraphModel for Xing40 {
                 cmin,
                 cmax,
             )?;
+            // The FFN branch reads the stream the ATTENTION write-back just
+            // produced (`sout[i]`), not the layer input (`sin[i]`) — a replace-all
+            // had flattened both collapses onto `sin`, which the near-zero `post`
+            // gate of layer 0 hid until layer 1's larger gate exposed it.
             dev.launch_hc_collapse_step(
-                sin.as_ref(),
+                sout.as_ref(),
                 as_rocm(scratch.pre[i].as_ref())?,
                 as_rocm(scratch.col[i].as_ref())?,
                 hc,
@@ -8007,10 +8074,100 @@ impl DecodeGraphModel for Xing40 {
                             eprintln!("[xing-graph] norm_buf0: len {} nan {nan} rms {rms:.4e}", v.len());
                         }
                     }
+                    // The gathered embedding row: the graph uses
+                    // launch_embedding_gather_dev_idx (IQ3_S kernel) where
+                    // eager uses grim_nn::embedding_gather_on_device.
+                    if let Some(li) = graph.buffers.layer_input.first() {
+                        if let Ok(v) = li.to_cpu_vec_f32() {
+                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                            eprintln!("[xing-graph] embedding row: n {} rms {r:.4e} head {:?}", v.len(), &v[..v.len().min(4)]);
+                        }
+                    }
+                    // Per-layer attn-branch input rms (post attn_norm), the
+                    // direct counterpart of eager's "attn_in" trace.
+                    {
+                        let parts: Vec<String> = g
+                            .col
+                            .iter()
+                            .enumerate()
+                            .take(6)
+                            .filter_map(|(i, b)| {
+                                as_rocm(b.as_ref()).ok().and_then(|st| {
+                                    st.to_cpu_vec_f32().ok().map(|v| {
+                                        let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                            / v.len().max(1) as f32)
+                                            .sqrt();
+                                        format!("L{i}:{r:.4e}")
+                                    })
+                                })
+                            })
+                            .collect();
+                        eprintln!("[xing-graph] col rms {}", parts.join(" "));
+                    }
+                    // Layer 0 vs layer 1 internals: which stage diverges.
+                    for li in 0..2usize {
+                        for (lbl, buf) in [
+                            ("sout", g.sout.get(li)),
+                            ("col", g.col.get(li)),
+                            ("attn", g.attn.get(li)),
+                            ("hcn", g.hcn.get(li)),
+                        ] {
+                            if let Some(b) = buf {
+                                dump(&format!("L{li} {lbl}"), b);
+                            }
+                        }
+                        if let Some(nb) = graph.buffers.norm_buf.get(li) {
+                            if let Ok(v) = nb.to_cpu_vec_f32() {
+                                let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                                eprintln!("[xing-graph] L{li} norm_buf rms {r:.4e}");
+                            }
+                        }
+                    }
+                    // Per-layer stream rms: compare against the eager path's
+                    // "L{i} in" trace to find the first diverging layer.
+                    {
+                        let parts: Vec<String> = g
+                            .sin
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, b)| {
+                                as_rocm(b.as_ref()).ok().and_then(|st| {
+                                    st.to_cpu_vec_f32().ok().map(|v| {
+                                        let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                            / v.len().max(1) as f32)
+                                            .sqrt();
+                                        format!("L{i}:{r:.4e}")
+                                    })
+                                })
+                            })
+                            .collect();
+                        eprintln!("[xing-graph] sin rms {}", parts.join(" "));
+                    }
+                    // Top-5 of the head output: the direct comparison point
+                    // against eager's --logprobs line for the same step.
+                    if let Ok(v) = graph.buffers.head_output.to_cpu_vec_f32() {
+                        {
+                            let last = &v[v.len().saturating_sub(self.cfg.vocab_size)..];
+                            let mx = last.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            let lse = mx as f64
+                                + last.iter().map(|x| ((x - mx) as f64).exp()).sum::<f64>().ln();
+                            let mut idx: Vec<u32> = (0..last.len() as u32).collect();
+                            idx.sort_by(|a, b| last[*b as usize].total_cmp(&last[*a as usize]));
+                            idx.truncate(5);
+                            let parts: Vec<String> = idx.iter().map(|i| {
+                                format!("{}:{:.4}", i, last[*i as usize] as f64 - lse)
+                            }).collect();
+                            let nonzero = last.iter().filter(|x| **x != 0.0).count();
+                            let within = last.iter().filter(|x| (**x - mx).abs() < 1e-3).count();
+                            eprintln!("[xing-graph] head stats: n {} nonzero {nonzero} within1e-3-of-max {within} max {mx:.4} min {:.4}", last.len(), last.iter().copied().fold(f32::INFINITY, f32::min));
+                            eprintln!("[xing-graph] head top5 [{}]", parts.join(" "));
+                        }
+                    }
                     if let Ok(b) = as_rocm(g.meaned.as_ref()) {
                         if let Ok(v) = b.to_cpu_vec_f32() {
                             let nan = v.iter().filter(|x| x.is_nan()).count();
-                            eprintln!("[xing-graph] meaned: len {} nan {nan}", v.len());
+                            let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                            eprintln!("[xing-graph] meaned: len {} nan {nan} rms {rms:.4e} head {:?}", v.len(), &v[..v.len().min(4)]);
                         }
                     }
                 }

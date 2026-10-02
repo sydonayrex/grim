@@ -720,6 +720,20 @@ impl Xing40HyperConnection {
             self.clamp_max,
         )?;
         let proj_host = proj.to_vec_f32()?;
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let r = (proj_host.iter().map(|x| x * x).sum::<f32>() / proj_host.len().max(1) as f32).sqrt();
+            eprintln!("[xing-trace] hc proj: n {} rms {r:.4e} head {:?}", proj_host.len(), &proj_host[..proj_host.len().min(6)]);
+            eprintln!("[xing-trace] hc pre: {:?}", gates.pre.to_cpu_vec_f32().map(|v| v[..v.len().min(4)].to_vec()));
+            eprintln!("[xing-trace] hc input_norm weight shape {:?}", self.input_norm.weight.shape());
+            if let Ok(wv) = self.input_norm.weight.to_vec_f32() {
+                eprintln!("[xing-trace] input_norm w[0..4] {:?} rms {:.4e}", &wv[..4.min(wv.len())],
+                    (wv.iter().map(|x| x * x).sum::<f32>() / wv.len().max(1) as f32).sqrt());
+            }
+            if let Ok(v) = normed.to_vec_f32() {
+                let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                eprintln!("[xing-trace] hc normed: n {} rms {r:.4e} head {:?}", v.len(), &v[..v.len().min(3)]);
+            }
+        }
         Ok((Xing40HcGatesD2D {
             pre: gates.pre,
             post: gates.post,
@@ -2573,11 +2587,20 @@ impl CausalLm for Xing40 {
             *kv_caches = vec![None; self.layers.len()];
         }
         for (i, layer) in self.layers.iter().enumerate() {
+            if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                xing_trace_stage(&format!("L{i} in"), &x);
+            }
             x = layer.forward(&x, &pos_v, &mut kv_caches[i])?;
+            if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                xing_trace_stage(&format!("L{i} out"), &x);
+            }
         }
         // Collapse the streams with a mean, then norm + lm_head.
         let collapsed = mean_collapse(&x, hc, hidden, seq_len, &plane)?;
         let normed = self.norm.forward(&collapsed)?;
+        // The graph head reads the mean of the hc streams then output-norm;
+        // this is the same quantity, so it is the parity comparison point.
+        xing_trace_stage("head input (normed collapsed)", &normed);
         let logits = self.output.forward(&normed)?;
         session.advance_pos(seq_len);
         Ok(logits)
