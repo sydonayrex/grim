@@ -132,6 +132,10 @@ pub(crate) struct KqNativeResident {
     /// assumed).
     pub gate_bytes: u64,
     pub down_bytes: u64,
+    /// Down bank scheme per layer: 1 = Q4_K (144 B per 256), 0 = IQ3_S.
+    /// The checkpoint's down banks are NOT uniform across layers (blk.2's is
+    /// Q4_K, others IQ3_S), so the kernel's down leg switches on this.
+    pub down_q4k: bool,
 }
 
 pub(crate) struct WhiteCrowResident {
@@ -336,6 +340,7 @@ pub(crate) fn ensure_kq_native(
                 num_experts: r.num_experts,
                 gate_bytes: r.gate_bytes,
                 down_bytes: r.down_bytes,
+                down_q4k: r.down_q4k,
             });
         }
     }
@@ -360,7 +365,10 @@ pub(crate) fn ensure_kq_native(
     for e in experts {
         if scheme_of(&e.gate.weight)? != grim_tensor::KQuantScheme::IQ3S
             || scheme_of(&e.up.weight)? != grim_tensor::KQuantScheme::IQ3S
-            || scheme_of(&e.down.weight)? != grim_tensor::KQuantScheme::Q4K
+            || !matches!(
+                scheme_of(&e.down.weight)?,
+                grim_tensor::KQuantScheme::Q4K | grim_tensor::KQuantScheme::IQ3S
+            )
         {
             let (g, u, d) = (
                 scheme_of(&e.gate.weight)?,
@@ -425,6 +433,7 @@ pub(crate) fn ensure_kq_native(
     // the phase-mask bisection chased).
     let gate_bytes = pick_expert_bytes(&experts[0], |e| &e.gate.weight);
     let down_bytes = pick_expert_bytes(&experts[0], |e| &e.down.weight);
+    let down_q4k = scheme_of(&experts[0].down.weight)? == grim_tensor::KQuantScheme::Q4K;
     let resident = KqNativeResident {
         gate_ptrs,
         up_ptrs,
@@ -432,6 +441,7 @@ pub(crate) fn ensure_kq_native(
         num_experts,
         gate_bytes,
         down_bytes,
+        down_q4k,
     };
     *cache.kq_native.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(KqNativeResident {
@@ -441,6 +451,7 @@ pub(crate) fn ensure_kq_native(
             num_experts: resident.num_experts,
             gate_bytes: resident.gate_bytes,
             down_bytes: resident.down_bytes,
+            down_q4k: resident.down_q4k,
         });
     Ok(resident)
 }
@@ -461,6 +472,7 @@ pub(crate) fn peek_kq_native(cache: &CharonCache) -> Option<KqNativeResident> {
         num_experts: r.num_experts,
         gate_bytes: r.gate_bytes,
         down_bytes: r.down_bytes,
+        down_q4k: r.down_q4k,
     })
 }
 
@@ -1104,6 +1116,7 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                     // past each row (page fault -> sync hang).
                     kq.gate_bytes / inter as u64,
                     kq.down_bytes / hidden as u64,
+                    i32::from(kq.down_q4k),
                 )?;
             }
             let out_t = Tensor::new(
@@ -2713,6 +2726,7 @@ mod kq_native_integration_tests {
             rsf,
             kq.gate_bytes / inter as u64,
             kq.down_bytes / hidden as u64,
+            i32::from(kq.down_q4k),
         )
         .expect("kq dispatch over the model's storages");
         eprintln!("[kq-model] dispatch returned (kernel + memset enqueued)");
@@ -2730,7 +2744,10 @@ mod kq_native_integration_tests {
             let gw = st_of(&bank.gate[e as usize].weight).copy_to_host().unwrap();
             let uw = st_of(&bank.up[e as usize].weight).copy_to_host().unwrap();
             let dwb = st_of(&bank.down[e as usize].weight).copy_to_host().unwrap();
-            let deq = |blob: &[u8], rows: usize, k: usize| -> Vec<f32> {
+            // gate/up are IQ3_S (110 B per 256); the down bank is Q4_K
+            // (144 B per 256) — decoding it with the IQ3_S stride produces
+            // finite-but-wrong reference values.
+            let deq_iq3s = |blob: &[u8], rows: usize, k: usize| -> Vec<f32> {
                 let mut flat = Vec::with_capacity(rows * k);
                 for r in 0..rows {
                     let row = &blob[r * (k / 256) * 110..(r + 1) * (k / 256) * 110];
@@ -2738,8 +2755,16 @@ mod kq_native_integration_tests {
                 }
                 flat
             };
-            let g_flat = deq(&gw, inter, hidden);
-            let u_flat = deq(&uw, inter, hidden);
+            let deq_q4k = |blob: &[u8], rows: usize, k: usize| -> Vec<f32> {
+                let mut flat = Vec::with_capacity(rows * k);
+                for r in 0..rows {
+                    let row = &blob[r * (k / 256) * 144..(r + 1) * (k / 256) * 144];
+                    flat.extend_from_slice(&grim_quant::dequant_q4k(row, k).unwrap());
+                }
+                flat
+            };
+            let g_flat = deq_iq3s(&gw, inter, hidden);
+            let u_flat = deq_iq3s(&uw, inter, hidden);
             let mut actv = vec![0f32; inter];
             for j in 0..inter {
                 let mut g = 0f32;
@@ -2751,7 +2776,7 @@ mod kq_native_integration_tests {
                 }
                 actv[j] = g / (1.0 + (-g).exp()) * u;
             }
-            let d_flat = deq(&dwb, hidden, inter);
+            let d_flat = deq_q4k(&dwb, hidden, inter);
             for h in 0..hidden {
                 let mut acc = 0f32;
                 for j in 0..inter {

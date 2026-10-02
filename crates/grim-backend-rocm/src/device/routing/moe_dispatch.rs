@@ -1583,6 +1583,7 @@ impl RocmDevice {
         routed_scaling_factor: f32,
         gate_row_bytes: u64,
         down_row_bytes: u64,
+        down_fmt: i32,
     ) -> Result<*mut c_void> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let a_ptr = activations
@@ -1628,6 +1629,7 @@ impl RocmDevice {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(inter as i32);
+        let mut down_fmt_i = down_fmt;
 
         // One 256-thread block per pair; dynamic shared staging holds `inter`
         // f32 — the size MUST be passed at launch (unsized dynamic LDS page-
@@ -1655,6 +1657,7 @@ impl RocmDevice {
                 arg(&mut gate_row_bytes_i),
                 arg(&mut down_row_bytes_i),
                 arg(&mut jlimit_i),
+                arg(&mut down_fmt_i),
             ],
             None,
             inter * std::mem::size_of::<f32>(),

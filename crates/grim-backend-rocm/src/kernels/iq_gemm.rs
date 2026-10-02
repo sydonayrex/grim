@@ -1266,7 +1266,7 @@ extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
     float* __restrict__ out,                          // [batch, hidden]
     int hidden, int inter, int num_pairs,
     float routed_scaling_factor, int num_experts, int batch, int phase_mask,
-    int gate_row_bytes, int down_row_bytes, int jlimit_arg)
+    int gate_row_bytes, int down_row_bytes, int jlimit_arg, int down_fmt)
 {
     const int pair = blockIdx.x;
     if (pair >= num_pairs) return;
@@ -1291,7 +1291,11 @@ extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
     // (storage.bytes() / rows) — the loader may re-tag/re-encode the down
     // bank, so the kernel must not assume the raw-file geometry.
     const int g_sb = gate_row_bytes / 110;  // IQ3_S super-blocks per gate/up row
-    const int d_sb = down_row_bytes / 144;  // Q4_K super-blocks per down row
+    // down bank format per layer: 1 = Q4_K (144 B/256), 0 = IQ3_S (110 B/256).
+    // The checkpoint's down banks are NOT uniform across layers (blk.2 is
+    // Q4_K, others IQ3_S), so the leg switches on the measured scheme.
+    const int down_block_bytes = down_fmt ? 144 : 110;
+    const int d_sb = down_row_bytes / down_block_bytes;  // super-blocks per down row
 
     const float* a = activations + (unsigned long long)tok * hidden;
 
@@ -1326,10 +1330,12 @@ extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
         for (int b = 0; b < d_sb; ++b) {
             const int kb = b * 256;
             #pragma unroll 8
-            // Down bank is Q4_K (144 B per 256) — decode with the SAME leaf
-            // function the weight path and the embedding gather use.
+            // Down decode with the SAME leaf functions the weight path and the
+            // embedding gather use, selected by the layer's measured format.
             for (int i = 0; i < 256; ++i) {
-                acc += s_act[kb + i] * dequant_q4k_element(dblk + b * 144, i);
+                acc += s_act[kb + i] * (down_fmt
+                    ? dequant_q4k_element(dblk + b * 144, i)
+                    : dequant_iq3s(dblk + b * 110, i));
             }
         }
         atomicAdd(out + (unsigned long long)tok * hidden + h,

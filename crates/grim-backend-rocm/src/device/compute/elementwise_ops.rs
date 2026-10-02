@@ -478,3 +478,39 @@ impl ElementwiseOps for RocmDevice {
             .ok_or_else(|| Error::Backend("argmax: empty tensor".into()))
     }
 }
+
+impl RocmDevice {
+    /// In-place sibling of `mul_scalar` that writes into a caller-provided
+    /// buffer — decode-graph capture-safe (allocates nothing, no sync).
+    pub fn mul_scalar_into(
+        &self,
+        x: &dyn grim_tensor::backend::BackendStorage,
+        scalar: f32,
+        out: &RocmStorage,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "mul_scalar_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let total = out.shape().elem_count();
+        let mut a_ptr = x_s.device_ptr.unwrap() as *mut std::ffi::c_void;
+        let mut b_ptr = out.device_ptr.unwrap() as *mut std::ffi::c_void;
+        let mut s = scalar;
+        let mut n = total as i32;
+        let (grid, block) = crate::device::util::linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_mul_scalar",
+            grid,
+            block,
+            &mut [
+                crate::arg(&mut a_ptr),
+                crate::arg(&mut b_ptr),
+                crate::arg(&mut s),
+                crate::arg(&mut n),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+}

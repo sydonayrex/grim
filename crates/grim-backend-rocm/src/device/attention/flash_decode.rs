@@ -134,6 +134,53 @@ impl RocmDevice {
         w_uv_head_stride_words: usize,
         live_len: Option<&RocmStorage>,
     ) -> Result<*mut c_void> {
+        let inv_sqrt_d = 1.0f32 / ((kv_lora_rank + qk_rope_dim) as f32).sqrt();
+        self.launch_mla_absorbed_decode_scaled(
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            w_uv,
+            out,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+            w_uv_offset_words,
+            w_uv_head_stride_words,
+            live_len,
+            inv_sqrt_d,
+        )
+    }
+
+    /// [`Self::launch_mla_absorbed_decode`] with a caller-supplied softmax
+    /// denominator.
+    ///
+    /// The default derives it from the latent width as `1/sqrt(rank + rope_d)`,
+    /// which is right only when the query's post-RoPE scale matches the latent
+    /// width. A model whose attention scale is set elsewhere — Xing4.0 folds a
+    /// YaRN `attention_factor^2` against the *nope+rope* width — needs its own
+    /// value. Doing that with a separate `mul_scalar` pass over q needs a
+    /// kernel that is issued for the first time inside the capture bracket,
+    /// which deadlocks the capture; scaling inside the kernel needs nothing new.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_absorbed_decode_scaled(
+        &self,
+        q_absorbed: &RocmStorage,
+        q_rope: &RocmStorage,
+        kv_cache: &RocmStorage,
+        w_uv: Option<&RocmStorage>,
+        out: &RocmStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
+        live_len: Option<&RocmStorage>,
+        inv_sqrt_d: f32,
+    ) -> Result<*mut c_void> {
         let q_abs_ptr = q_absorbed.device_ptr.ok_or_else(|| {
             Error::Backend("mla_absorbed_decode: q_absorbed has no device ptr".into())
         })?;
@@ -162,7 +209,7 @@ impl RocmDevice {
         let mut rope_d = qk_rope_dim as i32;
         let mut v_dim = v_head_dim as i32;
         let mut slen = seq_len as i32;
-        let mut inv_sqrt = 1.0f32 / ((kv_lora_rank + qk_rope_dim) as f32).sqrt();
+        let mut inv_sqrt = inv_sqrt_d;
         let mut has_w = has_w_uv;
         let mut w_off = w_uv_offset_words as i32;
         let mut w_stride = w_uv_head_stride_words as i32;

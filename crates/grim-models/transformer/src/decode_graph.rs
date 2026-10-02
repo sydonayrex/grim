@@ -6885,6 +6885,16 @@ pub struct Xing40GraphScratch {
     /// Absorbed query `[1, nh*rank]` (reused for the decode kernel's
     /// normalized-latent output when W_UV runs as the per-head GEMV).
     pub qabs: Vec<GBox>,
+    /// Scale-corrected query planes: the fused MLA decode kernel hardcodes
+    /// `1/sqrt(rank + rope_d)` while the model's kq_scale is
+    /// Attention output latent `[1, nh * rank]`.
+    ///
+    /// The fused MLA decode kernel writes its result here, NEVER back into
+    /// `qabs`: with `out == q_absorbed`, head `h` writes `[h*vd, h*vd+vd)`
+    /// while head `h'` reads `[h'*rank, h'*rank+rank)`, and those windows
+    /// overlap (vd=128, rank=512), so heads clobber each other's queries and
+    /// every replayed step is garbage.
+    pub qattn_latent: Vec<GBox>,
     /// Latent staging: kv_a output `[1, rank+rope_d]`, then the split
     /// c_kv / k_pe planes, then the packed row.
     pub kvstage: Vec<GBox>,
@@ -6947,6 +6957,7 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
         qn: Vec::with_capacity(n_layers),
         qp: Vec::with_capacity(n_layers),
         qabs: Vec::with_capacity(n_layers),
+        qattn_latent: Vec::with_capacity(n_layers),
         kvstage: Vec::with_capacity(n_layers),
         ckv: Vec::with_capacity(n_layers),
         kpe: Vec::with_capacity(n_layers),
@@ -7015,6 +7026,8 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
             grim_tensor::DType::F32,
         )?);
         s.qabs
+            .push(dev.zeros(&Shape::new(vec![batch, nh * rank]), grim_tensor::DType::F32)?);
+        s.qattn_latent
             .push(dev.zeros(&Shape::new(vec![batch, nh * rank]), grim_tensor::DType::F32)?);
         s.kvstage.push(dev.zeros(
             &Shape::new(vec![batch, rank + rope_d]),
@@ -7441,12 +7454,22 @@ impl DecodeGraphModel for Xing40 {
             // Latent-space attention over the LIVE length (pos_dev + 1); the
             // normalized latent lands in qabs and W_UV runs as the per-head
             // GEMV into attn.
-            dev.launch_mla_absorbed_decode(
+            // The softmax denominator is handed to the kernel rather than
+            // applied by a separate elementwise pass over q. The kernel's
+            // default is 1/sqrt(rank + rope_d); this model folds a YaRN
+            // attention_factor^2 against the *nope + rope* width instead.
+            // Issuing that extra `grim_mul_scalar` inside the capture bracket
+            // hangs the capture dead - bisected with GRIM_KQ_PRESCALE: it hangs
+            // even writing in place into qabs/qp (mode 4), so it is the launch
+            // in the bracket, not the destination buffers.
+            let mscale = cfg.rope_yarn.map(|y| y.attention_factor).unwrap_or(1.0f32);
+            let inv_sqrt_d = mscale * mscale / ((nope + rope_d) as f32).sqrt();
+            dev.launch_mla_absorbed_decode_scaled(
                 as_rocm(scratch.qabs[i].as_ref())?,
                 as_rocm(scratch.qp[i].as_ref())?,
                 &buffers.k_arena[i],
                 None,
-                as_rocm(scratch.qabs[i].as_ref())?,
+                as_rocm(scratch.qattn_latent[i].as_ref())?,
                 nh,
                 rank,
                 rope_d,
@@ -7455,11 +7478,12 @@ impl DecodeGraphModel for Xing40 {
                 0,
                 0,
                 Some(&buffers.pos_dev),
+                inv_sqrt_d,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
             if let Some(w_vc) = sa.w_vc_device(0)? {
                 dev.launch_xing_q_absorb(
-                    as_rocm(scratch.qabs[i].as_ref())?,
+                    as_rocm(scratch.qattn_latent[i].as_ref())?,
                     w_vc,
                     as_rocm(scratch.attn[i].as_ref())?,
                     nh,
@@ -7636,6 +7660,7 @@ impl DecodeGraphModel for Xing40 {
                         moe.routed_scaling_factor,
                         kq.gate_bytes / cfg.moe_intermediate_size as u64,
                         kq.down_bytes / hidden as u64,
+                        i32::from(kq.down_q4k),
                     )?;
                 } else if let Some(wc) = wc {
                     let g_wc = wc
@@ -7856,6 +7881,11 @@ impl DecodeGraphModel for Xing40 {
                 None => out.push(None),
             }
         }
+        eprintln!(
+            "[xing40-graph] kv seed: {} of {} layers have an eager latent cache (valid_rows {valid_rows}, latent_dim {latent_dim})",
+            out.iter().filter(|x| x.is_some()).count(),
+            out.len()
+        );
         Ok(out)
     }
 }

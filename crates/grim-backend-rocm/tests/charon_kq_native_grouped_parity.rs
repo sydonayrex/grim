@@ -25,6 +25,18 @@ const INTER: usize = 1024;
 const NUM_EXPERTS: usize = 64;
 const BATCH: usize = 1;
 
+thread_local! {
+    static SEPARATE_KEEP: std::cell::RefCell<Vec<Arc<dyn grim_tensor::backend::BackendStorage>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static SEPARATE_PTRS: std::cell::RefCell<
+        Option<(
+            Arc<dyn grim_tensor::backend::BackendStorage>,
+            Arc<dyn grim_tensor::backend::BackendStorage>,
+            Arc<dyn grim_tensor::backend::BackendStorage>,
+        )>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
 fn u8_storage(dev: &RocmDevice, v: &[u8]) -> Arc<dyn grim_tensor::backend::BackendStorage> {
     Arc::from(
         dev.from_cpu_bytes(
@@ -159,6 +171,86 @@ fn kq_native_grouped_matches_host_iq3s_reference() {
     let num_pairs = tokens.len();
     let rsf = 1.1f32;
 
+    // KQ_PARITY_SEPARATE_ALLOCS=1: one allocation per expert, exactly how
+    // ExpertBank materializes the model's per-expert banks (the isolated
+    // repro of the model-shaped wedge: same bytes, same geometry, different
+    // allocation layout).
+    if std::env::var("KQ_PARITY_SEPARATE_ALLOCS").as_deref() == Ok("1") {
+        let mut gate_addrs = Vec::new();
+        let mut up_addrs = Vec::new();
+        let mut down_addrs = Vec::new();
+        for e in 0..NUM_EXPERTS {
+            let g_off = e * INTER * gate_row_bytes;
+            let u_off = e * INTER * gate_row_bytes;
+            let d_off = e * HIDDEN * down_row_bytes;
+            let gd = u8_storage(&dev, &gate_blob[g_off..g_off + INTER * gate_row_bytes]);
+            let ud = u8_storage(&dev, &up_blob[u_off..u_off + INTER * gate_row_bytes]);
+            let dd = u8_storage(&dev, &down_blob[d_off..d_off + HIDDEN * down_row_bytes]);
+            let base = |a: &Arc<dyn grim_tensor::backend::BackendStorage>| -> usize {
+                a.as_any()
+                    .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
+                    .unwrap()
+                    .device_ptr_u64()
+                    .unwrap() as usize
+            };
+            gate_addrs.push(base(&gd));
+            up_addrs.push(base(&ud));
+            down_addrs.push(base(&dd));
+            // keep the storages alive for the dispatch
+            SEPARATE_KEEP.with(|k| k.borrow_mut().extend(vec![gd, ud, dd]));
+        }
+        SEPARATE_KEEP.with(|_k| {
+            let to_u32 = |addrs: &[usize]| -> Vec<u32> {
+                let mut bytes: Vec<u8> = Vec::new();
+                for a in addrs {
+                    bytes.extend_from_slice(&(*a as u64).to_le_bytes());
+                }
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            };
+            let g_ptrs = u32_storage(&dev, &to_u32(&gate_addrs));
+            let u_ptrs = u32_storage(&dev, &to_u32(&up_addrs));
+            let d_ptrs = u32_storage(&dev, &to_u32(&down_addrs));
+            SEPARATE_PTRS.with(|p| *p.borrow_mut() = Some((g_ptrs, u_ptrs, d_ptrs)));
+        });
+        let g_ptrs = SEPARATE_PTRS.with(|p| p.borrow().as_ref().unwrap().0.clone());
+        let u_ptrs = SEPARATE_PTRS.with(|p| p.borrow().as_ref().unwrap().1.clone());
+        let d_ptrs = SEPARATE_PTRS.with(|p| p.borrow().as_ref().unwrap().2.clone());
+        let a_t = f32_storage(&dev, &act);
+        let t_t = u32_storage(&dev, &tokens);
+        let e_t = u32_storage(&dev, &experts);
+        let w_t = f32_storage(&dev, &weights);
+        let out_rocm = grim_backend_rocm::memory::storage::RocmStorage::alloc_gpu(
+            &Shape::new(vec![1, HIDDEN]),
+            DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .expect("out");
+        dev.moe_fused_dispatch_kq_native_into(
+            as_rocm_s(&a_t),
+            as_rocm_s(&g_ptrs),
+            as_rocm_s(&u_ptrs),
+            as_rocm_s(&d_ptrs),
+            as_rocm_s(&t_t),
+            as_rocm_s(&e_t),
+            as_rocm_s(&w_t),
+            tokens.len(),
+            &out_rocm,
+            HIDDEN,
+            INTER,
+            rsf,
+            gate_row_bytes as u64,
+            down_row_bytes as u64,
+            0,
+        )
+        .expect("separate-alloc dispatch");
+        dev.synchronize();
+        eprintln!("[kq-parity] separate-allocation arm: dispatch + sync completed");
+        return;
+    }
     // Per-expert device pointer arrays over the blob slices.
     let mut gate_addrs: Vec<usize> = Vec::new();
     let mut up_addrs: Vec<usize> = Vec::new();
@@ -239,6 +331,7 @@ fn kq_native_grouped_matches_host_iq3s_reference() {
         rsf,
         gate_row_bytes,
         down_row_bytes,
+                0,
     )
     .expect("kq native dispatch");
     dev.synchronize();
@@ -411,6 +504,7 @@ fn kq_native_matches_host_on_real_banks() {
         rsf,
         gate_stride as u64,
         down_stride as u64,
+                0,
     )
     .expect("kq native dispatch (real banks)");
     dev.synchronize();
