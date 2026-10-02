@@ -273,7 +273,13 @@ esac
 echo
 echo "=== MUTATION B: LlamaConfig::default claims LayerNorm"
 cp "$model" "$tmp/model.orig"
-python3 - "$model" <<'PY'
+# Function-scoped like mutation C: the restore runs on EVERY path out,
+# including the one where the anchor has drifted. An earlier version ran them
+# separately, and a missing anchor skipped the restore and left
+# `LlamaConfig::default` claiming LayerNorm in the working tree -- found by a
+# later run, which then could not find its own anchor.
+mutate_b() {
+    python3 - "$model" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
@@ -283,16 +289,22 @@ if new == s:
     sys.exit("anchor not found")
 open(p, "w").write(new)
 PY
-if [ $? -ne 0 ]; then
-    fail "B: could not locate Default.norm_kind"
-else
+    if [ $? -ne 0 ]; then
+        fail "B: could not locate Default.norm_kind -- no mutation ran"
+        return 1
+    fi
     r="$(cargo test -p grim-models-transformer --test output_norm_spec -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "B SURVIVED -- the default is unpinned: $r" ;;
         *)             pass "B killed: $r" ;;
     esac
-fi
+    return 0
+}
+mutate_b || true
 cp "$tmp/model.orig" "$model"
+if ! cmp -s "$model" "$tmp/model.orig"; then
+    fail "B: model.rs was not restored"
+fi
 out="$(cargo test -p grim-models-transformer --test output_norm_spec -j 1 2>&1 | result_of)"
 r="$(printf '%s' "$out" | result_of)"
 case "$r" in
@@ -322,8 +334,7 @@ if old not in s:
 open(p, "w").write(s.replace(old, "        let x_norm = self.ffn_norm.forward(&added)?;", 1))
 PY
     if [ $? -ne 0 ]; then
-        report "C: could not locate the parallel-residual branch" "the anchor \
-did not match; block.rs is unchanged and no mutation ran"
+        fail "C: could not locate the parallel-residual branch -- no mutation ran"
         return 1
     fi
     r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
