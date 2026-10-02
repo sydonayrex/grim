@@ -558,6 +558,40 @@ impl BackendStorage for RocmStorage {
         &self.shape
     }
 
+    /// Read back a U32-typed storage (e.g. the MoE router's expert-id
+    /// buffer). Without this, reading one with `to_cpu_vec_f32` falls through
+    /// to `dequant_cpu`, which returns zeros for an integer dtype — and a
+    /// buffer of zeros is indistinguishable from a router that selected
+    /// expert 0 everywhere.
+    fn to_cpu_vec_u32(&self) -> Result<Vec<u32>> {
+        let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
+        let elem_count = self.shape.elem_count();
+        let need = (elem_count as u64).saturating_mul(crate::dtype_byte_size(&self.dtype) as u64);
+        if need as usize > self.bytes {
+            return Err(crate::Error::Shape(format!(
+                "to_cpu_vec_u32: shape needs {need} B, allocation is {} B",
+                self.bytes
+            )));
+        }
+        let mut raw = vec![0u8; need as usize];
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        crate::check_hip(
+            "hipMemcpyDtoH (u32)",
+            unsafe {
+                hipMemcpy(
+                    raw.as_mut_ptr() as *mut c_void,
+                    dev_ptr_void,
+                    need as usize,
+                    crate::HipMemcpyKind::DeviceToHost,
+                )
+            },
+        )?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
         let dev_ptr_void = self.device_ptr_checked()? as *mut c_void;
         let elem_count = self.shape.elem_count();

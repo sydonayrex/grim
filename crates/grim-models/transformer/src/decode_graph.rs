@@ -8109,6 +8109,57 @@ dev.launch_hc_collapse_step(
                     true, // xing4_0.expert_weights_norm
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+                // HOST ORACLE for the noaux_tc routing, at the first MoE
+                // layer. Independent of the device kernel: sigmoid the gate
+                // logits, select the top-k on (sigmoid + correction bias),
+                // and normalise the selected sigmoid scores. If the graph
+                // picks different experts than eager, nothing downstream can
+                // agree - and layers 2..39 are all moe+shared, so this is the
+                // first thing to check once layer 0 is oracle-verified.
+                if i == 2 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                    let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                    let gl = as_rocm(&buffers.moe_gate_logits[i]).and_then(|s| s.to_cpu_vec_f32());
+                    let bs = match bias {
+                        Some(b) => match as_rocm(b) { Ok(r) => r.to_cpu_vec_f32().ok(), Err(_) => None },
+                        None => None,
+                    };
+                    // u32, NOT f32: reading it with to_cpu_vec_f32 reports
+                    // zeros and looks exactly like a routing bug.
+                    let de = as_rocm(&buffers.moe_route_experts)
+                        .and_then(|s| s.to_cpu_vec_u32());
+                    let dw = as_rocm(&buffers.moe_route_weights).and_then(|s| s.to_cpu_vec_f32());
+                    eprintln!(
+                        "[xing-graph] ROUTING probe L2: logits_ok {} bias_ok {} experts_ok {:?} w_ok {}",
+                        gl.is_ok(), bs.is_some(), de.as_ref().map(|v| &v[..4.min(v.len())]), dw.is_ok()
+                    );
+                    if let (Ok(gl), Some(bs), Ok(de), Ok(dw)) = (gl, bs, de, dw) {
+                        let ne = gl.len();
+                        let sig: Vec<f32> = gl.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+                        let mut order: Vec<usize> = (0..ne).collect();
+                        order.sort_by(|a, b| {
+                            (sig[*b] + bs[*b])
+                                .partial_cmp(&(sig[*a] + bs[*a]))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let sel: Vec<usize> = order.iter().take(moe.num_experts_per_tok).copied().collect();
+                        let sum: f32 = sel.iter().map(|j| sig[*j]).sum();
+                        let dev_sel: Vec<usize> = de
+                            .iter()
+                            .take(moe.num_experts_per_tok)
+                            .map(|v| *v as usize)
+                            .collect();
+                        let _ = &dev_sel;
+                        let devs: Vec<f32> =
+                            dw.iter().take(moe.num_experts_per_tok).copied().collect();
+                        let same_set = sel.iter().filter(|j| dev_sel.contains(j)).count();
+                        eprintln!(
+                            "[xing-graph] ROUTING oracle: dev_experts {dev_sel:?} dev_w {:?} | host_experts {sel:?} host_w {:?} | overlap {same_set}/{}",
+                            devs.iter().map(|w| format!("{w:.4}")).collect::<Vec<_>>(),
+                            sel.iter().map(|j| format!("{:.4}", sig[*j] / sum)).collect::<Vec<_>>(),
+                            moe.num_experts_per_tok
+                        );
+                    }
+                }
                 // Arm 1 — native K-quant (zero extra VRAM): PEEK the pointer
                 // arrays prewarmed at pool build; a miss must not upload
                 // inside the capture bracket.
