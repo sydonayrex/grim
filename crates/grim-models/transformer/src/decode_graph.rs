@@ -7549,6 +7549,83 @@ dev.launch_hc_collapse_step(
                 1,
             )
             .map_err(grim_core::error::Error::Tensor)?;
+            // A/B the q rope: the graph ropes the whole [1, nh, rope_d] slab
+            // in place with rope_dev_base_into; eager ropes ONE HEAD AT A TIME
+            // with dev.rope and writes each result back per head. Two
+            // implementations of the same rotation - if one folds the YaRN
+            // mscale and the other does not, every attention output shifts.
+            // `qp` now holds the graph's ANSWER; the pre-rope bytes are
+            // re-derived from `qf` through the same q_split the capture used.
+            // Warmup only: allocation is capture-poison.
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                let Ok(got) = as_rocm(scratch.qp[i].as_ref())?.to_cpu_vec_f32() else { return Ok(()) };
+                let pre_shape = Shape::new(vec![1, nh * rope_d]);
+                let nope_shape = Shape::new(vec![1, nh * nope]);
+                let t_pre = dev.zeros(&pre_shape, grim_tensor::DType::F32);
+                let t_nope = dev.zeros(&nope_shape, grim_tensor::DType::F32);
+                if let (Ok(t_pre), Ok(t_nope)) = (t_pre, t_nope) {
+                    let t_pre_r: &grim_backend_rocm::RocmStorage =
+                        t_pre.as_any().downcast_ref().expect("rocm");
+                    let t_nope_r: &grim_backend_rocm::RocmStorage =
+                        t_nope.as_any().downcast_ref().expect("rocm");
+                    if dev
+                        .launch_xing_q_split(
+                            as_rocm(scratch.qf[i].as_ref())?,
+                            t_nope_r,
+                            t_pre_r,
+                            nh,
+                            nope,
+                            rope_d,
+                        )
+                        .is_ok()
+                    {
+                        if let Ok(pre) = t_pre.to_cpu_vec_f32() {
+                            let pos = vec![buffers.current_pos];
+                            let head_shape = Shape::new(vec![1, 1, rope_d]);
+                            if let Ok(mut refbuf) = dev.zeros(&pre_shape, grim_tensor::DType::F32) {
+                                let mut ok = true;
+                                for h in 0..nh {
+                                    let hs = Shape::new(vec![1, rope_d]);
+                                    let head_src = match dev.from_cpu(
+                                        &pre[h * rope_d..(h + 1) * rope_d],
+                                        &hs,
+                                        grim_tensor::DType::F32,
+                                    ) {
+                                        Ok(v) => v,
+                                        Err(_) => { ok = false; break; }
+                                    };
+                                    let mut ho = match dev.zeros(&head_shape, grim_tensor::DType::F32) {
+                                        Ok(v) => v,
+                                        Err(_) => { ok = false; break; }
+                                    };
+                                    match grim_tensor::AttentionOps::rope(dev.as_ref(), head_src.as_ref(), &pos, &scratch.rope_cfg, &head_shape) {
+                                        Ok((t, _)) => {
+                                            if dev.write_cols(
+                                                refbuf.as_mut(), nh * rope_d, h * rope_d,
+                                                t.as_ref(), 1, rope_d,
+                                            ).is_err() { ok = false; break; }
+                                        }
+                                        _ => { ok = false; break; }
+                                    }
+                                    let _ = &mut ho;
+                                }
+                                if ok {
+                                    dev.synchronize();
+                                    if let Ok(b) = refbuf.to_cpu_vec_f32() {
+                                        let md = got.iter().zip(b.iter())
+                                            .map(|(x, y)| (x - y).abs())
+                                            .fold(0.0f32, f32::max);
+                                        let rg = (got.iter().map(|x| x * x).sum::<f32>()
+                                            / got.len().max(1) as f32).sqrt();
+                                        eprintln!("[xing-graph] QROPE in_place_vs_perhead: max_abs {md:.4e} rel {:.4e} rms {rg:.4e}", md as f64 / (rg as f64).max(1e-12));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Absorb W_UK into the nope plane (F32 bank cache, [nh*rank, nope]).
             if let Some(w_uk) = sa.w_kc_device(0)? {
                 dev.launch_xing_q_absorb(
@@ -7748,6 +7825,79 @@ dev.launch_hc_collapse_step(
                 &buffers.norm_buf[i],
                 act,
             )?;
+            // Host oracle for the Q4_K o_proj. `fused_quant_gemm` cannot be
+            // A/B'd in-process (it deadlocks the warmup), so dequantize the
+            // weight on the host and compute the GEMV directly: that is ground
+            // truth for BOTH paths, and tells us whether the graph's result is
+            // right or merely different. First 512 outputs only - a full
+            // 3584x4096 host GEMV is minutes in a debug build.
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                let n_out = 512.min(hidden);
+                if let (Ok(a), Ok(w), Ok(nb)) = (
+                    as_rocm(scratch.attn[i].as_ref())?.to_cpu_vec_f32(),
+                    sa.o_proj.weight().to_vec_f32(),
+                    as_rocm(&buffers.norm_buf[i]).unwrap().to_cpu_vec_f32(),
+                ) {
+                    let k = a.len();
+                    let mut max_abs = 0.0f32;
+                    let mut ref_rms = 0.0f64;
+                    for j in 0..n_out {
+                        let mut acc = 0.0f32;
+                        for c in 0..k {
+                            acc += a[c] * w[j * k + c];
+                        }
+                        ref_rms += (acc as f64) * (acc as f64);
+                        let d = (acc - nb[j]).abs();
+                        if d > max_abs {
+                            max_abs = d;
+                        }
+                    }
+                    ref_rms = (ref_rms / n_out as f64).sqrt();
+                    let got_rms =
+                        (nb[..n_out].iter().map(|x| x * x).sum::<f32>() / n_out as f32).sqrt();
+                    eprintln!(
+                        "[xing-graph] OPROJ vs HOST oracle: max_abs {max_abs:.4e} rel {:.4e} ref_rms {ref_rms:.4e} got_rms {got_rms:.4e}",
+                        max_abs as f64 / ref_rms.max(1e-12)
+                    );
+                    // Same product through the fused-dequant leg, which takes
+                    // F32 A instead of quantizing it to Q8_1. If this lands at
+                    // ~1e-6 while the dot4 leg sits at ~6e-3, the Q8_1
+                    // ACTIVATION quantization is the entire error.
+                    if let (Ok(attn_r), Ok(o_ws2)) = (
+                        as_rocm(scratch.attn[i].as_ref()),
+                        as_rocm(sa.o_proj.weight().storage().as_ref()),
+                    ) {
+                        if let Ok(fb) = dev.zeros(&Shape::new(vec![1, hidden]), grim_tensor::DType::F32) {
+                            let fb_r: &grim_backend_rocm::RocmStorage =
+                                fb.as_any().downcast_ref().expect("rocm");
+                            if dev
+                                .launch_fused_dequant_gemm_q4k_for_ab(attn_r, o_ws2, fb_r, 1, hidden, nh * vd)
+                                .is_ok()
+                            {
+                                dev.synchronize();
+                                if let Ok(b) = fb.to_cpu_vec_f32() {
+                                    let mut md2 = 0.0f32;
+                                    for j in 0..n_out.min(hidden) {
+                                        let mut acc = 0.0f32;
+                                        for c in 0..(nh * vd) {
+                                            acc += a[c] * w[j * (nh * vd) + c];
+                                        }
+                                        let d = (acc - b[j]).abs();
+                                        if d > md2 {
+                                            md2 = d;
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[xing-graph] OPROJ fused-dequant vs HOST oracle: max_abs {md2:.4e} rel {:.4e}",
+                                        md2 as f64 / ref_rms.max(1e-12)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("oproj") {
                 return Ok(());
             }

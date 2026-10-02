@@ -152,7 +152,12 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                if (is_rdna2 || is_rdna34)
+                    && m == 1
+                    && !dot_disabled
+                    && k % 256 == 0
+                    && !crate::device::quant::exact_decode_gemv()
+                {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -1970,4 +1975,28 @@ fn fence_act_quant(dev: &RocmDevice, quantize_stream: *mut c_void) {
 
 fn wmma_quant_tile_ok(wave32: bool, m: usize, n: usize, k: usize, blk: usize) -> bool {
     wave32 && m % 16 == 0 && n % 64 == 0 && k % blk == 0
+}
+
+/// Whether decode GEMVs should use the exact fused-dequant leg instead of
+/// quantizing the activation to Q8_1 for the dot4 kernel.
+///
+/// Measured on Xing4.0's `o_proj` (Q4_K, m=1) against a host oracle built
+/// from the dequantized weight:
+///   dot4 with a Q8_1 activation .... rel 6.2e-3 (graph) / 1.4e-2 (eager)
+///   fused dequant with an F32 act ... rel 5.8e-7
+/// So the Q8_1 activation quantization IS the error, and because eager and the
+/// graph quantize differently it also puts ~0.6% between them — which then
+/// compounds over the residual stream and diverges their greedy tokens.
+///
+/// ONE switch, read by BOTH dispatch sites (the graph's `linear_decode_into`
+/// and eager's `quantized_matmul`). Two switches with different defaults is
+/// precisely how those two paths drifted apart in the first place.
+pub(crate) fn exact_decode_gemv() -> bool {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EXACT.get_or_init(|| {
+        !matches!(
+            std::env::var("GRIM_DECODE_EXACT_GEMV").as_deref(),
+            Ok("0" | "false" | "off")
+        )
+    })
 }

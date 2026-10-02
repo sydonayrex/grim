@@ -2124,6 +2124,23 @@ impl RocmDevice {
                     )?;
                     return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
                 }
+                // Exact leg: dequantize the weight inline and keep the
+                // activation in F32. Shares its switch with eager's
+                // `quantized_matmul` so the two decode paths cannot pick
+                // different GEMVs - see `exact_decode_gemv`.
+                if crate::device::quant::exact_decode_gemv() {
+                    match scheme {
+                        KQuantScheme::Q4K => {
+                            self.launch_fused_dequant_gemm_q4k(a_s, w, out, m, n, k)?;
+                            return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                        }
+                        KQuantScheme::IQ3S => {
+                            self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?;
+                            return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                        }
+                        _ => {}
+                    }
+                }
                 self.launch_quantize_q8_1(a_s, act_q81, m, k)?;
                 match scheme {
                     KQuantScheme::Q4K => self.launch_dot4_q4k_q81_gemv(act_q81, w, out, m, n, k)?,

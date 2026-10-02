@@ -1628,6 +1628,36 @@ impl Xing40Mla {
             ))?;
             if let Some(_handle) = fused {
                 let attn = wrap_like(x, attn, attn_shape);
+                // Same host oracle the graph path runs, so the two o_proj
+                // results are measured against ONE ground truth rather than
+                // against each other.
+                if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                    if let (Ok(a), Ok(w), Ok(o)) = (
+                        attn.to_vec_f32(),
+                        self.o_proj.weight().to_vec_f32(),
+                        self.o_proj.forward(&attn)?.to_vec_f32(),
+                    ) {
+                        let k = a.len();
+                        let n_out = 512.min(o.len());
+                        let (mut md, mut rr) = (0.0f32, 0.0f64);
+                        for j in 0..n_out {
+                            let mut acc = 0.0f32;
+                            for c in 0..k {
+                                acc += a[c] * w[j * k + c];
+                            }
+                            rr += (acc as f64) * (acc as f64);
+                            let d = (acc - o[j]).abs();
+                            if d > md {
+                                md = d;
+                            }
+                        }
+                        rr = (rr / n_out as f64).sqrt();
+                        eprintln!(
+                            "[xing-trace] EAGER OPROJ vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e}",
+                            md as f64 / rr.max(1e-12)
+                        );
+                    }
+                }
                 return Ok(Some(self.o_proj.forward(&attn)?));
             }
         }
@@ -2315,6 +2345,12 @@ impl Xing40Block {
         //    streams = post ⊗ attn_out + comb @ streams.
         let streams = self.attn_hc.update_d2d(x, &attn_out, &attn_gates)?;
         nan_stage("streams_after_attn", &streams);
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            if let Ok(v) = streams.to_vec_f32() {
+                let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                eprintln!("[xing-trace] streams_after_attn rms {r:.6e} head {:?}", &v[..4]);
+            }
+        }
         // 4. ffn_hc: collapse for the feed-forward.
         let ffn_gates = self.ffn_hc.gates_d2d(&streams)?;
         let collapsed = self.ffn_hc.collapse_d2d(&streams, &ffn_gates)?;
