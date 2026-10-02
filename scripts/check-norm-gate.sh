@@ -181,9 +181,31 @@ if [ "${ws_blocked:-0}" -eq 1 ]; then
 fi
 
 
+# A build or a suite can fail because the peer landed an edit AFTER the
+# workspace check ran. Re-attribute here: if the tree no longer compiles and
+# every error is theirs, report BLOCKED and stop, rather than emitting one FAIL
+# per crate that all restate one cause.
+check_workspace_still_sound() {
+    local out errs
+    out="$(cargo check --workspace --all-targets --message-format short 2>&1)"
+    [ $? -eq 0 ] && return 0
+    errs="$(printf '%s' "$out" | grep ': error' || true)"
+    [ -z "$errs" ] && return 0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        is_peer_error "$line" || return 0      # one of ours: keep going
+    done <<< "$errs"
+    report "the peer landed an edit after the workspace check" "$out"
+    echo
+    echo "---"
+    echo "norm gate BLOCKED (a peer's edit, not a norm regression)"
+    exit 2
+}
+
 echo "=== builds"
 for c in grim-nn grim-models-transformer grim-engine grim-cli \
          grim-server grim-garage grim-speculative; do
+    check_workspace_still_sound
     out="$(cargo build -p "$c" 2>&1)"
     diag="$(printf '%s' "$out" | grep -cE '^(error|warning)')"
     [ "$diag" -eq 0 ] && pass "$c builds" || fail "$c: $diag diagnostics"
@@ -203,6 +225,7 @@ known_flakes=(
     "test_memory_certificate_admission_gate_real_hw"
 )
 for c in grim-nn grim-models-transformer grim-engine; do
+    check_workspace_still_sound
     out="$(cargo test -p "$c" --lib -j 1 2>&1)"
     r="$(printf '%s' "$out" | result_of)"
     case "$r" in
@@ -243,6 +266,7 @@ for spec in \
     "grim-models-transformer model_module_structure"
 do
     # shellcheck disable=SC2086
+    check_workspace_still_sound
     set -- $spec
     r="$(cargo test -p "$1" --test "$2" -j 1 2>&1 | result_of)"
     case "$r" in

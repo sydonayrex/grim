@@ -330,6 +330,66 @@ else
 fi
 
 ###############################################################################
+printf '\n=== 5b. a peer edit that lands AFTER the workspace check\n'
+###############################################################################
+# The gate's workspace check runs first, but the peer commits continuously, so
+# an edit can land between that check and a build. That used to produce one FAIL
+# per crate -- eight of them, all restating one cause, all reading as norm
+# regressions.
+#
+# Test the FUNCTION, not the whole gate: extract it and call it with a stub
+# `is_peer_error`. Running the full gate to prove this needs the peer to commit
+# mid-run, which is not something a test can arrange.
+recheck="$(awk '/^check_workspace_still_sound\(\) \{/{g=1} g{print} g&&/^}$/{exit}' "$GATE")"
+if ! declare -f check_workspace_still_sound > /dev/null 2>&1; then
+    check_workspace_still_sound() { :; }
+fi
+eval "$recheck"
+if ! declare -f check_workspace_still_sound > /dev/null; then
+    fail "the gate defines no check_workspace_still_sound to re-attribute late breaks"
+else
+    pass "the gate defines check_workspace_still_sound"
+
+    # It must be CALLED, not merely defined: a definition nobody calls is the
+    # same defect as a missing check, and it looks identical in a diff.
+    calls="$(grep -c '^\s*check_workspace_still_sound$' "$GATE")"
+    if [ "$calls" -ge 3 ]; then
+        pass "it is called from $calls places (build loop, library loop, norm suites)"
+    else
+        fail "check_workspace_still_sound is called $calls time(s); the build and \
+suite loops need it"
+    fi
+
+    # Its decision: peer-only errors -> exit 2; one of ours -> carry on.
+    # `report` and `cargo` are stubbed and each call runs in its own subshell,
+    # because the function ends in `exit 2` -- calling it in this shell would
+    # terminate the test script. That is also why the first version of this
+    # produced no output at all rather than a failure.
+    (
+        report() { :; }
+        cargo() {
+            if [ "${1:-}" = "check" ]; then
+                printf '%s\n' "$SIM_ERRORS"
+                return 1
+            fi
+            return 0
+        }
+        is_peer_error() { case "$1" in *peer_*) return 0 ;; *) return 1 ;; esac; }
+        _run() { ( export SIM_ERRORS="$1"; check_workspace_still_sound ) >/dev/null 2>&1; echo $?; }
+        printf 'peer=%s ours=%s ' \
+            "$(_run 'a.rs:1:1: error: peer_thing broke')" \
+            "$(_run 'a.rs:1:1: error: my_thing broke')"
+    ) > "$work/recheck" 2>&1
+    got="$(cat "$work/recheck")"
+    if [ "$got" = "peer=2 ours=0 " ]; then
+        pass "peer-only errors exit 2; one of ours returns 0 and keeps going"
+    else
+        fail "re-check decided '$got', want 'peer=2 ours=0 '"
+    fi
+fi
+
+
+###############################################################################
 printf '\n=== 5. this script and the real gate are untouched\n'
 ###############################################################################
 if bash -n "$GATE" 2>/dev/null; then
