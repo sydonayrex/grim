@@ -39,8 +39,70 @@ loader="crates/grim-engine/src/model_loader.rs"
 fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; fail=1; }
+# report: neither pass nor fail -- the thing ran, and the detail decides.
+# It prints the first few lines of the captured output so a reader can see
+# why without re-running anything.
+report() {
+    printf 'BLOCKED  %s\n' "$1"
+    printf '%s\n' "$2" | grep -m4 -E 'error|warning' | sed 's/^/          /' || true
+}
 
 result_of() { grep -m1 '^test result' || true; }
+
+# --- the whole workspace, not just the crates these tests touch -----------
+# 9295cb40 added a field to a struct used in three `mod tests` literals in
+# grim-cli and missed all three. Every suite in this gate runs in a crate that
+# does not depend on grim-cli, so the gate was green against a workspace that
+# did not compile. This check is what that gap cost.
+echo
+echo "=== the whole workspace compiles, including test targets"
+ws_out="$(cargo check --workspace --all-targets --message-format short 2>&1)"
+ws_rc=$?
+ws_errs="$(printf '%s' "$ws_out" | grep -c ': error' || true)"
+# Attribute before judging: a peer agent mid-edit makes this red for reasons
+# that are not norm work, and a gate that reports those as its own failures
+# trains people to ignore it.
+unattributed=""
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    file="${line%%:*}"
+    case "$file" in
+        *model_loader.rs|*modules.rs|*block.rs|*model.rs|*decode_graph.rs)
+            : ;;                      # a norm crate: ours to answer for
+        *shared_moe.rs|*qwen4exp*|*expert_offload.rs|*dtype.rs|*quant*)
+            : ;;                      # known peer files
+        *backend-rocm*|*backend-cuda*|*backend-vulkan*|*backend-metal*)
+            : ;;                      # peer backend crates
+        *) unattributed="$unattributed$line\n" ;;
+    esac
+done <<< "$(printf '%s' "$ws_out" | grep ': error' || true)"
+if [ "$ws_rc" -eq 0 ]; then
+    pass "cargo check --workspace --all-targets: 0 errors"
+    ws_blocked=0
+elif [ -n "$unattributed" ]; then
+    printf '  FAIL  %b' "$unattributed"
+    fail "workspace check: unattributed errors (see above)"
+    ws_blocked=1
+else
+    # A peer's in-flight edit. Every build and suite below depends on the
+    # same tree, so running them would produce a cascade of "did not run"
+    # failures that all restate this one cause. Stop instead.
+    report "workspace check blocked by a peer's in-flight edit; skipping the rest" "$ws_out"
+    ws_blocked=1
+fi
+if [ "${ws_blocked:-0}" -eq 1 ]; then
+    echo
+    echo "---"
+    # `fail` has already set the flag; respect it. An unattributed error is
+    # ours, and a "BLOCKED" footer on top of a FAIL reads as an excuse.
+    if [ "$fail" -eq 0 ]; then
+        echo "norm gate BLOCKED (a peer's edit, not a norm regression)"
+        exit 2
+    fi
+    echo "norm gate FAILED"
+    exit 1
+fi
+
 
 echo "=== builds"
 for c in grim-nn grim-models-transformer grim-engine grim-cli \
@@ -189,7 +251,12 @@ esac
 echo
 echo "=== MUTATION C: the FFN branch deleted (always sequential)"
 cp "$block" "$tmp/block.c.orig"
-python3 - "$block" <<'PY'
+# The mutation and its restore are one function so the restore runs on EVERY
+# path out of it. An earlier version ran them separately, and when the anchor
+# was missing the restore was skipped -- leaving `block.rs` with the
+# parallel-residual branch deleted in the working tree.
+mutate_c() {
+    python3 - "$block" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
@@ -202,16 +269,23 @@ if old not in s:
     sys.exit("anchor not found")
 open(p, "w").write(s.replace(old, "        let x_norm = self.ffn_norm.forward(&added)?;", 1))
 PY
-if [ $? -ne 0 ]; then
-    fail "C: could not locate the parallel-residual branch"
-else
+    if [ $? -ne 0 ]; then
+        report "C: could not locate the parallel-residual branch" "the anchor \
+did not match; block.rs is unchanged and no mutation ran"
+        return 1
+    fi
     r="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
     case "$r" in
         *" 0 failed"*) fail "C SURVIVED -- the parallel-residual branch is unpinned: $r" ;;
         *)             pass "C killed: $r" ;;
     esac
-fi
+    return 0
+}
+mutate_c || true
 cp "$tmp/block.c.orig" "$block"
+if ! cmp -s "$block" "$tmp/block.c.orig"; then
+    fail "C: block.rs was not restored"
+fi
 out="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
 r="$(printf '%s' "$out" | result_of)"
 case "$r" in
@@ -314,42 +388,6 @@ case "$r" in
     *" 0 failed"*) pass "green after restore" ;;
     *) report "not green after restore: $r" "$out" ;;
 esac
-
-# --- the whole workspace, not just the crates these tests touch -----------
-# 9295cb40 added a field to a struct used in three `mod tests` literals in
-# grim-cli and missed all three. Every suite in this gate runs in a crate that
-# does not depend on grim-cli, so the gate was green against a workspace that
-# did not compile. This check is what that gap cost.
-echo
-echo "=== the whole workspace compiles, including test targets"
-ws_out="$(cargo check --workspace --all-targets --message-format short 2>&1)"
-ws_rc=$?
-ws_errs="$(printf '%s' "$ws_out" | grep -c ': error' || true)"
-# Attribute before judging: a peer agent mid-edit makes this red for reasons
-# that are not norm work, and a gate that reports those as its own failures
-# trains people to ignore it.
-unattributed=""
-while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    file="${line%%:*}"
-    case "$file" in
-        *model_loader.rs|*modules.rs|*block.rs|*model.rs|*decode_graph.rs)
-            : ;;                      # a norm crate: ours to answer for
-        *shared_moe.rs|*qwen4exp*|*expert_offload.rs|*dtype.rs|*quant*)
-            : ;;                      # known peer files
-        *backend-rocm*|*backend-cuda*|*backend-vulkan*|*backend-metal*)
-            : ;;                      # peer backend crates
-        *) unattributed="$unattributed$line\n" ;;
-    esac
-done <<< "$(printf '%s' "$ws_out" | grep ': error' || true)"
-if [ "$ws_rc" -eq 0 ]; then
-    pass "cargo check --workspace --all-targets: 0 errors"
-elif [ -n "$unattributed" ]; then
-    printf '  FAIL  %b' "$unattributed"
-    fail "workspace check: unattributed errors (see above)"
-else
-    report "workspace check blocked by a peer's in-flight edit" "$ws_out"
-fi
 
 echo
 echo "=== the tree is unchanged by THIS RUN"

@@ -74,7 +74,9 @@ fn tree_pie_gemv_standalone_control() -> TestResult {
         s ^= s << 13; s ^= s >> 7; s ^= s << 17;
         ((s >> 40) as f32 / 8_388_608.0) - 1.0
     };
-    let w: Vec<f32> = (0..k * n).map(|_| next() * 0.25).collect();
+    // O(1) weights: E2M2's smallest nonzero magnitude is 0.25, so sub-0.25
+    // fixtures pack to all-zero payloads and any GEMM over them is exactly 0.
+    let w: Vec<f32> = (0..k * n).map(|_| next()).collect();
     let x: Vec<f32> = (0..k).map(|_| next() * 0.5).collect();
 
     let act_bits: Vec<u8> = x.iter()
@@ -111,6 +113,10 @@ fn tree_pie_gemv_standalone_control() -> TestResult {
     };
     let (a, b, o) = (ptr(&act_t), ptr(&b_t), ptr(&out_t));
     let (mut a, mut b, mut nn, mut kk, mut o) = (a, b, n as i32, k as i32, o);
+    // NaN-poison C: distinguishes "kernel ran and computed 0" (zeros) from
+    // "kernel never wrote" (NaNs persist).
+    dev.write_f32_into(out_t.as_ref(), &vec![f32::NAN; n])
+        .map_err(|e| format!("nan-fill: {e}"))?;
 
     // Two candidate sources, because "standalone" has meant two different things and
     // I never checked which one the dispatched path actually runs:
@@ -134,12 +140,15 @@ fn tree_pie_gemv_standalone_control() -> TestResult {
         "grim_tree_pie_gemv",
         grim_backend_rocm::HipDim3::new(n as u32, 1, 1),
         grim_backend_rocm::HipDim3::new(WAVE as u32, 1, 1),
+        // Order matches the kernel's (act, B, C, N, K): C third. The old
+        // order (a, b, nn, kk, o) put N in the C slot: this control faulted
+        // through the harness while the dispatched GEMV (C third) worked.
         &mut [
             grim_backend_rocm::device::util::arg(&mut a),
             grim_backend_rocm::device::util::arg(&mut b),
+            grim_backend_rocm::device::util::arg(&mut o),
             grim_backend_rocm::device::util::arg(&mut nn),
             grim_backend_rocm::device::util::arg(&mut kk),
-            grim_backend_rocm::device::util::arg(&mut o),
         ],
     )
     .map_err(|e| format!("standalone gemv: {e}"))?;
@@ -170,7 +179,10 @@ fn tree_pie_gemm_standalone_source() -> TestResult {
         s ^= s << 17;
         ((s >> 40) as f32 / 8_388_608.0) - 1.0
     };
-    let w: Vec<f32> = (0..k * n).map(|_| next() * 0.25).collect();
+    // Deterministic O(1) weights (same construction as the dispatch test):
+    // E2M2 swallows sub-0.25 magnitudes to zero, so small-range fixtures read
+    // as kernel bugs; uniform data carries ~7.6e-2 of pure quant noise.
+    let w: Vec<f32> = (0..k * n).map(|i| ((i as f32 * 37.0) % 61.0) * 0.03125 - 0.9).collect();
     let x: Vec<f32> = (0..m * k).map(|_| next() * 0.5).collect();
 
     // Activations as f16, so nothing about this test depends on the dispatch's
@@ -226,18 +238,23 @@ fn tree_pie_gemm_standalone_source() -> TestResult {
     let (mut a, mut b, mut mm, mut nn, mut kk, mut o) = (a, b, m as i32, n as i32, k as i32, o);
 
     let src = format!("{DOT2_HELPER}\n{}", grim_backend_rocm::kernels::tree_pie::KERNEL_SOURCE);
+    // NOTE: this test previously launched "grim_tree_pie_gemv" here, so it never
+    // exercised the GEMM at all. Entry + grid + order must all be the GEMM's.
     dev.launch_from_source(
         &src,
         "grim_tree_pie_gemm",
-        grim_backend_rocm::HipDim3::new(n as u32, 1, 1),
+        grim_backend_rocm::HipDim3::new(n as u32, m.div_ceil(8) as u32, 1),
         grim_backend_rocm::HipDim3::new(WAVE as u32, 1, 1),
+        // Order matches the kernel's (act, B, C, M, N, K): C third. The old
+        // order (a, b, mm, nn, kk, o) put M in the C slot and the truncated C
+        // pointer in the K slot, driving a wild OOB loop: every fault so far.
         &mut [
             grim_backend_rocm::device::util::arg(&mut a),
             grim_backend_rocm::device::util::arg(&mut b),
+            grim_backend_rocm::device::util::arg(&mut o),
             grim_backend_rocm::device::util::arg(&mut mm),
             grim_backend_rocm::device::util::arg(&mut nn),
             grim_backend_rocm::device::util::arg(&mut kk),
-            grim_backend_rocm::device::util::arg(&mut o),
         ],
     )
     .map_err(|e| format!("standalone launch: {e}"))?;
@@ -269,6 +286,9 @@ fn tree_pie_gemm_standalone_source() -> TestResult {
     println!("  {nonzero} of {} outputs nonzero", m * n);
     println!("  worst relative error {worst:.3e}");
     assert!(nonzero > 0, "standalone GEMM produced all zeros");
-    assert!(worst < 0.05, "standalone GEMM disagrees: worst relative error {worst:.3e}");
+    // 0.15: kernel is bit-exact vs the dequant oracle (see the dispatch
+    // test's tree_pie_gemm_matches_dequant_oracle_exactly); this bound is
+    // E2M2 quant noise only.
+    assert!(worst < 0.15, "standalone GEMM disagrees: worst relative error {worst:.3e}");
     Ok(())
 }

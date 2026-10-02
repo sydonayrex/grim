@@ -146,9 +146,13 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
         ((s >> 40) as f32 / 8_388_608.0) - 1.0
     };
     for (i, v) in w.iter_mut().enumerate() {
-        // Identical construction to the passing GEMV test, so a failure at m=1
-        // cannot be blamed on the fixture.
-        *v = if m == 1 { ((i as f32 * 37.0) % 61.0) * 0.03125 - 0.9 } else { next() * 0.25 };
+        // Deterministic O(1) weights for every m (same construction as the
+        // passing GEMV test): E2M2's smallest nonzero magnitude is 0.25, so a
+        // small-range fixture packs to all-zero payloads, and uniform ±1 data
+        // carries ~7.6e-2 of pure quant noise (plan App. A4: 0.0517 weight
+        // RMSE), which a 0.05 bar misreads as a kernel defect. One
+        // distribution, one bar, both paths.
+        *v = ((i as f32 * 37.0) % 61.0) * 0.03125 - 0.9;
     }
     let mut x = vec![0.0f32; m * k];
     for v in x.iter_mut() {
@@ -226,51 +230,24 @@ fn prefill_case(dev: &RocmDevice, m: usize, n: usize, k: usize) -> TestResult<f6
     Ok(worst)
 }
 
-// Diagnosis history, kept because two of the three steps were wrong and the record
-// is more useful than a conclusion would be.
+// Diagnosis history, kept because three of the four steps were wrong and the
+// record is more useful than a conclusion would be.
 //
-//   1. The first failure was an all-zero output, including at `m = 1`, which routes
-//      to the unchanged GEMV path. I concluded the fault was in the test's fixtures.
-//      **That part held**: with the passing test's exact shapes and fixture the
-//      case runs clean. But I could not reproduce the all-zeros afterwards, so I do
-//      not actually know what caused it.
-//   2. I then concluded, and committed, that "a 2-D `[1, K]` activation shape makes
-//      the GEMV return zeros". **That was wrong.** Re-run with 2-D `[1, K]` and
-//      `[1, N]` and `m = 1` passes at 4.497e-2, with `GRIM_QMM_TRACE` reporting
-//      `m=1 n=64 k=128`. The shape is not the variable.
-//   3. With prefill wired, `m = 1` passes and `m = 2` faults the GPU. Diagnosing the
-//      fault did find a genuine out-of-bounds in my dispatch code: the converted
-//      activation was allocated `Shape::new(vec![k])` -- right for the GEMV's single
-//      row, an `m`x under-allocation for prefill, so the GEMM read `m*k` halves out of
-//      a `k`-half buffer. Fixed and commented. **The fault persists**, so at least one
-//      further cause is unknown.
+//   1.-3. (unchanged -- see git history for df4b1d22, 4fdf2ce8, 27f882fc.)
 //
-// So: the decode path is healthy under both 1-D and 2-D shapes; the prefill kernel
-// faults; and the original all-zero output remains unexplained. Treat the cause of
-// the first failure as open rather than closed, since the explanation that seemed to
-// fit did not survive a re-run.
-//
-// Pointer tracing then localised the fault. With `GRIM_QMM_TRACE`, the working `m = 1`
-// and the faulting `m = 2` report **identical** device pointers for act, b and out --
-// so the pointers are not the variable, and the GEMM is simply reading further than
-// the GEMV does. Two facts fit that:
-//
-//   - the fault address is `0x7f59...`, i.e. in the *host* mmap range, not a device
-//     VA. The converted activation is not reliably device-resident.
-//   - the `m * k` sizing fix **is** live (`Shape::new(vec![m * k])`, mod.rs:967), and
-//     the kernel's act index tops out at `(1*128 + 3*32 + 30) >> 1 == 127` u32 = 254
-//     halves, inside the 256-half buffer. So the *arithmetic* is in bounds; the buffer
-//     behind it is not as large as the arithmetic assumes.
-//
-// Reading: the host-side conversion path is the suspect, not the kernel. The GEMV
-// reads `k` halves and so never notices; the GEMM reads `m*k` and falls off the end.
-// That makes the host round-trip that this arm uses for non-f16 activations the thing
-// to fix -- either by keeping the converted buffer device-resident, or by refusing
-// prefill for converted activations specifically rather than for prefill wholesale.
-// Not root-caused: "host-backed and too small" and "device-backed but a stale
-// pointer" both fit, and they need different fixes.
+//   4. With prefill wired, `m = 1` passes and `m = 2` faults the GPU. The fault
+//      was a kernarg ORDER bug, found by launching trivial probes: the kernel
+//      takes (act, B, C, M, N, K) but every launcher and harness passed
+//      (a, b, mm, nn, kk, o) -- C last. So the kernel's C slot got M (a tiny
+//      int) and its K slot got the truncated C pointer (a huge int), driving a
+//      wild OOB loop. Counting "6 args" never catches this; only order does.
+//      Fixed in launch_tree_pie_gemm and in both standalone launches.
+//   5. With order fixed the fault became exact zeros, which was a FIXTURE bug:
+//      the m>1 weights were x0.25 randoms and E2M2's smallest nonzero magnitude
+//      is 0.25, so every payload nibble packed to +0.0 and the GEMM correctly
+//      returned 0. Host-side proof: pack_tree_pie_32 of the fixture's first
+//      block is [0,0,0,0,signs]. O(1) fixtures (same as the m=1 branch) fix it.
 #[test]
-#[ignore = "m=2 faults the GPU; m=1 passes under both 1-D and 2-D shapes"]
 fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {
     let Some(dev) = gpu_device() else { return Ok(()) };
 
@@ -280,8 +257,96 @@ fn tree_pie_prefill_matches_cpu_oracle_across_tile_boundaries() -> TestResult {
     for (m, k) in [(1usize, 128usize), (2, 128), (8, 128), (13, 128), (16, 128), (9, 256)] {
         let worst = prefill_case(&dev, m, N, k)?;
         println!("prefill m={m:>2} k={k}: worst relative error {worst:.3e}");
-        assert!(worst < 0.05, "prefill m={m} k={k}: worst relative error {worst:.3e}");
+        // Bar 0.15, not 0.05: the kernel is bit-exact vs the dequant oracle
+        // (see tree_pie_gemm_matches_dequant_oracle_exactly), so this bound
+        // measures E2M2 quant noise only -- plan App. A4 pins weight RMSE at
+        // 0.0517, and worst-over-m*n dots of cancellating sums roughly doubles
+        // it (m=13: 0.106 observed). A layout swap still reads O(1), an order
+        // above this bar.
+        assert!(worst < 0.15, "prefill m={m} k={k}: worst relative error {worst:.3e}");
     }
+    Ok(())
+}
+
+/// Prefill GEMM == host dequant oracle, bit-exact.
+///
+/// E2M2-grid-exact weights make dequantization lossless, so any residual error
+/// is kernel math alone (decode, fdot2 accumulation, cross-lane reduction,
+/// tiling), not format noise. This is the tight gate; the raw-oracle test
+/// above carries the format-noise bound. Both rows, ragged tile included.
+#[test]
+fn tree_pie_gemm_matches_dequant_oracle_exactly() -> TestResult {
+    let Some(dev) = gpu_device() else { return Ok(()) };
+    // E2M2-exact magnitudes: subnormal row {0.5, 1.0, 1.5} and normal rows.
+    let grid_vals = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let (m, n, k) = (13usize, 64usize, 128usize);
+    let mut s = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let v = grid_vals[(s >> 61) as usize % grid_vals.len()];
+        if (s >> 37) & 1 == 1 { -v } else { v }
+    };
+    let w: Vec<f32> = (0..k * n).map(|_| next()).collect();
+    let x: Vec<f32> = (0..m * k).map(|_| next()).collect();
+    let bits: Vec<u8> = x
+        .iter()
+        .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes().to_vec())
+        .collect();
+    let f16ty = DType { arith: ArithType::F16, storage: Storage::Native };
+    let act_t = MemoryOps::from_cpu_bytes(&dev, &bits, &Shape::new(vec![m, k]), f16ty)
+        .map_err(|e| format!("act h2d: {e}"))?;
+    let packed = pack_columns(&w, n, k);
+    let b_bytes: Vec<u8> = packed.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
+    let b_t = MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_bytes,
+        &Shape::new(vec![n * (k / 32) * TREE_PIE_WORDS_PER_32]),
+        DType { arith: ArithType::U32, storage: Storage::Native },
+    )
+    .map_err(|e| format!("b h2d: {e}"))?;
+    let out_t = MemoryOps::alloc_storage(
+        &dev,
+        &Shape::new(vec![m, n]),
+        DType { arith: ArithType::F32, storage: Storage::Native },
+    )
+    .map_err(|e| format!("out: {e}"))?;
+    fn raw(t: &Box<dyn grim_tensor::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+        grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
+    }
+    dev.launch_tree_pie_gemm(raw(&act_t), raw(&b_t), raw(&out_t), m, n, k)
+        .map_err(|e| format!("direct gemm: {e}"))?;
+    dev.synchronize();
+    let out = raw(&out_t).copy_to_host().map_err(|e| e.to_string())?;
+    let got: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(got.len(), m * n);
+    // Oracle against host-DEQUANTIZED weights (unpack, not raw): pure kernel math.
+    // A rides as f16 on device, so match its rounding.
+    let mut worst = 0.0f64;
+    for r in 0..m {
+        for col in 0..n {
+            let mut o = 0.0f64;
+            let mut sc = 0.0f64;
+            for g in 0..k / 32 {
+                let base = (col * (k / 32) + g) * TREE_PIE_WORDS_PER_32;
+                let wb: [i32; 5] = packed[base..base + 5].try_into().unwrap();
+                let dec = grim_quant::tree_pie::unpack_tree_pie_32(&wb);
+                for j in 0..32 {
+                    let a = half::f16::from_f32(x[r * k + g * 32 + j]).to_f32() as f64;
+                    let t = a * dec[j] as f64;
+                    o += t;
+                    sc += t.abs();
+                }
+            }
+            worst = worst.max(((got[r * n + col] as f64 - o) / sc.max(f64::MIN_POSITIVE)).abs());
+        }
+    }
+    println!("prefill-vs-dequant worst relative error {worst:.3e} (m={m} ragged tile)");
+    assert!(worst < 1e-3, "kernel math wrong: worst {worst:.3e}");
     Ok(())
 }
 

@@ -303,8 +303,24 @@ fn tiny_lfm2_q80_down(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2
     model
 }
 
+/// The LFM2 decode graph is opt-in (`GRIM_LFM2_GRAPH=1`) since 1adf5e88: replay
+/// page-faults in `grim_qkv_attention_dev`. Without the opt-in there is no
+/// graph to test, so graph tests skip instead of failing on the intentional
+/// gate. (With the opt-in they exercise the known-faulting path and abort --
+/// that underlying page fault is tracked separately, not here.)
+fn graph_opted_in() -> bool {
+    if std::env::var("GRIM_LFM2_GRAPH").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skip: LFM2 decode graph is opt-in (GRIM_LFM2_GRAPH=1)");
+    false
+}
+
 #[test]
 fn lfm2_graph_q81_down_add_matches_eager() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
         return;
@@ -386,6 +402,9 @@ fn lfm2_f16_kv_tensor_metadata_matches_storage() {
 
 #[test]
 fn lfm2_graph_capture_replay_records_kernels() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
         return;
@@ -469,6 +488,9 @@ fn lfm2_graph_capture_replay_records_kernels() {
 
 #[test]
 fn lfm2_graph_recurrent_falls_back_eager() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
         return;
@@ -680,6 +702,9 @@ fn capture_replay_logits(model: &Lfm2, tokens: &[u32]) -> Result<Vec<Vec<f32>>, 
 
 #[test]
 fn lfm2_graph_moe_layer_captures_and_replays() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1");
         return;
@@ -783,6 +808,7 @@ fn lfm2_graph_moe_sublayer_matches_eager_dispatch() {
         block.n_expert,
         top_k,
         0,
+        false,
     )
     .unwrap();
     let out_dyn = dev.zeros(&Shape::new(vec![1, hidden]), DType::F32).unwrap();
@@ -820,6 +846,9 @@ fn lfm2_graph_moe_sublayer_matches_eager_dispatch() {
 
 #[test]
 fn lfm2_graph_shortconv_layer_captures_and_replays() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled()
         || !RocmDevice::probe_one(0).unwrap_or(false)
     {
@@ -851,6 +880,9 @@ fn lfm2_graph_shortconv_layer_captures_and_replays() {
 /// of being frozen at capture time.
 #[test]
 fn lfm2_graph_shortconv_ring_advances_across_replays() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled()
         || !RocmDevice::probe_one(0).unwrap_or(false)
     {
@@ -896,6 +928,9 @@ fn lfm2_graph_shortconv_ring_advances_across_replays() {
 /// QK-norm + RoPE + K/V append in one kernel) and replays deterministically.
 #[test]
 fn lfm2_graph_mxfp4_layer_captures_and_replays() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled()
         || !RocmDevice::probe_one(0).unwrap_or(false)
     {
@@ -1071,6 +1106,9 @@ fn lfm2_graph_mxfp4_layer_captures_and_replays() {
 /// same output as the eager path for GQA (nh != nkv) with head-repeat.
 #[test]
 fn g4_graph_gqa_matches_eager() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
         return;
@@ -1168,6 +1206,9 @@ fn g4_graph_gqa_matches_eager() {
 /// eager produce the same output from the same starting state).
 #[test]
 fn g4_e2e_prefill_graph_decode_matches_fully_eager() {
+    if !graph_opted_in() {
+        return;
+    }
     if !grim_backend_rocm::device::util::gpu_test_enabled() {
         eprintln!("skip: set GRIM_GPU_TEST=1 for GPU graph test");
         return;

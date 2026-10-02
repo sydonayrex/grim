@@ -410,9 +410,52 @@ fn dot4_gemv_floor_small_vs_big_launch() {
         eprintln!("[floor-probe] j_m16_WHITERAVEN_fp8_wmma    scheme=FP8 n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
     }
 
+    // (k) WhiteRaven-BLOCKED FP8 E4M3 WMMA (16x16-blocked B, ldm=16): same
+    // 1.0 B/elem as (i), but each fragment load is one contiguous 256B tile
+    // instead of 16 K-strided 16B segments. Same bytes moved, so the GB/s
+    // delta against (i) isolates the access pattern. Correctness of the
+    // layout is gated by whiteraven_blocked_parity (bit-exact vs (i)).
+    {
+        let n = 16384usize;
+        let alloc = dev.allocator_handle();
+        let mut sseed: u64 = 83;
+        let mut nxt = move || {
+            sseed ^= sseed << 13;
+            sseed ^= sseed >> 17;
+            sseed ^= sseed << 5;
+            sseed
+        };
+        let b_fp8: Vec<u8> = (0..n * k).map(|_| (nxt() & 0xff) as u8).collect();
+        let b_blocked = grim_quant::block_fp8_16x16(&b_fp8, n, k).expect("block_fp8_16x16");
+        let a_row: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let mut a_fp8: Vec<u8> = vec![0u8; 16 * k]; // 16-row pad, row 0 = real
+        for (i, &v) in a_row.iter().enumerate() {
+            a_fp8[i] = grim_quant::quant_fp8(&[v]).unwrap()[0];
+        }
+        let a_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &a_fp8, &Shape::new(vec![16, k]),
+            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let b_dev = grim_tensor::MemoryOps::from_cpu_bytes(&dev, &b_blocked, &Shape::new(vec![n * k]),
+            DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let out = RocmStorage::alloc_gpu(&Shape::new(vec![1, n]), DType::F32, &alloc, 0).unwrap();
+        let a_rocm = a_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let b_rocm = b_dev.as_any().downcast_ref::<RocmStorage>().unwrap();
+        for _ in 0..3 {
+            dev.launch_wmma_gemm_fp8_e4m3_blocked(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+        }
+        dev.synchronize();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            dev.launch_wmma_gemm_fp8_e4m3_blocked(a_rocm, b_rocm, &out, 1, n, k).unwrap();
+        }
+        dev.synchronize();
+        let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+        let gb = n as f64 * k as f64 * 1.0 / 1e9;
+        let gbps = gb / (us * 1e-6);
+        eprintln!("[floor-probe] k_blocked_WHITERAVEN_fp8    scheme=FP8b n={n:<7} per_launch={us:>8.1} us  weight_GBps={gbps:>7.1}");
+    }
+
     // Verdict inputs, not a hard gate: this probe is evidence.
-    let small_gb = 16384.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
-    let big_gb = 248320.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
+    let small_gb = 16384.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;    let big_gb = 248320.0f64 * (k as f64 / 256.0) * 144.0 / 1e9;
     eprintln!(
         "[floor-probe] verdict inputs: small moves {small_gb:.3} GB in {us:.0} us; \
          big moves {big_gb:.3} GB in {us_big:.0} us; big is {:.1}x the bytes for {:.1}x the time",
