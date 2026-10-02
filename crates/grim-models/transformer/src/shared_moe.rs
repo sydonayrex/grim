@@ -2640,10 +2640,13 @@ mod kq_native_integration_tests {
         let kq = ensure_kq_native(0, &experts, &cache)
             .expect("ensure_kq_native over the model's own storages");
 
-        // Model-shaped routing: 1 token, 4 pairs over known experts.
-        let tokens = vec![0u32, 0, 0, 0];
-        let expert_ids = vec![7u32, 23, 41, 63];
-        let weights = vec![0.4f32, 0.3, 0.2, 0.1];
+        // Model-shaped routing: 1 token, ONE pair (the host oracle below
+        // dequantizes in a debug build — 4 pairs re-dequantized the same
+        // expert 4x and took minutes; the routing WEIGHT path is already
+        // covered by the production geometry parity test).
+        let tokens = vec![0u32];
+        let expert_ids = vec![7u32];
+        let weights = vec![0.4f32];
         let num_pairs = tokens.len();
         let rsf = 1.0f32;
 
@@ -2707,7 +2710,9 @@ mod kq_native_integration_tests {
             kq.down_bytes,
         )
         .expect("kq dispatch over the model's storages");
+        eprintln!("[kq-model] dispatch returned (kernel + memset enqueued)");
         dev.synchronize();
+        eprintln!("[kq-model] sync done (kernel completed)");
         let got_host = out_rocm.copy_to_host().expect("read out");
         let got: Vec<f32> = got_host
             .chunks_exact(4)

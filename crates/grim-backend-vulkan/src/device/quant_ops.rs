@@ -189,6 +189,10 @@ impl QuantOps for VulkanDevice {
                     BlockDtype::Fp4Block16 => grim_quant::dequant_fp4_block16(&b_bytes_cpu, k * n)?,
                     BlockDtype::Fp8Block16 => grim_quant::dequant_fp8_block16(&b_bytes_cpu, k * n)?,
                     BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&b_bytes_cpu)?,
+                    // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale).
+                    // Cross-agent courtesy fix: the arm was added upstream
+                    // without this vulkan match arm and blocked the tree.
+                    BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&b_bytes_cpu, k * n)?,
                     // GreyRaven 2:4: no packed byte format exists yet (E4's
                     // pack_grey_raven is unwritten; the host sparsifier holds f32
                     // survivors, not E4M3 bytes), so there is nothing to decode.
