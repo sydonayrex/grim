@@ -2640,6 +2640,43 @@ impl Xing40Block {
         // 6. Write the FFN result back into the streams.
         let out = self.ffn_hc.update_d2d(&streams, &ffn_out, &ffn_gates)?;
         nan_stage("block_out", &out);
+        // EAGER-SIDE FFN write-back oracle: the exact analogue of the graph's
+        // FFWB-DEPTH scan. Every graph-side stage is verified host-exact, so if
+        // EAGER's departs from the same formula, that is the residual.
+        // Decode only: with seq_len > 1 the stream carries one row per token and
+        // indexing it as a single row is wrong by construction.
+        if std::env::var_os("GRIM_XING_TRACE").is_some() && x.shape().dim(0).ok() == Some(1) {
+            let hc = self.ffn_hc.hc_mult;
+            let hidden = streams.shape().dim(1).unwrap_or(0) / hc.max(1);
+            let got = out.to_vec_f32().ok();
+            let sv = streams.to_vec_f32().ok();
+            let fv = ffn_out.to_vec_f32().ok();
+            let pv = ffn_gates.post.to_cpu_vec_f32().ok();
+            let cv = ffn_gates.comb.to_cpu_vec_f32().ok();
+            if let (Some(got), Some(sv), Some(fv), Some(pv), Some(cv)) = (got, sv, fv, pv, cv) {
+                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                for d in 0..hidden {
+                    for h in 0..hc {
+                        let mut acc = pv[h] * fv[d];
+                        for k in 0..hc {
+                            acc += cv[h * hc + k] * sv[k * hidden + d];
+                        }
+                        let diff = (acc - got[h * hidden + d]).abs();
+                        if diff > md {
+                            md = diff;
+                        }
+                        rr += (acc as f64) * (acc as f64);
+                    }
+                }
+                rr = (rr / (hc * hidden) as f64).sqrt();
+                let rel = md as f64 / rr.max(1e-12);
+                if rel > 1e-5 {
+                    eprintln!(
+                        "[xing-trace] EAGER FFWB LAYER FAIL rel {rel:.3e} (max_abs {md:.3e})"
+                    );
+                }
+            }
+        }
         Ok(out)
     }
 
