@@ -1577,6 +1577,24 @@ impl Xing40Mla {
         };
         let total_kv_len = latent_all.shape().dims()[0];
         xing_trace_stage("host latent_all", &latent_all);
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            if let Ok(v) = latent_all.to_vec_f32() {
+                let row = latent_all.shape().dim(1).unwrap_or(1);
+                let np = latent_all.shape().dim(0).unwrap_or(0);
+                let ckv = row.saturating_sub(64).max(1);
+                // Per-row rms of the c_kv half: a row whose head is all zeros
+                // while its rms is non-zero has an unwritten c_kv, which is
+                // what a KV-seed off-by-one looks like from the attention side.
+                let parts: Vec<String> = (0..np)
+                    .map(|r| {
+                        let seg = &v[r * row..r * row + ckv];
+                        let rms = (seg.iter().map(|x| x * x).sum::<f32>() / ckv as f32).sqrt();
+                        format!("{r}:{rms:.3}")
+                    })
+                    .collect();
+                eprintln!("[xing-trace] latent c_kv rms rows {} x {}: {}", np, ckv, parts.join(" "));
+            }
+        }
         let cache_offset = total_kv_len - seq_len;
         *kv_cache = Some((
             latent_all.clone(),
@@ -2568,6 +2586,17 @@ impl CausalLm for Xing40 {
             .map(|v| v.into_iter().map(|p| p as u32).collect())
             .unwrap_or_else(|_| (0..seq_len as u32).collect());
 
+        // Forward identity for parity work: the KV position is what actually
+        // names a decode step, and trace-line indexing does NOT (run.rs serves
+        // the graph's capture step and re-seed step eagerly, so the graph's
+        // first replay is not eager's last forward).
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            eprintln!(
+                "[xing-trace] FORWARD seq_len {seq_len} pos0 {:?} posN {:?}",
+                positions.to_vec_f32().ok().and_then(|v| v.first().copied()),
+                positions.to_vec_f32().ok().and_then(|v| v.last().copied())
+            );
+        }
         let x0 = grim_nn::embedding_gather_on_device(
             &self.tok_embeddings.weight,
             &ids,

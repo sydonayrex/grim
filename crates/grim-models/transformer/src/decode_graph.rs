@@ -8566,7 +8566,29 @@ dev.launch_hc_collapse_step(
                             let nonzero = last.iter().filter(|x| **x != 0.0).count();
                             let within = last.iter().filter(|x| (**x - mx).abs() < 1e-3).count();
                             eprintln!("[xing-graph] head stats: n {} nonzero {nonzero} within1e-3-of-max {within} max {mx:.4} min {:.4}", last.len(), last.iter().copied().fold(f32::INFINITY, f32::min));
-                            eprintln!("[xing-graph] head top5 [{}]", parts.join(" "));
+                            // KV arena rows around the replay position: the seed
+                            // is the one input the graph does not recompute, so
+                            // an off-by-one there is invisible everywhere else.
+                            let kvr = match graph.buffers.k_arena.first() { Some(k) => k.to_cpu_vec_f32(), None => return Ok(()) };
+                            if let Ok(kv) = kvr {
+                                let row = self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
+                                let p = graph.buffers.current_pos as usize;
+                                for r in [p.saturating_sub(2), p - 1, p] {
+                                    if r * row + row <= kv.len() {
+                                        let seg = &kv[r * row..r * row + row];
+                                        eprintln!(
+                                            "[xing-graph] ARENA row {r}: rms {:.4e} head {:?}",
+                                            (seg.iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                                            &seg[..4]
+                                        );
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "[xing-graph] REPLAY at kv_pos {} head top5 [{}]",
+                                graph.buffers.current_pos,
+                                parts.join(" ")
+                            );
                         }
                     }
                     if let Ok(b) = as_rocm(g.meaned.as_ref()) {
@@ -8613,10 +8635,27 @@ dev.launch_hc_collapse_step(
                                 "xing40 seed: latent cache has no device ptr".into(),
                             )
                         })? as *const f32;
+                    // Clamp to the rows the cache actually holds. run.rs
+                    // seeds BEFORE the step's eager forward runs, so the
+                    // caller's `valid_rows` is routinely one ahead of the
+                    // session's real row count; honouring it copied one
+                    // uninitialized row into the arena, and the replay then
+                    // attended over a latent whose c_kv half was zeros while
+                    // eager attended over the real one. Measured: arena row
+                    // 35 head [0,0,0,0] while every eager row's c_kv rms
+                    // was ~1.33.
+                    let have = latent.shape().dim(0).unwrap_or(0) as u32;
+                    let rows = valid_rows.min(have);
+                    if rows != valid_rows {
+                        eprintln!(
+                            "[xing40-graph] kv seed: clamped valid_rows {valid_rows} -> {rows} \
+                             (cache holds {have} rows)"
+                        );
+                    }
                     out.push(Some(EagerKvSource {
                         k_dev,
                         v_dev: k_dev,
-                        prefill_len: valid_rows,
+                        prefill_len: rows,
                         kv_stride: latent_dim,
                         gdl_state: None,
                         _anchor: std::marker::PhantomData,
