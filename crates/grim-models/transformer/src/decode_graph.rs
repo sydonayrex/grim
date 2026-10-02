@@ -7652,6 +7652,75 @@ dev.launch_hc_collapse_step(
             if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mlaout") {
                 return Ok(());
             }
+            // A/B the value up-projection: `xing_q_absorb` (what the graph
+            // uses) vs a per-head matmul (what eager uses) over the SAME
+            // latent and the SAME w_vc. Both sides are computed here, so
+            // neither depends on a buffer that has not been written yet.
+            // Warmup only: allocating is capture-poison.
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                if let Some(w_vc) = sa.w_vc_device(0)? {
+                    let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                    let lat = as_rocm(scratch.qattn_latent[i].as_ref())?;
+                    let w_r = as_rocm(w_vc)?;
+                    let attn_shape = Shape::new(vec![1, nh * vd]);
+                    if let (Ok(mut mm), Ok(xg)) = (
+                        dev.zeros(&attn_shape, grim_tensor::DType::F32),
+                        dev.zeros(&attn_shape, grim_tensor::DType::F32),
+                    ) {
+                        let mm_m: &mut dyn grim_tensor::BackendStorage = mm.as_mut();
+                        let xg_r: &grim_backend_rocm::RocmStorage =
+                            xg.as_any().downcast_ref().expect("rocm");
+                        dev.launch_xing_q_absorb(lat, w_r, xg_r, nh, vd, rank).ok();
+                        // Each head's [1, vd] must land at column h*vd, not
+                        // overwrite the whole buffer - matmul_into writes the
+                        // full `out`, so stage per head and write_cols it in.
+                        let head_shape = Shape::new(vec![1, vd]);
+                        let mut ok = dev.zeros(&head_shape, grim_tensor::DType::F32).is_ok();
+                        if ok {
+                            for h in 0..nh {
+                                let tmp = match dev.zeros(&head_shape, grim_tensor::DType::F32) {
+                                    Ok(t) => t,
+                                    Err(_) => { ok = false; break; }
+                                };
+                                let tmp_r: &grim_backend_rocm::RocmStorage =
+                                    tmp.as_any().downcast_ref().expect("rocm");
+                                let lat_h = dev.narrow_cols(
+                                    lat, nh * rank, h * rank, 1, rank,
+                                    &Shape::new(vec![1, rank]),
+                                );
+                                let w_h = dev.narrow_rows(
+                                    w_r, h * vd, vd, rank,
+                                    &Shape::new(vec![vd, rank]),
+                                );
+                                if let (Ok((l, _)), Ok((w, _))) = (lat_h, w_h) {
+                                    if dev.matmul_into(l.as_ref(), w.as_ref(), tmp_r).is_err() {
+                                        ok = false;
+                                        break;
+                                    }
+                                    if dev.write_cols(mm_m, nh * vd, h * vd, tmp_r, 1, vd).is_err() {
+                                        ok = false;
+                                        break;
+                                    }
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            dev.synchronize();
+                            if let (Ok(a), Ok(b)) = (xg.to_cpu_vec_f32(), mm.to_cpu_vec_f32()) {
+                                let md = a.iter().zip(b.iter())
+                                    .map(|(x, y)| (x - y).abs())
+                                    .fold(0.0f32, f32::max);
+                                let ra = (a.iter().map(|x| x * x).sum::<f32>()
+                                    / a.len().max(1) as f32).sqrt();
+                                eprintln!("[xing-graph] ABSORB xing_vs_matmul: max_abs {md:.4e} rel {:.4e} rms {ra:.4e}", md / ra.max(1e-12));
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(w_vc) = sa.w_vc_device(0)? {
             if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mla") {
                 return Ok(());
