@@ -424,6 +424,98 @@ fi
 
 
 ###############################################################################
+printf '\n=== 5d. the count end to end, without a sound workspace\n'
+###############################################################################
+# 5c asserts the gate HAS a count. This drives the whole gate with a mutation
+# deleted and a stubbed cargo, so the verdict is reached on a tree that does not
+# compile -- the peer is frequently mid-edit, and a check that only runs on a
+# clean tree silently goes unrun exactly when it is most wanted.
+#
+# The copy is in a temp dir with the four mutated files and a stub cargo that
+# reports "tests failed", which is what a KILLED mutation looks like. The
+# workspace check and the classifier are stubbed because neither is the subject.
+probe_tree() {
+    local d="$1" src="$2"
+    rm -rf "$d"; mkdir -p "$d"
+    local f
+    for f in "${FILES[@]}"; do
+        mkdir -p "$d/$(dirname "$f")"
+        cp "$REPO/$f" "$d/$f"
+    done
+    python3 - "$d" "$src" <<'PYEOF'
+import re, sys
+d, src = sys.argv[1], sys.argv[2]
+g = open(src).read()
+# The workspace check, the builds and the suites all read the tree, and the
+# stub cargo cannot satisfy them -- the library loop would set `fail` from a
+# fake result and the run would never be about the mutations. Cut to the
+# mutations and the verdict; that is the subject.
+import re as _re
+_g = g
+for _start, _end in [
+    ('echo "=== the whole workspace compiles', 'echo "=== MUTATION A:'),
+]:
+    _i = _g.index(_start); _j = _g.index(_end, _i)
+    _g = _g[:_i] + _g[_j:]
+_g = _g.replace("is_peer_error() {", "is_peer_error() { return 1;", 1)
+# The gate resolves its root from its own location:
+#   root="$(cd "$(dirname "$0")/.." && pwd)"
+# so gate.sh must sit in a `scripts/` directory ONE LEVEL ABOVE the file tree it
+# reads. At d/gate.sh, root is d/.. and every anchor misses -- which is what made
+# the control judge 0 of 6 while the same probe run by hand judged 6.
+import os as _os
+_os.makedirs(d + "/scripts", exist_ok=True)
+open(d + "/scripts/gate.sh", "w").write(_g)
+PYEOF
+}
+
+stub="$work/bin"
+mkdir -p "$stub"
+cat > "$stub/cargo" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in check|build) exit 0 ;; esac
+echo "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out"
+STUB
+chmod +x "$stub/cargo"
+
+# control: all six present
+probe_tree "$work/count-ctl" "$GATE"
+out_ctl="$work/count-ctl.out"
+( cd "$work/count-ctl" && PATH="$stub:$PATH" bash scripts/gate.sh ) > "$out_ctl" 2>&1
+n_ctl="$(grep -c 'killed:' "$out_ctl")"
+# mutation F deleted, the expected count left at 6
+probe_tree "$work/count-del" "$GATE"
+python3 - "$work/count-del/scripts/gate.sh" <<'PYEOF'
+import sys
+p = sys.argv[1]
+g = open(p).read()
+i = g.index('echo "=== MUTATION F:')
+j = g.index('echo "=== the tree is unchanged', i)
+open(p, "w").write(g[:i] + g[j:])
+PYEOF
+out_del="$work/count-del.out"
+( cd "$work/count-del" && PATH="$stub:$PATH" bash scripts/gate.sh ) > "$out_del" 2>&1
+n_del="$(grep -c 'killed:' "$out_del")"
+missing_line="$(grep -c 'mutations were judged' "$out_del" || true)"
+
+if [ "$n_ctl" -eq 6 ]; then
+    pass "control: all six mutations judged"
+else
+    fail "control judged $n_ctl of six mutations"
+fi
+if [ "$n_del" -eq 5 ] && [ "$missing_line" -ge 1 ]; then
+    pass "with F deleted: 5 judged, and the count reports the shortfall"
+else
+    fail "with F deleted: $n_del judged, shortfall reported $missing_line time(s) -- \
+the gate did not notice a missing mutation"
+fi
+if ! grep -q 'norm gate green' "$out_del"; then
+    pass "and the verdict is not green"
+else
+    fail "the gate still reported green with a mutation missing"
+fi
+
+###############################################################################
 printf '\n=== 5. this script and the real gate are untouched\n'
 ###############################################################################
 if bash -n "$GATE" 2>/dev/null; then
