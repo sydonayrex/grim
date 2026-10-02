@@ -1041,6 +1041,7 @@ mod tests {
             unk_token_id: None,
             chat_template: None,
             architecture: None,
+            added_tokens: Vec::new(),
         }
     }
 

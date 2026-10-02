@@ -1600,6 +1600,7 @@ mod tests {
             byte_decoder: None,
             chat_template: None,
             architecture: None,
+            added_tokens: Vec::new(),
         };
 
         let dataset = load_dataset_from_str(json, &tokenizer, 512).unwrap();
@@ -2084,6 +2085,7 @@ mod tests {
             byte_decoder: None,
             chat_template: None,
             architecture: None,
+            added_tokens: Vec::new(),
         };
 
         let paths = vec![
