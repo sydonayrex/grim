@@ -315,6 +315,42 @@ case "$r" in
     *) report "not green after restore: $r" "$out" ;;
 esac
 
+# --- the whole workspace, not just the crates these tests touch -----------
+# 9295cb40 added a field to a struct used in three `mod tests` literals in
+# grim-cli and missed all three. Every suite in this gate runs in a crate that
+# does not depend on grim-cli, so the gate was green against a workspace that
+# did not compile. This check is what that gap cost.
+echo
+echo "=== the whole workspace compiles, including test targets"
+ws_out="$(cargo check --workspace --all-targets --message-format short 2>&1)"
+ws_rc=$?
+ws_errs="$(printf '%s' "$ws_out" | grep -c ': error' || true)"
+# Attribute before judging: a peer agent mid-edit makes this red for reasons
+# that are not norm work, and a gate that reports those as its own failures
+# trains people to ignore it.
+unattributed=""
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    file="${line%%:*}"
+    case "$file" in
+        *model_loader.rs|*modules.rs|*block.rs|*model.rs|*decode_graph.rs)
+            : ;;                      # a norm crate: ours to answer for
+        *shared_moe.rs|*qwen4exp*|*expert_offload.rs|*dtype.rs|*quant*)
+            : ;;                      # known peer files
+        *backend-rocm*|*backend-cuda*|*backend-vulkan*|*backend-metal*)
+            : ;;                      # peer backend crates
+        *) unattributed="$unattributed$line\n" ;;
+    esac
+done <<< "$(printf '%s' "$ws_out" | grep ': error' || true)"
+if [ "$ws_rc" -eq 0 ]; then
+    pass "cargo check --workspace --all-targets: 0 errors"
+elif [ -n "$unattributed" ]; then
+    printf '  FAIL  %b' "$unattributed"
+    fail "workspace check: unattributed errors (see above)"
+else
+    report "workspace check blocked by a peer's in-flight edit" "$ws_out"
+fi
+
 echo
 echo "=== the tree is unchanged by THIS RUN"
 # Compared against a snapshot taken when the script started, not against HEAD.
