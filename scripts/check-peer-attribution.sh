@@ -138,10 +138,21 @@ case_is_peer "a norm suite fails to compile"      OURS \
 
 printf '\n=== 4. the structural rule: untracked or uncommitted is theirs\n'
 # The point of rule 2. These need no pattern at all.
-PEER_UNTRACKED='crates/grim-backend-rocm/tests/whiteraven_journey.rs:111:17: error: unused variable: `stage`'
-case_is_peer "an untracked file, unrecognised name" PEER "$PEER_UNTRACKED"
-case_is_peer "the same file with a nonsense symbol" PEER \
-    'crates/grim-backend-rocm/tests/whiteraven_journey.rs:42:3: error[E0308]: mismatched types: expected `u64`, found `usize`'
+# Do NOT hardcode an untracked file: the peer commits theirs, and a fixture
+# that silently becomes committed turns this from "the structural rule works"
+# into "the structural rule has nothing to test". Find one now, and if there is
+# none, say so rather than assert something vacuous.
+PEER_UNTRACKED_FILE="$(git -C "$REPO" status --porcelain \
+    | awk '$1 == "??" && $2 ~ /\.rs$/ { print $2; exit }')"
+if [ -z "$PEER_UNTRACKED_FILE" ]; then
+    fail "no untracked .rs file exists, so the structural rule is untested -- \
+the peer has committed all of theirs"
+else
+    case_is_peer "an untracked file ($(basename "$PEER_UNTRACKED_FILE"))" PEER \
+        "$PEER_UNTRACKED_FILE:1:1: error: probe"
+    case_is_peer "the same file with a nonsense symbol" PEER \
+        "$PEER_UNTRACKED_FILE:42:3: error[E0308]: mismatched types: expected `u64`, found `usize`"
+fi
 
 # A COMMITTED file that does not compile is ours. This is the assertion that
 # stops the classifier from becoming an escape hatch: widening the peer list
