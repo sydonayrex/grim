@@ -8621,6 +8621,20 @@ dev.launch_hc_collapse_step(
                             // is the one input the graph does not recompute, so
                             // an off-by-one there is invisible everywhere else.
                             let kvr = match graph.buffers.k_arena.first() { Some(k) => k.to_cpu_vec_f32(), None => return Ok(()) };
+                            let row = self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
+                            let p = graph.buffers.current_pos as usize;
+                            for (li, ka) in graph.buffers.k_arena.iter().enumerate().take(3) {
+                                if let Ok(kv) = ka.to_cpu_vec_f32() {
+                                    if p * row + row <= kv.len() {
+                                        let seg = &kv[p * row..p * row + row];
+                                        eprintln!(
+                                            "[xing-graph] ARENAROW L{li} pos {p} rms {:.6e} head {:?}",
+                                            (seg.iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                                            &seg[..4]
+                                        );
+                                    }
+                                }
+                            }
                             if let Ok(kv) = kvr {
                                 let row = self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
                                 let p = graph.buffers.current_pos as usize;

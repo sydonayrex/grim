@@ -1595,6 +1595,39 @@ impl Xing40Mla {
                 eprintln!("[xing-trace] latent c_kv rms rows {} x {}: {}", np, ckv, parts.join(" "));
             }
         }
+        if std::env::var_os("GRIM_XING_TRACE").is_some() && seq_len == 1 {
+            if let Ok(v) = latent_all.to_vec_f32() {
+                let row = latent_all.shape().dim(1).unwrap_or(0);
+                let np = latent_all.shape().dim(0).unwrap_or(0);
+                let pos = positions.last().copied().unwrap_or(u32::MAX);
+                if np > 0 && row > 0 {
+                    let last = (np - 1) * row;
+                    eprintln!(
+                        "[xing-trace] LATENTROW pos {pos} rows {np} rms {:.6e} head {:?}",
+                        (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                        &v[last..last + 4.min(row)]
+                    );
+                }
+            }
+        }
+        // row IS the current position's latent, so it is directly comparable
+        // with the graph's k_arena row at the same kv_pos. An earlier attempt
+        // sat in a wrapper that never runs on this path and printed nothing.
+        if std::env::var_os("GRIM_XING_TRACE").is_some() && seq_len == 1 {
+            if let Ok(v) = latent_all.to_vec_f32() {
+                let row = latent_all.shape().dim(1).unwrap_or(0);
+                let np = latent_all.shape().dim(0).unwrap_or(0);
+                let pos = positions.last().copied().unwrap_or(u32::MAX);
+                if np > 0 && row > 0 {
+                    let last = (np - 1) * row;
+                    eprintln!(
+                        "[xing-trace] LATENTROW pos {pos} rows {np} rms {:.6e} head {:?}",
+                        (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                        &v[last..last + 4.min(row)]
+                    );
+                }
+            }
+        }
         let cache_offset = total_kv_len - seq_len;
         *kv_cache = Some((
             latent_all.clone(),
