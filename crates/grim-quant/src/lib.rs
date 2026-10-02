@@ -9,6 +9,7 @@ use grim_tensor::error::{Error, Result};
 use iq_tables::KVALUES_IQ4NL as KVALUES_IQ4NL_REF;
 
 pub mod accuracy_gate;
+pub mod citycrow;
 pub mod grey_raven;
 pub mod gsq;
 pub mod iq_tables;
