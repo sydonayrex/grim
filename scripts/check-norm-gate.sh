@@ -59,12 +59,15 @@ is_peer_error() {
         *F32\|*Fp8Blocked*|*QuantFormat*|*expert_stage*|*index_head_dim*|\
         *index_n_heads*|*index_source_layer_ids*|*Xing40GraphScratch*|*k_norm*|\
         *act_fp8_pad_buf*|*layer_geoms*|*WhiteRaven*|*WhiteCrow*|*KqNative*|\
-        *moe_route_topk*|*tree_pie*|*TreePie*|*charon*)
+        *moe_route_topk*|*tree_pie*|*TreePie*|*charon*|\
+        *GgufDType*|*PQ2_0*|*PTQ1_0*|*TQ1_0*|*TQ2_0*|*Q1_0*|*Q2_0*|\
+        *unreachable_pattern*)
             return 0 ;;
         # then by FILE, for the peer's files we do not have symbols for
         *shared_moe.rs|*qwen4exp*|*expert_offload.rs|*dtype.rs|*deepseek32*|\
         *xing40*|*backend-rocm*|*backend-cuda*|*backend-vulkan*|*backend-metal*|\
-        *quant/*|*llama_bak*|*memory/*|*charon*|*tree_pie*|*iq_gemm*|*charon.rs*)
+        *quant/*|*llama_bak*|*memory/*|*charon*|*tree_pie*|*iq_gemm*|*charon.rs*|\
+        *gguf.rs*|*accuracy_gate.rs*)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -129,6 +132,15 @@ else
     # failures that all restate this one cause. Stop instead.
     report "workspace check blocked by a peer's in-flight edit; skipping the rest" "$ws_out"
     ws_blocked=1
+    # Be explicit about what BLOCKED does NOT prove. cargo stops at the first
+    # failing crate, so a peer error in grim-backend-rocm means grim-cli is
+    # never compiled and an error of ours in there is invisible. Verified: with
+    # both present, `cargo check -p grim-cli` reports only the peer's. This
+    # gate cannot see ours until the peer's tree is sound.
+    echo
+    echo "NOTE  this is NOT a clean bill of health: while a dependency is"
+    echo "      broken, later crates are never compiled, so an error in them"
+    echo "      would not appear. Re-run once the peer's tree is sound."
 fi
 if [ "${ws_blocked:-0}" -eq 1 ]; then
     echo
