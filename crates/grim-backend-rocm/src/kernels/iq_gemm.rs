@@ -1242,6 +1242,102 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
 
 
 }
+
+// --- Native K-quant grouped dispatch (xing4.0: IQ3_S gate/up + Q4_K down) ---
+// One block per (token, expert) pair; 256 threads. Reads the ALREADY-RESIDENT
+// packed per-expert banks through device pointer arrays (the banks ship as
+// part of the model, so this arm costs ZERO extra weight VRAM - unlike the
+// WhiteCrow stacks, it needs no budget). Per-expert blobs are contiguous
+// [row][super-block] packed rows: gate/up IQ3_S (110 B per 256 weights,
+// hidden/256 blocks per row), down Q4_K (144 B per 256, inter/256 blocks per
+// row - the runtime storages were measured, not assumed: gate/up 1576960 B,
+// down 2064384 B per expert). The decoders are the SAME leaf functions the
+// rest of the tree trusts (dequant_iq3s + IQ3S_GRID_B above in this TU;
+// dequant_q4k_element from shared_device_fns). Routing comes from device
+// buffers: decode-graph capture-safe.
+extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
+    const float* __restrict__ activations,            // [batch, hidden]
+    const unsigned long long* __restrict__ gate_ptrs, // [num_experts]
+    const unsigned long long* __restrict__ up_ptrs,   // [num_experts]
+    const unsigned long long* __restrict__ down_ptrs, // [num_experts]
+    const unsigned int* __restrict__ router_tokens,   // [num_pairs]
+    const unsigned int* __restrict__ router_experts,  // [num_pairs]
+    const float* __restrict__ router_weights,         // [num_pairs]
+    float* __restrict__ out,                          // [batch, hidden]
+    int hidden, int inter, int num_pairs,
+    float routed_scaling_factor, int num_experts, int batch, int phase_mask,
+    int gate_row_bytes, int down_row_bytes, int jlimit_arg)
+{
+    const int pair = blockIdx.x;
+    if (pair >= num_pairs) return;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int tok = (int)router_tokens[pair];
+    const int exp = (int)router_experts[pair];
+    // A routing id outside the bank set (or a token outside the batch) would
+    // read the pointer array / activations out of bounds and then dereference
+    // garbage - return instead of faulting.
+    if (exp < 0 || exp >= num_experts) return;
+    if (tok < 0 || tok >= batch) return;
+    const float w = router_weights[pair];
+
+    extern __shared__ float s_act[]; // [inter]
+
+    const unsigned char* gb = (const unsigned char*)gate_ptrs[exp];
+    const unsigned char* ub = (const unsigned char*)up_ptrs[exp];
+    const unsigned char* db = (const unsigned char*)down_ptrs[exp];
+    // Row strides are HOST-MEASURED from the actual per-expert storages
+    // (storage.bytes() / rows) — the loader may re-tag/re-encode the down
+    // bank, so the kernel must not assume the raw-file geometry.
+    const int g_sb = gate_row_bytes / 110;  // IQ3_S super-blocks per gate/up row
+    const int d_sb = down_row_bytes / 144;  // Q4_K super-blocks per down row
+
+    const float* a = activations + (unsigned long long)tok * hidden;
+
+    // Phase 1: fused gate|up with in-register SiLU combine -> shared act.
+    // phase_mask bit 0 gates this phase (fault bisection).
+    if (phase_mask & 1) {
+    for (int j = tid; j < jlimit_arg; j += nthreads) {
+        const unsigned char* gblk = gb + (unsigned long long)j * gate_row_bytes;
+        const unsigned char* ublk = ub + (unsigned long long)j * gate_row_bytes;
+        float g = 0.0f;
+        float u = 0.0f;
+        for (int b = 0; b < g_sb; ++b) {
+            const int kb = b * 256;
+            #pragma unroll 8
+            for (int i = 0; i < 256; ++i) {
+                const float av = a[kb + i];
+                g += av * dequant_iq3s(gblk + b * 110, i);
+                u += av * dequant_iq3s(ublk + b * 110, i);
+            }
+        }
+        s_act[j] = (g / (1.0f + expf(-g))) * u;
+    }
+    __syncthreads();
+    }
+
+    // Phase 2: down projection, atomicAdd accumulation with the routing
+    // weight. phase_mask bit 1 gates this phase (fault bisection).
+    if (phase_mask & 2) {
+    for (int h = tid; h < hidden; h += nthreads) {
+        const unsigned char* dblk = db + (unsigned long long)h * down_row_bytes;
+        float acc = 0.0f;
+        for (int b = 0; b < d_sb; ++b) {
+            const int kb = b * 256;
+            #pragma unroll 8
+            // Down bank is Q4_K (144 B per 256) — decode with the SAME leaf
+            // function the weight path and the embedding gather use.
+            for (int i = 0; i < 256; ++i) {
+                acc += s_act[kb + i] * dequant_q4k_element(dblk + b * 144, i);
+            }
+        }
+        atomicAdd(out + (unsigned long long)tok * hidden + h,
+                  routed_scaling_factor * w * acc);
+    }
+    }
+}
+
 "#;
 
 #[cfg(test)]

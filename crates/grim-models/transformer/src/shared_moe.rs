@@ -65,6 +65,10 @@ pub struct CharonCache {
     /// `GRIM_MOE_NATIVE_WHITECROW`; ~0.5 B/param vs 4 B/param for the f32
     /// stacks, which is what lets the decode graph's MoE leg fit in VRAM.
     whitecrow: Mutex<Option<WhiteCrowResident>>,
+    /// Native K-quant dispatch handles (per-expert pointer arrays over the
+    /// already-resident all-IQ3_S packed banks). Zero extra weight VRAM, so
+    /// this arm needs no budget gate.
+    kq_native: Mutex<Option<KqNativeResident>>,
     /// Set when a build was refused (budget/scheme); refused builds stay
     /// refused for this cache's lifetime so per-call retries stay cheap.
     whitecrow_refused: Mutex<bool>,
@@ -88,6 +92,10 @@ pub enum DispatchKind {
     /// dot4`): same numeric path (int32 Q8_1 dot products), different
     /// contraction. Recorded distinctly so tests/benches prove which ran.
     W8a8NativeDot4,
+    /// Native K-quant dispatch (`grim_moe_fused_dispatch_kq_native`): the
+    /// resident IQ3_S/Q4_K per-expert banks decoded in-register through
+    /// device pointer arrays. Zero extra weight VRAM.
+    KqNative,
     /// Native W8A8-fp8 dispatch (`grim_moe_fused_dispatch_w8a8_fp8`)
     /// straight from packed fp8 blobs.
     W8a8Fp8Native,
@@ -108,6 +116,24 @@ pub enum DispatchKind {
 /// expert `e` occupies `e * stride` bytes. Blob layout per expert mirrors
 /// `ostquant_segment_offsets`: `[u64 qw_len][qweight u32 words N*K/8]
 /// [u64 sc_len][scales bf16 N*K/128][u64 zr_len][zeros u8 N*K/128]`.
+/// Native K-quant grouped dispatch handles: device pointer arrays (one u64
+/// base pointer per expert, per projection) over the per-expert packed banks
+/// that are ALREADY resident as the model's own weights. Allocates only 3 x
+/// num_experts x 8 bytes. The arrays borrow the banks' device addresses; the
+/// banks live in the owning layer and outlive this cache, so the addresses
+/// are stable.
+pub(crate) struct KqNativeResident {
+    pub gate_ptrs: Arc<dyn grim_tensor::backend::BackendStorage>,
+    pub up_ptrs: Arc<dyn grim_tensor::backend::BackendStorage>,
+    pub down_ptrs: Arc<dyn grim_tensor::backend::BackendStorage>,
+    pub num_experts: usize,
+    /// PER-EXPERT packed bytes, per projection — the launcher derives the
+    /// per-row stride the kernel addresses with (host-measured, never
+    /// assumed).
+    pub gate_bytes: u64,
+    pub down_bytes: u64,
+}
+
 pub(crate) struct WhiteCrowResident {
     pub gate: Arc<dyn grim_tensor::backend::BackendStorage>,
     pub up: Arc<dyn grim_tensor::backend::BackendStorage>,
@@ -176,6 +202,7 @@ impl CharonCache {
             awq: Mutex::new(None),
             mxfp4: Mutex::new(None),
             whitecrow: Mutex::new(None),
+            kq_native: Mutex::new(None),
             whitecrow_refused: Mutex::new(false),
             last_dispatch: Mutex::new(DispatchKind::F32Dequant),
         }
@@ -186,6 +213,7 @@ impl CharonCache {
     pub fn invalidate(&self) {
         *self.resident.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.whitecrow.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.kq_native.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.whitecrow_refused.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *self.routing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.w8a8.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -267,6 +295,175 @@ pub type CharonScratchBuffers = (
 /// The conversion D2Hs, so this MUST run outside any graph-capture bracket:
 /// call it from the eager dispatch or at decode-graph pool-build time; a
 /// capture-time build poisons the capture.
+/// Build (once) the native K-quant dispatch handles: per-projection device
+/// pointer arrays over the per-expert packed banks. Only h2d-uploads 3 x
+/// num_experts x 8 bytes — the weights themselves are the model's own. The
+/// upload is tiny but still an H2D of host-owned data, so the capture path
+/// must call this from pool-build time (or peek via [`peek_kq_native`]),
+/// never from inside a capture bracket.
+fn pick_expert_bytes(
+    e: &MoeExpert,
+    pick: fn(&MoeExpert) -> &grim_tensor::Tensor,
+) -> u64 {
+    pick(e)
+        .storage()
+        .as_ref()
+        .as_any()
+        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+        .map(|st| st.bytes() as u64)
+        .unwrap_or(0)
+}
+
+pub(crate) fn ensure_kq_native(
+    ordinal: usize,
+    experts: &[MoeExpert],
+    cache: &CharonCache,
+) -> Result<KqNativeResident> {
+    // GRIM_MOE_KQ_FRESH=1: rebuild the pointer arrays on every call —
+    // staleness probe for the page-fault chase (are baked bank pointers
+    // going dangling between build and dispatch?).
+    let fresh = matches!(
+        std::env::var("GRIM_MOE_KQ_FRESH").as_deref(),
+        Ok("1" | "true")
+    );
+    if !fresh {
+        let guard = cache.kq_native.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = guard.as_ref() {
+            return Ok(KqNativeResident {
+                gate_ptrs: Arc::clone(&r.gate_ptrs),
+                up_ptrs: Arc::clone(&r.up_ptrs),
+                down_ptrs: Arc::clone(&r.down_ptrs),
+                num_experts: r.num_experts,
+                gate_bytes: r.gate_bytes,
+                down_bytes: r.down_bytes,
+            });
+        }
+    }
+    let num_experts = experts.len();
+    if num_experts == 0 {
+        return Err(grim_core::error::Error::Backend(
+            "kq native: no experts".into(),
+        ));
+    }
+    let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+    // Scheme contract: gate/up decode as IQ3_S, down as Q4_K (xing4.0's
+    // banks). Any other combination refuses - a wrong per-format decode is
+    // exactly the class of bug that size checks cannot see.
+    let scheme_of = |w: &grim_tensor::Tensor| -> Result<grim_tensor::KQuantScheme> {
+        match &w.dtype().storage {
+            grim_tensor::Storage::KQuant(sch) => Ok(*sch),
+            other => Err(grim_core::error::Error::Backend(format!(
+                "kq native: expert weight storage {other:?} is not packed K-quant"
+            ))),
+        }
+    };
+    for e in experts {
+        if scheme_of(&e.gate.weight)? != grim_tensor::KQuantScheme::IQ3S
+            || scheme_of(&e.up.weight)? != grim_tensor::KQuantScheme::IQ3S
+            || scheme_of(&e.down.weight)? != grim_tensor::KQuantScheme::Q4K
+        {
+            let (g, u, d) = (
+                scheme_of(&e.gate.weight)?,
+                scheme_of(&e.up.weight)?,
+                scheme_of(&e.down.weight)?,
+            );
+            let gd = e.gate.weight.shape().dims();
+            let dd = e.down.weight.shape().dims();
+            let gb2 = pick_expert_bytes(e, |x| &x.gate.weight);
+            let db2 = pick_expert_bytes(e, |x| &x.down.weight);
+            return Err(grim_core::error::Error::Backend(format!(
+                "kq native: banks are not the IQ3S gate/up + Q4K down set this kernel decodes: gate {g:?} up {u:?} down {d:?}, gate dims {gd:?} bytes {gb2}, down dims {dd:?} bytes {db2}"
+            )));
+        }
+    }
+    let ptr_array = |pick: fn(&MoeExpert) -> &grim_tensor::Tensor| -> Result<
+        Arc<dyn grim_tensor::backend::BackendStorage>,
+    > {
+        let mut addrs: Vec<u64> = Vec::with_capacity(num_experts);
+        for (ei, e) in experts.iter().enumerate() {
+            let st = pick(e)
+                .storage()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| {
+                    grim_core::error::Error::Backend("kq native: weight not RocmStorage".into())
+                })?;
+            if !st.device_ptr_is_valid() {
+                return Err(grim_core::error::Error::Backend(format!(
+                    "kq native: expert {ei} bank has an invalid device pointer (not uploaded?)"
+                )));
+            }
+            let addr = st.device_ptr_u64().ok_or_else(|| {
+                grim_core::error::Error::Backend("kq native: bank has no device ptr".into())
+            })?;
+            if std::env::var_os("GRIM_MOE_KQ_DEBUG").is_some() {
+                eprintln!("[kq-debug] expert {ei}: ptr {addr:#x} bytes {}", st.bytes());
+            }
+            addrs.push(addr);
+        }
+        // u64 addresses upload as raw little-endian bytes (never through
+        // f32); U32 words, 2 per address.
+        let bytes: Vec<u8> = addrs.iter().flat_map(|a| a.to_le_bytes()).collect();
+        let shape = grim_tensor::Shape::new(vec![addrs.len() * 2]);
+        let st = rocm.from_cpu_bytes(
+            &bytes,
+            &shape,
+            grim_tensor::DType {
+                arith: grim_tensor::ArithType::U32,
+                storage: grim_tensor::Storage::Native,
+            },
+        )?;
+        Ok(Arc::from(st))
+    };
+    let gate_ptrs = ptr_array(|e| &e.gate.weight)?;
+    let up_ptrs = ptr_array(|e| &e.up.weight)?;
+    let down_ptrs = ptr_array(|e| &e.down.weight)?;
+    // PER-EXPERT byte counts — the launcher derives the per-row stride as
+    // bytes / rows-of-one-expert; a total across all experts would inflate
+    // the stride by num_experts and read 64x past the bank (the page fault
+    // the phase-mask bisection chased).
+    let gate_bytes = pick_expert_bytes(&experts[0], |e| &e.gate.weight);
+    let down_bytes = pick_expert_bytes(&experts[0], |e| &e.down.weight);
+    let resident = KqNativeResident {
+        gate_ptrs,
+        up_ptrs,
+        down_ptrs,
+        num_experts,
+        gate_bytes,
+        down_bytes,
+    };
+    *cache.kq_native.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(KqNativeResident {
+            gate_ptrs: Arc::clone(&resident.gate_ptrs),
+            up_ptrs: Arc::clone(&resident.up_ptrs),
+            down_ptrs: Arc::clone(&resident.down_ptrs),
+            num_experts: resident.num_experts,
+            gate_bytes: resident.gate_bytes,
+            down_bytes: resident.down_bytes,
+        });
+    Ok(resident)
+}
+
+/// Cache-only peek for capture brackets (see `peek_whitecrow_stacks`).
+///
+/// Not called yet: the kq-native capture bracket that needs it is still
+/// unwired, and `-D dead_code` is on. Kept (rather than deleted) because the
+/// capture step must never call the `ensure_` variant -- a miss there D2Hs
+/// inside the bracket and poisons capture.
+#[allow(dead_code)]
+pub(crate) fn peek_kq_native(cache: &CharonCache) -> Option<KqNativeResident> {
+    let guard = cache.kq_native.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|r| KqNativeResident {
+        gate_ptrs: Arc::clone(&r.gate_ptrs),
+        up_ptrs: Arc::clone(&r.up_ptrs),
+        down_ptrs: Arc::clone(&r.down_ptrs),
+        num_experts: r.num_experts,
+        gate_bytes: r.gate_bytes,
+        down_bytes: r.down_bytes,
+    })
+}
+
 /// Cache-only peek: returns the resident WhiteCrow stacks if built, WITHOUT
 /// attempting a conversion. The capture step must use this (never `ensure_`),
 /// because a miss would D2H inside the capture bracket and poison it.
@@ -852,6 +1049,68 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
         route_mode,
         norm_weights,
     )?;
+
+    // Native K-quant arm (default for all-IQ3_S banks, e.g. xing4.0):
+    // decodes the ALREADY-RESIDENT per-expert banks in-register via
+    // device pointer arrays — zero extra weight VRAM, no budget gate. GRIM_
+    // MOE_KQ_NATIVE=0 disables. The build only uploads 3 pointer arrays, but
+    // that is still an H2D of host-owned data, so the capture path prewarms
+    // at pool-build and peeks (same discipline as the WhiteCrow arm).
+    if !matches!(
+        std::env::var("GRIM_MOE_KQ_NATIVE").as_deref(),
+        Ok("0" | "false" | "off")
+    ) {
+        if let Ok(kq) = ensure_kq_native(ordinal, experts, cache) {
+            cache.record_dispatch(DispatchKind::KqNative);
+            let out_shape = Shape::new(vec![seq_len, hidden]);
+            let out_storage_b = rocm.zeros(&out_shape, DType::F32)?;
+            let out_storage = out_storage_b
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(|| grim_tensor::Error::Backend("kq out not RocmStorage".into()))?;
+            if num_pairs > 0 {
+                let g_ptrs = kq
+                    .gate_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("kq gate ptrs not RocmStorage".into()))?;
+                let u_ptrs = kq
+                    .up_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("kq up ptrs not RocmStorage".into()))?;
+                let d_ptrs = kq
+                    .down_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("kq down ptrs not RocmStorage".into()))?;
+                rocm.moe_fused_dispatch_kq_native_into(
+                    x_rocm,
+                    g_ptrs,
+                    u_ptrs,
+                    d_ptrs,
+                    tokens_rocm,
+                    experts_rocm,
+                    weights_rocm,
+                    num_pairs,
+                    out_storage,
+                    hidden,
+                    inter,
+                    routed_scaling_factor,
+                    kq.gate_bytes,
+                    kq.down_bytes,
+                )?;
+            }
+            let out_t = Tensor::new(
+                Arc::from(out_storage_b),
+                out_shape,
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            );
+            return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+        }
+    }
 
     // WhiteCrow u4-group128 arm (GRIM_MOE_NATIVE_WHITECROW=1): K-quant
     // expert banks requantized once to OSTQuant blobs (~0.5 B/param vs the
@@ -2319,5 +2578,188 @@ mod tests {
             !cache.is_routing_engaged(),
             "invalidate must leave routing disengaged"
         );
+    }
+}
+
+#[cfg(test)]
+mod kq_native_integration_tests {
+    use super::*;
+
+    /// MODEL-SHAPED integration test — the "how it should work" oracle for
+    /// the exact production path: load blk.2's expert bank through
+    /// ExpertBank::load on the ROCm device (the storages the model actually
+    /// runs with), dispatch through the SAME `ensure_kq_native` +
+    /// `moe_fused_dispatch_kq_native_into` pair the eager arm uses, and
+    /// compare against host dequant of the same storages' bytes. If the e2e
+    /// page fault reproduces here, it is debuggable in a harness; if this
+    /// passes while the e2e faults, the difference isolates to the model's
+    /// invocation context.
+    #[test]
+    #[ignore = "needs XING_GGUF + a ROCm device; GRIM_RUN_GPU_TESTS=1"]
+    fn kq_native_over_model_bank_via_production_launcher() {
+        if std::env::var("GRIM_RUN_GPU_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let Ok(path) = std::env::var("XING_GGUF") else { return };
+        let hidden = 3584usize;
+        let inter = 1024usize;
+        let num_experts = 64usize;
+
+        use grim_format::tprov::GgufProvider;
+        let prov = GgufProvider::open(&path).expect("open gguf");
+        let ws = grim_nn::WeightSource::root(&prov, grim_tensor::Device::Rocm(0))
+            .pp("blk")
+            .pp("2");
+        let bank = grim_nn::moe::ExpertBank::load(&ws, num_experts, hidden, inter, false)
+            .expect("load bank on Rocm (model path)");
+
+        fn st_of(t: &grim_tensor::Tensor) -> &grim_backend_rocm::RocmStorage {
+            t.storage()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .unwrap()
+        }
+        eprintln!(
+            "[kq-model] gate[0] {:?} bytes {} | down[0] {:?} bytes {}",
+            bank.gate[0].weight.dtype(),
+            st_of(&bank.gate[0].weight).bytes(),
+            bank.down[0].weight.dtype(),
+            st_of(&bank.down[0].weight).bytes()
+        );
+
+        let dev = grim_backend_rocm::RocmDevice::shared(0);
+        let experts: Vec<MoeExpert> = (0..num_experts)
+            .map(|i| MoeExpert {
+                gate: bank.gate[i].clone(),
+                up: bank.up[i].clone(),
+                down: bank.down[i].clone(),
+            })
+            .collect();
+        let cache = CharonCache::new();
+        let kq = ensure_kq_native(0, &experts, &cache)
+            .expect("ensure_kq_native over the model's own storages");
+
+        // Model-shaped routing: 1 token, 4 pairs over known experts.
+        let tokens = vec![0u32, 0, 0, 0];
+        let expert_ids = vec![7u32, 23, 41, 63];
+        let weights = vec![0.4f32, 0.3, 0.2, 0.1];
+        let num_pairs = tokens.len();
+        let rsf = 1.0f32;
+
+        let act: Vec<f32> = (0..hidden).map(|i| ((i % 13) as f32 - 6.0) * 0.07).collect();
+        let up = |v: Vec<u8>| -> grim_tensor::Tensor {
+            grim_tensor::Tensor::new(
+                std::sync::Arc::from(
+                    dev.from_cpu_bytes(
+                        &v,
+                        &grim_tensor::Shape::new(vec![v.len()]),
+                        grim_tensor::DType {
+                            arith: grim_tensor::ArithType::U8,
+                            storage: grim_tensor::Storage::Native,
+                        },
+                    )
+                    .expect("upload"),
+                ),
+                grim_tensor::Shape::new(vec![v.len()]),
+                grim_tensor::DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                grim_tensor::Device::Rocm(0),
+            )
+        };
+        let u32_bytes = |v: &[u32]| -> Vec<u8> {
+            v.iter().flat_map(|x| x.to_le_bytes()).collect()
+        };
+        let f32_bytes = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|x| x.to_le_bytes()).collect()
+        };
+        let a_t = up(f32_bytes(&act));
+        let t_t = up(u32_bytes(&tokens));
+        let e_t = up(u32_bytes(&expert_ids));
+        let w_t = up(f32_bytes(&weights));
+        let out_rocm = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &grim_tensor::Shape::new(vec![1, hidden]),
+            grim_tensor::DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .expect("out");
+
+        fn arc_of(a: &Arc<dyn grim_tensor::backend::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
+            a.as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .unwrap()
+        }
+        dev.moe_fused_dispatch_kq_native_into(
+            st_of(&a_t),
+            arc_of(&kq.gate_ptrs),
+            arc_of(&kq.up_ptrs),
+            arc_of(&kq.down_ptrs),
+            st_of(&t_t),
+            st_of(&e_t),
+            st_of(&w_t),
+            num_pairs,
+            &out_rocm,
+            hidden,
+            inter,
+            rsf,
+            kq.gate_bytes,
+            kq.down_bytes,
+        )
+        .expect("kq dispatch over the model's storages");
+        dev.synchronize();
+        let got_host = out_rocm.copy_to_host().expect("read out");
+        let got: Vec<f32> = got_host
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Host reference over the RUNTIME storages' bytes.
+        let mut want = vec![0f32; hidden];
+        for (p, &e) in expert_ids.iter().enumerate() {
+            let gw = st_of(&bank.gate[e as usize].weight).copy_to_host().unwrap();
+            let uw = st_of(&bank.up[e as usize].weight).copy_to_host().unwrap();
+            let dwb = st_of(&bank.down[e as usize].weight).copy_to_host().unwrap();
+            let deq = |blob: &[u8], rows: usize, k: usize| -> Vec<f32> {
+                let mut flat = Vec::with_capacity(rows * k);
+                for r in 0..rows {
+                    let row = &blob[r * (k / 256) * 110..(r + 1) * (k / 256) * 110];
+                    flat.extend_from_slice(&grim_quant::dequant_iq3s(row, k).unwrap());
+                }
+                flat
+            };
+            let g_flat = deq(&gw, inter, hidden);
+            let u_flat = deq(&uw, inter, hidden);
+            let mut actv = vec![0f32; inter];
+            for j in 0..inter {
+                let mut g = 0f32;
+                let mut u = 0f32;
+                for i in 0..hidden {
+                    let av = act[i];
+                    g += av * g_flat[j * hidden + i];
+                    u += av * u_flat[j * hidden + i];
+                }
+                actv[j] = g / (1.0 + (-g).exp()) * u;
+            }
+            let d_flat = deq(&dwb, hidden, inter);
+            for h in 0..hidden {
+                let mut acc = 0f32;
+                for j in 0..inter {
+                    acc += actv[j] * d_flat[h * inter + j];
+                }
+                want[h] += rsf * weights[p] * acc;
+            }
+        }
+        let mut max_abs = 0f32;
+        let mut scale = 1e-6f32;
+        for (g, wv) in got.iter().zip(&want) {
+            max_abs = max_abs.max((g - wv).abs());
+            scale = scale.max(g.abs()).max(wv.abs());
+        }
+        let rel = max_abs / scale;
+        eprintln!(
+            "[kq-model] kernel vs host on runtime storages: max_abs {max_abs:.3e} rel {rel:.3e}"
+        );
+        assert!(rel < 1e-3, "model-shaped integration diverges (rel {rel:.3e})");
     }
 }

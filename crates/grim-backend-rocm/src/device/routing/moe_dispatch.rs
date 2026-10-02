@@ -1556,3 +1556,109 @@ impl RocmDevice {
         Ok(stream)
     }
 }
+
+impl RocmDevice {
+    /// Native K-quant grouped dispatch (`grim_moe_fused_dispatch_kq_native`):
+    /// gate/up decode in-register from the resident IQ3_S per-expert banks,
+    /// down from Q4_K, addressed through device pointer arrays (one u64 base
+    /// pointer per expert — the banks themselves are the model's own weights,
+    /// so this arm allocates no weight bytes). One block per (token, expert)
+    /// pair; routing read from device buffers; capture-safe. Output is
+    /// zeroed here via a stream memset, then accumulated with
+    /// `routed_scaling * w`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_fused_dispatch_kq_native_into(
+        &self,
+        activations: &RocmStorage,
+        gate_ptrs: &RocmStorage,
+        up_ptrs: &RocmStorage,
+        down_ptrs: &RocmStorage,
+        routing_tokens: &RocmStorage,
+        routing_experts: &RocmStorage,
+        routing_weights: &RocmStorage,
+        num_pairs: usize,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        gate_row_bytes: u64,
+        down_row_bytes: u64,
+    ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let a_ptr = activations
+            .device_ptr
+            .ok_or_else(|| Error::Backend("kq dispatch: activations has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("kq dispatch: out has no device ptr".into()))?;
+
+        check_hip("kq dispatch hipMemsetAsync(out, 0)", unsafe {
+            hipMemsetAsync(
+                out_ptr as *mut c_void,
+                0,
+                out_storage.bytes(),
+                self.active_stream(),
+            )
+        })?;
+
+        if num_pairs == 0 {
+            return Ok(self.active_stream());
+        }
+        let mut a = a_ptr as *mut c_void;
+        let mut g = gate_ptrs.device_ptr_checked()? as *mut c_void;
+        let mut u = up_ptrs.device_ptr_checked()? as *mut c_void;
+        let mut d = down_ptrs.device_ptr_checked()? as *mut c_void;
+        let mut tok_ptr = routing_tokens.device_ptr_checked()? as *mut c_void;
+        let mut exp_ptr = routing_experts.device_ptr_checked()? as *mut c_void;
+        let mut w_ptr = routing_weights.device_ptr_checked()? as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_pairs_i = num_pairs as i32;
+        let mut num_experts_i = gate_ptrs.shape().dims()[0] as i32 / 2;
+        let mut batch_i = out_storage.shape().dims()[0] as i32;
+        let mut rsf = routed_scaling_factor;
+        let mut phase_mask_i: i32 = std::env::var("GRIM_MOE_KQ_PHASE_MASK")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(3);
+        let mut gate_row_bytes_i = gate_row_bytes as i32;
+        let mut down_row_bytes_i = down_row_bytes as i32;
+        let mut jlimit_i: i32 = std::env::var("GRIM_MOE_KQ_JLIMIT")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(inter as i32);
+
+        // One 256-thread block per pair; dynamic shared staging holds `inter`
+        // f32 — the size MUST be passed at launch (unsized dynamic LDS page-
+        // faults the GPU; see the WhiteCrow twin of this launcher).
+        let stream = self.launch_compute_kernel_with_solution(
+            "grim_moe_fused_dispatch_kq_native",
+            HipDim3::new(num_pairs as u32, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut [
+                arg(&mut a),
+                arg(&mut g),
+                arg(&mut u),
+                arg(&mut d),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_pairs_i),
+                arg(&mut rsf),
+                arg(&mut num_experts_i),
+                arg(&mut batch_i),
+                arg(&mut phase_mask_i),
+                arg(&mut gate_row_bytes_i),
+                arg(&mut down_row_bytes_i),
+                arg(&mut jlimit_i),
+            ],
+            None,
+            inter * std::mem::size_of::<f32>(),
+        )?;
+        Ok(stream)
+    }
+}
