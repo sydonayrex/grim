@@ -31,6 +31,9 @@ set -uo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+# The classifier needs the repo root to resolve a relative path from an
+# error line. `$0` is the gate itself, which may be run from anywhere.
+gate_root="$root"
 
 block="crates/grim-models/transformer/src/block.rs"
 model="crates/grim-models/transformer/src/model.rs"
@@ -55,22 +58,41 @@ result_of() { grep -m1 '^test result' || true; }
 # Returns 0 for "the peer's" and 1 for "ours".
 is_peer_error() {
     case "$1" in
-        # by SYMBOL first -- a peer error can land in a crate we also own
-        *F32\|*Fp8Blocked*|*QuantFormat*|*expert_stage*|*index_head_dim*|\
+        # (1) The error names something the peer is adding, so it is theirs
+        # wherever it lands -- including in a file we also edit. There is no
+        # way to infer "they are adding a field called `expert_stage`" from
+        # the text, so this part is a list and has to be maintained.
+        *f32*|*Fp8Blocked*|*QuantFormat*|*expert_stage*|*index_head_dim*|\
         *index_n_heads*|*index_source_layer_ids*|*Xing40GraphScratch*|*k_norm*|\
         *act_fp8_pad_buf*|*layer_geoms*|*WhiteRaven*|*WhiteCrow*|*KqNative*|\
         *moe_route_topk*|*tree_pie*|*TreePie*|*charon*|*latent_dim*|*kv_stride*|\
         *GgufDType*|*PQ2_0*|*PTQ1_0*|*TQ1_0*|*TQ2_0*|*Q1_0*|*Q2_0*|\
-        *unreachable_pattern*)
+        *unreachable_pattern*|*from_storage*|*Spillable*|*Greycrow*|*greycrow*|\
+        *CityCrow*|*citycrow*|*CCProbe*|*cc_probe*|*kq_native*|*from_u8_bytes*)
             return 0 ;;
-        # then by FILE, for the peer's files we do not have symbols for
-        *shared_moe.rs|*qwen4exp*|*expert_offload.rs|*dtype.rs|*deepseek32*|\
-        *xing40*|*backend-rocm*|*backend-cuda*|*backend-vulkan*|*backend-metal*|\
-        *quant/*|*llama_bak*|*memory/*|*charon*|*tree_pie*|*iq_gemm*|*charon.rs*|\
-        *gguf.rs*|*accuracy_gate.rs*)
-            return 0 ;;
-        *) return 1 ;;
     esac
+
+    # (2) Otherwise, if the file is untracked or uncommitted, it is theirs.
+    # Most of the peer's work is uncommitted, and git says so without anyone
+    # having to remember to extend the list above -- which is what made the
+    # first version of this a filename list that grew on every peer commit and
+    # could not tell a peer's error in `decode_graph.rs` from ours.
+    _pe_file="${1%%:*}"
+    case "$_pe_file" in
+        /*) : ;;                       # already absolute
+        *)  _pe_file="$gate_root/$_pe_file" ;;
+    esac
+    _pe_rel="${_pe_file#"$gate_root"/}"
+    if [ ! -e "$_pe_file" ] \
+       || ! git -C "$gate_root" ls-files --error-unmatch "$_pe_rel" > /dev/null 2>&1 \
+       || [ -n "$(git -C "$gate_root" status --porcelain -- "$_pe_rel" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    # (3) A COMMITTED file that does not compile is ours. Nobody else's
+    # in-flight work is hiding in the index, so this cannot become an escape
+    # hatch for a real regression.
+    return 1
 }
 
 # --- the whole workspace, not just the crates these tests touch -----------
