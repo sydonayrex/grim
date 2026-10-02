@@ -7748,6 +7748,12 @@ dev.launch_hc_collapse_step(
             // in the bracket, not the destination buffers.
             let mscale = cfg.rope_yarn.map(|y| y.attention_factor).unwrap_or(1.0f32);
             let inv_sqrt_d = mscale * mscale / ((nope + rope_d) as f32).sqrt();
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                eprintln!(
+                    "[xing-graph] SCALE mscale {mscale:.6} nope {nope} rope_d {rope_d} inv_sqrt_d {inv_sqrt_d:.6e} cfg_yarn {:?}",
+                    cfg.rope_yarn.is_some()
+                );
+            }
             if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("append") {
                 return Ok(());
             }

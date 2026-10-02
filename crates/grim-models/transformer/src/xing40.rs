@@ -1607,6 +1607,23 @@ impl Xing40Mla {
                         (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
                         &v[last..last + 4.min(row)]
                     );
+                    // A SEEDED row, element-wise. Rows 0..np-1 reach the graph
+                    // through `seed_kv_arena_from_eager`, and one stale row out
+                    // of ~36 is the right magnitude for the residual attn_out
+                    // gap. Per-row rms (printed above) cannot settle it: a
+                    // wrong row can easily carry the right rms.
+                    let probe_rows = [10usize, (pos as usize).saturating_sub(2)];
+                    for r in probe_rows {
+                        if r < np {
+                            let s = r * row;
+                            eprintln!(
+                                "[xing-trace] SEEDEDROW pos {pos} row {r} rms {:.6e} head {:?}",
+                                (v[s..s + row].iter().map(|x| x * x).sum::<f32>() / row as f32)
+                                    .sqrt(),
+                                &v[s..s + 4.min(row)]
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1625,6 +1642,23 @@ impl Xing40Mla {
                         (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
                         &v[last..last + 4.min(row)]
                     );
+                    // A SEEDED row, element-wise. Rows 0..np-1 reach the graph
+                    // through `seed_kv_arena_from_eager`, and one stale row out
+                    // of ~36 is the right magnitude for the residual attn_out
+                    // gap. Per-row rms (printed above) cannot settle it: a
+                    // wrong row can easily carry the right rms.
+                    let probe_rows = [10usize, (pos as usize).saturating_sub(2)];
+                    for r in probe_rows {
+                        if r < np {
+                            let s = r * row;
+                            eprintln!(
+                                "[xing-trace] SEEDEDROW pos {pos} row {r} rms {:.6e} head {:?}",
+                                (v[s..s + row].iter().map(|x| x * x).sum::<f32>() / row as f32)
+                                    .sqrt(),
+                                &v[s..s + 4.min(row)]
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1654,6 +1688,15 @@ impl Xing40Mla {
         let scale = mscale * mscale / ((nope + rope_d) as f32).sqrt();
         if seq_len == 1 && rank <= 512 && !self.kv_b_proj.weight.dtype().is_quantized() {
             let kernel_scale = 1.0f32 / ((rank + rope_d) as f32).sqrt();
+            if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                eprintln!(
+                    "[xing-trace] SCALE scale {:.6} kernel_scale {:.6} ratio {:.6} mscale {:?}",
+                    scale,
+                    kernel_scale,
+                    scale / kernel_scale,
+                    self.rope.config.yarn.as_ref().map(|y| y.attention_factor)
+                );
+            }
             let ratio = scale / kernel_scale;
             // PRE-scale query dumps, position-tagged: the graph holds the
             // unscaled q_absorbed/q_rope and folds the ratio into the softmax
