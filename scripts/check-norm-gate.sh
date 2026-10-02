@@ -213,7 +213,16 @@ for c in grim-nn grim-models-transformer grim-engine grim-cli \
     check_workspace_still_sound
     out="$(cargo build -p "$c" 2>&1)"
     diag="$(printf '%s' "$out" | grep -cE '^(error|warning)')"
-    [ "$diag" -eq 0 ] && pass "$c builds" || fail "$c: $diag diagnostics"
+    if [ "$diag" -eq 0 ]; then
+        pass "$c builds"
+    else
+        # Re-check AFTER the build too. An edit that lands while this crate is
+        # building is caught by the NEXT iteration's re-check, which means one
+        # FAIL from the crate that was building escapes first -- observed as
+        # `FAIL grim-garage: 4 diagnostics` immediately before a clean BLOCKED.
+        check_workspace_still_sound
+        fail "$c: $diag diagnostics"
+    fi
 done
 
 echo

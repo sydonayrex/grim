@@ -138,20 +138,49 @@ case_is_peer "a norm suite fails to compile"      OURS \
 
 printf '\n=== 4. the structural rule: untracked or uncommitted is theirs\n'
 # The point of rule 2. These need no pattern at all.
-# Do NOT hardcode an untracked file: the peer commits theirs, and a fixture
-# that silently becomes committed turns this from "the structural rule works"
-# into "the structural rule has nothing to test". Find one now, and if there is
-# none, say so rather than assert something vacuous.
-PEER_UNTRACKED_FILE="$(git -C "$REPO" status --porcelain \
-    | awk '$1 == "??" && $2 ~ /\.rs$/ { print $2; exit }')"
-if [ -z "$PEER_UNTRACKED_FILE" ]; then
-    fail "no untracked .rs file exists, so the structural rule is untested -- \
-the peer has committed all of theirs"
+# Do NOT hardcode a fixture. The peer commits and creates files constantly, so
+# a hardcoded one silently changes class -- an untracked file that gets committed
+# becomes a COMMITTED file, and this rule then reports it as OURS, which is the
+# very next assertion. That happened: `whiteraven_journey.rs` and then
+# `citycrow.rs`.
+#
+# Either kind works -- untracked OR uncommitted -- because the rule is "not in
+# the index". Prefer a file that is NOT ours, so the assertion stays honest.
+PEER_FILE=""
+for cand in $(git -C "$REPO" status --porcelain \
+              | awk '$1 == "??" && $2 ~ /\.rs$/ { print $2 }'); do
+    PEER_FILE="$cand"; break
+done
+if [ -z "$PEER_FILE" ]; then
+    for cand in $(git -C "$REPO" status --porcelain \
+                  | awk '$1 != "??" && $2 ~ /\.rs$/ { print $2 }'); do
+        # Skip anything this work owns, or the assertion would be circular.
+        case "$cand" in
+            *model_loader.rs|*modules.rs|*/block.rs|*/model.rs) continue ;;
+        esac
+        PEER_FILE="$cand"; break
+    done
+fi
+if [ -z "$PEER_FILE" ]; then
+    fail "no untracked or uncommitted .rs file exists outside this work, so the \
+structural rule has no live fixture"
 else
-    case_is_peer "an untracked file ($(basename "$PEER_UNTRACKED_FILE"))" PEER \
-        "$PEER_UNTRACKED_FILE:1:1: error: probe"
+    # "committed" here means COMMITTED AND CLEAN, which is the one state that
+    # cannot demonstrate the rule. ls-files alone says tracked, which is true of
+    # a modified file too -- the first version reported "committed" for a file
+    # with uncommitted changes in it.
+    if [ -z "$(git -C "$REPO" status --porcelain -- "$PEER_FILE")" ] \
+       && git -C "$REPO" ls-files --error-unmatch "$PEER_FILE" > /dev/null 2>&1; then
+        fail "$PEER_FILE is committed and clean -- it cannot demonstrate the rule"
+    fi
+    case "$(git -C "$REPO" status --porcelain -- "$PEER_FILE" | cut -c1-2)" in
+        '??') state=untracked ;;
+        *)   state=uncommitted ;;
+    esac
+    case_is_peer "a $state file ($(basename "$PEER_FILE"))" PEER \
+        "$PEER_FILE:1:1: error: probe"
     case_is_peer "the same file with a nonsense symbol" PEER \
-        "$PEER_UNTRACKED_FILE:42:3: error[E0308]: mismatched types: expected `u64`, found `usize`"
+        "$PEER_FILE:42:3: error[E0308]: mismatched types: expected `u64`, found `usize`"
 fi
 
 # A COMMITTED file that does not compile is ours. This is the assertion that

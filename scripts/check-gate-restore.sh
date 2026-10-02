@@ -516,6 +516,35 @@ else
 fi
 
 ###############################################################################
+printf '\n=== 5e. an edit landing DURING a build, not before it\n'
+###############################################################################
+# `check_workspace_still_sound` runs BEFORE each build. An edit that lands while
+# `cargo build -p grim-garage` is running is caught by the NEXT iteration, so
+# one FAIL from the crate that was building escapes first. Observed: exactly
+# one -- `FAIL grim-garage: 4 diagnostics` -- then BLOCKED.
+#
+# The build result must therefore be attributed where it is produced, not only
+# on the following iteration. A test that only checks "the run ends BLOCKED"
+# passes while a FAIL leaks, which is the failure mode this whole work has been
+# chasing.
+# Assert the property directly: the build's FAIL must be preceded by a
+# re-check in the SAME branch. A structural search is the wrong tool here --
+# the first version used awk and matched its own bookkeeping rather than the
+# property, which is why it stayed red after the fix.
+build_loop="$(sed -n '/^echo "=== builds"/,/^done$/p' "$GATE")"
+# -B: the re-check is on the line(s) BEFORE the fail, inside the same else
+# branch. -A looked forward and so never matched -- which is why this stayed
+# red after the fix was in place.
+if printf '%s' "$build_loop" | grep -B3 'fail "\$c: \$diag diagnostics"' \
+     | grep -q 'check_workspace_still_sound'; then
+    pass "a build that fails re-checks before reporting, so an edit landing \
+during the build cannot leak one FAIL"
+else
+    fail "a build reports its FAIL without re-checking, so an edit landing \
+during the build leaks a FAIL before the next iteration blocks"
+fi
+
+###############################################################################
 printf '\n=== 5. this script and the real gate are untouched\n'
 ###############################################################################
 if bash -n "$GATE" 2>/dev/null; then
