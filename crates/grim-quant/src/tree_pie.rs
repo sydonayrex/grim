@@ -84,13 +84,7 @@ pub fn pack_tree_pie_32(values: &[f32; 32]) -> [i32; 5] {
         }
     }
 
-    [
-        payload[0],
-        payload[1],
-        payload[2],
-        payload[3],
-        signs as i32,
-    ]
+    [payload[0], payload[1], payload[2], payload[3], signs as i32]
 }
 
 /// Inverse of [`pack_tree_pie_32`].
@@ -99,8 +93,7 @@ pub fn unpack_tree_pie_32(packed: &[i32; 5]) -> [f32; 32] {
     let mut out = [0f32; 32];
 
     for (i, slot) in out.iter_mut().enumerate() {
-        let nibble =
-            ((packed[i / PER_PAYLOAD_WORD] as u32) >> ((i % PER_PAYLOAD_WORD) * 4)) & 0x0F;
+        let nibble = ((packed[i / PER_PAYLOAD_WORD] as u32) >> ((i % PER_PAYLOAD_WORD) * 4)) & 0x0F;
         let sign = ((signs >> i) & 1) << 4;
         *slot = e2m2_to_f32(nibble as u8 | sign as u8);
     }
@@ -179,10 +172,7 @@ pub fn e2m2_to_fp16_bits(code: TreePieE2M2) -> u16 {
             // m=3 -> 1.5 (field 15, mant 512). The field is 14 + (m >> 1);
             // the mantissa LSB is set only at m=3, which is ((m+1)>>2) -- an
             // (m-1)&1 or m&1 term would put .5 at 1.25 and break the row.
-            (
-                14u16 + (mant >> 1) as u16,
-                (((mant + 1) >> 2) as u16) << 9,
-            )
+            (14u16 + (mant >> 1) as u16, (((mant + 1) >> 2) as u16) << 9)
         }
     } else {
         ((exp as u16) + 15, (mant as u16) << 8)
@@ -302,7 +292,11 @@ pub fn dequant_tree_pie_bytes(raw: &[u8], n: usize) -> Vec<f32> {
 /// Pack `[f32]` into TreePie's byte storage form, the inverse of
 /// [`dequant_tree_pie_bytes`].
 pub fn pack_tree_pie_bytes(values: &[f32]) -> Vec<u8> {
-    assert!(values.len() % 32 == 0, "TreePie needs len % 32 == 0; got {}", values.len());
+    assert!(
+        values.len() % 32 == 0,
+        "TreePie needs len % 32 == 0; got {}",
+        values.len()
+    );
     let groups = values.len() / 32;
     let mut out = Vec::with_capacity(groups * TREE_PIE_WORDS_PER_32 * 4);
     for g in 0..groups {

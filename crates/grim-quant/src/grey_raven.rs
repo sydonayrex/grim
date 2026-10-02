@@ -140,14 +140,7 @@ impl Sparsified {
 ///
 /// Indexed by the 2-bit position code, which is therefore not a bitmask: pair
 /// index 0 is slots (0,1), index 5 is slots (2,3).
-const PAIRS: [[usize; GROUP_SURVIVORS]; 6] = [
-    [0, 1],
-    [0, 2],
-    [0, 3],
-    [1, 2],
-    [1, 3],
-    [2, 3],
-];
+const PAIRS: [[usize; GROUP_SURVIVORS]; 6] = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
 
 /// The position code for a pair of surviving slots.
 fn pair_code(a: usize, b: usize) -> u8 {
@@ -186,10 +179,7 @@ pub fn sparsify_2_4_flat(values: &[f32]) -> Result<Sparsified, &'static str> {
     let groups = values.len() / GROUP;
     let mut out = Sparsified {
         values: Vec::with_capacity(groups * GROUP_SURVIVORS),
-        metadata: vec![
-            0u8;
-            (groups * METADATA_BITS_PER_GROUP as usize).div_ceil(8)
-        ],
+        metadata: vec![0u8; (groups * METADATA_BITS_PER_GROUP as usize).div_ceil(8)],
     };
 
     for g in 0..groups {
@@ -357,7 +347,10 @@ pub fn prune_2of4(
             pairs.push(prune_group_2of4(&grp, &fis));
         }
     }
-    Ok(PruneMask { pairs, groups: rows * groups_per_row })
+    Ok(PruneMask {
+        pairs,
+        groups: rows * groups_per_row,
+    })
 }
 
 /// Flat Fisher-aware sparsify, producing the same [`Sparsified`] as
@@ -511,7 +504,9 @@ pub const fn index_field_for_pair(a: u8, b: u8) -> Option<u8> {
 /// Cheap enough to assert before packing, so a mask that cannot be emitted is
 /// caught at the boundary rather than as a wrong product on the GPU.
 pub fn mask_is_expressible(pairs: &[[u8; 2]]) -> bool {
-    pairs.iter().all(|p| index_field_for_pair(p[0], p[1]).is_some())
+    pairs
+        .iter()
+        .all(|p| index_field_for_pair(p[0], p[1]).is_some())
 }
 
 /// [`prune_group_2of4`] restricted to the pairs SWMMAC can encode.
@@ -564,7 +559,10 @@ pub fn prune_2of4_anchored(
             pairs.push(prune_group_2of4_anchored(&grp, &fis));
         }
     }
-    Ok(PruneMask { pairs, groups: rows * groups_per_row })
+    Ok(PruneMask {
+        pairs,
+        groups: rows * groups_per_row,
+    })
 }
 
 /// [`sparsify_2_4_flat_with_fisher`] using the anchored group rule, so the

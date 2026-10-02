@@ -275,8 +275,7 @@ pub(crate) mod x86 {
                     let mut a_pos = row_m * k;
 
                     for _blk in 0..blocks_per_row {
-                        let w =
-                            crate::dequant_iq3s_block(&b_row[b_pos..b_pos + IQ3S_BLOCK_BYTES]);
+                        let w = crate::dequant_iq3s_block(&b_row[b_pos..b_pos + IQ3S_BLOCK_BYTES]);
 
                         // Vectorized dot product: 32 x 8-lane MAC over the 256 weights.
                         let w_ptr = w.as_ptr();
@@ -457,8 +456,7 @@ pub(crate) mod neon {
                     let mut a_pos = row_m * k;
 
                     for _blk in 0..blocks_per_row {
-                        let w =
-                            crate::dequant_iq3s_block(&b_row[b_pos..b_pos + IQ3S_BLOCK_BYTES]);
+                        let w = crate::dequant_iq3s_block(&b_row[b_pos..b_pos + IQ3S_BLOCK_BYTES]);
 
                         // Vectorized dot product: 64 × 4-lane MAC over the 256 weights.
                         let w_ptr = w.as_ptr();

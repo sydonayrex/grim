@@ -79,25 +79,24 @@ pub const CALIBRATION_SEED: u64 = 0x5C12_4A17;
 /// The value is not hand-written. `calibration_matches_frozen_table` re-derives
 /// it in CI, so the constant cannot silently drift from its provenance -- a
 /// hand-edited table would be invisible otherwise.
-pub const SCRUB_JAY_CODEBOOK: [[i8; SCRUB_JAY_ENTRIES]; SCRUB_JAY_CODEBOOKS]
-    = [
-    [ 1,  8, 11, 14, 16, 18, 20, 21, 23, 24, 25, 27, 28, 29, 30, 31],
-    [ 0,  1,  9, 12, 14, 16, 18, 20, 21, 23, 24, 26, 27, 28, 30, 31],
-    [ 0,  1,  8, 10, 12, 14, 16, 18, 20, 22, 23, 25, 27, 28, 30, 31],
-    [ 0,  1,  6,  9, 11, 13, 15, 17, 19, 21, 22, 24, 26, 28, 29, 31],
-    [ 0,  1,  2,  7,  9, 12, 14, 16, 18, 20, 22, 23, 25, 27, 29, 31],
-    [ 0,  1,  2,  6,  8, 10, 12, 14, 17, 19, 21, 23, 25, 27, 29, 31],
-    [ 0,  1,  1,  2,  7,  9, 11, 13, 16, 18, 20, 22, 24, 26, 29, 31],
-    [ 0,  1,  1,  2,  6,  8, 10, 12, 15, 17, 19, 21, 24, 26, 29, 31],
-    [ 0,  1,  1,  2,  6,  7,  9, 12, 14, 16, 18, 21, 23, 26, 28, 31],
-    [ 0,  1,  1,  2,  2,  7,  9, 11, 13, 15, 18, 20, 23, 25, 28, 31],
-    [ 0,  1,  1,  2,  2,  6,  8, 10, 12, 14, 17, 19, 22, 25, 28, 31],
-    [ 0,  1,  1,  2,  2,  5,  7,  9, 11, 14, 16, 19, 22, 25, 28, 31],
-    [ 0,  1,  1,  1,  2,  2,  7,  8, 11, 13, 16, 18, 21, 24, 28, 31],
-    [ 0,  1,  1,  1,  2,  2,  6,  8, 10, 12, 15, 18, 21, 24, 27, 31],
-    [ 0,  1,  1,  1,  2,  2,  5,  7,  9, 12, 14, 17, 20, 24, 27, 31],
-    [ 0,  1,  1,  1,  2,  2,  5,  7,  9, 11, 14, 17, 20, 23, 27, 31],
-    ];
+pub const SCRUB_JAY_CODEBOOK: [[i8; SCRUB_JAY_ENTRIES]; SCRUB_JAY_CODEBOOKS] = [
+    [1, 8, 11, 14, 16, 18, 20, 21, 23, 24, 25, 27, 28, 29, 30, 31],
+    [0, 1, 9, 12, 14, 16, 18, 20, 21, 23, 24, 26, 27, 28, 30, 31],
+    [0, 1, 8, 10, 12, 14, 16, 18, 20, 22, 23, 25, 27, 28, 30, 31],
+    [0, 1, 6, 9, 11, 13, 15, 17, 19, 21, 22, 24, 26, 28, 29, 31],
+    [0, 1, 2, 7, 9, 12, 14, 16, 18, 20, 22, 23, 25, 27, 29, 31],
+    [0, 1, 2, 6, 8, 10, 12, 14, 17, 19, 21, 23, 25, 27, 29, 31],
+    [0, 1, 1, 2, 7, 9, 11, 13, 16, 18, 20, 22, 24, 26, 29, 31],
+    [0, 1, 1, 2, 6, 8, 10, 12, 15, 17, 19, 21, 24, 26, 29, 31],
+    [0, 1, 1, 2, 6, 7, 9, 12, 14, 16, 18, 21, 23, 26, 28, 31],
+    [0, 1, 1, 2, 2, 7, 9, 11, 13, 15, 18, 20, 23, 25, 28, 31],
+    [0, 1, 1, 2, 2, 6, 8, 10, 12, 14, 17, 19, 22, 25, 28, 31],
+    [0, 1, 1, 2, 2, 5, 7, 9, 11, 14, 16, 19, 22, 25, 28, 31],
+    [0, 1, 1, 1, 2, 2, 7, 8, 11, 13, 16, 18, 21, 24, 28, 31],
+    [0, 1, 1, 1, 2, 2, 6, 8, 10, 12, 15, 18, 21, 24, 27, 31],
+    [0, 1, 1, 1, 2, 2, 5, 7, 9, 12, 14, 17, 20, 24, 27, 31],
+    [0, 1, 1, 1, 2, 2, 5, 7, 9, 11, 14, 17, 20, 23, 27, 31],
+];
 
 /// The frozen table, by reference. No copy: 256 bytes of read-only data read
 /// once per block on a path the GPU will hammer.
@@ -469,7 +468,11 @@ pub fn raw_block_scale(block: &[f32; SCRUB_JAY_BLOCK], pre_scale: f32) -> f32 {
     for &v in block.iter() {
         peak = peak.max(v.abs());
     }
-    let pre = if pre_scale.abs() < 1e-12 { 1.0 } else { pre_scale };
+    let pre = if pre_scale.abs() < 1e-12 {
+        1.0
+    } else {
+        pre_scale
+    };
     if peak == 0.0 {
         1.0
     } else {
@@ -485,8 +488,7 @@ pub fn dequantize_block(
     scale: f32,
     pre_scale: f32,
 ) -> [f32; SCRUB_JAY_BLOCK] {
-    let book = &SCRUB_JAY_CODEBOOK
-        [(selector as usize).min(SCRUB_JAY_CODEBOOKS - 1)];
+    let book = &SCRUB_JAY_CODEBOOK[(selector as usize).min(SCRUB_JAY_CODEBOOKS - 1)];
     let mut out = [0f32; SCRUB_JAY_BLOCK];
     for (i, slot) in out.iter_mut().enumerate() {
         let level = book[(indices[i] as usize).min(SCRUB_JAY_ENTRIES - 1)] as f32;
@@ -525,9 +527,8 @@ pub fn serialize(
     scales: &[f32],
     pre_scale: f32,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        32 + selectors.len() + indices.len() / 2 + signs.len() + scales.len(),
-    );
+    let mut out =
+        Vec::with_capacity(32 + selectors.len() + indices.len() / 2 + signs.len() + scales.len());
     out.extend_from_slice(&(selectors.len() as u64).to_le_bytes());
     out.extend_from_slice(selectors);
     out.extend_from_slice(&(indices.len() as u64).to_le_bytes());
