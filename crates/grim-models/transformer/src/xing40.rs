@@ -2399,11 +2399,28 @@ impl Xing40Block {
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
             if let Ok(v) = streams.to_vec_f32() {
                 let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                eprintln!("[xing-trace] streams_after_attn rms {r:.6e} head {:?}", &v[..4]);
+                eprintln!("[xing-trace] STREAMATTN pos {} rms {r:.6e} head {:?}", positions.last().copied().unwrap_or(u32::MAX), &v[..4]);
             }
         }
         // 4. ffn_hc: collapse for the feed-forward.
         let ffn_gates = self.ffn_hc.gates_d2d(&streams)?;
+        // FFN hc gates, position-tagged: the one layer-0 quantity never
+        // compared across paths at a real prefix. The graph's post[0]/comb[0]
+        // hold exactly these after a replay (the FFN gate call is the last
+        // writer), so the two can be matched by kv_pos.
+        if trace_nan {
+            if let Ok(c) = ffn_gates.comb.to_cpu_vec_f32() {
+                let hc = self.ffn_hc.hc_mult;
+                let rows: Vec<f32> = (0..hc)
+                    .map(|h| (0..hc).map(|k| c[h * hc + k]).sum())
+                    .collect();
+                eprintln!(
+                    "[xing-trace] FFNGATES pos {} comb_rowsums {:?}",
+                    positions.last().copied().unwrap_or(u32::MAX),
+                    rows
+                );
+            }
+        }
         let collapsed = self.ffn_hc.collapse_d2d(&streams, &ffn_gates)?;
         let collapsed = self.ffn_norm.forward(&collapsed)?;
         nan_stage("ffn_in", &collapsed);

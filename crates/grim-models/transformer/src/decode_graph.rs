@@ -8592,10 +8592,150 @@ dev.launch_hc_collapse_step(
                             })
                             .collect();
                         eprintln!("[xing-graph] sin rms {}", parts.join(" "));
+                    // Value-absorb ORACLE, post-replay: attn[h,v] =
+                    // sum_c qattn_latent[h,c] * w_vc[h,v,c]. Both inputs
+                    // survive the replay, so this checks the absorb at the
+                    // real prefix rather than the warmup's slen=1.
+                    {
+                        let w = self.layers[0]
+                            .self_attn
+                            .w_vc_device(0)
+                            .ok()
+                            .flatten()
+                            .and_then(|w| as_rocm(w).ok())
+                            .and_then(|w| w.to_cpu_vec_f32().ok());
+                        let q = g.qattn_latent
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let a = g.attn
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        if let (Some(w), Some(q), Some(a)) = (w, q, a) {
+                            let nh = self.cfg.num_heads;
+                            let vd = self.cfg.v_head_dim;
+                            let rank = self.cfg.kv_lora_rank;
+                            let (mut md, mut rr) = (0.0f32, 0.0f64);
+                            for h in 0..nh {
+                                for v in 0..vd {
+                                    let mut acc = 0.0f32;
+                                    for c in 0..rank {
+                                        acc += q[h * rank + c] * w[(h * vd + v) * rank + c];
+                                    }
+                                    let d = (acc - a[h * vd + v]).abs();
+                                    if d > md {
+                                        md = d;
+                                    }
+                                    rr += (acc as f64) * (acc as f64);
+                                }
+                            }
+                            rr = (rr / (nh * vd) as f64).sqrt();
+                            let rg =
+                                (a.iter().map(|x| x * x).sum::<f32>() / a.len().max(1) as f32).sqrt();
+                            eprintln!(
+                                "[xing-graph] ABSORB post-replay vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                md as f64 / rr.max(1e-12)
+                            );
+                        }
+                    }
+
+                    // Post-attention stream (sout[0]) - the other input to the
+                    // FFN write-back, and the product of the attention branch.
+                    if let Some(sb) = g.sout.first() {
+                        if let Ok(st) = as_rocm(sb.as_ref()) {
+                            if let Ok(v) = st.to_cpu_vec_f32() {
+                                let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                    / v.len().max(1) as f32)
+                                    .sqrt();
+                                eprintln!(
+                                    "[xing-graph] STREAMATTN pos {} rms {r:.6e} head {:?}",
+                                    graph.buffers.current_pos,
+                                    &v[..4]
+                                );
+                            }
+                        }
+                    }
+                    // FFN WRITE-BACK ORACLE, POST-REPLAY. Every input
+                    // survives the replay: sout[0] (post-attention stream),
+                    // norm_buf[0] (the FFN output - the FFN gate call is the
+                    // last writer), post[0]/comb[0] (the FFN's own gates) and
+                    // sin[1] (the result). The warmup version of this check
+                    // only ever saw slen=1.
+                    if let (Some(sb), Some(nbb), Some(pb), Some(cb), Some(ob)) = (
+                        g.sout.first(),
+                        graph.buffers.norm_buf.first(),
+                        g.post.first(),
+                        g.comb.first(),
+                        g.sin.get(1),
+                    ) {
+                        let got = (
+                            as_rocm(sb.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
+                            as_rocm(nbb).and_then(|x| x.to_cpu_vec_f32()),
+                            as_rocm(pb.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
+                            as_rocm(cb.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
+                            as_rocm(ob.as_ref()).and_then(|x| x.to_cpu_vec_f32()),
+                        );
+                        if let (Ok(sinv), Ok(nbv), Ok(pv), Ok(cv), Ok(outv)) = got {
+                            let hid = self.cfg.hidden_size;
+                            let hc4 = self.cfg.hc_mult;
+                            let (mut md, mut rr) = (0.0f32, 0.0f64);
+                            for d in 0..hid {
+                                for h in 0..hc4 {
+                                    let mut acc = pv[h] * nbv[d];
+                                    for k in 0..hc4 {
+                                        acc += cv[h * hc4 + k] * sinv[k * hid + d];
+                                    }
+                                    let diff = (acc - outv[h * hid + d]).abs();
+                                    if diff > md {
+                                        md = diff;
+                                    }
+                                    rr += (acc as f64) * (acc as f64);
+                                }
+                            }
+                            rr = (rr / (hc4 * hid) as f64).sqrt();
+                            let rg = (outv.iter().map(|x| x * x).sum::<f32>()
+                                / outv.len().max(1) as f32)
+                                .sqrt();
+                            eprintln!(
+                                "[xing-graph] FFWB pos {} vs HOST oracle: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                graph.buffers.current_pos,
+                                md as f64 / rr.max(1e-12)
+                            );
+                        }
+                    }
+
+                    // Layer 0's FFN hc gates, post-replay: the FFN gate call
+                    // is the last writer of comb[0]/post[0], so these survive
+                    // and are directly comparable with eager's FFNGATES line.
+                    if let Some(c) = g.comb.first() {
+                        if let Ok(st) = as_rocm(c.as_ref()) {
+                            if let Ok(v) = st.to_cpu_vec_f32() {
+                                let hc4 = self.cfg.hc_mult;
+                                let rows: Vec<f32> = (0..hc4)
+                                    .map(|h| (0..hc4).map(|k| v[h * hc4 + k]).sum())
+                                    .collect();
+                                eprintln!(
+                                    "[xing-graph] FFNGATES pos {} comb_rowsums {:?}",
+                                    graph.buffers.current_pos,
+                                    rows
+                                );
+                            }
+                        }
+                    }
+                    // Layer 0's OUTPUT stream at this replay, tagged with the
+                    // position so it can be matched against eager's "L1 in".
                     if let Some(b) = g.sin.get(1) {
                         if let Ok(st) = as_rocm(b.as_ref()) {
                             if let Ok(v) = st.to_cpu_vec_f32() {
-                                eprintln!("[xing-graph] sin1 head {:?}", &v[..v.len().min(6)]);
+                                let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                    / v.len().max(1) as f32)
+                                    .sqrt();
+                                eprintln!(
+                                    "[xing-graph] SIN1 pos {} rms {r:.6e} head {:?}",
+                                    graph.buffers.current_pos,
+                                    &v[..v.len().min(4)]
+                                );
                             }
                         }
                     }
