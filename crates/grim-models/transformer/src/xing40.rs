@@ -2673,6 +2673,22 @@ impl CausalLm for Xing40 {
         // The graph head reads the mean of the hc streams then output-norm;
         // this is the same quantity, so it is the parity comparison point.
         xing_trace_stage("head input (normed collapsed)", &normed);
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            // The position is what names a decode step: run.rs interleaves
+            // eager and graph steps, so trace-line order is not the step.
+            if let Ok(v) = normed.to_vec_f32() {
+                let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                let pos = positions
+                    .to_vec_f32()
+                    .ok()
+                    .and_then(|p| p.last().copied())
+                    .unwrap_or(-1.0);
+                eprintln!(
+                    "[xing-trace] HEADINPUT pos {pos} rms {r:.6e} head {:?}",
+                    &v[..4.min(v.len())]
+                );
+            }
+        }
         let logits = self.output.forward(&normed)?;
         session.advance_pos(seq_len);
         Ok(logits)

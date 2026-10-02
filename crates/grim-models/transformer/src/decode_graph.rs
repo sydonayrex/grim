@@ -8644,9 +8644,8 @@ dev.launch_hc_collapse_step(
                     }
                     if let Ok(b) = as_rocm(g.meaned.as_ref()) {
                         if let Ok(v) = b.to_cpu_vec_f32() {
-                            let nan = v.iter().filter(|x| x.is_nan()).count();
                             let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                            eprintln!("[xing-graph] meaned: len {} nan {nan} rms {rms:.4e} head {:?}", v.len(), &v[..v.len().min(4)]);
+                            eprintln!("[xing-graph] HEADINPUT pos {} rms {rms:.6e} head {:?}", graph.buffers.current_pos, &v[..v.len().min(4)]);
                         }
                     }
                 }
