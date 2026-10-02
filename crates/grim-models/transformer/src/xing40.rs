@@ -1740,6 +1740,82 @@ impl Xing40Mla {
             ))?;
             if let Some(_handle) = fused {
                 let attn = wrap_like(x, attn, attn_shape);
+                // EAGER ATTENTION ORACLE. Every other stage on BOTH sides
+                // passes a host oracle, yet their `attn` differ by ~3% - and
+                // every other oracle STARTS DOWNSTREAM of this quantity, so it
+                // is the one link never checked against ground truth.
+                //
+                // Placed here, INSIDE the fused branch and after a device
+                // sync, because placed before the call it reads an unwritten
+                // buffer (dev_rms 0.0 -> a bogus rel 3.6). `dev_rms` is
+                // printed so a zero can never again be mistaken for a result.
+                if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                    const NOUT: usize = 256;
+                    grim_backend_rocm::RocmDevice::shared(ordinal).synchronize();
+                    let got = attn.to_vec_f32().ok();
+                    let qa = q_absorbed.to_vec_f32().ok();
+                    let qr = q_rope.to_vec_f32().ok();
+                    let kv = latent_all.to_vec_f32().ok();
+                    if let (Some(got), Some(qa), Some(qr), Some(kv)) = (got, qa, qr, kv) {
+                        let row = rank + rope_d;
+                        let slen = (kv.len() / row.max(1)).min(total_kv_len);
+                        let mut lat = vec![0.0f32; nh * rank];
+                        let mut scores = vec![0.0f32; slen];
+                        for h in 0..nh {
+                            for t in 0..slen {
+                                let mut sc = 0.0f32;
+                                for c in 0..rank {
+                                    sc += qa[h * rank + c] * kv[t * row + c];
+                                }
+                                for r in 0..rope_d {
+                                    sc += qr[h * rope_d + r] * kv[t * row + rank + r];
+                                }
+                                scores[t] = sc * scale;
+                            }
+                            let mx =
+                                scores[..slen].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            let mut ex = vec![0.0f32; slen];
+                            let mut sum = 0.0f32;
+                            for t in 0..slen {
+                                ex[t] = (scores[t] - mx).exp();
+                                sum += ex[t];
+                            }
+                            let iv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                            for c in 0..rank {
+                                let mut acc = 0.0f32;
+                                for t in 0..slen {
+                                    acc += ex[t] * iv * kv[t * row + c];
+                                }
+                                lat[h * rank + c] = acc;
+                            }
+                        }
+                        let w_vc = &self.w_vc;
+                        let n = NOUT.min(got.len());
+                        let mut refv = vec![0.0f32; n];
+                        for idx in 0..n {
+                            let h = idx / vd;
+                            let mut acc = 0.0f32;
+                            for c in 0..rank {
+                                let wi = (idx * rank + c) % w_vc.len().max(1);
+                                acc += lat[h * rank + c] * w_vc[wi];
+                            }
+                            refv[idx] = acc;
+                        }
+                        let md = refv[..n]
+                            .iter()
+                            .zip(got[..n].iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        let rr =
+                            (refv[..n].iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32).sqrt();
+                        let rg =
+                            (got[..n].iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32).sqrt();
+                        eprintln!(
+                            "[xing-trace] EAGER ATTN vs HOST (slen {slen}, first {n}): max_abs {md:.4e} rel {:.4e} host_rms {rr:.4e} dev_rms {rg:.4e}",
+                            md as f64 / (rr as f64).max(1e-12)
+                        );
+                    }
+                }
                 // Same host oracle the graph path runs, so the two o_proj
                 // results are measured against ONE ground truth rather than
                 // against each other.
