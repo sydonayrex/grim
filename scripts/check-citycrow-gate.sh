@@ -89,17 +89,18 @@ check() {
 check "lane stride 8 codes/word -> 4" \
     't.replace("let word = i / 8;", "let word = i / 4;")'
 
-# 2. The zero point. Offset-binary means 2 for a 2-bit code. Zero disables the
-#    two-dot correction and every weight reads as code*scale.
-check "zero point 1<<1 -> 1<<0" \
-    't.replace("KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => 1u8 << 1,",
-             "KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => 1u8 << 0,")'
+# 2. The zero point is MEASURED from the decoder, so the mutation that
+#    matters is one that breaks the probe: make it pick the wrong code.
+check "zero-point probe picks the wrong code" \
+    't.replace(".find(|&c| got[c as usize].abs() < 1e-3)",
+             ".find(|&c| got[c as usize].abs() < 1.5)")'
 
-# 3. The scheme dispatch. Sending GsqRco through the Q2_0 decoder is the exact
-#    silent-wrong-weights failure the module documents.
-check "gsqrco decoded as q2_0" \
-    't.replace("KQuantScheme::GsqRco3p5 => dequant_gsq_rco_3p5(data, num_weights)?,",
-             "KQuantScheme::GsqRco3p5 => dequant_q2_0(data, num_weights)?,")'
+# 3. The packer's bias must track the probed bias. If it drifts, a fixture
+#    round-trips through the wrong codebook -- the exact silent-wrong-weights
+#    failure the module exists to prevent.
+check "packer bias detached from the probe" \
+    't.replace("let t = (w / d + zero_point_probe() as f32).round().clamp(0.0, 3.0) as u8;",
+             "let t = (w / d + 1.0).round().clamp(0.0, 3.0) as u8;")'
 
 # 4. The group-size guard. Removing it lets a K that is not a multiple of 128
 #    through, and the dot8 accumulator then reads across a group boundary.

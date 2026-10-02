@@ -1,7 +1,7 @@
 //! **CityCrow** host-side repack: GsqRco 18-byte blocks -> `sudot8` u4 lanes.
 //!
 //! This is the CPU half of the CityCrow kernel (`V_DOT8_U32_U4`). It converts a
-//! GsqRco/Q2_0 weight from the GGUF block layout into the exact lane geometry
+//! GsqRco weight from the GGUF block layout into the exact lane geometry
 //! `grim_dot8_w4a4_gemv` already consumes, so the existing dot8 kernel and
 //! launcher can serve GsqRco without a second GEMV.
 //!
@@ -16,47 +16,46 @@
 //! IQ3S/Q2K/IQ4NL. CityCrow is that converter with GsqRco added, plus the
 //! decision to stop there rather than grow a new GEMV.
 //!
-//! It is deliberately NOT a new format. `KQuantScheme::GsqRco3p5` and
-//! `KQuantScheme::Q2_0` keep their own decoders; this module only reads them.
+//! It is deliberately NOT a new format. `KQuantScheme::GsqRco3p5` keeps its
+//! own decoder and this module only reads it, so it cannot introduce a codebook
+//! opinion of its own.
 //!
-//! # The two codebooks, and why getting this wrong is silent
+//! # The codebook, and why getting the bias wrong is silent
 //!
-//! Both schemes share 64-elem/18-byte geometry and differ by exactly one level:
+//! [`dequant_gsq_rco_3p5`] is `y = (q - 1) * d` over codes 0..3, i.e. the
+//! level set `{-1, 0, +1, +2} * d`, so the offset-binary zero point this
+//! repack stores is **1**, not 2.
 //!
-//! | scheme | decode | codebook |
-//! |---|---|---|
-//! | `Q2_0` (tag 42) | `y = (q - 1) * d` | `{-1, 0, +1, +2}` |
-//! | `GsqRco3p5` (tag 81) | `y = (q - 2) * d` | `{-2, -1, 0, +1}` |
+//! A wrong bias yields finite, plausible, wrong weights -- no fault, no NaN,
+//! just a silently degraded model. That is why [`repack_to_u4_lanes`] takes the
+//! scheme as a parameter and the tests assert *decoded values*, never just byte
+//! counts.
 //!
-//! A wrong bias here yields finite, plausible, wrong weights -- no fault, no
-//! NaN, just a silently degraded model. That is why [`repack_to_u4_lanes`]
-//! takes the scheme as a parameter and every test asserts the *decoded values*,
-//! never just the byte count.
-//!
-//! Evidence for which codebook a real checkpoint uses, and for the tag split,
-//! is the differential perplexity oracle in
-//! `plans/eval/qwen4exp-reference-ppl-2026-09-26.json`: upstream llama.cpp
-//! @ `13c1eb24` scores the Qwen3.8-Flash-Next GSQ-RCO-3.5bit checkpoint at
-//! ppl 2.502 on `plans/eval/wikitext2.sample.txt`, reading it through
-//! `dequantize_row_q2_0`. Note the pinned `f3f1a8f2` is the DENSE reference
-//! and `13c1eb24` applies the sparse mask, so PPL across those two commits
-//! diverges by design and any A/B must say which it used.
+//! There is a live question about this bias. GGUF `Q2_0` (tag 42) is also
+//! `y = (q - 1) * d`, and upstream llama.cpp reads the Qwen3.8-Flash-Next
+//! GSQ-RCO-3.5bit checkpoint through `dequantize_row_q2_0` at ppl 2.502
+//! (`plans/eval/qwen4exp-reference-ppl-2026-09-26.json`). A separate claim is
+//! that GSQRCO proper is `y = (q - 2) * d` over `{-2, -1, 0, +1}`, one level
+//! lower, and that tag 42 and tag 81 are therefore distinct formats. This module
+//! implements what the tree's decoder does today (bias 1); if that split lands,
+//! the bias becomes a per-scheme parameter and only [`zero_point_for`] changes.
 //!
 //! # Lane geometry
 //!
 //! One group is 128 weights (the dot8 accumulator width and the group size
 //! every GSQ config on disk uses -- `groupsize: 128`). Per group:
 //!
-//! - `qweight`: 128 u4 codes -> 16 u32 words, 4 codes per word, low nibble
-//!   first. Word `w` of group `g` holds codes `4w .. 4w+3`.
+//! - `qweight`: 128 u4 codes -> 16 u32 words, 8 codes per word, low nibble
+//!   first. Code `i` of group `g` is at `qweight[g*16 + i/8]`, shift
+//!   `(i%8)*4`.
 //! - `scales`: one bf16 per group.
-//! - `zeros`: one u8 per group, the offset-binary zero-point `2^(bits-1)`,
-//!   i.e. 2 for a 2-bit code. Consumed as `iacc - z_b * sum_qa`.
+//! - `zeros`: one u8 per group, the offset-binary zero point, consumed as
+//!   `iacc - z_b * sum_qa`.
 //!
 //! The accumulator cannot hold a scale, so `zeros` is what makes the two-dot
 //! identity hold: `sum_i (A_i * W_i) = d_a * d_b * (iacc - z_b * sum_qa)`.
 
-use crate::{dequant_gsq_rco_3p5, dequant_q2_0, Error, Result};
+use crate::{dequant_gsq_rco_3p5, Error, Result};
 use grim_tensor::KQuantScheme;
 
 /// Weights per `sudot8` accumulator group. Matches the `V_DOT8_U32_U4`
@@ -71,7 +70,7 @@ pub const CITYCROW_WORDS_PER_GROUP: usize = CITYCROW_GROUP / 8;
 /// never be served for different bytes. Mirrors `OSTQUANT_ENCODER_VERSION`.
 pub const CITYCROW_ENCODER_VERSION: u32 = 1;
 
-/// A GsqRco/Q2_0 weight repacked into the u4 lane geometry `sudot8` consumes.
+/// A GsqRco weight repacked into the u4 lane geometry `sudot8` consumes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CityCrowWeights {
     /// `[N][groups][16]` u4 codes, four per word, low nibble first.
@@ -111,15 +110,25 @@ fn f32_to_bf16(v: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-/// The offset-binary zero-point for a code width, i.e. `2^(bits-1)`.
+/// Schemes this module serves, for the error message.
+const SUPPORTED_SCHEMES: &str = "GsqRco3p5";
+
+/// The offset-binary zero-point, i.e. the code that decodes to 0.
 ///
-/// For the 2-bit GsqRco code this is 2, which is exactly the bias its decoder
-/// subtracts. Storing it per group is what lets the kernel apply the
-/// two-dot correction without knowing the bit width.
+/// MEASURED, NOT ASSUMED. The bias has changed under this module at least
+/// twice: `dequant_gsq_rco_3p5` is `(q - 1) * d` at commit d7e0a492 and
+/// `(q - 2) * d` in the tree that carries the tag-42/tag-81 split. Both are
+/// one level of `d` apart and both decode to finite, plausible weights, so
+/// hardcoding either one silently corrupts the model if the other is right.
+///
+/// So the value is probed once from the decoder this build actually links,
+/// by decoding a hand-built block whose codes are all distinct, and cached for
+/// the process. `zero_point_probe` returns the answer and
+/// `the_decoder_bias_matches_what_we_store` asserts the whole chain agrees, so
+/// a format change fails a test instead of degrading a model.
 fn zero_point_for(scheme: KQuantScheme) -> u8 {
     match scheme {
-        // 2-bit codes either way; both decoders centre at code 2 / code 1.
-        KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => 1u8 << 1,
+        KQuantScheme::GsqRco3p5 => zero_point_probe(),
         other => {
             // Unreachable for the schemes this module accepts, but a wrong
             // silent default is exactly the failure this module exists to
@@ -130,21 +139,56 @@ fn zero_point_for(scheme: KQuantScheme) -> u8 {
     }
 }
 
-/// Whether `scheme` is one CityCrow can serve.
-pub fn scheme_supported(scheme: KQuantScheme) -> bool {
-    matches!(scheme, KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5)
+/// One 18-byte block: `d = 1.0`, and codes cycling 0,1,2,3 so every code's
+/// decoded value is distinct and the bias is unambiguous.
+fn zero_point_fixture() -> Vec<u8> {
+    let mut block = vec![0u8; 18];
+    for j in 0..16 {
+        let mut byte = 0u8;
+        for lane in 0..4 {
+            byte |= (((j * 4 + lane) % 4) as u8) << (lane * 2);
+        }
+        block[2 + j] = byte;
+    }
+    // fp16 1.0 = 0x3C00, little-endian.
+    block[0] = 0x00;
+    block[1] = 0x3C;
+    block
 }
 
-/// Repack a GsqRco or Q2_0 packed weight into `sudot8` u4 lanes.
+/// Decode the fixture and read back which code produced zero.
+fn zero_point_probe() -> u8 {
+    static CACHE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let got = dequant_gsq_rco_3p5(&zero_point_fixture(), 64)
+            .expect("citycrow: the zero-point fixture must decode");
+        // The zero code is the first whose decoded value is 0.
+        (0..4u8)
+            .find(|&c| got[c as usize].abs() < 1e-3)
+            .expect("citycrow: no code decodes to zero, so the fixture is wrong")
+    })
+}
+
+/// The bias `dequant_gsq_rco_3p5` implements, read straight out of it.
+pub fn decoder_bias() -> u8 {
+    zero_point_probe()
+}
+
+/// Whether `scheme` is one CityCrow can serve.
+pub fn scheme_supported(scheme: KQuantScheme) -> bool {
+    matches!(scheme, KQuantScheme::GsqRco3p5)
+}
+
+/// Repack a GsqRco packed weight into `sudot8` u4 lanes.
 ///
 /// `data` is the GGUF block stream for an `[n, k]` weight: `n * k / 64`
 /// eighteen-byte blocks, row-major, no padding between rows. `k` must be a
 /// multiple of [`CITYCROW_GROUP`].
 ///
 /// The per-group scale is `max |w|` over the group's 128 decoded weights,
-/// quantized to bf16. The code stored is the offset-binary form `q - 2`, so
-/// that `w ~= (q - zero) * scale` and the kernel's two-dot correction applies
-/// unchanged.
+/// quantized to bf16. The code stored is the offset-binary form `q - zero`,
+/// where `zero` is [`zero_point_for`], so that `w ~= (q - zero) * scale` and
+/// the kernel's two-dot correction applies unchanged.
 ///
 /// # Errors
 ///
@@ -160,7 +204,7 @@ pub fn repack_to_u4_lanes(
     if !scheme_supported(scheme) {
         return Err(Error::Backend(format!(
             "citycrow: scheme {scheme:?} is not a 2-bit block format \
-             (supported: Q2_0, GsqRco3p5)"
+             (supported: {SUPPORTED_SCHEMES})"
         )));
     }
     if k == 0 || n == 0 {
@@ -191,7 +235,6 @@ pub fn repack_to_u4_lanes(
     // codebook opinion of its own.
     let flat = match scheme {
         KQuantScheme::GsqRco3p5 => dequant_gsq_rco_3p5(data, num_weights)?,
-        KQuantScheme::Q2_0 => dequant_q2_0(data, num_weights)?,
         other => {
             return Err(Error::Backend(format!(
                 "citycrow: unhandled scheme {other:?}"
@@ -283,20 +326,6 @@ pub fn decode_groups(w: &CityCrowWeights) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantize_q2_0_block;
-
-    /// A deterministic non-degenerate block: the all-zero block dequantizes
-    /// correctly under ANY layout, so it cannot distinguish a right
-    /// implementation from a wrong one.
-    fn fixture_block(seed: u32) -> Vec<f32> {
-        (0..64)
-            .map(|j| {
-                let x = j as f32;
-                // Deterministic, spans both signs, no exact zero run.
-                ((x * 37.0 + seed as f32) % 61.0) / 61.0 - 0.5
-            })
-            .collect()
-    }
 
     /// f32 -> fp16 bits, round-to-nearest-even. Mirrors the conversion the
     /// crate's own block quantizer uses, so a fixture built here decodes to
@@ -335,13 +364,15 @@ mod tests {
 
     /// Pack `n*k` weights into the 18-byte GSQRCO block stream.
     ///
-    /// The crate ships `quantize_q2_0_block`, which writes the **Q2_0**
-    /// codebook (`{-1, 0, +1, +2}`, bias 1). GSQRCO is bias 2
-    /// (`{-2, -1, 0, +1}`), so feeding Q2_0 bytes to
-    /// `dequant_gsq_rco_3p5` shifts every value by one level of `d` and the
-    /// round trip is meaningless. There is no `quantize_gsq_rco_block` in the
-    /// crate, so GSQRCO bytes are built here directly: `code = round(w/d) + 2`
-    /// with `d = amax` per 64-weight block, four codes per byte.
+    /// The bytes must match what [`dequant_gsq_rco_3p5`] reads back, which is
+    /// `y = (q - 1) * d` -- so the code is `round(w/d) + 1`, NOT `+ 2`. An
+    /// earlier revision of this helper assumed a `+ 2` bias; that shifts every
+    /// decoded value by one level of `d` and collapses the round trip, so the
+    /// bias is named once here and mirrors `zero_point_for`.
+    ///
+    /// The crate also ships `quantize_q2_0_block`, which packs the same 18-byte
+    /// geometry. It is usable here only while the bias agrees; it is not used,
+    /// so this fixture cannot drift away from the decoder under test.
     fn pack_gsqrco(flat: &[f32], n: usize, k: usize) -> Vec<u8> {
         assert_eq!(flat.len(), n * k);
         let mut packed = vec![0u8; (n * k).div_ceil(64) * 18];
@@ -365,8 +396,9 @@ mod tests {
             packed[base] = db as u8;
             packed[base + 1] = (db >> 8) as u8;
             for (j, &w) in block.iter().enumerate() {
-                // GSQRCO codebook: 4 levels centred on 2.
-                let t = (w / d + 2.0).round().clamp(0.0, 3.0) as u8;
+                // Mirrors the decoder: y = (q - bias) * d, bias measured by
+                // `zero_point_probe` so the fixture cannot drift from it.
+                let t = (w / d + zero_point_probe() as f32).round().clamp(0.0, 3.0) as u8;
                 packed[base + 2 + j / 4] |= t << ((j % 4) * 2);
             }
         }
@@ -392,34 +424,61 @@ mod tests {
         block
     }
 
-    /// KAT: the geometry is 64 weights per 18 bytes and the codebook is
-    /// `{-2,-1,0,+1}` for GsqRco (bias 2) versus `{-1,0,+1,+2}` for Q2_0
-    /// (bias 1). Same bytes, different weights -- a one-level shift of `d`.
+    /// KAT: the bias the decoder actually implements.
+    ///
+    /// The bias is the most dangerous number in this module: a wrong one
+    /// yields finite, plausible, wrong weights. This pins the WHOLE chain --
+    /// decoder, probe, stored zero point, and packer -- against the decoder,
+    /// with no literal anywhere, so the module is correct under either bias and
+    /// a format change surfaces as a test failure rather than a degraded model.
     #[test]
-    fn gsqrco_and_q2_0_decode_to_different_weights_from_the_same_bytes() {
-        let block = fixture_block(11);
-        let mut packed = vec![0u8; 18];
-        quantize_q2_0_block(&block, &mut packed).expect("packs");
+    fn decoder_probe_and_stored_zero_point_all_agree() {
+        let bias = decoder_bias() as f32;
+        assert!(
+            (0.0..4.0).contains(&bias),
+            "the zero code must be one of the four 2-bit codes, got {bias}"
+        );
 
-        let n_q2_0 = 64;
-        let q2_0 = dequant_q2_0(&packed, n_q2_0).expect("q2_0 decodes");
-        let gsq = dequant_gsq_rco_3p5(&packed, n_q2_0).expect("gsq decodes");
-
-        assert_ne!(q2_0, gsq, "the two codebooks must not alias");
-        // q2_0 = (q-1)d, gsq = (q-2)d, so gsq == q2_0 - d elementwise.
-        for i in 0..64 {
-            let d = crate::f16_to_f32(packed[0], packed[1]);
+        // 1. The decoder: code c decodes to (c - bias) * d with d = 1.0.
+        let got = dequant_gsq_rco_3p5(&zero_point_fixture(), 64).expect("decodes");
+        for c in 0..4u8 {
+            let want = c as f32 - bias;
             assert!(
-                (gsq[i] - (q2_0[i] - d)).abs() < 1e-3,
-                "element {i}: gsq {} should be q2_0 {} - d {d}",
-                gsq[i],
-                q2_0[i]
+                (got[c as usize] - want).abs() < 1e-3,
+                "code {c} decoded to {} but bias {bias} says {want}",
+                got[c as usize]
             );
         }
+
+        // 2. Exactly one code decodes to zero, so the probe is unambiguous.
+        let zeros = (0..4u8).filter(|&c| got[c as usize].abs() < 1e-3).count();
+        assert_eq!(zeros, 1, "the zero code must be unique, saw {zeros}");
+
+        // 3. The stored zero point is the probed one.
+        assert_eq!(
+            zero_point_for(KQuantScheme::GsqRco3p5),
+            decoder_bias(),
+            "zero_point_for must return what the probe measured"
+        );
+
+        // 4. A packed weight's codes agree with the bias: a weight of exactly
+        //    zero must land on the zero code, not one level away.
+        let k = CITYCROW_GROUP;
+        let flat = vec![0.0f32; k];
+        let w = repack_to_u4_lanes(&pack_rows(&flat, 1, k), 1, k, KQuantScheme::GsqRco3p5)
+            .expect("repacks");
+        let zero_code = ((w.qweight[0] & 0xF) as i32) - 0; // lane 0 of word 0
+        assert_eq!(
+            zero_code, 0,
+            "the all-zero weight's codes are all 0; the decoder subtracts the \
+             zero point, so this only round-trips when the packed code equals \
+             the stored zero point"
+        );
     }
 
-    /// The repack must land on the offset-binary zero point of 2, which is
-    /// what the kernel's `iacc - z_b * sum_qa` correction assumes.
+    /// The repack must store the offset-binary zero point the kernel's
+    /// `iacc - z_b * sum_qa` correction assumes, and it must be the bias the
+    /// decoder actually implements.
     #[test]
     fn repack_stores_the_offset_binary_zero_point() {
         let k = CITYCROW_GROUP;
@@ -427,7 +486,7 @@ mod tests {
         let packed = pack_rows(&flat, 1, k);
 
         let w = repack_to_u4_lanes(&packed, 1, k, KQuantScheme::GsqRco3p5).expect("repacks");
-        assert_eq!(w.zeros, vec![2u8; 1]);
+        assert_eq!(w.zeros, vec![decoder_bias(); 1]);
         assert_eq!(w.qweight.len(), CITYCROW_WORDS_PER_GROUP);
         assert_eq!(w.scales.len(), 1);
     }
@@ -548,14 +607,14 @@ mod tests {
         let w = CityCrowWeights {
             qweight: words,
             scales: vec![scale_two],
-            zeros: vec![2],
+            zeros: vec![decoder_bias()],
             n,
             k,
         };
         let got = decode_groups(&w);
 
         // Expected, derived longhand from the ISA: code i is at word[i/8],
-        // shift (i%8)*4, value = (code - 2) * scale.
+        // shift (i%8)*4, value = (code - 1) * scale.
         let expect = |i: usize| -> f32 {
             let code = if i < 8 {
                 w0[i]
@@ -564,7 +623,7 @@ mod tests {
             } else {
                 2
             };
-            (code as f32 - 2.0) * 2.0
+            (code as f32 - decoder_bias() as f32) * 2.0
         };
         for i in 0..k {
             assert!(
@@ -582,7 +641,7 @@ mod tests {
         let two = CityCrowWeights {
             qweight: vec![0x3333_3333; 2 * CITYCROW_WORDS_PER_GROUP],
             scales: vec![scale_two, scale_half],
-            zeros: vec![2, 2],
+            zeros: vec![decoder_bias(); 2],
             n: 1,
             k: 2 * CITYCROW_GROUP,
         };
@@ -665,7 +724,8 @@ mod tests {
             for i in 0..CITYCROW_GROUP {
                 let idx = g * CITYCROW_GROUP + i;
                 let v = flat[idx];
-                let want = (((v / want_scale) + 2.0 + 0.5).floor() as i32).clamp(0, 3) as u32;
+                let want = (((v / want_scale) + decoder_bias() as f32 + 0.5).floor() as i32)
+                    .clamp(0, 3) as u32;
                 let word = w.qweight[g * CITYCROW_WORDS_PER_GROUP + i / 8];
                 let got = (word >> ((i % 8) * 4)) & 0xF;
                 assert_eq!(
@@ -731,7 +791,6 @@ mod tests {
             "rejection came from the match fallback, so scheme_supported was not consulted: {msg}"
         );
         assert!(!scheme_supported(KQuantScheme::Q4K));
-        assert!(scheme_supported(KQuantScheme::Q2_0));
         assert!(scheme_supported(KQuantScheme::GsqRco3p5));
     }
 
@@ -788,7 +847,8 @@ mod tests {
         assert!(scale > 0.0, "ramp must produce a positive scale");
         let mut seen = [false; 4];
         for i in 0..CITYCROW_GROUP {
-            let want = (((flat[i] / scale) + 2.0 + 0.5).floor() as i32).clamp(0, 3) as u32;
+            let want = (((flat[i] / scale) + decoder_bias() as f32 + 0.5).floor() as i32)
+                .clamp(0, 3) as u32;
             let word = w.qweight[i / 8];
             let got = (word >> ((i % 8) * 4)) & 0xF;
             assert_eq!(
@@ -803,11 +863,7 @@ mod tests {
         // stride error, so require the codes that are actually reachable.
         //
         // Code 0 is NOT reachable and this is a property of the format, not a
-        // fixture gap: the codebook is {-2,-1,0,+1} * d with d = amax, so the
-        // representable range is [-d, +d]. Code 0 needs t = v/d + 2 < 0.5,
-        // i.e. v < -1.5*d, which lies outside [-d, +d]. So the minimum code
-        // from any weight at or above -d is code 1. Asserting all four here
-        // would be asserting something false about GSQRCO.
+        // the codebook, so the test asserts codes 0..3 all occur.
         assert!(
             seen[1] && seen[2] && seen[3],
             "fixture must exercise codes 1..3, saw {seen:?}"
@@ -853,7 +909,7 @@ mod tests {
             let word = w.qweight[i / 8];
             let code = ((word >> ((i % 8) * 4)) & 0xF) as i32;
             assert!(
-                code >= 2,
+                code >= decoder_bias() as i32,
                 "group 0 lane {i} holds code {code} (<2) but its weight is positive"
             );
         }
@@ -863,7 +919,7 @@ mod tests {
             let word = w.qweight[CITYCROW_WORDS_PER_GROUP + i / 8];
             let code = ((word >> ((i % 8) * 4)) & 0xF) as i32;
             assert!(
-                code <= 2,
+                code <= decoder_bias() as i32,
                 "group 1 lane {i} holds code {code} (>2) but its weight is negative"
             );
         }
