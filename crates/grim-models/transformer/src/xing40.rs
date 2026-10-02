@@ -2962,6 +2962,16 @@ impl CausalLm for Xing40 {
                 positions.to_vec_f32().ok().and_then(|v| v.first().copied()),
                 positions.to_vec_f32().ok().and_then(|v| v.last().copied())
             );
+            // Decode-step token feed, position by position. Every cross-path
+            // comparison past the first differing token is comparing different
+            // CONTEXTS, so this is the earliest place a divergence can appear.
+            if seq_len == 1 {
+                eprintln!(
+                    "[xing-trace] EAGERFEED pos {:?} token {:?}",
+                    positions.to_vec_f32().ok().and_then(|v| v.last().copied()),
+                    ids.get(0).copied()
+                );
+            }
         }
         let x0 = grim_nn::embedding_gather_on_device(
             &self.tok_embeddings.weight,

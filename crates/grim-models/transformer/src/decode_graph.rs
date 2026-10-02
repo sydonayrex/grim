@@ -8540,6 +8540,13 @@ dev.launch_hc_collapse_step(
         let dev = dev_for_xing40(self)?;
         crate::lfm2_graph::write_embedding_to_buffer(&dev, &graph.buffers.token_ids_dev, token_id)?;
         let pos = graph.buffers.current_pos;
+        // Decode-step token feed, position by position: compare against
+        // eager's EAGERFEED line to find the FIRST step where the two runs
+        // diverge - after which every cross-path comparison is a different
+        // context.
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            eprintln!("[xing-graph] GRAPHFEED pos {pos} token {token_id}");
+        }
         graph
             .buffers
             .write_pos_async(&dev, pos, graph.stream)
