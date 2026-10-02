@@ -839,6 +839,7 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
             Err("Fp8Blocked16 has no GGUF type tag and cannot be written by the oxidizer".into())
         }
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
+        QuantFormat::Q2_0 => Ok(GgufDType::Q2_0),
         QuantFormat::Q2K => Ok(GgufDType::Q2K),
         QuantFormat::Q3K => Ok(GgufDType::Q3K),
         QuantFormat::Q4K => Ok(GgufDType::Q4K),

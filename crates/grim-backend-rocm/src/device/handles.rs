@@ -163,6 +163,18 @@ unsafe extern "C" {
         kind: HipMemcpyKind,
         stream: *mut c_void,
     ) -> HipErrorT;
+    fn raw_hipMemsetD8Async(
+        devPtr: *mut c_void,
+        value: u8,
+        count: usize,
+        stream: *mut c_void,
+    ) -> HipErrorT;
+    fn raw_hipMemcpyDtoDAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        stream: *mut c_void,
+    ) -> HipErrorT;
     pub fn hipMemPrefetchAsync(
         devPtr: *const c_void,
         count: usize,
@@ -297,6 +309,31 @@ pub unsafe fn hipMemcpyAsync(
         );
     }
     unsafe { raw_hipMemcpyAsync(dst, src, count, kind, stream) }
+}
+
+/// Asynchronous byte memset on a specific stream (capture-safe: no sync, no
+/// allocation, issued on the stream that is recording).
+#[inline]
+#[allow(non_snake_case)]
+pub unsafe fn hipMemsetD8Async(
+    devPtr: *mut c_void,
+    value: u8,
+    count: usize,
+    stream: *mut c_void,
+) -> HipErrorT {
+    unsafe { raw_hipMemsetD8Async(devPtr, value, count, stream) }
+}
+
+/// Asynchronous device-to-device copy on a specific stream (capture-safe).
+#[inline]
+#[allow(non_snake_case)]
+pub unsafe fn hipMemcpyDtoDAsync(
+    dst: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    stream: *mut c_void,
+) -> HipErrorT {
+    unsafe { raw_hipMemcpyDtoDAsync(dst, src, count, stream) }
 }
 
 /// Blocks the calling thread until all previously enqueued work on the

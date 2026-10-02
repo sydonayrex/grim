@@ -2150,6 +2150,14 @@ impl RocmDevice {
                         }
                     }
                     KQuantScheme::Q2K => self.launch_dot4_q2k_q81_gemv(act_q81, w, out, m, n, k)?,
+                    // IQ3_S has NO dot4 GEMV, and it must never reach the
+                    // catch-all below: IQ3_S and Q3_K share the 110 B / 256
+                    // block size but not the layout, so decoding IQ3_S bytes
+                    // with the Q3_K kernel silently yields garbage (measured:
+                    // every Xing4.0 projection came out zero, because the whole
+                    // model is IQ3_S). The fused-dequant leg reads A as f32 and
+                    // dequantizes inline, so it needs no act_q81 either.
+                    KQuantScheme::IQ3S => self.launch_fused_dequant_gemm_iq3s(a_s, w, out, m, n, k)?,
                     _ => self.launch_dot4_q3k_q81_gemv(act_q81, w, out, m, n, k)?,
                 };
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
@@ -2570,5 +2578,68 @@ impl RocmDevice {
                 arg(&mut cptr),
             ],
         )
+    }
+}
+
+/// Capture-safe staging primitives: a byte memset and a device-to-device copy
+/// issued on the device's active stream.
+///
+/// Both are needed by paths that stage into a caller-owned scratch (the FP8
+/// padded-activation pad rows, for one) and both must be stream-ordered and
+/// allocation-free, which rules out the host round-trip they replace.
+impl RocmDevice {
+    /// Zero (or fill) `bytes` at `buf` on the active stream.
+    pub fn launch_memset_u8(
+        &self,
+        buf: &RocmStorage,
+        value: u8,
+        bytes: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        let ptr = buf.device_ptr.ok_or_else(|| {
+            crate::Error::Backend("launch_memset_u8: buffer has no device ptr".into())
+        })? as *mut std::ffi::c_void;
+        if bytes == 0 {
+            return Ok(ptr);
+        }
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let stream = self.active_stream();
+        crate::check_hip(
+            "hipMemsetD8Async",
+            unsafe { crate::device::handles::hipMemsetD8Async(ptr, value, bytes, stream) },
+        )?;
+        Ok(ptr)
+    }
+
+    /// Copy `bytes` from `src` to `dst + offset_bytes` on the active stream.
+    pub fn launch_memcpy_d2d(
+        &self,
+        dst: &RocmStorage,
+        src: &RocmStorage,
+        offset_bytes: usize,
+        bytes: usize,
+    ) -> Result<*mut std::ffi::c_void> {
+        let d = dst.device_ptr.ok_or_else(|| {
+            crate::Error::Backend("launch_memcpy_d2d: dst has no device ptr".into())
+        })? as *mut std::ffi::c_void;
+        let s = src.device_ptr.ok_or_else(|| {
+            crate::Error::Backend("launch_memcpy_d2d: src has no device ptr".into())
+        })? as *const std::ffi::c_void;
+        if bytes == 0 {
+            return Ok(d);
+        }
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let stream = self.active_stream();
+        crate::check_hip(
+            "hipMemcpyDtoDAsync",
+            unsafe {
+                crate::device::handles::hipMemcpyDtoDAsync(
+                    (d as usize + offset_bytes) as *mut std::ffi::c_void,
+                    s,
+                    bytes,
+                    stream,
+                )
+            },
+        )?;
+        Ok(d)
     }
 }

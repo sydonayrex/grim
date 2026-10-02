@@ -134,6 +134,7 @@ fn linear_into_named(
     let a_dims = a.shape().dims().to_vec();
     let o_dims = out.shape().dims().to_vec();
 
+
     // WhiteRaven blocked FP8 (16x16-blocked E4M3) cannot use
     // `linear_decode_into` here: its act path does a D2H readback plus an
     // allocation, and inside a capture the allocation is CAPTURE_POISON while
@@ -7243,6 +7244,70 @@ impl DecodeGraphModel for Xing40 {
         let flat = scratch.flat;
         let cfg = &self.cfg;
 
+        // Aliasing probe (env-gated): the graph writes NaN over sin[0] on every
+        // replay, and sin is read-only in this body. A pool buffer that OVERLAPS
+        // sin[0] would explain it — the node writing that buffer lands in sin.
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            let mut spans: Vec<(u64, u64, String)> = Vec::new();
+            let mut add = |st: &dyn BackendStorage, name: String| {
+                if let Some(r) = st.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>() {
+                    if let Some(p) = r.device_ptr_u64() {
+                        let n = r.shape().elem_count().max(1) as u64 * 4;
+                        spans.push((p, p + n, name));
+                    }
+                }
+            };
+            macro_rules! pool {
+                ($v:expr, $n:literal) => {
+                    if let Some(b) = $v.first() {
+                        add(b, format!("{}[0]", $n));
+                    }
+                };
+            }
+            macro_rules! scr {
+                ($v:expr, $n:literal) => {
+                    if let Some(b) = $v.first() {
+                        add(b.as_ref(), format!("{}[0]", $n));
+                    }
+                };
+            }
+            pool!(buffers.layer_input, "pool.layer_input");
+            pool!(buffers.layer_output, "pool.layer_output");
+            pool!(buffers.q_buf, "pool.q_buf");
+            pool!(buffers.k_buf, "pool.k_buf");
+            pool!(buffers.v_buf, "pool.v_buf");
+            pool!(buffers.attn_out_buf, "pool.attn_out_buf");
+            pool!(buffers.gate_up_buf, "pool.gate_up_buf");
+            pool!(buffers.gate_buf, "pool.gate_buf");
+            pool!(buffers.up_buf, "pool.up_buf");
+            pool!(buffers.activated_buf, "pool.activated_buf");
+            pool!(buffers.norm_buf, "pool.norm_buf");
+            pool!(buffers.act_q81_buf, "pool.act_q81_buf");
+            pool!(buffers.k_arena, "pool.k_arena");
+            scr!(scratch.sin, "scratch.sin");
+            scr!(scratch.sout, "scratch.sout");
+            scr!(scratch.hcn, "scratch.hcn");
+            scr!(scratch.proj, "scratch.proj");
+            scr!(scratch.pre, "scratch.pre");
+            scr!(scratch.col, "scratch.col");
+            scr!(scratch.attn, "scratch.attn");
+            scr!(scratch.qabs, "scratch.qabs");
+            let mut overlaps = Vec::new();
+            for i in 0..spans.len() {
+                for j in i + 1..spans.len() {
+                    let (a0, a1, an) = &spans[i];
+                    let (b0, b1, bn) = &spans[j];
+                    if a0 < b1 && b0 < a1 {
+                        overlaps.push(format!("{an} [{a0:#x},{a1:#x}) OVERLAPS {bn} [{b0:#x},{b1:#x})"));
+                    }
+                }
+            }
+            eprintln!("[xing-graph] span count {}; OVERLAPS: {}", spans.len(), overlaps.len());
+            for o in overlaps.iter().take(12) {
+                eprintln!("[xing-graph]   {o}");
+            }
+        }
+
         // Embedding gather → seed streams of layer 0.
         let w_emb = dst_downcast(self.tok_embeddings.weight.storage().as_ref())?;
         dev.launch_embedding_gather_dev_idx(
@@ -7269,14 +7334,27 @@ impl DecodeGraphModel for Xing40 {
 
         let h_shape = Shape::new(vec![batch, hidden]);
         let n_layers = self.layers.len();
-        for (i, layer) in self.layers.iter().enumerate() {
+        // Fault bisection: capture only the first N layers (default: all).
+        // With 0 the graph holds just the embedding gather + hc fan-out.
+        let cap_layers: usize = std::env::var("GRIM_XING_CAPTURE_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        for (i, layer) in self.layers.iter().enumerate().take(cap_layers) {
             let act = &buffers.act_q81_buf[i];
-            let sin: &GBox = if i == 0 {
-                &scratch.sin[0]
-            } else {
-                &scratch.sout[i - 1]
-            };
-            let sout = &scratch.sout[i];
+            // The running stream for this layer. It MUST be sin[i]: the
+            // write-back at the end of a layer publishes into sin[i+1] (and
+            // the last layer into sin[0] for the head), so sin[i] is the slot
+            // this layer reads. It used to read sout[i-1] here while every
+            // op below used sout[i] — two different buffers for one value, and
+            // sout was never written, so every layer after the first consumed
+            // uninitialized memory and the last layer published that NaN back
+            // into sin[0].
+            let sin: &GBox = &scratch.sin[i];
+            // Staging for the attention write-back (see the aliasing note
+            // there): sin[i] is this layer's input, sout[i] is the stream
+            // after the attention contribution has been folded in.
+            let sout: &GBox = &scratch.sout[i];
 
             // ── attn hc: gates over the raw stream state ──
             dev.rms_norm_into(
@@ -7310,6 +7388,9 @@ impl DecodeGraphModel for Xing40 {
                 cmax,
             )?;
             dev.launch_hc_collapse_step(
+                // The attention branch reads the layer INPUT. `sout[i]` is the
+                // staging buffer the attention write-back fills further down,
+                // so it is still zeros at this point.
                 sin.as_ref(),
                 as_rocm(scratch.pre[i].as_ref())?,
                 as_rocm(scratch.col[i].as_ref())?,
@@ -7325,6 +7406,9 @@ impl DecodeGraphModel for Xing40 {
             )
             .map_err(grim_core::error::Error::Tensor)?;
 
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("pre") {
+                return Ok(());
+            }
             // ── MLA ──
             let sa = &layer.self_attn;
             let rank = cfg.kv_lora_rank;
@@ -7464,6 +7548,9 @@ impl DecodeGraphModel for Xing40 {
             // in the bracket, not the destination buffers.
             let mscale = cfg.rope_yarn.map(|y| y.attention_factor).unwrap_or(1.0f32);
             let inv_sqrt_d = mscale * mscale / ((nope + rope_d) as f32).sqrt();
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("append") {
+                return Ok(());
+            }
             dev.launch_mla_absorbed_decode_scaled(
                 as_rocm(scratch.qabs[i].as_ref())?,
                 as_rocm(scratch.qp[i].as_ref())?,
@@ -7481,7 +7568,13 @@ impl DecodeGraphModel for Xing40 {
                 inv_sqrt_d,
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("mla_absorbed_decode: {e}")))?;
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mlaout") {
+                return Ok(());
+            }
             if let Some(w_vc) = sa.w_vc_device(0)? {
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("mla") {
+                return Ok(());
+            }
                 dev.launch_xing_q_absorb(
                     as_rocm(scratch.qattn_latent[i].as_ref())?,
                     w_vc,
@@ -7495,6 +7588,9 @@ impl DecodeGraphModel for Xing40 {
                     "xing40 graph: no device W_VC cache".into(),
                 ));
             }
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("absorb") {
+                return Ok(());
+            }
             linear_into(
                 &dev,
                 scratch.attn[i].as_ref(),
@@ -7502,17 +7598,29 @@ impl DecodeGraphModel for Xing40 {
                 &buffers.norm_buf[i],
                 act,
             )?;
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("oproj") {
+                return Ok(());
+            }
+            // The out buffer must NOT alias the streams input. The kernel's
+            // thread (h,d) writes element (h,d) while EVERY thread (i,d)
+            // reads element (h,d), so in-place corrupts the row another head
+            // is still reading — measured as all-NaN streams on every replay.
+            // sout[i] is that staging buffer; the FFN branch below reads it.
             dev.launch_hc_write_back_step(
                 &buffers.norm_buf[i],
                 as_rocm(scratch.post[i].as_ref())?,
                 as_rocm(scratch.comb[i].as_ref())?,
                 sin.as_ref(),
-                as_rocm(sout.as_ref())?,
+                as_rocm(scratch.sout[i].as_ref())?,
                 hc,
                 hidden,
             )?;
 
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("attn") {
+                return Ok(());
+            }
             // ── ffn hc ──
+            // Reads the stream the attention write-back just produced.
             dev.rms_norm_into(
                 sout.as_ref(),
                 &**layer.ffn_hc.input_norm.weight.storage(),
@@ -7544,7 +7652,7 @@ impl DecodeGraphModel for Xing40 {
                 cmax,
             )?;
             dev.launch_hc_collapse_step(
-                sout.as_ref(),
+                sin.as_ref(),
                 as_rocm(scratch.pre[i].as_ref())?,
                 as_rocm(scratch.col[i].as_ref())?,
                 hc,
@@ -7778,11 +7886,14 @@ impl DecodeGraphModel for Xing40 {
                 )));
             }
 
+            if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("ffn") {
+                return Ok(());
+            }
             // ── ffn write-back: streams carry to the next layer ──
-            let dst: &mut GBox = if i + 1 < n_layers {
-                &mut scratch.sin[i + 1]
+            let dst: &GBox = if i + 1 < n_layers {
+                &scratch.sin[i + 1]
             } else {
-                &mut scratch.sin[0] // last layer publishes into the seed slot
+                &scratch.sin[0] // last layer publishes into the seed slot
             };
             dev.launch_hc_write_back_step(
                 &buffers.norm_buf[i],
@@ -7793,6 +7904,9 @@ impl DecodeGraphModel for Xing40 {
                 hc,
                 hidden,
             )?;
+        }
+        if cap_layers < self.layers.len() {
+            return Ok(());
         }
 
         // Head: mean the final streams, output_norm, lm_head.
@@ -7835,7 +7949,74 @@ impl DecodeGraphModel for Xing40 {
             .map_err(|e| grim_core::error::Error::Backend(format!("write pos: {e}")))?;
         graph
             .replay()
-            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;
+            .map_err(|e| grim_core::error::Error::Backend(format!("replay: {e}")))?;        // Diagnostics: join BOTH streams before any readback.
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            dev.synchronize();
+            if let Some(scratch) = self.graph_scratch.get() {
+                if let Ok(g) = scratch.lock() {
+                    let dump = |label: &str, buf: &GBox| {
+                        if let Ok(st) = as_rocm(buf.as_ref()) {
+                            if let Ok(v) = st.to_cpu_vec_f32() {
+                                let rms = (v.iter().map(|x| x * x).sum::<f32>()
+                                    / v.len().max(1) as f32)
+                                    .sqrt();
+                                let nan = v.iter().filter(|x| x.is_nan()).count();
+                                eprintln!(
+                                    "[xing-graph] {label}: len {} rms {rms:.4e} nan {nan} head {:?}",
+                                    v.len(),
+                                    &v[..v.len().min(3)]
+                                );
+                            }
+                        }
+                    };
+                    for (label, buf) in [
+                        ("sin0", g.sin.first()),
+                        ("hcn0", g.hcn.first()),
+                        ("proj0", g.proj.first()),
+                        ("pre0", g.pre.first()),
+                        ("post0", g.post.first()),
+                        ("comb0", g.comb.first()),
+                        ("col0", g.col.first()),
+                        ("qlora0", g.qlora.first()),
+                        ("qf0", g.qf.first()),
+                        ("qn0", g.qn.first()),
+                        ("qp0", g.qp.first()),
+                        ("qabs0", g.qabs.first()),
+                        ("ckv0", g.ckv.first()),
+                        ("kpe0", g.kpe.first()),
+                        ("qattn0", g.qattn_latent.first()),
+                        ("attn0", g.attn.first()),
+                        ("shg0", g.shg.first()),
+                        ("shu0", g.shu.first()),
+                    ] {
+                        if let Some(b) = buf {
+                            dump(label, b);
+                        }
+                    }
+                    if let Some(sb) = g.sout.first().map(|x| x.as_ref()) {
+                        let Ok(b) = as_rocm(sb) else { return Ok(()) };
+                        if let Ok(v) = b.to_cpu_vec_f32() {
+                            let nan = v.iter().filter(|x| x.is_nan()).count();
+                            eprintln!("[xing-graph] sout0: len {} nan {nan}", v.len());
+                        }
+                    }
+                    if let Some(nb) = graph.buffers.norm_buf.first() {
+                        if let Ok(v) = nb.to_cpu_vec_f32() {
+                            let nan = v.iter().filter(|x| x.is_nan()).count();
+                            let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                            eprintln!("[xing-graph] norm_buf0: len {} nan {nan} rms {rms:.4e}", v.len());
+                        }
+                    }
+                    if let Ok(b) = as_rocm(g.meaned.as_ref()) {
+                        if let Ok(v) = b.to_cpu_vec_f32() {
+                            let nan = v.iter().filter(|x| x.is_nan()).count();
+                            eprintln!("[xing-graph] meaned: len {} nan {nan}", v.len());
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
