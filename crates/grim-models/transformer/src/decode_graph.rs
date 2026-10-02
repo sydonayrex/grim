@@ -8696,6 +8696,22 @@ dev.launch_hc_collapse_step(
                         }
                     }
 
+                    // The o_proj output the graph fed to the attention
+                    // write-back, snapshotted in-graph at the real prefix.
+                    if let Some(nb) = g.attn_out_snap
+                        .first()
+                        .and_then(|b| as_rocm(b.as_ref()).ok())
+                        .and_then(|b| b.to_cpu_vec_f32().ok())
+                    {
+                        let r =
+                            (nb.iter().map(|x| x * x).sum::<f32>() / nb.len().max(1) as f32).sqrt();
+                        eprintln!(
+                            "[xing-graph] ATTNOUT pos {} rms {r:.6e} head {:?}",
+                            graph.buffers.current_pos,
+                            &nb[..4.min(nb.len())]
+                        );
+                    }
+
                     // OPROJ oracle against the SNAPSHOT taken in-graph at the
                     // real prefix: attn[0] x o_proj^T. attn[0] is exact, the
                     // attention gates are exact, so if this fails the whole
@@ -8763,6 +8779,83 @@ dev.launch_hc_collapse_step(
                                 graph.buffers.current_pos,
                                 rows,
                                 &pv[..hc4.min(pv.len())]
+                            );
+                        }
+                    }
+
+                    // MLA latent-attention ORACLE, post-replay, over the real
+                    // arena prefix. qattn_latent feeds the absorb, which feeds
+                    // o_proj, which feeds the write-back — and attn_out has just
+                    // been measured DIFFERING between the paths while every
+                    // stage below it is host-exact, so this is the last link.
+                    {
+                        let rank = self.cfg.kv_lora_rank;
+                        let rope_d = self.cfg.qk_rope_head_dim;
+                        let nh = self.cfg.num_heads;
+                        let mscale =
+                            self.cfg.rope_yarn.map(|y| y.attention_factor).unwrap_or(1.0);
+                        let inv = mscale * mscale
+                            / ((self.cfg.qk_nope_head_dim + rope_d) as f32).sqrt();
+                        let qa = g.qabs
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let qr = g.qp
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let kv = graph.buffers.k_arena
+                            .first()
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        let got = g.qattn_latent
+                            .first()
+                            .and_then(|b| as_rocm(b.as_ref()).ok())
+                            .and_then(|b| b.to_cpu_vec_f32().ok());
+                        if let (Some(qa), Some(qr), Some(kv), Some(got)) = (qa, qr, kv, got) {
+                            let row = rank + rope_d;
+                            let slen = ((graph.buffers.current_pos as usize) + 1)
+                                .min(kv.len() / row.max(1));
+                            let mut scores = vec![0.0f32; slen];
+                            let (mut md, mut rr) = (0.0f32, 0.0f64);
+                            for h in 0..nh {
+                                for t in 0..slen {
+                                    let mut sc = 0.0f32;
+                                    for c in 0..rank {
+                                        sc += qa[h * rank + c] * kv[t * row + c];
+                                    }
+                                    for r in 0..rope_d {
+                                        sc += qr[h * rope_d + r] * kv[t * row + rank + r];
+                                    }
+                                    scores[t] = sc * inv;
+                                }
+                                let mx =
+                                    scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                                let mut ex = vec![0.0f32; slen];
+                                let mut sum = 0.0f32;
+                                for t in 0..slen {
+                                    ex[t] = (scores[t] - mx).exp();
+                                    sum += ex[t];
+                                }
+                                let iv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                                for c in 0..rank {
+                                    let mut acc = 0.0f32;
+                                    for t in 0..slen {
+                                        acc += ex[t] * iv * kv[t * row + c];
+                                    }
+                                    let d = (acc - got[h * rank + c]).abs();
+                                    if d > md {
+                                        md = d;
+                                    }
+                                    rr += (acc as f64) * (acc as f64);
+                                }
+                            }
+                            rr = (rr / (nh * rank) as f64).sqrt();
+                            let n = nh * rank;
+                            let rg =
+                                (got[..n].iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+                            eprintln!(
+                                "[xing-graph] QATTN post-replay vs HOST (slen {slen}): max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                                md as f64 / rr.max(1e-12)
                             );
                         }
                     }

@@ -1731,6 +1731,68 @@ impl Xing40Mla {
             scale,
         ))?;
 
+        // The same host latent-attention oracle the graph passes, run on
+        // EAGER's `out_latent` (the PREFILL kernel's output). The graph uses
+        // the decode kernel; the two were only ever A/B'd at slen=1, where
+        // they agree trivially. At a real prefix this says which is right.
+        // Decode only: with q_len > 1 each query is causally masked and this
+        // oracle (which attends the whole prefix) would be wrong by
+        // construction, not by kernel error.
+        if std::env::var_os("GRIM_XING_TRACE").is_some() && seq_len == 1 {
+            let got = out_latent.to_cpu_vec_f32().ok();
+            let qa = q_absorbed.to_vec_f32().ok();
+            let qr = q_rope.to_vec_f32().ok();
+            let kv = latent_all.to_vec_f32().ok();
+            if let (Some(got), Some(qa), Some(qr), Some(kv)) = (got, qa, qr, kv) {
+                let row = rank + rope_d;
+                let nq = got.len() / (nh * rank).max(1);
+                let slen = kv.len() / row.max(1);
+                let scale = scale.max(1e-30);
+                let mut scores = vec![0.0f32; slen];
+                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                for qi in 0..nq {
+                    for h in 0..nh {
+                        for t in 0..slen {
+                            let mut sc = 0.0f32;
+                            for c in 0..rank {
+                                sc += qa[(qi * nh + h) * rank + c] * kv[t * row + c];
+                            }
+                            for r in 0..rope_d {
+                                sc += qr[(qi * nh + h) * rope_d + r] * kv[t * row + rank + r];
+                            }
+                            scores[t] = sc * scale;
+                        }
+                        let mx =
+                            scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut ex = vec![0.0f32; slen];
+                        let mut sum = 0.0f32;
+                        for t in 0..slen {
+                            ex[t] = (scores[t] - mx).exp();
+                            sum += ex[t];
+                        }
+                        let iv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                        for c in 0..rank {
+                            let mut acc = 0.0f32;
+                            for t in 0..slen {
+                                acc += ex[t] * iv * kv[t * row + c];
+                            }
+                            let d = (acc - got[(qi * nh + h) * rank + c]).abs();
+                            if d > md {
+                                md = d;
+                            }
+                            rr += (acc as f64) * (acc as f64);
+                        }
+                    }
+                }
+                rr = (rr / (nq * nh * rank) as f64).sqrt();
+                let rg = (got.iter().map(|x| x * x).sum::<f32>() / got.len().max(1) as f32).sqrt();
+                eprintln!(
+                    "[xing-trace] EAGER QATTN vs HOST (slen {slen}): max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                    md as f64 / rr.max(1e-12)
+                );
+            }
+        }
+
         // 7. Per-head W_UV up-projection: attn[:, h] = latent[:, h] @ w_vc_t[h].
         //    One GEMM per head over the whole query block, rather than a fused
         //    `vd * rank` matmul inside every (query, head) attention block.
@@ -2411,10 +2473,62 @@ impl Xing40Block {
         // 2. Self-attention on the collapsed stream.
         let attn_out = self.self_attn.forward(&collapsed, positions, kv_cache)?;
         nan_stage("attn_out", &attn_out);
+        if trace_nan {
+            if let Ok(v) = attn_out.to_vec_f32() {
+                let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                eprintln!(
+                    "[xing-trace] ATTNOUT pos {} rms {r:.6e} head {:?}",
+                    positions.last().copied().unwrap_or(u32::MAX),
+                    &v[..4.min(v.len())]
+                );
+            }
+        }
         // 3. Write the attention result back into the streams:
         //    streams = post ⊗ attn_out + comb @ streams.
         let streams = self.attn_hc.update_d2d(x, &attn_out, &attn_gates)?;
         nan_stage("streams_after_attn", &streams);
+        // The SAME host attention-write-back oracle the graph passes, run on
+        // eager. sout[h*hidden+d] = post[h]*attn_out[d] +
+        // sum_k comb[h*hc+k]*x[k*hidden+d]. If eager fails this while the graph
+        // passes, the graph is right and eager is the outlier.
+        // Decode only: with seq_len > 1 the stream has one row per token and
+        // indexing it as a single row makes this oracle fail by construction.
+        if trace_nan && x.shape().dim(0).ok() == Some(1) {
+            let got = streams.to_vec_f32().ok();
+            let ain = attn_out.to_vec_f32().ok();
+            let xin = x.to_vec_f32().ok();
+            let pv = attn_gates.post.to_cpu_vec_f32().ok();
+            let cv = attn_gates.comb.to_cpu_vec_f32().ok();
+            if let (Some(got), Some(ain), Some(xin), Some(pv), Some(cv)) =
+                (got, ain, xin, pv, cv)
+            {
+                let hc = self.attn_hc.hc_mult;
+                // stream width is hc * hidden; hidden is not bound here.
+                let hidden = x.shape().dim(1).unwrap_or(0) / hc.max(1);
+                let (mut md, mut rr) = (0.0f32, 0.0f64);
+                for d in 0..hidden {
+                    for h in 0..hc {
+                        let mut acc = pv[h] * ain[d];
+                        for k in 0..hc {
+                            acc += cv[h * hc + k] * xin[k * hidden + d];
+                        }
+                        let diff = (acc - got[h * hidden + d]).abs();
+                        if diff > md {
+                            md = diff;
+                        }
+                        rr += (acc as f64) * (acc as f64);
+                    }
+                }
+                rr = (rr / (hc * hidden) as f64).sqrt();
+                let rg =
+                    (got.iter().map(|x| x * x).sum::<f32>() / got.len().max(1) as f32).sqrt();
+                eprintln!(
+                    "[xing-trace] EAGER ATTNWB pos {} vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
+                    positions.last().copied().unwrap_or(u32::MAX),
+                    md as f64 / rr.max(1e-12)
+                );
+            }
+        }
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
             if let Ok(v) = streams.to_vec_f32() {
                 let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
