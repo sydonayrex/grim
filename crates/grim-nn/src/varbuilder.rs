@@ -831,6 +831,19 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             FloatPackScheme::Fp4 => dequant_fp4(&raw.bytes, n),
             FloatPackScheme::Nf4 => dequant_nf4(&raw.bytes, n),
             FloatPackScheme::Fp8 => dequant_fp8(&raw.bytes, n),
+            // Blocked WhiteRaven layout: unblock with (n, k) geometry first
+            // (dequant_fp8 would misread codes as a scale header). This is the
+            // arm that makes blocked-WhiteRaven *loadable*.
+            FloatPackScheme::Fp8Blocked16 => {
+                if raw.shape.len() < 2 {
+                    return Err(Error::Unimplemented(format!(
+                        "Fp8Blocked16 materialization needs [n, k] shape, got {:?}",
+                        raw.shape
+                    )));
+                }
+                let (nn, kk) = (raw.shape[0], raw.shape[1]);
+                grim_quant::dequant_fp8_blocked16(&raw.bytes, nn, kk)
+            }
             // This is the arm that makes TreePie *loadable*: a checkpoint can
             // declare the scheme and the weights decode, rather than the format
             // existing only as a kernel plus a direct-call test.

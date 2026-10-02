@@ -14,17 +14,48 @@ use std::sync::Arc;
 
 use grim_tensor::BackendStorage;
 
-use crate::DTypeStorage;
-use crate::HipMemcpyKind;
 use crate::device::roc_device::RocmDevice;
 use crate::device::util::dtype_f32;
 use crate::memory::storage::RocmStorage;
+use crate::DTypeStorage;
+use crate::HipMemcpyKind;
 use crate::{
-    Shape, check_hip, hipGraphDestroy, hipGraphExecDestroy, hipGraphExecKernelNodeSetParams,
-    hipGraphInstantiate, hipMemcpyAsync, hipStreamBeginCapture, hipStreamEndCapture,
+    check_hip, hipGraphDestroy, hipGraphExecDestroy, hipGraphExecKernelNodeSetParams,
+    hipGraphInstantiate, hipMemcpyAsync, hipStreamBeginCapture, hipStreamEndCapture, Shape,
 };
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, DType};
+
+// Capture-scoped padded-fp8 act scratch for the WhiteRaven blocked leg.
+//
+// Installed by `begin_capture` and cleared by `end_capture`/`abort_capture` so
+// the pointer can never outlive the `DecodeGraphBuffers` that own it. It is
+// thread-local because capture is single-threaded per device; a stray read
+// outside a capture returns `None`, which the blocked leg treats as a hard
+// error rather than quietly falling back to the host conversion.
+thread_local! {
+    static CAPTURE_FP8_PAD: std::cell::Cell<*const RocmStorage> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+fn install_capture_fp8_pad(scratch: Option<&RocmStorage>) {
+    CAPTURE_FP8_PAD.with(|c| c.set(scratch.map_or(std::ptr::null(), |s| s as *const _)));
+}
+
+/// The padded-fp8 act scratch published for the open capture, if any.
+pub fn capture_fp8_pad_scratch() -> Option<&'static RocmStorage> {
+    CAPTURE_FP8_PAD.with(|c| {
+        let p = c.get();
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: installed by begin_capture and cleared by
+            // end_capture/abort_capture on the same thread, so the pointee
+            // (an element of the live DecodeGraphBuffers) outlives every read.
+            Some(unsafe { &*p })
+        }
+    })
+}
 
 /// Spec §Phase 1: owns all decode intermediates at fixed addresses.
 /// Allocated once at model load, never freed until unload.
@@ -135,6 +166,13 @@ pub struct DecodeGraphBuffers {
     /// Sized for max(hidden, intermediate): `(max/32)*36` bytes, reused
     /// sequentially across QKV and gate+up projections (stream-ordered).
     pub act_q81_buf: Vec<RocmStorage>,
+    /// Per-layer padded fp8 activation staging for the WhiteRaven blocked
+    /// WMMA GEMM. Sized `batch * 16 * max(hidden, intermediate)` u8 bytes so
+    /// a one-row decode still forms a whole 16-row fragment tile. Filled by
+    /// the `launch_quant_fp8` prologue at capture; reused sequentially
+    /// (stream-ordered). Distinct scratch from act_q81_buf: the blocked
+    /// kernel's A operand is fp8 codes, not Q8_1 blocks.
+    pub act_fp8_pad_buf: Vec<RocmStorage>,
     /// Per-layer fused-QKV output staging ([n_q + 2*n_kv] F32); the three
     /// Q/K/V slices are D2D-copied into `q/k/v_buf`.
     pub fused_qkv_out: Vec<RocmStorage>,
@@ -363,6 +401,7 @@ impl DecodeGraphBuffers {
         let mut attn_max_buf = Vec::with_capacity(num_layers);
         let mut attn_sum_buf = Vec::with_capacity(num_layers);
         let mut act_q81_buf = Vec::with_capacity(num_layers);
+        let mut act_fp8_pad_buf = Vec::with_capacity(num_layers);
         // M2/S2: MoE + ShortConv staging (empty when the model lacks those).
         let moe_layers = n_expert > 0 && top_k > 0;
         let sc_layers = sc_h_dim > 0 && sc_l_cache > 1;
@@ -489,6 +528,15 @@ impl DecodeGraphBuffers {
                 &Shape::new(vec![q81_bytes]),
                 q81_dt.clone(),
                 q81_bytes,
+                &dev.allocator,
+                dev.ordinal,
+            )?);
+            // Padded fp8 act scratch: max row padded to whole 16-row tiles.
+            let fp8_pad_bytes = batch * 16 * q81_elems.max(intermediate_size).max(32);
+            act_fp8_pad_buf.push(RocmStorage::alloc_gpu_with_bytes(
+                &Shape::new(vec![fp8_pad_bytes]),
+                q81_dt.clone(),
+                fp8_pad_bytes,
                 &dev.allocator,
                 dev.ordinal,
             )?);
@@ -735,6 +783,7 @@ impl DecodeGraphBuffers {
             token_ids_dev,
             attn_dummy,
             act_q81_buf,
+            act_fp8_pad_buf,
             fused_qkv_out,
             gdl: (0..num_layers).map(|_| None).collect(),
             kda: (0..num_layers).map(|_| None).collect(),
@@ -1498,6 +1547,10 @@ impl DecodeGraph {
             )));
         }
         self.capturing = true;
+        // Publish the padded-fp8 act scratch for the duration of the capture.
+        // The WhiteRaven blocked leg needs it (its A operand is fp8 codes,
+        // padded to whole 16-row tiles) and cannot allocate one here.
+        install_capture_fp8_pad(self.buffers.act_fp8_pad_buf.first());
         Ok(())
     }
 
@@ -1512,6 +1565,7 @@ impl DecodeGraph {
         // beyond cleanup: the partial graph is always discarded.
         let _ = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
         self.capturing = false;
+        install_capture_fp8_pad(None);
         if !graph.is_null() {
             unsafe {
                 let _ = hipGraphDestroy(graph);
@@ -1525,6 +1579,7 @@ impl DecodeGraph {
         let mut graph: *mut c_void = std::ptr::null_mut();
         // SAFETY: stream is under capture; graph out-ptr valid.
         let res: crate::HipErrorT = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
+        install_capture_fp8_pad(None);
         if res != crate::hipSuccess {
             self.capturing = false;
             return Err(Error::Backend(format!("hipStreamEndCapture failed: {res}")));
@@ -1805,29 +1860,27 @@ mod tests {
     #[test]
     fn decode_graph_buffers_allocate_rejects_zero_batch() {
         // Zero-dim guard fires before any HIP alloc; no GPU needed.
-        assert!(
-            DecodeGraphBuffers::allocate(
-                &crate::device::roc_device::RocmDevice::shared(0),
-                // num_layers, hidden, n_q, n_attn_out, n_k, n_v, inter,
-                // max_ctx, vocab, then the zero the guard is meant to catch.
-                1,
-                64,
-                64,
-                64,
-                64,
-                256,
-                8,
-                100,
-                8,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0
-            )
-            .is_err()
-        );
+        assert!(DecodeGraphBuffers::allocate(
+            &crate::device::roc_device::RocmDevice::shared(0),
+            // num_layers, hidden, n_q, n_attn_out, n_k, n_v, inter,
+            // max_ctx, vocab, then the zero the guard is meant to catch.
+            1,
+            64,
+            64,
+            64,
+            64,
+            256,
+            8,
+            100,
+            8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        )
+        .is_err());
     }
 
     #[test]

@@ -3,8 +3,8 @@
 
 use std::ffi::c_void;
 
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
@@ -15,10 +15,9 @@ use crate::device::gemm_tuning::{lookup_gemm_config_for_shape, lookup_solution_i
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    HipDim3, ROCBLAS_GEMM_FLAGS_NONE, RocblasInt, RocblasOperation, RocmHandle, arg,
-    arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, rocblas_gemm_ex,
+    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, rocblas_gemm_ex,
     rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success,
-    select_gemm_algo,
+    select_gemm_algo, HipDim3, RocblasInt, RocblasOperation, RocmHandle, ROCBLAS_GEMM_FLAGS_NONE,
 };
 
 impl RocmDevice {
@@ -834,6 +833,179 @@ impl RocmDevice {
 
         self.launch_compute_kernel(
             "grim_wmma_gemm_fp8_e4m3",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Act prologue for [`Self::launch_wmma_gemm_fp8_e4m3_blocked`]: quantize an
+    /// F32 activation `[m, k]` to FP8 E4M3 codes into `act_fp8_pad`
+    /// (`16*ceil(m/16) * k` bytes, pad rows +0.0).
+    ///
+    /// Exists so graph capture has a capture-safe path: the eager dispatch's
+    /// host conversion does a D2H readback (sync) and an allocation, both of
+    /// which poison or stall a captured graph. This writes into caller-owned
+    /// scratch, so replay re-quantizes fresh activations on device.
+    pub fn launch_quant_fp8_pad16(
+        &self,
+        act_f32: &RocmStorage,
+        act_fp8_pad: &RocmStorage,
+        m: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let x_ptr = act_f32
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quant_fp8_pad16: act has no device ptr".into()))?;
+        let o_ptr = act_fp8_pad
+            .device_ptr
+            .ok_or_else(|| Error::Backend("quant_fp8_pad16: out has no device ptr".into()))?;
+
+        let a_rows = m.div_ceil(16) * 16;
+        if act_fp8_pad.bytes < a_rows * k {
+            return Err(Error::Backend(format!(
+                "quant_fp8_pad16: scratch {}B < {needed}B (16*ceil({m}/16)*{k})",
+                act_fp8_pad.bytes,
+                needed = a_rows * k
+            )));
+        }
+
+        let (grid, block) = crate::device::util::linear_launch(m * k);
+        let mut x_ptr = x_ptr;
+        let mut o_ptr = o_ptr;
+        let mut mm = m as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_quant_fp8_pad16",
+            grid,
+            block,
+            &mut [arg(&mut x_ptr), arg(&mut o_ptr), arg(&mut mm), arg(&mut kk)],
+        )
+    }
+
+    /// Capture-safe WhiteRaven blocked decode leg: `launch_quant_fp8_pad16`
+    /// into caller-owned scratch, then the blocked WMMA GEMM. Both launches
+    /// read pre-allocated pointers, so this is safe inside `hipStreamBeginCapture`.
+    pub fn linear_decode_blocked_into(
+        &self,
+        a: &RocmStorage,
+        w: &RocmStorage,
+        out: &RocmStorage,
+        act_fp8_pad: &RocmStorage,
+    ) -> Result<*mut c_void> {
+        let k = a.shape().dims().last().copied().unwrap_or(0);
+        let m = a.shape().elem_count().checked_div(k.max(1)).unwrap_or(0);
+        if m == 0 || k == 0 {
+            return Err(Error::Unimplemented(
+                "linear_decode_blocked_into: empty activation".into(),
+            ));
+        }
+        let n = if m == 1 {
+            out.shape().elem_count()
+        } else {
+            out.shape().elem_count() / m
+        };
+        if w.shape().elem_count() % k.max(1) != 0 || w.shape().elem_count() / k.max(1) != n {
+            return Err(Error::ShapeMismatch {
+                expected: vec![1, n],
+                got: w.shape().dims().to_vec(),
+            });
+        }
+        if k % 16 != 0 || n % 16 != 0 {
+            return Err(Error::Backend(format!(
+                "WhiteRaven blocked requires k % 16 == 0 and n % 16 == 0; got k={k} n={n}"
+            )));
+        }
+        if a.dtype().arith != ArithType::F32 {
+            return Err(Error::DTypeMismatch(format!(
+                "linear_decode_blocked_into: act must be F32 (the prologue quantizes it); got {:?}",
+                a.dtype().arith
+            )));
+        }
+        self.launch_quant_fp8_pad16(a, act_fp8_pad, m, k)?;
+        self.launch_wmma_gemm_fp8_e4m3_blocked(act_fp8_pad, w, out, m, n, k)
+    }
+
+    /// Blocked-B twin of [`Self::launch_wmma_gemm_fp8_e4m3_for_ab`]: B arrives
+    /// in 16x16-blocked order (`grim_quant::block_fp8_16x16`,
+    /// [`grim_quant::FP8_BLOCK16_ENCODER_VERSION`]) so the kernel's B fragment
+    /// loads are contiguous 256B tiles instead of K-strided gathers. Same grid,
+    /// same A contract (padded to whole 16-row tiles), same masked epilogue.
+    /// `b` must hold exactly `n * k` blocked bytes with `n % 16 == 0`.
+    pub fn launch_wmma_gemm_fp8_e4m3_blocked(
+        &self,
+        a: &RocmStorage,
+        b_blocked: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        const TILE_M: usize = 16;
+        const N_TILES_PER_BLOCK: usize = 2;
+        let n_per_block = TILE_M * N_TILES_PER_BLOCK;
+
+        let a_ptr = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_fp8_e4m3_blocked: a has no device ptr".into()))?;
+        let b_ptr = b_blocked
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_fp8_e4m3_blocked: b has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_fp8_e4m3_blocked: out has no device ptr".into()))?;
+
+        if k % 16 != 0 {
+            return Err(Error::Backend(format!(
+                "wmma_fp8_e4m3_blocked: K={k} must be divisible by 16"
+            )));
+        }
+        if n % 16 != 0 {
+            return Err(Error::Backend(format!(
+                "wmma_fp8_e4m3_blocked: N={n} must be divisible by 16 for 16x16 blocks"
+            )));
+        }
+        // Same A-pad contract as the row-major entry: unmasked fragment loads
+        // read whole 16-row tiles.
+        let tile = 16usize;
+        if a.bytes() % (tile * k) != 0 || a.bytes() == 0 {
+            return Err(Error::Backend(format!(
+                "wmma_fp8_e4m3_blocked: A must be padded to whole {tile}-row tiles (got {} bytes, k={k})",
+                a.bytes()
+            )));
+        }
+        // Blocked B is a permutation, not a compression: exactly n*k bytes.
+        if b_blocked.bytes() != n * k {
+            return Err(Error::Backend(format!(
+                "wmma_fp8_e4m3_blocked: blocked B must hold exactly n*k={} bytes, got {}",
+                n * k,
+                b_blocked.bytes()
+            )));
+        }
+
+        let grid_dim = HipDim3::new(
+            (n as u32).div_ceil(n_per_block as u32),
+            (m as u32).div_ceil(TILE_M as u32),
+            1,
+        );
+        let block_dim = HipDim3::new(32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_wmma_gemm_fp8_e4m3_blocked",
             grid_dim,
             block_dim,
             &mut [
@@ -1797,10 +1969,15 @@ impl RocmDevice {
                 // only, env-gated off by default.
                 static W4A4_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let w4a4_decode = *W4A4_DECODE.get_or_init(|| {
-                    matches!(std::env::var("GRIM_DECODE_W4A4").as_deref(), Ok("1" | "true"))
+                    matches!(
+                        std::env::var("GRIM_DECODE_W4A4").as_deref(),
+                        Ok("1" | "true")
+                    )
                 });
-                if matches!(scheme, KQuantScheme::Q4K | KQuantScheme::Q5K | KQuantScheme::Q6K)
-                    && w4a4_decode
+                if matches!(
+                    scheme,
+                    KQuantScheme::Q4K | KQuantScheme::Q5K | KQuantScheme::Q6K
+                ) && w4a4_decode
                     && k % 128 == 0
                 {
                     // KDA-FIX: the cache key was the RAW DEVICE POINTER. The
@@ -1815,9 +1992,15 @@ impl RocmDevice {
                     // not have. Better still: weights are static for the
                     // process lifetime, so entries never evict.
                     static CONVERTED: std::sync::OnceLock<
-                        std::sync::Mutex<std::collections::HashMap<(usize, usize, [usize; 2]), std::sync::Arc<WhiteCrowDecodedWeights>>>,
+                        std::sync::Mutex<
+                            std::collections::HashMap<
+                                (usize, usize, [usize; 2]),
+                                std::sync::Arc<WhiteCrowDecodedWeights>,
+                            >,
+                        >,
                     > = std::sync::OnceLock::new();
-                    let cache = CONVERTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    let cache = CONVERTED
+                        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
                     let key = (
                         w.device_ptr.map(|p| p as usize).unwrap_or(0),
                         w.bytes,
@@ -1827,7 +2010,9 @@ impl RocmDevice {
                     let conv = match guard.get(&key) {
                         Some(c) => c.clone(),
                         None => {
-                            let c = std::sync::Arc::new(self.requant_kquant_to_whitecrow(w, n, k, *scheme)?);
+                            let c = std::sync::Arc::new(
+                                self.requant_kquant_to_whitecrow(w, n, k, *scheme)?,
+                            );
                             guard.insert(key, c.clone());
                             c
                         }
@@ -1875,6 +2060,76 @@ impl RocmDevice {
                 };
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
             }
+            // WhiteRaven blocked FP8 (16x16-blocked E4M3 B). The EAGER leg
+            // only: it quantizes A through the host (D2H readback plus an
+            // allocation), which is correct but not fast and is exactly what a
+            // HIP graph capture cannot contain. Graph decode must call
+            // `linear_decode_blocked_into` instead, which quantizes A on device
+            // into caller-owned scratch. Refusing under capture rather than
+            // silently doing it keeps the failure at the call site instead of
+            // as a poisoned graph.
+            DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::Fp8Blocked16) => {
+                if crate::decode_graph_buffers::capture_fp8_pad_scratch().is_some() {
+                    return Err(Error::Backend(
+                        "linear_decode_into: WhiteRaven blocked weight reached the eager leg \
+                         during graph capture; use linear_decode_blocked_into (host act \
+                         quantization allocates and syncs, which poisons capture)"
+                            .into(),
+                    ));
+                }
+                let a_s = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                    Error::Backend("linear_decode_into: a not RocmStorage".into())
+                })?;
+                if k % 16 != 0 || n % 16 != 0 {
+                    return Err(Error::Backend(format!(
+                        "WhiteRaven blocked requires k % 16 == 0 and n % 16 == 0; got k={k} n={n}"
+                    )));
+                }
+                // Either f32 acts (quantize here) or u8 codes (pad rows only).
+                let a_rows = m.div_ceil(16) * 16;
+                let mut padded = vec![0u8; a_rows * k];
+                if a.dtype().arith == ArithType::U8 {
+                    let raw = a_s
+                        .copy_to_host()
+                        .map_err(|e| Error::Backend(format!("WhiteRaven act readback: {e}")))?;
+                    if raw.len() < m * k {
+                        return Err(Error::Backend(format!(
+                            "WhiteRaven u8 act needs {0} codes, got {1}",
+                            m * k,
+                            raw.len()
+                        )));
+                    }
+                    for r in 0..m {
+                        padded[r * k..(r + 1) * k].copy_from_slice(&raw[r * k..(r + 1) * k]);
+                    }
+                } else {
+                    let raw = a
+                        .to_cpu_vec_f32()
+                        .map_err(|e| Error::Backend(format!("WhiteRaven act readback: {e}")))?;
+                    if raw.len() < m * k {
+                        return Err(Error::Backend(format!(
+                            "WhiteRaven act needs {0} values, got {1}",
+                            m * k,
+                            raw.len()
+                        )));
+                    }
+                    for (i, v) in raw.iter().take(m * k).enumerate() {
+                        padded[i] = grim_quant::f32_to_fp8_e4m3(*v);
+                    }
+                }
+                let converted = RocmStorage::copy_from_host_raw_bytes(
+                    &padded,
+                    &Shape::new(vec![a_rows, k]),
+                    DType {
+                        arith: ArithType::U8,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?;
+                self.launch_wmma_gemm_fp8_e4m3_blocked(&converted, w, out, m, n, k)?;
+                Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+            }
             _ => Err(Error::Unimplemented(format!(
                 "linear_decode_into: unsupported weight dtype for graph decode: {:?}",
                 w.dtype()
@@ -1902,7 +2157,6 @@ impl RocmDevice {
 /// total launch counter would still have moved, so "my kernel ran" could not be
 /// distinguished from "something ran".
 pub const BLASLT_ROUTE: &str = "blaslt_external";
-
 
 /// One q4k weight tensor requantized to the WhiteCrow u4 group-128 layout.
 /// The three storages must outlive every decode launch that reads them, so
@@ -1946,7 +2200,6 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::KQuantScheme,
     ) -> Result<WhiteCrowDecodedWeights> {
-        
         let packed = w.copy_to_host()?;
 
         // On-disk cache (GRIM_OSTQUANT_CACHE_DIR, default ~/.cache/grim/ostquant;
@@ -1987,7 +2240,8 @@ impl RocmDevice {
             if let Ok(meta) = std::fs::read(&path) {
                 if meta.len() >= 28 {
                     let rd = |o: usize| {
-                        u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]]) as usize
+                        u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]])
+                            as usize
                     };
                     if rd(0) == 0x57_43_00_01
                         && rd(4) == grim_quant::OSTQUANT_ENCODER_VERSION as usize
@@ -2079,7 +2333,14 @@ impl RocmDevice {
                         })
                     })
                     .collect();
-                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error::Backend("requant worker panicked".into())))).collect()
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(Error::Backend("requant worker panicked".into()))
+                        })
+                    })
+                    .collect()
             });
             let mut qw_all = Vec::new();
             let mut sc_all = Vec::new();
@@ -2190,17 +2451,30 @@ impl RocmDevice {
         sidx: &RocmStorage,
         c_out: &RocmStorage,
     ) -> Result<*mut c_void> {
-        let ap = a.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: a has no device ptr".into()))?;
-        let bp = b.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: b has no device ptr".into()))?;
-        let sp = sidx.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: sidx has no device ptr".into()))?;
-        let cp = c_out.device_ptr.ok_or_else(|| Error::Backend("grey_raven_probe: c has no device ptr".into()))?;
+        let ap = a
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_probe: a has no device ptr".into()))?;
+        let bp = b
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_probe: b has no device ptr".into()))?;
+        let sp = sidx
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_probe: sidx has no device ptr".into()))?;
+        let cp = c_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_probe: c has no device ptr".into()))?;
         let (mut aptr, mut bptr, mut sptr, mut cptr) = (ap, bp, sp, cp);
         self.launch_from_source(
             crate::kernels::grey_raven::PROBE_LANE_IDX_SOURCE,
             "grim_grey_raven_probe_lane_idx",
             HipDim3::new(1, 1, 1),
             HipDim3::new(32, 1, 1),
-            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut sptr), arg(&mut cptr)],
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut sptr),
+                arg(&mut cptr),
+            ],
         )
     }
 }

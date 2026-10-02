@@ -161,6 +161,11 @@ impl QuantOps for VulkanDevice {
                     FloatPackScheme::Fp4 => grim_quant::dequant_fp4(&b_bytes_cpu, k * n)?,
                     FloatPackScheme::Nf4 => grim_quant::dequant_nf4(&b_bytes_cpu, k * n)?,
                     FloatPackScheme::Fp8 => grim_quant::dequant_fp8(&b_bytes_cpu, k * n)?,
+                    // Blocked WhiteRaven layout: unblock first (dequant_fp8
+                    // would misread the first four codes as a scale header).
+                    FloatPackScheme::Fp8Blocked16 => {
+                        grim_quant::dequant_fp8_blocked16(&b_bytes_cpu, n, k)?
+                    }
                     // TreePie decodes on the CPU here: there is no Vulkan kernel for
                     // it, and shipping the dequantized f32 is correct if not fast.
                     FloatPackScheme::TreePie => {

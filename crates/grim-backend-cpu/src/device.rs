@@ -1698,6 +1698,13 @@ impl QuantOps for CpuDevice {
                     grim_tensor::QuantFormat::TreePie => {
                         grim_quant::tree_pie::dequant_tree_pie_bytes(&b_bytes, k * n)
                     }
+                    // WhiteRaven blocked: same E4M3 codes as Fp8, blocked
+                    // arrangement; unblock with (n, k) geometry first.
+                    grim_tensor::QuantFormat::Fp8Blocked16 => {
+                        grim_quant::dequant_fp8_blocked16(&b_bytes, n, k).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul FP8-blocked dequant: {e}"))
+                        })?
+                    }
                     // GGUF Q8_0 weights are resident as the native 34-byte block stream (2-byte f16 scale + 32 int8 quants per block), and `Linear::forward` passes an empty `b_scales` (scales live in the block headers).
                     // Decoding with the canonical `dequant_q80` - the hand-rolled loop below read stride-32 with a 1.0.
                     grim_tensor::QuantFormat::Q8_0 => grim_quant::dequant_q80(b_bytes, k * n)
@@ -2571,6 +2578,19 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::FloatPackScheme::Fp4 => grim_quant::dequant_fp4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::Nf4 => grim_quant::dequant_nf4(raw, n),
                 grim_tensor::dtype::FloatPackScheme::Fp8 => grim_quant::dequant_fp8(raw, n),
+                grim_tensor::dtype::FloatPackScheme::Fp8Blocked16 => {
+                    // Blocked WhiteRaven layout needs (n, k) to unblock;
+                    // dequant_fp8 would misread codes as a scale header.
+                    let dims = self.shape.dims();
+                    if dims.len() < 2 {
+                        return Err(Error::Backend(format!(
+                            "Fp8Blocked16 host dequant needs [n, k] shape, got {:?}",
+                            dims
+                        )));
+                    }
+                    let (nn, kk) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+                    grim_quant::dequant_fp8_blocked16(raw, nn, kk)
+                }
                 grim_tensor::dtype::FloatPackScheme::TreePie => {
                     Ok(grim_quant::tree_pie::dequant_tree_pie_bytes(raw, n))
                 }

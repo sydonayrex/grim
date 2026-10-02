@@ -23,6 +23,14 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.03,
                 max_delta_ppl: 0.015,
             },
+            // Same E4M3 codes as `Fp8`, different byte arrangement: a storage
+            // permutation, not a coarser quantizer, so it inherits Fp8's
+            // tolerances exactly.
+            QuantFormat::Fp8Blocked16 => Self {
+                min_cosine_similarity: 0.9995,
+                max_relative_l2_error: 0.03,
+                max_delta_ppl: 0.015,
+            },
             QuantFormat::Fp8Block16 => Self {
                 min_cosine_similarity: 0.9990,
                 max_relative_l2_error: 0.04,

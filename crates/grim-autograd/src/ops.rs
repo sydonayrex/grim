@@ -410,6 +410,8 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             FloatPackScheme::Fp4 => 4,
             FloatPackScheme::Nf4 => 4,
             FloatPackScheme::Fp8 => 8,
+            // Blocked is a permutation of Fp8: same 8 bits per stored code.
+            FloatPackScheme::Fp8Blocked16 => 8,
             FloatPackScheme::TreePie => 5,
             FloatPackScheme::MxFp4 => 4,
             FloatPackScheme::MxFp8 => 8,

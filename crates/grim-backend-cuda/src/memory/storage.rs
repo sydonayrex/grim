@@ -97,6 +97,14 @@ pub(crate) fn cuda_dequant_quantized_storage(
             FloatPackScheme::TreePie => {
                 Ok(grim_quant::tree_pie::dequant_tree_pie_bytes(b_bytes, elem_count))
             }
+            // Blocked WhiteRaven layout: CUDA has no WhiteRaven kernel and its
+            // B convention is [K, N] while the blocked layout is defined over
+            // [N, K] tiles, so unblocking here would need geometry this
+            // function does not carry. Refuse loudly rather than serve
+            // transposed weights (GreyRaven precedent two arms down).
+            FloatPackScheme::Fp8Blocked16 => Err(Error::Unimplemented(
+                "Fp8Blocked16 host dequant is not implemented on CUDA: the blocked layout is [N, K]-tiled and CUDA stores B as [K, N]".into(),
+            )),
             FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(b_bytes, elem_count),
             FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(b_bytes, elem_count),
             FloatPackScheme::NvFp4 => grim_quant::dequant_nvfp4(b_bytes, elem_count),

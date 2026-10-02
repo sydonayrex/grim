@@ -8,25 +8,25 @@ use grim_tensor::error::{Error, Result};
 /// the two largest entries (87.0/107.0 instead of 89.0/113.0).
 use iq_tables::KVALUES_IQ4NL as KVALUES_IQ4NL_REF;
 
-pub mod iq_tables;
 pub mod accuracy_gate;
 pub mod grey_raven;
 pub mod gsq;
+pub mod iq_tables;
 mod packed_gemm;
 pub mod qat_mxfp4;
 pub mod rco;
-pub mod soul_eater;
 pub mod scrub_jay;
+pub mod soul_eater;
 pub mod spqr;
 pub mod tree_pie;
 
 pub use accuracy_gate::{
-    AccuracyGate, AccuracyTolerance, AccuracyVerdict, compute_cosine_similarity,
-    compute_cross_entropy_ppl, compute_relative_l2_error,
+    compute_cosine_similarity, compute_cross_entropy_ppl, compute_relative_l2_error, AccuracyGate,
+    AccuracyTolerance, AccuracyVerdict,
 };
-pub use gsq::{GsqBlockFit, GsqConfig, gsq_fit_block};
-pub use rco::{RcoConfig, rco_search};
-pub use spqr::{SpqrSalientResidual, spqr_identify_salient};
+pub use gsq::{gsq_fit_block, GsqBlockFit, GsqConfig};
+pub use rco::{rco_search, RcoConfig};
+pub use spqr::{spqr_identify_salient, SpqrSalientResidual};
 
 /// Re-exported from `grim_tensor` so the `BackendDevice::quantize` trait method (which lives in `grim-tensor`) and the
 /// CPU `quant_*` reference functions (which live here) share one canonical enum without a circular dependency.
@@ -616,13 +616,21 @@ pub fn dequant_iq3xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
                 let base_idx = ib32 * 32 + l * 8;
                 for j in 0..4 {
                     if base_idx + j < block_len {
-                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
                         out.push(db * (grid1[j] as f32) * sign);
                     }
                 }
                 for j in 0..4 {
                     if base_idx + 4 + j < block_len {
-                        let sign = if (signs & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                        let sign = if (signs & KMASK_IQ2XS[j + 4]) != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
                         out.push(db * (grid2[j] as f32) * sign);
                     }
                 }
@@ -672,11 +680,19 @@ pub(crate) fn dequant_iq3s_block(blk: &[u8]) -> [f32; 256] {
             let grid2 = IQ3S_GRID[idx2].to_le_bytes();
 
             for j in 0..4 {
-                let sign = if (signs1[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                let sign = if (signs1[l] & KMASK_IQ2XS[j]) != 0 {
+                    -1.0f32
+                } else {
+                    1.0f32
+                };
                 w[ib32 * 32 + l * 8 + j] = db1 * (grid1[j] as f32) * sign;
             }
             for j in 0..4 {
-                let sign = if (signs1[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                let sign = if (signs1[l] & KMASK_IQ2XS[j + 4]) != 0 {
+                    -1.0f32
+                } else {
+                    1.0f32
+                };
                 w[ib32 * 32 + l * 8 + 4 + j] = db1 * (grid2[j] as f32) * sign;
             }
         }
@@ -691,11 +707,19 @@ pub(crate) fn dequant_iq3s_block(blk: &[u8]) -> [f32; 256] {
             let grid2 = IQ3S_GRID[idx2].to_le_bytes();
 
             for j in 0..4 {
-                let sign = if (signs2[l] & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                let sign = if (signs2[l] & KMASK_IQ2XS[j]) != 0 {
+                    -1.0f32
+                } else {
+                    1.0f32
+                };
                 w[(ib32 + 1) * 32 + l * 8 + j] = db2 * (grid1[j] as f32) * sign;
             }
             for j in 0..4 {
-                let sign = if (signs2[l] & KMASK_IQ2XS[j + 4]) != 0 { -1.0f32 } else { 1.0f32 };
+                let sign = if (signs2[l] & KMASK_IQ2XS[j + 4]) != 0 {
+                    -1.0f32
+                } else {
+                    1.0f32
+                };
                 w[(ib32 + 1) * 32 + l * 8 + 4 + j] = db2 * (grid2[j] as f32) * sign;
             }
         }
@@ -768,7 +792,11 @@ pub fn dequant_iq2xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
                 for j in 0..8 {
                     if base_idx + j < block_len {
                         let g = ((grid_val >> (8 * j)) & 0xff) as f32;
-                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
                         out.push(db * g * sign);
                     }
                 }
@@ -823,7 +851,11 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
                 for j in 0..8 {
                     if base_idx + j < block_len {
                         let g = ((grid_val >> (8 * j)) & 0xff) as f32;
-                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0f32 } else { 1.0f32 };
+                        let sign = if (signs & KMASK_IQ2XS[j]) != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
                         out.push(db[l / 2] * g * sign);
                     }
                 }
@@ -1840,7 +1872,11 @@ pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
         result = (mant as f32) / 512.0;
     }
 
-    if sign != 0 { -result } else { result }
+    if sign != 0 {
+        -result
+    } else {
+        result
+    }
 }
 
 fn f16_to_f32(lo: u8, hi: u8) -> f32 {
@@ -1852,7 +1888,11 @@ fn f16_to_f32(lo: u8, hi: u8) -> f32 {
         // Subnormal or zero. An f16 subnormal encodes `mant
         // * 2^-24` (exponent unbiased 1-14, with 10 mantissa bits).
         let value = (mant as f32) * 2f32.powi(-24);
-        if sign != 0 { -value } else { value }
+        if sign != 0 {
+            -value
+        } else {
+            value
+        }
     } else if exp == 31 {
         // NaN or inf
         f32::from_bits((sign << 31) | 0x7F800000 | (mant << 13))
@@ -2451,6 +2491,102 @@ pub fn quant_fp8(data: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Blocked-FP8 layout version for the WhiteRaven blocked WMMA path
+/// (`grim_wmma_gemm_fp8_e4m3_blocked`).
+///
+/// Bumped whenever the 16x16-block byte order changes. It must be mixed into
+/// the on-disk cache key of any blocked-FP8 tensor cache (the same discipline
+/// as `OSTQUANT_ENCODER_VERSION` for WhiteCrow), so a format change can never
+/// serve tensors converted by an older encoder.
+pub const FP8_BLOCK16_ENCODER_VERSION: u32 = 1;
+
+/// Rearrange FP8 E4M3 bytes `[N, K]` row-major into 16x16-blocked order for the
+/// WhiteRaven blocked WMMA kernel: for each N-tile of 16 rows and each K-block
+/// of 16 columns, the 256 bytes are stored contiguously in row-major order
+/// within the block. The kernel's `col_major` 16x16 fragment load with ldm=16
+/// then reads one contiguous 256B tile instead of 16 K-strided 16B segments.
+///
+/// Input is raw codes (no scale prefix, unlike `quant_fp8`'s output): exactly
+/// `n * k` bytes. Requires `n % 16 == 0` and `k % 16 == 0`; the byte count is
+/// unchanged, only the arrangement.
+pub fn block_fp8_16x16(data: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
+    if n % 16 != 0 || k % 16 != 0 {
+        return Err(Error::Backend(format!(
+            "block_fp8_16x16: need n % 16 == 0 and k % 16 == 0, got n={n} k={k}"
+        )));
+    }
+    if data.len() < n * k {
+        return Err(Error::Backend(format!(
+            "block_fp8_16x16: need {} bytes, got {}",
+            n * k,
+            data.len()
+        )));
+    }
+    let mut out = vec![0u8; n * k];
+    for nt in 0..n / 16 {
+        for kb in 0..k / 16 {
+            for c in 0..16 {
+                let src = (nt * 16 + c) * k + kb * 16;
+                let dst = (nt * (k / 16) + kb) * 256 + c * 16;
+                out[dst..dst + 16].copy_from_slice(&data[src..src + 16]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Inverse of [`block_fp8_16x16`]: restores row-major `[N, K]` order. Used by
+/// tests and by any path that must serve blocked bytes to a row-major reader.
+pub fn unblock_fp8_16x16(blocked: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
+    if n % 16 != 0 || k % 16 != 0 {
+        return Err(Error::Backend(format!(
+            "unblock_fp8_16x16: need n % 16 == 0 and k % 16 == 0, got n={n} k={k}"
+        )));
+    }
+    if blocked.len() < n * k {
+        return Err(Error::Backend(format!(
+            "unblock_fp8_16x16: need {} bytes, got {}",
+            n * k,
+            blocked.len()
+        )));
+    }
+    let mut out = vec![0u8; n * k];
+    for nt in 0..n / 16 {
+        for kb in 0..k / 16 {
+            for c in 0..16 {
+                let dst = (nt * 16 + c) * k + kb * 16;
+                let src = (nt * (k / 16) + kb) * 256 + c * 16;
+                out[dst..dst + 16].copy_from_slice(&blocked[src..src + 16]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Forward-looking on-disk cache key for blocked-FP8 tensors, mirroring the
+/// WhiteCrow discipline (`requant_kquant_to_whitecrow`): seahash of the source
+/// bytes mixed with geometry and [`FP8_BLOCK16_ENCODER_VERSION`], so a stale
+/// converter or a layout bump can never be served for a different weight.
+pub fn blocked_fp8_cache_key(n: usize, k: usize, src_hash: u64) -> u64 {
+    let mut h = src_hash;
+    h ^= (n as u64) << 1;
+    h ^= (k as u64) << 17;
+    h ^= (FP8_BLOCK16_ENCODER_VERSION as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h
+}
+
+/// Host dequant of 16x16-blocked FP8 bytes to f32 (scale 1.0): unblock to
+/// row-major, then decode each E4M3 code.
+///
+/// WARNING: do NOT feed blocked bytes to [`dequant_fp8`]: it reads a 4-byte
+/// f32 scale header that blocked tensors do not have, so the first four
+/// codes would be misread as a scale and every value after would shift by
+/// four. This function is the only host decoder for the blocked layout.
+pub fn dequant_fp8_blocked16(blocked: &[u8], n: usize, k: usize) -> Result<Vec<f32>> {
+    let row_major = unblock_fp8_16x16(blocked, n, k)?;
+    Ok(row_major.iter().map(|&b| fp8_e4m3_to_f32(b)).collect())
+}
+
 /// Quantize f32 to FP8 E4M3, round-to-nearest-**even**.
 ///
 /// # Rounding
@@ -2634,6 +2770,64 @@ pub fn dequant_nvfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Quantize f32 values to packed NVFP4 bytes (9 bytes per 16 values:
+/// 1 E4M3 scale byte + 8 packed E2M1 code bytes, low nibble first).
+pub fn quant_nvfp4(data: &[f32]) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    const SUB_BLOCK: usize = 16;
+    const E2M1_VALS: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+    let num_sub_blocks = data.len().div_ceil(SUB_BLOCK);
+    let mut out = Vec::with_capacity(num_sub_blocks * 9);
+
+    for chunk in data.chunks(SUB_BLOCK) {
+        let amax = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        // Scale = amax / 6.0, clamped to min normal and encoded to E4M3.
+        let raw_scale = if amax > 0.0 { amax / 6.0 } else { 0.0 };
+        let scale_byte = f32_to_fp8_e4m3(raw_scale);
+        out.push(scale_byte);
+
+        // Quantize against the decoded (rounded) scale so scale rounding doesn't clip
+        let eff_scale = nvfp4_e4m3_scale(scale_byte);
+        let inv_scale = if eff_scale > 0.0 {
+            1.0 / eff_scale
+        } else {
+            0.0
+        };
+
+        let mut codes = [0u8; 16];
+        for (i, &v) in chunk.iter().enumerate() {
+            let sign_bit = if v.is_sign_negative() { 0x8 } else { 0x0 };
+            let abs_norm = v.abs() * inv_scale;
+
+            // Nearest-neighbor matching on E2M1 magnitude grid: {0, .5, 1, 1.5, 2, 3, 4, 6}
+            let mut best_idx = 0u8;
+            let mut min_diff = f32::MAX;
+            for (idx, &grid_val) in E2M1_VALS.iter().enumerate() {
+                let diff = (abs_norm - grid_val).abs();
+                if diff < min_diff {
+                    min_diff = diff;
+                    best_idx = idx as u8;
+                }
+            }
+            codes[i] = sign_bit | best_idx;
+        }
+
+        // Pack low-nibble first: local%2==0 is in low nibble (code & 0x0F),
+        // local%2==1 is in high nibble (code << 4).
+        for pair in 0..8 {
+            let even = codes[pair * 2];
+            let odd = codes[pair * 2 + 1];
+            let packed_byte = (even & 0x0F) | ((odd & 0x0F) << 4);
+            out.push(packed_byte);
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod nvfp4_tests {
     use super::*;
@@ -2698,6 +2892,31 @@ mod nvfp4_tests {
         let err = dequant_nvfp4(&[0u8; 8], 16).unwrap_err();
         assert!(format!("{err}").contains("expected 9 bytes"), "got {err}");
     }
+
+    #[test]
+    fn quant_nvfp4_roundtrip_matches_dequant_oracle() {
+        // Construct 16 known E2M1 values with scale 1.0 (0x38 in E4M3)
+        let inputs = vec![
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let packed = quant_nvfp4(&inputs).expect("quant_nvfp4");
+        assert_eq!(packed.len(), 9);
+        assert_eq!(packed[0], UNIT_E4M3, "scale should be 1.0 (0x38 in E4M3)");
+
+        let dequant = dequant_nvfp4(&packed, 16).expect("dequant_nvfp4");
+        for (i, (&inp, &out)) in inputs.iter().zip(dequant.iter()).enumerate() {
+            assert_eq!(
+                inp.abs(),
+                out.abs(),
+                "mismatch at index {i}: {inp} vs {out}"
+            );
+            assert_eq!(
+                inp.is_sign_negative(),
+                out.is_sign_negative(),
+                "sign mismatch at index {i}"
+            );
+        }
+    }
 }
 
 // ── Nutcracker ───────────────────────────────────────────────────────────
@@ -2750,7 +2969,11 @@ pub const NUTCRACKER_SUB_BLOCK_BYTES: usize = 9;
 /// decoded values stay on the FP4 grid and the MAC stays low-precision.
 pub fn nutcracker_special_value(sel: u8) -> f32 {
     let mag = if sel & 0x1 != 0 { 2.5 } else { 5.0 };
-    if sel & 0x2 != 0 { -mag } else { mag }
+    if sel & 0x2 != 0 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 /// Split a Nutcracker block-scale byte into `(selector, scale)`.
@@ -3484,6 +3707,20 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         QuantFormat::TreePie => tree_pie::pack_tree_pie_bytes(data),
         QuantFormat::Nf4 => quant_nf4(data)?,
         QuantFormat::Fp8 => quant_fp8(data)?,
+        // WhiteRaven blocked: codes = per-code E4M3, then 16x16-blocked
+        // rearrange (requires the [n, k] shape: a permutation's index
+        // geometry cannot be recovered from a flat element count).
+        QuantFormat::Fp8Blocked16 => {
+            if plan.shape.len() < 2 {
+                return Err(Error::Backend(format!(
+                    "Fp8Blocked16 rewrite needs [n, k] shape, got {:?}",
+                    plan.shape
+                )));
+            }
+            let (n, k) = (plan.shape[0], plan.shape[1]);
+            let codes: Vec<u8> = data.iter().map(|&v| f32_to_fp8_e4m3(v)).collect();
+            block_fp8_16x16(&codes, n, k)?
+        }
         QuantFormat::Fp4Block16 => quant_fp4_block16(data, 16)?,
         QuantFormat::Fp8Block16 => quant_fp8_block16(data, 16)?,
         // GreyRaven is 2:4-pruned: pruning is a lossy, signal-dependent step
@@ -3569,17 +3806,18 @@ pub fn quant_iq4nl(data: &[f32]) -> Result<Vec<u8>> {
                 (a, m)
             }
         });
-        let mut d = if amax > 0.0 { max_signed / KVALUES_IQ4NL_REF[0] } else { 0.0 };
+        let mut d = if amax > 0.0 {
+            max_signed / KVALUES_IQ4NL_REF[0]
+        } else {
+            0.0
+        };
 
         // Least-squares refit: w[j] = x[j]^2, q = codebook[nearest(id*x)].
         let mut sumqx = 0.0f32;
         let mut sumq2 = 0.0f32;
         let idx: Vec<usize> = if d != 0.0 {
             let id = 1.0 / d;
-            chunk
-                .iter()
-                .map(|&x| best_index_iq4nl(id * x))
-                .collect()
+            chunk.iter().map(|&x| best_index_iq4nl(id * x)).collect()
         } else {
             vec![0; QK4_NL]
         };
@@ -3832,7 +4070,11 @@ pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
         let exp_bits = (bits >> 13) & 0x0000_7C00;
         let mantissa_bits = bits & 0x0000_0FFF;
         let nonsign = (exp_bits + mantissa_bits) as u16;
-        sign | if shl1_w > 0xFF00_0000 { 0x7E00 } else { nonsign }
+        sign | if shl1_w > 0xFF00_0000 {
+            0x7E00
+        } else {
+            nonsign
+        }
     }
 
     // llama.cpp `nearest_int`: bit-trick round-to-nearest-even via the f32
@@ -3915,7 +4157,8 @@ pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
                                 &waux[8 * k..8 * k + 8],
                                 this_scale,
                             )
-                            .expect("off-grid code has a neighbour") as i32;
+                            .expect("off-grid code has a neighbour")
+                            as i32;
                         let entry = KGRID_2BIT_1024[grid_index as usize];
                         for i in 0..8 {
                             laux[8 * k + i] = ((entry >> (2 * i)) & 0x3) as i8;
@@ -3953,8 +4196,14 @@ pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
                     let grid_index = match tables.map[u as usize] {
                         g if g >= 0 => g,
                         _ => tables
-                            .best_neighbour(u, &xval[8 * k..8 * k + 8], &waux[8 * k..8 * k + 8], group_scale)
-                            .expect("off-grid code has a neighbour") as i32,
+                            .best_neighbour(
+                                u,
+                                &xval[8 * k..8 * k + 8],
+                                &waux[8 * k..8 * k + 8],
+                                group_scale,
+                            )
+                            .expect("off-grid code has a neighbour")
+                            as i32,
                     };
                     let entry = KGRID_2BIT_1024[grid_index as usize];
                     for i in 0..8 {
@@ -6905,13 +7154,19 @@ mod tests {
             *b = 0xEE; // both nibbles -> kvalues[14] = 89
         }
         let res = dequant_iq4nl(&data, 32).expect("dequant_iq4nl");
-        assert!(res.iter().all(|v| (v - 89.0).abs() < 1e-5), "kvalues[14] != 89");
+        assert!(
+            res.iter().all(|v| (v - 89.0).abs() < 1e-5),
+            "kvalues[14] != 89"
+        );
 
         for b in data[2..18].iter_mut() {
             *b = 0xFF; // both nibbles -> kvalues[15] = 113
         }
         let res = dequant_iq4nl(&data, 32).expect("dequant_iq4nl");
-        assert!(res.iter().all(|v| (v - 113.0).abs() < 1e-5), "kvalues[15] != 113");
+        assert!(
+            res.iter().all(|v| (v - 113.0).abs() < 1e-5),
+            "kvalues[15] != 113"
+        );
 
         // Layout: 18 bytes per 32 weights, so 256 weights need 144 bytes.
         assert!(dequant_iq4nl(&vec![0u8; 144], 256).is_ok());
@@ -6923,7 +7178,7 @@ mod tests {
         let mut data = vec![0u8; 136];
         data[0] = 0x00;
         data[1] = 0x3c; // d = 1.0f16
-        // default scales 32 -> scale = 1.0 * (32 - 32) / 32 = 0.0
+                        // default scales 32 -> scale = 1.0 * (32 - 32) / 32 = 0.0
         data[2] = 32;
 
         let res = dequant_iq4xs(&data, 256).expect("dequant_iq4xs");
@@ -7383,13 +7638,7 @@ pub fn gemm_iq4nl_packed(
 
 /// Scalar reference implementation of [`gemm_iq4nl_packed`] (inputs already validated).
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-fn gemm_iq4nl_packed_scalar(
-    a: &[f32],
-    b_bytes: &[u8],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
+fn gemm_iq4nl_packed_scalar(a: &[f32], b_bytes: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
     let blocks_per_row = k / IQ4_NL_QK;
     let stride_b = blocks_per_row * IQ4_NL_BLOCK_BYTES;
 
@@ -7487,13 +7736,7 @@ pub fn gemm_iq3s_packed(
 
 /// Scalar reference implementation of [`gemm_iq3s_packed`] (inputs already validated).
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-fn gemm_iq3s_packed_scalar(
-    a: &[f32],
-    b_bytes: &[u8],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
+fn gemm_iq3s_packed_scalar(a: &[f32], b_bytes: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
     let blocks_per_row = k / IQ3S_QK;
     let stride_b = blocks_per_row * IQ3S_BLOCK_BYTES;
 
@@ -7505,7 +7748,9 @@ fn gemm_iq3s_packed_scalar(
             let b_row = &b_bytes[col_n * stride_b..(col_n + 1) * stride_b];
             let mut dot = 0.0f32;
             for blk in 0..blocks_per_row {
-                let w = dequant_iq3s_block(&b_row[blk * IQ3S_BLOCK_BYTES..(blk + 1) * IQ3S_BLOCK_BYTES]);
+                let w = dequant_iq3s_block(
+                    &b_row[blk * IQ3S_BLOCK_BYTES..(blk + 1) * IQ3S_BLOCK_BYTES],
+                );
                 let a_sub = &a_row[blk * IQ3S_QK..(blk + 1) * IQ3S_QK];
                 for j in 0..IQ3S_QK {
                     dot += a_sub[j] * w[j];
@@ -7973,5 +8218,93 @@ mod ostquant_w4_tests {
     #[test]
     fn quant_ostquant_w4_rejects_short_input() {
         assert!(quant_ostquant_w4_group128(&[0.0; 10], 4, 128).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fp8_block16_tests {
+    use super::*;
+
+    /// Block/unblock round-trips byte-exactly: the layout is a permutation,
+    /// not a quantization, so any difference is a packer bug.
+    #[test]
+    fn block16_roundtrips_byte_exact() {
+        let (n, k) = (48usize, 128usize);
+        let data: Vec<u8> = (0..n * k).map(|i| (i % 251) as u8).collect();
+        let blocked = block_fp8_16x16(&data, n, k).expect("block");
+        assert_eq!(blocked.len(), n * k);
+        assert_ne!(blocked, data, "blocked order must differ from row-major");
+        let back = unblock_fp8_16x16(&blocked, n, k).expect("unblock");
+        assert_eq!(back, data);
+    }
+
+    /// The blocked tile the kernel loads contiguously (ldm=16) holds exactly
+    /// the 16x16 block the old kernel gathered K-strided: tile (nt, kb) is
+    /// B rows nt*16..+16, cols kb*16..+16 in row-major-within-block order,
+    /// which is the fragment's (r, c) -> block[c][r] consumption order.
+    #[test]
+    fn block16_tile_matches_strided_gather_elementwise() {
+        let (n, k) = (32usize, 64usize);
+        let data: Vec<u8> = (0..n * k).map(|i| (i * 7 % 256) as u8).collect();
+        let blocked = block_fp8_16x16(&data, n, k).expect("block");
+        let kb_total = k / 16;
+        for nt in 0..n / 16 {
+            for kb in 0..kb_total {
+                for c in 0..16 {
+                    for r in 0..16 {
+                        let tile_off = (nt * kb_total + kb) * 256 + c * 16 + r;
+                        let row_major = (nt * 16 + c) * k + kb * 16 + r;
+                        assert_eq!(
+                            blocked[tile_off], data[row_major],
+                            "nt={nt} kb={kb} c={c} r={r}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block16_rejects_ragged_geometry_and_short_input() {
+        assert!(block_fp8_16x16(&[0u8; 256], 15, 16).is_err());
+        assert!(block_fp8_16x16(&[0u8; 256], 16, 17).is_err());
+        assert!(block_fp8_16x16(&[0u8; 100], 16, 16).is_err());
+        assert!(unblock_fp8_16x16(&[0u8; 100], 16, 16).is_err());
+    }
+
+    /// Cache-key discipline (mirrors WhiteCrow): geometry and encoder version
+    /// participate, so a layout bump or a different tensor can never collide.
+    #[test]
+    fn blocked_fp8_cache_key_separates_geometry_and_version() {
+        let h = 0x1234_5678_9ABC_DEF0u64;
+        assert_ne!(
+            blocked_fp8_cache_key(16, 128, h),
+            blocked_fp8_cache_key(32, 128, h)
+        );
+        assert_ne!(
+            blocked_fp8_cache_key(16, 128, h),
+            blocked_fp8_cache_key(16, 256, h)
+        );
+        assert_ne!(
+            blocked_fp8_cache_key(16, 128, h),
+            blocked_fp8_cache_key(16, 128, h ^ 1)
+        );
+        assert_eq!(FP8_BLOCK16_ENCODER_VERSION, 1);
+    }
+
+    /// Host dequant of blocked bytes equals per-code E4M3 decode of the
+    /// row-major originals: unblock first, never the scale-header reader.
+    #[test]
+    fn dequant_blocked16_matches_per_code_decode() {
+        let (n, k) = (32usize, 64usize);
+        let data: Vec<u8> = (0..n * k).map(|i| (i * 13 % 256) as u8).collect();
+        let blocked = block_fp8_16x16(&data, n, k).expect("block");
+        let got = dequant_fp8_blocked16(&blocked, n, k).expect("dequant");
+        assert_eq!(got.len(), n * k);
+        for (i, (&b, &v)) in data.iter().zip(&got).enumerate() {
+            // Bitwise: the data includes NaN codes (NaN != NaN by ==).
+            assert_eq!(v.to_bits(), fp8_e4m3_to_f32(b).to_bits(), "element {i}");
+        }
+        assert!(dequant_fp8_blocked16(&blocked, 15, 64).is_err());
     }
 }

@@ -385,6 +385,18 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
             grim_tensor::dtype::FloatPackScheme::Fp8 => {
                 grim_quant::dequant_fp8(&raw.bytes, elem_count)
             }
+            grim_tensor::dtype::FloatPackScheme::Fp8Blocked16 => {
+                // Blocked WhiteRaven layout needs (n, k) geometry to unblock;
+                // dequant_fp8 would misread codes as a scale header.
+                if raw.shape.len() < 2 {
+                    return Err(Error::Unimplemented(format!(
+                        "Fp8Blocked16 host dequant needs [n, k] shape, got {:?}",
+                        raw.shape
+                    )));
+                }
+                let (n, k) = (raw.shape[0], raw.shape[1]);
+                grim_quant::dequant_fp8_blocked16(&raw.bytes, n, k)
+            }
             grim_tensor::dtype::FloatPackScheme::TreePie => {
                 Ok(grim_quant::tree_pie::dequant_tree_pie_bytes(&raw.bytes, elem_count))
             }

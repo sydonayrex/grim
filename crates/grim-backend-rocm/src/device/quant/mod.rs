@@ -981,19 +981,112 @@ impl QuantOps for RocmDevice {
                         act_storage.dtype().arith == ArithType::F16,
                     );
                 }
-                // Prefill still refused: the GEMM's fault is now localised to the
-                // converted activation buffer, but not root-caused. See the note in
-                // tests/tree_pie_dispatch.rs.
-                // Prefill refused: the GEMM faults on every activation path tried,
-                // including f16 activations that bypass the host conversion
-                // entirely. The conversion is exonerated; the fault is in the kernel
-                // or its launch and is undiagnosed. See tree_pie_dispatch.rs.
+                // Prefill (m > 1) routes to `grim_tree_pie_gemm`, which shares one B
+                // decode across TP_M_TILE rows of A. Root cause of the old fault
+                // found and fixed: the launcher passed kernargs as
+                // (ap, bp, mm, nn, kk, op) while the kernel takes
+                // (act, B, C, M, N, K) -- M landed in the C slot and the
+                // truncated C pointer in the K slot. Order fixed in
+                // launch_tree_pie_gemm; prefill unwired here.
                 if m != 1 {
+                    self.launch_tree_pie_gemm(act_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_tree_pie_gemv(act_storage, b_storage, &out_storage, n, k)?;
+                }
+            }
+            DTypeStorage::FloatPack(FloatPackScheme::Fp8Blocked16) => {
+                // WhiteRaven blocked WMMA (V_WMMA_F32_16X16X16_FP8_FP8) for
+                // decode AND prefill: one kernel, grid_y covers m > 1. B is
+                // 16x16-blocked (block_fp8_16x16, FP8_BLOCK16_ENCODER_VERSION),
+                // so fragment loads are contiguous 256B tiles. Two hard
+                // preconditions, both enforced by the launcher as well:
+                // k % 16 == 0 (rocwmma steps K by 16, no tail) and n % 16 == 0
+                // (whole 16x16 blocks). The kernel is gfx1200/1201-only, so
+                // refuse elsewhere rather than letting JIT fail obscurely.
+                if k % 16 != 0 || n % 16 != 0 {
                     return Err(Error::Backend(format!(
-                        "TreePie prefill kernel faults; m = {m} has no working route"
+                        "WhiteRaven blocked requires k % 16 == 0 and n % 16 == 0; got k={k} n={n}"
                     )));
                 }
-                self.launch_tree_pie_gemv(act_storage, b_storage, &out_storage, n, k)?;
+                if !self.gpu_target.starts_with("gfx12") {
+                    return Err(Error::Backend(format!(
+                        "WhiteRaven blocked needs an RDNA4 target, got {}",
+                        self.gpu_target
+                    )));
+                }
+                // Activations arrive as whatever the caller had; the kernel
+                // wants fp8 codes padded to whole 16-row tiles (fragment loads
+                // are unmasked, only the store is). A u8 tensor of m*k codes
+                // passes through to the pad step untouched; anything else
+                // converts through the host, which is correct but not fast --
+                // a fallback, not the intended path (TreePie's act discipline).
+                // `RocmStorage` is not Clone, so the converted buffer is bound
+                // out here and borrowed below.
+                let converted;
+                let act_fp8 = if a_storage.dtype().arith == ArithType::U8 {
+                    let raw = a_storage.copy_to_host().map_err(|e| {
+                        Error::Backend(format!("WhiteRaven act readback: {e}"))
+                    })?;
+                    let a_rows = m.div_ceil(16) * 16;
+                    if raw.len() < m * k {
+                        return Err(Error::Backend(format!(
+                            "WhiteRaven u8 act needs {0} codes, got {1}",
+                            m * k,
+                            raw.len()
+                        )));
+                    }
+                    let mut padded = vec![0u8; a_rows * k];
+                    for r in 0..m {
+                        padded[r * k..(r + 1) * k].copy_from_slice(&raw[r * k..(r + 1) * k]);
+                    }
+                    converted = RocmStorage::copy_from_host_raw_bytes(
+                        &padded,
+                        &Shape::new(vec![a_rows * k]),
+                        DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
+                    &converted
+                } else {
+                    let raw = a_storage.copy_to_host().map_err(|e| {
+                        Error::Backend(format!("WhiteRaven act readback: {e}"))
+                    })?;
+                    let src = a_storage.dtype();
+                    let a_rows = m.div_ceil(16) * 16;
+                    let mut padded = vec![0u8; a_rows * k];
+                    if src.arith == ArithType::F32 {
+                        for (i, v) in raw.chunks_exact(4).take(m * k).enumerate() {
+                            let f = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+                            padded[i] = grim_quant::f32_to_fp8_e4m3(f);
+                        }
+                    } else if src.arith == ArithType::F16 {
+                        for (i, v) in raw.chunks_exact(2).take(m * k).enumerate() {
+                            let f = half::f16::from_le_bytes([v[0], v[1]].try_into().unwrap()).to_f32();
+                            padded[i] = grim_quant::f32_to_fp8_e4m3(f);
+                        }
+                    } else {
+                        return Err(Error::Backend(format!(
+                            "WhiteRaven act must be u8/f32/f16 codes, got {:?}",
+                            src.arith
+                        )));
+                    }
+                    converted = RocmStorage::copy_from_host_raw_bytes(
+                        &padded,
+                        &Shape::new(vec![a_rows * k]),
+                        DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
+                    &converted
+                };
+                self.launch_wmma_gemm_fp8_e4m3_blocked(
+                    act_fp8,
+                    b_storage,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                )?;
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
                 // The MXFP4 kernel reads one E8M0 exponent per 32-element block (block_idx = (col*K+k)/32) and expects B_codes / B_exps as separate device buffers.

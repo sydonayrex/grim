@@ -833,6 +833,11 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         QuantFormat::TreePie => {
             Err("TreePie has no GGUF type tag and cannot be written by the oxidizer".into())
         }
+        // WhiteRaven-blocked is grim-internal for now: the GGUF writer cannot
+        // tag a blocked-FP8 payload, so refuse at the point the user named it.
+        QuantFormat::Fp8Blocked16 => {
+            Err("Fp8Blocked16 has no GGUF type tag and cannot be written by the oxidizer".into())
+        }
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
         QuantFormat::Q2K => Ok(GgufDType::Q2K),
         QuantFormat::Q3K => Ok(GgufDType::Q3K),

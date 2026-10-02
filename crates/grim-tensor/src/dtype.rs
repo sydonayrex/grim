@@ -190,6 +190,14 @@ pub enum FloatPackScheme {
     Nf4,
     /// FP8 (E4M3 by default; E5M2 recognized).
     Fp8,
+    /// WhiteRaven-blocked FP8: E4M3 codes in 16x16-blocked order
+    /// (`grim_quant::block_fp8_16x16`), a permutation of [`Self::Fp8`] — same
+    /// byte count, different arrangement, so the WMMA fragment load is one
+    /// contiguous 256B tile instead of 16 K-strided segments. Requires
+    /// `n % 16 == 0` and `k % 16 == 0`. A separate variant from [`Self::Fp8`]
+    /// so a blocked tensor can never reach the row-major kernel (whose loads
+    /// would silently read the wrong elements, not fault).
+    Fp8Blocked16,
     /// TreePie (WS-A): 5-bit E2M2 with a separate sign plane, 5.0 bpw.
     ///
     /// 32 values per 5 i32 — four payload words holding `exp|mant` and one sign
@@ -243,6 +251,9 @@ pub enum QuantFormat {
     /// A separate variant from [`Self::Fp8`] so a GreyRaven tensor cannot be
     /// mistaken for a dense one on the way to a kernel with the wrong geometry.
     Fp8Sparse24,
+    /// WhiteRaven-blocked FP8: E4M3 codes in 16x16-blocked order. Same bytes
+    /// as [`Self::Fp8`] permuted; feeds the blocked WMMA kernel.
+    Fp8Blocked16,
     Iq4Nl,
     Iq4Xs,
     Iq3Xxs,
@@ -362,6 +373,8 @@ impl DType {
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => elem_count.div_ceil(2),
                 FloatPackScheme::Fp8 => elem_count,
+                // Blocked is a permutation of Fp8, not a compression: same count.
+                FloatPackScheme::Fp8Blocked16 => elem_count,
                 // 5 i32 = 20 bytes per 32 values. Ragged tails are rejected at
                 // the boundaries rather than rounded up here, because a partial
                 // group would silently overstate the density the format claims.
@@ -424,6 +437,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Fp8 => Storage::FloatPack(FloatPackScheme::Fp8),
             QuantFormat::TreePie => Storage::FloatPack(FloatPackScheme::TreePie),
             QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
+            QuantFormat::Fp8Blocked16 => Storage::FloatPack(FloatPackScheme::Fp8Blocked16),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
             QuantFormat::Fp8Block128 => Storage::Block(BlockDtype::Fp8Block128),
             QuantFormat::Fp8Sparse24 => Storage::Block(BlockDtype::Fp8Sparse24),
@@ -464,6 +478,7 @@ impl TryFrom<&Storage> for QuantFormat {
                 FloatPackScheme::Nf4 => Ok(QuantFormat::Nf4),
                 FloatPackScheme::Fp8 => Ok(QuantFormat::Fp8),
                 FloatPackScheme::TreePie => Ok(QuantFormat::TreePie),
+                FloatPackScheme::Fp8Blocked16 => Ok(QuantFormat::Fp8Blocked16),
                 _ => Err(()),
             },
             Storage::Block(b) => match b {

@@ -457,3 +457,48 @@ fn a_model_with_an_output_norm_bias_and_no_layer_bias_loads() {
         "the layer norm picked up a bias the checkpoint does not have"
     );
 }
+
+/// WhiteRaven blocked FP8 must survive the load path and map to its own
+/// `QuantFormat`.
+///
+/// The failure this pins: `QuantFormat::try_from(&Storage)` had no arm for
+/// `FloatPackScheme::Fp8Blocked16`, so `Linear::forward` returned
+/// Unimplemented("no QuantFormat mapping") at the first forward -- AFTER the
+/// load had succeeded and looked fine. A load-only assertion passes; only the
+/// mapping (which the forward calls) exercises the real gap.
+#[test]
+fn blocked_fp8_maps_to_its_own_format_and_dequantizes_row_major() {
+    use grim_tensor::dtype::{FloatPackScheme, Storage};
+
+    let (out, inn) = (16usize, 16usize);
+    let w: Vec<f32> = (0..out * inn).map(|i| (i as f32) * 0.03125 - 0.5).collect();
+    let codes: Vec<u8> = w.iter().map(|&v| grim_quant::f32_to_fp8_e4m3(v)).collect();
+    let blocked = grim_quant::block_fp8_16x16(&codes, out, inn).expect("block");
+    let storage = Storage::FloatPack(FloatPackScheme::Fp8Blocked16);
+
+    let fmt = grim_tensor::QuantFormat::try_from(&storage)
+        .expect("blocked fp8 must map to a QuantFormat");
+    assert_eq!(
+        fmt,
+        grim_tensor::QuantFormat::Fp8Blocked16,
+        "blocked fp8 must map to its own format, not Fp8 -- a shared tag would \
+         route a blocked tensor into the row-major kernel"
+    );
+    assert_ne!(
+        fmt,
+        grim_tensor::QuantFormat::Fp8,
+        "blocked and row-major fp8 must not share a QuantFormat"
+    );
+
+    // The host decoder the loader/CPU/Vulkan fallback uses must return the
+    // original codes in row-major order.
+    let back = grim_quant::dequant_fp8_blocked16(&blocked, out, inn).expect("dequant");
+    assert_eq!(back.len(), out * inn);
+    for (i, (&b, &v)) in codes.iter().zip(&back).enumerate() {
+        assert_eq!(
+            v.to_bits(),
+            grim_quant::fp8_e4m3_to_f32(b).to_bits(),
+            "element {i}: blocked round-trip diverged"
+        );
+    }
+}
