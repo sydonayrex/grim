@@ -93,12 +93,15 @@ fn dispatch_routes_to_the_blocked_kernel_and_not_the_row_major_one() -> TestResu
         "blocked dispatch must not also launch the row-major kernel -- B would \
          be read in the wrong layout"
     );
-    // The eager dispatch converts A on the host, so the prologue must NOT run
-    // here. It runs only in graph capture (linear_decode_blocked_into).
+    // The act prologue runs on BOTH paths now. It used to be capture-only,
+    // because the eager arm converted A through the host -- which cost ~200us
+    // per call and made the whole blocked dispatch 2.5x SLOWER than the
+    // row-major path whose kernel is 3.5x slower. So a zero here would mean the
+    // expensive host conversion crept back.
     assert_eq!(
         grim_backend_rocm::rocm_kernel_route_counter("grim_quant_fp8_pad16"),
-        prologue_before,
-        "the eager path must not use the capture-only act prologue"
+        prologue_before + 1,
+        "the eager path must quantize A on device, not through the host"
     );
     Ok(())
 }

@@ -11,10 +11,10 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, CoreTensorOps, QuantOps, Shape};
 
 use crate::device::roc_device::{
-    FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
+    RocmDevice, FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS,
 };
 use crate::memory::storage::RocmStorage;
-use crate::{RocmHandle, arg, dtype_f32};
+use crate::{arg, dtype_f32, RocmHandle};
 
 mod dequant_fp_quants;
 mod dequant_host;
@@ -280,6 +280,45 @@ impl QuantOps for RocmDevice {
                     )?;
                 }
             }
+            DTypeStorage::KQuant(KQuantScheme::Q2_0) => {
+                // Upstream GGUF Q2_0 (tag 42) x Q8_0 GEMV, ported from
+                // llama.cpp `ggml_vec_dot_q2_0_q8_0_generic`.
+                //
+                // Scalar integer MAC rather than the V_DOT4 path the Q8_0 arm
+                // uses: the weight's 2-bit codes are packed 4-per-byte and must
+                // be unpacked before any dot instruction sees them, so there is
+                // no 4-wide int8 operand to hand `sudot4`. The win is that the
+                // weight is never expanded to f32 -- 14.6 GB of expert bank
+                // stays packed in VRAM.
+                //
+                // A weight block pairs with exactly two activation blocks, so K
+                // must be 64-aligned; otherwise fall through to plain matmul,
+                // matching the generic `_` arm below.
+                if k % 64 == 0 && !Self::is_fp16_activation(a_storage) {
+                    let q80_bytes = (k / 32) * 34 * m;
+                    let mut buf_guard = self.act_q80_buf.write().unwrap_or_else(|e| e.into_inner());
+                    let need_alloc = match buf_guard.as_ref() {
+                        Some(s) => s.bytes < q80_bytes,
+                        None => true,
+                    };
+                    if need_alloc {
+                        *buf_guard = Some(RocmStorage::alloc_gpu(
+                            &Shape::new(vec![q80_bytes]),
+                            DType {
+                                arith: ArithType::U8,
+                                storage: DTypeStorage::Native,
+                            },
+                            &self.allocator,
+                            self.ordinal,
+                        )?);
+                    }
+                    let act_q80 = buf_guard.as_ref().unwrap();
+                    let _ = self.launch_quant_q8_0(a_storage, act_q80, m * k)?;
+                    self.launch_dot4_q2_0_q80_gemv(act_q80, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    return self.matmul(a, b_packed, out_shape);
+                }
+            }
             DTypeStorage::KQuant(KQuantScheme::Q6K) => {
                 let is_rdna34 = self.is_rdna34;
                 // RDNA2 has V_DOT4_I32_I8 (signed x signed) — same builtin flags
@@ -326,9 +365,12 @@ impl QuantOps for RocmDevice {
                 // this leg (it is gated on m == 1), so only decode steps can
                 // move — and an unchanged decode step means the head was
                 // never the remaining defect.
-                let q6k_dot4_ok =
-                    matches!(std::env::var("GRIM_Q6K_DOT4").as_deref(), Ok("1" | "true" | "on"));
-                if q6k_dot4_ok && (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                let q6k_dot4_ok = matches!(
+                    std::env::var("GRIM_Q6K_DOT4").as_deref(),
+                    Ok("1" | "true" | "on")
+                );
+                if q6k_dot4_ok && (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0
+                {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -927,67 +969,37 @@ impl QuantOps for RocmDevice {
                         "TreePie requires k % 32 == 0 for the 5.0 bpw claim; got k = {k}"
                     )));
                 }
-                // Activations arrive as whatever the caller had; the kernel wants
-                // packed f16 so the two decoded halves can feed the dot2 operand word
-                // directly. An f16 activation tensor is passed through untouched --
-                // that is the case a real decode loop hits, since TreePie's payoff is
-                // that B never gets dequantized. Anything else is converted through
-                // the host, which is correct but not fast; it is a fallback, not the
-                // intended path, and the comment is here so nobody reads it as one.
                 // `RocmStorage` is not Clone, so the converted buffer is bound
                 // out here and borrowed in both branches.
                 let converted;
                 let act_storage = if a_storage.dtype().arith == ArithType::F16 {
                     a_storage
                 } else {
-                    let raw = a_storage.copy_to_host().map_err(|e| {
-                        Error::Backend(format!("TreePie act readback: {e}"))
-                    })?;
+                    let raw = a_storage
+                        .copy_to_host()
+                        .map_err(|e| Error::Backend(format!("TreePie act readback: {e}")))?;
                     let src = a_storage.dtype();
-                    let mut bits: Vec<u8> = Vec::with_capacity(k * 2);
+                    let mut bits: Vec<u8> = Vec::with_capacity(m * k * 2);
                     if src.arith == ArithType::F32 {
                         for v in raw.chunks_exact(4) {
                             let f = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
                             bits.extend_from_slice(&half::f16::from_f32(f).to_bits().to_le_bytes());
                         }
                     } else {
-                        // Already a 16-bit activation dtype; reinterpret rather
-                        // than round-trip through f32, so an f16 tensor of f16
-                        // values is bit-preserved.
                         bits.extend_from_slice(&raw[..(m * k * 2).min(raw.len())]);
                     }
-                    // Sized m * k, not k. The GEMV only ever needs one row, so the
-                    // GEMV-era code here used k -- which under-allocated for
-                    // prefill by a factor of m, and the GEMM then read m*k halves
-                    // out of a k-half buffer. That is an out-of-bounds read on the
-                    // device, and it faulted the GPU rather than returning garbage,
-                    // which is the better of the two outcomes.
                     converted = RocmStorage::copy_from_host_raw_bytes(
                         &bits,
                         &Shape::new(vec![m * k]),
-                        DType { arith: ArithType::F16, storage: DTypeStorage::Native },
+                        DType {
+                            arith: ArithType::F16,
+                            storage: DTypeStorage::Native,
+                        },
                         &self.allocator,
                         self.ordinal,
                     )?;
                     &converted
                 };
-                let trace = *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some());
-                if trace {
-                    eprintln!(
-                        "[tp] m={m} n={n} k={k} act={:?} b={:?} out={:?} converted={}",
-                        act_storage.device_ptr.map(|p| p as u64),
-                        b_storage.device_ptr_u64(),
-                        out_storage.device_ptr.map(|p| p as u64),
-                        act_storage.dtype().arith == ArithType::F16,
-                    );
-                }
-                // Prefill (m > 1) routes to `grim_tree_pie_gemm`, which shares one B
-                // decode across TP_M_TILE rows of A. Root cause of the old fault
-                // found and fixed: the launcher passed kernargs as
-                // (ap, bp, mm, nn, kk, op) while the kernel takes
-                // (act, B, C, M, N, K) -- M landed in the C slot and the
-                // truncated C pointer in the K slot. Order fixed in
-                // launch_tree_pie_gemm; prefill unwired here.
                 if m != 1 {
                     self.launch_tree_pie_gemm(act_storage, b_storage, &out_storage, m, n, k)?;
                 } else {
@@ -995,98 +1007,39 @@ impl QuantOps for RocmDevice {
                 }
             }
             DTypeStorage::FloatPack(FloatPackScheme::Fp8Blocked16) => {
-                // WhiteRaven blocked WMMA (V_WMMA_F32_16X16X16_FP8_FP8) for
-                // decode AND prefill: one kernel, grid_y covers m > 1. B is
-                // 16x16-blocked (block_fp8_16x16, FP8_BLOCK16_ENCODER_VERSION),
-                // so fragment loads are contiguous 256B tiles. Two hard
-                // preconditions, both enforced by the launcher as well:
-                // k % 16 == 0 (rocwmma steps K by 16, no tail) and n % 16 == 0
-                // (whole 16x16 blocks). The kernel is gfx1200/1201-only, so
-                // refuse elsewhere rather than letting JIT fail obscurely.
-                if k % 16 != 0 || n % 16 != 0 {
-                    return Err(Error::Backend(format!(
-                        "WhiteRaven blocked requires k % 16 == 0 and n % 16 == 0; got k={k} n={n}"
-                    )));
-                }
-                if !self.gpu_target.starts_with("gfx12") {
-                    return Err(Error::Backend(format!(
-                        "WhiteRaven blocked needs an RDNA4 target, got {}",
-                        self.gpu_target
-                    )));
-                }
+                // WhiteRaven blocked WMMA (V_WMMA_F32_16X16X16_FP8_FP8), decode
+                // and prefill from one kernel: grid_y covers m > 1. B is
+                // 16x16-blocked (block_fp8_16x16, FP8_BLOCK16_ENCODER_VERSION)
+                // so each fragment load is one contiguous 256B tile.
                 // Activations arrive as whatever the caller had; the kernel
                 // wants fp8 codes padded to whole 16-row tiles (fragment loads
-                // are unmasked, only the store is). A u8 tensor of m*k codes
-                // passes through to the pad step untouched; anything else
-                // converts through the host, which is correct but not fast --
-                // a fallback, not the intended path (TreePie's act discipline).
-                // `RocmStorage` is not Clone, so the converted buffer is bound
-                // out here and borrowed below.
-                let converted;
-                let act_fp8 = if a_storage.dtype().arith == ArithType::U8 {
-                    let raw = a_storage.copy_to_host().map_err(|e| {
-                        Error::Backend(format!("WhiteRaven act readback: {e}"))
-                    })?;
-                    let a_rows = m.div_ceil(16) * 16;
-                    if raw.len() < m * k {
-                        return Err(Error::Backend(format!(
-                            "WhiteRaven u8 act needs {0} codes, got {1}",
-                            m * k,
-                            raw.len()
-                        )));
-                    }
-                    let mut padded = vec![0u8; a_rows * k];
-                    for r in 0..m {
-                        padded[r * k..(r + 1) * k].copy_from_slice(&raw[r * k..(r + 1) * k]);
-                    }
-                    converted = RocmStorage::copy_from_host_raw_bytes(
-                        &padded,
-                        &Shape::new(vec![a_rows * k]),
-                        DType { arith: ArithType::U8, storage: DTypeStorage::Native },
-                        &self.allocator,
-                        self.ordinal,
-                    )?;
-                    &converted
-                } else {
-                    let raw = a_storage.copy_to_host().map_err(|e| {
-                        Error::Backend(format!("WhiteRaven act readback: {e}"))
-                    })?;
-                    let src = a_storage.dtype();
-                    let a_rows = m.div_ceil(16) * 16;
-                    let mut padded = vec![0u8; a_rows * k];
-                    if src.arith == ArithType::F32 {
-                        for (i, v) in raw.chunks_exact(4).take(m * k).enumerate() {
-                            let f = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
-                            padded[i] = grim_quant::f32_to_fp8_e4m3(f);
-                        }
-                    } else if src.arith == ArithType::F16 {
-                        for (i, v) in raw.chunks_exact(2).take(m * k).enumerate() {
-                            let f = half::f16::from_le_bytes([v[0], v[1]].try_into().unwrap()).to_f32();
-                            padded[i] = grim_quant::f32_to_fp8_e4m3(f);
-                        }
-                    } else {
-                        return Err(Error::Backend(format!(
-                            "WhiteRaven act must be u8/f32/f16 codes, got {:?}",
-                            src.arith
-                        )));
-                    }
-                    converted = RocmStorage::copy_from_host_raw_bytes(
-                        &padded,
-                        &Shape::new(vec![a_rows * k]),
-                        DType { arith: ArithType::U8, storage: DTypeStorage::Native },
-                        &self.allocator,
-                        self.ordinal,
-                    )?;
-                    &converted
-                };
-                self.launch_wmma_gemm_fp8_e4m3_blocked(
-                    act_fp8,
-                    b_storage,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                )?;
+                // are unmasked, only the store is).
+                //
+                // This used to convert through the HOST -- a D2H readback plus
+                // a fresh allocation per call. Measured cost at decode shape
+                // (m=1, n=16384, k=4096): 347.8 us/call, versus 136.3 us for
+                // the row-major dispatch whose kernel is 3.5x SLOWER. The
+                // kernel win was real and the arm around it buried it: ~200us
+                // of per-call host work against ~90us of kernel time saved.
+                //
+                // So the eager path now uses the same capture-safe prologue as
+                // graph decode, writing into a cached per-device scratch. Both
+                // the sync and the allocation are gone; the quantization runs
+                // on device. Stream-ordered reuse is safe because the GEMM that
+                // reads the scratch is enqueued on the same stream.
+                if a_storage.dtype().arith != ArithType::U8
+                    && a_storage.dtype().arith != ArithType::F32
+                {
+                    return Err(Error::Backend(format!(
+                        "WhiteRaven act must be u8 codes or f32, got {:?}",
+                        a_storage.dtype().arith
+                    )));
+                }
+                let a_rows = m.div_ceil(16) * 16;
+                let scratch = self.white_raven_act_scratch(a_rows * k)?;
+                self.launch_quant_fp8_pad16(a_storage, &scratch, m, k)?;
+                let act_fp8 = scratch.as_ref();
+                self.launch_wmma_gemm_fp8_e4m3_blocked(act_fp8, b_storage, &out_storage, m, n, k)?;
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
                 // The MXFP4 kernel reads one E8M0 exponent per 32-element block (block_idx = (col*K+k)/32) and expects B_codes / B_exps as separate device buffers.

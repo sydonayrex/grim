@@ -10,6 +10,7 @@ use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, Shape};
+use std::sync::Arc;
 
 use crate::device::gemm_tuning::{lookup_gemm_config_for_shape, lookup_solution_index};
 use crate::device::roc_device::RocmDevice;
@@ -846,6 +847,70 @@ impl RocmDevice {
         )
     }
 
+    /// Cached per-device activation scratch for the WhiteRaven blocked leg.
+    ///
+    /// Sized on first use and reused thereafter, so the eager dispatch pays no
+    /// allocation per call -- measured at ~200us/call when it allocated a fresh
+    /// buffer and did a D2H readback, which was more than the kernel saved.
+    /// Keyed by byte size and grown (never shrunk) when a wider activation
+    /// shows up, so a decode-then-prefill sequence settles to one allocation.
+    ///
+    /// Reuse is stream-ordered: the prologue and the GEMM that reads the result
+    /// are enqueued back to back on this device's stream, so no second kernel
+    /// can observe a half-written scratch.
+    pub fn white_raven_act_scratch(&self, bytes: usize) -> Result<Arc<RocmStorage>> {
+        static SCRATCH: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, Arc<RocmStorage>>>,
+        > = std::sync::OnceLock::new();
+        let cache = SCRATCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = guard.get(&bytes) {
+            return Ok(s.clone());
+        }
+        // Grow-only: reuse the largest entry that already fits rather than
+        // allocating a second buffer for a smaller shape.
+        if let Some((&sz, s)) = guard
+            .iter()
+            .filter(|(_, s)| s.bytes() >= bytes)
+            .max_by_key(|(_, s)| s.bytes())
+        {
+            let _ = sz;
+            return Ok(s.clone());
+        }
+        let st = RocmStorage::alloc_gpu_with_bytes(
+            &Shape::new(vec![bytes]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            bytes,
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let st = Arc::new(st);
+        guard.insert(bytes, st.clone());
+        Ok(st)
+    }
+
+    /// Stage already-fp8 activation codes into the padded scratch: copy the
+    /// `m` real rows and zero the tail rows the fragment load will still read.
+    /// Stage already-fp8 activation codes into the padded scratch.
+    ///
+    /// A thin alias for [`Self::launch_quant_fp8_pad16`] with the dtype decided
+    /// by the caller: the kernel zeroes the pad rows in the same launch, which
+    /// is not optional -- a stale tail row is accumulated into the output as a
+    /// phantom activation, and at decode (m=1) that is 15 rows of whatever the
+    /// previous call left behind.
+    pub fn launch_fp8_pad_rows_into(
+        &self,
+        act_u8: &RocmStorage,
+        scratch: &RocmStorage,
+        m: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_quant_fp8_pad16(act_u8, scratch, m, k)
+    }
+
     /// Act prologue for [`Self::launch_wmma_gemm_fp8_e4m3_blocked`]: quantize an
     /// F32 activation `[m, k]` to FP8 E4M3 codes into `act_fp8_pad`
     /// (`16*ceil(m/16) * k` bytes, pad rows +0.0).
@@ -856,17 +921,36 @@ impl RocmDevice {
     /// scratch, so replay re-quantizes fresh activations on device.
     pub fn launch_quant_fp8_pad16(
         &self,
-        act_f32: &RocmStorage,
+        act: &RocmStorage,
         act_fp8_pad: &RocmStorage,
         m: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        let x_ptr = act_f32
+        let x_ptr = act
             .device_ptr
             .ok_or_else(|| Error::Backend("quant_fp8_pad16: act has no device ptr".into()))?;
         let o_ptr = act_fp8_pad
             .device_ptr
             .ok_or_else(|| Error::Backend("quant_fp8_pad16: out has no device ptr".into()))?;
+
+        // An already-fp8 act skips the conversion but still needs its pad rows,
+        // which is why this is a flag on one entry point rather than two
+        // kernels: the pad rows are zeroed by the same launch either way.
+        let src_is_fp8 = match act.dtype().arith {
+            ArithType::F32 => 0,
+            ArithType::U8 => 1,
+            other => {
+                return Err(Error::Backend(format!(
+                    "quant_fp8_pad16: act must be f32 or u8 codes, got {other:?}"
+                )))
+            }
+        };
+        if src_is_fp8 == 1 && act.bytes() < m * k {
+            return Err(Error::Backend(format!(
+                "quant_fp8_pad16: u8 act has {} bytes, need {m}*{k}",
+                act.bytes()
+            )));
+        }
 
         let a_rows = m.div_ceil(16) * 16;
         if act_fp8_pad.bytes < a_rows * k {
@@ -877,16 +961,26 @@ impl RocmDevice {
             )));
         }
 
-        let (grid, block) = crate::device::util::linear_launch(m * k);
+        // Grid covers the PADDED element count, not m*k. The kernel zeroes the
+        // tail rows itself; sizing the grid to m*k would leave 15 of 16 rows
+        // holding whatever the previous call wrote.
+        let (grid, block) = crate::device::util::linear_launch(a_rows * k);
         let mut x_ptr = x_ptr;
         let mut o_ptr = o_ptr;
         let mut mm = m as i32;
         let mut kk = k as i32;
+        let mut is_fp8 = src_is_fp8;
         self.launch_compute_kernel(
             "grim_quant_fp8_pad16",
             grid,
             block,
-            &mut [arg(&mut x_ptr), arg(&mut o_ptr), arg(&mut mm), arg(&mut kk)],
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut o_ptr),
+                arg(&mut mm),
+                arg(&mut kk),
+                arg(&mut is_fp8),
+            ],
         )
     }
 

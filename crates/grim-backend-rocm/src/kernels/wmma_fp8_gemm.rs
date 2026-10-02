@@ -191,14 +191,26 @@ extern "C" __global__ __launch_bounds__(32) void grim_wmma_gemm_fp8_e4m3_blocked
 // dot_gemv.rs::grim_f32_to_fp8_e4m3 -- the same rule all three must hold to,
 // because the A operand the kernel accumulates is whatever this produces.
 extern "C" __global__ __launch_bounds__(256) void grim_quant_fp8_pad16(
-    const float* __restrict__ x,   // [M, K] F32 activations
+    const float* __restrict__ x,   // [M, K] F32 activations, or [M, K] fp8
+                                   // codes reinterpreted when src_is_fp8 != 0
     unsigned char* __restrict__ out,// [16*ceil(M/16), K] FP8 E4M3 codes
-    int M, int K) {
+    int M, int K, int src_is_fp8) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = M * K;
+    // Tail rows must be zeroed: the fragment load reads whole 16-row tiles, and
+    // stale scratch would be accumulated as phantom activations (15 of them at
+    // decode, where M=1).
+    int padded_total = ((M + 15) / 16) * 16 * K;
+    if (idx >= total && idx < padded_total) {
+        out[idx] = 0;
+    }
     if (idx < total) {
         int row = idx / K;
         int col = idx - row * K;
+        if (src_is_fp8) {
+            out[row * K + col] = ((const unsigned char*)x)[idx];
+            return;
+        }
         float v = x[idx];
         unsigned sign = __builtin_signbit(v) ? 0x80u : 0x00u;
         float a = __builtin_fabsf(v);
@@ -332,6 +344,16 @@ mod self_tests {
         assert!(
             proto.contains("a >= 448.0f"),
             "act prologue must saturate at 448, not 480 (the 0x7F NaN slot)"
+        );
+        // Tail rows must be zeroed in the SAME launch: a separate memset would
+        // be a second stream operation, and at decode 15 of 16 rows are tail.
+        assert!(
+            proto.contains("padded_total"),
+            "act prologue must zero the pad rows it does not write"
+        );
+        assert!(
+            proto.contains("src_is_fp8"),
+            "act prologue must accept pre-encoded codes without a second pass"
         );
     }
 
