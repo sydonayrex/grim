@@ -57,6 +57,32 @@ pub trait TensorProvider: Send + Sync {
         let raw = self.get_packed(name)?;
         shard_raw_tensor(raw, dim, rank, world_size)
     }
+
+    /// Read a byte range of a tensor's stored payload without materializing
+    /// the whole tensor. Default implementation slices the packed bytes;
+    /// file-backed providers override it to slice the mmap directly.
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let raw = self.get_packed(name)?;
+        let start = start as usize;
+        let len = len as usize;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| Error::Backend("get_range overflow".into()))?;
+        if end > raw.bytes.len() {
+            return Err(Error::Backend(format!(
+                "get_range {start}..{end} exceeds tensor '{name}' byte length {}",
+                raw.bytes.len()
+            )));
+        }
+        Ok(raw.bytes[start..end].to_vec())
+    }
+
+    /// Path of the underlying checkpoint file, when the provider is
+    /// file-backed. Lets loaders re-open independent handles for lazy
+    /// per-expert byte-range fetches.
+    fn source_path(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Validates that `out_dim` divides evenly by `world_size` without splitting quantization blocks.

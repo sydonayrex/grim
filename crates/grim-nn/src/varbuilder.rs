@@ -319,6 +319,11 @@ impl<'a> WeightSource<'a> {
         }
     }
 
+    /// Access the underlying tensor provider.
+    pub fn provider(&self) -> &'a dyn grim_tensor::TensorProvider {
+        self.tensors
+    }
+
     /// Returns the target device for this WeightSource (CPU or GPU).
     pub fn device(&self) -> Device {
         self.device.clone()
@@ -343,7 +348,7 @@ impl<'a> WeightSource<'a> {
         materialize(raw, shape, dtype, provenance, &self.device)
     }
 
-    fn full_name(&self, leaf: &str) -> String {
+    pub fn full_name(&self, leaf: &str) -> String {
         let mut s = self.prefix.join(".");
         if !s.is_empty() {
             s.push('.');

@@ -28,6 +28,9 @@ pub struct GgufProvider {
     mmap: memmap2::Mmap,
     /// Byte offset of the aligned tensor-data section within the file.
     data_start: u64,
+    /// Path the provider was opened from; lets loaders re-open independent
+    /// handles for lazy byte-range expert fetches.
+    path: String,
     tensors: HashMap<String, GgufTensorInfo>,
     grim: GrimMetadata,
     overrides: HashMap<String, GrimQuantOverride>,
@@ -183,6 +186,7 @@ impl GgufProvider {
             file: gguf,
             mmap,
             data_start,
+            path: path.to_string(),
             tensors,
             grim,
             overrides,
@@ -365,6 +369,35 @@ impl TensorProvider for GgufProvider {
             dtype,
             provenance: QuantProvenance::GrimNative,
         })
+    }
+
+    fn source_path(&self) -> Option<&str> {
+        Some(&self.path)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GGUF file")))?;
+        let abs = self
+            .data_start
+            .checked_add(info.offset)
+            .and_then(|o| o.checked_add(start))
+            .ok_or_else(|| Error::Backend(format!("GGUF tensor '{name}' offset overflow")))?;
+        // Cap the read at the effective payload width of the whole tensor:
+        // per-expert strides are computed against it.
+        let total = effective_size_bytes(info, &self.overrides);
+        if start
+            .checked_add(len)
+            .map(|e| e as usize > total as usize)
+            .unwrap_or(true)
+        {
+            return Err(Error::Backend(format!(
+                "get_range {start}.. on '{name}' exceeds effective tensor size {total}"
+            )));
+        }
+        self.read_region(abs, len as usize)
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
@@ -1271,6 +1304,7 @@ pub struct SplitGgufProvider {
     shards: Vec<GgufProvider>,
     tensor_map: HashMap<String, usize>,
     total_expected_tensors: usize,
+    primary_path: String,
 }
 
 impl std::fmt::Debug for SplitGgufProvider {
@@ -1370,6 +1404,7 @@ impl SplitGgufProvider {
             shards: ordered_shards,
             tensor_map,
             total_expected_tensors: expected_tensors,
+            primary_path: primary_path.to_string(),
         })
     }
 
@@ -1417,6 +1452,17 @@ impl TensorProvider for SplitGgufProvider {
             Error::Backend(format!("tensor '{name}' not found across GGUF splits"))
         })?;
         self.shards[*idx].meta(name)
+    }
+
+    fn source_path(&self) -> Option<&str> {
+        Some(&self.primary_path)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let idx = self.tensor_map.get(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found across GGUF splits"))
+        })?;
+        self.shards[*idx].get_range(name, start, len)
     }
 
     fn tensor_names(&self) -> Vec<String> {

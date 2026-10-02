@@ -550,6 +550,8 @@ impl Qwen38MoeExpert {
 enum Qwen38MoeExperts {
     Bank(grim_nn::moe::ExpertBank),
     Individual(Vec<Qwen38MoeExpert>),
+    /// SSD-tiered: per-expert byte ranges fetched from the mmap at activation.
+    Offloaded(grim_nn::ExpertOffloadBanks),
 }
 
 enum Qwen38SharedExpert {
@@ -569,6 +571,10 @@ struct Qwen38MoeBlock {
     num_experts_per_tok: usize,
     routed_scaling_factor: f32,
     _charon_cache: crate::shared_moe::CharonCache,
+    /// Host-tiered expert staging cache: expert weights are materialized on
+    /// CPU (SSD/mmap-backed packed GGUF pages) and the active experts are
+    /// staged to the compute device on demand, keyed by expert index.
+    expert_stage: std::sync::Mutex<std::collections::HashMap<usize, (Linear, Linear, Linear)>>,
 }
 
 impl Qwen38MoeBlock {
@@ -580,21 +586,54 @@ impl Qwen38MoeBlock {
         )
         .or_else(|_| Linear::load_shape(&ws.scoped("gate"), [cfg.hidden_size, cfg.num_experts]))?;
 
-        let experts = if ws.has_tensor("ffn_gate_exps.weight") {
-            let bank = grim_nn::moe::ExpertBank::load(
-                ws,
+        let experts = if ws.device().is_cpu() {
+            if ws.has_tensor("ffn_gate_exps.weight") {
+                let bank = grim_nn::moe::ExpertBank::load(
+                    ws,
+                    cfg.num_experts,
+                    cfg.hidden_size,
+                    cfg.intermediate_size,
+                    false,
+                )?;
+                Qwen38MoeExperts::Bank(bank)
+            } else {
+                let mut exp_vec = Vec::with_capacity(cfg.num_experts);
+                for i in 0..cfg.num_experts {
+                    let expert_ws = ws.scoped("experts").scoped(&i.to_string());
+                    exp_vec.push(Qwen38MoeExpert::load(
+                        &expert_ws,
+                        cfg.hidden_size,
+                        cfg.intermediate_size,
+                    )?);
+                }
+                Qwen38MoeExperts::Individual(exp_vec)
+            }
+        } else if ws.has_tensor("ffn_gate_exps.weight") {
+            // GPU target: experts are too large to upload; keep them as mmap'd
+            // byte ranges (SSD-evictable) and stage active experts only.
+            let path = ws
+                .provider()
+                .source_path()
+                .ok_or_else(|| {
+                    grim_core::Error::Config(
+                        "expert offload requires a file-backed provider".into(),
+                    )
+                })?;
+            let stores = grim_nn::ExpertOffloadBanks::open(
+                path,
+                &ws.full_name("ffn_gate_exps.weight"),
+                &ws.full_name("ffn_up_exps.weight"),
+                &ws.full_name("ffn_down_exps.weight"),
                 cfg.num_experts,
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                false,
             )?;
-            Qwen38MoeExperts::Bank(bank)
+            Qwen38MoeExperts::Offloaded(stores)
         } else {
+            let expert_ws = ws.with_device(Device::Cpu);
             let mut exp_vec = Vec::with_capacity(cfg.num_experts);
             for i in 0..cfg.num_experts {
-                let expert_ws = ws.scoped("experts").scoped(&i.to_string());
+                let expert_ws_i = expert_ws.scoped("experts").scoped(&i.to_string());
                 exp_vec.push(Qwen38MoeExpert::load(
-                    &expert_ws,
+                    &expert_ws_i,
                     cfg.hidden_size,
                     cfg.intermediate_size,
                 )?);
@@ -636,19 +675,61 @@ impl Qwen38MoeBlock {
             num_experts_per_tok: cfg.num_experts_per_tok,
             routed_scaling_factor: cfg.routed_scaling_factor,
             _charon_cache: crate::shared_moe::CharonCache::new(),
+            expert_stage: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
     fn forward_expert(&self, idx: usize, x: &Tensor) -> Result<Tensor> {
-        match &self.experts {
-            Qwen38MoeExperts::Individual(list) => list[idx].forward(x),
-            Qwen38MoeExperts::Bank(bank) => {
-                let g = bank.gate[idx].forward(x)?;
-                let u = bank.up[idx].forward(x)?;
-                let act = grim_nn::modules::silu_mul_on_device(&g, &u)?;
-                Ok(bank.down[idx].forward(&act)?)
-            }
+        let target = x.device().clone();
+        if let Qwen38MoeExperts::Offloaded(store) = &self.experts {
+            let (g, u, d) = store.get(idx, &target)?;
+            let g_out = g.forward(x)?;
+            let u_out = u.forward(x)?;
+            let act = grim_nn::modules::silu_mul_on_device(&g_out, &u_out)?;
+            return Ok(d.forward(&act)?);
         }
+        let staged = {
+            let mut cache = self.expert_stage.lock().unwrap();
+            let cached = cache
+                .get(&idx)
+                .filter(|h| h.0.weight.device() == &target)
+                .cloned();
+            if let Some(h) = cached {
+                Some(h)
+            } else {
+                cache.remove(&idx);
+                if cache.len() >= 8 {
+                    cache.clear();
+                }
+                let triple = match &self.experts {
+                    Qwen38MoeExperts::Individual(list) => Some((
+                        list[idx].gate_proj.staged_to(&target)?,
+                        list[idx].up_proj.staged_to(&target)?,
+                        list[idx].down_proj.staged_to(&target)?,
+                    )),
+                    Qwen38MoeExperts::Bank(bank) => Some((
+                        bank.gate[idx].staged_to(&target)?,
+                        bank.up[idx].staged_to(&target)?,
+                        bank.down[idx].staged_to(&target)?,
+                    )),
+                    Qwen38MoeExperts::Offloaded(off) => {
+                        let t = off.get(idx, &target)?;
+                        Some(t)
+                    }
+                };
+                if let Some(t) = triple {
+                    cache.insert(idx, t.clone());
+                    Some(t)
+                } else {
+                    None
+                }
+            }
+        };
+        let (g, u, d) = staged.expect("expert weights always present");
+        let g_out = g.forward(x)?;
+        let u_out = u.forward(x)?;
+        let act = grim_nn::modules::silu_mul_on_device(&g_out, &u_out)?;
+        Ok(d.forward(&act)?)
     }
 
     fn forward_shared(&self, x: &Tensor) -> Result<Tensor> {
@@ -689,6 +770,7 @@ impl Qwen38MoeBlock {
         let num_exp = match &self.experts {
             Qwen38MoeExperts::Bank(b) => b.num_experts(),
             Qwen38MoeExperts::Individual(l) => l.len(),
+            Qwen38MoeExperts::Offloaded(_) => self.gate.weight.shape().dims()[0],
         };
 
         let logits_vec = router_logits.to_vec_f32()?;
@@ -1874,6 +1956,9 @@ pub struct Qwen38NgramEmbedding {
     pub proj: Linear,
     /// Deterministic coprime polynomial modular addressing generator.
     pub addressing: Qwen38NgramAddressing,
+    /// Optional tiered lookup: resident table + NVMe spill for the huge PLE
+    /// table. When `None`, rows are gathered from `table` directly.
+    pub spill: Option<std::sync::Arc<grim_nn::SpillableEmbedding>>,
 }
 
 impl Qwen38NgramEmbedding {
@@ -1888,7 +1973,11 @@ impl Qwen38NgramEmbedding {
             ));
         }
 
-        let table_vec = self.table.to_vec_f32()?;
+        let table_vec = if self.spill.is_none() {
+            Some(self.table.to_vec_f32()?)
+        } else {
+            None
+        };
         let n_heads = self.addressing.n_heads();
         // Upstream lays the gathered rows out as [ple_n_heads * n_tokens] and
         // then reshapes to [n_tokens, ple_n_heads * ple_head_dim], so the
@@ -1907,9 +1996,18 @@ impl Qwen38NgramEmbedding {
             for (h, &row) in rows.iter().enumerate() {
                 let src = row as usize * self.ngram_dim;
                 let dst = i * row_dim + h * self.ngram_dim;
-                if src + self.ngram_dim <= table_vec.len() {
-                    gathered_ngram[dst..dst + self.ngram_dim]
-                        .copy_from_slice(&table_vec[src..src + self.ngram_dim]);
+                if let Some(ref sp) = self.spill {
+                    let row_vec = sp.lookup(row)?;
+                    let end = dst + self.ngram_dim;
+                    if row_vec.len() >= self.ngram_dim {
+                        gathered_ngram[dst..end]
+                            .copy_from_slice(&row_vec[..self.ngram_dim]);
+                    }
+                } else if let Some(ref tv) = table_vec {
+                    if src + self.ngram_dim <= tv.len() {
+                        gathered_ngram[dst..dst + self.ngram_dim]
+                            .copy_from_slice(&tv[src..src + self.ngram_dim]);
+                    }
                 }
             }
         }
@@ -2069,9 +2167,13 @@ impl Qwen38FlashNext {
             // max(head_offset + head_vocab_size) is 320001446. Probing the
             // derived row count can therefore never match, so the tensor is
             // fetched by name and its own shape is trusted.
-            let table = match root.get([padded_rows, ngram_dim], "per_layer_token_embd.weight") {
+            let table = match root
+                .with_device(Device::Cpu)
+                .get([padded_rows, ngram_dim], "per_layer_token_embd.weight")
+            {
                 Ok(t) => t,
                 Err(_) => root
+                    .with_device(Device::Cpu)
                     .scoped("layers")
                     .scoped("1")
                     .scoped("ple")
@@ -2079,11 +2181,13 @@ impl Qwen38FlashNext {
                     .scoped("ngram_embedding")
                     .get([ngram_vocab, ngram_dim], "shard_0")
                     .or_else(|_| {
-                        root.scoped("ngram_embeddings")
+                        root.with_device(Device::Cpu)
+                            .scoped("ngram_embeddings")
                             .get([ngram_vocab, ngram_dim], "weight")
                     })
                     .or_else(|_| {
-                        root.scoped("ple_ngram_embd")
+                        root.with_device(Device::Cpu)
+                            .scoped("ple_ngram_embd")
                             .get([ngram_vocab, ngram_dim], "weight")
                     })
                     .map_err(|e| {
@@ -2098,6 +2202,7 @@ impl Qwen38FlashNext {
 
             let proj = Linear::load_shape(
                 &root
+                    .with_device(Device::Cpu)
                     .scoped("layers")
                     .scoped("1")
                     .scoped("ple")
@@ -2106,13 +2211,13 @@ impl Qwen38FlashNext {
             )
             .or_else(|_| {
                 Linear::load_shape(
-                    &root.scoped("ngram_proj"),
+                    &root.with_device(Device::Cpu).scoped("ngram_proj"),
                     [ple_gathered_dim, cfg.hidden_size],
                 )
             })
             .or_else(|_| {
                 Linear::load_shape(
-                    &root.scoped("ple_ngram_proj"),
+                    &root.with_device(Device::Cpu).scoped("ple_ngram_proj"),
                     [ple_gathered_dim, cfg.hidden_size],
                 )
             })
@@ -2124,6 +2229,15 @@ impl Qwen38FlashNext {
             })?;
 
             let addressing = cfg.ple_addressing()?;
+            let spill = std::env::var("GRIM_PLE_SPILL_F32").ok().map(|p| {
+                std::sync::Arc::new(grim_nn::SpillableEmbedding::new_spilled(
+                    None,
+                    std::path::PathBuf::from(p),
+                    64,
+                    1024,
+                    ngram_dim,
+                ))
+            });
 
             Some(Qwen38NgramEmbedding {
                 ngram_vocab_size: ngram_vocab,
@@ -2132,6 +2246,7 @@ impl Qwen38FlashNext {
                 table,
                 proj,
                 addressing,
+                spill,
             })
         } else {
             None
@@ -2211,6 +2326,7 @@ impl Qwen38FlashNext {
                 table,
                 proj,
                 addressing,
+                spill: None,
             })
         } else {
             None
@@ -2821,6 +2937,7 @@ mod moe_d2d_parity_tests {
             num_experts_per_tok: 2,
             routed_scaling_factor: 1.0,
             _charon_cache: crate::shared_moe::CharonCache::new(),
+            expert_stage: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2834,6 +2951,7 @@ mod moe_d2d_parity_tests {
         let experts = match &block.experts {
             Qwen38MoeExperts::Individual(v) => v,
             Qwen38MoeExperts::Bank(_) => panic!("host_reference only supports Individual experts"),
+            Qwen38MoeExperts::Offloaded(_) => panic!("host_reference only supports Individual experts"),
         };
         let n_exp = experts.len();
         let mut out = vec![0.0f32; seq * hidden];

@@ -3,6 +3,7 @@
 /// Tiered embedding lookup with optional NVMe spill path (Issue 3 of scythe_fixes_and_ngram_spill_plan.md).
 /// `SpillableEmbedding` is a drop-in wrapper around `Embedding` that adds a config-gated NvMe spill path for.
 pub mod embedding_spill;
+pub mod expert_offload;
 pub mod modules;
 pub mod moe;
 pub use moe::{
@@ -32,3 +33,4 @@ pub use moe_deterministic::{DeterministicTokenMap, ScoreboardSync};
 pub use moe_hybrid::{HybridExecutor, PcieBench};
 pub use scythe2::{Scythe2Linear, slice_input_dim, slice_output_dim};
 pub use varbuilder::WeightSource;
+pub use expert_offload::ExpertOffloadBanks;

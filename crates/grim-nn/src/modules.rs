@@ -824,6 +824,21 @@ impl Linear {
         Self::load(ws, shape[0], shape[1], false)
     }
 
+    pub fn staged_to(&self, target: &Device) -> Result<Self> {
+        if self.weight.device() == target {
+            return Ok(self.clone());
+        }
+        Ok(Self {
+            weight: move_to_device(&self.weight, target)?,
+            bias: match &self.bias {
+                Some(b) => Some(move_to_device(b, target)?),
+                None => None,
+            },
+            w_t: move_to_device(&self.w_t, target)?,
+            quant_format: None,
+        })
+    }
+
     /// F2 (full-parameter write-back): swap in freshly trained weights,
     /// recomputing the pre-transposed `w_t` that forward actually consumes.
     pub fn replace_weight(&mut self, weight: Tensor) -> Result<()> {
