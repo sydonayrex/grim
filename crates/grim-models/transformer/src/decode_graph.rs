@@ -6942,6 +6942,13 @@ pub struct Xing40GraphScratch {
     /// LAST layer's output, so any oracle needing layer 0's input stream must
     /// read this instead - reading sin[0] late silently produces a reference
     /// ~1900x too large.
+    /// Per-layer snapshot of the router's output. `moe_route_experts` /
+    /// `moe_route_weights` are single shared buffers that EVERY layer
+    /// overwrites, so post-replay they hold the LAST layer's routing; reading
+    /// them against an earlier layer's `norm_buf` compares two different
+    /// layers and "fails" at rel ~1.6 with nothing wrong in the model.
+    pub route_experts_snap: Vec<GBox>,
+    pub route_weights_snap: Vec<GBox>,
     pub sin0_snap: Vec<GBox>,
     pub attn_out_snap: Vec<GBox>,
     pub attn_post_snap: Vec<GBox>,
@@ -7003,6 +7010,8 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
         hc_fn_ffn: Vec::with_capacity(n_layers),
         hc_base: Vec::with_capacity(n_layers),
         hc_scale: Vec::with_capacity(n_layers),
+        route_experts_snap: Vec::with_capacity(n_layers),
+        route_weights_snap: Vec::with_capacity(n_layers),
         sin0_snap: Vec::with_capacity(1),
         attn_out_snap: Vec::with_capacity(n_layers),
         attn_post_snap: Vec::with_capacity(n_layers),
@@ -7041,6 +7050,14 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
             .push(dev.zeros(&Shape::new(vec![hc, batch]), grim_tensor::DType::F32)?);
         s.sin0_snap
             .push(dev.zeros(&Shape::new(vec![batch, flat]), grim_tensor::DType::F32)?);
+        s.route_experts_snap.push(dev.zeros(
+            &Shape::new(vec![batch * cfg.n_routed_experts.max(1)]),
+            grim_tensor::DType::U32,
+        )?);
+        s.route_weights_snap.push(dev.zeros(
+            &Shape::new(vec![batch * cfg.n_routed_experts.max(1)]),
+            grim_tensor::DType::F32,
+        )?);
         s.attn_out_snap
             .push(dev.zeros(&Shape::new(vec![batch, hidden]), grim_tensor::DType::F32)?);
         s.attn_post_snap
@@ -8162,6 +8179,16 @@ dev.launch_hc_collapse_step(
                     true, // xing4_0.expert_weights_norm
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;
+
+                // Snapshot this layer's routing before the next layer
+                // overwrites the shared buffers.
+                {
+                    let n = batch * moe.num_experts_per_tok;
+                    let e = as_rocm(scratch.route_experts_snap[i].as_ref())?;
+                    dev.copy_slice_into(e, &buffers.moe_route_experts, 0, n)?;
+                    let w = as_rocm(scratch.route_weights_snap[i].as_ref())?;
+                    dev.copy_slice_into(w, &buffers.moe_route_weights, 0, n)?;
+                }
                 // HOST ORACLE for the noaux_tc routing, at the first MoE
                 // layer. Independent of the device kernel: sigmoid the gate
                 // logits, select the top-k on (sigmoid + correction bias),
@@ -8951,6 +8978,119 @@ dev.launch_hc_collapse_step(
                             }
                         }
                     }
+                    // IN-SITU MoE ORACLE for layer 2 (the first moe+shared
+                    // layer). The dispatch has a bit-identical UNIT test but has
+                    // never been checked on the real routing: norm_buf[i] is
+                    // only ever an INPUT to the write-back oracle, which passes
+                    // regardless of whether the dispatch itself was right.
+                    // Routing comes from the PER-LAYER snapshot - the shared
+                    // buffers hold the last layer's routing post-replay.
+                    if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                        const ML: usize = 2;
+                        const NOUT: usize = 256;
+                        if let Some(moe) = &self.layers.get(ML).and_then(|l| l.moe.as_ref()) {
+                            let col = g
+                                .col
+                                .get(ML)
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|s| s.to_cpu_vec_f32().ok());
+                            let nb = graph
+                                .buffers
+                                .norm_buf
+                                .get(ML)
+                                .and_then(|s| s.to_cpu_vec_f32().ok());
+                            let sel = g
+                                .route_experts_snap
+                                .get(ML)
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|s| s.to_cpu_vec_u32().ok());
+                            let wts = g
+                                .route_weights_snap
+                                .get(ML)
+                                .and_then(|b| as_rocm(b.as_ref()).ok())
+                                .and_then(|s| s.to_cpu_vec_f32().ok());
+                            if let (Some(col), Some(nb), Some(sel), Some(wts)) = (col, nb, sel, wts)
+                            {
+                                let hidden = col.len();
+                                let topk = sel.len().min(wts.len());
+                                let mut acc = vec![0.0f32; NOUT.min(hidden)];
+                                let mut ok = true;
+                                for t in 0..topk {
+                                    let e = sel[t] as usize;
+                                    let w = wts[t] * moe.routed_scaling_factor;
+                                    let Some(x) = moe.experts.get(e) else { ok = false; break };
+                                    let (Ok(g1), Ok(u1), Ok(d1)) = (
+                                        x.w1.weight().to_vec_f32(),
+                                        x.w3.weight().to_vec_f32(),
+                                        x.w2.weight().to_vec_f32(),
+                                    ) else { ok = false; break };
+                                    let inter = g1.len() / hidden.max(1);
+                                    let mut act = vec![0.0f32; inter];
+                                    for j in 0..inter {
+                                        let (mut ga, mut ua) = (0.0f32, 0.0f32);
+                                        for c in 0..hidden.min(g1.len() / inter.max(1)) {
+                                            ga += col[c] * g1[j * hidden + c];
+                                            ua += col[c] * u1[j * hidden + c];
+                                        }
+                                        act[j] = (ga / (1.0 + (-ga).exp())) * ua;
+                                    }
+                                    for (j, o) in acc.iter_mut().enumerate().take(NOUT.min(hidden)) {
+                                        let mut v = 0.0f32;
+                                        for c in 0..inter.min(act.len()) {
+                                            v += act[c] * d1[j * inter + c];
+                                        }
+                                        *o += w * v;
+                                    }
+                                }
+                                if ok {
+                                    if let Some(sh) = &moe.shared_experts {
+                                        if let (Ok(s1), Ok(s3), Ok(s2)) = (
+                                            sh.w1.weight().to_vec_f32(),
+                                            sh.w3.weight().to_vec_f32(),
+                                            sh.w2.weight().to_vec_f32(),
+                                        ) {
+                                            let sinter = s1.len() / hidden.max(1);
+                                            let mut act = vec![0.0f32; sinter];
+                                            for j in 0..sinter {
+                                                let (mut ga, mut ua) = (0.0f32, 0.0f32);
+                                                for c in 0..hidden.min(s1.len() / sinter.max(1)) {
+                                                    ga += col[c] * s1[j * hidden + c];
+                                                    ua += col[c] * s3[j * hidden + c];
+                                                }
+                                                act[j] = (ga / (1.0 + (-ga).exp())) * ua;
+                                            }
+                                            for (j, o) in
+                                                acc.iter_mut().enumerate().take(NOUT.min(hidden))
+                                            {
+                                                let mut v = 0.0f32;
+                                                for c in 0..sinter.min(act.len()) {
+                                                    v += act[c] * s2[j * sinter + c];
+                                                }
+                                                *o += v;
+                                            }
+                                        }
+                                    }
+                                    let n = acc.len().min(nb.len());
+                                    let md = acc[..n]
+                                        .iter()
+                                        .zip(nb[..n].iter())
+                                        .map(|(x, y)| (x - y).abs())
+                                        .fold(0.0f32, f32::max);
+                                    let rr =
+                                        (acc[..n].iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32)
+                                            .sqrt();
+                                    let rg =
+                                        (nb[..n].iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32)
+                                            .sqrt();
+                                    eprintln!(
+                                        "[xing-graph] MOE-ORACLE L{ML} (first {n} outs, top{topk}): max_abs {md:.4e} rel {:.4e} host_rms {rr:.4e} dev_rms {rg:.4e}",
+                                        md as f64 / (rr as f64).max(1e-12)
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // FFN WRITE-BACK ORACLE ACROSS DEPTH, post-replay. Every
                     // input survives the replay for EVERY layer (sout[i] is
                     // written once by the attention branch, norm_buf[i] by the
