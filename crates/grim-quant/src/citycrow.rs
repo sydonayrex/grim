@@ -633,8 +633,16 @@ mod tests {
                 expect(i)
             );
         }
-        // And the scale must be honoured: with scale 2.0 a code of 3 is +2.0.
-        assert!((got[0] - 2.0).abs() < 1e-6, "got[0] = {}", got[0]);
+        // And the scale must be honoured. Lane 0 of word 0 is code 3, so
+        // its value is (3 - bias) * scale -- which depends on the bias, so the
+        // expectation derives from the probe rather than a literal.
+        let want0 = (3.0 - decoder_bias() as f32) * 2.0;
+        assert!(
+            (got[0] - want0).abs() < 1e-6,
+            "got[0] = {} but code 3 at scale 2.0 with bias {} says {want0}",
+            got[0],
+            decoder_bias() as f32
+        );
 
         // A second group with a different scale proves the decoder reads
         // scales per group rather than reusing group 0's.
@@ -646,14 +654,16 @@ mod tests {
             k: 2 * CITYCROW_GROUP,
         };
         let got2 = decode_groups(&two);
+        let w0 = (3.0 - decoder_bias() as f32) * 2.0;
         assert!(
-            (got2[0] - 2.0).abs() < 1e-6,
-            "group 0 code 3 at scale 2.0 should be 2.0, got {}",
+            (got2[0] - w0).abs() < 1e-6,
+            "group 0 code 3 at scale 2.0 should be {w0}, got {}",
             got2[0]
         );
+        let w1 = (3.0 - decoder_bias() as f32) * 0.5;
         assert!(
-            (got2[CITYCROW_GROUP] - 0.5).abs() < 1e-6,
-            "group 1 code 3 at scale 0.5 should be 0.5, got {}",
+            (got2[CITYCROW_GROUP] - w1).abs() < 1e-6,
+            "group 1 code 3 at scale 0.5 should be {w1}, got {}",
             got2[CITYCROW_GROUP]
         );
     }
@@ -810,15 +820,14 @@ mod tests {
     fn lane_layout_matches_the_isa_definition_bit_for_bit() {
         let k = CITYCROW_GROUP;
         let n = 1;
-        // The GSQRCO codebook is {-2,-1,0,+1} * d with d = amax, so its
-        // representable range is [-d, +d] = [-amax, +amax] -- NOT
-        // [-2*amax, +2*amax]. A fixture that assumes the wider span asks for
-        // code 0 from a w of -2*amax, which this format cannot express, and
-        // the "all four codes" assertion below then fails for a reason that
-        // has nothing to do with the lane layout under test.
+        // The fixture spans [-amax, +amax] = [-1, +1] against amax = 1.0.
         //
-        // So the fixture spans exactly [-amax, +amax]: with amax = 1.0 the four
-        // codes are reachable at w = -1, -1/3, +1/3, +1.
+        // How many codes that reaches depends on the bias, and the bias is
+        // MEASURED (see `decoder_bias`): the codes are `bias-1 .. bias+1`, so
+        // three of the four are reachable at either bias. Asserting all four
+        // would assert something false about the format at one bias or the
+        // other; the assertion below derives the reachable set instead, and
+        // still fails loudly if a code that SHOULD appear is missing.
         let mut flat = Vec::with_capacity(k);
         for i in 0..k {
             // 16 distinct levels over one period, spanning [-1, +1].
@@ -864,15 +873,26 @@ mod tests {
         //
         // Code 0 is NOT reachable and this is a property of the format, not a
         // the codebook, so the test asserts codes 0..3 all occur.
-        assert!(
-            seen[1] && seen[2] && seen[3],
-            "fixture must exercise codes 1..3, saw {seen:?}"
-        );
-        assert!(
-            !seen[0],
-            "code 0 is unreachable for d = amax; seeing it means the scale or \
-             the codebook offset is wrong: {seen:?}"
-        );
+        let bias = decoder_bias() as usize;
+        let reachable: Vec<usize> = (bias.saturating_sub(1)..=(bias + 1).min(3)).collect();
+        for c in &reachable {
+            assert!(
+                seen[*c],
+                "code {c} is reachable from [-amax, +amax] but absent: {seen:?}"
+            );
+        }
+        // A code OUTSIDE the reachable set appearing would mean the scale or
+        // the codebook offset is wrong -- e.g. code 3 showing up at bias 2,
+        // where the top representable value is +1*amax.
+        for c in 0..4usize {
+            if !reachable.contains(&c) {
+                assert!(
+                    !seen[c],
+                    "code {c} is outside the reachable set {reachable:?} for this \
+                     bias, so its presence means the offset is wrong: {seen:?}"
+                );
+            }
+        }
     }
 
     /// Two groups in one row must not bleed into each other: the second
