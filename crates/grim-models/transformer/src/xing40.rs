@@ -724,7 +724,14 @@ impl Xing40HyperConnection {
             let r = (proj_host.iter().map(|x| x * x).sum::<f32>() / proj_host.len().max(1) as f32).sqrt();
             eprintln!("[xing-trace] hc proj: n {} rms {r:.4e} head {:?}", proj_host.len(), &proj_host[..proj_host.len().min(6)]);
             eprintln!("[xing-trace] hc pre: {:?}", gates.pre.to_cpu_vec_f32().map(|v| v[..v.len().min(4)].to_vec()));
+            if let Ok(cv) = gates.comb.to_cpu_vec_f32() {
+                let rs: Vec<f32> = (0..self.hc_mult).map(|h| (0..self.hc_mult).map(|i| cv[h * self.hc_mult + i]).sum()).collect();
+                eprintln!("[xing-trace] hc comb rowsums {:?}", rs);
+                eprintln!("[xing-trace] hc post {:?}", gates.post.to_cpu_vec_f32().map(|v| v[..v.len().min(4)].to_vec()));
+            }
             eprintln!("[xing-trace] hc input_norm weight shape {:?}", self.input_norm.weight.shape());
+            eprintln!("[xing-trace] hc_fn dtype {:?} shape {:?}", self.hc_fn_weight().dtype(), self.hc_fn_weight().shape());
+            eprintln!("[xing-trace] input_norm eps {} dtype {:?}", self.input_norm.eps, self.input_norm.weight.dtype());
             if let Ok(wv) = self.input_norm.weight.to_vec_f32() {
                 eprintln!("[xing-trace] input_norm w[0..4] {:?} rms {:.4e}", &wv[..4.min(wv.len())],
                     (wv.iter().map(|x| x * x).sum::<f32>() / wv.len().max(1) as f32).sqrt());

@@ -7371,28 +7371,6 @@ impl DecodeGraphModel for Xing40 {
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("hc seed: {e}")))?;
         }
-        if std::env::var_os("GRIM_XING_TRACE").is_some() {
-            let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
-            if let Ok(st) = as_rocm(&buffers.layer_input[0]) {
-                if let Ok(v) = st.to_cpu_vec_f32() {
-                    let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                    eprintln!("[xing-graph] CAPTURE layer_input[0]: rms {r:.4e} head {:?} capturing={}", &v[..4], graph.capturing);
-                }
-            }
-            if let Ok(st) = as_rocm(scratch.sin[0].as_ref()) {
-                if let Ok(v) = st.to_cpu_vec_f32() {
-                    let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                    eprintln!(
-                        "[xing-graph] CAPTURE sin[0]: n {} rms {r:.4e} h0 {:?} h3584 {:?} capturing={}",
-                        v.len(),
-                        &v[..4],
-                        &v[3584..3588],
-                        graph.capturing
-                    );
-                }
-            }
-        }
-
         let h_shape = Shape::new(vec![batch, hidden]);
         let n_layers = self.layers.len();
         // Fault bisection: capture only the first N layers (default: all).
@@ -7448,7 +7426,32 @@ impl DecodeGraphModel for Xing40 {
                 cmin,
                 cmax,
             )?;
-            dev.launch_hc_collapse_step(
+                        // CAVEAT: this is a WARMUP pass. run.rs runs warmups on UNSEEDED
+            // buffers and then re-seeds, so only values UPSTREAM of the
+            // attention (embedding, collapse, attn gates, q path) are
+            // comparable to an eager run. Anything downstream of the KV
+            // attention reads a stale arena and legitimately differs — two
+            // rounds of chasing that were wasted before this was written down.
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                for (lbl, b) in [("post", scratch.post.first()), ("comb", scratch.comb.first())] {
+                    if let Some(b) = b {
+                        if let Ok(st) = as_rocm(b.as_ref()) {
+                            if let Ok(v) = st.to_cpu_vec_f32() {
+                                if lbl == "comb" {
+                                    let rows: Vec<f32> = (0..hc)
+                                        .map(|h| (0..hc).map(|i| v[h * hc + i]).sum())
+                                        .collect();
+                                    eprintln!("[xing-graph] WARM comb rowsums {rows:?}");
+                                } else {
+                                    eprintln!("[xing-graph] WARM post {v:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+dev.launch_hc_collapse_step(
                 // The attention branch reads the layer INPUT. `sout[i]` is the
                 // staging buffer the attention write-back fills further down,
                 // so it is still zeros at this point.
@@ -7464,8 +7467,25 @@ impl DecodeGraphModel for Xing40 {
                 layer.attn_norm.eps,
                 as_rocm(scratch.col[i].as_ref())?,
                 &h_shape,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+           )?;
+            // The FFN branch overwrites `col` later in this layer, so the
+            // attention-branch value is only observable here. Dump during the
+            // WARMUP pass (capturing=false => syncing is legal and the values
+            // are real); during the recorded pass this buffer is stale.
+            if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                if let Ok(st) = as_rocm(scratch.col[0].as_ref()) {
+                    if let Ok(v) = st.to_cpu_vec_f32() {
+                        let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
+                            .sqrt();
+                        eprintln!(
+                            "[xing-graph] WARM attn_in L{i}: n {} rms {r:.4e} head {:?}",
+                            v.len(),
+                            &v[..v.len().min(4)]
+                        );
+                    }
+                }
+            }
 
             if std::env::var("GRIM_XING_STOP").ok().as_deref() == Some("pre") {
                 return Ok(());
@@ -7714,7 +7734,43 @@ impl DecodeGraphModel for Xing40 {
                 cmin,
                 cmax,
             )?;
-            // The FFN branch reads the stream the ATTENTION write-back just
+                        if i == 0 && !graph.capturing && std::env::var_os("GRIM_XING_TRACE").is_some() {
+                let _ = grim_backend_rocm::device::helpers::hip_stream_synchronize(graph.stream);
+                // Same warmup caveat as above: the FFN proj reads a stream
+                // built on a stale KV arena.
+                if let Some(b) = scratch.proj.first() {
+                    if let Ok(st) = as_rocm(b.as_ref()) {
+                        if let Ok(v) = st.to_cpu_vec_f32() {
+                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                            eprintln!("[xing-graph] WARMFFN proj rms {r:.4e} head {:?}", &v[..6.min(v.len())]);
+                        }
+                    }
+                }
+                if let Some(b) = scratch.comb.first() {
+                    if let Ok(st) = as_rocm(b.as_ref()) {
+                        if let Ok(v) = st.to_cpu_vec_f32() {
+                            let rows: Vec<f32> = (0..hc).map(|h| (0..hc).map(|i| v[h * hc + i]).sum()).collect();
+                            eprintln!("[xing-graph] WARMFFN comb rowsums {rows:?}");
+                        }
+                    }
+                }
+                if let Some(b) = scratch.post.first() {
+                    if let Ok(st) = as_rocm(b.as_ref()) {
+                        if let Ok(v) = st.to_cpu_vec_f32() {
+                            eprintln!("[xing-graph] WARMFFN post {v:?}");
+                        }
+                    }
+                }
+                if let Some(b) = scratch.col.first() {
+                    if let Ok(st) = as_rocm(b.as_ref()) {
+                        if let Ok(v) = st.to_cpu_vec_f32() {
+                            let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                            eprintln!("[xing-graph] WARMFFN ffn_in n {} rms {r:.4e} head {:?}", v.len(), &v[..4.min(v.len())]);
+                        }
+                    }
+                }
+            }
+// The FFN branch reads the stream the ATTENTION write-back just
             // produced (`sout[i]`), not the layer input (`sin[i]`) — a replace-all
             // had flattened both collapses onto `sin`, which the near-zero `post`
             // gate of layer 0 hid until layer 1's larger gate exposed it.
@@ -8142,6 +8198,13 @@ impl DecodeGraphModel for Xing40 {
                             })
                             .collect();
                         eprintln!("[xing-graph] sin rms {}", parts.join(" "));
+                    if let Some(b) = g.sin.get(1) {
+                        if let Ok(st) = as_rocm(b.as_ref()) {
+                            if let Ok(v) = st.to_cpu_vec_f32() {
+                                eprintln!("[xing-graph] sin1 head {:?}", &v[..v.len().min(6)]);
+                            }
+                        }
+                    }
                     }
                     // Top-5 of the head output: the direct comparison point
                     // against eager's --logprobs line for the same step.
