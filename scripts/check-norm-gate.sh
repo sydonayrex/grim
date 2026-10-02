@@ -49,6 +49,27 @@ report() {
 
 result_of() { grep -m1 '^test result' || true; }
 
+# One classifier, used by BOTH the workspace scan and the per-crate scan. Two
+# copies of this list is exactly how they drifted, and the drift is why an
+# error in a peer's `charon.rs` still reported as our FAIL.
+# Returns 0 for "the peer's" and 1 for "ours".
+is_peer_error() {
+    case "$1" in
+        # by SYMBOL first -- a peer error can land in a crate we also own
+        *F32\|*Fp8Blocked*|*QuantFormat*|*expert_stage*|*index_head_dim*|\
+        *index_n_heads*|*index_source_layer_ids*|*Xing40GraphScratch*|*k_norm*|\
+        *act_fp8_pad_buf*|*layer_geoms*|*WhiteRaven*|*WhiteCrow*|*KqNative*|\
+        *moe_route_topk*|*tree_pie*|*TreePie*|*charon*)
+            return 0 ;;
+        # then by FILE, for the peer's files we do not have symbols for
+        *shared_moe.rs|*qwen4exp*|*expert_offload.rs|*dtype.rs|*deepseek32*|\
+        *xing40*|*backend-rocm*|*backend-cuda*|*backend-vulkan*|*backend-metal*|\
+        *quant/*|*llama_bak*|*memory/*|*charon*|*tree_pie*|*iq_gemm*|*charon.rs*)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # --- the whole workspace, not just the crates these tests touch -----------
 # 9295cb40 added a field to a struct used in three `mod tests` literals in
 # grim-cli and missed all three. Every suite in this gate runs in a crate that
@@ -63,19 +84,38 @@ ws_errs="$(printf '%s' "$ws_out" | grep -c ': error' || true)"
 # that are not norm work, and a gate that reports those as its own failures
 # trains people to ignore it.
 unattributed=""
+own_failed=0
 while IFS= read -r line; do
     [ -z "$line" ] && continue
-    file="${line%%:*}"
-    case "$file" in
-        *model_loader.rs|*modules.rs|*block.rs|*model.rs|*decode_graph.rs)
-            : ;;                      # a norm crate: ours to answer for
-        *shared_moe.rs|*qwen4exp*|*expert_offload.rs|*dtype.rs|*quant*)
-            : ;;                      # known peer files
-        *backend-rocm*|*backend-cuda*|*backend-vulkan*|*backend-metal*)
-            : ;;                      # peer backend crates
-        *) unattributed="$unattributed$line\n" ;;
-    esac
+    # `could not compile <crate>` carries no symbol and no file of its own; it
+    # is a peer error only if some error in this same output is. Count those
+    # separately so a cascade does not read as ours.
+    if is_peer_error "$line"; then
+        :                                      # theirs, wherever it lands
+    else
+        unattributed="$unattributed$line\n"    # ours
+    fi
 done <<< "$(printf '%s' "$ws_out" | grep ': error' || true)"
+
+# cargo stops after the first failing crate, so one peer's error can hide a
+# later one -- including ours. Check the crates this gate owns by name, one at
+# a time, so "is my code broken" does not depend on who failed first.
+own_broken=""
+for c in grim-core grim-nn grim-models-transformer grim-engine grim-cli \
+         grim-models-vision grim-format; do
+    o2="$(cargo check -p "$c" --all-targets --message-format short 2>&1)"
+    # A crate we own can still carry a peer's error, and the crate name alone
+    # cannot tell the two apart -- so this goes through the same classifier.
+    while IFS= read -r e; do
+        [ -z "$e" ] && continue
+        is_peer_error "$e" || own_broken="$own_broken$c: $e\n"
+    done <<< "$(printf '%s' "$o2" | grep ': error' || true)"
+done
+if [ -n "$own_broken" ]; then
+    printf '  FAIL  %b' "$own_broken"
+    fail "a crate this gate owns does not compile"
+    own_failed=1
+fi
 if [ "$ws_rc" -eq 0 ]; then
     pass "cargo check --workspace --all-targets: 0 errors"
     ws_blocked=0
@@ -95,7 +135,7 @@ if [ "${ws_blocked:-0}" -eq 1 ]; then
     echo "---"
     # `fail` has already set the flag; respect it. An unattributed error is
     # ours, and a "BLOCKED" footer on top of a FAIL reads as an excuse.
-    if [ "$fail" -eq 0 ]; then
+    if [ "$fail" -eq 0 ] && [ "$own_failed" -eq 0 ]; then
         echo "norm gate BLOCKED (a peer's edit, not a norm regression)"
         exit 2
     fi
