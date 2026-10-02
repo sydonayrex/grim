@@ -941,15 +941,6 @@ impl RocmDevice {
             )));
         }
         let stream = self.default_stream;
-        // TP-PROBE (scratch): bisects dispatched-vs-standalone launcher delta.
-        // Remove after diagnosis. Enabled by GRIM_TP_LAUNCH_GUARD=1.
-        let _tp_guard;
-        let stream = if std::env::var("GRIM_TP_LAUNCH_GUARD").is_ok() {
-            _tp_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-            self.active_stream()
-        } else {
-            stream
-        };
         let res = unsafe {
             hipModuleLaunchKernel(
                 func,

@@ -168,7 +168,10 @@ extern "C" __global__ void grim_tree_pie_gemm(
             #pragma unroll
             for (int t = 0; t < TP_M_TILE; ++t) {
                 if (t < rows) {
-                    unsigned a01 = act2[(((size_t)t * K) + (g * 32 + j)) >> 1];
+                    // A row is GLOBAL (m0 + t): t alone re-reads tile 0's rows
+                    // for every later tile while C advanced correctly -- ragged
+                    // and multi-tile prefill silently computed the wrong rows.
+                    unsigned a01 = act2[(((size_t)(m0 + t) * K) + (g * 32 + j)) >> 1];
                     acc[t] = grim_fdot2_f32_f16(a01, w01, acc[t]);
                 }
             }

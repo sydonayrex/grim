@@ -2292,6 +2292,7 @@ extern "C" __global__ void grim_moe_fused_dispatch_whitecrow(
         atomicAdd(out + (unsigned long long)tok * hidden + h, routed_scaling_factor * w * acc);
     }
 }
+
 "#;
 
 // Host launcher (parameter marshalling - pure, unit-testable without GPU)

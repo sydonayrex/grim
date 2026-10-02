@@ -1847,11 +1847,16 @@ impl RocmDevice {
         let (mut ap, mut bp, mut op) = (a_ptr, b_ptr, o_ptr);
         let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
         let tiles = m.div_ceil(TP_M_TILE).max(1) as u32;
+        // Kernarg order must match the kernel's (act, B, C, M, N, K): C is
+        // third, not last. Passing (ap, bp, mm, nn, kk, op) put M in the C
+        // slot and the truncated C pointer in the K slot, faulting every
+        // prefill launch while the GEMV (whose launcher already had C third)
+        // worked fine.
         self.launch_compute_kernel(
             "grim_tree_pie_gemm",
             HipDim3::new(n as u32, tiles, 1),
             HipDim3::new(32, 1, 1),
-            &mut [arg(&mut ap), arg(&mut bp), arg(&mut mm), arg(&mut nn), arg(&mut kk), arg(&mut op)],
+            &mut [arg(&mut ap), arg(&mut bp), arg(&mut op), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
         )
     }
 
