@@ -1655,6 +1655,24 @@ impl Xing40Mla {
         if seq_len == 1 && rank <= 512 && !self.kv_b_proj.weight.dtype().is_quantized() {
             let kernel_scale = 1.0f32 / ((rank + rope_d) as f32).sqrt();
             let ratio = scale / kernel_scale;
+            // PRE-scale query dumps, position-tagged: the graph holds the
+            // unscaled q_absorbed/q_rope and folds the ratio into the softmax
+            // denominator, so these are the quantities to compare there. The
+            // earlier comparison was taken in the warmup, i.e. at the capture
+            // step, never at a replay.
+            if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                for (nm, t) in [("QABS", &q_absorbed), ("QROPE", &q_rope)] {
+                    if let Ok(v) = t.to_vec_f32() {
+                        let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
+                            .sqrt();
+                        eprintln!(
+                            "[xing-trace] {nm} pos {} rms {r:.6e} head {:?}",
+                            positions.last().copied().unwrap_or(u32::MAX),
+                            &v[..4.min(v.len())]
+                        );
+                    }
+                }
+            }
             let qa_s = dev
                 .mul_scalar(q_absorbed.storage().as_ref(), ratio, &q_abs_shape)?
                 .0;
@@ -1738,6 +1756,15 @@ impl Xing40Mla {
         // Decode only: with q_len > 1 each query is causally masked and this
         // oracle (which attends the whole prefix) would be wrong by
         // construction, not by kernel error.
+        if std::env::var_os("GRIM_XING_TRACE").is_some() {
+            eprintln!(
+                "[xing-trace] PROBE-REACH seq_len {seq_len} got_ok {} qa_ok {} qr_ok {} kv_ok {}",
+                out_latent.to_cpu_vec_f32().is_ok(),
+                q_absorbed.to_vec_f32().is_ok(),
+                q_rope.to_vec_f32().is_ok(),
+                latent_all.to_vec_f32().is_ok()
+            );
+        }
         if std::env::var_os("GRIM_XING_TRACE").is_some() && seq_len == 1 {
             let got = out_latent.to_cpu_vec_f32().ok();
             let qa = q_absorbed.to_vec_f32().ok();

@@ -8696,6 +8696,27 @@ dev.launch_hc_collapse_step(
                         }
                     }
 
+                    // The PRE-scale query, held unscaled here (the ratio is folded into
+                    // `inv_sqrt_d`). This is the quantity eager dumps as QABS/QROPE
+                    // and the comparison that locates the divergence upstream of
+                    // the W_UV, which the fused/absorb alignment ruled out.
+                    for (nm, buf) in [("QABS", &g.qabs), ("QROPE", &g.qp)] {
+                        if let Some(b) = buf.first() {
+                            if let Ok(st) = as_rocm(b.as_ref()) {
+                                if let Ok(v) = st.to_cpu_vec_f32() {
+                                    let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                        / v.len().max(1) as f32)
+                                        .sqrt();
+                                    eprintln!(
+                                        "[xing-graph] {nm} pos {} rms {r:.6e} head {:?}",
+                                        graph.buffers.current_pos,
+                                        &v[..4.min(v.len())]
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // The o_proj output the graph fed to the attention
                     // write-back, snapshotted in-graph at the real prefix.
                     if let Some(nb) = g.attn_out_snap
@@ -9046,7 +9067,11 @@ dev.launch_hc_collapse_step(
                             if let Ok(kv) = kvr {
                                 let row = self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
                                 let p = graph.buffers.current_pos as usize;
-                                for r in [p.saturating_sub(2), p - 1, p] {
+                                // Include a SEEDED row (not one this replay
+                            // appended): rows 0..p-1 come from the eager
+                            // session, and a single stale one out of ~36 is
+                            // exactly the magnitude of the residual.
+                            for r in [10usize, p.saturating_sub(2), p - 1, p] {
                                     if r * row + row <= kv.len() {
                                         let seg = &kv[r * row..r * row + row];
                                         eprintln!(
