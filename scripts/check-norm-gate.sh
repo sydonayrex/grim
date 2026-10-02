@@ -59,7 +59,7 @@ is_peer_error() {
         *F32\|*Fp8Blocked*|*QuantFormat*|*expert_stage*|*index_head_dim*|\
         *index_n_heads*|*index_source_layer_ids*|*Xing40GraphScratch*|*k_norm*|\
         *act_fp8_pad_buf*|*layer_geoms*|*WhiteRaven*|*WhiteCrow*|*KqNative*|\
-        *moe_route_topk*|*tree_pie*|*TreePie*|*charon*|\
+        *moe_route_topk*|*tree_pie*|*TreePie*|*charon*|*latent_dim*|*kv_stride*|\
         *GgufDType*|*PQ2_0*|*PTQ1_0*|*TQ1_0*|*TQ2_0*|*Q1_0*|*Q2_0*|\
         *unreachable_pattern*)
             return 0 ;;
@@ -236,6 +236,7 @@ cp "$block" "$tmp/block.start"
 cp "$model" "$tmp/model.start"
 cp "$nn" "$tmp/nn.start"
 cp "$loader" "$tmp/loader.start"
+a_anchor() {
 cp "$block" "$tmp/block.orig"
 python3 - "$block" <<'PY'
 import re, sys
@@ -262,7 +263,14 @@ else
         *)             pass "A killed: $r" ;;
     esac
 fi
+
+    return 0
+}
+a_anchor || true
 cp "$tmp/block.orig" "$block"
+if ! cmp -s "$block" "$tmp/block.orig"; then
+    fail "A: block was not restored"
+fi
 out="$(cargo test -p grim-models-transformer --lib -j 1 2>&1 | result_of)"
 r="$(printf '%s' "$out" | result_of)"
 case "$r" in
@@ -360,6 +368,7 @@ echo
 echo "=== MUTATION D: load_tp ignores the config flag"
 # A test that sets the flag on an already-built block proves the branch works
 # but not that the flag is plumbed. This survived the whole library suite.
+d_anchor() {
 cp "$block" "$tmp/block.d.orig"
 python3 - "$block" <<'PY'
 import sys
@@ -379,7 +388,14 @@ else
         *)             pass "D killed: $r" ;;
     esac
 fi
+
+    return 0
+}
+d_anchor || true
 cp "$tmp/block.d.orig" "$block"
+if ! cmp -s "$block" "$tmp/block.d.orig"; then
+    fail "D: block was not restored"
+fi
 out="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
 r="$(printf '%s' "$out" | result_of)"
 case "$r" in
@@ -393,6 +409,7 @@ echo "=== MUTATION E: norm bias gated on the flag again"
 # attn_norm_b (gptneox, phi2, mpt, jais, orion, codeshell, starcoder,
 # starcoder2, nemotron, bloom, gpt2, falcon, jais2, phimoe, pockettts, rwkv6,
 # rwkv7, stablelm) compute a normalisation they were not trained with.
+e_anchor() {
 cp "$nn" "$tmp/nn.e.orig"
 python3 - "$nn" <<'PY'
 import sys
@@ -412,7 +429,14 @@ else
         *)             pass "E killed: $r" ;;
     esac
 fi
+
+    return 0
+}
+e_anchor || true
 cp "$tmp/nn.e.orig" "$nn"
+if ! cmp -s "$nn" "$tmp/nn.e.orig"; then
+    fail "E: nn was not restored"
+fi
 out="$(cargo test -p grim-models-transformer --test norm_adoption_seam -j 1 2>&1 | result_of)"
 r="$(printf '%s' "$out" | result_of)"
 case "$r" in
@@ -425,6 +449,7 @@ echo "=== MUTATION F: the loader maps every architecture to RMS"
 # `uses_layernorm` can be correct while `norm_kind_for` ignores it, which is
 # what shipped: the table existed and twenty LayerNorm models were still served
 # as RMS. The core test cannot catch this -- it only reads the table.
+f_anchor() {
 cp "$loader" "$tmp/loader.f.orig"
 python3 - "$loader" <<'PY'
 import sys
@@ -444,7 +469,14 @@ else
         *)             pass "F killed: $r" ;;
     esac
 fi
+
+    return 0
+}
+f_anchor || true
 cp "$tmp/loader.f.orig" "$loader"
+if ! cmp -s "$loader" "$tmp/loader.f.orig"; then
+    fail "F: loader was not restored"
+fi
 out="$(cargo test -p grim-engine --test norm_kind_wiring -j 1 2>&1)"
 r="$(printf '%s' "$out" | result_of)"
 case "$r" in
