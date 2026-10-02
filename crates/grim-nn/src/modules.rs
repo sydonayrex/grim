@@ -1128,8 +1128,13 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
     let (a, b) = (dims[0], dims[1]);
     let new_shape = Shape::new(vec![b, a]);
 
-    // ROCm quantized fast path: relabel only (kernel reads [out,in] directly).
-    if matches!(t.device(), Device::Rocm(_)) && t.dtype().is_quantized() {
+    // Quantized fast path (ROCm + CPU): relabel only (kernels read [out,in] directly).
+    // A1: CPU `quantized_matmul` consumes `weight` directly and transposes
+    // internally, so the F32 `to_vec_f32` copy below doubled RAM for every
+    // quantized Linear. Share storage; `w_t` stays packed and unused.
+    if t.dtype().is_quantized()
+        && (matches!(t.device(), Device::Rocm(_)) || t.device().is_cpu())
+    {
         return Ok(Tensor::new(
             t.storage().clone(),
             new_shape,
@@ -1154,8 +1159,10 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
         ));
     }
 
-    // All other cases (CPU/CUDA/Vulkan/Metal, F32 or quantized): genuinely transpose the data so `w_t` is in [in,out]=[k,n] row-major layout.
-    // Quantized tensors reaching here are already dequantized to F32 in `WeightSource::get` for CPU, so `to_vec_f32`.
+    // All other cases (CUDA/Vulkan/Metal quantized, plus F32 everywhere):
+    // genuinely transpose the data so `w_t` is in [in,out]=[k,n] row-major layout.
+    // CPU/ROCm quantized returned above, so `to_vec_f32` here never duplicates
+    // a packed CPU weight into F32.
     let src = t.to_vec_f32()?;
     let mut out = vec![0.0f32; a * b];
     for i in 0..a {
@@ -1631,13 +1638,13 @@ pub struct Embedding {
 /// 4.74 GiB over-allocation for a SILENT wrong embedding. Fix the decoder and
 /// gate it bit-exact against the reference first, then add IQ2_S here.
 fn embedding_has_packed_gather(storage: &Storage, device: &grim_tensor::Device) -> bool {
-    // The predicate is about the BACKEND, not just the dtype: only an
-    // accelerator has the on-device packed gather (`grim_embedding_q4k`).
-    // On the CPU device a K-quant table must be dequantized once on the host
-    // at load, exactly as the `embedding_packed` trait doc specifies.
-    if device.is_cpu() {
-        return false;
-    }
+    // The predicate is about the BACKEND, not just the dtype: an accelerator
+    // has the on-device packed gather (`grim_embedding_q4k`), and the CPU has
+    // a host packed gather (`CpuDevice::embedding_packed`, A2) that dequants
+    // one row at a time -- so K-quant tables in a verified scheme stay packed
+    // everywhere instead of deflating to f32 at load.
+    // Verified schemes only: Q4K + IQ3S. IQ2_S stays excluded (see above).
+    let _ = device;
     matches!(
         storage,
         Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
