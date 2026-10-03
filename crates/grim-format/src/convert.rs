@@ -970,14 +970,24 @@ fn pack_tensors(
                 dequant_tensor_data(&raw, elem_count)?
             };
 
-            let mut f32_values = f32_values;
+            let f32_values = f32_values;
 
-
+            // TRANSFORM PRELUDE SCOPE: SmoothQuant + SpinQuant alter the
+            // WEIGHT distribution only — they are quantization preprocessing
+            // whose activation-side counterpart the runtime does NOT apply.
+            // Feeding transformed weights to a tier that stores them at full
+            // precision (the F32 passthrough) or to a quantizer fit on the
+            // checkpoint's real weight distribution (GSQ-RCO) shifts every
+            // activation the model computes: the first .grim round-trip
+            // measured FULLY DISJOINT top-5 logits vs the source at step 0.
+            // The transforms stay on the FP8 named arms (raven/whiteraven),
+            // whose packed layouts were validated with them.
+            let mut f32_transformed = f32_values.clone();
             if meta.shape.len() == 2 {
                 let out_channels = meta.shape[0];
                 let in_channels = meta.shape[1];
                 let _ = grim_quant::apply_smoothquant_scale(
-                    &mut f32_values,
+                    &mut f32_transformed,
                     out_channels,
                     in_channels,
                     None,
@@ -992,7 +1002,7 @@ fn pack_tensors(
                     && elem_sqrt >= 16
                     && elem_sqrt.is_power_of_two()
                 {
-                    grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
+                    grim_quant::spinquant_rotate(&mut f32_transformed, elem_sqrt, 0.01, 5);
                 }
                 // else: attention projection but not a rotatable square block - fall through without rotating; do not error (non-square attention projections are legitimate, e.g.
                 // GQA with differing Q/KV dims).
@@ -1009,7 +1019,7 @@ fn pack_tensors(
                 && meta.shape[1] > 0
             {
                 let (n, k) = (meta.shape[0], meta.shape[1]);
-                let codes: Vec<u8> = f32_values
+                let codes: Vec<u8> = f32_transformed
                     .iter()
                     .map(|&v| grim_quant::f32_to_fp8_e4m3(v))
                     .collect();
@@ -1284,7 +1294,7 @@ fn pack_tensors(
                 && meta.shape[1] % 16 == 0
             {
                 let (n, k) = (meta.shape[0], meta.shape[1]);
-                let codes: Vec<u8> = f32_values
+                let codes: Vec<u8> = f32_transformed
                     .iter()
                     .map(|&v| grim_quant::f32_to_fp8_e4m3(v))
                     .collect();
