@@ -3,7 +3,9 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::BackendStorage;
+use grim_tensor::backend::ComputeHandle;
+use grim_tensor::dtype::{ArithType, DType};
+use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 use grim_tensor::error::{Error, Result};
 
 use crate::device::roc_device::RocmDevice;
@@ -314,6 +316,109 @@ impl RocmDevice {
                 arg(&mut kk),
             ],
         )
+    }
+
+    /// ForestRaven GEMV: F32 activations (quantized in-register) against a
+    /// per-row absmax INT8 blob (`Block(Int8PerChannel)`).
+    ///
+    /// Contract (refused, not clamped): `k % 32 == 0` (the kernel strides
+    /// 32-element blocks) and `b.bytes == 16 + n*k + 4*n` (framed blob:
+    /// `[u64 len][codes][u64 len][scales]`). A tail K would read codes past
+    /// the segment into the scales stream -- numerically silent -- and a
+    /// short blob would read past the allocation -- a fault. Both are host
+    /// errors with exact sizes attached, so the fix is always on the caller.
+    pub fn launch_dot4_forest_gemv(
+        &self,
+        act_f32: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 32 != 0 || k == 0 {
+            return Err(Error::Backend(format!(
+                "dot4_forest_gemv: K must be a nonzero multiple of 32 (block loop), got k={k}"
+            )));
+        }
+        let want_bytes = 16usize
+            .checked_add(n.checked_mul(k).ok_or_else(|| {
+                Error::Backend(format!("dot4_forest_gemv: n*k overflows (n={n}, k={k})"))
+            })?)
+            .and_then(|b| b.checked_add(4 * n))
+            .ok_or_else(|| Error::Backend("dot4_forest_gemv: blob size overflows".into()))?;
+        if b_storage.bytes != want_bytes {
+            return Err(Error::Backend(format!(
+                "dot4_forest_gemv: framed blob is {} bytes, need {} (16 + {n}*{k} codes + 4*{n} scales) -- truncated upload or wrong tensor",
+                b_storage.bytes, want_bytes
+            )));
+        }
+        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_forest_gemv: act_f32 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_forest_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_forest_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_forest_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// ForestRaven slow path: host-dequantize the framed blob to F32, upload,
+    /// and run the regular F32 matmul. Correct everywhere the kernel cannot
+    /// go (non-RDNA3/4, K tails, large prefill, `GRIM_DOT_GEMV=0`).
+    ///
+    /// This is per-call D2H + H2D plus an F32 GEMM: fine for one-shot prefill,
+    /// unacceptable per-token -- which is why the dispatch prefers the kernel
+    /// whenever its contract holds. The route is visible in benchmarks
+    /// because it runs different kernels, not because it logs.
+    pub fn forest_fallback_matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b_storage: &RocmStorage,
+        out_shape: &Shape,
+        _m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let blob = b_storage.copy_to_host().map_err(|e| {
+            Error::Backend(format!("forest fallback: blob download failed: {e}"))
+        })?;
+        let w = grim_quant::dequant_forest(&blob, n, k).map_err(|e| {
+            Error::Backend(format!("forest fallback: blob decode failed: {e}"))
+        })?;
+        let b_f32 = CoreTensorOps::from_cpu(
+            self,
+            &w,
+            &Shape::new(vec![n, k]),
+            DType {
+                arith: ArithType::F32,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+        )?;
+        self.matmul(a, b_f32.as_ref(), out_shape)
     }
 
     /// PLAN 4 Task 3: norm-fused single-projection dot4 GEMV directly from

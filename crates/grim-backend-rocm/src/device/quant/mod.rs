@@ -1455,12 +1455,69 @@ impl QuantOps for RocmDevice {
                 )?;
             }
             DTypeStorage::Block(bd) => {
-                // No fused block-quant GEMM on this backend. Falling through to
-                // `matmul` would reinterpret packed codes as F32 and emit
-                // garbage, so refuse explicitly and let the caller fall back.
-                return Err(Error::Unimplemented(format!(
-                    "ROCm quantized_matmul: no fused kernel for block format {bd:?}"
-                )));
+                // ForestRaven: per-row absmax INT8 GEMV via V_DOT4_I32_IU8.
+                // Kernel when its contract holds (RDNA3/4, F32 activations,
+                // K a nonzero multiple of 32, m within the dot4 prefill cap);
+                // host-dequant + F32 matmul otherwise. The fallback is
+                // correct everywhere and slow per-token, so the kernel is
+                // preferred, never assumed: every condition below names its
+                // reason, and GRIM_DOT_GEMV=0 forces the fallback for A/B.
+                if matches!(
+                    bd,
+                    grim_tensor::dtype::BlockDtype::Int8PerChannel
+                ) {
+                    let a_f32 = a_storage.dtype().arith == ArithType::F32
+                        && matches!(
+                            a_storage.dtype().storage,
+                            DTypeStorage::Native
+                        );
+                    if !a_f32 {
+                        return Err(Error::Backend(format!(
+                            "ROCm ForestRaven: activations must be F32 native (in-register quant), got {:?}",
+                            a_storage.dtype()
+                        )));
+                    }
+                    let dot_disabled = matches!(
+                        std::env::var("GRIM_DOT_GEMV").as_deref(),
+                        Ok("0" | "false" | "off")
+                    );
+                    let dot4_max_m: usize = std::env::var("GRIM_PREFILL_DOT4_M_MAX")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(64);
+                    if self.is_rdna34
+                        && !dot_disabled
+                        && k % 32 == 0
+                        && k > 0
+                        && m <= dot4_max_m
+                        && m > 0
+                    {
+                        self.launch_dot4_forest_gemv(
+                            a_storage,
+                            b_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
+                        )?;
+                    } else {
+                        return self.forest_fallback_matmul(
+                            a,
+                            b_storage,
+                            out_shape,
+                            m,
+                            n,
+                            k,
+                        );
+                    }
+                } else {
+                    // No fused block-quant GEMM on this backend. Falling through to
+                    // `matmul` would reinterpret packed codes as F32 and emit
+                    // garbage, so refuse explicitly and let the caller fall back.
+                    return Err(Error::Unimplemented(format!(
+                        "ROCm quantized_matmul: no fused kernel for block format {bd:?}"
+                    )));
+                }
             }
             _ => {
                 return self.matmul(a, b_packed, out_shape);

@@ -2598,6 +2598,117 @@ extern "C" __global__ void grim_dot8_w4a4_gemv(
 
 #endif // __gfx1200__ || __gfx1201__
 
+// ForestRaven decode/prefill GEMV: F32 activations quantized in-register
+// (per-32-block absmax, full-fp32 scale) against per-row absmax INT8 weights
+// in the framed blob ([u64 codes_len][codes N*K][u64 scales_len][scales N]).
+//
+// One scale multiply per output (d_a[block] * s_b[row]) instead of Q8_0's
+// per-32-block B scales: the B scale stream is N fp32, not N*K/32 fp16.
+// Integer accumulation via grim_sdot4 (V_DOT4_I32_IU8 on RDNA3/4), so the
+// dots are exact and the only rounding is the final float scaling -- the
+// host reference mirrors the in-register A quantization bit-for-bit and the
+// residual is pure float-association noise.
+//
+// Caller contract (checked host-side in the launcher, not here): K % 32 == 0
+// (block loop strides 32) and blob total == 16 + N*K + 4*N. A tail K would
+// read past the codes segment into the scales stream -- numerically silent,
+// so the gate lives on the host where it can refuse. N tails are handled
+// via active_cols; M rows via blockIdx.y like the Q8_0 GEMV above.
+//
+// Graph-capture safe (caller-owned buffers only, single launch, no scratch).
+extern "C" __global__ void grim_dot4_forest_gemv(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ Bblob,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    // Frame parse by arithmetic: the host validated the total size, so these
+    // offsets are exact without reading the length prefixes.
+    const signed char* Bcodes = (const signed char*)(Bblob + 8);
+    const float* Bscales = (const float*)(Bblob + 8 + (long long)N * K + 8);
+
+    const float* a_row = A + (long long)row * K;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    float s_b[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        s_b[j] = (j < active_cols) ? Bscales[col_base + j] : 0.0f;
+
+    const int n_blocks = K / 32;
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_blocks; blk += 32) {
+        const float* blk_src = a_row + (long long)blk * 32;
+
+        // 1. Per-32-block activation absmax. Full-fp32 scale, deliberately
+        // NOT fp16-rounded: unlike Q8_0/Q8_1 the A scale is ephemeral (never
+        // stored), so rounding it would lose precision for nothing. The host
+        // reference uses the same unrounded scale.
+        float amax = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 32; e++)
+            amax = fmaxf(amax, __builtin_fabsf(blk_src[e]));
+        const float d_a   = amax / 127.0f;
+        // Reciprocal-multiply, not divide-per-element: matches the host
+        // reference's formula bit-for-bit (same ops, same order), and the
+        // Q8_0 f32act kernel above does the same. Zero block -> all-zero
+        // codes and zero scale: contributes exactly 0, no NaN.
+        const float inv_a = (amax == 0.0f) ? 0.0f : (127.0f / amax);
+
+        int a4_reg[8];
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            signed char q0 = (signed char)__builtin_roundf(blk_src[p * 4 + 0] * inv_a);
+            signed char q1 = (signed char)__builtin_roundf(blk_src[p * 4 + 1] * inv_a);
+            signed char q2 = (signed char)__builtin_roundf(blk_src[p * 4 + 2] * inv_a);
+            signed char q3 = (signed char)__builtin_roundf(blk_src[p * 4 + 3] * inv_a);
+            a4_reg[p] = (int)((unsigned char)q0) |
+                        ((int)((unsigned char)q1) << 8) |
+                        ((int)((unsigned char)q2) << 16) |
+                        ((int)((unsigned char)q3) << 24);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            // B codes are dense row-major: row (col_base+j) starts at
+            // (col_base+j)*K, block blk at +blk*32. No per-block scale to
+            // load -- one s_b[j] for the whole row, hoisted above.
+            const signed char* b_blk =
+                Bcodes + (long long)(col_base + j) * K + (long long)blk * 32;
+            int iacc = 0;
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                int b4;
+                __builtin_memcpy(&b4, b_blk + p * 4, 4);
+                iacc = grim_sdot4(a4_reg[p], b4, iacc);
+            }
+            facc[j] += (float)iacc * d_a * s_b[j];
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 #endif // RDNA3/RDNA4
 
 // RDNA2 ISA probe: v_dot4_i32_i8 semantics on known packed operands.
