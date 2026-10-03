@@ -1,22 +1,21 @@
-//! GGUF `Q2_0` (dtype tag 42) dequantization KATs.
+//! GSQ-RCO 3.5-bit (GGUF tag 81) dequantization KATs.
 //!
-//! These replace a vacuous "all-zero block dequantizes to 256 zeros" check, which
-//! passes under *any* layout. The geometry and math asserted here are
-//! transcribed from ggml-org/llama.cpp at `f3f1a8f` — the runtime the
-//! Qwen3.8-Flash-Next GSQ-RCO release is pinned to:
-//!
-//! ```c
-//! #define QK2_0 64
-//! typedef struct { ggml_half d; uint8_t qs[QK2_0 / 4]; } block_q2_0;
-//! // dequantize_row_q2_0:
-//! const int q = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03;
-//! // 00=-1, 01=0, 10=+1, 11=+2
-//! y[i*qk + j] = ((int)q - 1) * d;
-//! ```
+//! These replace a vacuous "all-zero block dequantizes to 256 zeros" check,
+//! which passes under *any* layout. The block GEOMETRY is shared with
+//! upstream Q2_0 (llama.cpp `ggml-quants.c:439`: QK2_0 = 64, `ggml_half d`
+//! then 16 code bytes, 4 codes per byte low-first) — but the CODEBOOK is the
+//! GSQ paper's, per its own reference quantizer
+//! (old/repo/GSQ-main/src/quantization/gumbel_quantizer_2bit.py:10):
+//! `values = [-2, -1, 0, 1]`, i.e. `y = (q - 2) * d`. One level of d below
+//! Q2_0's `(q - 1) * d`. The bias-1 expectations this file used to pin were
+//! the Q2_0-compatible reading; they contradicted the committed decoder AND
+//! the GSQ source, and have been superseded (paper = source of truth per the
+//! GSQ-RCO format directive).
 
 use grim_format::gguf::GgufDType;
 use grim_quant::{
-    BLOCK_BYTES_GSQ_RCO_3P5, BLOCK_SIZE_GSQ_RCO_3P5, dequant_gsq_rco_3p5, quantize_q2_0_block,
+    BLOCK_BYTES_GSQ_RCO_3P5, BLOCK_SIZE_GSQ_RCO_3P5, dequant_gsq_rco_3p5,
+    quantize_gsq_rco_3p5_block,
 };
 use grim_tensor::provider::TensorProvider;
 
@@ -59,9 +58,10 @@ fn geometry_is_64_weights_per_18_byte_block() {
 }
 
 #[test]
-fn codebook_is_minus_one_zero_plus_one_plus_two() {
-    // The single most important property: code 1 is ZERO, code 0 is -d.
-    // Reading this as `-2..+1` (the older Q2_0 proposal) shifts every weight.
+fn codebook_is_minus_two_minus_one_zero_plus_one() {
+    // The single most important property: code 2 is ZERO, code 0 is -2d
+    // (GSQ paper: values = [-2, -1, 0, 1]). Reading this as Q2_0's
+    // `-1..+2` shifts every weight by one level of d — silently.
     let d = f32_to_f16_le(0.5);
     let mut block = [0u8; BLOCK_BYTES_GSQ_RCO_3P5];
     block[0] = d[0];
@@ -71,14 +71,14 @@ fn codebook_is_minus_one_zero_plus_one_plus_two() {
 
     let out = dequant_gsq_rco_3p5(&block, BLOCK_SIZE_GSQ_RCO_3P5).expect("dequant");
     assert_eq!(out.len(), 64);
-    assert_eq!(out[0], -0.5, "code 0 -> -d");
-    assert_eq!(out[1], 0.0, "code 1 -> 0");
-    assert_eq!(out[2], 0.5, "code 2 -> +d");
-    assert_eq!(out[3], 1.0, "code 3 -> +2d");
-    // j=4 starts a fresh code byte, which is still zero => code 0 => -d.
+    assert_eq!(out[0], -1.0, "code 0 -> -2d");
+    assert_eq!(out[1], -0.5, "code 1 -> -d");
+    assert_eq!(out[2], 0.0, "code 2 -> 0");
+    assert_eq!(out[3], 0.5, "code 3 -> +d");
+    // j=4 starts a fresh code byte, which is still zero => code 0 => -2d.
     // This is what a decoder that packs 4 codes per byte gets wrong.
-    assert_eq!(out[4], -0.5, "byte 1 restarts at j=4");
-    assert_eq!(out[63], -0.5);
+    assert_eq!(out[4], -1.0, "byte 1 restarts at j=4");
+    assert_eq!(out[63], -1.0);
 }
 
 #[test]
@@ -89,11 +89,11 @@ fn negative_scale_flips_sign_of_every_code() {
     block[0] = d[0];
     block[1] = d[1];
     for byte in block[2..].iter_mut() {
-        *byte = 0xff; // all codes = 3 -> +2d = -0.5
+        *byte = 0xff; // all codes = 3 -> +d = -0.25
     }
     let out = dequant_gsq_rco_3p5(&block, BLOCK_SIZE_GSQ_RCO_3P5).expect("dequant");
     assert!(
-        out.iter().all(|v| (*v - (-0.5)).abs() < 1e-6),
+        out.iter().all(|v| (*v - (-0.25)).abs() < 1e-6),
         "{:?}",
         out[0]
     );
@@ -109,12 +109,12 @@ fn subnormal_and_tiny_scales_decode() {
         block[1] = hb[1];
         block[2] = 0b11_10_01_00;
         let out = dequant_gsq_rco_3p5(&block, BLOCK_SIZE_GSQ_RCO_3P5).expect("dequant");
-        let got_d = -out[0];
+        let got_d = -out[0] / 2.0;
         assert!(
             (got_d - d).abs() <= d * 1e-2,
             "d={d} did not round-trip: got {got_d}"
         );
-        assert_eq!(out[1], 0.0);
+        assert_eq!(out[2], 0.0, "code 2 is the zero level");
     }
 }
 
@@ -135,33 +135,33 @@ fn block_stride_advances_by_18_not_72() {
 
     let out = dequant_gsq_rco_3p5(&buf, BLOCK_SIZE_GSQ_RCO_3P5 * 2).expect("dequant");
     assert_eq!(out.len(), 128);
-    assert!((out[0] - -0.5).abs() < 1e-6, "block 0 d");
-    assert!((out[64] - -2.0).abs() < 1e-6, "block 1 d");
-    assert!((out[67] - 4.0).abs() < 1e-6, "block 1 code 3 -> +2d");
+    assert!((out[0] - -1.0).abs() < 1e-6, "block 0 code 0 -> -2d");
+    assert!((out[64] - -4.0).abs() < 1e-6, "block 1 code 0 -> -2d");
+    assert!((out[67] - 2.0).abs() < 1e-6, "block 1 code 3 -> +d");
 }
 
 #[test]
 fn quantize_dequant_roundtrip_recovers_the_four_level_grid() {
-    // `d = max|x|`, so the codebook points are {-d, 0, +d, +2d} and +2d is
-    // unreachable by construction. Only {-d, 0, +d} can round-trip exactly;
-    // 0.25 exercises a non-grid value and must land within half a step.
+    // The GSQ codebook is {-2d, -d, 0, +d}. With d = 1 (the MSE fitter's
+    // choice for amax = 2) all four levels are exactly representable, so a
+    // grid-valued block must round-trip exactly; 0.25 exercises a non-grid
+    // value and must land within half a level.
     let mut vals = Vec::with_capacity(BLOCK_SIZE_GSQ_RCO_3P5);
     for j in 0..BLOCK_SIZE_GSQ_RCO_3P5 {
         vals.push(match j % 4 {
-            0 => -1.0,
-            1 => 0.0,
-            2 => 1.0,
-            _ => 0.25,
+            0 => -2.0,
+            1 => -1.0,
+            2 => 0.0,
+            _ => 1.0,
         });
     }
     let mut packed = vec![0u8; BLOCK_BYTES_GSQ_RCO_3P5];
-    quantize_q2_0_block(&vals, &mut packed).expect("quantize");
+    quantize_gsq_rco_3p5_block(&vals, &mut packed).expect("quantize");
 
     let out = dequant_gsq_rco_3p5(&packed, BLOCK_SIZE_GSQ_RCO_3P5).expect("dequant");
     for (i, (&want, &got)) in vals.iter().zip(out.iter()).enumerate() {
-        let tol = if want == 0.25 { 0.25 + 1e-6 } else { 1e-3 };
         assert!(
-            (want - got).abs() <= tol,
+            (want - got).abs() <= 1e-3,
             "index {i}: want {want}, got {got} (packed {packed:?})"
         );
     }
@@ -169,14 +169,15 @@ fn quantize_dequant_roundtrip_recovers_the_four_level_grid() {
 
 #[test]
 fn quantize_dequant_max_error_is_half_the_largest_step() {
-    // The grid is {-d, 0, d, 2d} with d = max|x|. The widest gap is 2d
-    // (between -d and +d), so worst-case error is bounded by d.
+    // The grid is {-2d, -d, 0, d} with a MSE-fitted d. The level gap is d,
+    // so nearest-level error is at most d/2; the one-level bound leaves the
+    // fitter slack.
     let n = BLOCK_SIZE_GSQ_RCO_3P5;
     let vals: Vec<f32> = (0..n)
         .map(|j| ((j as f32) / 7.0).sin() * 0.8 + ((j % 5) as f32 - 2.0) * 0.13)
         .collect();
     let mut packed = vec![0u8; BLOCK_BYTES_GSQ_RCO_3P5];
-    quantize_q2_0_block(&vals, &mut packed).expect("quantize");
+    quantize_gsq_rco_3p5_block(&vals, &mut packed).expect("quantize");
     let out = dequant_gsq_rco_3p5(&packed, n).expect("dequant");
 
     let d = vals.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -213,7 +214,7 @@ fn short_buffer_is_rejected() {
 fn all_zero_block_has_no_representable_scale_on_encode() {
     let vals = vec![0.0f32; BLOCK_SIZE_GSQ_RCO_3P5];
     let mut packed = vec![0u8; BLOCK_BYTES_GSQ_RCO_3P5];
-    let err = quantize_q2_0_block(&vals, &mut packed).expect_err("all-zero block");
+    let err = quantize_gsq_rco_3p5_block(&vals, &mut packed).expect_err("all-zero block");
     assert!(format!("{err}").contains("all zeros"));
 }
 
@@ -235,8 +236,8 @@ fn golden_hand_built_block_matches_spec_derived_values() {
     let deq = dequant_gsq_rco_3p5(&block, BLOCK_SIZE_GSQ_RCO_3P5).expect("dequant");
     assert_eq!(deq.len(), 64);
 
-    // y[j] = (code(j) - 1) * d, and the code pattern repeats every 4 weights.
-    const CODEBOOK: [f32; 4] = [-1.0, 0.0, 1.0, 2.0];
+    // y[j] = (code(j) - 2) * d (GSQ paper), pattern repeats every 4 weights.
+    const CODEBOOK: [f32; 4] = [-2.0, -1.0, 0.0, 1.0];
     for (j, &got) in deq.iter().enumerate() {
         let want = CODEBOOK[j % 4];
         assert!(
@@ -245,10 +246,10 @@ fn golden_hand_built_block_matches_spec_derived_values() {
             j % 4
         );
     }
-    assert_close_f32(deq[0], -1.0, "code 0 -> -d");
-    assert_close_f32(deq[1], 0.0, "code 1 -> 0 (zero is code 1, not code 0)");
-    assert_close_f32(deq[2], 1.0, "code 2 -> +d");
-    assert_close_f32(deq[3], 2.0, "code 3 -> +2d");
+    assert_close_f32(deq[0], -2.0, "code 0 -> -2d");
+    assert_close_f32(deq[1], -1.0, "code 1 -> -d");
+    assert_close_f32(deq[2], 0.0, "code 2 -> 0 (zero is code 2, not code 1)");
+    assert_close_f32(deq[3], 1.0, "code 3 -> +d");
 }
 
 // ---- Real checkpoint bytes --------------------------------------------
