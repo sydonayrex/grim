@@ -353,6 +353,20 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
             }
         },
         grim_tensor::dtype::Storage::Block(bd) => match bd {
+            // ForestRaven: decode the framed blob to dense f32. Needs the
+            // [n, k] geometry for the row count, which the raw shape carries;
+            // a flat element count cannot recover it.
+            grim_tensor::dtype::BlockDtype::Int8PerChannel => {
+                if raw.shape.len() < 2 {
+                    return Err(grim_tensor::error::Error::Backend(format!(
+                        "Int8PerChannel host dequant needs [n, k] shape, got {:?}",
+                        raw.shape
+                    )));
+                }
+                let (n, k) = (raw.shape[0], raw.shape[1]);
+                grim_quant::dequant_forest(&raw.bytes, n, k)
+                    .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))
+            }
             // GreyRaven 2:4: decode compacted survivors plus packed metadata
             // back to the pruned dense model. This reconstructs the PRUNED
             // weights, not the pre-prune dense ones -- that is the format's
@@ -801,19 +815,13 @@ fn pack_tensors(
             "whiteraven" | "raven" | "whitecrow" => {}
             "gsq_rco_3p5" | "gsqrco" => {}
             "greyraven" => {}
-            "forestraven" => {
-                return Err(Error::Backend(
-                    "--format forestraven: ForestRaven (bare INT8, V_DOT4_I32_IU8) has no \
-                     packer, no QuantFormat storage, and no kernel route. Serialise it as \
-                     Q8_0 and vectorise the dequantise-in-LDS path first."
-                        .into(),
-                ));
-            }
+            "forestraven" => {}
             other => {
                 return Err(Error::Backend(format!(
                     "--format '{other}': unknown. Supported: whiteraven (FP8-blocked), \
                      raven (FP8), whitecrow (W4A4 OSTQuant), greyraven (FP8 2:4, host-decode \
-                     only -- no production kernel yet), gsq_rco_3p5 (tag 81)."
+                     only -- no production kernel yet), forestraven (per-row absmax INT8, \
+                     host-decode only -- no kernel route yet), gsq_rco_3p5 (tag 81)."
                 )));
             }
         }
@@ -872,6 +880,9 @@ fn pack_tensors(
                 grim_tensor::dtype::Storage::Block(
                     grim_tensor::dtype::BlockDtype::Fp8Sparse24,
                 ) => Some((crate::gguf::GgufDType::GreyRaven, 4u8)),
+                grim_tensor::dtype::Storage::Block(
+                    grim_tensor::dtype::BlockDtype::Int8PerChannel,
+                ) => Some((crate::gguf::GgufDType::ForestRaven, 8u8)),
                 _ => None,
             };
             if let Some((tag, bpw)) = corvid_tag {
@@ -1154,6 +1165,63 @@ fn pack_tensors(
                     }
                 }
                 return Ok(((entry, packed), ext, Some(override_)));
+            }
+
+            // ForestRaven: symmetric per-output-row absmax INT8 in the framed
+            // blob. The article recipe (absmax symmetric, per-channel scales
+            // for weights) plus the SmoothQuant migration already applied to
+            // `f32_values` above -- activations are the outlier problem, and
+            // convert's pipeline migrates their difficulty to the weights
+            // before this arm ever sees them.
+            //
+            // No alignment constraint: per-row scales work for any K, unlike
+            // the 16-wide block formats. 1D tensors still fall through --
+            // norms stay high-precision, and the future `V_DOT4_I32_IU8`
+            // kernel wants 2D weights.
+            if matches!(fmt.as_deref(), Some("forestraven"))
+                && meta.shape.len() == 2
+                && meta.shape[0] > 0
+                && meta.shape[1] > 0
+            {
+                let (n, k) = (meta.shape[0], meta.shape[1]);
+                let (codes, scales) = grim_quant::quant_forest_per_channel(&f32_values, n, k)
+                    .map_err(|e| Error::Backend(format!("ForestRaven quant for '{name}': {e}")))?;
+                // Framed like WhiteCrow's triple stream: lengths first so a
+                // decoder never guesses geometry from a bare byte count.
+                let mut blob = Vec::with_capacity(16 + codes.len() + scales.len());
+                blob.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+                blob.extend_from_slice(&codes);
+                blob.extend_from_slice(&(scales.len() as u64).to_le_bytes());
+                blob.extend_from_slice(&scales);
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 8,
+                    payload_offset: 0,
+                    payload_size: blob.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 8,
+                    override_dtype: crate::gguf::GgufDType::ForestRaven,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, blob), ext, Some(override_)));
             }
 
             // WhiteRaven target: pack every 2D weight tensor as blocked FP8 in

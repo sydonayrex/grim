@@ -13,10 +13,10 @@
 //!    one unloadable outside grim *by construction* rather than by a policy
 //!    someone can forget to apply.
 //!
-//! WhiteRaven (670), Raven (669), WhiteCrow (660), and GreyRaven (671) all
-//! have file loaders today. ForestRaven (672) is refused with a message
-//! naming the format; this test pins that it is refused rather than
-//! silently decoded.
+//! Every member of the Raven/Crow series now has a file loader. ForestRaven
+//! (672) was the last to land: symmetric per-row absmax INT8 in a framed
+//! blob, decoded on the host. No member is refused anymore; this test pins
+//! that the refusals are gone rather than silently reintroduced.
 
 use grim_format::gguf::{map_gguf_dtype_to_storage, GgufDType};
 use grim_tensor::dtype::{FloatPackScheme, Storage as DTypeStorage};
@@ -128,32 +128,28 @@ fn whiteraven_resolves_to_the_blocked_fp8_storage() {
 }
 
 #[test]
-fn the_last_member_without_a_loader_is_refused_naming_the_format() {
-    // ForestRaven (672, bare INT8) is the only series member with no packer,
-    // no storage scheme, and no kernel route. It must be refused naming
-    // itself, not silently decoded as something else.
-    let d = GgufDType::ForestRaven;
-    let dt = map_gguf_dtype_to_storage(d);
-    match dt.storage {
-        DTypeStorage::Unsupported(u) => {
-            let reason = u.reason.to_lowercase();
-            assert!(
-                reason.contains(&d.display_name().to_lowercase())
-                    || reason.contains("raven")
-                    || reason.contains("crow"),
-                "{} must be refused naming itself, got: {reason}",
-                d.display_name()
-            );
-        },
-        other => panic!(
-            "{} has no loader and must not resolve to a real storage: {other:?}",
+fn every_series_member_resolves_to_a_real_storage() {
+    // The series is complete: no member may resolve to Unsupported. A format
+    // that regresses to Unsupported loads nowhere, and the failure surfaces
+    // as a consumer-side refusal far from this table.
+    for d in [
+        GgufDType::WhiteCrow,
+        GgufDType::Raven,
+        GgufDType::WhiteRaven,
+        GgufDType::GreyRaven,
+        GgufDType::ForestRaven,
+    ] {
+        let dt = map_gguf_dtype_to_storage(d);
+        assert!(
+            !matches!(dt.storage, DTypeStorage::Unsupported(_)),
+            "{} must resolve to a real storage",
             d.display_name()
-        ),
+        );
     }
 }
 
 #[test]
-fn raven_whitecrow_and_greyraven_resolve_to_loadable_storages() {
+fn raven_whitecrow_greyraven_and_forestraven_resolve_to_loadable_storages() {
     use grim_tensor::dtype::Storage;
     let raven = map_gguf_dtype_to_storage(GgufDType::Raven);
     assert!(matches!(
@@ -168,5 +164,13 @@ fn raven_whitecrow_and_greyraven_resolve_to_loadable_storages() {
     assert!(matches!(
         grey.storage,
         Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Sparse24)
+    ));
+    // ForestRaven: per-row absmax INT8 in the framed blob. The tag HAS a
+    // meaning (this storage); the GGUF container just cannot express the
+    // framing, so GGUF-direct refuses while .grim serves.
+    let forest = map_gguf_dtype_to_storage(GgufDType::ForestRaven);
+    assert!(matches!(
+        forest.storage,
+        Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
     ));
 }

@@ -674,6 +674,8 @@ enum Commands {
         /// `raven` (dense FP8), `whitecrow` (W4A4 OSTQuant),
         /// `greyraven` (FP8 2:4 magnitude-pruned; host-decode only, no
         /// production kernel yet -- 1D and K-misaligned tensors fall back),
+        /// `forestraven` (per-row absmax INT8; host-decode only, no kernel
+        /// route yet -- 1D tensors fall back),
         /// `gsqrco3p5` (GSQ-RCO 3.5-bit, tag 81).
         /// Default when omitted: `gsqrco3p5`.
         #[arg(long)]

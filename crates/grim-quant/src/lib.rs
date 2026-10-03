@@ -2053,24 +2053,24 @@ fn f16_to_f32(lo: u8, hi: u8) -> f32 {
 }
 
 /// ForestRaven: symmetric per-output-row absmax INT8.
-///
-/// Each row of an `[n, k]` weight matrix gets its own fp32 scale
-/// (`max|row| / 127`, 1.0 for an all-zero row) and its codes are
-/// `round(w / scale)` clamped to `[-128, 127]`. This is the article recipe
-/// (absmax symmetric, per-channel for weights): one scale per output
-/// channel costs `4n` bytes against `nk` codes -- under 0.1% for the shapes
-/// that matter -- while letting every channel use its full INT8 range.
-///
-/// This is deliberately NOT Q8_0: Q8_0 scales per 32-element block with fp16
-/// scales, which is finer-grained but forces a scale application per block
-/// in the GEMV. Per-row scales need exactly one scale multiply per output,
-/// which is what `V_DOT4_I32_IU8` wants. The two formats MUST NOT share a
-/// kernel: same codes, different scale streams.
-///
-/// Returns `(codes, scales)`: `n*k` int8 codes in row-major order and `n`
-/// fp32 little-endian scales. The framed blob layout
-/// (`[u64 codes_len][codes][u64 scales_len][scales]`) is assembled by the
-/// caller (convert, rewrite), mirroring WhiteCrow's triple-stream frame.
+ ///
+ /// Each row of an `[n, k]` weight matrix gets its own fp32 scale
+ /// (`max|row| / 127`, 1.0 for an all-zero row) and its codes are
+ /// `round(w / scale)` clamped to `[-128, 127]`. This is the article recipe
+ /// (absmax symmetric, per-channel for weights): one scale per output
+ /// channel costs `4n` bytes against `nk` codes -- under 0.1% for the shapes
+ /// that matter -- while letting every channel use its full INT8 range.
+ ///
+ /// This is deliberately NOT Q8_0: Q8_0 scales per 32-element block with fp16
+ /// scales, which is finer-grained but forces a scale application per block
+ /// in the GEMV. Per-row scales need exactly one scale multiply per output,
+ /// which is what `V_DOT4_I32_IU8` wants. The two formats MUST NOT share a
+ /// kernel: same codes, different scale streams.
+ ///
+ /// Returns `(codes, scales)`: `n*k` int8 codes in row-major order and `n`
+ /// fp32 little-endian scales. The framed blob layout
+ /// (`[u64 codes_len][codes][u64 scales_len][scales]`) is assembled by the
+ /// caller (convert, rewrite), mirroring WhiteCrow's triple-stream frame.
 pub fn quant_forest_per_channel(
     data: &[f32],
     n: usize,
@@ -2137,8 +2137,7 @@ pub fn dequant_forest(data: &[u8], n: usize, k: usize) -> std::result::Result<Ve
 
 /// Quantize a slice of f32 values to Q8_0 bytes.
 /// Each block of 32 gets a f16 scale and 32 i8 values.
-pub fn quant_q80(data: &[f32]) -> Result<Vec<u8>> {
-    let num_blocks = data.len().div_ceil(BLOCK_Q8_WEIGHTS);
+pub fn quant_q80(data: &[f32]) -> Result<Vec<u8>> {    let num_blocks = data.len().div_ceil(BLOCK_Q8_WEIGHTS);
     let mut out = Vec::with_capacity(num_blocks * (2 + BLOCK_Q8_WEIGHTS));
     for block in data.chunks(BLOCK_Q8_WEIGHTS) {
         let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -5422,11 +5421,36 @@ pub fn apply_smoothquant_scale(
         max_vals
     };
 
-    // Normalize so max scale = 1.0
-    let max_s = scales.iter().cloned().fold(0.0f32, f32::max);
+    // A channel whose inverse came from the 1e-8 floor (all-zero weights, or
+    // zero calibration acts) is dead: its scale is exactly 1e8, and letting it
+    // set the normalization below would shrink every live channel by ~1e-8 --
+    // a single dead neuron zeroing the whole tensor. Dead channels keep scale
+    // 1.0 (identity) and are excluded from the max. A live channel would need
+    // max exactly 1e-8 to collide with the floor value, which no real weight
+    // attains; the comparison is exact, not approximate, so there is no
+    // threshold to drift.
+    const DEAD_SCALE: f32 = 1e8;
+    // Liveness BEFORE pinning: after pinning, dead 1.0s are indistinguishable
+    // from live 1.0s, and letting a pinned dead row set the max would suppress
+    // live normalization. Dead rows are invisible to the pipeline, not just
+    // clamped by it.
+    let live: Vec<bool> = scales.iter().map(|&s| s < DEAD_SCALE).collect();
+    for (o, s) in scales.iter_mut().enumerate() {
+        if !live[o] {
+            *s = 1.0;
+        }
+    }
+    let max_s = scales
+        .iter()
+        .enumerate()
+        .filter(|(o, _)| live[*o])
+        .map(|(_, &s)| s)
+        .fold(0.0f32, f32::max);
     if max_s > 0.0 {
-        for s in &mut scales {
-            *s /= max_s;
+        for (o, s) in scales.iter_mut().enumerate() {
+            if live[o] {
+                *s /= max_s;
+            }
         }
     }
 
@@ -5672,6 +5696,30 @@ mod smoothquant_tests {
     fn smoothquant_panics_on_wrong_size() {
         let mut w = vec![1.0f32; 5];
         apply_smoothquant_scale(&mut w, 3, 3, None);
+    }
+
+    #[test]
+    fn smoothquant_zero_row_leaves_live_rows_untouched() {
+        // A single all-zero row must not perturb any other row: the zero
+        // row's inverse hits the 1e-8 floor (scale 1e8), and if that sets the
+        // normalization max every live row shrinks by ~1e-8 -- a dead neuron
+        // zeroing the whole tensor. Regression test: this once produced
+        // weights ~1e-8 of their true values with no error.
+        let mut weights = vec![
+            2.0, -2.0, 1.0, // row 0: max 2
+            0.0, 0.0, 0.0, // row 1: dead
+            4.0, -1.0, 0.5, // row 2: max 4
+        ];
+        let scales = apply_smoothquant_scale(&mut weights, 3, 3, None);
+        // Live rows normalize among themselves: max inverse is 1/2 (row 0),
+        // so row 0 -> 1.0, row 2 -> (1/4)/(1/2) = 0.5. Dead row pins at 1.0.
+        assert!((scales[0] - 1.0).abs() < 1e-6);
+        assert_eq!(scales[1], 1.0);
+        assert!((scales[2] - 0.5).abs() < 1e-6);
+        // Row 0 unchanged, row 2 halved, dead row still zero (not NaN).
+        assert_eq!(weights[0..3], [2.0, -2.0, 1.0]);
+        assert_eq!(weights[3..6], [0.0, 0.0, 0.0]);
+        assert_eq!(weights[6..9], [2.0, -0.5, 0.25]);
     }
 }
 

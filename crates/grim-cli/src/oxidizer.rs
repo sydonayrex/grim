@@ -878,7 +878,11 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         | QuantFormat::Fp8Block128
         // WhiteCrow is a kernel-policy payload like WhiteRaven: tag 660 exists
         // and GrimProvider reads it, but a stock GGUF reader must not accept it.
-        | QuantFormat::W4A4OstQuant => Err(format!(
+        // ForestRaven's row-scaled framing has no fixed block geometry, so no
+        // GGUF type can express it either: GrimProvider reads it from the
+        // .grim entry's explicit payload size.
+        | QuantFormat::W4A4OstQuant
+        | QuantFormat::Int8PerChannel => Err(format!(
             "quantization format {:?} is not supported in GGUF writer",
             format
         )),

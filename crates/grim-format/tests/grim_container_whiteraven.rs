@@ -524,6 +524,162 @@ fn convert_with_format_greyraven_leaves_1d_tensors_untouched() {
 }
 
 #[test]
+fn convert_with_format_forestraven_produces_row_scaled_int8() {
+    // ForestRaven: per-output-row absmax INT8 in the framed blob. The decoded
+    // model must equal the per-row int8 round of the source -- dense (no
+    // pruning, unlike GreyRaven), but quantized.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let mut want: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 13) % 29) as f32 * 0.0625 - 0.8)
+        .collect();
+    // Pin the zero-row edge through the full convert path: an all-zero row
+    // must get scale 1.0 and decode back to +0.0, not NaN.
+    for c in 0..k {
+        want[5 * k + c] = 0.0;
+    }
+    let payload: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let src = scratch.0.join("f32_forest.gguf");
+    write_gguf(&src, GgufDType::F32, "blk.weight", &[k as u64, n as u64], &payload);
+
+    let out = scratch.0.join("forest.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("forestraven".to_string()),
+        None,
+        None,
+    )
+    .expect("convert --format forestraven");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open grim");
+    let meta = gp.meta("blk.weight").expect("meta");
+    assert_eq!(
+        meta.dtype.storage,
+        grim_tensor::dtype::Storage::Block(
+            grim_tensor::dtype::BlockDtype::Int8PerChannel
+        ),
+        "--format forestraven must tag Block(Int8PerChannel)"
+    );
+    assert_eq!(meta.shape, vec![n, k]);
+
+    let raw = gp.get("blk.weight").expect("get");
+    // Framed blob: 8 + n*k + 8 + 4n.
+    assert_eq!(raw.bytes.len(), 16 + n * k + 4 * n);
+    let qw_len = u64::from_le_bytes(raw.bytes[0..8].try_into().unwrap()) as usize;
+    assert_eq!(qw_len, n * k, "codes segment is one byte per weight");
+    let sc_len =
+        u64::from_le_bytes(raw.bytes[8 + qw_len..16 + qw_len].try_into().unwrap()) as usize;
+    assert_eq!(sc_len, 4 * n, "scales segment is one fp32 per row");
+
+    // Per-row scales are absmax/127; the zero row gets exactly 1.0.
+    for r in 0..n {
+        let s = f32::from_le_bytes(
+            raw.bytes[16 + qw_len + r * 4..20 + qw_len + r * 4]
+                .try_into()
+                .unwrap(),
+        );
+        let amax = want[r * k..(r + 1) * k]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max);
+        let expect = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+        assert_eq!(
+            s.to_bits(),
+            expect.to_bits(),
+            "row {r} scale must be absmax/127"
+        );
+    }
+
+    // Decode equals the per-row int8 round, bit-exact.
+    let deq = grim_quant::dequant_forest(&raw.bytes, n, k).expect("dequant");
+    assert_eq!(deq.len(), n * k);
+    for r in 0..n {
+        let amax = want[r * k..(r + 1) * k]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max);
+        let s = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+        for c in 0..k {
+            let q = ((want[r * k + c] / s).round().clamp(-128.0, 127.0) as i8) as f32 * s;
+            // +0.0 and -0.0 compare equal but have different bits; the zero
+            // row must decode to exactly +0.0 (0.0 * 1.0), never -0.0.
+            if want[r * k + c] == 0.0 && amax == 0.0 {
+                assert_eq!(
+                    deq[r * k + c].to_bits(),
+                    0.0f32.to_bits(),
+                    "zero-row element must be exactly +0.0"
+                );
+            } else {
+                assert_eq!(
+                    deq[r * k + c].to_bits(),
+                    q.to_bits(),
+                    "element [{r},{c}] must be the int8 round"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn convert_with_format_forestraven_leaves_1d_tensors_untouched() {
+    // 1D norms stay high-precision: the future dot4 kernel wants 2D weights,
+    // and quantizing gains to int8 buys nothing.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let weights: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.001).collect();
+    let norms: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.01).collect();
+
+    let src = scratch.0.join("mixed_forest.gguf");
+    write_mixed(&src, &weights, &norms, n, k);
+
+    let out = scratch.0.join("mixed_forest.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("forestraven".to_string()),
+        None,
+        None,
+    )
+    .expect("convert");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open");
+    let w_meta = gp.meta("blk.weight").expect("meta weight");
+    assert_eq!(
+        w_meta.dtype.storage,
+        grim_tensor::dtype::Storage::Block(
+            grim_tensor::dtype::BlockDtype::Int8PerChannel
+        ),
+        "2D weight must become ForestRaven"
+    );
+    let n_meta = gp.meta("blk.norm.weight").expect("meta norm");
+    assert!(
+        !matches!(
+            n_meta.dtype.storage,
+            grim_tensor::dtype::Storage::Block(
+                grim_tensor::dtype::BlockDtype::Int8PerChannel
+            )
+        ),
+        "1D norm must NOT be tagged ForestRaven"
+    );
+}
+
+#[test]
 fn convert_with_format_whiteraven_leaves_non_conforming_tensors_untouched() {
     // 1D tensors (norm gains) carry no 2D shape to block -- the converter
     // must pack them with the uniform path rather than fail or silently

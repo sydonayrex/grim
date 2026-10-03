@@ -160,82 +160,45 @@ fn blocked_fp8_is_a_permutation_not_a_compression_and_ragged_n_is_the_kernels_re
 }
 
 #[test]
-fn the_other_series_tags_load_as_unsupported_naming_the_format_and_the_remedy() {
-    // Convention (matching `prism_unsupported_format_test`): the file opens and
-    // the tensor is returned, but its storage is `Unsupported` carrying a reason
-    // that names the format and says what to do. Refusing inside the provider
-    // would be worse -- it would turn "this format has no loader" into "this
-    // file is broken", which is a different bug and sends the user to the wrong
-    // place.
-    // ForestRaven (672) is the last series member with no loader; GreyRaven
-    // (671) resolved to a real load once its host decode landed.
-    for (dtype, tag_name) in [
-        (GgufDType::ForestRaven, "forestraven"),
-    ] {
-        let scratch = Scratch::new();
-        let path = scratch.path(&format!("{tag_name}.gguf"));
-        // Size the payload from the declared geometry, not from n*k: WhiteCrow
-        // is framed and occupies fewer bytes than its element count, and a
-        // fixture that wrote n*k would leave undeclared slack in the payload
-        // region -- a malformed file that still happens to read back the prefix
-        // we asked for.
-        let elems = 32u64 * 64;
-        let nbytes =
-            (elems / dtype.block_size() as u64) * dtype.type_size_per_block() as u64;
-        write_gguf(
-            &path,
-            dtype,
-            "w.weight",
-            &[32, 64],
-            &vec![0u8; nbytes as usize],
-        );
-        let provider = GgufProvider::open(path.to_str().expect("path")).expect("open");
-        let meta = provider.meta("w.weight").expect("meta");
-
-        let grim_tensor::dtype::Storage::Unsupported(f) = meta.dtype.storage else {
-            panic!(
-                "{} must not resolve to a real storage -- a packed kernel payload read \
-                 as a same-shaped standard format decodes to plausible garbage",
-                dtype.display_name()
-            );
-        };
-        assert_eq!(f.name, dtype.display_name());
-        assert_eq!(f.block_size, Some(dtype.block_size() as usize));
-        assert_eq!(
-            f.bytes_per_block,
-            Some(dtype.type_size_per_block() as usize),
-            "{} must report the geometry the loader would have to honour",
-            dtype.display_name()
-        );
-        // The message must say WHAT failed and WHAT to do about it.
-        for needle in [dtype.display_name(), "loader", "WhiteRaven"] {
-            assert!(
-                f.reason.contains(needle),
-                "{} reason missing {needle:?}: {}",
-                dtype.display_name(),
-                f.reason
-            );
-        }
-        // And the payload is read at the length the geometry declares -- and
-        // that length is nonzero. The reason a format has no loader must never
-        // be "it sized to nothing": that is indistinguishable, from the
-        // consumer's side, from a file that was truncated on copy.
-        //
-        // Derived from the geometry rather than hardcoded: WhiteCrow's framed
-        // group-128 payload is 16 * 67 = 1072 bytes for 2048 weights, not 2048.
-        // Writing a n*k buffer here and asserting `len() == n*k` would have
-        // "passed" for every bare-code format while quietly mis-asserting the
-        // one format whose geometry differs.
-        let expected = (32u64 * 64 / dtype.block_size() as u64) * dtype.type_size_per_block() as u64;
-        assert!(expected > 0, "{} geometry declares zero bytes", dtype.display_name());
-        let raw = provider.get("w.weight").expect("get");
-        assert_eq!(
-            raw.bytes.len() as u64,
-            expected,
-            "{} payload must be read at its declared geometry",
-            dtype.display_name()
-        );
-    }
+fn forestraven_gguf_direct_refuses_pointing_at_grim_while_the_tag_has_meaning() {
+    // ForestRaven is the asymmetric case: tag 672 maps to a REAL storage
+    // (`Block(Int8PerChannel)` -- the tag has meaning), but GGUF-direct reads
+    // cannot serve it (row-scaled framing has no fixed block geometry, so the
+    // reader cannot size the payload). The file must refuse at `get` naming
+    // the .grim path -- not hand back a truncated prefix, and not claim the
+    // tag is unknown.
+    //
+    // `meta` stays truthful (reports the real storage): the refusal belongs
+    // to the byte path, not the type mapping.
+    let scratch = Scratch::new();
+    let path = scratch.path("forestraven.gguf");
+    // Payload content is irrelevant: the refusal happens before any byte is
+    // read. Write n*k zero bytes to keep the file well-formed.
+    write_gguf(
+        &path,
+        GgufDType::ForestRaven,
+        "w.weight",
+        &[64, 32],
+        &vec![0u8; 32 * 64],
+    );
+    let provider = GgufProvider::open(path.to_str().expect("path")).expect("open");
+    let meta = provider.meta("w.weight").expect("meta");
+    assert_eq!(
+        meta.dtype.storage,
+        grim_tensor::dtype::Storage::Block(
+            grim_tensor::dtype::BlockDtype::Int8PerChannel
+        ),
+        "meta must report the tag's true meaning"
+    );
+    let err = provider
+        .get("w.weight")
+        .err()
+        .expect("GGUF-direct get of a row-scaled blob must refuse, not truncate");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("672") && msg.contains(".grim"),
+        "refusal must name the tag and the remedy, got: {msg}"
+    );
 }
 
 /// The regression that motivated declaring every geometry explicitly.
