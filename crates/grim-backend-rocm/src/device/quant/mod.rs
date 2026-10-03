@@ -285,6 +285,22 @@ impl QuantOps for RocmDevice {
                     )?;
                 }
             }
+            DTypeStorage::KQuant(KQuantScheme::GsqRco3p5) => {
+                // GSQ-RCO 3.5-bit (tag 81): NO GPU kernel yet. The CityCrow
+                // host repack (grim-quant citycrow.rs) plus the native
+                // sudot8 W4A4 GEMV is the planned fast path; until it lands,
+                // refuse LOUDLY. Silence here would fall through to the
+                // generic matmul catch-all, which reads 18-byte-per-64
+                // packed code bytes as f32 weights — plausible garbage.
+                let _ = (a, b_packed, out_shape);
+                return Err(Error::Backend(
+                    "GsqRco3p5 (GSQ-RCO tag 81) has no ROCm GPU dispatch yet: \
+                     the CityCrow sudot8 GEMV is pending. Run this model on the \
+                     CPU backend (host dequant is implemented), or convert the \
+                     2-bpw tiers to a GPU-served format."
+                        .into(),
+                ))
+            }
             DTypeStorage::KQuant(KQuantScheme::Q2_0) => {
                 // Upstream GGUF Q2_0 (tag 42) x Q8_0 GEMV, ported from
                 // llama.cpp `ggml_vec_dot_q2_0_q8_0_generic`.

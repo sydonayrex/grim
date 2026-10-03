@@ -11,7 +11,7 @@ use grim_backend_rocm::{
 use grim_format::GgufProvider;
 use grim_format::fusion::build_transformer_ir;
 use grim_format::gguf::{
-    GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp, GrimLayoutHint, GrimMetadata,
+    GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp, GrimMetadata,
     GrimRocmlProfile, GrimTrainQuantMode, read_gguf, read_tensor_bytes,
 };
 use grim_quant::{
@@ -246,6 +246,15 @@ pub fn cmd_oxidizer_search(
         &RcoConfig {
             target_bpw,
             steps: generations.max(20),
+            // TIER STRUCTURE: 2 = GSQ-RCO (tag 81, the one packed format
+            // with per-block scales and a matching reader), 32 = F32
+            // verbatim passthrough. The flat 3/4/8-bit tiers are NOT offered:
+            // pack_row_bpw_for_wave is scale-less and clamps to [-1, 1], so
+            // a "4-bit" assignment both destroyed accuracy and had no reader
+            // mapping (dtype_from_bitwidth decodes the bytes as Q4_K/MXFP4 —
+            // a different layout). Re-offer intermediate tiers only when a
+            // scaled packer + reader pair exists for them.
+            available_bpws: vec![2, 32],
             ..Default::default()
         },
         &importance_scores.layer_scores,
@@ -343,34 +352,15 @@ pub fn cmd_oxidizer_convert(
     grim_meta.lds_size = Some(grim_meta.rocml_profile.lds_size());
     grim_meta.quant_method = Some("evopress-gptq-sequential".into());
     grim_meta.calibration_dataset = calibration_dataset.clone();
-    grim_meta.quant_overrides = names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let bw = full_bitwidths[i];
-            let effective_bpw = if is_attention_projection(name) {
-                enforce_attention_precision(bw)
-            } else {
-                bw
-            };
-            let layout_hint = if is_attention_projection(name) {
-                Some(GrimLayoutHint::WavefrontTiled)
-            } else {
-                None
-            };
-            grim_format::gguf::GrimQuantOverride {
-                tensor_name: name.clone(),
-                effective_bpw,
-                override_dtype: bitwidth_to_dtype(effective_bpw),
-                importance_score: importance_scores
-                    .layer_scores
-                    .get(i)
-                    .copied()
-                    .unwrap_or(0.0),
-                layout_hint,
-            }
-        })
-        .collect();
+    // NO caller-side quant_overrides: `bitwidth_to_dtype` names Q4_K for a
+    // 4-bpw assignment, but the packer's uniform tier emits grim's FLAT
+    // 4-bit wave packing (a different byte layout the reader derives from
+    // `base_bitwidth`), and 2-bpw tiers are GSQ-RCO. A caller override that
+    // disagrees with the payload decodes correct bytes as the wrong scheme —
+    // norms panicked, the embedding table failed its row check. The packers
+    // in grim-format own the override list: they emit entries exactly for
+    // the tensors whose scheme the reader cannot derive from the bitwidth.
+    grim_meta.quant_overrides = Vec::new();
 
     let resolved_gcn = rocml_profile.unwrap_or("gfx1100");
     // Wavefront size: explicit override wins, else the profile-derived
@@ -508,19 +498,6 @@ fn load_importance_scores(path: &str) -> Result<ImportanceScores, String> {
     Ok(ImportanceScores::new(names, scores))
 }
 
-fn bitwidth_to_dtype(bw: u32) -> GgufDType {
-    match bw {
-        0 | 1 => GgufDType::Q2K,
-        2 => GgufDType::GsqRco3p5,
-        3 => GgufDType::Q3K,
-        4 => GgufDType::Q4K,
-        5 => GgufDType::Q5K,
-        6 => GgufDType::Q6K,
-        7 => GgufDType::Q6K,
-        8 => GgufDType::Q8K,
-        _ => GgufDType::Q8K,
-    }
-}
 
 pub fn build_rewritten_tensors(
     provider: &GgufProvider,

@@ -559,7 +559,16 @@ impl TryFrom<&Storage> for QuantFormat {
                 //
                 // Add this arm in the same change that adds the backend
                 // dispatch, not before.
-                _ => Err(()),
+                // GSQ-RCO 3.5-bit: mapped now that BOTH backends name the
+                // scheme — CPU `quantized_matmul` decodes it (device.rs
+                // QuantFormat::GsqRco3p5 arm), and the ROCm
+                // `quantized_matmul` arm REFUSES LOUDLY naming the missing
+                // CityCrow sudot8 kernel. The refusal is the point: the
+                // generic `_ =>` matmul catch-all would run on 18-byte-per-64
+                // packed bytes and produce silent garbage, which is exactly
+                // what this TryFrom arm previously refused to enable.
+                KQuantScheme::GsqRco3p5 => Ok(QuantFormat::GsqRco3p5),
+
             },
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 => Ok(QuantFormat::Fp4),

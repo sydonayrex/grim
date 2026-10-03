@@ -104,17 +104,16 @@ fn convert_to_grim_then_grim_provider_round_trips_tensor_payload() {
 
     let raw = provider.get(&tensor_name).expect("get must succeed");
 
-    let expected = grim_format::format::normals_packed_size_for_wave(
-        elem_count,
-        0,
-        4,
-        grim_format::format::WaveSize::from_gcn("gfx1100"),
-    );
+    // TIER CONTRACT: a 16-element [4,4] tensor is below the quant surface
+    // (non-2D-scale tier / inner dim < 64 block width), so the converter
+    // passes it through VERBATIM as native f32 — base_bitwidth 32 and
+    // exactly elem_count * 4 payload bytes, not a bit-packed stream.
+    let expected = (elem_count * 4) as u64;
     assert_eq!(
         raw.bytes.len() as u64,
         expected,
-        "Payload byte length must match the wave-aligned normals_packed_size.\n\
-         elem_count={}, base_bitwidth=4, expected={}, got={}",
+        "Payload byte length must be the verbatim f32 passthrough size.\n\
+         elem_count={}, expected={}, got={}",
         elem_count,
         expected,
         raw.bytes.len()
@@ -172,15 +171,10 @@ fn convert_to_grim_produces_deterministic_payload_for_same_input() {
         "Same input + same params must produce the same payload size"
     );
 
-    // Both runs must produce a wave-aligned payload whose size matches the
-    // independently-computed wave-aware normals_packed_size for the F32
-    // source tensor under the target GCN's wavefront (gfx1100 => Wave32).
-    let expected = grim_format::format::normals_packed_size_for_wave(
-        raw_a.shape.iter().product::<usize>(),
-        0,
-        4,
-        grim_format::format::WaveSize::from_gcn("gfx1100"),
-    );
+    // Both runs must produce the verbatim f32 passthrough payload
+    // (elem_count * 4 bytes) — the flat bit-pack tier this test used to pin
+    // is retired (scale-less [-1,1] clamp, no reader mapping).
+    let expected = (raw_a.shape.iter().product::<usize>() * 4) as u64;
     assert_eq!(raw_a.bytes.len() as u64, expected);
     assert_eq!(raw_b.bytes.len() as u64, expected);
 }

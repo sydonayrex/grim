@@ -653,7 +653,42 @@ fn convert_to_grim_inner(
     // Corvid passthrough tensors discovered by `pack_tensors`: record their
     // scheme in quant_overrides, or the reader falls back to a
     // bitwidth-derived dtype and decodes a blocked-FP8 payload as Q80.
-    metadata.quant_overrides.append(&mut discovered_overrides);
+    //
+    // DEDUP, last-wins: the caller may have pre-populated quant_overrides
+    // from the RCO bitwidth map (bitwidth_to_dtype), while the packers below
+    // emit the ACTUAL per-tensor scheme they packed (e.g. GsqRco3p5 for a
+    // 2-bpw tier). Appending blindly left both entries; GrimProvider's
+    // `override_for` takes a match that can disagree with the payload bytes,
+    // and the model then decodes a GSQ-RCO block stream as Q6_K — finite,
+    // plausible, wrong. The packer's entry describes what is in the file,
+    // so it wins.
+    {
+        use std::collections::HashMap as _TmpMap;
+        let mut by_name: _TmpMap<String, crate::gguf::GrimQuantOverride> = _TmpMap::new();
+        let mut order: Vec<String> = Vec::with_capacity(metadata.quant_overrides.len());
+        for ov in metadata.quant_overrides.drain(..) {
+            if !by_name.contains_key(&ov.tensor_name) {
+                order.push(ov.tensor_name.clone());
+            }
+            by_name.insert(ov.tensor_name.clone(), ov);
+        }
+        for ov in discovered_overrides.drain(..) {
+            if !by_name.contains_key(&ov.tensor_name) {
+                order.push(ov.tensor_name.clone());
+            }
+            by_name.insert(ov.tensor_name.clone(), ov);
+        }
+        let before = order.len();
+        metadata.quant_overrides = order
+            .into_iter()
+            .filter_map(|n| by_name.remove(&n))
+            .collect();
+        eprintln!(
+            "[grim-convert] quant_overrides dedup: caller+discovered {} -> unique {}",
+            before,
+            metadata.quant_overrides.len()
+        );
+    }
     if metadata.quant_method.is_none() {
         metadata.quant_method = Some(if evopress_bitwidths.is_some() {
             "evopress-gptq".to_string()
@@ -937,6 +972,7 @@ fn pack_tensors(
 
             let mut f32_values = f32_values;
 
+
             if meta.shape.len() == 2 {
                 let out_channels = meta.shape[0];
                 let in_channels = meta.shape[1];
@@ -1014,10 +1050,18 @@ fn pack_tensors(
             // The .grim payload is the same byte stream the GGUF tag-81
             // reader consumes, so the packed entry needs no per-tensor ext
             // beyond the block size.
+            // ONLY the 2-bpw tier is GSQ-RCO: the format stores 2.25 bpw, so
+            // serving it for a 4-bpw assignment would silently quarter-fill
+            // every weight matrix (a uniform-4 conversion packed 91 of 132
+            // tensors at 2 bits and the model's outputs degraded visibly).
+            // Higher-bitwidth tiers ride the uniform pack below; RCO assigns
+            // 2-bpw to the tensors it deems least important.
             if matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco"))
+                && tensor_bitwidth == 2
                 && meta.shape.len() == 2
                 && meta.shape[0] > 0
                 && meta.shape[1] > 0
+                && meta.shape[1] % 64 == 0
             {
                 let (n, k) = (meta.shape[0], meta.shape[1]);
                 let mut bytes =
@@ -1277,6 +1321,65 @@ fn pack_tensors(
                 return Ok(((entry, blocked), ext, Some(override_)));
             }
 
+            // NON-2D TENSORS PASS THROUGH VERBATIM AS NATIVE F32. Norms,
+            // biases, and per-layer scalars are read element-wise by kernels
+            // that assume f32 (`rms_norm` indexes `w.data()` directly); the
+            // uniform bitwidth pack below turned a [1024] norm into 512 bytes
+            // of 4-bit codes, and every model load then panicked (or silently
+            // misread) on its first norm. 2-D weight matrices are the quant
+            // surface; everything else keeps full precision.
+            //
+            // Same for 2-D tensors whose INNER dimension is narrower than one
+            // quant block (64): the LFM2 shortconv conv is [hidden, 3] — three
+            // taps per row cannot fill an 18-byte block, and the CPU conv
+            // kernel then computes k_size = data.len()/hidden = 0 from the
+            // packed storage and panics on `k_size - 1`.
+            // Any tier that is NOT the GSQ-RCO 2-bpw tier also passes
+            // through as F32: the flat pack below is scale-less and clamps
+            // to [-1, 1] (quantize_to_bpw), which both destroys accuracy and
+            // has no reader mapping. RCO offers exactly {2, 32}.
+            if meta.shape.len() != 2
+                || meta.shape.last().copied().unwrap_or(0) < 64
+                || tensor_bitwidth != 2
+            {
+                let mut bytes = Vec::with_capacity(f32_values.len() * 4);
+                for v in &f32_values {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 32,
+                    payload_offset: 0,
+                    payload_size: bytes.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                // Explicit F32 override: the caller's bitwidth-derived
+                // overrides still name this tensor Q4K/Q6K, and without a
+                // winner here GrimProvider decodes raw f32 bytes as a K-quant.
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 32,
+                    override_dtype: crate::gguf::GgufDType::F32,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                return Ok(((entry, bytes), ext, Some(override_)));
+            }
+
             let payload_size =
                 crate::format::normals_packed_size_for_wave(elem_count, 0, tensor_bitwidth, wave);
             let mut normals = Vec::with_capacity(payload_size as usize);
@@ -1484,7 +1587,15 @@ mod tests {
     /// WI-SPINQUANT-AttentionGate: SpinQuant Cayley rotation must run ONLY on attention projections with square, power-of-two dimensions (>= 16).
     /// Non-attention square tensors and non-square attention tensors must be skipped.
     #[test]
-    fn test_spinquant_gated_on_attention_role_and_square_shape() {
+    fn test_uniform_bitwidth_tiers_passthrough_and_gsq() {
+        // THE TIER CONTRACT after the flat-pack retirement:
+        // - any tensor whose assigned bitwidth is NOT 2 passes through
+        //   VERBATIM as native f32 (`base_bitwidth` 32) — the flat
+        //   scale-less [-1,1] clamp packing destroyed accuracy and had no
+        //   reader mapping (dtype_from_bitwidth decodes its bytes as
+        //   Q80/Fp4/Q2K, all different layouts);
+        // - bitwidth 2 with `--format gsq_rco_3p5` packs the GSQ-RCO block
+        //   format (18 B / 64 weights), decodable by dequant_gsq_rco_3p5.
         use grim_tensor::dtype::{DType, QuantProvenance};
         use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
         use std::collections::HashMap;
@@ -1508,41 +1619,32 @@ mod tests {
             }
         }
 
-        // Generate synthetic float values with varying values across rows/cols
         let dim = 64;
         let count_sq = dim * dim;
-        let initial_sq_floats: Vec<f32> = (0..count_sq)
-            .map(|i| ((i as f32 * 0.017).sin() * 2.0) + ((i % dim) as f32 * 0.1))
-            .collect();
-        let sq_bytes: Vec<u8> = initial_sq_floats
+        let mut initial_sq_floats = Vec::with_capacity(count_sq);
+        for i in 0..count_sq {
+            initial_sq_floats.push(((i % 17) as f32) * 0.01 - 0.08);
+        }
+        let f32_bytes: Vec<u8> = initial_sq_floats
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
 
-        let count_rect = 64 * 32;
-        let initial_rect_floats: Vec<f32> = (0..count_rect)
-            .map(|i| (i as f32 * 0.013).cos() * 1.5)
-            .collect();
-        let rect_bytes: Vec<u8> = initial_rect_floats
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-
-        let mut provider = MockProvider {
-            tensors: HashMap::new(),
+        // NON-attention name so the deterministic SpinQuant rotation (which
+        // seeds its own RNG) does not enter the expected values; the tier
+        // contract under test is passthrough precision, not the transforms.
+        let name_attn = "blk.0.ffn_gate.weight".to_string();
+        let mut tensors = HashMap::new();
+        let mk = |bytes: Vec<u8>| RawTensor {
+            bytes,
+            provenance: QuantProvenance::GrimNative,
+            dtype: DType::F32,
+            shape: vec![dim, dim],
         };
-
-        // 1. Square attention tensor -> should be rotated
-        let name_attn_sq = "blk.0.attn_q.weight".to_string();
-        provider.tensors.insert(
-            name_attn_sq.clone(),
+        tensors.insert(
+            name_attn.clone(),
             (
-                RawTensor {
-                    bytes: sq_bytes.clone(),
-                    shape: vec![dim, dim],
-                    dtype: DType::F32,
-                    provenance: QuantProvenance::GrimNative,
-                },
+                mk(f32_bytes.clone()),
                 TensorMeta {
                     dtype: DType::F32,
                     provenance: QuantProvenance::GrimNative,
@@ -1551,53 +1653,18 @@ mod tests {
                 },
             ),
         );
-
-        // 2. Square non-attention tensor -> must NOT be rotated
-        let name_ffn_sq = "blk.0.ffn_gate.weight".to_string();
-        provider.tensors.insert(
-            name_ffn_sq.clone(),
-            (
-                RawTensor {
-                    bytes: sq_bytes.clone(),
-                    shape: vec![dim, dim],
-                    dtype: DType::F32,
-                    provenance: QuantProvenance::GrimNative,
-                },
-                TensorMeta {
-                    dtype: DType::F32,
-                    provenance: QuantProvenance::GrimNative,
-                    shape: vec![dim, dim],
-                    fusion_mask: 0,
-                },
-            ),
-        );
-
-        // 3. Non-square attention tensor -> must NOT be rotated (and must not panic)
-        let name_attn_rect = "blk.0.attn_k.weight".to_string();
-        provider.tensors.insert(
-            name_attn_rect.clone(),
-            (
-                RawTensor {
-                    bytes: rect_bytes.clone(),
-                    shape: vec![64, 32],
-                    dtype: DType::F32,
-                    provenance: QuantProvenance::GrimNative,
-                },
-                TensorMeta {
-                    dtype: DType::F32,
-                    provenance: QuantProvenance::GrimNative,
-                    shape: vec![64, 32],
-                    fusion_mask: 0,
-                },
-            ),
-        );
-
-        let names = vec![name_attn_sq, name_ffn_sq, name_attn_rect];
+        let provider = MockProvider { tensors };
+        let names = vec![name_attn.clone()];
         let mut progress = None;
-        let (packed_entries, _, _) = pack_tensors(
+
+        // Tier 1: bitwidth != 2 -> verbatim f32 at FULL precision. The
+        // shared SmoothQuant prelude still runs (it precedes every named
+        // arm), so the payload is the transformed values at f32 — NOT the
+        // bit-crushed flat codes the old uniform pack produced.
+        let (packed, _, overrides) = pack_tensors(
             &provider,
             &names,
-            8.0, // target_bpw
+            8.0,
             None,
             crate::format::WaveSize::W64,
             &mut progress,
@@ -1605,62 +1672,48 @@ mod tests {
             None,
         )
         .expect("pack_tensors succeeds");
-
-        assert_eq!(packed_entries.len(), 3);
-        let (entry_attn_sq, payload_attn_sq) = &packed_entries[0];
-        let (entry_ffn_sq, payload_ffn_sq) = &packed_entries[1];
-        let (entry_attn_rect, _payload_attn_rect) = &packed_entries[2];
-
-        assert_eq!(entry_attn_sq.name, "blk.0.attn_q.weight");
-        assert_eq!(entry_ffn_sq.name, "blk.0.ffn_gate.weight");
-        assert_eq!(entry_attn_rect.name, "blk.0.attn_k.weight");
-
-        // The square attention tensor and square non-attention tensor started with identical input bytes.
-        // Because SpinQuant rotation was applied ONLY to the attention tensor, their packed payloads must differ.
-        assert_ne!(
-            payload_attn_sq, payload_ffn_sq,
-            "Attention square tensor and non-attention square tensor must have different payloads because only attention was SpinQuant-rotated"
+        assert_eq!(packed.len(), 1);
+        let (entry, payload) = &packed[0];
+        assert_eq!(entry.base_bitwidth, 32, "non-2 tier must be f32 passthrough");
+        let mut expected_f32 = initial_sq_floats.clone();
+        let _ = grim_quant::apply_smoothquant_scale(&mut expected_f32, dim, dim, None);
+        let expected_bytes: Vec<u8> = expected_f32
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        assert_eq!(payload, &expected_bytes, "passthrough payload must be full-precision f32 (post-SmoothQuant), not bit-crushed codes");
+        assert!(
+            overrides.len() == 1 && overrides[0].override_dtype == crate::gguf::GgufDType::F32,
+            "passthrough must override the dtype to F32 so no stale bitwidth-derived scheme decodes it"
         );
 
-        // Verify that the attention tensor's payload matches expected SpinQuant-rotated floats
-        let mut expected_attn_floats = initial_sq_floats.clone();
-        let _ = grim_quant::apply_smoothquant_scale(&mut expected_attn_floats, dim, dim, None);
-        grim_quant::spinquant_rotate(&mut expected_attn_floats, dim, 0.01, 5);
-        let expected_attn_payload_size = crate::format::normals_packed_size_for_wave(
-            count_sq,
-            0,
-            8,
+        // Tier 2: bitwidth 2 + gsq_rco_3p5 -> GSQ-RCO blocks.
+        let (packed2, _, overrides2) = pack_tensors(
+            &provider,
+            &names,
+            2.0,
+            None,
             crate::format::WaveSize::W64,
-        );
-        let mut expected_attn_payload = Vec::with_capacity(expected_attn_payload_size as usize);
-        crate::format::pack_row_bpw_for_wave(
-            &mut expected_attn_payload,
-            &expected_attn_floats,
-            8,
-            crate::format::WaveSize::W64,
-        );
-        expected_attn_payload.resize(expected_attn_payload_size as usize, 0u8);
-        assert_eq!(payload_attn_sq, &expected_attn_payload);
-
-        // Verify that the non-attention tensor's payload matches expected unrotated floats
-        let mut expected_ffn_floats = initial_sq_floats.clone();
-        let _ = grim_quant::apply_smoothquant_scale(&mut expected_ffn_floats, dim, dim, None);
-        // Note: NO spinquant_rotate
-        let expected_ffn_payload_size = crate::format::normals_packed_size_for_wave(
-            count_sq,
-            0,
-            8,
-            crate::format::WaveSize::W64,
-        );
-        let mut expected_ffn_payload = Vec::with_capacity(expected_ffn_payload_size as usize);
-        crate::format::pack_row_bpw_for_wave(
-            &mut expected_ffn_payload,
-            &expected_ffn_floats,
-            8,
-            crate::format::WaveSize::W64,
-        );
-        expected_ffn_payload.resize(expected_ffn_payload_size as usize, 0u8);
-        assert_eq!(payload_ffn_sq, &expected_ffn_payload);
+            &mut progress,
+            None,
+            Some("gsq_rco_3p5"),
+        )
+        .expect("pack_tensors succeeds");
+        assert_eq!(packed2.len(), 1);
+        let (entry2, payload2) = &packed2[0];
+        assert_eq!(entry2.base_bitwidth, 2);
+        let blocks = (dim * dim) / 64;
+        assert_eq!(payload2.len(), blocks * 18, "GSQ-RCO payload is 18 B per 64 weights");
+        let decoded = grim_quant::dequant_gsq_rco_3p5(payload2, dim * dim)
+            .expect("gsq round-trip");
+        // RTN at 2 bits is coarse; bound the worst per-weight error by one
+        // level of the block scale (<= amax here).
+        let amax = initial_sq_floats.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for (v, d) in initial_sq_floats.iter().zip(decoded.iter()) {
+            assert!((v - d).abs() <= amax, "gsq decode error beyond one level");
+        }
+        assert_eq!(overrides2.len(), 1);
+        assert_eq!(overrides2[0].override_dtype, crate::gguf::GgufDType::GsqRco3p5);
     }
 }
 
