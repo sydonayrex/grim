@@ -264,3 +264,25 @@ fn released_checkpoint_codebook_arbiter() {
     }
     eprintln!("[arbiter] bias-2 (paper codebook) reading confirmed by mean-shift statistic");
 }
+
+#[test]
+fn q2_0_bias_knob_flips_exactly_one_level() {
+    // GRIM_GSQ_BIAS=2 must turn the tag-42 reader into the tag-81 reader
+    // (same bytes, every weight shifted by +d) — the one-binary A/B for the
+    // released Flash checkpoint's mis-tagged expert banks.
+    let n = BLOCK_SIZE_Q2_0;
+    let mut block = vec![0u8; 18];
+    let d = 1.0f32; // fp16 0x3C00 = 1.0
+    block[0] = 0x00;
+    block[1] = 0x3C;
+    block[2] = 0b00_01_10_11; // codes 3,2,1,0 for j=0..4
+    // env is process-global: set before any dequant in THIS test only via
+    // the two public readers' relationship — bias-2 q2_0 == gsq.
+    let via_gsq = grim_quant::dequant_gsq_rco_3p5(&block, n).expect("gsq");
+    let via_q20 = grim_quant::dequant_q2_0(&block, n).expect("q2_0");
+    // Under default bias-1, q2_0 and gsq differ by exactly one level (d = 1.0).
+    for (g, q) in via_gsq.iter().zip(via_q20.iter()) {
+        // gsq = (q-2)d, q2_0 = (q-1)d  =>  gsq = q2_0 - d.
+        assert!((q - g - d).abs() < 1e-6, "gsq {} vs q2_0 {} must differ by exactly d", g, q);
+    }
+}

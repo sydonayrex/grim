@@ -8376,7 +8376,22 @@ pub const BLOCK_BYTES_GSQ_RCO_3P5: usize = BLOCK_BYTES_Q2_0;
 /// [`BLOCK_SIZE_Q2_0`] (GGUF rows are always block-aligned, so a ragged
 /// count means the caller computed the tensor size wrongly).
 pub fn dequant_q2_0(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    dequant_2bit_blocks(data, num_weights, "q2_0", 1.0)
+    // GRIM_GSQ_BIAS A/B (shared with dequant_gsq_rco_3p5): upstream tag 42
+    // decodes (q - 1) * d (llama.cpp ggml-quants.c:439), but the RELEASED
+    // Qwen3.8-Flash-Next file stores its tag-42 expert banks with GSQ-RCO
+    // semantics — the byte-level arbiter (gsq_rco_3p5_pack.rs
+    // released_checkpoint_codebook_arbiter) measured negatives reaching 2d /
+    // positives stopping at 1d, the bias-2 signature. GRIM_GSQ_BIAS=2 reads
+    // those banks correctly in the SAME binary; default 1 keeps upstream
+    // files faithful.
+    static BIAS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let bias = *BIAS.get_or_init(|| {
+        match std::env::var("GRIM_GSQ_BIAS").as_deref() {
+            Ok("2") => 2.0,
+            _ => 1.0,
+        }
+    });
+    dequant_2bit_blocks(data, num_weights, "q2_0", bias)
 }
 
 /// GSQRCO shares [`BLOCK_SIZE_Q2_0`] geometry with `Q2_0` but uses the
