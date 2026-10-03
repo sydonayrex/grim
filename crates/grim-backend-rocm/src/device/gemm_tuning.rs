@@ -105,9 +105,6 @@ pub enum ArchFamily {
     Rdna3,
     Rdna4,
     Rdna5,
-    Cdna1,
-    Cdna2,
-    Cdna3,
     Generic,
 }
 
@@ -134,15 +131,9 @@ impl ArchFamily {
             || lower.contains("gfx10")
         {
             Self::Rdna2
-        } else if lower.contains("940")
-            || lower.contains("941")
-            || lower.contains("942")
-            || lower.contains("gfx94")
-        {
-            Self::Cdna3
-        } else if lower.contains("908") || lower.contains("90a") || lower.contains("gfx90") {
-            Self::Cdna2
         } else {
+            // gfx9xx is CDNA. grim targets RDNA (and UDNA, classified above as
+            // Rdna4/Rdna5); data-centre parts fall through to Generic.
             Self::Generic
         }
     }
@@ -225,24 +216,6 @@ pub fn lookup_solution_index(m: usize, n: usize, k: usize, arch: &str, arith: Ar
                     ArithType::F16 => 210,
                     ArithType::BF16 => 211,
                     ArithType::F32 => 212,
-                    _ => 0,
-                },
-                _ => 0,
-            }
-        }
-        ArchFamily::Cdna2 | ArchFamily::Cdna3 => {
-            // CDNA MFMA wave64 matrix core solutions
-            match (m, n, k) {
-                (1, 4096, 4096) => match arith {
-                    ArithType::F16 => 301,
-                    ArithType::BF16 => 302,
-                    ArithType::F32 => 303,
-                    _ => 0,
-                },
-                (128, 4096, 4096) => match arith {
-                    ArithType::F16 => 310,
-                    ArithType::BF16 => 311,
-                    ArithType::F32 => 312,
                     _ => 0,
                 },
                 _ => 0,

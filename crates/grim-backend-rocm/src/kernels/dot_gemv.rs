@@ -23,6 +23,107 @@ __device__ __forceinline__ int grim_sdot4(int a, int b, int c) {
 #define GRIM_Q8_0_BLOCK_SIZE 32
 #define GRIM_Q8_0_BYTES      34
 
+// Upstream GGUF Q2_0 (dtype tag 42): ggml_half d + qs[16], 64 weights per
+// 18-byte block, codebook {-1, 0, +1, +2} (llama.cpp ggml-common.h:187).
+#define GRIM_Q2_0_BLOCK_SIZE 64
+#define GRIM_Q2_0_BYTES      18
+
+// Q2_0 x Q8_0 GEMV, ported from llama.cpp `ggml_vec_dot_q2_0_q8_0_generic`
+// (ggml/src/ggml-cpu/quants.c:177).
+//
+// The block pairing is the load-bearing constraint, and it is not symmetric:
+// ONE Q2_0 block of 64 weights maps to TWO Q8_0 blocks of 32, so each Q2_0
+// block issues two half-block dots against consecutive activation blocks. The
+// same pairing shows up on the GPU side as `get_dm(uint ib) { return
+// data_a[ib / 2].d; }` in the reference's `mul_mat_vecq_funcs.glsl`.
+//
+// Reference accumulation, transcribed verbatim:
+//     sumi_block  = sum over the 32 codes of ((code - 1) * qy)
+//     sumi       += d1_k * sumi_block          (d1 = the Q8_0 block's scale)
+//     sumf       += d0 * sumi                 (d0 = the Q2_0 block's scale)
+// The inner dot stays in integer: codes are in [-1, 2] and activations in
+// [-127, 127], so a 64-wide block accumulates to at most 2*127*64 = 16256,
+// comfortably inside int32. That is what keeps the weight packed -- no f32
+// expansion of the 14.6 GB expert banks.
+extern "C" __global__ void grim_dot4_q2_0_q80_gemv(
+    const unsigned char* __restrict__ A_q80,
+    const unsigned char* __restrict__ B_q20,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    const int col_base = blockIdx.x * 4;
+    const int row      = blockIdx.y;
+    const int lane     = threadIdx.x;
+
+    if (row >= M || col_base >= N) return;
+
+    const int n_x_blocks = K / GRIM_Q2_0_BLOCK_SIZE;   // 64-weight weight blocks
+    const int n_y_blocks = K / GRIM_Q8_0_BLOCK_SIZE;   // 32-weight activation blocks
+
+    const unsigned char* a_row =
+        A_q80 + (long long)row * n_y_blocks * GRIM_Q8_0_BYTES;
+
+    const int active_cols = (col_base + 4 <= N) ? 4 : (N - col_base);
+    const unsigned char* b_col[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        b_col[j] = (j < active_cols)
+                 ? B_q20 + (long long)(col_base + j) * n_x_blocks * GRIM_Q2_0_BYTES
+                 : nullptr;
+    }
+
+    float facc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int blk = lane; blk < n_x_blocks; blk += 32) {
+        // The two Q8_0 activation blocks that pair with this Q2_0 block.
+        const unsigned char* a_blk0 = a_row + (long long)(blk * 2)     * GRIM_Q8_0_BYTES;
+        const unsigned char* a_blk1 = a_row + (long long)(blk * 2 + 1) * GRIM_Q8_0_BYTES;
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= active_cols) break;
+            const unsigned char* b_blk = b_col[j] + blk * GRIM_Q2_0_BYTES;
+            float d0 = fp16_to_float_device(((const unsigned short*)b_blk)[0]);
+            const unsigned char* qs = b_blk + 2;   // 16 bytes = 64 two-bit codes
+
+            float sumi = 0.0f;
+            #pragma unroll
+            for (int half = 0; half < 2; half++) {
+                const unsigned char* a_blk = half == 0 ? a_blk0 : a_blk1;
+                float d1 = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
+                const signed char* qy = (const signed char*)(a_blk + 2);
+
+                int sumi_block = 0;
+                const unsigned char* qs_h = qs + half * 8;   // 8 bytes = 32 codes
+                for (int b = 0; b < 8; ++b) {
+                    const unsigned char byte = qs_h[b];
+                    // Unpack four 2-bit codes and map {0,1,2,3} -> {-1,0,+1,+2}.
+                    sumi_block += ((int)((byte >> 0) & 3) - 1) * (int)qy[b*4 + 0];
+                    sumi_block += ((int)((byte >> 2) & 3) - 1) * (int)qy[b*4 + 1];
+                    sumi_block += ((int)((byte >> 4) & 3) - 1) * (int)qy[b*4 + 2];
+                    sumi_block += ((int)((byte >> 6) & 3) - 1) * (int)qy[b*4 + 3];
+                }
+                sumi += d1 * (float)sumi_block;
+            }
+            facc[j] += d0 * sumi;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            facc[j] += __shfl_xor(facc[j], off);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int j = 0; j < active_cols; j++) {
+            C[(long long)row * N + col_base + j] = facc[j];
+        }
+    }
+}
+
 // PLAN-kernel-launch-reduction Phase B: QKV GEMV — one launch covers the three
 // projections (each col-base 4-group lies wholly inside one section, since the
 // launcher requires Nq % 4 == 0 and Nkv % 4 == 0). Same math as
@@ -2661,6 +2762,66 @@ extern "C" __global__ void grim_dot4_q4k_q81_gemv_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Q2_0 kernel must be present in the JIT source under the exact name
+    /// the launcher passes to `launch_compute_kernel`. A typo here would not
+    /// fail at build time -- the kernel is resolved by name at first launch.
+    #[test]
+    fn source_contains_q2_0_gemv_kernel() {
+        assert!(
+            KERNEL_SOURCE.contains("grim_dot4_q2_0_q80_gemv"),
+            "Q2_0 GEMV kernel missing from the JIT source"
+        );
+        // Geometry constants must match grim-tensor's `expected_bytes`, or the
+        // launcher would read rows with the wrong stride.
+        assert!(KERNEL_SOURCE.contains("#define GRIM_Q2_0_BLOCK_SIZE 64"));
+        assert!(KERNEL_SOURCE.contains("#define GRIM_Q2_0_BYTES      18"));
+        // The codebook offset is the whole reason Q2_0 is not Q2_K or GSQRCO.
+        assert!(
+            KERNEL_SOURCE.contains("((int)((byte >> 0) & 3) - 1)"),
+            "Q2_0 decode must map {{0,1,2,3}} -> {{-1,0,+1,+2}} (bias 1), not GSQRCO's bias 2"
+        );
+        // One weight block must consume exactly two activation blocks.
+        assert!(KERNEL_SOURCE.contains("blk * 2 + 1"));
+    }
+
+    /// The Q2_0 kernel must be compiled on the same target set as the rest of
+    /// this wave32-only source, and the dispatch must gate on it. A kernel
+    /// defined outside the `#if` would compile everywhere but be wrong on
+    /// wave64, where a 32-lane block's `__shfl_xor` reduction spans the full
+    /// 64-wide wave with lanes 32..63 outside the block.
+    #[test]
+    fn q2_0_kernel_sits_inside_the_wave32_guard() {
+        let start = KERNEL_SOURCE
+            .find("#if defined(__gfx1030__)")
+            .expect("wave32 guard header");
+        let kern = KERNEL_SOURCE
+            .find("__global__ void grim_dot4_q2_0_q80_gemv")
+            .expect("Q2_0 kernel");
+        // Walk the guard to its MATCHING `#endif`. A plain `find("#endif")`
+        // lands on the one closing `grim_sdot4`'s nested RDNA2-vs-RDNA3/4
+        // `#if`, which ends long before this kernel.
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, line) in KERNEL_SOURCE[start..].lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("#if") {
+                depth += 1;
+            } else if t.starts_with("#endif") {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + i);
+                    break;
+                }
+            }
+        }
+        let end = end.expect("wave32 guard footer");
+        assert!(
+            kern > start && kern < end,
+            "Q2_0 kernel must live inside the wave32 #if guard (kernel at {kern}, \
+             guard spans {start}..{end})"
+        );
+    }
 
     #[test]
     fn source_contains_dot4_gemv_kernel() {

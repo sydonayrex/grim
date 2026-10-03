@@ -74,8 +74,7 @@ fn gcn_arch_kind_debug_works() -> TestResult {
         GcnArch::RDNA2,
         GcnArch::RDNA3,
         GcnArch::RDNA4,
-        GcnArch::CDNA2,
-        GcnArch::CDNA3,
+        GcnArch::UDNA,
         GcnArch::Other,
     ];
     for k in kinds {
@@ -151,8 +150,7 @@ fn capability_table_fp32_baseline_always_available() -> TestResult {
         GcnArch::RDNA2,
         GcnArch::RDNA3,
         GcnArch::RDNA4,
-        GcnArch::CDNA2,
-        GcnArch::CDNA3,
+        GcnArch::UDNA,
         GcnArch::Other,
     ] {
         let c = arch_capability(arch);

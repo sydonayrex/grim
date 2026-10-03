@@ -335,6 +335,10 @@ pub struct RocmDevice {
     /// SPEED-ROC: Preallocated buffer for activation quant (Q8_1) in dot4 GEMV.
     /// Reused every decode GEMV, eliminating per-layer hipMalloc overhead.
     pub(crate) act_q81_buf: RwLock<Option<RocmStorage>>,
+    /// Preallocated buffer for activation quant (Q8_0, 34 B per 32 weights) in
+    /// the Q2_0 x Q8_0 GEMV. Separate from `act_q81_buf` because the two
+    /// formats have different block widths and are live at different times.
+    pub(crate) act_q80_buf: RwLock<Option<RocmStorage>>,
     /// Phase 4.5b: Preallocated buffers for W4A4 activation quantization in sudot8 GEMV.
     pub(crate) act_u4_codes_buf: Mutex<Option<RocmStorage>>,
     pub(crate) act_u4_scales_buf: Mutex<Option<RocmStorage>>,
@@ -747,10 +751,6 @@ impl RocmDevice {
             }
         } else {
             match crate::quantization::gcn_arch(&gpu_target) {
-                crate::quantization::GcnArch::CDNA1
-                | crate::quantization::GcnArch::CDNA2
-                | crate::quantization::GcnArch::CDNA3
-                | crate::quantization::GcnArch::CDNA4 => WavefrontSize::W64,
                 crate::quantization::GcnArch::RDNA1
                 | crate::quantization::GcnArch::RDNA2
                 | crate::quantization::GcnArch::RDNA3
@@ -885,7 +885,6 @@ impl RocmDevice {
                             crate::quantization::gcn_arch(&gpu_target),
                             crate::quantization::GcnArch::RDNA4
                                 | crate::quantization::GcnArch::UDNA
-                                | crate::quantization::GcnArch::CDNA4
                         )
                     }
                 },
@@ -905,6 +904,7 @@ impl RocmDevice {
             sampler_out_buf: Mutex::new(None),
             penalty_hist_buf: Mutex::new(None),
             act_q81_buf: RwLock::new(None),
+            act_q80_buf: RwLock::new(None),
             act_u4_codes_buf: Mutex::new(None),
             act_u4_scales_buf: Mutex::new(None),
             act_u4_sums_buf: Mutex::new(None),

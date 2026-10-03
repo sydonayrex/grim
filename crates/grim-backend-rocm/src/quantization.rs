@@ -13,15 +13,9 @@ pub enum GcnArch {
     RDNA3,
     /// RDNA4 — gfx1200-1201 (RDNA4 discrete and mobile).
     RDNA4,
-    /// CDNA1 — gfx906, gfx900 (MI50, MI60, Vega20).
-    CDNA1,
-    /// CDNA2 — gfx908, gfx90a (MI100, MI210, MI250, MI250X; full MFMA).
-    CDNA2,
-    /// CDNA3 — gfx940-942 (MI300 series; full MFMA + fp8 path).
-    CDNA3,
-    /// CDNA4 — gfx950 (MI350, MI355X series; FP8/FP4/MXFP4 MFMA).
-    CDNA4,
-    /// UDNA — gfx1200, gfx1300, gfx1301 (AMD Unified DNA architecture uniting RDNA & CDNA).
+    /// UDNA — gfx1200, gfx1300, gfx1301. Note this is NOT CDNA-only: UDNA
+    /// covers RDNA4's gfx1200/1201 as well as the gfx13x parts, so it is
+    /// dispatched alongside `RDNA4` rather than as a data-centre sibling.
     UDNA,
     /// Anything else (gfx0000, malformed strings).
     Other,
@@ -156,24 +150,11 @@ pub fn gcn_arch(name: &str) -> GcnArch {
     if let Some(s) = strip_prefix_digits(suffix, "12") {
         return family_rna4(s);
     }
-    if let Some(s) = strip_prefix_digits(suffix, "9") {
-        // gfx906/900 = CDNA1, gfx908/90a = CDNA2, gfx940-942 = CDNA3, gfx950 = CDNA4.
-        return match s {
-            r if r.starts_with("50") || r.starts_with("51") => GcnArch::CDNA4,
-            r if r.starts_with("40")
-                || r.starts_with("41")
-                || r.starts_with("42")
-                || r.starts_with("43")
-                || r.starts_with("44") =>
-            {
-                GcnArch::CDNA3
-            }
-            r if r.starts_with("08") || r.starts_with("0a") || r.starts_with("0A") => {
-                GcnArch::CDNA2
-            }
-            r if r.starts_with("06") => GcnArch::CDNA1,
-            _ => GcnArch::Other,
-        };
+    if strip_prefix_digits(suffix, "9").is_some() {
+        // gfx9xx is CDNA (MI50/MI100/MI300/MI350). grim targets RDNA and
+        // UDNA only, so these fall through to `Other` rather than being binned
+        // into a family we do not support.
+        return GcnArch::Other;
     }
     GcnArch::Other
 }
@@ -185,10 +166,6 @@ impl std::fmt::Display for GcnArch {
             GcnArch::RDNA2 => "RDNA2",
             GcnArch::RDNA3 => "RDNA3",
             GcnArch::RDNA4 => "RDNA4",
-            GcnArch::CDNA1 => "CDNA1",
-            GcnArch::CDNA2 => "CDNA2",
-            GcnArch::CDNA3 => "CDNA3",
-            GcnArch::CDNA4 => "CDNA4",
             GcnArch::UDNA => "UDNA",
             GcnArch::Other => "Other",
         };
@@ -338,17 +315,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             mxfp8_emulated: true,
             int8_w8a8: true,
         },
-        GcnArch::CDNA4 | GcnArch::CDNA3 => QuantCapability {
-            fp32: true,
-            f16: true,
-            bf16: true,
-            fp8: Fp8NativeFormat::Fnuz,
-            mxfp4_emulated: true,
-            nutcracker_emulated: true,
-            mxfp8_emulated: true,
-            int8_w8a8: true,
-        },
-        GcnArch::RDNA2 | GcnArch::RDNA3 | GcnArch::CDNA2 => QuantCapability {
+        GcnArch::RDNA2 | GcnArch::RDNA3 => QuantCapability {
             fp32: true,
             f16: true,
             bf16: true,
@@ -356,16 +323,6 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             mxfp4_emulated: true,
             nutcracker_emulated: true,
             mxfp8_emulated: true,
-            int8_w8a8: true,
-        },
-        GcnArch::CDNA1 => QuantCapability {
-            fp32: true,
-            f16: true,
-            bf16: false,
-            fp8: Fp8NativeFormat::None,
-            mxfp4_emulated: false,
-            nutcracker_emulated: false,
-            mxfp8_emulated: false,
             int8_w8a8: true,
         },
         GcnArch::RDNA1 | GcnArch::Other => QuantCapability {
@@ -461,12 +418,7 @@ mod self_tests {
 
     #[test]
     fn fp8_capable_buckets_match_spec() {
-        for arch in [
-            GcnArch::RDNA4,
-            GcnArch::CDNA3,
-            GcnArch::CDNA4,
-            GcnArch::UDNA,
-        ] {
+        for arch in [GcnArch::RDNA4, GcnArch::UDNA] {
             let c = arch_capability(arch);
             assert!(
                 c.supports(QuantMode::Fp8Native),
@@ -478,8 +430,6 @@ mod self_tests {
             GcnArch::RDNA1,
             GcnArch::RDNA2,
             GcnArch::RDNA3,
-            GcnArch::CDNA1,
-            GcnArch::CDNA2,
             GcnArch::Other,
         ] {
             let c = arch_capability(arch);
@@ -497,17 +447,11 @@ mod self_tests {
         assert_eq!(rdna4.fp8_native_format(), Fp8NativeFormat::OcpFn);
         let udna = arch_capability(GcnArch::UDNA);
         assert_eq!(udna.fp8_native_format(), Fp8NativeFormat::OcpFn);
-        let cdna3 = arch_capability(GcnArch::CDNA3);
-        assert_eq!(cdna3.fp8_native_format(), Fp8NativeFormat::Fnuz);
-        let cdna4 = arch_capability(GcnArch::CDNA4);
-        assert_eq!(cdna4.fp8_native_format(), Fp8NativeFormat::Fnuz);
         // Arches with no native FP8 element format at all.
         for arch in [
             GcnArch::RDNA1,
             GcnArch::RDNA2,
             GcnArch::RDNA3,
-            GcnArch::CDNA1,
-            GcnArch::CDNA2,
             GcnArch::Other,
         ] {
             assert_eq!(
@@ -520,11 +464,14 @@ mod self_tests {
 
     #[test]
     fn test_gcn_arch_parsing_cdna_and_udna() {
-        assert_eq!(gcn_arch("gfx906"), GcnArch::CDNA1);
-        assert_eq!(gcn_arch("gfx908"), GcnArch::CDNA2);
-        assert_eq!(gcn_arch("gfx90a"), GcnArch::CDNA2);
-        assert_eq!(gcn_arch("gfx940"), GcnArch::CDNA3);
-        assert_eq!(gcn_arch("gfx950"), GcnArch::CDNA4);
+        // gfx9xx is CDNA. grim does not target it, so it parses to `Other`
+        // rather than to a family we would then dispatch for.
+        assert_eq!(gcn_arch("gfx906"), GcnArch::Other);
+        assert_eq!(gcn_arch("gfx908"), GcnArch::Other);
+        assert_eq!(gcn_arch("gfx90a"), GcnArch::Other);
+        assert_eq!(gcn_arch("gfx940"), GcnArch::Other);
+        assert_eq!(gcn_arch("gfx950"), GcnArch::Other);
+        // UDNA is NOT CDNA-only: it also covers RDNA4's gfx1200/1201.
         assert_eq!(gcn_arch("gfx1200"), GcnArch::RDNA4);
         assert_eq!(gcn_arch("gfx1201"), GcnArch::RDNA4);
         assert_eq!(gcn_arch("gfx1300"), GcnArch::UDNA);
@@ -537,8 +484,6 @@ mod self_tests {
             GcnArch::RDNA2,
             GcnArch::RDNA3,
             GcnArch::RDNA4,
-            GcnArch::CDNA3,
-            GcnArch::CDNA4,
             GcnArch::UDNA,
         ] {
             assert_eq!(
@@ -564,12 +509,6 @@ mod self_tests {
 
     #[test]
     fn quant_capability_int8_w8a8_arch_table() {
-        // CDNA3 (gfx940) and RDNA3 (gfx1100) should both report int8_w8a8.
-        let cdna3 = arch_capability(GcnArch::CDNA3);
-        assert!(
-            cdna3.int8_w8a8,
-            "CDNA3 should support Int8W8A8 (int8 MFMA: mfma_i32_32x32x16_i8)"
-        );
         let rna3 = arch_capability(GcnArch::RDNA3);
         assert!(
             rna3.int8_w8a8,
@@ -593,7 +532,7 @@ mod self_tests {
 
     #[test]
     fn quantmode_supports_int8w8a8_gate() {
-        let cap = arch_capability(GcnArch::CDNA3);
+        let cap = arch_capability(GcnArch::RDNA3);
         assert!(cap.supports(QuantMode::Int8W8A8));
         let rna1_cap = arch_capability(GcnArch::RDNA1);
         assert!(!rna1_cap.supports(QuantMode::Int8W8A8));
@@ -645,8 +584,6 @@ mod self_tests {
             GcnArch::RDNA2,
             GcnArch::RDNA3,
             GcnArch::RDNA4,
-            GcnArch::CDNA3,
-            GcnArch::CDNA4,
             GcnArch::UDNA,
         ] {
             let cap = arch_capability(arch);
@@ -688,13 +625,6 @@ mod self_tests {
     #[test]
     fn tile_config_rdna2_single_n() {
         let cfg = TileConfig::for_arch(GcnArch::RDNA2);
-        assert_eq!(cfg.n, 16);
-        assert!(!cfg.dual_n);
-    }
-
-    #[test]
-    fn tile_config_cnda_single_n() {
-        let cfg = TileConfig::for_arch(GcnArch::CDNA3);
         assert_eq!(cfg.n, 16);
         assert!(!cfg.dual_n);
     }

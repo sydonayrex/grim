@@ -2104,12 +2104,13 @@ impl Qwen38FlashNext {
         // fail on `model.embed_tokens.weight`, while the synthetic tests -- which
         // emit the prefixed names -- passed.
         //
-        // The token embedding is therefore probed under all three real names.
-        // Probe by NAME, never by shape: the two containers disagree on the
-        // token embedding's orientation. safetensors stores
-        // [vocab, hidden]; GGUF stores `token_embd.weight` as [hidden, vocab],
-        // so one shared shape probe matches at most one of them and silently
-        // falls through to the wrong root.
+        // The token embedding is therefore probed under both real names.
+        // Probe by NAME, never by shape: safetensors nests it at
+        // `embed_tokens` while GGUF puts `token_embd.weight` at the root, so a
+        // shared shape probe would match at most one and silently fall through
+        // to the wrong root. Both containers agree on `[vocab, hidden]`
+        // row-major — GGUF's `ne = { n_embd, n_vocab }` is reversed by
+        // `GgufTensorInfo::shape()` — so only the name differs here.
         let root = if ws
             .scoped("model")
             .scoped("language_model")
@@ -2132,16 +2133,18 @@ impl Qwen38FlashNext {
             [cfg.vocab_size, cfg.hidden_size],
         )
         .or_else(|_| {
+            // GGUF stores this as `ne = { n_embd, n_vocab }` (llama.cpp
+            // `qwen4exp.cpp:170`), and `GgufTensorInfo::shape()` reverses `ne`
+            // into row-major order, so the row-major shape is
+            // `[n_vocab, n_embd]` — the same orientation as the safetensors
+            // arm above. The transpose arm that used to sit here
+            // (`[hidden, vocab]`) could never match a GGUF file: it fires
+            // only when `n_embd == n_vocab`, and when it did not it replaced
+            // the real error with a bogus "expected [2560, 248320]" that
+            // contradicted the bytes on disk.
             Linear::load_shape(
                 &root.scoped("token_embd"),
                 [cfg.vocab_size, cfg.hidden_size],
-            )
-        })
-        .or_else(|_| {
-            // GGUF orientation: [hidden, vocab].
-            Linear::load_shape(
-                &root.scoped("token_embd"),
-                [cfg.hidden_size, cfg.vocab_size],
             )
         })?;
 

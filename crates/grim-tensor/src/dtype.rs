@@ -166,6 +166,22 @@ pub enum BlockDtype {
     /// patterns. `expected_bytes` below implements 4.75 and
     /// `e3_effective_bpw_is_4_75` names the number so it cannot drift silently.
     Fp8Sparse24,
+    /// ForestRaven: symmetric per-output-row absmax INT8.
+    ///
+    /// One fp32 scale per row (`max|row| / 127`), codes `round(w/scale)` in
+    /// `[-128, 127]`. A distinct format from Q8_0, not a tuning knob: Q8_0
+    /// scales per 32-element block with fp16 scales, ForestRaven per output
+    /// row with fp32 -- same codes, different scale streams, and a kernel
+    /// reading one geometry with the other's scales produces finite,
+    /// plausible, wrong weights.
+    ///
+    /// The framed blob (`[u64 codes_len][codes][u64 scales_len][scales]`)
+    /// needs the row count to size the scale stream, which `expected_bytes`
+    /// cannot see (it takes only an element count). Like Fp8Block128 it
+    /// reports the codes part; the framing plus scales ride on the .grim
+    /// entry's explicit `payload_size`, and GGUF-direct refuses this format
+    /// because no fixed block geometry expresses row-scaled framing.
+    Int8PerChannel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -277,6 +293,10 @@ pub enum QuantFormat {
     Fp8Blocked16,
     /// WhiteCrow: W4A4 OSTQuant u4×u4, group-128, feeds `V_DOT8_I32_IU4`.
     W4A4OstQuant,
+    /// ForestRaven: symmetric per-output-row absmax INT8, feeds
+    /// `V_DOT4_I32_IU8`. See `BlockDtype::Int8PerChannel` for why this is not
+    /// Q8_0 under another name.
+    Int8PerChannel,
     Iq4Nl,
     Iq4Xs,
     Iq3Xxs,
@@ -446,6 +466,13 @@ impl DType {
                     let groups = elem_count.div_ceil(4);
                     groups * 2 + (groups * 3).div_ceil(8)
                 }
+                // ForestRaven: the codes part only. The framed blob also
+                // carries 16 framing bytes plus 4 scale bytes per output row,
+                // and the row count is not recoverable from an element count
+                // alone -- so like Fp8Block128, callers with the shape must
+                // use the real length (the .grim entry's explicit
+                // `payload_size`), never this estimate, to size a read.
+                BlockDtype::Int8PerChannel => elem_count,
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
             Storage::Unsupported(f) => match (f.block_size, f.bytes_per_block) {
@@ -482,6 +509,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
             QuantFormat::Fp8Blocked16 => Storage::FloatPack(FloatPackScheme::Fp8Blocked16),
             QuantFormat::W4A4OstQuant => Storage::W4A4OstQuant(OstQuantConfig { group_size: 128 }),
+            QuantFormat::Int8PerChannel => Storage::Block(BlockDtype::Int8PerChannel),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
             QuantFormat::Fp8Block128 => Storage::Block(BlockDtype::Fp8Block128),
             QuantFormat::Fp8Sparse24 => Storage::Block(BlockDtype::Fp8Sparse24),
@@ -517,6 +545,20 @@ impl TryFrom<&Storage> for QuantFormat {
                 KQuantScheme::IQ2XXS => Ok(QuantFormat::Iq2Xxs),
                 KQuantScheme::IQ2XS => Ok(QuantFormat::Iq2Xs),
                 KQuantScheme::IQ2S => Ok(QuantFormat::Iq2S),
+                // NOTE: `GsqRco3p5` deliberately has NO arm here yet, even
+                // though `From<QuantFormat> for Storage` maps it and
+                // `quantize_gsq_rco_3p5_block` can produce tag 81. The
+                // `TryFrom<&Storage>` direction is what `Linear::forward`
+                // reads, so adding it without a backend dispatch is worse
+                // than leaving it out: the weight would pass the format
+                // check, reach `RocmDevice::quantized_matmul`, miss the
+                // `KQuantScheme::GsqRco3p5` arm, and land in the generic
+                // `_ =>` arm that calls `self.matmul` on 18-byte-per-64
+                // packed bytes. That trades a loud "no QuantFormat mapping"
+                // error for silent garbage.
+                //
+                // Add this arm in the same change that adds the backend
+                // dispatch, not before.
                 _ => Err(()),
             },
             Storage::FloatPack(f) => match f {
@@ -535,6 +577,7 @@ impl TryFrom<&Storage> for QuantFormat {
                 BlockDtype::Nf4 => Ok(QuantFormat::Nf4),
                 BlockDtype::Fp8 => Ok(QuantFormat::Fp8),
                 BlockDtype::Fp8Sparse24 => Ok(QuantFormat::Fp8Sparse24),
+                BlockDtype::Int8PerChannel => Ok(QuantFormat::Int8PerChannel),
                 // Legacy Q4_0 shares IQ4_NL's density but not its block, and no
                 // canonical QuantFormat names it yet; refuse rather than
                 // report a format a decoder would not honour.
@@ -726,15 +769,16 @@ mod tests {
     fn every_kquant_scheme_maps_to_a_quant_format_and_back() {
         /// K-quants deliberately WITHOUT a `QuantFormat`, with the reason.
         ///
-        /// `GsqRco3p5` decodes correctly on the host
-        /// (`dequant_gsq_rco_3p5`, exercised by `CpuStorage::to_cpu_vec_f32`)
-        /// but has no `QuantFormat` variant, so it hits the same
-        /// `Linear::forward` error the Q3_K case did. It is called out here
-        /// rather than left implicit so the next person sees it as a known,
-        /// tracked gap instead of rediscovering it from a panic. Note that
-        /// nothing can actually produce it: GSQ-main defines no GGUF format
-        /// for GSQRCO (it deploys into existing K-Quant containers), so tag 81
-        /// has no producer. Retire it rather than wiring a kernel for it.
+        /// `GsqRco3p5` is here because it has a packer and a `From<QuantFormat>`
+        /// mapping but no backend dispatch: adding the `TryFrom` arm alone
+        /// would let a GSQRCO weight reach `RocmDevice::quantized_matmul`,
+        /// miss its match arm, and fall into the generic `_ =>` arm that calls
+        /// `self.matmul` on packed bytes — silent garbage instead of the loud
+        /// "no QuantFormat mapping" error. Fail loudly until the dispatch
+        /// exists; then remove it here and add the arm together.
+        ///
+        /// (An earlier note claimed tag 81 had no producer and should be
+        /// retired. That was wrong — `quantize_gsq_rco_3p5_block` writes it.)
         const NO_QUANT_FORMAT: &[KQuantScheme] = &[KQuantScheme::GsqRco3p5];
 
         const ALL: &[KQuantScheme] = &[

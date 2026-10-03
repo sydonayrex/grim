@@ -1694,6 +1694,15 @@ impl QuantOps for CpuDevice {
                             Error::Backend(format!("CPU quantized_matmul GreyRaven dequant: {e}"))
                         })?
                     }
+                    // ForestRaven: per-row absmax INT8 decodes to dense f32
+                    // with the framed-blob geometry (n, k). Same host-fallback
+                    // position as every other format without a dedicated CPU
+                    // kernel.
+                    grim_tensor::QuantFormat::Int8PerChannel => {
+                        grim_quant::dequant_forest(&b_bytes, n, k).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul ForestRaven dequant: {e}"))
+                        })?
+                    }
                     // TreePie is dense E2M2, so the plain dequant serves a matmul
                     // here. `k * n` must be a multiple of 32; the packer asserts.
                     grim_tensor::QuantFormat::TreePie => {
@@ -2637,13 +2646,22 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::BlockDtype::Fp4Block16 => {
                     grim_quant::dequant_fp4_block16(raw, n)
                 }
-                // GreyRaven 2:4: no packed byte format exists yet (E4's
                 // GreyRaven 2:4: the packed form exists (`pack_grey_raven`);
                 // decode to the pruned dense model. What does not exist yet
                 // is the production SWMMAC kernel, not the bytes.
                 grim_tensor::dtype::BlockDtype::Fp8Sparse24 => {
                     grim_quant::grey_raven::dequant_grey_raven(raw, n)
                         .map_err(|e| Error::Backend(format!("CPU GreyRaven dequant: {e}")))
+                }
+                // ForestRaven: per-row absmax INT8. This shape-less entry point
+                // (`raw`, `n`) cannot recover the row count the scale stream
+                // needs -- use the shaped paths (varbuilder materialization,
+                // CPU quantized_matmul, convert dequant), which pass (n, k).
+                // Refusing beats decoding with a guessed geometry.
+                grim_tensor::dtype::BlockDtype::Int8PerChannel => {
+                    Err(Error::Backend(
+                        "CPU to_cpu_vec_f32: Int8PerChannel needs (n, k) geometry for the scale stream; use a shaped decode path".to_string(),
+                    ))
                 }
                 grim_tensor::dtype::BlockDtype::Fp8Block16 => {
                     grim_quant::dequant_fp8_block16(raw, n)

@@ -194,9 +194,6 @@ impl QuantOps for VulkanDevice {
                     // Cross-agent courtesy fix: the arm was added upstream
                     // without this vulkan match arm and blocked the tree.
                     BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&b_bytes_cpu, k * n)?,
-                    // GreyRaven 2:4: no packed byte format exists yet (E4's
-                    // pack_grey_raven is unwritten; the host sparsifier holds f32
-                    // survivors, not E4M3 bytes), so there is nothing to decode.
                     // GreyRaven 2:4: the packed form exists (`pack_grey_raven`)
                     // and the host decodes it; what does not exist is a Vulkan
                     // kernel route. Refusing is the honest answer -- misreading
@@ -205,6 +202,14 @@ impl QuantOps for VulkanDevice {
                     BlockDtype::Fp8Sparse24 => {
                         return Err(grim_tensor::error::Error::Backend(
                             "GreyRaven 2:4 has no Vulkan kernel route yet (host decode via dequant_grey_raven only)".into(),
+                        ))
+                    }
+                    // ForestRaven: per-row absmax INT8. Same position as
+                    // GreyRaven -- the framed blob decodes on the host
+                    // (`dequant_forest`), but no Vulkan kernel consumes it.
+                    BlockDtype::Int8PerChannel => {
+                        return Err(grim_tensor::error::Error::Backend(
+                            "ForestRaven INT8 has no Vulkan kernel route yet (host decode via dequant_forest only)".into(),
                         ))
                     }
                 })

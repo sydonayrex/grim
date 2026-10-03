@@ -299,7 +299,15 @@ impl QuantOps for RocmDevice {
                 // A weight block pairs with exactly two activation blocks, so K
                 // must be 64-aligned; otherwise fall through to plain matmul,
                 // matching the generic `_` arm below.
-                if k % 64 == 0 && !Self::is_fp16_activation(a_storage) {
+                //
+                // `wave32` is required, not an optimisation. The kernel lives
+                // inside dot_gemv.rs's `#if defined(__gfx1030__) ... ||
+                // __gfx1201__` guard, so on CDNA (wave64) it is never compiled
+                // and the launch would fail at module lookup with a bare
+                // "kernel not found". That is a loud failure, not silent
+                // corruption -- but it is the wrong kind of loud, so gate it
+                // here and take the generic path instead.
+                if wave32 && k % 64 == 0 && !Self::is_fp16_activation(a_storage) {
                     let q80_bytes = (k / 32) * 34 * m;
                     let mut buf_guard = self.act_q80_buf.write().unwrap_or_else(|e| e.into_inner());
                     let need_alloc = match buf_guard.as_ref() {

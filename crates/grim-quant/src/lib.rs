@@ -2052,6 +2052,89 @@ fn f16_to_f32(lo: u8, hi: u8) -> f32 {
     }
 }
 
+/// ForestRaven: symmetric per-output-row absmax INT8.
+///
+/// Each row of an `[n, k]` weight matrix gets its own fp32 scale
+/// (`max|row| / 127`, 1.0 for an all-zero row) and its codes are
+/// `round(w / scale)` clamped to `[-128, 127]`. This is the article recipe
+/// (absmax symmetric, per-channel for weights): one scale per output
+/// channel costs `4n` bytes against `nk` codes -- under 0.1% for the shapes
+/// that matter -- while letting every channel use its full INT8 range.
+///
+/// This is deliberately NOT Q8_0: Q8_0 scales per 32-element block with fp16
+/// scales, which is finer-grained but forces a scale application per block
+/// in the GEMV. Per-row scales need exactly one scale multiply per output,
+/// which is what `V_DOT4_I32_IU8` wants. The two formats MUST NOT share a
+/// kernel: same codes, different scale streams.
+///
+/// Returns `(codes, scales)`: `n*k` int8 codes in row-major order and `n`
+/// fp32 little-endian scales. The framed blob layout
+/// (`[u64 codes_len][codes][u64 scales_len][scales]`) is assembled by the
+/// caller (convert, rewrite), mirroring WhiteCrow's triple-stream frame.
+pub fn quant_forest_per_channel(
+    data: &[f32],
+    n: usize,
+    k: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if data.len() < n * k {
+        return Err(Error::Backend(format!(
+            "quant_forest_per_channel: need {n}*{k} weights, got {}",
+            data.len()
+        )));
+    }
+    let mut codes = Vec::with_capacity(n * k);
+    let mut scales = Vec::with_capacity(n * 4);
+    for r in 0..n {
+        let row = &data[r * k..(r + 1) * k];
+        let amax = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+        scales.extend_from_slice(&scale.to_le_bytes());
+        for &v in row {
+            let q = (v / scale).round().clamp(-128.0, 127.0) as i8;
+            codes.push(q as u8);
+        }
+    }
+    Ok((codes, scales))
+}
+
+/// Decode ForestRaven's framed blob back to dense f32.
+///
+/// Inverse of the framed layout above. Validates total length against
+/// `(n, k)` geometry and refuses short/truncated buffers rather than
+/// decoding a prefix: a truncated scale stream would rescale whole rows by
+/// whatever bytes happen to follow, producing finite, plausible, wrong
+/// weights with no signal.
+pub fn dequant_forest(data: &[u8], n: usize, k: usize) -> std::result::Result<Vec<f32>, &'static str> {
+    if data.len() < 8 {
+        return Err("forest blob too short for codes length prefix");
+    }
+    let qw_len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+    if qw_len != n * k {
+        return Err("forest codes segment length does not match n*k");
+    }
+    if data.len() < 8 + qw_len + 8 {
+        return Err("forest blob too short for scales length prefix");
+    }
+    let sc_len = u64::from_le_bytes(data[8 + qw_len..16 + qw_len].try_into().unwrap()) as usize;
+    if sc_len != n * 4 {
+        return Err("forest scales segment length does not match n fp32 scales");
+    }
+    if data.len() != 16 + qw_len + sc_len {
+        return Err("forest blob has trailing bytes past the scales segment");
+    }
+    let codes = &data[8..8 + qw_len];
+    let raw_scales = &data[16 + qw_len..];
+    let mut out = Vec::with_capacity(n * k);
+    for r in 0..n {
+        let scale = f32::from_le_bytes(raw_scales[r * 4..(r + 1) * 4].try_into().unwrap());
+        for c in 0..k {
+            let q = codes[r * k + c] as i8 as f32;
+            out.push(q * scale);
+        }
+    }
+    Ok(out)
+}
+
 /// Quantize a slice of f32 values to Q8_0 bytes.
 /// Each block of 32 gets a f16 scale and 32 i8 values.
 pub fn quant_q80(data: &[f32]) -> Result<Vec<u8>> {
@@ -3905,6 +3988,24 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
             out.extend_from_slice(&sc);
             out.extend_from_slice(&(zr.len() as u64).to_le_bytes());
             out.extend_from_slice(&zr);
+            out
+        }
+        // ForestRaven: per-row absmax INT8 in the framed blob. Needs [n, k]
+        // for the row count, same as the W4A4 arm above needs it for groups.
+        QuantFormat::Int8PerChannel => {
+            if plan.shape.len() < 2 {
+                return Err(Error::Backend(format!(
+                    "Int8PerChannel rewrite needs [n, k] shape, got {:?}",
+                    plan.shape
+                )));
+            }
+            let (n, k) = (plan.shape[0], plan.shape[1]);
+            let (codes, scales) = quant_forest_per_channel(data, n, k)?;
+            let mut out = Vec::with_capacity(16 + codes.len() + scales.len());
+            out.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&codes);
+            out.extend_from_slice(&(scales.len() as u64).to_le_bytes());
+            out.extend_from_slice(&scales);
             out
         }
         // 128x128 block FP8 is a *load-time* format for checkpoints that already

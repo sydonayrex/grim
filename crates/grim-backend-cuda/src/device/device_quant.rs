@@ -336,11 +336,11 @@ impl CudaDevice {
                 KQuantScheme::IQ2XXS => ("grim_dequant_iq2xxs", 66, 256),
                 KQuantScheme::IQ2XS => ("grim_dequant_iq2xs", 74, 256),
                 KQuantScheme::IQ2S => ("grim_dequant_iq2s", 82, 256),
-                // GGUF Q2_0 (tag 42) has no CUDA kernel; it is dequantized on
-                // the host by cuda_dequant_quantized_storage instead.
-                KQuantScheme::GsqRco3p5 => {
+                // Q2_0 (tag 42) and Prism GSQRCO (tag 81) have no CUDA kernel; they are
+                // dequantized on the host by cuda_dequant_quantized_storage instead.
+                KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => {
                     return Err(Error::Backend(
-                            "dequantize_on_device: GGUF Q2_0 (tag 42, KQuantScheme::GsqRco3p5) has no CUDA kernel; use the host dequant path"
+                            format!("dequantize_on_device: KQuant {scheme:?} has no CUDA kernel; use the host dequant path")
                                 .into(),
                         ));
                 }
@@ -1351,6 +1351,8 @@ impl QuantOps for CudaDevice {
                 .map_err(|e| Error::Backend(format!("quantized_matmul Q6K dequant: {e}")))?,
             grim_tensor::QuantFormat::Q2K => grim_quant::dequant_q2k(&b_bytes, k * n)
                 .map_err(|e| Error::Backend(format!("quantized_matmul Q2K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Q2_0 => grim_quant::dequant_q2_0(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul Q2_0 dequant: {e}")))?,
             grim_tensor::QuantFormat::Q3K => grim_quant::dequant_q3k(&b_bytes, k * n)
                 .map_err(|e| Error::Backend(format!("quantized_matmul Q3K dequant: {e}")))?,
             grim_tensor::QuantFormat::Iq4Nl => grim_quant::dequant_iq4nl(&b_bytes, k * n)

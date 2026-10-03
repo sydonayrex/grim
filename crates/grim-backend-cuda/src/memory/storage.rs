@@ -124,7 +124,6 @@ pub(crate) fn cuda_dequant_quantized_storage(
             // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale) — same
             // host decode the vulkan quant_ops arm uses.
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(b_bytes, elem_count),
-            // GreyRaven 2:4: no packed byte format exists yet (E4's
             // GreyRaven 2:4: the packed form exists (`pack_grey_raven`) and the
             // host decodes it (`dequant_grey_raven`); what does not exist is a
             // CUDA kernel route. Unimplemented rather than a dense fallback:
@@ -132,6 +131,11 @@ pub(crate) fn cuda_dequant_quantized_storage(
             // dense code plane yields finite, plausible, wrong weights.
             BlockDtype::Fp8Sparse24 => Err(Error::Unimplemented(
                 "GreyRaven 2:4 has no CUDA kernel route yet (host decode via dequant_grey_raven only)".to_string(),
+            )),
+            // ForestRaven: per-row absmax INT8, framed blob. Host-decodable
+            // (`dequant_forest`); no CUDA kernel consumes it yet.
+            BlockDtype::Int8PerChannel => Err(Error::Unimplemented(
+                "ForestRaven INT8 has no CUDA kernel route yet (host decode via dequant_forest only)".to_string(),
             )),
         },
         DTypeStorage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(

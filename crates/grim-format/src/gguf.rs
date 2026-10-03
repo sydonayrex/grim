@@ -2256,30 +2256,17 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Sparse24),
         },
-        // ForestRaven is the last member with no loader: bare INT8 has no
-        // packer, no storage scheme, and no kernel route. It is refused HERE,
-        // naming the format, rather than left to fall through to a generic
-        // path -- a silently-wrong decode of a packed kernel payload is the
-        // failure mode this whole table exists to prevent.
+        // ForestRaven: symmetric per-output-row absmax INT8 in the framed
+        // blob (`[u64 codes_len][codes][u64 scales_len][scales]`). This IS the
+        // storage the format lives in -- but only the .grim reader can serve
+        // it, because the .grim entry carries an explicit payload size while
+        // the GGUF reader derives lengths from fixed block geometry, which
+        // row-scaled framing has none of. `GgufProvider` refuses tag 672
+        // below with a message pointing at `.grim`; `GrimProvider` serves it
+        // through the quant_override of the same tag.
         GgufDType::ForestRaven => DType {
             arith: grim_tensor::ArithType::F32,
-            storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
-                name: gguf_dtype.display_name(),
-                block_size: Some(gguf_dtype.block_size() as usize),
-                bytes_per_block: Some(gguf_dtype.type_size_per_block() as usize),
-                reason: format!(
-                    "{} is a grim-native kernel payload (GGUF tag {}, {}) with no file \
-                     loader yet. The loadable members are Raven (669), WhiteRaven (670), \
-                     GreyRaven (671), and WhiteCrow (660); ForestRaven (672, bare INT8) \
-                     has no packer or kernel route. Otherwise re-quantize to Q4_K/Q8_0.",
-                    gguf_dtype.display_name(),
-                    gguf_dtype.tag(),
-                    match gguf_dtype.grim_native_bpw() {
-                        Some(b) => format!("{b:.2} bpw"),
-                        None => "unknown width".into(),
-                    },
-                ),
-            }),
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel),
         },
         GgufDType::PQ2_0
         | GgufDType::PTQ1_0

@@ -390,10 +390,8 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             KQuantScheme::IQ4NL | KQuantScheme::IQ4XS => 4,
             KQuantScheme::IQ3XXS | KQuantScheme::IQ3S => 3,
             KQuantScheme::IQ2XXS | KQuantScheme::IQ2XS | KQuantScheme::IQ2S => 2,
-            // No bits-per-weight table for this variant yet; 4 is the block's
-            // packed density (72 B per 256 elements) rounded down, matching the
-            // `expected_bytes` entry in grim-tensor.
-            KQuantScheme::GsqRco3p5 => 3,
+            // 18 B per 64 elements = 2.25 bpw; floored to 2 for a whole-weight count.
+            KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => 2,
         },
         Storage::Block(bd) => match bd {
             BlockDtype::Fp4 | BlockDtype::Fp4Block16 => 4,
@@ -405,6 +403,9 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             // two pruned ones) and must not be reported here, or every size
             // estimate downstream would under-count by 8/4.75.
             BlockDtype::Fp8Sparse24 => 8,
+            // ForestRaven stores whole int8 bytes: code width 8. Per-row fp32
+            // scales are framing overhead on a different denominator.
+            BlockDtype::Int8PerChannel => 8,
             // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
             BlockDtype::Q4_0 => 4,
         },

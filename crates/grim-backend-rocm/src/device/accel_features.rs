@@ -10,14 +10,13 @@ use crate::hipGetDeviceCount;
 
 /// Whether the arch has native **MFMA** matrix cores for a given arithmetic [see: `cubecl`, `hip/arch.rs`, `is_mfma_capable()`, `gfx1200+`]
 pub fn mfma_supported(arch: GcnArch, mode: QuantMode) -> bool {
-    let is_cdna_or_udna = matches!(
-        arch,
-        GcnArch::CDNA1 | GcnArch::CDNA2 | GcnArch::CDNA3 | GcnArch::CDNA4 | GcnArch::UDNA
-    );
-    if !is_cdna_or_udna {
-        return false; // Older RDNA has no MFMA matrix cores.
+    // grim targets RDNA and UDNA. MFMA is the CDNA matrix core; on RDNA the
+    // path is WMMA/rocWMMA. UDNA carries the MFMA capability, so it keeps the
+    // check even though it also covers gfx1200/1201.
+    if !matches!(arch, GcnArch::UDNA) {
+        return false; // RDNA has no MFMA matrix cores.
     }
-    // Inside CDNA/UDNA, fp8 MFMA only where fp8 is native; fp16/bf16/fp32 always.
+    // On UDNA, fp8 MFMA only where fp8 is native; fp16/bf16/fp32 always.
     arch_capability(arch).supports(mode)
 }
 
@@ -31,15 +30,12 @@ pub fn mfma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
     let a = gcn_arch(arch);
     if mfma_supported(a, requested) {
         Ok(requested)
-    } else if !matches!(
-        a,
-        GcnArch::CDNA1 | GcnArch::CDNA2 | GcnArch::CDNA3 | GcnArch::CDNA4 | GcnArch::UDNA
-    ) {
+    } else if !matches!(a, GcnArch::UDNA) {
         Err("no MFMA matrix cores on RDNA; use WMMA/rocWMMA (GFX11+) or JIT HIP grim_* kernels")
     } else {
         match requested {
             QuantMode::Fp8Native => {
-                Err("no native fp8 MFMA on this CDNA arch; downshift via resolve_quant_mode")
+                Err("no native fp8 MFMA on this arch; downshift via resolve_quant_mode")
             }
             _ => Err("requested MFMA mode unavailable; fall back to fp32 path"),
         }
@@ -52,7 +48,7 @@ pub fn mfma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
 pub fn wmma_supported(arch: GcnArch, mode: QuantMode) -> bool {
     let is_wmma_capable = matches!(arch, GcnArch::RDNA3 | GcnArch::RDNA4 | GcnArch::UDNA);
     if !is_wmma_capable {
-        return false; // CDNA or older RDNA lacks WMMA.
+        return false; // Older RDNA lacks WMMA.
     }
     arch_capability(arch).supports(mode)
 }
@@ -68,7 +64,7 @@ pub fn wmma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
     if wmma_supported(a, requested) {
         Ok(requested)
     } else if !matches!(a, GcnArch::RDNA3 | GcnArch::RDNA4 | GcnArch::UDNA) {
-        Err("no WMMA matrix cores on this architecture; CDNA uses MFMA, older RDNA uses JIT HIP")
+        Err("no WMMA matrix cores on this architecture; older RDNA uses JIT HIP")
     } else {
         match requested {
             QuantMode::Fp8Native => {
@@ -85,18 +81,11 @@ pub fn wmma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
 pub fn ck_supported(arch: GcnArch) -> bool {
     matches!(
         arch,
-        GcnArch::RDNA2
-            | GcnArch::RDNA3
-            | GcnArch::RDNA4
-            | GcnArch::CDNA1
-            | GcnArch::CDNA2
-            | GcnArch::CDNA3
-            | GcnArch::CDNA4
-            | GcnArch::UDNA
+        GcnArch::RDNA2 | GcnArch::RDNA3 | GcnArch::RDNA4 | GcnArch::UDNA
     )
 }
 
-/// Dispatch gate: CK is usable on any modern RDNA/CDNA part. Returns `Ok` for [see: `Err`, `grim_*`]
+/// Dispatch gate: CK is usable on any modern RDNA/UDNA part. Returns `Ok` for [see: `Err`, `grim_*`]
 pub fn ck_dispatch(arch: &str) -> Result<(), &'static str> {
     if ck_supported(gcn_arch(arch)) {
         Ok(())
@@ -111,14 +100,7 @@ pub fn ck_dispatch(arch: &str) -> Result<(), &'static str> {
 pub fn miopen_supported(arch: GcnArch) -> bool {
     matches!(
         arch,
-        GcnArch::RDNA2
-            | GcnArch::RDNA3
-            | GcnArch::RDNA4
-            | GcnArch::CDNA1
-            | GcnArch::CDNA2
-            | GcnArch::CDNA3
-            | GcnArch::CDNA4
-            | GcnArch::UDNA
+        GcnArch::RDNA2 | GcnArch::RDNA3 | GcnArch::RDNA4 | GcnArch::UDNA
     )
 }
 
@@ -165,9 +147,9 @@ pub fn rccl_collective_dispatch(world_size: usize) -> Result<(), &'static str> {
 mod self_tests {
     use super::*;
 
-    // F6 — MFMA is CDNA and UDNA enabled.
+    // F6 — MFMA is a UDNA capability here; CDNA is not a grim target.
     #[test]
-    fn f6_mfma_cdna_and_udna() {
+    fn f6_mfma_udna_only() {
         // RDNA1/2/3 has no MFMA matrix cores.
         for arch in ["gfx1036", "gfx1100", "gfx1102"] {
             assert!(
@@ -176,41 +158,44 @@ mod self_tests {
             );
             assert!(mfma_dispatch(arch, QuantMode::F16).is_err());
         }
-        // CDNA1 (MI50) has fp16/fp32.
-        assert!(mfma_supported(gcn_arch("gfx906"), QuantMode::F16));
-        assert!(!mfma_supported(gcn_arch("gfx906"), QuantMode::Fp8Native));
+        // RDNA4 also has no MFMA — it uses WMMA, like the rest of RDNA.
+        assert!(!mfma_supported(gcn_arch("gfx1201"), QuantMode::F16));
 
-        // CDNA2 (MI200) has fp16/bf16/fp32 MFMA, NOT fp8.
-        assert!(mfma_supported(gcn_arch("gfx908"), QuantMode::F16));
-        assert!(mfma_supported(gcn_arch("gfx908"), QuantMode::Bf16));
-        assert!(!mfma_supported(gcn_arch("gfx908"), QuantMode::Fp8Native));
-
-        // CDNA3 (MI300) & CDNA4 (MI350) & UDNA (GFX13) have fp8 MFMA.
-        assert!(mfma_supported(gcn_arch("gfx942"), QuantMode::Fp8Native));
-        assert!(mfma_dispatch("gfx942", QuantMode::Fp8Native).is_ok());
-
-        assert!(mfma_supported(gcn_arch("gfx950"), QuantMode::Fp8Native));
-        assert!(mfma_dispatch("gfx950", QuantMode::Fp8Native).is_ok());
-
+        // UDNA carries the MFMA path, including native fp8.
+        assert!(mfma_supported(gcn_arch("gfx1300"), QuantMode::F16));
         assert!(mfma_supported(gcn_arch("gfx1300"), QuantMode::Fp8Native));
-    }
+        assert!(mfma_dispatch("gfx1300", QuantMode::Fp8Native).is_ok());
 
-    // F8 — CK valid on RDNA (WMMA) + CDNA (MFMA) + UDNA.
-    #[test]
-    fn f8_ck_on_rdna_and_cdna() {
-        for arch in [
-            "gfx1036", "gfx1100", "gfx1200", "gfx1300", "gfx908", "gfx942", "gfx950",
-        ] {
-            assert!(ck_dispatch(arch).is_ok(), "CK must be allowed on {arch}");
+        // CDNA parses to `Other`, so MFMA must be refused rather than
+        // silently admitted off a stale capability table.
+        for arch in ["gfx906", "gfx908", "gfx942", "gfx950"] {
+            assert_eq!(gcn_arch(arch), GcnArch::Other, "{arch} must be Other");
+            assert!(
+                !mfma_supported(gcn_arch(arch), QuantMode::F16),
+                "MFMA must be unsupported on unsupported {arch}"
+            );
+            assert!(mfma_dispatch(arch, QuantMode::F16).is_err());
         }
     }
 
-    // F9 — MIOpen on RDNA + CDNA + UDNA.
+    // F8 — CK valid on RDNA (WMMA) + UDNA.
     #[test]
-    fn f9_miopen_on_rdna_and_cdna() {
-        for arch in [
-            "gfx1036", "gfx1100", "gfx1200", "gfx1300", "gfx908", "gfx942", "gfx950",
-        ] {
+    fn f8_ck_on_rdna_and_udna() {
+        for arch in ["gfx1036", "gfx1100", "gfx1200", "gfx1300"] {
+            assert!(ck_dispatch(arch).is_ok(), "CK must be allowed on {arch}");
+        }
+        for arch in ["gfx908", "gfx942", "gfx950"] {
+            assert!(
+                ck_dispatch(arch).is_err(),
+                "CK must be refused on unsupported {arch}"
+            );
+        }
+    }
+
+    // F9 — MIOpen on RDNA + UDNA.
+    #[test]
+    fn f9_miopen_on_rdna_and_udna() {
+        for arch in ["gfx1036", "gfx1100", "gfx1200", "gfx1300"] {
             assert!(
                 miopen_supported(gcn_arch(arch)),
                 "MIOpen policy must cover {arch}"

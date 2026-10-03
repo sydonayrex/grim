@@ -1387,7 +1387,8 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 KQuantScheme::IQ2XXS => 2,
                 KQuantScheme::IQ2XS => 2,
                 KQuantScheme::IQ2S => 2,
-                KQuantScheme::GsqRco3p5 => 3,
+                // 18 B per 64 elements = 2.25 bpw; floored to 2 for a whole-weight count.
+                KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => 2,
             };
             (elem_count * bits).div_ceil(8)
         }
@@ -1408,6 +1409,10 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 // code width. See the autograd arm for why 4.75 is the wrong
                 // number to report at this denominator.
                 BlockDtype::Fp8Sparse24 => 8,
+                // ForestRaven: codes are whole int8 bytes, so 8 bits of code
+                // width. The per-row fp32 scales are framing overhead, not
+                // code width -- same denominator logic as GreyRaven above.
+                BlockDtype::Int8PerChannel => 8,
                 // Legacy GGUF Q4_0: 18 B per 32 weights = 4.5 code bits.
                 BlockDtype::Q4_0 => 4,
             };

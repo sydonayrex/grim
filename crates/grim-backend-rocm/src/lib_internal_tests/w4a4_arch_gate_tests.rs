@@ -40,10 +40,6 @@ fn ws_c2_w4a4_is_rejected_off_gfx12() {
         GcnArch::RDNA1,
         GcnArch::RDNA2,
         GcnArch::RDNA3,
-        GcnArch::CDNA1,
-        GcnArch::CDNA2,
-        GcnArch::CDNA3,
-        GcnArch::CDNA4,
         GcnArch::Other,
     ] {
         let err = w4a4_ostquant_supported(arch, 256)

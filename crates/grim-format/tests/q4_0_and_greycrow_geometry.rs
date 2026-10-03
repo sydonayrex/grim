@@ -8,7 +8,9 @@
 //! motivates the fix.
 
 use grim_format::gguf::{map_gguf_dtype_to_storage, GgufDType};
-use grim_tensor::dtype::{BlockDtype, Storage, UnsupportedFormat};
+use grim_format::tprov::GgufProvider;
+use grim_tensor::dtype::{BlockDtype, KQuantScheme, Storage, UnsupportedFormat};
+use grim_tensor::provider::TensorProvider;
 
 #[test]
 fn q4_0_is_block_32_with_18_bytes_not_a_kquant_superblock() {
@@ -129,6 +131,112 @@ fn greycrow_g32_repack_of_a_real_q4_0_payload_is_bit_exact() {
             a.to_bits(),
             b.to_bits(),
             "GreyCrow must equal Q4_0 exactly, diverged at {i}: {a} vs {b}"
+        );
+    }
+}
+
+/// Upstream `Q2_0` (tag 42) and Prism GSQRCO (tag 81) share 64-elem / 18-byte
+/// geometry but DIFFER by one codebook level, so they must stay separate
+/// schemes.
+///
+/// The bug this guards: `Q2_0` had no geometry at all
+/// (`type_size_per_block() == 0`), which made `read_gguf` reject the whole
+/// Qwen3.8-Flash-Next GSQ-RCO-3.5bit checkpoint with "dtype Q2_0 has no
+/// implemented block size". The tempting fix — alias tag 42 to the existing
+/// `GsqRco3p5` scheme, whose arithmetic happened to match — would be wrong in
+/// general: upstream decodes `y = (q - 1) * d` over `{-1, 0, +1, +2}`, GSQRCO
+/// decodes `y = (q - 2) * d` over `{-2, -1, 0, +1}`. Every expert weight would
+/// be off by exactly one scale, which is finite and plausible, not obviously
+/// broken.
+#[test]
+fn q2_0_and_gsqrco_share_geometry_but_not_a_scheme() {
+    // Geometry: identical, and matching upstream `block_q2_0`
+    // (ggml-common.h:187 = ggml_half d + qs[QK2_0/4], QK2_0 = 64).
+    assert_eq!(GgufDType::Q2_0.tag(), 42);
+    assert_eq!(GgufDType::GsqRco3p5.tag(), 81);
+    for tag in [GgufDType::Q2_0, GgufDType::GsqRco3p5] {
+        assert_eq!(tag.block_size(), 64, "{tag:?} block size");
+        assert_eq!(tag.type_size_per_block(), 18, "{tag:?} bytes per block");
+    }
+    // 64 weights in 18 bytes is 2.25 bpw, which matches the build record's
+    // `Q2_0: payload_bpw 2.25` for the real checkpoint.
+    assert_eq!(
+        map_gguf_dtype_to_storage(GgufDType::Q2_0).expected_bytes(64),
+        18
+    );
+
+    // Routing: two distinct schemes, never the same one.
+    let q2 = map_gguf_dtype_to_storage(GgufDType::Q2_0).storage;
+    let gsq = map_gguf_dtype_to_storage(GgufDType::GsqRco3p5).storage;
+    assert_eq!(q2, Storage::KQuant(KQuantScheme::Q2_0));
+    assert_eq!(gsq, Storage::KQuant(KQuantScheme::GsqRco3p5));
+    assert_ne!(q2, gsq);
+}
+
+/// The codebook is the whole point of keeping them apart: one non-degenerate
+/// block (all-zero input dequantizes correctly under ANY layout, so it cannot
+/// discriminate), decoded under both.
+#[test]
+fn q2_0_and_gsqrco_codebooks_are_one_level_apart() {
+    // d = 0.5 is exactly representable in fp16: 0x3800.
+    const D_HALF_F16: u16 = 0x3800;
+    let mut block = vec![0u8; 18];
+    block[0] = D_HALF_F16 as u8;
+    block[1] = (D_HALF_F16 >> 8) as u8;
+    // Byte 0 holds codes for elements 0..3; set them to 0,1,2,3 in order.
+    block[2] = 0b11_10_01_00;
+
+    let q2 = grim_quant::dequant_q2_0(&block, 64).unwrap();
+    let gsq = grim_quant::dequant_gsq_rco_3p5(&block, 64).unwrap();
+
+    // Upstream: (q - 1) * d -> {-1, 0, +1, +2} * 0.5
+    assert_eq!(&q2[..4], &[-0.5, 0.0, 0.5, 1.0]);
+    // GSQRCO: (q - 2) * d -> {-2, -1, 0, +1} * 0.5
+    assert_eq!(&gsq[..4], &[-1.0, -0.5, 0.0, 0.5]);
+
+    // Every element differs by exactly one scale.
+    for (a, b) in q2.iter().zip(gsq.iter()) {
+        assert!(
+            (a - b - 0.5).abs() < 1e-6,
+            "Q2_0 and GSQRCO must differ by exactly one d: {a} vs {b}"
+        );
+    }
+}
+
+/// End-to-end on the real checkpoint: the tag-42 expert banks parse, report
+/// the upstream 64-elem/18-byte geometry, and dequantize to finite values.
+///
+/// Before the fix, `read_gguf` rejected the whole file with "dtype Q2_0 has no
+/// implemented block size", so nothing in it was reachable. Note this reads one
+/// bank by byte range rather than materializing it: the tensor is 838 M params
+/// (~14.6 GB packed), which does not belong in a unit test.
+#[test]
+fn real_checkpoint_q2_0_expert_banks_parse_and_dequantize() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../models/QWen38-Flash/Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf");
+    if !path.exists() {
+        return;
+    }
+    let prov = GgufProvider::open(path.to_str().unwrap()).expect("real checkpoint opens");
+    for name in ["blk.0.ffn_down_exps.weight", "blk.0.ffn_up_exps.weight"] {
+        let meta = prov.meta(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            meta.dtype.storage,
+            Storage::KQuant(KQuantScheme::Q2_0),
+            "{name} must route to the upstream Q2_0 scheme"
+        );
+        let elems: usize = meta.shape.iter().product();
+        assert_eq!(elems % 64, 0, "{name} must be block-aligned");
+        assert_eq!(
+            meta.dtype.expected_bytes(elems),
+            (elems / 64) * 18,
+            "{name} byte size must follow 18 B / 64 elems"
+        );
+        // 2.25 bpw, matching the build record's Q2_0 payload_bpw.
+        let bpw = (meta.dtype.expected_bytes(elems) * 8) as f64 / elems as f64;
+        assert!(
+            (bpw - 2.25).abs() < 1e-9,
+            "{name} bpw {bpw} != 2.25"
         );
     }
 }

@@ -212,8 +212,7 @@ mod tests {
         assert!(wmma_supported(GcnArch::RDNA4, QuantMode::Fp8Native));
         assert!(wmma_supported(GcnArch::UDNA, QuantMode::Fp8Native));
 
-        // CDNA and RDNA1/2 do not support WMMA
-        assert!(!wmma_supported(GcnArch::CDNA2, QuantMode::F16));
+        // RDNA1/2 do not support WMMA
         assert!(!wmma_supported(GcnArch::RDNA1, QuantMode::F16));
 
         // dispatch checks

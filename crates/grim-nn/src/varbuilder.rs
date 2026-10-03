@@ -865,6 +865,19 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&raw.bytes),
             // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale).
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&raw.bytes, n),
+            // ForestRaven: per-row absmax INT8 in the framed blob. Row count
+            // from the tensor shape -- a flat element count cannot recover it.
+            BlockDtype::Int8PerChannel => {
+                if raw.shape.len() < 2 {
+                    return Err(Error::Unimplemented(format!(
+                        "Int8PerChannel materialization needs [n, k] shape, got {:?}",
+                        raw.shape
+                    )));
+                }
+                let (nn, kk) = (raw.shape[0], raw.shape[1]);
+                grim_quant::dequant_forest(&raw.bytes, nn, kk)
+                    .map_err(|e| Error::Unimplemented(e.to_string()))
+            }
             // GreyRaven 2:4: decode compacted survivors plus packed metadata
             // back to the pruned dense model. The file loads as F32 weights;
             // the production SWMMAC kernel is still the probe, so GPU dispatch

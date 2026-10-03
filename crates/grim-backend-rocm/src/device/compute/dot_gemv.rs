@@ -151,6 +151,65 @@ impl RocmDevice {
 
     /// Down-projection activation-reuse experiment: consume a Q8.1 activation
     /// row and fuse the residual epilogue into the Q8.0 dot4 launch.
+    /// Q2_0 x Q8_0 GEMV (upstream GGUF tag 42), ported from llama.cpp
+    /// `ggml_vec_dot_q2_0_q8_0_generic`.
+    ///
+    /// `act_q80` is Q8_0-quantized activations ([M, K], 34 B per 32 weights);
+    /// `b_storage` is the packed Q2_0 weight ([N, K], 18 B per 64 weights).
+    /// The kernel never materializes the weight in f32, which is the point:
+    /// the Qwen3.8-Flash-Next expert banks are ~14.6 GB packed.
+    ///
+    /// `K` must be a multiple of 64 so every weight block pairs with exactly
+    /// two activation blocks.
+    pub fn launch_dot4_q2_0_q80_gemv(
+        &self,
+        act_q80: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        if k % 64 != 0 {
+            return Err(Error::Backend(format!(
+                "dot4_q2_0_q80_gemv: K must be 64-aligned (k={k})"
+            )));
+        }
+        let a_ptr = act_q80.device_ptr.ok_or_else(|| {
+            Error::Backend("dot4_q2_0_q80_gemv: act_q80 has no device ptr".into())
+        })?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q2_0_q80_gemv: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_q2_0_q80_gemv: out has no device ptr".into()))?;
+        let grid_x = (n as u32).div_ceil(4);
+        let grid_dim = HipDim3::new(grid_x, m as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_dot4_q2_0_q80_gemv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Down-projection activation-reuse experiment: consume a prequantized Q8.1 activation
+    /// row and fuse the residual epilogue into the Q8.0 dot4 launch.
     pub fn launch_dot4_q80_q81_add_gemv(
         &self,
         act_q81: &RocmStorage,

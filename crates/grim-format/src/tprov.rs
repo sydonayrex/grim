@@ -536,6 +536,28 @@ impl GgufProvider {
     /// Slice a full tensor's packed bytes out of the mmap (zero copy into a fresh `Vec`).
     /// `GgufTensorInfo.offset` is relative to the tensor-data section start, which begins at `self.data_start`.
     fn slice_tensor(&self, info: &GgufTensorInfo) -> Result<Vec<u8>> {
+        // ForestRaven's framed blob (row-scaled INT8) has no fixed block
+        // geometry, so the length derivation below cannot size it. Refuse at
+        // this single choke point -- every byte-reading entry (`get`,
+        // `get_packed`, sharded variants, `get_range` callers via
+        // `effective_size_bytes`) funnels through here or through the size it
+        // computes -- rather than handing back a truncated prefix of the blob
+        // as if it were whole. `GrimProvider` serves the same tag through its
+        // quant_override, where the entry carries an explicit payload size.
+        let dtype = effective_dtype(info, &self.overrides);
+        if matches!(
+            dtype.storage,
+            grim_tensor::dtype::Storage::Block(
+                grim_tensor::dtype::BlockDtype::Int8PerChannel
+            )
+        ) {
+            return Err(Error::Backend(format!(
+                "tensor '{}' is ForestRaven (grim-native tag 672): its row-scaled \
+                 framing has no GGUF block geometry, so GGUF-direct reads cannot size it. \
+                 Convert with `grim convert --format forestraven` and load the .grim file.",
+                info.name
+            )));
+        }
         let start = self.data_start.checked_add(info.offset).ok_or_else(|| {
             Error::Backend(format!("GGUF tensor '{}' offset overflow", info.name))
         })?;

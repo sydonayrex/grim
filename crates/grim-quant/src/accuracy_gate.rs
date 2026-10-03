@@ -67,6 +67,15 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.10,
                 max_delta_ppl: 0.08,
             },
+            // Per-row absmax INT8: the article's recipe bounds the error at
+            // half a scale step per element, and per-channel scales keep every
+            // row's grid tight. Same tier as Q8_0 until measured against the
+            // real gate.
+            QuantFormat::Int8PerChannel => Self {
+                min_cosine_similarity: 0.9995,
+                max_relative_l2_error: 0.03,
+                max_delta_ppl: 0.02,
+            },
             QuantFormat::Q8_0 => Self {
                 min_cosine_similarity: 0.9995,
                 max_relative_l2_error: 0.03,
