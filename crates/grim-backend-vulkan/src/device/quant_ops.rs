@@ -141,6 +141,7 @@ impl QuantOps for VulkanDevice {
                     KQuantScheme::Q6K => grim_quant::dequant_q6k(&b_bytes_cpu, k * n)?,
                     KQuantScheme::Q80 => grim_quant::dequant_q80(&b_bytes_cpu, k * n)?,
                     KQuantScheme::Q2K => grim_quant::dequant_q2k(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::Q2_0 => grim_quant::dequant_q2_0(&b_bytes_cpu, k * n)?,
                     KQuantScheme::Q3K => grim_quant::dequant_q3k(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(&b_bytes_cpu, k * n)?,
@@ -149,7 +150,7 @@ impl QuantOps for VulkanDevice {
                     KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2S => grim_quant::dequant_iq2s(&b_bytes_cpu, k * n)?,
-                    // GGUF Q2_0 (tag 42): 64 weights per 18-byte block.
+                    // Prism GSQRCO (tag 81): same geometry, shifted codebook.
                     KQuantScheme::GsqRco3p5 => {
                         grim_quant::dequant_gsq_rco_3p5(&b_bytes_cpu, k * n)?
                     }
@@ -196,12 +197,14 @@ impl QuantOps for VulkanDevice {
                     // GreyRaven 2:4: no packed byte format exists yet (E4's
                     // pack_grey_raven is unwritten; the host sparsifier holds f32
                     // survivors, not E4M3 bytes), so there is nothing to decode.
-                    // Refusing is the honest answer -- misreading compacted
-                    // survivors as a dense code plane returns finite, plausible,
-                    // wrong weights, which is worse than an error.
+                    // GreyRaven 2:4: the packed form exists (`pack_grey_raven`)
+                    // and the host decodes it; what does not exist is a Vulkan
+                    // kernel route. Refusing is the honest answer -- misreading
+                    // compacted survivors as a dense code plane returns finite,
+                    // plausible, wrong weights, which is worse than an error.
                     BlockDtype::Fp8Sparse24 => {
                         return Err(grim_tensor::error::Error::Backend(
-                            "GreyRaven 2:4 has no packed format yet".into(),
+                            "GreyRaven 2:4 has no Vulkan kernel route yet (host decode via dequant_grey_raven only)".into(),
                         ))
                     }
                 })

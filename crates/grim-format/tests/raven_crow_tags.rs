@@ -13,9 +13,9 @@
 //!    one unloadable outside grim *by construction* rather than by a policy
 //!    someone can forget to apply.
 //!
-//! WhiteRaven (670), Raven (669), and WhiteCrow (660) all have file loaders
-//! today. ForestRaven (672) and GreyRaven (671) are refused with a message
-//! naming the format; this test pins that they are refused rather than
+//! WhiteRaven (670), Raven (669), WhiteCrow (660), and GreyRaven (671) all
+//! have file loaders today. ForestRaven (672) is refused with a message
+//! naming the format; this test pins that it is refused rather than
 //! silently decoded.
 
 use grim_format::gguf::{map_gguf_dtype_to_storage, GgufDType};
@@ -128,36 +128,32 @@ fn whiteraven_resolves_to_the_blocked_fp8_storage() {
 }
 
 #[test]
-fn the_rest_of_the_series_is_refused_naming_the_format() {
-    // Raven (669) and WhiteCrow (660) became loadable once their QuantFormats
-    // landed; only these two genuinely have no consumer yet. Both still count
-    // as grim-native tags: a stock GGUF reader must reject them the same way.
-    for d in [
-        GgufDType::ForestRaven,
-        GgufDType::GreyRaven,
-    ] {
-        let dt = map_gguf_dtype_to_storage(d);
-        match dt.storage {
-            DTypeStorage::Unsupported(u) => {
-                let reason = u.reason.to_lowercase();
-                assert!(
-                    reason.contains(&d.display_name().to_lowercase())
-                        || reason.contains("raven")
-                        || reason.contains("crow"),
-                    "{} must be refused naming itself, got: {reason}",
-                    d.display_name()
-                );
-            },
-            other => panic!(
-                "{} has no loader and must not resolve to a real storage: {other:?}",
+fn the_last_member_without_a_loader_is_refused_naming_the_format() {
+    // ForestRaven (672, bare INT8) is the only series member with no packer,
+    // no storage scheme, and no kernel route. It must be refused naming
+    // itself, not silently decoded as something else.
+    let d = GgufDType::ForestRaven;
+    let dt = map_gguf_dtype_to_storage(d);
+    match dt.storage {
+        DTypeStorage::Unsupported(u) => {
+            let reason = u.reason.to_lowercase();
+            assert!(
+                reason.contains(&d.display_name().to_lowercase())
+                    || reason.contains("raven")
+                    || reason.contains("crow"),
+                "{} must be refused naming itself, got: {reason}",
                 d.display_name()
-            ),
-        }
+            );
+        },
+        other => panic!(
+            "{} has no loader and must not resolve to a real storage: {other:?}",
+            d.display_name()
+        ),
     }
 }
 
 #[test]
-fn raven_and_whitecrow_resolve_to_loadable_storages() {
+fn raven_whitecrow_and_greyraven_resolve_to_loadable_storages() {
     use grim_tensor::dtype::Storage;
     let raven = map_gguf_dtype_to_storage(GgufDType::Raven);
     assert!(matches!(
@@ -166,4 +162,11 @@ fn raven_and_whitecrow_resolve_to_loadable_storages() {
     ));
     let crow = map_gguf_dtype_to_storage(GgufDType::WhiteCrow);
     assert!(matches!(crow.storage, Storage::W4A4OstQuant(_)));
+    // GreyRaven decodes on the host; the GPU kernel is still the probe, but
+    // the tag resolves to a real storage so the file loads.
+    let grey = map_gguf_dtype_to_storage(GgufDType::GreyRaven);
+    assert!(matches!(
+        grey.storage,
+        Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Sparse24)
+    ));
 }

@@ -167,11 +167,10 @@ fn the_other_series_tags_load_as_unsupported_naming_the_format_and_the_remedy() 
     // would be worse -- it would turn "this format has no loader" into "this
     // file is broken", which is a different bug and sends the user to the wrong
     // place.
-    // Raven (669) and WhiteCrow (660) resolved to real loads once their
-    // QuantFormats landed; only these two are still deliberately refused.
+    // ForestRaven (672) is the last series member with no loader; GreyRaven
+    // (671) resolved to a real load once its host decode landed.
     for (dtype, tag_name) in [
         (GgufDType::ForestRaven, "forestraven"),
-        (GgufDType::GreyRaven, "greyraven"),
     ] {
         let scratch = Scratch::new();
         let path = scratch.path(&format!("{tag_name}.gguf"));

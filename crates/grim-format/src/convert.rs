@@ -353,16 +353,14 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
             }
         },
         grim_tensor::dtype::Storage::Block(bd) => match bd {
-            // GreyRaven 2:4: refusing is correct behaviour, not a gap to paper
-            // over. Its packed form does not exist yet, and whatever fallback a
-            // missing arm would have reached for reinterprets the buffer as
-            // another format's code plane -- for compacted survivors plus packed
-            // metadata that yields finite, plausible, wrong weights. A loud
-            // refusal is worth more.
+            // GreyRaven 2:4: decode compacted survivors plus packed metadata
+            // back to the pruned dense model. This reconstructs the PRUNED
+            // weights, not the pre-prune dense ones -- that is the format's
+            // semantics, and re-converting a GreyRaven file through the
+            // uniform path must preserve them rather than fail.
             grim_tensor::dtype::BlockDtype::Fp8Sparse24 => {
-                Err(grim_tensor::error::Error::Backend(
-                    "GreyRaven 2:4 has no packed format yet".into(),
-                ))
+                grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, elem_count)
+                    .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))
             }
             grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
                 grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)
@@ -802,14 +800,7 @@ fn pack_tensors(
         match f.to_ascii_lowercase().as_str() {
             "whiteraven" | "raven" | "whitecrow" => {}
             "gsq_rco_3p5" | "gsqrco" => {}
-            "greyraven" => {
-                return Err(Error::Backend(
-                    "--format greyraven: GreyRaven (FP8 2:4, V_SWMMAC_F32_16X16X32) has a \
-                     packer but no production kernel yet; the probe kernel cannot consume a \
-                     converted model. Tracked as the next WS-E step."
-                        .into(),
-                ));
-            }
+            "greyraven" => {}
             "forestraven" => {
                 return Err(Error::Backend(
                     "--format forestraven: ForestRaven (bare INT8, V_DOT4_I32_IU8) has no \
@@ -821,7 +812,8 @@ fn pack_tensors(
             other => {
                 return Err(Error::Backend(format!(
                     "--format '{other}': unknown. Supported: whiteraven (FP8-blocked), \
-                     raven (FP8), whitecrow (W4A4 OSTQuant), gsq_rco_3p5 (tag 81)."
+                     raven (FP8), whitecrow (W4A4 OSTQuant), greyraven (FP8 2:4, host-decode \
+                     only -- no production kernel yet), gsq_rco_3p5 (tag 81)."
                 )));
             }
         }
@@ -852,21 +844,17 @@ fn pack_tensors(
             }
             let elem_count: usize = raw.shape.iter().product();
 
-            // Corvid formats (WhiteRaven today) are packed payloads whose
-            // layout no `pack_row_bpw_for_wave` mode can reproduce. The source
-            // provider already holds their bytes in the right order, so pass
-            // them through verbatim and remember the scheme in
-            // `quant_overrides` -- re-encoding through the F32 requant path
-            // would both lose the layout and decode the codes as weights.
             // Corvid formats are packed kernel layouts whose byte arrange no
             // `pack_row_bpw_for_wave` mode reproduces. If the source provider
             // already holds their bytes in the right order, pass them through
             // verbatim and remember the scheme in `quant_overrides` --
             // re-encoding through the F32 requant path would both lose the
-            // layout and decode the codes as weights. GreyRaven (2:4 packed)
-            // is deliberately NOT in this list: its only consumer refusing to
-            // read is the blocker we refuse to widen, so a raw pass-through
-            // would just stage silent prohibition. It errors loudly below.
+            // layout and decode the codes as weights.
+            //
+            // `base_bitwidth` is the fallback the reader uses when no override
+            // names the scheme; the override is authoritative. GreyRaven's true
+            // density is 4.75 bpw, which no u8 holds, so it records 4 the same
+            // way WhiteCrow records 4 for its true 4.19.
             let corvid_tag = match &raw.dtype.storage {
                 grim_tensor::dtype::Storage::FloatPack(
                     grim_tensor::dtype::FloatPackScheme::Fp8Blocked16,
@@ -881,6 +869,9 @@ fn pack_tensors(
                     crate::gguf::GgufDType::WhiteCrow,
                     4u8,
                 )),
+                grim_tensor::dtype::Storage::Block(
+                    grim_tensor::dtype::BlockDtype::Fp8Sparse24,
+                ) => Some((crate::gguf::GgufDType::GreyRaven, 4u8)),
                 _ => None,
             };
             if let Some((tag, bpw)) = corvid_tag {
@@ -1103,6 +1094,66 @@ fn pack_tensors(
                     }
                 }
                 return Ok(((entry, blob), ext, Some(override_)));
+            }
+
+            // GreyRaven 2:4: magnitude-only prune, then pack. Two things this
+            // arm is NOT:
+            //
+            // - It is not Fisher-guided. `sparsify_2_4_flat` keeps the two
+            //   largest-magnitude slots per K-group of 4, deterministically.
+            //   Fisher-guided pruning (E10) keeps more accuracy; magnitude
+            //   pruning is what a plain f32->bytes rewrite can honestly do,
+            //   and the test pins the pruned-not-dense semantics so nobody
+            //   mistakes the output for a lossless encoding.
+            // - It is not runnable on GPU yet. The packed file loads and
+            //   decodes on the host (varbuilder, CPU); ROCm/CUDA/Vulkan
+            //   dispatch refuses with a message naming the missing SWMMAC
+            //   GEMM. Converting now stages the artifact the kernel needs.
+            //
+            // K must be a multiple of 4: 2:4 groups run along K, and padding
+            // would invent weights. Non-conforming tensors fall through to
+            // the uniform path so the file still loads.
+            if matches!(fmt.as_deref(), Some("greyraven"))
+                && meta.shape.len() == 2
+                && meta.shape[0] > 0
+                && meta.shape[1] > 0
+                && meta.shape[1] % 4 == 0
+            {
+                let sparsified = grim_quant::grey_raven::sparsify_2_4_flat(&f32_values)
+                    .map_err(|e| Error::Backend(format!("GreyRaven prune for '{name}': {e}")))?;
+                let packed = grim_quant::grey_raven::pack_grey_raven(&sparsified);
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 4,
+                    payload_offset: 0,
+                    payload_size: packed.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                // effective_bpw records 5, not 4: the true density is 4.75,
+                // and capacity planning must not understate VRAM. The
+                // override_dtype (671) is authoritative for decode.
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 5,
+                    override_dtype: crate::gguf::GgufDType::GreyRaven,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, packed), ext, Some(override_)));
             }
 
             // WhiteRaven target: pack every 2D weight tensor as blocked FP8 in

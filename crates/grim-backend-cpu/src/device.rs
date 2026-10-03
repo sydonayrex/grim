@@ -1685,13 +1685,14 @@ impl QuantOps for CpuDevice {
                     out
                 }
                 _ => match format {
-                    // GreyRaven 2:4: 2:4 pruning is Fisher-guided and lossy, and
-                    // its packed form does not exist yet, so a dense-rewrite
-                    // matmul cannot serve it. Refuse rather than decode as dense.
+                    // GreyRaven 2:4: decode to the pruned dense model, then
+                    // matmul in F32 like every other host fallback. The packed
+                    // form exists (`pack_grey_raven`); what does not exist yet
+                    // is the production SWMMAC kernel.
                     grim_tensor::QuantFormat::Fp8Sparse24 => {
-                        return Err(Error::Backend(
-                            "GreyRaven 2:4 has no packed format yet".to_string(),
-                        ))
+                        grim_quant::grey_raven::dequant_grey_raven(&b_bytes, k * n).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul GreyRaven dequant: {e}"))
+                        })?
                     }
                     // TreePie is dense E2M2, so the plain dequant serves a matmul
                     // here. `k * n` must be a multiple of 32; the packer asserts.
@@ -2637,12 +2638,12 @@ impl BackendStorage for CpuStorage {
                     grim_quant::dequant_fp4_block16(raw, n)
                 }
                 // GreyRaven 2:4: no packed byte format exists yet (E4's
-                // pack_grey_raven is unwritten; the host sparsifier holds f32
-                // survivors, not E4M3 bytes). Refusing beats reinterpreting
-                // compacted survivors plus packed metadata as a dense code
-                // plane, which would return finite, plausible, wrong weights.
+                // GreyRaven 2:4: the packed form exists (`pack_grey_raven`);
+                // decode to the pruned dense model. What does not exist yet
+                // is the production SWMMAC kernel, not the bytes.
                 grim_tensor::dtype::BlockDtype::Fp8Sparse24 => {
-                    Err(Error::Backend("GreyRaven 2:4 has no packed format yet".to_string()))
+                    grim_quant::grey_raven::dequant_grey_raven(raw, n)
+                        .map_err(|e| Error::Backend(format!("CPU GreyRaven dequant: {e}")))
                 }
                 grim_tensor::dtype::BlockDtype::Fp8Block16 => {
                     grim_quant::dequant_fp8_block16(raw, n)

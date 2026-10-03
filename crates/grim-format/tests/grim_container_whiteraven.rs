@@ -372,6 +372,158 @@ fn unknown_format_fails_before_any_packing() {
 }
 
 #[test]
+fn convert_with_format_greyraven_prunes_packs_and_loads() {
+    // GreyRaven is LOSSY by construction: 2:4 magnitude prune, then E4M3.
+    // The decoded model must equal the pruned model, not the dense source.
+    // Asserting dense equality here would pin a false claim; asserting nothing
+    // about the values would let a dense passthrough slip by.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let want: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 37) % 61) as f32 * 0.03125 - 0.9)
+        .collect();
+    let payload: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let src = scratch.0.join("f32_grey.gguf");
+    write_gguf(&src, GgufDType::F32, "blk.weight", &[k as u64, n as u64], &payload);
+
+    let out = scratch.0.join("grey.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("greyraven".to_string()),
+        None,
+        None,
+    )
+    .expect("convert --format greyraven");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open grim");
+    let meta = gp.meta("blk.weight").expect("meta");
+    assert_eq!(
+        meta.dtype.storage,
+        grim_tensor::dtype::Storage::Block(
+            grim_tensor::dtype::BlockDtype::Fp8Sparse24
+        ),
+        "--format greyraven must tag Block(Fp8Sparse24)"
+    );
+    assert_eq!(meta.shape, vec![n, k]);
+
+    let raw = gp.get("blk.weight").expect("get");
+    let expected_len = grim_quant::grey_raven::packed_bytes_for(n * k);
+    assert_eq!(
+        raw.bytes.len(),
+        expected_len,
+        "payload must match the 4.75bpw geometry, not n*k"
+    );
+    assert!(
+        expected_len < n * k,
+        "a 2:4 payload that is not smaller than dense is not pruned"
+    );
+
+    // Host reference: magnitude prune (top-2 |v| per consecutive group of 4,
+    // ties by ascending slot -- the same rule `sparsify_2_4_flat` uses), then
+    // E4M3 round the survivors. Flat consecutive groups coincide with K-groups
+    // for row-major [n, k] with k % 4 == 0.
+    let mut pruned = want.clone();
+    for g in 0..(n * k / 4) {
+        let base = g * 4;
+        let mut order = [0usize, 1, 2, 3];
+        order.sort_by(|&a, &b| {
+            want[base + b]
+                .abs()
+                .partial_cmp(&want[base + a].abs())
+                .unwrap()
+                .then_with(|| a.cmp(&b))
+        });
+        pruned[base + order[2]] = 0.0;
+        pruned[base + order[3]] = 0.0;
+    }
+    let zeros = pruned.iter().filter(|&&v| v == 0.0).count();
+    assert_eq!(
+        zeros,
+        n * k / 2,
+        "every group of 4 must lose exactly 2 weights"
+    );
+
+    let deq = grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, n * k)
+        .expect("dequant");
+    assert_eq!(deq.len(), n * k);
+    for (i, (&w, &g)) in pruned.iter().zip(&deq).enumerate() {
+        if w == 0.0 {
+            assert_eq!(
+                g.to_bits(),
+                0.0f32.to_bits(),
+                "element {i}: pruned weights must decode to exactly +0.0"
+            );
+        } else {
+            let q = grim_quant::fp8_e4m3_to_f32(grim_quant::f32_to_fp8_e4m3(w));
+            assert_eq!(
+                g.to_bits(),
+                q.to_bits(),
+                "element {i}: survivor must be the E4M3 round, got {g:e} want {q:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn convert_with_format_greyraven_leaves_1d_tensors_untouched() {
+    // 1D norms carry no K axis to group along -- they must take the uniform
+    // path, not fail and not get tagged sparse.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let weights: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.001).collect();
+    let norms: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.01).collect();
+
+    let src = scratch.0.join("mixed_grey.gguf");
+    write_mixed(&src, &weights, &norms, n, k);
+
+    let out = scratch.0.join("mixed_grey.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("greyraven".to_string()),
+        None,
+        None,
+    )
+    .expect("convert");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open");
+    let w_meta = gp.meta("blk.weight").expect("meta weight");
+    assert_eq!(
+        w_meta.dtype.storage,
+        grim_tensor::dtype::Storage::Block(
+            grim_tensor::dtype::BlockDtype::Fp8Sparse24
+        ),
+        "2D K-aligned weight must become GreyRaven"
+    );
+    let n_meta = gp.meta("blk.norm.weight").expect("meta norm");
+    assert!(
+        !matches!(
+            n_meta.dtype.storage,
+            grim_tensor::dtype::Storage::Block(
+                grim_tensor::dtype::BlockDtype::Fp8Sparse24
+            )
+        ),
+        "1D norm must NOT be tagged sparse -- there is no K axis to group"
+    );
+}
+
+#[test]
 fn convert_with_format_whiteraven_leaves_non_conforming_tensors_untouched() {
     // 1D tensors (norm gains) carry no 2D shape to block -- the converter
     // must pack them with the uniform path rather than fail or silently

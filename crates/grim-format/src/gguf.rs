@@ -2248,12 +2248,20 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
                 group_size: 128,
             }),
         },
-        // The rest of the series has no production kernel/packer, so it is
-        // refused HERE, naming the format, rather than left to fall through to
-        // a generic path -- a silently-wrong decode of a packed kernel payload
-        // is the failure mode this whole table exists to prevent.
-        GgufDType::ForestRaven
-        | GgufDType::GreyRaven => DType {
+        // GreyRaven 2:4: E4M3 survivors plus per-group position metadata,
+        // 4.75 bpw. `Storage::Block(Fp8Sparse24)` decodes on the host via
+        // `dequant_grey_raven`; the production SWMMAC kernel is still the
+        // probe, so GPU dispatch refuses while host decode serves.
+        GgufDType::GreyRaven => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Sparse24),
+        },
+        // ForestRaven is the last member with no loader: bare INT8 has no
+        // packer, no storage scheme, and no kernel route. It is refused HERE,
+        // naming the format, rather than left to fall through to a generic
+        // path -- a silently-wrong decode of a packed kernel payload is the
+        // failure mode this whole table exists to prevent.
+        GgufDType::ForestRaven => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
                 name: gguf_dtype.display_name(),
@@ -2261,8 +2269,9 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
                 bytes_per_block: Some(gguf_dtype.type_size_per_block() as usize),
                 reason: format!(
                     "{} is a grim-native kernel payload (GGUF tag {}, {}) with no file \
-                     loader yet. WhiteRaven (tag 670) is the one member of the series \
-                     that loads today; write that, or re-quantize to Q4_K/Q8_0.",
+                     loader yet. The loadable members are Raven (669), WhiteRaven (670), \
+                     GreyRaven (671), and WhiteCrow (660); ForestRaven (672, bare INT8) \
+                     has no packer or kernel route. Otherwise re-quantize to Q4_K/Q8_0.",
                     gguf_dtype.display_name(),
                     gguf_dtype.tag(),
                     match gguf_dtype.grim_native_bpw() {

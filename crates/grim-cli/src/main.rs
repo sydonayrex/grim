@@ -672,6 +672,8 @@ enum Commands {
         /// Supported: `whiteraven` (FP8 E4M3, 16x16-blocked; requires 16-aligned
         /// 2D weights, everything else falls back to the uniform pack),
         /// `raven` (dense FP8), `whitecrow` (W4A4 OSTQuant),
+        /// `greyraven` (FP8 2:4 magnitude-pruned; host-decode only, no
+        /// production kernel yet -- 1D and K-misaligned tensors fall back),
         /// `gsqrco3p5` (GSQ-RCO 3.5-bit, tag 81).
         /// Default when omitted: `gsqrco3p5`.
         #[arg(long)]

@@ -86,8 +86,9 @@ pub(crate) fn cuda_dequant_quantized_storage(
             KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(b_bytes, elem_count),
             KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(b_bytes, elem_count),
             KQuantScheme::IQ2S => grim_quant::dequant_iq2s(b_bytes, elem_count),
-            // GGUF Q2_0 (tag 42). No CUDA dequant kernel exists; this path
+            // Upstream Q2_0 (tag 42). No CUDA dequant kernel exists; this path
             // runs on the host, so weights land back in VRAM as f32.
+            KQuantScheme::Q2_0 => grim_quant::dequant_q2_0(b_bytes, elem_count),
             KQuantScheme::GsqRco3p5 => grim_quant::dequant_gsq_rco_3p5(b_bytes, elem_count),
         },
         DTypeStorage::FloatPack(scheme) => match scheme {
@@ -124,12 +125,13 @@ pub(crate) fn cuda_dequant_quantized_storage(
             // host decode the vulkan quant_ops arm uses.
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(b_bytes, elem_count),
             // GreyRaven 2:4: no packed byte format exists yet (E4's
-            // pack_grey_raven is unwritten; the host sparsifier holds f32
-            // survivors, not E4M3 bytes). Unimplemented rather than a dense
-            // fallback: compacted survivors plus packed metadata reinterpreted
-            // as a dense code plane yields finite, plausible, wrong weights.
+            // GreyRaven 2:4: the packed form exists (`pack_grey_raven`) and the
+            // host decodes it (`dequant_grey_raven`); what does not exist is a
+            // CUDA kernel route. Unimplemented rather than a dense fallback:
+            // compacted survivors plus packed metadata reinterpreted as a
+            // dense code plane yields finite, plausible, wrong weights.
             BlockDtype::Fp8Sparse24 => Err(Error::Unimplemented(
-                "GreyRaven 2:4 has no packed format yet".to_string(),
+                "GreyRaven 2:4 has no CUDA kernel route yet (host decode via dequant_grey_raven only)".to_string(),
             )),
         },
         DTypeStorage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(

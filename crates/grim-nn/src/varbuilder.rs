@@ -16,7 +16,7 @@ use grim_quant::{
     dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_gsq_rco_3p5,
     dequant_iq2s, dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl,
     dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_nutcracker, dequant_nvfp4,
-    dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
+    dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q2_0, dequant_q80,
 };
 
 #[cfg(feature = "cuda-mem")]
@@ -825,6 +825,7 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             KQuantScheme::IQ2XXS => dequant_iq2xxs(&raw.bytes, n),
             KQuantScheme::IQ2XS => dequant_iq2xs(&raw.bytes, n),
             KQuantScheme::IQ2S => dequant_iq2s(&raw.bytes, n),
+            KQuantScheme::Q2_0 => dequant_q2_0(&raw.bytes, n),
             KQuantScheme::GsqRco3p5 => dequant_gsq_rco_3p5(&raw.bytes, n),
         },
         Storage::FloatPack(fp) => match fp {
@@ -864,11 +865,13 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&raw.bytes),
             // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale).
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&raw.bytes, n),
-            // GreyRaven 2:4: no packed byte format exists yet, so there is
-            // nothing to decode. Refusing beats reinterpreting compacted
-            // survivors plus packed metadata as a dense code plane.
+            // GreyRaven 2:4: decode compacted survivors plus packed metadata
+            // back to the pruned dense model. The file loads as F32 weights;
+            // the production SWMMAC kernel is still the probe, so GPU dispatch
+            // refuses while host decode serves.
             BlockDtype::Fp8Sparse24 => {
-                Err(Error::Unimplemented("GreyRaven 2:4 has no packed format yet".to_string()))
+                grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, n)
+                    .map_err(|e| Error::Unimplemented(e.to_string()))
             }
         },
         Storage::ResidualPacked(_) => Err(Error::Unimplemented(
