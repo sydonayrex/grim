@@ -41,7 +41,11 @@ pub struct GsqBlockFit {
 }
 
 /// Fit a sub-Q4 weight block using Gumbel-Softmax relaxation.
-/// Optimizes continuous coordinates `c_0, ..., c_{K-1}` and scalar `scale` such that soft relaxation $\sum_k P(w_i.
+/// The discrete grid is FIXED (reference GSQ learns only assignment + scale):
+/// 2-bit uses the GSQRCO codebook `{-2, -1, 0, +1}` (see `dequant_gsq_rco_3p5`,
+/// `y = (q - 2) * d`); other widths use a frozen uniform grid centered on zero.
+/// Only the group `scale` is optimized; per-weight codes come from a final
+/// hard argmax assignment.
 pub fn gsq_fit_block(data: &[f32], bits: u8, config: &GsqConfig) -> Result<GsqBlockFit> {
     if data.is_empty() {
         return Err(Error::Backend("gsq_fit_block: empty data block".into()));
@@ -58,9 +62,14 @@ pub fn gsq_fit_block(data: &[f32], bits: u8, config: &GsqConfig) -> Result<GsqBl
         1.0f32
     };
 
-    // Initial grid: uniform spacing centered around zero
-    let half_levels = (n_levels - 1) as f32 * 0.5;
-    let mut grid: Vec<f32> = (0..n_levels).map(|k| k as f32 - half_levels).collect();
+    // Fixed grid: the reference learns assignment + scale only. 2-bit pins the
+    // GSQRCO codebook; other widths freeze the uniform centered init.
+    let grid: Vec<f32> = if n_levels == 4 {
+        vec![-2.0, -1.0, 0.0, 1.0]
+    } else {
+        let half_levels = (n_levels - 1) as f32 * 0.5;
+        (0..n_levels).map(|k| k as f32 - half_levels).collect()
+    };
 
     // Optimization loop via Gumbel-Softmax gradient steps
     for step in 0..config.steps {
@@ -69,7 +78,6 @@ pub fn gsq_fit_block(data: &[f32], bits: u8, config: &GsqConfig) -> Result<GsqBl
             * (config.temperature_min / config.temperature_init).powf(progress);
 
         // Compute assignment logits: -||w_i - scale * c_k||^2
-        let mut d_grid = vec![0.0f32; n_levels];
         let mut d_scale = 0.0f32;
 
         for &w in data {
@@ -105,23 +113,16 @@ pub fn gsq_fit_block(data: &[f32], bits: u8, config: &GsqConfig) -> Result<GsqBl
             }
             let err = recon - w;
 
-            // Gradients w.r.t grid points and scale
+            // Gradient w.r.t. scale only; the grid is fixed.
             for k in 0..n_levels {
-                d_grid[k] += err * probs[k] * scale;
                 d_scale += err * probs[k] * grid[k];
             }
         }
 
-        // Apply parameter updates
+        // Scale update only; the grid stays fixed (no drift, no re-sort).
         let inv_n = 1.0 / num_weights as f32;
-        for k in 0..n_levels {
-            grid[k] -= config.lr * (d_grid[k] * inv_n);
-        }
         scale -= (config.lr * 0.5) * (d_scale * inv_n);
         scale = scale.max(1e-6);
-
-        // Maintain monotonic order of grid points
-        grid.sort_by(|a, b| a.partial_cmp(b).unwrap());
     }
 
     // Hard discretization step (argmax assignment)
@@ -173,7 +174,7 @@ mod tests {
 
         let fit = gsq_fit_block(&data, 2, &config).expect("gsq fit succeeds");
         assert_eq!(fit.codes.len(), 64);
-        assert_eq!(fit.grid.len(), 4);
+        assert_eq!(fit.grid, vec![-2.0, -1.0, 0.0, 1.0]);
         for &code in &fit.codes {
             assert!(code < 4);
         }

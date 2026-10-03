@@ -1516,6 +1516,174 @@ fn dot8_w4a4_gemv_parity() {
     );
 }
 
+/// CityCrow: GsqRco 2-bit weights repacked to sudot8 u4 lanes, through the
+/// existing `grim_dot8_w4a4_gemv` kernel via `launch_w4a4_ostquant_gemv`.
+///
+/// The B triple comes from `repack_to_u4_lanes`, not synthetic nibbles, and
+/// the CPU reference decodes via `decode_groups` — the same quantized weights
+/// the kernel was given — plus a bit-mirror of the device's activation
+/// quantizer. A wrong codebook or lane geometry shows up as O(amax) error,
+/// not tolerance noise.
+#[test]
+#[ignore]
+fn citycrow_sudot8_gemv_parity() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] citycrow sudot8 requires RDNA4 (gfx1200/gfx1201)");
+        return;
+    }
+
+    let m = 1usize;
+    let n = 8usize;
+    let k = 256usize; // 2 groups of 128
+    assert_eq!(k % grim_quant::citycrow::CITYCROW_GROUP, 0);
+    let n_groups = k / 128;
+    let words_per_col = k / 8;
+
+    let mut seed = 0xC17C_20u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    // ABS-scaled draws: an all-negative LCG run u4-quantizes to all-zero
+    // codes and passes 0.0-vs-0.0 vacuously (see the note in the W4A4 test).
+    let flat: Vec<f32> = (0..n * k).map(|_| rand() * 2.0).collect();
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs() * 2.5).collect();
+
+    // flat -> GsqRco 18-byte block stream via the shipped packer (bias-2,
+    // MSE-fitted fp16 scale). The test exercises the same bytes a real
+    // conversion writes, not a second implementation of the format.
+    let mut blocks = vec![0u8; (n * k).div_ceil(64) * 18];
+    grim_quant::quantize_gsq_rco_3p5_block(&flat, &mut blocks).expect("pack");
+
+    let repacked = grim_quant::citycrow::repack_to_u4_lanes(
+        &blocks,
+        n,
+        k,
+        KQuantScheme::GsqRco3p5,
+    )
+    .expect("citycrow repack");
+    assert_eq!(repacked.n, n);
+    assert_eq!(repacked.k, k);
+    let b_qw = repacked.qweight.clone();
+    let b_sc = repacked.scales.clone();
+    let b_zr = repacked.zeros.clone();
+
+    let a_dev = grim_tensor::CoreTensorOps::from_cpu(
+        &dev,
+        &a_f32,
+        &Shape::new(vec![m, k]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .expect("upload A");
+
+    let b_qw_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(b_qw.as_ptr() as *const u8, b_qw.len() * 4) };
+    let b_sc_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(b_sc.as_ptr() as *const u8, b_sc.len() * 2) };
+
+    let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        b_qw_bytes,
+        &Shape::new(vec![n, words_per_col]),
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
+    )
+    .expect("upload B qweight");
+
+    let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        b_sc_bytes,
+        &Shape::new(vec![n, n_groups]),
+        DType {
+            arith: ArithType::BF16,
+            storage: Storage::Native,
+        },
+    )
+    .expect("upload B scales");
+
+    let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+        &dev,
+        &b_zr,
+        &Shape::new(vec![n, n_groups]),
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )
+    .expect("upload B zeros");
+
+    let out_shape = Shape::new(vec![m, n]);
+    let out_storage_boxed = grim_tensor::CoreTensorOps::zeros(
+        &dev,
+        &out_shape,
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .expect("alloc out");
+
+    let a_rocm = grim_backend_rocm::as_rocm(a_dev.as_ref()).expect("a rocm");
+    let b_qw_rocm = grim_backend_rocm::as_rocm(b_qw_dev.as_ref()).expect("b_qw rocm");
+    let b_sc_rocm = grim_backend_rocm::as_rocm(b_sc_dev.as_ref()).expect("b_sc rocm");
+    let b_zr_rocm = grim_backend_rocm::as_rocm(b_zr_dev.as_ref()).expect("b_zr rocm");
+    let out_rocm = grim_backend_rocm::as_rocm(out_storage_boxed.as_ref()).expect("out rocm");
+
+    dev.launch_w4a4_ostquant_gemv(a_rocm, b_qw_rocm, b_sc_rocm, b_zr_rocm, out_rocm, m, n, k)
+        .expect("launch_w4a4_ostquant_gemv");
+
+    let c_dev =
+        grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref()).expect("d2h c");
+
+    // CPU reference: activation u4 mirror (matches grim_quantize_u4_group128:
+    // round-half-away, clamp [0,15]) dotted against decode_groups weights.
+    let w_deq = grim_quant::citycrow::decode_groups(&repacked);
+    let mut a_deq = vec![0.0f32; m * k];
+    for row in 0..m {
+        for g in 0..n_groups {
+            let grp_a = &a_f32[row * k + g * 128..row * k + (g + 1) * 128];
+            let max_val = grp_a.iter().fold(0.0f32, |mm, &x| mm.max(x.abs()));
+            let d = max_val / 15.0;
+            let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+            for i in 0..128 {
+                let q = (grp_a[i] * inv_d).round().clamp(0.0, 15.0);
+                a_deq[row * k + g * 128 + i] = q * d;
+            }
+        }
+    }
+
+    let mut c_cpu = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += a_deq[row * k + i] * w_deq[col * k + i];
+            }
+            c_cpu[row * n + col] = acc;
+        }
+    }
+
+    let diff = max_diff(&c_cpu, &c_dev);
+    eprintln!("[citycrow-sudot8-gemv-parity] m={m} n={n} k={k} max_diff={diff:.6}");
+    // Measured 2.1e-4 on gfx1201; 0.005 leaves ~20x headroom. A wrong
+    // codebook or lane geometry errs at O(amax) ~ 1.0, far above this.
+    assert!(
+        diff < 0.005,
+        "citycrow sudot8 GEMV diverges from CPU reference: {diff}"
+    );
+}
+
 /// Phase 4.5b: W4A4 GEMV against real model weights from Qwen3-4B OSTQuant layout.
 #[test]
 #[ignore]
