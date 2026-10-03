@@ -1383,6 +1383,8 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 KQuantScheme::IQ4NL => 4,
                 KQuantScheme::IQ4XS => 4,
                 KQuantScheme::IQ3XXS => 3,
+                KQuantScheme::IQ1S => 2, // 1.5625 bpw nominal; budget round-up
+                KQuantScheme::IQ1M => 2,
                 KQuantScheme::IQ3S => 3,
                 KQuantScheme::IQ2XXS => 2,
                 KQuantScheme::IQ2XS => 2,

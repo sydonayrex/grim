@@ -147,6 +147,8 @@ impl QuantOps for VulkanDevice {
                     KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ3S => grim_quant::dequant_iq3s(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ1S => grim_quant::dequant_iq1s(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ1M => grim_quant::dequant_iq1_m(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(&b_bytes_cpu, k * n)?,
                     KQuantScheme::IQ2S => grim_quant::dequant_iq2s(&b_bytes_cpu, k * n)?,

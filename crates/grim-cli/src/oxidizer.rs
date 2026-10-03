@@ -835,6 +835,8 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
         QuantFormat::Q2_0 => Ok(GgufDType::Q2_0),
         QuantFormat::GsqRco3p5 => Ok(GgufDType::GsqRco3p5),
+        QuantFormat::Iq1S => Ok(GgufDType::IQ1_S),
+        QuantFormat::Iq1M => Ok(GgufDType::IQ1_M),
         QuantFormat::Q2K => Ok(GgufDType::Q2K),
         QuantFormat::Q3K => Ok(GgufDType::Q3K),
         QuantFormat::Q4K => Ok(GgufDType::Q4K),

@@ -120,6 +120,14 @@ impl AccuracyTolerance {
             // typically a bit tighter than Q2_0's d=amax choice, but the
             // budget stays in the 2-bit tier until a real GSQ conversion
             // (calibration + Gumbel-Softmax) justifies Q3_K-class numbers.
+            // IQ1_S/IQ1_M: 1.56/1.75 bpw lattice formats. The tightest tier
+            // grim decodes; budgets reflect that honestly until measured
+            // against a real IQ1 checkpoint oracle.
+            QuantFormat::Iq1S | QuantFormat::Iq1M => Self {
+                min_cosine_similarity: 0.9500,
+                max_relative_l2_error: 0.45,
+                max_delta_ppl: 0.50,
+            },
             QuantFormat::GsqRco3p5 => Self {
                 min_cosine_similarity: 0.9750,
                 max_relative_l2_error: 0.34,

@@ -1755,7 +1755,17 @@ impl QuantOps for CpuDevice {
                                 Error::Backend(format!("CPU quantized_matmul GSQ_RCO dequant: {e}"))
                             })?
                     },
-                    grim_tensor::QuantFormat::Q2_0 => grim_quant::dequant_q2_0(b_bytes, k * n)
+                    grim_tensor::QuantFormat::Iq1S => {
+                        grim_quant::dequant_iq1s(b_bytes, k * n).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul IQ1_S dequant: {e}"))
+                        })?
+                    }
+                    grim_tensor::QuantFormat::Iq1M => {
+                        grim_quant::dequant_iq1_m(b_bytes, k * n).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul IQ1_M dequant: {e}"))
+                        })?
+                    }
+grim_tensor::QuantFormat::Q2_0 => grim_quant::dequant_q2_0(b_bytes, k * n)
                         .map_err(|e| {
                             Error::Backend(format!("CPU quantized_matmul Q2_0 dequant: {e}"))
                         })?,
@@ -2603,6 +2613,8 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::KQuantScheme::IQ2S => grim_quant::dequant_iq2s(raw, n),
                 // Upstream Q2_0 (tag 42): 64 weights per 18-byte block, codebook {-1,0,+1,+2}.
                 grim_tensor::dtype::KQuantScheme::Q2_0 => grim_quant::dequant_q2_0(raw, n),
+                grim_tensor::dtype::KQuantScheme::IQ1S => grim_quant::dequant_iq1s(raw, n),
+                grim_tensor::dtype::KQuantScheme::IQ1M => grim_quant::dequant_iq1_m(raw, n),
                 // Prism GSQRCO (tag 81): same geometry, codebook {-2,-1,0,+1}.
                 grim_tensor::dtype::KQuantScheme::GsqRco3p5 => {
                     grim_quant::dequant_gsq_rco_3p5(raw, n)

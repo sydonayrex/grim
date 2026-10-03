@@ -217,6 +217,14 @@ pub enum KQuantScheme {
     /// Prism-private GSQRCO at tag 81: same 64-elem/18-byte geometry as
     /// [`Self::Q2_0`] but the GSQRCO codebook `y = (q - 2) * d`.
     GsqRco3p5,
+    /// IQ1_S (llama.cpp tag 19): 1.5625 bpw, 50 B per 256-weight superblock
+    /// (`ggml-common.h:429`: fp16 d + qs[QK_K/8] + qh u16[QK_K/32]). Decoded
+    /// via the 2048-entry `iq1s_grid` lattice (`ggml-quants.c:2650`).
+    IQ1S,
+    /// IQ1_M (llama.cpp tag 29): 1.75 bpw, 56 B per 256-weight superblock
+    /// (`ggml-common.h:437`: qs[QK_K/8] + qh[QK_K/16] + scales[QK_K/32]; the
+    /// fp16 scale is bit-packed across the four scale u16s — `ggml-quants.c:2675`).
+    IQ1M,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -320,6 +328,10 @@ pub enum QuantFormat {
     /// decode: the two formats MUST NOT share a kernel. Grim's native tag,
     /// written by the oxidizer for .grim output and the `--format` default.
     GsqRco3p5,
+    /// IQ1_S (llama.cpp tag 19, 50 B/256) — see KQuantScheme::IQ1S.
+    Iq1S,
+    /// IQ1_M (llama.cpp tag 29, 56 B/256) — see KQuantScheme::IQ1M.
+    Iq1M,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -428,6 +440,10 @@ impl DType {
                 KQuantScheme::IQ2XS => (elem_count.div_ceil(256)) * 74,
                 KQuantScheme::IQ2S => (elem_count.div_ceil(256)) * 82,
                 KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => (elem_count.div_ceil(64)) * 18,
+                // IQ1_S/IQ1_M: 50/56 B per 256-weight superblock
+                // (ggml-common.h:429/:437 static_asserts).
+                KQuantScheme::IQ1S => elem_count.div_ceil(256) * 50,
+                KQuantScheme::IQ1M => elem_count.div_ceil(256) * 56,
             },
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => elem_count.div_ceil(2),
@@ -521,6 +537,8 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Iq2Xs => Storage::KQuant(KQuantScheme::IQ2XS),
             QuantFormat::Iq2S => Storage::KQuant(KQuantScheme::IQ2S),
             QuantFormat::GsqRco3p5 => Storage::KQuant(KQuantScheme::GsqRco3p5),
+            QuantFormat::Iq1S => Storage::KQuant(KQuantScheme::IQ1S),
+            QuantFormat::Iq1M => Storage::KQuant(KQuantScheme::IQ1M),
         }
     }
 }
@@ -545,6 +563,8 @@ impl TryFrom<&Storage> for QuantFormat {
                 KQuantScheme::IQ2XXS => Ok(QuantFormat::Iq2Xxs),
                 KQuantScheme::IQ2XS => Ok(QuantFormat::Iq2Xs),
                 KQuantScheme::IQ2S => Ok(QuantFormat::Iq2S),
+                KQuantScheme::IQ1S => Ok(QuantFormat::Iq1S),
+                KQuantScheme::IQ1M => Ok(QuantFormat::Iq1M),
                 // NOTE: `GsqRco3p5` deliberately has NO arm here yet, even
                 // though `From<QuantFormat> for Storage` maps it and
                 // `quantize_gsq_rco_3p5_block` can produce tag 81. The

@@ -608,6 +608,20 @@ impl QuantOps for RocmDevice {
                     )?;
                 }
             }
+            DTypeStorage::KQuant(KQuantScheme::IQ1S) => {
+                // Scalar fused-dequant GEMM ported from llama.cpp
+                // dequantize_row_iq1_s (ggml-quants.c:2650); the previous
+                // state aliased IQ1_S to IQ2S here, whose 66 B/256 kernel
+                // read 32% past the 50 B/256 allocation — the 27B
+                // Swift-1.5 artifact's `Page not present` fault.
+                self.launch_fused_dequant_gemm_iq1s(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ1M) => {
+                // Scalar fused-dequant GEMM ported from llama.cpp
+                // dequantize_row_iq1_m (ggml-quants.c:2675); same
+                // mis-aliasing history as IQ1S above (56 vs 66 B/256).
+                self.launch_fused_dequant_gemm_iq1m(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
             DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => {
                 self.launch_iq_wmma_fallback(
                     a_storage,
@@ -1716,6 +1730,28 @@ impl QuantOps for RocmDevice {
             }
             DTypeStorage::KQuant(KQuantScheme::Q3K) => {
                 self.launch_fused_dequant_backward_gemm_q3k(
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ1S) => {
+                // Backward: scalar fused-dequant GEMM (ggml-quants.c:2650).
+                self.launch_fused_dequant_backward_gemm_iq1s(
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ1M) => {
+                // Backward: scalar fused-dequant GEMM (ggml-quants.c:2675).
+                self.launch_fused_dequant_backward_gemm_iq1m(
                     dy_storage,
                     b_storage,
                     &dx_storage,

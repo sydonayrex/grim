@@ -390,6 +390,8 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             KQuantScheme::IQ4NL | KQuantScheme::IQ4XS => 4,
             KQuantScheme::IQ3XXS | KQuantScheme::IQ3S => 3,
             KQuantScheme::IQ2XXS | KQuantScheme::IQ2XS | KQuantScheme::IQ2S => 2,
+            // IQ1 lattice: 1.56/1.75 bpw nominal; floored to 2.
+            KQuantScheme::IQ1S | KQuantScheme::IQ1M => 2,
             // 18 B per 64 elements = 2.25 bpw; floored to 2 for a whole-weight count.
             KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => 2,
         },

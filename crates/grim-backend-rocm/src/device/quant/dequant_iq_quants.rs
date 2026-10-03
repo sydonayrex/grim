@@ -8,7 +8,7 @@ use grim_tensor::error::{Error, Result};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{HipDim3, arg};
+use crate::{arg, HipDim3};
 
 impl RocmDevice {
     pub(crate) fn launch_dequant_iq2xxs(
@@ -245,6 +245,70 @@ impl RocmDevice {
         k: usize,
     ) -> Result<*mut c_void> {
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq3s", a, b, out, m, n, k)
+    }
+
+    pub(crate) fn launch_fused_dequant_gemm_iq1s(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1s", a, b, out, m, n, k)
+    }
+
+    pub(crate) fn launch_fused_dequant_gemm_iq1m(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1m", a, b, out, m, n, k)
+    }
+
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq1s(
+        &self,
+        dy: &RocmStorage,
+        b: &RocmStorage,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple(
+            "grim_fused_dequant_backward_gemm_iq1s",
+            dy,
+            b,
+            dx,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq1m(
+        &self,
+        dy: &RocmStorage,
+        b: &RocmStorage,
+        dx: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple(
+            "grim_fused_dequant_backward_gemm_iq1m",
+            dy,
+            b,
+            dx,
+            m,
+            n,
+            k,
+        )
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq3s(

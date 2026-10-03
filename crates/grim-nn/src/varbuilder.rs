@@ -16,7 +16,7 @@ use grim_quant::{
     dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_gsq_rco_3p5,
     dequant_iq2s, dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl,
     dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_nf4, dequant_nutcracker, dequant_nvfp4,
-    dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q2_0, dequant_q80,
+    dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q2_0, dequant_q80, dequant_iq1s, dequant_iq1_m,
 };
 
 #[cfg(feature = "cuda-mem")]
@@ -825,6 +825,8 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             KQuantScheme::IQ2XXS => dequant_iq2xxs(&raw.bytes, n),
             KQuantScheme::IQ2XS => dequant_iq2xs(&raw.bytes, n),
             KQuantScheme::IQ2S => dequant_iq2s(&raw.bytes, n),
+            KQuantScheme::IQ1S => dequant_iq1s(&raw.bytes, n),
+            KQuantScheme::IQ1M => dequant_iq1_m(&raw.bytes, n),
             KQuantScheme::Q2_0 => dequant_q2_0(&raw.bytes, n),
             KQuantScheme::GsqRco3p5 => dequant_gsq_rco_3p5(&raw.bytes, n),
         },

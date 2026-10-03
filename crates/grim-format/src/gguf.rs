@@ -2177,9 +2177,22 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::IQ2XS),
         },
-        GgufDType::IQ2_S | GgufDType::IQ1_S | GgufDType::IQ1_M => DType {
+        // IQ1_S/IQ1_M have their OWN block geometries (50/56 B per 256 per
+        // ggml-common.h:429/:437) — aliasing them to IQ2S (66 B/256) made the
+        // IQ2S GPU kernel read 18-32% past the tensor allocation, which the
+        // 27B Swift-1.5 artifact (4x IQ1_M + 4x IQ1_S) exposed as a
+        // `Page not present` memory access fault at the first forward.
+        GgufDType::IQ2_S => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::IQ2S),
+        },
+        GgufDType::IQ1_S => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ1S),
+        },
+        GgufDType::IQ1_M => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ1M),
         },
         GgufDType::BF16 => DType::BF16,
         GgufDType::MXFP4 => DType {
