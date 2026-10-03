@@ -8384,7 +8384,20 @@ pub fn dequant_q2_0(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 /// `y = (q - 2) * d`. The two decoders differ by exactly one level of `d`,
 /// so a wrong-codebook decode yields finite, plausible, wrong weights.
 pub fn dequant_gsq_rco_3p5(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    dequant_2bit_blocks(data, num_weights, "gsq_rco_3p5", 2.0)
+    // GRIM_GSQ_BIAS: the one-knob A/B for the released-checkpoint codebook
+    // question (this session's open item). Default 2 = the GSQ paper's
+    // quantizer; GRIM_GSQ_BIAS=1 restores the llama.cpp Q2_0 reading
+    // (`(q - 1) * d`, ggml-quants.c:439) under which the release reportedly
+    // evals at ppl 2.502. Both arms in ONE binary so a ppl comparison cannot
+    // differ by build.
+    static BIAS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let bias = *BIAS.get_or_init(|| {
+        match std::env::var("GRIM_GSQ_BIAS").as_deref() {
+            Ok("1") => 1.0,
+            _ => 2.0,
+        }
+    });
+    dequant_2bit_blocks(data, num_weights, "gsq_rco_3p5", bias)
 }
 
 /// Shared core for the two 18-byte / 64-elem 2-bit formats: `y = (q - bias) * d`

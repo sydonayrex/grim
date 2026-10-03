@@ -118,3 +118,149 @@ fn rejects_bad_inputs() {
     let zeros = vec![0.0f32; BLOCK_SIZE_Q2_0];
     assert!(quantize_gsq_rco_3p5_block(&zeros, &mut out).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Released-checkpoint codebook arbiter.
+//
+// The two readings differ by EXACTLY one level of d on every weight:
+// v(q-2) - v(q-1) = -d. So if the bias-2 (paper) reading is right, the
+// per-block mean sits near zero (real weight blocks are near-symmetric);
+// if the released bytes were encoded for the bias-1 (Q2_0) reading, the
+// bias-2 decode shifts every weight by +d and the per-block mean sits at
+// ~+1 in units of d. One decode, one statistic — no model load needed.
+// ---------------------------------------------------------------------------
+/// Minimal IEEE f16 -> f32 (le bytes), test-local.
+fn f16_scale(lo: u8, hi: u8) -> f32 {
+    let h = u16::from_le_bytes([lo, hi]);
+    let sign = ((h >> 15) as f32) * -2.0 + 1.0;
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let man = (h & 0x03ff) as f32;
+    if exp == 0 {
+        return sign * man * 2f32.powi(-24);
+    }
+    if exp == 0x1f {
+        return f32::NAN;
+    }
+    sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15)
+}
+
+#[test]
+fn released_checkpoint_codebook_arbiter() {
+    use grim_format::gguf::GgufDType;
+    use grim_format::tprov::GgufProvider;
+    use grim_tensor::provider::TensorProvider;
+
+    // Tests run with the CRATE dir as cwd; the checkpoint lives in the
+    // workspace-root models/ tree. Resolve upward.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crate ancestors")
+        .join("models/QWen38-Flash/Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let provider = GgufProvider::open(&path.to_string_lossy()).expect("open provider");
+    let gguf = grim_format::gguf::read_gguf(std::io::BufReader::new(
+        std::fs::File::open(path).expect("open file"),
+    ))
+    .expect("read gguf");
+
+    // Sample several 18-byte-geometry tensors, first 4096 blocks each.
+    // The released file may store its expert banks under tag 42 (Q2_0)
+    // or tag 81 — the codebook question is identical for both, and the
+    // bias lives in the decoder, not the tag.
+    let mut hist: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    for t in gguf.tensors.iter() {
+        *hist.entry(t.dtype as i32).or_default() += 1;
+    }
+    eprintln!("[arbiter] dtype histogram: {hist:?}");
+    const NB: usize = 4096;
+    let mut per_tensor: Vec<(String, f64)> = Vec::new();
+    for t in gguf.tensors.iter().filter(|t| t.dtype == GgufDType::GsqRco3p5 || t.dtype == GgufDType::Q2_0).take(3) {
+        let raw = provider
+            .get_packed(&t.name)
+            .unwrap_or_else(|e| panic!("packed bytes for {}: {e}", t.name));
+        let nblocks = raw.bytes.len() / 18usize;
+        let nb = nblocks.min(NB);
+        let data = grim_quant::dequant_gsq_rco_3p5(
+            &raw.bytes[..nb * 18],
+            nb * 64,
+        )
+        .expect("decode");
+        let mut mean_sum = 0.0f64;
+        let mut skipped = 0usize;
+        for b in 0..nb {
+            let bytes = &raw.bytes[b * 18..(b + 1) * 18];
+            let d_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+            if d_bits == 0 {
+                skipped += 1; // d = 0: every code decodes to 0 under any bias
+                continue;
+            }
+            let d = f32::from_le_bytes([0, 0, bytes[1] & 0x80, 0]);
+            let _ = d;
+            // Decode this block's scale from fp16 (le) via half conversion:
+            let d_f32 = f16_scale(bytes[0], bytes[1]);
+            if !(d_f32 > 0.0) {
+                skipped += 1;
+                continue;
+            }
+            let blk = &data[b * 64..(b + 1) * 64];
+            // bias-2 decode: levels {-2d..+1d}. Mean in units of d.
+            mean_sum += blk.iter().map(|v| *v as f64 / d_f32 as f64).sum::<f64>() / 64.0;
+        }
+        if skipped > 0 {
+            eprintln!("[arbiter] {} skipped zero-scale blocks", skipped);
+        }
+        // RANGE-ASYMMETRY arbiter: the codebooks have different per-sign
+        // ranges. Bias-1 encoding (Q2_0): positives reach +2d, negatives
+        // only -1d -> max_pos/d ~ 2 and |min_neg|/d <= 1. Bias-2 (GSQ
+        // paper): mirror image. Unlike the mean shift, this does not
+        // depend on the weight distribution being symmetric.
+        let mut max_pos = 0.0f64;
+        let mut max_neg = 0.0f64;
+        for b in 0..nb {
+            let bytes = &raw.bytes[b * 18..(b + 1) * 18];
+            let d = f16_scale(bytes[0], bytes[1]);
+            if !(d > 0.0) {
+                continue;
+            }
+            let blk = &data[b * 64..(b + 1) * 64];
+            for v in blk {
+                if *v > 0.0 {
+                    max_pos = max_pos.max(*v as f64 / d as f64);
+                } else {
+                    max_neg = max_neg.max(-*v as f64 / d as f64);
+                }
+            }
+        }
+        eprintln!(
+            "[arbiter] {}: max_pos/d = {max_pos:.3}  |min_neg|/d = {max_neg:.3}  \
+             -> encoder codebook {}",
+            t.name,
+            if max_pos > max_neg * 1.5 { "bias-1 (Q2_0: positives reach 2d)" }
+            else if max_neg > max_pos * 1.5 { "bias-2 (GSQ paper: negatives reach 2d)" }
+            else { "INDETERMINATE" }
+        );
+        let mean = mean_sum / nb as f64;
+        per_tensor.push((t.name.clone(), mean));
+        eprintln!(
+            "[arbiter] {} blocks {}: per-block mean in units of d = {mean:+.4}",
+            t.name,
+            nb
+        );
+    }
+    assert!(!per_tensor.is_empty(), "no 18-byte-geometry tensor found");
+    for (name, mean) in &per_tensor {
+        // |mean| ~ 0 => bias 2 (paper) correct; |mean| ~ 1 => bias 1
+        // (Q2_0) correct — every weight shifted by a full level.
+        assert!(
+            mean.abs() < 0.5,
+            "{name}: per-block mean {mean:.4} d units — consistent with the \
+             bias-1 (Q2_0) reading, not the paper codebook"
+        );
+    }
+    eprintln!("[arbiter] bias-2 (paper codebook) reading confirmed by mean-shift statistic");
+}
