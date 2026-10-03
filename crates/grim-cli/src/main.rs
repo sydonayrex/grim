@@ -668,6 +668,11 @@ enum Commands {
         /// Offload tensor dequantization to host ROCm GPU during conversion (GPU-first with CPU fallback).
         #[arg(long, default_value_t = true)]
         gpu: bool,
+        /// Pack weights in a specific format instead of uniform target-bpw.
+        /// Supported: `whiteraven` (FP8 E4M3, 16x16-blocked; requires 16-aligned
+        /// 2D weights, everything else falls back to the uniform pack).
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Bake a trained LoRA/QLoRA adapter sidecar permanently into a base .grim model file.
     Merge {
@@ -930,6 +935,9 @@ enum OxidizerCommands {
         /// "w32", or "w64" (CDNA opt-in).
         #[arg(long, default_value = "auto")]
         wave: String,
+        /// Pack weights in a specific format (see `grim convert --format`).
+        #[arg(long)]
+        format: Option<String>,
         /// Offload tensor dequantization to host ROCm GPU during conversion (GPU-first with CPU fallback).
         #[arg(long, default_value_t = true)]
         gpu: bool,
@@ -2209,6 +2217,7 @@ async fn main() -> Result<()> {
             dataset,
             wave,
             gpu,
+            format,
         } => {
             // Detect input format and warn the user.
             let ext = std::path::Path::new(&input)
@@ -2311,6 +2320,7 @@ async fn main() -> Result<()> {
                 wave_override,
                 gpu,
                 Some(&mut cb),
+                format.as_deref(),
             ) {
                 prog.finish();
                 eprintln!("Conversion failed: {e}");
@@ -2426,6 +2436,7 @@ async fn main() -> Result<()> {
                     dataset,
                     wave,
                     gpu,
+                    format,
                 } => {
                     let wave_override = match wave.to_ascii_lowercase().as_str() {
                         "w32" => Some(grim_format::WaveSize::W32),
@@ -2452,6 +2463,7 @@ async fn main() -> Result<()> {
                         wave_override,
                         gpu,
                         Some(&mut cb),
+                        format.as_deref(),
                     ) {
                         prog.finish();
                         eprintln!("oxidizer convert failed: {e}");

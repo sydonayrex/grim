@@ -264,6 +264,7 @@ pub fn cmd_oxidizer_convert(
     wave_override: Option<grim_format::WaveSize>,
     use_gpu: bool,
     mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
+    target_format: Option<&str>,
 ) -> Result<(), String> {
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
@@ -407,7 +408,7 @@ pub fn cmd_oxidizer_convert(
             None,
             Some(full_bitwidths),
             Some(grim_meta),
-            None,
+            target_format.map(|f| f.to_string()),
             wave,
             progress,
             device,
@@ -424,7 +425,7 @@ pub fn cmd_oxidizer_convert(
             None,
             Some(full_bitwidths),
             Some(grim_meta),
-            None,
+            target_format.map(|f| f.to_string()),
             wave,
             progress,
         )

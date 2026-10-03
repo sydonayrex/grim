@@ -164,3 +164,151 @@ fn whiteraven_loads_through_the_grim_container_round_trip() {
     });
     assert!(found, "quant_overrides must name tag 670 for blk.weight");
 }
+
+#[test]
+fn convert_with_format_whiteraven_produces_a_blocked_fp8_grim_file() {
+    // Same fixture, but the SOURCE is a plain F32 checkpoint and WhiteRaven
+    // is requested as the conversion target. This is the path `grim convert
+    // --format whiteraven` drives; the weights have to come out quantized
+    // AND blocked, and the override must be written.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let want: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 37) % 61) as f32 * 0.03125 - 0.9)
+        .collect();
+    let payload: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let src = scratch.0.join("f32.gguf");
+    write_gguf(&src, GgufDType::F32, "blk.weight", &[k as u64, n as u64], &payload);
+
+    let out = scratch.0.join("wr.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("whiteraven".to_string()),
+        None,
+        None,
+    )
+    .expect("convert --format whiteraven");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open grim");
+    let meta = gp.meta("blk.weight").expect("meta");
+    assert_eq!(
+        meta.dtype.storage,
+        grim_tensor::dtype::Storage::FloatPack(
+            grim_tensor::dtype::FloatPackScheme::Fp8Blocked16
+        ),
+        "a --format whiteraven conversion must tag the tensor WhiteRaven"
+    );
+
+    let raw = gp.get("blk.weight").expect("get");
+    assert_eq!(raw.bytes.len(), n * k, "blocked FP8 is one byte per weight");
+
+    // The dequantized values must equal the ORIGINAL f32 weights rounded
+    // through E4M3 -- not a requantized-through-F32 artifact.
+    let deq = grim_quant::dequant_fp8_blocked16(&raw.bytes, n, k).expect("dequant");
+    for (i, (&w, &g)) in want.iter().zip(&deq).enumerate() {
+        let q = grim_quant::fp8_e4m3_to_f32(grim_quant::f32_to_fp8_e4m3(w));
+        assert_eq!(g.to_bits(), q.to_bits(), "element {i} should be the E4M3 round of the F32 weight");
+    }
+}
+
+#[test]
+fn convert_with_format_whiteraven_leaves_non_conforming_tensors_untouched() {
+    // 1D tensors (norm gains) carry no 2D shape to block -- the converter
+    // must pack them with the uniform path rather than fail or silently
+    // mis-shape them. The two records in one file exercise both arms.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let weights: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.001).collect();
+    let norms: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.01).collect();
+
+    // Each tensor needs its OWN payload offset. Writing 0 for both is not a
+    // caught error: both tensors then read from the start of the payload
+    // region, the second tensor's "weights" are the first tensor's, and the
+    // only symptom is a plausible, wrong tensor on the far side.
+    let src = scratch.0.join("mixed.gguf");
+    write_mixed(&src, &weights, &norms, n, k);
+
+    let out = scratch.0.join("mixed.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("whiteraven".to_string()),
+        None,
+        None,
+    )
+    .expect("convert");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open");
+    let w_meta = gp.meta("blk.weight").expect("meta weight");
+    assert_eq!(
+        w_meta.dtype.storage,
+        grim_tensor::dtype::Storage::FloatPack(
+            grim_tensor::dtype::FloatPackScheme::Fp8Blocked16
+        ),
+        "2D 16-aligned weight must become WhiteRaven"
+    );
+    let n_meta = gp.meta("blk.norm.weight").expect("meta norm");
+    assert!(
+        !matches!(
+            n_meta.dtype.storage,
+            grim_tensor::dtype::Storage::FloatPack(
+                grim_tensor::dtype::FloatPackScheme::Fp8Blocked16
+            )
+        ),
+        "1D norm must NOT be tagged WhiteRaven -- it cannot hold the layout"
+    );
+}
+
+/// A two-tensor GGUF with correct per-tensor payload offsets.
+fn write_mixed(path: &std::path::Path, weights: &[f32], norms: &[f32], n: usize, k: usize) {
+    let wbytes: Vec<u8> = weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let nbytes: Vec<u8> = norms.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&GGUF_VERSION.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    buf.extend_from_slice(&2u64.to_le_bytes());
+    push_string(&mut buf, "general.architecture");
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    push_string(&mut buf, "qwen4exp");
+    push_string(&mut buf, "general.name");
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    push_string(&mut buf, "mixed");
+
+    let tensor_section = |buf: &mut Vec<u8>, name: &str, dims: &[u64], dtype: GgufDType, offset: u64| {
+        push_string(buf, name);
+        buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for d in dims {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        buf.extend_from_slice(&dtype.tag().to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+    };
+    tensor_section(&mut buf, "blk.weight", &[k as u64, n as u64], GgufDType::F32, 0);
+    tensor_section(&mut buf, "blk.norm.weight", &[n as u64], GgufDType::F32, wbytes.len() as u64);
+
+    let aligned = (buf.len() + 31) / 32 * 32;
+    buf.resize(aligned, 0);
+    buf.extend_from_slice(&wbytes);
+    buf.extend_from_slice(&nbytes);
+
+    let mut f = std::fs::File::create(path).expect("create");
+    f.write_all(&buf).expect("write");
+}

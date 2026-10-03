@@ -597,6 +597,7 @@ fn convert_to_grim_inner(
         target_bpw,
         evopress_bitwidths.clone(),
         wave,
+        target_format.as_deref(),
         &mut progress,
         gpu_dequant,
     )?;
@@ -728,6 +729,7 @@ fn build_entries_from_source(
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
     wave: crate::format::WaveSize,
+    target_format: Option<&str>,
     progress: &mut Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
 ) -> Result<(
@@ -748,6 +750,7 @@ fn build_entries_from_source(
             wave,
             progress,
             gpu_dequant,
+            target_format,
         )
 
     } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
@@ -762,6 +765,7 @@ fn build_entries_from_source(
             wave,
             progress,
             gpu_dequant,
+            target_format,
         )
     } else {
         Err(Error::Backend(format!(
@@ -782,6 +786,7 @@ fn pack_tensors(
     wave: crate::format::WaveSize,
     progress: &mut Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
+    target_format: Option<&str>,
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
     Vec<crate::spec::GrimTensorExt>,
@@ -901,6 +906,59 @@ fn pack_tensors(
                 }
                 // else: attention projection but not a rotatable square block - fall through without rotating; do not error (non-square attention projections are legitimate, e.g.
                 // GQA with differing Q/KV dims).
+            }
+
+            // WhiteRaven target: pack every 2D weight tensor as blocked FP8 in
+            // one step -- F32 dequant, E4M3 codes, 16x16 tiling, and the
+            // quant_override that tells the reader this is a kernel layout
+            // rather than a bitwidth. Any tensor the format cannot hold
+            // (1D gains/biases, non-16-aligned attention rows of rare GQA
+            // shapes) falls through to the uniform path, so a mixed file
+            // still loads -- the non-WhiteRaven tensors simply carry no
+            // override.
+            if matches!(target_format, Some(f) if f.eq_ignore_ascii_case("whiteraven"))
+                && meta.shape.len() == 2
+                && meta.shape[0] > 0
+                && meta.shape[1] > 0
+                && meta.shape[0] % 16 == 0
+                && meta.shape[1] % 16 == 0
+            {
+                let (n, k) = (meta.shape[0], meta.shape[1]);
+                let codes: Vec<u8> = f32_values
+                    .iter()
+                    .map(|&v| grim_quant::f32_to_fp8_e4m3(v))
+                    .collect();
+                let blocked = grim_quant::block_fp8_16x16(&codes, n, k)
+                    .map_err(|e| Error::Backend(format!("WhiteRaven block for '{name}': {e}")))?;
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 8,
+                    payload_offset: 0,
+                    payload_size: blocked.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 8,
+                    override_dtype: crate::gguf::GgufDType::WhiteRaven,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, blocked), ext, Some(override_)));
             }
 
             let payload_size =
@@ -1227,6 +1285,7 @@ mod tests {
             None,
             crate::format::WaveSize::W64,
             &mut progress,
+            None,
             None,
         )
         .expect("pack_tensors succeeds");
