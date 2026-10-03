@@ -209,6 +209,86 @@ pub enum GgufDType {
     PQ2_0 = 142,
     #[allow(non_camel_case_types)]
     PTQ1_0 = 143,
+
+    // ---- Raven / Crow series: grim-native tags, width-partitioned ----------
+    //
+    // These are NOT GGUF. They live in grim's own tag space and only resolve
+    // under grim: a stock GGUF reader (llama.cpp, any other tool) has never
+    // heard of them and will reject the file, which is the point -- they
+    // describe kernel-specific payloads that carry no upstream meaning.
+    //
+    // The space is partitioned by weight width so a reader can reject a
+    // whole block with one comparison, and so a future 4-bit and 8-bit entry
+    // can never collide:
+    //
+    //   660..668  4-bit kernels
+    //   669..677  8-bit kernels
+    //
+    // 660 is the base of the 4-bit block and 669 the base of the 8-bit block,
+    // not an arbitrary pair of ids: 669 = 660 + 9 reserves exactly nine 4-bit
+    // slots before the 8-bit block begins.
+    //
+    // Every payload here is BARE CODES with no scale prefix. That is not an
+    // accident -- the kernels read `const float8_t*` / `unsigned*` straight
+    // out of the tensor, so a 4-byte f32 header (which `quant_fp8` emits for
+    // its own format) would shift every code by four and decode to finite,
+    // plausible, wrong weights.
+    /// Crow 4-bit block: W4A4 OSTQuant u4 x u4, native `V_DOT8_I32_IU4`.
+    /// Group-128: 64 packed codes + bf16 scale + u8 zero per 128 weights.
+    #[allow(non_camel_case_types)]
+    WhiteCrow = 660,
+    /// Raven: dense FP8 E4M3, native `V_DOT4_F32_FP8_FP8`. Bare codes.
+    #[allow(non_camel_case_types)]
+    Raven = 669,
+    /// WhiteRaven: FP8 E4M3 in 16x16-blocked order, native
+    /// `V_WMMA_F32_16X16X16_FP8_FP8`. Same bytes as `Raven`, permuted so each
+    /// WMMA fragment load is one contiguous 256B read instead of 16 K-strided
+    /// segments. Requires `n % 16 == 0` and `k % 16 == 0`.
+    #[allow(non_camel_case_types)]
+    WhiteRaven = 670,
+    /// GreyRaven: 2:4-sparse FP8 E4M3, native
+    /// `V_SWMMAC_F32_16X16X32_FP8_FP8`. 4.75 bpw: per 32 originals, 16 survivor
+    /// bytes + 12 metadata bytes. Declared so the tag space is complete and so
+    /// a file carrying it fails naming the format -- but there is no packer
+    /// yet, so nothing can load it.
+    #[allow(non_camel_case_types)]
+    GreyRaven = 671,
+    /// ForestRaven: INT8, native `V_DOT4_I32_IU8`. Bare codes.
+    #[allow(non_camel_case_types)]
+    ForestRaven = 672,
+}
+
+impl GgufDType {
+    /// Base of the grim-native 4-bit tag block (660).
+    pub const GRIM_NATIVE_4BIT_BASE: u32 = 660;
+    /// Base of the grim-native 8-bit tag block (669) = 4BIT_BASE + 9.
+    pub const GRIM_NATIVE_8BIT_BASE: u32 = 669;
+
+    /// True for the Raven/Crow tags, which resolve only under grim.
+    ///
+    /// Callers that hand files to OTHER readers must gate on this: a stock
+    /// GGUF reader rejects these tags as unknown, so a checkpoint carrying one
+    /// is unloadable outside grim by construction, not by accident.
+    pub fn is_grim_native(self) -> bool {
+        let t = self.tag();
+        (Self::GRIM_NATIVE_4BIT_BASE..Self::GRIM_NATIVE_8BIT_BASE).contains(&t)
+            || (Self::GRIM_NATIVE_8BIT_BASE..=Self::GRIM_NATIVE_8BIT_BASE + 8).contains(&t)
+    }
+
+    /// Element weight of the payload, in bits, for the grim-native tags.
+    ///
+    /// `None` for every other format; this exists because the grim-native
+    /// payloads are not described by ggml's block geometry (they are bare
+    /// code planes, plus one framed block for WhiteCrow).
+    pub fn grim_native_bpw(self) -> Option<f64> {
+        Some(match self {
+            GgufDType::WhiteCrow => 4.0 + (16.0 + 8.0) / 128.0, // codes + bf16 scale + u8 zero
+            GgufDType::Raven | GgufDType::WhiteRaven => 8.0,
+            GgufDType::ForestRaven => 8.0,
+            GgufDType::GreyRaven => 4.75,
+            _ => return None,
+        })
+    }
 }
 
 impl GgufDType {
@@ -254,6 +334,13 @@ impl GgufDType {
             81 => Some(GgufDType::GsqRco3p5),
             142 => Some(GgufDType::PQ2_0),
             143 => Some(GgufDType::PTQ1_0),
+            // grim-native Raven/Crow block. See the enum for the width
+            // partitioning and why these are not GGUF.
+            Self::GRIM_NATIVE_4BIT_BASE => Some(GgufDType::WhiteCrow),
+            669 => Some(GgufDType::Raven),
+            670 => Some(GgufDType::WhiteRaven),
+            671 => Some(GgufDType::GreyRaven),
+            672 => Some(GgufDType::ForestRaven),
             _ => None,
         }
     }
@@ -301,6 +388,11 @@ impl GgufDType {
             GgufDType::GsqRco3p5 => 81,
             GgufDType::PQ2_0 => 142,
             GgufDType::PTQ1_0 => 143,
+            GgufDType::WhiteCrow => 660,
+            GgufDType::Raven => 669,
+            GgufDType::WhiteRaven => 670,
+            GgufDType::GreyRaven => 671,
+            GgufDType::ForestRaven => 672,
         }
     }
 
@@ -351,10 +443,18 @@ impl GgufDType {
             | GgufDType::IQ1_M
             | GgufDType::MXFP4
             | GgufDType::NVFP4 => 256,
-            // GGUF Q2_0 (tag 42) packs 64 weights per block (QK2_0), not 256.
-            GgufDType::GsqRco3p5 => 64,
+            // GGUF Q2_0 (tag 42) packs 64 weights per block (QK2_0), not 256. Prism
+            // GSQRCO (tag 81) shares this geometry.
+            GgufDType::Q2_0 | GgufDType::GsqRco3p5 => 64,
             // Prism-private: both are group-size 128.
             GgufDType::PQ2_0 => 128,
+            // grim-native. WhiteCrow is the one framed payload: group-128 (64
+            // codes + bf16 scale + u8 zero = 67 bytes). The rest are bare code
+            // planes, so block_size 1 with one byte per element.
+            GgufDType::WhiteCrow => 128,
+            GgufDType::Raven | GgufDType::WhiteRaven | GgufDType::ForestRaven => 1,
+            // 2:4 sparse: 16 survivors + 12 metadata bytes per 32 originals.
+            GgufDType::GreyRaven => 32,
             GgufDType::PTQ1_0 => 128,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
@@ -398,12 +498,30 @@ impl GgufDType {
             // NVFP4: 256 weights per super-block. 1 byte E8M0 scale per 16-elem
             // sub-block (16 scales) + 128 bytes packed E2M1 codes (2 per byte).
             GgufDType::NVFP4 => 16 + 128,
-            // GsqRco3p5 (GGUF Q2_0, QK2_0=64): 2-byte fp16 delta + 64*2/8 packed codes.
-            GgufDType::GsqRco3p5 => 18,
+            // Upstream Q2_0 (`ggml-common.h:187`): ggml_half d + qs[QK2_0/4] = 2 + 16 B.
+            // Prism GSQRCO (tag 81) shares this geometry.
+            GgufDType::Q2_0 | GgufDType::GsqRco3p5 => 18,
             // PQ2_0: 2-byte fp16 delta + 128*2/8 packed codes.
             GgufDType::PQ2_0 => 34,
             // PTQ1_0: 24 B qs (5 trits/byte) + 2 B qh (4 trits/byte) + 2 B fp16 delta.
             GgufDType::PTQ1_0 => 28,
+            // ---- grim-native Raven/Crow ------------------------------------
+            //
+            // These matter more than their neighbours: the reader derives a
+            // tensor's byte length from `block_size` / `type_size_per_block`,
+            // and this fn's fallback is `_ => 0`. A grim-native tag missing
+            // here does not error -- it declares a ZERO-BYTE tensor, which
+            // loads successfully and hands every downstream consumer an empty
+            // buffer. That is the exact failure this whole tag block was built
+            // to avoid, so the omission is silent by design and must be caught
+            // by `no_declared_format_sizes_its_tensor_to_zero_bytes`.
+            // WhiteCrow: 64 codes + bf16 scale + u8 zero per 128 weights.
+            GgufDType::WhiteCrow => 64 + 2 + 1,
+            // Bare code planes: one byte per weight. See the enum -- the reason
+            // there is no 4-byte scale prefix here.
+            GgufDType::Raven | GgufDType::WhiteRaven | GgufDType::ForestRaven => 1,
+            // 2:4 sparse: 16 survivor bytes + 12 metadata bytes per 32 originals.
+            GgufDType::GreyRaven => 16 + 12,
             _ => 0,
         }
     }
@@ -2076,17 +2194,73 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::GsqRco3p5),
         },
+        // Upstream `Q2_0` (tag 42), NOT GSQRCO. Both pack 64 weights into 18 bytes
+        // (2.25 bpw), but their codebooks differ by one level: upstream is
+        // `y = (q - 1) * d` over `{-1, 0, +1, +2}`, GSQRCO is `y = (q - 2) * d`
+        // over `{-2, -1, 0, +1}`. Confusing the two yields finite, plausible,
+        // wrong weights, so they get separate schemes.
+        //
+        // This is the tag the Qwen3.8-Flash-Next GSQ-RCO-3.5bit release writes
+        // for 62 expert tensors. Upstream llama.cpp reads that file with
+        // `dequantize_row_q2_0` and scores ppl 2.502
+        // (`plans/eval/qwen4exp-reference-ppl-2026-09-26.json`), which is what
+        // identifies the payload as `Q2_0` rather than GSQRCO.
+        GgufDType::Q2_0 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q2_0),
+        },
         // Prism-private formats: parsed and sized correctly so a checkpoint
         // using them fails later with a clear "not implemented" naming the
         // format, rather than an unknown-tag parse failure here. They are
         // deliberately NOT given a KQuant scheme, so no existing fused kernel
         // can be selected for them by accident.
+        // ---- grim-native Raven/Crow ------------------------------------
+        //
+        // WhiteRaven is the only one with a real loader. Its payload is FP8
+        // E4M3 codes in 16x16-blocked order, which is exactly what
+        // `Storage::FloatPack(Fp8Blocked16)` means to every downstream
+        // consumer: `varbuilder::dequant_to_f32` unblocks, the ROCm dispatch
+        // routes to `grim_wmma_gemm_fp8_e4m3_blocked`, and the host fallbacks
+        // (CPU, Vulkan, grim-format) unblock before decoding.
+        //
+        // `arith: U8` is load-bearing: the codes ARE the bytes, and declaring
+        // F32 (as the older Fp8 tag does) invites a consumer to reinterpret
+        // them as floats.
+        GgufDType::WhiteRaven => DType {
+            arith: grim_tensor::ArithType::U8,
+            storage: Storage::FloatPack(FloatPackScheme::Fp8Blocked16),
+        },
+        // The rest of the series is tagged but not loadable yet. They are
+        // refused HERE, naming the format, rather than left to fall through to
+        // a generic path -- a silently-wrong decode of a packed kernel payload
+        // is the failure mode this whole table exists to prevent.
+        GgufDType::Raven
+        | GgufDType::WhiteCrow
+        | GgufDType::ForestRaven
+        | GgufDType::GreyRaven => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
+                name: gguf_dtype.display_name(),
+                block_size: Some(gguf_dtype.block_size() as usize),
+                bytes_per_block: Some(gguf_dtype.type_size_per_block() as usize),
+                reason: format!(
+                    "{} is a grim-native kernel payload (GGUF tag {}, {}) with no file \
+                     loader yet. WhiteRaven (tag 670) is the one member of the series \
+                     that loads today; write that, or re-quantize to Q4_K/Q8_0.",
+                    gguf_dtype.display_name(),
+                    gguf_dtype.tag(),
+                    match gguf_dtype.grim_native_bpw() {
+                        Some(b) => format!("{b:.2} bpw"),
+                        None => "unknown width".into(),
+                    },
+                ),
+            }),
+        },
         GgufDType::PQ2_0
         | GgufDType::PTQ1_0
         | GgufDType::TQ1_0
         | GgufDType::TQ2_0
-        | GgufDType::Q1_0
-        | GgufDType::Q2_0 => DType {
+        | GgufDType::Q1_0 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {
                 name: gguf_dtype.display_name(),
@@ -2140,7 +2314,15 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::IQ4_NL
         | GgufDType::IQ4_XS
         | GgufDType::MXFP4
-        | GgufDType::NVFP4 => Some(4),
+        | GgufDType::NVFP4
+        // grim-native: WhiteCrow is 4-bit plus per-group scale/zero overhead,
+        // so its true density is 4.18 bpw, not 4. Claiming exactly 4 would
+        // understate VRAM.
+        | GgufDType::WhiteCrow => Some(4),
+        GgufDType::Raven
+        | GgufDType::WhiteRaven
+        | GgufDType::ForestRaven
+        | GgufDType::GreyRaven => Some(8),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
         GgufDType::Q2K
@@ -2208,6 +2390,11 @@ impl GgufDType {
             GgufDType::I16 => "I16",
             GgufDType::I32 => "I32",
             GgufDType::I64 => "I64",
+            GgufDType::WhiteCrow => "WhiteCrow",
+            GgufDType::Raven => "Raven",
+            GgufDType::WhiteRaven => "WhiteRaven",
+            GgufDType::GreyRaven => "GreyRaven",
+            GgufDType::ForestRaven => "ForestRaven",
             GgufDType::Q4_0 => "Q4_0",
             GgufDType::Q4_1 => "Q4_1",
             GgufDType::Q4_2 => "Q4_2",

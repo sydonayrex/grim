@@ -833,11 +833,17 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         QuantFormat::TreePie => {
             Err("TreePie has no GGUF type tag and cannot be written by the oxidizer".into())
         }
-        // WhiteRaven-blocked is grim-internal for now: the GGUF writer cannot
-        // tag a blocked-FP8 payload, so refuse at the point the user named it.
-        QuantFormat::Fp8Blocked16 => {
-            Err("Fp8Blocked16 has no GGUF type tag and cannot be written by the oxidizer".into())
-        }
+        // WhiteRaven now HAS a GGUF tag -- 670, in grim's own block -- but the
+        // tag is deliberately unreadable by any other tool. Writing it here
+        // would emit a checkpoint that llama.cpp rejects as an unknown type,
+        // which is a worse outcome than refusing at the point the user named
+        // the format. Grim-native payloads go through the .grim format.
+        QuantFormat::Fp8Blocked16 => Err(format!(
+            "Fp8Blocked16 (WhiteRaven, grim-native GGUF tag {}) is not portable: a stock \
+             GGUF reader rejects tag {} as unknown. Use the .grim format.",
+            GgufDType::WhiteRaven.tag(),
+            GgufDType::WhiteRaven.tag(),
+        )),
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
         QuantFormat::Q2_0 => Ok(GgufDType::Q2_0),
         QuantFormat::Q2K => Ok(GgufDType::Q2K),
