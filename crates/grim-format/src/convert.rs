@@ -592,7 +592,7 @@ fn convert_to_grim_inner(
     let profile = gcn_to_profile(target_gcn);
     let wave = wave.unwrap_or_else(|| crate::format::WaveSize::from_gcn(target_gcn));
 
-    let (entries, ext_entries) = build_entries_from_source(
+    let (entries, ext_entries, mut discovered_overrides) = build_entries_from_source(
         input_path,
         target_bpw,
         evopress_bitwidths.clone(),
@@ -637,6 +637,10 @@ fn convert_to_grim_inner(
     if !ext_entries.is_empty() {
         metadata.ext_entries = ext_entries;
     }
+    // Corvid passthrough tensors discovered by `pack_tensors`: record their
+    // scheme in quant_overrides, or the reader falls back to a
+    // bitwidth-derived dtype and decodes a blocked-FP8 payload as Q80.
+    metadata.quant_overrides.append(&mut discovered_overrides);
     if metadata.quant_method.is_none() {
         metadata.quant_method = Some(if evopress_bitwidths.is_some() {
             "evopress-gptq".to_string()
@@ -729,6 +733,7 @@ fn build_entries_from_source(
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
     Vec<crate::spec::GrimTensorExt>,
+    Vec<crate::gguf::GrimQuantOverride>,
 )> {
     let lower = input_path.to_ascii_lowercase();
     if lower.ends_with(".gguf") || lower.ends_with(".grim") {
@@ -744,6 +749,7 @@ fn build_entries_from_source(
             progress,
             gpu_dequant,
         )
+
     } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
         let provider = crate::tprov::SafetensorsProvider::open(input_path)?;
         let mut names: Vec<String> = provider.tensors().keys().cloned().collect();
@@ -779,6 +785,7 @@ fn pack_tensors(
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
     Vec<crate::spec::GrimTensorExt>,
+    Vec<crate::gguf::GrimQuantOverride>,
 )> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -792,6 +799,7 @@ fn pack_tensors(
         Vec<(
             (crate::format::GrimTensorEntry, Vec<u8>),
             crate::spec::GrimTensorExt,
+            Option<crate::gguf::GrimQuantOverride>,
         )>,
     > = names
         .par_iter()
@@ -806,6 +814,49 @@ fn pack_tensors(
                 );
             }
             let elem_count: usize = raw.shape.iter().product();
+
+            // Corvid formats (WhiteRaven today) are packed payloads whose
+            // layout no `pack_row_bpw_for_wave` mode can reproduce. The source
+            // provider already holds their bytes in the right order, so pass
+            // them through verbatim and remember the scheme in
+            // `quant_overrides` -- re-encoding through the F32 requant path
+            // would both lose the layout and decode the codes as weights.
+            if matches!(
+                raw.dtype.storage,
+                grim_tensor::dtype::Storage::FloatPack(
+                    grim_tensor::dtype::FloatPackScheme::Fp8Blocked16
+                )
+            ) {
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: raw.shape.clone(),
+                    base_bitwidth: 8,
+                    payload_offset: 0,
+                    payload_size: raw.bytes.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 8,
+                    override_dtype: crate::gguf::GgufDType::WhiteRaven,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, raw.bytes), ext, Some(override_)));
+            }
 
             let tensor_bitwidth = if let Some(ref bitwidths) = evopress_bitwidths {
                 bitwidths
@@ -895,20 +946,24 @@ fn pack_tensors(
                 }
             }
 
-            Ok(((entry, normals), spqr_ext))
+            Ok(((entry, normals), spqr_ext, None))
         })
         .collect();
 
     let packed_items = packed_items?;
     let mut result = Vec::with_capacity(total);
     let mut ext_entries = Vec::with_capacity(total);
+    let mut overrides = Vec::new();
 
-    for (item, ext) in packed_items {
+    for (item, ext, ov) in packed_items {
         result.push(item);
         ext_entries.push(ext);
+        if let Some(o) = ov {
+            overrides.push(o);
+        }
     }
 
-    Ok((result, ext_entries))
+    Ok((result, ext_entries, overrides))
 }
 
 /// Map a GCN architecture string to a ROCm profile.
@@ -1165,7 +1220,7 @@ mod tests {
 
         let names = vec![name_attn_sq, name_ffn_sq, name_attn_rect];
         let mut progress = None;
-        let (packed_entries, _) = pack_tensors(
+        let (packed_entries, _, _) = pack_tensors(
             &provider,
             &names,
             8.0, // target_bpw

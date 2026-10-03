@@ -1099,6 +1099,27 @@ impl TensorProvider for GrimProvider {
         let mut reader = std::io::Cursor::new(&self.mmap[..]);
         let bytes = read_normals(&mut reader, entry)?;
 
+        // An explicit `grim.quant_overrides` entry names the tensor's true
+        // scheme and wins over every path below. This is the mechanism by
+        // which the Raven/Crow family round-trips through `.grim`: their
+        // payloads are packed kernel layouts that `dtype_from_bitwidth` --
+        // which sees only a bit count -- cannot reconstruct, and that the
+        // ExtFp8/block-16 heuristic below would actively misdecode.
+        if let Some(ov) = self.file.metadata.override_for(name) {
+            let dt = crate::gguf::map_gguf_dtype_to_storage(ov.override_dtype);
+            if !matches!(
+                dt.storage,
+                grim_tensor::dtype::Storage::Unsupported(_)
+            ) {
+                return Ok(RawTensor {
+                    bytes,
+                    shape: entry.shape.clone(),
+                    dtype: dt,
+                    provenance: QuantProvenance::GrimNative,
+                });
+            }
+        }
+
         if let Some(ext) = self.ext_for(name) {
             let residual = ext.scale_size != 0
                 || ext.backup1.bpw != 0
@@ -1212,8 +1233,24 @@ impl TensorProvider for GrimProvider {
             .tensor(name)
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in .grim file")))?;
         let fusion_mask = self.ext_for(name).map(|ext| ext.fusion_mask).unwrap_or(0);
+        // `meta` mirrors the override resolution in `get`: without it, a
+        // WhiteRaven tensor reports Q80 here while `get` returns the blocked
+        // dtype, and every consumer that trusts meta for layout decisions
+        // dispatches the wrong kernel.
+        let dt = self
+            .file
+            .metadata
+            .override_for(name)
+            .map(|ov| crate::gguf::map_gguf_dtype_to_storage(ov.override_dtype))
+            .filter(|dt| {
+                !matches!(
+                    dt.storage,
+                    grim_tensor::dtype::Storage::Unsupported(_)
+                )
+            })
+            .unwrap_or_else(|| dtype_from_bitwidth(entry.base_bitwidth));
         Ok(TensorMeta {
-            dtype: dtype_from_bitwidth(entry.base_bitwidth),
+            dtype: dt,
             provenance: QuantProvenance::GrimNative,
             shape: entry.shape.clone(),
             fusion_mask,
