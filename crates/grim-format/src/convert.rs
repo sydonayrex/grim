@@ -795,6 +795,38 @@ fn pack_tensors(
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // The format name is the contract with the user: an unknown string must
+    // fail the run BEFORE any tensor is packed, not silently produce a
+    // uniform target-bpw file under a different name.
+    if let Some(f) = target_format {
+        match f.to_ascii_lowercase().as_str() {
+            "whiteraven" | "raven" | "whitecrow" => {}
+            "gsq_rco_3p5" | "gsqrco" => {}
+            "greyraven" => {
+                return Err(Error::Backend(
+                    "--format greyraven: GreyRaven (FP8 2:4, V_SWMMAC_F32_16X16X32) has a \
+                     packer but no production kernel yet; the probe kernel cannot consume a \
+                     converted model. Tracked as the next WS-E step."
+                        .into(),
+                ));
+            }
+            "forestraven" => {
+                return Err(Error::Backend(
+                    "--format forestraven: ForestRaven (bare INT8, V_DOT4_I32_IU8) has no \
+                     packer, no QuantFormat storage, and no kernel route. Serialise it as \
+                     Q8_0 and vectorise the dequantise-in-LDS path first."
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(Error::Backend(format!(
+                    "--format '{other}': unknown. Supported: whiteraven (FP8-blocked), \
+                     raven (FP8), whitecrow (W4A4 OSTQuant), gsq_rco_3p5 (tag 81)."
+                )));
+            }
+        }
+    }
+
     let total = names.len();
     let completed = AtomicUsize::new(0);
     use std::sync::Mutex;
@@ -826,16 +858,36 @@ fn pack_tensors(
             // them through verbatim and remember the scheme in
             // `quant_overrides` -- re-encoding through the F32 requant path
             // would both lose the layout and decode the codes as weights.
-            if matches!(
-                raw.dtype.storage,
+            // Corvid formats are packed kernel layouts whose byte arrange no
+            // `pack_row_bpw_for_wave` mode reproduces. If the source provider
+            // already holds their bytes in the right order, pass them through
+            // verbatim and remember the scheme in `quant_overrides` --
+            // re-encoding through the F32 requant path would both lose the
+            // layout and decode the codes as weights. GreyRaven (2:4 packed)
+            // is deliberately NOT in this list: its only consumer refusing to
+            // read is the blocker we refuse to widen, so a raw pass-through
+            // would just stage silent prohibition. It errors loudly below.
+            let corvid_tag = match &raw.dtype.storage {
                 grim_tensor::dtype::Storage::FloatPack(
-                    grim_tensor::dtype::FloatPackScheme::Fp8Blocked16
-                )
-            ) {
+                    grim_tensor::dtype::FloatPackScheme::Fp8Blocked16,
+                ) => Some((
+                    crate::gguf::GgufDType::WhiteRaven,
+                    8u8,
+                )),
+                grim_tensor::dtype::Storage::FloatPack(
+                    grim_tensor::dtype::FloatPackScheme::Fp8,
+                ) => Some((crate::gguf::GgufDType::Raven, 8u8)),
+                grim_tensor::dtype::Storage::W4A4OstQuant(_) => Some((
+                    crate::gguf::GgufDType::WhiteCrow,
+                    4u8,
+                )),
+                _ => None,
+            };
+            if let Some((tag, bpw)) = corvid_tag {
                 let entry = crate::format::GrimTensorEntry {
                     name: name.clone(),
                     shape: raw.shape.clone(),
-                    base_bitwidth: 8,
+                    base_bitwidth: bpw,
                     payload_offset: 0,
                     payload_size: raw.bytes.len() as u64,
                     outlier_count: 0,
@@ -849,8 +901,8 @@ fn pack_tensors(
                 };
                 let override_ = crate::gguf::GrimQuantOverride {
                     tensor_name: name.clone(),
-                    effective_bpw: 8,
-                    override_dtype: crate::gguf::GgufDType::WhiteRaven,
+                    effective_bpw: bpw as u32,
+                    override_dtype: tag,
                     importance_score: 0.0,
                     layout_hint: None,
                 };
@@ -908,6 +960,151 @@ fn pack_tensors(
                 // GQA with differing Q/KV dims).
             }
 
+            // Raven (dense FP8, bare codes) and WhiteCrow (W4A4 OSTQuant
+            // blob) take the same shape as the WhiteRaven arm: a 2D tensor
+            // with a kernel-compatible extent, otherwise fall through to the
+            // uniform pack so the file still loads.
+            let fmt = target_format.map(|f| f.to_ascii_lowercase());
+            if matches!(fmt.as_deref(), Some("raven"))
+                && meta.shape.len() == 2
+                && meta.shape[0] > 0
+                && meta.shape[1] > 0
+            {
+                let (n, k) = (meta.shape[0], meta.shape[1]);
+                let codes: Vec<u8> = f32_values
+                    .iter()
+                    .map(|&v| grim_quant::f32_to_fp8_e4m3(v))
+                    .collect();
+                debug_assert_eq!(codes.len(), n * k);
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 8,
+                    payload_offset: 0,
+                    payload_size: codes.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 8,
+                    override_dtype: crate::gguf::GgufDType::Raven,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, codes), ext, Some(override_)));
+            }
+
+            // GSQ-RCO 3.5-bit (tag 81): 18 B / 64-weight blocks, GSQ codebook
+            // {-2,-1,0,+1} (old/repo/GSQ-main gumbel_quantizer_2bit.py:10).
+            // The .grim payload is the same byte stream the GGUF tag-81
+            // reader consumes, so the packed entry needs no per-tensor ext
+            // beyond the block size.
+            if matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco"))
+                && meta.shape.len() == 2
+                && meta.shape[0] > 0
+                && meta.shape[1] > 0
+            {
+                let (n, k) = (meta.shape[0], meta.shape[1]);
+                let mut bytes =
+                    vec![0u8; (n * k).div_ceil(grim_quant::BLOCK_SIZE_Q2_0) * grim_quant::BLOCK_BYTES_Q2_0];
+                grim_quant::quantize_gsq_rco_3p5_block(&f32_values, &mut bytes)
+                    .map_err(|e| Error::Backend(format!("GSQ-RCO quant for '{name}': {e}")))?;
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 2,
+                    payload_offset: 0,
+                    payload_size: bytes.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 64,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 2,
+                    override_dtype: crate::gguf::GgufDType::GsqRco3p5,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, bytes), ext, Some(override_)));
+            }
+
+            // WhiteCrow needs group-128 along K: a 32x64 attention projection
+            // cannot carry it, and silently emitting a two-segment group would
+            // encode weights the reader cannot reconstruct. Shape check first.
+            if matches!(fmt.as_deref(), Some("whitecrow"))
+                && meta.shape.len() == 2
+                && meta.shape[0] > 0
+                && meta.shape[1] > 0
+                && meta.shape[1] % 128 == 0
+            {
+                let (n, k) = (meta.shape[0], meta.shape[1]);
+                let (qw, sc, zr) = grim_quant::quant_ostquant_w4_group128(&f32_values, n, k)
+                    .map_err(|e| Error::Backend(format!("WhiteCrow quant for '{name}': {e}")))?;
+                // Same length-prefixed triple stream the native OSTQuant path
+                // and the ROCm sudot8 blob launcher consume.
+                let mut blob = Vec::with_capacity(24 + qw.len() + sc.len() + zr.len());
+                blob.extend_from_slice(&(qw.len() as u64).to_le_bytes());
+                blob.extend_from_slice(&qw);
+                blob.extend_from_slice(&(sc.len() as u64).to_le_bytes());
+                blob.extend_from_slice(&sc);
+                blob.extend_from_slice(&(zr.len() as u64).to_le_bytes());
+                blob.extend_from_slice(&zr);
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 4,
+                    payload_offset: 0,
+                    payload_size: blob.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 128,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 4,
+                    override_dtype: crate::gguf::GgufDType::WhiteCrow,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, blob), ext, Some(override_)));
+            }
+
             // WhiteRaven target: pack every 2D weight tensor as blocked FP8 in
             // one step -- F32 dequant, E4M3 codes, 16x16 tiling, and the
             // quant_override that tells the reader this is a kernel layout
@@ -916,7 +1113,7 @@ fn pack_tensors(
             // shapes) falls through to the uniform path, so a mixed file
             // still loads -- the non-WhiteRaven tensors simply carry no
             // override.
-            if matches!(target_format, Some(f) if f.eq_ignore_ascii_case("whiteraven"))
+            if matches!(fmt.as_deref(), Some("whiteraven"))
                 && meta.shape.len() == 2
                 && meta.shape[0] > 0
                 && meta.shape[1] > 0

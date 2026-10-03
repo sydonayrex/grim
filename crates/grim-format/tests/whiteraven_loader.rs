@@ -167,9 +167,9 @@ fn the_other_series_tags_load_as_unsupported_naming_the_format_and_the_remedy() 
     // would be worse -- it would turn "this format has no loader" into "this
     // file is broken", which is a different bug and sends the user to the wrong
     // place.
+    // Raven (669) and WhiteCrow (660) resolved to real loads once their
+    // QuantFormats landed; only these two are still deliberately refused.
     for (dtype, tag_name) in [
-        (GgufDType::Raven, "raven"),
-        (GgufDType::WhiteCrow, "whitecrow"),
         (GgufDType::ForestRaven, "forestraven"),
         (GgufDType::GreyRaven, "greyraven"),
     ] {

@@ -3887,6 +3887,26 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
                     .to_string(),
             ))
         }
+        QuantFormat::W4A4OstQuant => {
+            if plan.shape.len() < 2 {
+                return Err(Error::Backend(format!(
+                    "W4A4OstQuant rewrite needs [n, k] shape, got {:?}",
+                    plan.shape
+                )));
+            }
+            let (n, k) = (plan.shape[0], plan.shape[1]);
+            let (qw, sc, zr) = quant_ostquant_w4_group128(data, n, k)?;
+            // Same length-prefixed triple stream the native OSTQuant provider
+            // emits ([u64 qw_len][qw][u64 sc_len][sc][u64 zr_len][zr]).
+            let mut out = Vec::with_capacity(24 + qw.len() + sc.len() + zr.len());
+            out.extend_from_slice(&(qw.len() as u64).to_le_bytes());
+            out.extend_from_slice(&qw);
+            out.extend_from_slice(&(sc.len() as u64).to_le_bytes());
+            out.extend_from_slice(&sc);
+            out.extend_from_slice(&(zr.len() as u64).to_le_bytes());
+            out.extend_from_slice(&zr);
+            out
+        }
         // 128x128 block FP8 is a *load-time* format for checkpoints that already
         // ship it (DeepSeek-style `weight_scale_inv`). There is no f32 -> packed
         // rewriter: producing one would need a source-side scale grid.
@@ -3915,6 +3935,25 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         QuantFormat::Iq2Xxs => quant_iq2xxs(data)?,
         QuantFormat::Iq2Xs => quant_iq2xs(data)?,
         QuantFormat::Iq2S => quant_iq2s(data)?,
+        // Upstream Q2_0: one fp16 scale + 16 B of packed 2-bit codes per
+        // 64-weight block, 18 B/block.
+        QuantFormat::Q2_0 => {
+            let n = plan.shape.iter().product::<usize>();
+            let blocks = n.div_ceil(BLOCK_SIZE_Q2_0);
+            let mut bytes = vec![0u8; blocks * BLOCK_BYTES_Q2_0];
+            quantize_q2_0_block(data, &mut bytes)?;
+            bytes
+        }
+        // GSQ-RCO 3.5-bit (tag 81): same block bytes as Q2_0, codebook
+        // {-2,-1,0,+1} — the inverse of dequant_gsq_rco_3p5, NOT of
+        // dequant_q2_0. See quantize_gsq_rco_3p5_block for the sources.
+        QuantFormat::GsqRco3p5 => {
+            let n = plan.shape.iter().product::<usize>();
+            let blocks = n.div_ceil(BLOCK_SIZE_Q2_0);
+            let mut bytes = vec![0u8; blocks * BLOCK_BYTES_Q2_0];
+            quantize_gsq_rco_3p5_block(data, &mut bytes)?;
+            bytes
+        }
     };
 
     Ok(RewrittenTensorData {
@@ -8142,16 +8181,22 @@ pub fn dequant_fp8_block128(data: &[u8]) -> Result<Vec<f32>> {
     Ok(w)
 }
 
-/// Weights per Q2_0 block (`QK2_0` in ggml-common.h).
-pub const BLOCK_SIZE_GSQ_RCO_3P5: usize = 64;
-/// Bytes per Q2_0 block: 2-byte fp16 delta + 64*2/8 bytes of packed 2-bit codes.
-pub const BLOCK_BYTES_GSQ_RCO_3P5: usize = 18;
-
-/// Dequantize GGUF `Q2_0` (dtype tag 42) packed weights to `f32`.
+/// Weights per 18-byte 2-bit block (`QK2_0` in `ggml-common.h:187`).
 ///
-/// Layout and math are transcribed from ggml-org/llama.cpp at commit
-/// `f3f1a8f2760f28325a5ec20c05b171e5b7c83a29`, which is the runtime the
-/// Qwen3.8-Flash-Next GSQ-RCO release is pinned to:
+/// Shared by upstream `Q2_0` (tag 42) and Prism GSQRCO (tag 81): the block is
+/// `ggml_half d` + `qs[16]`, so both pack 64 weights into 18 bytes (2.25 bpw).
+pub const BLOCK_SIZE_Q2_0: usize = 64;
+/// Bytes per block: 2-byte fp16 delta + 64*2/8 bytes of packed 2-bit codes.
+pub const BLOCK_BYTES_Q2_0: usize = 18;
+/// Alias kept for the GSQRCO call sites, which share the same geometry.
+pub const BLOCK_SIZE_GSQ_RCO_3P5: usize = BLOCK_SIZE_Q2_0;
+/// Alias kept for the GSQRCO call sites, which share the same geometry.
+pub const BLOCK_BYTES_GSQ_RCO_3P5: usize = BLOCK_BYTES_Q2_0;
+
+/// Dequantize upstream GGUF `Q2_0` (dtype tag 42) packed weights to `f32`.
+///
+/// Transcribed from ggml-org/llama.cpp at commit `f3f1a8f27`, the runtime the
+/// Qwen3.8-Flash-Next GSQ-RCO-3.5bit release is pinned to:
 ///
 /// ```c
 /// #define QK2_0 64
@@ -8169,30 +8214,52 @@ pub const BLOCK_BYTES_GSQ_RCO_3P5: usize = 18;
 /// y[i*qk + j] = ((int)q - 1) * d;
 /// ```
 ///
-/// Note the 2-bit codebook is *asymmetric and zero-centered at code 1*, not the
-/// `-2..+1` used by the older `Q2_0` proposal, and there is no `dmin` and no
-/// per-sub-block scale. Effective rate is 2.25 bits per weight either way; the
-/// earlier 256-weight/72-byte reading of this format was wrong.
+/// The codebook is zero-centered at code 1 (`{-1, 0, +1, +2}`), there is no
+/// `dmin`, and no per-sub-block scale. This is NOT the GSQRCO codebook, which
+/// is `{-2, -1, 0, +1}` — see [`dequant_gsq_rco_3p5`]. Effective rate is 2.25
+/// bits per weight either way; the earlier 256-weight/72-byte reading of this
+/// format was wrong (72 B = 4 x 18 B describes the same bytes in
+/// groups-of-4 framing).
 ///
 /// # Errors
 /// Returns [`Error::Backend`] when `data` is shorter than the block-aligned
 /// requirement for `num_weights`, or when `num_weights` is not a multiple of
-/// [`BLOCK_SIZE_GSQ_RCO_3P5`] (GGUF rows are always block-aligned, so a ragged
+/// [`BLOCK_SIZE_Q2_0`] (GGUF rows are always block-aligned, so a ragged
 /// count means the caller computed the tensor size wrongly).
+pub fn dequant_q2_0(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    dequant_2bit_blocks(data, num_weights, "q2_0", 1.0)
+}
+
+/// GSQRCO shares [`BLOCK_SIZE_Q2_0`] geometry with `Q2_0` but uses the
+/// GumbelQuantizer2Bit codebook `{-2, -1, 0, +1} * scale`, i.e.
+/// `y = (q - 2) * d`. The two decoders differ by exactly one level of `d`,
+/// so a wrong-codebook decode yields finite, plausible, wrong weights.
 pub fn dequant_gsq_rco_3p5(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    dequant_2bit_blocks(data, num_weights, "gsq_rco_3p5", 2.0)
+}
+
+/// Shared core for the two 18-byte / 64-elem 2-bit formats: `y = (q - bias) * d`
+/// with `d` an fp16 read little-endian from the first two bytes of the block
+/// and 4 codes packed per byte.
+fn dequant_2bit_blocks(
+    data: &[u8],
+    num_weights: usize,
+    label: &str,
+    bias: f32,
+) -> Result<Vec<f32>> {
     if num_weights == 0 {
         return Ok(Vec::new());
     }
-    if num_weights % BLOCK_SIZE_GSQ_RCO_3P5 != 0 {
+    if num_weights % BLOCK_SIZE_Q2_0 != 0 {
         return Err(Error::Backend(format!(
-            "dequant_gsq_rco_3p5: {num_weights} weights is not a multiple of block size {BLOCK_SIZE_GSQ_RCO_3P5}"
+            "dequant_{label}: {num_weights} weights is not a multiple of block size {BLOCK_SIZE_Q2_0}"
         )));
     }
-    let num_blocks = num_weights / BLOCK_SIZE_GSQ_RCO_3P5;
-    let expected_bytes = num_blocks * BLOCK_BYTES_GSQ_RCO_3P5;
+    let num_blocks = num_weights / BLOCK_SIZE_Q2_0;
+    let expected_bytes = num_blocks * BLOCK_BYTES_Q2_0;
     if data.len() < expected_bytes {
         return Err(Error::Backend(format!(
-            "dequant_gsq_rco_3p5: buffer too short: expected {expected_bytes}, have {}",
+            "dequant_{label}: buffer too short: expected {expected_bytes}, have {}",
             data.len()
         )));
     }
@@ -8200,18 +8267,18 @@ pub fn dequant_gsq_rco_3p5(data: &[u8], num_weights: usize) -> Result<Vec<f32>> 
     let mut pos = 0;
     for _ in 0..num_blocks {
         let d = f16_to_f32(data[pos], data[pos + 1]);
-        let qs = &data[pos + 2..pos + BLOCK_BYTES_GSQ_RCO_3P5];
-        for j in 0..BLOCK_SIZE_GSQ_RCO_3P5 {
+        let qs = &data[pos + 2..pos + BLOCK_BYTES_Q2_0];
+        for j in 0..BLOCK_SIZE_Q2_0 {
             let q = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
-            out.push((q as f32 - 1.0) * d);
+            out.push((q as f32 - bias) * d);
         }
-        pos += BLOCK_BYTES_GSQ_RCO_3P5;
+        pos += BLOCK_BYTES_Q2_0;
     }
     Ok(out)
 }
 
-/// Pack `f32` weights into GGUF `Q2_0` blocks, the exact inverse of
-/// [`dequant_gsq_rco_3p5`].
+/// Pack `f32` weights into upstream GGUF `Q2_0` blocks, the exact inverse of
+/// [`dequant_q2_0`].
 ///
 /// This exists for round-trip KATs and for tests that need a non-degenerate
 /// block: an all-zero input block dequantizes correctly under *any* layout, so
@@ -8225,17 +8292,17 @@ pub fn dequant_gsq_rco_3p5(data: &[u8], num_weights: usize) -> Result<Vec<f32>> 
 ///
 /// # Errors
 /// Returns [`Error::Backend`] when `values.len()` is not a multiple of
-/// [`BLOCK_SIZE_GSQ_RCO_3P5`], when `data` is too small to hold the output, or
+/// [`BLOCK_SIZE_Q2_0`], when `data` is too small to hold the output, or
 /// when a block is all zeros (which has no representable `d`).
 pub fn quantize_q2_0_block(values: &[f32], out: &mut [u8]) -> Result<()> {
-    if values.len() % BLOCK_SIZE_GSQ_RCO_3P5 != 0 {
+    if values.len() % BLOCK_SIZE_Q2_0 != 0 {
         return Err(Error::Backend(format!(
-            "quantize_q2_0_block: {} values is not a multiple of block size {BLOCK_SIZE_GSQ_RCO_3P5}",
+            "quantize_q2_0_block: {} values is not a multiple of block size {BLOCK_SIZE_Q2_0}",
             values.len()
         )));
     }
-    let num_blocks = values.len() / BLOCK_SIZE_GSQ_RCO_3P5;
-    let needed = num_blocks * BLOCK_BYTES_GSQ_RCO_3P5;
+    let num_blocks = values.len() / BLOCK_SIZE_Q2_0;
+    let needed = num_blocks * BLOCK_BYTES_Q2_0;
     if out.len() < needed {
         return Err(Error::Backend(format!(
             "quantize_q2_0_block: output too short: need {needed}, have {}",
@@ -8244,7 +8311,7 @@ pub fn quantize_q2_0_block(values: &[f32], out: &mut [u8]) -> Result<()> {
     }
 
     for b in 0..num_blocks {
-        let block = &values[b * BLOCK_SIZE_GSQ_RCO_3P5..(b + 1) * BLOCK_SIZE_GSQ_RCO_3P5];
+        let block = &values[b * BLOCK_SIZE_Q2_0..(b + 1) * BLOCK_SIZE_Q2_0];
         let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         if !(amax > 0.0) {
             return Err(Error::Backend(format!(
@@ -8258,15 +8325,127 @@ pub fn quantize_q2_0_block(values: &[f32], out: &mut [u8]) -> Result<()> {
             )));
         }
         // Round-trip through fp16 so `d` here is bit-identical to what
-        // `dequant_gsq_rco_3p5` will read back, not the original f32 scale.
+        // `dequant_q2_0` will read back, not the original f32 scale.
         let d = f16_to_f32(d_bits as u8, (d_bits >> 8) as u8);
 
-        let base = b * BLOCK_BYTES_GSQ_RCO_3P5;
+        let base = b * BLOCK_BYTES_Q2_0;
         out[base] = d_bits as u8;
         out[base + 1] = (d_bits >> 8) as u8;
-        for j in 0..BLOCK_SIZE_GSQ_RCO_3P5 {
+        for j in 0..BLOCK_SIZE_Q2_0 {
             // Nearest codebook point in units of d: {-1, 0, +1, +2}.
             let t = (block[j] / d) + 1.0;
+            let code = if t <= 0.5 {
+                0u8
+            } else if t <= 1.5 {
+                1
+            } else if t <= 2.5 {
+                2
+            } else {
+                3
+            };
+            out[base + 2 + j / 4] |= code << ((j % 4) * 2);
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// GSQ-RCO 3.5-bit (GGUF tag 81) — the quantize side
+//
+// The format's source of truth is the GSQ paper's own quantizer
+// (old/repo/GSQ-main/src/quantization/gumbel_quantizer_2bit.py:10):
+// `values = [-2, -1, 0, 1]`, so codes 0..3 mean (q - 2) * d — one level of d
+// BELOW upstream Q2_0's (q - 1) * d (llama.cpp ggml-quants.c:439). The block
+// geometry (fp16 d at the head, 4 codes per byte low-nibble-first) is shared,
+// which is exactly why a wrong-codebook decode is silent: same bytes, finite,
+// plausible, off-by-one-level weights. `dequant_gsq_rco_3p5` above is the
+// bias-2 reader; this packer is its inverse.
+//
+// What this is NOT: the GSQ optimizer. The paper's scales are LEARNED per
+// group-128 by Gumbel-Softmax over calibration data; this writer does the
+// RTN baseline (nearest level, MSE-fitted per-block scale), which is the
+// floor the paper's method improves on. A true GSQ conversion is a
+// calibration run, not a kernel.
+// ============================================================================
+
+/// Quantize f32 weights into GSQ-RCO 3.5-bit blocks (GGUF tag 81), the exact
+/// inverse of [`dequant_gsq_rco_3p5`].
+///
+/// Per 64-weight block: fp16 `d` at the head, then 16 bytes of 2-bit codes,
+/// low nibble first, where code `q` decodes to `(q - 2) * d` over the level
+/// set `{-2, -1, 0, +1}`. The scale is fitted per block by a deterministic
+/// MSE scan over `d` in `[amax/2, amax]` — the range where the block's
+/// largest magnitude stays representable (below amax/2 the most negative
+/// weight needs a code below -2d; above amax the most positive weight
+/// exceeds the largest level +1d) — rounded through fp16 BEFORE code
+/// assignment, so `dequant_gsq_rco_3p5` reads back exactly the scale the
+/// codes were fitted against.
+///
+/// # Errors
+/// Mirrors [`quantize_q2_0_block`]: non-multiple of [`BLOCK_SIZE_Q2_0`],
+/// output too short, all-zero block, or a scale not representable in fp16.
+pub fn quantize_gsq_rco_3p5_block(values: &[f32], out: &mut [u8]) -> Result<()> {
+    if values.len() % BLOCK_SIZE_Q2_0 != 0 {
+        return Err(Error::Backend(format!(
+            "quantize_gsq_rco_3p5_block: {} values is not a multiple of block size {BLOCK_SIZE_Q2_0}",
+            values.len()
+        )));
+    }
+    let num_blocks = values.len() / BLOCK_SIZE_Q2_0;
+    let needed = num_blocks * BLOCK_BYTES_Q2_0;
+    if out.len() < needed {
+        return Err(Error::Backend(format!(
+            "quantize_gsq_rco_3p5_block: output too short: need {needed}, have {}",
+            out.len()
+        )));
+    }
+
+    for b in 0..num_blocks {
+        let block = &values[b * BLOCK_SIZE_Q2_0..(b + 1) * BLOCK_SIZE_Q2_0];
+        let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if !(amax > 0.0) {
+            return Err(Error::Backend(format!(
+                "quantize_gsq_rco_3p5_block: block {b} is all zeros and has no representable scale"
+            )));
+        }
+
+        let mut best_d_bits = 0u16;
+        let mut best_mse = f32::INFINITY;
+        for step in 0..=128u32 {
+            let d = amax / 2.0 + (amax / 2.0) * (step as f32 / 128.0);
+            let d_bits = f32_to_f16(d);
+            if d_bits == 0 {
+                continue;
+            }
+            // Fit codes against the fp16-ROUNDED scale: the decoder reads
+            // this exact value back, so the MSE must be measured against it,
+            // not against the pre-rounding f32.
+            let d16 = f16_to_f32(d_bits as u8, (d_bits >> 8) as u8);
+            let mut mse = 0.0f32;
+            for v in block {
+                let t = v / d16;
+                let level = (t.round() as i32).clamp(-2, 1) as f32;
+                let err = v - level * d16;
+                mse += err * err;
+            }
+            if mse < best_mse {
+                best_mse = mse;
+                best_d_bits = d_bits;
+            }
+        }
+        if best_d_bits == 0 {
+            return Err(Error::Backend(format!(
+                "quantize_gsq_rco_3p5_block: block {b} scale {amax} is not representable in fp16"
+            )));
+        }
+        let d = f16_to_f32(best_d_bits as u8, (best_d_bits >> 8) as u8);
+
+        let base = b * BLOCK_BYTES_Q2_0;
+        out[base] = best_d_bits as u8;
+        out[base + 1] = (best_d_bits >> 8) as u8;
+        for j in 0..BLOCK_SIZE_Q2_0 {
+            // Nearest codebook point in units of d: {-2, -1, 0, +1}.
+            let t = (block[j] / d) + 2.0;
             let code = if t <= 0.5 {
                 0u8
             } else if t <= 1.5 {

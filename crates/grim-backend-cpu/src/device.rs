@@ -1700,6 +1700,18 @@ impl QuantOps for CpuDevice {
                     }
                     // WhiteRaven blocked: same E4M3 codes as Fp8, blocked
                     // arrangement; unblock with (n, k) geometry first.
+                    // WhiteCrow: W4A4 OSTQuant. Host refusal: the packed blob
+                    // (length-prefixed [qw][sc][zr]) has no host decoder, and
+                    // dequantising it as a dense W4 stream would reinterpret
+                    // the segment prefixes as weights. The sudot8 path is
+                    // RDNA4-only; without it there is nothing to fall back to.
+                    grim_tensor::QuantFormat::W4A4OstQuant => {
+                        return Err(Error::Backend(
+                            "WhiteCrow (W4A4 OSTQuant): no CPU decode path; \
+                             produced on gfx12 via the sudot8 GEMM"
+                                .to_string(),
+                        ))
+                    }
                     grim_tensor::QuantFormat::Fp8Blocked16 => {
                         grim_quant::dequant_fp8_blocked16(&b_bytes, n, k).map_err(|e| {
                             Error::Backend(format!("CPU quantized_matmul FP8-blocked dequant: {e}"))
@@ -1726,6 +1738,16 @@ impl QuantOps for CpuDevice {
                     grim_tensor::QuantFormat::Q2K => grim_quant::dequant_q2k(b_bytes, k * n)
                         .map_err(|e| {
                             Error::Backend(format!("CPU quantized_matmul Q2K dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::GsqRco3p5 => {
+                        grim_quant::dequant_gsq_rco_3p5(b_bytes, k * n)
+                            .map_err(|e| {
+                                Error::Backend(format!("CPU quantized_matmul GSQ_RCO dequant: {e}"))
+                            })?
+                    },
+                    grim_tensor::QuantFormat::Q2_0 => grim_quant::dequant_q2_0(b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul Q2_0 dequant: {e}"))
                         })?,
                     grim_tensor::QuantFormat::Q3K => grim_quant::dequant_q3k(b_bytes, k * n)
                         .map_err(|e| {
@@ -2569,7 +2591,9 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(raw, n),
                 grim_tensor::dtype::KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(raw, n),
                 grim_tensor::dtype::KQuantScheme::IQ2S => grim_quant::dequant_iq2s(raw, n),
-                // GGUF Q2_0 (tag 42): 64 weights per 18-byte block.
+                // Upstream Q2_0 (tag 42): 64 weights per 18-byte block, codebook {-1,0,+1,+2}.
+                grim_tensor::dtype::KQuantScheme::Q2_0 => grim_quant::dequant_q2_0(raw, n),
+                // Prism GSQRCO (tag 81): same geometry, codebook {-2,-1,0,+1}.
                 grim_tensor::dtype::KQuantScheme::GsqRco3p5 => {
                     grim_quant::dequant_gsq_rco_3p5(raw, n)
                 }

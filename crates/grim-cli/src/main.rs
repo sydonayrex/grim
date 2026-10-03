@@ -670,7 +670,10 @@ enum Commands {
         gpu: bool,
         /// Pack weights in a specific format instead of uniform target-bpw.
         /// Supported: `whiteraven` (FP8 E4M3, 16x16-blocked; requires 16-aligned
-        /// 2D weights, everything else falls back to the uniform pack).
+        /// 2D weights, everything else falls back to the uniform pack),
+        /// `raven` (dense FP8), `whitecrow` (W4A4 OSTQuant),
+        /// `gsqrco3p5` (GSQ-RCO 3.5-bit, tag 81).
+        /// Default when omitted: `gsqrco3p5`.
         #[arg(long)]
         format: Option<String>,
     },

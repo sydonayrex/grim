@@ -13,9 +13,10 @@
 //!    one unloadable outside grim *by construction* rather than by a policy
 //!    someone can forget to apply.
 //!
-//! WhiteRaven (670) is the only member with a file loader today. The rest are
-//! refused with a message naming the format; this test pins that they are
-//! refused rather than silently decoded.
+//! WhiteRaven (670), Raven (669), and WhiteCrow (660) all have file loaders
+//! today. ForestRaven (672) and GreyRaven (671) are refused with a message
+//! naming the format; this test pins that they are refused rather than
+//! silently decoded.
 
 use grim_format::gguf::{map_gguf_dtype_to_storage, GgufDType};
 use grim_tensor::dtype::{FloatPackScheme, Storage as DTypeStorage};
@@ -128,9 +129,10 @@ fn whiteraven_resolves_to_the_blocked_fp8_storage() {
 
 #[test]
 fn the_rest_of_the_series_is_refused_naming_the_format() {
+    // Raven (669) and WhiteCrow (660) became loadable once their QuantFormats
+    // landed; only these two genuinely have no consumer yet. Both still count
+    // as grim-native tags: a stock GGUF reader must reject them the same way.
     for d in [
-        GgufDType::Raven,
-        GgufDType::WhiteCrow,
         GgufDType::ForestRaven,
         GgufDType::GreyRaven,
     ] {
@@ -152,4 +154,16 @@ fn the_rest_of_the_series_is_refused_naming_the_format() {
             ),
         }
     }
+}
+
+#[test]
+fn raven_and_whitecrow_resolve_to_loadable_storages() {
+    use grim_tensor::dtype::Storage;
+    let raven = map_gguf_dtype_to_storage(GgufDType::Raven);
+    assert!(matches!(
+        raven.storage,
+        Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::Fp8)
+    ));
+    let crow = map_gguf_dtype_to_storage(GgufDType::WhiteCrow);
+    assert!(matches!(crow.storage, Storage::W4A4OstQuant(_)));
 }

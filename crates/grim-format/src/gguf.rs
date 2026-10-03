@@ -2230,13 +2230,29 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::U8,
             storage: Storage::FloatPack(FloatPackScheme::Fp8Blocked16),
         },
-        // The rest of the series is tagged but not loadable yet. They are
+        // Raven: dense FP8 E4M3, the same bare-code plane [`Self::WhiteRaven`]
+        // permutes into 16x16 blocks. A source carrying it runs today: the
+        // ROCm dispatch routes `FloatPack(Fp8)` to the dot4 GEMV at m=1 and
+        // the MFMA fused-dequant path at m>1.
+        GgufDType::Raven => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::FloatPack(FloatPackScheme::Fp8),
+        },
+        // WhiteCrow: W4A4 OSTQuant u4×u4, group-128. The blob is three
+        // u64-length-prefixed streams ([qw][sc][zr]); `Storage::
+        // W4A4OstQuant` feeds the sudot8 GEMM on gfx12 through the ROCm
+        // dispatch.
+        GgufDType::WhiteCrow => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::W4A4OstQuant(grim_tensor::dtype::OstQuantConfig {
+                group_size: 128,
+            }),
+        },
+        // The rest of the series has no production kernel/packer, so it is
         // refused HERE, naming the format, rather than left to fall through to
         // a generic path -- a silently-wrong decode of a packed kernel payload
         // is the failure mode this whole table exists to prevent.
-        GgufDType::Raven
-        | GgufDType::WhiteCrow
-        | GgufDType::ForestRaven
+        GgufDType::ForestRaven
         | GgufDType::GreyRaven => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Unsupported(grim_tensor::dtype::UnsupportedFormat {

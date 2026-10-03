@@ -221,6 +221,157 @@ fn convert_with_format_whiteraven_produces_a_blocked_fp8_grim_file() {
 }
 
 #[test]
+fn convert_with_format_raven_produces_a_bare_fp8_payload() {
+    // Raven is dense FP8 in one row-major pass: a 32x64 F32 checkpoint in,
+    // n*k E4M3 codes out, tagged 669 with tag-derived bare-code storage.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let want: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 17) % 53) as f32 * 0.0625 - 1.5)
+        .collect();
+    let payload: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let src = scratch.0.join("f32_raven.gguf");
+    write_gguf(&src, GgufDType::F32, "blk.weight", &[k as u64, n as u64], &payload);
+
+    let out = scratch.0.join("raven.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("raven".to_string()),
+        None,
+        None,
+    )
+    .expect("convert --format raven");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open grim");
+    let meta = gp.meta("blk.weight").expect("meta");
+    assert_eq!(
+        meta.dtype.storage,
+        grim_tensor::dtype::Storage::FloatPack(
+            grim_tensor::dtype::FloatPackScheme::Fp8
+        ),
+        "--format raven must tag FloatPack(Fp8)"
+    );
+
+    let raw = gp.get("blk.weight").expect("get");
+    assert_eq!(raw.bytes.len(), n * k, "Raven payload is bare codes");
+
+    // NOTE the decode convention: the ROCm Fp8 path (dot4 GEMV / MFMA) loads
+    // the payload as bare codes one-per-weight, which is also what
+    // `expected_bytes` says the layout is. `grim_quant::dequant_fp8` is the
+    // OTHER convention (4-byte per-tensor scale prefix) used by the legacy
+    // `quant_fp8` producer -- it cannot be asked to decode a bare payload
+    // because it folds the first four codes into the scale. Decode per-code:
+    for (i, (&w, &g)) in want.iter().zip(raw.bytes.iter()).enumerate() {
+        let got = grim_quant::fp8_e4m3_to_f32(g);
+        let q = grim_quant::fp8_e4m3_to_f32(grim_quant::f32_to_fp8_e4m3(w));
+        assert_eq!(got.to_bits(), q.to_bits(), "element {i} diverged");
+    }
+}
+
+#[test]
+fn convert_with_format_whitecrow_produces_the_ostquant_blob() {
+    // WhiteCrow: W4A4 OSTQuant group-128. Needs K%128==0 -- 32x128 here.
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 128usize);
+    let want: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 11) % 41) as f32 * 0.125 - 2.5)
+        .collect();
+    let payload: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let src = scratch.0.join("f32_crow.gguf");
+    write_gguf(&src, GgufDType::F32, "blk.weight", &[k as u64, n as u64], &payload);
+
+    let out = scratch.0.join("crow.grim");
+    grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("whitecrow".to_string()),
+        None,
+        None,
+    )
+    .expect("convert --format whitecrow");
+
+    let gp = GrimProvider::open(out.to_str().unwrap()).expect("open grim");
+    let meta = gp.meta("blk.weight").expect("meta");
+    assert!(
+        matches!(
+            meta.dtype.storage,
+            grim_tensor::dtype::Storage::W4A4OstQuant(_)
+        ),
+        "--format whitecrow must tag W4A4OstQuant, got {:?}",
+        meta.dtype.storage
+    );
+
+    let raw = gp.get("blk.weight").expect("get");
+    // Framed triple stream: [u64 qw_len][qw][u64 sc_len][sc][u64 zr_len][zr].
+    // 32x128 at group-128 with 2-bit packed scale + 1-bit packed zero.
+    let qw_len = u64::from_le_bytes(raw.bytes[0..8].try_into().unwrap()) as usize;
+    let expected_qw = n * (k / 8) * 4;
+    assert_eq!(qw_len, expected_qw, "qw segment at the expected length");
+    let sc_len = u64::from_le_bytes(raw.bytes[8 + qw_len..16 + qw_len].try_into().unwrap()) as usize;
+    let expected_sc = n * (k / 128) * 2;
+    assert_eq!(sc_len, expected_sc, "sc segment at the expected length");
+    let zr_len =
+        u64::from_le_bytes(raw.bytes[16 + qw_len + sc_len..24 + qw_len + sc_len].try_into().unwrap())
+            as usize;
+    let expected_zr = n * (k / 128);
+    assert_eq!(zr_len, expected_zr, "zr segment at the expected length");
+    assert_eq!(raw.bytes.len(), 24 + qw_len + sc_len + zr_len);
+}
+
+#[test]
+fn unknown_format_fails_before_any_packing() {
+    let scratch = Scratch::new();
+    let (n, k) = (32usize, 64usize);
+    let weights: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.001).collect();
+    let src = scratch.0.join("f32_any.gguf");
+    let payload: Vec<u8> = weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+    write_gguf(&src, GgufDType::F32, "blk.weight", &[k as u64, n as u64], &payload);
+
+    let out = scratch.0.join("any.grim");
+    let err = grim_format::convert_to_grim(
+        src.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "gfx1200",
+        8.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        Some("typo_of_whitecrow".to_string()),
+        None,
+        None,
+    )
+    .expect_err("an unknown format name must fail at the boundary");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("unknown"),
+        "error must name the problem, got: {msg}"
+    );
+    assert!(
+        !out.exists(),
+        "an early --format failure must not leave a partial file behind"
+    );
+}
+
+#[test]
 fn convert_with_format_whiteraven_leaves_non_conforming_tensors_untouched() {
     // 1D tensors (norm gains) carry no 2D shape to block -- the converter
     // must pack them with the uniform path rather than fail or silently

@@ -59,6 +59,14 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.10,
                 max_delta_ppl: 0.08,
             },
+            // 4-bit weights, per-group (128) bf16 scales: same code-width
+            // class as Fp4, so the same provisional thresholds. Tighten once
+            // measured against the real OSTQuant gate.
+            QuantFormat::W4A4OstQuant => Self {
+                min_cosine_similarity: 0.9950,
+                max_relative_l2_error: 0.10,
+                max_delta_ppl: 0.08,
+            },
             QuantFormat::Q8_0 => Self {
                 min_cosine_similarity: 0.9995,
                 max_relative_l2_error: 0.03,
@@ -85,6 +93,28 @@ impl AccuracyTolerance {
                 min_cosine_similarity: 0.9900,
                 max_relative_l2_error: 0.18,
                 max_delta_ppl: 0.15,
+            },
+            // Upstream Q2_0: 2.25 bpw, 64-weight blocks with a single fp16 scale and the
+            // codebook {-1, 0, +1, +2}. Coarser than Q2_K (2.6 bpw, two scales
+            // plus a min per sub-block) so it cannot inherit Q2_K's budget, but
+            // it is a real shipped format with real measured perplexity (the
+            // Qwen3.8-Flash-Next GSQ-RCO-3.5bit release runs it for 62 expert
+            // banks), so the budget is tightened from the "unmeasured format"
+            // placeholder tier.
+            QuantFormat::Q2_0 => Self {
+                min_cosine_similarity: 0.9750,
+                max_relative_l2_error: 0.34,
+                max_delta_ppl: 0.34,
+            },
+            // GSQ-RCO 3.5-bit (tag 81): same 2.25 bpw block geometry as Q2_0
+            // with the GSQ codebook {-2,-1,0,+1}. The MSE-fitted RTN scale is
+            // typically a bit tighter than Q2_0's d=amax choice, but the
+            // budget stays in the 2-bit tier until a real GSQ conversion
+            // (calibration + Gumbel-Softmax) justifies Q3_K-class numbers.
+            QuantFormat::GsqRco3p5 => Self {
+                min_cosine_similarity: 0.9750,
+                max_relative_l2_error: 0.34,
+                max_delta_ppl: 0.34,
             },
             // Q2_K is 2.6 bpw with 2-bit codes and per-16-sub-block min/scale;
             // the worst of the K-quants grim can decode.

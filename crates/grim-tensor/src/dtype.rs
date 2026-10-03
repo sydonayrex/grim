@@ -184,8 +184,22 @@ pub enum KQuantScheme {
     IQ2XXS,
     IQ2XS,
     IQ2S,
-    /// GGUF `Q2_0` (dtype tag 42): 64 weights per 18-byte block, 2.25 bpw.
-    /// Used by the Qwen3.8-Flash-Next GSQ-RCO release for expert down-proj.
+    /// Upstream GGUF `Q2_0` (dtype tag 42): 64 weights per 18-byte block,
+    /// 2.25 bpw. Block layout (`ggml-common.h:187`) is `ggml_half d` followed
+    /// by `qs[QK2_0/4]`, and the decode is `y = (q - 1) * d` over a 2-bit code,
+    /// so the level set is `{-1, 0, +1, +2}`.
+    ///
+    /// This is a distinct scheme from [`Self::GsqRco3p5`] and must never be
+    /// aliased to it: GSQRCO's 2-bit codebook is `{-2, -1, 0, +1}`, i.e.
+    /// `y = (q - 2) * d`. The two differ by a one-level shift of `d`, which
+    /// is silently wrong rather than visibly broken.
+    ///
+    /// The Qwen3.8-Flash-Next GSQ-RCO-3.5bit release writes tag 42, and
+    /// upstream llama.cpp reads it as this format (see the differential PPL
+    /// oracle in `plans/eval/qwen4exp-reference-ppl-2026-09-26.json`).
+    Q2_0,
+    /// Prism-private GSQRCO at tag 81: same 64-elem/18-byte geometry as
+    /// [`Self::Q2_0`] but the GSQRCO codebook `y = (q - 2) * d`.
     GsqRco3p5,
 }
 
@@ -261,6 +275,8 @@ pub enum QuantFormat {
     /// WhiteRaven-blocked FP8: E4M3 codes in 16x16-blocked order. Same bytes
     /// as [`Self::Fp8`] permuted; feeds the blocked WMMA kernel.
     Fp8Blocked16,
+    /// WhiteCrow: W4A4 OSTQuant u4×u4, group-128, feeds `V_DOT8_I32_IU4`.
+    W4A4OstQuant,
     Iq4Nl,
     Iq4Xs,
     Iq3Xxs,
@@ -268,6 +284,22 @@ pub enum QuantFormat {
     Iq2Xxs,
     Iq2Xs,
     Iq2S,
+    /// Upstream GGUF `Q2_0` (dtype tag 42): 64 weights per 18-byte block,
+    /// 2.25 bpw, codebook `{-1, 0, +1, +2}` scaled by an fp16 per-block delta.
+    ///
+    /// Carried by the Qwen3.8-Flash-Next GSQ-RCO-3.5bit release, where it is
+    /// the tensor type of 62 expert banks (52.0 B params). Distinct from
+    /// [`Self::Q2K`]: Q2_K is a 256-weight super-block with two scales and a
+    /// min, so a Q2_K kernel reading Q2_0 bytes would produce finite garbage.
+    Q2_0,
+    /// GSQ-RCO 3.5-bit (GGUF tag 81): the same 18-byte block geometry as
+    /// [`Self::Q2_0`] but the GSQ paper's codebook — `values = [-2, -1, 0, 1]`
+    /// (old/repo/GSQ-main/src/quantization/gumbel_quantizer_2bit.py:10), so
+    /// code q decodes to `(q - 2) * d`, ONE level of d below Q2_0's
+    /// `(q - 1) * d` (llama.cpp ggml-quants.c:439). Same bytes, off-by-one
+    /// decode: the two formats MUST NOT share a kernel. Grim's native tag,
+    /// written by the oxidizer for .grim output and the `--format` default.
+    GsqRco3p5,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -375,7 +407,7 @@ impl DType {
                 KQuantScheme::IQ2XXS => (elem_count.div_ceil(256)) * 66,
                 KQuantScheme::IQ2XS => (elem_count.div_ceil(256)) * 74,
                 KQuantScheme::IQ2S => (elem_count.div_ceil(256)) * 82,
-                KQuantScheme::GsqRco3p5 => (elem_count.div_ceil(64)) * 18,
+                KQuantScheme::Q2_0 | KQuantScheme::GsqRco3p5 => (elem_count.div_ceil(64)) * 18,
             },
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 | FloatPackScheme::Nf4 => elem_count.div_ceil(2),
@@ -437,6 +469,7 @@ impl From<QuantFormat> for Storage {
     fn from(qf: QuantFormat) -> Self {
         match qf {
             QuantFormat::Q8_0 => Storage::KQuant(KQuantScheme::Q80),
+            QuantFormat::Q2_0 => Storage::KQuant(KQuantScheme::Q2_0),
             QuantFormat::Q2K => Storage::KQuant(KQuantScheme::Q2K),
             QuantFormat::Q3K => Storage::KQuant(KQuantScheme::Q3K),
             QuantFormat::Q4K => Storage::KQuant(KQuantScheme::Q4K),
@@ -448,6 +481,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::TreePie => Storage::FloatPack(FloatPackScheme::TreePie),
             QuantFormat::Fp4Block16 => Storage::Block(BlockDtype::Fp4Block16),
             QuantFormat::Fp8Blocked16 => Storage::FloatPack(FloatPackScheme::Fp8Blocked16),
+            QuantFormat::W4A4OstQuant => Storage::W4A4OstQuant(OstQuantConfig { group_size: 128 }),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
             QuantFormat::Fp8Block128 => Storage::Block(BlockDtype::Fp8Block128),
             QuantFormat::Fp8Sparse24 => Storage::Block(BlockDtype::Fp8Sparse24),
@@ -458,6 +492,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Iq2Xxs => Storage::KQuant(KQuantScheme::IQ2XXS),
             QuantFormat::Iq2Xs => Storage::KQuant(KQuantScheme::IQ2XS),
             QuantFormat::Iq2S => Storage::KQuant(KQuantScheme::IQ2S),
+            QuantFormat::GsqRco3p5 => Storage::KQuant(KQuantScheme::GsqRco3p5),
         }
     }
 }
@@ -470,6 +505,7 @@ impl TryFrom<&Storage> for QuantFormat {
             Storage::KQuant(k) => match k {
                 KQuantScheme::Q80 => Ok(QuantFormat::Q8_0),
                 KQuantScheme::Q2K => Ok(QuantFormat::Q2K),
+                KQuantScheme::Q2_0 => Ok(QuantFormat::Q2_0),
                 KQuantScheme::Q3K => Ok(QuantFormat::Q3K),
                 KQuantScheme::Q4K => Ok(QuantFormat::Q4K),
                 KQuantScheme::Q5K => Ok(QuantFormat::Q5K),
@@ -504,6 +540,7 @@ impl TryFrom<&Storage> for QuantFormat {
                 // report a format a decoder would not honour.
                 BlockDtype::Q4_0 => Err(()),
             },
+            Storage::W4A4OstQuant(_) => Ok(QuantFormat::W4A4OstQuant),
             _ => Err(()),
         }
     }
@@ -689,15 +726,15 @@ mod tests {
     fn every_kquant_scheme_maps_to_a_quant_format_and_back() {
         /// K-quants deliberately WITHOUT a `QuantFormat`, with the reason.
         ///
-        /// `GsqRco3p5` is GGUF tag 42 (`Q2_0`) as used by the Qwen3.8-Flash-Next
-        /// GSQ-RCO release for expert down-proj. It decodes fine
+        /// `GsqRco3p5` decodes correctly on the host
         /// (`dequant_gsq_rco_3p5`, exercised by `CpuStorage::to_cpu_vec_f32`)
-        /// but has no `QuantFormat` variant yet, so it hits the same
+        /// but has no `QuantFormat` variant, so it hits the same
         /// `Linear::forward` error the Q3_K case did. It is called out here
         /// rather than left implicit so the next person sees it as a known,
-        /// tracked gap instead of rediscovering it from a panic. Promote it to
-        /// a real mapping when a checkpoint actually needs it through the
-        /// quantized-matmul path.
+        /// tracked gap instead of rediscovering it from a panic. Note that
+        /// nothing can actually produce it: GSQ-main defines no GGUF format
+        /// for GSQRCO (it deploys into existing K-Quant containers), so tag 81
+        /// has no producer. Retire it rather than wiring a kernel for it.
         const NO_QUANT_FORMAT: &[KQuantScheme] = &[KQuantScheme::GsqRco3p5];
 
         const ALL: &[KQuantScheme] = &[
@@ -714,6 +751,7 @@ mod tests {
             KQuantScheme::IQ2XXS,
             KQuantScheme::IQ2XS,
             KQuantScheme::IQ2S,
+            KQuantScheme::Q2_0,
             KQuantScheme::GsqRco3p5,
         ];
         for &scheme in ALL {

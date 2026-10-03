@@ -266,6 +266,11 @@ pub fn cmd_oxidizer_convert(
     mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     target_format: Option<&str>,
 ) -> Result<(), String> {
+    // GRIM-FORMAT DEFAULT (user directive): a .grim conversion with no
+    // --format names GSQ-RCO 3.5-bit (tag 81). The .grim container is
+    // grim-native, so there is no portability constraint like WhiteRaven's;
+    // the GSQ paper's codebook is the source of truth for the format.
+    let target_format = target_format.or(Some("gsq_rco_3p5"));
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
@@ -506,7 +511,7 @@ fn load_importance_scores(path: &str) -> Result<ImportanceScores, String> {
 fn bitwidth_to_dtype(bw: u32) -> GgufDType {
     match bw {
         0 | 1 => GgufDType::Q2K,
-        2 => GgufDType::Q2K,
+        2 => GgufDType::GsqRco3p5,
         3 => GgufDType::Q3K,
         4 => GgufDType::Q4K,
         5 => GgufDType::Q5K,
@@ -811,6 +816,11 @@ fn write_gguf<W: Write, R: Read + Seek>(
 fn quant_format_for_bitwidth(bw: u32) -> Option<QuantFormat> {
     match bw {
         8 => Some(QuantFormat::Q8_0),
+        // RCO assigns 2 bpw to the least important tensors; the 2-bit tier
+        // is the GSQ-RCO-3.5-bit format (tag 81), not Q2_K — 18 B/64-weight
+        // blocks, GSQ codebook. Previously 2-bpw assignments silently skipped
+        // their tensors here (None), leaving them un-quantized in the .grim.
+        2 => Some(QuantFormat::GsqRco3p5),
         4 => Some(QuantFormat::Q4K),
         5 => Some(QuantFormat::Q5K),
         6 => Some(QuantFormat::Q6K),
@@ -847,6 +857,7 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         )),
         QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
         QuantFormat::Q2_0 => Ok(GgufDType::Q2_0),
+        QuantFormat::GsqRco3p5 => Ok(GgufDType::GsqRco3p5),
         QuantFormat::Q2K => Ok(GgufDType::Q2K),
         QuantFormat::Q3K => Ok(GgufDType::Q3K),
         QuantFormat::Q4K => Ok(GgufDType::Q4K),
@@ -864,7 +875,10 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         | QuantFormat::Fp8
         | QuantFormat::Fp4Block16
         | QuantFormat::Fp8Block16
-        | QuantFormat::Fp8Block128 => Err(format!(
+        | QuantFormat::Fp8Block128
+        // WhiteCrow is a kernel-policy payload like WhiteRaven: tag 660 exists
+        // and GrimProvider reads it, but a stock GGUF reader must not accept it.
+        | QuantFormat::W4A4OstQuant => Err(format!(
             "quantization format {:?} is not supported in GGUF writer",
             format
         )),
