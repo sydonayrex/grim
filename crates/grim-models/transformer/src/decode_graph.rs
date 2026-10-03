@@ -6957,6 +6957,9 @@ pub struct Xing40GraphScratch {
     pub hc_scale_ffn: Vec<GBox>,
     /// The checkpoint's rope (base + YaRN), interleaved pairing.
     pub rope_cfg: RopeConfig,
+    /// YaRN inv_freq table on device, uploaded once at scratch build — the
+    /// capture-safe input for `grim_rope_yarn_pos0`.
+    pub rope_inv_freq: Option<GBox>,
     pub mix: usize,
     pub flat: usize,
     pub rank: usize,
@@ -7025,6 +7028,20 @@ fn build_xing_scratch(model: &Xing40, dev: &Dev, batch: usize) -> Result<Xing40G
             // k_pe NeoX defect is exactly what this must not reintroduce).
             rc.interleaved = true;
             rc
+        },
+        // YaRN frequency table for the capture-safe `grim_rope_yarn_pos0`
+        // launch, uploaded ONCE here (outside capture, stable address). The
+        // eager path computes this table per call; the graph path cannot.
+        rope_inv_freq: {
+            let rope_cfg = &model.layers[0].self_attn.rope.config;
+            let (inv_freq, _) =
+                grim_backend_rocm::RocmDevice::yarn_inv_freq_and_mscale(rope_cfg);
+            let boxed = dev.from_cpu(
+                &inv_freq,
+                &Shape::new(vec![inv_freq.len()]),
+                grim_tensor::DType::F32,
+            )?;
+            Some(boxed)
         },
         mix,
         flat,
@@ -7598,16 +7615,28 @@ dev.launch_hc_collapse_step(
                 nope,
                 rope_d,
             )?;
-            dev.rope_dev_base_into(
-                as_rocm(scratch.qp[i].as_ref())?,
-                &buffers.pos_dev,
-                as_rocm(scratch.qp[i].as_ref())?,
-                &scratch.rope_cfg,
-                &Shape::new(vec![batch, nh, rope_d]),
-                nh,
-                1,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+            // YARN-CORRECT rope: rope_dev_base_into takes only `base` — no
+            // ramp, no mscale — so a YaRN checkpoint rotated by the wrong
+            // angles (rms-identical, values permuted; the qrope array diff
+            // measured max_abs 0.47 at identical rms). grim_rope_yarn_pos0
+            // is the same rotation the eager path's verified kernel does,
+            // reading the current position from pos_dev.
+            {
+                let inv_freq = scratch.rope_inv_freq.as_ref().ok_or_else(|| {
+                    grim_core::error::Error::Backend(
+                        "xing40 graph: no device inv_freq table".into(),
+                    )
+                })?;
+                dev.rope_dev_yarn_pos0_into(
+                    as_rocm(scratch.qp[i].as_ref())?,
+                    &buffers.pos_dev,
+                    as_rocm(inv_freq.as_ref())?,
+                    as_rocm(scratch.qp[i].as_ref())?,
+                    &scratch.rope_cfg,
+                    &Shape::new(vec![batch, nh, rope_d]),
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
             // A/B the q rope: the graph ropes the whole [1, nh, rope_d] slab
             // in place with rope_dev_base_into; eager ropes ONE HEAD AT A TIME
             // with dev.rope and writes each result back per head. Two
@@ -7724,16 +7753,23 @@ dev.launch_hc_collapse_step(
                 &Shape::new(vec![batch, rank]),
             )
             .map_err(grim_core::error::Error::Tensor)?;
-            dev.rope_dev_base_into(
-                as_rocm(scratch.kpe[i].as_ref())?,
-                &buffers.pos_dev,
-                as_rocm(scratch.kpe[i].as_ref())?,
-                &scratch.rope_cfg,
-                &Shape::new(vec![batch, 1, rope_d]),
-                1,
-                1,
-            )
-            .map_err(grim_core::error::Error::Tensor)?;
+            // Same yarn-correct rope for k_pe (see the q rope note above).
+            {
+                let inv_freq = scratch.rope_inv_freq.as_ref().ok_or_else(|| {
+                    grim_core::error::Error::Backend(
+                        "xing40 graph: no device inv_freq table".into(),
+                    )
+                })?;
+                dev.rope_dev_yarn_pos0_into(
+                    as_rocm(scratch.kpe[i].as_ref())?,
+                    &buffers.pos_dev,
+                    as_rocm(inv_freq.as_ref())?,
+                    as_rocm(scratch.kpe[i].as_ref())?,
+                    &scratch.rope_cfg,
+                    &Shape::new(vec![batch, 1, rope_d]),
+                )
+                .map_err(grim_core::error::Error::Tensor)?;
+            }
             dev.launch_xing_pack_latent(
                 as_rocm(scratch.ckv[i].as_ref())?,
                 as_rocm(scratch.kpe[i].as_ref())?,
@@ -9189,6 +9225,24 @@ dev.launch_hc_collapse_step(
                             }
                         }
                     }
+                    // Layer 0's INPUT streams at this replay: the step-start
+                    // state. Comparable with eager's "[xing-trace] block_in"
+                    // for the same position — if these differ, the divergence
+                    // is in the replay's step-start state, not in any layer.
+                    if let Some(b) = g.sin.first() {
+                        if let Ok(st) = as_rocm(b.as_ref()) {
+                            if let Ok(v) = st.to_cpu_vec_f32() {
+                                let r = (v.iter().map(|x| x * x).sum::<f32>()
+                                    / v.len().max(1) as f32)
+                                    .sqrt();
+                                eprintln!(
+                                    "[xing-graph] SIN0 pos {} rms {r:.6e} head {:?}",
+                                    graph.buffers.current_pos,
+                                    &v[..v.len().min(4)]
+                                );
+                            }
+                        }
+                    }
                     // Layer 0's OUTPUT stream at this replay, tagged with the
                     // position so it can be matched against eager's "L1 in".
                     if let Some(b) = g.sin.get(1) {
@@ -9205,6 +9259,41 @@ dev.launch_hc_collapse_step(
                             }
                         }
                     }
+                    }
+                    // GRIM_XING_DUMP=<prefix>: full per-layer attention
+                    // inputs/outputs at pos 41, matching eager's dumps —
+                    // qabs/qrope/kv (inputs) and qattn (decode-kernel output).
+                    if let Ok(prefix) = std::env::var("GRIM_XING_DUMP") {
+                        if graph.buffers.current_pos == 41 {
+                            // The enclosing trace block already holds the
+                            // scratch lock; `g` below IS that guard. Re-locking
+                            // here deadlocked the trace (deterministically).
+                            {
+                                let gx = &*g;
+                                let save = |name: String, v: &[f32]| {
+                                    let bytes: Vec<u8> =
+                                        v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                                    let _ = std::fs::write(name, bytes);
+                                };
+                                for li in 0..3.min(gx.qabs.len().min(gx.qp.len()).min(gx.qattn_latent.len())) {
+                                    if let Ok(v) = as_rocm(gx.qabs[li].as_ref()).and_then(|s| s.to_cpu_vec_f32()) {
+                                        save(format!("{prefix}_graph_qabs_L{li}.f32"), &v);
+                                    }
+                                    if let Ok(v) = as_rocm(gx.qp[li].as_ref()).and_then(|s| s.to_cpu_vec_f32()) {
+                                        save(format!("{prefix}_graph_qrope_L{li}.f32"), &v);
+                                    }
+                                    if let Some(ka) = graph.buffers.k_arena.get(li) {
+                                        // Full-arena readback hangs here; the
+                                        // eager side already proves the arena
+                                        // rows match, so skip the kv dump.
+                                        let _ = ka;
+                                    }
+                                    if let Ok(v) = as_rocm(gx.qattn_latent[li].as_ref()).and_then(|s| s.to_cpu_vec_f32()) {
+                                        save(format!("{prefix}_graph_qattn_L{li}.f32"), &v);
+                                    }
+                                }
+                            }
+                        }
                     }
                     // Top-5 of the head output: the direct comparison point
                     // against eager's --logprobs line for the same step.

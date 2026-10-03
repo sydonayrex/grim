@@ -866,6 +866,48 @@ pub trait AttentionOps {
         ))
     }
 
+    /// [`Self::mla_absorbed_decode`] with a caller-supplied softmax scale.
+    /// Xing4.0 folds a YaRN attention factor against the nope+rope width, so
+    /// the kernel-default `1/sqrt(rank + rope_d)` is wrong for it; pre-scaling
+    /// q instead needs an extra launch the HIP graph cannot issue inside the
+    /// capture bracket. Both decode paths call THIS method with the same
+    /// scale so they share one primitive.
+    fn mla_absorbed_decode_scaled(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
+        inv_sqrt_d: f32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            w_uv,
+            out,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+            w_uv_offset_words,
+            w_uv_head_stride_words,
+            inv_sqrt_d,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "mla_absorbed_decode_scaled not implemented for this backend".into(),
+        ))
+    }
+
     /// Latent-absorbed MLA attention over a **query block** (`q_len` tokens) with
     /// causal masking — the prefill sibling of [`Self::mla_absorbed_decode`].
     ///
@@ -2579,6 +2621,38 @@ impl<T: AttentionOps + ?Sized> AttentionOps for std::sync::Arc<T> {
             seq_len,
             w_uv_offset_words,
             w_uv_head_stride_words,
+        )
+    }
+    fn mla_absorbed_decode_scaled(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
+        inv_sqrt_d: f32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).mla_absorbed_decode_scaled(
+            q_absorbed,
+            q_rope,
+            kv_cache,
+            w_uv,
+            out,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+            w_uv_offset_words,
+            w_uv_head_stride_words,
+            inv_sqrt_d,
         )
     }
     fn mla_absorbed_prefill(

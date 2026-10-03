@@ -221,6 +221,71 @@ impl AttentionOps for RocmDevice {
         ))))
     }
 
+    fn mla_absorbed_decode_scaled(
+        &self,
+        q_absorbed: &dyn BackendStorage,
+        q_rope: &dyn BackendStorage,
+        kv_cache: &dyn BackendStorage,
+        w_uv: Option<&dyn BackendStorage>,
+        out: &dyn BackendStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+        w_uv_offset_words: usize,
+        w_uv_head_stride_words: usize,
+        inv_sqrt_d: f32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let q_abs = q_absorbed
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode_scaled: q_absorbed is not RocmStorage".into())
+            })?;
+        let q_r = q_rope
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode_scaled: q_rope is not RocmStorage".into())
+            })?;
+        let kv = kv_cache
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| {
+                Error::Backend("mla_absorbed_decode_scaled: kv_cache is not RocmStorage".into())
+            })?;
+        let o = out.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            Error::Backend("mla_absorbed_decode_scaled: out is not RocmStorage".into())
+        })?;
+        let w = w_uv
+            .map(|s| {
+                s.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                    Error::Backend("mla_absorbed_decode_scaled: w_uv is not RocmStorage".into())
+                })
+            })
+            .transpose()?;
+        self.launch_mla_absorbed_decode_scaled(
+            q_abs,
+            q_r,
+            kv,
+            w,
+            o,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            v_head_dim,
+            seq_len,
+            w_uv_offset_words,
+            w_uv_head_stride_words,
+            None,
+            inv_sqrt_d,
+        )?;
+        Ok(Box::new(crate::device::handles::RocmHandle::new(Some(
+            self.active_stream(),
+        ))))
+    }
+
     fn mla_absorbed_prefill(
         &self,
         q_absorbed: &dyn BackendStorage,

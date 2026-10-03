@@ -880,6 +880,55 @@ extern "C" __global__ void grim_rope_yarn(
     }
 }
 
+// grim_rope_yarn with the position taken from positions[0] and broadcast to
+// every row. The HIP decode graph holds ONE device u32 for the current step
+// (write_pos_async), not a per-row position array — an _into launcher with
+// this kernel is what makes the yarn-correct rotation capture-safe.
+extern "C" __global__ void grim_rope_yarn_pos0(
+    const float* __restrict__ x,
+    const unsigned int* __restrict__ positions,
+    const float* __restrict__ inv_freq,
+    float* __restrict__ out,
+    int b, int s, int d, int rotary_half, float mscale, int interleaved
+) {
+    int total = b * s * rotary_half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float pos = (float)positions[0];
+    if (idx < total) {
+        int bi = idx / (s * rotary_half);
+        int rem = idx - bi * (s * rotary_half);
+        int si = rem / rotary_half;
+        int i  = rem - si * rotary_half;
+        float val = pos * inv_freq[i];
+        float sin_val = sinf(val) * mscale;
+        float cos_val = cosf(val) * mscale;
+        int base_idx = (bi * s + si) * d;
+        // Pairing follows RopeConfig.interleaved (see grim_rope). CPU
+        // `Rope::forward` — the oracle — is interleaved (x[2i], x[2i+1]).
+        int a_idx = interleaved ? (base_idx + 2 * i) : (base_idx + i);
+        int b_idx = interleaved ? (base_idx + 2 * i + 1) : (base_idx + rotary_half + i);
+        float x1 = x[a_idx];
+        float x2 = x[b_idx];
+    out[a_idx] = x1 * cos_val - x2 * sin_val;
+    out[b_idx] = x2 * cos_val + x1 * sin_val;
+}
+
+    // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim.
+    int copy_start = 2 * rotary_half;
+    int copy_len   = d - copy_start;
+    if (copy_len > 0) {
+        int total2 = b * s * copy_len;
+        if (idx < total2) {
+            int bi = idx / (s * copy_len);
+            int rem = idx - bi * (s * copy_len);
+            int si = rem / copy_len;
+            int ci = rem - si * copy_len;
+            int src_idx = (bi * s + si) * d + copy_start + ci;
+            out[src_idx] = x[src_idx];
+        }
+    }
+}
+
 // PLAN 4 Task 4: QK-rope + KV-append fusion for the K/V pair. Rotates K rows
 // (QK-norm + NeoX RoPE, bit-identical to grim_qk_rope_dev_base) and appends
 // the rotated K rows AND the raw V rows to their arenas at pos_dev

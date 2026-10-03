@@ -1589,10 +1589,15 @@ impl Xing40Mla {
                     .map(|r| {
                         let seg = &v[r * row..r * row + ckv];
                         let rms = (seg.iter().map(|x| x * x).sum::<f32>() / ckv as f32).sqrt();
-                        format!("{r}:{rms:.3}")
+                        // Full-row (576, incl. the rope half) rms too: the
+                        // graph's ARENAROW/ARENA dumps rms the full row, so
+                        // this is the directly comparable number.
+                        let full = &v[r * row..(r + 1) * row];
+                        let frms = (full.iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt();
+                        format!("{r}:{rms:.3}/{frms:.3}")
                     })
                     .collect();
-                eprintln!("[xing-trace] latent c_kv rms rows {} x {}: {}", np, ckv, parts.join(" "));
+                eprintln!("[xing-trace] latent c_kv/full rms rows {} x {}: {}", np, ckv, parts.join(" "));
             }
         }
         if std::env::var_os("GRIM_XING_TRACE").is_some() && seq_len == 1 {
@@ -1686,7 +1691,20 @@ impl Xing40Mla {
             .map(|y| y.attention_factor)
             .unwrap_or(1.0f32);
         let scale = mscale * mscale / ((nope + rope_d) as f32).sqrt();
-        if seq_len == 1 && rank <= 512 && !self.kv_b_proj.weight.dtype().is_quantized() {
+        // The fused-W_UV leg below applies W_UV INSIDE the decode kernel, but
+        // the decode graph applies it with the SEPARATE `grim_xing_q_absorb`
+        // kernel — two implementations of the same product, and the 2e-4 gate
+        // divergence at the first replayed step. Default is now the graph's
+        // exact arrangement (handled by the seq_len==1 branch in 6b below);
+        // GRIM_XING_FUSED_WUV=1 restores this leg for A/B.
+        let fused_wuv = seq_len == 1
+            && rank <= 512
+            && !self.kv_b_proj.weight.dtype().is_quantized()
+            && matches!(
+                std::env::var("GRIM_XING_FUSED_WUV").as_deref(),
+                Ok("1" | "true" | "on")
+            );
+        if fused_wuv {
             let kernel_scale = 1.0f32 / ((rank + rope_d) as f32).sqrt();
             if std::env::var_os("GRIM_XING_TRACE").is_some() {
                 eprintln!(
@@ -1697,12 +1715,12 @@ impl Xing40Mla {
                     self.rope.config.yarn.as_ref().map(|y| y.attention_factor)
                 );
             }
-            let ratio = scale / kernel_scale;
-            // PRE-scale query dumps, position-tagged: the graph holds the
-            // unscaled q_absorbed/q_rope and folds the ratio into the softmax
-            // denominator, so these are the quantities to compare there. The
-            // earlier comparison was taken in the warmup, i.e. at the capture
-            // step, never at a replay.
+            // SAME PRIMITIVE AS THE GRAPH: the graph cannot prescale q inside
+            // the capture bracket (the extra launch hangs capture), so it folds
+            // the whole scale into `mla_absorbed_decode_scaled`'s inv_sqrt_d on
+            // UNSCALED q. Eager now takes the identical route — one kernel, one
+            // scale arrangement — instead of mul_scalar-prescaling q and riding
+            // the 1/sqrt(rank+rope) wrapper.
             if std::env::var_os("GRIM_XING_TRACE").is_some() {
                 for (nm, t) in [("QABS", &q_absorbed), ("QROPE", &q_rope)] {
                     if let Ok(v) = t.to_vec_f32() {
@@ -1716,17 +1734,11 @@ impl Xing40Mla {
                     }
                 }
             }
-            let qa_s = dev
-                .mul_scalar(q_absorbed.storage().as_ref(), ratio, &q_abs_shape)?
-                .0;
-            let qr_s = dev
-                .mul_scalar(q_rope.storage().as_ref(), ratio, &q_rope_shape)?
-                .0;
             let attn_shape = Shape::new(vec![1, nh * vd]);
             let mut attn = dev.zeros(&attn_shape, DType::F32)?;
-            let fused = or_host_fallback(dev.mla_absorbed_decode(
-                qa_s.as_ref(),
-                qr_s.as_ref(),
+            let fused = or_host_fallback(dev.mla_absorbed_decode_scaled(
+                q_absorbed.storage().as_ref(),
+                q_rope.storage().as_ref(),
                 latent_all.storage().as_ref(),
                 Some(self.kv_b_proj.weight.storage().as_ref()),
                 attn.as_mut(),
@@ -1737,6 +1749,7 @@ impl Xing40Mla {
                 total_kv_len,
                 nope * rank,
                 (nope + vd) * rank,
+                scale,
             ))?;
             if let Some(_handle) = fused {
                 let attn = wrap_like(x, attn, attn_shape);
@@ -1854,6 +1867,118 @@ impl Xing40Mla {
         //     emits the normalized latent, and W_UV is applied as per-head GEMMs.
         let out_latent_shape = Shape::new(vec![seq_len, nh * rank]);
         let mut out_latent = dev.zeros(&out_latent_shape, DType::F32)?;
+        if seq_len == 1 {
+            // SAME PRIMITIVES AS THE GRAPH at decode: the graph runs the MLA
+            // decode kernel on UNSCALED q with `scale` folded into inv_sqrt_d,
+            // then applies W_UV with the fused `grim_xing_q_absorb` kernel.
+            // Eager used the prefill kernel + per-head GEMMs here — a different
+            // reduction order on every token, the last primitive split between
+            // the two decode paths.
+            or_host_fallback(dev.mla_absorbed_decode_scaled(
+                q_absorbed.storage().as_ref(),
+                q_rope.storage().as_ref(),
+                latent_all.storage().as_ref(),
+                None,
+                out_latent.as_mut(),
+                nh,
+                rank,
+                rope_d,
+                vd,
+                total_kv_len,
+                0,
+                0,
+                scale,
+            ))?;
+            if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                for (nm, t) in [("EAGER qabs", &q_absorbed), ("EAGER qroped", &q_rope)] {
+                    if let Ok(v) = t.to_vec_f32() {
+                        let r =
+                            (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                        eprintln!(
+                            "[xing-trace] {nm}: len {} rms {r:.6e} head {:?}",
+                            v.len(),
+                            &v[..v.len().min(4)]
+                        );
+                    }
+                }
+            }
+            // GRIM_XING_DUMP=<prefix>: write the full per-layer attention
+            // inputs/outputs at pos 41 (layer order = call order) so the two
+            // decode paths can be diffed numerically, not by print precision.
+            if let Ok(prefix) = std::env::var("GRIM_XING_DUMP") {
+                if positions.last() == Some(&41) {
+                    let li_cap = std::env::var("GRIM_XING_DUMP_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX);
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static L: AtomicUsize = AtomicUsize::new(0);
+                    let li = L.fetch_add(1, Ordering::Relaxed);
+                    let dump_this = li < li_cap;
+                    let save = |name: String, v: &[f32]| {
+                        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                        let _ = std::fs::write(name, bytes);
+                    };
+                    if dump_this {
+                        if let Ok(v) = q_absorbed.to_vec_f32() {
+                            save(format!("{prefix}_eager_qabs_L{li}.f32"), &v);
+                        }
+                        if let Ok(v) = q_rope.to_vec_f32() {
+                            save(format!("{prefix}_eager_qrope_L{li}.f32"), &v);
+                        }
+                        if let Ok(v) = latent_all.storage().as_ref().to_cpu_vec_f32() {
+                            save(format!("{prefix}_eager_kv_L{li}.f32"), &v);
+                        }
+                        if let Ok(v) = out_latent.to_cpu_vec_f32() {
+                            save(format!("{prefix}_eager_qattn_L{li}.f32"), &v);
+                        }
+                    }
+                }
+            }
+            let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
+            let not_rocm = || {
+                grim_core::error::Error::Backend(
+                    "xing40 eager decode: storage is not RocmStorage".into(),
+                )
+            };
+            let lat = out_latent
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(not_rocm)?;
+            let w_vc = w_vc_dev
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(not_rocm)?;
+            let attn_shape1 = Shape::new(vec![1, nh * vd]);
+            let attn1 = dev.zeros(&attn_shape1, DType::F32)?;
+            let attn_s = attn1
+                .as_ref()
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .ok_or_else(not_rocm)?;
+            rocm.launch_xing_q_absorb(lat, w_vc, attn_s, nh, vd, rank)?;
+            if std::env::var_os("GRIM_XING_TRACE").is_some() {
+                // Direct counterparts of the graph's qattn0 / L0-attn dumps:
+                // with the arena rows already proven identical, a difference
+                // HERE is the first divergence between the two decode paths.
+                if let Ok(v) = out_latent.to_cpu_vec_f32() {
+                    let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                    eprintln!(
+                        "[xing-trace] EAGER qattn: len {} rms {r:.6e} head {:?}",
+                        v.len(),
+                        &v[..v.len().min(4)]
+                    );
+                }
+                if let Ok(v) = attn1.to_cpu_vec_f32() {
+                    let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
+                    eprintln!(
+                        "[xing-trace] EAGER attn: len {} rms {r:.6e} head {:?}",
+                        v.len(),
+                        &v[..v.len().min(4)]
+                    );
+                }
+            }
+            let attn1 = wrap_like(x, attn1, attn_shape1);
+            return Ok(Some(self.o_proj.forward(&attn1)?));
+        }
         or_host_fallback(dev.mla_absorbed_prefill(
             q_absorbed.storage().as_ref(),
             q_rope.storage().as_ref(),

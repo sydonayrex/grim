@@ -14,42 +14,18 @@ use crate::{
 };
 
 impl RocmDevice {
-    /// GPU-side YaRN / partial-rotary RoPE: computes `inv_freq[]` on the host, uploads it once per call, then dispatches `grim_rope_yarn` entirely on-device.
-    /// # Contract - `x_s` must have a valid device pointer (caller checks `device_ptr_is_valid`).
-    pub(crate) fn rope_launch_yarn(
-        &self,
-        x_s: &RocmStorage,
-        positions: &[u32],
-        cfg: &grim_tensor::RopeConfig,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // P1-3: raw HIP ops below bind to the calling thread's current
-        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
-        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        let dims = out_shape.dims();
-        if dims.len() != 3 || dims[2] != cfg.dim {
-            return Err(Error::Shape(format!(
-                "rope_launch_yarn: expected [B,S,D={}], got {:?}",
-                cfg.dim, dims
-            )));
-        }
-        let (b, s, d) = (dims[0], dims[1], dims[2]);
+    /// Host-side YaRN frequency ramp and rope mscale — the ONE definition,
+    /// shared by the eager `grim_rope_yarn` launch and the graph's
+    /// capture-safe `rope_dev_yarn_pos0_into` (a frequency table computed
+    /// anywhere else can silently drift from this ramp).
+    pub fn yarn_inv_freq_and_mscale(cfg: &grim_tensor::RopeConfig) -> (Vec<f32>, f32) {
+        let d = cfg.dim;
         let rotary_dim = cfg.rotary_dim.min(d);
         let rotary_half = rotary_dim / 2;
-        let yarn = cfg.yarn;
-
-        if positions.len() != s {
-            return Err(Error::Shape(
-                "rope_launch_yarn: positions length must match seq_len".into(),
-            ));
-        }
-
-        // Build the YaRN-ramp-corrected inv_freq[] on the host — O(rotary_half) work,
-        // negligible vs kernel launch overhead. This avoids storing per-layer buffers.
         let inv_freq: Vec<f32> = (0..rotary_half)
             .map(|i| {
                 let freq = 1.0_f32 / cfg.base.powf((2 * i) as f32 / d as f32);
-                match yarn {
+                match cfg.yarn {
                     None => freq,
                     Some(y) => {
                         // llama.cpp's YaRN ramp (ggml-cpu/ops.cpp `rope_yarn`),
@@ -78,22 +54,49 @@ impl RocmDevice {
                 }
             })
             .collect();
-        // The rope multiplier is NOT the kq-scale mscale: llama.cpp feeds
-        // `cparams.yarn_attn_factor` to ggml_rope_ext and builds a separate
-        // mscale for kq_scale, and for some checkpoints (Xing4.0) the two are
-        // reciprocals. `rope_mscale: None` keeps every pre-existing checkpoint
-        // on `attention_factor`.
-        //
-        // llama.cpp then multiplies by (1 + 0.1*ln(1/freq_scale)) inside
-        // rope_yarn whenever YaRN is active — for Xing4.0 the two factors
-        // cancel to exactly 1.0. The kernel applies `mscale` to cos/sin, so
-        // the boost belongs here with the ramp that gates it.
-        let mscale = yarn
-            .map(|y| {
-                y.rope_mscale.unwrap_or(y.attention_factor)
-                    * (1.0 + 0.1 * (y.factor).ln())
-            })
+        // See the long comment in `rope_launch_yarn`: the rope mscale is NOT
+        // the kq-scale mscale, and llama.cpp's (1 + 0.1*ln(1/freq_scale))
+        // boost belongs here with the ramp that gates it.
+        let mscale = cfg
+            .yarn
+            .map(|y| y.rope_mscale.unwrap_or(y.attention_factor) * (1.0 + 0.1 * (y.factor).ln()))
             .unwrap_or(1.0_f32);
+        (inv_freq, mscale)
+    }
+
+    /// GPU-side YaRN / partial-rotary RoPE: computes `inv_freq[]` on the host, uploads it once per call, then dispatches `grim_rope_yarn` entirely on-device.
+    /// # Contract - `x_s` must have a valid device pointer (caller checks `device_ptr_is_valid`).
+    pub(crate) fn rope_launch_yarn(
+        &self,
+        x_s: &RocmStorage,
+        positions: &[u32],
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // P1-3: raw HIP ops below bind to the calling thread's current
+        // device — pin to the owning ordinal (see matmul_op fix, 2026-08-23e).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dims = out_shape.dims();
+        if dims.len() != 3 || dims[2] != cfg.dim {
+            return Err(Error::Shape(format!(
+                "rope_launch_yarn: expected [B,S,D={}], got {:?}",
+                cfg.dim, dims
+            )));
+        }
+        let (b, s, d) = (dims[0], dims[1], dims[2]);
+        let rotary_dim = cfg.rotary_dim.min(d);
+        let rotary_half = rotary_dim / 2;
+        if positions.len() != s {
+            return Err(Error::Shape(
+                "rope_launch_yarn: positions length must match seq_len".into(),
+            ));
+        }
+
+        // Build the YaRN-ramp-corrected inv_freq[] on the host — O(rotary_half) work,
+        // negligible vs kernel launch overhead. This avoids storing per-layer buffers.
+        // The ramp/mscale math lives in `yarn_inv_freq_and_mscale` so the
+        // graph's capture-safe launcher cannot drift from it.
+        let (inv_freq, mscale) = Self::yarn_inv_freq_and_mscale(cfg);
 
         // Upload positions and inv_freq to device-resident scratch buffers.
         // These are temporary allocations freed after the stream synchronises.
@@ -228,6 +231,83 @@ impl RocmDevice {
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Capture-safe YaRN RoPE into a caller-provided buffer: the [`Self::rope_launch_yarn`]
+    /// math (same ramp, same mscale, same `grim_rope_yarn` rotation) with NO
+    /// allocation and NO upload inside — the inv_freq table is a persistent
+    /// device buffer the caller builds once at graph creation, and the
+    /// position is a single device u32 broadcast to every row (`grim_rope_yarn_pos0`).
+    /// `rope_dev_base_into` cannot serve a YaRN model: it takes only `base`
+    /// and no ramp/mscale, so a YaRN checkpoint's graph path rotates by the
+    /// WRONG ANGLES while preserving every pair's norm (rms-identical,
+    /// values permuted by angle).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_dev_yarn_pos0_into(
+        &self,
+        x_storage: &dyn BackendStorage,
+        pos_dev: &dyn BackendStorage,
+        inv_freq_dev: &RocmStorage,
+        out_storage: &RocmStorage,
+        cfg: &grim_tensor::RopeConfig,
+        out_shape: &Shape,
+    ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let dims = out_shape.dims();
+        if dims.len() != 3 || dims[2] != cfg.dim {
+            return Err(Error::Shape(format!(
+                "rope_dev_yarn_pos0_into expects (B,S,D={}), got {:?}",
+                cfg.dim, dims
+            )));
+        }
+        let (b, s, d) = (dims[0], dims[1], dims[2]);
+        let rotary_dim = cfg.rotary_dim.min(d);
+        let rotary_half = rotary_dim / 2;
+        let x_s = as_rocm(x_storage)?;
+        let pos_s = as_rocm(pos_dev)?;
+        if !x_s.device_ptr_is_valid() || !pos_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "rope_dev_yarn_pos0_into: input lacks a valid device pointer".into(),
+            ));
+        }
+        let (_, mscale) = Self::yarn_inv_freq_and_mscale(cfg);
+
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut pos_ptr = dev_ptr(pos_s)?;
+        let mut freq_ptr = dev_ptr(inv_freq_dev)?;
+        let mut out_ptr = dev_ptr(out_storage)?;
+        let mut b_i = b as i32;
+        let mut s_i = s as i32;
+        let mut d_i = d as i32;
+        let mut rh_i = rotary_half as i32;
+        let mut ms_f = mscale;
+        let mut inter_i = if cfg.interleaved { 1 } else { 0 };
+
+        let copy_len = d - 2 * rotary_half;
+        let total = b
+            * s
+            * rotary_half
+                .max(if copy_len > 0 { copy_len } else { 0 })
+                .max(1);
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_rope_yarn_pos0",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut pos_ptr),
+                arg(&mut freq_ptr),
+                arg(&mut out_ptr),
+                arg(&mut b_i),
+                arg(&mut s_i),
+                arg(&mut d_i),
+                arg(&mut rh_i),
+                arg(&mut ms_f),
+                arg(&mut inter_i),
+            ],
+        )?;
         Ok(())
     }
 

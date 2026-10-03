@@ -1939,16 +1939,13 @@ impl RocmDevice {
             std::env::var("GRIM_DOT_GEMV").as_deref(),
             Ok("0" | "false" | "off")
         );
-        let f32_gemv_disabled = matches!(
-            std::env::var("GRIM_F32_GEMV").as_deref(),
-            Ok("0" | "false" | "off")
-        );
         match &w.dtype().storage {
             DTypeStorage::Native => {
-                if !f32_gemv_disabled {
-                    let stream = self.launch_f32_gemv_into(a, w, out, n, k)?;
-                    return Ok(Box::new(RocmHandle::new(Some(stream))));
-                }
+                // Same dispatch eager's Linear uses (fp32-GEMV fast path for
+                // n>=2048, rocBLAS below) so both decode paths share one
+                // primitive per weight — hc_fn is [24, 14336] and takes
+                // rocBLAS on BOTH paths through this route. (GRIM_F32_GEMV=0
+                // used to force this leg; it is now the only leg.)
                 self.matmul_into(a, w, out)?;
                 Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
             }
