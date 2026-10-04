@@ -2817,6 +2817,7 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-core",
+ "grim-format",
  "grim-nn",
  "grim-tensor",
  "serde_json",
