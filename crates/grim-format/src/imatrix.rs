@@ -124,9 +124,8 @@ fn read_imatrix_from_provider(provider: &GgufProvider, path: &str) -> Result<Ima
 fn read_counts(provider: &GgufProvider, base: &str, n_values: usize) -> Result<Vec<f32>> {
     let counts_key = format!("{base}.counts");
     if let Some(v) = provider.metadata(&counts_key) {
-        if let Some(mut counts) = gguf_value_f32_vec(v) {
-            align_counts(&mut counts, &counts_key, n_values)?;
-            return Ok(counts);
+        if let Some(counts) = gguf_value_f32_vec(v) {
+            return expand_counts(counts, &counts_key, n_values);
         }
         return Err(Error::Backend(format!(
             "imatrix: '{counts_key}' metadata is not numeric"
@@ -156,25 +155,35 @@ fn read_counts(provider: &GgufProvider, base: &str, n_values: usize) -> Result<V
                 )))
             }
         };
-        let mut counts = counts;
-        align_counts(&mut counts, &counts_key, n_values)?;
-        return Ok(counts);
+        return expand_counts(counts, &counts_key, n_values);
     }
     // A writer that recorded no counts measured one chunk per column by
     // definition of `in_sum2` — treat every count as 1 rather than failing.
     Ok(vec![1.0; n_values])
 }
 
-fn align_counts(counts: &mut Vec<f32>, key: &str, n_values: usize) -> Result<()> {
+/// Expand `counts` to one count per `in_sum2` element. Three shapes occur in
+/// the wild: elementwise (len == n), a single scalar broadcast, and — for MoE
+/// expert tensors like `ffn_down_exps` (shape [n_expert, rows, cols]) — one
+/// count PER EXPERT over a flat expert-major in_sum2 (llama.cpp records how
+/// many chunks routed to each expert). Anything else is corruption.
+fn expand_counts(counts: Vec<f32>, key: &str, n_values: usize) -> Result<Vec<f32>> {
     if counts.len() == n_values {
-        return Ok(());
+        return Ok(counts);
     }
     if counts.len() == 1 {
-        counts.resize(n_values, counts[0]);
-        return Ok(());
+        return Ok(vec![counts[0]; n_values]);
+    }
+    if n_values % counts.len() == 0 {
+        let group = n_values / counts.len();
+        let mut out = Vec::with_capacity(n_values);
+        for c in &counts {
+            out.extend(std::iter::repeat(*c).take(group));
+        }
+        return Ok(out);
     }
     Err(Error::Backend(format!(
-        "imatrix: '{key}' length {} does not match its .in_sum2 length {n_values}",
+        "imatrix: '{key}' length {} neither matches, broadcasts over, nor          evenly divides its .in_sum2 length {n_values}",
         counts.len()
     )))
 }
@@ -456,6 +465,35 @@ mod tests {
     }
 
     #[test]
+    fn moe_expert_group_counts_align_per_expert() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp(
+            &dir.path().join("im.moe.gguf"),
+            GgufBuilder::new()
+                .tensor(
+                    "blk.10.ffn_down_exps.weight.in_sum2",
+                    GgufDType::F32,
+                    &[4],
+                    [8.0f32, 4.0, 9.0, 3.0]
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect(),
+                )
+                .tensor(
+                    "blk.10.ffn_down_exps.weight.counts",
+                    GgufDType::I32,
+                    &[2],
+                    [2i32, 3].iter().flat_map(|f| f.to_le_bytes()).collect(),
+                )
+                .build(),
+        );
+        let im = read_imatrix_scores(&path).unwrap();
+        // 2 experts x 2 columns: expert 0 count 2 -> mean(8/2, 4/2)=3,
+        // expert 1 count 3 -> mean(9/3, 3/3)=2; overall mean = 2.5
+        assert!((im.scores[0].1 - 2.5).abs() < 1e-6, "{}", im.scores[0].1);
+    }
+
+    #[test]
     fn counts_length_mismatch_fails_loud() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_temp(
@@ -473,15 +511,15 @@ mod tests {
                 .tensor(
                     "blk.0.w.counts",
                     GgufDType::I32,
-                    &[2],
-                    [1i32, 1].iter().flat_map(|f| f.to_le_bytes()).collect(),
+                    &[3],
+                    [1i32, 1, 1].iter().flat_map(|f| f.to_le_bytes()).collect(),
                 )
                 .build(),
         );
         let err = read_imatrix_scores(&path).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("blk.0.w.counts"), "{msg}");
-        assert!(msg.contains("length"), "{msg}");
+        assert!(msg.contains("divides"), "{msg}");
     }
 
 }
