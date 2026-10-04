@@ -447,10 +447,18 @@ pub fn cmd_oxidizer_convert(
     // ORDERING CONTRACT: pack_tensors consumes the per-tensor bitwidth vector
     // POSITIONALLY against its own sorted provider-name list. open_provider
     // hands back HashMap order — unsorted names here silently rotate the
-    // whole assignment (the Xing4.0 run packed 651 random tensors at the F32
-    // rung, 66 GB, while the search reported a nominal 3.5).
+    // whole assignment. The sizes vector travels WITH the names: sorting the
+    // names alone desynchronizes name -> size, and the RCO search then
+    // optimizes the budget against scrambled sizes (a 3.5-bpw "realized"
+    // report over a 6.2-bpw file).
     let mut names = names;
-    names.sort();
+    let mut sizes = sizes;
+    {
+        let mut pairs: Vec<(String, usize)> = names.into_iter().zip(sizes).collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        names = pairs.iter().map(|(n, _)| n.clone()).collect();
+        sizes = pairs.iter().map(|(_, sz)| *sz).collect();
+    }
     let embed_attachments = embed.resolve(model_path)?;
 
     // Calibration source priority: an explicit imatrix GGUF (the flag's path,
