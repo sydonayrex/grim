@@ -23,7 +23,7 @@
 
 use grim_core::error::{Error, Result};
 
-use super::Qwen3VlClip;
+use super::{MropeCache, MropeParams, Qwen3VlClip};
 
 /// Row-major `y = x @ w + b`, where `w` is `[nin, nout]`.
 ///
@@ -259,8 +259,8 @@ impl Qwen3VlClip {
                 3 * e,
                 &blk.attn_qkv_bias,
             );
-            let (_q, _k, v) = split_qkv(&qkv, n_rows, e);
-            let (qr, kr) = self.rope_qk(n_rows, heads, head_dim, px, py)?;
+            let (q, k, v) = split_qkv(&qkv, n_rows, e);
+            let (qr, kr) = self.rope_qk(&q, &k, n_rows, heads, head_dim, px, py)?;
 
             let ctx = attention(&qr, &kr, &v, n_rows, heads, head_dim);
             let attn_proj = linear(&ctx, n_rows, &blk.attn_out_weight, e, e, &blk.attn_out_bias);
@@ -391,24 +391,62 @@ impl Qwen3VlClip {
 
     /// Vision M-RoPE over the per-token position ids.
     ///
-    /// Task 2.2 (WI-3) implements the real rotation. Until then this refuses:
-    /// returning unrotated q/k would yield a tower that is deterministic,
-    /// plausible, and wrong - the RoPE is an identity at position 0, so every
-    /// single-position gate would pass while the model was comprehensively wrong.
+    /// Position ids are built once per image by [`MropeCache::position_ids`]
+    /// rather than per block, since every block sees the same token grid.
+    /// `q` and `k` arrive as flat `[rows, heads, head_dim]` buffers.
+    ///
+    /// Both the reference (`qwen3vl.cpp:100-111`) and this implementation rotate
+    /// the full head with half-split pairing and NO causal masking, because a
+    /// vision tower is an encoder.
     fn rope_qk(
         &self,
+        q: &[f32],
+        k: &[f32],
         rows: usize,
-        _heads: usize,
-        _head_dim: usize,
-        _px: usize,
-        _py: usize,
+        heads: usize,
+        head_dim: usize,
+        px: usize,
+        py: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        Err(Error::Unimplemented(format!(
-            "Qwen3-VL vision M-RoPE is not implemented yet; {rows} rows would \
-             otherwise be encoded with unrotated q/k, which is silently wrong"
-        )))
+        let params = MropeParams {
+            head_dim,
+            num_sections: 4,
+            freq_base: ROPE_FREQ_BASE,
+        };
+        if !params.is_valid() {
+            return Err(Error::Config(format!(
+                "vision rope: head_dim {head_dim} cannot be split into 4 non-empty \
+                 sections (needs >= 8 dims); embedding_length {} / heads {} is too \
+                 narrow for this projector",
+                self.cfg.embedding_length, heads
+            )));
+        }
+        // `ids.len()` is px*py by construction, which is exactly `rows`: the rows
+        // here are the PRE-merge patch rows (the merger reshape happens after the
+        // transformer stack, qwen3vl.cpp:174-181). An earlier version asserted
+        // the two were equal; that check could never fire and was removed rather
+        // than kept as decoration.
+        debug_assert_eq!(
+            MropeCache::position_ids(px, py, self.cfg.spatial_merge_size).len(),
+            rows,
+            "pre-merge rows and position ids must agree by construction"
+        );
+        let ids = MropeCache::position_ids(px, py, self.cfg.spatial_merge_size);
+        Ok((
+            params.apply_batch(q, rows, heads, &ids),
+            params.apply_batch(k, rows, heads, &ids),
+        ))
     }
 }
+
+/// `freq_base` the vision tower's rope runs at. The reference passes 10000
+/// (`qwen3vl.cpp:106-107`); this is NOT the text tower's 10000000
+/// (`qwen35.rope.freq_base` in the text GGUF), and using that value here would be
+/// a silent, total loss of positional signal.
+///
+/// Public so a test can pin the value: it is otherwise unobservable, because a
+/// wrong base still produces a norm-preserving, finite, correctly-shaped rotation.
+pub const ROPE_FREQ_BASE: f32 = 10000.0;
 
 /// The 5-op spatial-merge chain of `qwen3vl.cpp:18-31`, as explicit index passes.
 ///

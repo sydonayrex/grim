@@ -14,7 +14,10 @@
 
 mod config;
 mod forward;
+mod mrope;
 mod weights;
 
 pub use config::Qwen3VlClipConfig;
+pub use forward::ROPE_FREQ_BASE;
+pub use mrope::{MropeCache, MropeParams};
 pub use weights::{assert_non_degenerate, Qwen3VlBlock, Qwen3VlClip};

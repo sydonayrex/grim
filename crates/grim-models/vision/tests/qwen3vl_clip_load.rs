@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use grim_models_vision::qwen3vl_clip::{Qwen3VlClipConfig, assert_non_degenerate};
+use grim_models_vision::qwen3vl_clip::{assert_non_degenerate, Qwen3VlClipConfig};
 use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 
@@ -415,8 +415,7 @@ fn qwen3vl_clip_real() {
         );
     };
     println!("real mmproj: {}", path.display());
-    let provider = GgufProvider::open(path.to_str().expect("utf-8 path"))
-        .expect("mmproj opens");
+    let provider = GgufProvider::open(path.to_str().expect("utf-8 path")).expect("mmproj opens");
     let cfg = Qwen3VlClipConfig::from_provider(&provider).expect("geometry parses");
     cfg.ensure_supported()
         .expect("no deepstack in this checkpoint");

@@ -17,14 +17,16 @@ use grim_models_vision::qwen3vl_clip::{Qwen3VlClip, Qwen3VlClipConfig};
 use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 
-/// A 4x4-patch tower: patch 4, hidden 8, 2 heads of dim 4, 2 blocks, merge 2.
+/// A 4x4-patch tower: patch 4, hidden 16, 2 heads of dim 8, 2 blocks, merge 2.
 /// `image_size` 16 gives a 4x4 grid = 16 patches -> 4 merged tokens, and the
-/// merger consumes 4 * 8 = 32 features.
+/// merger consumes 4 * 16 = 64 features.
 fn tiny_config() -> Qwen3VlClipConfig {
     Qwen3VlClipConfig {
         image_size: 16,
         patch_size: 4,
-        embedding_length: 8,
+        // hidden 16 / 2 heads = head_dim 8, the smallest width that still splits
+        // into the 4 non-empty rope sections the vision tower requires.
+        embedding_length: 16,
         feed_forward_length: 16,
         block_count: 2,
         num_heads: 2,
@@ -294,6 +296,34 @@ fn non_square_image_of_valid_geometry_is_accepted() {
         patch_rows / cfg.merge_area
     );
 }
+
+
+/// A head too narrow for the four rope sections is refused with a clear message.
+///
+/// `head_dim 4` gives 2 pairs, which cannot fill four non-empty sections. Without
+/// the guard this is a divide-by-zero panic inside the rope, which in a serving
+/// process is a crash rather than a diagnostic.
+#[test]
+fn head_too_narrow_for_the_rope_is_refused_not_panicked() {
+    let mut cfg = tiny_config();
+    // hidden 8 / 2 heads = head_dim 4.
+    cfg.embedding_length = 8;
+    cfg.feed_forward_length = 16;
+    let p = separable_provider(&cfg);
+    let clip = Qwen3VlClip::load(&p, cfg.clone()).expect("tower loads");
+    let side = cfg.image_size;
+    let pixels = varied_pixels(&cfg, side, side);
+    let err = clip
+        .forward_cpu(&pixels, side, side)
+        .err()
+        .expect("a head too narrow for four sections must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rope") && msg.contains("8"),
+        "the error must name the rope and the required width: {msg}"
+    );
+}
+
 
 /// Repeated calls must agree. This catches state leaking between calls, which
 /// the device path will need; it does NOT catch a permutation bug, which is
