@@ -205,6 +205,9 @@ fn grey_raven_sidx_field_sweep() -> TestResult {
     // byte-0 broadcast. Predicts (2,2)->collapse [sidx=0xA] and (3,3)->
     // collapse [sidx=0xF], and straight/crossed splits elsewhere.
     sidxs.extend([0xAu32, 0xFu32]);
+    // Complete the 4x4: (0,2),(0,3),(1,2),(1,3),(2,1),(2,3),(3,1),(3,2).
+    // sidx = f1*4 + f0 for field pair 0.
+    sidxs.extend([8u32, 12, 9, 13, 6, 14, 7, 11]);
     for sidx in sidxs {
         // p%16 -> set of residue strings seen (summarizes all 512 B bytes in
         // 16 entries: bytes sharing p%16 share C-block structure).
@@ -243,6 +246,57 @@ fn grey_raven_sidx_field_sweep() -> TestResult {
         for (r, set) in &map {
             let v: Vec<&String> = set.iter().collect();
             println!("  p%16={r:<2} residues={v:?}");
+        }
+    }
+    Ok(())
+}
+
+/// E6 halves disambiguation: do A-lane halves carry different K-groups?
+///
+/// The pairing sweep used A[g] = 2^(g mod 8), identical across halves, so
+/// K-groups {0..3} and {4..7} are indistinguishable in the data. This probe
+/// phase-shifts the second half by 4 residues (A[g] = 2^((g+4) mod 8) for
+/// g >= 128). If halves carry different groups, second-half C values show
+/// shifted residues; if the hardware aliases halves, nothing changes.
+/// sidx in {0, 1}: baseline broadcast plus the one split, enough to see
+/// whether the split acts on one half or both.
+#[test]
+fn grey_raven_halves_disambiguation() -> TestResult {
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
+    let p2 = pow2_codes();
+    let mut a = vec![0u8; 256];
+    for g in 0..256 {
+        let r = if g < 128 { g % 8 } else { (g + 4) % 8 };
+        a[g] = p2[r];
+    }
+    let b_one = grim_quant::f32_to_fp8_e4m3(1.0);
+    let b_zero = grim_quant::f32_to_fp8_e4m3(0.0);
+    // Sample B bytes covering all chunk positions (full 512 is unnecessary:
+    // the question is halves, and chunks repeat every 16).
+    for sidx in [0u32, 1] {
+        println!("=== halves sidx={sidx} ===");
+        for p in (0..64usize).step_by(1) {
+            let mut b = vec![b_zero; 512];
+            b[p] = b_one;
+            let c = run_mma(&dev, &a, &b, sidx)?;
+            let mut nz: Vec<(usize, u32)> = Vec::new();
+            for (i, &v) in c.iter().enumerate() {
+                if v != 0.0 {
+                    assert_eq!(v, v.round(), "non-integer C");
+                    nz.push((i, v as u32));
+                }
+            }
+            if !nz.is_empty() {
+                // Split C indices into halves (0-127 vs 128-255) to see
+                // whether residues differ by half.
+                let lo: Vec<(usize, u32)> =
+                    nz.iter().filter(|(i, _)| *i < 128).cloned().collect();
+                let hi: Vec<(usize, u32)> =
+                    nz.iter().filter(|(i, _)| *i >= 128).cloned().collect();
+                println!("  p={p:>3} lo={lo:?} hi={hi:?}");
+            }
         }
     }
     Ok(())
