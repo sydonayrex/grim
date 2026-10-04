@@ -35,7 +35,7 @@ impl Lcg {
             .0
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        ((self.0 >> 40) as f32 / (1u32 << 24) as f32) - 1.0
+        ((self.0 >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0  // [-1, 1): the *2.0 is load-bearing (one-sided draws make u4/int8 gates vacuous)
     }
 }
 
