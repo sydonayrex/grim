@@ -13,7 +13,8 @@
 //!   degeneracy gate.
 
 mod config;
+mod forward;
 mod weights;
 
 pub use config::Qwen3VlClipConfig;
-pub use weights::{Qwen3VlBlock, Qwen3VlClip, assert_non_degenerate};
+pub use weights::{assert_non_degenerate, Qwen3VlBlock, Qwen3VlClip};

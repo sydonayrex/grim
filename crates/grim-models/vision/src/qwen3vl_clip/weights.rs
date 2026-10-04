@@ -211,7 +211,12 @@ impl Qwen3VlClip {
         for i in 0..cfg.block_count {
             let p = format!("v.blk.{i}");
             let block = Qwen3VlBlock {
-                attn_qkv_weight: load_f32(provider, &ws, &format!("{p}.attn_qkv.weight"), e * qkv_out)?,
+                attn_qkv_weight: load_f32(
+                    provider,
+                    &ws,
+                    &format!("{p}.attn_qkv.weight"),
+                    e * qkv_out,
+                )?,
                 attn_qkv_bias: load_f32(provider, &ws, &format!("{p}.attn_qkv.bias"), qkv_out)?,
                 attn_out_weight: load_f32(provider, &ws, &format!("{p}.attn_out.weight"), e * e)?,
                 attn_out_bias: load_f32(provider, &ws, &format!("{p}.attn_out.bias"), e)?,
