@@ -256,6 +256,13 @@ pub enum GgufDType {
     /// ForestRaven: INT8, native `V_DOT4_I32_IU8`. Bare codes.
     #[allow(non_camel_case_types)]
     ForestRaven = 672,
+    /// GreyRaven-HW tiled: per-(16-row tile, 32-col window) 256 B A-fragment
+    /// in hardware lane order plus one u32 sidx (260 B per 512 weights).
+    /// The kernel-consumable arrangement; flat tag 671 stays the canonical
+    /// interchange form. Same WhiteRaven lesson: distinct layouts, distinct
+    /// tags, no silent conversion.
+    #[allow(non_camel_case_types)]
+    GreyRavenHw = 673,
 }
 
 impl GgufDType {
@@ -286,6 +293,7 @@ impl GgufDType {
             GgufDType::Raven | GgufDType::WhiteRaven => 8.0,
             GgufDType::ForestRaven => 8.0,
             GgufDType::GreyRaven => 4.75,
+            GgufDType::GreyRavenHw => 260.0 * 8.0 / 512.0,
             _ => return None,
         })
     }
@@ -341,6 +349,7 @@ impl GgufDType {
             670 => Some(GgufDType::WhiteRaven),
             671 => Some(GgufDType::GreyRaven),
             672 => Some(GgufDType::ForestRaven),
+            673 => Some(GgufDType::GreyRavenHw),
             _ => None,
         }
     }
@@ -393,6 +402,7 @@ impl GgufDType {
             GgufDType::WhiteRaven => 670,
             GgufDType::GreyRaven => 671,
             GgufDType::ForestRaven => 672,
+            GgufDType::GreyRavenHw => 673,
         }
     }
 
@@ -455,6 +465,8 @@ impl GgufDType {
             GgufDType::Raven | GgufDType::WhiteRaven | GgufDType::ForestRaven => 1,
             // 2:4 sparse: 16 survivors + 12 metadata bytes per 32 originals.
             GgufDType::GreyRaven => 32,
+            // HW-tiled: 512 weights per (16x32) tile-window.
+            GgufDType::GreyRavenHw => 512,
             GgufDType::PTQ1_0 => 128,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
@@ -522,6 +534,8 @@ impl GgufDType {
             GgufDType::Raven | GgufDType::WhiteRaven | GgufDType::ForestRaven => 1,
             // 2:4 sparse: 16 survivor bytes + 12 metadata bytes per 32 originals.
             GgufDType::GreyRaven => 16 + 12,
+            // HW-tiled: 256 B frag + u32 sidx per 512 weights.
+            GgufDType::GreyRavenHw => 256 + 4,
             _ => 0,
         }
     }
@@ -2467,6 +2481,15 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Sparse24),
         },
+        // GreyRaven-HW tiled: the kernel-consumable arrangement (frag order +
+        // sidx words). Served ONLY through .grim (explicit payload sizes):
+        // GGUF-direct refuses below because a stock reader must never accept
+        // tag 673, and grim's own GGUF reader cannot validate the tile
+        // tiling from byte counts alone.
+        GgufDType::GreyRavenHw => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw),
+        },
         // ForestRaven: symmetric per-output-row absmax INT8 in the framed
         // blob (`[u64 codes_len][codes][u64 scales_len][scales]`). This IS the
         // storage the format lives in -- but only the .grim reader can serve
@@ -2546,6 +2569,10 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         | GgufDType::WhiteRaven
         | GgufDType::ForestRaven
         | GgufDType::GreyRaven => Some(8),
+        // HW-tiled: 260 B per 512 weights = 4.0625 bpw. Reports 4 (whole
+        // weights); the true density lives in grim_native_bpw, same split
+        // as the WhiteCrow arm above.
+        GgufDType::GreyRavenHw => Some(4),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
         GgufDType::Q2K
@@ -2617,6 +2644,7 @@ impl GgufDType {
             GgufDType::Raven => "Raven",
             GgufDType::WhiteRaven => "WhiteRaven",
             GgufDType::GreyRaven => "GreyRaven",
+            GgufDType::GreyRavenHw => "GreyRavenHw",
             GgufDType::ForestRaven => "ForestRaven",
             GgufDType::Q4_0 => "Q4_0",
             GgufDType::Q4_1 => "Q4_1",

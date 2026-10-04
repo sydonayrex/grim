@@ -196,14 +196,22 @@ impl QuantOps for VulkanDevice {
                     // Cross-agent courtesy fix: the arm was added upstream
                     // without this vulkan match arm and blocked the tree.
                     BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&b_bytes_cpu, k * n)?,
-                    // GreyRaven 2:4: the packed form exists (`pack_grey_raven`)
-                    // and the host decodes it; what does not exist is a Vulkan
-                    // kernel route. Refusing is the honest answer -- misreading
-                    // compacted survivors as a dense code plane returns finite,
-                    // plausible, wrong weights, which is worse than an error.
+                    // GreyRaven 2:4 flat: the packed form exists
+                    // (`pack_grey_raven`) and the host decodes it; what does
+                    // not exist is a Vulkan kernel route. Refusing is the
+                    // honest answer -- misreading compacted survivors as a
+                    // dense code plane returns finite, plausible, wrong
+                    // weights, which is worse than an error.
                     BlockDtype::Fp8Sparse24 => {
                         return Err(grim_tensor::error::Error::Backend(
                             "GreyRaven 2:4 has no Vulkan kernel route yet (host decode via dequant_grey_raven only)".into(),
+                        ))
+                    }
+                    // GreyRaven-HW tiled: HW order + sidx words. Host-decodable
+                    // (`dequant_grey_raven_hw`); no Vulkan kernel consumes it.
+                    BlockDtype::Fp8Sparse24Hw => {
+                        return Err(grim_tensor::error::Error::Backend(
+                            "GreyRaven-HW has no Vulkan kernel route yet (host decode via dequant_grey_raven_hw only)".into(),
                         ))
                     }
                     // ForestRaven: per-row absmax INT8. Same position as

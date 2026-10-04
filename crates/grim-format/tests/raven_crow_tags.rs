@@ -32,6 +32,7 @@ fn every_raven_crow_tag_is_far_above_the_upstream_range() {
         GgufDType::Raven,
         GgufDType::WhiteRaven,
         GgufDType::GreyRaven,
+        GgufDType::GreyRavenHw,
         GgufDType::ForestRaven,
     ] {
         assert!(
@@ -65,6 +66,7 @@ fn the_tag_space_is_partitioned_by_weight_width() {
         GgufDType::Raven,
         GgufDType::WhiteRaven,
         GgufDType::GreyRaven,
+        GgufDType::GreyRavenHw,
         GgufDType::ForestRaven,
     ] {
         assert!(
@@ -99,6 +101,7 @@ fn tags_round_trip_through_from_tag() {
         GgufDType::Raven,
         GgufDType::WhiteRaven,
         GgufDType::GreyRaven,
+        GgufDType::GreyRavenHw,
         GgufDType::ForestRaven,
     ] {
         assert_eq!(
@@ -137,6 +140,7 @@ fn every_series_member_resolves_to_a_real_storage() {
         GgufDType::Raven,
         GgufDType::WhiteRaven,
         GgufDType::GreyRaven,
+        GgufDType::GreyRavenHw,
         GgufDType::ForestRaven,
     ] {
         let dt = map_gguf_dtype_to_storage(d);

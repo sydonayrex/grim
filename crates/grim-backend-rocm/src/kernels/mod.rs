@@ -65,6 +65,8 @@ pub mod scrub_jay;
 /// GreyRaven (WS-E) probe for the sparse FP8 SWMMAC fragment layout. Not yet a
 /// GEMM: the layout is what E6 has to discover first.
 pub mod grey_raven;
+/// GreyRaven production GEMM over HW-order tiled weights (E6 closed).
+pub mod grey_raven_gemm;
 pub mod rwkv;
 pub mod sage_attention;
 pub mod scythe_persistent;

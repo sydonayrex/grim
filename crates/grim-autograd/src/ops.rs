@@ -405,6 +405,8 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             // two pruned ones) and must not be reported here, or every size
             // estimate downstream would under-count by 8/4.75.
             BlockDtype::Fp8Sparse24 => 8,
+            // GreyRaven-HW: same survivor bytes, hardware order.
+            BlockDtype::Fp8Sparse24Hw => 8,
             // ForestRaven stores whole int8 bytes: code width 8. Per-row fp32
             // scales are framing overhead on a different denominator.
             BlockDtype::Int8PerChannel => 8,

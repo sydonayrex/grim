@@ -182,6 +182,16 @@ pub enum BlockDtype {
     /// entry's explicit `payload_size`, and GGUF-direct refuses this format
     /// because no fixed block geometry expresses row-scaled framing.
     Int8PerChannel,
+    /// GreyRaven-HW tiled: per-(16-row tile, 32-col window) 256 B A-fragment
+    /// in hardware lane order plus one u32 sidx, i.e. 260 B per 512 weights.
+    ///
+    /// A DISTINCT layout from [`Self::Fp8Sparse24`] (flat survivors +
+    /// bitstream), not a tuning knob: the flat order cannot feed the SWMMAC
+    /// fragment without a runtime shuffle, and the sidx words exist only
+    /// here. Same WhiteRaven lesson -- same bytes percolated differently
+    /// decode to finite, plausible, wrong weights -- so it gets its own tag
+    /// (673), its own QuantFormat, and no silent conversion either way.
+    Fp8Sparse24Hw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -305,6 +315,9 @@ pub enum QuantFormat {
     /// `V_DOT4_I32_IU8`. See `BlockDtype::Int8PerChannel` for why this is not
     /// Q8_0 under another name.
     Int8PerChannel,
+    /// GreyRaven-HW tiled: the kernel-consumable arrangement. See
+    /// `BlockDtype::Fp8Sparse24Hw`.
+    Fp8Sparse24Hw,
     Iq4Nl,
     Iq4Xs,
     Iq3Xxs,
@@ -489,6 +502,9 @@ impl DType {
                 // use the real length (the .grim entry's explicit
                 // `payload_size`), never this estimate, to size a read.
                 BlockDtype::Int8PerChannel => elem_count,
+                // GreyRaven-HW: 260 B per 512 weights, exact for whole tiles.
+                // Tails round up (over-allocates, never truncates).
+                BlockDtype::Fp8Sparse24Hw => elem_count.div_ceil(512) * 260,
             },
             Storage::ResidualPacked(cfg) => (elem_count * (cfg.bpw as usize)).div_ceil(8),
             Storage::Unsupported(f) => match (f.block_size, f.bytes_per_block) {
@@ -526,6 +542,7 @@ impl From<QuantFormat> for Storage {
             QuantFormat::Fp8Blocked16 => Storage::FloatPack(FloatPackScheme::Fp8Blocked16),
             QuantFormat::W4A4OstQuant => Storage::W4A4OstQuant(OstQuantConfig { group_size: 128 }),
             QuantFormat::Int8PerChannel => Storage::Block(BlockDtype::Int8PerChannel),
+            QuantFormat::Fp8Sparse24Hw => Storage::Block(BlockDtype::Fp8Sparse24Hw),
             QuantFormat::Fp8Block16 => Storage::Block(BlockDtype::Fp8Block16),
             QuantFormat::Fp8Block128 => Storage::Block(BlockDtype::Fp8Block128),
             QuantFormat::Fp8Sparse24 => Storage::Block(BlockDtype::Fp8Sparse24),
@@ -607,6 +624,7 @@ impl TryFrom<&Storage> for QuantFormat {
                 BlockDtype::Fp8 => Ok(QuantFormat::Fp8),
                 BlockDtype::Fp8Sparse24 => Ok(QuantFormat::Fp8Sparse24),
                 BlockDtype::Int8PerChannel => Ok(QuantFormat::Int8PerChannel),
+                BlockDtype::Fp8Sparse24Hw => Ok(QuantFormat::Fp8Sparse24Hw),
                 // Legacy Q4_0 shares IQ4_NL's density but not its block, and no
                 // canonical QuantFormat names it yet; refuse rather than
                 // report a format a decoder would not honour.

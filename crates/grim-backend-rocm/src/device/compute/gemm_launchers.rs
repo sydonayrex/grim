@@ -762,6 +762,75 @@ impl RocmDevice {
         )
     }
 
+    /// GreyRaven production GEMM over HW-order tiled weights.
+    ///
+    /// Unlike the probe above this runs from the JIT aggregate (it needs
+    /// `float_to_fp8_e4m3_hip` from quant_standalone for the in-register B
+    /// gather), so the entry is `grim_grey_raven_gemm` via
+    /// `launch_compute_kernel`, which also records the route counter the
+    /// journey tests assert on.
+    ///
+    /// Contract (refused, not clamped): `blob.bytes == n_tiles*n_windows*260`
+    /// with `n_tiles = ceil(n/16)`, `n_windows = ceil(k/32)`. A short blob
+    /// would fault the frag loads; an over-long one means the caller paired
+    /// the wrong geometry with the payload. Both name exact sizes.
+    pub fn launch_grey_raven_gemm(
+        &self,
+        w_blob: &RocmStorage,
+        x: &RocmStorage,
+        y_out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        n_tiles: usize,
+        n_windows: usize,
+    ) -> Result<*mut c_void> {
+        let want_bytes = n_tiles
+            .checked_mul(n_windows)
+            .and_then(|t| t.checked_mul(260))
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: tile geometry overflows".into()))?;
+        if w_blob.bytes != want_bytes {
+            return Err(Error::Backend(format!(
+                "grey_raven_gemm: HW blob is {} bytes, need {} ({} N-tiles x {} K-windows x 260) -- truncated upload or wrong tensor",
+                w_blob.bytes, want_bytes, n_tiles, n_windows
+            )));
+        }
+        let wptr = w_blob
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: w has no device ptr".into()))?;
+        let xptr = x
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: x has no device ptr".into()))?;
+        let yptr = y_out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: y has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(n_tiles as u32, m.div_ceil(16) as u32, 1);
+        let block_dim = HipDim3::new(32, 1, 1);
+        let mut w = wptr;
+        let mut xx = xptr;
+        let mut yy = yptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut nt = n_tiles as i32;
+        let mut nw = n_windows as i32;
+        self.launch_compute_kernel(
+            "grim_grey_raven_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut w),
+                arg(&mut xx),
+                arg(&mut yy),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut nt),
+                arg(&mut nw),
+            ],
+        )
+    }
+
     pub fn launch_wmma_gemm_fp8_e4m3_for_ab(
         &self,
         a: &RocmStorage,

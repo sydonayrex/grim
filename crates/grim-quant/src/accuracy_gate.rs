@@ -47,6 +47,15 @@ impl AccuracyTolerance {
                 max_relative_l2_error: 0.12,
                 max_delta_ppl: 0.08,
             },
+            // HW-tiled GreyRaven: same codes as Fp8Sparse24, but tile-coupled
+            // patterns (shared across 16 rows and K-halves) prune less
+            // optimally than independent groups. Same provisional tier until
+            // E9 measures the coupled gate.
+            QuantFormat::Fp8Sparse24Hw => Self {
+                min_cosine_similarity: 0.995,
+                max_relative_l2_error: 0.12,
+                max_delta_ppl: 0.08,
+            },
             // Same E4M3 element format as `Fp8`; only the scale granularity
             // differs (128x128 grid vs per-tensor), so the same tolerances apply.
             QuantFormat::Fp8Block128 => Self {

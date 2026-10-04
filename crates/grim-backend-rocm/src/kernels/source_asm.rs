@@ -72,6 +72,9 @@ pub fn compute_kernel_source() -> String {
     // append hipModuleGetFunction fails on first falcon_h1/mamba decode step.
     s.push_str(crate::kernels::selective_scan::KERNEL_SOURCE);
     s.push_str(crate::kernels::quant_standalone::KERNEL_SOURCE);
+    // GreyRaven production GEMM (E6 closed). After quant_standalone: uses
+    // float_to_fp8_e4m3_hip for the in-register B gather.
+    s.push_str(crate::kernels::grey_raven_gemm::GEMM_SOURCE);
     // MXFP4/MXFP8 standalone dequant kernels (grim_dequant_mxfp4 et al.) —
     // same aggregate-unit requirement as the q4k/iq families above.
     s.push_str(crate::kernels::mxfp_standalone::KERNEL_SOURCE);

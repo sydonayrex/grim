@@ -201,6 +201,42 @@ fn forestraven_gguf_direct_refuses_pointing_at_grim_while_the_tag_has_meaning() 
     );
 }
 
+#[test]
+fn greyraven_hw_gguf_direct_refuses_pointing_at_grim() {
+    // Same asymmetric case as ForestRaven, other direction: tag 673 maps to a
+    // REAL storage (`Block(Fp8Sparse24Hw)`), but GGUF-direct cannot validate
+    // the tile tiling from byte counts alone (a divisible product with an
+    // untilable shape would load an unusable blob). Refuse at `get` naming
+    // the .grim path; `meta` stays truthful.
+    let scratch = Scratch::new();
+    let path = scratch.path("greyhw.gguf");
+    write_gguf(
+        &path,
+        GgufDType::GreyRavenHw,
+        "w.weight",
+        &[64, 32],
+        &vec![0u8; 32 * 64 / 512 * 260],
+    );
+    let provider = GgufProvider::open(path.to_str().expect("path")).expect("open");
+    let meta = provider.meta("w.weight").expect("meta");
+    assert_eq!(
+        meta.dtype.storage,
+        grim_tensor::dtype::Storage::Block(
+            grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw
+        ),
+        "meta must report the tag's true meaning"
+    );
+    let err = provider
+        .get("w.weight")
+        .err()
+        .expect("GGUF-direct get of a tiled blob must refuse, not guess");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("673") && msg.contains(".grim"),
+        "refusal must name the tag and the remedy, got: {msg}"
+    );
+}
+
 /// The regression that motivated declaring every geometry explicitly.
 ///
 /// `type_size_per_block`'s fallback is `_ => 0`, and the reader derives a
@@ -215,6 +251,7 @@ fn no_declared_format_sizes_its_tensor_to_zero_bytes() {
         GgufDType::Raven,
         GgufDType::WhiteRaven,
         GgufDType::GreyRaven,
+        GgufDType::GreyRavenHw,
         GgufDType::ForestRaven,
     ] {
         assert!(

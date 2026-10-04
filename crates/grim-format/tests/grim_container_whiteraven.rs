@@ -373,10 +373,10 @@ fn unknown_format_fails_before_any_packing() {
 
 #[test]
 fn convert_with_format_greyraven_prunes_packs_and_loads() {
-    // GreyRaven is LOSSY by construction: 2:4 magnitude prune, then E4M3.
-    // The decoded model must equal the pruned model, not the dense source.
-    // Asserting dense equality here would pin a false claim; asserting nothing
-    // about the values would let a dense passthrough slip by.
+    // GreyRaven-HW is LOSSY by construction: tile-coupled 2:4 prune, then
+    // E4M3 in hardware order. The decoded model must equal the pruned model,
+    // not the dense source -- and the coupling (shared patterns across 16
+    // rows and K-halves) must hold, or the sidx words cannot select it.
     let scratch = Scratch::new();
     let (n, k) = (32usize, 64usize);
     let want: Vec<f32> = (0..n * k)
@@ -409,54 +409,24 @@ fn convert_with_format_greyraven_prunes_packs_and_loads() {
     assert_eq!(
         meta.dtype.storage,
         grim_tensor::dtype::Storage::Block(
-            grim_tensor::dtype::BlockDtype::Fp8Sparse24
+            grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw
         ),
-        "--format greyraven must tag Block(Fp8Sparse24)"
+        "--format greyraven must tag Block(Fp8Sparse24Hw)"
     );
     assert_eq!(meta.shape, vec![n, k]);
 
     let raw = gp.get("blk.weight").expect("get");
-    let expected_len = grim_quant::grey_raven::packed_bytes_for(n * k);
-    assert_eq!(
-        raw.bytes.len(),
-        expected_len,
-        "payload must match the 4.75bpw geometry, not n*k"
-    );
-    assert!(
-        expected_len < n * k,
-        "a 2:4 payload that is not smaller than dense is not pruned"
-    );
+    // 2 row-tiles x 2 windows x 260 B.
+    assert_eq!(raw.bytes.len(), 2 * 2 * 260);
 
-    // Host reference: magnitude prune (top-2 |v| per consecutive group of 4,
-    // ties by ascending slot -- the same rule `sparsify_2_4_flat` uses), then
-    // E4M3 round the survivors. Flat consecutive groups coincide with K-groups
-    // for row-major [n, k] with k % 4 == 0.
-    let mut pruned = want.clone();
-    for g in 0..(n * k / 4) {
-        let base = g * 4;
-        let mut order = [0usize, 1, 2, 3];
-        order.sort_by(|&a, &b| {
-            want[base + b]
-                .abs()
-                .partial_cmp(&want[base + a].abs())
-                .unwrap()
-                .then_with(|| a.cmp(&b))
-        });
-        pruned[base + order[2]] = 0.0;
-        pruned[base + order[3]] = 0.0;
-    }
-    let zeros = pruned.iter().filter(|&&v| v == 0.0).count();
-    assert_eq!(
-        zeros,
-        n * k / 2,
-        "every group of 4 must lose exactly 2 weights"
-    );
-
-    let deq = grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, n * k)
+    let deq = grim_quant::grey_raven::dequant_grey_raven_hw(&raw.bytes, n, k)
         .expect("dequant");
     assert_eq!(deq.len(), n * k);
-    for (i, (&w, &g)) in pruned.iter().zip(&deq).enumerate() {
-        if w == 0.0 {
+    // Every survivor is the E4M3 round of the SOURCE at its position (the
+    // packer encodes, never invents), and pruned cells are exactly +0.0.
+    // Implementation-independent: holds regardless of which pattern won.
+    for (i, (&w, &g)) in want.iter().zip(&deq).enumerate() {
+        if g == 0.0 {
             assert_eq!(
                 g.to_bits(),
                 0.0f32.to_bits(),
@@ -467,8 +437,47 @@ fn convert_with_format_greyraven_prunes_packs_and_loads() {
             assert_eq!(
                 g.to_bits(),
                 q.to_bits(),
-                "element {i}: survivor must be the E4M3 round, got {g:e} want {q:e}"
+                "element {i}: survivor must be the E4M3 round of source, got {g:e} want {q:e}"
             );
+        }
+    }
+    // 2:4 structure: every live K-group keeps exactly 2.
+    for r in 0..n {
+        for g in 0..k / 4 {
+            let nz = (0..4).filter(|s| deq[r * k + 4 * g + s] != 0.0).count();
+            // An all-zero source group decodes all-zero (0 survivors, not 2):
+            // the packer cannot invent mass. Otherwise exactly 2.
+            let src_nz = (0..4).filter(|s| want[r * k + 4 * g + s] != 0.0).count();
+            if src_nz == 0 {
+                assert_eq!(nz, 0);
+            } else {
+                assert_eq!(nz, 2, "row {r} group {g} must keep exactly 2");
+            }
+        }
+    }
+    // Coupling: groups {p, p+4} of each 32-window share survivor slots
+    // (hardware forced sharing). Verify slot sets match within each pair,
+    // skipping rows where either group is all-zero in source.
+    for r in (0..n).step_by(16) {
+        for w0 in 0..k / 32 {
+            for p in 0..4 {
+                for rr in r..(r + 16).min(n) {
+                    let a = (0..4)
+                        .filter(|s| deq[rr * k + 4 * (8 * w0 + p) + s] != 0.0)
+                        .collect::<Vec<_>>();
+                    let b = (0..4)
+                        .filter(|s| deq[rr * k + 4 * (8 * w0 + p + 4) + s] != 0.0)
+                        .collect::<Vec<_>>();
+                    let sa = (0..4).any(|s| want[rr * k + 4 * (8 * w0 + p) + s] != 0.0);
+                    let sb = (0..4).any(|s| want[rr * k + 4 * (8 * w0 + p + 4) + s] != 0.0);
+                    if sa && sb {
+                        assert_eq!(
+                            a, b,
+                            "tile row {rr} window {w0} pair {p}: groups must share slots"
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -507,16 +516,16 @@ fn convert_with_format_greyraven_leaves_1d_tensors_untouched() {
     assert_eq!(
         w_meta.dtype.storage,
         grim_tensor::dtype::Storage::Block(
-            grim_tensor::dtype::BlockDtype::Fp8Sparse24
+            grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw
         ),
-        "2D K-aligned weight must become GreyRaven"
+        "2D weight must become GreyRaven-HW"
     );
     let n_meta = gp.meta("blk.norm.weight").expect("meta norm");
     assert!(
         !matches!(
             n_meta.dtype.storage,
             grim_tensor::dtype::Storage::Block(
-                grim_tensor::dtype::BlockDtype::Fp8Sparse24
+                grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw
             )
         ),
         "1D norm must NOT be tagged sparse -- there is no K axis to group"

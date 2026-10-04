@@ -867,6 +867,19 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp8Block128 => grim_quant::dequant_fp8_block128(&raw.bytes),
             // Legacy GGUF Q4_0 (18 B blocks, w = (q - 8) * scale).
             BlockDtype::Q4_0 => grim_quant::dequant_q4_0(&raw.bytes, n),
+            // GreyRaven-HW tiled: hardware order + sidx words decode to the
+            // coupled-pruned dense model. Row/col counts from the tensor shape.
+            BlockDtype::Fp8Sparse24Hw => {
+                if raw.shape.len() < 2 {
+                    return Err(Error::Unimplemented(format!(
+                        "Fp8Sparse24Hw materialization needs [n, k] shape, got {:?}",
+                        raw.shape
+                    )));
+                }
+                let (nn, kk) = (raw.shape[0], raw.shape[1]);
+                grim_quant::grey_raven::dequant_grey_raven_hw(&raw.bytes, nn, kk)
+                    .map_err(|e| Error::Unimplemented(e.to_string()))
+            }
             // ForestRaven: per-row absmax INT8 in the framed blob. Row count
             // from the tensor shape -- a flat element count cannot recover it.
             BlockDtype::Int8PerChannel => {

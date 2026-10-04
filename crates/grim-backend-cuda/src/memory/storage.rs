@@ -132,6 +132,11 @@ pub(crate) fn cuda_dequant_quantized_storage(
             BlockDtype::Fp8Sparse24 => Err(Error::Unimplemented(
                 "GreyRaven 2:4 has no CUDA kernel route yet (host decode via dequant_grey_raven only)".to_string(),
             )),
+            // GreyRaven-HW tiled: HW order + sidx words. Host-decodable
+            // (`dequant_grey_raven_hw`); no CUDA kernel consumes it.
+            BlockDtype::Fp8Sparse24Hw => Err(Error::Unimplemented(
+                "GreyRaven-HW has no CUDA kernel route yet (host decode via dequant_grey_raven_hw only)".to_string(),
+            )),
             // ForestRaven: per-row absmax INT8, framed blob. Host-decodable
             // (`dequant_forest`); no CUDA kernel consumes it yet.
             BlockDtype::Int8PerChannel => Err(Error::Unimplemented(

@@ -376,6 +376,20 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
                 grim_quant::grey_raven::dequant_grey_raven(&raw.bytes, elem_count)
                     .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))
             }
+            // GreyRaven-HW tiled: decode the hardware-order blob (frag order +
+            // sidx words) back to the coupled-pruned dense model. Needs [n, k]
+            // for tiling, like ForestRaven needs it for rows.
+            grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw => {
+                if raw.shape.len() < 2 {
+                    return Err(grim_tensor::error::Error::Backend(format!(
+                        "Fp8Sparse24Hw host dequant needs [n, k] shape, got {:?}",
+                        raw.shape
+                    )));
+                }
+                let (n, k) = (raw.shape[0], raw.shape[1]);
+                grim_quant::grey_raven::dequant_grey_raven_hw(&raw.bytes, n, k)
+                    .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))
+            }
             grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
                 grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)
             }
@@ -854,9 +868,8 @@ fn pack_tensors(
             other => {
                 return Err(Error::Backend(format!(
                     "--format '{other}': unknown. Supported: whiteraven (FP8-blocked), \
-                     raven (FP8), whitecrow (W4A4 OSTQuant), greyraven (FP8 2:4, host-decode \
-                     only -- no production kernel yet), forestraven (per-row absmax INT8, \
-                     host-decode only -- no kernel route yet), gsq_rco_3p5 (tag 81)."
+                     raven (FP8), whitecrow (W4A4 OSTQuant), greyraven (FP8 2:4 HW-tiled), \
+                     forestraven (per-row absmax INT8), gsq_rco_3p5 (tag 81)."
                 )));
             }
         }
@@ -915,6 +928,11 @@ fn pack_tensors(
                 grim_tensor::dtype::Storage::Block(
                     grim_tensor::dtype::BlockDtype::Fp8Sparse24,
                 ) => Some((crate::gguf::GgufDType::GreyRaven, 4u8)),
+                // HW-tiled sources (already kernel-ordered) pass through as
+                // 673: re-encoding through f32 would lose the coupling.
+                grim_tensor::dtype::Storage::Block(
+                    grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw,
+                ) => Some((crate::gguf::GgufDType::GreyRavenHw, 4u8)),
                 grim_tensor::dtype::Storage::Block(
                     grim_tensor::dtype::BlockDtype::Int8PerChannel,
                 ) => Some((crate::gguf::GgufDType::ForestRaven, 8u8)),
@@ -1161,38 +1179,38 @@ fn pack_tensors(
                 return Ok(((entry, blob), ext, Some(override_)));
             }
 
-            // GreyRaven 2:4: magnitude-only prune, then pack. Two things this
+            // GreyRaven-HW tiled: tile-coupled magnitude prune, then hardware-
+            // order pack (frag order + sidx words, tag 673). Two things this
             // arm is NOT:
             //
-            // - It is not Fisher-guided. `sparsify_2_4_flat` keeps the two
-            //   largest-magnitude slots per K-group of 4, deterministically.
-            //   Fisher-guided pruning (E10) keeps more accuracy; magnitude
-            //   pruning is what a plain f32->bytes rewrite can honestly do,
-            //   and the test pins the pruned-not-dense semantics so nobody
-            //   mistakes the output for a lossless encoding.
-            // - It is not runnable on GPU yet. The packed file loads and
-            //   decodes on the host (varbuilder, CPU); ROCm/CUDA/Vulkan
-            //   dispatch refuses with a message naming the missing SWMMAC
-            //   GEMM. Converting now stages the artifact the kernel needs.
+            // - It is not Fisher-guided. Coupled patterns minimize dropped
+            //   magnitude-squared per (16-row tile, window, pair-class);
+            //   Fisher-guided pruning keeps more accuracy but needs calibration
+            //   statistics convert does not have.
+            // - It is not the flat 671 layout. Flat (survivors + bitstream) is
+            //   the interchange/host form; 673 is the kernel-consumable form.
+            //   Flat SOURCES pass through verbatim below as 671 (no lossy
+            //   re-prune); only dense sources become 673 here.
             //
-            // K must be a multiple of 4: 2:4 groups run along K, and padding
-            // would invent weights. Non-conforming tensors fall through to
-            // the uniform path so the file still loads.
+            // No K-alignment constraint: partial windows/tiles zero-pad (a
+            // padded zero group takes broadcast pattern (0,0) on zeros =
+            // exact 0). 1D tensors fall through to the uniform path.
             if matches!(fmt.as_deref(), Some("greyraven"))
                 && meta.shape.len() == 2
                 && meta.shape[0] > 0
                 && meta.shape[1] > 0
-                && meta.shape[1] % 4 == 0
             {
-                let sparsified = grim_quant::grey_raven::sparsify_2_4_flat(&f32_values)
-                    .map_err(|e| Error::Backend(format!("GreyRaven prune for '{name}': {e}")))?;
-                let packed = grim_quant::grey_raven::pack_grey_raven(&sparsified);
+                let (n, k) = (meta.shape[0], meta.shape[1]);
+                let pats = grim_quant::grey_raven::coupled_patterns_2_4(&f32_values, n, k)
+                    .map_err(|e| Error::Backend(format!("GreyRaven couple for '{name}': {e}")))?;
+                let blob = grim_quant::grey_raven::pack_grey_raven_hw(&f32_values, n, k, &pats)
+                    .map_err(|e| Error::Backend(format!("GreyRaven pack for '{name}': {e}")))?;
                 let entry = crate::format::GrimTensorEntry {
                     name: name.clone(),
                     shape: meta.shape.clone(),
                     base_bitwidth: 4,
                     payload_offset: 0,
-                    payload_size: packed.len() as u64,
+                    payload_size: blob.len() as u64,
                     outlier_count: 0,
                     outlier_offset: 0,
                     ..Default::default()
@@ -1202,13 +1220,13 @@ fn pack_tensors(
                     block_size: 0,
                     ..Default::default()
                 };
-                // effective_bpw records 5, not 4: the true density is 4.75,
+                // effective_bpw records 5, not 4: the true density is ~4.06,
                 // and capacity planning must not understate VRAM. The
-                // override_dtype (671) is authoritative for decode.
+                // override_dtype (673) is authoritative for decode.
                 let override_ = crate::gguf::GrimQuantOverride {
                     tensor_name: name.clone(),
                     effective_bpw: 5,
-                    override_dtype: crate::gguf::GgufDType::GreyRaven,
+                    override_dtype: crate::gguf::GgufDType::GreyRavenHw,
                     importance_score: 0.0,
                     layout_hint: None,
                 };
@@ -1218,7 +1236,7 @@ fn pack_tensors(
                         cb("pack", count, total);
                     }
                 }
-                return Ok(((entry, packed), ext, Some(override_)));
+                return Ok(((entry, blob), ext, Some(override_)));
             }
 
             // ForestRaven: symmetric per-output-row absmax INT8 in the framed

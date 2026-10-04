@@ -1694,6 +1694,13 @@ impl QuantOps for CpuDevice {
                             Error::Backend(format!("CPU quantized_matmul GreyRaven dequant: {e}"))
                         })?
                     }
+                    // GreyRaven-HW tiled: HW order + sidx words decode to the
+                    // coupled-pruned dense model. Same host-fallback position.
+                    grim_tensor::QuantFormat::Fp8Sparse24Hw => {
+                        grim_quant::grey_raven::dequant_grey_raven_hw(&b_bytes, n, k).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul GreyRaven-HW dequant: {e}"))
+                        })?
+                    }
                     // ForestRaven: per-row absmax INT8 decodes to dense f32
                     // with the framed-blob geometry (n, k). Same host-fallback
                     // position as every other format without a dedicated CPU
@@ -2664,6 +2671,14 @@ impl BackendStorage for CpuStorage {
                 grim_tensor::dtype::BlockDtype::Fp8Sparse24 => {
                     grim_quant::grey_raven::dequant_grey_raven(raw, n)
                         .map_err(|e| Error::Backend(format!("CPU GreyRaven dequant: {e}")))
+                }
+                // GreyRaven-HW: same shape problem as Int8PerChannel below --
+                // tiling needs (rows, cols), this entry point has only an
+                // element count. Use a shaped path.
+                grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw => {
+                    Err(Error::Backend(
+                        "CPU to_cpu_vec_f32: Fp8Sparse24Hw needs (rows, cols) tiling geometry; use a shaped decode path".to_string(),
+                    ))
                 }
                 // ForestRaven: per-row absmax INT8. This shape-less entry point
                 // (`raw`, `n`) cannot recover the row count the scale stream

@@ -3969,6 +3969,26 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
                     .to_string(),
             ))
         }
+        // GreyRaven-HW tiled: magnitude-coupled prune + hardware-order pack.
+        // Unlike flat Fp8Sparse24 this IS a pure f32 -> bytes function (the
+        // coupling is decided inside), so it belongs in this match.
+        QuantFormat::Fp8Sparse24Hw => {
+            if plan.shape.len() < 2 {
+                return Err(Error::Backend(format!(
+                    "Fp8Sparse24Hw rewrite needs [n, k] shape, got {:?}",
+                    plan.shape
+                )));
+            }
+            let (n, k) = (plan.shape[0], plan.shape[1]);
+            let pats = grey_raven::coupled_patterns_2_4(data, n, k)
+                .map_err(|e| Error::Backend(e.to_string()))?;
+            // Single canonical blob: per (tile, window) [256 B frag][u32 sidx].
+            // Fixed geometry (no length prefixes): the launcher parses it
+            // arithmetically from (n, k), unlike the ForestRaven/WhiteCrow
+            // frames whose segment counts vary.
+            grey_raven::pack_grey_raven_hw(data, n, k, &pats)
+                .map_err(|e| Error::Backend(e.to_string()))?
+        }
         QuantFormat::W4A4OstQuant => {
             if plan.shape.len() < 2 {
                 return Err(Error::Backend(format!(

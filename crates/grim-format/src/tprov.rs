@@ -546,6 +546,12 @@ impl GgufProvider {
         // computes -- rather than handing back a truncated prefix of the blob
         // as if it were whole. `GrimProvider` serves the same tag through its
         // quant_override, where the entry carries an explicit payload size.
+        // GreyRaven-HW tiled refuses for the same structural reason from the
+        // other direction: its 512/260 geometry sizes conforming shapes
+        // exactly, but a non-conforming shape (n%16 or k%32 nonzero with a
+        // divisible product) would load an untilable blob -- and no writer
+        // emits 673 GGUF anyway (the oxidizer refuses), so GGUF-direct has no
+        // legitimate input. Both formats live in .grim.
         let dtype = effective_dtype(info, &self.overrides);
         if matches!(
             dtype.storage,
@@ -557,6 +563,20 @@ impl GgufProvider {
                 "tensor '{}' is ForestRaven (grim-native tag 672): its row-scaled \
                  framing has no GGUF block geometry, so GGUF-direct reads cannot size it. \
                  Convert with `grim convert --format forestraven` and load the .grim file.",
+                info.name
+            )));
+        }
+        if matches!(
+            dtype.storage,
+            grim_tensor::dtype::Storage::Block(
+                grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw
+            )
+        ) {
+            return Err(Error::Backend(format!(
+                "tensor '{}' is GreyRaven-HW (grim-native tag 673): load it from \
+                 a .grim file (`grim convert --format greyraven`), whose entries \
+                 carry explicit payload sizes. GGUF-direct cannot validate the \
+                 tile tiling.",
                 info.name
             )));
         }

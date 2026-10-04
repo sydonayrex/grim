@@ -1411,6 +1411,8 @@ fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
                 // code width. See the autograd arm for why 4.75 is the wrong
                 // number to report at this denominator.
                 BlockDtype::Fp8Sparse24 => 8,
+                // GreyRaven-HW: same E4M3 survivor bytes, different order.
+                BlockDtype::Fp8Sparse24Hw => 8,
                 // ForestRaven: codes are whole int8 bytes, so 8 bits of code
                 // width. The per-row fp32 scales are framing overhead, not
                 // code width -- same denominator logic as GreyRaven above.

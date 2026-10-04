@@ -602,3 +602,246 @@ pub fn sparsify_2_4_flat_anchored_with_fisher(
     }
     Ok(out)
 }
+
+/// The six 2:4 survivor-slot patterns, index 0-5. Same pairs `pair_code`
+/// names, as ascending slot lists so sidx emission is a direct read.
+pub const PATTERNS_24: [[usize; 2]; 6] = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+
+/// Bytes of one hardware tile-window: 256 B A-fragment plus one u32 sidx.
+pub const HW_TILE_WINDOW_BYTES: usize = 256 + 4;
+
+/// Hardware-order GreyRaven payload for one (16-row tile, 32-col window):
+/// 256 B A-fragment in lane order plus the sidx word selecting the four
+/// pair-patterns. Produced/consumed as a unit; see `pack_grey_raven_hw`.
+pub struct GreyHwTile {
+    /// 256 B, lane `l` = bytes `[l*8, l*8+8)`: row `l % 16`, half `l >= 16`
+    /// holds K-groups `{4,5,6,7}` (first half: `{0,1,2,3}`); positions
+    /// `{2t, 2t+1}` hold group `(4*half + t)` survivors, ranks ascending.
+    pub frag: [u8; 256],
+    /// sidx pair `p` (fields `{2p, 2p+1}`) = `(B-byte rank0, B-byte rank1)`
+    /// for K-groups `{p, p+4}` of this window, shared across all 16 rows.
+    pub sidx: u32,
+}
+
+/// Coupled 2:4 pattern selection for the hardware tile.
+///
+/// The instruction exposes FOUR sidx field-pairs per 32-wide K-window but the
+/// window holds EIGHT K-groups, so pair `p` serves groups `{p, p+4}` jointly
+/// -- and one sidx word serves the whole 16-row tile, so all 16 rows share.
+/// Each class (tile, window, p) therefore covers 16 rows x 2 groups x 4
+/// slots = 128 weights and carries ONE pattern. This function chooses, per
+/// class, the pattern minimizing total dropped magnitude-squared (the
+/// magnitude-only analogue of the Fisher choice; a Fisher-weighted variant
+/// can reuse the same structure).
+///
+/// Returns per-class `(slot rank0, slot rank1)` ascending, indexed
+/// `[tile * n_window_pairs + window * 4 + p]` where `n_window_pairs =
+/// cols.div_ceil(32) * 4`. Rows/cols need not be multiples of 16/32:
+/// partial tiles/windows couple over their available cells, and empty
+/// groups (fully out-of-bounds) take pattern `(0, 0)` (broadcast on zeros,
+/// contributes exactly 0).
+pub fn coupled_patterns_2_4(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<[u8; 2]>, &'static str> {
+    if rows == 0 || cols == 0 {
+        return Err("need nonzero rows and cols");
+    }
+    if weights.len() < rows * cols {
+        return Err("weights shorter than rows*cols");
+    }
+    let n_tiles = rows.div_ceil(16);
+    let n_windows = cols.div_ceil(32);
+    let mut out = Vec::with_capacity(n_tiles * n_windows * 4);
+    for t in 0..n_tiles {
+        for w in 0..n_windows {
+            for p in 0..4 {
+                // Cells: rows [16t, 16t+16) x groups {8w+p, 8w+p+4}.
+                let mut best = (0usize, 1usize);
+                let mut best_cost = f32::INFINITY;
+                for cand in PATTERNS_24 {
+                    let mut cost = 0.0f32;
+                    let mut any = false;
+                    for r in 0..16 {
+                        let row = 16 * t + r;
+                        if row >= rows {
+                            continue;
+                        }
+                        for &g in &[p, p + 4] {
+                            let gb = 32 * w + 4 * g;
+                            // Group fully out of bounds contributes nothing
+                            // but must not poison the choice.
+                            let mut g_any = false;
+                            for s in 0..4 {
+                                let k = gb + s;
+                                if k < cols {
+                                    g_any = true;
+                                    if s != cand[0] && s != cand[1] {
+                                        let v = weights[row * cols + k];
+                                        cost += v * v;
+                                        any = true;
+                                    }
+                                }
+                            }
+                            let _ = g_any;
+                        }
+                    }
+                    if any && cost < best_cost {
+                        best_cost = cost;
+                        best = (cand[0], cand[1]);
+                    }
+                }
+                // No live cells (fully padded window/pair): broadcast pattern
+                // (0,0) on zeros. Diagonal sidx = reserved broadcast, exact 0.
+                out.push([best.0 as u8, best.1 as u8]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Pack weights into hardware tile order plus sidx words.
+///
+/// `patterns` comes from [`coupled_patterns_2_4`] (same rows/cols/tiling).
+/// Survivors are E4M3-encoded with the shared RNE converter, so a GreyRaven
+/// tensor and a dense FP8 tensor of the same values carry identical codes.
+/// Out-of-bounds cells (partial tiles/windows) encode as zero bytes; their
+/// patterns are `(0, 0)` broadcast, contributing exactly 0.
+///
+/// Layout per (tile, window): 256 B frag followed by one little-endian u32
+/// sidx. Total `n_tiles * n_windows * 260` bytes.
+pub fn pack_grey_raven_hw(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+    patterns: &[[u8; 2]],
+) -> Result<Vec<u8>, &'static str> {
+    if rows == 0 || cols == 0 {
+        return Err("need nonzero rows and cols");
+    }
+    if weights.len() < rows * cols {
+        return Err("weights shorter than rows*cols");
+    }
+    let n_tiles = rows.div_ceil(16);
+    let n_windows = cols.div_ceil(32);
+    if patterns.len() < n_tiles * n_windows * 4 {
+        return Err("patterns shorter than n_tiles*n_windows*4");
+    }
+    // Canonical blob: per (tile, window) [256 B frag][u32 sidx LE].
+    // Interleaved (not split) so the kernel loads frag + selector adjacently
+    // and the buffer is self-delimiting: total n_tiles*n_windows*260 bytes.
+    let mut blob = Vec::with_capacity(n_tiles * n_windows * HW_TILE_WINDOW_BYTES);
+    for t in 0..n_tiles {
+        for w in 0..n_windows {
+            // sidx word for this (tile, window): pair p at bits [4p+3:4p].
+            let mut word: u32 = 0;
+            for p in 0..4 {
+                let (s0, s1) = {
+                    let pat = patterns[(t * n_windows + w) * 4 + p];
+                    (pat[0] as u32, pat[1] as u32)
+                };
+                word |= (s0 | (s1 << 2)) << (4 * p);
+            }
+            // A-frag: lane l -> row (l%16) of this tile, half h = l>=16 ->
+            // groups {4h..4h+3} of this window; positions {2t,2t+1} get the
+            // two survivors of absolute group (8w + 4h + t), ranks ascending.
+            // (Absolute group gb = 8w + 4h + t; its k-base is 32w + 4(4h+t)%8?
+            // NO -- groups are absolute along K: window w covers groups
+            // 8w..8w+7; half h covers groups 8w+4h..8w+4h+3; position t picks
+            // group 8w+4h+t.)
+            let mut frag = [0u8; 256];
+            for l in 0..32 {
+                let r = 16 * t + (l % 16);
+                let h = usize::from(l >= 16);
+                for tt in 0..4 {
+                    let g = 8 * w + 4 * h + tt;
+                    let pat = patterns[(t * n_windows + w) * 4 + (tt % 4)];
+                    for (rank, &slot) in [pat[0] as usize, pat[1] as usize]
+                        .iter()
+                        .enumerate()
+                    {
+                        let k = 4 * g + slot;
+                        let v = if r < rows && k < cols {
+                            weights[r * cols + k]
+                        } else {
+                            0.0
+                        };
+                        frag[l * 8 + 2 * tt + rank] = crate::f32_to_fp8_e4m3(v);
+                    }
+                }
+            }
+            blob.extend_from_slice(&frag);
+            blob.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    Ok(blob)
+}
+
+/// Decode a hardware-order payload back to dense f32 (the pruned model).
+///
+/// Inverse of [`pack_grey_raven_hw`]: parses per-(tile, window) frag+sidx
+/// with `rows`/`cols` geometry. Validates total lengths; refuses short,
+/// truncated, or trailing-byte buffers rather than decoding a prefix.
+pub fn dequant_grey_raven_hw(
+    blob: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>, &'static str> {
+    if rows == 0 || cols == 0 {
+        return Err("need nonzero rows and cols");
+    }
+    let n_tiles = rows.div_ceil(16);
+    let n_windows = cols.div_ceil(32);
+    if blob.len() != n_tiles * n_windows * HW_TILE_WINDOW_BYTES {
+        return Err("blob length does not match tiling geometry");
+    }
+    let mut out = vec![0.0f32; rows * cols];
+    for t in 0..n_tiles {
+        for w in 0..n_windows {
+            let base = (t * n_windows + w) * HW_TILE_WINDOW_BYTES;
+            let word = u32::from_le_bytes(
+                blob[base + 256..base + 260].try_into().unwrap(),
+            );
+            for l in 0..32 {
+                let r = 16 * t + (l % 16);
+                if r >= rows {
+                    continue;
+                }
+                let h = usize::from(l >= 16);
+                for tt in 0..4 {
+                    // sidx pair p=(tt%4)... pair index within window: the
+                    // residue pair {(tt%4)*2...} NO -- pair p serves groups
+                    // {p, p+4}; position-pair {2t,2t+1} with t=tt%4 belongs
+                    // to pair p = tt%4. Groups served: {p, p+4}; this half h
+                    // selects group 4h + (p%4)... = 4h + tt%4. Consistent with
+                    // pack (same expression), so decode mirrors it exactly.
+                    let p = tt % 4;
+                    let fa = ((word >> (4 * p)) & 3) as usize;
+                    let fb = ((word >> (4 * p + 2)) & 3) as usize;
+                    // Diagonal (x,x) = broadcast byte x... but which VALUES?
+                    // Broadcast pairs both ranks with B-byte x; the VALUES
+                    // still live at positions {2t,2t+1} (ranks ascending).
+                    // Decode reads values positionally (ranks), slots from
+                    // sidx only to place them at k. Diagonal: both ranks at
+                    // slot fa. Non-diagonal: rank0 at fa, rank1 at fb.
+                    let g = 8 * w + 4 * h + (tt % 4);
+                    for (rank, pos) in [(2 * (tt % 4)), 2 * (tt % 4) + 1]
+                        .iter()
+                        .enumerate()
+                    {
+                        let v = crate::fp8_e4m3_to_f32(blob[base + l * 8 + pos]);
+                        // Diagonal (fa == fb) is the reserved broadcast: both
+                        // ranks land on fa. Otherwise rank selects its slot.
+                        let slot = if rank == 1 && fa != fb { fb } else { fa };
+                        let k = 4 * g + slot;
+                        if k < cols {
+                            out[r * cols + k] = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}

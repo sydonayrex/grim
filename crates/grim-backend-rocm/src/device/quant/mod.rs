@@ -1540,6 +1540,72 @@ impl QuantOps for RocmDevice {
                             k,
                         );
                     }
+                } else if matches!(
+                    bd,
+                    grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw
+                ) {
+                    // GreyRaven-HW tiled: production SWMMAC GEMM (E6 closed).
+                    // Kernel on gfx12 (RDNA4/UDNA carry V_SWMMAC; RDNA3 and
+                    // older do not); host-dequant + F32 matmul otherwise.
+                    // F32 native activations only: the kernel gathers X as
+                    // float and encodes E4M3 in-register.
+                    let a_f32 = a_storage.dtype().arith == ArithType::F32
+                        && matches!(
+                            a_storage.dtype().storage,
+                            DTypeStorage::Native
+                        );
+                    if !a_f32 {
+                        return Err(Error::Backend(format!(
+                            "ROCm GreyRaven-HW: activations must be F32 native, got {:?}",
+                            a_storage.dtype()
+                        )));
+                    }
+                    let gfx12 = matches!(
+                        crate::quantization::gcn_arch(&self.gpu_target),
+                        crate::quantization::GcnArch::RDNA4
+                            | crate::quantization::GcnArch::UDNA
+                    );
+                    if gfx12 && m > 0 && n > 0 && k > 0 {
+                        let n_tiles = n.div_ceil(16);
+                        let n_windows = k.div_ceil(32);
+                        self.launch_grey_raven_gemm(
+                            b_storage,
+                            a_storage,
+                            &out_storage,
+                            m,
+                            n,
+                            k,
+                            n_tiles,
+                            n_windows,
+                        )?;
+                    } else if gfx12 {
+                        return Err(Error::Backend(format!(
+                            "ROCm GreyRaven-HW: degenerate shape m={m} n={n} k={k}"
+                        )));
+                    } else {
+                        // Slow path, correct everywhere: decode the HW blob on
+                        // the host, upload F32, regular matmul. Per-call D2H +
+                        // H2D; fine for non-gfx12 bring-up, never hot.
+                        let blob = b_storage.copy_to_host().map_err(|e| {
+                            Error::Backend(format!("grey fallback: download failed: {e}"))
+                        })?;
+                        let w = grim_quant::grey_raven::dequant_grey_raven_hw(
+                            &blob, n, k,
+                        )
+                        .map_err(|e| {
+                            Error::Backend(format!("grey fallback: decode failed: {e}"))
+                        })?;
+                        let b_f32 = CoreTensorOps::from_cpu(
+                            self,
+                            &w,
+                            &Shape::new(vec![n, k]),
+                            DType {
+                                arith: ArithType::F32,
+                                storage: DTypeStorage::Native,
+                            },
+                        )?;
+                        return self.matmul(a, b_f32.as_ref(), out_shape);
+                    }
                 } else {
                     // No fused block-quant GEMM on this backend. Falling through to
                     // `matmul` would reinterpret packed codes as F32 and emit
