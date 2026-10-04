@@ -862,6 +862,10 @@ fn build_entries_from_source(
 }
 
 /// Pack tensors from a provider into registry entries + normals payloads.
+/// ORDERING CONTRACT: `evopress_bitwidths` is indexed positionally against
+/// `names`, which this function sorts — callers MUST pass the vector aligned
+/// to the sorted provider-name order (an unsorted caller's assignment lands on
+/// arbitrary tensors, silently).
 /// Also returns per-tensor `GrimTensorExt` entries containing SpQR salient indices/values so the caller can populate `metadata.ext_entries`.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
@@ -1165,22 +1169,19 @@ fn pack_tensors(
             // The .grim payload is the same byte stream the GGUF tag-81
             // reader consumes, so the packed entry needs no per-tensor ext
             // beyond the block size.
-            // ONLY the 2-bpw tier is GSQ-RCO: the format stores 2.25 bpw, so
-            // serving it for a 4-bpw assignment would silently quarter-fill
-            // every weight matrix (a uniform-4 conversion packed 91 of 132
-            // tensors at 2 bits and the model's outputs degraded visibly).
-            // Higher-bitwidth tiers ride the uniform pack below; RCO assigns
-            // 2-bpw to the tensors it deems least important.
+            // GSQ-RCO tier = bitwidth 2 (2.25 bpw block stream, bias-2
+            // codebook). Applies to 2-D weights AND the 3-D MoE expert stacks
+            // (the released Qwen3.8-Flash-Next GSQ-RCO artifact carries its
+            // 2.25-bpw tier on expert tensors). Shape-agnostic: the block
+            // stream is flat, so eligibility is elem_count % 64 == 0.
             if matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco"))
                 && tensor_bitwidth == 2
-                && meta.shape.len() == 2
-                && meta.shape[0] > 0
-                && meta.shape[1] > 0
-                && meta.shape[1] % 64 == 0
+                && meta.shape.len() >= 2
+                && meta.shape.iter().all(|d| *d > 0)
+                && elem_count % grim_quant::BLOCK_SIZE_Q2_0 == 0
             {
-                let (n, k) = (meta.shape[0], meta.shape[1]);
                 let mut bytes =
-                    vec![0u8; (n * k).div_ceil(grim_quant::BLOCK_SIZE_Q2_0) * grim_quant::BLOCK_BYTES_Q2_0];
+                    vec![0u8; elem_count.div_ceil(grim_quant::BLOCK_SIZE_Q2_0) * grim_quant::BLOCK_BYTES_Q2_0];
                 grim_quant::quantize_gsq_rco_3p5_block(&f32_values, &mut bytes)
                     .map_err(|e| Error::Backend(format!("GSQ-RCO quant for '{name}': {e}")))?;
                 let entry = crate::format::GrimTensorEntry {
@@ -1212,6 +1213,70 @@ fn pack_tensors(
                     }
                 }
                 return Ok(((entry, bytes), ext, Some(override_)));
+            }
+
+            // K-Quant tiers of the GSQ-RCO budget ladder (RCO paper,
+            // arXiv 2605.00649: per-group format assignment under an exact
+            // average-bit budget; the released Qwen3.8-Flash-Next
+            // GSQ-RCO-3.5bit artifact is exactly such a mix — 3.4375 / 2.625
+            // / 2.25 / 8.5 / 32 bpw averaging 3.06). grim ships encoders and
+            // readers for Q4_K/Q5_K/Q6_K/Q8_0, so every rung below carries a
+            // real scaled packer AND a reader mapping. Without this arm a
+            // 4/5/6-bpw RCO assignment silently fell into the F32 passthrough
+            // and a 29B checkpoint converted to 100 GB.
+            if matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco")) {
+                let tier = match tensor_bitwidth {
+                    4 => Some((4u8, 256usize, crate::gguf::GgufDType::Q4K)),
+                    5 => Some((5, 256, crate::gguf::GgufDType::Q5K)),
+                    6 => Some((6, 256, crate::gguf::GgufDType::Q6K)),
+                    8 => Some((8, 32, crate::gguf::GgufDType::Q8_0)),
+                    _ => None,
+                };
+                if let Some((bits, block, gdtype)) = tier {
+                    if meta.shape.len() >= 2
+                        && meta.shape.iter().all(|d| *d > 0)
+                        && elem_count % block == 0
+                    {
+                        let bytes = match bits {
+                            4 => grim_quant::quant_q4k(&f32_values),
+                            5 => grim_quant::quant_q5k(&f32_values),
+                            6 => grim_quant::quant_q6k(&f32_values),
+                            _ => grim_quant::quant_q80(&f32_values),
+                        }
+                        .map_err(|e| {
+                            Error::Backend(format!("Q{bits}_K quant for '{name}': {e}"))
+                        })?;
+                        let entry = crate::format::GrimTensorEntry {
+                            name: name.clone(),
+                            shape: meta.shape.clone(),
+                            base_bitwidth: bits,
+                            payload_offset: 0,
+                            payload_size: bytes.len() as u64,
+                            outlier_count: 0,
+                            outlier_offset: 0,
+                            ..Default::default()
+                        };
+                        let ext = crate::spec::GrimTensorExt {
+                            tensor_name: name.clone(),
+                            block_size: block as u16,
+                            ..Default::default()
+                        };
+                        let override_ = crate::gguf::GrimQuantOverride {
+                            tensor_name: name.clone(),
+                            effective_bpw: bits as u32,
+                            override_dtype: gdtype,
+                            importance_score: 0.0,
+                            layout_hint: None,
+                        };
+                        let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(ref mtx) = progress_mutex {
+                            if let Ok(mut cb) = mtx.lock() {
+                                cb("pack", count, total);
+                            }
+                        }
+                        return Ok(((entry, bytes), ext, Some(override_)));
+                    }
+                }
             }
 
             // WhiteCrow needs group-128 along K: a 32x64 attention projection
@@ -1820,11 +1885,57 @@ mod tests {
         let names = vec![name_attn.clone()];
         let mut progress = None;
 
-        // Tier 1: bitwidth != 2 -> verbatim f32 at FULL precision. The
-        // shared SmoothQuant prelude still runs (it precedes every named
-        // arm), so the payload is the transformed values at f32 — NOT the
-        // bit-crushed flat codes the old uniform pack produced.
+        // Tier 1 (K-quant ladder): bitwidth 4 + gsq_rco_3p5 -> Q4_K blocks
+        // (4.5 bpw, scaled packer + reader). This arm is what a mixed RCO
+        // budget needs; before it existed a 4-bpw assignment fell into the
+        // F32 passthrough and a 29B checkpoint converted to 100 GB.
         let (packed, _, overrides) = pack_tensors(
+            &provider,
+            &names,
+            4.0,
+            None,
+            crate::format::WaveSize::W64,
+            &mut progress,
+            None,
+            Some("gsq_rco_3p5"),
+        )
+        .expect("pack_tensors succeeds");
+        assert_eq!(packed.len(), 1);
+        let (entry, payload) = &packed[0];
+        assert_eq!(entry.base_bitwidth, 4, "4-bpw tier must pack Q4_K, not F32");
+        assert_eq!(payload.len(), (dim * dim) / 256 * 144, "Q4_K is 144 B per 256 weights");
+        let decoded_q4k = grim_quant::dequant_q4k(payload, dim * dim).expect("q4k round-trip");
+        let amax_q4k = initial_sq_floats.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for (v, d) in initial_sq_floats.iter().zip(decoded_q4k.iter()) {
+            assert!((v - d).abs() <= amax_q4k, "q4k decode error beyond one level");
+        }
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].override_dtype, crate::gguf::GgufDType::Q4K);
+
+        // Tier 1b: bitwidth 8 -> Q8_0 (the artifact's small-tensor tier).
+        let (packed8, _, overrides8) = pack_tensors(
+            &provider,
+            &names,
+            8.0,
+            None,
+            crate::format::WaveSize::W64,
+            &mut progress,
+            None,
+            Some("gsq_rco_3p5"),
+        )
+        .expect("pack_tensors succeeds");
+        assert_eq!(packed8[0].0.base_bitwidth, 8);
+        assert_eq!(overrides8[0].override_dtype, crate::gguf::GgufDType::Q8_0);
+        let decoded_q80 = grim_quant::dequant_q80(&packed8[0].1, dim * dim).expect("q80 round-trip");
+        for (v, d) in initial_sq_floats.iter().zip(decoded_q80.iter()) {
+            assert!((v - d).abs() <= amax_q4k, "q80 decode error beyond one level");
+        }
+
+        // Tier 1c: no named format (plain .grim) keeps the verbatim F32
+        // passthrough for a non-2 tier — and NO SmoothQuant transform on it
+        // (transforms belong to the FP8 arms only; a transformed passthrough
+        // shifts every activation the runtime computes).
+        let (packed_passthru, _, overrides_p) = pack_tensors(
             &provider,
             &names,
             8.0,
@@ -1835,20 +1946,19 @@ mod tests {
             None,
         )
         .expect("pack_tensors succeeds");
-        assert_eq!(packed.len(), 1);
-        let (entry, payload) = &packed[0];
-        assert_eq!(entry.base_bitwidth, 32, "non-2 tier must be f32 passthrough");
-        let mut expected_f32 = initial_sq_floats.clone();
-        let _ = grim_quant::apply_smoothquant_scale(&mut expected_f32, dim, dim, None);
-        let expected_bytes: Vec<u8> = expected_f32
+        assert_eq!(
+            packed_passthru[0].0.base_bitwidth, 32,
+            "no-format 8-bpw stays verbatim F32"
+        );
+        let expected_bytes: Vec<u8> = initial_sq_floats
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
-        assert_eq!(payload, &expected_bytes, "passthrough payload must be full-precision f32 (post-SmoothQuant), not bit-crushed codes");
-        assert!(
-            overrides.len() == 1 && overrides[0].override_dtype == crate::gguf::GgufDType::F32,
-            "passthrough must override the dtype to F32 so no stale bitwidth-derived scheme decodes it"
+        assert_eq!(
+            &packed_passthru[0].1, &expected_bytes,
+            "passthrough must be the checkpoint's own values, untransformed"
         );
+        assert_eq!(overrides_p[0].override_dtype, crate::gguf::GgufDType::F32);
 
         // Tier 2: bitwidth 2 + gsq_rco_3p5 -> GSQ-RCO blocks.
         let (packed2, _, overrides2) = pack_tensors(
@@ -1877,6 +1987,49 @@ mod tests {
         }
         assert_eq!(overrides2.len(), 1);
         assert_eq!(overrides2[0].override_dtype, crate::gguf::GgufDType::GsqRco3p5);
+
+        // Tier 3: the 3-D MoE expert stacks [n_expert, rows, cols] pack into
+        // the same flat GSQ-RCO block stream (the released Qwen3.8-Flash
+        // artifact carries its 2.25-bpw tier on expert tensors). The block
+        // format is shape-agnostic; eligibility is elem_count % 64.
+        let mut exps = HashMap::new();
+        let exps_name = "blk.2.ffn_gate_exps.weight".to_string();
+        let exps_shape = vec![4usize, 128usize, 64usize];
+        let exps_floats: Vec<f32> = (0..4 * 128 * 64)
+            .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+            .collect();
+        exps.insert(
+            exps_name.clone(),
+            (
+                RawTensor {
+                    bytes: exps_floats.iter().flat_map(|f| f.to_le_bytes()).collect(),
+                    provenance: QuantProvenance::GrimNative,
+                    dtype: DType::F32,
+                    shape: exps_shape.clone(),
+                },
+                TensorMeta {
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                    shape: exps_shape,
+                    fusion_mask: 0,
+                },
+            ),
+        );
+        let provider_exps = MockProvider { tensors: exps };
+        let (packed_exps, _, ov_exps) = pack_tensors(
+            &provider_exps,
+            &[exps_name],
+            2.0,
+            None,
+            crate::format::WaveSize::W64,
+            &mut progress,
+            None,
+            Some("gsq_rco_3p5"),
+        )
+        .expect("3-D expert stack packs");
+        assert_eq!(packed_exps[0].0.base_bitwidth, 2);
+        assert_eq!(packed_exps[0].1.len(), (4 * 128 * 64) / 64 * 18);
+        assert_eq!(ov_exps[0].override_dtype, crate::gguf::GgufDType::GsqRco3p5);
     }
 }
 

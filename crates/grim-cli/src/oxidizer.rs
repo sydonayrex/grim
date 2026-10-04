@@ -274,15 +274,22 @@ pub fn cmd_oxidizer_search(
         &RcoConfig {
             target_bpw,
             steps: generations.max(20),
-            // TIER STRUCTURE: 2 = GSQ-RCO (tag 81, the one packed format
-            // with per-block scales and a matching reader), 32 = F32
-            // verbatim passthrough. The flat 3/4/8-bit tiers are NOT offered:
-            // pack_row_bpw_for_wave is scale-less and clamps to [-1, 1], so
-            // a "4-bit" assignment both destroyed accuracy and had no reader
-            // mapping (dtype_from_bitwidth decodes the bytes as Q4_K/MXFP4 —
-            // a different layout). Re-offer intermediate tiers only when a
-            // scaled packer + reader pair exists for them.
-            available_bpws: vec![2, 32],
+            // GSQ-RCO LADDER (RCO paper arXiv 2605.00649: exact-budget
+            // per-group format assignment; the released
+            // Qwen3.8-Flash-Next-GSQ-RCO-3.5bit artifact is exactly such a
+            // mix — Q3_K 3.4375 / Q2_K 2.625 / Q2_0-GSQ 2.25 / Q8_0 8.5 /
+            // F32, averaging 3.06 against a 3.5 nominal).
+            //
+            // grim has no f32 encoders for Q3_K/Q2_K (named load-time-only
+            // error in rewrite_tensor_data), so the nearest encodable rungs
+            // are Q4_K 4.5 / Q5_K 5.5 / Q6_K 6.5 — each with a scaled packer
+            // AND a reader mapping on every backend. The previous {2, 32}
+            // menu made every mid-tier weight unreachable: a 4.0 budget over
+            // {2.25, 32} forced most tensors to F32 and converted Xing4.0 to
+            // 100 GB. The retired flat wave tiers (3/4/8-bit) remain out —
+            // scale-less and reader-less.
+            available_bpws: vec![2, 4, 5, 6, 32],
+            costs: Some(vec![2.25, 4.5, 5.5, 6.5, 32.0]),
             ..Default::default()
         },
         &importance_scores.layer_scores,
@@ -432,6 +439,13 @@ pub fn cmd_oxidizer_convert(
     // the GSQ paper's codebook is the source of truth for the format.
     let target_format = target_format.or(Some("gsq_rco_3p5"));
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
+    // ORDERING CONTRACT: pack_tensors consumes the per-tensor bitwidth vector
+    // POSITIONALLY against its own sorted provider-name list. open_provider
+    // hands back HashMap order — unsorted names here silently rotate the
+    // whole assignment (the Xing4.0 run packed 651 random tensors at the F32
+    // rung, 66 GB, while the search reported a nominal 3.5).
+    let mut names = names;
+    names.sort();
     let embed_attachments = embed.resolve(model_path)?;
 
     // Calibration source priority: an explicit imatrix GGUF (the flag's path,
@@ -527,6 +541,39 @@ pub fn cmd_oxidizer_convert(
         })
         .collect();
 
+    // Realized storage density against the nominal budget — the released
+    // artifact reports both (nominal 3.5 / realized 3.06 bpw). Charged on the
+    // same true costs the search optimized against (GSQ 2.25, Q4_K 4.5,
+    // Q5_K 5.5, Q6_K 6.5, F32 32).
+    let tier_cost = |bw: u32| -> f64 {
+        match bw {
+            2 => 2.25,
+            4 => 4.5,
+            5 => 5.5,
+            6 => 6.5,
+            8 => 8.5,
+            32 => 32.0,
+            other => other as f64,
+        }
+    };
+    let (mut alloc_bits, mut alloc_params) = (0.0f64, 0.0f64);
+    for (i, &size) in tensor_sizes.iter().enumerate() {
+        let bw = bitwidths.get(i).copied().unwrap_or(default_bw);
+        alloc_bits += size as f64 * tier_cost(bw);
+        alloc_params += size as f64;
+    }
+    let realized_bpw = if alloc_params > 0.0 {
+        alloc_bits / alloc_params
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[grim convert] GSQ-RCO budget: nominal {:.2} bpw, realized {:.3} bpw over {} scored tensors",
+        target_bpw,
+        realized_bpw,
+        bitwidths.len()
+    );
+
     grim_meta.magic = Some("grim-v1".into());
     grim_meta.quant_version = Some(OXIDIZER_VERSION);
     grim_meta.rocml_profile = rocml_profile
@@ -559,10 +606,16 @@ pub fn cmd_oxidizer_convert(
                 } else {
                     bw
                 };
-                let dtype = if effective_bpw <= 2 {
-                    GgufDType::GsqRco3p5
-                } else {
-                    GgufDType::F32
+                // The GSQ-RCO ladder, rung by rung: the sidecar's dtype must
+                // be what the packer ACTUALLY emitted or a re-quant reads the
+                // allocation as F32 and re-decodes Q4_K bytes as raw f32.
+                let dtype = match effective_bpw {
+                    2 => GgufDType::GsqRco3p5,
+                    4 => GgufDType::Q4K,
+                    5 => GgufDType::Q5K,
+                    6 => GgufDType::Q6K,
+                    8 => GgufDType::Q8_0,
+                    _ => GgufDType::F32,
                 };
                 grim_format::gguf::GrimQuantOverride {
                     tensor_name: name.clone(),
@@ -583,8 +636,9 @@ pub fn cmd_oxidizer_convert(
             })
             .collect();
         grim_meta.rco_allocation_provenance = Some(format!(
-            "search target_bpw={:.2} tensors={}",
+            "search target_bpw={:.2} realized_bpw={:.3} tensors={}",
             target_bpw,
+            realized_bpw,
             alloc.len()
         ));
         grim_meta.rco_allocation = Some(alloc);
@@ -618,8 +672,16 @@ pub fn cmd_oxidizer_convert(
             None
         }
     });
-    // GPU-first conversion path: try initializing ROCm device first, fallback to CPU
-    let gpu_device = if use_gpu {
+    // GPU-first conversion path: try initializing ROCm device first, fallback
+    // to CPU. GRIM_CONVERT_GPU=0 forces the CPU pipeline outright — with no
+    // visible HIP device the auto-detect can hang instead of failing over,
+    // and a mid-run kernel fault aborts the conversion (both seen converting
+    // Xing4.0 on RDNA4), while host dequant is the same deterministic math.
+    let gpu_requested = use_gpu
+        && std::env::var("GRIM_CONVERT_GPU")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let gpu_device = if gpu_requested {
         match grim_backend_rocm::RocmDevice::try_new(0) {
             Ok(device) => {
                 println!(
