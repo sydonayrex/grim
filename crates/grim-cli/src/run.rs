@@ -18,6 +18,38 @@ use grim_engine::{
     Engine, EngineConfig,
 };
 use grim_format::GgufTokenizer;
+
+/// One-file speculative loading: when no --draft-model was given, a `.grim`
+/// carrying an embedded MTP sidecar supplies the draft from the same file —
+/// extracted to a content-addressed cache path (sha-prefixed, so repeat runs
+/// reuse the extraction and different models never collide).
+fn embedded_mtp_draft_path(model_path: &str) -> Option<String> {
+    if !model_path.ends_with(".grim") {
+        return None;
+    }
+    let att = grim_format::format::attachment_index_from_file(model_path)
+        .ok()?
+        .into_iter()
+        .find(|a| a.kind == "mtp")?;
+    let sha16: String = att.sha256.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let dest = std::env::temp_dir()
+        .join("grim-sidecars")
+        .join(format!("{sha16}-mtp.gguf"));
+    match grim_format::format::extract_attachment_from_file(model_path, "mtp", &dest) {
+        Ok(Some(p)) => {
+            eprintln!(
+                "[grim] embedded MTP sidecar -> draft model at {}",
+                p.display()
+            );
+            Some(p.to_string_lossy().into_owned())
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("[grim] WARNING: embedded MTP sidecar extraction failed: {e}");
+            None
+        }
+    }
+}
 use grim_models_transformer::{
     Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek32, DeepSeek4, Gemma2, Lfm2, Lfm2Config, Llama,
     LlamaConfig, Mistral3, Qwen35,
@@ -916,6 +948,9 @@ pub async fn cmd_run(
     // Full DSpark (markov+confidence scheduling) is wired in the HTTP engine path;
     // CLI one-shot uses plain autoregressive + pre-loaded draft for future extension.
     // ponytail: plain wrapper — add DSpark when CLI speculation throughput is measured.
+    // One-file speculative loading: fall back to an embedded MTP sidecar
+    // when --draft-model was not given.
+    let draft_model = draft_model.or_else(|| embedded_mtp_draft_path(&model_path_str));
     let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
         let dev = model.device().clone();
         match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {
@@ -1890,6 +1925,9 @@ pub async fn cmd_run_interactive(
     // ponytail: plain wrapper — full DSpark via HTTP engine path.
     // DSpark speculative wrapping (see cmd_run): draft backbone + markov +
     // entropy confidence + PID depth tuner; the old plain() ignored the draft.
+    // One-file speculative loading: fall back to an embedded MTP sidecar
+    // when --draft-model was not given.
+    let draft_model = draft_model.or_else(|| embedded_mtp_draft_path(&model_path_str));
     let model: Box<dyn CausalLm> = if let Some(ref d_path) = draft_model {
         let dev = model.device().clone();
         match grim_engine::model_loader::load_eagle3_from_path(d_path, dev) {

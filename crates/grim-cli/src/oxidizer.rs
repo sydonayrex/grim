@@ -142,6 +142,34 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
         "grim.quant_overrides: {} entries",
         grim.quant_overrides.len()
     );
+    if let Some(alloc) = &grim.rco_allocation {
+        println!(
+            "grim.rco.allocation: {} entries (provenance: {})",
+            alloc.len(),
+            grim.rco_allocation_provenance.as_deref().unwrap_or("unknown")
+        );
+    }
+    if let Some(scores) = &grim.calibration_scores {
+        println!("grim.calibration.scores: {} tensors", scores.len());
+    }
+    match grim_format::format::attachment_index_from_file(path) {
+        Ok(idx) if idx.is_empty() => println!("embedded sidecars: none"),
+        Ok(idx) => {
+            println!(
+                "embedded sidecars: {}",
+                idx.iter()
+                    .map(|a| format!(
+                        "{} ({} bytes, sha256:{})",
+                        a.kind,
+                        a.size,
+                        a.sha256.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Err(e) => println!("embedded sidecars: index unreadable ({e})"),
+    }
     Ok(())
 }
 
@@ -263,6 +291,87 @@ pub fn cmd_oxidizer_search(
     )
 }
 
+/// The three embedded sidecar payloads a conversion can carry. Every field
+/// is an explicit path (hard error if missing) or `None` (auto-detect a
+/// sibling GGUF next to the input). The payloads ride an end-of-file trailer
+/// inside the single output `.grim` — no separate sidecar files ship.
+#[derive(Debug, Default, Clone)]
+pub struct EmbedSidecars {
+    /// Multimodal projector GGUF (required for multimodal models, optional
+    /// on text-only).
+    pub mmproj: Option<String>,
+    /// Importance-matrix GGUF (only meaningful for imatrix-derived formats).
+    pub imatrix: Option<String>,
+    /// MTP / speculative-draft GGUF (MTP tensors beyond the main checkpoint).
+    pub mtp: Option<String>,
+}
+
+/// Sibling file names auto-detected next to the input model, in probe order.
+fn sibling_candidates(kind: &str, model_path: &str) -> Vec<String> {
+    let p = Path::new(model_path);
+    let dir = p.parent().unwrap_or_else(|| Path::new("."));
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| "model");
+    let pats: &[&str] = match kind {
+        "mmproj" => &[
+            "{s}-mmproj.gguf",
+            "mmproj-{s}.gguf",
+            "{s}.mmproj.gguf",
+            "mmproj.gguf",
+        ],
+        "imatrix" => &["{s}-imatrix.gguf", "{s}.imatrix.gguf", "imatrix-{s}.gguf"],
+        "mtp" => &["{s}-mtp.gguf", "{s}.mtp.gguf", "{s}-mtp-draft.gguf", "{s}-draft.gguf"],
+        _ => &[],
+    };
+    pats.iter()
+        .map(|pat| dir.join(pat.replace("{s}", stem)).to_string_lossy().into_owned())
+        .collect()
+}
+
+impl EmbedSidecars {
+    /// Resolve every kind to concrete bytes: an explicit path must exist
+    /// (fail loud), `None` auto-detects a sibling and stays silent when the
+    /// model simply has no such sidecar. Returns (kind, bytes) pairs in
+    /// trailer order mmproj, imatrix, mtp.
+    pub fn resolve(&self, model_path: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let mut out = Vec::new();
+        for (kind, explicit) in [
+            ("mmproj", &self.mmproj),
+            ("imatrix", &self.imatrix),
+            ("mtp", &self.mtp),
+        ] {
+            let path: String = match explicit {
+                Some(p) => {
+                    if !Path::new(p).exists() {
+                        return Err(format!(
+                            "--embed-{kind}: file not found: {p}"
+                        ));
+                    }
+                    p.clone()
+                }
+                None => match sibling_candidates(kind, model_path)
+                    .into_iter()
+                    .find(|c| Path::new(c).exists())
+                {
+                    Some(c) => c,
+                    None => continue,
+                },
+            };
+            let bytes = fs::read(&path)
+                .map_err(|e| format!("--embed-{kind}: cannot read {path}: {e}"))?;
+            eprintln!(
+                "[grim convert] embedding {kind} sidecar: {} ({} bytes)",
+                path,
+                bytes.len()
+            );
+            out.push((kind.to_string(), bytes));
+        }
+        Ok(out)
+    }
+}
+
 pub fn cmd_oxidizer_convert(
     model_path: &str,
     output_path: &str,
@@ -274,6 +383,7 @@ pub fn cmd_oxidizer_convert(
     use_gpu: bool,
     mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     target_format: Option<&str>,
+    embed: &EmbedSidecars,
 ) -> Result<(), String> {
     // GRIM-FORMAT DEFAULT (user directive): a .grim conversion with no
     // --format names GSQ-RCO 3.5-bit (tag 81). The .grim container is
@@ -281,8 +391,21 @@ pub fn cmd_oxidizer_convert(
     // the GSQ paper's codebook is the source of truth for the format.
     let target_format = target_format.or(Some("gsq_rco_3p5"));
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
+    // Calibration source priority: a sibling `.importance.json` (the most
+    // recent explicit calibration) beats the embedded `grim.calibration.scores`
+    // sidecar, which beats recalibrating from scratch — re-converting a
+    // shipped single-file `.grim` on another machine must not silently
+    // recalibrate when it already carries its own scores.
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
+    } else if let Some(scores) = grim_meta.calibration_scores.clone() {
+        let (embedded_names, embedded_scores): (Vec<String>, Vec<f32>) =
+            scores.into_iter().unzip();
+        eprintln!(
+            "[grim convert] using embedded calibration sidecar ({} tensors)",
+            embedded_names.len()
+        );
+        ImportanceScores::new(embedded_names, embedded_scores)
     } else {
         cmd_oxidizer_calibrate(
             model_path,
@@ -292,6 +415,7 @@ pub fn cmd_oxidizer_convert(
         )?
     };
 
+    let embed_attachments = embed.resolve(model_path)?;
     let tensor_names = importance_scores.tensor_names.clone();
     let name_to_idx: std::collections::HashMap<&str, usize> = names
         .iter()
@@ -361,6 +485,68 @@ pub fn cmd_oxidizer_convert(
     // in grim-format own the override list: they emit entries exactly for
     // the tensors whose scheme the reader cannot derive from the bitwidth.
     grim_meta.quant_overrides = Vec::new();
+    // SIDECAR 1 — RCO allocation: the per-tensor assignment travels with the
+    // file (the loose `.rco-allocation.txt` is an artifact dump; this is the
+    // authoritative copy, validated against actual payloads at load).
+    {
+        let alloc: Vec<grim_format::gguf::GrimQuantOverride> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let bw = full_bitwidths.get(i).copied().unwrap_or(default_bw);
+                let effective_bpw = if is_attention_projection(name) {
+                    enforce_attention_precision(bw)
+                } else {
+                    bw
+                };
+                let dtype = if effective_bpw <= 2 {
+                    GgufDType::GsqRco3p5
+                } else {
+                    GgufDType::F32
+                };
+                grim_format::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw,
+                    override_dtype: dtype,
+                    importance_score: importance_scores
+                        .layer_scores
+                        .get(
+                            imp_name_to_idx
+                                .get(name.as_str())
+                                .copied()
+                                .unwrap_or(i),
+                        )
+                        .copied()
+                        .unwrap_or(0.0),
+                    layout_hint: None,
+                }
+            })
+            .collect();
+        grim_meta.rco_allocation_provenance = Some(format!(
+            "search target_bpw={:.2} tensors={}",
+            target_bpw,
+            alloc.len()
+        ));
+        grim_meta.rco_allocation = Some(alloc);
+    }
+    // SIDECAR 2 — calibration: per-tensor importance scores embedded so
+    // re-quantization does not depend on a loose `.importance.json`.
+    {
+        let scores: Vec<(String, f32)> = importance_scores
+            .tensor_names
+            .iter()
+            .enumerate()
+            .map(|(_i, name)| {
+                let score = imp_name_to_idx
+                    .get(name.as_str())
+                    .and_then(|&idx| importance_scores.layer_scores.get(idx))
+                    .copied()
+                    .unwrap_or(0.0);
+                (name.clone(), score)
+            })
+            .collect();
+        grim_meta.calibration_scores = Some(scores);
+    }
 
     let resolved_gcn = rocml_profile.unwrap_or("gfx1100");
     // Wavefront size: explicit override wins, else the profile-derived
@@ -426,6 +612,25 @@ pub fn cmd_oxidizer_convert(
         )
         .map_err(|e| e.to_string())?;
     }
+
+    // Embedded sidecars ride an end-of-file trailer appended to the finished
+    // output, so every pre-attachment reader and tensor offset is untouched.
+    if !embed_attachments.is_empty() {
+        let mut out = fs::OpenOptions::new()
+            .append(true)
+            .open(output_path)
+            .map_err(|e| format!("cannot reopen {output_path} for sidecars: {e}"))?;
+        let n = grim_format::format::write_attachments(&mut out, &embed_attachments)
+            .map_err(|e| e.to_string())?;
+        eprintln!(
+            "[grim convert] embedded {n} sidecar attachment(s) in-file: {}",
+            embed_attachments
+                .iter()
+                .map(|(k, b)| format!("{k} ({} bytes)", b.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -452,7 +657,7 @@ pub fn cmd_oxidizer_prepare(
         grim.quant_method
             .get_or_insert_with(|| "train-prepare".into());
     }
-    write_grim_file(input_path, output_path, &grim, &HashMap::new())
+    write_grim_file(input_path, output_path, &grim, &HashMap::new(), &[])
 }
 
 pub fn cmd_oxidizer_fuse(
@@ -473,7 +678,7 @@ pub fn cmd_oxidizer_fuse(
     grim.kv_layout_optimized = Some(rocm);
     grim.xnack_enabled = Some(false);
     grim.quant_method.get_or_insert_with(|| "rocm-fuse".into());
-    write_grim_file(input_path, output_path, &grim, &HashMap::new())
+    write_grim_file(input_path, output_path, &grim, &HashMap::new(), &[])
 }
 
 fn inferred_fusion_ops(names: &[String]) -> Vec<GrimFusionOp> {
@@ -637,7 +842,7 @@ pub fn cmd_oxidizer_raven(
         Some(&grim_meta),
     )?;
 
-    write_grim_file(model_path, output_path, &grim_meta, &rewritten)
+    write_grim_file(model_path, output_path, &grim_meta, &rewritten, &[])
 }
 
 /// Compute curvature. Uses Fisher/GGN diagonal when calibration_batch has samples, else heuristic proxy.
@@ -673,6 +878,7 @@ fn write_grim_file(
     dst_path: &str,
     grim_meta: &GrimMetadata,
     rewritten_tensors: &HashMap<String, RewrittenTensorData>,
+    attachments: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     let src = fs::File::open(src_path).map_err(|e| e.to_string())?;
     let mut src_reader = BufReader::new(src);
@@ -693,7 +899,24 @@ fn write_grim_file(
         rewritten_tensors,
         &mut src_reader,
     )?;
-    writer.flush().map_err(|e| e.to_string())
+    writer.flush().map_err(|e| e.to_string())?;
+    // Embedded sidecars ride an end-of-file trailer so every pre-attachment
+    // reader (and every existing tensor offset) is untouched.
+    if !attachments.is_empty() {
+        let mut file = writer.into_inner().map_err(|e| e.to_string())?;
+        let n = grim_format::format::write_attachments(&mut file, attachments)
+            .map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        eprintln!(
+            "[grim convert] embedded {n} sidecar attachment(s) in-file: {}",
+            attachments
+                .iter()
+                .map(|(k, b)| format!("{k} ({} bytes)", b.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn write_gguf<W: Write, R: Read + Seek>(
@@ -1039,16 +1262,71 @@ fn align32(value: u64) -> u64 {
 }
 
 #[cfg(test)]
+mod embed_sidecars_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_auto_detects_sibling_sidecars_in_probe_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("qwen3.grim");
+        std::fs::write(&model, b"fake").unwrap();
+        // Only the second probe pattern exists — the first candidate misses.
+        let mmproj = dir.path().join("mmproj-qwen3.gguf");
+        std::fs::write(&mmproj, b"MMPPROJ-BYTES").unwrap();
+        let mtp = dir.path().join("qwen3-mtp.gguf");
+        std::fs::write(&mtp, b"MTP-BYTES").unwrap();
+        // imatrix: no sibling at all -> silently absent.
+
+        let resolved = EmbedSidecars::default()
+            .resolve(model.to_str().unwrap())
+            .unwrap();
+        let kinds: Vec<&str> = resolved.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["mmproj", "mtp"]);
+        assert_eq!(resolved[0].1, b"MMPPROJ-BYTES".to_vec());
+        assert_eq!(resolved[1].1, b"MTP-BYTES".to_vec());
+    }
+
+    #[test]
+    fn resolve_explicit_missing_path_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m.grim");
+        std::fs::write(&model, b"fake").unwrap();
+        let err = EmbedSidecars {
+            mmproj: Some(dir.path().join("nope.gguf").to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+        .resolve(model.to_str().unwrap())
+        .unwrap_err();
+        assert!(err.contains("--embed-mmproj"), "{err}");
+        assert!(err.contains("nope.gguf"), "{err}");
+    }
+
+    #[test]
+    fn resolve_explicit_path_wins_over_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m.grim");
+        std::fs::write(&model, b"fake").unwrap();
+        let sibling = dir.path().join("m-mmproj.gguf");
+        std::fs::write(&sibling, b"SIBLING").unwrap();
+        let explicit_dir = tempfile::tempdir().unwrap();
+        let explicit = explicit_dir.path().join("other-mmproj.gguf");
+        std::fs::write(&explicit, b"EXPLICIT").unwrap();
+
+        let resolved = EmbedSidecars {
+            mmproj: Some(explicit.to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+        .resolve(model.to_str().unwrap())
+        .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].1, b"EXPLICIT".to_vec());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[test]
-    fn bitwidth_maps_to_expected_dtype() {
-        assert_eq!(bitwidth_to_dtype(2), GgufDType::Q2K);
-        assert_eq!(bitwidth_to_dtype(4), GgufDType::Q4K);
-        assert_eq!(bitwidth_to_dtype(7), GgufDType::Q6K);
-    }
 
     #[test]
     fn prepare_round_trips_grim_metadata() {

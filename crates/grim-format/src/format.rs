@@ -864,6 +864,271 @@ pub fn pack_row_bpw_for_wave(out: &mut Vec<u8>, row_values: &[f32], bpw: u8, wav
     out.resize(aligned, 0u8);
 }
 
+// ============================================================================
+// Embedded sidecar attachments (mmproj / imatrix / MTP-draft GGUFs)
+//
+// Written as a TRAILER at end-of-file so nothing about the existing header /
+// metadata / registry / payload layout changes, and readers compiled before
+// attachments existed still work. Layout:
+//
+//   "GRIMATT"                         (7 bytes)
+//   u32 count
+//   count x { u16 kind_len, kind bytes, u64 offset, u64 size, sha256[32] }
+//   u64 trailer_start (points at the "GRIMATT" magic, for EOF discovery)
+//
+// `offset` is absolute within the .grim file. Kinds in use: "mmproj"
+// (multimodal projector; REQUIRED for multimodal models, absent on
+// text-only), "imatrix" (importance-matrix GGUF; present only for
+// imatrix-derived formats), "mtp" (MTP / speculative-draft GGUF carrying
+// tensors beyond the main checkpoint).
+// ============================================================================
+
+pub const ATTACHMENT_MAGIC: &[u8; 7] = b"GRIMATT";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddedAttachment {
+    pub kind: String,
+    /// Absolute file offset of the blob.
+    pub offset: u64,
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Append attachments + the index trailer at the current end of `w`.
+/// Returns the number of attachments written. Call AFTER all tensor
+/// payloads are final — offsets are absolute file positions.
+pub fn write_attachments<W: Write + Seek>(
+    w: &mut W,
+    attachments: &[(String, Vec<u8>)],
+) -> Result<usize> {
+    // 1) Blob payloads first — appended at the current end of file. There is
+    //    no per-blob length prefix; the index's `offset`/`size` are the only
+    //    length truth, so the reader can slice without any implicit framing.
+    let mut written: Vec<EmbeddedAttachment> = Vec::with_capacity(attachments.len());
+    for (kind, bytes) in attachments {
+        let offset = w.seek(std::io::SeekFrom::End(0))?;
+        w.write_all(bytes)?;
+        let mut sha = [0u8; 32];
+        sha.copy_from_slice(&sha256_bytes(bytes));
+        written.push(EmbeddedAttachment {
+            kind: kind.clone(),
+            offset,
+            size: bytes.len() as u64,
+            sha256: sha,
+        });
+    }
+    // 2) The trailer itself: [magic][count][entries...][trailer_start]. The
+    //    reader parses entries immediately after `count`, so the blobs must
+    //    already be in place and out of the way.
+    let trailer_start = w.seek(std::io::SeekFrom::End(0))?;
+    w.write_all(ATTACHMENT_MAGIC)?;
+    w.write_all(&(attachments.len() as u32).to_le_bytes())?;
+    for a in &written {
+        w.write_all(&(a.kind.len() as u16).to_le_bytes())?;
+        w.write_all(a.kind.as_bytes())?;
+        w.write_all(&a.offset.to_le_bytes())?;
+        w.write_all(&a.size.to_le_bytes())?;
+        w.write_all(&a.sha256)?;
+    }
+    w.write_all(&trailer_start.to_le_bytes())?;
+    Ok(written.len())
+}
+
+fn sha256_bytes(data: &[u8]) -> Vec<u8> {
+    // Same primitive the provenance checksum uses (grim-cli/src/verify.rs).
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+/// Parse the attachment index from a byte buffer that is a SUFFIX of the
+/// `.grim` file, starting at absolute file offset `base` — either the whole
+/// file (mmap, `base = 0`) or just the trailer tail (streamed reader,
+/// `base = trailer_start`). The final 8 bytes store the absolute offset of
+/// the `GRIMATT` magic; attachment offsets are absolute file offsets and are
+/// NOT validated here (this slice may not contain the blobs) — the byte
+/// extraction paths bounds-check and SHA-gate every read. Returns an empty
+/// index when no trailer is present.
+pub fn parse_attachment_index(buf: &[u8], base: u64) -> Result<Vec<EmbeddedAttachment>> {
+    let buf_len = buf.len() as u64;
+    if buf_len < 15 {
+        return Ok(Vec::new()); // too small for any trailer; no attachments
+    }
+    let stored = u64::from_le_bytes(buf[(buf_len - 8) as usize..].try_into().unwrap());
+    if stored < base || stored + 15 > base + buf_len {
+        return Ok(Vec::new()); // trailer not inside this slice / absent
+    }
+    let ts = (stored - base) as usize;
+    if &buf[ts..ts + 7] != ATTACHMENT_MAGIC {
+        return Ok(Vec::new());
+    }
+    let mut pos = ts + 7;
+    if pos + 4 > buf.len() {
+        return Err(Error::Backend("truncated attachment index: no count".into()));
+    }
+    let count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    // The trailer indexes one sidecar per known kind — a count beyond that is
+    // corruption, not a big attachment set; refuse before sizing anything.
+    if count > 16 {
+        return Err(Error::Backend(format!(
+            "attachment index declares {count} entries; more than 16 is corruption"
+        )));
+    }
+    fn need(buf: &[u8], pos: usize, n: usize, what: &str) -> Result<()> {
+        if pos + n > buf.len() {
+            return Err(Error::Backend(format!(
+                "truncated attachment index while reading {what}"
+            )));
+        }
+        Ok(())
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        need(buf, pos, 2, "kind length")?;
+        let kind_len = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        need(buf, pos, kind_len, "kind name")?;
+        let kind = String::from_utf8_lossy(&buf[pos..pos + kind_len]).into_owned();
+        pos += kind_len;
+        need(buf, pos, 16, "offset/size")?;
+        let offset = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let size = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        need(buf, pos, 32, "sha256")?;
+        let sha256 = buf[pos..pos + 32].try_into().unwrap();
+        pos += 32;
+        out.push(EmbeddedAttachment {
+            kind,
+            offset,
+            size,
+            sha256,
+        });
+    }
+    Ok(out)
+}
+
+/// Discover the attachment index from any reader positioned anywhere in a
+/// .grim file (the trailer start is stored in the final 8 bytes).
+pub fn read_attachment_index<R: Read + Seek>(r: &mut R) -> Result<Vec<EmbeddedAttachment>> {
+    let end = r.seek(SeekFrom::End(0))?;
+    if end < 15 {
+        return Ok(Vec::new());
+    }
+    r.seek(SeekFrom::Start(end - 8))?;
+    let mut tb = [0u8; 8];
+    r.read_exact(&mut tb)?;
+    let trailer_start = u64::from_le_bytes(tb);
+    if trailer_start >= end {
+        return Ok(Vec::new());
+    }
+    r.seek(SeekFrom::Start(trailer_start))?;
+    let mut buf = vec![0u8; (end - trailer_start) as usize];
+    r.read_exact(&mut buf)?;
+    parse_attachment_index(&buf, trailer_start)
+}
+
+/// Read the attachment index from a file on disk (tail read only — O(1) in
+/// the file size). Works on any `.grim` carrier: the native GRIM container
+/// and the GGUF-layout oxidizer output both leave the EOF trailer untouched.
+pub fn attachment_index_from_file<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Vec<EmbeddedAttachment>> {
+    let mut f = std::fs::File::open(path.as_ref()).map_err(|e| {
+        Error::Backend(format!(
+            "cannot open '{}' for attachment index: {e}",
+            path.as_ref().display()
+        ))
+    })?;
+    read_attachment_index(&mut f)
+}
+
+/// Extract one attachment from a file on disk to `dest`, SHA-verified, with
+/// the same reuse rule as [`GrimProvider::extract_attachment`] (an existing
+/// `dest` is kept only when it still hashes to the trailer's digest).
+pub fn extract_attachment_from_file<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+    path: P,
+    kind: &str,
+    dest: Q,
+) -> Result<Option<std::path::PathBuf>> {
+    let att = match attachment_index_from_file(path.as_ref())?
+        .into_iter()
+        .find(|a| a.kind == kind)
+    {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let dest = dest.as_ref();
+    let reuse = std::fs::read(dest)
+        .ok()
+        .is_some_and(|existing| attachment_matches(&existing, &att));
+    if !reuse {
+        let mut f = std::fs::File::open(path.as_ref()).map_err(|e| {
+            Error::Backend(format!(
+                "cannot open '{}' for attachment extraction: {e}",
+                path.as_ref().display()
+            ))
+        })?;
+        let bytes = read_attachment_bytes(&mut f, &att)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Error::Backend(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+        std::fs::write(dest, &bytes)
+            .map_err(|e| Error::Backend(format!("cannot write {}: {e}", dest.display())))?;
+    }
+    Ok(Some(dest.to_path_buf()))
+}
+
+/// SHA-256 gate shared by every attachment read path.
+fn verify_attachment_sha(bytes: &[u8], att: &EmbeddedAttachment) -> Result<()> {
+    if sha256_bytes(bytes) != att.sha256 {
+        return Err(Error::Backend(format!(
+            "attachment '{}' failed SHA-256 verification",
+            att.kind
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `bytes` hash to the digest recorded in the trailer for `att` —
+/// the reuse check for previously extracted attachments.
+pub fn attachment_matches(bytes: &[u8], att: &EmbeddedAttachment) -> bool {
+    sha256_bytes(bytes) == att.sha256
+}
+
+/// Read one attachment's bytes out of a FULL-file buffer (e.g. an mmap),
+/// verifying SHA-256. Attachment offsets are absolute file offsets.
+pub fn attachment_bytes_from_buf(buf: &[u8], att: &EmbeddedAttachment) -> Result<Vec<u8>> {
+    let start = att.offset as usize;
+    let end = start + att.size as usize;
+    if end > buf.len() || start > end {
+        return Err(Error::Backend(format!(
+            "attachment '{}' range {start}..{end} exceeds file length {}",
+            att.kind,
+            buf.len()
+        )));
+    }
+    let bytes = &buf[start..end];
+    verify_attachment_sha(bytes, att)?;
+    Ok(bytes.to_vec())
+}
+
+/// Read one attachment's bytes by kind, verifying SHA-256.
+pub fn read_attachment_bytes<R: Read + Seek>(
+    r: &mut R,
+    att: &EmbeddedAttachment,
+) -> Result<Vec<u8>> {
+    r.seek(SeekFrom::Start(att.offset))?;
+    let mut buf = vec![0u8; att.size as usize];
+    r.read_exact(&mut buf)?;
+    verify_attachment_sha(&buf, att)?;
+    Ok(buf)
+}
+
 /// Symmetric uniform quantization of a single f32 value to `bpw` bits.
 /// Returns a code in `[0, 2^bpw - 1]`. Used by [`pack_row_bpw`].
 fn quantize_to_bpw(value: f32, bpw: u8) -> u8 {
@@ -1864,5 +2129,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- embedded sidecar attachments (GRIMATT trailer) ---
+
+    #[test]
+    fn attachment_trailer_round_trips_three_kinds() {
+        use std::io::Write as _;
+        let blobs: Vec<(String, Vec<u8>)> = vec![
+            ("mmproj".into(), vec![0xAA; 1000]),
+            ("imatrix".into(), b"gguf-imatrix-payload".to_vec()),
+            ("mtp".into(), vec![0x55; 77]),
+        ];
+        let mut cur = std::io::Cursor::new(Vec::<u8>::new());
+        // Leading bytes so attachment offsets must be absolute, not relative.
+        cur.write_all(&[0u8; 123]).unwrap();
+        let n = write_attachments(&mut cur, &blobs).unwrap();
+        assert_eq!(n, 3);
+
+        cur.set_position(0);
+        let idx = read_attachment_index(&mut cur).unwrap();
+        assert_eq!(idx.len(), 3);
+        for (i, (kind, bytes)) in blobs.iter().enumerate() {
+            assert_eq!(&idx[i].kind, kind);
+            assert_eq!(idx[i].size, bytes.len() as u64);
+            cur.set_position(0);
+            let got = read_attachment_bytes(&mut cur, &idx[i]).unwrap();
+            assert_eq!(&got, bytes);
+        }
+    }
+
+    #[test]
+    fn attachment_corruption_fails_sha_verification() {
+        use std::io::Write as _;
+        let mut cur = std::io::Cursor::new(Vec::<u8>::new());
+        cur.write_all(&[0u8; 10]).unwrap();
+        write_attachments(&mut cur, &[("mtp".to_string(), vec![1u8; 64])]).unwrap();
+        cur.set_position(0);
+        let idx = read_attachment_index(&mut cur).unwrap();
+        assert_eq!(idx.len(), 1);
+
+        let mut data = cur.into_inner();
+        let off = idx[0].offset as usize;
+        data[off + 3] ^= 0xFF; // flip one payload byte in place
+        let mut cur2 = std::io::Cursor::new(data);
+        let err = read_attachment_bytes(&mut cur2, &idx[0])
+            .err()
+            .expect("corrupted attachment must fail SHA verification");
+        let msg = format!("{err}");
+        assert!(msg.contains("SHA-256"), "error should name the gate: {msg}");
+        assert!(msg.contains("mtp"), "error should name the kind: {msg}");
+    }
+
+    #[test]
+    fn attachment_index_empty_for_trailerless_file() {
+        let mut plain = std::io::Cursor::new(vec![7u8; 64]);
+        assert!(read_attachment_index(&mut plain).unwrap().is_empty());
+        let mut tiny = std::io::Cursor::new(vec![1u8; 8]);
+        assert!(read_attachment_index(&mut tiny).unwrap().is_empty());
     }
 }

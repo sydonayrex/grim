@@ -11,8 +11,10 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider, shard_raw_tensor};
 
 use crate::format::{
-    GrimFile, GrimTensorEntry, read_normals, read_outliers, read_outliers_with_encoding,
+    EmbeddedAttachment, GrimFile, GrimTensorEntry, attachment_bytes_from_buf,
+    parse_attachment_index, read_normals, read_outliers, read_outliers_with_encoding,
 };
+
 use crate::gguf::{
     GgufDType, GgufFile, GgufTensorInfo, GrimFusionOp, GrimMetadata, GrimQuantOverride,
     GrimTrainQuantMode, read_gguf,
@@ -1074,6 +1076,57 @@ impl GrimProvider {
         self.file.metadata.wavefront_size
     }
 
+    /// Embedded sidecar attachment index (mmproj / imatrix / MTP-draft GGUFs),
+    /// parsed from the end-of-file GRIMATT trailer. Empty when the file carries
+    /// no attachments (or was written by a pre-attachment writer).
+    pub fn attachment_index(&self) -> Result<Vec<EmbeddedAttachment>> {
+        parse_attachment_index(&self.mmap, 0)
+    }
+
+    /// Extract one embedded attachment by kind ("mmproj" | "imatrix" | "mtp"),
+    /// SHA-256 verified. `Ok(None)` when the file does not embed that sidecar —
+    /// the caller then falls back to a sibling file if one exists.
+    pub fn read_attachment(&self, kind: &str) -> Result<Option<Vec<u8>>> {
+        for att in self.attachment_index()? {
+            if att.kind == kind {
+                return attachment_bytes_from_buf(&self.mmap, &att).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Extract an embedded attachment to `dest` (parent dirs created). When
+    /// `dest` already exists it is SHA-checked against the trailer and only
+    /// rewritten on mismatch, so repeated loads do not re-copy a multi-GB
+    /// projector. Returns the destination path, or `Ok(None)` when the kind
+    /// is not embedded.
+    pub fn extract_attachment(
+        &self,
+        kind: &str,
+        dest: &std::path::Path,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let att = match self.attachment_index()?.iter().find(|a| a.kind == kind) {
+            Some(a) => a.clone(),
+            None => return Ok(None),
+        };
+        // Reuse an earlier extraction only when the on-disk copy still hashes
+        // to the trailer's digest — a same-length corrupt file must not pass.
+        if std::fs::read(dest)
+            .ok()
+            .is_some_and(|existing| crate::format::attachment_matches(&existing, &att))
+        {
+            return Ok(Some(dest.to_path_buf()));
+        }
+        let bytes = attachment_bytes_from_buf(&self.mmap, &att)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Backend(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        std::fs::write(dest, &bytes)
+            .map_err(|e| Error::Backend(format!("cannot write {}: {e}", dest.display())))?;
+        Ok(Some(dest.to_path_buf()))
+    }
+
     /// Look up the per-tensor capability extension for `name`, if any.
     /// Returns `None` for plain version-1 tensors that carry no extension declaration.
     pub fn ext_for(&self, name: &str) -> Option<&crate::spec::GrimTensorExt> {
@@ -1781,6 +1834,78 @@ mod tests {
         assert_eq!(outliers.len(), 1);
         assert_eq!(outliers[0].index, 0);
         assert!((outliers[0].value - 1.0).abs() < 1e-2);
+    }
+
+
+    #[test]
+    fn grim_provider_reads_and_extracts_embedded_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.grim");
+        write_minimal_grim_file(&path);
+
+        // Append two sidecars the way the oxidizer does: after all payloads.
+        let mmproj = vec![0xABu8; 512];
+        let mtp = b"mtp-draft-gguf-bytes".to_vec();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let n = crate::format::write_attachments(
+                &mut f,
+                &[
+                    ("mmproj".to_string(), mmproj.clone()),
+                    ("mtp".to_string(), mtp.clone()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(n, 2);
+        }
+
+        let provider = GrimProvider::open(path.to_str().unwrap()).unwrap();
+        let idx = provider.attachment_index().unwrap();
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0].kind, "mmproj");
+        assert_eq!(idx[1].kind, "mtp");
+
+        assert_eq!(
+            provider.read_attachment("mmproj").unwrap(),
+            Some(mmproj.clone())
+        );
+        assert_eq!(provider.read_attachment("mtp").unwrap(), Some(mtp.clone()));
+        assert_eq!(provider.read_attachment("imatrix").unwrap(), None);
+
+        // Extraction: exact bytes land on disk; a second call reuses them.
+        let dest = dir.path().join("sidecars").join("mmproj.gguf");
+        let extracted = provider
+            .extract_attachment("mmproj", &dest)
+            .unwrap()
+            .expect("mmproj embedded");
+        assert_eq!(extracted, dest);
+        assert_eq!(std::fs::read(&dest).unwrap(), mmproj);
+        provider.extract_attachment("mmproj", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), mmproj);
+
+        // A same-length corrupt extraction is detected and repaired.
+        std::fs::write(&dest, vec![0u8; mmproj.len()]).unwrap();
+        provider.extract_attachment("mmproj", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), mmproj);
+
+        // A kind that is not embedded yields None even with a dest.
+        let none = provider
+            .extract_attachment("imatrix", &dir.path().join("im.gguf"))
+            .unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn grim_provider_attachment_index_empty_without_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.grim");
+        write_minimal_grim_file(&path);
+        let provider = GrimProvider::open(path.to_str().unwrap()).unwrap();
+        assert!(provider.attachment_index().unwrap().is_empty());
+        assert_eq!(provider.read_attachment("mmproj").unwrap(), None);
     }
 
     #[test]

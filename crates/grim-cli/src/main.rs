@@ -680,6 +680,22 @@ enum Commands {
         /// Default when omitted: `gsqrco3p5`.
         #[arg(long)]
         format: Option<String>,
+        /// Embed a multimodal projector GGUF (mmproj) as an in-file sidecar.
+        /// Required for multimodal models; harmless/optional on text-only.
+        /// With no path, a sibling mmproj GGUF next to --input is auto-detected.
+        #[arg(long)]
+        embed_mmproj: Option<String>,
+        /// Embed an importance-matrix GGUF (imatrix) as an in-file sidecar so
+        /// re-quantization does not depend on a loose file. Not needed for
+        /// non-imatrix formats. With no path, a sibling imatrix GGUF next to
+        /// --input is auto-detected.
+        #[arg(long)]
+        embed_imatrix: Option<String>,
+        /// Embed an MTP / speculative-draft GGUF (extra MTP tensors beyond
+        /// the main checkpoint) as an in-file sidecar. With no path, a
+        /// sibling MTP/draft GGUF next to --input is auto-detected.
+        #[arg(long)]
+        embed_mtp: Option<String>,
     },
     /// Bake a trained LoRA/QLoRA adapter sidecar permanently into a base .grim model file.
     Merge {
@@ -2225,6 +2241,9 @@ async fn main() -> Result<()> {
             wave,
             gpu,
             format,
+            embed_mmproj,
+            embed_imatrix,
+            embed_mtp,
         } => {
             // Detect input format and warn the user.
             let ext = std::path::Path::new(&input)
@@ -2328,6 +2347,11 @@ async fn main() -> Result<()> {
                 gpu,
                 Some(&mut cb),
                 format.as_deref(),
+                &oxidizer::EmbedSidecars {
+                    mmproj: embed_mmproj,
+                    imatrix: embed_imatrix,
+                    mtp: embed_mtp,
+                },
             ) {
                 prog.finish();
                 eprintln!("Conversion failed: {e}");
@@ -2471,6 +2495,7 @@ async fn main() -> Result<()> {
                         gpu,
                         Some(&mut cb),
                         format.as_deref(),
+                        &Default::default(),
                     ) {
                         prog.finish();
                         eprintln!("oxidizer convert failed: {e}");

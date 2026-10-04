@@ -846,6 +846,20 @@ pub struct GrimMetadata {
     pub calibration_dataset: Option<String>,
     /// Per-tensor encoding overrides (non-uniform bitwidth assignment).
     pub quant_overrides: Vec<GrimQuantOverride>,
+
+    /// RCO bit-allocation sidecar: the per-tensor assignment the search (or a
+    /// reused external allocation) produced, embedded so the allocation
+    /// travels with the file instead of a loose `.rco-allocation.txt`.
+    /// Shape mirrors `quant_overrides` but carries the ASSIGNMENT (pre-pack)
+    /// rather than the packer's payload verdict.
+    pub rco_allocation: Option<Vec<GrimQuantOverride>>,
+    /// Source provenance for the allocation: "search" (run in-session),
+    /// "reused:<name>" (external table), plus the target bpw.
+    pub rco_allocation_provenance: Option<String>,
+
+    /// Calibration sidecar: per-tensor importance scores embedded so
+    /// re-quantization does not depend on a loose `.importance.json`.
+    pub calibration_scores: Option<Vec<(String, f32)>>,
     /// Preferred quant materialization for training-capable `.grim` artifacts.
     pub train_quant_mode: Option<GrimTrainQuantMode>,
     /// Requested fusion patterns for training or runtime lowering.
@@ -903,6 +917,9 @@ impl Default for GrimMetadata {
             quant_method: None,
             calibration_dataset: None,
             quant_overrides: Vec::new(),
+            rco_allocation: None,
+            rco_allocation_provenance: None,
+            calibration_scores: None,
             train_quant_mode: None,
             train_fusion_ops: Vec::new(),
             rocm_fusion_ops: Vec::new(),
@@ -1096,6 +1113,79 @@ impl GrimMetadata {
             .get("grim.quant_overrides")
             .and_then(read_grim_quant_overrides)
             .unwrap_or_default();
+        // Sidecars: RCO allocation (same field order as the write side) and
+        // calibration scores. Malformed entries are skipped with a named
+        // warning rather than failing the whole load.
+        let rco_allocation = metadata.get("grim.rco.allocation").and_then(|v| {
+            let arr = v.as_array()?;
+            let mut alloc = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let inner = match entry.as_array() {
+                    Some(a) if a.len() >= 4 => a,
+                    _ => {
+                        eprintln!("[grim-format] skipping malformed rco allocation entry");
+                        continue;
+                    }
+                };
+                let name = match inner[0].as_str() {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                let bpw = match inner[1] {
+                    GgufValue::Uint32(b) => b,
+                    _ => continue,
+                };
+                let dtype = GgufDType::from_tag(match inner[2] {
+                    GgufValue::Uint32(t) => t,
+                    _ => continue,
+                });
+                let score = match inner[3] {
+                    GgufValue::Float32(f) => f,
+                    _ => 0.0,
+                };
+                let layout_hint = inner
+                    .get(4)
+                    .and_then(|v| v.as_str())
+                    .and_then(layout_hint_from_tag);
+                if let Some(dt) = dtype {
+                    alloc.push(GrimQuantOverride {
+                        tensor_name: name,
+                        effective_bpw: bpw,
+                        override_dtype: dt,
+                        importance_score: score,
+                        layout_hint,
+                    });
+                }
+            }
+            Some(alloc)
+        });
+        let rco_allocation_provenance = metadata
+            .get("grim.rco.allocation.provenance")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let calibration_scores = metadata.get("grim.calibration.scores").and_then(|v| {
+            let arr = v.as_array()?;
+            let mut scores = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let inner = match entry.as_array() {
+                    Some(a) if a.len() >= 2 => a,
+                    _ => {
+                        eprintln!("[grim-format] skipping malformed calibration score entry");
+                        continue;
+                    }
+                };
+                let name = match inner[0].as_str() {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                let score = match inner[1] {
+                    GgufValue::Float32(f) => f,
+                    _ => 0.0,
+                };
+                scores.push((name, score));
+            }
+            Some(scores)
+        });
         let train_quant_mode = metadata
             .get("grim.train.quant_mode")
             .and_then(|v| v.as_str())
@@ -1140,6 +1230,9 @@ impl GrimMetadata {
             quant_method,
             calibration_dataset,
             quant_overrides,
+            rco_allocation,
+            rco_allocation_provenance,
+            calibration_scores,
             train_quant_mode,
             train_fusion_ops,
             rocm_fusion_ops,
@@ -1232,6 +1325,45 @@ impl GrimMetadata {
             metadata.insert(
                 "grim.calibration_dataset".into(),
                 GgufValue::String(calibration_dataset.clone()),
+            );
+        }
+        if let Some(alloc) = &self.rco_allocation {
+            metadata.insert(
+                "grim.rco.allocation".into(),
+                GgufValue::Array(
+                    alloc.iter()
+                        .map(|ov| {
+                            GgufValue::Array(vec![
+                                GgufValue::String(ov.tensor_name.clone()),
+                                GgufValue::Uint32(ov.effective_bpw),
+                                GgufValue::Uint32(ov.override_dtype.tag()),
+                                GgufValue::Float32(ov.importance_score),
+                            GgufValue::String(layout_hint_tag(ov.layout_hint.as_ref()).to_string()),
+                            ])
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(prov) = &self.rco_allocation_provenance {
+            metadata.insert(
+                "grim.rco.allocation.provenance".into(),
+                GgufValue::String(prov.clone()),
+            );
+        }
+        if let Some(scores) = &self.calibration_scores {
+            metadata.insert(
+                "grim.calibration.scores".into(),
+                GgufValue::Array(
+                    scores.iter()
+                        .map(|(name, score)| {
+                            GgufValue::Array(vec![
+                                GgufValue::String(name.clone()),
+                                GgufValue::Float32(*score),
+                            ])
+                        })
+                        .collect(),
+                ),
             );
         }
         if !self.quant_overrides.is_empty() {
@@ -1376,6 +1508,31 @@ impl GrimMetadata {
                 "quant_overrides".into(),
                 serde_json::Value::Array(
                     self.quant_overrides.iter().map(override_to_json).collect(),
+                ),
+            );
+        }
+        if let Some(alloc) = &self.rco_allocation {
+            obj.insert(
+                "rco_allocation".into(),
+                serde_json::Value::Array(alloc.iter().map(override_to_json).collect()),
+            );
+        }
+        if let Some(prov) = &self.rco_allocation_provenance {
+            obj.insert(
+                "rco_allocation_provenance".into(),
+                serde_json::Value::String(prov.clone()),
+            );
+        }
+        if let Some(scores) = &self.calibration_scores {
+            obj.insert(
+                "calibration_scores".into(),
+                serde_json::Value::Array(
+                    scores
+                        .iter()
+                        .map(|(name, score)| {
+                            serde_json::json!({ "name": name, "score": score })
+                        })
+                        .collect(),
                 ),
             );
         }
@@ -1551,6 +1708,26 @@ impl GrimMetadata {
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(override_from_json).collect())
             .unwrap_or_default();
+        let rco_allocation = obj
+            .get("rco_allocation")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(override_from_json).collect());
+        let rco_allocation_provenance = obj
+            .get("rco_allocation_provenance")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let calibration_scores = obj.get("calibration_scores").and_then(|v| v.as_array()).map(
+            |arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        Some((
+                            e.get("name")?.as_str()?.to_string(),
+                            e.get("score")?.as_f64()? as f32,
+                        ))
+                    })
+                    .collect::<Vec<(String, f32)>>()
+            },
+        );
         let train_quant_mode = obj
             .get("train_quant_mode")
             .and_then(|v| v.as_str())
@@ -1649,6 +1826,9 @@ impl GrimMetadata {
             quant_method,
             calibration_dataset,
             quant_overrides,
+            rco_allocation,
+            rco_allocation_provenance,
+            calibration_scores,
             train_quant_mode,
             train_fusion_ops,
             rocm_fusion_ops,
@@ -1668,6 +1848,24 @@ impl GrimMetadata {
             ext_entries,
             gguf_metadata,
         }
+    }
+}
+
+/// Canonical `GrimLayoutHint` spelling — shared by the GGUF sidecar array and
+/// the native JSON layer so the two carriers cannot drift apart.
+fn layout_hint_tag(hint: Option<&GrimLayoutHint>) -> &'static str {
+    match hint {
+        Some(GrimLayoutHint::WavefrontTiled) => "wavefront-tiled",
+        Some(GrimLayoutHint::BlockSparse) => "block-sparse",
+        None => "none",
+    }
+}
+
+fn layout_hint_from_tag(tag: &str) -> Option<GrimLayoutHint> {
+    match tag {
+        "wavefront-tiled" => Some(GrimLayoutHint::WavefrontTiled),
+        "block-sparse" => Some(GrimLayoutHint::BlockSparse),
+        _ => None,
     }
 }
 
@@ -2480,6 +2678,27 @@ mod tests {
                 importance_score: 0.42,
                 layout_hint: Some(GrimLayoutHint::WavefrontTiled),
             }],
+            rco_allocation: Some(vec![
+                GrimQuantOverride {
+                    tensor_name: "model.layers.0.wq".into(),
+                    effective_bpw: 4,
+                    override_dtype: GgufDType::Q4K,
+                    importance_score: 0.42,
+                    layout_hint: Some(GrimLayoutHint::WavefrontTiled),
+                },
+                GrimQuantOverride {
+                    tensor_name: "model.layers.1.wo".into(),
+                    effective_bpw: 2,
+                    override_dtype: GgufDType::GsqRco3p5,
+                    importance_score: 0.11,
+                    layout_hint: None,
+                },
+            ]),
+            rco_allocation_provenance: Some("search target_bpw=2.10 tensors=2".into()),
+            calibration_scores: Some(vec![
+                ("model.layers.0.wq".to_string(), 0.42),
+                ("model.layers.1.wo".to_string(), 0.11),
+            ]),
             train_quant_mode: Some(GrimTrainQuantMode::Bf16),
             train_fusion_ops: vec![GrimFusionOp::RmsNormMatMul],
             rocm_fusion_ops: vec![GrimFusionOp::QkvAttention],
@@ -2542,6 +2761,17 @@ mod tests {
             original.quant_overrides[0].layout_hint,
             restored.quant_overrides[0].layout_hint
         );
+        let orig_alloc = original.rco_allocation.as_ref().unwrap();
+        let rest_alloc = restored.rco_allocation.as_ref().unwrap();
+        assert_eq!(orig_alloc.len(), rest_alloc.len());
+        assert_eq!(orig_alloc[1].tensor_name, rest_alloc[1].tensor_name);
+        assert_eq!(orig_alloc[1].effective_bpw, rest_alloc[1].effective_bpw);
+        assert_eq!(orig_alloc[1].override_dtype, rest_alloc[1].override_dtype);
+        assert_eq!(
+            original.rco_allocation_provenance,
+            restored.rco_allocation_provenance
+        );
+        assert_eq!(original.calibration_scores, restored.calibration_scores);
         assert_eq!(original.train_quant_mode, restored.train_quant_mode);
         assert_eq!(original.train_fusion_ops, restored.train_fusion_ops);
         assert_eq!(original.rocm_fusion_ops, restored.rocm_fusion_ops);
@@ -2847,5 +3077,39 @@ mod tests {
             matches!(value, GgufValue::Array(_)),
             "expected array at depth limit"
         );
+    }
+
+    #[test]
+    fn rco_allocation_and_calibration_sidecars_round_trip_via_gguf_metadata() {
+        let original = sample_metadata();
+        let meta = original.to_gguf_metadata();
+        assert!(meta.contains_key("grim.rco.allocation"));
+        assert!(meta.contains_key("grim.rco.allocation.provenance"));
+        assert!(meta.contains_key("grim.calibration.scores"));
+
+        let restored = GrimMetadata::from_gguf_metadata(&meta);
+        let orig_alloc = original.rco_allocation.as_ref().unwrap();
+        let rest_alloc = restored.rco_allocation.as_ref().unwrap();
+        assert_eq!(orig_alloc.len(), rest_alloc.len());
+        for (o, r) in orig_alloc.iter().zip(rest_alloc.iter()) {
+            assert_eq!(o.tensor_name, r.tensor_name);
+            assert_eq!(o.effective_bpw, r.effective_bpw);
+            assert_eq!(o.override_dtype, r.override_dtype);
+            assert!((o.importance_score - r.importance_score).abs() < 1e-6);
+            assert_eq!(o.layout_hint, r.layout_hint);
+        }
+        assert_eq!(
+            original.rco_allocation_provenance,
+            restored.rco_allocation_provenance
+        );
+        assert_eq!(original.calibration_scores, restored.calibration_scores);
+    }
+
+    #[test]
+    fn sidecars_default_absent_for_plain_metadata() {
+        let restored = GrimMetadata::from_gguf_metadata(&HashMap::new());
+        assert!(restored.rco_allocation.is_none());
+        assert!(restored.rco_allocation_provenance.is_none());
+        assert!(restored.calibration_scores.is_none());
     }
 }
