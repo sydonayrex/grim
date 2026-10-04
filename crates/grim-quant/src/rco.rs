@@ -79,18 +79,35 @@ pub fn rco_search(
     let max_possible_bits = total_params as f64 * max_bpw;
     let target_bits = target_bits.clamp(min_possible_bits, max_possible_bits);
 
-    let imp_sum: f32 = importance_scores.iter().sum::<f32>().max(1e-9);
+    // RANK-BASED MIXED-PRECISION INIT (the paper's semantics: spend the
+    // budget where importance is). The old init scored every rung as
+    // |cost - target * normalized_importance| — on a real cost ladder that
+    // parks every above-average-importance tensor on the TOP rung (the
+    // Xing4.0 run handed the highest-importance expert stacks F32 at a
+    // 3.5-bpw budget, 96 GB output). Here the importance percentile of a
+    // tensor is matched against each rung's cost percentile: most important
+    // starts at the top rung, least important at the floor. The annealer and
+    // the exact-budget repair then fine-tune toward B.
     let mut theta = vec![vec![0.0f64; k_candidates]; n_tensors];
-
-    for (i, (&imp, _)) in importance_scores
-        .iter()
-        .zip(tensor_sizes.iter())
-        .enumerate()
-    {
-        let norm_imp = (imp / imp_sum) * n_tensors as f32;
-        for (k, &bpw) in bpws_f64.iter().enumerate() {
-            let dist = (bpw - (config.target_bpw as f64 * norm_imp as f64)).abs();
-            theta[i][k] = -dist;
+    let mut by_importance: Vec<usize> = (0..n_tensors).collect();
+    by_importance.sort_by(|&a, &b| {
+        importance_scores[a]
+            .partial_cmp(&importance_scores[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (rank, &i) in by_importance.iter().enumerate() {
+        let imp_frac = if n_tensors > 1 {
+            rank as f64 / (n_tensors - 1) as f64
+        } else {
+            0.5
+        };
+        for k in 0..k_candidates {
+            let cost_frac = if k_candidates > 1 {
+                k as f64 / (k_candidates - 1) as f64
+            } else {
+                0.5
+            };
+            theta[i][k] = -8.0 * (cost_frac - imp_frac).abs();
         }
     }
 
@@ -205,7 +222,12 @@ pub fn rco_search(
                 }
             }
         }
-    } else if total_allocated_bits < target_bits {
+    }
+    // Refill pass: demoting a coarse ladder overshoots the budget (with five
+    // tensors one rung step IS ~0.5 bpw), so after any demotion we climb
+    // back toward B with promotions that still fit. Previously this ran only
+    // when the annealer under-shot, leaving over-shot runs stranded low.
+    if total_allocated_bits < target_bits {
         let mut indices: Vec<usize> = (0..n_tensors).collect();
         indices.sort_by(|&a, &b| {
             let score_a = importance_scores[a] / (tensor_sizes[a] as f32 + 1.0);
@@ -245,6 +267,62 @@ pub fn rco_search(
 
 #[cfg(test)]
 mod tests {
+    /// MoE-shaped gate: with the Xing4.0 profile (huge low-density expert
+    /// tensors + many small high-importance ones), a 3.5-bpw budget over
+    /// {GSQ 2.25, Q4_K 4.5, Q5_K 5.5, Q6_K 6.5} must (a) realize the budget,
+    /// (b) never hand a weight tensor the F32 rung, and (c) spend the cheap
+    /// rung on big, low-importance tensors. The old init did the opposite:
+    /// the top-importance tensors landed on the TOP rung, which is how a
+    /// 3.5-bpw conversion produced 96 GB.
+    #[test]
+    fn moe_profile_spends_the_budget_by_importance_density() {
+        let costs = [2.25f64, 4.5, 5.5, 6.5];
+        let cfg = RcoConfig {
+            target_bpw: 3.5,
+            steps: 80,
+            available_bpws: vec![2, 4, 5, 6],
+            costs: Some(costs.iter().map(|c| *c as f32).collect()),
+            ..Default::default()
+        };
+        // 60 blocks x 3 expert tensors (huge, middling importance) +
+        // 60 x 4 attention tensors (small, high importance) + norms.
+        let mut importance: Vec<f32> = Vec::new();
+        let mut sizes: Vec<usize> = Vec::new();
+        for b in 0..60 {
+            for _ in 0..3 {
+                importance.push(0.9 + (b % 7) as f32 * 0.05);
+                sizes.push(1024 * 1024 * 64);
+            }
+            for _ in 0..4 {
+                importance.push(2.0 + (b % 5) as f32 * 0.1);
+                sizes.push(4096 * 1024);
+            }
+        }
+        let genes = rco_search(&cfg, &importance, &sizes, None);
+        assert_eq!(genes.len(), importance.len());
+        let total: usize = sizes.iter().sum();
+        let realized: f64 = genes
+            .iter()
+            .zip(&sizes)
+            .map(|(&g, &s)| s as f64 * costs[cfg.available_bpws.iter().position(|&b| b == g).unwrap()])
+            .sum::<f64>()
+            / total as f64;
+        assert!(
+            (realized - 3.5).abs() < 0.45,
+            "realized {realized:.3} must land near the 3.5 nominal"
+        );
+        // The biggest, least-important tier must be cheap: mean gene over the
+        // expert slots must beat the attention slots.
+        let exps_mean: f32 = genes.iter().step_by(7).take(60).map(|&g| g as f32).sum();
+        let attn_mean: f32 = (0..60).map(|b| genes[b * 7 + 3] as f32).sum();
+        assert!(
+            exps_mean / 60.0 < attn_mean / 60.0,
+            "big low-importance tensors must take the cheaper rungs ({:.2} vs {:.2})",
+            exps_mean / 60.0,
+            attn_mean / 60.0
+        );
+    }
+
     /// The budget must be charged against TRUE storage densities: a nominal
     /// 3.0 bpw over {GSQ 2.25, Q4_K 4.5} has to realize ~3.0, not ~3.3 (the
     /// integer-label stand-ins) — this is what "achieve a nominal target"

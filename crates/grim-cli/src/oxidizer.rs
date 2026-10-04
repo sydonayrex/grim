@@ -288,8 +288,13 @@ pub fn cmd_oxidizer_search(
             // {2.25, 32} forced most tensors to F32 and converted Xing4.0 to
             // 100 GB. The retired flat wave tiers (3/4/8-bit) remain out —
             // scale-less and reader-less.
-            available_bpws: vec![2, 4, 5, 6, 32],
-            costs: Some(vec![2.25, 4.5, 5.5, 6.5, 32.0]),
+            // 32 (F32) is NOT an RCO option: verbatim F32 is the shape-gate
+            // fallback for 1-D norms and sub-block tensors, never a budget
+            // choice — offering it let the search park high-importance
+            // tensors on it (the artifact gives F32 to 2.6M of 125B params,
+            // i.e. norms only).
+            available_bpws: vec![2, 4, 5, 6],
+            costs: Some(vec![2.25, 4.5, 5.5, 6.5]),
             ..Default::default()
         },
         &importance_scores.layer_scores,
@@ -528,15 +533,24 @@ pub fn cmd_oxidizer_convert(
         );
     }
 
-    // Create full bitwidths array: scored tensors get EvoPress bitwidth, others get target_bpw.
+    // Create full bitwidths array: scored tensors get EvoPress bitwidth, others
+    // get target_bpw. Attention-projection precision is enforced HERE, once —
+    // the allocation sidecar used to record a post-enforcement tier while the
+    // packer consumed the raw gene, so the sidecar and the payload disagreed
+    // on 416 of 977 tensors.
     let default_bw = target_bpw.round() as u32;
     let full_bitwidths: Vec<u32> = names
         .iter()
         .map(|name| {
-            if let Some(&idx) = imp_name_to_idx.get(name.as_str()) {
+            let raw = if let Some(&idx) = imp_name_to_idx.get(name.as_str()) {
                 bitwidths[idx]
             } else {
                 default_bw
+            };
+            if is_attention_projection(name) {
+                enforce_attention_precision(raw)
+            } else {
+                raw
             }
         })
         .collect();
@@ -601,11 +615,7 @@ pub fn cmd_oxidizer_convert(
             .enumerate()
             .map(|(i, name)| {
                 let bw = full_bitwidths.get(i).copied().unwrap_or(default_bw);
-                let effective_bpw = if is_attention_projection(name) {
-                    enforce_attention_precision(bw)
-                } else {
-                    bw
-                };
+                let effective_bpw = bw; // enforced once, where full_bitwidths is built
                 // The GSQ-RCO ladder, rung by rung: the sidecar's dtype must
                 // be what the packer ACTUALLY emitted or a re-quant reads the
                 // allocation as F32 and re-decodes Q4_K bytes as raw f32.
