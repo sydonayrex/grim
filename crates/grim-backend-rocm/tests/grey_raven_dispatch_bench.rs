@@ -5,27 +5,22 @@
 //! materializes through the real dispatch (frag loads + B transpose-gather
 //! + scattered C writes are all overhead dense FP8 does not pay).
 //!
-//! Two caveats, both recorded rather than hidden:
 //!
-//! 1. Raven's m=16 path (fused-dequant MFMA) measures ~13.7ms here --
-//!    orders of magnitude slower than the arithmetic justifies, which smells
-//!    like a separate pre-existing pathology in that arm (host-side work per
-//!    call? a missing fast path?). The 17x below is real (same rig, same
-//!    shapes) but flatters grey: beating a broken baseline is not the same
-//!    as being fast. Grey's own absolute numbers (20.9 GB/s at m=16) are far
-//!    from HBM limits for the opposite reason -- see (2).
+//! Measured (RX 9070 XT, gfx1201, n=k=4096, `grey_raven_dispatch_bench`,
+//! WITH the B-prologue; pre-prologue numbers were 783/802 us):
+//!   m=1 :  68.5 us, 245 GB/s -- 0.76x vs Raven dot4 GEMV (52-63 us).
+//!         Near-parity with the purpose-built decode kernel despite
+//!         M-padding 15/16 columns: the prologue + frag loads are cheap
+//!         enough that the 2:4 halved traffic nearly compensates.
+//!   m=16:  60.7 us, 276 GB/s -- 1.16x vs Raven row-major WMMA (70-100 us).
+//!         A real win over dense in the same instruction class, from halved
+//!         weight traffic (4.06 vs 8 bpw). Larger batches should widen it
+//!         (more N-tiles amortize the same B-frag).
 //!
-//! 2. Grey's B fragment (512 B transpose-gather + E4M3 encode per window)
-//!    is recomputed per N-tile, but it depends only on (M-tile, window):
-//!    256x redundant work on the benchmark shape. A B-prologue kernel
-//!    (quantize once per (M-tile, window) into fragment order, consume from
-//!    there -- the WhiteRaven act-prologue playbook) removes it. Until then
-//!    grey is correct and competitive, not optimal.
-//!
-//! Gate: must not lose to dense at prefill (the reason 2:4 exists). Decode
-//! (m=1) reports without a hard gate -- the M-padding makes it structurally
-//! disadvantaged, and the number is recorded so the trade-off is explicit
-//! rather than hidden.
+//! Earlier this doc recorded 17x over Raven's fused-dequant MFMA arm; that
+//! arm turned out to be a scalar fallback (per-element powf dequant, ~13.7ms
+//! at m=16) and has since been rewired to the same row-major WMMA Raven now
+//! runs. The comparison above is against the fixed baseline.
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{ArithType, DType, MemoryOps, QuantFormat, QuantOps, Shape, Storage};

@@ -109,9 +109,13 @@ fn blocked_dispatch_beats_the_fp8_path_it_replaces() -> TestResult {
         let w: Vec<f32> = (0..n * k).map(|_| rng.f32()).collect();
         let codes: Vec<u8> = w.iter().map(|&v| grim_quant::f32_to_fp8_e4m3(v)).collect();
 
-        // Row-major: quant_fp8 prepends a 4-byte f32 scale of 1.0.
-        let mut rowmajor = 1.0f32.to_le_bytes().to_vec();
-        rowmajor.extend_from_slice(&codes);
+        // Row-major: bare E4M3 codes, n*k bytes, no scale prefix. This is the
+        // dispatch contract (tag-669/convert emit bare; the launcher validates
+        // 16-row-tile padding on the byte count). The legacy `quant_fp8`
+        // 4-byte-prefixed layout is NOT accepted here -- it fails the tile
+        // check by construction, which is preferable to silently shifting
+        // every code by four.
+        let rowmajor = codes.clone();
         let w_row = MemoryOps::from_cpu_bytes(
             &dev,
             &rowmajor,

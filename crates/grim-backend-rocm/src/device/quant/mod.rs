@@ -977,6 +977,40 @@ impl QuantOps for RocmDevice {
                 if is_rdna34 && m == 1 && !dot_disabled && k % 32 == 0 {
                     self.launch_dot4_fp8_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                 }
+                // gfx12 prefill: row-major FP8 WMMA (`grim_wmma_gemm_fp8_e4m3`,
+                // the kernel WhiteRaven measured 3.5x against at the kernel
+                // level). Same capture-safe act prologue as the WhiteRaven
+                // arm: F32/U8 activations -> padded FP8 codes in cached
+                // per-device scratch, no host round-trip. B is bare FP8 codes
+                // row-major (the tag-669/convert contract: n*k bytes, no
+                // 4-byte scale prefix -- the launcher validates tile padding).
+                //
+                // This replaced `grim_fused_dequant_gemm_fp8_mfma`, which
+                // despite its name is a scalar fallback (one thread per
+                // output, per-element powf() dequant, no tiling): ~13.7ms at
+                // m=16/n=k=4096 versus ~0.2ms here. The scalar kernel stays
+                // for non-gfx12 and ragged shapes, where it is correct.
+                else if self.gpu_target.starts_with("gfx12") && m > 1 {
+                    if a_storage.dtype().arith != ArithType::U8
+                        && a_storage.dtype().arith != ArithType::F32
+                    {
+                        return Err(Error::Backend(format!(
+                            "Raven prefill act must be u8 codes or f32, got {:?}",
+                            a_storage.dtype().arith
+                        )));
+                    }
+                    let a_rows = m.div_ceil(16) * 16;
+                    let scratch = self.white_raven_act_scratch(a_rows * k)?;
+                    self.launch_quant_fp8_pad16(a_storage, &scratch, m, k)?;
+                    self.launch_wmma_gemm_fp8_e4m3_for_ab(
+                        scratch.as_ref(),
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
+                }
                 // gfx1200+ uses MFMA for FP8 throughput; other architectures use scalar.
                 else if self.gpu_target.starts_with("gfx12") {
                     self.launch_fused_dequant_gemm_fp8_mfma(
@@ -1568,9 +1602,25 @@ impl QuantOps for RocmDevice {
                     if gfx12 && m > 0 && n > 0 && k > 0 {
                         let n_tiles = n.div_ceil(16);
                         let n_windows = k.div_ceil(32);
+                        let m_tiles = m.div_ceil(16);
+                        // B-prologue first: quantize X into fragment order once
+                        // per (M-tile, window) in cached scratch, then the GEMM
+                        // reads plain fragments. Same-stream ordering makes the
+                        // reuse safe (WhiteRaven act-prologue discipline).
+                        let b_scratch = self.white_raven_act_scratch(
+                            m_tiles * n_windows * 512,
+                        )?;
+                        self.launch_grey_raven_b_prologue(
+                            a_storage,
+                            &b_scratch,
+                            m,
+                            k,
+                            m_tiles,
+                            n_windows,
+                        )?;
                         self.launch_grey_raven_gemm(
                             b_storage,
-                            a_storage,
+                            &b_scratch,
                             &out_storage,
                             m,
                             n,

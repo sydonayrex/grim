@@ -762,6 +762,67 @@ impl RocmDevice {
         )
     }
 
+    /// GreyRaven B-prologue: quantize X into fragment-ordered FP8 once per
+    /// (M-tile, K-window), so the main kernel loads plain 16 B per lane with
+    /// no gather, no encode, and no bounds checks in its hot loop.
+    ///
+    /// Without this, every N-tile re-gathers and re-encodes the same B
+    /// window (256x redundant on square shapes) -- measured as the entire
+    /// performance gap to dense. With it, the prologue runs once per
+    /// (M-tile, window) into cached scratch, stream-ordered before the GEMM
+    /// on the same stream (the WhiteRaven act-prologue discipline).
+    pub fn launch_grey_raven_b_prologue(
+        &self,
+        x: &RocmStorage,
+        b_frag: &RocmStorage,
+        m: usize,
+        k: usize,
+        m_tiles: usize,
+        n_windows: usize,
+    ) -> Result<*mut c_void> {
+        let want_bytes = m_tiles
+            .checked_mul(n_windows)
+            .and_then(|t| t.checked_mul(512))
+            .ok_or_else(|| Error::Backend("grey_b_prologue: frag geometry overflows".into()))?;
+        // Scratch comes from a grow-only cache: it may be LARGER than asked
+        // (reuse), never smaller. Validate the floor; the kernel addresses
+        // the first want_bytes and ignores the rest.
+        if b_frag.bytes < want_bytes {
+            return Err(Error::Backend(format!(
+                "grey_b_prologue: scratch is {} bytes, need at least {} ({} M-tiles x {} windows x 512)",
+                b_frag.bytes, want_bytes, m_tiles, n_windows
+            )));
+        }
+        let xptr = x
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_b_prologue: x has no device ptr".into()))?;
+        let bptr = b_frag
+            .device_ptr
+            .ok_or_else(|| Error::Backend("grey_b_prologue: out has no device ptr".into()))?;
+        let total = want_bytes as u64;
+        let grid_dim = HipDim3::new(total.div_ceil(256) as u32, 1, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut xx = xptr;
+        let mut bb = bptr;
+        let mut mm = m as i32;
+        let mut kk = k as i32;
+        let mut mt = m_tiles as i32;
+        let mut nw = n_windows as i32;
+        self.launch_compute_kernel(
+            "grim_grey_raven_b_prologue",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut xx),
+                arg(&mut bb),
+                arg(&mut mm),
+                arg(&mut kk),
+                arg(&mut mt),
+                arg(&mut nw),
+            ],
+        )
+    }
+
     /// GreyRaven production GEMM over HW-order tiled weights.
     ///
     /// Unlike the probe above this runs from the JIT aggregate (it needs
@@ -777,7 +838,7 @@ impl RocmDevice {
     pub fn launch_grey_raven_gemm(
         &self,
         w_blob: &RocmStorage,
-        x: &RocmStorage,
+        b_frag: &RocmStorage,
         y_out: &RocmStorage,
         m: usize,
         n: usize,
@@ -798,35 +859,38 @@ impl RocmDevice {
         let wptr = w_blob
             .device_ptr
             .ok_or_else(|| Error::Backend("grey_raven_gemm: w has no device ptr".into()))?;
-        let xptr = x
+        let bptr = b_frag
             .device_ptr
-            .ok_or_else(|| Error::Backend("grey_raven_gemm: x has no device ptr".into()))?;
+            .ok_or_else(|| Error::Backend("grey_raven_gemm: b_frag has no device ptr (run the prologue first)".into()))?;
         let yptr = y_out
             .device_ptr
             .ok_or_else(|| Error::Backend("grey_raven_gemm: y has no device ptr".into()))?;
         let grid_dim = HipDim3::new(n_tiles as u32, m.div_ceil(16) as u32, 1);
         let block_dim = HipDim3::new(32, 1, 1);
+        let m_tiles = m.div_ceil(16);
         let mut w = wptr;
-        let mut xx = xptr;
+        let mut bb = bptr;
         let mut yy = yptr;
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
         let mut nt = n_tiles as i32;
         let mut nw = n_windows as i32;
+        let mut mt = m_tiles as i32;
         self.launch_compute_kernel(
             "grim_grey_raven_gemm",
             grid_dim,
             block_dim,
             &mut [
                 arg(&mut w),
-                arg(&mut xx),
+                arg(&mut bb),
                 arg(&mut yy),
                 arg(&mut mm),
                 arg(&mut nn),
                 arg(&mut kk),
                 arg(&mut nt),
                 arg(&mut nw),
+                arg(&mut mt),
             ],
         )
     }
