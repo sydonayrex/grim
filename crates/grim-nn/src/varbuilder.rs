@@ -348,6 +348,28 @@ impl<'a> WeightSource<'a> {
         materialize(raw, shape, dtype, provenance, &self.device)
     }
 
+    /// Materialize a `RawTensor` addressed by a name that is already fully
+    /// qualified, rather than resolved through this source's prefix.
+    ///
+    /// `full_name` always renders `prefix + "." + leaf`, so it cannot address a
+    /// tensor whose own name contains dots (e.g. a GGUF `v.patch_embd.weight.1`)
+    /// without appending a spurious separator. Loaders whose names come from the
+    /// file's own tensor table use this to materialise verbatim.
+    pub fn materialize_named(
+        &self,
+        raw: grim_tensor::provider::RawTensor,
+        name: &str,
+        shape: impl Into<Shape>,
+    ) -> Result<Tensor> {
+        self.materialize_raw(raw, shape.into())
+            .map_err(|e| match e {
+                grim_tensor::error::Error::Backend(msg) => {
+                    grim_tensor::error::Error::Backend(format!("{name}: {msg}"))
+                }
+                other => other,
+            })
+    }
+
     pub fn full_name(&self, leaf: &str) -> String {
         let mut s = self.prefix.join(".");
         if !s.is_empty() {
