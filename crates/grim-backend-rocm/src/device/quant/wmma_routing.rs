@@ -5,13 +5,13 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::BackendStorage;
 use grim_tensor::dtype::{ArithType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
+use grim_tensor::BackendStorage;
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{HipDim3, arg};
+use crate::{arg, HipDim3};
 
 impl RocmDevice {
     /// Returns `true` when the activation storage holds native FP16 data
@@ -395,6 +395,21 @@ pub(crate) fn wmma_route_decision(
     }
 }
 
+/// Serializes GpuDequant dispatches per device ordinal.
+///
+/// The conversion pack loop runs under rayon, so many tensors dequantize
+/// concurrently on one device. Driven SERIALLY the standalone dequant path is
+/// bit-exact at the largest checkpoint sizes (xing_dequant_real_parity gates
+/// token_embd 469M / ffn_*_exps 235M elements against the CPU oracle), but the
+/// concurrent conversion run faulted with hipErrorLaunchFailure (719). A
+/// device-side mutex makes the conversion take the proven-serial path; these
+/// kernels are bandwidth-bound, so cross-tensor parallelism bought little.
+fn dequant_serial_lock(ordinal: usize) -> &'static std::sync::Mutex<()> {
+    static LOCKS: std::sync::OnceLock<Vec<std::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| (0..16).map(|_| std::sync::Mutex::new(())).collect());
+    &locks[ordinal.min(15)]
+}
+
 impl grim_format::convert::GpuDequant for RocmDevice {
     /// `Ok(None)` => storage has no WMMA host-dequant arm; caller must use the generic dequant path.
     fn dequantize(
@@ -403,6 +418,7 @@ impl grim_format::convert::GpuDequant for RocmDevice {
         bytes: &[u8],
         elem_count: usize,
     ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        let _serial = dequant_serial_lock(self.ordinal).lock().unwrap_or_else(|e| e.into_inner());
         use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme, Storage};
         match storage {
             Storage::KQuant(KQuantScheme::Q80) => {
@@ -621,7 +637,10 @@ mod block_size_tests {
         // green, because nothing looked at those numbers.
         let mut problems: Vec<String> = Vec::new();
         let row = |tag: &str| {
-            T::TILED_QUANT_TABLE.iter().find(|(_, t, _, _)| *t == tag).copied()
+            T::TILED_QUANT_TABLE
+                .iter()
+                .find(|(_, t, _, _)| *t == tag)
+                .copied()
         };
         for (tag, elems, bytes) in expected {
             match row(tag) {

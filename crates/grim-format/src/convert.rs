@@ -1000,6 +1000,20 @@ fn pack_tensors(
                 target_bpw.round() as u8
             };
 
+            // Names the tensor in flight when a GPU op faults mid-conversion —
+            // a bare hipErrorLaunchFailure used to abort with no pointer to
+            // the offending tensor. OnceLock: an env read per tensor per pack
+            // pass was the GRIM_DEBUG_ATTN_SHAPES mistake again.
+            static CONV_DEQUANT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CONV_DEQUANT_DEBUG.get_or_init(|| {
+                std::env::var("GRIM_DEBUG_CONV_DEQUANT").as_deref() == Ok("1")
+            }) {
+                eprintln!(
+                    "[conv-dequant] {:?} {name} elems={elem_count} bytes={}",
+                    std::thread::current().id(),
+                    raw.bytes.len()
+                );
+            }
             let f32_values = if let Some(gpu) = gpu_dequant {
                 match gpu.dequantize(&raw.dtype.storage, &raw.bytes, elem_count)? {
                     Some(vals) => vals,
@@ -1030,7 +1044,15 @@ fn pack_tensors(
                 fmt_early.as_deref(),
                 Some("raven") | Some("whiteraven")
             );
-            let mut f32_transformed = f32_values.clone();
+            // The transformed view exists only for the FP8 arms; cloning per
+            // tensor on every other arm doubled the peak allocation for
+            // nothing (a [64, 1024, 3584] expert tensor is ~1 GB of f32, and
+            // under rayon those clones OOM'd the host).
+            let mut f32_transformed = if transforms_arm {
+                f32_values.clone()
+            } else {
+                Vec::new()
+            };
             if transforms_arm && meta.shape.len() == 2 {
                 let out_channels = meta.shape[0];
                 let in_channels = meta.shape[1];
