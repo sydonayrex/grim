@@ -200,6 +200,13 @@ impl GgufProvider {
         self.file.metadata.get(key)
     }
 
+    /// Full metadata map — for scanners that must enumerate keys (the imatrix
+    /// reader walks `.in_sum2` metadata entries when the file stores them as
+    /// KVs rather than tensor entries).
+    pub fn metadata_map(&self) -> &HashMap<String, crate::gguf::GgufValue> {
+        &self.file.metadata
+    }
+
     pub fn architecture(&self) -> Option<&str> {
         self.metadata("general.architecture")?.as_str()
     }

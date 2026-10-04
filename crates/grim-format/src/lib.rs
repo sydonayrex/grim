@@ -10,6 +10,7 @@ pub mod ftw;
 /// the former grim-tensor-graph crate; `GrimFusionOp` lives here).
 pub mod fusion;
 pub mod gguf;
+pub mod imatrix;
 pub mod gptq;
 pub mod onnx;
 pub mod ostquant;

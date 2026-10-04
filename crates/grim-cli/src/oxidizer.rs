@@ -330,6 +330,47 @@ fn sibling_candidates(kind: &str, model_path: &str) -> Vec<String> {
         .collect()
 }
 
+/// Where a consumable imatrix GGUF lives, in priority order: the explicit
+/// `--embed-imatrix` path, an auto-detected sibling next to the input, or —
+/// when re-converting a `.grim` — the in-file `imatrix` sidecar extracted to
+/// a content-addressed cache path. `None` means nothing to consume.
+fn imatrix_source_path(
+    model_path: &str,
+    embed: &EmbedSidecars,
+    embed_attachments: &[(String, Vec<u8>)],
+) -> Option<String> {
+    if let Some(p) = &embed.imatrix {
+        return Some(p.clone()); // resolve() already validated existence
+    }
+    if let Some(sibling) = sibling_candidates("imatrix", model_path)
+        .into_iter()
+        .find(|c| Path::new(c).exists())
+    {
+        return Some(sibling);
+    }
+    if model_path.ends_with(".grim") {
+        let att = grim_format::format::attachment_index_from_file(model_path)
+            .ok()?
+            .into_iter()
+            .find(|a| a.kind == "imatrix")?;
+        let sha16: String = att
+            .sha256
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let dest = std::env::temp_dir()
+            .join("grim-sidecars")
+            .join(format!("{sha16}-imatrix.gguf"));
+        return grim_format::format::extract_attachment_from_file(model_path, "imatrix", &dest)
+            .ok()
+            .flatten()
+            .map(|p| p.to_string_lossy().into_owned());
+    }
+    let _ = embed_attachments; // bytes already validated by resolve(); path form is what the parser needs
+    None
+}
+
 impl EmbedSidecars {
     /// Resolve every kind to concrete bytes: an explicit path must exist
     /// (fail loud), `None` auto-detects a sibling and stays silent when the
@@ -391,13 +432,33 @@ pub fn cmd_oxidizer_convert(
     // the GSQ paper's codebook is the source of truth for the format.
     let target_format = target_format.or(Some("gsq_rco_3p5"));
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
-    // Calibration source priority: a sibling `.importance.json` (the most
-    // recent explicit calibration) beats the embedded `grim.calibration.scores`
-    // sidecar, which beats recalibrating from scratch — re-converting a
-    // shipped single-file `.grim` on another machine must not silently
-    // recalibrate when it already carries its own scores.
+    let embed_attachments = embed.resolve(model_path)?;
+
+    // Calibration source priority: an explicit imatrix GGUF (the flag's path,
+    // a sibling auto-detect, or the in-file `imatrix` sidecar) outranks the
+    // embedded `grim.calibration.scores` scores, which outrank recalibrating
+    // from scratch. A sibling `.importance.json` still wins over the imatrix —
+    // it is the most recent explicitly-produced calibration. Re-converting a
+    // shipped single-file `.grim` on another machine must never silently
+    // recalibrate when it already carries calibration data.
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
+    } else if let Some(imatrix_path) = imatrix_source_path(model_path, embed, &embed_attachments) {
+        match grim_format::imatrix::read_imatrix_scores(&imatrix_path) {
+            Ok(im) => {
+                eprintln!(
+                    "[grim convert] using imatrix '{}': {} measured tensors, chunks={:?}",
+                    imatrix_path,
+                    im.scores.len(),
+                    im.chunk_count
+                );
+                let (names, scores): (Vec<String>, Vec<f32>) = im.scores.into_iter().unzip();
+                ImportanceScores::new(names, scores)
+            }
+            Err(e) => {
+                return Err(format!("imatrix '{imatrix_path}' failed to parse: {e}"))
+            }
+        }
     } else if let Some(scores) = grim_meta.calibration_scores.clone() {
         let (embedded_names, embedded_scores): (Vec<String>, Vec<f32>) =
             scores.into_iter().unzip();
@@ -415,7 +476,6 @@ pub fn cmd_oxidizer_convert(
         )?
     };
 
-    let embed_attachments = embed.resolve(model_path)?;
     let tensor_names = importance_scores.tensor_names.clone();
     let name_to_idx: std::collections::HashMap<&str, usize> = names
         .iter()
