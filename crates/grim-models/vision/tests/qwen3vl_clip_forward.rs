@@ -253,12 +253,16 @@ fn square_image_yields_merged_tokens_by_projection_dim() {
 
 /// The patch bias must reach the output. If the bias were dropped, or applied
 /// along the wrong axis of the merge, this fails.
+///
+/// The bias is per-element non-constant because the loader's variance gate
+/// rejects a constant payload: a constant vector has `var == 0`, which is
+/// indistinguishable from "declared but never loaded". That gate is doing its
+/// job here, so the fixture has to vary.
 #[test]
 fn patch_bias_reaches_the_output() {
     let cfg = tiny_config();
     let mut p = separable_provider(&cfg);
-    let e = cfg.embedding_length;
-    p.set("v.patch_embd.bias", e, |_| 0.25);
+    p.set_nonzero("v.patch_embd.bias", cfg.embedding_length, |_| 0.25);
     let clip = Qwen3VlClip::load(&p, cfg.clone()).expect("tower loads");
     let side = cfg.image_size;
     let pixels = vec![0.5f32; 3 * side * side];
