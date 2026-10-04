@@ -299,11 +299,32 @@ fn dequant_group_int_bytes(
 
 fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Result<Vec<f32>> {
     match &raw.dtype.storage {
-        grim_tensor::dtype::Storage::Native => Ok(raw
-            .bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()),
+        // Native covers F16 and BF16 as well as F32 — their payloads are TWO
+        // bytes per element. Reading them at F32 width yields exactly half the
+        // elements as garbage (Xing4.0's F16 hyper-connection tensors
+        // [14336, 24] produced 172032 f32s against a 344064-element shape and
+        // tripped the packer's shape assert downstream).
+        grim_tensor::dtype::Storage::Native => match raw.dtype.arith {
+            grim_tensor::dtype::ArithType::F32 => Ok(raw
+                .bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()),
+            grim_tensor::dtype::ArithType::F16 => Ok(raw
+                .bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()),
+            grim_tensor::dtype::ArithType::BF16 => Ok(raw
+                .bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()),
+            other => Err(Error::Backend(format!(
+                "cannot materialize native tensor of arith type {other:?} to f32; \
+                 the converter only consumes float tensors"
+            ))),
+        },
         grim_tensor::dtype::Storage::KQuant(scheme) => match scheme {
             grim_tensor::dtype::KQuantScheme::Q80 => {
                 grim_quant::dequant_q80(&raw.bytes, elem_count)
@@ -1000,8 +1021,17 @@ fn pack_tensors(
             // measured FULLY DISJOINT top-5 logits vs the source at step 0.
             // The transforms stay on the FP8 named arms (raven/whiteraven),
             // whose packed layouts were validated with them.
+            // 6dd74408: the transforms alter the WEIGHT distribution in a way
+            // only their FP8 packing contracts account for — on every other
+            // arm they shift every activation. They are gated to the FP8
+            // named arms here, not merely documented.
+            let fmt_early = target_format.map(|f| f.to_ascii_lowercase());
+            let transforms_arm = matches!(
+                fmt_early.as_deref(),
+                Some("raven") | Some("whiteraven")
+            );
             let mut f32_transformed = f32_values.clone();
-            if meta.shape.len() == 2 {
+            if transforms_arm && meta.shape.len() == 2 {
                 let out_channels = meta.shape[0];
                 let in_channels = meta.shape[1];
                 let _ = grim_quant::apply_smoothquant_scale(
@@ -1014,7 +1044,7 @@ fn pack_tensors(
 
             // SpinQuant Cayley rotation (WI-SPINQUANT-AttentionGate): only run on
             // attention projections (e.g. Q/K/V/O) with a square, power-of-two dimension >= 16.
-            if grim_quant::is_attention_projection(name) {
+            if transforms_arm && grim_quant::is_attention_projection(name) {
                 let elem_sqrt = (elem_count as f64).sqrt() as usize;
                 if elem_sqrt * elem_sqrt == elem_count
                     && elem_sqrt >= 16
@@ -1546,6 +1576,54 @@ pub fn encode_outliers_with_encoding(
 
 #[cfg(test)]
 mod tests {
+    use grim_tensor::dtype::{ArithType, DType, QuantProvenance};
+    use grim_tensor::provider::RawTensor;
+
+    /// Xing4.0 regression: F16 native tensors read at F32 width yield exactly
+    /// half the elements as garbage (hc_attn_fn [14336, 24] -> 172032 vs
+    /// 344064 and a packer assert). The Native arm must honor element width.
+    #[test]
+    fn dequant_tensor_data_decodes_f16_and_bf16_at_two_bytes() {
+        let f16_bytes: Vec<u8> = [1.0f32, -2.5, 0.25]
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .flatten()
+            .collect();
+        let raw = RawTensor {
+            bytes: f16_bytes,
+            shape: vec![3],
+            dtype: DType {
+                arith: ArithType::F16,
+                storage: Storage::Native,
+            },
+            provenance: QuantProvenance::GrimNative,
+        };
+        let out = dequant_tensor_data(&raw, 3).unwrap();
+        assert_eq!(out.len(), 3, "F16 must yield one f32 per 2-byte element");
+        assert!((out[0] - 1.0).abs() < 1e-3);
+        assert!((out[1] - -2.5).abs() < 1e-3);
+        assert!((out[2] - 0.25).abs() < 1e-3);
+
+        let bf16_bytes: Vec<u8> = [1.0f32, -2.0]
+            .iter()
+            .map(|v| half::bf16::from_f32(*v).to_le_bytes())
+            .flatten()
+            .collect();
+        let raw_bf16 = RawTensor {
+            bytes: bf16_bytes,
+            shape: vec![2],
+            dtype: DType {
+                arith: ArithType::BF16,
+                storage: Storage::Native,
+            },
+            provenance: QuantProvenance::GrimNative,
+        };
+        let out_bf16 = dequant_tensor_data(&raw_bf16, 2).unwrap();
+        assert_eq!(out_bf16.len(), 2);
+        assert!((out_bf16[0] - 1.0).abs() < 1e-2);
+        assert!((out_bf16[1] - -2.0).abs() < 1e-2);
+    }
+
     use super::*;
 
     /// Phase 5: small outlier lists use the legacy flat encoding.

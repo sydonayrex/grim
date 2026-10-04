@@ -1167,6 +1167,17 @@ fn materialize_f32(
             .take(elem_count)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()),
+        // F16/BF16: two bytes per element (a 4-byte read yields half the
+        // elements — the exact defect that tripped the packer on Xing4.0's
+        // F16 hyper-connection tensors).
+        GgufDType::F16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()),
+        GgufDType::BF16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()),
         GgufDType::Q8_0 => dequant_q80(bytes, elem_count).map_err(|e| e.to_string()),
         GgufDType::Q4K | GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => {
             dequant_q4k(bytes, elem_count).map_err(|e| e.to_string())

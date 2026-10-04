@@ -2549,6 +2549,7 @@ dependencies = [
  "grim-server",
  "grim-speculative",
  "grim-tensor",
+ "half",
  "libc",
  "pulldown-cmark",
  "rand 0.10.2",
