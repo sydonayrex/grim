@@ -607,19 +607,24 @@ fn convert_to_grim_inner(
             .map_err(|e| Error::Backend(format!("failed to open GGUF for EvoPress: {e}")))?;
         let mut tensor_names: Vec<String> = provider.tensors().keys().cloned().collect();
         tensor_names.sort();
-        let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> =
-            Vec::with_capacity(tensor_names.len());
+        // STREAMED scoring: dequant one tensor, score it, drop it. The batch
+        // form retained EVERY tensor's f32 simultaneously (~15 GB across this
+        // checkpoint's 977 tensors) on top of the pack output — the profile
+        // that OOM'd the host twice on Xing4.0. compute_importance_scores is
+        // a per-tensor fold with no cross-tensor state, so scoring against a
+        // one-element slice per step is mathematically identical.
+        let mut importance_scores: Vec<f32> = Vec::with_capacity(tensor_names.len());
+        let mut tensor_sizes: Vec<usize> = Vec::with_capacity(tensor_names.len());
         for name in &tensor_names {
             let raw = provider.get(name)?;
             let meta = provider.meta(name)?;
             let rows = meta.shape.first().copied().unwrap_or(1);
             let cols = meta.shape.get(1).copied().unwrap_or(1);
-            // Use the raw f32 values if available, otherwise dequantize
             let data: Vec<f32> = dequant_tensor_data(&raw, rows * cols)?;
-            tensor_data.push((name.clone(), data, rows, cols));
+            importance_scores
+                .extend(grim_quant::compute_importance_scores(&[(name.clone(), data, rows, cols)]));
+            tensor_sizes.push(rows * cols);
         }
-        let importance_scores = grim_quant::compute_importance_scores(&tensor_data);
-        let tensor_sizes: Vec<usize> = tensor_data.iter().map(|(_, _, r, c)| r * c).collect();
         let config = grim_quant::RcoConfig {
             steps: generations.max(20),
             target_bpw,
@@ -1005,6 +1010,36 @@ fn pack_tensors(
             // the offending tensor. OnceLock: an env read per tensor per pack
             // pass was the GRIM_DEBUG_ATTN_SHAPES mistake again.
             static CONV_DEQUANT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            // Memory-curve probe: private pages + packed-bytes-so-far every 25
+            // tensors — separates accumulation growth from per-tensor
+            // transients when a conversion climbs toward the OOM wall.
+            static PACK_MEMPROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *PACK_MEMPROBE.get_or_init(|| {
+                std::env::var("GRIM_DEBUG_CONV_MEM").as_deref() == Ok("1")
+            }) {
+                static PACK_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static PACKED_SUM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let n = PACK_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                PACKED_SUM.fetch_add(raw.bytes.len(), std::sync::atomic::Ordering::Relaxed);
+                if n % 25 == 0 {
+                    let priv_kb: usize = std::fs::read_to_string("/proc/self/smaps_rollup")
+                        .ok()
+                        .and_then(|t| {
+                            t.lines()
+                                .filter(|l| l.starts_with("Private_"))
+                                .map(|l| l.split_whitespace().nth(1).unwrap_or("0").parse::<usize>().unwrap_or(0))
+                                .sum::<usize>()
+                                .into()
+                        })
+                        .unwrap_or(0);
+                    eprintln!(
+                        "[conv-mem] #{n} {name} src_bytes={} packed_so_far_GB={:.2} private_GB={:.2}",
+                        raw.bytes.len(),
+                        PACKED_SUM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1073741824.0,
+                        priv_kb as f64 / 1048576.0
+                    );
+                }
+            }
             if *CONV_DEQUANT_DEBUG.get_or_init(|| {
                 std::env::var("GRIM_DEBUG_CONV_DEQUANT").as_deref() == Ok("1")
             }) {
