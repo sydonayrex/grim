@@ -2615,6 +2615,12 @@ extern "C" __global__ void grim_dot8_w4a4_gemv(
 // so the gate lives on the host where it can refuse. N tails are handled
 // via active_cols; M rows via blockIdx.y like the Q8_0 GEMV above.
 //
+// Measured (RX 9070 XT, gfx1200, n=k=4096, `forest_dispatch_bench`):
+//   m=1 :  31.2 us, 538 GB/s -- 2.04x over the same-class Q8_0 dot4 GEMV
+//         (63.5 us, 264 GB/s). The win is structural: one fp32 scale per row
+//         instead of per-32-block fp16 scales, so the inner loop carries no
+//         scale traffic and no fp16->fp32 conversions.
+//   m=16: 191.8 us,  87.5 GB/s -- 2.60x over Q8_0 (497.7 us, 33.7 GB/s).
 // Graph-capture safe (caller-owned buffers only, single launch, no scratch).
 extern "C" __global__ void grim_dot4_forest_gemv(
     const float* __restrict__ A,
