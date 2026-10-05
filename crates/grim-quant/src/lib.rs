@@ -4087,7 +4087,13 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
             let n = plan.shape.iter().product::<usize>();
             let blocks = n.div_ceil(BLOCK_SIZE_Q2_0);
             let mut bytes = vec![0u8; blocks * BLOCK_BYTES_Q2_0];
-            quantize_gsq_rco_3p5_block(data, &mut bytes)?;
+            let mut flushed = 0usize;
+            quantize_gsq_rco_3p5_block_counted(data, &mut bytes, &mut flushed)?;
+            if flushed > 0 {
+                eprintln!(
+                    "[gsq-quant] {flushed}/{blocks} blocks flushed to zero (dead or sub-fp16 scale)"
+                );
+            }
             bytes
         }
     };
@@ -8736,6 +8742,20 @@ pub fn quantize_q2_0_block(values: &[f32], out: &mut [u8]) -> Result<()> {
 /// Mirrors [`quantize_q2_0_block`]: non-multiple of [`BLOCK_SIZE_Q2_0`],
 /// output too short, all-zero block, or a scale not representable in fp16.
 pub fn quantize_gsq_rco_3p5_block(values: &[f32], out: &mut [u8]) -> Result<()> {
+    let mut flushed = 0usize;
+    quantize_gsq_rco_3p5_block_counted(values, out, &mut flushed)
+}
+
+/// Counted variant: `flushed` receives the number of blocks written as
+/// d=0/codes=0 because they had no representable scale (all-zero, or a
+/// scale too small for fp16). Callers that convert real checkpoints MUST
+/// pass a real counter and report it — a silently dropped block family is
+/// exactly the failure the arbiter's ~50% zero-scale finding predicts.
+pub fn quantize_gsq_rco_3p5_block_counted(
+    values: &[f32],
+    out: &mut [u8],
+    flushed: &mut usize,
+) -> Result<()> {
     if values.len() % BLOCK_SIZE_Q2_0 != 0 {
         return Err(Error::Backend(format!(
             "quantize_gsq_rco_3p5_block: {} values is not a multiple of block size {BLOCK_SIZE_Q2_0}",
@@ -8754,10 +8774,17 @@ pub fn quantize_gsq_rco_3p5_block(values: &[f32], out: &mut [u8]) -> Result<()> 
     for b in 0..num_blocks {
         let block = &values[b * BLOCK_SIZE_Q2_0..(b + 1) * BLOCK_SIZE_Q2_0];
         let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // Flush classes (2026-10-04): an all-zero block and a scale too
+        // small for fp16 both encode as d=0 / codes=0, which the decoder
+        // reproduces as exact zeros. These previously returned Err — the
+        // released GSQ-RCO artifacts carry ~50% zero-scale blocks, so a
+        // real conversion tripped this constantly. Structural errors
+        // (length, capacity) still fail loud below.
         if !(amax > 0.0) {
-            return Err(Error::Backend(format!(
-                "quantize_gsq_rco_3p5_block: block {b} is all zeros and has no representable scale"
-            )));
+            let base = b * BLOCK_BYTES_Q2_0;
+            out[base..base + BLOCK_BYTES_Q2_0].fill(0);
+            *flushed += 1;
+            continue;
         }
 
         let mut best_d_bits = 0u16;
@@ -8785,9 +8812,10 @@ pub fn quantize_gsq_rco_3p5_block(values: &[f32], out: &mut [u8]) -> Result<()> 
             }
         }
         if best_d_bits == 0 {
-            return Err(Error::Backend(format!(
-                "quantize_gsq_rco_3p5_block: block {b} scale {amax} is not representable in fp16"
-            )));
+            let base = b * BLOCK_BYTES_Q2_0;
+            out[base..base + BLOCK_BYTES_Q2_0].fill(0);
+            *flushed += 1;
+            continue;
         }
         let d = f16_to_f32(best_d_bits as u8, (best_d_bits >> 8) as u8);
 
@@ -9641,5 +9669,63 @@ mod q3k_q2k_quant_tests {
     fn q3k_rejects_non_block_multiple() {
         assert!(quant_q3k(&vec![0.5f32; 255]).is_err());
         assert!(quant_q2k(&vec![0.5f32; 100]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod gsq_flush_tests {
+    use super::*;
+
+    /// An all-zero 64-block flushes to d=0/codes=0 and decodes to exact
+    /// zeros — previously a hard Err that made real-checkpoint conversion
+    /// impossible (the released Flash artifact carries ~50% zero-scale
+    /// blocks).
+    #[test]
+    fn gsq_all_zero_block_flushes_instead_of_erroring() {
+        let mut data = vec![0.5f32; 128];
+        data[64..128].fill(0.0); // second 64-block dead
+        let mut out = vec![0xFFu8; 2 * BLOCK_BYTES_Q2_0];
+        let mut flushed = 0usize;
+        quantize_gsq_rco_3p5_block_counted(&data, &mut out, &mut flushed)
+            .expect("dead block must flush, not error");
+        assert_eq!(flushed, 1);
+        // First block quantized normally (nonzero d bytes), second zeroed.
+        assert!(out[0..BLOCK_BYTES_Q2_0].iter().any(|&b| b != 0));
+        assert!(out[BLOCK_BYTES_Q2_0..].iter().all(|&b| b == 0));
+        let decoded = dequant_gsq_rco_3p5(&out, 128).expect("decode");
+        for (i, v) in decoded.iter().enumerate() {
+            let want = if i < 64 { data[i] } else { 0.0 };
+            assert!((v - want).abs() < 0.05, "elem {i}: {v} vs {want}");
+        }
+    }
+
+    /// A tiny-amax block whose fitted scale cannot survive fp16 rounding
+    /// flushes to zero rather than erroring (lib.rs fits codes against the
+    /// fp16-ROUNDED scale; a scale below f16 subnormal range yields
+    /// best_d_bits == 0 for every scan step).
+    #[test]
+    fn gsq_sub_fp16_scale_block_flushes_instead_of_erroring() {
+        let data = vec![1e-30f32; 64];
+        let mut out = vec![0u8; BLOCK_BYTES_Q2_0];
+        let mut flushed = 0usize;
+        quantize_gsq_rco_3p5_block_counted(&data, &mut out, &mut flushed)
+            .expect("sub-fp16 scale must flush, not error");
+        assert_eq!(flushed, 1);
+        assert!(out.iter().all(|&b| b == 0));
+        let decoded = dequant_gsq_rco_3p5(&out, 64).expect("decode");
+        assert!(decoded.iter().all(|v| *v == 0.0));
+    }
+
+    /// A normal block must not report any flush — the counted variant is
+    /// behavior-identical to the old encoder on healthy input.
+    #[test]
+    fn gsq_healthy_block_reports_zero_flushes() {
+        let data: Vec<f32> = (0..64).map(|i| ((i % 7) as f32) * 0.01 - 0.03).collect();
+        let mut out = vec![0u8; BLOCK_BYTES_Q2_0];
+        let mut flushed = 0usize;
+        quantize_gsq_rco_3p5_block_counted(&data, &mut out, &mut flushed).expect("quant");
+        assert_eq!(flushed, 0);
+        let legacy = quantize_gsq_rco_3p5_block(&data, &mut out);
+        assert!(legacy.is_ok());
     }
 }

@@ -1182,8 +1182,18 @@ fn pack_tensors(
             {
                 let mut bytes =
                     vec![0u8; elem_count.div_ceil(grim_quant::BLOCK_SIZE_Q2_0) * grim_quant::BLOCK_BYTES_Q2_0];
-                grim_quant::quantize_gsq_rco_3p5_block(&f32_values, &mut bytes)
-                    .map_err(|e| Error::Backend(format!("GSQ-RCO quant for '{name}': {e}")))?;
+                let mut gsq_flushed = 0usize;
+                grim_quant::quantize_gsq_rco_3p5_block_counted(
+                    &f32_values,
+                    &mut bytes,
+                    &mut gsq_flushed,
+                )
+                .map_err(|e| Error::Backend(format!("GSQ-RCO quant for '{name}': {e}")))?;
+                if gsq_flushed > 0 {
+                    eprintln!(
+                        "[grim-convert] '{name}': {gsq_flushed} GSQ blocks flushed to zero (dead or sub-fp16 scale)"
+                    );
+                }
                 let entry = crate::format::GrimTensorEntry {
                     name: name.clone(),
                     shape: meta.shape.clone(),
