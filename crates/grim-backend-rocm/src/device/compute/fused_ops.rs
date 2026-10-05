@@ -1056,6 +1056,60 @@ impl RocmDevice {
             )));
         }
 
+        // Packed elementwise-INT8 norm (ForestRaven framed 1-D blob): expand
+        // the codes+scales to an f32 weight via grim_int8_expand_row, then
+        // run the UNCHANGED fused kernel on the f32 norm.
+        // CAPTURE CONSTRAINT: this branch ALLOCATES the expanded weight on
+        // every call — it is NOT capture-safe by itself. Callers under a
+        // captured decode graph must expand once OUTSIDE capture (the graph
+        // prewarm pattern) or route this norm through the unfused
+        // rms_norm_i8 path. An amortized residency cache keyed on the blob
+        // pointer is the follow-up if profiling demands the fused arm under
+        // capture.
+        if let Some(rs) = w_norm.as_any().downcast_ref::<RocmStorage>() {
+            if matches!(
+                rs.dtype().storage,
+                grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
+            ) {
+                if k != rs.shape().elem_count() {
+                    return Err(Error::Shape(format!(
+                        "rmsnorm_matmul: INT8 norm len {} != k {k}",
+                        rs.shape().elem_count()
+                    )));
+                }
+                // Expansion needs no matrix shape: reuse the caller's x
+                // stream; codes @+8, single f32 scale @+8+k+8.
+                let base = dev_ptr(rs)? as usize;
+                let w_f32 = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![k]),
+                    dtype_f32(),
+                    &self.allocator,
+                    self.ordinal,
+                )?;
+                let blob_len = rs.bytes();
+                let mut blob_len_i = blob_len as i32;
+                let mut k_i8 = k as i32;
+                {
+                    let mut out_ptr = dev_ptr(&w_f32)?;
+                    let mut codes_ptr = (base + 8) as *mut c_void;
+                    let mut scale_ptr = (base + 8 + k + 8) as *mut c_void;
+                    self.launch_compute_kernel(
+                        "grim_int8_expand_row",
+                        HipDim3::new((k as u32).div_ceil(256), 1, 1),
+                        HipDim3::new(256, 1, 1),
+                        &mut [
+                            arg(&mut codes_ptr),
+                            arg(&mut scale_ptr),
+                            arg(&mut out_ptr),
+                            arg(&mut k_i8),
+                            arg(&mut blob_len_i),
+                        ],
+                    )?;
+                }
+                return self.rmsnorm_matmul(x, &w_f32, weight_mat, eps, out_shape);
+            }
+        }
+
         let config = RmsNormMatMulFusionConfig {
             hidden_size: k,
             intermediate_size: n,

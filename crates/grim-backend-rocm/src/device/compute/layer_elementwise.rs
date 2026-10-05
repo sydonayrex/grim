@@ -638,6 +638,65 @@ impl RocmDevice {
         let mut row_len_i = row_len as i32;
         let mut eps_f = eps;
         let mut total_i = total as i32;
+        // Elementwise-INT8 weight/bias (ForestRaven framed blobs): frame
+        // offsets computable host-side (1 B/elem — codes @+8, single f32
+        // scale @+8+len+8); the kernel loads scales from device memory.
+        // Bias codes may be NULL (unbiased norm -> add 0).
+        let w_packed = weight.as_any().downcast_ref::<RocmStorage>().filter(|rs| {
+            matches!(
+                rs.dtype().storage,
+                grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
+            )
+        });
+        if let Some(rs) = w_packed {
+            let w_base_ptr = dev_ptr_dyn(weight)? as usize;
+            let w_elem = rs.shape().elem_count();
+            let mut w_codes = (w_base_ptr as usize + 8) as *mut c_void;
+            let mut w_scales = (w_base_ptr as usize + 8 + w_elem + 8) as *mut c_void;
+            let (mut b_codes, mut b_scales) = match bias {
+                Some(b) => {
+                    let bs = b.as_any().downcast_ref::<RocmStorage>()
+                        .filter(|bs| matches!(
+                            bs.dtype().storage,
+                            grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
+                        ));
+                    match bs {
+                        Some(bs) => {
+                            let bbase = match dev_ptr_dyn(b) {
+                                Ok(p) => p as usize,
+                                Err(e) => return Err(e),
+                            };
+                            let belem = bs.shape().elem_count();
+                            (
+                                (bbase + 8) as *mut c_void,
+                                (bbase + 8 + belem + 8) as *mut c_void,
+                            )
+                        }
+                        None => (std::ptr::null_mut(), std::ptr::null_mut()),
+                    }
+                }
+                None => (std::ptr::null_mut(), std::ptr::null_mut()),
+            };
+            let (grid, block) = warp_rows_launch(total / row_len.max(1));
+            let handle = self.launch_compute_kernel(
+                "grim_layer_norm_i8",
+                grid,
+                block,
+                &mut [
+                    arg(&mut x_ptr),
+                    arg(&mut w_codes),
+                    arg(&mut w_scales),
+                    arg(&mut b_codes),
+                    arg(&mut b_scales),
+                    arg(&mut out_ptr),
+                    arg(&mut row_len_i),
+                    arg(&mut eps_f),
+                    arg(&mut total_i),
+                ],
+            )?;
+            let _ = handle; // launch fn returns the kernel handle ptr; stream-ordered
+            return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+        }
         let (grid, block) = warp_rows_launch(total / row_len.max(1));
         self.launch_compute_kernel(
             "grim_layer_norm",

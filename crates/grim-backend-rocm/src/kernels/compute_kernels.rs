@@ -1211,6 +1211,22 @@ grim_rms_norm_i8(const float* __restrict__ x, const signed char* __restrict__ co
     }
 }
 
+// Elementwise-INT8 expand: framed blob (codes @+8, single f32 scale at
+// +8+k+8) -> f32 weight. Serves the fused rmsnorm_matmul for packed norm
+// weights: expand once, then the unchanged fused kernel runs on f32.
+// k_i8 = element count; blob_len is a paranoia bound (codes must lie
+// entirely inside it).
+extern "C" __global__ void grim_int8_expand_row(
+    const signed char* __restrict__ codes, const float* __restrict__ scale,
+    float* __restrict__ out, int k_i8, int blob_len) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k_i8) return;
+    // codes start at blob+8; the last code byte is at 8+k-1, and blob_len
+    // must cover 8+k+8+4 (scale) at minimum.
+    if (8 + k_i8 + 12 > blob_len) return;
+    out[i] = scale[0] * (float)codes[i];
+}
+
 // LayerNorm with elementwise-INT8 weight and bias (both framed blobs, one
 // scale each; bias codes pointer may be NULL for an unbiased norm).
 extern "C" __global__ void __launch_bounds__(256)
