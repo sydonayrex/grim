@@ -292,9 +292,12 @@ pub fn cmd_oxidizer_search(
             // fallback for 1-D norms and sub-block tensors, never a budget
             // choice — offering it let the search park high-importance
             // tensors on it (the artifact gives F32 to 2.6M of 125B params,
-            // i.e. norms only).
-            available_bpws: vec![2, 4, 5, 6],
-            costs: Some(vec![2.25, 4.5, 5.5, 6.5]),
+            // i.e. norms only). Labels are ordered by COST (the position-
+            // based repair walks rungs pairwise): 7 = Q2_K 2.625 slots
+            // between GSQ 2.25 and Q3_K 3.4375 — the released artifact's
+            // dominant rungs are Q3_K (60.4B params) and Q2_0/Q2_K.
+            available_bpws: vec![2, 7, 3, 4, 5, 6],
+            costs: Some(vec![2.25, 2.625, 3.4375, 4.5, 5.5, 6.5]),
             ..Default::default()
         },
         &importance_scores.layer_scores,
@@ -547,6 +550,21 @@ pub fn cmd_oxidizer_convert(
     // packer consumed the raw gene, so the sidecar and the payload disagreed
     // on 416 of 977 tensors.
     let default_bw = target_bpw.round() as u32;
+    // Rung labels are not densities (3 packs 3.4375 bpw, 7 packs 2.625), so
+    // the attention floor compares DENSITIES and remaps to the Q4_K rung.
+    let tier_density = |bw: u32| -> f64 {
+        match bw {
+            2 => 2.25,
+            3 => 3.4375,
+            4 => 4.5,
+            5 => 5.5,
+            6 => 6.5,
+            7 => 2.625,
+            8 => 8.5,
+            32 => 32.0,
+            other => other as f64,
+        }
+    };
     let full_bitwidths: Vec<u32> = names
         .iter()
         .map(|name| {
@@ -555,8 +573,8 @@ pub fn cmd_oxidizer_convert(
             } else {
                 default_bw
             };
-            if is_attention_projection(name) {
-                enforce_attention_precision(raw)
+            if is_attention_projection(name) && tier_density(raw) < 5.5 {
+                5 // attention floor: Q5_K (was enforce_attention_precision)
             } else {
                 raw
             }
@@ -567,17 +585,7 @@ pub fn cmd_oxidizer_convert(
     // artifact reports both (nominal 3.5 / realized 3.06 bpw). Charged on the
     // same true costs the search optimized against (GSQ 2.25, Q4_K 4.5,
     // Q5_K 5.5, Q6_K 6.5, F32 32).
-    let tier_cost = |bw: u32| -> f64 {
-        match bw {
-            2 => 2.25,
-            4 => 4.5,
-            5 => 5.5,
-            6 => 6.5,
-            8 => 8.5,
-            32 => 32.0,
-            other => other as f64,
-        }
-    };
+    let tier_cost = tier_density;
     let (mut alloc_bits, mut alloc_params) = (0.0f64, 0.0f64);
     for (i, &size) in tensor_sizes.iter().enumerate() {
         let bw = bitwidths.get(i).copied().unwrap_or(default_bw);
@@ -629,9 +637,11 @@ pub fn cmd_oxidizer_convert(
                 // allocation as F32 and re-decodes Q4_K bytes as raw f32.
                 let dtype = match effective_bpw {
                     2 => GgufDType::GsqRco3p5,
+                    3 => GgufDType::Q3K,
                     4 => GgufDType::Q4K,
                     5 => GgufDType::Q5K,
                     6 => GgufDType::Q6K,
+                    7 => GgufDType::Q2K,
                     8 => GgufDType::Q8_0,
                     _ => GgufDType::F32,
                 };

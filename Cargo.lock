@@ -2820,6 +2820,7 @@ dependencies = [
  "grim-format",
  "grim-nn",
  "grim-tensor",
+ "miniz_oxide 0.8.9",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -2873,6 +2874,7 @@ dependencies = [
  "grim-format",
  "grim-nn",
  "grim-tensor",
+ "half",
  "rayon",
  "serde",
  "serde_json",

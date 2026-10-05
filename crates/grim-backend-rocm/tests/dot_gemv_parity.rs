@@ -1167,7 +1167,10 @@ fn dot4_q2k_gemv_parity() {
             blk[sub] = sc | (mi << 4);
             for w in 0..16 {
                 let q = (rand() as u8) % 4;
-                blk[16 + sub * 4 + w / 4] |= q << ((w % 4) * 2);
+                // llama.cpp interleaved codes (ggml-quants.c:959): field
+                // 2*((sub%8)/2) of byte qs[(sub/8)*32 + w + (sub%2)*16].
+                let byte = 16 + (sub / 8) * 32 + w + (sub % 2) * 16;
+                blk[byte] |= q << (2 * ((sub % 8) / 2));
             }
         }
     }
@@ -1364,12 +1367,13 @@ fn dot8_w4a4_gemv_parity() {
         ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
 
-    // Synthesize activation vector A [1, K]. ABS is load-bearing: this seed's
-    // LCG draws were all-negative, which u4-quantizes to all-zero codes and
-    // made this gate pass 0.0-vs-0.0 VACUOUSLY (max_diff 0.000000) — the
-    // kernel was never actually checked until the WhiteCrow requant work
-    // tripped over it.
-    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs() * 2.5).collect();
+    // Synthesize activation vector A [1, K]. Signed draws: the act quantizer
+    // is signed-symmetric now, so negatives are live data, not zeroes. (ABS
+    // was once load-bearing here — all-negative draws used to quantize to
+    // all-zero codes and the gate passed 0.0-vs-0.0 vacuously; that clamp
+    // is gone. DO NOT reintroduce ABS: it would leave the negative path
+    // untested.)
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 2.5).collect();
 
     // Synthesize weights B in OSTQuant layout:
     // qweight: [N, K / 8] uint32
@@ -1473,17 +1477,19 @@ fn dot8_w4a4_gemv_parity() {
         grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref()).expect("d2h c");
 
     // CPU reference:
-    // 1. Quantize activation A to unsigned 4-bit per 128-element group
+    // 1. Quantize activation A to SIGNED-symmetric 4-bit per 128-element
+    //    group (mirrors grim_quantize_u4_group128: absmax/7 scale, round
+    //    half-away, clamp [-8, 7] -- negatives survive as negative nibbles).
     // 2. Dequantize weights: W_i = scale_w * (nibble - zero_w)
     // 3. Dot product: sum A_i * W_i
     let mut a_deq = vec![0.0f32; k];
     for g in 0..n_groups {
         let grp_a = &a_f32[g * 128..(g + 1) * 128];
         let max_val = grp_a.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let d = max_val / 15.0;
-        let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+        let d = max_val / 7.0;
+        let inv_d = if max_val > 1e-9 { 7.0 / max_val } else { 0.0 };
         for i in 0..128 {
-            let q = (grp_a[i] * inv_d).round().clamp(0.0, 15.0);
+            let q = (grp_a[i] * inv_d).round().clamp(-8.0, 7.0);
             a_deq[g * 128 + i] = q * d;
         }
     }
@@ -1550,10 +1556,8 @@ fn citycrow_sudot8_gemv_parity() {
         ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
 
-    // ABS-scaled draws: an all-negative LCG run u4-quantizes to all-zero
-    // codes and passes 0.0-vs-0.0 vacuously (see the note in the W4A4 test).
     let flat: Vec<f32> = (0..n * k).map(|_| rand() * 2.0).collect();
-    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs() * 2.5).collect();
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 2.5).collect();
 
     // flat -> GsqRco 18-byte block stream via the shipped packer (bias-2,
     // MSE-fitted fp16 scale). The test exercises the same bytes a real
@@ -1647,17 +1651,18 @@ fn citycrow_sudot8_gemv_parity() {
         grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref()).expect("d2h c");
 
     // CPU reference: activation u4 mirror (matches grim_quantize_u4_group128:
-    // round-half-away, clamp [0,15]) dotted against decode_groups weights.
+    // round-half-away, clamp [-8, 7], absmax/7 scale) dotted against
+    // decode_groups weights.
     let w_deq = grim_quant::citycrow::decode_groups(&repacked);
     let mut a_deq = vec![0.0f32; m * k];
     for row in 0..m {
         for g in 0..n_groups {
             let grp_a = &a_f32[row * k + g * 128..row * k + (g + 1) * 128];
             let max_val = grp_a.iter().fold(0.0f32, |mm, &x| mm.max(x.abs()));
-            let d = max_val / 15.0;
-            let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+            let d = max_val / 7.0;
+            let inv_d = if max_val > 1e-9 { 7.0 / max_val } else { 0.0 };
             for i in 0..128 {
-                let q = (grp_a[i] * inv_d).round().clamp(0.0, 15.0);
+                let q = (grp_a[i] * inv_d).round().clamp(-8.0, 7.0);
                 a_deq[row * k + g * 128 + i] = q * d;
             }
         }
@@ -1813,10 +1818,10 @@ fn dot8_w4a4_qwen3_model_tensor_parity() {
     for g in 0..n_groups {
         let grp_a = &a_f32[g * 128..(g + 1) * 128];
         let max_val = grp_a.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let d = max_val / 15.0;
-        let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+        let d = max_val / 7.0;
+        let inv_d = if max_val > 1e-9 { 7.0 / max_val } else { 0.0 };
         for i in 0..128 {
-            let q = (grp_a[i] * inv_d).round().clamp(0.0, 15.0);
+            let q = (grp_a[i] * inv_d).round().clamp(-8.0, 7.0);
             a_deq[g * 128 + i] = q * d;
         }
     }
@@ -2361,12 +2366,7 @@ fn decode_w4a4_requant_parity_vs_original_f32() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
-    // ABS on activations is load-bearing: this seed's LCG draws are
-    // effectively all-negative, and u4 codes clamp negatives to 0 — an
-    // all-zero activation quantizes to an all-zero code vector and the gate
-    // would compare 0-vs-125 and 'fail' for a reason that has nothing to do
-    // with the requant path.
-    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs()).collect();
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand()).collect();
     let b_f32: Vec<f32> = (0..n * k).map(|_| rand()).collect();
     let b_bytes = grim_quant::quant_q4k(&b_f32).expect("quant_q4k");
 
@@ -2483,7 +2483,7 @@ fn dot8_w4a4_gemv_parity_n256_k512() {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
-    let a_f32: Vec<f32> = (0..m * k).map(|_| rand().abs() * 2.5).collect();
+    let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 2.5).collect();
     let mut b_qw = vec![0u32; n * words_per_col];
     let mut b_sc = vec![0u16; n * n_groups];
     let mut b_zr = vec![0u8; n * n_groups];
@@ -2538,10 +2538,10 @@ fn dot8_w4a4_gemv_parity_n256_k512() {
     for g in 0..n_groups {
         let grp = &a_f32[g * 128..(g + 1) * 128];
         let max_val = grp.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let d = max_val / 15.0;
-        let inv_d = if max_val > 1e-9 { 15.0 / max_val } else { 0.0 };
+        let d = max_val / 7.0;
+        let inv_d = if max_val > 1e-9 { 7.0 / max_val } else { 0.0 };
         for i in 0..128 {
-            a_deq[g * 128 + i] = (grp[i] * inv_d).round().clamp(0.0, 15.0) * d;
+            a_deq[g * 128 + i] = (grp[i] * inv_d).round().clamp(-8.0, 7.0) * d;
         }
     }
     let mut c_cpu = vec![0.0f32; m * n];

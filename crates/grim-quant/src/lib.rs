@@ -1326,6 +1326,13 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         )));
     }
 
+    // llama.cpp `dequantize_row_q2_K` (ggml-quants.c:959-989): the qs codes
+    // are INTERLEAVED across sub-blocks — byte qs[j/4 + l] holds one 2-bit
+    // code for each of the four 32-weight runs (L[j+l], L[j+l+32],
+    // L[j+l+64], L[j+l+96]), exactly like Q3_K's qs. The previous reader
+    // here consumed 4 sequential bytes per sub-block (a Q2_0-era layout
+    // that exists in no released GGUF) and silently misread every real
+    // tag-10 tensor.
     let mut out = Vec::with_capacity(num_weights);
     let mut pos = 0;
 
@@ -1335,22 +1342,31 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         let d = f16_to_f32(data[pos + 80], data[pos + 81]);
         let dmin = f16_to_f32(data[pos + 82], data[pos + 83]);
 
-        // 16 sub-blocks of 16 weights. QNT-1 fix: `dmin` now reads its own 2 bytes at
-        // offset 82/83 (previously aliased to `d`'s bytes at 80/81, so every min scale was wrong).
         let mut block_out = [0.0f32; 256];
+        let mut is = 0usize;
         let mut q_off = 0usize;
-        for sb in 0..16 {
-            let sc = (scales[sb] & 0x0F) as f32;
-            let m = (scales[sb] >> 4) as f32;
-            let dl = d * sc;
-            let ml = dmin * m;
-            for w in 0..16 {
-                let byte = qs[q_off + w / 4];
-                let shift = (w % 4) * 2;
-                let q_val = ((byte >> shift) & 3) as f32;
-                block_out[sb * 16 + w] = dl * q_val - ml;
+        for n in (0..256).step_by(128) {
+            let mut shift: u32 = 0;
+            for _j in 0..4 {
+                let sc = scales[is];
+                is += 1;
+                let dl = d * (sc & 0xF) as f32;
+                let ml = dmin * (sc >> 4) as f32;
+                for l in 0..16 {
+                    let q_val = ((qs[q_off + l] >> shift) & 3) as f32;
+                    block_out[n + _j * 32 + l] = dl * q_val - ml;
+                }
+                let sc = scales[is];
+                is += 1;
+                let dl = d * (sc & 0xF) as f32;
+                let ml = dmin * (sc >> 4) as f32;
+                for l in 0..16 {
+                    let q_val = ((qs[q_off + l + 16] >> shift) & 3) as f32;
+                    block_out[n + _j * 32 + 16 + l] = dl * q_val - ml;
+                }
+                shift += 2;
             }
-            q_off += 4;
+            q_off += 32;
         }
 
         for &v in &block_out {
@@ -9088,5 +9104,542 @@ mod fp8_block16_tests {
             assert_eq!(v.to_bits(), fp8_e4m3_to_f32(b).to_bits(), "element {i}");
         }
         assert!(dequant_fp8_blocked16(&blocked, 15, 64).is_err());
+    }
+}
+
+// ============================================================================
+// Q3_K / Q2_K encoders — the RCO ladder's dominant rungs in the released
+// GSQ-RCO artifacts (60.4B of 125.1B params at Q3_K 3.4375 bpw, 8.4B at
+// Q2_K 2.625). These are the first f32 encoders for these formats in grim;
+// until now both were load-time-only (the named-error arm in
+// rewrite_tensor_data) because "silently rewriting to a neighbouring
+// K-quant would be wrong data wearing the right label".
+//
+// Both are faithful ports of the llama.cpp reference quantizers, cited per
+// function. The byte layouts they emit are exactly what grim's own
+// `dequant_q3k` / `dequant_q2k` (this file) and llama.cpp's readers consume.
+// ============================================================================
+
+/// llama.cpp `nearest_int` (ggml-quants.c:621): round-to-nearest via the f32
+/// mantissa bit trick.
+#[inline]
+fn qk_nearest_int(fval: f32) -> i32 {
+    debug_assert!(fval.abs() <= 4194303.0f32);
+    let val = fval + 12582912.0f32;
+    (val.to_bits() & 0x007f_ffff) as i32 - 0x0040_0000
+}
+
+/// llama.cpp `make_q3_quants` (ggml-quants.c:696-752): per-16 sub-block scale
+/// search for Q3_K, with the 5-iteration greedy RMSE refinement
+/// (`do_rmse = true`). Returns the fitted scale and fills `l_out` with
+/// UNSIGNED codes in [0, 2*nmax) (the `l + nmax` shift is applied inside).
+fn make_q3_quants(n: usize, nmax: i32, x: &[f32], l_out: &mut [i8]) -> f32 {
+    const GROUP_MAX_EPS: f32 = 1e-15; // ggml-quants.c:20
+    let mut max = 0.0f32;
+    let mut amax = 0.0f32;
+    for &v in x.iter().take(n) {
+        let ax = v.abs();
+        if ax > amax {
+            amax = ax;
+            max = v;
+        }
+    }
+    if amax < GROUP_MAX_EPS {
+        for l in l_out.iter_mut().take(n) {
+            *l = 0;
+        }
+        return 0.0;
+    }
+    let iscale = -(nmax as f32) / max;
+    let mut sumlx = 0.0f32;
+    let mut suml2 = 0.0f32;
+    for i in 0..n {
+        let mut l = qk_nearest_int(iscale * x[i]);
+        l = (-nmax).max((nmax - 1).min(l));
+        l_out[i] = l as i8;
+        let w = x[i] * x[i];
+        sumlx += w * x[i] * l as f32;
+        suml2 += w * (l * l) as f32;
+    }
+    // 5 passes of single-coordinate re-assignment, accepted only when the
+    // weighted squared error strictly improves (ggml-quants.c:714-740).
+    for _ in 0..5 {
+        let mut n_changed = 0;
+        for i in 0..n {
+            let w = x[i] * x[i];
+            let slx = sumlx - w * x[i] * l_out[i] as f32;
+            if slx > 0.0 {
+                let sl2 = suml2 - w * (l_out[i] as f32) * (l_out[i] as f32);
+                let mut new_l = qk_nearest_int(x[i] * sl2 / slx);
+                new_l = (-nmax).max((nmax - 1).min(new_l));
+                if new_l as i8 != l_out[i] {
+                    let slx2 = slx + w * x[i] * new_l as f32;
+                    let sl22 = sl2 + w * (new_l * new_l) as f32;
+                    if sl22 > 0.0 && slx2 * slx2 * suml2 > sumlx * sumlx * sl22 {
+                        l_out[i] = new_l as i8;
+                        sumlx = slx2;
+                        suml2 = sl22;
+                        n_changed += 1;
+                    }
+                }
+            }
+        }
+        if n_changed == 0 {
+            break;
+        }
+    }
+    for l in l_out.iter_mut().take(n) {
+        *l += nmax as i8;
+    }
+    if suml2 > 0.0 {
+        sumlx / suml2
+    } else {
+        0.0
+    }
+}
+
+/// Quantize f32 data to Q3_K blocks (110 bytes per 256 weights).
+///
+/// Faithful port of llama.cpp `quantize_row_q3_K_ref`
+/// (ggml-quants.c:1229-1300). Layout per block: hmask[32] (high bits, bit
+/// k of byte b = weight b + 32k), qs[64] (2-bit codes, 4 runs of 32 per
+/// byte), scales[12] (16 6-bit scales in the ggml shuffle), d (f16).
+pub fn quant_q3k(data: &[f32]) -> Result<Vec<u8>> {
+    const BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 110;
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if data.len() % BLOCK != 0 {
+        return Err(Error::Backend(format!(
+            "quant_q3k: {} weights is not a multiple of the 256-weight block",
+            data.len()
+        )));
+    }
+    let n_blocks = data.len() / BLOCK;
+    let mut out = vec![0u8; n_blocks * BLOCK_BYTES];
+    let mut l = [0i8; 256];
+    let mut scales_f = [0.0f32; 16];
+
+    for b in 0..n_blocks {
+        let xb = &data[b * BLOCK..(b + 1) * BLOCK];
+        let o = b * BLOCK_BYTES;
+
+        // Sub-block scales (ggml-quants.c:1237-1244).
+        let mut max_scale = 0.0f32;
+        let mut amax = 0.0f32;
+        for j in 0..16 {
+            scales_f[j] = make_q3_quants(16, 4, &xb[16 * j..], &mut l[16 * j..]);
+            let scale = scales_f[j].abs();
+            if scale > amax {
+                amax = scale;
+                max_scale = scales_f[j];
+            }
+        }
+
+        // Pack the 16 6-bit scales into 12 bytes and fit d
+        // (ggml-quants.c:1246-1264).
+        let d_f16: u16 = if max_scale != 0.0 {
+            let iscale = -32.0f32 / max_scale;
+            let mut sc = [0u8; 12];
+            for j in 0..16 {
+                let mut lv = qk_nearest_int(iscale * scales_f[j]);
+                lv = (-32).max(31.min(lv)) + 32;
+                if j < 8 {
+                    sc[j] = (lv & 0xF) as u8;
+                } else {
+                    sc[j - 8] |= ((lv & 0xF) as u8) << 4;
+                }
+                let hi = (lv >> 4) as u8;
+                sc[j % 4 + 8] |= hi << (2 * (j / 4));
+            }
+            out[o + 96..o + 108].copy_from_slice(&sc);
+            f32_to_f16(1.0 / iscale)
+        } else {
+            f32_to_f16(0.0)
+        };
+        out[o + 108] = (d_f16 & 0xFF) as u8;
+        out[o + 109] = (d_f16 >> 8) as u8;
+
+        // Re-derive the codes against the QUANTIZED scale
+        // (ggml-quants.c:1266-1280). A zero-scale sub-block keeps its
+        // make_q3_quants codes; the decoder multiplies by dl = 0 there.
+        let d_all = f16_to_f32((d_f16 & 0xFF) as u8, (d_f16 >> 8) as u8);
+        for j in 0..16 {
+            let sc6: i32 = if j < 8 {
+                // low nibble of scales[j] + 2 high bits from scales[8 + j%4]
+                let low = (out[o + 96 + j] & 0xF) as i32;
+                let high = ((out[o + 96 + 8 + j % 4] >> (2 * (j / 4))) & 3) as i32;
+                (low | (high << 4)) - 32
+            } else {
+                let low = (out[o + 96 + j - 8] >> 4) as i32;
+                let high = ((out[o + 96 + 8 + j % 4] >> (2 * (j / 4))) & 3) as i32;
+                (low | (high << 4)) - 32
+            };
+            let d_j = d_all * sc6 as f32;
+            if d_j == 0.0 {
+                continue;
+            }
+            for ii in 0..16 {
+                let mut lv = qk_nearest_int(xb[16 * j + ii] / d_j);
+                lv = (-4).max(3.min(lv));
+                l[16 * j + ii] = (lv + 4) as i8; // unsigned 0..7, high bit pending
+            }
+        }
+
+        // Split L into low 2 bits + high bit (ggml-quants.c:1282-1294):
+        // bit k of hmask byte b = weight b + 32k.
+        let mut hmask = [0u8; 32];
+        for j in 0..256 {
+            if l[j] > 3 {
+                hmask[j % 32] |= 1 << (j / 32);
+                l[j] -= 4;
+            }
+        }
+        out[o..o + 32].copy_from_slice(&hmask);
+
+        // qs: 4 consecutive 32-weight runs per byte, 2 bits each
+        // (ggml-quants.c:1295-1301).
+        for j in (0..256).step_by(128) {
+            for l_i in 0..32 {
+                out[o + 32 + j / 4 + l_i] = (l[j + l_i] as u8)
+                    | ((l[j + l_i + 32] as u8) << 2)
+                    | ((l[j + l_i + 64] as u8) << 4)
+                    | ((l[j + l_i + 96] as u8) << 6);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// llama.cpp `make_qkx2_quants` (ggml-quants.c:799-878): per-16 sub-block
+/// scale+min search for Q2_K over a 16-step scan, weighted-MAD objective
+/// (`use_mad = true` from the q2_K caller).
+#[allow(clippy::too_many_arguments)]
+fn make_qkx2_quants(
+    n: usize,
+    nmax: u8,
+    x: &[f32],
+    weights: &[f32],
+    l_out: &mut [u8],
+    the_min: &mut f32,
+    rmin: f32,
+    rdelta: f32,
+    nstep: usize,
+) -> f32 {
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        sum_w += weights[i];
+        sum_x += weights[i] * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        for l in l_out.iter_mut().take(n) {
+            *l = 0;
+        }
+        *the_min = -min;
+        return 0.0;
+    }
+    let nmax_f = nmax as f32;
+    let iscale0 = nmax_f / (max - min);
+    let mut scale = 1.0 / iscale0;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let l = qk_nearest_int(iscale0 * (x[i] - min)).clamp(0, nmax as i32) as u8;
+        l_out[i] = l;
+        let diff = (scale * l as f32 + min - x[i]).abs(); // use_mad
+        best_error += weights[i] * diff;
+    }
+    // 16-step scale scan (ggml-quants.c:842-874).
+    for is in 0..=nstep {
+        let iscale = (rmin + rdelta * is as f32 + nmax_f) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        let mut laux = [0u8; 16];
+        for i in 0..n {
+            let l = qk_nearest_int(iscale * (x[i] - min)).clamp(0, nmax as i32) as u8;
+            laux[i] = l;
+            let lf = l as f32;
+            let w = weights[i];
+            sum_l += w * lf;
+            sum_l2 += w * lf * lf;
+            sum_xl += w * lf * x[i];
+        }
+        let d = sum_w * sum_l2 - sum_l * sum_l;
+        if d > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = (this_scale * laux[i] as f32 + this_min - x[i]).abs();
+                cur_error += weights[i] * diff;
+            }
+            if cur_error < best_error {
+                for i in 0..n {
+                    l_out[i] = laux[i];
+                }
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    scale
+}
+
+/// Quantize f32 data to Q2_K blocks (84 bytes per 256 weights).
+///
+/// Faithful port of llama.cpp `quantize_row_q2_K_ref`
+/// (ggml-quants.c:891-957). Layout per block: scales[16] (low nibble =
+/// scale, high nibble = min), qs[64] (2-bit codes, same run packing as
+/// Q3_K), d (f16), dmin (f16).
+pub fn quant_q2k(data: &[f32]) -> Result<Vec<u8>> {
+    const BLOCK: usize = 256;
+    const BLOCK_BYTES: usize = 84;
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if data.len() % BLOCK != 0 {
+        return Err(Error::Backend(format!(
+            "quant_q2k: {} weights is not a multiple of the 256-weight block",
+            data.len()
+        )));
+    }
+    const Q4SCALE: f32 = 15.0; // ggml-quants.c:902
+    let n_blocks = data.len() / BLOCK;
+    let mut out = vec![0u8; n_blocks * BLOCK_BYTES];
+    let mut l = [0u8; 256];
+    let mut weights = [0.0f32; 16];
+    let mut scales_f = [0.0f32; 16];
+    let mut mins_f = [0.0f32; 16];
+
+    for b in 0..n_blocks {
+        let xb = &data[b * BLOCK..(b + 1) * BLOCK];
+        let o = b * BLOCK_BYTES;
+
+        // Sub-block scale+min search (ggml-quants.c:905-919).
+        let mut max_scale = 0.0f32;
+        let mut max_min = 0.0f32;
+        for j in 0..16 {
+            for li in 0..16 {
+                weights[li] = xb[16 * j + li].abs();
+            }
+            scales_f[j] = make_qkx2_quants(
+                16,
+                3,
+                &xb[16 * j..],
+                &weights,
+                &mut l[16 * j..],
+                &mut mins_f[j],
+                -0.5,
+                0.1,
+                15,
+            );
+            if scales_f[j] > max_scale {
+                max_scale = scales_f[j];
+            }
+            if mins_f[j] > max_min {
+                max_min = mins_f[j];
+            }
+        }
+
+        // Quantize the sub-block scales/mins to 4 bits each
+        // (ggml-quants.c:921-941).
+        let d_f16: u16 = if max_scale > 0.0 {
+            let iscale = Q4SCALE / max_scale;
+            for j in 0..16 {
+                let lv = qk_nearest_int(iscale * scales_f[j]);
+                out[o + j] = lv.clamp(0, 15) as u8;
+            }
+            f32_to_f16(max_scale / Q4SCALE)
+        } else {
+            for j in 0..16 {
+                out[o + j] = 0;
+            }
+            f32_to_f16(0.0)
+        };
+        let dmin_f16: u16 = if max_min > 0.0 {
+            let iscale = Q4SCALE / max_min;
+            for j in 0..16 {
+                let lv = qk_nearest_int(iscale * mins_f[j]);
+                out[o + j] |= (lv.clamp(0, 15) as u8) << 4;
+            }
+            f32_to_f16(max_min / Q4SCALE)
+        } else {
+            f32_to_f16(0.0)
+        };
+        out[o + 80] = (d_f16 & 0xFF) as u8;
+        out[o + 81] = (d_f16 >> 8) as u8;
+        out[o + 82] = (dmin_f16 & 0xFF) as u8;
+        out[o + 83] = (dmin_f16 >> 8) as u8;
+
+        // Re-derive the codes against the QUANTIZED scale/min
+        // (ggml-quants.c:943-954).
+        let d_all = f16_to_f32((d_f16 & 0xFF) as u8, (d_f16 >> 8) as u8);
+        let dmin_all = f16_to_f32((dmin_f16 & 0xFF) as u8, (dmin_f16 >> 8) as u8);
+        for j in 0..16 {
+            let sc = (out[o + j] & 0xF) as f32;
+            let mn = (out[o + j] >> 4) as f32;
+            let d_j = d_all * sc;
+            let dm_j = dmin_all * mn;
+            if d_j == 0.0 {
+                continue;
+            }
+            for ii in 0..16 {
+                let lv = qk_nearest_int((xb[16 * j + ii] + dm_j) / d_j);
+                l[16 * j + ii] = lv.clamp(0, 3) as u8;
+            }
+        }
+
+        // qs: identical 2-bit run packing to Q3_K (ggml-quants.c:950-956).
+        for j in (0..256).step_by(128) {
+            for l_i in 0..32 {
+                out[o + 16 + j / 4 + l_i] = l[j + l_i]
+                    | (l[j + l_i + 32] << 2)
+                    | (l[j + l_i + 64] << 4)
+                    | (l[j + l_i + 96] << 6);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod q3k_q2k_quant_tests {
+    use super::*;
+
+    /// All-positive constant block: make_q3_quants puts every code at L=0
+    /// (l=-4 pre-shift), the fitted scale is negative so the 6-bit stored
+    /// scale is 0 and d = c/128. Hand-computed expectation:
+    /// d_f16 = c/128, hmask all zero, qs all zero, scales[12] all zero.
+    #[test]
+    fn q3k_constant_positive_block_kat() {
+        let c = 1.0f32;
+        let data = vec![c; 256];
+        let bytes = quant_q3k(&data).expect("quant");
+        assert_eq!(bytes.len(), 110);
+        let d = f16_to_f32(bytes[108], bytes[109]);
+        assert!((d - c / 128.0).abs() < 1e-3, "d={d}");
+        assert!(bytes[..32].iter().all(|&b| b == 0), "hmask must be zero");
+        assert!(bytes[32..96].iter().all(|&b| b == 0), "qs must be zero");
+        assert!(bytes[96..108].iter().all(|&b| b == 0), "scales must be zero");
+        let out = dequant_q3k(&bytes, 256).expect("dequant");
+        for (i, v) in out.iter().enumerate() {
+            assert!((v - c).abs() < 0.02, "elem {i}: {v}");
+        }
+    }
+
+    /// Q2_K constant block: scale search collapses to L=0 codes with
+    /// scale/min nibbles carrying the value; decode returns ~c.
+    #[test]
+    fn q2k_constant_block_round_trip() {
+        let c = -0.75f32;
+        let data = vec![c; 256];
+        let bytes = quant_q2k(&data).expect("quant");
+        assert_eq!(bytes.len(), 84);
+        let out = dequant_q2k(&bytes, 256).expect("dequant");
+        for (i, v) in out.iter().enumerate() {
+            assert!((v - c).abs() < 0.08, "elem {i}: {v} vs {c}");
+        }
+    }
+
+    /// All-zero block hits the GROUP_MAX_EPS path (ggml-quants.c:703-707):
+    /// codes zero, scale zero, decodes to exact zeros.
+    #[test]
+    fn q3k_zero_block_decodes_to_zeros() {
+        let bytes = quant_q3k(&vec![0.0f32; 256]).expect("quant");
+        let out = dequant_q3k(&bytes, 256).expect("dequant");
+        assert!(out.iter().all(|v| *v == 0.0));
+        let bytes2 = quant_q2k(&vec![0.0f32; 256]).expect("quant");
+        let out2 = dequant_q2k(&bytes2, 256).expect("dequant");
+        assert!(out2.iter().all(|v| *v == 0.0));
+    }
+
+    /// Random data round-trips within the codebook's coarseness: Q3_K has 8
+    /// levels over the sub-block range (half-step ~amax/8) plus 6-bit scale
+    /// quantization; Q2_K has 4 levels with min subtraction.
+    #[test]
+    fn q3k_and_q2k_random_round_trip_within_bounds() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+        };
+        let data: Vec<f32> = (0..256 * 32).map(|_| next() * (1.0 + (next() * 4.0))).collect();
+        let amax = data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+
+        let q3 = quant_q3k(&data).expect("q3k");
+        assert_eq!(q3.len(), data.len() / 256 * 110);
+        let d3 = dequant_q3k(&q3, data.len()).expect("deq");
+        let max_err3: f32 = d3.iter().zip(&data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(max_err3 < 0.35 * amax, "q3k max err {max_err3} vs amax {amax}");
+
+        let q2 = quant_q2k(&data).expect("q2k");
+        assert_eq!(q2.len(), data.len() / 256 * 84);
+        let d2 = dequant_q2k(&q2, data.len()).expect("deq");
+        let max_err2: f32 = d2.iter().zip(&data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(max_err2 < 0.55 * amax, "q2k max err {max_err2} vs amax {amax}");
+    }
+
+    /// Real-checkpoint gate: dequant a Xing4.0 IQ3_S tensor to f32, requant
+    /// to Q3_K and Q2_K, and require the requantized rows to track the f32
+    /// (mean error well under the source format's own step). Skips when
+    /// XING_GGUF is unset (matches the xing_dequant_real_parity gate).
+    #[test]
+    fn real_checkpoint_requant_tracks_the_f32() {
+        let path = match std::env::var("XING_GGUF") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        use std::io::{Read, Seek};
+        let f = std::fs::File::open(&path).unwrap();
+        let gg = grim_format::gguf::read_gguf(&f).unwrap();
+        let t = gg.tensors.iter().find(|t| t.name == "blk.0.attn_q_a.weight").unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.seek(std::io::SeekFrom::Start(gg.data_start + t.offset)).unwrap();
+        let mut raw = vec![0u8; t.size_bytes as usize];
+        f.read_exact(&mut raw).unwrap();
+        let n = t.shape().iter().product::<usize>();
+        let f32s = dequant_iq3s(&raw, n).expect("source dequant");
+        let amax = f32s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+
+        let q3 = quant_q3k(&f32s).expect("q3k");
+        let d3 = dequant_q3k(&q3, n).expect("deq");
+        let sum3: f32 = d3.iter().zip(&f32s).map(|(a, b)| (a - b).abs()).sum();
+        let mean3 = sum3 / n as f32;
+        assert!(mean3 < 0.02 * amax, "q3k mean err {mean3} vs amax {amax}");
+
+        let q2 = quant_q2k(&f32s).expect("q2k");
+        let d2 = dequant_q2k(&q2, n).expect("deq");
+        let sum2: f32 = d2.iter().zip(&f32s).map(|(a, b)| (a - b).abs()).sum();
+        let mean2 = sum2 / n as f32;
+        assert!(mean2 < 0.06 * amax, "q2k mean err {mean2} vs amax {amax}");
+    }
+
+    /// Non-multiple-of-256 fails loud (the packer's shape gate also checks,
+    /// but the encoder itself must not silently truncate).
+    #[test]
+    fn q3k_rejects_non_block_multiple() {
+        assert!(quant_q3k(&vec![0.5f32; 255]).is_err());
+        assert!(quant_q2k(&vec![0.5f32; 100]).is_err());
     }
 }

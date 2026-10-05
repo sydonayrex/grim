@@ -1226,9 +1226,11 @@ fn pack_tensors(
             // and a 29B checkpoint converted to 100 GB.
             if matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco")) {
                 let tier = match tensor_bitwidth {
-                    4 => Some((4u8, 256usize, crate::gguf::GgufDType::Q4K)),
+                    3 => Some((3u8, 256usize, crate::gguf::GgufDType::Q3K)),
+                    4 => Some((4, 256, crate::gguf::GgufDType::Q4K)),
                     5 => Some((5, 256, crate::gguf::GgufDType::Q5K)),
                     6 => Some((6, 256, crate::gguf::GgufDType::Q6K)),
+                    7 => Some((3, 256, crate::gguf::GgufDType::Q2K)), // true 2.625 bpw; base_bitwidth 3 is the fallback only
                     8 => Some((8, 32, crate::gguf::GgufDType::Q8_0)),
                     _ => None,
                 };
@@ -1237,10 +1239,12 @@ fn pack_tensors(
                         && meta.shape.iter().all(|d| *d > 0)
                         && elem_count % block == 0
                     {
-                        let bytes = match bits {
-                            4 => grim_quant::quant_q4k(&f32_values),
-                            5 => grim_quant::quant_q5k(&f32_values),
-                            6 => grim_quant::quant_q6k(&f32_values),
+                        let bytes = match gdtype {
+                            crate::gguf::GgufDType::Q2K => grim_quant::quant_q2k(&f32_values),
+                            crate::gguf::GgufDType::Q3K => grim_quant::quant_q3k(&f32_values),
+                            crate::gguf::GgufDType::Q4K => grim_quant::quant_q4k(&f32_values),
+                            crate::gguf::GgufDType::Q5K => grim_quant::quant_q5k(&f32_values),
+                            crate::gguf::GgufDType::Q6K => grim_quant::quant_q6k(&f32_values),
                             _ => grim_quant::quant_q80(&f32_values),
                         }
                         .map_err(|e| {

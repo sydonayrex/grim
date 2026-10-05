@@ -89,8 +89,10 @@ __device__ __forceinline__ void grim_deq_q2k(const unsigned char* blk, int w, fl
         unsigned char sc_byte = scales[sub];
         float sc = (float)(sc_byte & 0x0F);
         float m  = (float)(sc_byte >> 4);
-        int q_byte = sub * 4 + in_sub / 4;
-        int q_shift = (in_sub % 4) * 2;
+        // llama.cpp interleaved codes (ggml-quants.c:959): field
+        // 2*((sub%8)/2) of byte qs[(sub/8)*32 + in_sub + (sub%2)*16].
+        int q_byte = (sub / 8) * 32 + in_sub + (sub % 2) * 16;
+        int q_shift = 2 * ((sub % 8) / 2);
         unsigned char q = (qs[q_byte] >> q_shift) & 0x03;
         out[e] = d * sc * (float)q - dmin * m;
     }

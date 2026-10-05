@@ -727,8 +727,11 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         float sc = (float)(scales[sub] & 0x0F);
         float m  = (float)(scales[sub] >> 4);
 
-        int q_byte = sub * 4 + w / 4;
-        int q_shift = (w % 4) * 2;
+        // llama.cpp interleaved codes (ggml-quants.c:959): field
+        // 2*((sub%8)/2) of byte qs[(sub/8)*32 + w + (sub%2)*16]. The
+        // sequential 4-bytes-per-sub-block form exists in no released GGUF.
+        int q_byte = (sub / 8) * 32 + w + (sub % 2) * 16;
+        int q_shift = 2 * ((sub % 8) / 2);
         unsigned char q_code = (qs[q_byte] >> q_shift) & 0x03;
 
         return d * sc * (float)q_code - dmin * m;

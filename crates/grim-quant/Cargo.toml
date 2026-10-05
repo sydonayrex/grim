@@ -21,6 +21,7 @@ name = "grim_quant"
 path = "src/lib.rs"
 
 [dev-dependencies]
+half = "2.0"
 grim-format = { workspace = true }
 grim-nn = { workspace = true, features = ["rocm-mem"] }
 grim-backend-rocm = { workspace = true }

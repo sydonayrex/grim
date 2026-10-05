@@ -20,8 +20,13 @@ extern "C" {
         float sc = (float)(scales[sub] & 0x0F);
         float m  = (float)(scales[sub] >> 4);
 
-        int q_byte = sub * 4 + w / 4;
-        int q_shift = (w % 4) * 2;
+        // llama.cpp interleaved codes (ggml-quants.c:959): weight w of
+        // sub-block `sub` lives at field 2*((sub%8)/2) of byte
+        // qs[(sub/8)*32 + (w%16) + (sub%2)*16]. (Was a sequential
+        // 4-bytes-per-sub-block layout that exists in no released GGUF;
+        // fixed 2026-10-04 alongside the new quant_q2k encoder.)
+        int q_byte = (sub / 8) * 32 + (w % 16) + (sub % 2) * 16;
+        int q_shift = 2 * ((sub % 8) / 2);
         unsigned char q_code = (qs[q_byte] >> q_shift) & 0x03;
 
         return d * sc * (float)q_code - dmin * m;

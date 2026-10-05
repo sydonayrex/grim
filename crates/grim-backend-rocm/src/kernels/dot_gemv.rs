@@ -1854,15 +1854,25 @@ extern "C" __global__ void grim_dot4_fp8_gemv(
 
 
 // ─── Phase 4.5f: Q2_K dot4 GEMV (two-dot decomposition) ───────────────────
-// Grim Q2_K layout (matches grim_quant::dequant_q2k): 84 bytes per 256 weights:
-// 16 scale bytes (4-bit sc + 4-bit m per 16-elem sub-block), 64 code bytes
-// (4x 2-bit codes per byte), f16 d @80, f16 dmin @82.
-// value_i = d*sc*q_i - dmin*m. Two-dot: dot = d*sc*Σ(a_i*q_i) - dmin*m*Σa_i.
-// Activations are Q8_1: a_i = code_i * d_a, Σa_i = sum_a (stored in block).
+// llama.cpp Q2_K layout (matches grim_quant::dequant_q2k, ggml-quants.c:959):
+// 84 bytes per 256 weights: 16 scale bytes (4-bit sc + 4-bit m per 16-elem
+// sub-block), 64 code bytes INTERLEAVED — byte qs[j/4 + l] holds one 2-bit
+// code for each of the four 32-weight runs (fields 0/2/4/6 = runs j=0..3),
+// f16 d @80, f16 dmin @82. value = d*sc*q - dmin*m. Two-dot:
+// dot = d*sc*Σ(a_i*q_i) - dmin*m*Σa_i. Activations are Q8_1.
+// (Was a sequential 4-bytes-per-sub-block layout that exists in no released
+// GGUF; fixed 2026-10-04 alongside the new quant_q2k encoder.)
 
 __device__ __forceinline__ int grim_expand2_q2k(unsigned char b) {
     return (int)((b & 3u) | ((b >> 2 & 3u) << 8) | ((b >> 4 & 3u) << 16)
                | ((b >> 6 & 3u) << 24));
+}
+
+// Extract the 2-bit code at field `shift` from 4 consecutive INTERLEAVED
+// code bytes into the packed 4-code form grim_sdot4 consumes.
+__device__ __forceinline__ int grim_extract4_q2k_ilv(const unsigned char* p, int shift) {
+    return (int)(((p[0] >> shift) & 3u) | (((p[1] >> shift) & 3u) << 8)
+               | (((p[2] >> shift) & 3u) << 16) | (((p[3] >> shift) & 3u) << 24));
 }
 
 extern "C" __global__ void grim_dot4_q2k_q81_gemv(
@@ -1912,12 +1922,21 @@ extern "C" __global__ void grim_dot4_q2k_q81_gemv(
                     const float sc = (float)(b_sb[sub] & 0x0F);
                     const float mi = (float)(b_sb[sub] >> 4);
 
+                    // Interleaved codes: sub-block `sub` covers weights
+                    // n = (sub/8)*128, run j = (sub%8)/2, half-plane
+                    // sub%2; code for weight l=i lives at field 2*j of
+                    // byte qs[(sub/8)*32 + i + (sub%2)*16].
+                    const int nh = sub / 8;
+                    const int run = (sub % 8) / 2;
+                    const int hplane = sub % 2;
+                    const unsigned char* qs_ilv = b_sb + 16 + nh * 32 + hplane * 16;
+                    const int shift = 2 * run;
                     int pos = 0;
                     #pragma unroll
                     for (int i = 0; i < 16; i += 4) {
                         int a4;
                         __builtin_memcpy(&a4, a_codes + half * 16 + i, 4);
-                        int q4 = grim_expand2_q2k(b_sb[16 + sub * 4 + i / 4]);
+                        int q4 = grim_extract4_q2k_ilv(qs_ilv + i, shift);
                         pos = grim_sdot4(a4, q4, pos);
                     }
                     facc[j] += d * sc * ((float)pos * d_a) - dmin * mi * sum_a;
@@ -2448,8 +2467,10 @@ __device__ __forceinline__ float grim_bf16_to_float(unsigned short h) {
 
 #define GRIM_U4_GROUP_SIZE 128
 
-// Quantize A [M, K] -> packed unsigned 4-bit nibbles + scale + sum of codes per 128-element group.
-// 128 floats -> 16 uint32 words (each word packs 8 unsigned 4-bit nibbles, little-endian).
+// Quantize A [M, K] -> packed SIGNED-symmetric 4-bit nibbles + scale + sum of
+// codes per 128-element group.
+// 128 floats -> 16 uint32 words (each word packs 8 signed 4-bit nibbles
+// little-endian, two's complement; the sudot8 consumer reads A signed).
 extern "C" __global__ void grim_quantize_u4_group128(
     const float* __restrict__ src,
     unsigned int* __restrict__ dst_codes,
@@ -2479,15 +2500,21 @@ extern "C" __global__ void grim_quantize_u4_group128(
         local_max = fmaxf(local_max, __shfl_xor(local_max, mask));
     }
 
-    const float d = local_max / 15.0f;
-    const float inv_d = (local_max > 1e-9f) ? (15.0f / local_max) : 0.0f;
+    const float d = local_max / 7.0f;
+    const float inv_d = (local_max > 1e-9f) ? (7.0f / local_max) : 0.0f;
 
-    unsigned int q0 = (unsigned int)fminf(fmaxf(__builtin_roundf(v0 * inv_d), 0.0f), 15.0f);
-    unsigned int q1 = (unsigned int)fminf(fmaxf(__builtin_roundf(v1 * inv_d), 0.0f), 15.0f);
-    unsigned int q2 = (unsigned int)fminf(fmaxf(__builtin_roundf(v2 * inv_d), 0.0f), 15.0f);
-    unsigned int q3 = (unsigned int)fminf(fmaxf(__builtin_roundf(v3 * inv_d), 0.0f), 15.0f);
+    // Signed-symmetric codes in [-8, 7]: negative activations survive as
+    // negative nibbles (two's complement) instead of clamping to 0. The
+    // packing below is bit-identical either way -- (unsigned char) of a
+    // negative signed char is modulo 256 -- so only the range and the scale
+    // change, not the layout. -8 is never emitted (symmetric range); the
+    // sudot8 consumer reads A signed (see grim_dot8_w4a4_gemv).
+    signed char q0 = (signed char)fminf(fmaxf(__builtin_roundf(v0 * inv_d), -8.0f), 7.0f);
+    signed char q1 = (signed char)fminf(fmaxf(__builtin_roundf(v1 * inv_d), -8.0f), 7.0f);
+    signed char q2 = (signed char)fminf(fmaxf(__builtin_roundf(v2 * inv_d), -8.0f), 7.0f);
+    signed char q3 = (signed char)fminf(fmaxf(__builtin_roundf(v3 * inv_d), -8.0f), 7.0f);
 
-    int thread_sum = (int)(q0 + q1 + q2 + q3);
+    int thread_sum = (int)q0 + (int)q1 + (int)q2 + (int)q3;
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         thread_sum += __shfl_xor(thread_sum, mask);
@@ -2500,7 +2527,12 @@ extern "C" __global__ void grim_quantize_u4_group128(
 
     // Pack 8 nibbles into 16 words across the 32 threads.
     // Thread 2*i supplies bits 0..15, thread 2*i+1 supplies bits 16..31.
-    unsigned int half_word = q0 | (q1 << 4) | (q2 << 8) | (q3 << 12);
+    // Mask to nibbles explicitly: signed-char promotion sign-extends, so
+    // shifting a negative q without masking would corrupt upper bits.
+    unsigned int half_word = ((unsigned int)(unsigned char)q0)
+        | (((unsigned int)(unsigned char)q1) << 4)
+        | (((unsigned int)(unsigned char)q2) << 8)
+        | (((unsigned int)(unsigned char)q3) << 12);
     unsigned int other_half = __shfl_xor(half_word, 1);
     if ((tid & 1) == 0) {
         unsigned int word = half_word | (other_half << 16);
@@ -2570,7 +2602,9 @@ extern "C" __global__ void grim_dot8_w4a4_gemv(
             for (int w = 0; w < 16; w++) {
                 unsigned int a_word = a_grp[w];
                 unsigned int b_word = b_grp[w];
-                iacc = __builtin_amdgcn_sudot8(false, a_word, false, b_word, iacc, false);
+                // A signed (symmetric [-8, 7] nibbles), B unsigned (0-15 with
+                // zero point): the mixed-sign dot the W4A4 format requires.
+                iacc = __builtin_amdgcn_sudot8(true, a_word, false, b_word, iacc, false);
             }
 
             // Two-dot zero-point algebraic formulation:
