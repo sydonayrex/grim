@@ -1,6 +1,7 @@
 //! Core tensor computation, GEMM, elementwise, autograd, and optimizer operations for `RocmDevice`.
 //! GEMM launchers: rocBLAS/decode paths, WMMA (incl. fused dequant-GEMM), FP8 RDNA4, matmul ops.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use std::sync::atomic::Ordering;
@@ -2110,6 +2111,61 @@ impl RocmDevice {
                     Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
                 }
             }
+            DTypeStorage::KQuant(KQuantScheme::GsqRco3p5) => {
+                // CityCrow decode, deliberately a DEDICATE arm rather than a
+                // member of the K-quant or-pattern below.
+                //
+                // That or-pattern ends in `match scheme { ... _ =>
+                // launch_dot4_q3k_q81_gemv }`. A 2-bit block format dropped into
+                // it would decode GSQRCO bytes with the **Q3_K** kernel -- the
+                // same trap the IQ3_S comment further down describes, except
+                // worse, because Q3_K's super-blocks are a different size so the
+                // result is garbage rather than an error. GSQRCO also has no
+                // WMMA leg and no dot4 leg, so its ONLY correct route is u4
+                // lanes; keeping it separate makes that structural.
+                //
+                // No `act_q81` scratch is needed: `launch_w4a4_ostquant_gemv`
+                // quantizes activations into its own u4 scratch buffers.
+                //
+                // Sharing `GRIM_DECODE_W4A4` with the WhiteCrow leg below is
+                // deliberate, per the same one-switch discipline the Q6_K leg
+                // follows: a capture run and an eager run must not be able to
+                // disagree about which GEMV a weight takes. The conversion D2Hs
+                // and allocates, so it is not capture-safe and stays opt-in.
+                let arch = crate::quantization::gcn_arch(&self.gpu_target);
+                crate::quantization::w4a4_ostquant_supported(arch, k).map_err(Error::Backend)?;
+                static W4A4_DECODE: OnceLock<bool> = OnceLock::new();
+                let w4a4_decode = *W4A4_DECODE.get_or_init(|| {
+                    matches!(
+                        std::env::var("GRIM_DECODE_W4A4").as_deref(),
+                        Ok("1" | "true")
+                    )
+                });
+                if !w4a4_decode {
+                    return Err(Error::Backend(
+                        "linear_decode_into: GsqRco3p5 has only the CityCrow \
+                         u4-lane route, and it is env-gated because the \
+                         conversion D2Hs the packed weight (not capture-safe). \
+                         Set GRIM_DECODE_W4A4=1, or use the eager path."
+                            .into(),
+                    ));
+                }
+                let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+                    Error::Backend("linear_decode_into: a not RocmStorage".into())
+                })?;
+                let lanes = self.u4_lane_weights(w, n, k, KQuantScheme::GsqRco3p5)?;
+                self.launch_w4a4_ostquant_gemv(
+                    a_rocm,
+                    lanes.qweight_rocm()?,
+                    lanes.scales_rocm()?,
+                    lanes.zeros_rocm()?,
+                    out,
+                    m,
+                    n,
+                    k,
+                )?;
+                return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+            }
             DTypeStorage::KQuant(
                 scheme @ (KQuantScheme::Q4K
                 | KQuantScheme::Q5K
@@ -2191,6 +2247,12 @@ impl RocmDevice {
                 // packed bytes on first use, so it must NOT run under graph
                 // capture (hipMemcpy sync + alloc poison capture) — eager path
                 // only, env-gated off by default.
+                //
+                // The arch gate is `.is_ok()` rather than a `?` on purpose: this
+                // leg is an optimization over the dot4 GEMV below, so a card
+                // without v_dot8 simply keeps the dot4 route instead of erroring.
+                // The CityCrow arm above inverts that, because GSQRCO has no
+                // other route to fall back to.
                 static W4A4_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let w4a4_decode = *W4A4_DECODE.get_or_init(|| {
                     matches!(
@@ -2203,50 +2265,22 @@ impl RocmDevice {
                     KQuantScheme::Q4K | KQuantScheme::Q5K | KQuantScheme::Q6K
                 ) && w4a4_decode
                     && k % 128 == 0
+                    && crate::quantization::w4a4_ostquant_supported(
+                        crate::quantization::gcn_arch(&self.gpu_target),
+                        k,
+                    )
+                    .is_ok()
                 {
-                    // KDA-FIX: the cache key was the RAW DEVICE POINTER. The
-                    // caching allocator recycles blocks — a freed weight
-                    // storage's pointer can be handed to a DIFFERENT tensor,
-                    // and the cache then serves that tensor the first one's
-                    // converted weights (silent wrong weights). Key on
-                    // (pointer, bytes, shape) — three recycled-pointer
-                    // collisions in a row with matching bytes AND shape are
-                    // not a realistic hazard, and the true fix (keyed on the
-                    // allocator generation) needs an allocator API this does
-                    // not have. Better still: weights are static for the
-                    // process lifetime, so entries never evict.
-                    static CONVERTED: std::sync::OnceLock<
-                        std::sync::Mutex<
-                            std::collections::HashMap<
-                                (usize, usize, [usize; 2]),
-                                std::sync::Arc<WhiteCrowDecodedWeights>,
-                            >,
-                        >,
-                    > = std::sync::OnceLock::new();
-                    let cache = CONVERTED
-                        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-                    let key = (
-                        w.device_ptr.map(|p| p as usize).unwrap_or(0),
-                        w.bytes,
-                        [n, k],
-                    );
-                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-                    let conv = match guard.get(&key) {
-                        Some(c) => c.clone(),
-                        None => {
-                            let c = std::sync::Arc::new(
-                                self.requant_kquant_to_whitecrow(w, n, k, *scheme)?,
-                            );
-                            guard.insert(key, c.clone());
-                            c
-                        }
-                    };
-                    drop(guard);
+                    // The conversion memo (and its KDA-FIX key discipline) now
+                    // lives in `u4_lane_weights`, shared with the CityCrow arm
+                    // and the eager `quantized_matmul` dispatch, so a model
+                    // driven through more than one of those paths converts once.
+                    let lanes = self.u4_lane_weights(w, n, k, *scheme)?;
                     self.launch_w4a4_ostquant_gemv(
                         a_s,
-                        conv.qweight_rocm()?,
-                        conv.scales_rocm()?,
-                        conv.zeros_rocm()?,
+                        lanes.qweight_rocm()?,
+                        lanes.scales_rocm()?,
+                        lanes.zeros_rocm()?,
                         out,
                         m,
                         n,
@@ -2416,6 +2450,246 @@ pub struct WhiteCrowDecodedWeights {
     pub zeros: Box<dyn grim_tensor::backend::BackendStorage>,
 }
 
+/// Which u4-lane converter produced a cached triple.
+///
+/// Two converters emit **different bytes for the same input weight**: the
+/// WhiteCrow requant is a 16-level affine `[min, max]` encode with a per-group
+/// derived zero, while CityCrow is a 4-level symmetric `absmax` encode whose
+/// `zeros` is the offset-binary codebook bias. So a cache entry from one must
+/// never be served to the other — a stale or aliased entry does not error, it
+/// returns a finite, plausible, wrong model.
+///
+/// Two independent guards, because either alone is a single point of failure:
+/// a distinct `magic` verified on read (and written into the header), and a
+/// distinct file extension so a `.wc` file is never even opened by a `.cc`
+/// lookup. The encoder version rides in the key hash as well, so bumping a
+/// converter retires its own entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct U4LaneConverter {
+    pub(crate) magic: u32,
+    pub(crate) ext: &'static str,
+    pub(crate) encoder_version: u32,
+}
+
+impl U4LaneConverter {
+    /// `dequant -> quant_ostquant_w4_group128`, for the 4/6/8-bit K-quants.
+    const WHITECROW: Self = Self {
+        magic: 0x57_43_00_01,
+        ext: "wc",
+        encoder_version: grim_quant::OSTQUANT_ENCODER_VERSION,
+    };
+
+    /// `citycrow::repack_to_u4_lanes`, for GSQ-RCO's own 2-bit codebook.
+    const CITYCROW: Self = Self {
+        magic: 0x43_43_00_01,
+        ext: "cc",
+        encoder_version: grim_quant::citycrow::CITYCROW_ENCODER_VERSION,
+    };
+}
+
+/// Fixed-size header ahead of the three segments: magic, encoder version, n, k,
+/// then the three segment lengths. Seven u32 = 28 bytes.
+pub(crate) const U4_LANE_CACHE_HEADER: usize = 28;
+
+/// Cache directory for converted u4-lane triples (`GRIM_OSTQUANT_CACHE_DIR`,
+/// else `$XDG_CACHE_HOME`/`$HOME`/`.cache`/grim/ostquant). `None` when no home
+/// is discoverable, which disables the on-disk cache rather than guessing.
+fn u4_lane_cache_dir() -> Option<std::path::PathBuf> {
+    std::env::var("GRIM_OSTQUANT_CACHE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                })?;
+            Some(base.join("grim").join("ostquant"))
+        })
+}
+
+/// Whether the on-disk conversion cache is enabled. `GRIM_OSTQUANT_CACHE` in
+/// {0, false, off} turns it off; anything else (including unset) leaves it on.
+pub(crate) fn u4_lane_cache_enabled_for(raw: Option<&str>) -> bool {
+    !matches!(raw, Some("0" | "false" | "off"))
+}
+
+/// Read [`u4_lane_cache_enabled_for`] from the environment.
+///
+/// The policy is split out above so it can be tested as a pure function of the
+/// raw value. Testing it through the environment would mean mutating
+/// process-global state from a test, which races every other test in the binary
+/// that reads the same variable.
+fn u4_lane_cache_enabled() -> bool {
+    u4_lane_cache_enabled_for(std::env::var("GRIM_OSTQUANT_CACHE").ok().as_deref())
+}
+
+/// Key mixing the source bytes, the geometry, the scheme, and the converter's
+/// own identity.
+///
+/// The pack of `(n, k)` and the scheme are mixed in because the same bytes read
+/// at a different geometry produce a different triple, and because two schemes
+/// can share a block size while meaning different things.
+///
+/// Pure: it reads no environment, so the caller decides whether to ask for a key
+/// at all and tests need no global state.
+pub(crate) fn u4_lane_cache_key(
+    packed: &[u8],
+    n: usize,
+    k: usize,
+    scheme: grim_tensor::KQuantScheme,
+    converter: U4LaneConverter,
+) -> u64 {
+    let mut h = seahash::hash(packed);
+    h ^= (n as u64) << 1;
+    h ^= (k as u64) << 17;
+    h ^= (scheme as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= (converter.encoder_version as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    // The magic rides in the hash too, not only in the header. Both encoders
+    // are at version 1, so the version term alone cannot separate them and a
+    // future extension-unification would then be caught by nothing but the
+    // header check. Folding it in makes this the third independent guard.
+    //
+    // Cost: the existing `.wc` cache entries were written without this term, so
+    // the first run after this change misses them and reconverts once. A
+    // load-time cost, no correctness impact.
+    h ^ (converter.magic as u64).wrapping_mul(0xA076_1D64_78BD_642F)
+}
+
+/// Read a cached triple, or `None` on any miss or inconsistency.
+///
+/// A header that does not verify is treated as a miss rather than an error: a
+/// half-written or foreign file must cost the conversion, not the run. The
+/// length triple is checked against the actual file size before any slice is
+/// taken, so a truncated file cannot panic the reader.
+pub(crate) fn u4_lane_cache_read(
+    dir: &std::path::Path,
+    key: u64,
+    converter: U4LaneConverter,
+    n: usize,
+    k: usize,
+) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let blob = std::fs::read(dir.join(format!("{key:016x}.{}", converter.ext))).ok()?;
+    if blob.len() < U4_LANE_CACHE_HEADER {
+        return None;
+    }
+    let rd =
+        |o: usize| u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]) as usize;
+    if rd(0) != converter.magic as usize
+        || rd(4) != converter.encoder_version as usize
+        || rd(8) != n
+        || rd(12) != k
+    {
+        return None;
+    }
+    let (lq, ls, lz) = (rd(16), rd(20), rd(24));
+    if blob.len() != U4_LANE_CACHE_HEADER + lq + ls + lz {
+        return None;
+    }
+    let body = &blob[U4_LANE_CACHE_HEADER..];
+    Some((
+        body[..lq].to_vec(),
+        body[lq..lq + ls].to_vec(),
+        body[lq + ls..lq + ls + lz].to_vec(),
+    ))
+}
+
+/// Persist a triple for the next run. Best-effort: a failed write costs the
+/// conversion next time and nothing else, so every error is swallowed here
+/// rather than propagated into the inference path.
+pub(crate) fn u4_lane_cache_write(
+    dir: &std::path::Path,
+    key: u64,
+    converter: U4LaneConverter,
+    n: usize,
+    k: usize,
+    qw: &[u8],
+    sc: &[u8],
+    zr: &[u8],
+) {
+    let mut blob = Vec::with_capacity(U4_LANE_CACHE_HEADER + qw.len() + sc.len() + zr.len());
+    for v in [
+        converter.magic as usize,
+        converter.encoder_version as usize,
+        n,
+        k,
+        qw.len(),
+        sc.len(),
+        zr.len(),
+    ] {
+        blob.extend_from_slice(&(v as u32).to_le_bytes());
+    }
+    blob.extend_from_slice(qw);
+    blob.extend_from_slice(sc);
+    blob.extend_from_slice(zr);
+    let final_path = dir.join(format!("{key:016x}.{}", converter.ext));
+    // Write-then-rename: a reader must never observe a partial file, and a
+    // crash mid-write leaves the `.tmp` to be swept rather than a valid-looking
+    // short entry that the length check would (correctly) reject every time.
+    let tmp = dir.join(format!("{key:016x}.{}.tmp", converter.ext));
+    if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &blob).is_ok() {
+        let _ = std::fs::rename(&tmp, final_path);
+    }
+}
+
+/// Which encoder a scheme is served by, and therefore which cache identity its
+/// converted bytes belong to.
+///
+/// This is the single place the scheme -> encoder decision is made.
+/// `encode_u4_lanes` splits on the same boundary (`GsqRco3p5` vs everything
+/// else), so the two cannot drift: a scheme can only be cached under the
+/// converter that actually produced it.
+///
+/// # Errors
+///
+/// Refuses a scheme no u4-lane encoder serves, rather than falling back to the
+/// affine encoder — Q2_0 shares GSQRCO's 18-byte-per-64 geometry but not its
+/// codebook, and the affine encoder would produce a plausible, wrong model.
+pub(crate) fn u4_lane_converter_for(scheme: grim_tensor::KQuantScheme) -> Result<U4LaneConverter> {
+    use grim_tensor::KQuantScheme;
+    match scheme {
+        KQuantScheme::GsqRco3p5 => Ok(U4LaneConverter::CITYCROW),
+        KQuantScheme::Q4K
+        | KQuantScheme::Q5K
+        | KQuantScheme::Q6K
+        | KQuantScheme::Q3K
+        | KQuantScheme::IQ3S
+        | KQuantScheme::Q2K
+        | KQuantScheme::IQ4NL => Ok(U4LaneConverter::WHITECROW),
+        other => Err(Error::Backend(format!(
+            "u4_lane_converter_for: no u4-lane encoder serves {other:?}"
+        ))),
+    }
+}
+
+/// Host dequant for one scheme's packed bytes.
+///
+/// The two callers (parallel per-row-chunk and serial whole-tensor) previously
+/// carried byte-identical 7-arm matches; a scheme added to one but not the other
+/// would error in one path and quietly diverge in the other.
+fn dequant_kquant_slice(
+    scheme: grim_tensor::KQuantScheme,
+    packed: &[u8],
+    num_weights: usize,
+) -> Result<Vec<f32>> {
+    use grim_tensor::KQuantScheme;
+    match scheme {
+        KQuantScheme::Q4K => grim_quant::dequant_q4k(packed, num_weights),
+        KQuantScheme::Q5K => grim_quant::dequant_q5k(packed, num_weights),
+        KQuantScheme::Q6K => grim_quant::dequant_q6k(packed, num_weights),
+        KQuantScheme::Q3K => grim_quant::dequant_q3k(packed, num_weights),
+        KQuantScheme::IQ3S => grim_quant::dequant_iq3s(packed, num_weights),
+        KQuantScheme::Q2K => grim_quant::dequant_q2k(packed, num_weights),
+        KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(packed, num_weights),
+        other => Err(Error::Backend(format!(
+            "dequant_kquant_slice: no dequant for {other:?}"
+        ))),
+    }
+}
+
 impl WhiteCrowDecodedWeights {
     pub fn qweight_rocm(&self) -> Result<&RocmStorage> {
         self.qweight
@@ -2438,10 +2712,51 @@ impl WhiteCrowDecodedWeights {
 }
 
 impl RocmDevice {
-    /// Dequantize a packed Q4_K weight tensor on the host and re-encode it as
-    /// unsigned-4-bit group-128 OSTQuant (WhiteCrow). One-time cost per tensor
-    /// (~a few ms for a 9B FFN matrix); see GRIM_DECODE_W4A4 in
-    /// `linear_decode_into`.
+    /// Flatten a CityCrow repack into the little-endian byte triple that the u4
+    /// lane kernel and its on-disk cache both speak.
+    ///
+    /// Byte-identical in *shape* to what `quant_ostquant_w4_group128` emits --
+    /// `qweight` as u32 words, `scales` as u16 bf16, `zeros` as u8 -- which is
+    /// the whole point of reusing the kernel: `grim_dot8_w4a4_gemv` cannot tell
+    /// the two encoders apart, because both feed the same
+    /// `iacc - z_b * sum_qa` correction. Only the `zeros` semantics differ.
+    fn citycrow_lane_bytes(
+        w: &grim_quant::citycrow::CityCrowWeights,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut qw = Vec::with_capacity(w.qweight.len() * 4);
+        for word in &w.qweight {
+            qw.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut sc = Vec::with_capacity(w.scales.len() * 2);
+        for s in &w.scales {
+            sc.extend_from_slice(&s.to_le_bytes());
+        }
+        (qw, sc, w.zeros.clone())
+    }
+
+    /// Dequantize a packed K-quant weight tensor on the host and re-encode it as
+    /// unsigned-4-bit group-128 lanes for `grim_dot8_w4a4_gemv`. One-time cost
+    /// per tensor (~a few ms for a 9B FFN matrix).
+    ///
+    /// Two encoders live here because they share the output layout but not the
+    /// algorithm, so conflating them would be a correctness bug rather than a
+    /// duplication:
+    ///
+    /// - **WhiteCrow** (`Q4K`, `Q5K`, `Q6K`, `Q3K`, `IQ3S`, `Q2K`, `IQ4NL`):
+    ///   dequantize to f32, then `quant_ostquant_w4_group128` -- a 16-level
+    ///   affine `[min, max]` encode with a per-group derived zero.
+    /// - **CityCrow** (`GsqRco3p5`): `citycrow::repack_to_u4_lanes` straight off
+    ///   the packed bytes -- a 4-level symmetric `absmax` encode whose `zeros` is
+    ///   the offset-binary codebook bias, probed from the decoder at runtime
+    ///   rather than hardcoded, because a wrong bias yields finite, plausible,
+    ///   wrong weights with no fault and no NaN.
+    ///
+    /// CityCrow never inflates the 2.25 bpw source to f32 on the host, which is
+    /// what keeps a GSQRCO load affordable: decode -> 4-bit codes -> upload, and
+    /// the packed stream stays packed throughout.
+    ///
+    /// See `GRIM_DECODE_W4A4` in `linear_decode_into` for the decode-graph
+    /// switch; the eager `quantized_matmul` path calls this unconditionally.
     pub fn requant_kquant_to_whitecrow(
         &self,
         w: &RocmStorage,
@@ -2450,62 +2765,38 @@ impl RocmDevice {
         scheme: grim_tensor::KQuantScheme,
     ) -> Result<WhiteCrowDecodedWeights> {
         let packed = w.copy_to_host()?;
+        let converter = u4_lane_converter_for(scheme)?;
+        let cache_key =
+            u4_lane_cache_enabled().then(|| u4_lane_cache_key(&packed, n, k, scheme, converter));
 
-        // On-disk cache (GRIM_OSTQUANT_CACHE_DIR, default ~/.cache/grim/ostquant;
-        // GRIM_OSTQUANT_CACHE=0 disables). The key mixes the encoder version,
-        // the geometry and a hash of the PACKED source bytes, so a stale
-        // converter can never be served for a different weight.
-        let disk_enabled = !matches!(
-            std::env::var("GRIM_OSTQUANT_CACHE").as_deref(),
-            Ok("0") | Ok("false") | Ok("off")
-        );
-        let cache_key: Option<u64> = disk_enabled.then(|| {
-            let mut h = seahash::hash(&packed);
-            h ^= (n as u64) << 1;
-            h ^= (k as u64) << 17;
-            h ^= (scheme as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            h ^= (grim_quant::OSTQUANT_ENCODER_VERSION as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-            h
-        });
-        let cache_dir = || {
-            std::env::var("GRIM_OSTQUANT_CACHE_DIR")
-                .ok()
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    let base = std::env::var("XDG_CACHE_HOME")
-                        .ok()
-                        .map(std::path::PathBuf::from)
-                        .or_else(|| {
-                            std::env::var("HOME")
-                                .ok()
-                                .map(|h| std::path::PathBuf::from(h).join(".cache"))
-                        })?;
-                    Some(base.join("grim").join("ostquant"))
-                })
-        };
-        if let (Some(key), Some(dir)) = (cache_key, cache_dir()) {
-            let path = dir.join(format!("{key:016x}.wc"));
-            // Header: magic, encoder version, n, k, three lengths.
-            if let Ok(meta) = std::fs::read(&path) {
-                if meta.len() >= 28 {
-                    let rd = |o: usize| {
-                        u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]])
-                            as usize
-                    };
-                    if rd(0) == 0x57_43_00_01
-                        && rd(4) == grim_quant::OSTQUANT_ENCODER_VERSION as usize
-                        && rd(8) == n
-                        && rd(12) == k
-                        && meta.len() == 28 + rd(16) + rd(20) + rd(24)
-                    {
-                        let (lq, ls, lz) = (rd(16), rd(20), rd(24));
-                        let qw = meta[28..28 + lq].to_vec();
-                        let sc = meta[28 + lq..28 + lq + ls].to_vec();
-                        let zr = meta[28 + lq + ls..28 + lq + ls + lz].to_vec();
-                        return self.whitecrow_from_host_bytes(qw, sc, zr, n, k);
-                    }
-                }
+        if let (Some(key), Some(dir)) = (cache_key, u4_lane_cache_dir()) {
+            if let Some((qw, sc, zr)) = u4_lane_cache_read(&dir, key, converter, n, k) {
+                return self.whitecrow_from_host_bytes(qw, sc, zr, n, k);
             }
+        }
+
+        let (qw, sc, zr) = self.encode_u4_lanes(&packed, n, k, scheme)?;
+        if let (Some(key), Some(dir)) = (cache_key, u4_lane_cache_dir()) {
+            u4_lane_cache_write(&dir, key, converter, n, k, &qw, &sc, &zr);
+        }
+        self.whitecrow_from_host_bytes(qw, sc, zr, n, k)
+    }
+
+    /// Host-side packed-bytes -> u4 lane geometry for one scheme.
+    ///
+    /// Split out of [`Self::requant_kquant_to_whitecrow`] so cache read, encode,
+    /// and cache write are three separable steps, and so the encode is reachable
+    /// without a device allocation.
+    fn encode_u4_lanes(
+        &self,
+        packed: &[u8],
+        n: usize,
+        k: usize,
+        scheme: grim_tensor::KQuantScheme,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if matches!(scheme, grim_tensor::KQuantScheme::GsqRco3p5) {
+            let repacked = grim_quant::citycrow::repack_to_u4_lanes(packed, n, k, scheme)?;
+            return Ok(Self::citycrow_lane_bytes(&repacked));
         }
 
         // Convert row-block-parallel: both stages are row-separable (a Q4_K
@@ -2513,6 +2804,11 @@ impl RocmDevice {
         // linear_decode_into already requires k % 128 == 0, k % 256 == 0), and
         // every output buffer is row-major, so chunking rows and concatenating
         // in order is byte-identical to the serial path.
+        //
+        // CityCrow is deliberately serial above. `repack_to_u4_lanes` is also
+        // row-separable and could be chunked the same way, but parallelizing it
+        // is a measured optimization, not a correctness requirement, and shipping
+        // the simple version first keeps any later speedup attributable.
         let (block_bytes, per_256): (usize, usize) = match scheme {
             grim_tensor::KQuantScheme::Q4K => (144, 256),
             grim_tensor::KQuantScheme::Q5K => (176, 256),
@@ -2526,7 +2822,7 @@ impl RocmDevice {
             _ => {
                 return Err(Error::Backend(format!(
                     "requant_kquant_to_whitecrow: unsupported scheme {scheme:?}"
-                )))
+                )));
             }
         };
         let threads = std::thread::available_parallelism()
@@ -2535,7 +2831,7 @@ impl RocmDevice {
             .min(8)
             .max(1);
         let row_bytes = (k / per_256) * block_bytes;
-        let (qw, sc, zr) = if threads > 1 && n >= 2 && k % per_256 == 0 {
+        if threads > 1 && n >= 2 && k % per_256 == 0 {
             let rows_per = n.div_ceil(threads);
             let chunks: Vec<(usize, usize)> = (0..n)
                 .step_by(rows_per)
@@ -2550,34 +2846,7 @@ impl RocmDevice {
                         scope.spawn(move || {
                             let slice = &packed[r0 * row_bytes..r1 * row_bytes];
                             let rows = r1 - r0;
-                            let dq = match scheme {
-                                grim_tensor::KQuantScheme::Q4K => {
-                                    grim_quant::dequant_q4k(slice, rows * k)?
-                                }
-                                grim_tensor::KQuantScheme::Q5K => {
-                                    grim_quant::dequant_q5k(slice, rows * k)?
-                                }
-                                grim_tensor::KQuantScheme::Q6K => {
-                                    grim_quant::dequant_q6k(slice, rows * k)?
-                                }
-                                grim_tensor::KQuantScheme::Q3K => {
-                                    grim_quant::dequant_q3k(slice, rows * k)?
-                                }
-                                grim_tensor::KQuantScheme::IQ3S => {
-                                    grim_quant::dequant_iq3s(slice, rows * k)?
-                                }
-                                grim_tensor::KQuantScheme::Q2K => {
-                                    grim_quant::dequant_q2k(slice, rows * k)?
-                                }
-                                grim_tensor::KQuantScheme::IQ4NL => {
-                                    grim_quant::dequant_iq4nl(slice, rows * k)?
-                                }
-                                _ => {
-                                    return Err(Error::Backend(format!(
-                                        "requant_kquant_to_whitecrow: no dequant for {scheme:?}"
-                                    )))
-                                }
-                            };
+                            let dq = dequant_kquant_slice(scheme, slice, rows * k)?;
                             grim_quant::quant_ostquant_w4_group128(&dq, rows, k)
                         })
                     })
@@ -2600,50 +2869,57 @@ impl RocmDevice {
                 sc_all.extend_from_slice(&b);
                 zr_all.extend_from_slice(&c);
             }
-            (qw_all, sc_all, zr_all)
-        } else {
-            let dequantized = match scheme {
-                grim_tensor::KQuantScheme::Q4K => grim_quant::dequant_q4k(&packed, n * k)?,
-                grim_tensor::KQuantScheme::Q5K => grim_quant::dequant_q5k(&packed, n * k)?,
-                grim_tensor::KQuantScheme::Q6K => grim_quant::dequant_q6k(&packed, n * k)?,
-                grim_tensor::KQuantScheme::Q3K => grim_quant::dequant_q3k(&packed, n * k)?,
-                grim_tensor::KQuantScheme::IQ3S => grim_quant::dequant_iq3s(&packed, n * k)?,
-                grim_tensor::KQuantScheme::Q2K => grim_quant::dequant_q2k(&packed, n * k)?,
-                grim_tensor::KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(&packed, n * k)?,
-                _ => {
-                    return Err(Error::Backend(format!(
-                        "requant_kquant_to_whitecrow: no dequant for {scheme:?}"
-                    )))
-                }
-            };
-            grim_quant::quant_ostquant_w4_group128(&dequantized, n, k)?
-        };
-        // Persist for the next run (best-effort; a failed write only costs
-        // the conversion next time).
-        if let (Some(key), Some(dir)) = (cache_key, cache_dir()) {
-            let mut blob: Vec<u8> = Vec::with_capacity(28 + qw.len() + sc.len() + zr.len());
-            let push_u = |v: &mut Vec<u8>, x: usize| {
-                v.extend_from_slice(&(x as u32).to_le_bytes());
-            };
-            push_u(&mut blob, 0x57_43_00_01);
-            push_u(&mut blob, grim_quant::OSTQUANT_ENCODER_VERSION as usize);
-            push_u(&mut blob, n);
-            push_u(&mut blob, k);
-            push_u(&mut blob, qw.len());
-            push_u(&mut blob, sc.len());
-            push_u(&mut blob, zr.len());
-            blob.extend_from_slice(&qw);
-            blob.extend_from_slice(&sc);
-            blob.extend_from_slice(&zr);
-            let tmp = dir.join(format!("{key:016x}.wc.tmp"));
-            if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&tmp, &blob).is_ok() {
-                let _ = std::fs::rename(&tmp, dir.join(format!("{key:016x}.wc")));
-            }
+            return Ok((qw_all, sc_all, zr_all));
         }
-        self.whitecrow_from_host_bytes(qw, sc, zr, n, k)
+
+        let dequantized = dequant_kquant_slice(scheme, packed, n * k)?;
+        grim_quant::quant_ostquant_w4_group128(&dequantized, n, k)
     }
 
-    /// Upload already-converted WhiteCrow bytes (qweight as u32 words,
+    /// Get `w` in u4 group-128 lane form, converting at most once per
+    /// `(device pointer, byte length, shape)` for the process lifetime.
+    ///
+    /// Both the eager `quantized_matmul` arm and the `linear_decode_into`
+    /// WhiteCrow leg call this, so a model that is exercised through both paths
+    /// pays one conversion rather than one per path.
+    ///
+    /// KDA-FIX, inherited from the decode leg this replaces: the cache key is
+    /// the raw device pointer plus length plus shape, never the pointer alone.
+    /// The caching allocator recycles blocks, so a freed weight's pointer can be
+    /// handed to a different tensor — keying on the pointer alone served that
+    /// tensor the first one's converted weights, which is silent wrong weights,
+    /// not a crash. Three recycled-pointer collisions in a row with matching
+    /// bytes AND shape is not a realistic hazard, and the true fix (keying on
+    /// an allocator generation) needs an allocator API this does not have.
+    ///
+    /// Weights are static for the process lifetime, so entries never evict.
+    pub fn u4_lane_weights(
+        &self,
+        w: &RocmStorage,
+        n: usize,
+        k: usize,
+        scheme: grim_tensor::KQuantScheme,
+    ) -> Result<Arc<WhiteCrowDecodedWeights>> {
+        type LaneCache = std::sync::Mutex<
+            std::collections::HashMap<(usize, usize, [usize; 2]), Arc<WhiteCrowDecodedWeights>>,
+        >;
+        static CONVERTED: OnceLock<LaneCache> = OnceLock::new();
+        let cache = CONVERTED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let key = (
+            w.device_ptr.map(|p| p as usize).unwrap_or(0),
+            w.bytes,
+            [n, k],
+        );
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = guard.get(&key) {
+            return Ok(hit.clone());
+        }
+        let converted = Arc::new(self.requant_kquant_to_whitecrow(w, n, k, scheme)?);
+        guard.insert(key, converted.clone());
+        Ok(converted)
+    }
+
+    /// Upload already-converted u4 lane bytes (qweight as u32 words,
     /// group-128 bf16 scales, u8 zeros).
     fn whitecrow_from_host_bytes(
         &self,

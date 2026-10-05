@@ -582,28 +582,19 @@ impl TryFrom<&Storage> for QuantFormat {
                 KQuantScheme::IQ2S => Ok(QuantFormat::Iq2S),
                 KQuantScheme::IQ1S => Ok(QuantFormat::Iq1S),
                 KQuantScheme::IQ1M => Ok(QuantFormat::Iq1M),
-                // NOTE: `GsqRco3p5` deliberately has NO arm here yet, even
-                // though `From<QuantFormat> for Storage` maps it and
-                // `quantize_gsq_rco_3p5_block` can produce tag 81. The
-                // `TryFrom<&Storage>` direction is what `Linear::forward`
-                // reads, so adding it without a backend dispatch is worse
-                // than leaving it out: the weight would pass the format
-                // check, reach `RocmDevice::quantized_matmul`, miss the
-                // `KQuantScheme::GsqRco3p5` arm, and land in the generic
-                // `_ =>` arm that calls `self.matmul` on 18-byte-per-64
-                // packed bytes. That trades a loud "no QuantFormat mapping"
-                // error for silent garbage.
+                // GSQ-RCO 3.5-bit (tag 81). The ROCm backend serves it through
+                // CityCrow: `repack_to_u4_lanes` converts the 18-byte-per-64
+                // blocks to the u4 group-128 lanes `grim_dot8_w4a4_gemv`
+                // consumes, on RDNA4 gfx1200/gfx1201. The CPU backend decodes
+                // it directly.
                 //
-                // Add this arm in the same change that adds the backend
-                // dispatch, not before.
-                // GSQ-RCO 3.5-bit: mapped now that BOTH backends name the
-                // scheme — CPU `quantized_matmul` decodes it (device.rs
-                // QuantFormat::GsqRco3p5 arm), and the ROCm
-                // `quantized_matmul` arm REFUSES LOUDLY naming the missing
-                // CityCrow sudot8 kernel. The refusal is the point: the
-                // generic `_ =>` matmul catch-all would run on 18-byte-per-64
-                // packed bytes and produce silent garbage, which is exactly
-                // what this TryFrom arm previously refused to enable.
+                // This arm and `NO_QUANT_FORMAT` moved together on purpose: an
+                // earlier revision enabled the mapping while the ROCm dispatch
+                // still refused, which meant the weight passed the format check,
+                // reached `quantized_matmul`, and would have landed in the
+                // generic `_ =>` arm calling `self.matmul` on 18-byte-per-64
+                // packed bytes. A loud "no QuantFormat mapping" error is the
+                // better failure, so neither side moves alone.
                 KQuantScheme::GsqRco3p5 => Ok(QuantFormat::GsqRco3p5),
 
             },
@@ -816,17 +807,16 @@ mod tests {
     fn every_kquant_scheme_maps_to_a_quant_format_and_back() {
         /// K-quants deliberately WITHOUT a `QuantFormat`, with the reason.
         ///
-        /// `GsqRco3p5` is here because it has a packer and a `From<QuantFormat>`
-        /// mapping but no backend dispatch: adding the `TryFrom` arm alone
-        /// would let a GSQRCO weight reach `RocmDevice::quantized_matmul`,
-        /// miss its match arm, and fall into the generic `_ =>` arm that calls
-        /// `self.matmul` on packed bytes — silent garbage instead of the loud
-        /// "no QuantFormat mapping" error. Fail loudly until the dispatch
-        /// exists; then remove it here and add the arm together.
-        ///
-        /// (An earlier note claimed tag 81 had no producer and should be
-        /// retired. That was wrong — `quantize_gsq_rco_3p5_block` writes it.)
-        const NO_QUANT_FORMAT: &[KQuantScheme] = &[KQuantScheme::GsqRco3p5];
+        /// Empty: every K-quant now has both directions of the mapping.
+        /// `GsqRco3p5` was the last holdout, kept here on purpose until the ROCm
+        /// dispatch existed, because the `TryFrom` arm alone would have let a
+        /// GSQRCO weight reach `RocmDevice::quantized_matmul`, miss its match
+        /// arm, and fall into the generic `_ =>` arm that calls `self.matmul`
+        /// on packed bytes — silent garbage instead of the loud "no QuantFormat
+        /// mapping" error. The dispatch now exists (CityCrow, in
+        /// `grim-backend-rocm`'s `device/quant/mod.rs`), so the `TryFrom` arm
+        /// and this list were removed in the same change, as the note required.
+        const NO_QUANT_FORMAT: &[KQuantScheme] = &[];
 
         const ALL: &[KQuantScheme] = &[
             KQuantScheme::Q2K,

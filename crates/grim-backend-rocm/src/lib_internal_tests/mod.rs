@@ -6,6 +6,8 @@ mod attention_precision_tests;
 #[cfg(test)]
 mod builtin_name_oracle_tests;
 #[cfg(test)]
+mod citycrow_dispatch_tests;
+#[cfg(test)]
 mod common;
 #[cfg(test)]
 mod device_lifecycle_tests;

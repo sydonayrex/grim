@@ -286,20 +286,40 @@ impl QuantOps for RocmDevice {
                 }
             }
             DTypeStorage::KQuant(KQuantScheme::GsqRco3p5) => {
-                // GSQ-RCO 3.5-bit (tag 81): NO GPU kernel yet. The CityCrow
-                // host repack (grim-quant citycrow.rs) plus the native
-                // sudot8 W4A4 GEMV is the planned fast path; until it lands,
-                // refuse LOUDLY. Silence here would fall through to the
-                // generic matmul catch-all, which reads 18-byte-per-64
-                // packed code bytes as f32 weights — plausible garbage.
-                let _ = (a, b_packed, out_shape);
-                return Err(Error::Backend(
-                    "GsqRco3p5 (GSQ-RCO tag 81) has no ROCm GPU dispatch yet: \
-                     the CityCrow sudot8 GEMV is pending. Run this model on the \
-                     CPU backend (host dequant is implemented), or convert the \
-                     2-bpw tiers to a GPU-served format."
-                        .into(),
-                ))
+                // CityCrow: GSQ-RCO (tag 81) is the densest K-quant in the tree
+                // at 2.25 bpw (18 B per 64 weights), and `V_DOT8_I32_IU4`
+                // consumes 4-bit lanes -- so feeding it the packed blocks
+                // directly would inflate to 4.0 bpw, 1.78x the bytes, throwing
+                // away the format's only property. Instead the resident packed
+                // tensor stays at 2.25 bpw and `repack_to_u4_lanes` pays the
+                // 4.0 bpw conversion once, at first use, then the existing
+                // `grim_dot8_w4a4_gemv` serves it with no second GEMV.
+                //
+                // The conversion D2Hs and allocates, so it must not run under
+                // HIP graph capture (`hipMemcpy` sync + alloc poison capture).
+                // `u4_lane_weights` memoizes per (pointer, bytes, shape), so the
+                // eager path pays it once per weight, not once per launch.
+                //
+                // Arch first, then K: on a non-gfx12 card the GPU is the
+                // problem, and a "K must be divisible by 128" message would
+                // mislead. `w4a4_ostquant_supported` is the same gate the
+                // `W4A4OstQuant` arm below uses, for the same kernel.
+                crate::quantization::w4a4_ostquant_supported(
+                    crate::quantization::gcn_arch(&self.gpu_target),
+                    k,
+                )
+                .map_err(Error::Backend)?;
+                let lanes = self.u4_lane_weights(b_storage, n, k, KQuantScheme::GsqRco3p5)?;
+                self.launch_w4a4_ostquant_gemv(
+                    a_storage,
+                    lanes.qweight_rocm()?,
+                    lanes.scales_rocm()?,
+                    lanes.zeros_rocm()?,
+                    &out_storage,
+                    m,
+                    n,
+                    k,
+                )?;
             }
             DTypeStorage::KQuant(KQuantScheme::Q2_0) => {
                 // Upstream GGUF Q2_0 (tag 42) x Q8_0 GEMV, ported from
@@ -2144,6 +2164,27 @@ impl QuantOps for RocmDevice {
                     k,
                     &mut [],
                 )?;
+            }
+            DTypeStorage::KQuant(scheme @ (KQuantScheme::GsqRco3p5 | KQuantScheme::Q2_0)) => {
+                // Both are 18-byte-per-64 2-bit block formats, and neither has a
+                // backward kernel. The `_` arm below would call
+                // `launch_fused_dequant_backward_gemm_f16`, which reads the
+                // weight as f16 -- i.e. it would read the 18-byte packed code
+                // stream as half-precision floats and produce finite, plausible,
+                // garbage gradients with no fault and no NaN.
+                //
+                // This arm exists because the forward dispatch now serves
+                // GsqRco3p5: enabling the forward route without pinning the
+                // backward route is what turns a loud refusal into silent
+                // gradient corruption.
+                return Err(Error::Backend(format!(
+                    "{scheme:?} has no ROCm backward_dx kernel: its forward \
+                     route (CityCrow sudot8) is inference-only. Refusing rather \
+                     than falling through to the f16 residual-packing kernel, \
+                     which would read packed code bytes as f16 and return \
+                     plausible garbage gradients. Use an inference-only run, or \
+                     a format with both directions."
+                )));
             }
             _ => {
                 self.launch_fused_dequant_backward_gemm_f16(
