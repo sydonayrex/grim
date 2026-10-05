@@ -91,6 +91,59 @@ fn report(name: &str, src: &str, w: &[f32], q: &[f32], k_dim: usize, n_rows: usi
     );
 }
 
+/// Corvid rung study (2026-10-05): can WhiteCrow replace Q4_K and
+/// ForestRaven replace Q8_0/F32? Same fake-quant method as the GSQ study.
+#[test]
+fn corvid_rungs_on_real_banks() {
+    let path = match std::env::var("XING_GGUF") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("[SKIP] XING_GGUF unset"); return; }
+    };
+
+    // 1) Q4K -> WhiteCrow: attn_output [4096, 3584], k % 128 == 0.
+    let (w, shape, src) = load_bank(&path, "blk.10.attn_output.weight");
+    let (n, k) = (shape[0], shape[1]);
+    let (qw, sc, zr) = grim_quant::quant_ostquant_w4_group128(&w, n, k).expect("wc pack");
+    let wc = grim_quant::dequant_ostquant_w4a4(&qw, &sc, &zr, &[n, k], 128).expect("wc deq");
+    report("blk.10.attn_output Q4K->WhiteCrow", &src, &w, &wc, k, n, 0);
+
+    // 2) IQ3_S-decoded f32 -> ForestRaven (per-row absmax INT8): the
+    //    Q8_0/F32-runG question answered on real weight distributions.
+    let (w2, shape2, src2) = load_bank(&path, "blk.10.attn_q_a.weight");
+    let (n2, k2) = (shape2[0], shape2[1]);
+    let (codes, scales) = grim_quant::quant_forest_per_channel(&w2, n2, k2).expect("fr pack");
+    // decode: framed blob = per-row absmax INT8; dequant via the quantizer's
+    // own inverse: y = scale[row] * code.
+    let mut fr = vec![0.0f32; w2.len()];
+    for r in 0..n2 {
+        let scale = f32::from_le_bytes(scales[r*4..r*4+4].try_into().unwrap());
+        for c in 0..k2 {
+            fr[r * k2 + c] = scale * (codes[r * k2 + c] as i8 as f32);
+        }
+    }
+    report("blk.10.attn_q_a IQ3S->ForestRaven", &src2, &w2, &fr, k2, n2, 0);
+
+    // 3) F32 norm -> per-tensor absmax INT8 (the user's "ForestRaven does
+    //    F32"): output_norm.weight [3584], one scale for the whole vector.
+    let f = std::fs::File::open(&path).unwrap();
+    let gg = grim_format::gguf::read_gguf(&f).unwrap();
+    let t = gg.tensors.iter().find(|t| t.name == "output_norm.weight").unwrap();
+    let mut f2 = std::fs::File::open(&path).unwrap();
+    f2.seek(std::io::SeekFrom::Start(gg.data_start + t.offset)).unwrap();
+    let mut raw = vec![0u8; t.size_bytes as usize];
+    f2.read_exact(&mut raw).unwrap();
+    let norm: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let amax = norm.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let scale = amax / 127.0;
+    let q: Vec<f32> = norm.iter().map(|v| (v / scale).round() * scale).collect();
+    let max_e: f32 = norm.iter().zip(&q).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    let mean_e: f64 = norm.iter().zip(&q).map(|(a, b)| (a - b).abs() as f64).sum::<f64>() / norm.len() as f64;
+    println!(
+        "output_norm F32->INT8-per-tensor: max_rel={:.4} mean_rel={:.4} (values are elementwise-read, not GEMV)",
+        max_e / amax, mean_e / (amax as f64)
+    );
+}
+
 #[test]
 fn gsq_fakequant_on_real_expert_banks() {
     let path = match std::env::var("XING_GGUF") {
