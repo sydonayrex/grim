@@ -125,8 +125,21 @@ check "bf16 round-to-nearest -> truncate" \
 #    every code in the lane, so a zero group decodes to the zero point rather
 #    than to zero.
 check "zero-group scale 0 -> 1.0" \
-    't.replace("if amax > 0.0 { f32_to_bf16(amax) } else { 0 }",
-             "if amax > 0.0 { f32_to_bf16(amax) } else { f32_to_bf16(1.0) }")'
+    't.replace("if amax > 0.0 { f32_to_bf16(step) } else { 0 }",
+             "if amax > 0.0 { f32_to_bf16(step) } else { f32_to_bf16(1.0) }")'
+
+# 8b. THE PER-SIDE STEP. This is the defect the gfx1200 parity test caught: the
+#     stored scale is the codebook STEP, and the zero code has `zero` codes
+#     below it and `3 - zero` above, so the two sides have different reach and a
+#     single `amax` over-shrinks the step on the long side (every weight then
+#     lands half a scale off). Collapsing `above` to a constant 3 makes the step
+#     too large for the positive side, which is the same class of error.
+#     `repack_reconstructs_the_source_weights` is the only test that can see it:
+#     its tolerance is 0.25 of the group scale, and the pre-fix repack measured
+#     0.5.
+check "step ignores the codebook's short side" \
+    't.replace("let above = (3u8.saturating_sub(zero)).max(1) as f32;",
+             "let above = 3.0f32;")'
 
 # 9. The packer/decoder mirror. decode_groups must invert the same stride the
 #    packer wrote. The round-trip test alone cannot see this: if BOTH used the

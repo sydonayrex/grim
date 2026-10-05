@@ -185,10 +185,19 @@ pub fn scheme_supported(scheme: KQuantScheme) -> bool {
 /// eighteen-byte blocks, row-major, no padding between rows. `k` must be a
 /// multiple of [`CITYCROW_GROUP`].
 ///
-/// The per-group scale is `max |w|` over the group's 128 decoded weights,
-/// quantized to bf16. The code stored is the offset-binary form `q - zero`,
-/// where `zero` is [`zero_point_for`], so that `w ~= (q - zero) * scale` and
-/// the kernel's two-dot correction applies unchanged.
+/// The per-group scale is the codebook STEP over the group's 128 decoded
+/// weights, quantized to bf16. The code stored is the offset-binary form
+/// `q - zero`, where `zero` is [`zero_point_for`], so that
+/// `w ~= (q - zero) * scale` and the kernel's two-dot correction applies
+/// unchanged.
+///
+/// The step is `max(|w_min| / zero, w_max / (3 - zero))` — the max of the two
+/// per-side bounds, because the zero code has `zero` codes below it and
+/// `3 - zero` above, so the two sides reach different distances. It is NOT
+/// `max |w|`, and it is NOT `max |w| / max(zero, 3 - zero)` either: a single
+/// `amax` cannot describe both sides, and dividing it by the wider span
+/// over-shrinks the step until the long side overflows past code 3. See the
+/// comment at the scale computation in [`repack_to_u4_lanes`].
 ///
 /// # Errors
 ///
@@ -256,10 +265,45 @@ pub fn repack_to_u4_lanes(
         let base = row * k + col;
 
         let group = &flat[base..base + CITYCROW_GROUP];
-        let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let w_min = group.iter().fold(0.0f32, |m, &v| m.min(v));
+        let w_max = group.iter().fold(0.0f32, |m, &v| m.max(v));
+        let amax = w_min.abs().max(w_max);
+        // The stored scale is the codebook STEP, and the step is set by
+        // whichever side of the zero code needs more room -- NOT by `amax`
+        // alone.
+        //
+        // Code `q` decodes to `(q - zero) * step`, so the zero code has `zero`
+        // codes below it and `3 - zero` above. The two sides therefore have
+        // DIFFERENT reach, and for the shipped bias-2 codebook
+        // `{-2,-1,0,+1} * d` that is 2 down and 1 up. A single `amax` cannot
+        // describe both: the group's largest magnitude may sit on the short
+        // side. Taking `step = amax / max(zero, 3 - zero)` therefore over-shrinks
+        // whenever the data is asymmetric, and the long side then overflows
+        // past code 3.
+        //
+        // Both sides impose a LOWER bound on the step -- `t` must stay within
+        // [0, 3] -- so the finest resolution that still fits is the max of the
+        // two per-side bounds:
+        //
+        //     step = max( |w_min| / zero ,  w_max / (3 - zero) )
+        //
+        // Checked against the three shapes that occur: production bias-2 blocks
+        // decode to [-2d, +d] giving max(2d/2, d/1) = d; a symmetric fixture
+        // [-d, +d] gives max(d/2, d/1) = d; bias-1 [-d, +2d] gives max(d/1, 2d/2)
+        // = d. All three recover the exact step.
+        //
+        // An earlier revision used `scale = amax`, which assumes the group's
+        // amplitude is ONE step from the zero code. That holds only for a
+        // symmetric `{-1, 0, +1}` level set, which neither bias produces; it
+        // doubled the step, made the two interior levels unrepresentable, and
+        // put every weight half a scale from the truth -- a silent O(amax/2)
+        // error that measured max_diff 2.79 on the gfx1200 parity test.
+        let below = zero.max(1) as f32;
+        let above = (3u8.saturating_sub(zero)).max(1) as f32;
+        let step = ((-w_min).max(0.0) / below).max(w_max.max(0.0) / above);
         // An all-zero group has no representable scale. Zeroing it is exact,
         // not a fallback: every code then decodes to 0 * 0 = 0.
-        let scale_bits = if amax > 0.0 { f32_to_bf16(amax) } else { 0 };
+        let scale_bits = if amax > 0.0 { f32_to_bf16(step) } else { 0 };
         scales[g] = scale_bits;
         if amax == 0.0 {
             // Leave the codes at 0 so the lane value is the zero-point, which
@@ -272,12 +316,13 @@ pub fn repack_to_u4_lanes(
         for (i, &w) in group.iter().enumerate() {
             // Offset-binary: code in [0, 4), value = (code - zero) * scale.
             let t = w / scale + zero as f32;
-            // `t` is bounded by construction: `scale` is bf16(amax), so it is
-            // within a relative 2^-9 of amax, giving
-            // t in [zero - 1.002, zero + 1.002] = [0.998, 3.002] for a 2-bit
-            // code. Rounding that lands in [1, 3] with no clamp needed, which
-            // is why the mutation gate has no clamp to kill here.
-            let code = (t + 0.5).floor() as u8;
+            // `t` is in [0, 3] by construction above. The clamp covers the one
+            // way it can escape: `scale` is bf16(step), and bf16 rounding the
+            // scale DOWN makes `w / scale` overshoot by up to 2^-9 relative,
+            // which at the very edge of a level set can push a rounded code to
+            // 4. Clamping keeps a 4 out of the low nibble, which the kernel
+            // would read as a fifth level and turn into a wrong weight.
+            let code = ((t + 0.5).floor() as u8).min(3);
             debug_assert!(code <= 3, "offset-binary code out of range: {code}");
             // 8 codes per u32: four bits each, lowest code in the low nibble.
             let word = i / 8;
@@ -491,39 +536,60 @@ mod tests {
         assert_eq!(w.scales.len(), 1);
     }
 
-    /// The load-bearing test: a CityCrow repack must reconstruct the same
-    /// weights its own decoder produced, to bf16 scale precision. This is
-    /// what a parity test on GPU compares against, so if it is wrong here the
-    /// kernel is wrong there.
+    /// The load-bearing test: a CityCrow repack must reconstruct the weights its
+    /// own decoder produced, to well inside one quantisation step. This is what
+    /// a parity test on GPU compares against, so if it is wrong here the kernel
+    /// is wrong there.
+    ///
+    /// Packed with `quantize_gsq_rco_3p5_block` — the PRODUCTION packer — not
+    /// `pack_rows`. The hand-rolled fixture fits `d = amax` per 64-block and
+    /// clamps its codes, so it emits only the three levels `{-d, 0, +d}`. Two
+    /// such blocks make a 128-wide group with up to five distinct magnitudes,
+    /// which four codes cannot reproduce exactly at ANY step, so a tight
+    /// tolerance against it measures the fixture's shape rather than the
+    /// repack. Production blocks are 4-level and MSE-fitted, and a single
+    /// per-group step reproduces them to ~0.15 of a step (measured); the gate is
+    /// 0.25.
+    ///
+    /// Round-to-nearest at step `s` bounds the error at `s / 2`, so 0.25 is a
+    /// real gate rather than the bound itself: the pre-fix repack sat at 0.5
+    /// and this assertion is what it needed to fail.
     #[test]
     fn repack_reconstructs_the_source_weights() {
         let k = CITYCROW_GROUP * 2;
         let n = 3;
         let mut flat = Vec::with_capacity(n * k);
+        let mut seed = 0x5EED_1234u64;
         for r in 0..n {
-            for i in 0..k {
-                let x = (i as f32 + r as f32 * 7.0) / k as f32;
-                // Non-uniform per row so group scales differ.
-                flat.push((x - 0.5) * (1.0 + r as f32));
+            for _ in 0..k {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // Non-uniform amplitude per row so group scales differ.
+                flat.push(((seed >> 33) as f32 / u32::MAX as f32 * 2.0 - 1.0) * (1.0 + r as f32));
             }
         }
-        let packed = pack_rows(&flat, n, k);
+        let mut packed = vec![0u8; (n * k).div_ceil(64) * 18];
+        crate::quantize_gsq_rco_3p5_block(&flat, &mut packed).expect("packs");
 
         let w = repack_to_u4_lanes(&packed, n, k, KQuantScheme::GsqRco3p5).expect("repacks");
         let got = decode_groups(&w);
 
         // Compare against the source decoder, which is the ground truth for
-        // "what does this format mean", tolerating only the group's own bf16
-        // scale rounding.
+        // "what does this format mean".
         let want = dequant_gsq_rco_3p5(&packed, n * k).expect("decodes");
         let mut worst: f32 = 0.0;
         for i in 0..n * k {
-            let scale = w.scales[i / CITYCROW_GROUP].max(1) as f32;
-            let tol = 0.02 * scale + 1e-6;
+            // The tolerance must be in the group's SCALE, so it has to decode
+            // `scales` -- a Vec<u16> of bf16 BIT PATTERNS. This line previously
+            // read `w.scales[..].max(1) as f32`, which is the bit pattern as an
+            // integer (0x3F80 -> 16256), giving a tolerance of ~325 and making
+            // this assertion unfailable. That is why a 2x-too-coarse scale sat
+            // here unnoticed and reached the GPU parity test at max_diff 2.79.
+            let scale = bf16_to_f32(w.scales[i / CITYCROW_GROUP]).abs().max(1e-9);
+            let tol = 0.25 * scale + 1e-6;
             worst = worst.max((got[i] - want[i]).abs() / tol);
             assert!(
                 (got[i] - want[i]).abs() < tol,
-                "element {i}: repack {} vs source {} (tol {tol})",
+                "element {i}: repack {} vs source {} (tol {tol}, group scale {scale})",
                 got[i],
                 want[i]
             );
