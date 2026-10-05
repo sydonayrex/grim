@@ -1179,6 +1179,76 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
     }
 }
 
+// Elementwise-INT8 weight variants of the norm kernels: the weight is a
+// ForestRaven framed blob resident on-device — codes at blob+8, per-WEIGHT-row
+// f32 scales at blob + 8 + codes_len + 8 (offsets computable host-side because
+// Int8PerChannel is 1 byte/element; no D2H at dispatch). For 1-D norm weights
+// there is one scale, shared by every x row (broadcast).
+extern "C" __global__ void __launch_bounds__(256)
+grim_rms_norm_i8(const float* __restrict__ x, const signed char* __restrict__ codes,
+                 const float* __restrict__ scales, float* __restrict__ out,
+                 int row_len, float eps, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* x_row = x + (size_t)warp_id * row_len;
+    float* o_row = out + (size_t)warp_id * row_len;
+    const float w_scale = scales[0];
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    float ss = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        float v = x_row[col];
+        ss += v * v;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(shfl_mask, ss, off);
+    float rms = sqrtf(ss / (float)row_len + eps);
+    for (int col = lane; col < row_len; col += 32) {
+        o_row[col] = x_row[col] * (w_scale * (float)codes[col]) / rms;
+    }
+}
+
+// LayerNorm with elementwise-INT8 weight and bias (both framed blobs, one
+// scale each; bias codes pointer may be NULL for an unbiased norm).
+extern "C" __global__ void __launch_bounds__(256)
+grim_layer_norm_i8(const float* __restrict__ x, const signed char* __restrict__ w_codes,
+                   const float* __restrict__ w_scales, const signed char* __restrict__ b_codes,
+                   const float* __restrict__ b_scales, float* __restrict__ out,
+                   int row_len, float eps, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* x_row = x + (size_t)warp_id * row_len;
+    float* o_row = out + (size_t)warp_id * row_len;
+    const float w_scale = w_scales[0];
+    const float b_scale = b_scales ? b_scales[0] : 0.0f;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    float mean = 0.0f;
+    for (int col = lane; col < row_len; col += 32) mean += x_row[col];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) mean += __shfl_xor_sync(shfl_mask, mean, off);
+    mean /= (float)row_len;
+    float var = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        float d = x_row[col] - mean;
+        var += d * d;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) var += __shfl_xor_sync(shfl_mask, var, off);
+    float rstd = rsqrtf(var / (float)row_len + eps);
+    for (int col = lane; col < row_len; col += 32) {
+        float v = (x_row[col] - mean) * rstd;
+        float wv = w_scale * (float)w_codes[col];
+        float bv = b_codes ? b_scale * (float)b_codes[col] : 0.0f;
+        o_row[col] = v * wv + bv;
+    }
+}
+
 // Warp-per-row LayerNorm (mean/variance, unlike RMS norm); bias pointer may be NULL.
 // Used by per-head Q/K norms (Chameleon swin_norm) inside decode-graph capture.
 extern "C" __global__ void __launch_bounds__(256)

@@ -322,6 +322,7 @@ impl CoreTensorOps for RocmDevice {
             ));
         }
         let total = out.elem_count();
+
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
 
         let mut out_ptr = dev_ptr(&storage)?;
@@ -431,6 +432,51 @@ impl CoreTensorOps for RocmDevice {
         let x_dims = x.shape().dims();
         if x_dims.is_empty() {
             return Err(Error::Shape("rms_norm: empty input".into()));
+        }
+        let row_len = out
+            .dims()
+            .last()
+            .copied()
+            .ok_or_else(|| Error::Shape("empty tensor dims".into()))?;
+        let total = out.elem_count();
+        // Elementwise-INT8 weight (ForestRaven framed blob, 1-D norm): the
+        // frame offsets are computable host-side because Int8PerChannel is
+        // 1 byte/element — codes at +8, the single f32 scale at +8+len+8.
+        // No D2H at dispatch; the kernel loads the scale from device memory.
+        if let Some(rs) = weight.as_any().downcast_ref::<RocmStorage>() {
+            if matches!(
+                rs.dtype().storage,
+                grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
+            ) {
+                let elem = rs.shape().elem_count();
+                let base = w_ptr as usize;
+                let mut codes_ptr = (base + 8) as *mut c_void;
+                let mut scales_ptr = (base + 8 + elem + 8) as *mut c_void;
+                let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+                let mut out_ptr = dev_ptr(&storage)?;
+                let mut row_len_i = row_len as i32;
+                let mut eps_f = eps;
+                let mut total_i = total as i32;
+                let (grid, block) = warp_rows_launch(total / row_len.max(1));
+                self.launch_compute_kernel(
+                    "grim_rms_norm_i8",
+                    grid,
+                    block,
+                    &mut [
+                        arg(&mut x_ptr),
+                        arg(&mut codes_ptr),
+                        arg(&mut scales_ptr),
+                        arg(&mut out_ptr),
+                        arg(&mut row_len_i),
+                        arg(&mut eps_f),
+                        arg(&mut total_i),
+                    ],
+                )?;
+                return Ok((
+                    Box::new(storage),
+                    Box::new(RocmHandle::new(Some(self.active_stream()))),
+                ));
+            }
         }
         let row_len = out
             .dims()

@@ -2087,6 +2087,51 @@ fn f16_to_f32(lo: u8, hi: u8) -> f32 {
  /// fp32 little-endian scales. The framed blob layout
  /// (`[u64 codes_len][codes][u64 scales_len][scales]`) is assembled by the
  /// caller (convert, rewrite), mirroring WhiteCrow's triple-stream frame.
+/// Dequantize a framed Int8PerChannel blob (`[u64 codes_len][i8 codes]
+/// [u64 scales_len][f32 scales]`, per-row absmax) back to f32. `k` is the
+/// contiguous row length: element i uses scale[i / k]. For 1-D elementwise
+/// tensors (norm weights) k = elem_count and every element shares scale[0].
+/// This is the CPU read path for elementwise-INT8 weights and the oracle
+/// for the `grim_rms_norm_i8` / `grim_layer_norm_i8` kernels.
+pub fn dequant_int8_per_channel_framed(blob: &[u8], elem_count: usize, k: usize) -> Result<Vec<f32>> {
+    if blob.len() < 16 {
+        return Err(Error::Backend(format!(
+            "dequant_int8_per_channel_framed: blob too short: {}",
+            blob.len()
+        )));
+    }
+    let codes_len = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
+    if codes_len != elem_count {
+        return Err(Error::Backend(format!(
+            "dequant_int8_per_channel_framed: codes_len {codes_len} != elem_count {elem_count}"
+        )));
+    }
+    if blob.len() < 8 + codes_len + 8 {
+        return Err(Error::Backend("dequant_int8_per_channel_framed: truncated codes".into()));
+    }
+    let codes = &blob[8..8 + codes_len];
+    let scales_len = u64::from_le_bytes(blob[8 + codes_len..8 + codes_len + 8].try_into().unwrap())
+        as usize;
+    let scales_bytes = &blob[8 + codes_len + 8..];
+    if scales_bytes.len() < scales_len {
+        return Err(Error::Backend("dequant_int8_per_channel_framed: truncated scales".into()));
+    }
+    if k == 0 || scales_len < (elem_count.div_ceil(k)) * 4 {
+        return Err(Error::Backend(format!(
+            "dequant_int8_per_channel_framed: scales_len {scales_len} too small for k={k}"
+        )));
+    }
+    let scales: Vec<f32> = scales_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let mut out = Vec::with_capacity(elem_count);
+    for (i, &c) in codes.iter().enumerate() {
+        out.push(scales[i / k] * (c as i8 as f32));
+    }
+    Ok(out)
+}
+
 pub fn quant_forest_per_channel(
     data: &[f32],
     n: usize,
@@ -4028,13 +4073,18 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         // ForestRaven: per-row absmax INT8 in the framed blob. Needs [n, k]
         // for the row count, same as the W4A4 arm above needs it for groups.
         QuantFormat::Int8PerChannel => {
-            if plan.shape.len() < 2 {
-                return Err(Error::Backend(format!(
-                    "Int8PerChannel rewrite needs [n, k] shape, got {:?}",
-                    plan.shape
-                )));
+            if plan.shape.is_empty() {
+                return Err(Error::Backend(
+                    "Int8PerChannel rewrite needs a non-empty shape".into(),
+                ));
             }
-            let (n, k) = (plan.shape[0], plan.shape[1]);
+            // 1-D elementwise tensors (norm weights) pack as a single row:
+            // per-tensor absmax INT8, same framed blob as [n, k].
+            let (n, k) = if plan.shape.len() == 1 {
+                (1usize, plan.shape[0])
+            } else {
+                (plan.shape[0], plan.shape[1])
+            };
             let (codes, scales) = quant_forest_per_channel(data, n, k)?;
             let mut out = Vec::with_capacity(16 + codes.len() + scales.len());
             out.extend_from_slice(&(codes.len() as u64).to_le_bytes());

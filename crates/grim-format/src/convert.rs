@@ -1532,6 +1532,56 @@ fn pack_tensors(
             // through as F32: the flat pack below is scale-less and clamps
             // to [-1, 1] (quantize_to_bpw), which both destroys accuracy and
             // has no reader mapping. RCO offers exactly {2, 32}.
+            // Elementwise-INT8 rung (corvid adaptation): 1-D norm weights
+            // (name ends "norm.weight", >= 256 elements) pack as per-tensor
+            // absmax INT8 in the ForestRaven framed blob. Measured on real
+            // Xing4.0 banks: max rel 0.39%, mean 0.20%. The consumers are the
+            // grim_rms_norm_i8 / grim_layer_norm_i8 kernels (ROCm) and the
+            // CPU inline-dequant path; other elementwise 1-D tensors
+            // (biases, hc scales) stay F32 — their kernels do not exist.
+            if matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco"))
+                && meta.shape.len() == 1
+                && name.ends_with("norm.weight")
+                && elem_count >= 256
+            {
+                let (codes, scales) =
+                    grim_quant::quant_forest_per_channel(&f32_values, 1, elem_count)?;
+                let mut blob = Vec::with_capacity(16 + codes.len() + scales.len());
+                blob.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+                blob.extend_from_slice(&codes);
+                blob.extend_from_slice(&(scales.len() as u64).to_le_bytes());
+                blob.extend_from_slice(&scales);
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 8,
+                    payload_offset: 0,
+                    payload_size: blob.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 8,
+                    override_dtype: crate::gguf::GgufDType::ForestRaven,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, blob), ext, Some(override_)));
+            }
+
             if meta.shape.len() != 2
                 || meta.shape.last().copied().unwrap_or(0) < 64
                 || tensor_bitwidth != 2

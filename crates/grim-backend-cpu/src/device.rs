@@ -447,6 +447,49 @@ impl CoreTensorOps for CpuDevice {
         }
         let n_rows = x.shape().elem_count() / dim;
         let xd = x.data();
+        // Elementwise-INT8 weight (ForestRaven framed blob: [u64 codes_len]
+        // [i8 codes][u64 scales_len][f32 scales], one scale for the whole
+        // 1-D weight): dequant inline, then the plain f32 path. The packed
+        // storage is detectable by its dtype — data() returns the packed
+        // bytes for a Block(Int8PerChannel) storage.
+        if matches!(
+            w.dtype().storage,
+            grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
+        ) {
+            let packed: &[u8] = w
+                .as_any()
+                .downcast_ref::<CpuStorage>()
+                .and_then(|cs| cs.raw_bytes.as_deref())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[]);
+            if packed.len() < 16 + dim + 8 {
+                return Err(Error::Shape(
+                    "rms_norm: INT8 weight blob shorter than its frame".into(),
+                ));
+            }
+            let codes_len = u64::from_le_bytes(packed[0..8].try_into().unwrap()) as usize;
+            if codes_len != dim {
+                return Err(Error::Shape(format!(
+                    "rms_norm: INT8 codes_len {codes_len} != dim {dim}"
+                )));
+            }
+            let codes = &packed[8..8 + dim];
+            let scales_off = 8 + dim + 8;
+            let w_scale = f32::from_le_bytes(packed[scales_off..scales_off + 4].try_into().unwrap());
+            let mut out = vec![0.0f32; n_rows * dim];
+            for r in 0..n_rows {
+                let row = &xd[r * dim..(r + 1) * dim];
+                let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+                let scale = 1.0 / (mean_sq + eps).sqrt();
+                for c in 0..dim {
+                    out[r * dim + c] = row[c] * scale * (w_scale * codes[c] as i8 as f32);
+                }
+            }
+            return Ok((
+                Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+                Box::new(ReadyHandle),
+            ));
+        }
         let wd = w.data();
         let mut out = vec![0.0f32; n_rows * dim];
         for r in 0..n_rows {
