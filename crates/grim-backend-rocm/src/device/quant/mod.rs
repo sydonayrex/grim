@@ -20,6 +20,7 @@ mod dequant_fp_quants;
 mod dequant_host;
 mod dequant_iq_quants;
 mod dequant_k_quants;
+mod dequant_q2_0;
 mod gptq_awq;
 mod mxfp_gemm;
 mod quantize_forward;
@@ -2165,26 +2166,48 @@ impl QuantOps for RocmDevice {
                     &mut [],
                 )?;
             }
-            DTypeStorage::KQuant(scheme @ (KQuantScheme::GsqRco3p5 | KQuantScheme::Q2_0)) => {
-                // Both are 18-byte-per-64 2-bit block formats, and neither has a
-                // backward kernel. The `_` arm below would call
-                // `launch_fused_dequant_backward_gemm_f16`, which reads the
-                // weight as f16 -- i.e. it would read the 18-byte packed code
-                // stream as half-precision floats and produce finite, plausible,
-                // garbage gradients with no fault and no NaN.
+            DTypeStorage::KQuant(KQuantScheme::Q2_0) => {
+                // Q2_0 has its own backward kernel. Until this arm existed the
+                // scheme fell through to the `_` arm below, which calls
+                // `launch_fused_dequant_backward_gemm_f16` -- that reads the
+                // weight as f16, i.e. it read the 18-byte packed code stream as
+                // half-precision floats and returned finite, plausible, garbage
+                // gradients with no fault and no NaN.
+                self.launch_fused_dequant_backward_gemm_q2_0(
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::GsqRco3p5) => {
+                // GSQ-RCO has NO backward kernel, and this arm is the only
+                // thing standing between it and silent gradient corruption.
                 //
-                // This arm exists because the forward dispatch now serves
-                // GsqRco3p5: enabling the forward route without pinning the
-                // backward route is what turns a loud refusal into silent
-                // gradient corruption.
-                return Err(Error::Backend(format!(
-                    "{scheme:?} has no ROCm backward_dx kernel: its forward \
-                     route (CityCrow sudot8) is inference-only. Refusing rather \
-                     than falling through to the f16 residual-packing kernel, \
-                     which would read packed code bytes as f16 and return \
-                     plausible garbage gradients. Use an inference-only run, or \
-                     a format with both directions."
-                )));
+                // The forward route is CityCrow: `repack_to_u4_lanes` converts
+                // the 18-byte blocks to the u4 group-128 lanes
+                // `grim_dot8_w4a4_gemv` consumes. A backward kernel would have
+                // to read those u4 lanes, not the source blocks, so it is not a
+                // Q2_0-shaped kernel with a different offset -- the weight
+                // layout on the backward path genuinely differs, and writing it
+                // is its own piece of work rather than an arm here.
+                //
+                // The `_` arm's f16 residual-packing kernel would read the
+                // packed code bytes as half-precision floats. Refusing is the
+                // point.
+                return Err(Error::Backend(
+                    "GsqRco3p5 has no ROCm backward_dx kernel. Its forward \
+                     route (CityCrow u4 lanes) is inference-only, and its weight \
+                     layout on the backward path would be those u4 lanes rather \
+                     than the source 18-byte blocks, so this is not a Q2_0 arm \
+                     with a different offset. Refusing rather than falling \
+                     through to the f16 residual-packing kernel, which would read \
+                     packed code bytes as f16 and return plausible garbage \
+                     gradients."
+                        .into(),
+                ));
             }
             _ => {
                 self.launch_fused_dequant_backward_gemm_f16(

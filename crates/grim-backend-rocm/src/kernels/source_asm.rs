@@ -29,6 +29,11 @@ pub fn compute_kernel_source() -> String {
     // fp16_to_float_device from shared_device_fns (pushed first). Arch-guarded
     // to RDNA3/4 inside the source itself.
     s.push_str(crate::kernels::dot_gemv::KERNEL_SOURCE);
+    // Q2_0 (GGUF tag 42) fused-dequant backward. After dot_gemv, which holds
+    // `fp16_to_float_device`'s definition site for the Q2_0 forward GEMV. NOT
+    // feature-gated: the Q2_0 forward is unconditional, and gating only the
+    // backward would reproduce the half-wired state this kernel fixes.
+    s.push_str(crate::kernels::q2_0_gemm::KERNEL_SOURCE);
     // TreePie (WS-A): 5.0 bpw decode + M=1 GEMV. After dot_gemv -- reuses
     // grim_fdot2_f32_f16 from it.
     s.push_str(crate::kernels::tree_pie::KERNEL_SOURCE);
