@@ -890,6 +890,24 @@ __device__ __forceinline__ float iq4nl_codebook(int n) {
     return CB[n & 15];
 }
 
+// Signed IQ4_NL codebook, verbatim from llama.cpp `kvalues_iq4nl` and from
+// `grim_quant::iq_tables::KVALUES_IQ4NL` -- which is the table
+// `dequant_iq4xs` and `dequant_iq4nl` actually index.
+//
+// Distinct from [`iq4nl_codebook`] above, and deliberately so: that table is
+// unsigned magnitudes (indices 0..7 are positive) because the IQ4_NL decode
+// takes the sign from a separate sign plane, and its last two entries are
+// 87/107 rather than the canonical 89/113. Neither property is usable where the
+// nibble itself carries the sign. One table per convention is the honest fix;
+// aliasing them would silently negate every negative weight.
+__device__ __forceinline__ float kvalues_iq4nl_signed(int n) {
+    const float CB[16] = {
+        -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+        1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+    };
+    return CB[n & 15];
+}
+
 __device__ __forceinline__ float iq4xs_codebook(int n) {
     const float CB[16] = {
         0.0f, 0.11314126f, 0.24373604f, 0.39743365f,
@@ -918,16 +936,26 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
         float sign = sbit ? -1.0f : 1.0f;
         return iq4nl_codebook(nibble) * scale * sign;
     } else if (fmt == 1) { // iq4xs
+        // block_iq4_xs: d f16 @0..2, scales_h u16 @2..4, scales_l[4] @4..8,
+        // qs[128] @8..136. The 6-bit sub-block scale is SPLIT: 4 low bits from
+        // `scales_l` (two sub-blocks per byte) and 2 high bits from `scales_h`
+        // (two bits per sub-block). It cannot be read out of one byte with a
+        // shift, which is what the previous form tried -- at sb=1 that read
+        // `(byte >> 6) & 0x3F` and so could only ever recover 2 of the 6 bits.
+        // With a 32-valued scale that decoded to 0 and the whole sub-block
+        // multiplied out to zero.
         float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
-        const unsigned char* scales_buf = d + 2;
+        const unsigned char* scales_l = d + 4;
+        unsigned int scales_h = (unsigned int)d[2] | ((unsigned int)d[3] << 8);
         const unsigned char* qs = d + 8;
-        int sb = local / 32;
-        int sc_val = (scales_buf[sb * 6 / 8] >> ((sb * 6) % 8)) & 0x3F;
-        float scale = scale_d * ((float)sc_val - 32.0f) * (1.0f / 32.0f);
-        int nibble = (qs[local / 2] >> ((local & 1) * 4)) & 0x0F;
-        float code_mag = iq4xs_codebook(nibble & 7);
-        float sign = (nibble & 8) ? -1.0f : 1.0f;
-        return code_mag * scale * sign;
+        int ib = local / 32;                 // 8 sub-blocks of 32 per block
+        int ls = (int)((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+               | (int)((((scales_h >> (2 * ib)) & 0x03)) << 4);
+        float dl = scale_d * ((float)ls - 32.0f);
+        int j = local - ib * 32;             // 0..31
+        unsigned char qbyte = qs[ib * 16 + (j & 15)];
+        int nib = (j < 16) ? (int)(qbyte & 0x0F) : (int)(qbyte >> 4);
+        return dl * kvalues_iq4nl_signed(nib);
     } else if (fmt == 2) { // iq3xxs
         float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
         const unsigned char* qs = d + 2;
