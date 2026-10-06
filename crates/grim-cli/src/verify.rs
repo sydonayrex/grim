@@ -179,6 +179,43 @@ fn verify_metadata<R: Read + Seek>(
     let hash = hasher.finalize();
     println!("[OK]  Model Provenance Checksum: sha256:{:x}", hash);
 
+    // 6. Embedded sidecar attachments (GRIMATT trailer): report kinds and
+    //    re-verify every blob's SHA-256 against the index.
+    match grim_format::format::parse_attachment_index(&file_buf, 0) {
+        Ok(idx) if idx.is_empty() => {
+            println!("[--]  Embedded sidecar attachments: none");
+        }
+        Ok(idx) => {
+            println!(
+                "[OK]  Embedded sidecar attachments: {}",
+                idx.iter()
+                    .map(|a| a.kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for att in &idx {
+                match grim_format::format::attachment_bytes_from_buf(&file_buf, att) {
+                    Ok(_) => println!(
+                        "[OK]    {}: {} bytes, sha256:{}",
+                        att.kind,
+                        att.size,
+                        att.sha256.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    ),
+                    Err(e) => {
+                        report.errors.push(format!("Attachment '{}': {e}", att.kind));
+                        println!("[ERR]  Attachment '{}': {e}", att.kind);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            report
+                .errors
+                .push(format!("Attachment index unreadable: {e}"));
+            println!("[ERR]  Attachment index: {e}");
+        }
+    }
+
     Ok(())
 }
 
