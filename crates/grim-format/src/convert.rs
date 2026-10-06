@@ -1219,6 +1219,7 @@ fn pack_tensors(
                 && tensor_bitwidth == 2
                 && meta.shape.len() >= 2
                 && meta.shape.iter().all(|d| *d > 0)
+                && meta.shape.last().copied().unwrap_or(0) >= 64
                 && elem_count % grim_quant::BLOCK_SIZE_Q2_0 == 0
             {
                 let mut bytes =
@@ -1288,6 +1289,7 @@ fn pack_tensors(
                 if let Some((bits, block, gdtype)) = tier {
                     if meta.shape.len() >= 2
                         && meta.shape.iter().all(|d| *d > 0)
+                        && meta.shape.last().copied().unwrap_or(0) >= 64
                         && elem_count % block == 0
                     {
                         let bytes = match gdtype {
@@ -1580,7 +1582,13 @@ fn pack_tensors(
             // grim_rms_norm_i8 / grim_layer_norm_i8 kernels (ROCm) and the
             // CPU inline-dequant path; other elementwise 1-D tensors
             // (biases, hc scales) stay F32 — their kernels do not exist.
-            if matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco"))
+            // GRIM_NORM_INT8=0 skips this rung (bisect knob for the NaN
+            // serving defect — norms fall through to F32 passthrough).
+            let norm_int8_enabled = std::env::var("GRIM_NORM_INT8")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if norm_int8_enabled
+                && matches!(fmt.as_deref(), Some("gsq_rco_3p5") | Some("gsqrco"))
                 && meta.shape.len() == 1
                 && name.ends_with("norm.weight")
                 && elem_count >= 256

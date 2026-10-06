@@ -296,8 +296,29 @@ pub fn cmd_oxidizer_search(
             // based repair walks rungs pairwise): 7 = Q2_K 2.625 slots
             // between GSQ 2.25 and Q3_K 3.4375 — the released artifact's
             // dominant rungs are Q3_K (60.4B params) and Q2_0/Q2_K.
-            available_bpws: vec![2, 7, 3, 4, 5, 6],
-            costs: Some(vec![2.25, 2.625, 3.4375, 4.5, 5.5, 6.5]),
+            // GRIM_RCO_MENU bisect knob: comma-separated bpw labels to
+            // restrict the ladder (diagnostic for serving defects).
+            available_bpws: std::env::var("GRIM_RCO_MENU")
+                .ok()
+                .map(|v| v.split(',').filter_map(|x| x.trim().parse::<u32>().ok()).collect())
+                .unwrap_or_else(|| vec![2, 7, 3, 4, 5, 6]),
+            costs: {
+                let all = [(2u32, 2.25f64), (7, 2.625), (3, 3.4375), (4, 4.5), (5, 5.5), (6, 6.5)];
+                let menu = std::env::var("GRIM_RCO_MENU")
+                    .ok()
+                    .map(|v| v.split(',').filter_map(|x| x.trim().parse::<u32>().ok()).collect::<Vec<u32>>())
+                    .unwrap_or_else(|| vec![2, 7, 3, 4, 5, 6]);
+                Some(
+                    menu.iter()
+                        .map(|m| {
+                            all.iter()
+                                .find(|(l, _)| l == m)
+                                .map(|(_, c)| *c as f32)
+                                .unwrap_or(*m as f32)
+                        })
+                        .collect(),
+                )
+            },
             ..Default::default()
         },
         &importance_scores.layer_scores,
