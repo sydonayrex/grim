@@ -1169,6 +1169,47 @@ fn pack_tensors(
             // The .grim payload is the same byte stream the GGUF tag-81
             // reader consumes, so the packed entry needs no per-tensor ext
             // beyond the block size.
+            // EXPERT STACKS PASS THROUGH VERBATIM (2026-10-05): the kq-native
+            // MoE dispatch decodes gate/up as IQ3_S and down as Q4_K/IQ3_S,
+            // and the GSQ/Q2K rungs on these banks are quality-dead anyway
+            // (Phase 0' fake-quant: output error 2.1-2.4x signal). Re-slicing
+            // the [n_experts, out, in] 3-D bank through a 2-D packer also
+            // corrupts the per-expert row geometry. Pass the source bytes
+            // through with an IQ3S override so kq-native serves them
+            // natively — the corvid rungs apply to NON-expert tensors.
+            if name.contains("_exps") {
+                let entry = crate::format::GrimTensorEntry {
+                    name: name.clone(),
+                    shape: meta.shape.clone(),
+                    base_bitwidth: 3,
+                    payload_offset: 0,
+                    payload_size: raw.bytes.len() as u64,
+                    outlier_count: 0,
+                    outlier_offset: 0,
+                    ..Default::default()
+                };
+                let ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let override_ = crate::gguf::GrimQuantOverride {
+                    tensor_name: name.clone(),
+                    effective_bpw: 3,
+                    override_dtype: crate::gguf::GgufDType::IQ3_S,
+                    importance_score: 0.0,
+                    layout_hint: None,
+                };
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref mtx) = progress_mutex {
+                    if let Ok(mut cb) = mtx.lock() {
+                        cb("pack", count, total);
+                    }
+                }
+                return Ok(((entry, raw.bytes), ext, Some(override_)));
+            }
+
+
             // GSQ-RCO tier = bitwidth 2 (2.25 bpw block stream, bias-2
             // codebook). Applies to 2-D weights AND the 3-D MoE expert stacks
             // (the released Qwen3.8-Flash-Next GSQ-RCO artifact carries its
@@ -2080,6 +2121,10 @@ mod tests {
             ),
         );
         let provider_exps = MockProvider { tensors: exps };
+        // The expert stack now PASSES THROUGH as source IQ3_S bytes (the
+        // kq-native dispatch decodes IQ3_S gate/up natively, and the Phase 0'
+        // fake-quant study showed GSQ requant of these banks is quality-dead)
+        // — the GSQ rung is reserved for non-expert tensors.
         let (packed_exps, _, ov_exps) = pack_tensors(
             &provider_exps,
             &[exps_name],
@@ -2091,9 +2136,8 @@ mod tests {
             Some("gsq_rco_3p5"),
         )
         .expect("3-D expert stack packs");
-        assert_eq!(packed_exps[0].0.base_bitwidth, 2);
-        assert_eq!(packed_exps[0].1.len(), (4 * 128 * 64) / 64 * 18);
-        assert_eq!(ov_exps[0].override_dtype, crate::gguf::GgufDType::GsqRco3p5);
+        assert_eq!(packed_exps[0].0.base_bitwidth, 3);
+        assert_eq!(ov_exps[0].override_dtype, crate::gguf::GgufDType::IQ3_S);
     }
 }
 
