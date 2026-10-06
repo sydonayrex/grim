@@ -1353,7 +1353,24 @@ fn charon_grouped_q80_matches_fp32() {
 // pattern; the KAT still proves the kernel decodes those bytes identically to
 // `dequant_q2k/q3k`.
 
-const IQK_BLOCK_BYTES: [usize; 12] = [170, 136, 96, 110, 66, 74, 82, 144, 176, 210, 76, 82];
+// Bytes per super-block, per format, matching `iqk_weight`'s table in
+// `kernels/charon.rs`.
+//
+// iq4nl was wrong before: it is 18 bytes per **32** weights (llama.cpp
+// `QK4_NL = 32`), not a 256-weight super-block. The old 170 matched no
+// llama.cpp layout at all, so slicing an expert out of the packed bank ran off
+// the end of the buffer. 36 is two 18-byte blocks because a MoE expert here is
+// INTER*HIDDEN = 64 weights, so this table is expert-size dependent.
+//
+// iq3xxs is 98 (2 + 64 qs + 32 scales_and_signs), the layout
+// `grim_quant::dequant_iq3xxs` actually reads -- and the only real IQ3_XXS
+// implementation in the tree. `quant_iq3xxs` still emits 96, and the ROCm and
+// CUDA kernels are both stubs that fabricate values with
+// `(grid_idx + sub_idx * 17) % 7`; the CUDA one is labelled "bit-accurate vs
+// grim_quant::dequant_iq3xxs", which is false. So iq3xxs fails here on a short
+// encoder, and that is the honest report until the encoder is brought up to the
+// format. The kernel and this table are aligned on 98 in anticipation.
+const IQK_BLOCK_BYTES: [usize; 12] = [36, 136, 98, 110, 66, 74, 82, 144, 176, 210, 76, 82];
 const IQK_NAMES: [&str; 12] = [
     "iq4nl", "iq4xs", "iq3xxs", "iq3s", "iq2xxs", "iq2xs", "iq2s", "q4k", "q5k", "q6k", "q2k",
     "q3k",
