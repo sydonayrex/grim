@@ -102,8 +102,7 @@ fn model_architecture_bert_is_not_routed() {
     // is not this one.
     let src = loader();
     assert!(
-        !src.contains("ModelArchitecture::Bert =>")
-            && !src.contains("| ModelArchitecture::Bert "),
+        !src.contains("ModelArchitecture::Bert =>") && !src.contains("| ModelArchitecture::Bert "),
         "ModelArchitecture::Bert is now routed; if that is deliberate, BertBlock \\
          becomes live for plain BERT and the six sites above are no longer the \\
          whole blast radius"
@@ -117,10 +116,7 @@ fn the_loader_builds_two_configs_it_then_discards() {
     // GGUF's epsilon is read and dropped.
     let src = loader();
     for name in ["modern_bert_cfg", "nomic_bert_cfg"] {
-        let uses: Vec<usize> = src
-            .match_indices(name)
-            .map(|(i, _)| i)
-            .collect();
+        let uses: Vec<usize> = src.match_indices(name).map(|(i, _)| i).collect();
         // Two per load path: the declaration and the log. If a use appears
         // beyond those, the value is no longer discarded and the epsilon
         // question has been answered.
@@ -151,7 +147,9 @@ fn bert_config_has_no_epsilon_field() {
     // put the value. If a `layer_norm_eps` appears here, the loader should be
     // passing it and point 3 above is answered.
     let src = bert_rs();
-    let start = src.find("pub struct BertConfig").expect("BertConfig must exist");
+    let start = src
+        .find("pub struct BertConfig")
+        .expect("BertConfig must exist");
     let body_end = src[start..].find("\n}").expect("BertConfig must be closed");
     let body = &src[start..start + body_end];
     assert!(

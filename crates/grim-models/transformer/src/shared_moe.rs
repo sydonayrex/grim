@@ -76,12 +76,19 @@ pub struct CharonCache {
     /// Tests assert this to prove the NATIVE quantized arm ran (a numeric
     /// match alone cannot distinguish it from the dequant fallback — both
     /// compute the same math by design).
+    /// One-time-per-cache arm-selection trace: refusals name themselves at
+    /// the decision site exactly once (this cache is per MoE layer), so a
+    /// run log answers "which arm served this layer and why not the native
+    /// ones" without per-token spam.
+    arm_trace: Mutex<std::collections::HashSet<&'static str>>,
+    won_logged: Mutex<std::collections::HashSet<&'static str>>,
     last_dispatch: Mutex<DispatchKind>,
 }
 
 /// Which numeric path served a `fused_moe_dispatch_from_logits` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchKind {
+
     /// f32 expert stacks (native f32, or any quantized format dequantized
     /// to f32 at stack-build time).
     F32Dequant,
@@ -110,6 +117,22 @@ pub enum DispatchKind {
     /// once to OSTQuant u4 group-128 blobs, decoded in-register with f32
     /// activations. ~0.5 B/param resident vs the f32 stacks' 4 B/param.
     WhiteCrowNative,
+}
+
+impl DispatchKind {
+    /// Stable per-variant key for the one-time arm-selection trace.
+    fn trace_key(self) -> &'static str {
+        match self {
+            DispatchKind::F32Dequant => "F32Dequant",
+            DispatchKind::KqNative => "KqNative",
+            DispatchKind::W8a8Native => "W8a8Native",
+            DispatchKind::W8a8NativeDot4 => "W8a8NativeDot4",
+            DispatchKind::W8a8Fp8Native => "W8a8Fp8Native",
+            DispatchKind::AwqNative => "AwqNative",
+            DispatchKind::Mxfp4Native => "Mxfp4Native",
+            DispatchKind::WhiteCrowNative => "WhiteCrowNative",
+        }
+    }
 }
 
 /// Resident WhiteCrow u4-group128 expert blobs. One blob per projection;
@@ -209,6 +232,8 @@ impl CharonCache {
             kq_native: Mutex::new(None),
             whitecrow_refused: Mutex::new(false),
             last_dispatch: Mutex::new(DispatchKind::F32Dequant),
+            arm_trace: Mutex::new(std::collections::HashSet::new()),
+            won_logged: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -219,6 +244,8 @@ impl CharonCache {
         *self.whitecrow.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.kq_native.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.whitecrow_refused.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.arm_trace.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.won_logged.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.routing.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.w8a8.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.w8a8fp8.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -245,7 +272,49 @@ impl CharonCache {
     }
 
     fn record_dispatch(&self, kind: DispatchKind) {
+        {
+            let mut won = self.won_logged.lock().unwrap_or_else(|e| e.into_inner());
+            if won.insert(kind.trace_key()) {
+                eprintln!("[moe-arm] WINNER: {:?}", kind);
+            }
+        }
         *self.last_dispatch.lock().unwrap_or_else(|e| e.into_inner()) = kind;
+    }
+
+    /// Log an arm refusal once per cache (per MoE layer): the arm's static
+    /// key dedupes, the error text names the reason at the decision site.
+    fn trace_arm_refusal(&self, arm: &'static str, err: &grim_core::error::Error) {
+        let logged = self
+            .arm_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(arm);
+        if logged {
+            eprintln!("[moe-arm] {arm}: REFUSED — {err}");
+        }
+    }
+
+    /// One-time diagnostic by arbitrary key (e.g. the observed bank scheme).
+    fn trace_once(&self, key: &'static str, msg: &str) {
+        let logged = self
+            .arm_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+        if logged {
+            eprintln!("[moe-arm] {key}: {msg}");
+        }
+    }
+
+    fn trace_arm_disabled(&self, arm: &'static str, reason: &str) {
+        let logged = self
+            .arm_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(arm);
+        if logged {
+            eprintln!("[moe-arm] {arm}: DISABLED — {reason}");
+        }
     }
 }
 
@@ -1072,7 +1141,20 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
         std::env::var("GRIM_MOE_KQ_NATIVE").as_deref(),
         Ok("0" | "false" | "off")
     ) {
+        if let Err(ref e) = ensure_kq_native(ordinal, experts, cache) {
+            cache.trace_arm_refusal("KqNative", e);
+        }
         if let Ok(kq) = ensure_kq_native(ordinal, experts, cache) {
+            if let Some(e0) = experts.first() {
+                let sch = match &e0.gate.weight.dtype().storage {
+                    grim_tensor::Storage::KQuant(sch) => format!("{sch:?}"),
+                    other => format!("{other:?}"),
+                };
+                cache.trace_once(
+                    "KqNative-gate-scheme",
+                    &format!("kq arm accepted; expert[0] gate bank storage = {sch}"),
+                );
+            }
             cache.record_dispatch(DispatchKind::KqNative);
             let out_shape = Shape::new(vec![seq_len, hidden]);
             let out_storage_b = rocm.zeros(&out_shape, DType::F32)?;
@@ -1136,6 +1218,16 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
     // kernel. Env-gated because the requant is lossy relative to the
     // checkpoint's own quantization; a build failure here degrades to the
     // arms below (printed, not silent — the Q6K lm_head lesson).
+    if let Err(ref e) = ensure_whitecrow_scratch(ordinal, experts, cache) {
+        let disabled = std::env::var("GRIM_MOE_NATIVE_WHITECROW")
+            .map(|v| !matches!(v.as_str(), "1" | "true" | "on"))
+            .unwrap_or(true);
+        if disabled {
+            cache.trace_arm_disabled("WhiteCrowNative", "GRIM_MOE_NATIVE_WHITECROW not enabled");
+        } else {
+            cache.trace_arm_refusal("WhiteCrowNative", e);
+        }
+    }
     if let Ok(wc) = ensure_whitecrow_scratch(ordinal, experts, cache) {
         cache.record_dispatch(DispatchKind::WhiteCrowNative);
         let out_shape = Shape::new(vec![seq_len, hidden]);

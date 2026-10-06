@@ -370,6 +370,11 @@ impl<'a> WeightSource<'a> {
             })
     }
 
+    /// Concrete provider type for load-path diagnostics (arm tracing).
+    pub fn provider_type_name(&self) -> &'static str {
+        std::any::type_name_of_val(self.tensors)
+    }
+
     pub fn full_name(&self, leaf: &str) -> String {
         let mut s = self.prefix.join(".");
         if !s.is_empty() {

@@ -35,6 +35,10 @@ pub trait TensorProvider: Send + Sync {
     fn get_packed(&self, name: &str) -> Result<RawTensor> {
         self.get(name)
     }
+    /// Load-path diagnostics: which concrete provider served a tensor.
+    fn provider_kind(&self) -> &'static str {
+        "unknown"
+    }
     /// Optional hint — metadata the loader wants to expose without
     /// materializing the full tensor (shape, dtype, provenance).
     fn meta(&self, name: &str) -> Result<TensorMeta>;

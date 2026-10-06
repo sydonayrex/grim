@@ -620,6 +620,19 @@ impl ExpertBank {
 
         for (p_idx, (name, out, in_)) in projections.iter().enumerate() {
             let raw = ws.get_raw_packed(name)?;
+            // One-time-per-bank-name load diagnostic: names the scheme the
+            // MoE arm will actually decode (the reconvert-bypass lesson —
+            // the .grim said GSQ while the runtime served sibling IQ3_S).
+            static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+                std::sync::OnceLock::new();
+            let seen_set = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            {
+                let mut seen = seen_set.lock().unwrap_or_else(|e| e.into_inner());
+                let key = format!("{name}:{:?}", raw.dtype);
+                if seen.insert(key) {
+                    eprintln!("[expert-bank] {name}: bank dtype = {:?}", raw.dtype);
+                }
+            }
             let dims = &raw.shape;
             let expected = vec![num_experts, *out, *in_];
             if *dims != expected {
@@ -874,6 +887,19 @@ impl NonGatedExpertBank {
 
         for (p_idx, (name, out, in_)) in projections.iter().enumerate() {
             let raw = ws.get_raw_packed(name)?;
+            // One-time-per-bank-name load diagnostic: names the scheme the
+            // MoE arm will actually decode (the reconvert-bypass lesson —
+            // the .grim said GSQ while the runtime served sibling IQ3_S).
+            static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+                std::sync::OnceLock::new();
+            let seen_set = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            {
+                let mut seen = seen_set.lock().unwrap_or_else(|e| e.into_inner());
+                let key = format!("{name}:{:?}", raw.dtype);
+                if seen.insert(key) {
+                    eprintln!("[expert-bank] {name}: bank dtype = {:?}", raw.dtype);
+                }
+            }
             let dims = &raw.shape;
             let expected = vec![num_experts, *out, *in_];
             if *dims != expected {

@@ -65,7 +65,11 @@ fn bertblock_runs_and_is_finite() {
         (0..h).map(|i| i as f32 * 0.5 - 0.75).collect::<Vec<f32>>(),
         grim_tensor::Shape::new(vec![1, h]),
     );
-    let got = b.forward(&x).expect("forward").to_vec_f32().expect("readable");
+    let got = b
+        .forward(&x)
+        .expect("forward")
+        .to_vec_f32()
+        .expect("readable");
     assert_eq!(got.len(), h, "output must keep the hidden size");
     assert!(
         got.iter().all(|v| v.is_finite()),

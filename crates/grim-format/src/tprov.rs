@@ -409,6 +409,10 @@ impl TensorProvider for GgufProvider {
         self.read_region(abs, len as usize)
     }
 
+    fn provider_kind(&self) -> &'static str {
+        "GgufProvider(sibling GGUF)"
+    }
+
     fn meta(&self, name: &str) -> Result<TensorMeta> {
         let info = self
             .tensors
@@ -1329,6 +1333,10 @@ impl TensorProvider for GrimProvider {
         })
     }
 
+    fn provider_kind(&self) -> &'static str {
+        "GrimProvider(.grim payloads)"
+    }
+
     fn meta(&self, name: &str) -> Result<TensorMeta> {
         let entry = self
             .file
@@ -1408,7 +1416,20 @@ impl<'a> TensorProvider for RemappingTensorProvider<'a> {
 
     fn get_packed(&self, name: &str) -> Result<RawTensor> {
         let mapped = (self.remap)(name);
+        if name.contains("ffn_gate_exps") {
+            static ONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if ONCE.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+                eprintln!(
+                    "[remap] get_packed('{name}') -> '{mapped}' via {}",
+                    self.inner.provider_kind()
+                );
+                let _ = ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.inner.get_packed(&mapped)
+    }
+    fn provider_kind(&self) -> &'static str {
+        self.inner.provider_kind()
     }
 
     fn get_packed_sharded(
