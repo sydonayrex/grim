@@ -2046,6 +2046,10 @@ pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     }
 }
 
+fn f16_to_f32_bits(bits: u16) -> f32 {
+    f16_to_f32((bits & 0xFF) as u8, (bits >> 8) as u8)
+}
+
 fn f16_to_f32(lo: u8, hi: u8) -> f32 {
     let bits = u16::from_le_bytes([lo, hi]);
     let sign = (bits >> 15) as u32;
@@ -2575,95 +2579,178 @@ pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
 
 /// Quantize a slice of f32 values to Q6_K bytes per the ggml super-block format.
 /// Encodes 256-weight blocks into 210-byte Q6_K super-blocks.
+fn sc_bytes_f(scales_f: &[f32; 16], sg: usize, is_half: usize, q_slot: usize) -> i32 {
+    // The stored i8 scale for this group, mirrored from the write loop.
+    // Recomputing it here keeps the code-derivation consistent with the
+    // stored bytes (the fit scale is quantized to i8 before use).
+    let max_scale = scales_f.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if max_scale == 0.0 {
+        return 0;
+    }
+    let iscale = -128.0 / max_scale;
+    qk_nearest_int(iscale * scales_f[sg * 8 + is_half + q_slot * 2]).clamp(-127, 127)
+}
+
 pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
-    const BLOCK_SIZE: usize = 256;
+    const BLOCK: usize = 256;
     const BLOCK_BYTES: usize = 210;
 
     if data.is_empty() {
         return Ok(Vec::new());
     }
+    if data.len() % BLOCK != 0 {
+        return Err(Error::Backend(format!(
+            "quant_q6k: {} weights is not a multiple of the 256-weight block",
+            data.len()
+        )));
+    }
 
-    let num_blocks = data.len().div_ceil(BLOCK_SIZE);
-    let mut out = Vec::with_capacity(num_blocks * BLOCK_BYTES);
-
-    for block in data.chunks(BLOCK_SIZE) {
-        let mut block_data = [0.0f32; 256];
-        block_data[..block.len()].copy_from_slice(block);
-
-        // Q6_K uses 16 sub-blocks of 16 weights each, each with its own i8 scale.
-        // Global d is f16.
-        let mut sub_scales = [0i8; 16];
-        for s in 0..16 {
-            let sub = &block_data[s * 16..(s + 1) * 16];
-            let max_abs = sub.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            let sc = if max_abs > 0.0 {
-                (max_abs / 31.0).round() as i8
-            } else {
-                1
-            };
-            sub_scales[s] = sc.clamp(1, 63);
+    // Weighted best-fit scale for a 16-weight sub-block over the SIGNED
+    // 6-bit grid [-32, 31] (llama.cpp make_qx_quants, ggml-quants.c:628,
+    // including the +-0.1 iscale refinement scan; weights = x^2).
+    fn fit_scale_q6(x: &[f32], l_out: &mut [i32]) -> f32 {
+        const EPS: f32 = 1e-15;
+        let mut max = 0.0f32;
+        let mut amax = 0.0f32;
+        for &v in x {
+            let a = v.abs();
+            if a > amax {
+                amax = a;
+                max = v;
+            }
         }
+        if amax < EPS {
+            for l in l_out.iter_mut() {
+                *l = 0;
+            }
+            return 0.0;
+        }
+        let nmax = 32.0f32;
+        let iscale = -nmax / max;
+        let mut sumlx = 0.0f32;
+        let mut suml2 = 0.0f32;
+        for (i, &v) in x.iter().enumerate() {
+            let l = qk_nearest_int(iscale * v).clamp(-32, 31);
+            l_out[i] = l;
+            let w = v * v;
+            sumlx += w * v * l as f32;
+            suml2 += w * (l * l) as f32;
+        }
+        let mut scale = if suml2 > 0.0 { sumlx / suml2 } else { 0.0 };
+        let mut best = scale * sumlx;
+        for is in -9..=9 {
+            if is == 0 {
+                continue;
+            }
+            let iscale2 = -(nmax + 0.1 * is as f32) / max;
+            let (mut sumlx2, mut suml22) = (0.0f32, 0.0f32);
+            for &v in x.iter() {
+                let l = qk_nearest_int(iscale2 * v).clamp(-32, 31);
+                let w = v * v;
+                sumlx2 += w * v * l as f32;
+                suml22 += w * (l * l) as f32;
+            }
+            if suml22 > 0.0 && sumlx2 * sumlx2 > best * suml22 {
+                for (i, l) in l_out.iter_mut().enumerate() {
+                    *l = qk_nearest_int(iscale2 * x[i]).clamp(-32, 31);
+                }
+                scale = sumlx2 / suml22;
+                best = scale * sumlx2;
+            }
+        }
+        scale
+    }
 
-        let max_sc = sub_scales
-            .iter()
-            .map(|&s| s.max(1) as f32)
-            .fold(0.0f32, f32::max);
-        let d = if max_sc > 0.0 { max_sc / 63.0 } else { 1.0 };
+    let n_blocks = data.len() / BLOCK;
+    let mut out = Vec::with_capacity(n_blocks * BLOCK_BYTES);
 
-        // Normalize sub-scales to [1..63] relative to d
-        if d > 0.0 {
-            for sc in sub_scales.iter_mut() {
-                if *sc as f32 / d > 63.0 {
-                    *sc = 63;
+    for b in 0..n_blocks {
+        let block = &data[b * BLOCK..(b + 1) * BLOCK];
+        let mut l = [0i32; 256];
+        let mut scales_f = [0.0f32; 16];
+        let mut max_scale = 0.0f32;
+        let mut max_abs_scale = 0.0f32;
+
+        // DECODER CONTRACT (grim's dequant_q6k, this file): weight w =
+        // sg*128 + q_slot*32 + is_half*16 + l, with scale index
+        // sg*8 + is_half + q_slot*2. 16 groups of 16 weights, matching the
+        // 16 signed i8 scale slots. The previous encoder grouped by
+        // half*2 + l8 (8-weight groups) — a mapping the decoder never
+        // reads, so every Q6_K tensor decoded to garbage.
+        for sg in 0..2 {
+            for q_slot in 0..4 {
+                for is_half in 0..2 {
+                    let gidx = sg * 8 + is_half + q_slot * 2;
+                    let base = sg * 128 + q_slot * 32 + is_half * 16;
+                    let sc = fit_scale_q6(&block[base..base + 16], &mut l[base..base + 16]);
+                    scales_f[gidx] = sc;
+                    if sc.abs() > max_abs_scale {
+                        max_abs_scale = sc.abs();
+                        max_scale = sc;
+                    }
                 }
             }
         }
 
+        let d = if max_scale != 0.0 {
+            f16_to_f32_bits(f32_to_f16(-max_scale / 128.0))
+        } else {
+            0.0
+        };
+
+        // PACKING per the decoder: q_slot 0/2 write ql[ql_idx + l]
+        // (low/high nibble), q_slot 1/3 write ql[ql_idx + 32 + l]
+        // (low/high); qh[qh_idx + l] bits q_slot*2..+1. Codes are derived
+        // against the QUANTIZED pair (d, stored i8 scale).
         let mut ql = [0u8; 128];
         let mut qh = [0u8; 64];
-
-        // Q6_K layout: 2 super-groups of 128 weights each.
-        // Each super-group: 4 sub-blocks of 32 weights.
         for sg in 0..2 {
-            let sg_base = sg * 128;
-            for l in 0..32 {
-                // 4 weights at positions within this super-group:
-                let w0 = block_data[sg_base + l];
-                let w1 = block_data[sg_base + 64 + l];
-                let w2 = block_data[sg_base + l + 32];
-                let w3 = block_data[sg_base + 96 + l];
-
-                let is = l / 16; // sub-block index within this super-group (0 or 1)
-                let sc_idx = sg * 8 + is * 4;
-
-                let quantize_q6 = |v: f32, sc: i8| -> u8 {
-                    if sc > 0 {
-                        ((v / (d * sc as f32)).round() + 32.0).clamp(0.0, 63.0) as u8
-                    } else {
-                        32
+            let ql_idx = sg * 64;
+            let qh_idx = sg * 32;
+            for q_slot in 0..4 {
+                for is_half in 0..2 {
+                    let base = sg * 128 + q_slot * 32 + is_half * 16;
+                    let dd = d * sc_bytes_f(&scales_f, sg, is_half, q_slot) as f32;
+                    if dd == 0.0 {
+                        continue;
                     }
-                };
-
-                let q1 = quantize_q6(w0, sub_scales[sc_idx]);
-                let q2 = quantize_q6(w2, sub_scales[sc_idx + 2]);
-                let q3 = quantize_q6(w1, sub_scales[sc_idx + 1]);
-                let q4 = quantize_q6(w3, sub_scales[sc_idx + 3]);
-
-                let ql_off = sg * 64;
-                let qh_off = sg * 32;
-
-                ql[ql_off + l] = (q1 & 0x0F) | ((q3 & 0x0F) << 4);
-                ql[ql_off + l + 32] = (q2 & 0x0F) | ((q4 & 0x0F) << 4);
-                qh[qh_off + l] = ((q1 >> 4) & 0x03)
-                    | (((q2 >> 4) & 0x03) << 2)
-                    | (((q3 >> 4) & 0x03) << 4)
-                    | (((q4 >> 4) & 0x03) << 6);
+                    for l in 0..16 {
+                        let w = base + l;
+                        let q = ((block[w] / dd).round() + 32.0).clamp(0.0, 63.0) as u8;
+                        let low = q & 0x0F;
+                        let high = (q >> 4) & 0x03;
+                        // is_half*16 offset applies to BOTH ql and qh: the
+                        // decoder's weight w = sg*128 + q_slot*32 + is_half*16 + l
+                        // reads ql[ql_idx + (local%32)] and qh[qh_idx + local%32]
+                        // where local%32 = is_half*16 + l.
+                        let ql_pos = ql_idx + is_half * 16 + l
+                            + if q_slot == 1 || q_slot == 3 { 32 } else { 0 };
+                        let qh_pos = qh_idx + is_half * 16 + l;
+                        if q_slot == 0 || q_slot == 1 {
+                            ql[ql_pos] = (ql[ql_pos] & 0xF0) | low;
+                        } else {
+                            ql[ql_pos] = (ql[ql_pos] & 0x0F) | (low << 4);
+                        }
+                        qh[qh_pos] |= high << (q_slot * 2);
+                    }
+                }
             }
         }
-
         out.extend_from_slice(&ql);
         out.extend_from_slice(&qh);
-        out.extend_from_slice(&sub_scales.map(|s| s as u8));
+        // scales stored as u8 cast of i8 (decoder reads via `as i8`)
+        for sg in 0..2 {
+            for q_slot in 0..4 {
+                for is_half in 0..2 {
+                    let gidx = sg * 8 + is_half + q_slot * 2;
+                    let stored = qk_nearest_int(
+                        (-128.0 / max_scale) * scales_f[gidx],
+                    )
+                    .clamp(-127, 127);
+                    out.push(stored as i8 as u8);
+                }
+            }
+        }
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
     }
 
@@ -5071,8 +5158,12 @@ fn f32_to_f16(v: f32) -> u16 {
         return (sign << 15) | 0x7C00;
     }
     if exp <= 0x70 {
-        // Underflow: subnormal
-        return sign << 15;
+        // Underflow to f16 SUBNORMAL: value = mant16 * 2^-24 (the decode
+        // side handles this). Flushing to zero here silently zeroed Q6_K
+        // blocks whose f16 d field sat at the subnormal boundary.
+        let mag = v.abs() * 16777216.0; // * 2^24
+        let mant16 = (mag.round() as u32).min(0x03FF) as u16;
+        return (sign << 15) | mant16;
     }
     let new_exp = exp - 127 + 15;
     if new_exp <= 0 {
