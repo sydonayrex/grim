@@ -740,9 +740,15 @@ impl GrimRocmlProfile {
         match self {
             GrimRocmlProfile::Cdna2 => 32,
             GrimRocmlProfile::Cdna3 => 32,
-            GrimRocmlProfile::Rdna2 => 64,
-            GrimRocmlProfile::Rdna3 => 64,
-            GrimRocmlProfile::Rdna4 => 64,
+            // RDNA hardware executes Wave32 (gfx1100/gfx1200 report
+            // wavefront 32; the CLI contract is "RDNA -> Wave32"). The
+            // previous 64s here stamped W64 into every RDNA .grim, and the
+            // loader's Wave64/Wave32 compat guard then fell back to the
+            // sibling GGUF at load — the converted file was never served
+            // (Xing4.0, 2026-10-05).
+            GrimRocmlProfile::Rdna2 => 32,
+            GrimRocmlProfile::Rdna3 => 32,
+            GrimRocmlProfile::Rdna4 => 32,
             GrimRocmlProfile::All | GrimRocmlProfile::Unknown => 0,
         }
     }
@@ -2834,13 +2840,15 @@ mod tests {
     }
 
     /// WI-S5: the RDNA2 (gfx1036) profile parses from both `rdna2` and `gfx1036` aliases, returns the RDNA-family numeric
-    /// hints (wavefront 64, LDS 32 kB), and round-trips through JSON metadata exactly like its RDNA3/RDNA4 siblings.
+    /// hints (wavefront 32 — RDNA hardware executes Wave32; the earlier 64 was a table defect that stamped W64 into every
+    /// RDNA .grim and tripped the loader's Wave64/Wave32 guard into a sibling-GGUF fallback), and round-trips through JSON
+    /// metadata exactly like its RDNA3/RDNA4 siblings.
     #[test]
     fn rocml_profile_rdna2_parses_aliases_and_round_trips() {
         assert_eq!(GrimRocmlProfile::parse("rdna2"), GrimRocmlProfile::Rdna2);
         assert_eq!(GrimRocmlProfile::parse("gfx1036"), GrimRocmlProfile::Rdna2);
         assert_eq!(GrimRocmlProfile::parse("RDNA2"), GrimRocmlProfile::Rdna2);
-        assert_eq!(GrimRocmlProfile::Rdna2.wavefront_size(), 64);
+        assert_eq!(GrimRocmlProfile::Rdna2.wavefront_size(), 32);
         assert_eq!(GrimRocmlProfile::Rdna2.lds_size(), 32768);
 
         // Round-trip through the JSON metadata layer.
@@ -2850,7 +2858,7 @@ mod tests {
         original.lds_size = Some(GrimRocmlProfile::Rdna2.lds_size());
         let restored = GrimMetadata::from_json(&original.to_json());
         assert_eq!(restored.rocml_profile, GrimRocmlProfile::Rdna2);
-        assert_eq!(restored.wavefront_size, 64);
+        assert_eq!(restored.wavefront_size, 32);
         assert_eq!(restored.lds_size, Some(32768));
     }
 
