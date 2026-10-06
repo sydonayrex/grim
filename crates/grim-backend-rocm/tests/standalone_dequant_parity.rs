@@ -237,14 +237,22 @@ fn mxfp8_kernel_matches_cpu_oracle() {
 }
 
 // The dyn-Fn parameter keeps each quant-format case a one-liner at the call site.
+//
+// `block_elems` is per-format and load-bearing: IQ4_NL is 18 bytes per **32**
+// weights (llama.cpp `QK4_NL = 32`), while every other format here is a
+// 256-element super-block. Deriving the weight count from a shared 256 -- as
+// this helper used to -- made IQ4_NL ask the kernel for 512 weights from 36
+// bytes, and then assert the kernel returned 512. The kernel was right: 36
+// bytes is 2 blocks of 32.
 #[allow(clippy::type_complexity)]
 fn run_iq(
     name: &str,
     block_bytes: usize,
+    block_elems: usize,
     cpu: &dyn Fn(&[u8], usize) -> Result<Vec<f32>, QuantError>,
 ) {
     let n_blocks = 2usize;
-    let n_weights = n_blocks * 256;
+    let n_weights = n_blocks * block_elems;
     let mut bytes = Vec::with_capacity(n_blocks * block_bytes);
     for i in 0..(n_blocks * block_bytes) {
         bytes.push((i * 7 % 256) as u8);
@@ -291,11 +299,11 @@ fn run_iq(
 #[test]
 #[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn iq_kernels_run_and_report_deviation() {
-    run_iq("iq2xxs", 66, &|b, n| dequant_iq2xxs(b, n));
-    run_iq("iq2xs", 74, &|b, n| dequant_iq2xs(b, n));
-    run_iq("iq2s", 82, &|b, n| dequant_iq2s(b, n));
-    run_iq("iq3xxs", 96, &|b, n| dequant_iq3xxs(b, n));
-    run_iq("iq3s", 110, &|b, n| dequant_iq3s(b, n));
-    run_iq("iq4nl", 18, &|b, n| dequant_iq4nl(b, n));
-    run_iq("iq4xs", 136, &|b, n| dequant_iq4xs(b, n));
+    run_iq("iq2xxs", 66, 256, &|b, n| dequant_iq2xxs(b, n));
+    run_iq("iq2xs", 74, 256, &|b, n| dequant_iq2xs(b, n));
+    run_iq("iq2s", 82, 256, &|b, n| dequant_iq2s(b, n));
+    run_iq("iq3xxs", 96, 256, &|b, n| dequant_iq3xxs(b, n));
+    run_iq("iq3s", 110, 256, &|b, n| dequant_iq3s(b, n));
+    run_iq("iq4nl", 18, 32, &|b, n| dequant_iq4nl(b, n));
+    run_iq("iq4xs", 136, 256, &|b, n| dequant_iq4xs(b, n));
 }
