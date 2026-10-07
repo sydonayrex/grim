@@ -490,6 +490,88 @@ fn try_graph_decode_step(
     // below never materializes them, so a diverging replay is invisible
     // (steps 2+ print no logprobs). GRIM_DEBUG_TOPLOGITS=1 enables.
     if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+        // Localize the first NaN: scan each layer's graph-owned input buffer
+        // (post-replay, stream synced by read paths below... sync first).
+        unsafe {
+            let _ = grim_backend_rocm::hipDeviceSynchronize();
+        }
+        use grim_tensor::BackendStorage as _BS;
+        let classify = |buf: &dyn grim_tensor::BackendStorage| -> &'static str {
+            let mut v = [0f32; 4];
+            let p = match _BS::device_ptr(buf) {
+                Some(q) => q as *mut std::ffi::c_void,
+                None => return "no-ptr",
+            };
+            let _ = unsafe {
+                grim_backend_rocm::hipMemcpy(
+                    v.as_mut_ptr() as *mut std::ffi::c_void,
+                    p,
+                    16,
+                    grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                )
+            };
+            if v.iter().any(|x| x.is_nan()) {
+                "NaN"
+            } else if v.iter().any(|x| x.is_infinite()) {
+                "Inf"
+            } else {
+                "ok"
+            }
+        };
+        let first_nan_in = (0..g.buffers.layer_input.len())
+            .find(|&i| classify(&g.buffers.layer_input[i]) == "NaN");
+        let first_bad_out = (0..g.buffers.layer_output.len())
+            .find(|&i| classify(&g.buffers.layer_output[i]) != "ok");
+        // Optional raw peek (GRIM_PEEK_ADDR=0x...): read 4 f32 from any
+        // device address after the replay sync — localizes which baked
+        // graph pointer actually goes stale.
+        let mut addrs: Vec<(String, usize)> = std::env::var("GRIM_PEEK_ADDR")
+            .ok()
+            .and_then(|a| usize::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+            .map(|q| vec![("GRIM_PEEK_ADDR".to_string(), q)])
+            .unwrap_or_default();
+        if let Some(a) = grim_backend_rocm::device::compute::gemm_launchers::last_captured_head_gemv_a() {
+            addrs.push(("head_gemv_A".to_string(), a));
+        }
+        for (tag, q) in addrs {
+            {
+            let mut v = [0f32; 4];
+            let _ = unsafe {
+                grim_backend_rocm::hipMemcpy(
+                    v.as_mut_ptr() as *mut std::ffi::c_void,
+                    q as *mut std::ffi::c_void,
+                    16,
+                    grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                )
+            };
+            eprintln!("[graph-peek] {tag} {q:#x} head={v:?}");
+            }
+        }
+        if let Ok(addr) = std::env::var("GRIM_PEEK_ADDR") {
+            let hex = addr.trim_start_matches("0x");
+            if let Ok(q) = usize::from_str_radix(hex, 16) {
+                let mut v = [0f32; 4];
+                let _ = unsafe {
+                    grim_backend_rocm::hipMemcpy(
+                        v.as_mut_ptr() as *mut std::ffi::c_void,
+                        q as *mut std::ffi::c_void,
+                        16,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    )
+                };
+                eprintln!("[graph-peek] {addr} head={v:?}");
+            }
+        }
+        let hiptr = _BS::device_ptr(&g.buffers.head_input)
+            .map(|q| q as *mut std::ffi::c_void)
+            .unwrap_or(std::ptr::null_mut());
+        eprintln!("[graph-nanscan] head_input ptr={hiptr:p}");
+        let head_in = classify(&g.buffers.head_input);
+        let head_out = classify(&*g.buffers.head_output);
+        eprintln!(
+            "[graph-nanscan] first NaN layer_input={first_nan_in:?}; first non-ok layer_output={first_bad_out:?} of {} layers; head_input={head_in} head_output={head_out}",
+            g.buffers.layer_output.len()
+        );
         if let Ok(flat) = g.read_logits_f32() {
             if flat.len() == vocab {
                 let mut idx: Vec<u32> = (0..vocab as u32).collect();

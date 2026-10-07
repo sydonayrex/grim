@@ -575,6 +575,45 @@ impl RocmDevice {
             ));
         }
         let mut out_ptr = dev_ptr(out)?;
+        // Elementwise-INT8 weight (ForestRaven framed blob, 1-D norm): same
+        // branch as the allocating `rms_norm`. WITHOUT this, the packed blob
+        // reaches the F32 kernel and its header + i8 codes are read as f32
+        // weights — i8 byte pairs spell NaN/Inf patterns, so every replayed
+        // decode step NaNs the normed hidden (the .grim-vs-GGUF graph
+        // divergence: GGUF norms are F32 and never took this path).
+        if let Some(rs) = weight.as_any().downcast_ref::<RocmStorage>() {
+            if matches!(
+                rs.dtype().storage,
+                grim_tensor::dtype::Storage::Block(grim_tensor::dtype::BlockDtype::Int8PerChannel)
+            ) {
+                let elem = rs.shape().elem_count();
+                let base = w_ptr as usize;
+                let mut codes_ptr = (base + 8) as *mut c_void;
+                let mut scales_ptr = (base + 8 + elem + 8) as *mut c_void;
+                let mut row_len_i = row_len as i32;
+                let mut eps_f = eps;
+                let mut total_i = total as i32;
+                let (grid, block) = warp_rows_launch(total / row_len.max(1));
+                // In-place (out aliases x) is safe: the kernel reads
+                // x_row[col] and writes o_row[col] within one statement,
+                // disjoint cols per lane.
+                self.launch_compute_kernel(
+                    "grim_rms_norm_i8",
+                    grid,
+                    block,
+                    &mut [
+                        arg(&mut x_ptr),
+                        arg(&mut codes_ptr),
+                        arg(&mut scales_ptr),
+                        arg(&mut out_ptr),
+                        arg(&mut row_len_i),
+                        arg(&mut eps_f),
+                        arg(&mut total_i),
+                    ],
+                )?;
+                return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+            }
+        }
         let mut row_len_i = row_len as i32;
         let mut eps_f = eps;
         let mut total_i = total as i32;
