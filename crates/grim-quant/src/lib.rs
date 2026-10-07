@@ -2579,15 +2579,17 @@ pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
 
 /// Quantize a slice of f32 values to Q6_K bytes per the ggml super-block format.
 /// Encodes 256-weight blocks into 210-byte Q6_K super-blocks.
-fn sc_bytes_f(scales_f: &[f32; 16], sg: usize, is_half: usize, q_slot: usize) -> i32 {
-    // The stored i8 scale for this group, mirrored from the write loop.
-    // Recomputing it here keeps the code-derivation consistent with the
-    // stored bytes (the fit scale is quantized to i8 before use).
-    let max_scale = scales_f.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    if max_scale == 0.0 {
+fn sc_bytes_f(scales_f: &[f32; 16], max_scale_signed: f32, sg: usize, is_half: usize, q_slot: usize) -> i32 {
+    // The stored i8 scale for this group. MUST use the same SIGNED max_scale
+    // (the scale with the largest magnitude, sign included) as the byte
+    // writer and d = -max_scale/128: recomputing it as a max of absolutes
+    // negates every stored scale whenever the dominant group's fit scale is
+    // negative, and the block then decodes inverted (round-trip maxdiff
+    // 2x amax on real heavy-tailed data; invisible on uniform random data).
+    if max_scale_signed == 0.0 {
         return 0;
     }
-    let iscale = -128.0 / max_scale;
+    let iscale = -128.0 / max_scale_signed;
     qk_nearest_int(iscale * scales_f[sg * 8 + is_half + q_slot * 2]).clamp(-127, 127)
 }
 
@@ -2710,7 +2712,7 @@ pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
             for q_slot in 0..4 {
                 for is_half in 0..2 {
                     let base = sg * 128 + q_slot * 32 + is_half * 16;
-                    let dd = d * sc_bytes_f(&scales_f, sg, is_half, q_slot) as f32;
+                    let dd = d * sc_bytes_f(&scales_f, max_scale, sg, is_half, q_slot) as f32;
                     if dd == 0.0 {
                         continue;
                     }

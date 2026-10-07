@@ -107,3 +107,63 @@ fn roundtrips() {
         println!("Q6K dbg: scale-index check done");
     }
 }
+
+// Regression gate for the inverted-block defect: sc_bytes_f used to recompute
+// max_scale as a max of ABSOLUTES while the byte writer and d use the SIGNED
+// max_scale. Blocks whose dominant group scale is negative then decoded
+// inverted (maxdiff 2x amax). Uniform random data nearly always has a
+// positive dominant scale, so the old gate could not see it; this test
+// builds blocks whose max-abs group scale is negative BY CONSTRUCTION and
+// asserts, per block and per tensor.
+#[test]
+fn q6k_roundtrip_negative_dominant_scale() {
+    // 8 blocks of 5 groups with alternating-sign heavy-tailed scales: group g
+    // has magnitude 2^(g-5) and sign (-1)^g, so blocks where the max-abs
+    // group (magnitude 1.0) is odd carry a NEGATIVE dominant fit scale.
+    let mut data: Vec<f32> = Vec::new();
+    for _b in 0..8 {
+        for g in 0..16usize {
+            let mag = 2.0f32.powi(g as i32 - 5) * if g % 2 == 1 { -1.0 } else { 1.0 };
+            for l in 0..16 {
+                let v = mag * ((l as f32 * 0.618 + g as f32 * 0.113).fract() - 0.5) * 2.0;
+                data.push(v);
+            }
+        }
+    }
+    let n = data.len();
+    let packed = quant_q6k(&data).expect("quant_q6k");
+    let back = dequant_q6k(&packed, n).expect("dequant_q6k");
+    let max_d: f32 = back.iter().zip(&data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    let amax = data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let ratio = max_d / amax;
+    assert!(
+        ratio < 0.08,
+        "Q6K round-trip with negative-dominant-scale blocks: max_d/amax={ratio} (inverted-block defect)"
+    );
+    // Sign sanity: the largest-magnitude elements must not come back negated.
+    for (i, (&src, &dec)) in data.iter().zip(&back).enumerate() {
+        if src.abs() > amax * 0.9 {
+            assert!(
+                (src - dec).abs() < src.abs() * 0.25,
+                "element {i} (|v| near amax) diverged: src={src} dec={dec}"
+            );
+        }
+    }
+}
+
+// The uniform-data round-trip above is only a smoke signal; make it ASSERT.
+#[test]
+fn q6k_roundtrip_uniform_asserted() {
+    let mut state = 0x5EED_F00D_CAFEu64;
+    let mut next = || {
+        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+        ((state >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+    };
+    let n = 256 * 64;
+    let data: Vec<f32> = (0..n).map(|_| next()).collect();
+    let packed = quant_q6k(&data).expect("quant_q6k");
+    let back = dequant_q6k(&packed, n).expect("dequant_q6k");
+    let max_d: f32 = back.iter().zip(&data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    let amax = data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(max_d / amax < 0.08, "uniform Q6K round-trip max_d/amax={}", max_d / amax);
+}

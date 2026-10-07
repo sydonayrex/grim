@@ -1177,7 +1177,32 @@ fn pack_tensors(
             // corrupts the per-expert row geometry. Pass the source bytes
             // through with an IQ3S override so kq-native serves them
             // natively — the corvid rungs apply to NON-expert tensors.
-            if name.contains("_exps") {
+            // Only K-quant BANKS pass through verbatim. The override names
+            // the SOURCE scheme, never a hard-coded IQ3_S: an IQ3_M
+            // checkpoint's ffn_down_exps banks are Q4_K (144 B/256, not
+            // IQ3_S 110 B/256), and an IQ3_S tag on Q4_K bytes makes
+            // GrimProvider serve a wrong-size slice that decodes to NaN.
+            // kq-native's contract takes Q4_K down banks, so the source tag
+            // is servable by construction. Anything else (Native f32/BF16,
+            // exotic IQ schemes with no GGUF tag) falls through to the tier
+            // arms, which requant from dequant — a verbatim copy there would
+            // be unservable.
+            let exps_src_tag = if name.contains("_exps") {
+                match &raw.dtype.storage {
+                    grim_tensor::dtype::Storage::KQuant(k) => match k {
+                        grim_tensor::dtype::KQuantScheme::Q4K => Some(crate::gguf::GgufDType::Q4K),
+                        grim_tensor::dtype::KQuantScheme::Q6K => Some(crate::gguf::GgufDType::Q6K),
+                        grim_tensor::dtype::KQuantScheme::Q5K => Some(crate::gguf::GgufDType::Q5K),
+                        grim_tensor::dtype::KQuantScheme::Q80 => Some(crate::gguf::GgufDType::Q8_0),
+                        grim_tensor::dtype::KQuantScheme::IQ3S => Some(crate::gguf::GgufDType::IQ3_S),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(src_tag) = exps_src_tag {
                 let entry = crate::format::GrimTensorEntry {
                     name: name.clone(),
                     shape: meta.shape.clone(),
@@ -1195,8 +1220,14 @@ fn pack_tensors(
                 };
                 let override_ = crate::gguf::GrimQuantOverride {
                     tensor_name: name.clone(),
-                    effective_bpw: 3,
-                    override_dtype: crate::gguf::GgufDType::IQ3_S,
+                    effective_bpw: match src_tag {
+                        crate::gguf::GgufDType::Q4K => 4,
+                        crate::gguf::GgufDType::Q6K => 6,
+                        crate::gguf::GgufDType::Q5K => 5,
+                        crate::gguf::GgufDType::Q8_0 => 8,
+                        _ => 3,
+                    },
+                    override_dtype: src_tag,
                     importance_score: 0.0,
                     layout_hint: None,
                 };
@@ -1937,7 +1968,7 @@ mod tests {
         //   Q80/Fp4/Q2K, all different layouts);
         // - bitwidth 2 with `--format gsq_rco_3p5` packs the GSQ-RCO block
         //   format (18 B / 64 weights), decodable by dequant_gsq_rco_3p5.
-        use grim_tensor::dtype::{DType, QuantProvenance};
+        use grim_tensor::dtype::{ArithType, DType, KQuantScheme, QuantProvenance, Storage};
         use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
         use std::collections::HashMap;
 
@@ -2129,10 +2160,9 @@ mod tests {
             ),
         );
         let provider_exps = MockProvider { tensors: exps };
-        // The expert stack now PASSES THROUGH as source IQ3_S bytes (the
-        // kq-native dispatch decodes IQ3_S gate/up natively, and the Phase 0'
-        // fake-quant study showed GSQ requant of these banks is quality-dead)
-        // — the GSQ rung is reserved for non-expert tensors.
+        // A Native (f32) expert stack is NOT a K-quant bank: it falls through
+        // to the GSQ tier arm, which requants from dequant. (Verbatim
+        // passthrough of f32 bytes tagged IQ3_S would serve garbage.)
         let (packed_exps, _, ov_exps) = pack_tensors(
             &provider_exps,
             &[exps_name],
@@ -2144,8 +2174,49 @@ mod tests {
             Some("gsq_rco_3p5"),
         )
         .expect("3-D expert stack packs");
-        assert_eq!(packed_exps[0].0.base_bitwidth, 3);
-        assert_eq!(ov_exps[0].override_dtype, crate::gguf::GgufDType::IQ3_S);
+        assert_eq!(packed_exps[0].0.base_bitwidth, 2);
+        assert_eq!(ov_exps[0].override_dtype, crate::gguf::GgufDType::GsqRco3p5);
+
+        // A real IQ3_S K-quant expert bank PASSES THROUGH with its SOURCE
+        // tag (never a hard-coded IQ3_S on foreign bytes — an IQ3_M
+        // checkpoint's ffn_down_exps banks are Q4_K and an IQ3_S tag on
+        // those serves a wrong-size slice that decodes to NaN).
+        let mut kq = HashMap::new();
+        let kq_name = "blk.2.ffn_gate_exps.weight".to_string();
+        let kq_shape = vec![4usize, 128usize, 64usize];
+        // IQ3_S: 110 bytes per 256 weights; 32768 weights = 128 blocks.
+        let kq_bytes: Vec<u8> = (0..128 * 110).map(|i| (i % 251) as u8).collect();
+        kq.insert(
+            kq_name.clone(),
+            (
+                RawTensor {
+                    bytes: kq_bytes.clone(),
+                    provenance: QuantProvenance::GrimNative,
+                    dtype: DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::IQ3S) },
+                    shape: kq_shape.clone(),
+                },
+                TensorMeta {
+                    dtype: DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::IQ3S) },
+                    provenance: QuantProvenance::GrimNative,
+                    shape: kq_shape,
+                    fusion_mask: 0,
+                },
+            ),
+        );
+        let provider_kq = MockProvider { tensors: kq };
+        let (packed_kq, _, ov_kq) = pack_tensors(
+            &provider_kq,
+            &[kq_name],
+            2.0,
+            None,
+            crate::format::WaveSize::W64,
+            &mut progress,
+            None,
+            Some("gsq_rco_3p5"),
+        )
+        .expect("IQ3_S expert bank passes through");
+        assert_eq!(packed_kq[0].1, kq_bytes, "bank bytes must be verbatim");
+        assert_eq!(ov_kq[0].override_dtype, crate::gguf::GgufDType::IQ3_S);
     }
 }
 
