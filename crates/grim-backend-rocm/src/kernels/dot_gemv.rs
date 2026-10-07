@@ -1914,7 +1914,6 @@ extern "C" __global__ void grim_dot4_q2k_q81_gemv(
             for (int half_pair = 0; half_pair < 8; half_pair++) {
                 const unsigned char* a_blk = a_sb + half_pair * GRIM_Q8_1_BYTES;
                 float d_a   = fp16_to_float_device(((const unsigned short*)a_blk)[0]);
-                float sum_a = fp16_to_float_device(((const unsigned short*)a_blk)[1]);
                 const signed char* a_codes = (const signed char*)(a_blk + 4);
 
                 for (int half = 0; half < 2; half++) {
@@ -1932,14 +1931,27 @@ extern "C" __global__ void grim_dot4_q2k_q81_gemv(
                     const unsigned char* qs_ilv = b_sb + 16 + nh * 32 + hplane * 16;
                     const int shift = 2 * run;
                     int pos = 0;
+                    int a_sum = 0;
                     #pragma unroll
                     for (int i = 0; i < 16; i += 4) {
                         int a4;
                         __builtin_memcpy(&a4, a_codes + half * 16 + i, 4);
                         int q4 = grim_extract4_q2k_ilv(qs_ilv + i, shift);
                         pos = grim_sdot4(a4, q4, pos);
+                        // The dmin correction needs the sum over THIS half's
+                        // 16 codes: each sub-block covers half a q8_1 block,
+                        // and the stored f16 sum spans all 32 codes. Using it
+                        // double-counted (once per half) and mixed halves.
+                        a_sum += a_codes[half * 16 + i];
+                        a_sum += a_codes[half * 16 + i + 1];
+                        a_sum += a_codes[half * 16 + i + 2];
+                        a_sum += a_codes[half * 16 + i + 3];
                     }
-                    facc[j] += d * sc * ((float)pos * d_a) - dmin * mi * sum_a;
+                    // Both terms scale the raw codes by d_a: the q8_1 f16
+                    // sum_a is in code units, so using it here (besides
+                    // spanning 32 codes) left the dmin term unscaled.
+                    facc[j] += d * sc * ((float)pos * d_a)
+                             - dmin * mi * ((float)a_sum * d_a);
                 }
             }
         }
@@ -2529,10 +2541,10 @@ extern "C" __global__ void grim_quantize_u4_group128(
     // Thread 2*i supplies bits 0..15, thread 2*i+1 supplies bits 16..31.
     // Mask to nibbles explicitly: signed-char promotion sign-extends, so
     // shifting a negative q without masking would corrupt upper bits.
-    unsigned int half_word = ((unsigned int)(unsigned char)q0)
-        | (((unsigned int)(unsigned char)q1) << 4)
-        | (((unsigned int)(unsigned char)q2) << 8)
-        | (((unsigned int)(unsigned char)q3) << 12);
+    unsigned int half_word = (((unsigned int)(unsigned char)q0) & 0xFu)
+        | ((((unsigned int)(unsigned char)q1) & 0xFu) << 4)
+        | ((((unsigned int)(unsigned char)q2) & 0xFu) << 8)
+        | ((((unsigned int)(unsigned char)q3) & 0xFu) << 12);
     unsigned int other_half = __shfl_xor(half_word, 1);
     if ((tid & 1) == 0) {
         unsigned int word = half_word | (other_half << 16);
