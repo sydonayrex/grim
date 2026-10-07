@@ -310,14 +310,13 @@ impl QuantOps for RocmDevice {
                     k,
                 )
                 .map_err(Error::Backend)?;
-                // Capture refusal (see the twin gate in gemm_launchers
-                // linear_decode_into): a u4-lane GEMV captured into the
-                // decode graph poisons the replay with NaN logits. Eager
-                // steps keep the u4 route.
+                // Twin refusal (see gemm_launchers linear_decode_into):
+                // GSQ-free control also NaNs — .grim graph divergence, not
+                // this route; u4 GEMV stays eager under capture.
                 if self.is_capturing() {
                     return Err(Error::Backend(
-                        "quantized_matmul: GsqRco3p5 u4-lane route is not \
-                         capture-safe — captured replays emit NaN logits."
+                        "quantized_matmul: GsqRco3p5 u4-lane route refused \
+                         under capture — .grim graph replay NaNs even GSQ-free."
                             .into(),
                     ));
                 }

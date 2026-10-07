@@ -1149,12 +1149,30 @@ impl RocmDevice {
     /// Raise/lower the capture gate from the OTHER capture mechanisms
     /// (DecodeGraphBuffers::begin_capture, the graph_capture manager) that
     /// open hipStreamBeginCapture on their own streams and never touch the
-    /// begin_graph_capture flag. Routes that must refuse capture gate on
-    /// this; NOT RAISING it makes their kernels silently launch on the
-    /// default stream, never enter the graph, and replay reads an
-    /// uninitialized output buffer (the .grim Xing4.0 all-NaN replay).
-    pub fn set_capture_gate(&self, on: bool) {
+    /// begin_graph_capture flag.
+    ///
+    /// The gate MUST carry the capture stream: `active_stream()` returns
+    /// `capture_stream` while the gate is up, which is what routes launched
+    /// via `active_stream()` (the u4-lane GEMVs) need to actually be
+    /// RECORDED into the graph. Raising the gate without a stream makes
+    /// those kernels launch on the default stream, never enter the graph,
+    /// and replay reads an uninitialized output buffer (the .grim Xing4.0
+    /// all-NaN replay, f0859982).
+    pub fn set_capture_gate(&self, on: bool, stream: Option<*mut c_void>) {
         self.capture_active.store(on, Ordering::SeqCst);
+        if on {
+            if let Some(s) = stream {
+                *self
+                    .capture_stream
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(s);
+            }
+        } else {
+            *self
+                .capture_stream
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     pub(crate) fn active_capture_stream(&self) -> Option<*mut c_void> {
@@ -1493,7 +1511,6 @@ impl RocmDevice {
         // refuse, failing the capture cleanly to eager. The manager opens
         // hipStreamBeginCapture directly and never touches the
         // begin_graph_capture flag, so that flag is invisible here.
-        self.capture_active.store(true, Ordering::SeqCst);
         let gate_result = (|| -> Result<()> {
             let mgr = self
                 .graph_capture_mgr
@@ -1502,10 +1519,15 @@ impl RocmDevice {
             let mgr = mgr.as_ref().ok_or_else(|| {
                 Error::Backend("capture_decode_step: graph capture manager not initialized".into())
             })?;
-            mgr.get_or_capture(key, record)?;
-            mgr.replay(key)
+            let stream = mgr.capture_stream_handle()?;
+            self.set_capture_gate(true, Some(stream));
+            let r = (|| {
+                mgr.get_or_capture(key, record)?;
+                mgr.replay(key)
+            })();
+            self.set_capture_gate(false, None);
+            r
         })();
-        self.capture_active.store(false, Ordering::SeqCst);
         gate_result
     }
 

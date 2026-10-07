@@ -2151,26 +2151,51 @@ impl RocmDevice {
                             .into(),
                     ));
                 }
-                // Capture refusal, 2026-10-07: a u4-lane GEMV captured into
-                // the decode graph poisons the replay — .grim Xing4.0 logits
-                // go all-NaN from the FIRST replayed step (bisected: GGUF
-                // graph with the same routes minus GSQ replays clean; GSQ-only
-                // u4 config still NaNs). The eager u4 GEMV is fine (eager
-                // fallback text is correct through the same route), so keep
-                // the route for eager steps and let capture fail cleanly to
-                // the eager path. Mechanism under investigation.
-                if self.is_capturing() {
-                    return Err(Error::Backend(
-                        "linear_decode_into: GsqRco3p5 u4-lane route is not \
-                         capture-safe — captured replays emit NaN logits. \
-                         Decode takes the eager path for this tensor."
-                            .into(),
-                    ));
-                }
                 let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                     Error::Backend("linear_decode_into: a not RocmStorage".into())
                 })?;
+                // Capture refusal RESTORED (supersedes the f0859982 reading):
+                // the GSQ-free control artifact (GRIM_RCO_MENU="7,3,4,5,6")
+                // ALSO replays all-NaN, so the GSQ u4 GEMV was never the
+                // poison — the defect is a .grim-vs-GGUF graph divergence
+                // independent of the ladder. Until that is root-caused the
+                // u4 GEMV stays out of captured graphs; eager keeps it.
+                if self.is_capturing() {
+                    return Err(Error::Backend(
+                        "linear_decode_into: GsqRco3p5 u4-lane route refused \
+                         under capture — .grim graph replay NaNs even GSQ-free; \
+                         defect is not this route. Decode takes eager."
+                            .into(),
+                    ));
+                }
                 let lanes = self.u4_lane_weights(w, n, k, KQuantScheme::GsqRco3p5)?;
+                // Diagnostic (GRIM_DEBUG_TOPLOGITS): when the capture gate is
+                // DOWN this call is either an eager step or follows a
+                // replay+sync, so a blocking peek at the graph's input and
+                // output buffers shows what the replay actually fed and
+                // produced. During capture (gate up) the D2H is skipped — a
+                // sync mid-capture would invalidate the graph.
+                let peek_io = !self.is_capturing()
+                    && std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some();
+                if peek_io {
+                    let peek = |s: &RocmStorage, tag: &str| {
+                        let mut v = [0f32; 4];
+                        let p = s.device_ptr.unwrap_or(0) as *mut c_void;
+                        let _ = crate::check_hip(
+                            "gsq-peek",
+                            unsafe {
+                                crate::hipMemcpy(
+                                    v.as_mut_ptr() as *mut c_void,
+                                    p,
+                                    16,
+                                    crate::HipMemcpyKind::DeviceToHost,
+                                )
+                            },
+                        );
+                        eprintln!("[gsq-peek] {tag} ptr={p:p} head={v:?}");
+                    };
+                    peek(a_rocm, "input");
+                }
                 self.launch_w4a4_ostquant_gemv(
                     a_rocm,
                     lanes.qweight_rocm()?,
@@ -2181,6 +2206,25 @@ impl RocmDevice {
                     n,
                     k,
                 )?;
+                if peek_io {
+                    let peek = |s: &RocmStorage, tag: &str| {
+                        let mut v = [0f32; 4];
+                        let p = s.device_ptr.unwrap_or(0) as *mut c_void;
+                        let _ = crate::check_hip(
+                            "gsq-peek",
+                            unsafe {
+                                crate::hipMemcpy(
+                                    v.as_mut_ptr() as *mut c_void,
+                                    p,
+                                    16,
+                                    crate::HipMemcpyKind::DeviceToHost,
+                                )
+                            },
+                        );
+                        eprintln!("[gsq-peek] {tag} ptr={p:p} head={v:?}");
+                    };
+                    peek(out, "out");
+                }
                 return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
             }
             DTypeStorage::KQuant(

@@ -219,6 +219,14 @@ impl GraphCaptureManager {
 
     /// Lazily create the capture stream. If creation fails, returns the error and keeps the cache empty;
     /// callers will get `Err` again on the next call (no silent CPU fallback per `rust-gpu-discipline` §3).
+    /// The manager's (lazily created, cached) capture stream. The device's
+    /// capture gate registers this so `active_stream()` returns it while the
+    /// gate is up — launches that go through `active_stream()` are then
+    /// recorded into the graph instead of silently missing it.
+    pub fn capture_stream_handle(&self) -> Result<*mut c_void> {
+        self.ensure_capture_stream()
+    }
+
     fn ensure_capture_stream(&self) -> Result<*mut c_void> {
         if let Some(s) = *self
             .capture_stream

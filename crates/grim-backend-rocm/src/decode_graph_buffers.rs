@@ -1552,7 +1552,7 @@ impl DecodeGraph {
         // on the default stream, never enter this graph, and every replay
         // reads an uninitialized output (all-NaN logits).
         crate::device::roc_device::RocmDevice::shared(self.ordinal)
-            .set_capture_gate(true);
+            .set_capture_gate(true, Some(self.stream));
         // Publish the padded-fp8 act scratch for the duration of the capture.
         // The WhiteRaven blocked leg needs it (its A operand is fp8 codes,
         // padded to whole 16-row tiles) and cannot allocate one here.
@@ -1572,7 +1572,7 @@ impl DecodeGraph {
         let _ = unsafe { hipStreamEndCapture(self.stream, &mut graph) };
         self.capturing = false;
         crate::device::roc_device::RocmDevice::shared(self.ordinal)
-            .set_capture_gate(false);
+            .set_capture_gate(false, None);
         install_capture_fp8_pad(None);
         if !graph.is_null() {
             unsafe {
@@ -1591,7 +1591,7 @@ impl DecodeGraph {
         if res != crate::hipSuccess {
             self.capturing = false;
             crate::device::roc_device::RocmDevice::shared(self.ordinal)
-                .set_capture_gate(false);
+                .set_capture_gate(false, None);
             return Err(Error::Backend(format!("hipStreamEndCapture failed: {res}")));
         }
         let mut exec: *mut c_void = std::ptr::null_mut();
@@ -1608,7 +1608,7 @@ impl DecodeGraph {
         if inst != crate::hipSuccess {
             self.capturing = false;
             crate::device::roc_device::RocmDevice::shared(self.ordinal)
-                .set_capture_gate(false);
+                .set_capture_gate(false, None);
             unsafe {
                 let _ = hipGraphDestroy(graph);
             }
@@ -1620,7 +1620,7 @@ impl DecodeGraph {
         if upload != crate::hipSuccess {
             self.capturing = false;
             crate::device::roc_device::RocmDevice::shared(self.ordinal)
-                .set_capture_gate(false);
+                .set_capture_gate(false, None);
             unsafe {
                 let _ = hipGraphExecDestroy(exec);
                 let _ = hipGraphDestroy(graph);
