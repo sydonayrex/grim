@@ -16,6 +16,11 @@
 //! before asserting anything, so running it without `GRIM_CAPTURE_GRAPH=1` is
 //! a failure, not a skip.
 //!
+//! 2026-10-03: the original version read back the destination WITHOUT
+//! replaying the captured graph — work submitted during capture is recorded,
+//! not executed, so element 0 was always 0 and the "missing copy" was the
+//! missing launch. Both sub-cases now replay_graph before verifying.
+//!
 //! Gated: `GRIM_GPU_TEST=1 GRIM_CAPTURE_GRAPH=1`.
 
 use grim_backend_rocm::RocmDevice;
@@ -67,6 +72,13 @@ fn d2d_copy_succeeds_inside_graph_capture() {
         )
     });
 
+    // Work submitted during capture is RECORDED, not executed: end_graph_capture
+    // only instantiates. Without an explicit replay the destination is still
+    // zeros and this test would convict a correct copy node.
+    match dev.replay_graph("d2d_probe_a") {
+        Ok(true) => {}
+        other => panic!("replay_graph(d2d_probe_a) did not launch a graph: {other:?}"),
+    }
     dev.synchronize();
     let got_a = dst_a.to_cpu_vec_f32().expect("read back A");
     for (i, (&g, &w)) in got_a.iter().zip(want.iter()).enumerate() {
@@ -112,6 +124,10 @@ fn d2d_copy_with_destination_allocated_inside_capture_succeeds() {
         )
     });
 
+    match dev.replay_graph("d2d_probe_b") {
+        Ok(true) => {}
+        other => panic!("replay_graph(d2d_probe_b) did not launch a graph: {other:?}"),
+    }
     dev.synchronize();
     let got = dst.to_cpu_vec_f32().expect("read back B");
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {

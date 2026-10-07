@@ -17,9 +17,10 @@ use crate::device::gemm_tuning::{lookup_gemm_config_for_shape, lookup_solution_i
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
 use crate::{
-    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, rocblas_gemm_ex,
-    rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm, rocblas_status_success,
-    select_gemm_algo, HipDim3, RocblasInt, RocblasOperation, RocmHandle, ROCBLAS_GEMM_FLAGS_NONE,
+    arg, arith_to_compute_dtype, arith_to_rocblas_dtype, check_hip, hipMemGetInfo,
+    rocblas_gemm_ex, rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm,
+    rocblas_status_success, select_gemm_algo, HipDim3, RocblasInt, RocblasOperation, RocmHandle,
+    ROCBLAS_GEMM_FLAGS_NONE,
 };
 
 impl RocmDevice {
@@ -2275,18 +2276,25 @@ impl RocmDevice {
                     // lives in `u4_lane_weights`, shared with the CityCrow arm
                     // and the eager `quantized_matmul` dispatch, so a model
                     // driven through more than one of those paths converts once.
-                    let lanes = self.u4_lane_weights(w, n, k, *scheme)?;
-                    self.launch_w4a4_ostquant_gemv(
-                        a_s,
-                        lanes.qweight_rocm()?,
-                        lanes.scales_rocm()?,
-                        lanes.zeros_rocm()?,
-                        out,
-                        m,
-                        n,
-                        k,
-                    )?;
-                    return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                    // Budget-aware: a lane copy that would leave less than
+                    // the 256 MiB reserve returns None and the weight KEEPS
+                    // the dot4 route below — sticky for the process, so
+                    // capture and eager agree per tensor.
+                    if let Some(lanes) =
+                        Self::u4_lane_weights_budgeted(self, w, n, k, *scheme, true)?
+                    {
+                        self.launch_w4a4_ostquant_gemv(
+                            a_s,
+                            lanes.qweight_rocm()?,
+                            lanes.scales_rocm()?,
+                            lanes.zeros_rocm()?,
+                            out,
+                            m,
+                            n,
+                            k,
+                        )?;
+                        return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                    }
                 }
                 // Exact leg: dequantize the weight inline and keep the
                 // activation in F32. Shares its switch with eager's
@@ -2900,8 +2908,37 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::KQuantScheme,
     ) -> Result<Arc<WhiteCrowDecodedWeights>> {
+        Self::u4_lane_weights_budgeted(self, w, n, k, scheme, false)?.ok_or_else(|| {
+            Error::Backend(
+                "u4-lane conversion declined by the VRAM budget, but this \
+                 caller has no fallback route (GsqRco3p5 decodes ONLY via \
+                 u4 lanes). Free VRAM or drop GRIM_DECODE_W4A4."
+                    .into(),
+            )
+        })
+    }
+
+    /// Budget-aware [`Self::u4_lane_weights`]: when `budget` is set, a
+    /// conversion that would push free VRAM below the reserve headroom
+    /// returns `Ok(None)` instead of allocating. Unbounded, the lane cache
+    /// filled the 17.1 GB Xing4.0 card to 0 bytes free and the next lazy
+    /// hipModuleLoad died (209 = hipErrorOutOfMemory). Declines are memoized
+    /// like conversions so the decision is STICKY per weight: a tensor that
+    /// kept its dot4/WMMA route during eager prefill must not flip to a
+    /// D2H conversion later under graph capture.
+    pub fn u4_lane_weights_budgeted(
+        &self,
+        w: &RocmStorage,
+        n: usize,
+        k: usize,
+        scheme: grim_tensor::KQuantScheme,
+        budget: bool,
+    ) -> Result<Option<Arc<WhiteCrowDecodedWeights>>> {
         type LaneCache = std::sync::Mutex<
-            std::collections::HashMap<(usize, usize, [usize; 2]), Arc<WhiteCrowDecodedWeights>>,
+            std::collections::HashMap<
+                (usize, usize, [usize; 2]),
+                Option<Arc<WhiteCrowDecodedWeights>>,
+            >,
         >;
         static CONVERTED: OnceLock<LaneCache> = OnceLock::new();
         let cache = CONVERTED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -2914,9 +2951,34 @@ impl RocmDevice {
         if let Some(hit) = guard.get(&key) {
             return Ok(hit.clone());
         }
+        // Reserve: lazy kernel-module loads and activation scratch still
+        // need headroom after the last lane copy lands. 256 MiB is far above
+        // any single hsaco and small against a 17 GB card.
+        const VRAM_RESERVE_BYTES: usize = 256 * 1024 * 1024;
+        if budget {
+            let lane_bytes = n * (k / 2) // qweight u4
+                + n * (k / 128) * 2 // scales bf16
+                + n * (k / 128) // zeros u8
+                + 1024 * 1024; // upload slack
+            let (mut free_mem, mut total_mem) = (0usize, 0usize);
+            let ok = unsafe { hipMemGetInfo(&mut free_mem, &mut total_mem) };
+            let fits = ok == 0 && free_mem > lane_bytes + VRAM_RESERVE_BYTES;
+            if !fits {
+                static DECLINED_ONCE: OnceLock<()> = OnceLock::new();
+                if DECLINED_ONCE.set(()).is_ok() {
+                    eprintln!(
+                        "[u4-lane] budget decline: {scheme:?} [{n},{k}] needs ~{lane_bytes} B, \
+                         free={free_mem}/{total_mem} B (reserve {VRAM_RESERVE_BYTES} B) — \
+                         weight keeps its dot4/WMMA route for this process"
+                    );
+                }
+                guard.insert(key, None);
+                return Ok(None);
+            }
+        }
         let converted = Arc::new(self.requant_kquant_to_whitecrow(w, n, k, scheme)?);
-        guard.insert(key, converted.clone());
-        Ok(converted)
+        guard.insert(key, Some(converted.clone()));
+        Ok(Some(converted))
     }
 
     /// Upload already-converted u4 lane bytes (qweight as u32 words,
