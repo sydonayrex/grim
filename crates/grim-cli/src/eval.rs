@@ -6,7 +6,18 @@ use grim_core::model::CausalLm;
 use grim_tensor::Device;
 
 /// PPL sliding-window size in tokens.
-const PPL_WINDOW: usize = 2048;
+/// Eval window in tokens. GRIM_EVAL_WINDOW overrides: the default 2048
+/// costs a ~7-minute eager forward per window on large MoE models (the eval
+/// path is not the decode graph), which no leash survives. A smaller window
+/// is a valid RELATIVE comparison when every model uses the same value.
+const PPL_WINDOW_DEFAULT: usize = 2048;
+fn ppl_window() -> usize {
+    std::env::var("GRIM_EVAL_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&w| w >= 64)
+        .unwrap_or(PPL_WINDOW_DEFAULT)
+}
 
 /// Resolve the eval device: explicit `GRIM_BACKEND` / `GRIM_FORCE_DEVICE`
 /// (`rocm[:ord]`, `cuda[:ord]`) wins; otherwise auto-probe ROCm and fall back
@@ -79,30 +90,38 @@ fn load_model(model: &str) -> Result<(Box<dyn CausalLm>, String)> {
 
 /// Compute windowed perplexity of `tokens` under `model`.
 /// Slides a window of `PPL_WINDOW` tokens with full overlap; each window predicts its last token.
+fn chrono_like_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}s", d.as_secs())
+}
+
 pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)> {
-    if tokens.len() < PPL_WINDOW + 1 {
+    if tokens.len() < ppl_window() + 1 {
         return Err(Error::Config(format!(
             "corpus too small: { } tokens, need >= {}",
             tokens.len(),
-            PPL_WINDOW + 1
+            ppl_window() + 1
         )));
     }
     let mut sum_nll = 0.0f64;
     let mut n_windows = 0usize;
     let mut start = 0usize;
+    eprintln!("[eval] windows begin {}", chrono_like_now());
     // GRIM_EVAL_MAX_WINDOWS: deterministic prefix cap.
     // Baselines produced with a cap record it in their metrics JSON - same corpus +.
     let max_windows: Option<usize> = std::env::var("GRIM_EVAL_MAX_WINDOWS")
         .ok()
         .and_then(|v| v.parse().ok());
-    while start + PPL_WINDOW < tokens.len() {
+    while start + ppl_window() < tokens.len() {
         if let Some(cap) = max_windows {
             if n_windows >= cap {
                 break;
             }
         }
-        let ctx = &tokens[start..start + PPL_WINDOW];
-        let target = tokens[start + PPL_WINDOW];
+        let ctx = &tokens[start..start + ppl_window()];
+        let target = tokens[start + ppl_window()];
 
         // BUG FIX (2026-09-24): tensors MUST be created on the model's device.
         // The old code used grim_backend_cpu::cpu_tensor here, which created CPU
@@ -123,12 +142,58 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
         // Fresh session per window: each window is an independent prediction,
         // and this avoids cross-window cache contamination.
         let mut sess = model.new_session();
+        let w_start = std::time::Instant::now();
         let logits = model.forward(&mut *sess, &ids, &positions, &[])?;
-        let all = logits.to_vec_f32()?;
-        // Last row of logits predicts the token AFTER the context.
-        let vocab = all.len() / ctx.len();
-        let last_row_start = all.len() - vocab.max(1);
-        let last_logits = &all[last_row_start..];
+        eprintln!(
+            "[eval] window {n_windows}: forward {} ms",
+            w_start.elapsed().as_millis()
+        );
+        // Only the LAST row predicts the next token. Reading the full
+        // [1, ctx, vocab] block back is ~1 GB of D2H per window at 2048 ctx
+        // and dominated the harness. GRIM_EVAL_LAST_ROW_ONLY=1 (default on)
+        // copies just the final vocab slice on-device, then reads that back.
+        let last_row_only = std::env::var("GRIM_EVAL_LAST_ROW_ONLY")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let vocab = logits.shape().elem_count() / ctx.len().max(1);
+        let last_logits: Vec<f32> = if last_row_only
+            && vocab > 0
+            && logits.shape().elem_count() >= vocab
+        {
+            if let grim_tensor::Device::Rocm(ord) = model.device() {
+                let arc = grim_backend_rocm::RocmDevice::shared(*ord);
+                use grim_tensor::MemoryOps as _MO;
+                let small = _MO::alloc_storage(
+                    arc.as_ref(),
+                        &grim_tensor::Shape::new(vec![vocab]),
+                        grim_tensor::dtype::DType::F32,
+                    )
+                    .map_err(|e| Error::Backend(format!("eval last-row alloc: {e}")))?;
+                let dst = small.as_ref();
+                let src_dyn: &dyn grim_tensor::BackendStorage =
+                    logits.storage().as_ref();
+                arc.copy_slice_range(
+                    dst,
+                    0,
+                    src_dyn,
+                    (ctx.len() - 1) * vocab,
+                    vocab,
+                )
+                .map_err(|e| Error::Backend(format!("eval last-row copy: {e}")))?;
+                arc.synchronize();
+                small
+                    .to_cpu_vec_f32()
+                    .map_err(|e| Error::Backend(format!("eval last-row read: {e}")))?
+            } else {
+                let all = logits.to_vec_f32()?;
+                let v = all.len() / ctx.len();
+                all[all.len() - v.max(1)..].to_vec()
+            }
+        } else {
+            let all = logits.to_vec_f32()?;
+            let v = all.len() / ctx.len();
+            all[all.len() - v.max(1)..].to_vec()
+        };
 
         // log-softmax of the target token.
         let max_l = last_logits
@@ -147,7 +212,7 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
             .ok_or_else(|| Error::Config(format!("target token {target} out of vocab")))?;
         sum_nll += ((log_sum_exp - target_l) as f64).max(0.0);
         n_windows += 1;
-        start += PPL_WINDOW; // non-overlapping stride keeps runtime bounded
+        start += ppl_window(); // non-overlapping stride keeps runtime bounded
     }
     if n_windows == 0 {
         return Err(Error::Config("no complete windows in corpus".into()));
@@ -399,9 +464,20 @@ pub async fn cmd_eval(
                 let text = std::fs::read_to_string(&corpus_path)
                     .map_err(|e| Error::Config(format!("corpus read: {e}")))?;
                 let (loaded, resolved_path) = load_model(&model)?;
-                // Tokenizer comes from the model file itself.
-                let provider = grim_format::GgufProvider::open(resolved_path.as_str())?;
-                let tokenizer = provider.tokenizer()?;
+                // Tokenizer comes from the model file itself. A .grim
+                // carries the GGUF tokenizer metadata embedded at conversion;
+                // GgufProvider::open on one dies on the magic check.
+                let tokenizer = if std::path::Path::new(resolved_path.as_str())
+                    .extension()
+                    .map(|e| e == "grim")
+                    .unwrap_or(false)
+                {
+                    let provider = grim_format::GrimProvider::open(resolved_path.as_str())?;
+                    provider.tokenizer()?
+                } else {
+                    let provider = grim_format::GgufProvider::open(resolved_path.as_str())?;
+                    provider.tokenizer()?
+                };
                 let tokens = tokenizer.encode(&text);
                 eprintln!("[eval] ppl: {} tokens", tokens.len());
                 let (ppl, windows) = compute_ppl(loaded.as_ref(), &tokens)?;
