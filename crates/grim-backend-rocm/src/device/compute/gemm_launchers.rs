@@ -2151,6 +2151,22 @@ impl RocmDevice {
                             .into(),
                     ));
                 }
+                // Capture refusal, 2026-10-07: a u4-lane GEMV captured into
+                // the decode graph poisons the replay — .grim Xing4.0 logits
+                // go all-NaN from the FIRST replayed step (bisected: GGUF
+                // graph with the same routes minus GSQ replays clean; GSQ-only
+                // u4 config still NaNs). The eager u4 GEMV is fine (eager
+                // fallback text is correct through the same route), so keep
+                // the route for eager steps and let capture fail cleanly to
+                // the eager path. Mechanism under investigation.
+                if self.is_capturing() {
+                    return Err(Error::Backend(
+                        "linear_decode_into: GsqRco3p5 u4-lane route is not \
+                         capture-safe — captured replays emit NaN logits. \
+                         Decode takes the eager path for this tensor."
+                            .into(),
+                    ));
+                }
                 let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                     Error::Backend("linear_decode_into: a not RocmStorage".into())
                 })?;
@@ -2953,8 +2969,14 @@ impl RocmDevice {
         }
         // Reserve: lazy kernel-module loads and activation scratch still
         // need headroom after the last lane copy lands. 256 MiB is far above
-        // any single hsaco and small against a 17 GB card.
-        const VRAM_RESERVE_BYTES: usize = 256 * 1024 * 1024;
+        // any single hsaco and small against a 17 GB card. GRIM_U4_RESERVE_MB
+        // overrides (diagnostic: a huge reserve forces every Q4K/Q5K/Q6K
+        // weight to decline and keep its dot4/WMMA route).
+        let vram_reserve_bytes: usize = std::env::var("GRIM_U4_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(256 * 1024 * 1024);
         if budget {
             let lane_bytes = n * (k / 2) // qweight u4
                 + n * (k / 128) * 2 // scales bf16
@@ -2962,13 +2984,13 @@ impl RocmDevice {
                 + 1024 * 1024; // upload slack
             let (mut free_mem, mut total_mem) = (0usize, 0usize);
             let ok = unsafe { hipMemGetInfo(&mut free_mem, &mut total_mem) };
-            let fits = ok == 0 && free_mem > lane_bytes + VRAM_RESERVE_BYTES;
+            let fits = ok == 0 && free_mem > lane_bytes + vram_reserve_bytes;
             if !fits {
                 static DECLINED_ONCE: OnceLock<()> = OnceLock::new();
                 if DECLINED_ONCE.set(()).is_ok() {
                     eprintln!(
                         "[u4-lane] budget decline: {scheme:?} [{n},{k}] needs ~{lane_bytes} B, \
-                         free={free_mem}/{total_mem} B (reserve {VRAM_RESERVE_BYTES} B) — \
+                         free={free_mem}/{total_mem} B (reserve {vram_reserve_bytes} B) — \
                          weight keeps its dot4/WMMA route for this process"
                     );
                 }

@@ -310,6 +310,17 @@ impl QuantOps for RocmDevice {
                     k,
                 )
                 .map_err(Error::Backend)?;
+                // Capture refusal (see the twin gate in gemm_launchers
+                // linear_decode_into): a u4-lane GEMV captured into the
+                // decode graph poisons the replay with NaN logits. Eager
+                // steps keep the u4 route.
+                if self.is_capturing() {
+                    return Err(Error::Backend(
+                        "quantized_matmul: GsqRco3p5 u4-lane route is not \
+                         capture-safe — captured replays emit NaN logits."
+                            .into(),
+                    ));
+                }
                 let lanes = self.u4_lane_weights(b_storage, n, k, KQuantScheme::GsqRco3p5)?;
                 self.launch_w4a4_ostquant_gemv(
                     a_storage,

@@ -486,6 +486,31 @@ fn try_graph_decode_step(
     }
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
 
+    // Diagnostic: dump the replayed graph's own logits — the Sampled path
+    // below never materializes them, so a diverging replay is invisible
+    // (steps 2+ print no logprobs). GRIM_DEBUG_TOPLOGITS=1 enables.
+    if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+        if let Ok(flat) = g.read_logits_f32() {
+            if flat.len() == vocab {
+                let mut idx: Vec<u32> = (0..vocab as u32).collect();
+                idx.sort_by(|&a, &b| flat[b as usize].total_cmp(&flat[a as usize]));
+                let top: Vec<String> = idx[..5]
+                    .iter()
+                    .map(|&i| format!("{i}:{:.4}", flat[i as usize]))
+                    .collect();
+                eprintln!(
+                    "[graph-toplogits] step={step} top5=[{}] argmax={}",
+                    top.join(", "),
+                    idx[0]
+                );
+            } else {
+                eprintln!("[graph-toplogits] step={step} logits len {} != vocab {vocab}", flat.len());
+            }
+        } else {
+            eprintln!("[graph-toplogits] step={step} read_logits_f32 failed");
+        }
+    }
+
     if allow_gpu_sample {
         // G1: launch the sampler on `g.stream` (the replay stream) so it is
         // stream-ordered AFTER `hipGraphLaunch`. Ambient `active_stream()`

@@ -1140,6 +1140,23 @@ impl RocmDevice {
     }
 
     /// If a graph-capture session is active, returns the dedicated capture stream. [see: `None`]
+    /// True only between `begin_graph_capture` and `end_graph_capture` —
+    /// the public gate for routes that must refuse capture.
+    pub fn is_capturing(&self) -> bool {
+        self.capture_active.load(Ordering::SeqCst)
+    }
+
+    /// Raise/lower the capture gate from the OTHER capture mechanisms
+    /// (DecodeGraphBuffers::begin_capture, the graph_capture manager) that
+    /// open hipStreamBeginCapture on their own streams and never touch the
+    /// begin_graph_capture flag. Routes that must refuse capture gate on
+    /// this; NOT RAISING it makes their kernels silently launch on the
+    /// default stream, never enter the graph, and replay reads an
+    /// uninitialized output buffer (the .grim Xing4.0 all-NaN replay).
+    pub fn set_capture_gate(&self, on: bool) {
+        self.capture_active.store(on, Ordering::SeqCst);
+    }
+
     pub(crate) fn active_capture_stream(&self) -> Option<*mut c_void> {
         if self.capture_active.load(Ordering::SeqCst) {
             *self
@@ -1471,16 +1488,25 @@ impl RocmDevice {
     ) -> Result<()> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         self.ensure_graph_capture_mgr();
-        let mgr = self
-            .graph_capture_mgr
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mgr = mgr.as_ref().ok_or_else(|| {
-            Error::Backend("capture_decode_step: graph capture manager not initialized".into())
-        })?;
-        mgr.get_or_capture(key, record)?;
-        mgr.replay(key)?;
-        Ok(())
+        // Raise the capture gate for the WHOLE record closure: routes that
+        // are not capture-safe (GsqRco3p5 u4-lane GEMV) check this and
+        // refuse, failing the capture cleanly to eager. The manager opens
+        // hipStreamBeginCapture directly and never touches the
+        // begin_graph_capture flag, so that flag is invisible here.
+        self.capture_active.store(true, Ordering::SeqCst);
+        let gate_result = (|| -> Result<()> {
+            let mgr = self
+                .graph_capture_mgr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mgr = mgr.as_ref().ok_or_else(|| {
+                Error::Backend("capture_decode_step: graph capture manager not initialized".into())
+            })?;
+            mgr.get_or_capture(key, record)?;
+            mgr.replay(key)
+        })();
+        self.capture_active.store(false, Ordering::SeqCst);
+        gate_result
     }
 
     /// Replay a previously captured full decode-step graph.
