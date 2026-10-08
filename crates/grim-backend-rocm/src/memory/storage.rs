@@ -84,6 +84,16 @@ impl RocmStorage {
         allocator: &Arc<RocmCachingAllocator>,
         ordinal: usize,
     ) -> Result<Self> {
+        // GRIM_ALLOC_TRACE: name every large allocation so per-token churn is
+        // attributable (the 27B 16 MiB-per-decode-step hunt).
+        if bytes >= 8 * 1024 * 1024 && std::env::var_os("GRIM_ALLOC_TRACE").is_some() {
+            eprintln!(
+                "[alloc-big] {} bytes={} shape={:?}",
+                alloc_label(&dtype, shape),
+                bytes,
+                shape.dims()
+            );
+        }
         if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
             crate::memory::budget::note_managed_fallback(ordinal, bytes);
             // WI-M1 context discipline: `hipMallocManaged` binds the new allocation to the CALLING THREAD's current device.
