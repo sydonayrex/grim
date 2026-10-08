@@ -1455,6 +1455,87 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
 // rest of the tree trusts (dequant_iq3s + IQ3S_GRID_B above in this TU;
 // dequant_q4k_element from shared_device_fns). Routing comes from device
 // buffers: decode-graph capture-safe.
+// ===================== PREFILL dequant-once arm =====================
+// Dequantizes ONE expert's three banks to f32 (gate/up [inter, hidden],
+// down [hidden, inter]) so a prefill window can run per-expert rocBLAS
+// SGEMMs instead of the per-pair in-register decode. Launched once per
+// expert with a 44 MB rolling scratch — see `moe_dequant_gemm_prefill_into`.
+// blockIdx.y: 0 gate, 1 up, 2 down.
+extern "C" __global__ void grim_dequant_expert_banks_f32(
+    const unsigned long long* __restrict__ gate_ptrs,
+    const unsigned long long* __restrict__ up_ptrs,
+    const unsigned long long* __restrict__ down_ptrs,
+    float* __restrict__ out_gate,   // [inter, hidden]
+    float* __restrict__ out_up,     // [inter, hidden]
+    float* __restrict__ out_down,   // [hidden, inter]
+    int inter, int hidden, int expert,
+    int gate_row_bytes, int down_row_bytes, int down_fmt)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int bank = blockIdx.y;
+    // TRANSPOSED writes: the prefill arm feeds these to matmul as the
+    // NON-transposed B operand — gate/up land as [hidden, inter], down as
+    // [inter, hidden].
+    if (bank == 0 || bank == 1) {
+        if (row >= inter) return;
+        const unsigned char* src = (bank == 0
+            ? (const unsigned char*)(size_t)gate_ptrs[expert]
+            : (const unsigned char*)(size_t)up_ptrs[expert])
+            + (unsigned long long)row * gate_row_bytes;
+        float* dst = (bank == 0 ? out_gate : out_up);
+        for (int i = tid * 4; i < hidden; i += blockDim.x * 4) {
+            float w4[4];
+            dequant_iq3s_x4(src, i, w4);
+            dst[(size_t)(i + 0) * inter + row] = w4[0];
+            dst[(size_t)(i + 1) * inter + row] = w4[1];
+            dst[(size_t)(i + 2) * inter + row] = w4[2];
+            dst[(size_t)(i + 3) * inter + row] = w4[3];
+        }
+    } else {
+        if (row >= hidden) return;
+        const unsigned char* src = (const unsigned char*)(size_t)down_ptrs[expert]
+            + (unsigned long long)row * down_row_bytes;
+        float* dst = out_down;
+        for (int i = tid * 4; i < inter; i += blockDim.x * 4) {
+            if (down_fmt) {
+                const int b = i / 256;
+                dst[(size_t)(i + 0) * hidden + row] = dequant_q4k_element(src + b * 144, i % 256);
+            } else {
+                float w4[4];
+                dequant_iq3s_x4(src, i, w4);
+                dst[(size_t)(i + 0) * hidden + row] = w4[0];
+                dst[(size_t)(i + 1) * hidden + row] = w4[1];
+                dst[(size_t)(i + 2) * hidden + row] = w4[2];
+                dst[(size_t)(i + 3) * hidden + row] = w4[3];
+            }
+        }
+    }
+}
+
+// out[r] = x[toks[r]] for r in 0..count (pair-compact gather).
+extern "C" __global__ void grim_moe_gather_rows(
+    const float* __restrict__ x, const int* __restrict__ toks,
+    float* __restrict__ out, int hidden)
+{
+    const int r = blockIdx.x;
+    const int tok = toks[r];
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x)
+        out[(long long)r * hidden + i] = x[(long long)tok * hidden + i];
+}
+
+// out[toks[r]] += wts[r] * in[r] (pair-compact scaled scatter-add).
+extern "C" __global__ void grim_moe_scatter_add_rows(
+    float* __restrict__ out, const int* __restrict__ toks,
+    const float* __restrict__ wts, const float* __restrict__ in, int hidden)
+{
+    const int r = blockIdx.x;
+    const int tok = toks[r];
+    const float w = wts[r];
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x)
+        atomicAdd(out + (long long)tok * hidden + i, w * in[(long long)r * hidden + i]);
+}
+
 extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
     const float* __restrict__ activations,            // [batch, hidden]
     const unsigned long long* __restrict__ gate_ptrs, // [num_experts]

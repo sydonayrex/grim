@@ -1665,3 +1665,248 @@ impl RocmDevice {
         Ok(stream)
     }
 }
+
+// ---------------------------------------------------------------------------
+// PREFILL dequant-once MoE arm (eval/prefill shapes, seq_len >= 32).
+// For each expert: dequant its three packed banks into a rolling f32 scratch
+// (44 MB, fits where a whole-layer F16 copy would not), gather the pairs
+// routed to it, run gate/up/down matmuls on the proven matmul path, and
+// scaled scatter-add into the layer output. NOT capture-safe (host routing
+// readback) — decode stays on the per-pair kernel.
+// ---------------------------------------------------------------------------
+pub struct MoEDequantGemmScratch {
+    pub bg_t: RocmStorage, // [hidden, inter]  gate^T
+    pub bu_t: RocmStorage, // [hidden, inter]  up^T
+    pub bd_t: RocmStorage, // [inter, hidden]  down^T
+    pub xe: RocmStorage,   // [num_pairs, hidden]
+    pub key: (usize, usize, usize),
+}
+
+static MOE_DG_SCRATCH: std::sync::OnceLock<std::sync::Mutex<Option<(usize, MoEDequantGemmScratch)>>> =
+    std::sync::OnceLock::new();
+
+impl RocmDevice {
+    /// See the module-level comment. Returns Ok(()) after writing `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_dequant_gemm_prefill_into(
+        &self,
+        x_rocm: &RocmStorage,
+        g_ptrs: &RocmStorage,
+        u_ptrs: &RocmStorage,
+        d_ptrs: &RocmStorage,
+        tokens_rocm: &RocmStorage,
+        experts_rocm: &RocmStorage,
+        weights_rocm: &RocmStorage,
+        num_pairs: usize,
+        out: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        gate_row_bytes: u64,
+        down_row_bytes: u64,
+        down_q4k: bool,
+    ) -> Result<()> {
+        use grim_tensor::{ArithType, MemoryOps, Storage};
+        if num_pairs == 0 {
+            return Ok(());
+        }
+
+        // 1. Routing readback (tiny; prefill is not capture-bound).
+        let tok_host = tokens_rocm.copy_to_host().map_err(|e| Error::Backend(e.to_string()))?;
+        let exp_host = experts_rocm.copy_to_host().map_err(|e| Error::Backend(e.to_string()))?;
+        let w_host = weights_rocm.copy_to_host().map_err(|e| Error::Backend(e.to_string()))?;
+        let u32le = |b: &[u8], i: usize| {
+            u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+        };
+        let f32le = |b: &[u8], i: usize| {
+            f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+        };
+        let mut order: Vec<usize> = (0..num_pairs).collect();
+        order.sort_by_key(|&p| u32le(&exp_host, p));
+        let sorted_toks: Vec<i32> = order.iter().map(|&p| u32le(&tok_host, p) as i32).collect();
+        let sorted_wts: Vec<f32> =
+            order.iter().map(|&p| f32le(&w_host, p) * routed_scaling_factor).collect();
+
+        // 2. Scratch + stream. The cache guard is held for the whole arm so
+        // the storages stay borrowed (RocmStorage is not Clone); the arm is
+        // called once per layer, sequentially.
+        let cell = MOE_DG_SCRATCH.get_or_init(|| std::sync::Mutex::new(None));
+        let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let need_key = (hidden, inter, num_pairs);
+        if !matches!(guard.as_ref(), Some((ord, s)) if *ord == self.ordinal && s.key == need_key)
+        {
+            let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+            let s = MoEDequantGemmScratch {
+                bg_t: RocmStorage::alloc_gpu(
+                    &Shape::new(vec![hidden, inter]),
+                    f32ty.clone(),
+                    &self.allocator,
+                    self.ordinal,
+                )?,
+                bu_t: RocmStorage::alloc_gpu(
+                    &Shape::new(vec![hidden, inter]),
+                    f32ty.clone(),
+                    &self.allocator,
+                    self.ordinal,
+                )?,
+                bd_t: RocmStorage::alloc_gpu(
+                    &Shape::new(vec![inter, hidden]),
+                    f32ty.clone(),
+                    &self.allocator,
+                    self.ordinal,
+                )?,
+                xe: RocmStorage::alloc_gpu(
+                    &Shape::new(vec![num_pairs, hidden]),
+                    f32ty.clone(),
+                    &self.allocator,
+                    self.ordinal,
+                )?,
+                key: need_key,
+            };
+            *guard = Some((self.ordinal, s));
+        }
+        let scratch = &guard.as_ref().unwrap().1;
+        let _stream = self.active_stream();
+
+        let gate_ptrs_p = g_ptrs.device_ptr_checked()? as *mut c_void;
+        let up_ptrs_p = u_ptrs.device_ptr_checked()? as *mut c_void;
+        let down_ptrs_p = d_ptrs.device_ptr_checked()? as *mut c_void;
+        let a_x_p = x_rocm.device_ptr_checked()? as *mut c_void;
+        let mut out_p = out.device_ptr_checked()? as *mut c_void;
+
+        // 3. Per-expert segments in the sorted order.
+        let mut seg_start = 0usize;
+        while seg_start < num_pairs {
+            let e = u32le(&exp_host, order[seg_start]) as usize;
+            let mut seg_end = seg_start;
+            while seg_end < num_pairs && u32le(&exp_host, order[seg_end]) == e as u32 {
+                seg_end += 1;
+            }
+            let count = seg_end - seg_start;
+            let toks_slice: Vec<i32> = sorted_toks[seg_start..seg_end].to_vec();
+            let wts_slice: Vec<f32> = sorted_wts[seg_start..seg_end].to_vec();
+            let toks_st = MemoryOps::from_cpu_bytes(
+                self as &dyn grim_tensor::BackendDevice,
+                unsafe { std::slice::from_raw_parts(toks_slice.as_ptr() as *const u8, count * 4) },
+                &Shape::new(vec![count]),
+                DType { arith: ArithType::U32, storage: Storage::Native },
+            )
+            .map_err(|e2| Error::Backend(format!("dg toks h2d: {e2}")))?;
+            let wts_st = MemoryOps::from_cpu_bytes(
+                self as &dyn grim_tensor::BackendDevice,
+                unsafe { std::slice::from_raw_parts(wts_slice.as_ptr() as *const u8, count * 4) },
+                &Shape::new(vec![count]),
+                DType { arith: ArithType::F32, storage: Storage::Native },
+            )
+            .map_err(|e2| Error::Backend(format!("dg wts h2d: {e2}")))?;
+            let mut toks_p = crate::device::util::as_rocm(toks_st.as_ref())?
+                .device_ptr_checked()? as *mut c_void;
+            let mut wts_p = crate::device::util::as_rocm(wts_st.as_ref())?
+                .device_ptr_checked()? as *mut c_void;
+
+            // (a) dequant expert e's banks, transposed, into the scratch.
+            let mut gate_ptrs_p = gate_ptrs_p;
+            let mut up_ptrs_p = up_ptrs_p;
+            let mut down_ptrs_p = down_ptrs_p;
+            let mut og = scratch.bg_t.device_ptr_checked()? as *mut c_void;
+            let mut ou = scratch.bu_t.device_ptr_checked()? as *mut c_void;
+            let mut od = scratch.bd_t.device_ptr_checked()? as *mut c_void;
+            let mut inter_i = inter as i32;
+            let mut hidden_i = hidden as i32;
+            let mut expert_i = e as i32;
+            let mut grb_i = gate_row_bytes as i32;
+            let mut drb_i = down_row_bytes as i32;
+            let mut dfmt_i = down_q4k as i32;
+            self.launch_compute_kernel(
+                "grim_dequant_expert_banks_f32",
+                HipDim3::new(hidden.max(inter) as u32, 3, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [
+                    arg(&mut gate_ptrs_p),
+                    arg(&mut up_ptrs_p),
+                    arg(&mut down_ptrs_p),
+                    arg(&mut og),
+                    arg(&mut ou),
+                    arg(&mut od),
+                    arg(&mut inter_i),
+                    arg(&mut hidden_i),
+                    arg(&mut expert_i),
+                    arg(&mut grb_i),
+                    arg(&mut drb_i),
+                    arg(&mut dfmt_i),
+                ],
+            )?;
+
+            // (b) gather this expert's token rows into Xe rows 0..count.
+            let mut a_x_p = a_x_p;
+            let mut xe_p = scratch.xe.device_ptr_checked()? as *mut c_void;
+            self.launch_compute_kernel(
+                "grim_moe_gather_rows",
+                HipDim3::new(count as u32, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [arg(&mut a_x_p), arg(&mut toks_p), arg(&mut xe_p), arg(&mut hidden_i)],
+            )?;
+
+            // (c) gate / up matmuls on the proven path:
+            //     Y[count,inter] = Xe[count,hidden] x B[hidden,inter]
+            // matmul reads A's rows 0..count (k from its shape's last dim).
+            let bg_ref: &dyn grim_tensor::BackendStorage = &scratch.bg_t;
+            let bu_ref: &dyn grim_tensor::BackendStorage = &scratch.bu_t;
+            let bd_ref: &dyn grim_tensor::BackendStorage = &scratch.bd_t;
+            let xe_ref: &dyn grim_tensor::BackendStorage = &scratch.xe;
+            let (yg_st, _) = self.matmul_op(
+                xe_ref,
+                bg_ref,
+                &Shape::new(vec![count, inter]),
+                crate::autotune::GemmOp::Ffn,
+            )?;
+            let (yu_st, _) = self.matmul_op(
+                xe_ref,
+                bu_ref,
+                &Shape::new(vec![count, inter]),
+                crate::autotune::GemmOp::Ffn,
+            )?;
+            let mut yg_p = crate::device::util::as_rocm(yg_st.as_ref())?
+                .device_ptr_checked()? as *mut c_void;
+            let mut yu_p = crate::device::util::as_rocm(yu_st.as_ref())?
+                .device_ptr_checked()? as *mut c_void;
+
+            // (d) silu(gate) * up over [count, inter].
+            let mut n_silu = (count * inter) as i32;
+            let blocks = (count * inter).div_ceil(256) as u32;
+            self.launch_compute_kernel(
+                "grim_silu_mul",
+                HipDim3::new(blocks, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [arg(&mut yg_p), arg(&mut yu_p), arg(&mut yg_p), arg(&mut n_silu)],
+            )?;
+
+            // (e) down matmul: D[count,hidden] = C[count,inter] x Bd[inter,hidden]
+            let (dt_st, _) = self.matmul_op(
+                yg_st.as_ref(),
+                bd_ref,
+                &Shape::new(vec![count, hidden]),
+                crate::autotune::GemmOp::Ffn,
+            )?;
+            let mut dt_p = crate::device::util::as_rocm(dt_st.as_ref())?
+                .device_ptr_checked()? as *mut c_void;
+
+            // (f) scaled scatter-add into the layer output.
+            self.launch_compute_kernel(
+                "grim_moe_scatter_add_rows",
+                HipDim3::new(count as u32, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [
+                    arg(&mut out_p),
+                    arg(&mut toks_p),
+                    arg(&mut wts_p),
+                    arg(&mut dt_p),
+                    arg(&mut hidden_i),
+                ],
+            )?;
+
+            seg_start = seg_end;
+        }
+        Ok(())
+    }
+}

@@ -1162,6 +1162,118 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                 .as_any()
                 .downcast_ref::<grim_backend_rocm::RocmStorage>()
                 .ok_or_else(|| grim_tensor::Error::Backend("kq out not RocmStorage".into()))?;
+            // OPT-IN until the per-expert GEMM dispatch is made cheap: the arm
+            // is CORRECT (PPL parity with kq-native) but currently SLOWER
+            // (349 s vs 98 s per 256-token window) — 2432 tiny matmul_op
+            // dispatches with fresh output allocations per window. Enable
+            // with GRIM_MOE_PREFILL_GEMM=1.
+            if num_pairs > 0
+                && seq_len >= 32
+                && std::env::var_os("GRIM_MOE_PREFILL_GEMM").is_some()
+            {
+                // PREFILL dequant-once arm: per-pair in-register decode costs
+                // 1.56 s per MoE layer at these shapes; dequant each expert
+                // once (44 MB rolling scratch) and run per-expert SGEMMs
+                // instead. Not capture-safe — decode (seq_len < 32) keeps the
+                // per-pair kernel below.
+                cache.record_dispatch(DispatchKind::KqNative);
+                let out_shape = Shape::new(vec![seq_len, hidden]);
+                let out_storage_b = rocm.zeros(&out_shape, DType::F32)?;
+                let out_storage = out_storage_b
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| {
+                        grim_tensor::Error::Backend("kq out not RocmStorage".into())
+                    })?;
+                let g_ptrs = kq
+                    .gate_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("kq gate ptrs not RocmStorage".into()))?;
+                let u_ptrs = kq
+                    .up_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("kq up ptrs not RocmStorage".into()))?;
+                let d_ptrs = kq
+                    .down_ptrs
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .ok_or_else(|| grim_tensor::Error::Backend("kq down ptrs not RocmStorage".into()))?;
+                rocm.moe_dequant_gemm_prefill_into(
+                    x_rocm,
+                    g_ptrs,
+                    u_ptrs,
+                    d_ptrs,
+                    tokens_rocm,
+                    experts_rocm,
+                    weights_rocm,
+                    num_pairs,
+                    out_storage,
+                    hidden,
+                    inter,
+                    routed_scaling_factor,
+                    kq.gate_bytes / inter as u64,
+                    kq.down_bytes / hidden as u64,
+                    kq.down_q4k,
+                )?;
+                // GRIM_MOE_ARM_DIFF=1: also run the per-pair kernel and print
+                // the max-abs difference — localizes dequant-gemm bugs.
+                if std::env::var_os("GRIM_MOE_ARM_DIFF").is_some() {
+                    let out2_b = rocm.zeros(&out_shape, DType::F32)?;
+                    let out2 = out2_b
+                        .as_any()
+                        .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                        .unwrap();
+                    rocm.moe_fused_dispatch_kq_native_into(
+                        x_rocm,
+                        g_ptrs,
+                        u_ptrs,
+                        d_ptrs,
+                        tokens_rocm,
+                        experts_rocm,
+                        weights_rocm,
+                        num_pairs,
+                        out2,
+                        hidden,
+                        inter,
+                        routed_scaling_factor,
+                        kq.gate_bytes / inter as u64,
+                        kq.down_bytes / hidden as u64,
+                        i32::from(kq.down_q4k),
+                    )?;
+                    let ab = out_storage.copy_to_host().unwrap();
+                    let bb = out2.copy_to_host().unwrap();
+                    let a: Vec<f32> = ab.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let b: Vec<f32> = bb.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                    let na = a.iter().fold(0.0f32, |m2, v| m2.max(v.abs()));
+                    let nb = b.iter().fold(0.0f32, |m2, v| m2.max(v.abs()));
+                    let sa: f32 = a.iter().map(|v| v.abs()).sum();
+                    let sb: f32 = b.iter().map(|v| v.abs()).sum();
+                    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+                    let na2: f32 = a.iter().map(|v| v * v).sum();
+                    let nb2: f32 = b.iter().map(|v| v * v).sum();
+                    let cos = dot / (na2.sqrt() * nb2.sqrt() + 1e-9);
+                    let mut mism: Vec<String> = Vec::new();
+                    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                        if (x - y).abs() > 1.0 {
+                            mism.push(format!("i={i} tok={} col={} a={x:.4} b={y:.4}", i / 3584, i % 3584));
+                        }
+                        if mism.len() >= 6 { break; }
+                    }
+                    eprintln!("[moe-arm-diff] max_abs={md} amax_a={na} amax_b={nb} sum|a|={sa} sum|b|={sb} cos={cos:.4} len={}", a.len());
+                    for m in &mism { eprintln!("[moe-arm-diff]   {m}"); }
+                }
+                let out_t = Tensor::new(
+                    Arc::from(out_storage_b),
+                    out_shape,
+                    DType::F32,
+                    x.provenance().clone(),
+                    x.device().clone(),
+                );
+                return shared_expert_tail(dev, out_t, x, shared_expert).map(Some);
+            }
             if num_pairs > 0 {
                 let g_ptrs = kq
                     .gate_ptrs
