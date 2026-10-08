@@ -107,14 +107,17 @@ fn should_use_managed(mode: &str, free: u64, total: u64, bytes: u64, budget: u64
     match mode {
         "1" | "true" | "always" => true,
         "auto" => {
-            // Small tensors stay VRAM-resident even past the budget: on the
-            // 27B the 20 KB MTP hnorm spilled to host-backed managed memory
-            // once the ledger crossed 90%, and every decode step then read
-            // it over PCIe. If the real allocation fails, alloc_gpu's error
-            // path still falls back to managed — worst case is today's
-            // behavior, best case the small tensor is resident.
+            // Small tensors stay VRAM-resident while the driver reports
+            // headroom (bytes + the 64 MB driver cushion): on the 27B the
+            // 20 KB MTP hnorm spilled to host-backed managed memory once
+            // the ledger crossed 90%, and every decode step then read it
+            // over PCIe. BUT an unconditional exemption let hundreds of
+            // small tensors consume the pool and pushed a 16 MB allocation
+            // into managed memory instead — a GPU SVM page fault. Hence the
+            // headroom check: spill small tensors when headroom is gone.
             if bytes <= SMALL_VRAM_RESIDENT_MAX {
-                return false;
+                let cushion = 64 * 1024 * 1024;
+                return free < bytes.saturating_add(cushion);
             }
             free < bytes || total.saturating_sub(free) > budget
         }
@@ -181,10 +184,29 @@ mod tests {
     /// step. The alloc_gpu error path still catches a genuine OOM.
     #[test]
     fn auto_mode_keeps_small_tensors_vram_resident() {
-        assert!(!should_use_managed("auto", 40, 100, 20 * 1024, 50));
-        assert!(!should_use_managed("auto", 1, 100, 4 * 1024 * 1024, 100));
-        // Just over the threshold spills again (free < request).
-        assert!(should_use_managed("auto", 1, 100, 5 * 1024 * 1024, 100));
+        assert!(!should_use_managed(
+            "auto",
+            200 * 1024 * 1024,
+            100 * 1024 * 1024,
+            20 * 1024,
+            50 * 1024 * 1024
+        ));
+        // 200 MB free: 4 MB + 64 MB cushion fits — resident.
+        assert!(!should_use_managed(
+            "auto",
+            200 * 1024 * 1024,
+            100 * 1024 * 1024,
+            4 * 1024 * 1024,
+            50 * 1024 * 1024
+        ));
+        // 1 MB free: cushion gone — spill even a small alloc.
+        assert!(should_use_managed(
+            "auto",
+            1 * 1024 * 1024,
+            100 * 1024 * 1024,
+            20 * 1024,
+            50 * 1024 * 1024
+        ));
     }
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
