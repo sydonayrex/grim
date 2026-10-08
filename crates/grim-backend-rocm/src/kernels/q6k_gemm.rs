@@ -111,12 +111,37 @@ extern "C" {
         int sb_idx = k_idx / 256;
         int in_sb = k_idx % 256;
 
+        // Hoist the loop-invariant index decomposition out of the N loop.
+        // `dequant_q6k_element` recomputed n/pos/quarter/l/is/sc_idx
+        // (5 divs/mods) per N element; all depend only on in_sb.
+        const int k_n       = in_sb / 128;
+        const int k_pos     = in_sb % 128;
+        const int k_quarter = k_pos / 32;
+        const int k_l       = k_pos % 32;
+        const int k_is      = k_l / 16;
+        const int k_sc_idx  = k_n * 8 + k_is + 2 * k_quarter;
+        const int k_ql_base = k_n * 64 + k_l;
+        const int k_ql_off  = ((k_quarter & 1) ? 32 : 0);
+        const int k_qh_idx  = k_n * 32 + k_l;
+        const int k_qh_shift = 2 * k_quarter;
+        const int k_hi_nib  = (k_quarter & 2) ? 1 : 0;
+
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
             float dy_val = dY[row * N + n];
             const unsigned char* block_ptr = B_q6k + n * row_bytes + sb_idx * 210;
-            float w_val = dequant_q6k_element(block_ptr, in_sb);
-            acc += dy_val * w_val;
+            const unsigned char* ql = block_ptr;
+            const unsigned char* qh = block_ptr + 128;
+            const signed char* scales = (const signed char*)(block_ptr + 192);
+            const unsigned short* d_ptr = (const unsigned short*)(block_ptr + 208);
+            float d = fp16_to_float_device(d_ptr[0]);
+            signed char sc = scales[k_sc_idx];
+            unsigned char ql_byte = ql[k_ql_base + k_ql_off];
+            int nibble = k_hi_nib ? (ql_byte >> 4) : (ql_byte & 0x0F);
+            unsigned char qh_byte = qh[k_qh_idx];
+            int qh_bits = (qh_byte >> k_qh_shift) & 0x03;
+            int q_code = nibble | (qh_bits << 4);
+            acc += dy_val * (d * (float)sc * ((float)q_code - 32.0f));
         }
 
         dX[row * K + k_idx] = acc;

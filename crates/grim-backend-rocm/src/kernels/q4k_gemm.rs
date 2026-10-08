@@ -80,12 +80,35 @@ extern "C" {
         int sb_idx = k_idx / 256;
         int in_sb = k_idx % 256;
 
+        // Hoist the loop-invariant index decomposition out of the N loop.
+        // Previously `dequant_q4k_element` recomputed group/half/l/is
+        // (3 divs/mods + branch) per N element; they depend only on in_sb.
+        const int k_group = in_sb / 64;
+        const int k_half  = (in_sb % 64) / 32;
+        const int k_l     = in_sb % 32;
+        const int k_is    = 2 * k_group + k_half;
+        const int k_qs_off = k_group * 32 + k_l;
+        const int k_is_low = (k_is < 4) ? 1 : 0;
+
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
             float dy_val = dY[row * N + n];
             const unsigned char* block_ptr = B_q4k + n * row_bytes + sb_idx * 144;
-            float w_val = dequant_q4k_element(block_ptr, in_sb);
-            acc += dy_val * w_val;
+            const unsigned short* h_ptr = (const unsigned short*)block_ptr;
+            float d = fp16_to_float_device(h_ptr[0]);
+            float dmin = fp16_to_float_device(h_ptr[1]);
+            const unsigned char* scales = block_ptr + 4;
+            unsigned char sc, m;
+            if (k_is_low) {
+                sc = scales[k_is] & 63;
+                m  = scales[k_is + 4] & 63;
+            } else {
+                sc = (scales[k_is + 4] & 0xF) | ((scales[k_is - 4] >> 6) << 4);
+                m  = (scales[k_is + 4] >> 4)  | ((scales[k_is] >> 6) << 4);
+            }
+            unsigned char byte = (block_ptr + 16)[k_qs_off];
+            unsigned char q = k_half ? (byte >> 4) : (byte & 0x0F);
+            acc += dy_val * (d * (float)sc * (float)q - dmin * (float)m);
         }
 
         dX[row * K + k_idx] = acc;
