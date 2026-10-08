@@ -609,6 +609,39 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
         return db * g * sign;
     }
 
+    // 4 consecutive IQ3_S elements (in_sb % 4 == 0, within one 32-block).
+    // They share the scale byte, quadrant (l / m>=4), grid row (idx) and
+    // sign byte, so the per-element scattered IQ3S_GRID_B global fetches
+    // collapse to ONE contiguous 4-byte row read. Bit-identical to four
+    // dequant_iq3s calls.
+    __device__ inline void dequant_iq3s_x4(const unsigned char* blk, int in_sb, float* out) {
+        float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+        const unsigned char* qs = blk + 2;
+        const unsigned char* qh = blk + 66;
+        const unsigned char* signs = blk + 74;
+        const unsigned char* scales = blk + 106;
+        int k = in_sb / 64;
+        int t = in_sb / 32;
+        int e0 = in_sb % 32;
+        int l = e0 / 8;
+        int m0 = e0 % 8;
+        unsigned char sc = scales[k];
+        unsigned char nib = (((unsigned int)(in_sb % 64)) < 32u) ? (sc & 0xF) : (sc >> 4);
+        float db = d * (1.0f + 2.0f * (float)nib);
+        int qh_bit = 2 * l + (m0 >= 4 ? 1 : 0);
+        int idx = qs[t * 8 + 2 * l + (m0 >= 4 ? 1 : 0)]
+                | ((((int)qh[t] >> qh_bit) & 1) << 8);
+        unsigned char sign_byte = signs[t * 4 + l];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int m = m0 + j;
+            int col = (m >= 4) ? (m - 4) : m;
+            float g = (float)(signed char)IQ3S_GRID_B[idx][col];
+            float sign = ((sign_byte >> m) & 1) ? -1.0f : 1.0f;
+            out[j] = db * g * sign;
+        }
+    }
+
     // ===================== IQ4 variants =====================
 
     // block_iq4_nl: 18 bytes per 32 weights (QK4_NL = 32), 4-bit signed codes.
@@ -1476,11 +1509,16 @@ extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
         float u = 0.0f;
         for (int b = 0; b < g_sb; ++b) {
             const int kb = b * 256;
-            #pragma unroll 8
-            for (int i = 0; i < 256; ++i) {
-                const float av = a[kb + i];
-                g += av * dequant_iq3s(gblk + b * 110, i);
-                u += av * dequant_iq3s(ublk + b * 110, i);
+            #pragma unroll 2
+            for (int i = 0; i < 256; i += 4) {
+                float g4[4];
+                float u4[4];
+                dequant_iq3s_x4(gblk + b * 110, i, g4);
+                dequant_iq3s_x4(ublk + b * 110, i, u4);
+                g += a[kb + i + 0] * g4[0] + a[kb + i + 1] * g4[1]
+                   + a[kb + i + 2] * g4[2] + a[kb + i + 3] * g4[3];
+                u += a[kb + i + 0] * u4[0] + a[kb + i + 1] * u4[1]
+                   + a[kb + i + 2] * u4[2] + a[kb + i + 3] * u4[3];
             }
         }
         s_act[j] = (g / (1.0f + expf(-g))) * u;
@@ -1496,13 +1534,20 @@ extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
         float acc = 0.0f;
         for (int b = 0; b < d_sb; ++b) {
             const int kb = b * 256;
-            #pragma unroll 8
             // Down decode with the SAME leaf functions the weight path and the
             // embedding gather use, selected by the layer's measured format.
-            for (int i = 0; i < 256; ++i) {
-                acc += s_act[kb + i] * (down_fmt
-                    ? dequant_q4k_element(dblk + b * 144, i)
-                    : dequant_iq3s(dblk + b * 110, i));
+            if (down_fmt) {
+                #pragma unroll 8
+                for (int i = 0; i < 256; ++i) {
+                    acc += s_act[kb + i] * dequant_q4k_element(dblk + b * 144, i);
+                }
+            } else {
+                for (int i = 0; i < 256; i += 4) {
+                    float w4[4];
+                    dequant_iq3s_x4(dblk + b * 110, i, w4);
+                    acc += s_act[kb + i + 0] * w4[0] + s_act[kb + i + 1] * w4[1]
+                         + s_act[kb + i + 2] * w4[2] + s_act[kb + i + 3] * w4[3];
+                }
             }
         }
         atomicAdd(out + (unsigned long long)tok * hidden + h,
