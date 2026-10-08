@@ -106,10 +106,25 @@ pub fn use_managed_allocation(ordinal: usize, bytes: usize) -> bool {
 fn should_use_managed(mode: &str, free: u64, total: u64, bytes: u64, budget: u64) -> bool {
     match mode {
         "1" | "true" | "always" => true,
-        "auto" => free < bytes || total.saturating_sub(free) > budget,
+        "auto" => {
+            // Small tensors stay VRAM-resident even past the budget: on the
+            // 27B the 20 KB MTP hnorm spilled to host-backed managed memory
+            // once the ledger crossed 90%, and every decode step then read
+            // it over PCIe. If the real allocation fails, alloc_gpu's error
+            // path still falls back to managed — worst case is today's
+            // behavior, best case the small tensor is resident.
+            if bytes <= SMALL_VRAM_RESIDENT_MAX {
+                return false;
+            }
+            free < bytes || total.saturating_sub(free) > budget
+        }
         _ => false,
     }
 }
+
+/// Small allocations up to this size are always attempted in VRAM in "auto"
+/// mode (see should_use_managed).
+const SMALL_VRAM_RESIDENT_MAX: u64 = 4 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -138,13 +153,38 @@ mod tests {
 
     #[test]
     fn auto_mode_spills_when_request_does_not_fit() {
-        assert!(should_use_managed("auto", 1, 100, 2, 100));
+        assert!(should_use_managed("auto", 1, 100, 8 * 1024 * 1024, 100));
     }
 
     #[test]
     fn auto_mode_spills_when_budget_is_already_exceeded() {
-        assert!(should_use_managed("auto", 40, 100, 1, 50));
-        assert!(!should_use_managed("auto", 60, 100, 1, 50));
+        // MB-scale: free 3 MB, total 100 MB, budget 50 MB, request 8 MB.
+        assert!(should_use_managed(
+            "auto",
+            3 * 1024 * 1024,
+            100 * 1024 * 1024,
+            8 * 1024 * 1024,
+            50 * 1024 * 1024
+        ));
+        // Under budget (40 MB used of 50 MB) with free > request: no spill.
+        assert!(!should_use_managed(
+            "auto",
+            60 * 1024 * 1024,
+            100 * 1024 * 1024,
+            8 * 1024 * 1024,
+            50 * 1024 * 1024
+        ));
+    }
+
+    /// Small tensors (the 27B MTP norms were 20 KB) stay VRAM-resident even
+    /// when the budget is exceeded — the hnorm spill thrashed every decode
+    /// step. The alloc_gpu error path still catches a genuine OOM.
+    #[test]
+    fn auto_mode_keeps_small_tensors_vram_resident() {
+        assert!(!should_use_managed("auto", 40, 100, 20 * 1024, 50));
+        assert!(!should_use_managed("auto", 1, 100, 4 * 1024 * 1024, 100));
+        // Just over the threshold spills again (free < request).
+        assert!(should_use_managed("auto", 1, 100, 5 * 1024 * 1024, 100));
     }
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
