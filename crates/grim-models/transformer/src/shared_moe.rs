@@ -1167,9 +1167,22 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
             // (349 s vs 98 s per 256-token window) — 2432 tiny matmul_op
             // dispatches with fresh output allocations per window. Enable
             // with GRIM_MOE_PREFILL_GEMM=1.
+            if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+                eprintln!(
+                    "[dg-hook] reached: num_pairs={num_pairs} seq_len={seq_len} enabled={}",
+                    std::env::var_os("GRIM_MOE_PREFILL_GEMM").is_some()
+                );
+            }
+            // DEFAULT for prefill shapes: per-expert dequant-once + bucketed
+            // GEMMs. 256-token window ~4 s vs the per-pair kernel's 34-98 s,
+            // PPL parity with kq-native (14.0575 vs 14.05) and with a host
+            // oracle on a controlled bank (1.8e-6). Opt OUT with
+            // GRIM_MOE_PREFILL_GEMM=0.
             if num_pairs > 0
                 && seq_len >= 32
-                && std::env::var_os("GRIM_MOE_PREFILL_GEMM").is_some()
+                && std::env::var("GRIM_MOE_PREFILL_GEMM")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
             {
                 // PREFILL dequant-once arm: per-pair in-register decode costs
                 // 1.56 s per MoE layer at these shapes; dequant each expert
@@ -1200,7 +1213,7 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                     .as_any()
                     .downcast_ref::<grim_backend_rocm::RocmStorage>()
                     .ok_or_else(|| grim_tensor::Error::Backend("kq down ptrs not RocmStorage".into()))?;
-                rocm.moe_dequant_gemm_prefill_into(
+                if let Err(e) = rocm.moe_dequant_gemm_prefill_into(
                     x_rocm,
                     g_ptrs,
                     u_ptrs,
@@ -1216,7 +1229,16 @@ pub fn fused_moe_dispatch_from_logits_with_bias(
                     kq.gate_bytes / inter as u64,
                     kq.down_bytes / hidden as u64,
                     kq.down_q4k,
-                )?;
+                ) {
+                    // The caller of this dispatch swallows errors and falls
+                    // back to the kq arm (xing40.rs `if let Ok(Some(out))`),
+                    // which made a broken arm look like a working slow one.
+                    // Name the failure loudly under the trace env.
+                    if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+                        eprintln!("[dg-arm-error] {e}");
+                    }
+                    return Err(e.into());
+                }
                 // GRIM_MOE_ARM_DIFF=1: also run the per-pair kernel and print
                 // the max-abs difference — localizes dequant-gemm bugs.
                 if std::env::var_os("GRIM_MOE_ARM_DIFF").is_some() {
@@ -2981,6 +3003,29 @@ mod kq_native_integration_tests {
                 actv[j] = g / (1.0 + (-g).exp()) * u;
             }
             let d_flat = deq_q4k(&dwb, hidden, inter);
+            if p == 0 {
+                let g_dot: f32 = (0..hidden).map(|i| act[i] * g_flat[i]).sum();
+                let u_dot: f32 = (0..hidden).map(|i| act[i] * u_flat[i]).sum();
+                eprintln!("[dg-host] pair0 j=0: g_dot={g_dot:.6} u_dot={u_dot:.6} expected_act0={:.6}",
+                    (g_dot / (1.0 + (-g_dot).exp())) * u_dot);
+                {
+                    // Host down dot for output h=0, computed AFTER actv exists:
+                    // reuse the same expression the want-loop uses.
+                    let d_flat_h = deq_q4k(&dwb, hidden, inter);
+                    let d_dot: f32 = (0..inter).map(|j| actv[j] * d_flat_h[j]).sum();
+                    eprintln!("[dg-host] pair0 h=0: d_dot={d_dot:.6} (arm manual_d0 was printed by the arm)");
+                }
+                eprintln!(
+                    "[dg-host] pair0: tok={} exp={e} w={} x[0..3]={:?} g[0..3]={:?} u[0..3]={:?} act[0..3]={:?} d[0..3]={:?}",
+                    tokens[0],
+                    weights[0],
+                    &act[..3],
+                    &g_flat[..3],
+                    &u_flat[..3],
+                    &actv[..3],
+                    &d_flat[..3]
+                );
+            }
             for h in 0..hidden {
                 let mut acc = 0f32;
                 for j in 0..inter {
@@ -3000,5 +3045,83 @@ mod kq_native_integration_tests {
             "[kq-model] kernel vs host on runtime storages: max_abs {max_abs:.3e} rel {rel:.3e}"
         );
         assert!(rel < 1e-3, "model-shaped integration diverges (rel {rel:.3e})");
+
+        // ---- A/B: the dequant-once prefill arm on the SAME inputs ----------
+        // MUST be zeroed: the arm's scatter is an atomicAdd accumulation.
+        let out2 = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &grim_tensor::Shape::new(vec![1, hidden]),
+            grim_tensor::DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .expect("out2");
+        {
+            let zero = vec![0u8; hidden * 4];
+            let tmp = grim_backend_rocm::RocmStorage::alloc_gpu(
+                &grim_tensor::Shape::new(vec![hidden]),
+                grim_tensor::DType::F32,
+                &dev.allocator_handle(),
+                0,
+            )
+            .expect("tmp");
+            let _ = &zero;
+            let _ = &tmp;
+            // Copy zeros in: device-to-device from a freshly zeroed upload.
+            let zeros_st = dev
+                .from_cpu(&vec![0f32; hidden], &grim_tensor::Shape::new(vec![hidden]), grim_tensor::DType::F32)
+                .expect("zeros");
+            let zs = zeros_st
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .expect("rocm");
+            let dst = out2.device_ptr_checked().unwrap() as *mut std::ffi::c_void;
+            let src = zs.device_ptr_checked().unwrap() as *const std::ffi::c_void;
+            unsafe {
+                let _ = grim_backend_rocm::hipMemcpy(
+                    dst,
+                    src,
+                    hidden * 4,
+                    grim_backend_rocm::HipMemcpyKind::DeviceToDevice,
+                );
+            }
+            dev.synchronize();
+        }
+        dev.moe_dequant_gemm_prefill_into(
+            st_of(&a_t),
+            arc_of(&kq.gate_ptrs),
+            arc_of(&kq.up_ptrs),
+            arc_of(&kq.down_ptrs),
+            st_of(&t_t),
+            st_of(&e_t),
+            st_of(&w_t),
+            num_pairs,
+            &out2,
+            hidden,
+            inter,
+            rsf,
+            kq.gate_bytes / inter as u64,
+            kq.down_bytes / hidden as u64,
+            kq.down_q4k,
+        )
+        .expect("dequant-gemm arm");
+        dev.synchronize();
+        let got2_host = out2.copy_to_host().expect("read out2");
+        let got2: Vec<f32> = got2_host
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut d_ab = 0f32;
+        let mut d_ah = 0f32;
+        for i in 0..hidden {
+            d_ab = d_ab.max((got[i] - got2[i]).abs());
+            d_ah = d_ah.max((want[i] - got2[i]).abs());
+        }
+        let s_ab = got.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let s_ah = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        eprintln!(
+            "[dg-model] arm vs kq: max_abs {d_ab:.3e} rel {:.3e}; arm vs host: max_abs {d_ah:.3e} rel {:.3e}",
+            d_ab / s_ab,
+            d_ah / s_ah
+        );
     }
 }

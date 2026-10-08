@@ -1474,40 +1474,43 @@ extern "C" __global__ void grim_dequant_expert_banks_f32(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int bank = blockIdx.y;
-    // TRANSPOSED writes: the prefill arm feeds these to matmul as the
-    // NON-transposed B operand — gate/up land as [hidden, inter], down as
-    // [inter, hidden].
+    // NATURAL layout, no transpose: matmul_op_into computes A x B^T with B
+    // stored [out, in] — which is exactly how the banks already lie
+    // (gate/up [inter, hidden], down [hidden, inter]).
     if (bank == 0 || bank == 1) {
         if (row >= inter) return;
         const unsigned char* src = (bank == 0
             ? (const unsigned char*)(size_t)gate_ptrs[expert]
             : (const unsigned char*)(size_t)up_ptrs[expert])
             + (unsigned long long)row * gate_row_bytes;
-        float* dst = (bank == 0 ? out_gate : out_up);
+        float* dst = (bank == 0 ? out_gate : out_up) + (unsigned long long)row * hidden;
         for (int i = tid * 4; i < hidden; i += blockDim.x * 4) {
             float w4[4];
-            dequant_iq3s_x4(src, i, w4);
-            dst[(size_t)(i + 0) * inter + row] = w4[0];
-            dst[(size_t)(i + 1) * inter + row] = w4[1];
-            dst[(size_t)(i + 2) * inter + row] = w4[2];
-            dst[(size_t)(i + 3) * inter + row] = w4[3];
+            // The x4 helper indexes WITHIN a 256-weight super-block: advance
+            // the base by the block stride. Passing the whole-row index read
+            // block 0's bytes for every element past 255 — heads matched, the
+            // rest was wrong, and a same-scratch "manual" check certified it.
+            dequant_iq3s_x4(src + (size_t)(i / 256) * 110, i % 256, w4);
+            dst[i] = w4[0]; dst[i+1] = w4[1]; dst[i+2] = w4[2]; dst[i+3] = w4[3];
         }
     } else {
         if (row >= hidden) return;
         const unsigned char* src = (const unsigned char*)(size_t)down_ptrs[expert]
             + (unsigned long long)row * down_row_bytes;
-        float* dst = out_down;
+        float* dst = out_down + (unsigned long long)row * inter;
         for (int i = tid * 4; i < inter; i += blockDim.x * 4) {
             if (down_fmt) {
-                const int b = i / 256;
-                dst[(size_t)(i + 0) * hidden + row] = dequant_q4k_element(src + b * 144, i % 256);
+                // The loop strides by 4 — write all four lanes. Writing only
+                // dst[i] left 3/4 of every Q4_K down row unwritten.
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int ii = i + k;
+                    dst[ii] = dequant_q4k_element(src + (size_t)(ii / 256) * 144, ii % 256);
+                }
             } else {
                 float w4[4];
-                dequant_iq3s_x4(src, i, w4);
-                dst[(size_t)(i + 0) * hidden + row] = w4[0];
-                dst[(size_t)(i + 1) * hidden + row] = w4[1];
-                dst[(size_t)(i + 2) * hidden + row] = w4[2];
-                dst[(size_t)(i + 3) * hidden + row] = w4[3];
+                dequant_iq3s_x4(src + (size_t)(i / 256) * 110, i % 256, w4);
+                dst[i] = w4[0]; dst[i+1] = w4[1]; dst[i+2] = w4[2]; dst[i+3] = w4[3];
             }
         }
     }

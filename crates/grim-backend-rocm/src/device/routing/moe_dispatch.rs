@@ -1675,11 +1675,23 @@ impl RocmDevice {
 // readback) — decode stays on the per-pair kernel.
 // ---------------------------------------------------------------------------
 pub struct MoEDequantGemmScratch {
-    pub bg_t: RocmStorage, // [hidden, inter]  gate^T
-    pub bu_t: RocmStorage, // [hidden, inter]  up^T
-    pub bd_t: RocmStorage, // [inter, hidden]  down^T
-    pub xe: RocmStorage,   // [num_pairs, hidden]
+    pub bg_t: RocmStorage, // [inter, hidden]  (A x B^T convention)
+    pub bu_t: RocmStorage, // [inter, hidden]
+    pub bd_t: RocmStorage, // [hidden, inter]
+    /// Per-count-bucket gather/matmul buffers, sorted by bucket size. The
+    /// matmul validates A's rows against the output's M, so every GEMM must
+    /// run at a shape where A, B and C agree — the bucket IS that shape.
+    /// Rows beyond the expert's real count hold stale data; only `count`
+    /// rows are ever scattered, and silu of stale finite data is finite.
+    pub buckets: Vec<(usize, MoEBucketBufs)>,
     pub key: (usize, usize, usize),
+}
+
+pub struct MoEBucketBufs {
+    pub xe: RocmStorage, // [bucket, hidden]
+    pub yg: RocmStorage, // [bucket, inter]
+    pub yu: RocmStorage, // [bucket, inter]
+    pub dt: RocmStorage, // [bucket, hidden]
 }
 
 static MOE_DG_SCRATCH: std::sync::OnceLock<std::sync::Mutex<Option<(usize, MoEDequantGemmScratch)>>> =
@@ -1707,6 +1719,9 @@ impl RocmDevice {
         down_q4k: bool,
     ) -> Result<()> {
         use grim_tensor::{ArithType, MemoryOps, Storage};
+        if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+            eprintln!("[dg-entry] arm entered: num_pairs={num_pairs} hidden={hidden} inter={inter}");
+        }
         if num_pairs == 0 {
             return Ok(());
         }
@@ -1738,29 +1753,89 @@ impl RocmDevice {
             let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
             let s = MoEDequantGemmScratch {
                 bg_t: RocmStorage::alloc_gpu(
-                    &Shape::new(vec![hidden, inter]),
-                    f32ty.clone(),
-                    &self.allocator,
-                    self.ordinal,
-                )?,
-                bu_t: RocmStorage::alloc_gpu(
-                    &Shape::new(vec![hidden, inter]),
-                    f32ty.clone(),
-                    &self.allocator,
-                    self.ordinal,
-                )?,
-                bd_t: RocmStorage::alloc_gpu(
                     &Shape::new(vec![inter, hidden]),
                     f32ty.clone(),
                     &self.allocator,
                     self.ordinal,
                 )?,
-                xe: RocmStorage::alloc_gpu(
-                    &Shape::new(vec![num_pairs, hidden]),
+                bu_t: RocmStorage::alloc_gpu(
+                    &Shape::new(vec![inter, hidden]),
                     f32ty.clone(),
                     &self.allocator,
                     self.ordinal,
                 )?,
+                bd_t: RocmStorage::alloc_gpu(
+                    &Shape::new(vec![hidden, inter]),
+                    f32ty.clone(),
+                    &self.allocator,
+                    self.ordinal,
+                )?,
+                buckets: {
+                    let mut buckets = Vec::new();
+                    let mut b = 32usize;
+                    while b < num_pairs {
+                        buckets.push((
+                            b,
+                            MoEBucketBufs {
+                                xe: RocmStorage::alloc_gpu(
+                                    &Shape::new(vec![b, hidden]),
+                                    f32ty.clone(),
+                                    &self.allocator,
+                                    self.ordinal,
+                                )?,
+                                yg: RocmStorage::alloc_gpu(
+                                    &Shape::new(vec![b, inter]),
+                                    f32ty.clone(),
+                                    &self.allocator,
+                                    self.ordinal,
+                                )?,
+                                yu: RocmStorage::alloc_gpu(
+                                    &Shape::new(vec![b, inter]),
+                                    f32ty.clone(),
+                                    &self.allocator,
+                                    self.ordinal,
+                                )?,
+                                dt: RocmStorage::alloc_gpu(
+                                    &Shape::new(vec![b, hidden]),
+                                    f32ty.clone(),
+                                    &self.allocator,
+                                    self.ordinal,
+                                )?,
+                            },
+                        ));
+                        b *= 2;
+                    }
+                    buckets.push((
+                        num_pairs,
+                        MoEBucketBufs {
+                            xe: RocmStorage::alloc_gpu(
+                                &Shape::new(vec![num_pairs, hidden]),
+                                f32ty.clone(),
+                                &self.allocator,
+                                self.ordinal,
+                            )?,
+                            yg: RocmStorage::alloc_gpu(
+                                &Shape::new(vec![num_pairs, inter]),
+                                f32ty.clone(),
+                                &self.allocator,
+                                self.ordinal,
+                            )?,
+                            yu: RocmStorage::alloc_gpu(
+                                &Shape::new(vec![num_pairs, inter]),
+                                f32ty.clone(),
+                                &self.allocator,
+                                self.ordinal,
+                            )?,
+                            dt: RocmStorage::alloc_gpu(
+                                &Shape::new(vec![num_pairs, hidden]),
+                                f32ty.clone(),
+                                &self.allocator,
+                                self.ordinal,
+                            )?,
+                        },
+                    ));
+                    buckets
+                },
                 key: need_key,
             };
             *guard = Some((self.ordinal, s));
@@ -1775,6 +1850,15 @@ impl RocmDevice {
         let mut out_p = out.device_ptr_checked()? as *mut c_void;
 
         // 3. Per-expert segments in the sorted order.
+        let (mut t_up, mut t_dq, mut t_ga, mut t_gm, mut t_si, mut t_sc) = (
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+        );
+        let mut n_experts_seen = 0usize;
         let mut seg_start = 0usize;
         while seg_start < num_pairs {
             let e = u32le(&exp_host, order[seg_start]) as usize;
@@ -1785,6 +1869,7 @@ impl RocmDevice {
             let count = seg_end - seg_start;
             let toks_slice: Vec<i32> = sorted_toks[seg_start..seg_end].to_vec();
             let wts_slice: Vec<f32> = sorted_wts[seg_start..seg_end].to_vec();
+            t_up = std::time::Instant::now();
             let toks_st = MemoryOps::from_cpu_bytes(
                 self as &dyn grim_tensor::BackendDevice,
                 unsafe { std::slice::from_raw_parts(toks_slice.as_ptr() as *const u8, count * 4) },
@@ -1805,6 +1890,8 @@ impl RocmDevice {
                 .device_ptr_checked()? as *mut c_void;
 
             // (a) dequant expert e's banks, transposed, into the scratch.
+            t_dq = std::time::Instant::now();
+            n_experts_seen += 1;
             let mut gate_ptrs_p = gate_ptrs_p;
             let mut up_ptrs_p = up_ptrs_p;
             let mut down_ptrs_p = down_ptrs_p;
@@ -1837,9 +1924,23 @@ impl RocmDevice {
                 ],
             )?;
 
-            // (b) gather this expert's token rows into Xe rows 0..count.
+            // Bucket this expert's count: all GEMMs run at the bucket shape
+            // (A rows == C rows) so the matmul shape checks pass and every
+            // buffer is preallocated — no per-call allocation.
+            let bucket = scratch
+                .buckets
+                .iter()
+                .find(|(b, _)| *b >= count)
+                .map(|(b, bufs)| (*b, bufs))
+                .ok_or_else(|| {
+                    Error::Backend(format!("no bucket for count={count} (num_pairs={num_pairs})"))
+                })?;
+            let (bsize, bb) = bucket;
+
+            // (b) gather this expert's token rows into the bucket's Xe.
+            t_ga = std::time::Instant::now();
             let mut a_x_p = a_x_p;
-            let mut xe_p = scratch.xe.device_ptr_checked()? as *mut c_void;
+            let mut xe_p = bb.xe.device_ptr_checked()? as *mut c_void;
             self.launch_compute_kernel(
                 "grim_moe_gather_rows",
                 HipDim3::new(count as u32, 1, 1),
@@ -1847,33 +1948,52 @@ impl RocmDevice {
                 &mut [arg(&mut a_x_p), arg(&mut toks_p), arg(&mut xe_p), arg(&mut hidden_i)],
             )?;
 
-            // (c) gate / up matmuls on the proven path:
-            //     Y[count,inter] = Xe[count,hidden] x B[hidden,inter]
-            // matmul reads A's rows 0..count (k from its shape's last dim).
+            // (c) gate / up matmuls on the proven path, into preallocated
+            //     bucket outputs: Y[bsize,inter] = Xe[bsize,hidden] x B[hidden,inter]
+            t_gm = std::time::Instant::now();
             let bg_ref: &dyn grim_tensor::BackendStorage = &scratch.bg_t;
             let bu_ref: &dyn grim_tensor::BackendStorage = &scratch.bu_t;
             let bd_ref: &dyn grim_tensor::BackendStorage = &scratch.bd_t;
-            let xe_ref: &dyn grim_tensor::BackendStorage = &scratch.xe;
-            let (yg_st, _) = self.matmul_op(
-                xe_ref,
-                bg_ref,
-                &Shape::new(vec![count, inter]),
-                crate::autotune::GemmOp::Ffn,
-            )?;
-            let (yu_st, _) = self.matmul_op(
-                xe_ref,
-                bu_ref,
-                &Shape::new(vec![count, inter]),
-                crate::autotune::GemmOp::Ffn,
-            )?;
-            let mut yg_p = crate::device::util::as_rocm(yg_st.as_ref())?
-                .device_ptr_checked()? as *mut c_void;
-            let mut yu_p = crate::device::util::as_rocm(yu_st.as_ref())?
-                .device_ptr_checked()? as *mut c_void;
+            self.matmul_op_into(&bb.xe, bg_ref, &bb.yg, crate::autotune::GemmOp::Ffn)?;
+            self.matmul_op_into(&bb.xe, bu_ref, &bb.yu, crate::autotune::GemmOp::Ffn)?;
+            let mut yg_p = bb.yg.device_ptr_checked()? as *mut c_void;
+            let mut yu_p = bb.yu.device_ptr_checked()? as *mut c_void;
 
-            // (d) silu(gate) * up over [count, inter].
-            let mut n_silu = (count * inter) as i32;
-            let blocks = (count * inter).div_ceil(256) as u32;
+            // Probe: manual gate dot vs the bucket GEMM (first expert, layer 0).
+            if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() && seg_start == 0 {
+                static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if ONCE.set(()).is_ok() {
+                    let rd = |ptr: *const c_void, n: usize| -> Vec<f32> {
+                        let mut b = vec![0u8; n * 4];
+                        let _ = unsafe {
+                            crate::hipMemcpy(
+                                b.as_mut_ptr() as *mut c_void,
+                                ptr,
+                                n * 4,
+                                crate::HipMemcpyKind::DeviceToHost,
+                            )
+                        };
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    };
+                    let xe0 = rd(bb.xe.device_ptr_checked()? as *const c_void, hidden);
+                    let bg0 = rd(scratch.bg_t.device_ptr_checked()? as *const c_void, hidden);
+                    let manual: f32 = xe0.iter().zip(&bg0).map(|(a, b)| a * b).sum();
+                    let yg0 = rd(yg_p as *const c_void, 4);
+                    eprintln!(
+                        "[dg-parity] count={count} bucket={bsize} manual_gate_y0={manual:.5} gemm_y0={:.5} xe0[0..3]={:?} bg0[0..3]={:?}",
+                        yg0[0],
+                        &xe0[..3],
+                        &bg0[..3]
+                    );
+                }
+            }
+
+            // (d) silu(gate) * up over the whole bucket.
+            t_si = std::time::Instant::now();
+            let mut n_silu = (bsize * inter) as i32;
+            let blocks = (bsize * inter).div_ceil(256) as u32;
             self.launch_compute_kernel(
                 "grim_silu_mul",
                 HipDim3::new(blocks, 1, 1),
@@ -1881,17 +2001,49 @@ impl RocmDevice {
                 &mut [arg(&mut yg_p), arg(&mut yu_p), arg(&mut yg_p), arg(&mut n_silu)],
             )?;
 
-            // (e) down matmul: D[count,hidden] = C[count,inter] x Bd[inter,hidden]
-            let (dt_st, _) = self.matmul_op(
-                yg_st.as_ref(),
-                bd_ref,
-                &Shape::new(vec![count, hidden]),
-                crate::autotune::GemmOp::Ffn,
-            )?;
-            let mut dt_p = crate::device::util::as_rocm(dt_st.as_ref())?
-                .device_ptr_checked()? as *mut c_void;
+            // (e) down matmul: D[bsize,hidden] = C[bsize,inter] x Bd[inter,hidden]
+            self.matmul_op_into(&bb.yg, bd_ref, &bb.dt, crate::autotune::GemmOp::Ffn)?;
+            let mut dt_p = bb.dt.device_ptr_checked()? as *mut c_void;
+
+            // Probe: silu output and the down GEMM (first expert, layer 0).
+            if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() && seg_start == 0 {
+                static ONCE2: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if ONCE2.set(()).is_ok() {
+                    let rd = |ptr: *const c_void, n: usize| -> Vec<f32> {
+                        let mut b = vec![0u8; n * 4];
+                        let _ = unsafe {
+                            crate::hipMemcpy(
+                                b.as_mut_ptr() as *mut c_void,
+                                ptr,
+                                n * 4,
+                                crate::HipMemcpyKind::DeviceToHost,
+                            )
+                        };
+                        b.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    };
+                    let c0 = rd(yg_p as *const c_void, inter); // post-silu row 0
+                    let yu0 = rd(yu_p as *const c_void, 4);
+                    eprintln!("[dg-parity2] yu0[0..4]={:?}", yu0);
+                    let bd0 = rd(scratch.bd_t.device_ptr_checked()? as *const c_void, inter);
+                    let manual_d: f32 = c0.iter().zip(&bd0).map(|(a, b)| a * b).sum();
+                    let dt0 = rd(dt_p as *const c_void, 4);
+                    eprintln!(
+                        "[dg-parity2] c0[0..3]={:?} bd0[0..3]={:?} manual_d0={manual_d:.5} gemm_d0={:.5}",
+                        &c0[..3],
+                        &bd0[..3],
+                        dt0[0]
+                    );
+                }
+            }
 
             // (f) scaled scatter-add into the layer output.
+            t_sc = std::time::Instant::now();
+            if std::env::var_os("GRIM_DG_NO_SCATTER").is_some() {
+                seg_start = seg_end;
+                continue;
+            }
             self.launch_compute_kernel(
                 "grim_moe_scatter_add_rows",
                 HipDim3::new(count as u32, 1, 1),
@@ -1905,7 +2057,62 @@ impl RocmDevice {
                 ],
             )?;
 
+            if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() && seg_start == 0 {
+                static ONCE3: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if ONCE3.set(()).is_ok() {
+                    let tok0 = toks_slice[0] as usize;
+                    let mut head = [0f32; 4];
+                    let _ = unsafe {
+                        crate::hipMemcpy(
+                            head.as_mut_ptr() as *mut c_void,
+                            (out_p as usize + tok0 * hidden * 4) as *mut c_void,
+                            16,
+                            crate::HipMemcpyKind::DeviceToHost,
+                        )
+                    };
+                    let mut dt_head = [0f32; 4];
+                    let _ = unsafe {
+                        crate::hipMemcpy(
+                            dt_head.as_mut_ptr() as *mut c_void,
+                            dt_p as *const c_void,
+                            16,
+                            crate::HipMemcpyKind::DeviceToHost,
+                        )
+                    };
+                    eprintln!(
+                        "[dg-scatter] tok0={tok0} w0={:.4} out[tok0][0..4]={head:?} dt[0][0..4]={dt_head:?}",
+                        wts_slice[0]
+                    );
+                }
+            }
             seg_start = seg_end;
+        }
+        if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+            let covered: usize = {
+                // recompute coverage cheaply from the segments already walked
+                let mut c = 0usize;
+                let mut s = 0usize;
+                while s < num_pairs {
+                    let e = u32le(&exp_host, order[s]) as u32;
+                    let mut t = s;
+                    while t < num_pairs && u32le(&exp_host, order[t]) == e {
+                        t += 1;
+                    }
+                    c += t - s;
+                    s = t;
+                }
+                c
+            };
+            eprintln!(
+                "[dg-trace] layer done: covered={covered}/{num_pairs} experts={} upload={}ms dequant={}ms gather={}ms gemm={}ms silu={}ms scatter={}ms",
+                n_experts_seen,
+                t_up.elapsed().as_millis(),
+                t_dq.elapsed().as_millis(),
+                t_ga.elapsed().as_millis(),
+                t_gm.elapsed().as_millis(),
+                t_si.elapsed().as_millis(),
+                t_sc.elapsed().as_millis(),
+            );
         }
         Ok(())
     }
