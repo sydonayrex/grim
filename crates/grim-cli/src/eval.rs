@@ -106,6 +106,7 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
         )));
     }
     let mut sum_nll = 0.0f64;
+    let mut n_tokens = 0usize;
     let mut n_windows = 0usize;
     let mut start = 0usize;
     eprintln!("[eval] windows begin {}", chrono_like_now());
@@ -121,7 +122,6 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
             }
         }
         let ctx = &tokens[start..start + ppl_window()];
-        let target = tokens[start + ppl_window()];
 
         // BUG FIX (2026-09-24): tensors MUST be created on the model's device.
         // The old code used grim_backend_cpu::cpu_tensor here, which created CPU
@@ -148,76 +148,57 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
             "[eval] window {n_windows}: forward {} ms",
             w_start.elapsed().as_millis()
         );
-        // Only the LAST row predicts the next token. Reading the full
-        // [1, ctx, vocab] block back is ~1 GB of D2H per window at 2048 ctx
-        // and dominated the harness. GRIM_EVAL_LAST_ROW_ONLY=1 (default on)
-        // copies just the final vocab slice on-device, then reads that back.
+        // PER-TOKEN NLL: causal attention means row i of the logits block
+        // is computed from tokens 0..=i and predicts token i+1 — so ONE
+        // window of W tokens scores W next-token predictions, not one. This
+        // replaces the old one-target-per-window estimator, whose PPL from a
+        // handful of windows was noise-dominated (3 predictions cannot rank
+        // ladders). Full-matrix readback is required; at window=256 the
+        // block is 128 MB. GRIM_EVAL_LAST_ROW_ONLY=1 restores the old
+        // single-target read for smoke runs.
+        let vocab = logits.shape().elem_count() / ctx.len().max(1);
         let last_row_only = std::env::var("GRIM_EVAL_LAST_ROW_ONLY")
             .map(|v| v != "0")
-            .unwrap_or(true);
-        let vocab = logits.shape().elem_count() / ctx.len().max(1);
-        let last_logits: Vec<f32> = if last_row_only
-            && vocab > 0
-            && logits.shape().elem_count() >= vocab
-        {
-            if let grim_tensor::Device::Rocm(ord) = model.device() {
-                let arc = grim_backend_rocm::RocmDevice::shared(*ord);
-                use grim_tensor::MemoryOps as _MO;
-                let small = _MO::alloc_storage(
-                    arc.as_ref(),
-                        &grim_tensor::Shape::new(vec![vocab]),
-                        grim_tensor::dtype::DType::F32,
-                    )
-                    .map_err(|e| Error::Backend(format!("eval last-row alloc: {e}")))?;
-                let dst = small.as_ref();
-                let src_dyn: &dyn grim_tensor::BackendStorage =
-                    logits.storage().as_ref();
-                arc.copy_slice_range(
-                    dst,
-                    0,
-                    src_dyn,
-                    (ctx.len() - 1) * vocab,
-                    vocab,
-                )
-                .map_err(|e| Error::Backend(format!("eval last-row copy: {e}")))?;
-                arc.synchronize();
-                small
-                    .to_cpu_vec_f32()
-                    .map_err(|e| Error::Backend(format!("eval last-row read: {e}")))?
-            } else {
-                let all = logits.to_vec_f32()?;
-                let v = all.len() / ctx.len();
-                all[all.len() - v.max(1)..].to_vec()
-            }
+            .unwrap_or(false);
+        if last_row_only {
+            let all = logits.to_vec_f32()?;
+            let v = all.len() / ctx.len().max(1);
+            let last_logits = &all[all.len() - v.max(1)..];
+            let target = tokens[start + ppl_window()];
+            let max_l = last_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_sum_exp = max_l
+                + last_logits.iter().map(|l| (*l - max_l).exp()).sum::<f32>().ln();
+            let target_l = last_logits.get(target as usize).copied().ok_or_else(|| {
+                Error::Config(format!("target token {target} out of vocab"))
+            })?;
+            sum_nll += ((log_sum_exp - target_l) as f64).max(0.0);
+            n_tokens += 1;
         } else {
             let all = logits.to_vec_f32()?;
-            let v = all.len() / ctx.len();
-            all[all.len() - v.max(1)..].to_vec()
-        };
-
-        // log-softmax of the target token.
-        let max_l = last_logits
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let log_sum_exp = max_l
-            + last_logits
-                .iter()
-                .map(|l| (*l - max_l).exp())
-                .sum::<f32>()
-                .ln();
-        let target_l = last_logits
-            .get(target as usize)
-            .copied()
-            .ok_or_else(|| Error::Config(format!("target token {target} out of vocab")))?;
-        sum_nll += ((log_sum_exp - target_l) as f64).max(0.0);
+            for i in 0..ctx.len() {
+                let row = &all[i * vocab..(i + 1) * vocab];
+                let target = tokens[start + i + 1];
+                let max_l = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let log_sum_exp =
+                    max_l + row.iter().map(|l| (*l - max_l).exp()).sum::<f32>().ln();
+                let target_l = row.get(target as usize).copied().ok_or_else(|| {
+                    Error::Config(format!("target token {target} out of vocab"))
+                })?;
+                sum_nll += ((log_sum_exp - target_l) as f64).max(0.0);
+                n_tokens += 1;
+            }
+        }
         n_windows += 1;
         start += ppl_window(); // non-overlapping stride keeps runtime bounded
     }
     if n_windows == 0 {
         return Err(Error::Config("no complete windows in corpus".into()));
     }
-    let mean_nll = sum_nll / n_windows as f64;
+    if n_tokens == 0 {
+        return Err(Error::Config("no tokens scored".into()));
+    }
+    let mean_nll = sum_nll / n_tokens as f64;
+    eprintln!("[eval] ppl: {n_tokens} scored tokens in {n_windows} windows");
     Ok((mean_nll.exp() as f32, n_windows))
 }
 
