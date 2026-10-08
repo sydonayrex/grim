@@ -2884,13 +2884,15 @@ mod kq_native_integration_tests {
         let kq = ensure_kq_native(0, &experts, &cache)
             .expect("ensure_kq_native over the model's own storages");
 
-        // Model-shaped routing: 1 token, ONE pair (the host oracle below
-        // dequantizes in a debug build — 4 pairs re-dequantized the same
-        // expert 4x and took minutes; the routing WEIGHT path is already
-        // covered by the production geometry parity test).
-        let tokens = vec![0u32];
-        let expert_ids = vec![7u32];
-        let weights = vec![0.4f32];
+        // Model-shaped routing: one token, FOUR pairs across three experts
+        // with differing counts (expert 7 twice) — the bucket buffer is
+        // reused across segments, so rows beyond a segment's count hold the
+        // PREVIOUS expert's data; this routing is what catches a stale-row
+        // leak into the scattered output. The host oracle below dequantizes
+        // in a debug build (slow — keep the pair count small).
+        let tokens = vec![0u32, 0u32, 0u32, 0u32];
+        let expert_ids = vec![7u32, 12u32, 7u32, 19u32];
+        let weights = vec![0.3f32, 0.3f32, 0.2f32, 0.2f32];
         let num_pairs = tokens.len();
         let rsf = 1.0f32;
 
