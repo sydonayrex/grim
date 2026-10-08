@@ -12,6 +12,7 @@ pub mod accuracy_gate;
 pub mod citycrow;
 pub mod grey_raven;
 pub mod gsq;
+pub mod iq3xxs_quant;
 pub mod iq_tables;
 mod packed_gemm;
 pub mod qat_mxfp4;
