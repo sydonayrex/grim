@@ -37,11 +37,12 @@ extern "C" {
 
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int sb = 0; sb < blocks_per_row; ++sb) {
-            // 8 sub-blocks of 32: decode d, dmin, sc, m ONCE per sub-block
-            // rather than re-reading them per weight. The previous form
-            // re-loaded 2 fp16 scales + unpacked sc/m for every k.
-            for (int is = 0; is < 8; ++is) {
-                float dsc4[4], dm4[4];
+            // Both nibbles of each qs byte are decoded together: the low
+            // nibble is sub-block is=2g, the high nibble is=2g+1. One byte
+            // load yields 2 weights (8 with 4 columns); previously each half
+            // ran its own loop with its own byte load.
+            for (int g = 0; g < 4; ++g) {
+                float dsc4[4][2], dm4[4][2];
                 const unsigned char* qs4[4];
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -51,36 +52,49 @@ extern "C" {
                         const float d    = fp16_to_float_device(h_ptr[0]);
                         const float dmin = fp16_to_float_device(h_ptr[1]);
                         const unsigned char* scales = block_ptr + 4;
-                        unsigned char sc, m;
-                        if (is < 4) {
-                            sc = scales[is] & 63;
-                            m  = scales[is + 4] & 63;
+                        // is=2g (low half)
+                        unsigned char sc0, m0;
+                        const int is0 = 2 * g;
+                        if (is0 < 4) {
+                            sc0 = scales[is0] & 63;
+                            m0  = scales[is0 + 4] & 63;
                         } else {
-                            sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
-                            m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                            sc0 = (scales[is0 + 4] & 0xF) | ((scales[is0 - 4] >> 6) << 4);
+                            m0  = (scales[is0 + 4] >> 4)  | ((scales[is0] >> 6) << 4);
                         }
-                        dsc4[j] = d * (float)sc;
-                        dm4[j]  = dmin * (float)m;
-                        const int group = is >> 1;
-                        qs4[j] = block_ptr + 16 + group * 32;
+                        // is=2g+1 (high half)
+                        unsigned char sc1, m1;
+                        const int is1 = 2 * g + 1;
+                        if (is1 < 4) {
+                            sc1 = scales[is1] & 63;
+                            m1  = scales[is1 + 4] & 63;
+                        } else {
+                            sc1 = (scales[is1 + 4] & 0xF) | ((scales[is1 - 4] >> 6) << 4);
+                            m1  = (scales[is1 + 4] >> 4)  | ((scales[is1] >> 6) << 4);
+                        }
+                        dsc4[j][0] = d * (float)sc0;
+                        dm4[j][0]  = dmin * (float)m0;
+                        dsc4[j][1] = d * (float)sc1;
+                        dm4[j][1]  = dmin * (float)m1;
+                        qs4[j] = block_ptr + 16 + g * 32;
                     }
                 }
-                const int half = is & 1;
-                // float4 activation loads: 8 vector loads cover the 32 weights.
                 for (int l = 0; l < 32; l += 4) {
-                    float4 a4;
-                    __builtin_memcpy(&a4, Arow + sb * 256 + is * 32 + l, 16);
-                    const float* af = (const float*)&a4;
+                    // One float4 per half: 2 vector loads cover 8 weights.
+                    float4 a4lo, a4hi;
+                    __builtin_memcpy(&a4lo, Arow + sb * 256 + (2 * g) * 32 + l, 16);
+                    __builtin_memcpy(&a4hi, Arow + sb * 256 + (2 * g + 1) * 32 + l, 16);
+                    const float* alo = (const float*)&a4lo;
+                    const float* ahi = (const float*)&a4hi;
                     #pragma unroll
                     for (int e = 0; e < 4; ++e) {
-                        const float a_val = af[e];
                         const int ll = l + e;
                         #pragma unroll
                         for (int j = 0; j < 4; ++j) {
                             if (j < active) {
                                 const unsigned char packed = qs4[j][ll];
-                                const int q_low = half ? (packed >> 4) : (packed & 0x0F);
-                                acc[j] += a_val * (dsc4[j] * (float)q_low - dm4[j]);
+                                acc[j] += alo[e] * (dsc4[j][0] * (float)(packed & 0x0F) - dm4[j][0]);
+                                acc[j] += ahi[e] * (dsc4[j][1] * (float)(packed >> 4) - dm4[j][1]);
                             }
                         }
                     }

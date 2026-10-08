@@ -72,10 +72,14 @@ extern "C" {
             // super-block is 2 outer blocks x 4 quarters x 2 sub-blocks of 16,
             // so each scale byte is loaded once per 16 weights instead of once
             // per weight.
+            // Quarter pairs (0,2) and (1,3) share one ql byte: the low nibble
+            // is quarter qa, the high nibble quarter qb=qa+2. One byte load
+            // yields 2 weights; previously each quarter ran its own loop.
             for (int n = 0; n < 2; ++n) {
-                for (int quarter = 0; quarter < 4; ++quarter) {
+                for (int p = 0; p < 2; ++p) {
+                    const int qa = p, qb = p + 2;
                     for (int is = 0; is < 2; ++is) {
-                        float dsc4[4];
+                        float dsc4[4][2];
                         const unsigned char* ql4[4];
                         const unsigned char* qh4[4];
                         #pragma unroll
@@ -87,33 +91,37 @@ extern "C" {
                                 const signed char* scales = (const signed char*)(block_ptr + 192);
                                 const unsigned short* d_ptr = (const unsigned short*)(block_ptr + 208);
                                 const float d = fp16_to_float_device(d_ptr[0]);
-                                dsc4[j] = d * (float)scales[n * 8 + is + 2 * quarter];
+                                dsc4[j][0] = d * (float)scales[n * 8 + is + 2 * qa];
+                                dsc4[j][1] = d * (float)scales[n * 8 + is + 2 * qb];
                                 ql4[j] = ql;
                                 qh4[j] = qh;
                             }
                         }
                         const int ql_base = n * 64;
-                        const int ql_off  = ((quarter & 1) ? 32 : 0);
+                        const int ql_off  = ((qa & 1) ? 32 : 0);
                         const int qh_base = n * 32;
-                        const int qh_shift = 2 * quarter;
-                        const int hi_nib = (quarter & 2) ? 1 : 0;
-                        const int kbase = sb * 256 + n * 128 + quarter * 32;
+                        const int kbase_a = sb * 256 + n * 128 + qa * 32;
+                        const int kbase_b = sb * 256 + n * 128 + qb * 32;
                         for (int l = is * 16; l < is * 16 + 16; l += 4) {
-                            float4 a4;
-                            __builtin_memcpy(&a4, Arow + kbase + l, 16);
-                            const float* af = (const float*)&a4;
+                            float4 a4a, a4b;
+                            __builtin_memcpy(&a4a, Arow + kbase_a + l, 16);
+                            __builtin_memcpy(&a4b, Arow + kbase_b + l, 16);
+                            const float* afa = (const float*)&a4a;
+                            const float* afb = (const float*)&a4b;
                             #pragma unroll
                             for (int e = 0; e < 4; ++e) {
-                                const float a_val = af[e];
                                 const int ll = l + e;
                                 #pragma unroll
                                 for (int j = 0; j < 4; ++j) {
                                     if (j < active) {
                                         const unsigned char ql_byte = ql4[j][ql_base + ll + ql_off];
-                                        const int nibble = hi_nib ? (ql_byte >> 4) : (ql_byte & 0x0F);
                                         const unsigned char qh_byte = qh4[j][qh_base + ll];
-                                        const int qh_bits = (qh_byte >> qh_shift) & 0x03;
-                                        acc[j] += a_val * (dsc4[j] * ((float)(nibble | (qh_bits << 4)) - 32.0f));
+                                        const int nib_lo = ql_byte & 0x0F;
+                                        const int nib_hi = ql_byte >> 4;
+                                        const int bh_a = (qh_byte >> (2 * qa)) & 0x03;
+                                        const int bh_b = (qh_byte >> (2 * qb)) & 0x03;
+                                        acc[j] += afa[e] * (dsc4[j][0] * ((float)(nib_lo | (bh_a << 4)) - 32.0f));
+                                        acc[j] += afb[e] * (dsc4[j][1] * ((float)(nib_hi | (bh_b << 4)) - 32.0f));
                                     }
                                 }
                             }
