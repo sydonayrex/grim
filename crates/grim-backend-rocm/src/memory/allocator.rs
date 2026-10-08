@@ -202,6 +202,11 @@ impl RocmCachingAllocator {
         let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
         let res = check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) });
         if res.is_err() {
+            if std::env::var_os("GRIM_ALLOC_TRACE").is_some() {
+                eprintln!(
+                    "[alloc] hipMalloc({cls}) FAILED — empty_cache + one retry (managed fallback next if this fails)"
+                );
+            }
             self.empty_cache();
             check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) })?;
         }
@@ -222,23 +227,35 @@ impl RocmCachingAllocator {
     }
 
     fn audit_insert(&self, ptr: u64, cls: usize) {
-        if !self.audit_on() { return; }
+        // `live` is an INVARIANT, not a debug aid: `empty_cache` refuses to unmap
+        // a slab or pool buffer that a live entry still points into, and it can
+        // only do that if this map is always accurate. Gating the maintenance on
+        // `audit_on()` left it empty in production, which made the guard a no-op
+        // and let a slab be unmapped under a live RocmStorage.
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = live.insert(ptr, cls) {
-            eprintln!("[alloc-audit] DOUBLE-BOOKING: {ptr:#x} id{} handed out while live (class {old}, now {cls})", self.id);
+            if self.audit_on() {
+                eprintln!("[alloc-audit] DOUBLE-BOOKING: {ptr:#x} id{} handed out while live (class {old}, now {cls})", self.id);
+            }
         }
-        let live_bytes: usize = live.values().sum();
-        if live_bytes >= self.next_live_report.load(Ordering::Relaxed) {
-            eprintln!("[alloc-audit] live total: {:.2} GiB across {} blocks", live_bytes as f64 / (1 << 30) as f64, live.len());
-            self.next_live_report.fetch_add(1 << 30, Ordering::Relaxed);
+        if self.audit_on() {
+            let live_bytes: usize = live.values().sum();
+            if live_bytes >= self.next_live_report.load(Ordering::Relaxed) {
+                eprintln!("[alloc-audit] live total: {:.2} GiB across {} blocks", live_bytes as f64 / (1 << 30) as f64, live.len());
+                self.next_live_report.fetch_add(1 << 30, Ordering::Relaxed);
+            }
         }
     }
 
     fn audit_remove(&self, ptr: u64, cls: usize) {
-        if !self.audit_on() { return; }
+        // Same invariant reasoning as `audit_insert`: the removal must always
+        // happen, the diagnostics around it are what `audit_on()` gates.
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         match live.remove(&ptr) {
             None => {
+                if !self.audit_on() {
+                    return;
+                }
                 eprintln!("[alloc-audit] FREE OF UNKNOWN: {ptr:#x} class {cls} not live");
                 // One-shot backtrace names the duplicate-free caller.
                 static ONCE: std::sync::atomic::AtomicBool =
@@ -247,7 +264,11 @@ impl RocmCachingAllocator {
                     eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
                 }
             }
-            Some(c) if c != cls => eprintln!("[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))", self.id),
+            Some(c) if c != cls => {
+                if self.audit_on() {
+                    eprintln!("[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))", self.id);
+                }
+            }
             _ => {}
         }
     }
@@ -381,21 +402,61 @@ impl RocmCachingAllocator {
             let _ = crate::hipDeviceSynchronize();
         }
         // Release slab sub-allocations too.
+        //
+        // A slab may only be unmapped once NOTHING live points into it. `live`
+        // maps every handed-out pointer to its size class, and a slab-served
+        // pointer is an interior offset into its slab, so a live entry inside
+        // [base, base+size) means some RocmStorage still reads and writes
+        // through this slab.
+        //
+        // Freeing it regardless is a use-after-free, and a silent one: the
+        // storage keeps an `Arc` to this allocator, so the allocator outlives
+        // the slab and nothing downstream notices until a DtoH reports the
+        // pointer as unregistered (`hipPointerGetAttributes` -> device -2).
+        // That is what `MoeFfn::forward_rocm` hit -- it allocates its output
+        // from a LOCAL `RocmDevice`, returns the tensor, and drops the device
+        // on the way out, and `Drop` calls here.
+        //
+        // The same guard covers pool buffers: a live entry there is a handed-out
+        // block, and unmapping it is the identical defect.
+        //
+        // Copied out rather than held as a guard so no lock is taken while
+        // another is acquired.
+        let live: std::collections::HashSet<u64> = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
         {
             if let Ok(mut frees) = self.slab_free.lock() {
                 frees.clear();
             }
             if let Ok(mut slabs) = self.slabs.lock() {
+                let mut keep = Vec::with_capacity(slabs.len());
                 for s in slabs.drain(..) {
-                    unsafe {
-                        let _ = hipFree(s.base as *mut c_void);
+                    let lo = s.base;
+                    let hi = s.base + s.size as u64;
+                    if live.iter().any(|p| *p >= lo && *p < hi) {
+                        // Still referenced: leave mapped. It becomes freeable on
+                        // a later empty_cache once its last slot is released.
+                        keep.push(s);
+                    } else {
+                        unsafe {
+                            let _ = hipFree(s.base as *mut c_void);
+                        }
                     }
                 }
+                *slabs = keep;
             }
         }
         let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         for (_cls, bufs) in pool.drain() {
             for p in bufs {
+                if live.contains(&p.ptr) {
+                    continue;
+                }
                 unsafe {
                     let _ = hipFree(p.ptr as *mut c_void);
                     if !p.event.is_null() {
