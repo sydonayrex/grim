@@ -56,13 +56,37 @@ extern "C" {
         const unsigned char* row_b_ptr = B_q6k + col * row_bytes;
 
         float acc = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            float a_val = A[row * K + k];
-            int sb_idx = k / 256;
-            int in_sb = k % 256;
-            const unsigned char* block_ptr = row_b_ptr + sb_idx * 210;
-            float w_val = dequant_q6k_element(block_ptr, in_sb);
-            acc += a_val * w_val;
+        for (int sb = 0; sb < blocks_per_row; ++sb) {
+            const unsigned char* block_ptr = row_b_ptr + sb * 210;
+            const unsigned char* ql = block_ptr;
+            const unsigned char* qh = block_ptr + 128;
+            const signed char*   scales = (const signed char*)(block_ptr + 192);
+            const unsigned short* d_ptr = (const unsigned short*)(block_ptr + 208);
+            const float d = fp16_to_float_device(d_ptr[0]);
+
+            // Hoist d/scales decode out of the per-weight loop. Q6_K's
+            // super-block is 2 outer blocks x 4 quarters x 2 sub-blocks of 16,
+            // so each scale byte is loaded once per 16 weights instead of once
+            // per weight.
+            for (int n = 0; n < 2; ++n) {
+                for (int quarter = 0; quarter < 4; ++quarter) {
+                    for (int is = 0; is < 2; ++is) {
+                        const signed char sc = scales[n * 8 + is + 2 * quarter];
+                        const float dsc = d * (float)sc;
+                        for (int l = is * 16; l < is * 16 + 16; ++l) {
+                            const int ql_offset = n * 64 + l + ((quarter & 1) ? 32 : 0);
+                            const unsigned char ql_byte = ql[ql_offset];
+                            const int nibble = (quarter & 2) ? (ql_byte >> 4) : (ql_byte & 0x0F);
+                            const unsigned char qh_byte = qh[n * 32 + l];
+                            const int qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
+                            const int q_code = nibble | (qh_bits << 4);
+                            const float w_val = dsc * ((float)q_code - 32.0f);
+                            const float a_val = A[row * K + sb * 256 + n * 128 + quarter * 32 + l];
+                            acc += a_val * w_val;
+                        }
+                    }
+                }
+            }
         }
 
         C[row * N + col] = acc;

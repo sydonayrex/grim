@@ -61,13 +61,42 @@ extern "C" {
         const unsigned char* row_b_ptr = B_q5k + col * row_bytes;
 
         float acc = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            float a_val = A[row * K + k];
-            int sb_idx = k / 256;
-            int in_sb = k % 256;
-            const unsigned char* block_ptr = row_b_ptr + sb_idx * 176;
-            float w_val = dequant_q5k_element(block_ptr, in_sb);
-            acc += a_val * w_val;
+        for (int sb = 0; sb < blocks_per_row; ++sb) {
+            const unsigned char* block_ptr = row_b_ptr + sb * 176;
+            const unsigned short* h_ptr = (const unsigned short*)block_ptr;
+            const float d    = fp16_to_float_device(h_ptr[0]);
+            const float dmin = fp16_to_float_device(h_ptr[1]);
+            const unsigned char* scales = block_ptr + 4;
+            const unsigned char* qh     = block_ptr + 16;
+            const unsigned char* qs     = block_ptr + 48;
+
+            // Hoist d/dmin/sc/m/qh access to one read per sub-block.
+            // Same scalar MAC structure, but no per-weight metadata decode.
+            for (int is = 0; is < 8; ++is) {
+                unsigned char sc, m;
+                if (is < 4) {
+                    sc = scales[is] & 63;
+                    m  = scales[is + 4] & 63;
+                } else {
+                    sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+                    m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                }
+                const float dsc = d * (float)sc;
+                const float dm  = dmin * (float)m;
+                // is = 2*n + hi, so n = is/2 group, hi = is%2 sub-block of 32
+                const int n  = is >> 1;
+                const int hi = is & 1;
+                const unsigned char* qs_sub = qs + n * 32;
+                for (int l = 0; l < 32; ++l) {
+                    const unsigned char packed = qs_sub[l];
+                    const int q_low = hi ? (packed >> 4) : (packed & 0x0F);
+                    const int msb = (qh[l] >> (2 * n + hi)) & 1;
+                    const int q_code = q_low | (msb << 4);
+                    const float w_val = dsc * (float)q_code - dm;
+                    const float a_val = A[row * K + sb * 256 + is * 32 + l];
+                    acc += a_val * w_val;
+                }
+            }
         }
 
         C[row * N + col] = acc;
