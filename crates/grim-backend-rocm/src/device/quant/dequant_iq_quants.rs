@@ -188,7 +188,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2xxs", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2xxs", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq2xxs(
@@ -220,7 +220,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2xs", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2xs", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq2xs(
@@ -252,7 +252,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2s", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2s", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq2s(
@@ -284,7 +284,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq3xxs", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq3xxs", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq3xxs(
@@ -316,7 +316,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq3s", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq3s", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_gemm_iq1s(
@@ -328,7 +328,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1s", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1s", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_gemm_iq1m(
@@ -340,7 +340,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1m", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq1m", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq1s(
@@ -412,7 +412,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4nl", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4nl", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq4nl(
@@ -444,7 +444,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4xs", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4xs", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_iq4xs(

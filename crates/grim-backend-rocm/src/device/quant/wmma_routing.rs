@@ -241,6 +241,7 @@ impl RocmDevice {
         m: usize,
         n: usize,
         k: usize,
+        cols_per_thread: usize,
     ) -> Result<*mut c_void> {
         // SPEED-ROC-8: opt-in LDS-tiled prefill path (per-format GRIM_*_TILED).
         if let Some((tag, blk)) = Self::tiled_quant_lookup(name) {
@@ -274,8 +275,11 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
         const BLOCK_SIZE: usize = 256;
+        // Kernels that handle multiple columns per thread (Q4/Q5/Q6_K scalar
+        // forwards do 4) cover m*ceil(n/cols) threads, not m*n.
+        let cols = cols_per_thread.max(1);
         let total_elems: u64 = (m as u64)
-            .checked_mul(n as u64)
+            .checked_mul(n.div_ceil(cols) as u64)
             .ok_or_else(|| Error::Backend(format!("{}: m*n overflow", name)))?;
         let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()

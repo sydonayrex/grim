@@ -93,7 +93,7 @@ pub mod q4k_test_shim {
         n: usize,
         k: usize,
     ) -> Result<*mut std::ffi::c_void> {
-        dev.launch_fused_deq_gemm_simple(kernel, a, b, out, m, n, k)
+        dev.launch_fused_deq_gemm_simple(kernel, a, b, out, m, n, k, 1)
     }
 
     /// SPEED-ROC-8: launch a tiled quant fused dequant-GEMM (backward) by

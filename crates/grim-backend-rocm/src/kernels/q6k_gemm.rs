@@ -44,26 +44,30 @@ extern "C" {
         float* __restrict__ C,
         int M, int N, int K)
     {
+        // 4 columns per thread: one activation load feeds 4 MACs. Same
+        // traffic argument as the Q4_K kernel.
+        const unsigned long long ncols4 = ((unsigned long long)N + 3) / 4;
         const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-        const unsigned long long total = (unsigned long long)M * N;
+        const unsigned long long total = (unsigned long long)M * ncols4;
         if (idx >= total) return;
 
-        const int row = (int)(idx / N);
-        const int col = (int)(idx % N);
+        const int row = (int)(idx / ncols4);
+        const int col0 = (int)(idx % ncols4) * 4;
+        const int active = (col0 + 4 <= N) ? 4 : (N - col0);
 
         const int blocks_per_row = K / 256;
         const int row_bytes = blocks_per_row * 210;
-        const unsigned char* row_b_ptr = B_q6k + col * row_bytes;
+        const unsigned char* bcol[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            bcol[j] = (j < active)
+                ? B_q6k + (long long)(col0 + j) * row_bytes
+                : (const unsigned char*)0;
+        }
+        const float* Arow = A + (long long)row * K;
 
-        float acc = 0.0f;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int sb = 0; sb < blocks_per_row; ++sb) {
-            const unsigned char* block_ptr = row_b_ptr + sb * 210;
-            const unsigned char* ql = block_ptr;
-            const unsigned char* qh = block_ptr + 128;
-            const signed char*   scales = (const signed char*)(block_ptr + 192);
-            const unsigned short* d_ptr = (const unsigned short*)(block_ptr + 208);
-            const float d = fp16_to_float_device(d_ptr[0]);
-
             // Hoist d/scales decode out of the per-weight loop. Q6_K's
             // super-block is 2 outer blocks x 4 quarters x 2 sub-blocks of 16,
             // so each scale byte is loaded once per 16 weights instead of once
@@ -71,25 +75,58 @@ extern "C" {
             for (int n = 0; n < 2; ++n) {
                 for (int quarter = 0; quarter < 4; ++quarter) {
                     for (int is = 0; is < 2; ++is) {
-                        const signed char sc = scales[n * 8 + is + 2 * quarter];
-                        const float dsc = d * (float)sc;
-                        for (int l = is * 16; l < is * 16 + 16; ++l) {
-                            const int ql_offset = n * 64 + l + ((quarter & 1) ? 32 : 0);
-                            const unsigned char ql_byte = ql[ql_offset];
-                            const int nibble = (quarter & 2) ? (ql_byte >> 4) : (ql_byte & 0x0F);
-                            const unsigned char qh_byte = qh[n * 32 + l];
-                            const int qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
-                            const int q_code = nibble | (qh_bits << 4);
-                            const float w_val = dsc * ((float)q_code - 32.0f);
-                            const float a_val = A[row * K + sb * 256 + n * 128 + quarter * 32 + l];
-                            acc += a_val * w_val;
+                        float dsc4[4];
+                        const unsigned char* ql4[4];
+                        const unsigned char* qh4[4];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            if (j < active) {
+                                const unsigned char* block_ptr = bcol[j] + sb * 210;
+                                const unsigned char* ql = block_ptr;
+                                const unsigned char* qh = block_ptr + 128;
+                                const signed char* scales = (const signed char*)(block_ptr + 192);
+                                const unsigned short* d_ptr = (const unsigned short*)(block_ptr + 208);
+                                const float d = fp16_to_float_device(d_ptr[0]);
+                                dsc4[j] = d * (float)scales[n * 8 + is + 2 * quarter];
+                                ql4[j] = ql;
+                                qh4[j] = qh;
+                            }
+                        }
+                        const int ql_base = n * 64;
+                        const int ql_off  = ((quarter & 1) ? 32 : 0);
+                        const int qh_base = n * 32;
+                        const int qh_shift = 2 * quarter;
+                        const int hi_nib = (quarter & 2) ? 1 : 0;
+                        const int kbase = sb * 256 + n * 128 + quarter * 32;
+                        for (int l = is * 16; l < is * 16 + 16; l += 4) {
+                            float4 a4;
+                            __builtin_memcpy(&a4, Arow + kbase + l, 16);
+                            const float* af = (const float*)&a4;
+                            #pragma unroll
+                            for (int e = 0; e < 4; ++e) {
+                                const float a_val = af[e];
+                                const int ll = l + e;
+                                #pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    if (j < active) {
+                                        const unsigned char ql_byte = ql4[j][ql_base + ll + ql_off];
+                                        const int nibble = hi_nib ? (ql_byte >> 4) : (ql_byte & 0x0F);
+                                        const unsigned char qh_byte = qh4[j][qh_base + ll];
+                                        const int qh_bits = (qh_byte >> qh_shift) & 0x03;
+                                        acc[j] += a_val * (dsc4[j] * ((float)(nibble | (qh_bits << 4)) - 32.0f));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        C[row * N + col] = acc;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (j < active) C[(long long)row * N + col0 + j] = acc[j];
+        }
     }
 
     __global__ void grim_fused_dequant_backward_gemm_q6k(

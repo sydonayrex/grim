@@ -8,7 +8,7 @@ use grim_tensor::error::{Error, Result};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{HipDim3, arg};
+use crate::{arg, HipDim3};
 
 impl RocmDevice {
     /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
@@ -80,8 +80,11 @@ impl RocmDevice {
         }
 
         const BLOCK_SIZE: usize = 256;
+        // The scalar kernel handles 4 columns per thread (ncols4), so the
+        // grid covers m*ceil(n/4) threads, not m*n.
+        let ncols4 = n.div_ceil(4);
         let total_elems: u64 = (m as u64)
-            .checked_mul(n as u64)
+            .checked_mul(ncols4 as u64)
             .ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k: m*n overflow".into()))?;
         let grid_x: u32 = (total_elems.div_ceil(BLOCK_SIZE as u64))
             .try_into()
@@ -343,7 +346,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q5k", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q5k", a, b, out, m, n, k, 4)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_q5k(
@@ -392,7 +395,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q6k", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q6k", a, b, out, m, n, k, 4)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_q6k(
@@ -441,7 +444,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q2k", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q2k", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_q2k(
@@ -490,7 +493,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q3k", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q3k", a, b, out, m, n, k, 1)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_q3k(
@@ -533,7 +536,7 @@ impl RocmDevice {
         if rows4_min_n > 0 && n >= rows4_min_n && n % 4 == 0 {
             return self.launch_fused_dequant_gemm_q8_0_rows4(a, b, out, m, n, k);
         }
-        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q8_0", a, b, out, m, n, k)
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q8_0", a, b, out, m, n, k, 1)
     }
 
     /// SPEED-ROC: Q8_0 NUM_ROWS=4 launcher — each thread computes 4 consecutive

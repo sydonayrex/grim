@@ -49,57 +49,90 @@ extern "C" {
         float* __restrict__ C,
         int M, int N, int K)
     {
+        // 4 columns per thread: one activation load feeds 4 MACs. See the Q4_K
+        // kernel for the traffic argument; same structure here.
+        const unsigned long long ncols4 = ((unsigned long long)N + 3) / 4;
         const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-        const unsigned long long total = (unsigned long long)M * N;
+        const unsigned long long total = (unsigned long long)M * ncols4;
         if (idx >= total) return;
 
-        const int row = (int)(idx / N);
-        const int col = (int)(idx % N);
+        const int row = (int)(idx / ncols4);
+        const int col0 = (int)(idx % ncols4) * 4;
+        const int active = (col0 + 4 <= N) ? 4 : (N - col0);
 
         const int blocks_per_row = K / 256;
         const int row_bytes = blocks_per_row * 176;
-        const unsigned char* row_b_ptr = B_q5k + col * row_bytes;
+        const unsigned char* bcol[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            bcol[j] = (j < active)
+                ? B_q5k + (long long)(col0 + j) * row_bytes
+                : (const unsigned char*)0;
+        }
+        const float* Arow = A + (long long)row * K;
 
-        float acc = 0.0f;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int sb = 0; sb < blocks_per_row; ++sb) {
-            const unsigned char* block_ptr = row_b_ptr + sb * 176;
-            const unsigned short* h_ptr = (const unsigned short*)block_ptr;
-            const float d    = fp16_to_float_device(h_ptr[0]);
-            const float dmin = fp16_to_float_device(h_ptr[1]);
-            const unsigned char* scales = block_ptr + 4;
-            const unsigned char* qh     = block_ptr + 16;
-            const unsigned char* qs     = block_ptr + 48;
-
-            // Hoist d/dmin/sc/m/qh access to one read per sub-block.
+            // Hoist d/dmin/sc/m access to one read per sub-block.
             // Same scalar MAC structure, but no per-weight metadata decode.
             for (int is = 0; is < 8; ++is) {
-                unsigned char sc, m;
-                if (is < 4) {
-                    sc = scales[is] & 63;
-                    m  = scales[is + 4] & 63;
-                } else {
-                    sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
-                    m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                float dsc4[4], dm4[4];
+                const unsigned char* qs4[4];
+                const unsigned char* qh4[4];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (j < active) {
+                        const unsigned char* block_ptr = bcol[j] + sb * 176;
+                        const unsigned short* h_ptr = (const unsigned short*)block_ptr;
+                        const float d    = fp16_to_float_device(h_ptr[0]);
+                        const float dmin = fp16_to_float_device(h_ptr[1]);
+                        const unsigned char* scales = block_ptr + 4;
+                        unsigned char sc, m;
+                        if (is < 4) {
+                            sc = scales[is] & 63;
+                            m  = scales[is + 4] & 63;
+                        } else {
+                            sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+                            m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                        }
+                        dsc4[j] = d * (float)sc;
+                        dm4[j]  = dmin * (float)m;
+                        // is = 2*n + hi, so n = is/2 group, hi = is%2
+                        const int n = is >> 1;
+                        qs4[j] = block_ptr + 48 + n * 32;
+                        qh4[j] = block_ptr + 16;
+                    }
                 }
-                const float dsc = d * (float)sc;
-                const float dm  = dmin * (float)m;
                 // is = 2*n + hi, so n = is/2 group, hi = is%2 sub-block of 32
                 const int n  = is >> 1;
                 const int hi = is & 1;
-                const unsigned char* qs_sub = qs + n * 32;
-                for (int l = 0; l < 32; ++l) {
-                    const unsigned char packed = qs_sub[l];
-                    const int q_low = hi ? (packed >> 4) : (packed & 0x0F);
-                    const int msb = (qh[l] >> (2 * n + hi)) & 1;
-                    const int q_code = q_low | (msb << 4);
-                    const float w_val = dsc * (float)q_code - dm;
-                    const float a_val = A[row * K + sb * 256 + is * 32 + l];
-                    acc += a_val * w_val;
+                const int msb_shift = 2 * n + hi;
+                for (int l = 0; l < 32; l += 4) {
+                    float4 a4;
+                    __builtin_memcpy(&a4, Arow + sb * 256 + is * 32 + l, 16);
+                    const float* af = (const float*)&a4;
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const float a_val = af[e];
+                        const int ll = l + e;
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            if (j < active) {
+                                const unsigned char packed = qs4[j][ll];
+                                const int q_low = hi ? (packed >> 4) : (packed & 0x0F);
+                                const int msb = (qh4[j][ll] >> msb_shift) & 1;
+                                acc[j] += a_val * (dsc4[j] * (float)(q_low | (msb << 4)) - dm4[j]);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        C[row * N + col] = acc;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (j < active) C[(long long)row * N + col0 + j] = acc[j];
+        }
     }
 
     __global__ void grim_fused_dequant_backward_gemm_q5k(

@@ -10,55 +10,88 @@ extern "C" {
         float* __restrict__ C,
         int M, int N, int K)
     {
+        // 4 columns per thread: the activation row is identical for all N
+        // columns, so one A load feeds 4 MACs. At decode (M=1, N=16384,
+        // K=4096) the scalar 1-col form re-reads the 16 KB A row once per
+        // column (268 MB of A traffic vs 37 MB of weights); this cuts that 4x.
+        // The 4 weight blocks differ per column, so W decode stays per-column.
+        const unsigned long long ncols4 = ((unsigned long long)N + 3) / 4;
         const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-        const unsigned long long total = (unsigned long long)M * N;
+        const unsigned long long total = (unsigned long long)M * ncols4;
         if (idx >= total) return;
 
-        const int row = (int)(idx / N);
-        const int col = (int)(idx % N);
+        const int row = (int)(idx / ncols4);
+        const int col0 = (int)(idx % ncols4) * 4;
+        const int active = (col0 + 4 <= N) ? 4 : (N - col0);
 
         const int blocks_per_row = K / 256;
         const int row_bytes = blocks_per_row * 144;
-        const unsigned char* row_b_ptr = B_q4k + col * row_bytes;
+        const unsigned char* bcol[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            bcol[j] = (j < active)
+                ? B_q4k + (long long)(col0 + j) * row_bytes
+                : (const unsigned char*)0;
+        }
+        const float* Arow = A + (long long)row * K;
 
-        float acc = 0.0f;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int sb = 0; sb < blocks_per_row; ++sb) {
-            const unsigned char* block_ptr = row_b_ptr + sb * 144;
-            const unsigned short* h_ptr = (const unsigned short*)block_ptr;
-            const float d    = fp16_to_float_device(h_ptr[0]);
-            const float dmin = fp16_to_float_device(h_ptr[1]);
-            const unsigned char* scales = block_ptr + 4;
-            const unsigned char* qs     = block_ptr + 16;
-
             // 8 sub-blocks of 32: decode d, dmin, sc, m ONCE per sub-block
             // rather than re-reading them per weight. The previous form
             // re-loaded 2 fp16 scales + unpacked sc/m for every k.
             for (int is = 0; is < 8; ++is) {
-                unsigned char sc, m;
-                if (is < 4) {
-                    sc = scales[is] & 63;
-                    m  = scales[is + 4] & 63;
-                } else {
-                    sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
-                    m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                float dsc4[4], dm4[4];
+                const unsigned char* qs4[4];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (j < active) {
+                        const unsigned char* block_ptr = bcol[j] + sb * 144;
+                        const unsigned short* h_ptr = (const unsigned short*)block_ptr;
+                        const float d    = fp16_to_float_device(h_ptr[0]);
+                        const float dmin = fp16_to_float_device(h_ptr[1]);
+                        const unsigned char* scales = block_ptr + 4;
+                        unsigned char sc, m;
+                        if (is < 4) {
+                            sc = scales[is] & 63;
+                            m  = scales[is + 4] & 63;
+                        } else {
+                            sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
+                            m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
+                        }
+                        dsc4[j] = d * (float)sc;
+                        dm4[j]  = dmin * (float)m;
+                        const int group = is >> 1;
+                        qs4[j] = block_ptr + 16 + group * 32;
+                    }
                 }
-                const float dsc = d * (float)sc;
-                const float dm  = dmin * (float)m;
-
-                const int group = is >> 1;
-                const int half  = is & 1;
-                const unsigned char* qs_sub = qs + group * 32;
-                for (int l = 0; l < 32; ++l) {
-                    const unsigned char packed = qs_sub[l];
-                    const int q_low = half ? (packed >> 4) : (packed & 0x0F);
-                    const float w_val = dsc * (float)q_low - dm;
-                    const float a_val = A[row * K + sb * 256 + is * 32 + l];
-                    acc += a_val * w_val;
+                const int half = is & 1;
+                // float4 activation loads: 8 vector loads cover the 32 weights.
+                for (int l = 0; l < 32; l += 4) {
+                    float4 a4;
+                    __builtin_memcpy(&a4, Arow + sb * 256 + is * 32 + l, 16);
+                    const float* af = (const float*)&a4;
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const float a_val = af[e];
+                        const int ll = l + e;
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            if (j < active) {
+                                const unsigned char packed = qs4[j][ll];
+                                const int q_low = half ? (packed >> 4) : (packed & 0x0F);
+                                acc[j] += a_val * (dsc4[j] * (float)q_low - dm4[j]);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        C[row * N + col] = acc;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (j < active) C[(long long)row * N + col0 + j] = acc[j];
+        }
     }
 
     __global__ void grim_fused_dequant_backward_gemm_q4k(
