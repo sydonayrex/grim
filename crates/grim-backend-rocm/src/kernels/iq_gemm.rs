@@ -1527,6 +1527,20 @@ extern "C" __global__ void grim_moe_gather_rows(
         out[(long long)r * hidden + i] = x[(long long)tok * hidden + i];
 }
 
+// Fixed-order reduction of per-pair rows into a single-token output
+// (decode: batch 1). Deterministic — pairs summed in index order.
+extern "C" __global__ void grim_moe_pairs_reduce(
+    const float* __restrict__ pair_out, float* __restrict__ out,
+    int hidden, int num_pairs)
+{
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    float acc = 0.0f;
+    for (int p = 0; p < num_pairs; ++p)
+        acc += pair_out[(unsigned long long)p * hidden + h];
+    out[h] = acc;
+}
+
 // out[toks[r]] += wts[r] * in[r] (pair-compact scaled scatter-add).
 extern "C" __global__ void grim_moe_scatter_add_rows(
     float* __restrict__ out, const int* __restrict__ toks,
@@ -1537,6 +1551,38 @@ extern "C" __global__ void grim_moe_scatter_add_rows(
     const float w = wts[r];
     for (int i = threadIdx.x; i < hidden; i += blockDim.x)
         atomicAdd(out + (long long)tok * hidden + i, w * in[(long long)r * hidden + i]);
+}
+
+// DETERMINISTIC variant: write w*in[r] to out[idx[r]] (plain store, no
+// atomics). idx[r] is the pair's position in TOKEN-sorted order, so the
+// subsequent per-token reduction sums in a fixed order.
+extern "C" __global__ void grim_moe_scatter_rows_idx(
+    float* __restrict__ out, const int* __restrict__ idx,
+    const float* __restrict__ wts, const float* __restrict__ in, int hidden)
+{
+    const int r = blockIdx.x;
+    const int dst = idx[r];
+    const float w = wts[r];
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x)
+        out[(long long)dst * hidden + i] = w * in[(long long)r * hidden + i];
+}
+
+// Per-token fixed-order reduction over pair rows: out[t] = sum of
+// full[off[t]..off[t+1]) in index order. Grid = num_tokens; offsets are the
+// CSR over the token-sorted pairs. Plain adds in a fixed order — no atomics.
+extern "C" __global__ void grim_moe_token_reduce(
+    const float* __restrict__ full, const int* __restrict__ offsets,
+    float* __restrict__ out, int hidden)
+{
+    const int t = blockIdx.x;
+    const int lo = offsets[t];
+    const int hi = offsets[t + 1];
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = lo; j < hi; ++j)
+            acc += full[(long long)j * hidden + i];
+        out[(long long)t * hidden + i] = acc;
+    }
 }
 
 extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
@@ -1550,7 +1596,8 @@ extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
     float* __restrict__ out,                          // [batch, hidden]
     int hidden, int inter, int num_pairs,
     float routed_scaling_factor, int num_experts, int batch, int phase_mask,
-    int gate_row_bytes, int down_row_bytes, int jlimit_arg, int down_fmt)
+    int gate_row_bytes, int down_row_bytes, int jlimit_arg, int down_fmt,
+    float* __restrict__ pair_out, int deterministic)
 {
     const int pair = blockIdx.x;
     if (pair >= num_pairs) return;
@@ -1634,8 +1681,15 @@ extern "C" __global__ void grim_moe_fused_dispatch_kq_native(
                 }
             }
         }
-        atomicAdd(out + (unsigned long long)tok * hidden + h,
-                  routed_scaling_factor * w * acc);
+        if (deterministic) {
+            // Per-pair rows + a fixed-order reduce: atomicAdd float ordering
+            // made decode tails vary run to run.
+            pair_out[(unsigned long long)pair * hidden + h] =
+                routed_scaling_factor * w * acc;
+        } else {
+            atomicAdd(out + (unsigned long long)tok * hidden + h,
+                      routed_scaling_factor * w * acc);
+        }
     }
     }
 }

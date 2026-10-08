@@ -1634,6 +1634,31 @@ impl RocmDevice {
         // One 256-thread block per pair; dynamic shared staging holds `inter`
         // f32 — the size MUST be passed at launch (unsized dynamic LDS page-
         // faults the GPU; see the WhiteCrow twin of this launcher).
+        // DETERMINISM scratch: per-pair down rows, reduced in fixed order.
+        use grim_tensor::{ArithType as _AT, Storage as _ST};
+        static PAIR_OUT: std::sync::OnceLock<std::sync::Mutex<Option<(usize, usize, RocmStorage)>>> =
+            std::sync::OnceLock::new();
+        let pcell = PAIR_OUT.get_or_init(|| std::sync::Mutex::new(None));
+        let mut pguard = pcell.lock().unwrap_or_else(|e| e.into_inner());
+        let np_key = num_pairs;
+        if !matches!(pguard.as_ref(), Some((ord, key, _)) if *ord == self.ordinal && *key == np_key)
+        {
+            let po = RocmStorage::alloc_gpu(
+                &Shape::new(vec![num_pairs * hidden]),
+                DType { arith: _AT::F32, storage: _ST::Native },
+                &self.allocator,
+                self.ordinal,
+            )?;
+            *pguard = Some((self.ordinal, np_key, po));
+        }
+        let pair_out_p = pguard
+            .as_ref()
+            .unwrap()
+            .2
+            .device_ptr_checked()? as *mut c_void;
+        drop(pguard);
+        let mut pair_out_p = pair_out_p;
+        let mut det_i: i32 = if batch_i == 1 { 1 } else { 0 };
         let stream = self.launch_compute_kernel_with_solution(
             "grim_moe_fused_dispatch_kq_native",
             HipDim3::new(num_pairs as u32, 1, 1),
@@ -1658,10 +1683,27 @@ impl RocmDevice {
                 arg(&mut down_row_bytes_i),
                 arg(&mut jlimit_i),
                 arg(&mut down_fmt_i),
+                arg(&mut pair_out_p),
+                arg(&mut det_i),
             ],
             None,
             inter * std::mem::size_of::<f32>(),
         )?;
+        // DETERMINISM: the kernel now writes per-pair rows into pair_out;
+        // reduce them into `out` in fixed pair order (batch is always 1 on
+        // this decode path — one token's 4..top_k pairs).
+        if det_i == 1 {
+            let reduce_blocks = hidden.div_ceil(256) as u32;
+            let mut po = pair_out_p;
+            let mut np_i = num_pairs as i32;
+            let mut hi2 = hidden as i32;
+            self.launch_compute_kernel(
+                "grim_moe_pairs_reduce",
+                HipDim3::new(reduce_blocks, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [arg(&mut po), arg(&mut optr), arg(&mut hi2), arg(&mut np_i)],
+            )?;
+        }
         Ok(stream)
     }
 }
@@ -1684,6 +1726,8 @@ pub struct MoEDequantGemmScratch {
     /// Rows beyond the expert's real count hold stale data; only `count`
     /// rows are ever scattered, and silu of stale finite data is finite.
     pub buckets: Vec<(usize, MoEBucketBufs)>,
+    /// Pair-indexed down outputs, rows in TOKEN-sorted order (determinism).
+    pub dtf: RocmStorage, // [num_pairs, hidden]
     pub key: (usize, usize, usize),
 }
 
@@ -1738,6 +1782,58 @@ impl RocmDevice {
         };
         let mut order: Vec<usize> = (0..num_pairs).collect();
         order.sort_by_key(|&p| u32le(&exp_host, p));
+
+        // Determinism: rank every pair by (token, original index). Each
+        // expert's down rows land at these positions in a pair-indexed
+        // buffer, and the final per-token reduction sums them in this fixed
+        // order — no atomics.
+        let mut tsorted: Vec<usize> = (0..num_pairs).collect();
+        tsorted.sort_by_key(|&p| (u32le(&tok_host, p), p));
+        let rank_of_orig: Vec<usize> = {
+            let mut r = vec![0usize; num_pairs];
+            for (pos, &p) in tsorted.iter().enumerate() {
+                r[p] = pos;
+            }
+            r
+        };
+        let num_tokens = if tsorted.is_empty() {
+            1
+        } else {
+            u32le(&tok_host, tsorted[tsorted.len() - 1]) as usize + 1
+        };
+        let mut offs: Vec<i32> = vec![0i32; num_tokens + 1];
+        {
+            let mut s = 0usize;
+            while s < tsorted.len() {
+                let t = u32le(&tok_host, tsorted[s]) as usize;
+                let mut e2 = s;
+                while e2 < tsorted.len() && u32le(&tok_host, tsorted[e2]) as usize == t {
+                    e2 += 1;
+                }
+                offs[t] = s as i32;
+                offs[t + 1] = e2 as i32;
+                s = e2;
+            }
+            // Forward-fill for tokens with no pairs (lo == hi).
+            let mut prev = 0i32;
+            for t in 0..num_tokens {
+                if offs[t] != offs[t + 1] {
+                    prev = offs[t + 1];
+                } else {
+                    offs[t] = prev;
+                    offs[t + 1] = prev;
+                }
+            }
+        }
+        let offs_st = MemoryOps::from_cpu_bytes(
+            self as &dyn grim_tensor::BackendDevice,
+            unsafe { std::slice::from_raw_parts(offs.as_ptr() as *const u8, offs.len() * 4) },
+            &Shape::new(vec![offs.len()]),
+            DType { arith: ArithType::U32, storage: Storage::Native },
+        )
+        .map_err(|e2| Error::Backend(format!("dg offs h2d: {e2}")))?;
+        let offs_p = crate::device::util::as_rocm(offs_st.as_ref())?
+            .device_ptr_checked()? as *mut c_void;
         let sorted_toks: Vec<i32> = order.iter().map(|&p| u32le(&tok_host, p) as i32).collect();
         let sorted_wts: Vec<f32> =
             order.iter().map(|&p| f32le(&w_host, p) * routed_scaling_factor).collect();
@@ -1836,7 +1932,13 @@ impl RocmDevice {
                     ));
                     buckets
                 },
-                key: need_key,
+                dtf: RocmStorage::alloc_gpu(
+                &Shape::new(vec![num_pairs, hidden]),
+                f32ty.clone(),
+                &self.allocator,
+                self.ordinal,
+            )?,
+            key: need_key,
             };
             *guard = Some((self.ordinal, s));
         }
@@ -1887,6 +1989,21 @@ impl RocmDevice {
             let mut toks_p = crate::device::util::as_rocm(toks_st.as_ref())?
                 .device_ptr_checked()? as *mut c_void;
             let mut wts_p = crate::device::util::as_rocm(wts_st.as_ref())?
+                .device_ptr_checked()? as *mut c_void;
+            let idx_slice: Vec<i32> = order[seg_start..seg_end]
+                .iter()
+                .map(|&orig| rank_of_orig[orig] as i32)
+                .collect();
+            let idx_st = MemoryOps::from_cpu_bytes(
+                self as &dyn grim_tensor::BackendDevice,
+                unsafe {
+                    std::slice::from_raw_parts(idx_slice.as_ptr() as *const u8, count * 4)
+                },
+                &Shape::new(vec![count]),
+                DType { arith: ArithType::U32, storage: Storage::Native },
+            )
+            .map_err(|e2| Error::Backend(format!("dg idx h2d: {e2}")))?;
+            let idx_p = crate::device::util::as_rocm(idx_st.as_ref())?
                 .device_ptr_checked()? as *mut c_void;
 
             // (a) dequant expert e's banks, transposed, into the scratch.
@@ -2044,17 +2161,28 @@ impl RocmDevice {
                 seg_start = seg_end;
                 continue;
             }
+            // DETERMINISTIC: write w*D into pair-indexed rows (token-sorted
+            // order), then reduce per token in fixed order. No atomics.
+            let mut idx_p2 = idx_p;
+            let mut dtf_p = scratch.dtf.device_ptr_checked()? as *mut c_void;
             self.launch_compute_kernel(
-                "grim_moe_scatter_add_rows",
+                "grim_moe_scatter_rows_idx",
                 HipDim3::new(count as u32, 1, 1),
                 HipDim3::new(256, 1, 1),
                 &mut [
-                    arg(&mut out_p),
-                    arg(&mut toks_p),
+                    arg(&mut dtf_p),
+                    arg(&mut idx_p2),
                     arg(&mut wts_p),
                     arg(&mut dt_p),
                     arg(&mut hidden_i),
                 ],
+            )?;
+            let mut offs_p2 = offs_p;
+            self.launch_compute_kernel(
+                "grim_moe_token_reduce",
+                HipDim3::new(num_tokens as u32, 1, 1),
+                HipDim3::new(256, 1, 1),
+                &mut [arg(&mut dtf_p), arg(&mut offs_p2), arg(&mut out_p), arg(&mut hidden_i)],
             )?;
 
             if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() && seg_start == 0 {
