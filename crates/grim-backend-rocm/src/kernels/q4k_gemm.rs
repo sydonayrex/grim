@@ -108,6 +108,122 @@ extern "C" {
         }
     }
 
+    // SPEED-ROC-9: K-split decode specialization (m==1). The 4-col scalar
+    // kernel launches N/4 threads at m==1 (~16 waves on a full card), leaving
+    // the GPU latency-bound. This kernel splits K 4 ways AND does 2 columns
+    // per thread: 2*N threads (128 waves at N=4096), each decoding 2 columns
+    // over K/4 weights. Partial sums reduce through LDS; lane split==0 of
+    // each group of 4 writes the 2 outputs. Requires K%1024==0 so every
+    // split owns whole 256-weight blocks. Weights stay Q4_K; A stays f32.
+    __global__ void grim_fused_dequant_gemm_q4k_ksplit(
+        const float* __restrict__ A,
+        const unsigned char* __restrict__ B_q4k,
+        float* __restrict__ C,
+        int M, int N, int K)
+    {
+        const unsigned long long npairs = ((unsigned long long)N + 1) / 2;
+        const unsigned long long total = (unsigned long long)M * npairs * 4;
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        // NOTE: no early exit here. Threads past `total` write zeros into the
+        // reduction buffer so a valid split==0 lane never reduces over garbage
+        // in a partially-filled final block.
+        const int valid = (idx < total) ? 1 : 0;
+
+        const int rem = (int)(idx % (npairs * 4));
+        const int row = (int)(idx / (npairs * 4));
+        const int pair = rem / 4;
+        const int split = rem % 4;
+        const int col0 = pair * 2;
+        const int active = (valid && col0 + 2 <= N) ? 2 : ((valid) ? (N - col0) : 0);
+
+        const int blocks_per_row = K / 256;
+        const int nsb4 = blocks_per_row / 4;
+        const int row_bytes = blocks_per_row * 144;
+        const unsigned char* bcol[2];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            bcol[j] = (j < active)
+                ? B_q4k + (long long)(col0 + j) * row_bytes + (long long)split * nsb4 * 144
+                : (const unsigned char*)0;
+        }
+        const float* Arow = A + (long long)row * K;
+        const int kbase = split * nsb4 * 256;
+
+        float acc[2] = {0.0f, 0.0f};
+        if (valid) {
+        for (int sb = 0; sb < nsb4; ++sb) {
+            for (int g = 0; g < 4; ++g) {
+                float dsc[2][2], dm[2][2];
+                const unsigned char* qs[2];
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    if (j < active) {
+                        const unsigned char* block_ptr = bcol[j] + sb * 144;
+                        const unsigned short* h_ptr = (const unsigned short*)block_ptr;
+                        const float d    = fp16_to_float_device(h_ptr[0]);
+                        const float dmin = fp16_to_float_device(h_ptr[1]);
+                        const unsigned char* scales = block_ptr + 4;
+                        const int is0 = 2 * g, is1 = 2 * g + 1;
+                        unsigned char sc0, m0, sc1, m1;
+                        if (is0 < 4) {
+                            sc0 = scales[is0] & 63;
+                            m0  = scales[is0 + 4] & 63;
+                        } else {
+                            sc0 = (scales[is0 + 4] & 0xF) | ((scales[is0 - 4] >> 6) << 4);
+                            m0  = (scales[is0 + 4] >> 4)  | ((scales[is0] >> 6) << 4);
+                        }
+                        if (is1 < 4) {
+                            sc1 = scales[is1] & 63;
+                            m1  = scales[is1 + 4] & 63;
+                        } else {
+                            sc1 = (scales[is1 + 4] & 0xF) | ((scales[is1 - 4] >> 6) << 4);
+                            m1  = (scales[is1 + 4] >> 4)  | ((scales[is1] >> 6) << 4);
+                        }
+                        dsc[j][0] = d * (float)sc0;
+                        dm[j][0]  = dmin * (float)m0;
+                        dsc[j][1] = d * (float)sc1;
+                        dm[j][1]  = dmin * (float)m1;
+                        qs[j] = block_ptr + 16 + g * 32;
+                    }
+                }
+                for (int l = 0; l < 32; l += 4) {
+                    float4 a4lo, a4hi;
+                    __builtin_memcpy(&a4lo, Arow + kbase + sb * 256 + (2 * g) * 32 + l, 16);
+                    __builtin_memcpy(&a4hi, Arow + kbase + sb * 256 + (2 * g + 1) * 32 + l, 16);
+                    const float* alo = (const float*)&a4lo;
+                    const float* ahi = (const float*)&a4hi;
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const int ll = l + e;
+                        #pragma unroll
+                        for (int j = 0; j < 2; ++j) {
+                            if (j < active) {
+                                const unsigned char packed = qs[j][ll];
+                                acc[j] += alo[e] * (dsc[j][0] * (float)(packed & 0x0F) - dm[j][0]);
+                                acc[j] += ahi[e] * (dsc[j][1] * (float)(packed >> 4) - dm[j][1]);
+                            }
+                        }
+                    }
+                }
+            }
+        } // for sb
+        } // if (valid)
+
+        // Reduce the 4 K-splits through LDS; split==0 writes both outputs.
+        // Block is (256,1,1): threadIdx.x = pair_in_block*4 + split.
+        __shared__ float red[256][2];
+        red[threadIdx.x][0] = acc[0];
+        red[threadIdx.x][1] = acc[1];
+        __syncthreads();
+        if (split == 0 && valid) {
+            const int base = threadIdx.x;
+            float s0 = red[base][0] + red[base + 1][0] + red[base + 2][0] + red[base + 3][0];
+            float s1 = red[base][1] + red[base + 1][1] + red[base + 2][1] + red[base + 3][1];
+            if (active > 0) C[(long long)row * N + col0] = s0;
+            if (active > 1) C[(long long)row * N + col0 + 1] = s1;
+        }
+    }
+
     __global__ void grim_fused_dequant_backward_gemm_q4k(
         const float* __restrict__ dY,
         const unsigned char* __restrict__ B_q4k,

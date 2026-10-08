@@ -65,6 +65,20 @@ impl RocmDevice {
             // plan Step 3).
             true
         });
+        // SPEED-ROC-9: K-split decode path (m==1). The 4-col scalar kernel
+        // launches N/4 threads at m==1 (~16 waves), leaving the GPU
+        // latency-bound; the K-split kernel launches 2*N threads over 4-way
+        // K chunks. Falls back to scalar when K is not a multiple of 1024.
+        if m == 1 && k % 1024 == 0 {
+            return self.launch_fused_dequant_gemm_q4k_ksplit(
+                a_storage,
+                b_q4k_storage,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
         // m >= 2 (not 16): TILE_M=4 covers the 9B prefill shape M=5 with one
         // partial tile; the scalar fallback re-reads every weight block M
         // times (0.2 GB/s measured at M=5 in skinny_m_kquant gate).
@@ -103,6 +117,67 @@ impl RocmDevice {
 
         self.launch_compute_kernel(
             "grim_fused_dequant_gemm_q4k",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// SPEED-ROC-9: K-split Q4_K forward GEMM launcher (decode path, m==1).
+    /// Grid: ceil(m*npairs*4/256) blocks of 256 threads, where npairs =
+    /// ceil(n/2). The kernel requires block (256,1,1): threadIdx.x =
+    /// pair_in_block*4 + split feeds the LDS reduction. K must be a multiple
+    /// of 1024 so every split owns whole 256-weight blocks.
+    pub(crate) fn launch_fused_dequant_gemm_q4k_ksplit(
+        &self,
+        a_storage: &RocmStorage,
+        b_q4k_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q4k_ksplit: a has no device ptr".into())
+        })?;
+        let b_ptr = b_q4k_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q4k_ksplit: b has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_dequant_gemm_q4k_ksplit: out has no device ptr".into())
+        })?;
+        if k % 1024 != 0 {
+            return Err(Error::Backend(format!(
+                "fused_dequant_gemm_q4k_ksplit: k={k} must be a multiple of 1024"
+            )));
+        }
+
+        const BLOCK_SIZE: usize = 256;
+        let total = (m as u64) * (n.div_ceil(2) as u64) * 4u64;
+        let grid_x: u32 = (total.div_ceil(BLOCK_SIZE as u64))
+            .try_into()
+            .map_err(|_| {
+                Error::Backend("fused_dequant_gemm_q4k_ksplit: grid too large for u32".to_string())
+            })?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_q4k_ksplit",
             grid_dim,
             block_dim,
             &mut [
