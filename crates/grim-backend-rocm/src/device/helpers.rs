@@ -119,7 +119,16 @@ pub fn memcpy_with_xnack_fallback(
 /// Some `__global__` kernels (e.g.
 pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(Vec<u8>, String)> {
     let mut prog: HiprtcProgram = std::ptr::null_mut();
-    let source_cstr = CString::new(source)
+    // HIPRTC does not expose <stdint.h> on every code-object path (observed
+    // on gfx1036: `uint8_t`/`int8_t` unknown type names in kernels that use
+    // them, while the same sources compiled fine on gfx1200). Prepend the
+    // typedefs to EVERY compile — redeclaring an identical typedef is legal
+    // C++, so this is a no-op where the types already exist.
+    let source_full = format!(
+        "typedef unsigned char uint8_t;\n typedef signed char int8_t;\n typedef unsigned short uint16_t;\n typedef short int16_t;\n typedef unsigned int uint32_t;\n typedef int int32_t;\n typedef unsigned long long uint64_t;\n typedef long long int64_t;\n {}",
+        source
+    );
+    let source_cstr = CString::new(source_full)
         .map_err(|e| Error::Backend(format!("CString conversion failed: {}", e)))?;
     let name_cstr = CString::new(entry_name)
         .map_err(|e| Error::Backend(format!("CString conversion failed: {}", e)))?;
