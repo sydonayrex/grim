@@ -800,7 +800,15 @@ impl Linear {
         has_bias: bool,
     ) -> Result<Self> {
         let weight = ws.get([out_dim, in_dim], "weight")?;
-        let w_t = transpose_last_two(&weight)?;
+        // A quantized weight cannot transpose while staying packed: the old
+        // code host-dequanted to F32 here just to transpose — a 5 GB dead
+        // allocation for the 27B LM head that forward never reads (it uses
+        // the natural quantized weight). Keep the packed tensor instead.
+        let w_t = if weight.dtype().is_quantized() {
+            weight.clone()
+        } else {
+            transpose_last_two(&weight)?
+        };
         let quant_format = if weight.dtype().is_quantized() {
             Some(weight.dtype().clone())
         } else {
@@ -860,7 +868,15 @@ impl Linear {
         let weight = ws
             .with_tp_config(tp)
             .get_sharded([shard_out, in_dim], "weight", 0)?;
-        let w_t = transpose_last_two(&weight)?;
+        // A quantized weight cannot transpose while staying packed: the old
+        // code host-dequanted to F32 here just to transpose — a 5 GB dead
+        // allocation for the 27B LM head that forward never reads (it uses
+        // the natural quantized weight). Keep the packed tensor instead.
+        let w_t = if weight.dtype().is_quantized() {
+            weight.clone()
+        } else {
+            transpose_last_two(&weight)?
+        };
         let quant_format = if weight.dtype().is_quantized() {
             Some(weight.dtype().clone())
         } else {
@@ -938,7 +954,15 @@ impl Linear {
         raw.bytes = bytes;
         let shape = Shape::new(vec![out_dim, in_dim]);
         let weight = ws.materialize_raw(raw, shape)?;
-        let w_t = transpose_last_two(&weight)?;
+        // A quantized weight cannot transpose while staying packed: the old
+        // code host-dequanted to F32 here just to transpose — a 5 GB dead
+        // allocation for the 27B LM head that forward never reads (it uses
+        // the natural quantized weight). Keep the packed tensor instead.
+        let w_t = if weight.dtype().is_quantized() {
+            weight.clone()
+        } else {
+            transpose_last_two(&weight)?
+        };
         let quant_format = if weight.dtype().is_quantized() {
             Some(weight.dtype().clone())
         } else {
@@ -970,7 +994,15 @@ impl Linear {
         let weight = ws
             .with_tp_config(tp)
             .get_sharded([out_dim, shard_in], "weight", 1)?;
-        let w_t = transpose_last_two(&weight)?;
+        // A quantized weight cannot transpose while staying packed: the old
+        // code host-dequanted to F32 here just to transpose — a 5 GB dead
+        // allocation for the 27B LM head that forward never reads (it uses
+        // the natural quantized weight). Keep the packed tensor instead.
+        let w_t = if weight.dtype().is_quantized() {
+            weight.clone()
+        } else {
+            transpose_last_two(&weight)?
+        };
         let quant_format = if weight.dtype().is_quantized() {
             Some(weight.dtype().clone())
         } else {

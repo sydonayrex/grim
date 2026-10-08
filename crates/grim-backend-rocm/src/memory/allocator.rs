@@ -208,7 +208,37 @@ impl RocmCachingAllocator {
                 );
             }
             self.empty_cache();
-            check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) })?;
+            let retried = check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) });
+            if retried.is_err() && cls <= Self::SLAB_SIZE {
+                // FRAGMENTATION fallback: free VRAM exists but no contiguous
+                // cls-sized region (the 27B at decode: 0.45 GiB free, live
+                // 128 MiB slabs everywhere, hipMalloc(16 MiB) failing). A
+                // fresh slab CAN fit — hipMalloc(128 MiB) — and the bump
+                // allocator serves the request from it. The slab system is
+                // active whenever the first small alloc ran; if it never
+                // did, this path just falls through to the error and the
+                // managed fallback as before.
+                if let Ok(mut slabs) = self.slabs.lock() {
+                    let _guard =
+                        crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                    let mut p: *mut c_void = std::ptr::null_mut();
+                    if check_hip(
+                        "hipMalloc(fragmentation slab)",
+                        unsafe { hipMalloc(&mut p, Self::SLAB_SIZE) },
+                    )
+                    .is_ok()
+                    {
+                        self.malloc_count.fetch_add(1, Ordering::Relaxed);
+                        let base = p as u64;
+                        let slot = cls.div_ceil(Self::SLOT_GRAN) * Self::SLOT_GRAN;
+                        slabs.push(Slab { base, size: Self::SLAB_SIZE, bump: slot });
+                        self.audit_trace("FSLAB", base, slot);
+                        self.audit_insert(base, slot);
+                        return Ok(p);
+                    }
+                }
+            }
+            retried?;
         }
         drop(_guard);
         self.malloc_count.fetch_add(1, Ordering::Relaxed);
