@@ -557,6 +557,33 @@ impl RocmDevice {
         )
     }
 
+    /// Public A/B wrapper around [`Self::launch_wmma_fused_dequant_q4k`].
+    ///
+    /// The kernel is a 16-row x 64-column tile with 128 threads per block
+    /// (`grid = (n/64, m/16)`, `block = 128`), and its cost does not match any
+    /// bound that can be computed from the outside: at M=251 on the 9B it is 38x
+    /// off its ALU bound, 369x off the DRAM floor, and ~20x off f16-WMMA peak,
+    /// with healthy occupancy (vgpr=88, LDS=6656 B). `rocprofv3 --pmc` cannot
+    /// localise it (counter replay + interdependent kernels = queue-sync
+    /// timeout), so the stall has to be bracketed by timing the kernel at
+    /// controlled shapes from a test.
+    ///
+    /// Thin on purpose, exactly like [`Self::launch_fused_dequant_gemm_q4k_for_ab`]:
+    /// no behaviour of its own, so an A/B measurement cannot drift from the
+    /// production dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_wmma_fused_dequant_q4k_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_fused_dequant_q4k(a_storage, b_storage, out_storage, m, n, k)
+    }
+
     /// SPEED-ROC: WMMA fused-dequant Q5_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q5k(

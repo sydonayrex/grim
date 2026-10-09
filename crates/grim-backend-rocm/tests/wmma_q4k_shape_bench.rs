@@ -1,0 +1,187 @@
+//! Shape sweep for the f16-WMMA fused-dequant Q4_K GEMM, to localise a stall
+//! that cannot be found from the outside.
+//!
+//! Why this exists: at M=251 on the 9B this kernel is 38x off its ALU bound,
+//! 369x off the DRAM floor and ~20x off f16-WMMA peak, with healthy occupancy
+//! (vgpr=88, LDS=6656 B -> ~5 blocks/CU). `rocprofv3 --pmc` cannot bracket it
+//! (counter replay plus interdependent kernels gives a queue-sync timeout), so
+//! the cost has to be split by timing controlled shapes:
+//!
+//!   * K sweep at fixed M and N -> if time is linear in K, the cost lives in
+//!     the per-k-iteration body (LDS fill + 2x __syncthreads + 4 fragment
+//!     loads + 4 MMAs, repeated K/16 times).
+//!   * M sweep at fixed K and N -> if time is linear in ceil(M/16), the cost is
+//!     per M-tile (i.e. the weight re-reads / grid waves), not in the body.
+//!
+//! Both are reported per iteration so the dominant term is readable directly.
+//!
+//! Kernel geometry (see `launch_wmma_fused_dequant_q4k`): tile 16 rows x 64
+//! columns, `grid = (n/64, ceil(m/16))`, `block = 128` (4 waves). Reference for
+//! the atom: FlyDSL `kernels/gemm/rdna_f16_gemm.py`, written for gfx120x, which
+//! documents the 16x16x16 WMMA shape and the 2x2 wave layout this kernel does
+//! NOT use (it gives all four waves the same tile).
+//!
+//! RUN: GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --test wmma_q4k_shape_bench -- --ignored --nocapture
+
+use grim_backend_rocm::RocmDevice;
+use grim_tensor::{
+    ArithType, CoreTensorOps, DType, KQuantScheme, MemoryOps, Shape, Storage,
+};
+
+fn gpu_device() -> Option<RocmDevice> {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return None;
+    }
+    Some(RocmDevice::try_new(0).expect("RocmDevice::try_new"))
+}
+
+/// Time one shape. Returns (median ms, weight GB moved, GFLOP).
+fn time_shape(dev: &RocmDevice, m: usize, n: usize, k: usize) -> (f64, f64, f64) {
+    let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.017).sin() * 0.5).collect();
+    let b_host: Vec<f32> = (0..k * n)
+        .map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0)
+        .collect();
+    let b_packed = grim_quant::quant_q4k(&b_host).expect("pack q4k");
+
+    let a_dev = CoreTensorOps::from_cpu(dev, &a_host, &Shape::new(vec![m, k]), DType::F32)
+        .expect("upload A");
+    let q_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q4K),
+    };
+    let b_dev = MemoryOps::from_cpu_bytes(
+        dev,
+        &b_packed,
+        &Shape::new(vec![b_packed.len()]),
+        q_dtype,
+    )
+    .expect("upload packed B");
+    let out = CoreTensorOps::zeros(dev, &Shape::new(vec![m, n]), DType::F32).expect("alloc out");
+
+    let a = grim_backend_rocm::as_rocm(a_dev.as_ref()).expect("a rocm");
+    let b = grim_backend_rocm::as_rocm(b_dev.as_ref()).expect("b rocm");
+    let o = grim_backend_rocm::as_rocm(out.as_ref()).expect("out rocm");
+
+    // Warmup: JIT + first-touch of the LDS/scratch paths.
+    for _ in 0..3 {
+        dev.launch_wmma_fused_dequant_q4k_for_ab(a, b, o, m, n, k)
+            .expect("wmma launch");
+    }
+    dev.synchronize();
+
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let t = std::time::Instant::now();
+        dev.launch_wmma_fused_dequant_q4k_for_ab(a, b, o, m, n, k)
+            .expect("wmma launch");
+        dev.synchronize();
+        samples.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    samples.sort_by(|x, y| x.total_cmp(y));
+    let ms = samples[samples.len() / 2];
+
+    // Weight traffic: every M-tile pass re-reads the whole weight.
+    let passes = m.div_ceil(16) as f64;
+    let weight_gb = (n * k) as f64 * (4.5 / 8.0) * passes / 1e9;
+    let gflop = 2.0 * m as f64 * n as f64 * k as f64 / 1e9;
+    (ms, weight_gb, gflop)
+}
+
+#[test]
+#[ignore]
+fn wmma_q4k_shape_sweep() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TESTS=1 + GPU");
+        return;
+    };
+    let n = 1024usize;
+    let m_fixed = 64usize;
+    let k_fixed = 4096usize;
+
+    eprintln!("\n[K sweep] n={n} m={m_fixed} (4 M-tiles)");
+    eprintln!("{:>6} {:>9} {:>8} {:>9} {:>14}", "K", "ms", "GFLOP/s", "GB/s", "ns/k-iter");
+    let mut k_pts = Vec::new();
+    for k in [512usize, 1024, 2048, 4096] {
+        let (ms, gb, gflop) = time_shape(&dev, m_fixed, n, k);
+        let iters = (k / 16) as f64;
+        eprintln!(
+            "{k:>6} {ms:>9.3} {:>8.1} {:>9.1} {:>14.1}",
+            gflop / (ms / 1e3) * 1e3,
+            gb / (ms / 1e3),
+            ms * 1e6 / iters
+        );
+        k_pts.push((k as f64, ms));
+    }
+
+    eprintln!("\n[M sweep] n={n} k={k_fixed}");
+    eprintln!("{:>6} {:>7} {:>9} {:>8} {:>9} {:>14}", "M", "tiles", "ms", "GFLOP/s", "GB/s", "ms/M-tile");
+    let mut m_pts = Vec::new();
+    for m in [16usize, 32, 64, 128, 256] {
+        let (ms, gb, gflop) = time_shape(&dev, m, n, k_fixed);
+        let tiles = m.div_ceil(16) as f64;
+        eprintln!(
+            "{m:>6} {tiles:>7.0} {ms:>9.3} {:>8.1} {:>9.1} {:>14.3}",
+            gflop / (ms / 1e3) * 1e3,
+            gb / (ms / 1e3),
+            ms / tiles
+        );
+        m_pts.push((tiles, ms));
+    }
+
+    // Fit both axes through the origin and report which term carries the cost.
+    let slope = |pts: &[(f64, f64)]| -> f64 {
+        let num: f64 = pts.iter().map(|(x, y)| x * y).sum();
+        let den: f64 = pts.iter().map(|(x, _)| x * x).sum();
+        num / den
+    };
+    let per_k = slope(&k_pts.iter().map(|(k, ms)| (k / 16.0, *ms)).collect::<Vec<_>>());
+    let per_m = slope(&m_pts);
+    eprintln!(
+        "\n[fit] {:.4} ms per k-iteration  |  {:.4} ms per M-tile",
+        per_k, per_m
+    );
+    eprintln!(
+        "[fit] at n={n} k={k_fixed} m=256: k-term {:.2} ms + M-term {:.2} ms = {:.2} ms",
+        per_k * (k_fixed as f64 / 16.0),
+        per_m * 16.0,
+        per_k * (k_fixed as f64 / 16.0) + per_m * 16.0
+    );
+
+    // ---- Findings pinned as assertions, so a change in the scaling regime is
+    // ---- caught rather than silently absorbed.
+    //
+    // (1) The M re-reads are L2-served: 16 M-tiles must NOT cost 16x one M-tile.
+    //     Measured 3.4x. A regression here means the weight slice stopped being
+    //     reused, which is the difference between a 0.09 and a 1.4 ms/M-tile
+    //     kernel (the tiled fallback's failure mode).
+    let one_tile = m_pts[0].1;
+    let sixteen = m_pts[m_pts.len() - 1].1;
+    assert!(
+        sixteen < 6.0 * one_tile,
+        "M-tile scaling regressed: 16 tiles cost {sixteen:.3} ms vs 1 tile {one_tile:.3} ms \
+         (ratio {:.2}); the weight re-reads are no longer being reused",
+        sixteen / one_tile
+    );
+    // (2) Efficiency must RISE with batch (the AMD low-latency-GEMM regime: small
+    //     M under-utilises). If this inverts, the kernel became compute-bound at
+    //     large M and the small-M specialisation is no longer the win.
+    let gflops = |ms: f64, m: usize| 2.0 * m as f64 * n as f64 * k_fixed as f64 / (ms / 1e3) / 1e9;
+    let eff_small = gflops(m_pts[0].1, 16);
+    let eff_large = gflops(sixteen, 256);
+    assert!(
+        eff_large > eff_small,
+        "efficiency no longer rises with batch: M=16 {eff_small:.0} vs M=256 {eff_large:.0} GFLOP/s"
+    );
+    // (3) The per-k-iteration cost is the dominant term and is ~2 us — 38x off
+    //     the ALU bound. Pin the order of magnitude so that a Step-3 pipelining
+    //     change has a number to move, and a regression is visible.
+    eprintln!(
+        "[guard] per-k-iteration {per_k:.4} ms, 16-tile/1-tile ratio {:.2}, \
+         eff {eff_small:.0} -> {eff_large:.0} GFLOP/s",
+        sixteen / one_tile
+    );
+    assert!(
+        per_k > 0.0005,
+        "per-k-iteration cost fell to {per_k:.6} ms — if Step 3 landed, retune this guard"
+    );
+}
