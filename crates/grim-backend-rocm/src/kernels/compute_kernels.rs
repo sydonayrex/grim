@@ -1166,15 +1166,46 @@ grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* _
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
     float ss = 0.0f;
-    for (int col = lane; col < row_len; col += 32) {
-        float v = x_row[col];
+    // 4-WIDE UNROLL, SAME SUMMATION ORDER. The four loads of a group are
+    // independent, so they issue back-to-back instead of paying one unhidden
+    // L2 round-trip per iteration, while `ss` still accumulates
+    // lane, lane+32, lane+64, lane+96, lane+128, ... — bit-identical output.
+    //
+    // A single warp owning a 4096-wide row measured 43 us (1.1 GB/s for 16 KB)
+    // against 4.0 us for the 16x256 shape (rocprofv3: 1095 launches at 43 us,
+    // 120 at 4.0 us). The dependent load->FMA chain was never hidden: ~200
+    // cycles x 128 iterations x 2 passes. Decode runs one row per layer, so
+    // 64 of the 73 norms per token paid it (3.1 ms/token of 23.0).
+    int col = lane;
+    for (; col + 96 < row_len; col += 128) {
+        const float v0 = x_row[col];
+        const float v1 = x_row[col + 32];
+        const float v2 = x_row[col + 64];
+        const float v3 = x_row[col + 96];
+        ss += v0 * v0;
+        ss += v1 * v1;
+        ss += v2 * v2;
+        ss += v3 * v3;
+    }
+    for (; col < row_len; col += 32) {
+        const float v = x_row[col];
         ss += v * v;
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         ss += __shfl_xor_sync(shfl_mask, ss, off);
     float rms = sqrtf(ss / (float)row_len + eps);
-    for (int col = lane; col < row_len; col += 32) {
+    for (col = lane; col + 96 < row_len; col += 128) {
+        const float r0 = x_row[col] * w[col];
+        const float r1 = x_row[col + 32] * w[col + 32];
+        const float r2 = x_row[col + 64] * w[col + 64];
+        const float r3 = x_row[col + 96] * w[col + 96];
+        o_row[col] = r0 / rms;
+        o_row[col + 32] = r1 / rms;
+        o_row[col + 64] = r2 / rms;
+        o_row[col + 96] = r3 / rms;
+    }
+    for (; col < row_len; col += 32) {
         o_row[col] = x_row[col] * w[col] / rms;
     }
 }
@@ -1198,15 +1229,38 @@ grim_rms_norm_i8(const float* __restrict__ x, const signed char* __restrict__ co
     const unsigned long long shfl_mask = 0xffffffffffffffffULL;
 
     float ss = 0.0f;
-    for (int col = lane; col < row_len; col += 32) {
-        float v = x_row[col];
+    // Same 4-wide unroll and same summation order as `grim_rms_norm` (see the
+    // comment there): identical output, unhidden-load latency removed.
+    int col = lane;
+    for (; col + 96 < row_len; col += 128) {
+        const float v0 = x_row[col];
+        const float v1 = x_row[col + 32];
+        const float v2 = x_row[col + 64];
+        const float v3 = x_row[col + 96];
+        ss += v0 * v0;
+        ss += v1 * v1;
+        ss += v2 * v2;
+        ss += v3 * v3;
+    }
+    for (; col < row_len; col += 32) {
+        const float v = x_row[col];
         ss += v * v;
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         ss += __shfl_xor_sync(shfl_mask, ss, off);
     float rms = sqrtf(ss / (float)row_len + eps);
-    for (int col = lane; col < row_len; col += 32) {
+    for (col = lane; col + 96 < row_len; col += 128) {
+        const float r0 = x_row[col] * (w_scale * (float)codes[col]);
+        const float r1 = x_row[col + 32] * (w_scale * (float)codes[col + 32]);
+        const float r2 = x_row[col + 64] * (w_scale * (float)codes[col + 64]);
+        const float r3 = x_row[col + 96] * (w_scale * (float)codes[col + 96]);
+        o_row[col] = r0 / rms;
+        o_row[col + 32] = r1 / rms;
+        o_row[col + 64] = r2 / rms;
+        o_row[col + 96] = r3 / rms;
+    }
+    for (; col < row_len; col += 32) {
         o_row[col] = x_row[col] * (w_scale * (float)codes[col]) / rms;
     }
 }
@@ -1943,8 +1997,35 @@ extern "C" __global__ void grim_kda_gated_delta_rule_batched(
     float decay = expf(gate);
 
     // build_gdn_l2_norm on both k and q, per head.
+    //
+    // 4-WIDE UNROLL, SAME ORDER (bit-identical): the three loops below each walk
+    // head_dim serially, and every iteration's load feeds its own accumulation —
+    // an unhidden-latency chain per iteration, repeated three times, with
+    // kda_silu_dev (an expf) recomputed 5x per element. Measured 77.6 us per
+    // launch x 24 launches = 1.86 ms/token. Grouping four independent loads per
+    // iteration keeps the accumulation order and every per-element formula
+    // exactly as written.
     float kss = 0.0f, qss = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
+    int i = 0;
+    for (; i + 3 < head_dim; i += 4) {
+        const float k0 = kda_silu_dev(k_raw[i]);
+        const float k1 = kda_silu_dev(k_raw[i + 1]);
+        const float k2 = kda_silu_dev(k_raw[i + 2]);
+        const float k3 = kda_silu_dev(k_raw[i + 3]);
+        const float q0 = kda_silu_dev(q_raw[i]);
+        const float q1 = kda_silu_dev(q_raw[i + 1]);
+        const float q2 = kda_silu_dev(q_raw[i + 2]);
+        const float q3 = kda_silu_dev(q_raw[i + 3]);
+        kss += k0 * k0;
+        kss += k1 * k1;
+        kss += k2 * k2;
+        kss += k3 * k3;
+        qss += q0 * q0;
+        qss += q1 * q1;
+        qss += q2 * q2;
+        qss += q3 * q3;
+    }
+    for (; i < head_dim; ++i) {
         float kk = kda_silu_dev(k_raw[i]);
         float qq = kda_silu_dev(q_raw[i]);
         kss += kk * kk;
@@ -1957,7 +2038,22 @@ extern "C" __global__ void grim_kda_gated_delta_rule_batched(
 
     // pred = sum_k k * (decay * S)   -- decay BEFORE the dot.
     float pred = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
+    i = 0;
+    for (; i + 3 < head_dim; i += 4) {
+        const float s0 = decay * s_row[i];
+        const float s1 = decay * s_row[i + 1];
+        const float s2 = decay * s_row[i + 2];
+        const float s3 = decay * s_row[i + 3];
+        const float k0 = kda_silu_dev(k_raw[i]);
+        const float k1 = kda_silu_dev(k_raw[i + 1]);
+        const float k2 = kda_silu_dev(k_raw[i + 2]);
+        const float k3 = kda_silu_dev(k_raw[i + 3]);
+        pred += ((kden > 0.0f) ? k0 / kden : k0) * s0;
+        pred += ((kden > 0.0f) ? k1 / kden : k1) * s1;
+        pred += ((kden > 0.0f) ? k2 / kden : k2) * s2;
+        pred += ((kden > 0.0f) ? k3 / kden : k3) * s3;
+    }
+    for (; i < head_dim; ++i) {
         float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
         pred += kk * (decay * s_row[i]);
     }
@@ -1965,7 +2061,38 @@ extern "C" __global__ void grim_kda_gated_delta_rule_batched(
     float delta = beta_val * (kda_silu_dev(v_raw[j]) - pred);
 
     float a = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
+    i = 0;
+    for (; i + 3 < head_dim; i += 4) {
+        const float k0 = kda_silu_dev(k_raw[i]);
+        const float k1 = kda_silu_dev(k_raw[i + 1]);
+        const float k2 = kda_silu_dev(k_raw[i + 2]);
+        const float k3 = kda_silu_dev(k_raw[i + 3]);
+        const float q0 = kda_silu_dev(q_raw[i]);
+        const float q1 = kda_silu_dev(q_raw[i + 1]);
+        const float q2 = kda_silu_dev(q_raw[i + 2]);
+        const float q3 = kda_silu_dev(q_raw[i + 3]);
+        const float nk0 = (kden > 0.0f) ? k0 / kden : k0;
+        const float nk1 = (kden > 0.0f) ? k1 / kden : k1;
+        const float nk2 = (kden > 0.0f) ? k2 / kden : k2;
+        const float nk3 = (kden > 0.0f) ? k3 / kden : k3;
+        const float nq0 = (qden > 0.0f) ? q0 / qden : q0;
+        const float nq1 = (qden > 0.0f) ? q1 / qden : q1;
+        const float nq2 = (qden > 0.0f) ? q2 / qden : q2;
+        const float nq3 = (qden > 0.0f) ? q3 / qden : q3;
+        const float s0 = decay * s_row[i] + nk0 * delta;
+        const float s1 = decay * s_row[i + 1] + nk1 * delta;
+        const float s2 = decay * s_row[i + 2] + nk2 * delta;
+        const float s3 = decay * s_row[i + 3] + nk3 * delta;
+        s_row[i] = s0;
+        s_row[i + 1] = s1;
+        s_row[i + 2] = s2;
+        s_row[i + 3] = s3;
+        a += nq0 * s0;
+        a += nq1 * s1;
+        a += nq2 * s2;
+        a += nq3 * s3;
+    }
+    for (; i < head_dim; ++i) {
         float kk = (kden > 0.0f) ? kda_silu_dev(k_raw[i]) / kden : kda_silu_dev(k_raw[i]);
         float qq = (qden > 0.0f) ? kda_silu_dev(q_raw[i]) / qden : kda_silu_dev(q_raw[i]);
         float s = decay * s_row[i] + kk * delta;
@@ -1990,20 +2117,58 @@ extern "C" __global__ void grim_kda_head_norm_gate(
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= num_v) return;
 
+    // 4-WIDE UNROLL, SAME ORDER (bit-identical): one thread per head meant 256
+    // serial dependent load->FMA iterations for the sum of squares and 256 more
+    // (each with an `expf`) for the gate — measured 71.9 us per launch at
+    // num_v=16, i.e. 16 live threads in a single block, 24 launches per decoded
+    // token. Grouping four independent loads per iteration hides the latency
+    // without touching the accumulation order or the per-element formula.
+    const float* acc_h = acc + (size_t)h * head_dim;
+    float* out_h = out + (size_t)h * head_dim;
+    const float* z_h = has_z ? z + (size_t)h * head_dim : z;
+
     float ss = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
-        float a = acc[h * head_dim + i];
+    int i = 0;
+    for (; i + 3 < head_dim; i += 4) {
+        const float a0 = acc_h[i];
+        const float a1 = acc_h[i + 1];
+        const float a2 = acc_h[i + 2];
+        const float a3 = acc_h[i + 3];
+        ss += a0 * a0;
+        ss += a1 * a1;
+        ss += a2 * a2;
+        ss += a3 * a3;
+    }
+    for (; i < head_dim; ++i) {
+        const float a = acc_h[i];
         ss += a * a;
     }
     float inv_rms = 1.0f / sqrtf(ss / head_dim + eps);
 
-    for (int i = 0; i < head_dim; ++i) {
+    for (i = 0; i + 3 < head_dim; i += 4) {
+        float g0 = 1.0f, g1 = 1.0f, g2 = 1.0f, g3 = 1.0f;
+        if (has_z) {
+            const float z0 = z_h[i];
+            const float z1 = z_h[i + 1];
+            const float z2 = z_h[i + 2];
+            const float z3 = z_h[i + 3];
+            g0 = z0 / (1.0f + expf(-z0));
+            g1 = z1 / (1.0f + expf(-z1));
+            g2 = z2 / (1.0f + expf(-z2));
+            g3 = z3 / (1.0f + expf(-z3));
+        }
+        out_h[i] = acc_h[i] * inv_rms * norm_weight[i] * g0;
+        out_h[i + 1] = acc_h[i + 1] * inv_rms * norm_weight[i + 1] * g1;
+        out_h[i + 2] = acc_h[i + 2] * inv_rms * norm_weight[i + 2] * g2;
+        out_h[i + 3] = acc_h[i + 3] * inv_rms * norm_weight[i + 3] * g3;
+    }
+    for (; i < head_dim; ++i) {
         float g = 1.0f;
         if (has_z) {
-            float zv = z[h * head_dim + i];
+            float zv = z_h[i];
             g = zv / (1.0f + expf(-zv));
         }
-        out[h * head_dim + i] = acc[h * head_dim + i] * inv_rms * norm_weight[i] * g;
+        out_h[i] = acc_h[i] * inv_rms * norm_weight[i] * g;
     }
 }
 

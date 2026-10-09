@@ -618,6 +618,32 @@ impl RocmDevice {
         let mut eps_f = eps;
         let mut total_i = total as i32;
         let (grid, block) = warp_rows_launch(total / row_len.max(1));
+        // GRIM_DEBUG_NORM_SHAPES=1: one line per DISTINCT (dims, row_len) with
+        // the launch geometry. A 2048-row x row_len=2 norm and a 1-row x 4096
+        // norm have the SAME element count and wildly different cost, so the
+        // element count alone cannot tell you whether a launch is misconfigured.
+        // OnceLock, not a bare `var_os`: this sits on a per-layer path and the
+        // eager fallback runs it ~81 times per token.
+        static NORM_SHAPES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NORM_SHAPES.get_or_init(|| std::env::var_os("GRIM_DEBUG_NORM_SHAPES").is_some()) {
+            use std::sync::{Mutex, OnceLock};
+            static SEEN: OnceLock<Mutex<std::collections::HashSet<(Vec<usize>, usize)>>> =
+                OnceLock::new();
+            let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+            let key = (out_shape.dims().to_vec(), row_len);
+            if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
+                eprintln!(
+                    "[norm-shapes] dims={:?} row_len={} total={} rows={} grid=({},{},1) block={}",
+                    out_shape.dims(),
+                    row_len,
+                    total,
+                    total / row_len.max(1),
+                    grid.x,
+                    grid.y,
+                    block.x,
+                );
+            }
+        }
         self.launch_compute_kernel(
             "grim_rms_norm",
             grid,
