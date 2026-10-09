@@ -1505,17 +1505,36 @@ pub async fn cmd_run(
             None
         };
 
+        // GRIM_DEBUG_STEP_TIMING=1: one line per step with which path served it.
+        // The run's reported average is dominated by one-time costs (lane
+        // conversions, warmup, capture) unless you can see the distribution —
+        // a 9B run reported "355 ms/token" whose steady-state replays were
+        // 35 ms and whose first steps were 345 ms eager (rocprof /tmp/rp9e).
+        macro_rules! step_timing {
+            ($us:expr, $path:expr) => {
+                if std::env::var_os("GRIM_DEBUG_STEP_TIMING").is_some() {
+                    eprintln!(
+                        "[step-timing] step={} path={} {:.2} ms",
+                        generated,
+                        $path,
+                        $us as f64 / 1000.0
+                    );
+                }
+            };
+        }
         let next_token = match graph_hit {
             Some(GraphDecodeResult::Sampled(tok)) => {
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                step_timing!(step_us, "graph-sampled");
                 tok
             }
             Some(GraphDecodeResult::Logits(logits)) => {
                 let step_us = step_start.elapsed().as_micros() as u64;
                 decode_total_us += step_us;
                 decode_count += 1;
+                step_timing!(step_us, "graph-logits");
                 let logits_vec = logits.to_vec_f32()?;
                 let last_start = logits_vec.len().saturating_sub(vocab);
                 let last_logits = &logits_vec[last_start..];
@@ -1540,6 +1559,9 @@ pub async fn cmd_run(
                 if !is_prefill {
                     decode_total_us += step_us;
                     decode_count += 1;
+                    step_timing!(step_us, "eager");
+                } else {
+                    step_timing!(step_us, "prefill");
                 }
 
                 // SPEED-ROC: on decode steps (single-row logits) sample straight from the

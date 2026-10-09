@@ -542,11 +542,16 @@ mod tests {
     #[test]
     fn window_size_constant_sane() {
         // Guard: the sliding window must exceed a single block so the
-        // last-token prediction has real context.
+        // last-token prediction has real context. Asserts the DEFAULT (the
+        // value `ppl_window()` falls back to); the effective window is
+        // runtime-tunable via GRIM_EVAL_WINDOW and guarded by that function's
+        // own `>= 64` filter.
         const {
-            assert!(PPL_WINDOW >= 512);
+            assert!(PPL_WINDOW_DEFAULT >= 512);
         }
-        assert!(PPL_WINDOW.is_power_of_two());
+        assert!(PPL_WINDOW_DEFAULT.is_power_of_two());
+        // The runtime override cannot drop below the documented floor.
+        assert!(ppl_window() >= 64);
     }
 
     #[test]
