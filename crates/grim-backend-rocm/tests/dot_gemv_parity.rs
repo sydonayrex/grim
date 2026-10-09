@@ -1522,6 +1522,200 @@ fn dot8_w4a4_gemv_parity() {
     );
 }
 
+/// The m > 1 lane GEMV, which nothing exercised before this gate.
+///
+/// `dot8_w4a4_gemv_parity` (and every sibling: `_qwen3_model_tensor_parity`,
+/// `_n256_k512`, `decode_w4a4_requant_parity_vs_original_f32`) all pin `m = 1`.
+/// The kernel indexes A per row (`a_codes_row = A_codes + row * n_groups * 16`)
+/// and leaves B column-only, and `launch_w4a4_ostquant_gemv` sizes its act
+/// scratch as `m * n_groups * ...`, so m > 1 *looks* supported — but looking
+/// supported is not evidence. This is the shape prefill would call it in
+/// (M = 5 is the 9B's 5-token prompt), so it is the shape to test.
+///
+/// Rows carry DISTINCT data and every row is asserted separately: a kernel
+/// that read row 0 for every row would pass a whole-matrix max-diff against a
+/// fixture whose rows were identical, and would pass on row 0 in any case.
+#[test]
+fn dot8_w4a4_gemv_parity_multi_row() {
+    let _lock = DOT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1 + GPU");
+        return;
+    };
+    if !dev.gcn_arch().starts_with("gfx12") {
+        eprintln!("[SKIP] dot8_w4a4_gemv requires RDNA4 (gfx1200/gfx1201)");
+        return;
+    }
+
+    // 5 is the production prefill M (and an odd one, so a ceil(M/4) tiling bug
+    // shows); 2 and 8 bracket it. k spans two 128-groups and lands on a group
+    // boundary; n is not a multiple of 4. The last two are production-shaped:
+    // k=4096 is the 9B's real K (n_groups=32, words_per_col=512), so the
+    // group/word index arithmetic is exercised at the width the model uses
+    // rather than only at toy k.
+    for (m, n, k) in [
+        (2usize, 8usize, 128usize),
+        (5, 32, 256),
+        (8, 12, 384),
+        (5, 64, 1024),
+        (3, 16, 4096),
+    ] {
+        let n_groups = k / 128;
+        let words_per_col = k / 8;
+
+        let mut seed = 0x5A5A_0000u64 ^ ((m as u64) << 16) ^ (n as u64);
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let a_f32: Vec<f32> = (0..m * k).map(|_| rand() * 2.5).collect();
+
+        let bf16_bits = |v: f32| -> u16 { (v.to_bits() >> 16) as u16 };
+        let mut b_qw = vec![0u32; n * words_per_col];
+        let mut b_sc = vec![0u16; n * n_groups];
+        let mut b_zr = vec![0u8; n * n_groups];
+        for col in 0..n {
+            for g in 0..n_groups {
+                b_sc[col * n_groups + g] = bf16_bits(0.001f32 * (1.0 + rand().abs()));
+                b_zr[col * n_groups + g] = ((seed % 16) as u8).min(15);
+            }
+            for w in 0..words_per_col {
+                let mut word = 0u32;
+                for i in 0..8 {
+                    let nib = ((seed.wrapping_add(w as u64 * 8 + i as u64)) % 16) as u32;
+                    word |= (nib & 0xF) << (i * 4);
+                }
+                b_qw[col * words_per_col + w] = word;
+            }
+        }
+
+        let a_dev = grim_tensor::CoreTensorOps::from_cpu(
+            &dev,
+            &a_f32,
+            &Shape::new(vec![m, k]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+        )
+        .expect("upload A");
+
+        let b_qw_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(b_qw.as_ptr() as *const u8, b_qw.len() * 4) };
+        let b_sc_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(b_sc.as_ptr() as *const u8, b_sc.len() * 2) };
+
+        let b_qw_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            b_qw_bytes,
+            &Shape::new(vec![n, words_per_col]),
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
+        )
+        .expect("upload B qweight");
+        let b_sc_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            b_sc_bytes,
+            &Shape::new(vec![n, n_groups]),
+            DType {
+                arith: ArithType::BF16,
+                storage: Storage::Native,
+            },
+        )
+        .expect("upload B scales");
+        let b_zr_dev = grim_tensor::MemoryOps::from_cpu_bytes(
+            &dev,
+            &b_zr,
+            &Shape::new(vec![n, n_groups]),
+            DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            },
+        )
+        .expect("upload B zeros");
+
+        let out_shape = Shape::new(vec![m, n]);
+        let out_storage_boxed = grim_tensor::CoreTensorOps::zeros(
+            &dev,
+            &out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+        )
+        .expect("alloc out");
+
+        let a_rocm = grim_backend_rocm::as_rocm(a_dev.as_ref()).expect("a rocm");
+        let b_qw_rocm = grim_backend_rocm::as_rocm(b_qw_dev.as_ref()).expect("b_qw rocm");
+        let b_sc_rocm = grim_backend_rocm::as_rocm(b_sc_dev.as_ref()).expect("b_sc rocm");
+        let b_zr_rocm = grim_backend_rocm::as_rocm(b_zr_dev.as_ref()).expect("b_zr rocm");
+        let out_rocm = grim_backend_rocm::as_rocm(out_storage_boxed.as_ref()).expect("out rocm");
+
+        dev.launch_w4a4_ostquant_gemv(a_rocm, b_qw_rocm, b_sc_rocm, b_zr_rocm, out_rocm, m, n, k)
+            .expect("launch_w4a4_ostquant_gemv");
+
+        let c_dev = grim_tensor::BackendStorage::to_cpu_vec_f32(out_storage_boxed.as_ref())
+            .expect("d2h c");
+
+        // Per-row CPU reference: the activation quantizer is per (row, group),
+        // so each row has its own scales.
+        let mut c_cpu = vec![0.0f32; m * n];
+        for row in 0..m {
+            let a_row = &a_f32[row * k..(row + 1) * k];
+            let mut a_deq = vec![0.0f32; k];
+            for g in 0..n_groups {
+                let grp_a = &a_row[g * 128..(g + 1) * 128];
+                let max_val = grp_a.iter().fold(0.0f32, |mx, &x| mx.max(x.abs()));
+                let d = max_val / 7.0;
+                let inv_d = if max_val > 1e-9 { 7.0 / max_val } else { 0.0 };
+                for i in 0..128 {
+                    let q = (grp_a[i] * inv_d).round().clamp(-8.0, 7.0);
+                    a_deq[g * 128 + i] = q * d;
+                }
+            }
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for g in 0..n_groups {
+                    let sc_bits = b_sc[col * n_groups + g];
+                    let sc = f32::from_bits((sc_bits as u32) << 16);
+                    let zr = b_zr[col * n_groups + g] as f32;
+                    for w in 0..16 {
+                        let word = b_qw[col * words_per_col + g * 16 + w];
+                        for i in 0..8 {
+                            let nib = ((word >> (i * 4)) & 0xF) as f32;
+                            acc += a_deq[g * 128 + w * 8 + i] * (sc * (nib - zr));
+                        }
+                    }
+                }
+                c_cpu[row * n + col] = acc;
+            }
+        }
+
+        let overall = max_diff(&c_cpu, &c_dev);
+        eprintln!("[dot8-w4a4-gemv-parity-multi] m={m} n={n} k={k} max_diff={overall:.6}");
+        assert!(
+            overall < 0.01,
+            "m={m} n={n} k={k}: lane GEMV diverges from CPU reference: {overall}"
+        );
+        // Row-by-row, so a row-indexing bug cannot hide behind a small
+        // overall max or behind an accidentally-identical fixture.
+        for row in 0..m {
+            let want = &c_cpu[row * n..(row + 1) * n];
+            let got = &c_dev[row * n..(row + 1) * n];
+            let d = max_diff(want, got);
+            assert!(
+                d < 0.01,
+                "m={m} n={n} k={k}: row {row} diverges: {d} (want {:?} got {:?})",
+                &want[..want.len().min(4)],
+                &got[..got.len().min(4)]
+            );
+        }
+    }
+}
+
 /// CityCrow: GsqRco 2-bit weights repacked to sudot8 u4 lanes, through the
 /// existing `grim_dot8_w4a4_gemv` kernel via `launch_w4a4_ostquant_gemv`.
 ///

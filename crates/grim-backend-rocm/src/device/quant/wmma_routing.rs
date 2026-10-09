@@ -157,11 +157,15 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        // DECODE-SIZED m goes to the u4-lane GEMV first: the tiled kernel
-        // measures 7 ms/launch at the 9B's decode-adjacent shapes while the
-        // lane GEMV runs at 70 us (485 GB/s vs ~10 GB/s). Only K-quant
-        // formats with a lane conversion are eligible.
-        if m <= 4 {
+        // SMALL-M (decode AND prefill) goes to the u4-lane GEMV first: the
+        // tiled kernel measures 7 ms/launch at the 9B's shapes while the lane
+        // GEMV runs at 70 us (485 GB/s vs ~10 GB/s), and the tiled kernel's
+        // weight reuse factor is only TILE_M = 4, so prefill re-reads and
+        // re-dequantizes the whole weight set once per 4 rows of A. Only
+        // K-quant formats with a lane conversion are eligible. The M bound is
+        // shared with the q4k arm — one switch, one bound, so the schemes
+        // cannot drift apart.
+        if m <= crate::device::quant::dequant_k_quants::lane_gemm_max_m() {
             let scheme = if kernel.contains("q4k") {
                 Some(grim_tensor::dtype::KQuantScheme::Q4K)
             } else if kernel.contains("q5k") {
@@ -173,7 +177,7 @@ impl RocmDevice {
             };
             if let Some(s) = scheme {
                 if let Some(stream) =
-                    self.try_u4_lane_decode(a_storage, b_storage, out_storage, m, n, k, s)?
+                    self.try_u4_lane_gemm(a_storage, b_storage, out_storage, m, n, k, s)?
                 {
                     return Ok(stream);
                 }

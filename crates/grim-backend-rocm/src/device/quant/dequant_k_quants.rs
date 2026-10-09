@@ -8,7 +8,60 @@ use grim_tensor::error::{Error, Result};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, HipDim3};
+use crate::arg;
+use crate::HipDim3;
+
+/// Largest M for which a quantized GEMM takes the u4-lane route instead of the
+/// LDS-tiled kernel.
+///
+/// Why a bound at all: the lane GEMV puts M in the grid (`grid_y = M`) and
+/// re-reads B once per row, so its cost grows ~linearly in M, while the tiled
+/// kernel's grows as `ceil(M / TILE_M)` with TILE_M = 4. The tiled kernel is so
+/// much slower per pass (measured ~8 GB/s effective, because its dequant loop
+/// reads B column-major out of a row-major packed layout, so a warp touches 32
+/// separate 64-byte sectors to use 32 bytes) that the lane route wins across a
+/// wide range — but not unboundedly: past the point where the per-tensor weight
+/// slice stops fitting L2, the M re-reads hit DRAM and M-fold traffic is fatal.
+///
+/// Measured on the 9B (Qwen3.5-9B Q4_K_M, GPU 1, GRIM_CONTEXT=4096), prefill
+/// step only, `GRIM_LANE_GEMM_MAX_M` swept:
+///
+/// ```text
+///   prompt tokens     tiled      lane     lane, minus the ~3.8 s one-time
+///     5              1447 ms    3976 ms   176 ms   (35 ms/token)
+///    61              9535       4235      435      (7.1)
+///   251             38548       5123     1323      (5.3)
+///   512                 ~79 s    8136     4336      (8.5)
+///  1051               171.3 s   12286     8486      (8.1)
+///  2104                 ~324 s  20574    16774      (7.9)
+/// ```
+///
+/// The tiled column is `ceil(m/4) * 5.7 GB / 8 GB/s` and matches measurement to
+/// within a few percent at every point — that cost model is the whole argument.
+/// The lane column's marginal cost is flat at ~8 ms/token, which is 5.7 GB /
+/// 8 ms = 712 GB/s: ABOVE the card's DRAM rate, so the M re-reads are being
+/// served from L2 (each tensor's lane copy is <= 28 MB here, against a 64 MB
+/// infinity cache). It has not fallen off a cliff at any point measured.
+///
+/// The bound is nevertheless finite and defaults to the project's pinned
+/// comparison context (4096). Past it the tiled path is used — i.e. today's
+/// behaviour, so a large-M regression is impossible — but note that neither
+/// path is *right* there: the real fix for long prompts is a GEMM with a large
+/// M tile and matrix cores (see the AMD low-latency-GEMM work: inter-CTA
+/// split-K for occupancy, an LDS multi-stage pipeline, MFMA). The lane GEMV is
+/// a GEMV: it pays M passes over the weights no matter how they are cached.
+pub(crate) fn lane_gemm_max_m() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("GRIM_LANE_GEMM_MAX_M")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(LANE_GEMM_MAX_M_DEFAULT)
+    })
+}
+
+/// Default M bound for the lane GEMM route (see [`lane_gemm_max_m`]).
+const LANE_GEMM_MAX_M_DEFAULT: usize = 4096;
 
 impl RocmDevice {
     /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
@@ -65,15 +118,24 @@ impl RocmDevice {
             // plan Step 3).
             true
         });
-        // DECODE FAST PATH FIRST: convert the bank once to CityCrow u4 lanes
-        // and decode on the native v_dot8 GEMV. The floor probe measures the
-        // K-quant decode kernels at 4.6-8 GB/s while the u4-lane GEMV runs at
-        // 485 GB/s at the same shape — a 60-100x gap. GRIM_DECODE_W4A4=0 opts
-        // out (u4 requant is lossy vs the checkpoint's own quantization).
+        // LANE FAST PATH: convert the weight once to CityCrow u4 lanes and run
+        // the native v_dot8 GEMV. The floor probe measures the K-quant decode
+        // kernels at 4.6-8 GB/s while the u4-lane GEMV runs at 485 GB/s at the
+        // same shape — a 60-100x gap. GRIM_DECODE_W4A4=0 opts out (u4 requant
+        // is lossy vs the checkpoint's own quantization).
+        //
+        // The M bound is `lane_gemm_max_m()`, not `m == 1`: prefill is a
+        // small-M GEMM and the tiled kernel's weight reuse factor is only 4
+        // (TILE_M), so it re-reads and re-dequantizes the whole weight set once
+        // per 4 rows at ~8 GB/s. Measured prefill cost is linear at ~154 ms per
+        // prompt token, which is exactly 5.7 GB/4 per token at 8 GB/s. The lane
+        // GEMV instead grows the grid by M (grid_y = M), so the extra passes are
+        // L2-served while the per-tensor slice (<= 28 MB here) stays resident.
+        // `dot8_w4a4_gemv_parity_multi_row` pins that M > 1 is correct.
         let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
             .map(|v| v != "0")
             .unwrap_or(true);
-        if m == 1
+        if m <= lane_gemm_max_m()
             && w4a4_decode
             && k % 128 == 0
             && crate::quantization::w4a4_ostquant_supported(
@@ -516,6 +578,56 @@ impl RocmDevice {
             return Ok(stream);
         }
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q6k", a, b, out, m, n, k, 4)
+    }
+
+    /// Shared lane routing for any M: convert the weight once to CityCrow u4
+    /// lanes and run the native v_dot8 GEMV (485 GB/s measured vs 4.6-8 GB/s
+    /// for the K-quant fused kernels). Returns Some(stream) when the lane route
+    /// served the GEMM. `budget = true` keeps the lane cache inside the VRAM
+    /// headroom; a declined conversion falls through to the caller's kernel.
+    ///
+    /// Unlike [`Self::try_u4_lane_decode`] this does NOT gate on `m == 1` — the
+    /// caller owns the M bound, because the right bound is a property of the
+    /// dispatch site (decode is always M=1; prefill's bound is a measured
+    /// crossover). See `lane_gemm_max_m`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_u4_lane_gemm(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        scheme: grim_tensor::dtype::KQuantScheme,
+    ) -> Result<Option<*mut c_void>> {
+        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if !w4a4_decode
+            || k % 128 != 0
+            || crate::quantization::w4a4_ostquant_supported(
+                crate::quantization::gcn_arch(&self.gpu_target),
+                k,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if let Some(lanes) = Self::u4_lane_weights_budgeted(self, b, n, k, scheme, true)? {
+            self.launch_w4a4_ostquant_gemv(
+                a,
+                lanes.qweight_rocm()?,
+                lanes.scales_rocm()?,
+                lanes.zeros_rocm()?,
+                out,
+                m,
+                n,
+                k,
+            )?;
+            return Ok(Some(self.active_stream()));
+        }
+        Ok(None)
     }
 
     /// Shared decode-time lane routing: convert the bank once to CityCrow u4
