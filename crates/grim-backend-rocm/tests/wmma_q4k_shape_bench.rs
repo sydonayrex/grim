@@ -21,6 +21,48 @@
 //! documents the 16x16x16 WMMA shape and the 2x2 wave layout this kernel does
 //! NOT use (it gives all four waves the same tile).
 //!
+//! ---------------------------------------------------------------------------
+//! WHAT WAS REFUTED HERE, so the next attempt does not re-run it (2026-10-08):
+//!
+//! With per-k-step at ~2.06 us and 38x off the ALU bound, three candidate
+//! mechanisms were tested and all three are refuted:
+//!
+//!   1. LDS BANK CONFLICTS. Padded every LDS row stride 16 -> 24 halves (the
+//!      `a_k_pad=8` convention of FlyDSL `kernels/gemm/rdna_f16_gemm.py`), which
+//!      takes the B-fill store (`lds_b[t] + r*16 + half*8`, a 16-half stride =
+//!      8 banks apart on a 32-bank LDS, ~4-way) down to ~2-way, and passed the
+//!      padded `ld` to `load_matrix_sync`. Result: 1782 -> 1796 ns per k-step,
+//!      i.e. NO CHANGE within noise. Not bank conflicts.
+//!
+//!   2. PIPELINE DEPTH. Went from a 2-stage to a 4-stage LDS ring so the
+//!      prefetch sits DEPTH-1 slices ahead instead of one. Result: 1818 ns,
+//!      slightly WORSE (more LDS = lower occupancy). Not depth-limited.
+//!
+//!   3. WMMA EMULATION. Disassembled the JIT hsaco for this kernel
+//!      (`llvm-objdump -d --arch-name=amdgcn` on
+//!      `~/.cache/grim/.../grim_grim_wmma_fused_dequant_q4k_gfx1200_*.hsaco`):
+//!      `v_wmma_f32_16x16x16_f16` is emitted 60 times, so rocWMMA is using the
+//!      native RDNA4 matrix path, not a VALU fallback. Not emulation.
+//!
+//! THE MECHANISM THAT SURVIVES is in the dequant itself, on both axes at once:
+//!
+//!   * BYTE GRANULARITY. `grim_deq_q4k` reads the block one byte at a time —
+//!     `scales[s]`, `scales[s+4]`, `qs[qsb]` — about 10 scalar 1-byte loads per
+//!     8-weight call, 128 calls per k-step, with each lane on a DIFFERENT
+//!     column's block, so a warp's load becomes ~32 separate transactions.
+//!   * 16x REDUNDANCY. `kk / blk` is constant for k0 in [0,240], so the same
+//!     144-byte block is re-read on each of the 16 k-steps inside its
+//!     256-weight span.
+//!
+//! FIX DESIGN (not implemented): stage the PACKED block bytes into LDS once per
+//! 256-weight span with a coalesced copy, then extract per k-step from LDS. For
+//! a 64-column tile that is 64 cols x (128 qs + 12 scales) B = 8.9 KB per stage;
+//! two stages 17.9 KB + c_out 4 KB = 22 KB, i.e. ~2 blocks/CU against ~5 today —
+//! so occupancy has to be re-checked. This is the Marlin/Petit offline-shuffle
+//! idea applied in-kernel, and it subsumes the re-scoped Step 2: the shuffle
+//! exists to make that staging copy contiguous and 16-byte vectorized.
+//!
+//! ---------------------------------------------------------------------------
 //! RUN: GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --test wmma_q4k_shape_bench -- --ignored --nocapture
 
 use grim_backend_rocm::RocmDevice;
