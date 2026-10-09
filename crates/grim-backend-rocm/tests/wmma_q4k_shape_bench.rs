@@ -64,13 +64,21 @@
 //! M=251 4767 -> 3354 ms. **SLOWER at M=4056: model prefill 39451 -> 62577 ms
 //! (reproduced twice)**. Reverted: the user's real workload is the 4K prompt.
 //!
-//! The M-dependence is UNEXPLAINED — vgpr actually FELL 88 -> 72 (better
-//! occupancy) and the staged-in-LDS variant reproduced the same 62 s, so neither
-//! occupancy nor staging explains it. Before re-attempting, characterise the
-//! inversion: sweep M on the REAL model at 251/512/1024/2048/4056 with both
-//! dequant variants, and only ship a per-M dispatch once the crossover is
-//! measured and its mechanism understood. A threshold shipped without that
-//! understanding would be an unverified heuristic.
+//! The M-dependence is REAL and now MEASURED on the real model, in one healthy
+//! host state (decode steady-state 20.13-20.28 ms/token in the same window):
+//!
+//!   prompt tokens   byte-wise   vectorized
+//!         5            480 ms     351 ms    vectorized 1.37x faster
+//!       251           4767        3354      1.42x faster
+//!      4056          39451       61496      1.56x SLOWER
+//!
+//! vgpr fell 88 -> 72 (better occupancy) and the staged-in-LDS variant
+//! reproduced the same 62 s, so neither occupancy nor staging explains the
+//! inversion. The byte-wise dequant ships: it wins at 4K prompts, which are the
+//! workload this work was measured on, and the small-M gap is 129 ms where the
+//! large-M gap is 22 s. A per-M dispatch needs the crossover localised (somewhere
+//! in 251..4056) and its mechanism understood first — a threshold without that
+//! would be an unverified heuristic.
 //!
 //! ---------------------------------------------------------------------------
 //! FIX DESIGN (not implemented): stage the PACKED block bytes into LDS once per
