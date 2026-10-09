@@ -64,12 +64,14 @@ __device__ __forceinline__ void grim_big_deq_q4k(
     const bool low = off0 < 32;
 
     unsigned int qw_lo, qw_hi;
-    __builtin_memcpy(&qw_lo, qs + qsb, 4);
-    __builtin_memcpy(&qw_hi, qs + qsb + 4, 4);
+    qw_lo = (unsigned int)qs[qsb] | ((unsigned int)qs[qsb + 1] << 8)
+          | ((unsigned int)qs[qsb + 2] << 16) | ((unsigned int)qs[qsb + 3] << 24);
+    qw_hi = (unsigned int)qs[qsb + 4] | ((unsigned int)qs[qsb + 5] << 8)
+          | ((unsigned int)qs[qsb + 6] << 16) | ((unsigned int)qs[qsb + 7] << 24);
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
         const unsigned int byte = (e < 4) ? (qw_lo >> (8 * e)) : (qw_hi >> (8 * (e - 4)));
-        const unsigned int q = low ? (byte & 0x0Fu) : (byte >> 4);
+        const unsigned int q = low ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
         out[e] = ds * (float)q - dm;
     }
 }
@@ -143,13 +145,6 @@ extern "C" __global__ void grim_wmma_big_q4k(
     grim_big_fill_stage(sA[0], sB[0], A, B_q, tid, row_base, col_base,
                         0, M, N, K, row_bytes);
     __syncthreads();
-
-    // PROBE DUMP (temporary): sA stage 0 then stage 1 to C, return.
-    for (int idx = tid; idx < BIG_BM * BIG_LD; idx += 128)
-        C[idx] = (float)sA[0][idx];
-    for (int idx = tid; idx < BIG_BM * BIG_LD; idx += 128)
-        C[BIG_BM * BIG_LD + idx] = (float)sA[1][idx];
-    return;
 
     const int n_k_steps = K / BIG_BK;
     for (int it = 0; it < n_k_steps; ++it) {

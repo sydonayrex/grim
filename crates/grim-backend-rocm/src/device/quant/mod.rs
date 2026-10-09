@@ -187,10 +187,16 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q4k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                // NOTE: the 64x64x32 big-tile kernel (grim_wmma_big_q4k) is
-                // implemented but NOT dispatched: exact at one K step, inf from
-                // the second (pipeline stage handoff) - repro and state in
-                // tests/big_q4k_probe.rs. Fix before dispatching.
+                // 64x64x32 big-tile kernel for large-M prefill: one weight
+                // pass per 64 rows instead of ceil(M/16). The previous NOTE
+                // here blamed a "pipeline stage handoff" for the inf from K
+                // step 2; the real defect was a missing & 0x0F on the
+                // high-nibble path of grim_big_deq_q4k (found by dumping the
+                // dequant's own intermediates — d/sc/qs bytes were all
+                // correct, the nibble was a 28-bit shift). Partial tiles are
+                // masked in-kernel.
+                } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
+                    self.launch_wmma_big_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 256) {
                     self.launch_wmma_fused_dequant_q4k(
                         a_storage,

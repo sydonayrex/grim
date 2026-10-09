@@ -327,18 +327,16 @@ fn wmma_big_q4k_large_m_parity_and_route() {
         let big = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big_q4k");
         let small = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
         eprintln!("[big-q4k] m={m} big={big} small16={small}");
-        // STATE: the big-tile kernel is implemented but NOT dispatched (inf from
-        // K step 2 — see tests/big_q4k_probe.rs). While the dispatch arm is
-        // disabled, this shape must route to the 16-row kernel and still be
-        // numerically correct. FLIP BOTH ASSERTIONS when the kernel is fixed
-        // and the arm is re-enabled.
-        assert_eq!(
-            big, 0,
-            "m={m}: the big-tile kernel is dispatch-disabled; it served this shape anyway"
-        );
+        // The high-nibble mask defect is fixed (missing & 0x0F on the w>=32
+        // path of grim_big_deq_q4k — see tests/big_q4k_probe.rs), so the
+        // big-tile kernel serves every m >= 64.
         assert!(
-            small > 0,
-            "m={m}: the 16-row kernel must serve large-M while the big tile is disabled"
+            big > 0,
+            "m={m}: the big-tile kernel must serve large-M prefill"
+        );
+        assert_eq!(
+            small, 0,
+            "m={m}: the 16-row kernel must not serve shapes the big tile owns"
         );
     }
 }
