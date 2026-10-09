@@ -54,6 +54,25 @@
 //!     144-byte block is re-read on each of the 16 k-steps inside its
 //!     256-weight span.
 //!
+//! ALSO TESTED AND REVERTED (M-DEPENDENT, 2026-10-08): vectorizing the Q4K
+//! dequant read — the 8 weights of one call are eight CONTIGUOUS qs bytes
+//! sharing one 6-bit scale pair (qsb = 32*(w/64) + (w%64), a multiple of 8), so
+//! two 4-byte loads replace ~10 scalar 1-byte loads. CORRECT: parity max_diff
+//! dropped to exactly 0 for Q4K at m=1/3/5/17 (the Q8_0 and fp16 gates, which do
+//! not use this dequant, were unchanged at 0.19168091 / 0.27461243). FASTER at
+//! M<=251: M=256/n=1024 1.392 -> 0.909 ms (1.53x, 2.36 TFLOP/s); model prefill
+//! M=251 4767 -> 3354 ms. **SLOWER at M=4056: model prefill 39451 -> 62577 ms
+//! (reproduced twice)**. Reverted: the user's real workload is the 4K prompt.
+//!
+//! The M-dependence is UNEXPLAINED — vgpr actually FELL 88 -> 72 (better
+//! occupancy) and the staged-in-LDS variant reproduced the same 62 s, so neither
+//! occupancy nor staging explains it. Before re-attempting, characterise the
+//! inversion: sweep M on the REAL model at 251/512/1024/2048/4056 with both
+//! dequant variants, and only ship a per-M dispatch once the crossover is
+//! measured and its mechanism understood. A threshold shipped without that
+//! understanding would be an unverified heuristic.
+//!
+//! ---------------------------------------------------------------------------
 //! FIX DESIGN (not implemented): stage the PACKED block bytes into LDS once per
 //! 256-weight span with a coalesced copy, then extract per k-step from LDS. For
 //! a 64-column tile that is 64 cols x (128 qs + 12 scales) B = 8.9 KB per stage;
