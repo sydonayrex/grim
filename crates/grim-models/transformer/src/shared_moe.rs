@@ -3125,5 +3125,111 @@ mod kq_native_integration_tests {
             d_ab / s_ab,
             d_ah / s_ah
         );
+
+        // ---- DECODE-SHAPE TIMING: batch 1, 4 pairs, 4 distinct experts -----
+        // The question: at seq_len=1 does dequant-once-per-expert + small
+        // GEMMs beat the per-pair in-register kernel? 4 top-k experts means
+        // 4 bank dequants (22 MB f32 scratch, reused) vs the kernel reading
+        // ~22 MB of packed bytes with scalar decode.
+        let d_toks = vec![0u32, 0u32, 0u32, 0u32];
+        let d_exps = vec![7u32, 12u32, 19u32, 23u32];
+        let d_wts = vec![0.25f32, 0.25f32, 0.25f32, 0.25f32];
+        let d_toks_st = dev
+            .from_cpu_bytes(
+                &d_toks.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                &grim_tensor::Shape::new(vec![4]),
+                grim_tensor::DType { arith: grim_tensor::ArithType::U32, storage: grim_tensor::Storage::Native },
+            )
+            .expect("d toks");
+        let d_exps_st = dev
+            .from_cpu_bytes(
+                &d_exps.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                &grim_tensor::Shape::new(vec![4]),
+                grim_tensor::DType { arith: grim_tensor::ArithType::U32, storage: grim_tensor::Storage::Native },
+            )
+            .expect("d exps");
+        let d_wts_st = dev
+            .from_cpu_bytes(
+                &d_wts.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                &grim_tensor::Shape::new(vec![4]),
+                grim_tensor::DType::F32,
+            )
+            .expect("d wts");
+        fn st_of2<'a>(a: &'a Arc<dyn grim_tensor::backend::BackendStorage>) -> &'a grim_backend_rocm::RocmStorage {
+            a.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap()
+        }
+        let d_toks_arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(d_toks_st);
+        let d_exps_arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(d_exps_st);
+        let d_wts_arc: Arc<dyn grim_tensor::backend::BackendStorage> = Arc::from(d_wts_st);
+        let out_d = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &grim_tensor::Shape::new(vec![1, hidden]),
+            grim_tensor::DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .expect("out_d");
+        const ITERS: usize = 50;
+
+        // warmup + time the kq per-pair kernel (memset per iter: it atomicAdds)
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            unsafe {
+                let _ = grim_backend_rocm::hipMemsetAsync(
+                    out_d.device_ptr_checked().unwrap() as *mut std::ffi::c_void,
+                    0,
+                    hidden * 4,
+                    0 as *mut std::ffi::c_void,
+                );
+            }
+            dev.moe_fused_dispatch_kq_native_into(
+                st_of(&a_t),
+                arc_of(&kq.gate_ptrs),
+                arc_of(&kq.up_ptrs),
+                arc_of(&kq.down_ptrs),
+                st_of2(&d_toks_arc),
+                st_of2(&d_exps_arc),
+                st_of2(&d_wts_arc),
+                4,
+                &out_d,
+                hidden,
+                inter,
+                rsf,
+                kq.gate_bytes / inter as u64,
+                kq.down_bytes / hidden as u64,
+                i32::from(kq.down_q4k),
+            )
+            .expect("kq decode iter");
+        }
+        dev.synchronize();
+        let kq_ms = t0.elapsed().as_millis() as f64 / ITERS as f64;
+
+        // warmup + time the dequant-gemm arm
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            dev.moe_dequant_gemm_prefill_into(
+                st_of(&a_t),
+                arc_of(&kq.gate_ptrs),
+                arc_of(&kq.up_ptrs),
+                arc_of(&kq.down_ptrs),
+                st_of2(&d_toks_arc),
+                st_of2(&d_exps_arc),
+                st_of2(&d_wts_arc),
+                4,
+                &out_d,
+                hidden,
+                inter,
+                rsf,
+                kq.gate_bytes / inter as u64,
+                kq.down_bytes / hidden as u64,
+                kq.down_q4k,
+            )
+            .expect("arm decode iter");
+        }
+        dev.synchronize();
+        let arm_ms = t0.elapsed().as_millis() as f64 / ITERS as f64;
+        eprintln!(
+            "[dg-timing] decode shape (1 tok, 4 pairs/4 experts): kq per-pair {kq_ms:.2} ms/call, dequant-gemm {arm_ms:.2} ms/call, ratio {:.2}x",
+            kq_ms / arm_ms
+        );
     }
 }
