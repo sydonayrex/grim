@@ -298,3 +298,42 @@ fn wmma_quant_partial_m_parity_and_route() {
         );
     }
 }
+
+/// Large-M parity + routing for the 64x64x32 big-tile kernel.
+///
+/// Exercises what its name says: full 64-row tiles (m=1024) and a PARTIAL last
+/// tile (m=1000 = 15 full + 40 rows), against the host oracle, through the
+/// production dispatch. The route counter asserts `grim_wmma_big_q4k` is the
+/// kernel under test (not the 16-row tile it sits beside in the dispatch).
+#[test]
+#[ignore]
+fn wmma_big_q4k_large_m_parity_and_route() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TESTS=1");
+        return;
+    };
+    for m in [64usize, 1000usize, 1024usize] {
+        grim_backend_rocm::reset_kernel_route_counters();
+        run_case(
+            &dev,
+            m,
+            1024,
+            4096,
+            KQuantScheme::Q4K,
+            grim_tensor::QuantFormat::Q4K,
+            &quant_q4k,
+            &|blk, n| grim_quant::dequant_q4k(blk, n).unwrap(),
+        );
+        let big = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big_q4k");
+        let small = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
+        eprintln!("[big-q4k] m={m} big={big} small16={small}");
+        assert!(
+            big > 0,
+            "m={m}: the 64x64x32 big-tile kernel must serve this shape (route counter saw big={big})"
+        );
+        assert_eq!(
+            small, 0,
+            "m={m}: the 16-row kernel must not serve a large-M shape"
+        );
+    }
+}

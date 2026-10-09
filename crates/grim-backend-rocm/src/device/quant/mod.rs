@@ -187,6 +187,17 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q4k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
+                } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 && wmma_quant_enabled() {
+                    // Large-M prefill: 64x64x32 tile, 64 weight passes at M=4056
+                    // instead of the 16-row tile's 254 (4x less weight traffic).
+                    self.launch_wmma_big_q4k(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 256) {
                     self.launch_wmma_fused_dequant_q4k(
                         a_storage,
