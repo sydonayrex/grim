@@ -65,6 +65,45 @@ impl RocmDevice {
             // plan Step 3).
             true
         });
+        // DECODE FAST PATH FIRST: convert the bank once to CityCrow u4 lanes
+        // and decode on the native v_dot8 GEMV. The floor probe measures the
+        // K-quant decode kernels at 4.6-8 GB/s while the u4-lane GEMV runs at
+        // 485 GB/s at the same shape — a 60-100x gap. GRIM_DECODE_W4A4=0 opts
+        // out (u4 requant is lossy vs the checkpoint's own quantization).
+        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if m == 1
+            && w4a4_decode
+            && k % 128 == 0
+            && crate::quantization::w4a4_ostquant_supported(
+                crate::quantization::gcn_arch(&self.gpu_target),
+                k,
+            )
+            .is_ok()
+        {
+            if let Some(lanes) = Self::u4_lane_weights_budgeted(
+                self,
+                b_q4k_storage,
+                n,
+                k,
+                grim_tensor::dtype::KQuantScheme::Q4K,
+                true,
+            )? {
+                self.launch_w4a4_ostquant_gemv(
+                    a_storage,
+                    lanes.qweight_rocm()?,
+                    lanes.scales_rocm()?,
+                    lanes.zeros_rocm()?,
+                    out_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+                return Ok(self.active_stream());
+            }
+        }
+
         // SPEED-ROC-9: K-split decode path (m==1). The 4-col scalar kernel
         // launches N/4 threads at m==1 (~16 waves), leaving the GPU
         // latency-bound; the K-split kernel launches 2*N threads over 4-way
@@ -470,7 +509,60 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // DECODE FAST PATH: same lane routing as Q4_K. The scalar q6k fused
+        // kernel measures 18.5 ms/launch on the 9B decode (6.0 GB/s) while
+        // the u4-lane GEMV runs at 70 us (485 GB/s). GRIM_DECODE_W4A4=0 opts out.
+        if let Some(stream) = self.try_u4_lane_decode(a, b, out, m, n, k, grim_tensor::dtype::KQuantScheme::Q6K)? {
+            return Ok(stream);
+        }
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q6k", a, b, out, m, n, k, 4)
+    }
+
+    /// Shared decode-time lane routing: convert the bank once to CityCrow u4
+    /// lanes and run the native v_dot8 GEMV (485 GB/s measured vs 4.6-8 GB/s
+    /// for the K-quant fused kernels at decode shapes). Returns Some(stream)
+    /// when the lane route served the GEMV. `budget = true` keeps the lane
+    /// cache inside the VRAM headroom; a declined conversion falls through to
+    /// the caller's kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_u4_lane_decode(
+        &self,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        scheme: grim_tensor::dtype::KQuantScheme,
+    ) -> Result<Option<*mut c_void>> {
+        let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if m != 1
+            || !w4a4_decode
+            || k % 128 != 0
+            || crate::quantization::w4a4_ostquant_supported(
+                crate::quantization::gcn_arch(&self.gpu_target),
+                k,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if let Some(lanes) = Self::u4_lane_weights_budgeted(self, b, n, k, scheme, true)? {
+            self.launch_w4a4_ostquant_gemv(
+                a,
+                lanes.qweight_rocm()?,
+                lanes.scales_rocm()?,
+                lanes.zeros_rocm()?,
+                out,
+                m,
+                n,
+                k,
+            )?;
+            return Ok(Some(self.active_stream()));
+        }
+        Ok(None)
     }
 
     pub(crate) fn launch_fused_dequant_backward_gemm_q6k(

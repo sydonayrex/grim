@@ -157,6 +157,28 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // DECODE-SIZED m goes to the u4-lane GEMV first: the tiled kernel
+        // measures 7 ms/launch at the 9B's decode-adjacent shapes while the
+        // lane GEMV runs at 70 us (485 GB/s vs ~10 GB/s). Only K-quant
+        // formats with a lane conversion are eligible.
+        if m <= 4 {
+            let scheme = if kernel.contains("q4k") {
+                Some(grim_tensor::dtype::KQuantScheme::Q4K)
+            } else if kernel.contains("q5k") {
+                Some(grim_tensor::dtype::KQuantScheme::Q5K)
+            } else if kernel.contains("q6k") {
+                Some(grim_tensor::dtype::KQuantScheme::Q6K)
+            } else {
+                None
+            };
+            if let Some(s) = scheme {
+                if let Some(stream) =
+                    self.try_u4_lane_decode(a_storage, b_storage, out_storage, m, n, k, s)?
+                {
+                    return Ok(stream);
+                }
+            }
+        }
         let a_ptr = a_storage
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{}: a has no device ptr", kernel)))?;

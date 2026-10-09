@@ -237,7 +237,24 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                // DECODE FAST PATH: u4 lanes before the dot4 GEMV (2.2 ms
+                // per launch measured vs 70 us for the lane kernel). The
+                // lanes write out_storage directly; the arm falls through to
+                // the shared return.
+                let lane_served = self
+                    .try_u4_lane_decode(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        grim_tensor::dtype::KQuantScheme::Q5K,
+                    )?
+                    .is_some();
+                if lane_served {
+                    // out_storage is written by the lane GEMV.
+                } else if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());
@@ -310,16 +327,8 @@ impl QuantOps for RocmDevice {
                     k,
                 )
                 .map_err(Error::Backend)?;
-                // Twin refusal (see gemm_launchers linear_decode_into):
-                // GSQ-free control also NaNs — .grim graph divergence, not
-                // this route; u4 GEMV stays eager under capture.
-                if self.is_capturing() {
-                    return Err(Error::Backend(
-                        "quantized_matmul: GsqRco3p5 u4-lane route refused \
-                         under capture — .grim graph replay NaNs even GSQ-free."
-                            .into(),
-                    ));
-                }
+                // Capture-safe as of the rms_norm_into Int8PerChannel fix
+                // (see the twin note in gemm_launchers linear_decode_into).
                 let lanes = self.u4_lane_weights(b_storage, n, k, KQuantScheme::GsqRco3p5)?;
                 self.launch_w4a4_ostquant_gemv(
                     a_storage,
@@ -590,7 +599,24 @@ impl QuantOps for RocmDevice {
                     std::env::var("GRIM_DOT_GEMV").as_deref(),
                     Ok("0" | "false" | "off")
                 );
-                if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
+                // DECODE FAST PATH: u4 lanes before the dot4 GEMV (2.2 ms
+                // per launch measured vs 70 us for the lane kernel). The
+                // lanes write out_storage directly; the arm falls through to
+                // the shared return.
+                let lane_served = self
+                    .try_u4_lane_decode(
+                        a_storage,
+                        b_storage,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                        grim_tensor::dtype::KQuantScheme::Q5K,
+                    )?
+                    .is_some();
+                if lane_served {
+                    // out_storage is written by the lane GEMV.
+                } else if (is_rdna2 || is_rdna34) && m == 1 && !dot_disabled && k % 256 == 0 {
                     let q81_bytes = (k / 32) * 36 * m;
                     let shape = Shape::new(vec![q81_bytes]);
                     let mut buf_guard = self.act_q81_buf.write().unwrap_or_else(|e| e.into_inner());

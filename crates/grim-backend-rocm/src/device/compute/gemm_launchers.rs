@@ -2154,20 +2154,9 @@ impl RocmDevice {
                 let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                     Error::Backend("linear_decode_into: a not RocmStorage".into())
                 })?;
-                // Capture refusal RESTORED (supersedes the f0859982 reading):
-                // the GSQ-free control artifact (GRIM_RCO_MENU="7,3,4,5,6")
-                // ALSO replays all-NaN, so the GSQ u4 GEMV was never the
-                // poison — the defect is a .grim-vs-GGUF graph divergence
-                // independent of the ladder. Until that is root-caused the
-                // u4 GEMV stays out of captured graphs; eager keeps it.
-                if self.is_capturing() {
-                    return Err(Error::Backend(
-                        "linear_decode_into: GsqRco3p5 u4-lane route refused \
-                         under capture — .grim graph replay NaNs even GSQ-free; \
-                         defect is not this route. Decode takes eager."
-                            .into(),
-                    ));
-                }
+                // Capture-safe as of the rms_norm_into Int8PerChannel fix
+                // (layer_elementwise.rs): the replay NaN was the F32 rms
+                // kernel reading the packed norm blob, not this route.
                 let lanes = self.u4_lane_weights(w, n, k, KQuantScheme::GsqRco3p5)?;
                 // Diagnostic (GRIM_DEBUG_TOPLOGITS): when the capture gate is
                 // DOWN this call is either an eager step or follows a
@@ -2300,60 +2289,41 @@ impl RocmDevice {
                     }
                     return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
                 }
-                // GRIM_DECODE_W4A4=1: q4k weights are requantized once, per
-                // tensor, to the WhiteCrow u4 group-128 layout and decode rides
-                // the native v_dot8 GEMV. Probe-measured 435 GB/s vs 23 GB/s
-                // for the q4k dot4 kernel (tests/dot4_gemv_floor_probe.rs).
-                // Conversion is cached per weight device pointer; it D2Hs the
-                // packed bytes on first use, so it must NOT run under graph
-                // capture (hipMemcpy sync + alloc poison capture) — eager path
-                // only, env-gated off by default.
+                // DECODE FAST PATH: a Q4_K/Q5_K/Q6_K weight is requantized
+                // once, per tensor, to the WhiteCrow u4 group-128 layout and
+                // decode rides the native v_dot8 GEMV. Probe-measured 435 GB/s
+                // vs 23 GB/s for the q4k dot4 kernel (tests/dot4_gemv_floor_probe.rs).
                 //
-                // The arch gate is `.is_ok()` rather than a `?` on purpose: this
-                // leg is an optimization over the dot4 GEMV below, so a card
-                // without v_dot8 simply keeps the dot4 route instead of erroring.
-                // The CityCrow arm above inverts that, because GSQRCO has no
-                // other route to fall back to.
-                static W4A4_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let w4a4_decode = *W4A4_DECODE.get_or_init(|| {
-                    matches!(
-                        std::env::var("GRIM_DECODE_W4A4").as_deref(),
-                        Ok("1" | "true")
-                    )
-                });
+                // This is the SAME route the nested `launch_fused_dequant_gemm_q{4,6}k`
+                // heads take — deliberately the same shared helper, memo, budget
+                // and `GRIM_DECODE_W4A4` switch, so one weight cannot take two
+                // different GEMVs depending on which caller reaches it. It is
+                // default-ON: Q5_K previously reached the dot4 GEMV below from
+                // here and nothing else, which cost 34.2 ms/token of the 9B's
+                // 41.6 ms/token decode kernel time (16 launches/token at
+                // 2.17 ms each, rocprof /tmp/rp9e).
+                //
+                // Capture-safety: the conversion D2Hs the packed bytes and
+                // allocates on first use, which a capture bracket cannot survive.
+                // run.rs calls `forward_capture` twice on unseeded buffers before
+                // `begin_capture`, so every weight this leg will touch is already
+                // memoized when the bracket opens and the in-capture path is a
+                // cache hit that allocates nothing. GRIM_DECODE_W4A4=0 opts out
+                // (u4 requant is lossy against the checkpoint's own quantization).
+                //
+                // The arch gate is inside the helper as `.is_ok()` rather than a
+                // `?` on purpose: this leg is an optimization over the dot4 GEMV
+                // below, so a card without v_dot8 simply keeps the dot4 route
+                // instead of erroring. The CityCrow arm above inverts that,
+                // because GSQRCO has no other route to fall back to.
                 if matches!(
                     scheme,
                     KQuantScheme::Q4K | KQuantScheme::Q5K | KQuantScheme::Q6K
-                ) && w4a4_decode
-                    && k % 128 == 0
-                    && crate::quantization::w4a4_ostquant_supported(
-                        crate::quantization::gcn_arch(&self.gpu_target),
-                        k,
-                    )
-                    .is_ok()
-                {
-                    // The conversion memo (and its KDA-FIX key discipline) now
-                    // lives in `u4_lane_weights`, shared with the CityCrow arm
-                    // and the eager `quantized_matmul` dispatch, so a model
-                    // driven through more than one of those paths converts once.
-                    // Budget-aware: a lane copy that would leave less than
-                    // the 256 MiB reserve returns None and the weight KEEPS
-                    // the dot4 route below — sticky for the process, so
-                    // capture and eager agree per tensor.
-                    if let Some(lanes) =
-                        Self::u4_lane_weights_budgeted(self, w, n, k, *scheme, true)?
+                ) {
+                    if let Some(stream) =
+                        self.try_u4_lane_decode(a_s, w, out, m, n, k, *scheme)?
                     {
-                        self.launch_w4a4_ostquant_gemv(
-                            a_s,
-                            lanes.qweight_rocm()?,
-                            lanes.scales_rocm()?,
-                            lanes.zeros_rocm()?,
-                            out,
-                            m,
-                            n,
-                            k,
-                        )?;
-                        return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
+                        return Ok(Box::new(RocmHandle::new(Some(stream))));
                     }
                 }
                 // Exact leg: dequantize the weight inline and keep the
@@ -2363,6 +2333,24 @@ impl RocmDevice {
                 if crate::device::quant::exact_decode_gemv() {
                     match scheme {
                         KQuantScheme::Q4K => {
+                            if std::env::var_os("GRIM_DEBUG_TOPLOGITS").is_some() {
+                                eprintln!(
+                                    "[q4k-gemv] A={:p} W={:p} C={:p} m={m} n={n} k={k} capturing={}",
+                                    a_s.device_ptr.unwrap_or(0) as *mut c_void,
+                                    w.device_ptr.unwrap_or(0) as *mut c_void,
+                                    out.device_ptr.unwrap_or(0) as *mut c_void,
+                                    self.is_capturing(),
+                                );
+                                if self.is_capturing() && n > 65536 {
+                                    // Register the CAPTURED A of the vocab-scale
+                                    // GEMV (the LM head) for the post-replay scan.
+                                    *CAPTURED_HEAD_GEMV_A
+                                        .get_or_init(|| std::sync::Mutex::new(None))
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) =
+                                        Some(a_s.device_ptr.unwrap_or(0) as usize);
+                                }
+                            }
                             self.launch_fused_dequant_gemm_q4k(a_s, w, out, m, n, k)?;
                             return Ok(Box::new(RocmHandle::new(Some(self.active_stream()))));
                         }
@@ -3193,4 +3181,17 @@ impl RocmDevice {
         )?;
         Ok(d)
     }
+}
+
+static CAPTURED_HEAD_GEMV_A: std::sync::OnceLock<std::sync::Mutex<Option<usize>>> =
+    std::sync::OnceLock::new();
+
+/// Diagnostic: the A pointer the LM-head Q4_K GEMV bound at capture time
+/// (registered when GRIM_DEBUG_TOPLOGITS is set). The post-replay scan reads
+/// it to peek the buffer the graph actually consumes.
+pub fn last_captured_head_gemv_a() -> Option<usize> {
+    *CAPTURED_HEAD_GEMV_A
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
