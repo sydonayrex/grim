@@ -1,6 +1,9 @@
 //! SPEED-ROC: GPU parity for the consolidated WMMA fused-dequant kernels
 //! (`grim_wmma_fused_dequant_{q8_0,q4k,q5k,q2k,q3k,q6k}`) against a
-//! dequantize-then-matmul CPU reference, at decode shape M=1.
+//! dequantize-then-matmul CPU reference, at decode shape M=1 and at PARTIAL-M
+//! prefill shapes (see `wmma_quant_partial_m_parity_and_route`, which also
+//! asserts through the launch route counter that the WMMA kernel is the one
+//! under test — a numeric parity run alone cannot tell the paths apart).
 //!
 //! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test wmma_quant_parity -- --ignored
 
@@ -111,7 +114,13 @@ fn wmma_quant_decode_parity() {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1");
         return;
     };
-    // Decode shape: M=1 (dispatches to the WMMA kernels under default GRIM_WMM_MAX_M=4).
+    // Decode shape: M=1. NOTE: this test checks NUMBERS ONLY, so it does not by
+    // itself prove the WMMA kernel ran — it passes through any correct path.
+    // `wmma_quant_partial_m_parity_and_route` adds the route-counter assertion.
+    // (The previous comment here claimed M=1 "dispatches to the WMMA kernels
+    // under default GRIM_WMM_MAX_M=4"; that was stale — the tile gate required
+    // m % 16 == 0, so M=1 fell through to the non-WMMA fallback, and
+    // GRIM_WMM_MAX_M is not consulted in this arm at all.)
     run_case(
         &dev,
         1,
@@ -226,4 +235,66 @@ fn pack_q8_0(data: &[f32]) -> Result<Vec<u8>, grim_tensor::error::Error> {
 fn f16_deq(blk: &[u8]) -> f32 {
     // little-endian fp16 scale at block start
     half::f16::from_le_bytes([blk[0], blk[1]]).to_f32()
+}
+
+/// Numeric AND routing guard for PARTIAL-M dispatch to the f16-WMMA kernels.
+///
+/// `wmma_quant_tile_ok` required `m % 16 == 0`, which excluded every real
+/// prefill shape (the 9B's 5-token prompt is M=5; a 4K prompt is M=4056). The
+/// clause is gone, so this test pins both halves of the contract:
+///
+///   1. ROUTING — the dispatch reaches `grim_wmma_fused_dequant_q4k` at a
+///      partial M, asserted through the launch route counter rather than
+///      inferred. This is the half the sibling numeric tests cannot see.
+///   2. NUMBERS — the output matches a host oracle that dequantizes the packed
+///      weights itself (`ref_matmul` + `grim_quant::dequant_q4k`), which is what
+///      proves the partial tile's out-of-range rows are ZERO-FILLED instead of
+///      reading past the end of A or writing past the end of C.
+///
+/// M brackets the 16-row WMMA fragment height: 1 and 3 are a single partial
+/// tile, 5 is the production prefill shape, and 17 crosses into a second tile
+/// (one full tile plus one row), so both the masked tail and the tile-crossing
+/// path are exercised. The fragment-height independence of `load_matrix_sync`
+/// is the property under test (FlyDSL `kernels/gemm/rdna_f16_gemm.py`, written
+/// for gfx120x, documents the same 16x16x16 atom for this card).
+#[test]
+#[ignore]
+fn wmma_quant_partial_m_parity_and_route() {
+    let Some(dev) = gpu_device() else {
+        eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1");
+        return;
+    };
+    for m in [1usize, 3, 5, 17] {
+        grim_backend_rocm::reset_kernel_route_counters();
+        run_case(
+            &dev,
+            m,
+            1024,
+            1024,
+            KQuantScheme::Q4K,
+            grim_tensor::QuantFormat::Q4K,
+            &quant_q4k,
+            &|blk, n| grim_quant::dequant_q4k(blk, n).unwrap(),
+        );
+        let wmma =
+            grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
+        let tiled =
+            grim_backend_rocm::rocm_kernel_route_counter("grim_fused_dequant_gemm_q4k_tiled");
+        let ksplit =
+            grim_backend_rocm::rocm_kernel_route_counter("grim_fused_dequant_gemm_q4k_ksplit");
+        eprintln!("[wmma-partial-m] m={m} wmma={wmma} tiled={tiled} ksplit={ksplit}");
+        assert!(
+            wmma > 0,
+            "m={m}: a partial-M tile must reach the f16-WMMA kernel; the route counter saw \
+             wmma={wmma} tiled={tiled} ksplit={ksplit}"
+        );
+        assert_eq!(
+            tiled, 0,
+            "m={m}: the LDS-tiled fallback must not serve this shape"
+        );
+        assert_eq!(
+            ksplit, 0,
+            "m={m}: the K-split decode kernel must not serve this shape"
+        );
+    }
 }

@@ -187,7 +187,7 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q4k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 256) {
+                } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 256) {
                     self.launch_wmma_fused_dequant_q4k(
                         a_storage,
                         b_storage,
@@ -283,7 +283,7 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q5k(
                         a_storage,
                         b_storage,
@@ -468,7 +468,7 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q6k(
                         a_storage,
                         b_storage,
@@ -549,7 +549,7 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q2k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q2k(
                         a_storage,
                         b_storage,
@@ -645,7 +645,7 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q3k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
-                } else if is_rdna34 && wmma_quant_tile_ok(wave32, m, n, k, 16) {
+                } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q3k(
                         a_storage,
                         b_storage,
@@ -2306,8 +2306,52 @@ fn fence_act_quant(dev: &RocmDevice, quantize_stream: *mut c_void) {
     }
 }
 
+/// Whether a quantized GEMM may use the f16-WMMA matrix-core path.
+///
+/// The M extent is deliberately UNCONSTRAINED (`m > 0` only). The kernel masks
+/// every partial tile — A fill `(row < M && kk < K) ? A[...] : 0`, B dequant
+/// guarded by `col < N && kk < K` else zeros, C store `row < M && col < N` — so
+/// `m % 16 == 0` was never a correctness requirement, and it excluded every real
+/// prefill shape: the 9B's 5-token prompt is M=5 and a 4K-token prompt is
+/// M=4056, neither a multiple of 16.
+///
+/// Reference for the tiling: FlyDSL `kernels/gemm/rdna_f16_gemm.py`, written for
+/// gfx120x (this card), documents the 16x16x16 WMMA atom and that the fragment
+/// load does not require the M extent to be a multiple of the fragment height
+/// (`load_matrix_sync` from rocWMMA, which grim's kernel already uses).
+/// `partial_m_tiles_are_accepted` pins this contract.
+///
+/// `k % blk` is a genuine format precondition: a packed row is whole quant
+/// blocks and the dequant indexes `kk / blk`. `n % 64` is conservative rather
+/// than required (the kernel masks columns too); retained because no measured
+/// shape needs it relaxed, and pinned by the same test so relaxing it later is a
+/// deliberate act.
 fn wmma_quant_tile_ok(wave32: bool, m: usize, n: usize, k: usize, blk: usize) -> bool {
-    wave32 && m % 16 == 0 && n % 64 == 0 && k % blk == 0
+    m > 0 && wave32 && n % 64 == 0 && k % blk == 0
+}
+
+/// Policy switch for the f16-WMMA quantized path, split into a pure predicate so
+/// it can be tested without mutating process-global environment state (the same
+/// reason `u4_lane_cache_enabled_for` exists).
+fn wmma_quant_enabled_for(raw: Option<&str>) -> bool {
+    !matches!(raw, Some("0" | "false" | "off"))
+}
+
+/// Whether the f16-WMMA matrix-core path may serve quantized GEMMs at all.
+///
+/// Default ON. `GRIM_WMM_QUANT=0` restores the pre-change routing — it is the
+/// A/B control for the partial-M tile-gate change (without it there is no way to
+/// measure the tiled fallback against the matrix-core path on the same build)
+/// and the rollback switch if the WMMA path misbehaves on some model.
+fn wmma_quant_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| wmma_quant_enabled_for(std::env::var("GRIM_WMM_QUANT").ok().as_deref()))
+}
+
+/// Shape gate AND policy, the single predicate the five per-scheme dispatch arms
+/// consult.
+fn wmma_quant_path_ok(wave32: bool, m: usize, n: usize, k: usize, blk: usize) -> bool {
+    wmma_quant_enabled() && wmma_quant_tile_ok(wave32, m, n, k, blk)
 }
 
 /// Whether decode GEMVs should use the exact fused-dequant leg instead of
@@ -2332,4 +2376,66 @@ pub(crate) fn exact_decode_gemv() -> bool {
             Ok("0" | "false" | "off")
         )
     })
+}
+
+#[cfg(test)]
+mod wmma_tile_gate_tests {
+    use super::wmma_quant_tile_ok;
+
+    /// RED/GREEN guard for the M clause of the WMMA tile gate.
+    ///
+    /// The f16-WMMA quantized kernel masks EVERY partial tile: the A fill is
+    /// `(row < M && kk < K) ? A[...] : 0`, the B dequant is guarded by
+    /// `col < N && kk < K` (else zeros), and the C store is guarded by
+    /// `row < M && col < N`. So a row count that is not a multiple of the
+    /// 16-row WMMA tile is already handled correctly, and requiring
+    /// `m % 16 == 0` only kept the matrix-core path away from real prefill
+    /// shapes (the 9B's is M=5).
+    ///
+    /// Reference for the tiling: FlyDSL `kernels/gemm/rdna_f16_gemm.py`, which
+    /// is written for gfx120x (this card) and documents the 16x16x16 WMMA atom,
+    /// the 2x2 wave layout and the K-padded LDS tiles; and rocWMMA's
+    /// `load_matrix_sync`/`store_matrix_sync`, whose fragment load does not
+    /// require the M extent to be a multiple of the fragment height.
+    #[test]
+    fn partial_m_tiles_are_accepted() {
+        const BLK: usize = 256;
+        // Accepted for ANY M: the kernel masks the tail rows.
+        for m in [1usize, 5, 15, 16, 17, 251] {
+            assert!(
+                wmma_quant_tile_ok(true, m, 64, 256, BLK),
+                "m={m} must be accepted: the WMMA kernel masks rows >= M"
+            );
+        }
+        // Still rejected: these are real preconditions, not conservatism.
+        assert!(
+            !wmma_quant_tile_ok(false, 5, 64, 256, BLK),
+            "wave64 (CDNA) has no WMMA path"
+        );
+        assert!(
+            !wmma_quant_tile_ok(true, 5, 64, 255, BLK),
+            "k must be a multiple of the quant block: rows are whole blocks"
+        );
+        // And the N clause is retained conservatively (the kernel masks columns
+        // too, so this one is stricter than necessary) — pinned so that
+        // relaxing it later is a deliberate, tested act rather than a drive-by.
+        assert!(
+            !wmma_quant_tile_ok(true, 5, 63, 256, BLK),
+            "n % 64 is retained: conservative, not required by the kernel"
+        );
+    }
+
+    /// The A/B control must be reachable without mutating the environment:
+    /// `wmma_quant_enabled_for` is the pure predicate the OnceLock wraps, so the
+    /// opt-out is tested as a value rather than by `set_var` (which would race
+    /// every other test in the binary that reads the same variable).
+    #[test]
+    fn policy_switch_defaults_on_and_opts_out() {
+        assert!(super::wmma_quant_enabled_for(None), "unset must mean ON");
+        assert!(super::wmma_quant_enabled_for(Some("1")));
+        assert!(super::wmma_quant_enabled_for(Some("true")));
+        assert!(!super::wmma_quant_enabled_for(Some("0")));
+        assert!(!super::wmma_quant_enabled_for(Some("false")));
+        assert!(!super::wmma_quant_enabled_for(Some("off")));
+    }
 }
