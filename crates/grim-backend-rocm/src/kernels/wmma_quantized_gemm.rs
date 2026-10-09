@@ -32,21 +32,38 @@ __device__ __forceinline__ void grim_deq_q4k(const unsigned char* blk, int w, fl
     float dmin = fp16_to_float_device(h[1]);
     const unsigned char* scales = blk + 4;
     const unsigned char* qs = blk + 16;
+
+    // The eight weights of one call are EIGHT CONTIGUOUS qs bytes sharing ONE
+    // 6-bit scale pair: for wv = w..w+7, k = wv/64 and (off >= 32) are constant
+    // (runs are 8-aligned and 32 is a multiple of 8), so qsb = 32*k + (w%64) + e,
+    // a multiple of 8 and therefore 8-byte aligned whenever the block base is
+    // (144 = 18*8, so every block in a row is). Two 4-byte loads replace eight
+    // 1-byte loads: the direct path issued ~10 scalar 1-byte loads per call with
+    // each lane on a DIFFERENT column's block, i.e. ~32 sectors per warp load
+    // instruction. Multiplication order is unchanged (`d * sc * q` still
+    // evaluates as `(d * sc) * q`).
+    const int k = w / 64;
+    const int off0 = w % 64;
+    const int s = 2 * k + (off0 >= 32 ? 1 : 0);
+    const int qsb = 32 * k + (off0 & 31);
+    unsigned char sc, m;
+    if (s < 4) { sc = scales[s] & 63; m = scales[s + 4] & 63; }
+    else {
+        sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
+        m = (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4);
+    }
+    const float ds = d * (float)sc;
+    const float dm = dmin * (float)m;
+    const bool low = off0 < 32;
+
+    unsigned int qw_lo, qw_hi;
+    __builtin_memcpy(&qw_lo, qs + qsb, 4);
+    __builtin_memcpy(&qw_hi, qs + qsb + 4, 4);
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        int wv = w + e;
-        int k = wv / 64, off = wv % 64;
-        int s = 2 * k + (off >= 32 ? 1 : 0);
-        int j = off & 31;
-        unsigned char sc, m;
-        if (s < 4) { sc = scales[s] & 63; m = scales[s + 4] & 63; }
-        else {
-            sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
-            m = (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4);
-        }
-        int qsb = 32 * k + j;
-        unsigned char q = (off < 32) ? (qs[qsb] & 0x0F) : (qs[qsb] >> 4);
-        out[e] = d * (float)sc * (float)q - dmin * (float)m;
+        const unsigned int byte = (e < 4) ? (qw_lo >> (8 * e)) : (qw_hi >> (8 * (e - 4)));
+        const unsigned int q = low ? (byte & 0x0Fu) : (byte >> 4);
+        out[e] = ds * (float)q - dm;
     }
 }
 
@@ -201,47 +218,6 @@ fn wmma_quant_kernel_source(
 // Four B tiles per block amortize A load + LDS barriers over 4 mma_sync;
 // multi-wave blocks give cross-wave LDS-latency hiding. Requires
 // workgroup-scope sync (__syncthreads) - wave_barrier races across waves.
-// One 16-element K slice of the A and B tiles, filled into LDS.
-//
-// Extracted from the kernel body so the double-buffered pipeline below can call
-// it for either stage. `lds_b` is a pointer-to-array so one function serves the
-// per-stage sub-array (`lds_b[stage]`).
-__device__ __forceinline__ void grim_wmma_fill_stage_{fmt}{a_suffix}(
-    _Float16* lds_a, _Float16 (*lds_b)[16 * 16],
-    const {a_ty}* __restrict__ A, const unsigned char* __restrict__ B_q,
-    int tid, int row_base, int col_base, int k0,
-    int M, int N, int K, int n_blocks_per_row)
-{{
-    for (int idx = tid; idx < 256; idx += 128) {{
-        int i = idx / 16;
-        int j = idx % 16;
-        int row = row_base + i;
-        int kk = k0 + j;
-        lds_a[idx] = (row < M && kk < K) ? {a_cast}A[row * K + kk] : (_Float16)0;
-    }}
-    for (int idx = tid; idx < 128; idx += 128) {{
-        int t = idx / 32;
-        int rem = idx % 32;
-        int r = rem / 2;
-        int half = rem % 2;
-        int col = col_base + t * 16 + r;
-        int kk = k0 + half * 8;
-        _Float16* dst = lds_b[t] + r * 16 + half * 8;
-        if (col < N && kk < K) {{
-            const unsigned char* blkptr = B_q
-                + (long long)col * n_blocks_per_row * {bytes}
-                + (long long)(kk / {blk}) * {bytes};
-            float acc[8];
-            {deq_fn}(blkptr, kk % {blk}, acc);
-            #pragma unroll
-            for (int e = 0; e < 8; ++e) dst[e] = (_Float16)acc[e];
-        }} else {{
-            #pragma unroll
-            for (int e = 0; e < 8; ++e) dst[e] = (_Float16)0;
-        }}
-    }}
-}}
-
 extern "C" __global__ void grim_wmma_fused_dequant_{fmt}{a_suffix}(
     const {a_ty}* __restrict__ A,
     const unsigned char* __restrict__ B_q,
@@ -256,19 +232,8 @@ extern "C" __global__ void grim_wmma_fused_dequant_{fmt}{a_suffix}(
     const int n_blocks_per_row = K / {blk};
     const int tid = threadIdx.x;              // 0..127
 
-    // DOUBLE-BUFFERED LDS (two stages).
-    //
-    // The single-buffered version paid THREE __syncthreads() per 16-element K
-    // step and serialised fill -> frag_a -> fill -> MMA -> fill, so every global
-    // dequant load latency was exposed: measured 2.06 us per K step, and 38x off
-    // the kernel's ALU bound overall (see tests/wmma_q4k_shape_bench.rs, which
-    // also shows the per-tile cost FALLING as the grid grows — the signature of
-    // latency exposure rather than throughput). With two stages the next slice's
-    // global loads are issued BEFORE the current slice's MMAs, so that latency
-    // overlaps compute, and one barrier per step orders the stages against each
-    // other. This is the multi-stage LDS pipeline of AMD's low-latency-GEMM work.
-    __shared__ _Float16 lds_a[2][16 * 16];      // 2 x 512 B
-    __shared__ _Float16 lds_b[2][4][16 * 16];   // 2 x 2 KB
+    __shared__ _Float16 lds_a[16 * 16];       // 512 B
+    __shared__ _Float16 lds_b[4][16 * 16];    // 2 KB
 
     fragment<matrix_a, 16, 16, 16, _Float16, row_major> frag_a;
     fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b[4];
@@ -276,33 +241,50 @@ extern "C" __global__ void grim_wmma_fused_dequant_{fmt}{a_suffix}(
     #pragma unroll
     for (int t = 0; t < 4; ++t) fill_fragment(frag_c[t], 0.0f);
 
-    const int n_k_steps = (K + 15) / 16;
-
-    // Prologue: stage 0 holds K slice 0.
-    grim_wmma_fill_stage_{fmt}{a_suffix}(
-        lds_a[0], lds_b[0], A, B_q, tid, row_base, col_base, 0,
-        M, N, K, n_blocks_per_row);
-    __syncthreads();
-
-    for (int it = 0; it < n_k_steps; ++it) {{
-        const int cur = it & 1;
-        // Prefetch the NEXT slice into the other stage. These are the global
-        // dequant loads; issuing them before the MMAs is the whole point.
-        if (it + 1 < n_k_steps) {{
-            grim_wmma_fill_stage_{fmt}{a_suffix}(
-                lds_a[cur ^ 1], lds_b[cur ^ 1], A, B_q, tid, row_base, col_base,
-                (it + 1) * 16, M, N, K, n_blocks_per_row);
+    for (int k0 = 0; k0 < K; k0 += 16) {{
+        // Coop A fill: 2 elems/thread.
+        for (int idx = tid; idx < 256; idx += 128) {{
+            int i = idx / 16;
+            int j = idx % 16;
+            int row = row_base + i;
+            int kk = k0 + j;
+            lds_a[idx] = (row < M && kk < K) ? {a_cast}A[row * K + kk] : (_Float16)0;
         }}
-        load_matrix_sync(frag_a, lds_a[cur], 16);
+        __syncthreads();
+        load_matrix_sync(frag_a, lds_a, 16);
+
+        // Coop B fill: each thread owns one (tile, row, 8-k-run) slot:
+        // 4 tiles x 16 rows x 2 halves = 128 slots = 1 per thread.
+        // 8 consecutive k-elems stay inside one dequant block (k0 steps 16,
+        // halves are 8-aligned) -> one scale load, contiguous codes.
+        for (int idx = tid; idx < 128; idx += 128) {{
+            int t = idx / 32;               // B tile 0..3
+            int rem = idx % 32;
+            int r = rem / 2;                // weight row 0..15
+            int half = rem % 2;             // 8-elem run 0..1
+            int col = col_base + t * 16 + r;
+            int kk = k0 + half * 8;
+            _Float16* dst = lds_b[t] + r * 16 + half * 8;
+            if (col < N && kk < K) {{
+                const unsigned char* blkptr = B_q
+                    + (long long)col * n_blocks_per_row * {bytes}
+                    + (long long)(kk / {blk}) * {bytes};
+                float acc[8];
+                {deq_fn}(blkptr, kk % {blk}, acc);
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) dst[e] = (_Float16)acc[e];
+            }} else {{
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) dst[e] = (_Float16)0;
+            }}
+        }}
+        __syncthreads();
         #pragma unroll
         for (int t = 0; t < 4; ++t) {{
-            load_matrix_sync(frag_b[t], lds_b[cur][t], 16);
+            load_matrix_sync(frag_b[t], lds_b[t], 16);
             mma_sync(frag_c[t], frag_a, frag_b[t], frag_c[t]);
         }}
-        // One barrier per step. It orders this step's prefetch writes against the
-        // next iteration's reads of that stage (last read two iterations ago, so
-        // no read/write hazard on the stage being written now).
-        __syncthreads();
+        __syncthreads(); // LDS reuse next iteration
     }}
 
     __shared__ float c_out[4][16 * 16];
