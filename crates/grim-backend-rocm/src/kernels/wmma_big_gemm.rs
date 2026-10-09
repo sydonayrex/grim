@@ -26,11 +26,24 @@
 //! 256-weight block is whole). Partial M/N tiles are masked: A rows >= M and
 //! columns >= N are zero-filled, and the C store guards `row < M && col < N`.
 
-pub const KERNEL_SOURCE: &str = r#"
-#define BIG_BM 64
-#define BIG_BN 64
+/// Kernel source template. Two geometries ship from it:
+/// 64x64/128thr (`grim_wmma_big_q4k`) and 128x64/256thr (`grim_wmma_big128_q4k`).
+/// BM=128 halves the weight passes again (prefill is weight-traffic-bound);
+/// BN stays 64 because the C quadrant staging is what would blow the 64 KB
+/// LDS/workgroup budget at 128x128 (sA 20 KB + sB 10 KB + 8 quadrants 32 KB
+/// = 62 KB for 128x64; 104 KB for 128x128 — does not fit).
+pub const TEMPLATE: &str = r#"
+#define BIG_BM __BM__
+#define BIG_BN __BN__
 #define BIG_BK 32
 #define BIG_LD (BIG_BK + 8)
+#define BIG_THREADS __THREADS__
+#define BIG_WAVES (BIG_THREADS / 32)
+#define BIG_WN (BIG_BN / 32)
+#define BIG_NAME __NAME__
+
+#ifndef GRIM_BIG_HELPERS
+#define GRIM_BIG_HELPERS
 
 // f16 -> f32, bit-exact (standalone TU: no shared header helpers).
 __device__ __forceinline__ float grim_big_f16(unsigned short v) {
@@ -79,14 +92,17 @@ __device__ __forceinline__ void grim_big_deq_q4k(
 // Large-M fused-dequant GEMM: C[M,N] = A[M,K] @ dequant(B_q[N,K])^T, Q4_K.
 
 // Fill one 32-wide K slice of both LDS tiles. Explicit parameters, no captures.
+// Geometry comes in as parameters: this helper is compiled ONCE (the
+// include-once guard below) but serves both tile geometries — macro-based
+// sizes here would bake the 64-tile constants into the 128-tile's fills.
 __device__ __forceinline__ void grim_big_fill_stage(
     _Float16* sA, _Float16* sB,
     const float* __restrict__ A, const unsigned char* __restrict__ B_q,
     int tid, int row_base, int col_base, int k0,
-    int M, int N, int K, long long row_bytes)
+    int M, int N, int K, long long row_bytes, int bm, int threads)
 {
     const int w_base = (k0 / 32) % 8 * 32;
-    for (int idx = tid; idx < BIG_BM * BIG_BK; idx += 128) {
+    for (int idx = tid; idx < bm * BIG_BK; idx += threads) {
         const int rr = idx / BIG_BK;
         const int kk = idx % BIG_BK;
         const int row = row_base + rr;
@@ -94,7 +110,7 @@ __device__ __forceinline__ void grim_big_fill_stage(
         sA[rr * BIG_LD + kk] = (row < M && kg < K)
             ? (_Float16)A[(long long)row * K + kg] : (_Float16)0;
     }
-    for (int idx = tid; idx < BIG_BN * (BIG_BK / 8); idx += 128) {
+    for (int idx = tid; idx < BIG_BN * (BIG_BK / 8); idx += BIG_THREADS) {
         const int cc = idx / (BIG_BK / 8);
         const int rr = idx % (BIG_BK / 8);
         const int col = col_base + cc;
@@ -114,7 +130,9 @@ __device__ __forceinline__ void grim_big_fill_stage(
     }
 }
 
-extern "C" __global__ void grim_wmma_big_q4k(
+#endif  // GRIM_BIG_HELPERS
+
+extern "C" __global__ void BIG_NAME(
     const float* __restrict__ A, const unsigned char* __restrict__ B_q,
     float* __restrict__ C, int M, int N, int K)
 {
@@ -122,15 +140,15 @@ extern "C" __global__ void grim_wmma_big_q4k(
     const int row_base = blockIdx.y * BIG_BM;
     const int tid = threadIdx.x;          // 0..127, 4 waves
     const int wave = tid >> 5;            // 0..3
-    const int wm = wave >> 1;             // row half 0..1
-    const int wn = wave & 1;              // col half 0..1
+    const int wm = wave / BIG_WN;         // row quadrant 0..BIG_BM/32
+    const int wn = wave % BIG_WN;         // col quadrant 0..BIG_BN/32
 
     const int n_blocks = K / 256;
     const long long row_bytes = (long long)n_blocks * 144;
 
     __shared__ _Float16 sA[2][BIG_BM * BIG_LD];   // 2 x 5 KB
     __shared__ _Float16 sB[2][BIG_BN * BIG_LD];   // 2 x 5 KB
-    __shared__ float cq[4][32 * 32];              // per-wave quadrant, 4 KB
+    __shared__ float cq[BIG_WAVES][32 * 32];              // per-wave quadrant, 4 KB
 
     using namespace rocwmma;
     fragment<matrix_a, 16, 16, 16, _Float16, row_major> fa[2][2];   // [mi][kh]
@@ -143,7 +161,7 @@ extern "C" __global__ void grim_wmma_big_q4k(
             fill_fragment(fc[mi][ni], 0.0f);
 
     grim_big_fill_stage(sA[0], sB[0], A, B_q, tid, row_base, col_base,
-                        0, M, N, K, row_bytes);
+                        0, M, N, K, row_bytes, BIG_BM, BIG_THREADS);
     __syncthreads();
 
     const int n_k_steps = K / BIG_BK;
@@ -154,7 +172,7 @@ extern "C" __global__ void grim_wmma_big_q4k(
         if (it + 1 < n_k_steps)
             grim_big_fill_stage(sA[buf ^ 1], sB[buf ^ 1], A, B_q, tid,
                                 row_base, col_base, (it + 1) * BIG_BK,
-                                M, N, K, row_bytes);
+                                M, N, K, row_bytes, BIG_BM, BIG_THREADS);
         #pragma unroll
         for (int kh = 0; kh < 2; ++kh) {
             #pragma unroll
@@ -200,3 +218,21 @@ extern "C" __global__ void grim_wmma_big_q4k(
     }
 }
 "#;
+
+pub fn kernel_source(kernel_name: &str, bm: usize, bn: usize, threads: usize) -> String {
+    TEMPLATE
+        .replace("__BM__", &bm.to_string())
+        .replace("__BN__", &bn.to_string())
+        .replace("__THREADS__", &threads.to_string())
+        .replace("__NAME__", kernel_name)
+}
+
+/// The 64x64 tile (dispatched at 64 <= m < 128).
+pub fn big64_source() -> String {
+    kernel_source("grim_wmma_big_q4k", 64, 64, 128)
+}
+
+/// The 128x64 tile (dispatched at m >= 128).
+pub fn big128_source() -> String {
+    kernel_source("grim_wmma_big128_q4k", 128, 64, 256)
+}

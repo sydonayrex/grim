@@ -325,18 +325,27 @@ fn wmma_big_q4k_large_m_parity_and_route() {
             &|blk, n| grim_quant::dequant_q4k(blk, n).unwrap(),
         );
         let big = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big_q4k");
+        let big128 = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big128_q4k");
         let small = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
-        eprintln!("[big-q4k] m={m} big={big} small16={small}");
+        eprintln!("[big-q4k] m={m} big={big} big128={big128} small16={small}");
         // The high-nibble mask defect is fixed (missing & 0x0F on the w>=32
-        // path of grim_big_deq_q4k — see tests/big_q4k_probe.rs), so the
-        // big-tile kernel serves every m >= 64.
-        assert!(
-            big > 0,
-            "m={m}: the big-tile kernel must serve large-M prefill"
-        );
+        // path of grim_big_deq_q4k — see tests/big_q4k_probe.rs). m >= 128
+        // takes the 128x64 tile (one weight pass per 128 rows), 64 <= m < 128
+        // the 64x64 tile.
+        if m >= 128 {
+            assert!(
+                big128 > 0,
+                "m={m}: the 128x64 tile must serve large-M prefill"
+            );
+        } else {
+            assert!(
+                big > 0,
+                "m={m}: the 64x64 tile must serve 64 <= m < 128"
+            );
+        }
         assert_eq!(
-            small, 0,
-            "m={m}: the 16-row kernel must not serve shapes the big tile owns"
+            big + big128 + small, 1,
+            "m={m}: exactly one WMMA tile kernel must serve this shape"
         );
     }
 }

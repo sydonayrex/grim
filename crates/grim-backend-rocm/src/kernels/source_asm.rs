@@ -46,7 +46,8 @@ pub fn compute_kernel_source() -> String {
     // Consolidated cooperative-LDS source — generated, not a const (KERNEL_SOURCE is empty).
     s.push_str(&crate::kernels::wmma_quantized_gemm::quant_kernel_source());
     // SPEED-ROC-BIG: 64x64x32 fused-dequant WMMA GEMM for large-M prefill (Q4_K).
-    s.push_str(crate::kernels::wmma_big_gemm::KERNEL_SOURCE);
+    s.push_str(&crate::kernels::wmma_big_gemm::big64_source());
+    s.push_str(&crate::kernels::wmma_big_gemm::big128_source());
     // SPEED-ROC: WMMA fused-dequant IQ-family GEMM (RDNA3/4).
     // Must come AFTER iq_gemm (reuses dequant_iqXX device helpers).
     s.push_str(crate::kernels::wmma_iq_gemm::KERNEL_SOURCE);

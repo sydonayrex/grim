@@ -642,6 +642,65 @@ impl RocmDevice {
         self.launch_wmma_big_q4k(a_storage, b_storage, out_storage, m, n, k)
     }
 
+    /// 128x64-tile twin of [`Self::launch_wmma_big_q4k`]: one weight pass per
+    /// 128 rows. BN stays 64 to hold the C quadrant staging inside the
+    /// 64 KB LDS/workgroup budget (see kernels/wmma_big_gemm.rs).
+    pub(crate) fn launch_wmma_big128_q4k(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_big128_q4k: a has no device ptr".into()))?;
+        let b_ptr = b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_big128_q4k: b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("wmma_big128_q4k: out has no device ptr".into()))?;
+        let grid_x = n.div_ceil(64) as u32;
+        let grid_y = m.div_ceil(128) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_wmma_big128_q4k",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Public A/B wrapper (bench + parity harness entry).
+    pub fn launch_wmma_big128_q4k_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_big128_q4k(a_storage, b_storage, out_storage, m, n, k)
+    }
+
     /// SPEED-ROC: WMMA fused-dequant Q5_K GEMM launcher (RDNA3/4).
     #[allow(dead_code)]
     pub(crate) fn launch_wmma_fused_dequant_q5k(
