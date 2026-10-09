@@ -144,6 +144,13 @@ extern "C" __global__ void grim_wmma_big_q4k(
                         0, M, N, K, row_bytes);
     __syncthreads();
 
+    // PROBE DUMP (temporary): sA stage 0 then stage 1 to C, return.
+    for (int idx = tid; idx < BIG_BM * BIG_LD; idx += 128)
+        C[idx] = (float)sA[0][idx];
+    for (int idx = tid; idx < BIG_BM * BIG_LD; idx += 128)
+        C[BIG_BM * BIG_LD + idx] = (float)sA[1][idx];
+    return;
+
     const int n_k_steps = K / BIG_BK;
     for (int it = 0; it < n_k_steps; ++it) {
         const int buf = it & 1;
