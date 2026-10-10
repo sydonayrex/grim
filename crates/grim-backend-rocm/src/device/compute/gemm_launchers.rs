@@ -3066,8 +3066,19 @@ impl RocmDevice {
         let cache_key =
             u4_lane_cache_enabled().then(|| u4_lane_cache_key(&packed, n, k, scheme, converter));
 
+        if std::env::var("GRIM_U4_TRACE").is_ok() {
+            eprintln!(
+                "[u4-trace] key={:?} dir={:?} enabled={}",
+                cache_key.map(|k| format!("{k:016x}")),
+                u4_lane_cache_dir(),
+                u4_lane_cache_enabled()
+            );
+        }
         if let (Some(key), Some(dir)) = (cache_key, u4_lane_cache_dir()) {
             if let Some((qw, sc, zr)) = u4_lane_cache_read(&dir, key, converter, n, k) {
+                if std::env::var("GRIM_U4_TRACE").is_ok() {
+                    eprintln!("[u4-trace] HIT key={key:016x} [{n},{k}]");
+                }
                 return self.whitecrow_from_host_bytes(qw, sc, zr, n, k);
             }
         }
@@ -3271,7 +3282,16 @@ impl RocmDevice {
                 return Ok(None);
             }
         }
+        let u4_trace = std::env::var("GRIM_U4_TRACE").is_ok();
+        let u4_t0 = std::time::Instant::now();
         let converted = Arc::new(self.requant_kquant_to_whitecrow(w, n, k, scheme)?);
+        if u4_trace {
+            eprintln!(
+                "[u4-trace] requant [{n},{k}] {:?} ({} MiB packed)",
+                u4_t0.elapsed(),
+                w.bytes / (1024 * 1024)
+            );
+        }
         guard.insert(key, Some(converted.clone()));
         Ok(Some(converted))
     }
@@ -3294,6 +3314,7 @@ impl RocmDevice {
         // qweight is u32 WORDS ([N, K/8] words, 4 B each) — the W4A4 kernel
         // indexes it as `const unsigned int*`. Uploading as U8 truncated the
         // buffer to a quarter and the kernel read garbage.
+        let wc_t0 = std::time::Instant::now();
         let qweight = MemoryOps::from_cpu_bytes(
             self as &dyn BackendDevice,
             &qw,
@@ -3318,6 +3339,9 @@ impl RocmDevice {
                 storage: DTypeStorage::Native,
             },
         )?;
+        if std::env::var("GRIM_U4_TRACE").is_ok() {
+            eprintln!("[u4-trace] upload [{}x{}] {:?}", n, k, wc_t0.elapsed());
+        }
         Ok(WhiteCrowDecodedWeights {
             qweight,
             scales,

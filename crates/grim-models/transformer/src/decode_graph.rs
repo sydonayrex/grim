@@ -36,6 +36,19 @@ pub trait DecodeGraphModel: Send + Sync {
     /// Allocate or retrieve a fixed decode buffer pool for this model.
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph>;
 
+    /// Populate the decode-only u4-lane weight memo for every K-quant linear
+    /// in the model.
+    ///
+    /// Pure preparation: it reads no session state and writes none, and the
+    /// weights it converts are read-only, so it may run on a background thread
+    /// while prefill drives the SAME weights through their packed route. The
+    /// first decode step would otherwise pay this on the critical path —
+    /// measured 3.5 s for the Qwen3.5-9B (201 tensors: D2H of the packed
+    /// weight for the cache key, the on-disk lane read, then the H2D upload).
+    fn prewarm_lane_weights(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Record a decode step (single token) into the provided DecodeGraph bracket.
     fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()>;
 
@@ -1596,6 +1609,73 @@ impl Qwen35Block {
 // ─── DecodeGraphModel implementation for Qwen3.5 ───────────────────────────
 
 impl DecodeGraphModel for Qwen35 {
+    /// Convert every K-quant linear's weight to u4 lanes NOW, so the first
+    /// decode step does not pay it (measured 3.5 s for the 9B: 201 tensors,
+    /// packed-weight D2H for the cache key + on-disk lane read + H2D upload).
+    /// Best effort by design: a tensor that does not fit the VRAM budget is
+    /// skipped and keeps its own route, exactly as the lazy path would decide.
+    fn prewarm_lane_weights(&self) -> Result<()> {
+        use grim_backend_rocm::RocmStorage;
+        use grim_nn::modules::Linear;
+        use grim_tensor::Storage;
+        let dev = dev_for_qwen35(self)?;
+        let mut linears: Vec<&Linear> = Vec::new();
+        for b in &self.blocks {
+            for l in [
+                b.wq.as_ref(), b.wk.as_ref(), b.wv.as_ref(), b.wo.as_ref(),
+                b.attn_qkv.as_ref(), b.attn_gate.as_ref(), b.ssm_out.as_ref(),
+                b.ssm_alpha.as_ref(), b.ssm_beta.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                linears.push(l);
+            }
+            linears.push(&b.ffn_gate);
+            linears.push(&b.ffn_up);
+            linears.push(&b.ffn_down);
+        }
+        linears.push(&self.output);
+        let mut done = 0usize;
+        let mut skipped = 0usize;
+        for l in linears {
+            let w = l.weight();
+            let dims = w.shape().dims().to_vec();
+            let Some(&k) = dims.last() else { continue };
+            if k == 0 {
+                continue;
+            }
+            let scheme = match &w.dtype().storage {
+                Storage::KQuant(s) => *s,
+                _ => continue,
+            };
+            if !matches!(
+                scheme,
+                grim_tensor::KQuantScheme::Q4K
+                    | grim_tensor::KQuantScheme::Q5K
+                    | grim_tensor::KQuantScheme::Q6K
+                    | grim_tensor::KQuantScheme::Q3K
+                    | grim_tensor::KQuantScheme::IQ3S
+                    | grim_tensor::KQuantScheme::Q2K
+                    | grim_tensor::KQuantScheme::IQ4NL
+                    | grim_tensor::KQuantScheme::GsqRco3p5
+            ) {
+                continue;
+            }
+            let Some(wr) = w.storage().as_any().downcast_ref::<RocmStorage>() else {
+                continue;
+            };
+            let n = w.shape().elem_count() / k;
+            match dev.u4_lane_weights_budgeted(wr, n, k, scheme, true) {
+                Ok(Some(_)) => done += 1,
+                Ok(None) => skipped += 1,
+                Err(_) => skipped += 1,
+            }
+        }
+        eprintln!("[prewarm] u4 lane weights: {done} ready, {skipped} skipped");
+        Ok(())
+    }
+
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(

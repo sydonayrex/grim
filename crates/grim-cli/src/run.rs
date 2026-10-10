@@ -337,8 +337,15 @@ fn try_graph_decode_step(
                 // discarded — the seed below re-establishes prompt state
                 // afterwards, so warmup side effects (KV appends, conv-ring
                 // advances) can't desync graph state from the eager session.
+                let wt = std::time::Instant::now();
                 let _ = graph_model.forward_capture(&mut g, token_id);
+                let w1 = wt.elapsed();
+                let wt2 = std::time::Instant::now();
                 let _ = graph_model.forward_capture(&mut g, token_id);
+                let w2 = wt2.elapsed();
+                if std::env::var("GRIM_CAPTURE_TRACE").is_ok() {
+                    eprintln!("[capture-trace] warmup1={w1:?} warmup2={w2:?}");
+                }
 
                 if let Err(e) = seed_from_session!(g) {
                     graph_retry.note_fail(step);
@@ -364,8 +371,15 @@ fn try_graph_decode_step(
                     );
                     return None;
                 }
+                let bt = std::time::Instant::now();
                 let cap = graph_model.forward_capture(&mut g, token_id);
+                let rt = bt.elapsed();
+                let et = std::time::Instant::now();
                 let end = g.end_capture();
+                let et_d = et.elapsed();
+                if std::env::var("GRIM_CAPTURE_TRACE").is_ok() {
+                    eprintln!("[capture-trace] begin+record={rt:?} end+instantiate={et_d:?}");
+                }
                 if cap.is_err() || end.is_err() {
                     let _ = g.abort_capture();
                     graph_retry.note_fail(step);
@@ -1376,6 +1390,8 @@ pub async fn cmd_run(
     // i-was-dumb-graph.md Phase 5: full-model graph state. Allocated once,
     // reused for stable addresses. `None` + `graph_failed` = eager fallback.
     let mut ctx_exhausted = false;
+    // One-shot: the decode-only lane-weight prewarm overlaps the prefill.
+    let mut prewarm_done = false;
     let mut decode_graph: Option<grim_backend_rocm::FullDecodeGraph> = None;
     let mut graph_just_captured = false;
     let mut graph_retry = grim_backend_rocm::graph_capture::GraphRetryPolicy::default_policy();
@@ -1553,8 +1569,50 @@ pub async fn cmd_run(
                 sampler.sample(&last_logits_tensor, &history)?
             }
             None => {
-                let logits =
-                    CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?;
+                // Overlap the decode-only u4-lane weight conversion with the
+                // prefill (measured 3.5 s for the 9B when it lands on the
+                // first decode step: 201 tensors, packed-weight D2H + on-disk
+                // lane read + H2D). The prewarm reads the SAME weights
+                // read-only through their packed route and writes only its own
+                // lane buffers, so the two can share the device.
+                let gm_ref = resolve_graph_model(&*model);
+                // GRIM_PREWARM=0 keeps the pre-change behaviour (conversion on
+                // the first decode step) for A/B verification.
+                let prewarm_opt_out = matches!(
+                    std::env::var("GRIM_PREWARM").as_deref(),
+                    Ok("0" | "false" | "off")
+                );
+                let want_prewarm =
+                    is_prefill && !prewarm_done && gm_ref.is_some() && !prewarm_opt_out;
+                if is_prefill {
+                    prewarm_done = true;
+                }
+                let logits = if want_prewarm {
+                    std::thread::scope(|scope| {
+                        let handle = scope.spawn(|| {
+                            let t0 = std::time::Instant::now();
+                            let r = gm_ref.map(|gm| gm.prewarm_lane_weights());
+                            if std::env::var("GRIM_PREWARM_TRACE").is_ok() {
+                                eprintln!(
+                                    "[prewarm-trace] lane weights {:?} ok={:?}",
+                                    t0.elapsed(),
+                                    r.map(|x| x.is_ok())
+                                );
+                            }
+                        });
+                        let out = CausalLm::forward(
+                            &*model,
+                            &mut session,
+                            input_tensor,
+                            positions_tensor,
+                            &[],
+                        );
+                        let _ = handle.join();
+                        out
+                    })?
+                } else {
+                    CausalLm::forward(&*model, &mut session, input_tensor, positions_tensor, &[])?
+                };
                 let step_us = step_start.elapsed().as_micros() as u64;
                 if !is_prefill {
                     decode_total_us += step_us;
