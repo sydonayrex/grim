@@ -197,8 +197,18 @@ impl QuantOps for RocmDevice {
                 // masked in-kernel.
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
+                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
+                    }) {
+                        eprintln!("[big-gemm] Q4K m={m} n={n} k={k} -> launch_wmma_big128_q4k");
+                    }
                 } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
+                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
+                    }) {
+                        eprintln!("[big-gemm] Q4K m={m} n={n} k={k} -> launch_wmma_big_q4k");
+                    }
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 256) {
                     self.launch_wmma_fused_dequant_q4k(
                         a_storage,
@@ -297,8 +307,18 @@ impl QuantOps for RocmDevice {
                     }
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
+                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
+                    }) {
+                        eprintln!("[big-gemm] Q5K m={m} n={n} k={k} -> launch_wmma_big128_q5k");
+                    }
                 } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
+                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
+                    }) {
+                        eprintln!("[big-gemm] Q5K m={m} n={n} k={k} -> launch_wmma_big_q5k");
+                    }
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q5k(
                         a_storage,
@@ -486,8 +506,18 @@ impl QuantOps for RocmDevice {
                     }
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
+                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
+                    }) {
+                        eprintln!("[big-gemm] Q6K m={m} n={n} k={k} -> launch_wmma_big128_q6k");
+                    }
                 } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
+                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
+                    }) {
+                        eprintln!("[big-gemm] Q6K m={m} n={n} k={k} -> launch_wmma_big_q6k");
+                    }
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q6k(
                         a_storage,
@@ -2346,6 +2376,11 @@ fn fence_act_quant(dev: &RocmDevice, quantize_stream: *mut c_void) {
 /// than required (the kernel masks columns too); retained because no measured
 /// shape needs it relaxed, and pinned by the same test so relaxing it later is a
 /// deliberate act.
+/// Env-gated per-launch big-tile trace (GRIM_BIG_GEMM_TRACE): one line per
+/// big-tile GEMM with its shape, for per-GEMM accounting against the model's
+/// call sites. OnceLock'd like GRIM_DEBUG_ATTN_SHAPES (4f296464).
+pub(crate) static BIG_GEMM_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn wmma_quant_tile_ok(wave32: bool, m: usize, n: usize, k: usize, blk: usize) -> bool {
     m > 0 && wave32 && n % 64 == 0 && k % blk == 0
 }
