@@ -578,9 +578,25 @@ impl RecurrentOps for RocmDevice {
         let mut eps_f = eps;
         let mut has_z_i = i32::from(z_s.is_some());
 
-        let (grid, block) = linear_launch(num_value_heads * head_dim);
+        // v2 (one block per value head, block = head_dim) replaces v1's
+        // one-thread-per-(head,row) layout, which recomputed every head's
+        // k/q SiLU norms head_dim times per token and ran the head norm as a
+        // serial 32-thread tail pass. Measured 681.8 -> see
+        // tests/kda_scan_bench.rs. head_dim > 1024 cannot use v2 (shared
+        // arrays are 1024) and falls back to v1.
+        let (grid, block, kernel) = if head_dim <= 1024 {
+            (
+                num_value_heads as u32,
+                head_dim as u32,
+                "grim_kda_gated_delta_rule_scan_v2",
+            )
+        } else {
+            let (g, b) = linear_launch(num_value_heads * head_dim);
+            (g.x, b.x, "grim_kda_gated_delta_rule_scan")
+        };
+        let (grid, block) = (HipDim3::new(grid, 1, 1), HipDim3::new(block, 1, 1));
         self.launch_compute_kernel(
-            "grim_kda_gated_delta_rule_scan",
+            kernel,
             grid,
             block,
             &mut [

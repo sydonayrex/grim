@@ -2175,6 +2175,126 @@ extern "C" __global__ void grim_kda_head_norm_gate(
 // GPU KDA Recurrent Prefill scan kernel for seq_len > 1.
 // Runs across all value heads and recurrent state rows over time t in 0..seq_len.
 // Conv stream layout per token: [q (num_k * head_dim) | k (num_k * head_dim) | v (num_v * head_dim)].
+// v2 of the scan: one BLOCK per value head, thread j owns state row j.
+//
+// Why a rewrite (measured 2026-10-10, tests/kda_scan_bench.rs: 681.8 ms per
+// launch at the 9B geometry, seq=4056): v1 launches one thread per
+// (head, row) and every row-thread of a head RECOMPUTES the same k/q SiLU
+// norms each token — 3*head_dim^2 transcendental evaluations per head per
+// token where ~3*head_dim suffices — and the head norm runs as a serial
+// j==0 tail pass over all tokens on 32 threads after the main loop. v2
+// computes each SiLU once, reduces the norms with warp shuffles + shared
+// memory, and fuses the head norm into the token loop.
+//
+// launch contract: grid = (num_v), block = (head_dim), head_dim <= 1024.
+// No thread exits before the barriers: when head_dim < 32 the warp
+// reductions run over a partial warp, which is fine — every lane of warp 0
+// exists and participates.
+
+__device__ inline float kda_block_sum(float v, float* s_red) {
+    // full-warp shuffle reduction, then one value per warp into s_red,
+    // then warp 0 finishes. Callers must __syncthreads() before reading.
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_xor(v, off);
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (lane == 0) s_red[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        const int nwarp = (blockDim.x + 31) >> 5;
+        float w = (lane < nwarp) ? s_red[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            w += __shfl_xor(w, off);
+        if (lane == 0) s_red[0] = w;
+    }
+    __syncthreads();
+    return s_red[0];
+}
+
+extern "C" __global__ void grim_kda_gated_delta_rule_scan_v2(
+    const float* conv_out_seq,
+    const float* alpha_seq,
+    const float* beta_seq,
+    const float* dt_bias,
+    const float* ssm_a,
+    const float* norm_weight,
+    const float* z_seq,
+    float* S,
+    float* out_seq,
+    int seq_len, int num_v, int num_k, int head_dim, float eps, int has_z)
+{
+    const int h = blockIdx.x;
+    const int j = threadIdx.x;
+
+    __shared__ float s_nk[1024];
+    __shared__ float s_nq[1024];
+    __shared__ float s_vv[1024];
+    __shared__ float s_red[32];
+
+    const int key_dim = num_k * head_dim;
+    const int value_dim = num_v * head_dim;
+    const int conv_dim = 2 * key_dim + value_dim;
+    float* s_row = S + ((long long)h * head_dim + j) * head_dim;
+    const float rstd_d = rsqrtf((float)head_dim);
+
+    for (int t = 0; t < seq_len; ++t) {
+        const float* conv_tok = conv_out_seq + (long long)t * conv_dim;
+        const float* q_raw = conv_tok + (h % num_k) * head_dim;
+        const float* k_raw = conv_tok + key_dim + (h % num_k) * head_dim;
+        const float* v_raw = conv_tok + 2 * key_dim + h * head_dim;
+
+        const float kk = kda_silu_dev(k_raw[j]);
+        const float qq = kda_silu_dev(q_raw[j]);
+        const float vv = kda_silu_dev(v_raw[j]);
+
+        // per-head scalars, computed redundantly per thread (3 transcendentals;
+        // cheaper than broadcasting through shared memory with a barrier)
+        float alpha_t = alpha_seq[t * num_v + h];
+        float beta_t = beta_seq[t * num_v + h];
+        float gate = kda_softplus_dev(alpha_t + dt_bias[h]) * ssm_a[h];
+        float beta_val = 1.0f / (1.0f + expf(-beta_t));
+        float decay = expf(gate);
+
+        float kden = sqrtf(kda_block_sum(kk * kk, s_red) + eps);
+        float qden = sqrtf(kda_block_sum(qq * qq, s_red) + eps);
+
+        s_nk[j] = (kden > 0.0f) ? kk / kden : kk;
+        s_nq[j] = (qden > 0.0f) ? qq / qden : qq;
+        s_vv[j] = vv;
+        __syncthreads();
+
+        float pred = 0.0f;
+        for (int i = 0; i < head_dim; ++i)
+            pred += s_nk[i] * (decay * s_row[i]);
+        float delta = beta_val * (s_vv[j] - pred);
+
+        float a = 0.0f;
+        for (int i = 0; i < head_dim; ++i) {
+            float s2 = decay * s_row[i] + s_nk[i] * delta;
+            s_row[i] = s2;
+            a += s_nq[i] * s2;
+        }
+        const float a_scaled = a * rstd_d;
+        out_seq[(long long)t * value_dim + h * head_dim + j] = a_scaled;
+
+        // fused head norm: rms over the head's rows, then scale+gate
+        float ss = kda_block_sum(a_scaled * a_scaled, s_red);
+        const float inv_rms = 1.0f / sqrtf(ss * rstd_d * rstd_d + eps);
+        float g = 1.0f;
+        if (has_z && z_seq) {
+            const float zv = z_seq[(long long)t * value_dim + h * head_dim + j];
+            g = zv / (1.0f + expf(-zv));
+        }
+        out_seq[(long long)t * value_dim + h * head_dim + j] =
+            a_scaled * inv_rms * norm_weight[j] * g;
+        // s_nk/s_nq/s_vv/s_red are rewritten next token; the barrier inside
+        // kda_block_sum orders this token's reads already, but the s_nk
+        // writes at the top of the next iteration race with this token's
+        // pred/update reads without this one.
+        __syncthreads();
+    }
+}
+
 extern "C" __global__ void grim_kda_gated_delta_rule_scan(
     const float* conv_out_seq,  // [seq_len, conv_dim]
     const float* alpha_seq,     // [seq_len, num_v]
