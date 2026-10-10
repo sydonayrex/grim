@@ -295,6 +295,10 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q5k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
+                } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
+                    self.launch_wmma_big128_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
+                    self.launch_wmma_big_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q5k(
                         a_storage,
@@ -480,6 +484,10 @@ impl QuantOps for RocmDevice {
                         fence_act_quant(self, q_stream);
                         self.launch_dot4_q6k_q81_gemv(act_q81, b_storage, &out_storage, m, n, k)?;
                     }
+                } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
+                    self.launch_wmma_big128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
+                    self.launch_wmma_big_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
                     self.launch_wmma_fused_dequant_q6k(
                         a_storage,

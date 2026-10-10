@@ -41,6 +41,8 @@ pub const TEMPLATE: &str = r#"
 #define BIG_WAVES (BIG_THREADS / 32)
 #define BIG_WN (BIG_BN / 32)
 #define BIG_NAME __NAME__
+#define BIG_FILL __FILL__
+#define BIG_BBLK __BBLK__
 
 #ifndef GRIM_BIG_HELPERS
 #define GRIM_BIG_HELPERS
@@ -89,46 +91,123 @@ __device__ __forceinline__ void grim_big_deq_q4k(
     }
 }
 
-// Large-M fused-dequant GEMM: C[M,N] = A[M,K] @ dequant(B_q[N,K])^T, Q4_K.
-
-// Fill one 32-wide K slice of both LDS tiles. Explicit parameters, no captures.
-// Geometry comes in as parameters: this helper is compiled ONCE (the
-// include-once guard below) but serves both tile geometries — macro-based
-// sizes here would bake the 64-tile constants into the 128-tile's fills.
-__device__ __forceinline__ void grim_big_fill_stage(
-    _Float16* sA, _Float16* sB,
-    const float* __restrict__ A, const unsigned char* __restrict__ B_q,
-    int tid, int row_base, int col_base, int k0,
-    int M, int N, int K, long long row_bytes, int bm, int threads)
+// Q5_K dequant for one 8-weight run (w multiple of 8, run within one
+// 32-weight half): one 6-bit scale pair, 8 contiguous ql bytes (blk+48),
+// one constant high bit per run from qh (blk+16, bit 2*k + half).
+// Multiplication order matches grim_deq_q5k (wmma_quantized_gemm.rs).
+__device__ __forceinline__ void grim_big_deq_q5k(
+    const unsigned char* blk, int w, float* out)
 {
-    const int w_base = (k0 / 32) % 8 * 32;
-    for (int idx = tid; idx < bm * BIG_BK; idx += threads) {
-        const int rr = idx / BIG_BK;
-        const int kk = idx % BIG_BK;
-        const int row = row_base + rr;
-        const int kg = k0 + kk;
-        sA[rr * BIG_LD + kk] = (row < M && kg < K)
-            ? (_Float16)A[(long long)row * K + kg] : (_Float16)0;
+    const float d = grim_big_f16(((const unsigned short*)blk)[0]);
+    const float dmin = grim_big_f16(((const unsigned short*)blk)[1]);
+    const unsigned char* scales = blk + 4;
+    const unsigned char* qh = blk + 16;
+    const unsigned char* qs = blk + 48;
+    const int k = w / 64;
+    const int off0 = w % 64;
+    const int s = 2 * k + (off0 >= 32 ? 1 : 0);
+    unsigned char sc, m;
+    if (s < 4) { sc = scales[s] & 63; m = scales[s + 4] & 63; }
+    else {
+        sc = (unsigned char)((scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4));
+        m = (unsigned char)((scales[s + 4] >> 4) | ((scales[s] >> 6) << 4));
     }
-    for (int idx = tid; idx < BIG_BN * (BIG_BK / 8); idx += BIG_THREADS) {
-        const int cc = idx / (BIG_BK / 8);
-        const int rr = idx % (BIG_BK / 8);
-        const int col = col_base + cc;
-        const int w_in = w_base + rr * 8;
-        float acc[8];
-        if (col < N) {
-            const unsigned char* blkptr = B_q
-                + (long long)col * row_bytes + (long long)(k0 / 256) * 144;
-            grim_big_deq_q4k(blkptr, w_in, acc);
-        } else {
-            #pragma unroll
-            for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
-        }
-        _Float16* dst = sB + cc * BIG_LD + rr * 8;
-        #pragma unroll
-        for (int e = 0; e < 8; ++e) dst[e] = (_Float16)acc[e];
+    const int j = off0 & 31;
+    const int qsb = 32 * k + j;
+    const int bit = 2 * k + (off0 >= 32 ? 1 : 0);
+    unsigned int ql_lo, ql_hi;
+    ql_lo = (unsigned int)qs[qsb] | ((unsigned int)qs[qsb + 1] << 8)
+          | ((unsigned int)qs[qsb + 2] << 16) | ((unsigned int)qs[qsb + 3] << 24);
+    ql_hi = (unsigned int)qs[qsb + 4] | ((unsigned int)qs[qsb + 5] << 8)
+          | ((unsigned int)qs[qsb + 6] << 16) | ((unsigned int)qs[qsb + 7] << 24);
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const unsigned int byte = (e < 4) ? (ql_lo >> (8 * e)) : (ql_hi >> (8 * (e - 4)));
+        const unsigned char hi = (unsigned char)((qh[j + e] >> bit) & 1) << 4;
+        const unsigned char q = (off0 < 32) ? ((byte & 0x0Fu) | hi)
+                                            : (((byte >> 4) & 0x0Fu) | hi);
+        out[e] = d * (float)sc * (float)q - dmin * (float)m;
     }
 }
+
+// Q6_K dequant for one 8-weight run: one signed 8-bit scale, 8 contiguous
+// ql bytes, constant 2-bit qh field per run. Matches grim_deq_q6k.
+__device__ __forceinline__ void grim_big_deq_q6k(
+    const unsigned char* blk, int w, float* out)
+{
+    const unsigned char* ql = blk;
+    const unsigned char* qh = blk + 128;
+    const signed char* scales = (const signed char*)(blk + 192);
+    const float d = grim_big_f16(((const unsigned short*)blk)[104]);  // byte 208
+    const int n = w >> 7;
+    const int pos0 = w & 0x7F;
+    const int quarter = pos0 >> 5;
+    const int l0 = pos0 & 0x1F;
+    const int sc_idx = (n << 3) + (l0 >> 4) + (quarter << 1);
+    const signed char sc = scales[sc_idx];
+    const int ql_off = (n << 6) + l0 + ((quarter & 1) ? 32 : 0);
+    unsigned int ql_lo, ql_hi;
+    ql_lo = (unsigned int)ql[ql_off] | ((unsigned int)ql[ql_off + 1] << 8)
+          | ((unsigned int)ql[ql_off + 2] << 16) | ((unsigned int)ql[ql_off + 3] << 24);
+    ql_hi = (unsigned int)ql[ql_off + 4] | ((unsigned int)ql[ql_off + 5] << 8)
+          | ((unsigned int)ql[ql_off + 6] << 16) | ((unsigned int)ql[ql_off + 7] << 24);
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const unsigned char ql_byte = (unsigned char)((e < 4)
+            ? ((ql_lo >> (8 * e)) & 0xFF) : ((ql_hi >> (8 * (e - 4))) & 0xFF));
+        const int nibble = (quarter & 2) ? (ql_byte >> 4) : (ql_byte & 0x0F);
+        const unsigned char qh_byte = qh[(n << 5) + l0 + e];
+        const int qh_bits = (qh_byte >> (quarter << 1)) & 0x03;
+        const int q_code = nibble | (qh_bits << 4);
+        out[e] = d * (float)sc * ((float)q_code - 32.0f);
+    }
+}
+
+// Large-M fused-dequant GEMM: C[M,N] = A[M,K] @ dequant(B_q[N,K])^T.
+// One fill function per format, generated by this defining macro: the helper
+// is inside the include-once guard, so a plain __device__ fn would bake the
+// FIRST format's dequant and block size into every later geometry (the same
+// trap as the 64-tile geometry bake, hit on 2026-10-10). FILL/DEQ are token
+// parameters; BBLK is the format's bytes-per-256-weight block.
+#define BIG_DEFINE_FILL(FILL, DEQ, BBLK)                                   \
+__device__ __forceinline__ void FILL(                                      \
+    _Float16* sA, _Float16* sB,                                            \
+    const float* __restrict__ A, const unsigned char* __restrict__ B_q,    \
+    int tid, int row_base, int col_base, int k0,                           \
+    int M, int N, int K, long long row_bytes, int bm, int threads)         \
+{                                                                          \
+    const int w_base = (k0 / 32) % 8 * 32;                                 \
+    for (int idx = tid; idx < bm * BIG_BK; idx += threads) {               \
+        const int rr = idx / BIG_BK;                                       \
+        const int kk = idx % BIG_BK;                                       \
+        const int row = row_base + rr;                                     \
+        const int kg = k0 + kk;                                            \
+        sA[rr * BIG_LD + kk] = (row < M && kg < K)                         \
+            ? (_Float16)A[(long long)row * K + kg] : (_Float16)0;          \
+    }                                                                      \
+    for (int idx = tid; idx < BIG_BN * (BIG_BK / 8); idx += threads) {     \
+        const int cc = idx / (BIG_BK / 8);                                 \
+        const int rr = idx % (BIG_BK / 8);                                 \
+        const int col = col_base + cc;                                     \
+        const int w_in = w_base + rr * 8;                                  \
+        float acc[8];                                                      \
+        if (col < N) {                                                     \
+            const unsigned char* blkptr = B_q                              \
+                + (long long)col * row_bytes + (long long)(k0 / 256) * BBLK; \
+            DEQ(blkptr, w_in, acc);                                        \
+        } else {                                                           \
+            _Pragma("unroll")                                              \
+            for (int e = 0; e < 8; ++e) acc[e] = 0.0f;                     \
+        }                                                                  \
+        _Float16* dst = sB + cc * BIG_LD + rr * 8;                         \
+        _Pragma("unroll")                                                  \
+        for (int e = 0; e < 8; ++e) dst[e] = (_Float16)acc[e];             \
+    }                                                                      \
+}
+
+BIG_DEFINE_FILL(grim_big_fill_stage_q4k, grim_big_deq_q4k, 144)
+BIG_DEFINE_FILL(grim_big_fill_stage_q5k, grim_big_deq_q5k, 176)
+BIG_DEFINE_FILL(grim_big_fill_stage_q6k, grim_big_deq_q6k, 210)
 
 #endif  // GRIM_BIG_HELPERS
 
@@ -144,7 +223,7 @@ extern "C" __global__ void BIG_NAME(
     const int wn = wave % BIG_WN;         // col quadrant 0..BIG_BN/32
 
     const int n_blocks = K / 256;
-    const long long row_bytes = (long long)n_blocks * 144;
+    const long long row_bytes = (long long)n_blocks * BIG_BBLK;
 
     __shared__ _Float16 sA[2][BIG_BM * BIG_LD];   // 2 x 5 KB
     __shared__ _Float16 sB[2][BIG_BN * BIG_LD];   // 2 x 5 KB
@@ -160,8 +239,8 @@ extern "C" __global__ void BIG_NAME(
         for (int ni = 0; ni < 2; ++ni)
             fill_fragment(fc[mi][ni], 0.0f);
 
-    grim_big_fill_stage(sA[0], sB[0], A, B_q, tid, row_base, col_base,
-                        0, M, N, K, row_bytes, BIG_BM, BIG_THREADS);
+    BIG_FILL(sA[0], sB[0], A, B_q, tid, row_base, col_base,
+             0, M, N, K, row_bytes, BIG_BM, BIG_THREADS);
     __syncthreads();
 
     const int n_k_steps = K / BIG_BK;
@@ -170,9 +249,9 @@ extern "C" __global__ void BIG_NAME(
         // Prefetch the next 32-wide K slice into the other stage: the dequant's
         // global loads overlap this step's MMAs.
         if (it + 1 < n_k_steps)
-            grim_big_fill_stage(sA[buf ^ 1], sB[buf ^ 1], A, B_q, tid,
-                                row_base, col_base, (it + 1) * BIG_BK,
-                                M, N, K, row_bytes, BIG_BM, BIG_THREADS);
+            BIG_FILL(sA[buf ^ 1], sB[buf ^ 1], A, B_q, tid,
+                     row_base, col_base, (it + 1) * BIG_BK,
+                     M, N, K, row_bytes, BIG_BM, BIG_THREADS);
         #pragma unroll
         for (int kh = 0; kh < 2; ++kh) {
             #pragma unroll
@@ -219,20 +298,40 @@ extern "C" __global__ void BIG_NAME(
 }
 "#;
 
-pub fn kernel_source(kernel_name: &str, bm: usize, bn: usize, threads: usize) -> String {
+pub fn kernel_source(
+    kernel_name: &str,
+    bm: usize,
+    bn: usize,
+    threads: usize,
+    fill_fn: &str,
+    blk_bytes: usize,
+) -> String {
     TEMPLATE
         .replace("__BM__", &bm.to_string())
         .replace("__BN__", &bn.to_string())
         .replace("__THREADS__", &threads.to_string())
         .replace("__NAME__", kernel_name)
+        .replace("__FILL__", fill_fn)
+        .replace("__BBLK__", &blk_bytes.to_string())
+}
+
+/// (fill fn, bytes per 256-weight block) per format.
+fn fmt_params(fill: &str) -> (&'static str, usize) {
+    match fill {
+        "q5k" => ("grim_big_fill_stage_q5k", 176),
+        "q6k" => ("grim_big_fill_stage_q6k", 210),
+        _ => ("grim_big_fill_stage_q4k", 144),
+    }
 }
 
 /// The 64x64 tile (dispatched at 64 <= m < 128).
-pub fn big64_source() -> String {
-    kernel_source("grim_wmma_big_q4k", 64, 64, 128)
+pub fn big64_source(fill: &str) -> String {
+    let (f, blk) = fmt_params(fill);
+    kernel_source(&format!("grim_wmma_big_{fill}"), 64, 64, 128, f, blk)
 }
 
 /// The 128x64 tile (dispatched at m >= 128).
-pub fn big128_source() -> String {
-    kernel_source("grim_wmma_big128_q4k", 128, 64, 256)
+pub fn big128_source(fill: &str) -> String {
+    let (f, blk) = fmt_params(fill);
+    kernel_source(&format!("grim_wmma_big128_{fill}"), 128, 64, 256, f, blk)
 }
