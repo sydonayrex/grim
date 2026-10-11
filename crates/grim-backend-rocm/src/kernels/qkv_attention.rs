@@ -1107,23 +1107,31 @@ extern "C" __global__ void grim_qkv_attention_tiled(
     const unsigned short* k16 = (const unsigned short*)k_tensor;
     const unsigned short* v16 = (const unsigned short*)v_tensor;
 
-    for (int j = j_start; j < j_end; ++j) {
-        // One K row and one V row per iteration, reused by every query in the
-        // tile — this is the whole point of the kernel.
-        float kreg[8];
-        float vreg[8];
+    // Software-pipelined loads: row j+1 is fetched while row j is consumed.
+    // Without this the loop serializes on its two HBM loads per iteration —
+    // the kernel was latency-bound at ~50 GB/s achieved, well under the
+    // ~440 GB/s the traffic alone would allow.
+    auto load_kv_row = [&](int j, float* kr, float* vr) {
         #pragma unroll
         for (int c = 0; c < 8; ++c) {
             const int d = lane + c * 32;
             if (d < head_dim) {
                 const long long off = (long long)kv_head * head_dim + (long long)j * kv_stride + d;
-                kreg[c] = fp16_bits_to_float_device(k16[off]);
-                vreg[c] = fp16_bits_to_float_device(v16[off]);
+                kr[c] = fp16_bits_to_float_device(k16[off]);
+                vr[c] = fp16_bits_to_float_device(v16[off]);
             } else {
-                kreg[c] = 0.0f;
-                vreg[c] = 0.0f;
+                kr[c] = 0.0f;
+                vr[c] = 0.0f;
             }
         }
+    };
+    float kreg[8];
+    float vreg[8];
+    if (j_start < j_end) load_kv_row(j_start, kreg, vreg);
+    for (int j = j_start; j < j_end; ++j) {
+        float knext[8];
+        float vnext[8];
+        if (j + 1 < j_end) load_kv_row(j + 1, knext, vnext);
         const int t_min = (j - cache_offset - i0 > 0) ? (j - cache_offset - i0) : 0;
         #pragma unroll
         for (int t = 0; t < QMAX; ++t) {
@@ -1141,6 +1149,11 @@ extern "C" __global__ void grim_qkv_attention_tiled(
             rsum[t] = rsum[t] * sa + sb;
             #pragma unroll
             for (int c = 0; c < 8; ++c) acc[t][c] = acc[t][c] * sa + sb * vreg[c];
+        }
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            kreg[c] = knext[c];
+            vreg[c] = vnext[c];
         }
     }
 
