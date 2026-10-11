@@ -49,6 +49,8 @@ pub fn compute_kernel_source() -> String {
     for fmt in ["q4k", "q5k", "q6k"] {
         s.push_str(&crate::kernels::wmma_big_gemm::big64_source(fmt));
         s.push_str(&crate::kernels::wmma_big_gemm::big128_source(fmt));
+        // DEBUG: the 64x128 experiment tile under investigation.
+        s.push_str(&crate::kernels::wmma_big_gemm::big64x128_source(fmt));
     }
     // SPEED-ROC: WMMA fused-dequant IQ-family GEMM (RDNA3/4).
     // Must come AFTER iq_gemm (reuses dequant_iqXX device helpers).

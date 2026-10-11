@@ -326,25 +326,20 @@ fn wmma_big_q4k_large_m_parity_and_route() {
         );
         let big = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big_q4k");
         let big128 = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big128_q4k");
+        let big64x128 =
+            grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_big64x128_q4k");
         let small = grim_backend_rocm::rocm_kernel_route_counter("grim_wmma_fused_dequant_q4k");
-        eprintln!("[big-q4k] m={m} big={big} big128={big128} small16={small}");
-        // The high-nibble mask defect is fixed (missing & 0x0F on the w>=32
-        // path of grim_big_deq_q4k — see tests/big_q4k_probe.rs). m >= 128
-        // takes the 128x64 tile (one weight pass per 128 rows), 64 <= m < 128
-        // the 64x64 tile.
-        if m >= 128 {
-            assert!(
-                big128 > 0,
-                "m={m}: the 128x64 tile must serve large-M prefill"
-            );
-        } else {
-            assert!(
-                big > 0,
-                "m={m}: the 64x64 tile must serve 64 <= m < 128"
-            );
-        }
+        eprintln!("[big-q4k] m={m} big={big} big128={big128} big64x128={big64x128} small16={small}");
+        // The 64x128 tile (12.89 ms vs 128x64's 19.88 at m=4056 n=4096 k=4096)
+        // owns every m >= 64 whose n is a multiple of 128 — the test's n=1024
+        // qualifies — because halving the A-side passes beats everything else
+        // now that the fill is the limiter.
+        assert!(
+            big64x128 > 0,
+            "m={m}: the 64x128 tile must serve large-M prefill at n%128==0"
+        );
         assert_eq!(
-            big + big128 + small, 1,
+            big + big128 + big64x128 + small, 1,
             "m={m}: exactly one WMMA tile kernel must serve this shape"
         );
     }

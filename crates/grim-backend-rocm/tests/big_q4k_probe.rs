@@ -108,6 +108,36 @@ fn big_q4k_prefill_bench_vs_16row() {
     dev.synchronize();
     eprintln!("[big-q4k-bench] big64: {:.2} ms/launch at m={m} n={n} k={k}",
               t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+
+    // A/B: 64x128 tile (halves A passes). CORRECTNESS-CHECKED — a variant that
+    // skips work wins the timing by not computing (that happened).
+    if std::env::var("GRIM_BENCH_64X128").is_ok() {
+        dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        {
+            let got = out.to_cpu_vec_f32().unwrap();
+            let ndeq = grim_quant::dequant_q4k(&b_packed, k * n).unwrap();
+            let mut md = 0.0f32;
+            for i in (0..m).step_by((m / 32).max(1)) {
+                for j in (0..n).step_by((n / 32).max(1)) {
+                    let mut acc = 0.0f32;
+                    for kk in 0..k {
+                        acc += a_host[i * k + kk] * ndeq[j * k + kk];
+                    }
+                    md = md.max((got[i * n + j] - acc).abs());
+                }
+            }
+            eprintln!("[big-q4k-bench] big64x128 spot max_diff={md:.4}");
+            assert!(md < 1.0, "64x128 variant computes wrong results (max_diff={md})");
+        }
+        dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        }
+        dev.synchronize();
+        eprintln!("[big-q4k-bench] big64x128: {:.2} ms/launch at m={m} n={n} k={k}",
+                  t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    }
 }
 
 /// Full-C parity for the 128x64 tile through the direct launcher, then the

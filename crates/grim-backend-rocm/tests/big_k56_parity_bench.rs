@@ -106,11 +106,10 @@ fn big_q56_parity_and_route() {
                 )
                 .expect("quantized_matmul dispatch");
             handle.synchronize().expect("sync");
-            let name = match (fmt.as_ref(), m) {
-                ("q5k", mm) if mm >= 128 => "grim_wmma_big128_q5k",
-                ("q5k", _) => "grim_wmma_big_q5k",
-                ("q6k", mm) if mm >= 128 => "grim_wmma_big128_q6k",
-                (_, _) => "grim_wmma_big_q6k",
+            // n=1024 is a multiple of 128, so the 64x128 tile owns all m >= 64.
+            let name = match fmt.as_ref() {
+                "q5k" => "grim_wmma_big64x128_q5k",
+                _ => "grim_wmma_big64x128_q6k",
             };
             let hits = grim_backend_rocm::rocm_kernel_route_counter(name);
             eprintln!("[big{fmt}-route] m={m} {name}={hits}");

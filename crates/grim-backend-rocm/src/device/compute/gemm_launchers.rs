@@ -694,6 +694,7 @@ impl RocmDevice {
         &self,
         kernel: &str,
         bm: usize,
+        bn: usize,
         a_storage: &RocmStorage,
         b_storage: &RocmStorage,
         out_storage: &RocmStorage,
@@ -710,10 +711,10 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{kernel}: out has no device ptr")))?;
-        let grid_x = n.div_ceil(64) as u32;
+        let grid_x = n.div_ceil(bn) as u32;
         let grid_y = m.div_ceil(bm) as u32;
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
-        let block_dim = HipDim3::new(if bm == 128 { 256 } else { 128 }, 1, 1);
+        let block_dim = HipDim3::new(if bm == 128 || bn == 128 { 256 } else { 128 }, 1, 1);
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
         let mut optr = out_ptr;
@@ -735,29 +736,84 @@ impl RocmDevice {
         )
     }
 
+    /// PRODUCTION: 64x128 tile for Q4_K/Q5_K/Q6_K large-M prefill (m >= 64,
+    /// n % 128 == 0). 8 waves, 2 blocks/CU.
+    pub(crate) fn launch_wmma_big64x128_fmt(
+        &self,
+        kernel: &str,
+        a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
+        m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_big_fmt(kernel, 64, 128, a_storage, b_storage, out_storage, m, n, k)
+    }
+    pub(crate) fn launch_wmma_big64x128_q4k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q4k", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_wmma_big64x128_q5k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q5k", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_wmma_big64x128_q6k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q6k", a, b, out, m, n, k)
+    }
+
+    /// A/B EXPERIMENT: 64x128 tile, 256 threads (8 waves: 2 row x 4 col quadrants).
+    pub fn launch_wmma_big64x128_q4k_for_ab(
+        &self,
+        a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
+        m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr
+            .ok_or_else(|| Error::Backend("wmma_big64x128_q4k: a has no device ptr".into()))?;
+        let b_ptr = b_storage.device_ptr
+            .ok_or_else(|| Error::Backend("wmma_big64x128_q4k: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr
+            .ok_or_else(|| Error::Backend("wmma_big64x128_q4k: out has no device ptr".into()))?;
+        let grid_dim = HipDim3::new(n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(
+            "grim_wmma_big64x128_q4k",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr),
+                  arg(&mut mm), arg(&mut nn), arg(&mut kk)],
+        )
+    }
+
     pub(crate) fn launch_wmma_big_q5k(
         &self,
         a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_big_fmt("grim_wmma_big_q5k", 64, a, b, out, m, n, k)
+        self.launch_wmma_big_fmt("grim_wmma_big_q5k", 64, 64, a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big_q6k(
         &self,
         a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_big_fmt("grim_wmma_big_q6k", 64, a, b, out, m, n, k)
+        self.launch_wmma_big_fmt("grim_wmma_big_q6k", 64, 64, a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big128_q5k(
         &self,
         a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_big_fmt("grim_wmma_big128_q5k", 128, a, b, out, m, n, k)
+        self.launch_wmma_big_fmt("grim_wmma_big128_q5k", 128, 64, a, b, out, m, n, k)
     }
     pub(crate) fn launch_wmma_big128_q6k(
         &self,
         a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_big_fmt("grim_wmma_big128_q6k", 128, a, b, out, m, n, k)
+        self.launch_wmma_big_fmt("grim_wmma_big128_q6k", 128, 64, a, b, out, m, n, k)
     }
 
     /// Public A/B wrapper (bench + parity harness entry).

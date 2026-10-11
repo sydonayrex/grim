@@ -174,7 +174,7 @@ __device__ __forceinline__ void FILL(                                      \
     _Float16* sA, _Float16* sB,                                            \
     const float* __restrict__ A, const unsigned char* __restrict__ B_q,    \
     int tid, int row_base, int col_base, int k0,                           \
-    int M, int N, int K, long long row_bytes, int bm, int threads)         \
+    int M, int N, int K, long long row_bytes, int bm, int bn, int threads) \
 {                                                                          \
     const int w_base = (k0 / 32) % 8 * 32;                                 \
     for (int idx = tid; idx < bm * BIG_BK; idx += threads) {               \
@@ -185,7 +185,7 @@ __device__ __forceinline__ void FILL(                                      \
         sA[rr * BIG_LD + kk] = (row < M && kg < K)                         \
             ? (_Float16)A[(long long)row * K + kg] : (_Float16)0;          \
     }                                                                      \
-    for (int idx = tid; idx < BIG_BN * (BIG_BK / 8); idx += threads) {     \
+    for (int idx = tid; idx < bn * (BIG_BK / 8); idx += threads) {         \
         const int cc = idx / (BIG_BK / 8);                                 \
         const int rr = idx % (BIG_BK / 8);                                 \
         const int col = col_base + cc;                                     \
@@ -250,7 +250,7 @@ extern "C" __global__ void BIG_NAME(
             fill_fragment(fc[mi][ni], 0.0f);
 
     BIG_FILL(sA[0], sB[0], A, B_q, tid, row_base, col_base,
-             0, M, N, K, row_bytes, BIG_BM, BIG_THREADS);
+             0, M, N, K, row_bytes, BIG_BM, BIG_BN, BIG_THREADS);
     __syncthreads();
 
     const int n_k_steps = K / BIG_BK;
@@ -261,7 +261,23 @@ extern "C" __global__ void BIG_NAME(
         if (it + 1 < n_k_steps)
             BIG_FILL(sA[buf ^ 1], sB[buf ^ 1], A, B_q, tid,
                      row_base, col_base, (it + 1) * BIG_BK,
-                     M, N, K, row_bytes, BIG_BM, BIG_THREADS);
+                     M, N, K, row_bytes, BIG_BM, BIG_BN, BIG_THREADS);
+#ifdef BIG_DEBUG_DUMP_SB
+        // DEBUG: after the it=0 prefetch, dump BOTH sB stages to C and exit.
+        if (it == 0) {
+            __syncthreads();
+            for (int idx = tid; idx < BIG_BN * BIG_LD; idx += BIG_THREADS) {
+                C[idx] = (float)sB[0][idx];
+                C[BIG_BN * BIG_LD + idx] = (float)sB[1][idx];
+            }
+            // Compile-time self-report: what does THIS instantiation see?
+            C[20100] = (float)BIG_BN;
+            C[20101] = (float)BIG_THREADS;
+            C[20102] = (float)BIG_BM;
+            C[20103] = (float)BIG_LD;
+            return;
+        }
+#endif
         #pragma unroll
         for (int kh = 0; kh < 2; ++kh) {
             #pragma unroll
@@ -365,4 +381,14 @@ pub fn big64_source(fill: &str) -> String {
 pub fn big128_source(fill: &str) -> String {
     let (f, blk) = fmt_params(fill);
     kernel_source(&format!("grim_wmma_big128_{fill}"), 128, 64, 256, f, blk)
+}
+
+/// A/B EXPERIMENT: 64x128 tile — half the A-side passes, same LDS (2 blocks/CU).
+pub fn big64x128_source(fill: &str) -> String {
+    let (f, blk) = fmt_params(fill);
+    let mut src = kernel_source(&format!("grim_wmma_big64x128_{fill}"), 64, 128, 256, f, blk);
+    if std::env::var("GRIM_DUMP_SB").is_ok() {
+        src = format!("#define BIG_DEBUG_DUMP_SB 1\n{}", src);
+    }
+    src
 }
