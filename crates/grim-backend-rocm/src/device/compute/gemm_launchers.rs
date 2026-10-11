@@ -705,47 +705,115 @@ impl RocmDevice {
         let a_ptr = a_storage
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{kernel}: a has no device ptr")))?;
-        let b_ptr = b_storage
+        self.launch_wmma_big_fmt_a16(kernel, bm, bn, a_ptr, b_storage, out_storage, m, n, k, 0)
+    }
+
+    /// a_f16 = 0 -> A is f32 (converted in the fill, the historic behaviour);
+    /// 1 -> A is already f16 halves (the pre-converted activation path). The
+    /// arg list MUST always carry a_f16: every big-tile kernel takes it.
+    fn launch_wmma_big_fmt_a16(
+        &self,
+        kernel: &str,
+        bm: usize,
+        bn: usize,
+        mut a_ptr: u64,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        a_f16: i32,
+    ) -> Result<*mut c_void> {
+        let mut bptr = b_storage
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{kernel}: b has no device ptr")))?;
-        let out_ptr = out_storage
+        let mut optr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{kernel}: out has no device ptr")))?;
         let grid_x = n.div_ceil(bn) as u32;
         let grid_y = m.div_ceil(bm) as u32;
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
         let block_dim = HipDim3::new(if bm == 128 || bn == 128 { 256 } else { 128 }, 1, 1);
-        let mut aptr = a_ptr;
-        let mut bptr = b_ptr;
-        let mut optr = out_ptr;
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
+        let mut af = a_f16;
         self.launch_compute_kernel(
             kernel,
             grid_dim,
             block_dim,
             &mut [
-                arg(&mut aptr),
+                arg(&mut a_ptr),
                 arg(&mut bptr),
                 arg(&mut optr),
                 arg(&mut mm),
                 arg(&mut nn),
                 arg(&mut kk),
+                arg(&mut af),
             ],
         )
     }
 
     /// PRODUCTION: 64x128 tile for Q4_K/Q5_K/Q6_K large-M prefill (m >= 64,
     /// n % 128 == 0). 8 waves, 2 blocks/CU.
+    ///
+    /// The A-side dominates the fill (f32 loads + converts, once per column
+    /// block), so f32 activations are pre-converted to f16 ONCE per tensor
+    /// (memoized on the device allocation) and the fill loads halves. The
+    /// fill already rounded A to f16 in LDS, so the result is bit-identical.
     pub(crate) fn launch_wmma_big64x128_fmt(
         &self,
         kernel: &str,
-        a_storage: &RocmStorage, b_storage: &RocmStorage, out_storage: &RocmStorage,
-        m: usize, n: usize, k: usize,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_big_fmt(kernel, 64, 128, a_storage, b_storage, out_storage, m, n, k)
+        let a16_ptr = self.f32_activation_as_f16_ptr(a_storage, m * k)?;
+        self.launch_wmma_big_fmt_a16(kernel, 64, 128, a16_ptr, b_storage, out_storage, m, n, k, 1)
     }
+
+    fn f32_activation_as_f16_ptr(
+        &self,
+        a: &RocmStorage,
+        elems: usize,
+    ) -> Result<u64> {
+        static F16_A: OnceLock<std::sync::Mutex<std::collections::HashMap<(u64, usize), Arc<RocmStorage>>>> =
+            OnceLock::new();
+        if a.dtype.arith != ArithType::F32 {
+            return Err(Error::Backend("f32_activation_as_f16: A is not f32".into()));
+        }
+        let key = (a.device_ptr.unwrap_or(0), a.bytes);
+        let map = F16_A.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Some(hit) = map.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(hit.device_ptr.unwrap_or(0));
+        }
+        let shape = Shape::new(vec![elems]);
+        let dst = RocmStorage::alloc_gpu(
+            &shape,
+            DType { arith: ArithType::F32, storage: DTypeStorage::Native },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let mut sptr = a.device_ptr.ok_or_else(|| Error::Backend("cvt: src ptr".into()))?;
+        let mut dptr = dst.device_ptr.ok_or_else(|| Error::Backend("cvt: dst ptr".into()))?;
+        let mut n_i = elems as i32;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        self.launch_compute_kernel(
+            "grim_cvt_f32_f16",
+            HipDim3::new(1024, 1, 1),
+            HipDim3::new(256, 1, 1),
+            &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut n_i)],
+        )?;
+        let dptr_ret = dst.device_ptr.unwrap_or(0);
+        map.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::new(dst));
+        Ok(dptr_ret)
+    }
+
     pub(crate) fn launch_wmma_big64x128_q4k(
         &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
     ) -> Result<*mut c_void> {

@@ -52,6 +52,22 @@ __device__ __forceinline__ float grim_big_f16(unsigned short v) {
     return (float)(*((_Float16 const*)&v));
 }
 
+// f32 -> f16 activation pre-conversion for the big tiles: the fill re-reads
+// and re-converts A for every column block, so converting once up front
+// halves the A traffic and deletes the converts. One grid-stride pass.
+// Lives under the include-once guard: a __global__ in the open template text
+// would be emitted once per instantiation and collide.
+extern "C" __global__ void grim_cvt_f32_f16(
+    const float* __restrict__ src, unsigned short* __restrict__ dst, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        _Float16 v = (_Float16)src[i];
+        __builtin_memcpy(&dst[i], &v, 2);
+    }
+}
+
 // Vectorized Q4_K dequant. The 8 weights of one call are 8 contiguous qs bytes
 // (qsb = 32*(w/64) + (w%64), a multiple of 8) sharing one 6-bit scale pair, so
 // two 4-byte loads replace ~10 scalar 1-byte loads. Nibble selection is a
@@ -174,16 +190,25 @@ __device__ __forceinline__ void FILL(                                      \
     _Float16* sA, _Float16* sB,                                            \
     const float* __restrict__ A, const unsigned char* __restrict__ B_q,    \
     int tid, int row_base, int col_base, int k0,                           \
-    int M, int N, int K, long long row_bytes, int bm, int bn, int threads) \
+    int M, int N, int K, long long row_bytes, int bm, int bn, int threads, \
+    int a_f16)                                                             \
 {                                                                          \
+    const unsigned short* a16 = (const unsigned short*)A;                  \
     const int w_base = (k0 / 32) % 8 * 32;                                 \
     for (int idx = tid; idx < bm * BIG_BK; idx += threads) {               \
         const int rr = idx / BIG_BK;                                       \
         const int kk = idx % BIG_BK;                                       \
         const int row = row_base + rr;                                     \
         const int kg = k0 + kk;                                            \
-        sA[rr * BIG_LD + kk] = (row < M && kg < K)                         \
-            ? (_Float16)A[(long long)row * K + kg] : (_Float16)0;          \
+        if (a_f16) {                                                       \
+            _Float16 v = (_Float16)0;                                      \
+            if (row < M && kg < K)                                         \
+                __builtin_memcpy(&v, &a16[(long long)row * K + kg], 2);    \
+            sA[rr * BIG_LD + kk] = v;                                      \
+        } else {                                                           \
+            sA[rr * BIG_LD + kk] = (row < M && kg < K)                     \
+                ? (_Float16)A[(long long)row * K + kg] : (_Float16)0;      \
+        }                                                                  \
     }                                                                      \
     for (int idx = tid; idx < bn * (BIG_BK / 8); idx += threads) {         \
         const int cc = idx / (BIG_BK / 8);                                 \
@@ -213,7 +238,7 @@ BIG_DEFINE_FILL(grim_big_fill_stage_q6k, grim_big_deq_q6k, 210)
 
 extern "C" __global__ void BIG_NAME(
     const float* __restrict__ A, const unsigned char* __restrict__ B_q,
-    float* __restrict__ C, int M, int N, int K)
+    float* __restrict__ C, int M, int N, int K, int a_f16)
 {
     const int col_base = blockIdx.x * BIG_BN;
     const int row_base = blockIdx.y * BIG_BM;
@@ -250,7 +275,7 @@ extern "C" __global__ void BIG_NAME(
             fill_fragment(fc[mi][ni], 0.0f);
 
     BIG_FILL(sA[0], sB[0], A, B_q, tid, row_base, col_base,
-             0, M, N, K, row_bytes, BIG_BM, BIG_BN, BIG_THREADS);
+             0, M, N, K, row_bytes, BIG_BM, BIG_BN, BIG_THREADS, a_f16);
     __syncthreads();
 
     const int n_k_steps = K / BIG_BK;
@@ -261,7 +286,7 @@ extern "C" __global__ void BIG_NAME(
         if (it + 1 < n_k_steps)
             BIG_FILL(sA[buf ^ 1], sB[buf ^ 1], A, B_q, tid,
                      row_base, col_base, (it + 1) * BIG_BK,
-                     M, N, K, row_bytes, BIG_BM, BIG_BN, BIG_THREADS);
+                     M, N, K, row_bytes, BIG_BM, BIG_BN, BIG_THREADS, a_f16);
 #ifdef BIG_DEBUG_DUMP_SB
         // DEBUG: after the it=0 prefetch, dump BOTH sB stages to C and exit.
         if (it == 0) {
