@@ -1028,6 +1028,179 @@ extern "C" __global__ void grim_kv_append(
 // input pointer, replayed with the live value. Only the kv_seq_len parameter is
 // replaced; cache_offset is dropped (decode is always steps==1 at abs position
 // total-1, which the caller passes as part of total_dev semantics via total only).
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Query-tiled prefill attention.
+//
+// `grim_qkv_attention` launches one block per (query, head) and each block reads
+// its whole causal KV range from DRAM, so a K/V element is re-read once per
+// query: at 3928 tokens that is 126.4 GB per launch, and the measured 287 ms is
+// exactly that traffic at ~440 GB/s (this card is 256-bit GDDR6, ~640 GB/s
+// theoretical). The kernel is at its memory roofline — the only lever is to
+// read K/V less often.
+//
+// This variant puts QT consecutive queries in one block, so a K/V element read
+// from DRAM is reused QT times out of registers. Traffic falls by ~QT.
+//
+// Contract: head_dim <= 256, block = 128 (4 waves), no sliding window, no
+// softcap, no alibi — callers that need those keep the scalar kernel. Each
+// query keeps its own online-softmax state and its own causal bound
+// (abs_i = cache_offset + i), so the tiling does not change the result.
+extern "C" __global__ void grim_qkv_attention_tiled(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    int num_heads, int num_kv_heads, int head_dim, int seq_len, int kv_seq_len,
+    int cache_offset, float inv_sqrt_d, int qt
+) {
+    constexpr int QMAX = 4;
+    const int h = blockIdx.y;
+    const int i0 = blockIdx.x * qt;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int num_waves = blockDim.x >> 5;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int kv_stride = num_kv_heads * head_dim;
+    const int nqt = (qt < QMAX) ? qt : QMAX;
+    // QMAX is the UNROLL width: unrolling wider than the tile makes every K/V
+    // row do the wider tile's work and blows the register arrays (measured:
+    // QMAX=8 with qt=4 was slower than the scalar kernel it replaced).
+
+    __shared__ float s_m[QMAX][4];
+    __shared__ float s_s[QMAX][4];
+    __shared__ float s_acc[QMAX][4][260];
+
+    // Per-query state: q in registers, online-softmax max/sum, and the
+    // value accumulator (8 chunks of head_dim/32).
+    float qreg[QMAX][8];
+    float acc[QMAX][8];
+    float rmax[QMAX];
+    float rsum[QMAX];
+    #pragma unroll
+    for (int t = 0; t < QMAX; ++t) {
+        rmax[t] = -1e30f;
+        rsum[t] = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            acc[t][c] = 0.0f;
+            const int d = lane + c * 32;
+            const int i = i0 + t;
+            qreg[t][c] = (t < nqt && i < seq_len && d < head_dim)
+                ? q[((long long)i * num_heads + h) * head_dim + d] : 0.0f;
+        }
+    }
+
+    // Block KV range: [0, hi_max). A query t only owns keys up to its own
+    // abs_i, and abs_i grows with t, so for a given j the participating
+    // queries are exactly t >= j - (cache_offset + i0).
+    const int abs_i_last = cache_offset + i0 + nqt - 1;
+    const int hi = (abs_i_last + 1 < kv_seq_len) ? (abs_i_last + 1) : kv_seq_len;
+    const int range_len = (hi > 0) ? hi : 0;
+    const int base = range_len / num_waves;
+    const int rem = range_len % num_waves;
+    const int j_start = wave * base + (wave < rem ? wave : rem);
+    const int j_end = j_start + base + (wave < rem ? 1 : 0);
+
+    const unsigned short* k16 = (const unsigned short*)k_tensor;
+    const unsigned short* v16 = (const unsigned short*)v_tensor;
+
+    for (int j = j_start; j < j_end; ++j) {
+        // One K row and one V row per iteration, reused by every query in the
+        // tile — this is the whole point of the kernel.
+        float kreg[8];
+        float vreg[8];
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const int d = lane + c * 32;
+            if (d < head_dim) {
+                const long long off = (long long)kv_head * head_dim + (long long)j * kv_stride + d;
+                kreg[c] = fp16_bits_to_float_device(k16[off]);
+                vreg[c] = fp16_bits_to_float_device(v16[off]);
+            } else {
+                kreg[c] = 0.0f;
+                vreg[c] = 0.0f;
+            }
+        }
+        const int t_min = (j - cache_offset - i0 > 0) ? (j - cache_offset - i0) : 0;
+        #pragma unroll
+        for (int t = 0; t < QMAX; ++t) {
+            if (t >= nqt || t < t_min) continue;
+            float score = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) score += qreg[t][c] * kreg[c];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) score += __shfl_xor(score, off);
+            score *= inv_sqrt_d;
+            const float m_new = fmaxf(rmax[t], score);
+            const float sa = expf(rmax[t] - m_new);
+            const float sb = expf(score - m_new);
+            rmax[t] = m_new;
+            rsum[t] = rsum[t] * sa + sb;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) acc[t][c] = acc[t][c] * sa + sb * vreg[c];
+        }
+    }
+
+    // Publish per-(query, wave) partials, then let wave 0 merge them.
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < QMAX; ++t) {
+            s_m[t][wave] = rmax[t];
+            s_s[t][wave] = rsum[t];
+        }
+    }
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        const int d = lane + c * 32;
+        if (d < 256) {
+            #pragma unroll
+            for (int t = 0; t < QMAX; ++t) {
+                s_acc[t][wave][d] = (t < nqt && d < head_dim) ? acc[t][c] : 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+    if (wave != 0) return;
+
+    #pragma unroll
+    for (int t = 0; t < QMAX; ++t) {
+        if (t >= nqt) continue;
+        const int i = i0 + t;
+        if (i >= seq_len) continue;
+        float m_final = s_m[t][0];
+        float sum_final = s_s[t][0];
+        #pragma unroll
+        for (int w = 1; w < 4; ++w) {
+            if (w >= num_waves) break;
+            const float mw = s_m[t][w];
+            const float uw = s_s[t][w];
+            const float m_new = fmaxf(m_final, mw);
+            const float sa = expf(m_final - m_new);
+            const float sb = expf(mw - m_new);
+            sum_final = sum_final * sa + uw * sb;
+            m_final = m_new;
+        }
+        const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+        float* orow = out + ((long long)i * num_heads + h) * head_dim;
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const int d = lane + c * 32;
+            if (d < head_dim) {
+                float a = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    if (w >= num_waves) break;
+                    a += s_acc[t][w][d] * expf(s_m[t][w] - m_final);
+                }
+                orow[d] = a * inv_sum;
+            }
+        }
+    }
+}
+
 extern "C" __global__ void grim_qkv_attention_dev(
     const float* __restrict__ q,
     const float* __restrict__ k_tensor,

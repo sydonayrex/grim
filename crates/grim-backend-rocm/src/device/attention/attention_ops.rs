@@ -630,6 +630,63 @@ impl AttentionOps for RocmDevice {
             return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
         }
 
+        // ─── Query-tiled prefill attention ──────────────────────────────
+        //
+        // The scalar kernel below launches one block per (query, head) and each
+        // block reads its whole causal KV range from DRAM: at 3928 tokens that
+        // is 126.4 GB of traffic per layer, and the measured 287 ms is exactly
+        // that at ~440 GB/s — i.e. the kernel sits ON this card's GDDR6
+        // roofline, so the only lever is reading K/V less often. The tiled
+        // kernel puts QT consecutive queries in one block and reuses each K/V
+        // row from registers, cutting traffic by ~QT.
+        //
+        // Conditions mirror the scalar kernel's contract: no window, no
+        // softcap, no alibi, no max/sum side outputs, head_dim <= 256, and a
+        // whole number of query heads per KV head.
+        let tiled_qt: usize = std::env::var("GRIM_ATTN_QT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        if tiled_qt > 1
+            && seq_len >= 64
+            && window.is_none()
+            && out_max.is_none()
+            && out_sum.is_none()
+            && softcap <= 0.0
+            && config.head_dim <= 256
+            && config.num_kv_heads > 0
+            && config.num_heads % config.num_kv_heads == 0
+        {
+            let qt: usize = tiled_qt.min(4);
+            let mut qt_i = qt as i32;
+            let tiled_grid = crate::HipDim3::new(
+                seq_len.div_ceil(qt) as u32,
+                config.num_heads as u32,
+                1,
+            );
+            let tiled_block = crate::HipDim3::new(128, 1, 1);
+            let stream = self.launch_compute_kernel(
+                "grim_qkv_attention_tiled",
+                tiled_grid,
+                tiled_block,
+                &mut [
+                    arg(&mut qptr),
+                    arg(&mut kptr),
+                    arg(&mut vptr),
+                    arg(&mut optr),
+                    arg(&mut nh),
+                    arg(&mut nkv),
+                    arg(&mut hd),
+                    arg(&mut sl),
+                    arg(&mut ksl),
+                    arg(&mut co),
+                    arg(&mut isd),
+                    arg(&mut qt_i),
+                ],
+            )?;
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
+
         let mut launch_block_dim = launch.block_dim;
         let arch_leak: &'static str = self.intern_str(&self.gpu_target);
         let key = crate::autotune::KernelKey {
