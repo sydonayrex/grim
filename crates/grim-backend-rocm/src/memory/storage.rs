@@ -463,6 +463,25 @@ impl RocmStorage {
             }
         };
 
+        // The lane-cache key is a hash of the packed bytes, and the conversion
+        // runs on the decode path where those bytes live only on the device.
+        // Uploading is the one moment they are in host memory, so take the
+        // hash here: it removes a full D2H plus the hashing (measured 2.5 s
+        // across 201 weights) from the first decode step.
+        if let grim_tensor::Storage::KQuant(scheme) = dtype.storage {
+            use grim_tensor::KQuantScheme as S;
+            let lane_served = matches!(
+                scheme,
+                S::Q4K | S::Q5K | S::Q6K | S::Q3K | S::IQ3S | S::Q2K | S::IQ4NL | S::GsqRco3p5
+            );
+            if lane_served && bytes >= 1024 * 1024 {
+                crate::device::compute::gemm_launchers::register_weight_source_hash(
+                    dev_ptr_void as u64,
+                    bytes,
+                    seahash::hash(host_bytes),
+                );
+            }
+        }
         let upload_result = unsafe {
             hipMemcpy(
                 dev_ptr_void,

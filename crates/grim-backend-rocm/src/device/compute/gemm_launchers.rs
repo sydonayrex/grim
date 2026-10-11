@@ -2840,7 +2840,22 @@ pub(crate) fn u4_lane_cache_key(
     scheme: grim_tensor::KQuantScheme,
     converter: U4LaneConverter,
 ) -> u64 {
-    let mut h = seahash::hash(packed);
+    u4_lane_cache_key_from_hash(seahash::hash(packed), n, k, scheme, converter)
+}
+
+/// The mixing half of [`u4_lane_cache_key`], taking the source-bytes hash as
+/// an input.
+///
+/// Split out so a weight whose bytes were hashed at UPLOAD time (when they are
+/// already on the host, for free) can be keyed without a device-to-host copy.
+/// The mixing is identical, so the on-disk entries stay valid.
+pub(crate) fn u4_lane_cache_key_from_hash(
+    mut h: u64,
+    n: usize,
+    k: usize,
+    scheme: grim_tensor::KQuantScheme,
+    converter: U4LaneConverter,
+) -> u64 {
     h ^= (n as u64) << 1;
     h ^= (k as u64) << 17;
     h ^= (scheme as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -2854,6 +2869,49 @@ pub(crate) fn u4_lane_cache_key(
     // the first run after this change misses them and reconverts once. A
     // load-time cost, no correctness impact.
     h ^ (converter.magic as u64).wrapping_mul(0xA076_1D64_78BD_642F)
+}
+
+/// Hash of a packed weight's SOURCE bytes, registered when the bytes are still
+/// on the host (during upload).
+///
+/// The lane cache is keyed by a hash of the packed bytes, and the conversion
+/// runs on the DECODE path where those bytes are only on the device — so the
+/// key used to cost a full device-to-host copy of every weight (measured
+/// 0.98 s) plus hashing them (1.5 s) on the first decode step. Uploading is
+/// the one moment the bytes are already in host memory, so the hash is taken
+/// there and remembered against the device allocation.
+///
+/// Keyed by `(device pointer, byte length)`: two live allocations cannot share
+/// both, and the entry is only ever consulted for a weight this process
+/// uploaded.
+/// The registry itself. ONE map for both functions: declaring the `OnceLock`
+/// inside each of them gave register and lookup separate maps, so every lookup
+/// missed while the counters said the entries were there.
+static WEIGHT_SOURCE_HASHES: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, usize), u64>>,
+> = OnceLock::new();
+
+fn weight_source_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<(u64, usize), u64>>
+{
+    WEIGHT_SOURCE_HASHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn register_weight_source_hash(device_ptr: u64, bytes: usize, hash: u64) {
+    weight_source_hashes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((device_ptr, bytes), hash);
+}
+
+/// The hash registered by [`register_weight_source_hash`], if this process
+/// uploaded these bytes.
+pub(crate) fn weight_source_hash(device_ptr: Option<u64>, bytes: usize) -> Option<u64> {
+    let ptr = device_ptr?;
+    weight_source_hashes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(ptr, bytes))
+        .copied()
 }
 
 /// Read a cached triple, or `None` on any miss or inconsistency.
@@ -3061,10 +3119,29 @@ impl RocmDevice {
         k: usize,
         scheme: grim_tensor::KQuantScheme,
     ) -> Result<WhiteCrowDecodedWeights> {
-        let packed = w.copy_to_host()?;
+        let u4_split = std::env::var("GRIM_U4_TRACE").is_ok();
         let converter = u4_lane_converter_for(scheme)?;
-        let cache_key =
-            u4_lane_cache_enabled().then(|| u4_lane_cache_key(&packed, n, k, scheme, converter));
+        // The key needs a hash of the packed bytes. If this process uploaded
+        // them, the hash was taken then and the D2H (and the hashing) is
+        // skipped entirely; otherwise fall back to reading them back.
+        let known_hash = weight_source_hash(w.device_ptr, w.bytes);
+        let sp0 = std::time::Instant::now();
+        let packed = if known_hash.is_none() {
+            Some(w.copy_to_host()?)
+        } else {
+            None
+        };
+        let sp1 = std::time::Instant::now();
+        let cache_key = u4_lane_cache_enabled().then(|| match known_hash {
+            Some(h) => u4_lane_cache_key_from_hash(h, n, k, scheme, converter),
+            None => u4_lane_cache_key(
+                packed.as_deref().unwrap_or(&[]),
+                n,
+                k,
+                scheme,
+                converter,
+            ),
+        });
 
         if std::env::var("GRIM_U4_TRACE").is_ok() {
             eprintln!(
@@ -3075,15 +3152,28 @@ impl RocmDevice {
             );
         }
         if let (Some(key), Some(dir)) = (cache_key, u4_lane_cache_dir()) {
+            let sp2 = std::time::Instant::now();
             if let Some((qw, sc, zr)) = u4_lane_cache_read(&dir, key, converter, n, k) {
-                if std::env::var("GRIM_U4_TRACE").is_ok() {
-                    eprintln!("[u4-trace] HIT key={key:016x} [{n},{k}]");
+                if u4_split {
+                    eprintln!(
+                        "[u4-split] [{n},{k}] d2h={:?} disk={:?}",
+                        sp1.duration_since(sp0),
+                        sp2.elapsed()
+                    );
                 }
                 return self.whitecrow_from_host_bytes(qw, sc, zr, n, k);
             }
         }
 
-        let (qw, sc, zr) = self.encode_u4_lanes(&packed, n, k, scheme)?;
+        let packed_owned;
+        let packed_ref: &[u8] = match packed.as_deref() {
+            Some(p) => p,
+            None => {
+                packed_owned = w.copy_to_host()?;
+                &packed_owned
+            }
+        };
+        let (qw, sc, zr) = self.encode_u4_lanes(packed_ref, n, k, scheme)?;
         if let (Some(key), Some(dir)) = (cache_key, u4_lane_cache_dir()) {
             u4_lane_cache_write(&dir, key, converter, n, k, &qw, &sc, &zr);
         }
