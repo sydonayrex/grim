@@ -3674,3 +3674,54 @@ pub fn last_captured_head_gemv_a() -> Option<usize> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
 }
+
+/// ρ microbench entry: memory-free fp32-FMA (VALU) and f16-WMMA (TC) loops.
+/// Returns (cc_tflops, tc_tflops); ρ = tc/cc decides whether dequant-on-the-
+/// fly is structurally right for this silicon (APEX4 framework, old/res4).
+pub fn rho_microbench_for_test(dev: &RocmDevice, iters: i32) -> Result<(f64, f64)> {
+        use std::time::Instant;
+    use grim_tensor::CoreTensorOps;
+    let _dev_guard = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+    let threads: u64 = 32 * 1024;
+    let block: u32 = 256;
+    let grid = (threads / block as u64) as u32;
+    let out = CoreTensorOps::zeros(
+        dev,
+        &Shape::new(vec![(threads + 4096) as usize]),
+        DType::F32,
+    )?;
+    let mut optr = out
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| Error::Backend("rho: out not RocmStorage".into()))?
+        .device_ptr
+        .unwrap_or(0);
+
+    let mut run = |kernel: &str, iters: i32| -> f64 {
+        let mut it = iters;
+        let t0 = Instant::now();
+        let _ = dev.launch_compute_kernel(
+            kernel,
+            HipDim3::new(grid, 1, 1),
+            HipDim3::new(block, 1, 1),
+            &mut [arg(&mut optr), arg(&mut it)],
+        );
+        let _ = out.to_cpu_vec_f32();
+        t0.elapsed().as_secs_f64()
+    };
+
+    let _ = run("grim_rho_fp32_fma", 100);
+    let _ = run("grim_rho_wmma_f16", 100);
+
+    let it32 = iters;
+    let t = run("grim_rho_fp32_fma", it32);
+    let cc_tflops = (threads * it32 as u64) as f64 * 8.0 / t / 1e12;
+
+    let itw = iters / 2;
+    let t = run("grim_rho_wmma_f16", itw);
+    let waves = threads / 32;
+    let tc_tflops = (waves * (itw as u64 / 4) * 4 * 8192) as f64 / t / 1e12;
+
+    Ok((cc_tflops, tc_tflops))
+
+}

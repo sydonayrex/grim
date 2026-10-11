@@ -167,6 +167,7 @@ pub use crate::device::roc_device::{
 };
 
 pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
+pub use crate::device::compute::gemm_launchers::rho_microbench_for_test;
 pub use crate::decode_graph_buffers::{
     DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
     launch_attention, launch_qkv_gemv, write_embedding_to_buffer, write_embeddings_to_buffer_batch,

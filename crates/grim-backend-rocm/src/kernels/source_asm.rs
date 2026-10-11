@@ -11,6 +11,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
+    s.push_str(crate::kernels::rho_microbench::KERNEL_SOURCE);
     // GRAVE Phase 4: fused GDN-2 state-update + output + gated norm, one
     // launch per GDL layer. Standalone TU (no cross-kernel helpers).
     s.push_str(crate::kernels::gla_kernels::GLA_KERNEL_SOURCE);

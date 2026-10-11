@@ -82,4 +82,5 @@ pub mod wmma_fp8_gemm;
 pub mod wmma_gemm;
 pub mod wmma_iq_gemm;
 pub mod wmma_big_gemm;
+pub mod rho_microbench;
 pub mod wmma_quantized_gemm;
