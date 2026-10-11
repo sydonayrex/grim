@@ -662,7 +662,86 @@ impl LlamaBlock {
 
 // ─── DecodeGraphModel implementation for Llama ─────────────────────────────
 
+/// Convert one linear weight's K-quant storage to u4 lanes, best-effort.
+///
+/// Shared by every `DecodeGraphModel::prewarm_lane_weights` implementation:
+/// the Llama/Lfm2/Gemma2/... block structs differ, but the per-tensor work is
+/// identical (scheme gate, budgeted conversion). Returns true when the tensor
+/// ended up with lanes available.
+pub(crate) fn prewarm_one_kquant_linear(dev: &Arc<Dev>, w: &grim_tensor::Tensor) -> bool {
+    use grim_backend_rocm::RocmStorage;
+    use grim_tensor::KQuantScheme;
+    let dims = w.shape().dims().to_vec();
+    let Some(&k) = dims.last() else { return false };
+    if k == 0 {
+        return false;
+    }
+    let scheme = match &w.dtype().storage {
+        grim_tensor::Storage::KQuant(s) => *s,
+        _ => return false,
+    };
+    if !matches!(
+        scheme,
+        KQuantScheme::Q4K
+            | KQuantScheme::Q5K
+            | KQuantScheme::Q6K
+            | KQuantScheme::Q3K
+            | KQuantScheme::IQ3S
+            | KQuantScheme::Q2K
+            | KQuantScheme::IQ4NL
+            | KQuantScheme::GsqRco3p5
+    ) {
+        return false;
+    }
+    let Some(ws) = w.storage().as_any().downcast_ref::<RocmStorage>() else {
+        return false;
+    };
+    let n = w.shape().elem_count() / k;
+    matches!(
+        dev.u4_lane_weights_budgeted(ws, n, k, scheme, true),
+        Ok(Some(_))
+    )
+}
+
+/// Walk a model's linear weights and convert every lane-served K-quant.
+pub(crate) fn prewarm_lane_weights_for(
+    dev: &Arc<Dev>,
+    weights: Vec<&grim_tensor::Tensor>,
+) -> Result<()> {
+    let total = weights.len();
+    let done = weights
+        .iter()
+        .filter(|w| prewarm_one_kquant_linear(dev, w))
+        .count();
+    eprintln!("[prewarm] u4 lane weights: {done} ready, {} skipped", total - done);
+    Ok(())
+}
+
 impl DecodeGraphModel for Llama {
+    /// Convert every K-quant linear to u4 lanes now (see prewarm_lane_weights).
+    fn prewarm_lane_weights(&self) -> Result<()> {
+        let dev = dev_for_llama(self)?;
+        let mut weights: Vec<&grim_tensor::Tensor> = Vec::new();
+        for b in &self.layers {
+            for l in [
+                Some(&b.wq), Some(&b.wk), Some(&b.wv),
+                b.g_proj.as_ref(), b.w_gate.as_ref(), b.w_up.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                weights.push(l.weight());
+            }
+            weights.push(&b.wo.weight());
+            if let Some(d) = b.w_down.as_ref() {
+                weights.push(&d.weight());
+            }
+        }
+        weights.push(&self.output.weight());
+        prewarm_lane_weights_for(&dev, weights)
+    }
+
+
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
@@ -1050,6 +1129,34 @@ impl DecodeGraphModel for Llama {
 // ─── DecodeGraphModel implementation for LFM2 ──────────────────────────────
 
 impl DecodeGraphModel for crate::lfm2::Lfm2 {
+    /// Convert every K-quant linear to u4 lanes now (see the Qwen35 impl and
+    /// prewarm_lane_weights_for): the first decode step would otherwise pay
+    /// the conversions on the critical path.
+    fn prewarm_lane_weights(&self) -> Result<()> {
+        let ordinal = match &self.device {
+            grim_tensor::Device::Rocm(o) => *o,
+            _ => return Ok(()),
+        };
+        let dev = grim_backend_rocm::RocmDevice::shared(ordinal);
+        let mut weights: Vec<&grim_tensor::Tensor> = Vec::new();
+        for b in &self.layers {
+            for l in [
+                b.wq.as_ref(), b.wk.as_ref(), b.wv.as_ref(), b.wo.as_ref(),
+                b.shortconv_in_proj.as_ref(), b.shortconv_out_proj.as_ref(),
+                b.gdl_b_proj.as_ref(), b.gdl_w_proj.as_ref(), b.gdl_f_proj.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                weights.push(l.weight());
+            }
+            weights.push(&b.ffn_gate.weight());
+            weights.push(&b.ffn_up.weight());
+            weights.push(&b.ffn_down.weight());
+        }
+        prewarm_lane_weights_for(&dev, weights)
+    }
+
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
         self.get_or_create_decode_graph(max_ctx, batch)
     }
@@ -2753,6 +2860,9 @@ macro_rules! impl_llama_wrapper_graph {
             impl DecodeGraphModel for crate::$module::$name {
                 fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
                     self.inner.get_or_create_decode_graph(max_ctx, batch)
+                }
+                fn prewarm_lane_weights(&self) -> Result<()> {
+                    self.inner.prewarm_lane_weights()
                 }
                 fn forward_capture(&self, graph: &mut DecodeGraph, token_id: u32) -> Result<()> {
                     self.inner.forward_capture(graph, token_id)
