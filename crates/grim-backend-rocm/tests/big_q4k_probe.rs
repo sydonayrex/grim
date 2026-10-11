@@ -77,7 +77,8 @@ fn big_q4k_prefill_bench_vs_16row() {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TESTS=1");
         return;
     };
-    let (m, n, k) = (4056usize, 4096usize, 4096usize);
+    let m: usize = std::env::var("GRIM_BENCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(4056);
+    let (n, k) = (4096usize, 4096usize);
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
     let b_host: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0).collect();
     let b_packed = grim_quant::quant_q4k(&b_host).unwrap();
@@ -172,7 +173,8 @@ fn big128_q4k_parity_and_bench() {
     }
 
     // bench at the production prefill shape
-    let (m, n, k) = (4056usize, 4096usize, 4096usize);
+    let m: usize = std::env::var("GRIM_BENCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(4056);
+    let (n, k) = (4096usize, 4096usize);
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
     let b_host: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0).collect();
     let b_packed = grim_quant::quant_q4k(&b_host).unwrap();

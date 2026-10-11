@@ -227,7 +227,17 @@ extern "C" __global__ void BIG_NAME(
 
     __shared__ _Float16 sA[2][BIG_BM * BIG_LD];   // 2 x 5 KB
     __shared__ _Float16 sB[2][BIG_BN * BIG_LD];   // 2 x 5 KB
-    __shared__ float cq[BIG_WAVES][32 * 32];              // per-wave quadrant, 4 KB
+    // C staging for BOUNDARY blocks only, aliased onto the B fill buffer.
+    //
+    // The old layout gave every wave its own quadrant (32 KB of cq), which put
+    // the kernel at 63488 B of LDS and capped it at ONE block per CU. Interior
+    // blocks now store straight from the accumulators, and boundary blocks
+    // stage one quadrant at a time — and that staging reuses sB, which is dead
+    // once the K loop ends. LDS stays 30720 B (2 blocks per CU) with the
+    // conflict-free pad intact: a separate 4 KB cq forced ld=36 to fit, and
+    // that pad measured ~50% slower (29.3 vs 19.7 ms at m=4096).
+    float* cq = (float*)sB[0];
+    constexpr int CQ_LD = 32;
 
     using namespace rocwmma;
     fragment<matrix_a, 16, 16, 16, _Float16, row_major> fa[2][2];   // [mi][kh]
@@ -274,26 +284,46 @@ extern "C" __global__ void BIG_NAME(
         __syncthreads();
     }
 
-    // Per-wave 32x32 quadrant to LDS, then one masked cooperative global write.
-    #pragma unroll
-    for (int mi = 0; mi < 2; ++mi)
+    // Interior blocks (the overwhelming majority) write C straight from the
+    // accumulator fragments: no LDS round trip, no extra barrier.
+    const bool interior = (row_base + BIG_BM <= M) && (col_base + BIG_BN <= N);
+    if (interior) {
         #pragma unroll
-        for (int ni = 0; ni < 2; ++ni)
-            store_matrix_sync(cq[wave] + (mi * 16) * 32 + ni * 16, fc[mi][ni], 32,
-                              layout_t::mem_row_major);
-    __syncthreads();
-    // Per-WAVE lane iteration: each wave writes ALL 1024 slots of its own
-    // 32x32 quadrant. `idx = tid + k*128` would cover only the quarter of the
-    // quadrant whose slots are congruent to the wave's lanes (mod 128) — the
-    // other 3/4 never written and read back as fresh-LDS zeros.
-    const int lane = tid & 31;
-    for (int idx = lane; idx < 32 * 32; idx += 32) {
-        const int i = idx / 32;
-        const int j = idx % 32;
-        const int row = row_base + wm * 32 + i;
-        const int col = col_base + wn * 32 + j;
-        if (row < M && col < N)
-            C[(long long)row * N + col] = cq[wave][i * 32 + j];
+        for (int mi = 0; mi < 2; ++mi)
+            #pragma unroll
+            for (int ni = 0; ni < 2; ++ni)
+                store_matrix_sync(
+                    C + (long long)(row_base + wm * 32 + mi * 16) * N
+                      + (col_base + wn * 32 + ni * 16),
+                    fc[mi][ni], N, layout_t::mem_row_major);
+    } else {
+        // Boundary block: stage ONE quadrant at a time and mask the write.
+        // `idx = tid + k*BIG_THREADS` covers all 1024 slots exactly once.
+        const int lane_q = tid & 31;
+        (void)lane_q;
+        #pragma unroll 1
+        for (int w = 0; w < BIG_WAVES; ++w) {
+            if (wave == w) {
+                #pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+                    #pragma unroll
+                    for (int ni = 0; ni < 2; ++ni)
+                        store_matrix_sync(cq + (mi * 16) * CQ_LD + ni * 16, fc[mi][ni], CQ_LD,
+                                          layout_t::mem_row_major);
+            }
+            __syncthreads();
+            const int qwm = w / BIG_WN;
+            const int qwn = w % BIG_WN;
+            for (int idx = tid; idx < 32 * 32; idx += BIG_THREADS) {
+                const int i = idx / 32;
+                const int j = idx % 32;
+                const int row = row_base + qwm * 32 + i;
+                const int col = col_base + qwn * 32 + j;
+                if (row < M && col < N)
+                    C[(long long)row * N + col] = cq[i * CQ_LD + j];
+            }
+            __syncthreads();
+        }
     }
 }
 "#;
@@ -329,6 +359,7 @@ pub fn big64_source(fill: &str) -> String {
     let (f, blk) = fmt_params(fill);
     kernel_source(&format!("grim_wmma_big_{fill}"), 64, 64, 128, f, blk)
 }
+
 
 /// The 128x64 tile (dispatched at m >= 128).
 pub fn big128_source(fill: &str) -> String {
