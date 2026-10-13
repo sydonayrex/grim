@@ -650,8 +650,16 @@ impl RocmDevice {
         let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
             .map(|v| v != "0")
             .unwrap_or(true);
+        // Q5K is excluded from the u4-lane GEMV: its converted lanes decode
+        // ~0.2 off against a host reference at M=1 (measured 0.13-0.31 on
+        // Qwen3.8-27B attn_q/qkv/gate/ssm_out and Qwen3.5-9B attn_qkv, warmed
+        // steady state, sleep-invariant), while Q4K/Q6K sit at ~3e-4 through
+        // the same kernel. Q5K M=1 falls through to the exact dot4/WMMA legs.
+        // The M>1 u4-GEMM route is unaffected (verified ~2e-3) and stays.
+        let q5k_decode_skip = matches!(scheme, grim_tensor::dtype::KQuantScheme::Q5K);
         if m != 1
             || !w4a4_decode
+            || q5k_decode_skip
             || k % 128 != 0
             || crate::quantization::w4a4_ostquant_supported(
                 crate::quantization::gcn_arch(&self.gpu_target),

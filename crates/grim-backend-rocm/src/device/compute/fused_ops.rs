@@ -277,6 +277,11 @@ impl RocmDevice {
         wk: &dyn BackendStorage,
         wv: &dyn BackendStorage,
     ) -> Result<FusedQkvWeights> {
+        if self.is_rdna34 {
+            return Err(Error::Backend(
+                "build_fused_qkv_q80: fused Q8_0 QKV disabled on RDNA3/4 (unsigned dot4)".into(),
+            ));
+        }
         let q80 = DType {
             arith: ArithType::F32,
             storage: DTypeStorage::KQuant(grim_tensor::dtype::KQuantScheme::Q80),

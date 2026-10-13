@@ -933,7 +933,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q5k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q5k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q2_K GEMM launcher (RDNA3/4).
@@ -947,7 +947,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q2k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q2k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q3_K GEMM launcher (RDNA3/4).
@@ -961,7 +961,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q3k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q3k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant Q6_K GEMM launcher (RDNA3/4).
@@ -975,7 +975,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q6k", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_q6k", a, b, out, m, n, k, 64)
     }
 
     /// SPEED-ROC: WMMA fused-dequant IQ-family GEMM launchers (RDNA3/4).
@@ -989,7 +989,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xxs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xxs", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1002,7 +1002,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2xs", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1015,7 +1015,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2s", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq2s", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1028,7 +1028,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3xxs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3xxs", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1041,7 +1041,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3s", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq3s", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1054,7 +1054,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4nl", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4nl", a, b, out, m, n, k, 16)
     }
 
     #[allow(dead_code)]
@@ -1067,7 +1067,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
-        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4xs", a, b, out, m, n, k)
+        self.launch_wmma_fused_dequant_quant("grim_wmma_fused_dequant_iq4xs", a, b, out, m, n, k, 16)
     }
 
     /// SPEED-ROC: FP8 E4M3 WMMA GEMM launcher (RDNA4 only, 383 TFLOPS).
@@ -1623,6 +1623,7 @@ impl RocmDevice {
         m: usize,
         n: usize,
         k: usize,
+        n_tile: u32,
     ) -> Result<*mut c_void> {
         let a_ptr = a_storage
             .device_ptr
@@ -1634,7 +1635,12 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{name}: out has no device ptr")))?;
 
-        let grid_x = n.div_ceil(64) as u32;
+        // Grid stride follows the KERNEL's N tile, not a hardcoded 64:
+        // the macro-stamped K-quant kernels tile 64-wide while the explicit
+        // IQ kernels (wmma_iq_gemm.rs) tile 16-wide. A 64-wide grid on a
+        // 16-wide kernel leaves cols >= 16*ceil(N/64) unwritten (measured:
+        // IQ4_NL ffn_down [5120,17408] at M=1 computed only cols 0..1280).
+        let grid_x = n.div_ceil(n_tile as usize) as u32;
         let grid_y = m.div_ceil(16) as u32;
         let grid_dim = HipDim3::new(grid_x, grid_y, 1);
         let block_dim = HipDim3::new(128, 1, 1);
@@ -2458,7 +2464,15 @@ impl RocmDevice {
                     )));
                 }
                 let k_aligned = k - (k % 32);
-                if self.is_dot4_arch && !dot_disabled && k_aligned >= 32 {
+                // Same signed-dot restriction as the eager Q8_0 arm
+                // (device/quant/mod.rs): on RDNA3/4 the dot4 kernel reads
+                // signed Q8_0 codes as unsigned. Fall through to the exact
+                // WMMA fused-dequant leg there; RDNA2 keeps dot4.
+                if self.is_dot4_arch
+                    && !dot_disabled
+                    && !self.is_rdna34
+                    && k_aligned >= 32
+                {
                     let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                         Error::Backend("linear_decode_into: a not RocmStorage".into())
                     })?;
