@@ -1725,7 +1725,7 @@ impl DecodeGraphModel for Qwen35 {
         use grim_backend_rocm::RocmStorage;
         use grim_nn::modules::Linear;
         use grim_tensor::Storage;
-        let dev = dev_for_qwen35(self)?;
+        let _dev = dev_for_qwen35(self)?;
         let mut linears: Vec<&Linear> = Vec::new();
         for b in &self.blocks {
             for l in [
@@ -1772,8 +1772,14 @@ impl DecodeGraphModel for Qwen35 {
             let Some(wr) = w.storage().as_any().downcast_ref::<RocmStorage>() else {
                 continue;
             };
+            // Lane buffers are per-weight device memory: allocate each on the
+            // card that owns the packed weight. Prewarming everything on the
+            // model's nominal device concentrated ~6 GB of lane copies on GPU 0
+            // (measured 15.9 GB vs 8.5 GB) and made the lane buffer read a
+            // foreign-card weight.
+            let owner = Dev::shared(wr.device_ordinal());
             let n = w.shape().elem_count() / k;
-            match dev.u4_lane_weights_budgeted(wr, n, k, scheme, true) {
+            match owner.u4_lane_weights_budgeted(wr, n, k, scheme, true) {
                 Ok(Some(_)) => done += 1,
                 Ok(None) => skipped += 1,
                 Err(_) => skipped += 1,
@@ -1789,6 +1795,27 @@ impl DecodeGraphModel for Qwen35 {
                 "decode graph disabled by env".into(),
             ));
         }
+        // The decode graph is recorded on ONE device (`dev_for_qwen35` = the
+        // model's nominal device). A layer-split model has blocks whose weights
+        // and eager KV arenas live on another GPU; recording their kernels into
+        // this device's graph — and seeding the graph arenas from cross-device
+        // eager arenas — dereferences foreign memory. That is the `Page not
+        // present` fault at the first decode step: `seed_kv_arena_from_eager`
+        // issues `hipMemcpyAsync(dst=graph_arena_on_dev0, src=eager_arena_on_dev1)`
+        // on dev0's stream for every layer on dev1. Refuse here so the caller
+        // stays on the eager path, which moves the hidden state per block
+        // explicitly and is correct across devices.
+        let multi_device = match self.blocks.first() {
+            Some(first) => self.blocks.iter().any(|b| b.device != first.device),
+            None => false,
+        };
+        if multi_device {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph is single-device; this model is layer-split across \
+                 multiple GPUs — using eager"
+                    .into(),
+            ));
+        }
         let dev = dev_for_qwen35(self)?;
         let stream = dev
             .get_stream_from_pool(0)
@@ -1800,7 +1827,30 @@ impl DecodeGraphModel for Qwen35 {
         // coupling the two is what made the conv scratch 2048 rows too narrow
         // on Qwen3.5-9B and aborted capture at step 1.
         let kda_conv = (self.cfg.ssm_dt_rank + 2 * self.cfg.ssm_n_group) * self.cfg.ssm_d_state;
-        let n_q = (self.cfg.num_heads * self.cfg.head_dim).max(kda_conv);
+        // `q_buf` holds a PROJECTION OUTPUT, so its width must cover the widest
+        // projection any layer writes into it:
+        //   * recurrent (KDA) layers write `attn_qkv` at the conv width,
+        //   * full-attention layers write the FUSED q+gate at `2 * q_dim`
+        //     (llama.cpp `create_tensor_qkv(..., n_embd_head_k*n_head*2)`).
+        // Sizing it `max(q_dim, kda_conv)` omitted the factor of 2, so on the
+        // 27B (`q_dim=6144`, `kda_conv=10240`) the attention q+gate output
+        // (12288) did not fit and capture aborted at layer 3 with
+        // `expected [1,12288], got [1,10240]`. Derive the width from the loaded
+        // weights so it tracks whatever this checkpoint actually projects.
+        let q_dim = self.cfg.num_heads * self.cfg.head_dim;
+        let mut n_q = q_dim.max(kda_conv);
+        for b in &self.blocks {
+            if b.is_full_attention {
+                if let Some(wq) = &b.wq {
+                    n_q = n_q.max(wq.weight().shape().dims()[0]);
+                }
+                if let Some(qkv) = &b.attn_qkv {
+                    n_q = n_q.max(qkv.weight().shape().dims()[0]);
+                }
+            } else if let Some(qkv) = &b.attn_qkv {
+                n_q = n_q.max(qkv.weight().shape().dims()[0]);
+            }
+        }
         let n_k = self.cfg.num_kv_heads * self.cfg.head_dim;
         let n_v = n_k;
         let inter = self.cfg.intermediate_size;
@@ -1841,6 +1891,45 @@ impl DecodeGraphModel for Qwen35 {
             sc_l_cache,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("graph pool alloc: {e}")))?;
+
+        // Size each layer's `q_buf` to ITS OWN projection width. The pool
+        // allocates one width for every layer, but a recurrent layer projects
+        // `attn_qkv` at the conv width while a full-attention layer projects
+        // the fused q+gate at `2*q_dim`. A single shared width fails
+        // `linear_decode`'s exact out-shape check on whichever layer type does
+        // not match it (`kda.attn_qkv @ layer 0: expected [1,10240], got
+        // [1,12288]`). `q_buf` also backs the short-conv scratch for recurrent
+        // layers, and there its width IS the conv width, so per-layer sizing is
+        // correct for both uses.
+        let dt = grim_tensor::DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: grim_tensor::Storage::Native,
+        };
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let width = if block.is_full_attention {
+                block
+                    .wq
+                    .as_ref()
+                    .map(|l| l.weight().shape().dims()[0])
+                    .or_else(|| block.attn_qkv.as_ref().map(|l| l.weight().shape().dims()[0]))
+                    .unwrap_or(2 * q_dim)
+            } else {
+                block
+                    .attn_qkv
+                    .as_ref()
+                    .map(|l| l.weight().shape().dims()[0])
+                    .unwrap_or(kda_conv)
+            };
+            if width != n_q && width > 0 {
+                buffers.q_buf[layer_idx] = grim_backend_rocm::RocmStorage::alloc_gpu(
+                    &Shape::new(vec![batch, width]),
+                    dt.clone(),
+                    &dev.allocator_handle(),
+                    dev.ordinal(),
+                )
+                .map_err(|e| grim_core::error::Error::Backend(format!("q_buf layer alloc: {e}")))?;
+            }
+        }
 
         if self.cfg.ssm_dt_rank > 0 {
             let n_val = self.cfg.ssm_dt_rank;

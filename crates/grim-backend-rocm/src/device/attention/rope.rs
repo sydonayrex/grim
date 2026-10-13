@@ -729,6 +729,7 @@ impl RocmDevice {
         max_seq_len: usize,
         rope_interleaved: bool,
     ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gamma_q_ptr = gamma_q_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_q has no device ptr".into())
         })?;

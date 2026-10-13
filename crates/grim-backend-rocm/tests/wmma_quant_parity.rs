@@ -20,6 +20,19 @@ fn gpu_device() -> Option<RocmDevice> {
     Some(RocmDevice::try_new(0).expect("RocmDevice::try_new"))
 }
 
+/// The kernel route counters are process-global, so two tests that launch the
+/// same WMMA kernel concurrently both increment the counter the other is
+/// asserting on. Under the default parallel `cargo test` this made
+/// `wmma_big_q4k_large_m_parity_and_route` fail with `small16=1` — a stray
+/// launch from a sibling test, not a routing defect (it passes with
+/// `--test-threads=1`). Every test in this file that launches or reads the
+/// counters takes this lock.
+static ROUTE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn route_counter_lock() -> std::sync::MutexGuard<'static, ()> {
+    ROUTE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// CPU reference: dequantize packed B to f32 then plain matmul C = A @ B^T.
 fn ref_matmul(
     a: &[f32],
@@ -96,11 +109,30 @@ fn run_case(
     let got = out_s.to_cpu_vec_f32().expect("to_cpu");
 
     let want = ref_matmul(&a_host, &b_packed, m, n, k, scheme, deq);
+    // NaN-aware: `f32::max` IGNORES NaN, so the previous
+    // `max_diff = max_diff.max((got - want).abs())` reported `max_diff=0` for a
+    // kernel that emitted all-NaN. That is exactly how a broken Q4_K dequant
+    // (NaN on every real weight) rode this gate green. Count non-finite
+    // differences explicitly.
     let mut max_diff = 0.0f32;
+    let mut nonfinite = 0usize;
     for i in 0..want.len() {
-        max_diff = max_diff.max((got[i] - want[i]).abs());
+        let d = (got[i] - want[i]).abs();
+        if d.is_finite() {
+            if d > max_diff {
+                max_diff = d;
+            }
+        } else {
+            nonfinite += 1;
+        }
     }
-    eprintln!("[{format:?}] m={m} n={n} k={k} max_diff={max_diff}");
+    eprintln!(
+        "[{format:?}] m={m} n={n} k={k} max_diff={max_diff} nonfinite={nonfinite}"
+    );
+    assert_eq!(
+        nonfinite, 0,
+        "{format:?}: WMMA kernel produced {nonfinite} non-finite outputs (NaN/Inf)"
+    );
     assert!(
         max_diff < 0.5,
         "{format:?}: WMMA kernel diverges from reference (max_diff={max_diff})"
@@ -114,6 +146,7 @@ fn wmma_quant_decode_parity() {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1");
         return;
     };
+    let _route = route_counter_lock();
     // Decode shape: M=1. NOTE: this test checks NUMBERS ONLY, so it does not by
     // itself prove the WMMA kernel ran — it passes through any correct path.
     // `wmma_quant_partial_m_parity_and_route` adds the route-counter assertion.
@@ -157,6 +190,7 @@ fn wmma_quant_fp16_input_parity() {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1");
         return;
     };
+    let _route = route_counter_lock();
     let (m, n, k) = (1usize, 1024usize, 1024usize);
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
     let b_orig: Vec<f32> = (0..k * n)
@@ -264,6 +298,7 @@ fn wmma_quant_partial_m_parity_and_route() {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TEST=1");
         return;
     };
+    let _route = route_counter_lock();
     for m in [1usize, 3, 5, 17] {
         grim_backend_rocm::reset_kernel_route_counters();
         run_case(
@@ -312,6 +347,7 @@ fn wmma_big_q4k_large_m_parity_and_route() {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TESTS=1");
         return;
     };
+    let _route = route_counter_lock();
     for m in [64usize, 1000usize, 1024usize] {
         grim_backend_rocm::reset_kernel_route_counters();
         run_case(

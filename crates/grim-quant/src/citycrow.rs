@@ -55,7 +55,7 @@
 //! The accumulator cannot hold a scale, so `zeros` is what makes the two-dot
 //! identity hold: `sum_i (A_i * W_i) = d_a * d_b * (iacc - z_b * sum_qa)`.
 
-use crate::{dequant_gsq_rco_3p5, Error, Result};
+use crate::{Error, Result, dequant_gsq_rco_3p5};
 use grim_tensor::KQuantScheme;
 
 /// Weights per `sudot8` accumulator group. Matches the `V_DOT8_U32_U4`
@@ -247,7 +247,7 @@ pub fn repack_to_u4_lanes(
         other => {
             return Err(Error::Backend(format!(
                 "citycrow: unhandled scheme {other:?}"
-            )))
+            )));
         }
     };
 
@@ -781,7 +781,7 @@ mod tests {
         for g in 0..3 {
             for i in 0..CITYCROW_GROUP {
                 let frac = (i % 16) as f32 / 16.0; // [0, 15/16]
-                                                   // Positive values only, so every code is >= the zero point.
+                // Positive values only, so every code is >= the zero point.
                 flat.push(frac * amps[g]);
             }
         }
@@ -899,7 +899,7 @@ mod tests {
             // 16 distinct levels over one period, spanning [-1, +1].
             let level = (i % 16) as f32 / 16.0; // [0, 1)
             let mut v = level * 2.0 - 1.0; // [-1, 1)
-                                           // Pin both extremes so codes 0 (-1) and 3 (+1) are represented.
+            // Pin both extremes so codes 0 (-1) and 3 (+1) are represented.
             match i % 16 {
                 0 => v = -1.0,
                 8 => v = 1.0,

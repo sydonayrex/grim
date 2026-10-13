@@ -110,6 +110,7 @@ impl RocmCachingAllocator {
 
     /// Allocate a device buffer of at least `bytes` usable bytes, reusing a pooled
     pub fn alloc(&self, bytes: usize) -> Result<*mut c_void> {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let cls = Self::size_class(bytes);
         // Pool disabled (the default): serve SMALL allocations from 128 MiB
         // slabs. gfx1200's hipMalloc commit granularity costs ~0.5 MB per
@@ -315,6 +316,7 @@ impl RocmCachingAllocator {
     /// the violations ([alloc-audit]/[alloc-trace]); GRIM_ALLOC_POOL=1 opts
     /// back into reuse for perf work once the duplicate-owner site is fixed.
     pub fn free(&self, ptr: *mut c_void, bytes: usize) {
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // Audit BEFORE any branch: the no-pool path returns below and the
         // live-set must still see the release, or every later handout of a
         // legitimately recycled driver address prints as phantom

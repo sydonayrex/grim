@@ -146,7 +146,23 @@ pub fn copy_route(
 ) -> Result<()> {
     match route {
         RouteLink::PeerDirect => {
-            crate::rccl::p2p_memcpy_async(dst_ptr, dst_device, src_ptr, src_device, len, stream)?;
+            if crate::rccl::p2p_memcpy_async(dst_ptr, dst_device, src_ptr, src_device, len, stream).is_err() {
+                let staging = take_staging(stream, len, src_device)?;
+                {
+                    let _leg = crate::device::util::DeviceGuard::set(src_device);
+                    crate::device::helpers::check_hip(
+                        "copy_route: D2H fallback",
+                        unsafe { hipMemcpyAsync(staging.as_device_ptr(), src_ptr, len, HipMemcpyKind::DeviceToHost, stream) },
+                    )?;
+                }
+                {
+                    let _leg = crate::device::util::DeviceGuard::set(dst_device);
+                    crate::device::helpers::check_hip(
+                        "copy_route: H2D fallback",
+                        unsafe { hipMemcpyAsync(dst_ptr, staging.as_device_ptr(), len, HipMemcpyKind::HostToDevice, stream) },
+                    )?;
+                }
+            }
         }
         RouteLink::HostBounce => {
             let staging = take_staging(stream, len, src_device)?;

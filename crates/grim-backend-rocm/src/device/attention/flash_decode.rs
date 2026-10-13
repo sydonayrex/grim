@@ -24,6 +24,7 @@ impl RocmDevice {
         kv_seq_len: usize,
         num_splits: usize,
     ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let q_ptr = q_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("flash_decode: q has no device ptr".into()))?;

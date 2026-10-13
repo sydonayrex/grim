@@ -1132,6 +1132,13 @@ impl Xing40Mla {
     ) -> Result<Tensor> {
 
         let seq_len = x.shape().dims()[0];
+        if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+            eprintln!(
+                "[moe-shape] x dims={:?} seq_len={} ",
+                x.shape().dims(),
+                seq_len
+            );
+        }
 
         // On a device the whole MLA forward is device-resident: the host path below
         // builds CPU activations and then calls CPU-device ops against the
@@ -1373,6 +1380,13 @@ impl Xing40Mla {
         let vd = self.v_head_dim;
         let rank = self.kv_a_layernorm.weight.shape().dims()[0];
         let seq_len = x.shape().dims()[0];
+        if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+            eprintln!(
+                "[moe-shape] x dims={:?} seq_len={} ",
+                x.shape().dims(),
+                seq_len
+            );
+        }
         let dev = pick_device_for_tensor(x);
         let row = rank + rope_d;
         let q_stride = nope + rope_d; // per-head width inside q_full
@@ -2465,6 +2479,13 @@ impl Xing40Moe {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.gate.forward(x)?;
         let seq_len = x.shape().dims()[0];
+        if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+            eprintln!(
+                "[moe-shape] x dims={:?} seq_len={} ",
+                x.shape().dims(),
+                seq_len
+            );
+        }
         // Gate-logits D2H is deferred behind a closure so the bias-aware D2D
         // dispatch below never performs it. Only the two fallbacks call this.
         let host_logits = || logits.to_vec_f32();
@@ -2889,6 +2910,13 @@ impl Xing40Block {
         kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
+        if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
+            eprintln!(
+                "[moe-shape] x dims={:?} seq_len={} ",
+                x.shape().dims(),
+                seq_len
+            );
+        }
         // 1. attn_hc: collapse the multi-stream state into the single attention input.
         let (attn_gates, collapsed_v) = self.attn_hc.forward(x, seq_len)?;
         let collapsed = cpu_tensor(collapsed_v, Shape::new(vec![seq_len, self.hidden_size]));

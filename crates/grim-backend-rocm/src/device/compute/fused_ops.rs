@@ -200,6 +200,7 @@ impl RocmDevice {
         n_kv: usize,
         hidden: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let n_total = n_q
             .checked_add(
                 n_kv.checked_mul(2)
@@ -492,6 +493,7 @@ impl RocmDevice {
         act_q81: &RocmStorage,
         weights: &FusedQkvWeights,
     ) -> Result<FusedQkvGateLogits> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let n_total = weights.n_total_with_gates();
         let out_storage = RocmStorage::alloc_gpu(
             &Shape::new(vec![n_total]),
@@ -694,6 +696,7 @@ impl RocmDevice {
         act_f32: &RocmStorage,
         fused: &FusedGateUpQ4KWeights,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let n_total = fused.n_total();
         let out = RocmStorage::alloc_gpu(
             &Shape::new(vec![1, n_total]),
@@ -724,6 +727,7 @@ impl RocmDevice {
         n_up: usize,
         hidden: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let n_total = n_gate.checked_add(n_up).ok_or_else(|| {
             Error::Backend("launch_fused_gate_up_dot4: n_gate+n_up overflow".into())
         })?;
@@ -1020,6 +1024,7 @@ impl RocmDevice {
         eps: f32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let x_s = as_rocm(x)?;
         let w_norm_s = as_rocm(w_norm)?;
         let w_mat_s = as_rocm(weight_mat)?;
@@ -1163,6 +1168,7 @@ impl RocmDevice {
         k: usize,
         eps: f32,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let x_s = as_rocm(x)?;
         let gamma_s = as_rocm(gamma)?;
         let w_codes_s = as_rocm(w_codes)?;
@@ -1353,6 +1359,7 @@ impl RocmDevice {
         Box<dyn BackendStorage>,
         Box<dyn ComputeHandle>,
     )> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let x_s = as_rocm(x)?;
         let res_s = as_rocm(residual)?;
         let w_s = as_rocm(weight)?;
@@ -1419,6 +1426,7 @@ impl RocmDevice {
         Box<dyn BackendStorage>,
         Box<dyn ComputeHandle>,
     )> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let h = as_rocm(hidden)?;
         let w = as_rocm(lm_head)?;
         let t = as_rocm(targets)?;
@@ -1501,6 +1509,7 @@ impl RocmDevice {
         v_tile_size: i32,
         inv_batch: f32,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let h = as_rocm(hidden)?;
         let w = as_rocm(lm_head)?;
         let t = as_rocm(targets)?;
@@ -1576,6 +1585,7 @@ impl RocmDevice {
         targets: &[usize],
         label_smoothing: Option<f32>,
     ) -> Result<(f32, Box<dyn BackendStorage>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let l_s = as_rocm(logits)?;
         if !l_s.device_ptr_is_valid() {
             return Err(Error::Backend(

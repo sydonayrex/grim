@@ -294,6 +294,7 @@ impl RocmDevice {
         quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let config = {
             let out_dims = out_shape.dims();
             if out_dims.len() != 3 {
@@ -560,6 +561,7 @@ impl RocmDevice {
         kv_seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let q_s = as_rocm(q)?;
         let k_s = as_rocm(k)?;
         let v_s = as_rocm(v)?;
@@ -630,6 +632,7 @@ impl RocmDevice {
         cache_offset: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_dims = out_shape.dims();
         if out_dims.len() != 3 {
             return Err(Error::Shape(
@@ -756,6 +759,7 @@ impl RocmDevice {
         k_scale: f32,
         v_scale: f32,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_dims = out_shape.dims();
         if out_dims.len() != 3 {
             return Err(Error::Shape(
@@ -823,6 +827,7 @@ impl RocmDevice {
         cache_offset: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         // ─── structural validation ───────────────────────────────────────── [see: `qkv_attention`]
         let out_dims = out_shape.dims();
         if out_dims.len() != 4 {

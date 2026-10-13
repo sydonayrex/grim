@@ -77,6 +77,7 @@ impl RocmDevice {
         n_bit: u8,
         num_blocks: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_shape = Shape::from_slice(&[num_weights]);
         let out = RocmStorage::alloc_gpu(
             &out_shape,
@@ -149,6 +150,7 @@ impl RocmDevice {
         embedding_dim: usize,
         tensor_scale: f32,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_shape = Shape::from_slice(&[total_elements]);
         let out = RocmStorage::alloc_gpu(
             &out_shape,
@@ -647,6 +649,7 @@ impl RocmDevice {
         k: usize,
         group_size: usize,
     ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if k % 128 != 0 {
             return Err(Error::Backend(format!(
                 "launch_w4a4_ostquant_gemv_blob: K={k} must be divisible by 128"
@@ -858,6 +861,7 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if k % 128 != 0 {
             return Err(Error::Backend(format!(
                 "launch_w4a4_ostquant_gemv: K={k} must be divisible by 128"
@@ -1003,6 +1007,7 @@ impl RocmDevice {
         k_dim: usize,
         group_size: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::ArithType;
         let id: Vec<f32> = (0..k_dim)
             .flat_map(|i| (0..k_dim).map(move |j| if i == j { 1.0f32 } else { 0.0 }))
@@ -1038,6 +1043,7 @@ impl RocmDevice {
         bits: u8,
         group_size: usize,
     ) -> Result<Box<dyn BackendStorage>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::ArithType;
         let mut vpw: i32 = match bits {
             2 => 16,

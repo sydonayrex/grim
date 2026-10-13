@@ -1587,6 +1587,18 @@ pub async fn cmd_run(
                 if is_prefill {
                     prewarm_done = true;
                 }
+                // Diagnostic (GRIM_MGPU_SYNC=1): drain every visible ROCm device
+                // before starting a step. If a cross-device page fault
+                // disappears with this on, the cause is an unsynced dependency
+                // between the previous step's last-device work and this step's
+                // first-device kernels.
+                if std::env::var_os("GRIM_MGPU_SYNC").is_some() {
+                    if let Ok(devs) = grim_backend_rocm::RocmDevice::probe() {
+                        for d in &devs {
+                            d.synchronize();
+                        }
+                    }
+                }
                 let logits = if want_prewarm {
                     std::thread::scope(|scope| {
                         let handle = scope.spawn(|| {

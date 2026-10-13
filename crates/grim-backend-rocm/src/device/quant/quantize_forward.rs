@@ -11,7 +11,7 @@ use grim_tensor::{BackendStorage, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{HipDim3, RocmHandle, arg, as_rocm, dev_ptr, dtype_f32, linear_launch};
+use crate::{arg, as_rocm, dev_ptr, dtype_f32, linear_launch, HipDim3, RocmHandle};
 
 impl RocmDevice {
     /// Launch standalone Q8_0 quantization HIP kernel.
@@ -66,6 +66,7 @@ impl RocmDevice {
         x: &dyn BackendStorage,
         format: grim_tensor::QuantFormat,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let x_s = as_rocm(x)?;
         if !x_s.device_ptr_is_valid() {
             return Err(Error::Backend(
@@ -133,6 +134,7 @@ impl RocmDevice {
         Box<dyn BackendStorage>,
         Box<dyn ComputeHandle>,
     )> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let g_s = as_rocm(gate)?;
         let u_s = as_rocm(up)?;
         if !g_s.device_ptr_is_valid() || !u_s.device_ptr_is_valid() {

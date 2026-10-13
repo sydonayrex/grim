@@ -757,10 +757,7 @@ pub fn pack_grey_raven_hw(
                 for tt in 0..4 {
                     let g = 8 * w + 4 * h + tt;
                     let pat = patterns[(t * n_windows + w) * 4 + (tt % 4)];
-                    for (rank, &slot) in [pat[0] as usize, pat[1] as usize]
-                        .iter()
-                        .enumerate()
-                    {
+                    for (rank, &slot) in [pat[0] as usize, pat[1] as usize].iter().enumerate() {
                         let k = 4 * g + slot;
                         let v = if r < rows && k < cols {
                             weights[r * cols + k]
@@ -800,9 +797,7 @@ pub fn dequant_grey_raven_hw(
     for t in 0..n_tiles {
         for w in 0..n_windows {
             let base = (t * n_windows + w) * HW_TILE_WINDOW_BYTES;
-            let word = u32::from_le_bytes(
-                blob[base + 256..base + 260].try_into().unwrap(),
-            );
+            let word = u32::from_le_bytes(blob[base + 256..base + 260].try_into().unwrap());
             for l in 0..32 {
                 let r = 16 * t + (l % 16);
                 if r >= rows {
@@ -826,10 +821,7 @@ pub fn dequant_grey_raven_hw(
                     // sidx only to place them at k. Diagonal: both ranks at
                     // slot fa. Non-diagonal: rank0 at fa, rank1 at fb.
                     let g = 8 * w + 4 * h + (tt % 4);
-                    for (rank, pos) in [(2 * (tt % 4)), 2 * (tt % 4) + 1]
-                        .iter()
-                        .enumerate()
-                    {
+                    for (rank, pos) in [(2 * (tt % 4)), 2 * (tt % 4) + 1].iter().enumerate() {
                         let v = crate::fp8_e4m3_to_f32(blob[base + l * 8 + pos]);
                         // Diagonal (fa == fb) is the reserved broadcast: both
                         // ranks land on fa. Otherwise rank selects its slot.

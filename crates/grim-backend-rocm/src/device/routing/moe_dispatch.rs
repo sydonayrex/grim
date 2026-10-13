@@ -29,6 +29,7 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gate_buf = self.from_cpu(gate_flat, &Shape::new(vec![gate_flat.len()]), DType::F32)?;
         let up_buf = self.from_cpu(up_flat, &Shape::new(vec![up_flat.len()]), DType::F32)?;
         let down_buf = self.from_cpu(down_flat, &Shape::new(vec![down_flat.len()]), DType::F32)?;
@@ -60,6 +61,7 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -107,6 +109,7 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -155,6 +158,7 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -272,6 +276,7 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.moe_fused_dispatch_resident_routing_into(
@@ -413,6 +418,7 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.moe_fused_dispatch_resident_routing_w8a8_int8_into(
@@ -571,6 +577,7 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.moe_fused_dispatch_resident_routing_w8a8_int8_dot4_into(
@@ -734,6 +741,7 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.moe_fused_dispatch_resident_routing_w8a8_fp8_into(
@@ -890,6 +898,7 @@ impl RocmDevice {
         group_size: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.moe_fused_dispatch_resident_routing_awq_into(
@@ -1099,6 +1108,7 @@ impl RocmDevice {
         inter: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let stream = self.moe_fused_dispatch_resident_routing_mxfp4_into(
@@ -1281,6 +1291,7 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -1358,6 +1369,7 @@ impl RocmDevice {
         num_experts: usize,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -1419,6 +1431,7 @@ impl RocmDevice {
         down_stride: u64,
         routed_scaling_factor: f32,
     ) -> Result<(RocmStorage, RocmHandle)> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -1762,6 +1775,7 @@ impl RocmDevice {
         down_row_bytes: u64,
         down_q4k: bool,
     ) -> Result<()> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::{ArithType, MemoryOps, Storage};
         if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
             eprintln!("[dg-entry] arm entered: num_pairs={num_pairs} hidden={hidden} inter={inter}");

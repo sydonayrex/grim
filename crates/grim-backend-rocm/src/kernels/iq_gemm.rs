@@ -666,29 +666,34 @@ static const unsigned char IQ3S_GRID_B[512][4] = {
     }
 
     // block_q4_XS: 136 bytes per 256 weights, 4-bit codes + 6-bit sub-block scales
+    // block_iq4_xs (136 B / 256): d f16 @0..2, scales_h u16 @2..4,
+    // scales_l[4] @4..8, qs[128] @8..136. Matches llama.cpp
+    // `dequantize_row_iq4_xs` and `grim_quant::dequant_iq4xs`.
+    //
+    // The previous body was a stub that disagreed with BOTH in four ways: it
+    // read the 8 sub-block scales as a contiguous 6-bit field (they are a
+    // 2-bit high part per sub-block in `scales_h` plus a 4-bit low part in
+    // `scales_l`), omitted the `-32` bias, interleaved the nibbles (they are
+    // 16 low then 16 high per sub-block), and skipped the `kvalues_iq4nl`
+    // codebook. 117 tensors in the 27B are IQ4_XS, so every one decoded wrong.
     __device__ inline float dequant_iq4xs(const unsigned char* blk, int in_sb) {
-        float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* sc = blk + 2;   // 6 bytes = 8 sub-blocks × 6 bits packed, 3 more bytes for 24 bits total
-        const unsigned char* qs = blk + 8;   // 128 bytes = 256 4-bit codes
-
-        int group = in_sb / 32; // 8 sub-blocks of 32 weights
-
-        // 6-bit scale unpacking: scales are packed 6 bits each across 8 sub-blocks
-        // 8 × 6 = 48 bits = 6 bytes
-        int sc_byte_idx = (group * 6) / 8;
-        int sc_bit_offset = (group * 6) % 8;
-        unsigned int sc_val = 0;
-        sc_val = sc[sc_byte_idx] >> sc_bit_offset;
-        if (sc_bit_offset > 2) {
-            sc_val |= (unsigned int)sc[sc_byte_idx + 1] << (8 - sc_bit_offset);
-        }
-        sc_val &= 0x3F;
-
-        // 4-bit code extraction
-        int q_byte = in_sb / 2;
-        unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
-
-        return d * (float)sc_val * (float)q_code;
+        const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+        const unsigned char* sc_h = blk + 2;
+        const unsigned char* sc_l = blk + 4;
+        const unsigned char* qs = blk + 8;
+        const int ib = in_sb >> 5;
+        const int j = in_sb & 31;
+        const unsigned int scales_h = (unsigned int)sc_h[0] | ((unsigned int)sc_h[1] << 8);
+        const int ls = (int)((sc_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                     | (((int)((scales_h >> (2 * ib)) & 3)) << 4);
+        const float dl = d * (float)(ls - 32);
+        const unsigned char qb = qs[ib * 16 + (j & 15)];
+        const unsigned char q_code = (j < 16) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
+        static const float kvalues_iq4nl[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+        };
+        return dl * kvalues_iq4nl[q_code];
     }
 
     // ===================== Q4_K (full, for standalone) =====================

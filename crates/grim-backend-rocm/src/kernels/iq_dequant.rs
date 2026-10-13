@@ -103,22 +103,36 @@ extern "C" {
         return d * kvalues_iq4nl[q_code];
     }
 
+    // block_iq4_xs (136 B / 256): d f16 @0..2, scales_h u16 @2..4,
+    // scales_l[4] @4..8, qs[128] @8..136. Matches llama.cpp
+    // `dequantize_row_iq4_xs` and `grim_quant::dequant_iq4xs` byte-for-byte.
+    //
+    // The previous body was a stub that disagreed with BOTH in four ways: it
+    // read the 8 sub-block scales as a contiguous 6-bit field (they are a
+    // 2-bit high part per sub-block in `scales_h` plus a 4-bit low part in
+    // `scales_l`), omitted the `-32` bias, interleaved the nibbles (they are
+    // 16 low then 16 high per sub-block), and skipped the `kvalues_iq4nl`
+    // codebook. Every IQ4_XS weight — 117 tensors in the 27B — decoded wrong,
+    // which is why the 27B was gibberish while the 9B (no IQ4_XS) was correct.
     __device__ inline float dequant_iq4xs_device(const unsigned char* blk, int in_sb) {
-        float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* sc = blk + 2;
+        const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+        const unsigned char* sc_h = blk + 2;
+        const unsigned char* sc_l = blk + 4;
         const unsigned char* qs = blk + 8;
-        int group = in_sb / 32;
-        int sc_byte_idx = (group * 6) / 8;
-        int sc_bit_offset = (group * 6) % 8;
-        unsigned int sc_val = 0;
-        sc_val = sc[sc_byte_idx] >> sc_bit_offset;
-        if (sc_bit_offset > 2) {
-            sc_val |= (unsigned int)sc[sc_byte_idx + 1] << (8 - sc_bit_offset);
-        }
-        sc_val &= 0x3F;
-        int q_byte = in_sb / 2;
-        unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
-        return d * (float)sc_val * (float)q_code;
+        const int ib = in_sb >> 5;   // sub-block 0..7 (32 weights each)
+        const int j = in_sb & 31;    // 0..31 within the sub-block
+        const unsigned int scales_h = (unsigned int)sc_h[0] | ((unsigned int)sc_h[1] << 8);
+        const int ls = (int)((sc_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                     | (((int)((scales_h >> (2 * ib)) & 3)) << 4);
+        const float dl = d * (float)(ls - 32);
+        // Elements 0..15 take the LOW nibble of qs[0..15]; 16..31 the HIGH.
+        const unsigned char qb = qs[ib * 16 + (j & 15)];
+        const unsigned char q_code = (j < 16) ? (qb & 0x0F) : ((qb >> 4) & 0x0F);
+        static const float kvalues_iq4nl[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+        };
+        return dl * kvalues_iq4nl[q_code];
     }
 
     // ─── Standalone global kernels ──────────────────────────────────

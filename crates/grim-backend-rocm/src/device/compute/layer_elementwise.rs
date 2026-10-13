@@ -903,6 +903,7 @@ impl RocmDevice {
         clamp_min: f32,
         clamp_max: f32,
     ) -> Result<MhcGateTensors> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         if seq == 0 {
             return Err(Error::Backend("mhc_gates_into: empty sequence".into()));
         }

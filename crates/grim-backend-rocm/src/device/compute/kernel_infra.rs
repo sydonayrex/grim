@@ -920,6 +920,9 @@ impl RocmDevice {
         args: &mut [*mut c_void],
     ) -> Result<*mut c_void> {
         use std::ffi::CString;
+        // Unguarded seam — jit_compile_or_cache releases its DeviceGuard on
+        // return, leaving hipModuleLoad unguarded. Add guard.
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let (path, _lowered) = self.jit_compile_or_cache(source, entry, None)?;
         let path_c = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|e| Error::Backend(format!("launch_from_source: bad path: {e}")))?;
@@ -1102,6 +1105,9 @@ impl RocmDevice {
         // between runs (grim_silu_mul, then grim_rms_norm) which an arch fault
         // would not do. Check the bytes, not just the ordinals, before blaming
         // the context.
+        // Force a real hipSetDevice — CUR_DEV cache can be stale (drifted thread
+        // context during graph capture) causing hipModuleLoad 209.
+        crate::device::util::note_current_device(-1);
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         self.stamp_launch_post_pin(trace_on, entry, grid);
         let mut module_cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());

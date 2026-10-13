@@ -524,22 +524,39 @@ impl Qwen35Block {
             .get_unconstrained("ssm_a")
             .ok()
             .and_then(|t| t.to_vec_f32().ok());
-        let ssm_alpha = Linear::load_column_parallel(
-            &ws.pp("ssm_alpha"),
-            cfg.hidden_size,
-            cfg.ssm_dt_rank,
-            false,
-            tp,
-        )
-        .ok();
-        let ssm_beta = Linear::load_column_parallel(
-            &ws.pp("ssm_beta"),
-            cfg.hidden_size,
-            cfg.ssm_dt_rank,
-            false,
-            tp,
-        )
-        .ok();
+        // The KDA alpha/beta gates are loaded at f32 even when the checkpoint
+        // quantizes them. They are tiny ([dt_rank, hidden] = 48x5120 = 0.5 MB
+        // each) and precision-critical: alpha is the recurrence decay and beta
+        // the write strength, so a coarse quantized projection corrupts the
+        // whole Gated DeltaNet stream. The reference Q4_K_M checkpoint keeps
+        // them f32; a UD checkpoint that quantizes them to Q8_0 routed them
+        // through the int8-dot GEMV, whose activation quantization is coarser
+        // than llama.cpp's q8_1 and moved the 27B's step-0 logprob from -0.2 to
+        // -4.6. Dequantizing these two to f32 restores it. `GRIM_SSM_AB_F32=0`
+        // keeps the checkpoint scheme for A/B.
+        let ab_f32 = !matches!(
+            std::env::var("GRIM_SSM_AB_F32").as_deref(),
+            Ok("0" | "false" | "off")
+        );
+        let load_ab = |name: &str| -> Option<Linear> {
+            if ab_f32 {
+                ws.pp(name)
+                    .get_f32([cfg.ssm_dt_rank, cfg.hidden_size], "weight")
+                    .ok()
+                    .map(|t| Linear::from_tensor(t, None))
+            } else {
+                Linear::load_column_parallel(
+                    &ws.pp(name),
+                    cfg.hidden_size,
+                    cfg.ssm_dt_rank,
+                    false,
+                    tp,
+                )
+                .ok()
+            }
+        };
+        let ssm_alpha = load_ab("ssm_alpha");
+        let ssm_beta = load_ab("ssm_beta");
         let ssm_dt_bias = ws
             .get_unconstrained("ssm_dt.bias")
             .ok()
@@ -1744,6 +1761,8 @@ impl Qwen35 {
             cfg.num_kv_heads,
             cfg.head_dim,
             cfg.full_attention_interval,
+            cfg.vocab_size,
+            cfg.hidden_size,
         );
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
@@ -3873,6 +3892,44 @@ const VRAM_PLAN_FRACTION: f64 = 0.90;
 /// backend without `hipMemGetInfo`), keeping the old behavior as the
 /// conservative default.
 #[allow(clippy::too_many_arguments)]
+/// Bytes a non-layer weight will actually occupy once loaded, given the
+/// embedding/head load rules: a verified K-quant scheme stays packed, any
+/// other quantized scheme dequantizes to f32. Sizing from checkpoint bytes
+/// alone under-counts a Q6_K table by ~7x (715 MB packed vs 5.09 GB f32) and
+/// leaves the owning card over-filled by the difference.
+fn non_layer_weight_bytes(
+    ws: &WeightSource<'_>,
+    prefix: &str,
+    fallback_elems: usize,
+    is_embedding: bool,
+) -> u64 {
+    let w = ws.pp(prefix);
+    let packed = w.prefix_bytes();
+    match w.meta("weight") {
+        Some(m) => {
+            let elems: usize = m.shape.iter().product();
+            match &m.dtype.storage {
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K)
+                | Storage::KQuant(grim_tensor::dtype::KQuantScheme::IQ3S) => packed,
+                // `Embedding::load` dequantizes an unverified scheme to f32;
+                // `Linear::load_column_parallel` keeps the packed tensor (it
+                // reads the natural weight, never the transpose). Reserving
+                // f32 for the LM head would over-charge the last card by ~4 GB.
+                Storage::KQuant(_) if is_embedding => elems as u64 * 4,
+                Storage::KQuant(_) => packed,
+                _ => packed,
+            }
+        }
+        None => {
+            if packed > 0 {
+                packed
+            } else {
+                fallback_elems as u64 * 4
+            }
+        }
+    }
+}
+
 fn plan_layer_devices(
     ws: &WeightSource<'_>,
     devices: &[Device],
@@ -3881,6 +3938,8 @@ fn plan_layer_devices(
     kv_heads: usize,
     head_dim: usize,
     interval: usize,
+    vocab: usize,
+    hidden: usize,
 ) -> Vec<Device> {
     // Single-device or unknown layout: nothing to plan.
     if devices.len() <= 1 {
@@ -3984,6 +4043,32 @@ fn plan_layer_devices(
         return (0..num_layers).map(round_robin).collect();
     };
 
+    // Non-layer weights are pinned by `load_tp`: `token_embd` to the first
+    // device, `output` to the last. Reserve their loaded footprint up front, or
+    // the layer loop balances against a budget that silently over-commits the
+    // owning card. The embedding is the dangerous one: an unverified quant
+    // scheme dequantizes to f32 (715 MB packed -> 5.09 GB for the 27B vocab),
+    // while the LM head keeps its packed tensor.
+    if remaining.len() > 1 {
+        let embed_bytes =
+            non_layer_weight_bytes(ws, "token_embd", vocab.saturating_mul(hidden), true);
+        let output_bytes =
+            non_layer_weight_bytes(ws, "output", vocab.saturating_mul(hidden), false);
+        remaining[0] = remaining[0].saturating_sub(embed_bytes);
+        let last = remaining.len() - 1;
+        remaining[last] = remaining[last].saturating_sub(output_bytes);
+        if std::env::var_os("GRIM_PLACEMENT_TRACE").is_some() {
+            eprintln!(
+                "[qwen35] placement reserve: token_embd={:.2} GB -> dev0, output={:.2} GB -> dev{}; \
+                 per-device plannable remaining after reserve: {:?}",
+                embed_bytes as f64 / 1e9,
+                output_bytes as f64 / 1e9,
+                last,
+                remaining.iter().map(|b| *b as f64 / 1e9).collect::<Vec<_>>()
+            );
+        }
+    }
+
     let mut assignment = Vec::with_capacity(num_layers);
     // Size each block from checkpoint metadata before committing it.
     let layer_bytes: Vec<u64> = (0..num_layers)
@@ -4073,27 +4158,74 @@ fn assign_by_headroom(
 ) -> (Vec<usize>, usize) {
     // Effective FP16 throughput. A throttled card advertises less than its peak,
     // and a device with no measured row scores 0 rather than an invented number.
-    let throughput = |i: usize| -> f32 {
+    let throughput = |i: usize| -> f64 {
         caps.get(i)
-            .map(|c| c.tflops_fp16 * (1.0 - c.throttle_pct))
+            .map(|c| (c.tflops_fp16 * (1.0 - c.throttle_pct)) as f64)
             .unwrap_or(0.0)
     };
+    let n = remaining.len();
+    if n == 0 {
+        return (Vec::new(), layer_bytes.len());
+    }
+    // Layers are assigned as CONTIGUOUS blocks per device, not by a per-layer
+    // max-headroom pick. The per-layer greedy alternates GPUs whenever the two
+    // headrooms are within one layer of each other — which is exactly the
+    // balanced case it is supposed to produce — so a 64-layer model bounces its
+    // hidden state across the interconnect on nearly every layer. Grouping the
+    // layers means one cross-device hop per forward instead of ~60.
+    //
+    // Each device's share is proportional to its measured throughput times its
+    // headroom, so a faster or roomier card takes a larger contiguous block and
+    // uniform cards split evenly.
+    let total_bytes: u64 = layer_bytes.iter().sum();
+    let weight = |i: usize| -> f64 {
+        let t = throughput(i);
+        let base = if t > 0.0 { t } else { 1.0 };
+        base * (remaining[i] as f64).max(1.0)
+    };
+    let total_w: f64 = (0..n).map(weight).sum();
+    let target: Vec<f64> = (0..n)
+        .map(|i| {
+            if total_w > 0.0 {
+                total_bytes as f64 * weight(i) / total_w
+            } else {
+                total_bytes as f64 / n as f64
+            }
+        })
+        .collect();
+
+    let mut used = vec![0u64; n];
     let mut targets = Vec::with_capacity(layer_bytes.len());
     let mut unplaced = 0usize;
+    let mut cur = 0usize;
     for &bytes in layer_bytes {
-        // A device is a candidate only if this layer actually fits on it.
-        let target = match (0..remaining.len())
-            .filter(|&i| bytes <= remaining[i])
-            .max_by(|&a, &b| {
-                throughput(a)
-                    .partial_cmp(&throughput(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| remaining[a].cmp(&remaining[b]))
-                    // `max_by` yields the LAST of several equal maxima, so
-                    // invert the index to make the lowest ordinal win a tie.
-                    .then_with(|| b.cmp(&a))
-            }) {
-            Some(idx) => idx,
+        // Preferred candidate: the current block's device while it still fits
+        // and is under its byte share, else the next device in order.
+        let mut chosen: Option<usize> = None;
+        for i in cur..n {
+            if used[i] + bytes <= remaining[i] && (used[i] as f64) < target[i] {
+                chosen = Some(i);
+                break;
+            }
+        }
+        // Last-resort contiguous fit: the current device may exceed its share
+        // when nothing later can hold the layer.
+        if chosen.is_none() && cur < n && used[cur] + bytes <= remaining[cur] {
+            chosen = Some(cur);
+        }
+        // Fall back to any device that fits, least-loaded first.
+        if chosen.is_none() {
+            chosen = (0..n)
+                .filter(|&i| used[i] + bytes <= remaining[i])
+                .min_by_key(|&i| used[i]);
+        }
+        match chosen {
+            Some(i) => {
+                used[i] += bytes;
+                remaining[i] = remaining[i].saturating_sub(bytes);
+                targets.push(i);
+                cur = i;
+            }
             None => {
                 unplaced += 1;
                 // Overflow must SPREAD. Sending every unplaced layer to device 0
@@ -4101,16 +4233,15 @@ fn assign_by_headroom(
                 // `65/65 layers exceed aggregate plannable VRAM` and then placed
                 // all 65 on GPU 0, which is what filled it and locked the system.
                 // The least-loaded device is the safe overflow target.
-                remaining
+                let idx = remaining
                     .iter()
                     .enumerate()
                     .max_by_key(|(_, r)| **r)
                     .map(|(i, _)| i)
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                targets.push(idx);
             }
-        };
-        remaining[target] = remaining[target].saturating_sub(bytes);
-        targets.push(target);
+        }
     }
     (targets, unplaced)
 }

@@ -667,7 +667,12 @@ impl QuantOps for RocmDevice {
                         m,
                         n,
                         k,
-                        grim_tensor::dtype::KQuantScheme::Q5K,
+                        // Q3_K, not Q5_K: this is the Q3_K arm. Passing Q5_K
+                        // sized the row stride at 176 B/block (3520 B/row)
+                        // against a Q3_K allocation of 110 B/block, so the
+                        // requant sliced past the tensor and aborted. The
+                        // scheme here must be the arm's own dtype.
+                        grim_tensor::dtype::KQuantScheme::Q3K,
                     )?
                     .is_some();
                 if lane_served {

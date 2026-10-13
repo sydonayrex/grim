@@ -2402,6 +2402,7 @@ impl RocmDevice {
         out: &RocmStorage,
         act_q81: &RocmStorage,
     ) -> Result<Box<dyn ComputeHandle>> {
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::KQuantScheme;
         let a_dims = a.shape().dims();
         let k = a_dims.last().copied().unwrap_or(0);
@@ -3244,6 +3245,47 @@ impl RocmDevice {
         scheme: grim_tensor::KQuantScheme,
     ) -> Result<WhiteCrowDecodedWeights> {
         let u4_split = std::env::var("GRIM_U4_TRACE").is_ok();
+        // Storage/dtype coherence: the decode path derives `scheme` from the
+        // weight's dtype, so a Q5_K tag over a Q3_K/IQ3_S-sized allocation
+        // (38,297,600 B for [17408,5120]) means the loader sized the tensor
+        // with one scheme and tagged it with another. Name both here rather
+        // than failing later inside the row-slicing loop.
+        if let grim_tensor::dtype::Storage::KQuant(_) = &w.dtype.storage {
+            let expected = w.dtype.expected_bytes(w.shape.elem_count()) as u64;
+            if expected != w.bytes as u64 {
+                return Err(Error::Backend(format!(
+                    "requant_kquant_to_whitecrow: storage/dtype mismatch: shape={:?} \
+                     dtype={:?} scheme={scheme:?} bytes={} expected_bytes={}",
+                    w.shape.dims(),
+                    w.dtype,
+                    w.bytes,
+                    expected
+                )));
+            }
+        }
+        // Shape/stride guard at the entry that owns `w`, so the diagnostic can
+        // name the weight's own shape/dtype/bytes rather than just the slice.
+        let blk_per_256: usize = match scheme {
+            grim_tensor::KQuantScheme::Q4K => 144,
+            grim_tensor::KQuantScheme::Q5K => 176,
+            grim_tensor::KQuantScheme::Q6K => 210,
+            grim_tensor::KQuantScheme::Q3K | grim_tensor::KQuantScheme::IQ3S => 110,
+            grim_tensor::KQuantScheme::Q2K => 84,
+            grim_tensor::KQuantScheme::IQ4NL => 144,
+            _ => 0,
+        };
+        if blk_per_256 > 0 && k % 256 == 0 {
+            let row_bytes = (k / 256) * blk_per_256;
+            if row_bytes > 0 && n > w.bytes / row_bytes {
+                return Err(Error::Backend(format!(
+                    "requant_kquant_to_whitecrow: storage/dtype mismatch: w.shape={:?} \
+                     w.dtype={:?} scheme={scheme:?} w.bytes={} n={n} k={k} row_bytes={row_bytes}",
+                    w.shape.dims(),
+                    w.dtype,
+                    w.bytes
+                )));
+            }
+        }
         let converter = u4_lane_converter_for(scheme)?;
         // The key needs a hash of the packed bytes. If this process uploaded
         // them, the hash was taken then and the D2H (and the hashing) is
@@ -3353,6 +3395,22 @@ impl RocmDevice {
             .min(8)
             .max(1);
         let row_bytes = (k / per_256) * block_bytes;
+        // Shape/stride guard: `n` and `k` come from the caller and, for a
+        // transposed view (LM head `[vocab, hidden]` over a `[hidden, vocab]`
+        // packed layout), can disagree with the resident bytes. Slicing on the
+        // disagreement panicked a worker thread with a bare "range out of
+        // range"; name the tensor and the two geometries instead.
+        if row_bytes > 0 && k % per_256 == 0 {
+            let rows_avail = packed.len() / row_bytes;
+            if n > rows_avail {
+                return Err(Error::Backend(format!(
+                    "requant_kquant_to_whitecrow: shape/stride mismatch: n={n} k={k} \
+                     scheme={scheme:?} packed_bytes={} row_bytes={row_bytes} \
+                     rows_available={rows_avail}",
+                    packed.len()
+                )));
+            }
+        }
         if threads > 1 && n >= 2 && k % per_256 == 0 {
             let rows_per = n.div_ceil(threads);
             let chunks: Vec<(usize, usize)> = (0..n)
