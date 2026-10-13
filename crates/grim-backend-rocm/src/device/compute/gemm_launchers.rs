@@ -3522,7 +3522,7 @@ impl RocmDevice {
     ) -> Result<Option<Arc<WhiteCrowDecodedWeights>>> {
         type LaneCache = std::sync::Mutex<
             std::collections::HashMap<
-                (usize, usize, [usize; 2]),
+                (usize, usize, [usize; 2], usize, grim_tensor::KQuantScheme),
                 Option<Arc<WhiteCrowDecodedWeights>>,
             >,
         >;
@@ -3532,6 +3532,8 @@ impl RocmDevice {
             w.device_ptr.map(|p| p as usize).unwrap_or(0),
             w.bytes,
             [n, k],
+            self.ordinal,
+            scheme,
         );
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = guard.get(&key) {
