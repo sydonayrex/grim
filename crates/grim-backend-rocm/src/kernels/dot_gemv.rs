@@ -13,13 +13,15 @@ __device__ __forceinline__ int grim_sdot4(int a, int b, int c) {
     // All B operands in these kernels are < 128, so signed B is equivalent.
     return __builtin_amdgcn_sdot4(a, b, c, false);
 #else
-    // EXPERIMENT (q4k-inf debug): explicit signed-a x unsigned-b byte MACs.
-    // If parity passes with this and fails with the builtin, the builtin call
-    // misuses the instruction's operand semantics on gfx1201.
-    return (int)((char)(a & 0xff)) * ((int)(unsigned char)(b & 0xff))
-         + (int)((char)((a >> 8) & 0xff)) * ((int)(unsigned char)((b >> 8) & 0xff))
-         + (int)((char)((a >> 16) & 0xff)) * ((int)(unsigned char)((b >> 16) & 0xff))
-         + (int)((char)((a >> 24) & 0xff)) * ((int)(unsigned char)((b >> 24) & 0xff))
+    // RDNA3/4 have no signed I8 dot, so the builtin lowers to the UNSIGNED
+    // V_DOT4_I32_IU8. Emit the dot explicitly with BOTH operands sign-extended
+    // from their packed bytes: signed activation codes x signed weight codes.
+    // K-quant codes are < 128 so their bytes are unaffected; Q8_0/Q8_1 codes
+    // are signed and this is the fix that makes those exact.
+    return (int)((char)(a & 0xff)) * ((int)(char)(b & 0xff))
+         + (int)((char)((a >> 8) & 0xff)) * ((int)(char)((b >> 8) & 0xff))
+         + (int)((char)((a >> 16) & 0xff)) * ((int)(char)((b >> 16) & 0xff))
+         + (int)((char)((a >> 24) & 0xff)) * ((int)(char)((b >> 24) & 0xff))
          + c;
     // RDNA3/4: dot8-insts (sdot4 removed on RDNA4).
     // return __builtin_amdgcn_sudot4(true, a, true, b, c, false);

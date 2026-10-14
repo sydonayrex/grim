@@ -875,21 +875,14 @@ impl QuantOps for RocmDevice {
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(64);
-                    // Q8_0 codes are SIGNED (-128..127), but every dot4 kernel
-                    // below folds B through `grim_sdot4`, which on RDNA3/4
-                    // (no I8 dot instructions) lowers to the UNSIGNED
-                    // V_DOT4_I32_IU8 dot: each negative code reads +256 too
-                    // large (measured exact +204/-52 ratio on Qwen3.8-27B
-                    // blk.11.attn_v; step-0 -1.36 vs the -0.20 oracle).
-                    // Q4K/Q5K/Q6K survive only because their codes are < 128.
-                    // RDNA3/4 therefore skip dot4 for Q8_0 and take the exact
-                    // WMMA fused-dequant path; RDNA2 keeps dot4 (real dots).
-                    let signed_dot_ok = !is_rdna34;
-                    if !dot_disabled
-                        && m <= dot4_max_m
-                        && !Self::is_fp16_activation(a_storage)
-                        && signed_dot_ok
-                    {
+                    // Q8_0 codes are SIGNED (-128..127). `grim_sdot4` now emits
+                    // the dot with BOTH packed operands sign-extended (the
+                    // RDNA3/4 fallback used to read B as unsigned, which made
+                    // every negative weight code read +256 too large — the
+                    // Qwen3.8-27B blk.11.attn_v defect). Q4K/Q5K/Q6K codes are
+                    // < 128, so the signed B path is numerically identical for
+                    // them. Q8_0 therefore uses dot4 on every arch again.
+                    if !dot_disabled && m <= dot4_max_m && !Self::is_fp16_activation(a_storage) {
                         // N4: K80 fallback — round K down to a 32-multiple. A
                         // tightly-packed Q8_0 buffer stores only K/32 full
                         // blocks, so the missing tail weight is zero by

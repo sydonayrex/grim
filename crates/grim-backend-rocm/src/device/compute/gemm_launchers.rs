@@ -2464,15 +2464,9 @@ impl RocmDevice {
                     )));
                 }
                 let k_aligned = k - (k % 32);
-                // Same signed-dot restriction as the eager Q8_0 arm
-                // (device/quant/mod.rs): on RDNA3/4 the dot4 kernel reads
-                // signed Q8_0 codes as unsigned. Fall through to the exact
-                // WMMA fused-dequant leg there; RDNA2 keeps dot4.
-                if self.is_dot4_arch
-                    && !dot_disabled
-                    && !self.is_rdna34
-                    && k_aligned >= 32
-                {
+                // `grim_sdot4` now sign-extends both packed operands, so the
+                // dot4 leg is exact for signed Q8_0 codes on every arch.
+                if self.is_dot4_arch && !dot_disabled && k_aligned >= 32 {
                     let a_rocm = a.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
                         Error::Backend("linear_decode_into: a not RocmStorage".into())
                     })?;
