@@ -91,7 +91,16 @@ impl QuantOps for RocmDevice {
                 dims[dims.len() - 1],
             ),
         };
-        let k = a_storage.shape().dims().last().copied().unwrap_or(0);
+        // A U8 activation is a packed Q8_1 buffer: (k/32)*36 bytes, so its
+        // last dim is NOT k. Deriving K from it makes every block loop and
+        // B-row stride run 9/8 too far and read B out of bounds (the
+        // `n=1024 k=1152` trace and GPU page fault seen when a q81 buffer is
+        // routed through this entry). Take K from the weight instead.
+        let k = if a_storage.dtype().arith == ArithType::U8 {
+            b_storage.shape().dims().last().copied().unwrap_or(0)
+        } else {
+            a_storage.shape().dims().last().copied().unwrap_or(0)
+        };
         static QMM_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if crate::device::util::is_debug_enabled()
             || *QMM_TRACE.get_or_init(|| std::env::var_os("GRIM_QMM_TRACE").is_some())
