@@ -61,10 +61,16 @@ pub(crate) fn linear_into(
 /// Pure host-side predicate: may this layer use the sudot4 fused path?
 /// Mirrors the launchers' own validation (hidden%32, dot4 arch, opt-out flag)
 /// so the branch is decided with zero enqueues — no mid-capture fallback.
+///
+/// Every call site pairs this with `is_q80`, and Q8_0 B codes are SIGNED
+/// (-128..127) while RDNA3/4 `grim_sdot4` lowers to the UNSIGNED dot: the
+/// fused path is therefore exact only where `q80_dot_ok()` holds (RDNA2).
+/// K-quant dot paths are unaffected (codes < 128) and keep their own gates.
 pub(crate) fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
     hidden != 0
         && hidden % 32 == 0
         && dev.supports_dot4()
+        && dev.q80_dot_ok()
         && !matches!(
             std::env::var("GRIM_DOT_GEMV").as_deref(),
             Ok("0" | "false" | "off")
@@ -1207,7 +1213,7 @@ fn dst_downcast(dst: &dyn grim_tensor::BackendStorage) -> Result<&grim_backend_r
 impl Lfm2Block {
     /// S2 (PLAN-kernel-fusion): ShortConv sublayer + dense FFN tail, fully
     /// enqueued. Conv state lives in the per-layer device ring
-    /// `buffers.sc_state[layer_idx]` (column-major `[h_dim, kc]`, the HIP
+    /// `buffers.sc_state[layer_idx]` (channel-major `[h_dim, kc]`, the HIP
     /// kernel's in-place layout); it is seeded on first use from the host
     /// mirror OUTSIDE any capture bracket (first warmup forward), then
     /// updated in-place by the conv kernel inside the graph. Batch is 1 for
@@ -1279,6 +1285,17 @@ impl Lfm2Block {
         //      b∥x∥c straight from the in_proj output, computes bx = b*x,
         //      runs the causal conv with in-place state update, and applies
         //      the c gate — replacing (3 slice copies + mul + conv + mul).
+        // Kernel depth must come from the checkpoint, not a literal: the
+        // ring is sized from `n_shortconv_l_cache`, so a hard-coded 3 would
+        // make the kernel and the ring disagree on depth for any checkpoint
+        // whose `n_shortconv_l_cache` isn't 3 (finite, plausible-looking
+        // output — the failure mode that matters).
+        let l_cache = conv
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(3);
         dev.short_conv1d_fused_step_into(
             &buffers.sc_proj_buf[layer_idx],
             conv.storage().as_ref(),
@@ -1286,7 +1303,7 @@ impl Lfm2Block {
             &buffers.sc_y[layer_idx],
             buffers.batch.max(1),
             hidden,
-            3, // l_cache
+            l_cache,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("sc fused conv: {e}")))?;
 

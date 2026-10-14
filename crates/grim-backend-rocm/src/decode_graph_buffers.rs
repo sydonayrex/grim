@@ -146,7 +146,7 @@ pub struct DecodeGraphBuffers {
     pub moe_route_weights: RocmStorage, // [batch*top_k] f32
     /// S2: ShortConv staging. Empty vecs when the model has no ShortConv
     /// layers. `sc_state[l]` is the device-resident ring `[h_dim*(kc)]`
-    /// (column-major [d, kc], the HIP kernel's in-place layout).
+    /// (channel-major [d, kc], the HIP kernel's in-place layout).
     pub sc_proj_buf: Vec<RocmStorage>, // [batch, 3*h_dim]
     pub sc_b: Vec<RocmStorage>,         // [batch*h_dim]
     pub sc_c: Vec<RocmStorage>,
@@ -290,7 +290,7 @@ pub struct EagerKdaSource<'a> {
 
 /// Prefill seeding for a recurrent (ShortConv) layer's device ring. The host
 /// mirror holds `kc` rows of `h_dim` (`host[t*h_dim + d]` = b·x from `t` steps
-/// ago); the device ring is the transposed column-major `[d, kc]` layout the
+/// ago); the device ring is the transposed channel-major `[d, kc]` layout the
 /// `grim_short_conv1d_causal_step` kernel updates in place.
 /// Device conv-ring seed: the eager prefill ran the D2D conv, so the LIVE
 /// ring is `conv_state_dev` (kernel layout `[channel][tap]`, same layout the

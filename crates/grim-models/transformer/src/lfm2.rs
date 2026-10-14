@@ -171,7 +171,7 @@ impl ModelConfig for Lfm2Config {
 #[allow(clippy::large_enum_variant)]
 pub enum Lfm2LayerCache {
     /// ShortConv state: host mirror (row-major `[t, d]` layout, same as CPU path expects)
-    /// plus optional device-resident ring buffer (column-major `[d, kc]` layout matching the
+    /// plus optional device-resident ring buffer (channel-major `[d, kc]` layout matching the
     /// HIP kernel contract). The device buffer is allocated once on first ROCm decode step and
     /// updated in-place by `grim_short_conv1d_causal_step` — no per-token H2D or host transpose.
     /// During HIP graph capture the host mirror is NOT synced (host syncs abort capture); it is
