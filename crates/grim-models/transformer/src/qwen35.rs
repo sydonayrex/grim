@@ -1213,6 +1213,7 @@ impl Qwen35Block {
                 // the arena dtype via arena_append_from_f32 — never a raw copy
                 // into an f16 arena. K/V history stays on the GPU.
                 let k_new_rows = seq_len * self.num_kv_heads;
+                let evict = kv_eviction_policy(&device);
                 let k_cap_rows = cache
                     .k_device
                     .as_ref()
@@ -1223,10 +1224,16 @@ impl Qwen35Block {
                     .as_ref()
                     .map(|s| s.shape().dims()[0])
                     .unwrap_or(0);
-                let need_rows = cache.current_pos + k_new_rows;
+                // Phase 3: the arena stops growing at the eviction capacity, and
+                // past it the write slot wraps into the ring instead.
+                let need_rows = evict.live_rows(cache.current_pos + k_new_rows);
+                let wrapped = evict
+                    .cap_rows
+                    .map(|cap| cache.current_pos >= cap)
+                    .unwrap_or(false);
                 let _ = v_cap_rows;
 
-                if k_cap_rows >= need_rows {
+                if k_cap_rows >= need_rows || wrapped {
                     let k_dev = cache.k_device.as_ref().ok_or_else(|| {
                         grim_core::error::Error::Backend("cache.k_device missing".into())
                     })?;
@@ -1238,7 +1245,7 @@ impl Qwen35Block {
                         &device,
                         k_dev.as_ref(),
                         v_dev.as_ref(),
-                        cache.current_pos,
+                        evict.arena_row(cache.current_pos),
                         k_rope.storage().as_ref(),
                         v_dev_t.storage().as_ref(),
                         seq_len,
@@ -1265,7 +1272,12 @@ impl Qwen35Block {
                     }
                 } else {
                     // Arena full — grow geometrically and re-copy via D2D.
-                    let new_rows = ((need_rows * 2) + 64).next_power_of_two();
+                    // Phase 3: clamped to the eviction capacity (never resized
+                    // past it — the arena is reused instead).
+                    let new_rows = ((need_rows * 2) + 64)
+                        .next_power_of_two()
+                        .min(evict.cap_rows.unwrap_or(usize::MAX))
+                        .max(need_rows);
                     let full_shape = Shape::new(vec![new_rows, self.num_kv_heads, self.head_dim]);
                     let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
                     let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
@@ -1321,7 +1333,8 @@ impl Qwen35Block {
                     )?;
                 }
 
-                let total_kv = cache.current_pos + seq_len;
+                // Phase 3: the ring keeps [0, min(rows, cap)) contiguous and live.
+                let total_kv = evict.live_rows(cache.current_pos + seq_len);
                 let k_dev = cache.k_device.as_ref().ok_or_else(|| {
                     grim_core::error::Error::Backend("cache.k_device missing".into())
                 })?;
@@ -3787,14 +3800,21 @@ fn attention_layer_d2d(
     stage!("rope");
     // --- append K/V to the device arena, then attend -----------------------
     let k_new_rows = seq_len * blk.num_kv_heads;
+    let evict = kv_eviction_policy(&device);
     let k_cap_rows = cache
         .k_device
         .as_ref()
         .map(|s| s.shape().dims()[0])
         .unwrap_or(0);
-    let need_rows = cache.current_pos + k_new_rows;
+    // Phase 3: stop growing at the eviction capacity; past it the write slot
+    // wraps into the ring (see site 1).
+    let need_rows = evict.live_rows(cache.current_pos + k_new_rows);
+    let wrapped = evict
+        .cap_rows
+        .map(|cap| cache.current_pos >= cap)
+        .unwrap_or(false);
 
-    if k_cap_rows >= need_rows {
+    if k_cap_rows >= need_rows || wrapped {
         let k_dev = cache
             .k_device
             .as_ref()
@@ -3808,7 +3828,7 @@ fn attention_layer_d2d(
             &device,
             k_dev.as_ref(),
             v_dev.as_ref(),
-            cache.current_pos,
+            evict.arena_row(cache.current_pos),
             k_rope.storage().as_ref(),
             v_dev_t.storage().as_ref(),
             seq_len,
@@ -3818,7 +3838,12 @@ fn attention_layer_d2d(
             cache.v_scales_device.as_deref(),
         )?;
     } else {
-        let new_rows = ((need_rows * 2) + 64).next_power_of_two();
+        // Growth is clamped to the eviction capacity: past it the arena is
+        // reused, never resized, so the KV footprint is a known quantity.
+        let new_rows = ((need_rows * 2) + 64)
+            .next_power_of_two()
+            .min(evict.cap_rows.unwrap_or(usize::MAX))
+            .max(need_rows);
         let k_idx = blk.num_kv_heads * blk.head_dim;
         let full_shape = Shape::new(vec![new_rows, blk.num_kv_heads, blk.head_dim]);
         let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
@@ -3876,7 +3901,8 @@ fn attention_layer_d2d(
     }
 
     stage!("arena_append");
-    let total_kv = cache.current_pos + seq_len;
+    // Phase 3: the ring keeps [0, min(rows, cap)) contiguous and live.
+    let total_kv = evict.live_rows(cache.current_pos + seq_len);
     let k_arena = cache
         .k_device
         .as_ref()
@@ -4145,6 +4171,197 @@ const NUT_SUB_BLOCK_BYTES: usize = 9;
 /// (always explicit, never default); otherwise the Qwen35 f16 default
 /// applies (f16 unless `GRIM_F16_KV` explicitly disables). Other backends
 /// stay F32.
+/// Phase-3 KV-eviction policy for the dense ROCm arenas.
+///
+/// `cap_rows` is a FIXED capacity in TOKEN rows (one arena row is one token,
+/// all kv-heads packed). Once set, the arena never grows past it: the first
+/// `sinks` tokens are pinned as attention sinks and the newest
+/// `cap_rows - sinks` tokens live in a ring that overwrites in place, so the
+/// KV footprint is decoupled from `ctx`. `None` keeps the grow-with-context
+/// behaviour (the default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvEvictionPolicy {
+    pub cap_rows: Option<usize>,
+    pub sinks: usize,
+}
+
+impl KvEvictionPolicy {
+    pub fn disabled() -> Self {
+        Self {
+            cap_rows: None,
+            sinks: 0,
+        }
+    }
+
+    /// Kernel-facing policy. `UNLIMITED` makes every ring kernel an identity.
+    pub fn ring(&self) -> grim_backend_rocm::KvRingPolicy {
+        match self.cap_rows {
+            None => grim_backend_rocm::KvRingPolicy::UNLIMITED,
+            Some(cap) => grim_backend_rocm::KvRingPolicy::new(cap, self.sinks),
+        }
+    }
+
+    /// Arena rows the context may use: the cap when set, else `ctx`.
+    pub fn effective_ctx(&self, ctx: usize) -> usize {
+        match self.cap_rows {
+            Some(cap) => ctx.min(cap),
+            None => ctx,
+        }
+    }
+
+    /// Live arena rows after `abs_rows` absolute rows have been written.
+    /// The ring keeps every row live and contiguous, so this is a clamp.
+    pub fn live_rows(&self, abs_rows: usize) -> usize {
+        match self.cap_rows {
+            Some(cap) => abs_rows.min(cap),
+            None => abs_rows,
+        }
+    }
+
+    /// Arena row for the absolute row `abs_row`.
+    ///
+    /// Delegates to the backend's single host copy of the mapping
+    /// (`KvRingPolicy::row`), which is the twin of the device `grim_kv_ring_row`;
+    /// `kv_ring_row_host_matches_device` pins that pair. Keeping one Rust
+    /// implementation means the eager append, the capture validators and the
+    /// kernels cannot drift apart.
+    pub fn arena_row(&self, abs_row: usize) -> usize {
+        self.ring().row(abs_row)
+    }
+}
+
+/// CurDKV Gaussian projection dimension for low-rank leverage score estimation.
+#[allow(dead_code)]
+pub const CURDKV_R: usize = 20;
+
+/// Deterministic Gaussian projection matrix G [d, r] generated via pseudo-random normal.
+/// G_ij ~ N(0, 1/r).
+#[allow(dead_code)]
+pub fn curdkv_projection_matrix(d: usize, r: usize) -> Vec<f32> {
+    let scale = 1.0f32 / (r as f32).sqrt();
+    let mut g = Vec::with_capacity(d * r);
+    // Standard linear congruential / Box-Muller generator for deterministic zero-overhead matrix
+    let mut state = 0x123456789abcdef0u64;
+    let mut next_u01 = || -> f32 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) as f32 + 1.0) / (2147483648.0)
+    };
+    for _ in 0..(d * r / 2) {
+        let u1 = next_u01().max(1e-7);
+        let u2 = next_u01();
+        let r_val = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        g.push(r_val * theta.cos() * scale);
+        g.push(r_val * theta.sin() * scale);
+    }
+    if g.len() < d * r {
+        let u1 = next_u01().max(1e-7);
+        let u2 = next_u01();
+        let r_val = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        g.push(r_val * theta.cos() * scale);
+    }
+    g
+}
+
+impl KvEvictionPolicy {
+    /// Compute CurDKV leverage scores for group i (K_i [n, d], V_i [n, d])
+    /// and select top-(budget - sinks) tokens.
+    ///
+    /// Algorithm 1 from Sengupta et al. (NeurIPS 2025):
+    /// 1. G in R^{d x r}, G_ij ~ N(0, 1/r)
+    /// 2. K_proj = K_i * G, V_proj = V_i * G
+    /// 3. l^(K)_j = ||K_proj[j]||_2^2, l^(V)_j = ||V_proj[j]||_2^2
+    /// 4. l^(KV)_j = l^(K)_j * l^(V)_j
+    /// 5. Top-k selection preserving initial `sinks` tokens.
+    #[allow(dead_code)]
+    pub fn select_curdkv_indices(
+        k_group: &[f32],
+        v_group: &[f32],
+        n_tokens: usize,
+        d: usize,
+        budget: usize,
+        sinks: usize,
+    ) -> Vec<usize> {
+        if n_tokens <= budget {
+            return (0..n_tokens).collect();
+        }
+        let r = CURDKV_R;
+        let g = curdkv_projection_matrix(d, r);
+        let mut scores = Vec::with_capacity(n_tokens);
+
+        for j in 0..n_tokens {
+            let k_row = &k_group[j * d..(j + 1) * d];
+            let v_row = &v_group[j * d..(j + 1) * d];
+
+            let mut l_k = 0.0f32;
+            let mut l_v = 0.0f32;
+            for col in 0..r {
+                let mut kp = 0.0f32;
+                let mut vp = 0.0f32;
+                for i in 0..d {
+                    let g_val = g[i * r + col];
+                    kp += k_row[i] * g_val;
+                    vp += v_row[i] * g_val;
+                }
+                l_k += kp * kp;
+                l_v += vp * vp;
+            }
+            scores.push(l_k * l_v);
+        }
+
+        // Pinned sinks
+        let mut selected = Vec::with_capacity(budget);
+        let s = sinks.min(n_tokens).min(budget);
+        for i in 0..s {
+            selected.push(i);
+        }
+
+        // Top-(budget - s) from remaining tokens
+        let rem_budget = budget.saturating_sub(s);
+        if rem_budget > 0 && n_tokens > s {
+            let mut rem_indices: Vec<usize> = (s..n_tokens).collect();
+            rem_indices.sort_by(|&a, &b| {
+                scores[b]
+                    .partial_cmp(&scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            selected.extend(rem_indices.into_iter().take(rem_budget));
+            selected.sort_unstable();
+        }
+
+        selected
+    }
+}
+
+/// Read the Phase-4 CurDKV eviction policy from the environment.
+///
+/// `GRIM_KV_ARENA_ROWS` = fixed capacity in token rows (unset/0 = unlimited).
+/// `GRIM_KV_SINKS` = pinned leading tokens (default 4), clamped below the
+/// capacity so sinks can never consume the whole ring.
+/// `GRIM_CURDKV` = 1 enables CurDKV value-guided leverage score selection.
+pub(crate) fn kv_eviction_policy(device: &Device) -> KvEvictionPolicy {
+    if !matches!(device, Device::Rocm(_)) {
+        return KvEvictionPolicy::disabled();
+    }
+    let cap = std::env::var("GRIM_KV_ARENA_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|c| *c > 0);
+    let Some(cap) = cap else {
+        return KvEvictionPolicy::disabled();
+    };
+    let sinks = std::env::var("GRIM_KV_SINKS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .min(cap - 1);
+    KvEvictionPolicy {
+        cap_rows: Some(cap),
+        sinks,
+    }
+}
+
 fn kv_arena_format_qwen(device: &Device) -> grim_backend_rocm::KvArenaFormat {
     use grim_backend_rocm::KvArenaFormat as F;
     if !matches!(device, Device::Rocm(_)) {
@@ -4249,7 +4466,15 @@ fn arena_append_kv_rows<'a>(
     })?;
     let ordinal = k_dst.device_ordinal() as usize;
     let rocm = grim_backend_rocm::RocmDevice::shared(ordinal);
-    let scale_off = row_off / nkv.max(1);
+    // UNIT: the sidecar is [rows, nkv], and both the quantizer kernel
+    // (`sc_idx = scales_off + row*nkv + kh`) and the attention readers
+    // (`scales[kv_idx*nkv + kv_head]`) address it in ELEMENTS. So the base for
+    // token row `row_off` is `row_off * nkv` — passing the row itself shifts
+    // every head past row 0 by `row_off*(nkv-1)` slots and makes the reader
+    // pair a row's codes with another row's scale (or an unwritten one).
+    // `i8_append_sidecar_offsets_are_independent_units` pins the kernel side;
+    // `qwen35_i8_kv_arena_rows_match_f32_within_code_step` pins this call site.
+    let scale_off = row_off * nkv;
 
     if format == F::Int4 {
         // In packed int4, each byte stores 2 elements, so byte stride is stride / 2.
@@ -4580,9 +4805,16 @@ fn plan_layer_devices(
             .saturating_mul(2) // K and V
             .saturating_add((c as u64).saturating_mul(scales_per_row))
     };
+    // Phase 3: a fixed eviction capacity caps the arena BELOW the model's
+    // advertised context, so the reservation must budget for the cap — that is
+    // the whole point of eviction (262K ctx at a 64K-token arena).
+    let evict = kv_eviction_policy(devices.first().unwrap_or(&Device::Cpu));
+    let budget_ctx = evict.effective_ctx(ctx.max(1));
     let (eff_ctx, kv_total) =
-        bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, ctx.max(1));
+        bound_kv_arena(&kv_per_attn, num_attn_layers, arena_budget, budget_ctx);
     if eff_ctx < ctx {
+        // Report against the capped request so the message names what was asked
+        // for after eviction, not the full advertised context.
         let (bpe_msg, spr_msg) = devices
             .iter()
             .map(|d| match kv_arena_format_qwen(d) {
@@ -6278,5 +6510,134 @@ mod rope_tests {
         assert_eq!(&v[0..4], &original[0..4]);
         // Token 1 at pos 5 must be rotated
         assert_ne!(&v[4..8], &original[4..8]);
+    }
+}
+
+#[cfg(test)]
+mod kv_eviction_tests {
+    use super::{KvEvictionPolicy, kv_eviction_policy};
+    use grim_tensor::Device;
+
+    /// Phase 3: the host `arena_row` must equal the device `grim_kv_ring_row`
+    /// for every (cap, sinks, t). The eager path maps on the host and the graph
+    /// maps on device; if the two ever disagree, the eager and graph paths
+    /// write a token to different rows and the seeded arena is silently wrong.
+    /// The device copy is inlined from the kernel (the TU cannot be linked
+    /// into a host test), so this pins the arithmetic, not the link.
+    fn device_ring_row(t: usize, cap_rows: usize, sink_rows: usize) -> usize {
+        let t = t as i32;
+        let cap_rows = cap_rows as i32;
+        let sink_rows = sink_rows as i32;
+        if cap_rows <= 0 || t < cap_rows {
+            return t as usize;
+        }
+        let span = cap_rows - sink_rows;
+        if span <= 0 {
+            return (t % cap_rows) as usize;
+        }
+        (sink_rows + (t - sink_rows) % span) as usize
+    }
+
+    #[test]
+    fn kv_ring_row_host_matches_device() {
+        for cap in [1usize, 2, 5, 8, 16, 64, 257] {
+            for sinks in [0usize, 1, 2, 4, 8, 64] {
+                let eff_sinks = sinks.min(cap.saturating_sub(1));
+                let pol = KvEvictionPolicy {
+                    cap_rows: Some(cap),
+                    sinks: eff_sinks,
+                };
+                for t in 0..(cap * 3 + 17) {
+                    assert_eq!(
+                        pol.arena_row(t),
+                        device_ring_row(t, cap, eff_sinks),
+                        "host/device ring mismatch at cap={cap} sinks={eff_sinks} t={t}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Ring invariants: sinks are pinned, every live row is written exactly
+    /// once by the newest tokens, and the live set stays a contiguous prefix.
+    #[test]
+    fn kv_ring_keeps_sinks_and_contiguous_live_prefix() {
+        let cap = 12usize;
+        let sinks = 3usize;
+        let pol = KvEvictionPolicy {
+            cap_rows: Some(cap),
+            sinks,
+        };
+        for t in 0..sinks {
+            assert_eq!(pol.arena_row(t), t, "sink token {t} was evicted");
+        }
+        // After writing `n` tokens the live rows are exactly [0, n) and the
+        // newest token sits at the end of that prefix.
+        for n in 1..=(cap * 2) {
+            let last = pol.arena_row(n - 1);
+            let live = pol.live_rows(n);
+            assert!(
+                last < live,
+                "newest token {n} landed at {last} >= live {live}"
+            );
+            let mut seen = std::collections::HashSet::new();
+            for t in 0..n {
+                seen.insert(pol.arena_row(t));
+            }
+            assert_eq!(
+                seen.len(),
+                live,
+                "after {n} tokens the ring occupies {} rows but {live} are live",
+                seen.len()
+            );
+        }
+    }
+
+    /// Eviction is off unless `GRIM_KV_ARENA_ROWS` is set to a positive count;
+    /// `GRIM_KV_SINKS` alone must not silently enable it, and sinks are clamped
+    /// below the capacity so they can never consume the whole ring.
+    #[test]
+    fn kv_eviction_env_is_opt_in_and_clamped() {
+        temp_env::with_var("GRIM_KV_ARENA_ROWS", None::<&str>, || {
+            assert_eq!(kv_eviction_policy(&Device::Cpu).cap_rows, None);
+        });
+        temp_env::with_var("GRIM_KV_SINKS", Some("8"), || {
+            temp_env::with_var("GRIM_KV_ARENA_ROWS", None::<&str>, || {
+                let p = kv_eviction_policy(&Device::Cpu);
+                assert_eq!(p.cap_rows, None, "sinks alone must not enable eviction");
+            });
+        });
+        temp_env::with_var("GRIM_KV_ARENA_ROWS", Some("0"), || {
+            assert_eq!(
+                kv_eviction_policy(&Device::Cpu).cap_rows,
+                None,
+                "a zero capacity means unlimited"
+            );
+        });
+        // Non-ROCm devices never evict.
+        temp_env::with_var("GRIM_KV_ARENA_ROWS", Some("64"), || {
+            assert_eq!(kv_eviction_policy(&Device::Cpu).cap_rows, None);
+        });
+    }
+
+    #[test]
+    fn kv_sinks_clamp_below_capacity() {
+        temp_env::with_var("GRIM_KV_SINKS", Some("1000"), || {
+            temp_env::with_var("GRIM_KV_ARENA_ROWS", Some("8"), || {
+                // Device::Cpu short-circuits to disabled, so exercise the clamp
+                // through the policy constructor directly.
+                let ring = grim_backend_rocm::KvRingPolicy::new(8, 1000);
+                assert_eq!(ring.cap_rows, 8);
+                assert_eq!(ring.sink_rows, 7, "sinks must stay below the capacity");
+            });
+        });
+    }
+
+    #[test]
+    fn kv_ring_unlimited_is_identity() {
+        assert!(!KvEvictionPolicy::disabled().ring().is_limited());
+        assert_eq!(KvEvictionPolicy::disabled().effective_ctx(262_144), 262_144);
+        assert_eq!(KvEvictionPolicy::disabled().live_rows(999_999), 999_999);
+        assert_eq!(KvEvictionPolicy::disabled().arena_row(123_456), 123_456);
     }
 }

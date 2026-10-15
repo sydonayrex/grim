@@ -98,6 +98,7 @@ fn rope_append_kv_matches_separate_rope_plus_appends() {
             steps,
             batch,
             slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .unwrap();
         grim_backend_rocm::launch_kv_append_batch(
@@ -109,6 +110,7 @@ fn rope_append_kv_matches_separate_rope_plus_appends() {
             steps,
             batch,
             slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .unwrap();
 
