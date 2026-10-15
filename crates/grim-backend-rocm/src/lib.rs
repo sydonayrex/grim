@@ -135,7 +135,7 @@ pub use crate::gptq_kernel::wavefront_size_for_gcn;
 pub use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE;
 pub use crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE;
 pub use crate::kernels::jit_cache::HsacoKernelCache;
-pub use crate::kernels::qkv_attention::kv_f16_enabled;
+pub use crate::kernels::qkv_attention::{kv_arena_format, kv_f16_enabled};
 pub use crate::kernels::source_asm::compute_kernel_source;
 
 pub use crate::device::compute::{FusedGateUpQ4KWeights, FusedGateUpWeights, FusedQkvWeights};
@@ -167,11 +167,11 @@ pub use crate::device::roc_device::{
 };
 
 pub use crate::decode_graph_buffers::DecodeGraph as FullDecodeGraph;
-pub use crate::device::compute::gemm_launchers::rho_microbench_for_test;
 pub use crate::decode_graph_buffers::{
     DecodeGraphBuffers, EagerKvSource, check_layer_topology, decode_graph_enabled,
     launch_attention, launch_qkv_gemv, write_embedding_to_buffer, write_embeddings_to_buffer_batch,
 };
+pub use crate::device::compute::gemm_launchers::rho_microbench_for_test;
 pub use crate::device::parallel_comm::{
     CommBackendType, HostStagingRing, ParallelCommunicator, ParallelTopology,
 };
@@ -187,9 +187,11 @@ pub use fusion::{
 };
 
 pub use kernels::qkv_attention::{
-    BlockTableEntry, KvCacheQuantFormat, launch_bump_i32, launch_bump_i32_slots, launch_kv_append,
-    launch_kv_append_batch, launch_paged_attention, launch_paged_attention_quant,
-    launch_qkv_attention_dev, launch_qkv_attention_dev_batch, launch_qkv_attention_wmma,
+    BlockTableEntry, KvArenaFormat, KvCacheQuantFormat, launch_bump_i32, launch_bump_i32_slots,
+    launch_kv_append, launch_kv_append_batch, launch_kv_append_i8, launch_kv_quantize_rows_i8,
+    launch_kv_quantize_rows_i4,
+    launch_paged_attention, launch_paged_attention_quant, launch_qkv_attention_dev,
+    launch_qkv_attention_dev_batch, launch_qkv_attention_dev_batch_i8, launch_qkv_attention_wmma,
     launch_tree_attention,
 };
 pub use kernels::tile_picker::run_install_tune;

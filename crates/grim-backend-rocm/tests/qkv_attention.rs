@@ -23,7 +23,9 @@
 //!   but the .hipfb binary is not registered for these test shapes on this RDNA4 box.
 //!   10 CPU-reference and structural tests pass.
 
-use grim_backend_rocm::{AttentionOps, CoreTensorOps, QkvAttentionFusionConfig, RocmDevice};
+use grim_backend_rocm::{
+    AttentionOps, BackendStorage, CoreTensorOps, QkvAttentionFusionConfig, RocmDevice,
+};
 use grim_tensor::{DType, Shape};
 
 /// Pure-Rust reference implementation of causal GQA attention.
@@ -718,4 +720,876 @@ fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
     for x in got {
         assert!(!x.is_nan(), "GPU output must not be NaN for empty KV cache");
     }
+}
+
+/// Regression gate for the query-tiled prefill branch: `grim_qkv_attention_tiled`
+/// reads K/V unconditionally as fp16, so on f32 arenas it reinterprets bytes
+/// and the scores go NaN (measured: 113-token 9B prefill, NaN logprobs).
+/// The launcher must only take the tiled branch for f16 K/V; on f32 it must
+/// fall through to the exact scalar kernel. seq=96 fires the branch
+/// (threshold 64); the reference comparison + NaN assert pin the behavior.
+#[test]
+#[ignore]
+fn qkv_attention_long_prefill_f32_matches_reference() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
+
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) =
+        (96_usize, 8, 4, 64, 96, 0);
+
+    let q_data: Vec<f32> = (0..(seq_len * num_heads * head_dim))
+        .map(|i| (i as f32 * 0.13).sin() * 0.5)
+        .collect();
+    let k_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| (i as f32 * 0.11).cos() * 0.5)
+        .collect();
+    let v_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| (i as f32 * 0.07).sin() * 0.5)
+        .collect();
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+
+    let q_buf = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    let k_buf = dev
+        .from_cpu(
+            &k_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let v_buf = dev
+        .from_cpu(
+            &v_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+
+    let (out, h) = dev
+        .qkv_attention(
+            q_buf.as_ref(),
+            k_buf.as_ref(),
+            v_buf.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset as u32,
+            None, // window: full causal
+            &out_shape,
+            None,
+            None,
+        )
+        .unwrap();
+    h.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().unwrap();
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "qkv_attention produced non-finite output on f32 K/V at seq=96"
+    );
+    let want = reference_attention(
+        &q_data,
+        &k_data,
+        &v_data,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
+    );
+    if !approx_close(&got, &want, 1e-3) {
+        for i in 0..got.len() {
+            let x = got[i];
+            let y = want[i];
+            let abs = (x - y).abs();
+            let denom = x.abs().max(y.abs()).max(1e-6);
+            let diff = abs / denom;
+            // Fail only when BOTH absolute and relative tolerances blow:
+            // near-zero outputs (here ~6e-6) legitimately differ in the
+            // last ulp across summation orders (abs diff here ~7e-12).
+            if diff > 1e-3 && abs > 1e-5 {
+                panic!(
+                    "GPU output diverged from CPU reference at index {}: got={}, want={}, diff={}",
+                    i, x, y, diff
+                );
+            }
+        }
+    }
+}
+
+/// Phase-1 f16 arena gates: (a) `convert_f32_to_f16_into` roundtrips f32
+/// within f16 epsilon; (b) the f16kv attention variant matches the f32 scalar
+/// kernel on the same logical K/V. Both must pass before f16 arenas can go
+/// default-on. Synthetic, no checkpoint.
+#[test]
+#[ignore]
+fn f16_arena_convert_and_attend_parity() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+
+    // (a) convert roundtrip: f32 -> f16 bits -> f32 must match within
+    // f16 rounding (~5e-4 relative on these magnitudes).
+    {
+        let n = 1024usize;
+        let src: Vec<f32> = (0..n)
+            .map(|i| ((i * 7 % 101) as f32) / 101.0 - 0.5)
+            .collect();
+        let src_dev = dev
+            .from_cpu(&src, &Shape::from_slice(&[n]), DType::F32)
+            .unwrap();
+        let src_rocm = grim_backend_rocm::as_rocm(src_dev.as_ref()).unwrap();
+        let f16dt = DType {
+            arith: grim_tensor::ArithType::F16,
+            storage: grim_tensor::Storage::Native,
+        };
+        let dst_store = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            f16dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        dev.convert_f32_to_f16_into(src_rocm, 0, &dst_store, 0, n)
+            .expect("convert");
+        dev.synchronize();
+        let back = dst_store.to_cpu_vec_f32().expect("d2h");
+        assert_eq!(back.len(), n, "convert changed element count");
+        let diff = max_abs_diff(&back, &src);
+        eprintln!("[convert-parity] n={n} max_abs_diff={diff:.6}");
+        assert!(
+            diff < 2e-3,
+            "f32->f16->f32 roundtrip off by {diff:.6} (f16 budget ~5e-4)"
+        );
+    }
+
+    // (b) f16kv kernel vs f32 kernel on identical logical K/V.
+    {
+        use grim_tensor::ArithType;
+        let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (4_usize, 8, 4, 64, 16);
+        let mut seed = 0xF16u64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let q_data: Vec<f32> = (0..(seq_len * num_heads * head_dim))
+            .map(|_| rand() * 0.5)
+            .collect();
+        let k_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+            .map(|_| rand() * 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+            .map(|_| rand() * 0.5)
+            .collect();
+        let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+
+        // f32 reference through the standard entry point.
+        let q32 = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+        let k32 = dev
+            .from_cpu(
+                &k_data,
+                &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let v32 = dev
+            .from_cpu(
+                &v_data,
+                &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let (out32, h32) = dev
+            .qkv_attention(
+                q32.as_ref(),
+                k32.as_ref(),
+                v32.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                0,
+                None,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
+        h32.synchronize().expect("sync");
+        let want = out32.to_cpu_vec_f32().unwrap();
+
+        // f16 arenas: convert K/V through the production converter.
+        let f16dt = DType {
+            arith: ArithType::F16,
+            storage: grim_tensor::Storage::Native,
+        };
+        let k16up = dev
+            .from_cpu(
+                &k_data,
+                &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let v16up = dev
+            .from_cpu(
+                &v_data,
+                &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let k16 = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            f16dt.clone(),
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        let v16 = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            f16dt,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        let nk = kv_seq_len * num_kv_heads * head_dim;
+        dev.convert_f32_to_f16_into(
+            grim_backend_rocm::as_rocm(k16up.as_ref()).unwrap(),
+            0,
+            &k16,
+            0,
+            nk,
+        )
+        .unwrap();
+        dev.convert_f32_to_f16_into(
+            grim_backend_rocm::as_rocm(v16up.as_ref()).unwrap(),
+            0,
+            &v16,
+            0,
+            nk,
+        )
+        .unwrap();
+        let (out16, h16) = dev
+            .qkv_attention(
+                q32.as_ref(),
+                &k16,
+                &v16,
+                num_kv_heads,
+                kv_seq_len,
+                0,
+                None,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
+        h16.synchronize().expect("sync");
+        let got = out16.to_cpu_vec_f32().unwrap();
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "f16kv attention produced non-finite output"
+        );
+        let diff = max_abs_diff(&got, &want);
+        eprintln!("[f16kv-parity] seq=4 max_abs_diff={diff:.6}");
+        assert!(
+            diff < 2e-3,
+            "f16kv attention diverges from f32: {diff:.6} (f16 rounding budget ~1e-3)"
+        );
+    }
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// Canary for f16-KV attention: with a single KV row, softmax is exactly 1
+/// and every query must return the (f16-rounded) V row. Fails loudly on
+/// row-addressing bugs (stride/off-by-half) that a statistical parity gate
+/// can only flag as "large diff".
+#[test]
+#[ignore]
+fn f16kv_attention_single_row_broadcast() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 32, 1);
+    let q_data: Vec<f32> = (0..(seq_len * num_heads * head_dim))
+        .map(|i| ((i * 3 % 17) as f32) / 17.0 - 0.25)
+        .collect();
+    let k_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| ((i * 5 % 13) as f32) / 13.0 - 0.5)
+        .collect();
+    let v_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| ((i * 7 % 19) as f32) / 19.0 - 0.4)
+        .collect();
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+    let f16dt = DType {
+        arith: ArithType::F16,
+        storage: grim_tensor::Storage::Native,
+    };
+    let q32 = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    let kup = dev
+        .from_cpu(
+            &k_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let vup = dev
+        .from_cpu(
+            &v_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let k16 = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+        f16dt.clone(),
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let v16 = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+        f16dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let nk = kv_seq_len * num_kv_heads * head_dim;
+    dev.convert_f32_to_f16_into(
+        grim_backend_rocm::as_rocm(kup.as_ref()).unwrap(),
+        0,
+        &k16,
+        0,
+        nk,
+    )
+    .unwrap();
+    dev.convert_f32_to_f16_into(
+        grim_backend_rocm::as_rocm(vup.as_ref()).unwrap(),
+        0,
+        &v16,
+        0,
+        nk,
+    )
+    .unwrap();
+    let (out, h) = dev
+        .qkv_attention(
+            q32.as_ref(),
+            &k16,
+            &v16,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+            None,
+            None,
+        )
+        .unwrap();
+    h.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().unwrap();
+    // Expected: each query head returns V row of its kv head. Tolerance
+    // admits f16 rounding (no half crate in test deps); row-addressing bugs
+    // show as O(0.1+) errors, far above this bar.
+    let v16host: &[f32] = &v_data;
+    let qpk = num_heads / num_kv_heads;
+    let mut worst = 0.0f32;
+    for i in 0..seq_len {
+        for h in 0..num_heads {
+            let kh = h / qpk;
+            for d in 0..head_dim {
+                let g = got[(i * num_heads + h) * head_dim + d];
+                let w = v16host[kh * head_dim + d];
+                worst = worst.max((g - w).abs());
+            }
+        }
+    }
+    eprintln!("[f16kv-canary] kvlen=1 broadcast worst={worst:.6}");
+    assert!(worst < 5e-3, "f16kv single-row broadcast off by {worst:.6}");
+}
+
+/// Phase-2 int8 gates: append-quantize roundtrip, scalar-i8 attend vs f32,
+/// and the kv_len=1 broadcast canary. Synthetic, no checkpoint.
+#[test]
+#[ignore]
+fn int8_append_quantize_parity() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (n_rows, nkv, hd) = (5_usize, 4, 64);
+    let stride = nkv * hd;
+    let mut seed = 0x18u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let src: Vec<f32> = (0..(n_rows * stride)).map(|_| rand()).collect();
+    let src_dev = dev
+        .from_cpu(&src, &Shape::from_slice(&[n_rows, stride]), DType::F32)
+        .unwrap();
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, stride]),
+        u8dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    grim_backend_rocm::launch_kv_quantize_rows_i8(
+        &dev,
+        src_dev.as_ref(),
+        0,
+        &codes,
+        0,
+        &scales,
+        0,
+        n_rows,
+        stride,
+        nkv,
+        hd,
+    )
+    .expect("quantize");
+    dev.synchronize();
+    let cb = codes.to_cpu_vec_u32().expect("codes d2h");
+    let codes_u8: Vec<u8> = cb.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let sc = scales.to_cpu_vec_f32().expect("scales d2h");
+    eprintln!(
+        "[i8-append] scales head={:.5?} codes head={:?}",
+        &sc[..8.min(sc.len())],
+        &codes_u8[..16.min(codes_u8.len())]
+    );
+    assert_eq!(codes_u8.len(), n_rows * stride);
+    assert_eq!(sc.len(), n_rows * nkv);
+    // Host dequant must reproduce the source within int8 rounding
+    // (|e| <= scale/2 <= amax/254 per element).
+    let mut worst = 0.0f32;
+    let mut amax = 0.0f32;
+    for r in 0..n_rows {
+        for h in 0..nkv {
+            let s = sc[r * nkv + h];
+            assert!(s.is_finite() && s >= 0.0, "bad scale r={r} h={h}: {s}");
+            for d in 0..hd {
+                let i = r * stride + h * hd + d;
+                amax = amax.max(src[i].abs());
+                let got = ((codes_u8[i] as f32) - 128.0) / 127.0 * s;
+                worst = worst.max((got - src[i]).abs());
+            }
+        }
+    }
+    eprintln!("[i8-append] rows={n_rows} worst={worst:.6} amax={amax:.4}");
+    assert!(
+        worst <= amax / 200.0 + 1e-6,
+        "int8 append roundtrip off by {worst:.6} at amax {amax:.4}"
+    );
+}
+
+#[test]
+#[ignore]
+fn int8_attend_matches_f32() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (4_usize, 8, 4, 64, 16);
+    let mut seed = 0x1851u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q_data: Vec<f32> = (0..(seq_len * num_heads * head_dim))
+        .map(|_| rand() * 0.5)
+        .collect();
+    let k_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|_| rand() * 0.5)
+        .collect();
+    let v_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|_| rand() * 0.5)
+        .collect();
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+    let q32 = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    let k32 = dev
+        .from_cpu(
+            &k_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let v32 = dev
+        .from_cpu(
+            &v_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let (out32, h32) = dev
+        .qkv_attention(
+            q32.as_ref(),
+            k32.as_ref(),
+            v32.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+            None,
+            None,
+        )
+        .unwrap();
+    h32.synchronize().expect("sync");
+    let want = out32.to_cpu_vec_f32().unwrap();
+
+    // int8 arenas through the production quantizer.
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let stride = num_kv_heads * head_dim;
+    let mk = |_data: &[f32]| {
+        let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, stride]),
+            u8dt.clone(),
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads]),
+            DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        (codes, scales)
+    };
+    let (kcodes, kscales) = mk(&k_data);
+    let (vcodes, vscales) = mk(&v_data);
+    for (data, codes, scales) in [(&k_data, &kcodes, &kscales), (&v_data, &vcodes, &vscales)] {
+        let up = dev
+            .from_cpu(data, &Shape::from_slice(&[kv_seq_len, stride]), DType::F32)
+            .unwrap();
+        grim_backend_rocm::launch_kv_quantize_rows_i8(
+            &dev,
+            up.as_ref(),
+            0,
+            codes,
+            0,
+            scales,
+            0,
+            kv_seq_len,
+            stride,
+            num_kv_heads,
+            head_dim,
+        )
+        .unwrap();
+    }
+    dev.synchronize();
+    let (out8, h8) = dev
+        .qkv_attention_i8(
+            q32.as_ref(),
+            &kcodes,
+            &kscales,
+            &vcodes,
+            &vscales,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+        )
+        .unwrap();
+    h8.synchronize().expect("sync");
+    let got = out8.to_cpu_vec_f32().unwrap();
+    assert!(got.iter().all(|x| x.is_finite()), "int8 attend non-finite");
+    let diff = max_abs_diff(&got, &want);
+    eprintln!("[i8-attend] seq=4 max_abs_diff={diff:.6}");
+    assert!(
+        diff < 3e-2,
+        "int8 attend diverges from f32: {diff:.6} (measure first, then justify)"
+    );
+}
+
+/// int8 canary: kv_len=1 must broadcast V rows (f16-canary twin).
+#[test]
+#[ignore]
+fn int8_attend_single_row_broadcast() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 32, 1);
+    let q_data = vec![0.1f32; seq_len * num_heads * head_dim];
+    let k_data = vec![0.1f32; kv_seq_len * num_kv_heads * head_dim];
+    let v_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| (i % head_dim) as f32 * 0.05)
+        .collect();
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let stride = num_kv_heads * head_dim;
+    let q32 = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    let quant = |data: &[f32]| {
+        let up = dev
+            .from_cpu(data, &Shape::from_slice(&[kv_seq_len, stride]), DType::F32)
+            .unwrap();
+        let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, stride]),
+            u8dt.clone(),
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads]),
+            DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        grim_backend_rocm::launch_kv_quantize_rows_i8(
+            &dev,
+            up.as_ref(),
+            0,
+            &codes,
+            0,
+            &scales,
+            0,
+            kv_seq_len,
+            stride,
+            num_kv_heads,
+            head_dim,
+        )
+        .unwrap();
+        (codes, scales)
+    };
+    let (kcodes, kscales) = quant(&k_data);
+    let (vcodes, vscales) = quant(&v_data);
+    dev.synchronize();
+    let (out, h) = dev
+        .qkv_attention_i8(
+            q32.as_ref(),
+            &kcodes,
+            &kscales,
+            &vcodes,
+            &vscales,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+        )
+        .unwrap();
+    h.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().unwrap();
+    let qpk = num_heads / num_kv_heads;
+    let mut worst = 0.0f32;
+    for i in 0..seq_len {
+        for h in 0..num_heads {
+            let kh = h / qpk;
+            for d in 0..head_dim {
+                let g = got[(i * num_heads + h) * head_dim + d];
+                let w = v_data[kh * head_dim + d];
+                worst = worst.max((g - w).abs());
+            }
+        }
+    }
+    eprintln!("[i8-canary] kvlen=1 broadcast worst={worst:.6}");
+    assert!(worst < 1e-2, "int8 single-row broadcast off by {worst:.6}");
+}
+
+/// Phase 3 int4: quantize parity vs host reference.
+#[test]
+#[ignore]
+fn int4_append_quantize_parity() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (n_rows, nkv, head_dim) = (4_usize, 2_usize, 64_usize);
+    let stride = nkv * head_dim;
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let src: Vec<f32> = (0..n_rows * stride)
+        .map(|i| (((i * 17) % 43) as f32) / 43.0 - 0.5)
+        .collect();
+    let src_t = dev
+        .from_cpu(&src, &Shape::from_slice(&[n_rows, stride]), DType::F32)
+        .unwrap();
+    // packed 4-bit storage is stride / 2 bytes
+    let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, stride / 2]),
+        u8dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    grim_backend_rocm::launch_kv_quantize_rows_i4(
+        &dev,
+        src_t.as_ref(),
+        0,
+        &codes,
+        0,
+        &scales,
+        0,
+        n_rows,
+        stride,
+        nkv,
+        head_dim,
+    )
+    .unwrap();
+    dev.synchronize();
+    let cb = codes.to_cpu_vec_u32().unwrap();
+    let codes_bytes: Vec<u8> = cb.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let scales_f32 = scales.to_cpu_vec_f32().unwrap();
+
+    let mut worst = 0.0f32;
+    for r in 0..n_rows {
+        for kh in 0..nkv {
+            let sc = scales_f32[r * nkv + kh];
+            for d in 0..head_dim {
+                let orig = src[r * stride + kh * head_dim + d];
+                let byte_idx = r * (stride / 2) + kh * (head_dim / 2) + (d / 2);
+                let packed = codes_bytes[byte_idx];
+                let code = if (d & 1) == 0 {
+                    (packed & 0x0f) as i32
+                } else {
+                    ((packed >> 4) & 0x0f) as i32
+                };
+                let dequant = ((code - 7) as f32 / 7.0f32) * sc;
+                worst = worst.max((dequant - orig).abs());
+            }
+        }
+    }
+    eprintln!("[i4-append] rows={n_rows} worst reconstruction error={worst:.4}");
+    // 4-bit step is scale/7; max error is scale/14 ~ 0.5/14 ~ 0.036
+    assert!(worst < 0.08, "int4 reconstruction error too high: {worst:.4}");
+}
+
+/// Phase 3 int4: kv_len=1 must broadcast V rows.
+#[test]
+#[ignore]
+fn int4_attend_single_row_broadcast() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len) = (2_usize, 4, 2, 32, 1);
+    let q_data = vec![0.1f32; seq_len * num_heads * head_dim];
+    let k_data = vec![0.1f32; kv_seq_len * num_kv_heads * head_dim];
+    let v_data: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
+        .map(|i| (i % head_dim) as f32 * 0.05)
+        .collect();
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let stride = num_kv_heads * head_dim;
+    let q32 = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    let quant = |data: &[f32]| {
+        let up = dev
+            .from_cpu(data, &Shape::from_slice(&[kv_seq_len, stride]), DType::F32)
+            .unwrap();
+        let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, stride / 2]),
+            u8dt.clone(),
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads]),
+            DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap();
+        grim_backend_rocm::launch_kv_quantize_rows_i4(
+            &dev,
+            up.as_ref(),
+            0,
+            &codes,
+            0,
+            &scales,
+            0,
+            kv_seq_len,
+            stride,
+            num_kv_heads,
+            head_dim,
+        )
+        .unwrap();
+        (codes, scales)
+    };
+    let (kcodes, kscales) = quant(&k_data);
+    let (vcodes, vscales) = quant(&v_data);
+    dev.synchronize();
+    let (out, h) = dev
+        .qkv_attention_i4(
+            q32.as_ref(),
+            &kcodes,
+            &kscales,
+            &vcodes,
+            &vscales,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            &out_shape,
+        )
+        .unwrap();
+    h.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().unwrap();
+    let qpk = num_heads / num_kv_heads;
+    let mut worst = 0.0f32;
+    for i in 0..seq_len {
+        for h in 0..num_heads {
+            let kh = h / qpk;
+            for d in 0..head_dim {
+                let g = got[(i * num_heads + h) * head_dim + d];
+                let w = v_data[kh * head_dim + d];
+                worst = worst.max((g - w).abs());
+            }
+        }
+    }
+    eprintln!("[i4-canary] kvlen=1 broadcast worst={worst:.6}");
+    assert!(worst < 0.15, "int4 single-row broadcast off by {worst:.6}");
 }

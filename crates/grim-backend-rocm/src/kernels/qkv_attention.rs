@@ -3,13 +3,62 @@
 extern crate alloc;
 
 /// GRAVE Phase 1: store the LFM2-family KV arena in f16 (2 bytes/element)
-/// instead of f32 — halves attention bytes. Read at BOTH the arena allocation
-/// sites and the kernel launchers so the flag stays consistent. LFM2-family
+/// instead of f32 — halves attention bytes. Read at arena allocation sites
+/// (launchers derive representation from storage instead). LFM2-family
 /// only; other models' arenas are unaffected while the default is off.
 pub fn kv_f16_enabled() -> bool {
     std::env::var("GRIM_F16_KV")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
+}
+
+/// Dense KV-arena representation on ROCm.
+///
+/// `GRIM_KV_ARENA=f32|f16|int8` wins when set; otherwise the legacy
+/// `GRIM_F16_KV` maps on (any non-`0`/`false`) to F16 and anything else to
+/// F32. Global default is F32 — models opt into narrower formats through
+/// their own `kv_arena_dtype` (Qwen35 defaults to F16; int8 is always
+/// explicit). Launchers never read this: they derive the representation
+/// from arena storage (storage truth).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KvArenaFormat {
+    F32,
+    F16,
+    Int8,
+    Int4,
+}
+
+impl KvArenaFormat {
+    /// Bytes per stored element, excluding sidecars (scales ride separately).
+    pub fn bytes_per_elem(self) -> f32 {
+        match self {
+            KvArenaFormat::F32 => 4.0,
+            KvArenaFormat::F16 => 2.0,
+            KvArenaFormat::Int8 => 1.0,
+            KvArenaFormat::Int4 => 0.5,
+        }
+    }
+}
+
+/// Resolve the dense-arena representation (see [`KvArenaFormat`]).
+pub fn kv_arena_format() -> KvArenaFormat {
+    match std::env::var("GRIM_KV_ARENA").as_deref() {
+        Ok("f32") => KvArenaFormat::F32,
+        Ok("f16") => KvArenaFormat::F16,
+        Ok("int8" | "i8" | "q8") => KvArenaFormat::Int8,
+        Ok("int4" | "i4" | "q4") => KvArenaFormat::Int4,
+        Ok(other) => {
+            eprintln!("[kv] GRIM_KV_ARENA={other:?} unrecognized (f32|f16|int8|int4); using F32");
+            KvArenaFormat::F32
+        }
+        Err(_) => {
+            if kv_f16_enabled() {
+                KvArenaFormat::F16
+            } else {
+                KvArenaFormat::F32
+            }
+        }
+    }
 }
 
 /// HIP source for `grim_qkv_attention`. [see: `COMPUTE_KERNEL_SOURCE`, `lib.rs::RocmDevice::qkv_attention`, `j`, `__shared__`]
@@ -167,6 +216,737 @@ void grim_qkv_attention(
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
                 out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_head[j * (num_kv_heads * head_dim) + d];
+            }
+        }
+    }
+
+    // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform (all lanes see same j_start/j_end loop range).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Reconstruct this lane's slice of the normalized attention vector.
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue. Each wave-0 lane owns its strided slice of the head_dim axis; per output column oc
+        // the lane partial is butterfly-reduced across the wavefront and lane 0 atomically accumulates into the (host-zeroed) fused output row.
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
+
+
+// int8-KV variant of `grim_qkv_attention` (Phase 2 KV shrink): identical
+// math, K/V rows read as biased-u8 codes with f32 per-(row,kv_head)
+// scales. q, out, and all epilogues are untouched f32.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_i8kv(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,   // absolute position of q[head, 0, *]
+    float inv_sqrt_d,
+    int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
+                        // Pass 0 for full causal attention (no window).
+    float softcap,      // logit softcapping cap (e.g. 50.0f for Gemma-2). Pass <=0.0f to disable.
+                        // WI-F2 - fused O-projection epilogue.
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    // ALiBi per-head slopes [num_heads]. When has_alibi != 0 the score for
+    // query abs_i / key j gains slopes[h] * (j - abs_i). Pass null/0 to skip.
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
+    // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
+    const int i = blockIdx.x;             // query position (0..seq_len)
+    const int h = blockIdx.y;             // head index
+    if (i >= seq_len || h >= num_heads) return;
+
+    // GQA mapping: every (num_heads/num_kv_heads) query heads share one kv_head.
+    // The host validates that num_heads % num_kv_heads == 0, so this is exact.
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+
+    // Pointers to this head's q column / kv column.
+    // Layouts (Phase-1 contract): q: [seq_len, num_heads, head_dim] -> q_offset = (i * num_heads + h).
+    const int q_offset = (i * num_heads + h) * head_dim;
+
+    // Cache offset: query position i within this call is at absolute position
+    // (cache_offset + i). All past K/V positions are valid up to that.
+    const int abs_i = cache_offset + i;
+
+    // ────────────────────────────────────────────────────────────────────── Phase 1: online softmax.
+    // Running max + running weighted sum, no full score vector materialized; kv_seq_len may exceed the.
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    // num_waves = actual launched block size / wave size.
+    // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
+    const int num_waves = blockDim.x / wave_size;
+
+    // Every head_dim axis loop must cover the SAME range as the q staging loop
+    // (8 chunks). It used to be 4, which covered only 4*wave_size = 128 dims, so
+    // for head_dim 256 the upper half of every output row was never written and
+    // read back as whatever the allocation held - observed as exactly half the
+    // output elements wrong. s_acc[8][260] and the head_dim>256 guard already
+    // assumed 256.
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+
+    // Hardware-aware head-dim cap.
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    // Per-wavefront partials published to LDS for the wave-0 merge.
+    // Sized to worst-case 8 wavefronts (RDNA iGPU Wave32 + block 256 host path) and head.
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    // Causal KV range for this query: [lo, hi) where: hi = min(abs_i + 1, kv_seq_len) (standard causal upper bound) lo = window_lo (0 for full attention; sliding lower
+    // bound for SWA) `window_lo` is pre-computed on the host as max(0, abs_i - window + 1) so the kernel stays branch-free for the common full-causal case (window_lo == 0).
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;             // 0 for full causal; >= 0 for SWA
+    const int range_len = hi - lo;        // may be 0 if lo >= hi (empty window)
+
+    // Quarter-stride partitioning of [lo, hi) across the wavefronts.
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    // j_start / j_end are offsets into [0, range_len); add `lo` when accessing KV.
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Fast-path GQA key/value stride pointers
+    // int8-KV variant (Phase 2): codes are u8 (biased +128, same element
+    // layout as f32 rows, 1 B/elem); scales are f32 per (row, kv_head).
+    const unsigned char* __restrict__ k_u8 =
+        ((const unsigned char*)k_tensor) + (long long)kv_head * head_dim;
+    const unsigned char* __restrict__ v_u8 =
+        ((const unsigned char*)v_tensor) + (long long)kv_head * head_dim;
+    const int kv_stride = num_kv_heads * head_dim;
+
+    // Stage this lane's strided slice of q into registers ONCE.
+    // The previous form re-fetched the whole q head from global memory on every KV token.
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        // Lane-strided partial dot product Q.K, then butterfly reduction.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                float k_dq = ((float)((int)k_u8[j * kv_stride + dd] - 128) / 127.0f)
+                    * k_scales[(long long)j * num_kv_heads + kv_head];
+                partial += q_reg[chunk] * k_dq;
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        // Online-softmax update
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                float v_dq = ((float)((int)v_u8[j * (num_kv_heads * head_dim) + d] - 128) / 127.0f)
+                    * v_scales[(long long)j * num_kv_heads + kv_head];
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform (all lanes see same j_start/j_end loop range).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Reconstruct this lane's slice of the normalized attention vector.
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue. Each wave-0 lane owns its strided slice of the head_dim axis; per output column oc
+        // the lane partial is butterfly-reduced across the wavefront and lane 0 atomically accumulates into the (host-zeroed) fused output row.
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
+
+// int4-KV variant of `grim_qkv_attention` (Phase 3 KV shrink: ~2.2GB @ 262K):
+// K/V rows read as packed nibbles (2 values per byte, low nibble first,
+// biased by +7, range -7..+7 mapped to 0..14).
+// Scales are f32 per (row, kv_head).
+// q, out, and all epilogues are untouched f32.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_i4kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Packed int4 storage: 2 values per byte. Row stride in bytes is (num_kv_heads * head_dim) / 2.
+    // Offset for head is (kv_head * head_dim) / 2 bytes.
+    const int kv_stride_bytes = (num_kv_heads * head_dim) / 2;
+    const int head_offset_bytes = (kv_head * head_dim) / 2;
+    const unsigned char* __restrict__ k_bytes = k_tensor + head_offset_bytes;
+    const unsigned char* __restrict__ v_bytes = v_tensor + head_offset_bytes;
+
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float partial = 0.0f;
+        const long long row_base_bytes = (long long)j * kv_stride_bytes;
+        const float k_sc = k_scales[(long long)j * num_kv_heads + kv_head];
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                unsigned char packed = k_bytes[row_base_bytes + (dd >> 1)];
+                int code = (dd & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+                float k_dq = ((float)(code - 7) / 7.0f) * k_sc;
+                partial += q_reg[chunk] * k_dq;
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        const float v_sc = v_scales[(long long)j * num_kv_heads + kv_head];
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                unsigned char packed = v_bytes[row_base_bytes + (d >> 1)];
+                int code = (d & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+                float v_dq = ((float)(code - 7) / 7.0f) * v_sc;
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
+
+// f16-KV variant of `grim_qkv_attention` (Phase 1 KV shrink): bit-identical
+// math, K/V rows read as fp16 through u16 views. q, out, and all
+// epilogues (max/sum/softcap/alibi/fused-O) are untouched f32.
+extern "C" __global__ __launch_bounds__(256)
+void grim_qkv_attention_f16kv(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,   // absolute position of q[head, 0, *]
+    float inv_sqrt_d,
+    int window_lo,      // sliding-window lower bound: max(0, abs_i - window + 1).
+                        // Pass 0 for full causal attention (no window).
+    float softcap,      // logit softcapping cap (e.g. 50.0f for Gemma-2). Pass <=0.0f to disable.
+                        // WI-F2 - fused O-projection epilogue.
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    // ALiBi per-head slopes [num_heads]. When has_alibi != 0 the score for
+    // query abs_i / key j gains slopes[h] * (j - abs_i). Pass null/0 to skip.
+    const float* __restrict__ alibi_slopes,
+    int has_alibi
+) {
+    // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
+    // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts) or 256 on.
+    const int i = blockIdx.x;             // query position (0..seq_len)
+    const int h = blockIdx.y;             // head index
+    if (i >= seq_len || h >= num_heads) return;
+
+    // GQA mapping: every (num_heads/num_kv_heads) query heads share one kv_head.
+    // The host validates that num_heads % num_kv_heads == 0, so this is exact.
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+
+    // Pointers to this head's q column / kv column.
+    // Layouts (Phase-1 contract): q: [seq_len, num_heads, head_dim] -> q_offset = (i * num_heads + h).
+    const int q_offset = (i * num_heads + h) * head_dim;
+
+    // Cache offset: query position i within this call is at absolute position
+    // (cache_offset + i). All past K/V positions are valid up to that.
+    const int abs_i = cache_offset + i;
+
+    // ────────────────────────────────────────────────────────────────────── Phase 1: online softmax.
+    // Running max + running weighted sum, no full score vector materialized; kv_seq_len may exceed the.
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    // num_waves = actual launched block size / wave size.
+    // Uses blockDim.x (not a compile-time constant) so it matches the real launch: 128 on gfx1036.
+    const int num_waves = blockDim.x / wave_size;
+
+    // Every head_dim axis loop must cover the SAME range as the q staging loop
+    // (8 chunks). It used to be 4, which covered only 4*wave_size = 128 dims, so
+    // for head_dim 256 the upper half of every output row was never written and
+    // read back as whatever the allocation held - observed as exactly half the
+    // output elements wrong. s_acc[8][260] and the head_dim>256 guard already
+    // assumed 256.
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+
+    // Hardware-aware head-dim cap.
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    // Per-wavefront partials published to LDS for the wave-0 merge.
+    // Sized to worst-case 8 wavefronts (RDNA iGPU Wave32 + block 256 host path) and head.
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    // Causal KV range for this query: [lo, hi) where: hi = min(abs_i + 1, kv_seq_len) (standard causal upper bound) lo = window_lo (0 for full attention; sliding lower
+    // bound for SWA) `window_lo` is pre-computed on the host as max(0, abs_i - window + 1) so the kernel stays branch-free for the common full-causal case (window_lo == 0).
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;             // 0 for full causal; >= 0 for SWA
+    const int range_len = hi - lo;        // may be 0 if lo >= hi (empty window)
+
+    // Quarter-stride partitioning of [lo, hi) across the wavefronts.
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    // j_start / j_end are offsets into [0, range_len); add `lo` when accessing KV.
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Fast-path GQA key/value stride pointers
+    const float* __restrict__ k_head = &k_tensor[kv_head * head_dim];
+    const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
+    // f16-KV variant: same math, K/V read through u16 views (arenas hold
+    // fp16 when GRIM_F16_KV is on; q stays f32).
+    //
+    // STRIDE CORRECTNESS (do not "simplify"): the head base MUST be computed
+    // in u16 units from the tensor base. `&k_tensor[kv_head*head_dim]` advances
+    // kv_head*head_dim FLOATS (= ×4 bytes); reinterpreting that address as u16
+    // puts every kv_head>0 at 2x its true offset (head 0 accidentally exact,
+    // all later heads out-of-bounds). Index from the u16 base instead.
+    const unsigned short* __restrict__ k_head16 =
+        ((const unsigned short*)k_tensor) + kv_head * head_dim;
+    const unsigned short* __restrict__ v_head16 =
+        ((const unsigned short*)v_tensor) + kv_head * head_dim;
+    (void)k_head;
+    (void)v_head;
+    const int kv_stride = num_kv_heads * head_dim;
+
+    // Stage this lane's strided slice of q into registers ONCE.
+    // The previous form re-fetched the whole q head from global memory on every KV token.
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        // Lane-strided partial dot product Q.K, then butterfly reduction.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                partial += q_reg[chunk] * fp16_bits_to_float_device(k_head16[j * kv_stride + dd]);
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        // Online-softmax update
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * fp16_bits_to_float_device(v_head16[j * (num_kv_heads * head_dim) + d]);
             }
         }
     }
@@ -988,6 +1768,87 @@ void grim_qkv_attention_paged_quant(
     }
 }
 
+
+// Phase 2 (int8 KV arenas): append-quantize. One block per (slot, step, kv_head)
+// head-vector quantizes `head_dim` f32 values to symmetric int8
+// (q = clamp(round(x/scale), -127, 127), scale = maxabs/127, all-zero row
+// stores scale 1.0 + zero codes) into the codes arena, plus one f32 scale
+// into the scales sidecar. `head_dim` <= 256 (block 256, one thread/elem).
+// Strides are in ELEMENTS of their own buffer.
+extern "C" __global__ void grim_kv_append_i8(
+    const float* __restrict__ k_rot,
+    const int* __restrict__ past_dev,
+    unsigned char* __restrict__ codes,
+    float* __restrict__ scales,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim,
+    int steps,
+    int batch,
+    int arena_slot_stride,
+    int scale_slot_stride) {
+    const int vec = blockIdx.x;  // one head-vector per block
+    const int tid = threadIdx.x;
+    const int vecs_per_slot = steps * nkv_heads;
+    const int total_vecs = batch * vecs_per_slot;
+    if (vec >= total_vecs) return;
+    const int slot = vec / vecs_per_slot;
+    const int rem = vec - slot * vecs_per_slot;
+    const int step = rem / nkv_heads;
+    const int kh = rem - step * nkv_heads;
+    const int past = past_dev[slot];
+    const int abs_row = past + step;
+    const long long src_base = ((long long)slot * steps + step) * kv_stride + (long long)kh * head_dim;
+    const long long dst_base = (long long)slot * arena_slot_stride + (long long)abs_row * kv_stride + (long long)kh * head_dim;
+    const long long sc_idx = (long long)slot * scale_slot_stride + (long long)abs_row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    float v = (tid < head_dim) ? k_rot[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    // Cross-wave fold through shared (mirrors grim_qkv_attention), then
+    // broadcast the winning scale: every quantizing thread needs the SAME
+    // denominator, not its wave's partial max.
+    __shared__ float s_max[8];
+    __shared__ float s_scale;
+    if (lane_id == 0) s_max[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    // NOTE: lanes outside wave 0 hold a partial max here; only lane 0's
+    // value is final (contributors tids 0..num_waves-1 all live in wave 0
+    // when num_waves <= wave_size, i.e. block 256 on wave32/wave64).
+    float scale = 1.0f;
+    if (tid == 0) {
+        // Legacy int8 convention (matches `grim_kv_dequant_attention`): the
+        // stored scale is the vector maxabs and codes are fractions of it,
+        // dequant = (code-128)/127*scale. NOT the step size.
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale = scale;
+    }
+    __syncthreads();
+    scale = s_scale;
+    if (tid < head_dim) {
+        // Reciprocal of the BROADCAST winning scale (not the thread's
+        // partial mx): every code in the vector shares one denominator.
+        // Codes are fractions of maxabs: q = round(v/scale*127).
+        float inv = (scale > 1e-30f) ? (127.0f / scale) : 0.0f;
+        int q = (int)__builtin_roundf(v * inv);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        // Stored biased by 128 (u8); readers subtract 128 (matches the
+        // legacy int8 dequant convention `(int8-128)/127*scale` with the
+        // sign folded into the byte).
+        codes[dst_base + tid] = (unsigned char)(q + 128);
+    }
+}
+
 // Item 3 — device-side KV append. Replaces the host-offset `copy_slice_into`:
 // each thread reads `past = past_dev[slot]` ON DEVICE, computes its own destination
 // offset `slot*arena_slot_stride + past*kv_stride + local`, and copies one element.
@@ -1413,6 +2274,209 @@ extern "C" __global__ void grim_qkv_attention_dev(
     }
 }
 
+
+// int8-KV device-total variant of `grim_qkv_attention_dev` (Phase 2):
+// identical math and capture semantics, K/V rows read as biased-u8
+// codes with f32 per-(slot,row,kv_head) scales. No f16/f32 legs.
+extern "C" __global__ void grim_qkv_attention_dev_i8(
+    const float* __restrict__ q,
+    const float* __restrict__ k_tensor,
+    const float* __restrict__ v_tensor,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* __restrict__ total_dev,
+    int steps,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int batch,
+    int arena_slot_stride,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    int scale_slot_stride
+) {
+    // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
+    // P3: blockIdx.z is the batch slot — every slot has its own arena region
+    // (`slot * arena_slot_stride`) and its own position scalar (`total_dev[slot]`).
+    const int slot = blockIdx.z;
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = slot * (seq_len * num_heads * head_dim)
+        + (i * num_heads + h) * head_dim;
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+    const int d = lane_id;
+    const bool thread_active = d < head_dim;
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) out[q_offset + d] = nanf("");
+        }
+        return;
+    }
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+    // Device-driven KV length. `total_dev` holds the per-slot pre-step past
+    // count (bumped by grim_bump_i32 AFTER this attention node), and `steps` is
+    // the number of rows the preceding kv_append node appended IN EACH SLOT —
+    // so the live KV length during this attention is `total_dev[slot] + steps`.
+    // `steps` is a graph-safe constant (1 for decode), so replay N times
+    // re-derives the right total from the live per-slot total_dev each time.
+    const int kv_seq_len = total_dev[slot] + steps;
+    // Decode: single query at absolute position (kv_seq_len - 1).
+    const int abs_i = kv_seq_len - 1;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    // int8-KV variant (Phase 2): codes are biased-u8 (same element layout
+    // as f32 rows, 1 B/elem); scales are f32 per (slot, row, kv_head).
+    const unsigned char* __restrict__ k_u8 = (const unsigned char*)k_tensor;
+    const unsigned char* __restrict__ v_u8 = (const unsigned char*)v_tensor;
+    const int kv_stride = num_kv_heads * head_dim;
+    float q_reg[8];
+    if (thread_active) {
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
+        }
+    }
+    for (int j = j_start; j < j_end; ++j) {
+        const int kv_idx = lo + j;
+        float score = 0.0f;
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) {
+                float kvv = ((float)((int)k_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_stride + (long long)kv_head * head_dim + idx] - 128) / 127.0f)
+                    * k_scales[(long long)slot * scale_slot_stride + (long long)kv_idx * num_kv_heads + kv_head];
+                score += q_reg[c] * kvv;
+            }
+        }
+        // Wave-uniform total score (every lane holds the sum).
+        for (int off = wave_size / 2; off > 0; off >>= 1)
+            score += __shfl_xor(score, off);
+        score *= inv_sqrt_d;
+        if (thread_active) {
+            if (softcap > 0.0f) {
+                float t = score / softcap;
+                score = softcap * logf(1.0f + expf((t > -20.0f) ? t : -20.0f));
+            }
+            if (has_alibi) score += alibi_slopes[h] * ((float)kv_idx - (float)abs_i);
+            float mw = fmaxf(running_max, score);
+            float scale_a = expf(running_max - mw);
+            float scale_b = expf(score - mw);
+            running_sum = running_sum * scale_a + scale_b;
+            for (int c = 0; c < 4; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim) {
+                    float vv = ((float)((int)v_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_stride + (long long)kv_head * head_dim + idx] - 128) / 127.0f)
+                        * v_scales[(long long)slot * scale_slot_stride + (long long)kv_idx * num_kv_heads + kv_head];
+                    out_acc[c] = out_acc[c] * scale_a + scale_b * vv;
+                }
+            }
+            running_max = mw;
+        }
+    }
+    // Publish per-wavefront partials: max/sum are wave-uniform (lane 0 stores
+    // the wave's scalars); acc is per-lane strided. Empty waves keep
+    // running_max = -1e30 and are skipped by the merge (scale 0).
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int c = 0; c < 4; ++c) {
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            s_acc[wave_id][idx] = out_acc[c];
+        } else if (idx < 256) {
+            s_acc[wave_id][idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (wave_id != 0) return;
+
+    // Wave-0 merge of per-wave scalars (same pattern as grim_qkv_attention).
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        sum_final = sum_final * expf(m_final - m_new) + uw * expf(mw - m_new);
+        m_final = m_new;
+    }
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    // Each lane reconstructs its strided slice of the normalized attention row.
+    float attn_reg[4];
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        attn_reg[c] = 0.0f;
+        int idx = d + c * wave_size;
+        if (idx < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][idx] * expf(s_max[w] - m_final);
+            }
+            attn_reg[c] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int c = 0; c < 4; ++c) {
+            int idx = d + c * wave_size;
+            if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
+        }
+    } else {
+        // WI-F2 fused O-projection epilogue: each wave-0 lane owns a strided
+        // slice of head_dim; per output column the lane partial is
+        // butterfly-reduced and lane 0 atomically accumulates into the
+        // (host-zeroed) fused output row. `out` here is [seq_len, o_dim].
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            for (int c = 0; c < 4; ++c) {
+                int idx = d + c * wave_size;
+                if (idx < head_dim) {
+                    partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
+                }
+            }
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[slot * (seq_len * o_dim) + i * o_dim + oc], partial);
+            }
+        }
+    }
+}
+
 // P3: per-slot position bump. Grid (batch,1,1)/(1,1,1) — thread b bumps
 // `past_dev[b] += steps`. batch=1 callers launch grid (1,1,1): slot 0.
 extern "C" __global__ void grim_bump_i32(
@@ -1464,6 +2528,137 @@ extern "C" __global__ void grim_scythe_publish_head(
 ) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *head_dev = head_value;
+    }
+}
+
+// Phase 2 (eager int8 append): quantize explicit f32 rows to biased-u8 codes
+// + f32 per-head scales at explicit destination offsets (host-computed, like
+// `copy_slice_range`). One block per (row, kv_head) head-vector; block 256.
+extern "C" __global__ void grim_kv_quantize_rows_i8(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ codes,
+    int codes_off,
+    float* __restrict__ scales,
+    int scales_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int vec = blockIdx.x;  // one head-vector per block
+    const int tid = threadIdx.x;
+    const int vecs = n_rows * nkv_heads;
+    if (vec >= vecs) return;
+    const int row = vec / nkv_heads;
+    const int kh = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    const long long dst_base = (long long)codes_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    const long long sc_idx = (long long)scales_off + (long long)row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    float v = (tid < head_dim) ? src[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    __shared__ float s_max[8];
+    __shared__ float s_scale;
+    if (lane_id == 0) s_max[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    float scale = 1.0f;
+    if (tid == 0) {
+        // Legacy int8 convention (matches `grim_kv_dequant_attention`): the
+        // stored scale is the vector maxabs and codes are fractions of it,
+        // dequant = (code-128)/127*scale. NOT the step size.
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale = scale;
+    }
+    __syncthreads();
+    scale = s_scale;
+    if (tid < head_dim) {
+        // Reciprocal of the BROADCAST winning scale (not the thread's
+        // partial mx): every code in the vector shares one denominator.
+        // Codes are fractions of maxabs: q = round(v/scale*127).
+        float inv = (scale > 1e-30f) ? (127.0f / scale) : 0.0f;
+        int q = (int)__builtin_roundf(v * inv);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        codes[dst_base + tid] = (unsigned char)(q + 128);
+    }
+}
+
+// Phase 3 (eager int4 append): quantize explicit f32 rows to packed u4 nibbles
+// (2 values per byte, low nibble first, biased by +7) + f32 per-head scales.
+// One block per (row, kv_head) head-vector; block 256.
+extern "C" __global__ void grim_kv_quantize_rows_i4(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ codes,
+    int codes_off,
+    float* __restrict__ scales,
+    int scales_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int vec = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int vecs = n_rows * nkv_heads;
+    if (vec >= vecs) return;
+    const int row = vec / nkv_heads;
+    const int kh = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    // codes row stride in bytes is kv_stride / 2. Head offset is kh * head_dim / 2.
+    const long long dst_base = (long long)codes_off + (long long)row * (kv_stride / 2) + (long long)kh * (head_dim / 2);
+    const long long sc_idx = (long long)scales_off + (long long)row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+
+    float v = (tid < head_dim) ? src[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    __shared__ float s_max[8];
+    __shared__ float s_scale;
+    if (lane_id == 0) s_max[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    float scale = 1.0f;
+    if (tid == 0) {
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale = scale;
+    }
+    __syncthreads();
+    scale = s_scale;
+
+    // Quantize to [-7, +7] -> [0, 14]
+    int q = 7;
+    if (tid < head_dim) {
+        float inv = (scale > 1e-30f) ? (7.0f / scale) : 0.0f;
+        int val = (int)__builtin_roundf(v * inv);
+        val = val < -7 ? -7 : (val > 7 ? 7 : val);
+        q = val + 7;
+    }
+
+    // Pack adjacent pairs (even/odd lane) into single bytes
+    // Only even lanes write to codes buffer
+    int q_odd = __shfl_xor_sync(0xffffffffffffffffULL, q, 1);
+    if ((tid & 1) == 0 && tid < head_dim) {
+        unsigned char packed = (unsigned char)((q & 0x0f) | ((q_odd & 0x0f) << 4));
+        codes[dst_base + (tid >> 1)] = packed;
     }
 }
 "#;
@@ -1994,7 +3189,8 @@ pub fn launch_paged_attention_quant(
     if quant_format == KvCacheQuantFormat::WhiteCrow {
         return Err(crate::Error::Backend(
             "launch_paged_attention_quant: WhiteCrow KV pages have no kernel decode leg yet; \
-             run with GRIM_PACKED_POOL=0 (dense KV) until the WhiteCrow leg lands".into(),
+             run with GRIM_PACKED_POOL=0 (dense KV) until the WhiteCrow leg lands"
+                .into(),
         ));
     }
     let mut qf = quant_format as i32;
@@ -2068,24 +3264,25 @@ fn kv_rot_device_ptr(
     )))
 }
 
-/// M3: KV-arena dtype must match the live `GRIM_F16_KV` flag. A stale F32
-/// arena read as F16 (or vice versa) silently reinterprets bits — Err here
-/// routes callers to the host fallback instead of garbage.
-fn check_kv_arena_dtype(arena: &dyn BackendStorage, what: &str) -> Result<(), crate::Error> {
+/// M3: KV-arena representation from STORAGE, not env. Uniform F32 or
+/// uniform F16 arenas are accepted regardless of `GRIM_F16_KV` (the flag is
+/// only an allocation hint); anything else — mixed dtypes, packed/quant
+/// storages that the dense kernels would reinterpret — fails loud here and
+/// routes callers to the host fallback instead of garbage. Returns true for
+/// f16 arenas (kernels take the f16 leg) and false for f32.
+fn kv_arena_f16(arena: &dyn BackendStorage, what: &str) -> Result<bool, crate::Error> {
     use crate::memory::storage::RocmStorage;
     let s = arena
         .as_any()
         .downcast_ref::<RocmStorage>()
         .ok_or_else(|| crate::Error::Backend(format!("{what}: K/V arena must be RocmStorage")))?;
-    let want_f16 = kv_f16_enabled();
-    let is_f16 = s.dtype.arith == grim_tensor::dtype::ArithType::F16;
-    if is_f16 != want_f16 {
-        return Err(crate::Error::Backend(format!(
-            "{what}: arena dtype {:?} does not match GRIM_F16_KV={want_f16}",
-            s.dtype.arith,
-        )));
+    match s.dtype.arith {
+        grim_tensor::dtype::ArithType::F16 => Ok(true),
+        grim_tensor::dtype::ArithType::F32 => Ok(false),
+        other => Err(crate::Error::Backend(format!(
+            "{what}: K/V arena dtype {other:?} needs the paged quant path, not dense kernels"
+        ))),
     }
-    Ok(())
 }
 
 pub fn launch_kv_append(
@@ -2096,7 +3293,7 @@ pub fn launch_kv_append(
     kv_stride: usize,
     steps: usize,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
-    check_kv_arena_dtype(k_arena, "kv_append")?;
+    let mut f16_flag = kv_arena_f16(k_arena, "kv_append")? as i32;
     let total = steps * kv_stride;
     let arena_s = k_arena
         .as_any()
@@ -2116,7 +3313,6 @@ pub fn launch_kv_append(
     let mut stride_i = kv_stride as i32;
     let mut steps_i = steps as i32;
     let (grid, block) = crate::device::util::linear_launch(total);
-    let mut f16_flag = kv_f16_enabled() as i32;
     // Legacy single-sequence path: batch=1 (slot always 0 in the kernel).
     dev.launch_compute_kernel(
         "grim_kv_append",
@@ -2149,7 +3345,7 @@ pub fn launch_kv_append_batch(
     batch: usize,
     arena_slot_stride: usize,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
-    check_kv_arena_dtype(k_arena, "kv_append_batch")?;
+    let mut f16_flag = kv_arena_f16(k_arena, "kv_append_batch")? as i32;
     let arena_s = k_arena
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -2175,7 +3371,6 @@ pub fn launch_kv_append_batch(
     let mut slot_stride_i = arena_slot_stride as i32;
     let total = batch.max(1) * steps * kv_stride;
     let (grid, block) = crate::device::util::linear_launch(total);
-    let mut f16_flag = kv_f16_enabled() as i32;
     dev.launch_compute_kernel(
         "grim_kv_append",
         grid,
@@ -2189,6 +3384,276 @@ pub fn launch_kv_append_batch(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut f16_flag),
+        ],
+    )
+}
+
+// Phase 2 launcher: `grim_kv_append_i8`. Quantizes `steps` f32 rows per slot
+/// (each (step, kv_head) head-vector independently, symmetric int8 with an
+/// f32 per-vector scale) into the u8 codes arena + f32 scales sidecar.
+/// Block 256 required (one thread per head_dim element, `head_dim` <= 256).
+#[allow(clippy::too_many_arguments)]
+/// Phase 2 launcher: `grim_kv_quantize_rows_i8`. Host-offset sibling of
+/// `launch_kv_append_i8` for the eager path (offsets computed on host like
+/// `copy_slice_range`; no past_dev). Quantizes `n_rows` f32 head-vectors.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_quantize_rows_i8(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    codes: &dyn BackendStorage,
+    codes_off: usize,
+    scales: &dyn BackendStorage,
+    scales_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i8: src must be F32".into(),
+        ));
+    }
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i8: codes must be RocmStorage".into())
+        })?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i8: codes must be U8".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i8: scales must be RocmStorage".into())
+        })?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i8: scales must be F32".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_i8: head_dim {head_dim} not in 1..=256"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: src has no device ptr".into())
+    })?;
+    let mut cptr = codes_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: codes have no device ptr".into())
+    })?;
+    let mut scptr = scales_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i8: scales have no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut codes_off_i = codes_off as i32;
+    let mut scales_off_i = scales_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_i8",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut cptr),
+            arg(&mut codes_off_i),
+            arg(&mut scptr),
+            arg(&mut scales_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
+/// Phase 3 launcher: `grim_kv_quantize_rows_i4`.
+/// Quantizes `n_rows` f32 head-vectors into packed 4-bit nibbles + f32 per-vector scales.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_quantize_rows_i4(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    codes: &dyn BackendStorage,
+    codes_off: usize,
+    scales: &dyn BackendStorage,
+    scales_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i4: src must be F32".into(),
+        ));
+    }
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i4: codes must be RocmStorage".into())
+        })?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i4: codes must be U8 (byte storage for packed u4)".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i4: scales must be RocmStorage".into())
+        })?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i4: scales must be F32".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim > 256 || head_dim % 2 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_i4: head_dim {head_dim} must be even and in 1..=256"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: src has no device ptr".into())
+    })?;
+    let mut cptr = codes_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: codes have no device ptr".into())
+    })?;
+    let mut scptr = scales_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i4: scales have no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut codes_off_i = codes_off as i32;
+    let mut scales_off_i = scales_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_i4",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut cptr),
+            arg(&mut codes_off_i),
+            arg(&mut scptr),
+            arg(&mut scales_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
+pub fn launch_kv_append_i8(
+    dev: &crate::RocmDevice,
+    k_rot: &dyn BackendStorage,
+    past_dev: &dyn BackendStorage,
+    codes: &dyn BackendStorage,
+    scales: &dyn BackendStorage,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    batch: usize,
+    arena_slot_stride: usize,
+    scale_slot_stride: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: codes must be RocmStorage".into()))?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_append_i8: codes arena must be U8 (int8 format)".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: scales must be RocmStorage".into()))?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_append_i8: scales sidecar must be F32".into(),
+        ));
+    }
+    if head_dim == 0 || head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "kv_append_i8: head_dim {head_dim} not in 1..=256"
+        )));
+    }
+    let mut rot_ptr = kv_rot_device_ptr(k_rot, "k_rot_i8")?;
+    let past_s = past_dev
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_append_i8: past_dev must be RocmStorage".into())
+        })?;
+    let mut codes_ptr = codes_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: codes have no device ptr".into()))?;
+    let mut scales_ptr = scales_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: scales have no device ptr".into()))?;
+    let mut past_ptr = past_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("kv_append_i8: past_dev has no device ptr".into()))?;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let mut steps_i = steps as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let mut sc_slot_stride_i = scale_slot_stride as i32;
+    let grid = crate::HipDim3::new((batch.max(1) * steps * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_append_i8",
+        grid,
+        block,
+        &mut [
+            arg(&mut rot_ptr),
+            arg(&mut past_ptr),
+            arg(&mut codes_ptr),
+            arg(&mut scales_ptr),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+            arg(&mut steps_i),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut sc_slot_stride_i),
         ],
     )
 }
@@ -2287,8 +3752,14 @@ pub fn launch_qkv_attention_dev_batch(
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
         .ok_or_else(|| crate::Error::Backend(format!("{}: q must be RocmStorage", KERNEL)))?;
-    check_kv_arena_dtype(k_tensor, "grim_qkv_attention_dev")?;
-    check_kv_arena_dtype(v_tensor, "grim_qkv_attention_dev")?;
+    let k_f16 = kv_arena_f16(k_tensor, "grim_qkv_attention_dev k")?;
+    let v_f16 = kv_arena_f16(v_tensor, "grim_qkv_attention_dev v")?;
+    if k_f16 != v_f16 {
+        return Err(crate::Error::Backend(
+            "grim_qkv_attention_dev: K/V arenas must share one dtype (storage truth)".into(),
+        ));
+    }
+    let mut f16_flag = k_f16 as i32;
     let k_s = k_tensor
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -2367,7 +3838,7 @@ pub fn launch_qkv_attention_dev_batch(
         .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
     let mut batch_i = batch.max(1) as i32;
     let mut slot_stride_i = arena_slot_stride as i32;
-    let mut f16_flag = kv_f16_enabled() as i32;
+    // f16_flag derived from the arenas above (storage truth).
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
     dev.launch_compute_kernel(
@@ -2398,6 +3869,175 @@ pub fn launch_qkv_attention_dev_batch(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut f16_flag),
+        ],
+    )
+}
+
+/// Phase-2 launcher: `grim_qkv_attention_dev_i8`. Device-total twin of the
+/// scalar int8 attend: K/V are biased-u8 codes with f32 per-(slot,row,kv_head)
+/// scales. Same capture semantics as `launch_qkv_attention_dev_batch`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_qkv_attention_dev_batch_i8(
+    dev: &crate::RocmDevice,
+    q: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    out: &dyn BackendStorage,
+    out_max: &dyn BackendStorage,
+    out_sum: &dyn BackendStorage,
+    total_dev: &dyn BackendStorage,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    steps: u32,
+    inv_sqrt_d: f32,
+    window_lo: i32,
+    softcap: f32,
+    o_proj_w: &dyn BackendStorage,
+    o_dim: u32,
+    fuse_o: u32,
+    alibi_slopes: &dyn BackendStorage,
+    has_alibi: u32,
+    batch: usize,
+    arena_slot_stride: usize,
+    scale_slot_stride: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    const KERNEL: &str = "grim_qkv_attention_dev_i8";
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "{}: head_dim {} exceeds kernel cap of 256",
+            KERNEL, head_dim
+        )));
+    }
+    let q_s = q
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend(format!("{}: q must be RocmStorage", KERNEL)))?;
+    for (buf, what, want) in [
+        (k_codes, "k_codes", ArithType::U8),
+        (v_codes, "v_codes", ArithType::U8),
+        (k_scales, "k_scales", ArithType::F32),
+        (v_scales, "v_scales", ArithType::F32),
+    ] {
+        let r = buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!("{KERNEL}: {what} must be RocmStorage"))
+        })?;
+        if r.dtype.arith != want {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} must be {want:?}, got {:?}",
+                r.dtype.arith
+            )));
+        }
+        if !r.device_ptr_is_valid() {
+            return Err(crate::Error::Backend(format!(
+                "{KERNEL}: {what} lacks a valid device pointer"
+            )));
+        }
+    }
+    fn dc<'a>(
+        b: &'a dyn BackendStorage,
+        what: &'static str,
+    ) -> Result<&'a RocmStorage, crate::Error> {
+        b.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+            crate::Error::Backend(format!(
+                "grim_qkv_attention_dev_i8: {what} must be RocmStorage"
+            ))
+        })
+    }
+    let out_s = dc(out, "out")?;
+    let om_s = dc(out_max, "out_max")?;
+    let os_s = dc(out_sum, "out_sum")?;
+    let total_s = dc(total_dev, "total_dev")?;
+    let oproj_s = dc(o_proj_w, "o_proj_w")?;
+    let alibi_s = dc(alibi_slopes, "alibi_slopes")?;
+    let kq = dc(k_codes, "k_codes")?;
+    let ks = dc(k_scales, "k_scales")?;
+    let vq = dc(v_codes, "v_codes")?;
+    let vs = dc(v_scales, "v_scales")?;
+    let mut q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no ptr".into()))?;
+    let mut k_ptr = kq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_codes have no ptr".into()))?;
+    let mut ksc_ptr = ks
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_scales have no ptr".into()))?;
+    let mut v_ptr = vq
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_codes have no ptr".into()))?;
+    let mut vsc_ptr = vs
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_scales have no ptr".into()))?;
+    let mut o_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no ptr".into()))?;
+    let mut om_ptr = om_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_max has no ptr".into()))?;
+    let mut os_ptr = os_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out_sum has no ptr".into()))?;
+    let mut tot_ptr = total_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("total_dev has no ptr".into()))?;
+    let mut nh = num_heads as i32;
+    let mut nkv = num_kv_heads as i32;
+    let mut hd = head_dim as i32;
+    let mut sl = seq_len as i32;
+    let mut steps_i = steps as i32;
+    let mut isd = inv_sqrt_d;
+    let mut wl = window_lo;
+    let mut sc = softcap;
+    let mut od = o_dim as i32;
+    let mut fo = fuse_o as i32;
+    let mut asl = alibi_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("alibi_slopes has no ptr".into()))?;
+    let mut ha = has_alibi as i32;
+    let mut batch_i = batch.max(1) as i32;
+    let mut slot_stride_i = arena_slot_stride as i32;
+    let mut sc_slot_stride_i = scale_slot_stride as i32;
+    let mut opptr = oproj_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("o_proj_w has no ptr".into()))?;
+    let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
+    let block_dim = crate::HipDim3::new(128, 1, 1);
+    dev.launch_compute_kernel(
+        KERNEL,
+        grid_dim,
+        block_dim,
+        &mut [
+            arg(&mut q_ptr),
+            arg(&mut k_ptr),
+            arg(&mut v_ptr),
+            arg(&mut ksc_ptr),
+            arg(&mut vsc_ptr),
+            arg(&mut o_ptr),
+            arg(&mut om_ptr),
+            arg(&mut os_ptr),
+            arg(&mut nh),
+            arg(&mut nkv),
+            arg(&mut hd),
+            arg(&mut sl),
+            arg(&mut tot_ptr),
+            arg(&mut steps_i),
+            arg(&mut isd),
+            arg(&mut wl),
+            arg(&mut sc),
+            arg(&mut opptr),
+            arg(&mut od),
+            arg(&mut fo),
+            arg(&mut asl),
+            arg(&mut ha),
+            arg(&mut batch_i),
+            arg(&mut slot_stride_i),
+            arg(&mut sc_slot_stride_i),
         ],
     )
 }
@@ -3301,8 +4941,38 @@ mod tests {
 }
 
 #[cfg(test)]
+mod kv_kernel_source_structure_tests {
+    use super::KERNEL_SOURCE;
+
+    /// Every `grim_*` kernel in this TU must carry `extern "C" __global__`.
+    /// A script-generated duplicate once lost its prefix line: the TU still
+    /// parsed (the body became a host function), hiprtc failed every entry
+    /// compiled afterwards with `__shared__ not allowed in __host__`, and the
+    /// failure surfaced far from its cause. String-level, runs everywhere.
+    #[test]
+    fn every_kernel_has_global_prefix() {
+        for (i, line) in KERNEL_SOURCE.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("void grim_") {
+                let prev: Vec<&str> = KERNEL_SOURCE.lines().take(i).collect();
+                let mut j = prev.len();
+                while j > 0 && prev[j - 1].trim().is_empty() {
+                    j -= 1;
+                }
+                let pre = prev[j - 1];
+                assert!(
+                    pre.contains("__global__"),
+                    "kernel without __global__ prefix near TU line {}: {t} (previous: {pre})",
+                    i + 1,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod kv_arena_dtype_tests {
-    use super::check_kv_arena_dtype;
+    use super::kv_arena_f16;
     use grim_tensor::dtype::{ArithType, Storage};
     use grim_tensor::{CoreTensorOps, DType, Shape};
 
@@ -3310,41 +4980,61 @@ mod kv_arena_dtype_tests {
         crate::RocmDevice::try_new(0).ok()
     }
 
-    /// M3: arena dtype must match the live `GRIM_F16_KV` flag (off by default
-    /// here — no env mutation, so no races with parallel tests assuming the
-    /// default). F32 arena passes; F16 arena must Err loudly instead of being
-    /// silently reinterpreted by the kernel. The mirrored case (flag on, F32
-    /// arena) shares the same `!=` branch.
+    fn arena_of(dev: &crate::RocmDevice, arith: ArithType) -> Box<dyn grim_tensor::BackendStorage> {
+        let shape = Shape::new(vec![4, 64]);
+        let data = vec![0.5f32; 4 * 64];
+        dev.from_cpu(
+            &data,
+            &shape,
+            DType {
+                arith,
+                storage: Storage::Native,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Storage truth: uniform F32 or uniform F16 arenas are accepted
+    /// regardless of `GRIM_F16_KV` (no env mutation here, so no races with
+    /// parallel tests). Packed/quant storages fail loud — the dense kernels
+    /// would reinterpret their bytes.
     #[test]
-    fn kv_arena_dtype_mismatch_is_loud_not_silent() {
+    fn kv_arena_dtype_storage_truth() {
         let Some(dev) = gpu_dev() else {
             eprintln!("[SKIP] requires GPU");
             return;
         };
-        assert!(
-            !super::kv_f16_enabled(),
-            "test assumes default GRIM_F16_KV off; run without the flag"
+        assert_eq!(
+            kv_arena_f16(arena_of(&dev, ArithType::F32).as_ref(), "m3-test").unwrap(),
+            false,
+            "F32 arena must take the f32 leg"
         );
-        let shape = Shape::new(vec![4, 64]);
-        let data = vec![0.5f32; 4 * 64];
-        let f32_arena = dev.from_cpu(&data, &shape, DType::F32).unwrap();
-        check_kv_arena_dtype(f32_arena.as_ref(), "m3-test")
-            .expect("F32 arena with flag off must pass");
-        let f16_arena = dev
-            .from_cpu(
-                &data,
-                &shape,
-                DType {
-                    arith: ArithType::F16,
-                    storage: Storage::Native,
-                },
-            )
-            .unwrap();
-        let err = check_kv_arena_dtype(f16_arena.as_ref(), "m3-test")
-            .expect_err("F16 arena with flag off must Err loudly");
-        assert!(
-            format!("{err:?}").contains("does not match"),
-            "unexpected error shape: {err:?}"
+        assert_eq!(
+            kv_arena_f16(arena_of(&dev, ArithType::F16).as_ref(), "m3-test").unwrap(),
+            true,
+            "F16 arena must take the f16 leg"
         );
+    }
+
+    /// The flag is an allocation hint, not a behavior switch: F32 arenas
+    /// keep working with the flag ON, and F16 arenas with it OFF.
+    #[test]
+    fn kv_arena_dtype_ignores_env() {
+        let Some(dev) = gpu_dev() else {
+            eprintln!("[SKIP] requires GPU");
+            return;
+        };
+        temp_env::with_var("GRIM_F16_KV", Some("1"), || {
+            assert_eq!(
+                kv_arena_f16(arena_of(&dev, ArithType::F32).as_ref(), "m3-test").unwrap(),
+                false
+            );
+        });
+        temp_env::with_var("GRIM_F16_KV", Some("0"), || {
+            assert_eq!(
+                kv_arena_f16(arena_of(&dev, ArithType::F16).as_ref(), "m3-test").unwrap(),
+                true
+            );
+        });
     }
 }

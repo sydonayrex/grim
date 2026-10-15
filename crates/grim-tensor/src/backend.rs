@@ -1018,6 +1018,52 @@ pub trait AttentionOps {
         ))
     }
 
+    /// QKV attention over int8-quantized dense KV arenas (Phase-2 KV shrink).
+    ///
+    /// `k_codes`/`v_codes` are biased-u8 rows (`q+128`) with f32
+    /// per-(row, kv_head) `k_scales`/`v_scales`; `q` stays f32. Same
+    /// contract as [`Self::qkv_attention`] minus max/sum side outputs,
+    /// alibi, and fused-O. Backends without an int8 reader return
+    /// `Unimplemented` and callers fall back to the dense path.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_i8(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_codes: &dyn BackendStorage,
+        _k_scales: &dyn BackendStorage,
+        _v_codes: &dyn BackendStorage,
+        _v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_i8 not implemented for this backend".into(),
+        ))
+    }
+
+    /// Phase 3 dense-arena attention: packed 4-bit nibbles + per-(row, kv_head) scales.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_attention_i4(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_codes: &dyn BackendStorage,
+        _k_scales: &dyn BackendStorage,
+        _v_codes: &dyn BackendStorage,
+        _v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _window: Option<usize>,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_i4 not implemented for this backend".into(),
+        ))
+    }
+
     /// Paged (block-table) attention over a QUANTIZED KV cache.
     ///
     /// Distinct from [`Self::qkv_attention_paged`], whose kernel reads page rows
@@ -3096,8 +3142,20 @@ impl<T: RecurrentOps + ?Sized> RecurrentOps for std::sync::Arc<T> {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).kda_gated_delta_rule_scan(
-            conv_out, alpha, beta, dt_bias, ssm_a, norm_weight, z, state, seq_len,
-            num_value_heads, num_key_heads, head_dim, eps, out_shape,
+            conv_out,
+            alpha,
+            beta,
+            dt_bias,
+            ssm_a,
+            norm_weight,
+            z,
+            state,
+            seq_len,
+            num_value_heads,
+            num_key_heads,
+            head_dim,
+            eps,
+            out_shape,
         )
     }
 

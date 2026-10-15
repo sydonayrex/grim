@@ -465,6 +465,164 @@ pub fn fused_or_scalar_attention_arena(
     )
 }
 
+/// Phase-2 int8 dense-arena attention: [`fused_or_scalar_attention_arena_device`]
+/// for u8 code arenas with f32 per-(row, kv_head) scales.
+///
+/// Device-only by construction. The host reference reads arena rows as f32 and
+/// has no int8 dequant path, so a declined launch is an `Err` — never a silent
+/// reinterpret of the codes (which is the failure this whole phase exists to
+/// avoid). Callers must own the sidecars before entering here.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i8_arena_device(
+    q_st: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_i8(
+        q_st,
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// Phase-2 int8 dense-arena attention with a host-resident query:
+/// [`fused_or_scalar_attention_i8_arena_device`] after uploading `q`. The
+/// upload is the only D2H/H2D here; K/V history never leaves the device.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i8_arena(
+    q: &[f32],
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_i8_arena_device(
+        q_st.as_ref(),
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
+/// Phase-3 int4 dense-arena attention for device-resident query.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i4_arena_device(
+    q_st: &dyn BackendStorage,
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let out_shape = Shape::new(vec![steps, num_heads * head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let cache_offset = kv_len.saturating_sub(steps);
+    let (storage, _handle) = dev.qkv_attention_i4(
+        q_st,
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        num_kv_heads,
+        kv_len,
+        cache_offset as u32,
+        window,
+        &out_shape,
+    )?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        grim_tensor::QuantProvenance::default(),
+        device.clone(),
+    ))
+}
+
+/// Phase-3 int4 dense-arena attention with a host-resident query.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_or_scalar_attention_i4_arena(
+    q: &[f32],
+    k_codes: &dyn BackendStorage,
+    k_scales: &dyn BackendStorage,
+    v_codes: &dyn BackendStorage,
+    v_scales: &dyn BackendStorage,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    steps: usize,
+    window: Option<usize>,
+    device: &Device,
+) -> Result<Tensor> {
+    let q_shape = Shape::new(vec![steps, num_heads, head_dim]);
+    let dev = pick_device_for_storage_device(device);
+    let q_st = dev.from_cpu(q, &q_shape, DType::F32)?;
+    fused_or_scalar_attention_i4_arena_device(
+        q_st.as_ref(),
+        k_codes,
+        k_scales,
+        v_codes,
+        v_scales,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        steps,
+        window,
+        device,
+    )
+}
+
 /// Paged attention entry point (WI-X2): operates on device-resident KV pages via block tables,
 /// avoiding full-history CPU-to-GPU re-uploading on decode steps.
 #[allow(clippy::too_many_arguments)]
