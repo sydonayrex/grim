@@ -35,16 +35,25 @@ fn big_q4k_full_c_parity() {
     };
     for (m, n, k) in [(64usize, 64, 256), (37, 64, 256), (64, 64, 2048)] {
         let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
-        let b_host: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0).collect();
+        let b_host: Vec<f32> = (0..k * n)
+            .map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0)
+            .collect();
         let b_packed = grim_quant::quant_q4k(&b_host).unwrap();
-        let a_dev = CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
-        let q_dtype = DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q4K) };
-        let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype).unwrap();
+        let a_dev =
+            CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
+        let q_dtype = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        };
+        let b_dev =
+            MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype)
+                .unwrap();
         let out = CoreTensorOps::zeros(&dev, &Shape::new(vec![m * n]), DType::F32).unwrap();
         let a_r = grim_backend_rocm::as_rocm(a_dev.as_ref()).unwrap();
         let b_r = grim_backend_rocm::as_rocm(b_dev.as_ref()).unwrap();
         let o_r = grim_backend_rocm::as_rocm(out.as_ref()).unwrap();
-        dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
         let got = out.to_cpu_vec_f32().unwrap();
 
         // Host oracle: dequantize (column-major N x K, blocks of 256 weights)
@@ -77,42 +86,62 @@ fn big_q4k_prefill_bench_vs_16row() {
         eprintln!("[SKIP] requires GRIM_RUN_GPU_TESTS=1");
         return;
     };
-    let m: usize = std::env::var("GRIM_BENCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(4056);
+    let m: usize = std::env::var("GRIM_BENCH_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4056);
     let (n, k) = (4096usize, 4096usize);
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
-    let b_host: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0).collect();
+    let b_host: Vec<f32> = (0..k * n)
+        .map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0)
+        .collect();
     let b_packed = grim_quant::quant_q4k(&b_host).unwrap();
-    let a_dev = CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
-    let q_dtype = DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q4K) };
-    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype).unwrap();
+    let a_dev =
+        CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let q_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q4K),
+    };
+    let b_dev =
+        MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype)
+            .unwrap();
     let out = CoreTensorOps::zeros(&dev, &Shape::new(vec![m * n]), DType::F32).unwrap();
     let a_r = grim_backend_rocm::as_rocm(a_dev.as_ref()).unwrap();
     let b_r = grim_backend_rocm::as_rocm(b_dev.as_ref()).unwrap();
     let o_r = grim_backend_rocm::as_rocm(out.as_ref()).unwrap();
 
     let iters = 10usize;
-    dev.launch_wmma_fused_dequant_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+    dev.launch_wmma_fused_dequant_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+        .unwrap();
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        dev.launch_wmma_fused_dequant_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_fused_dequant_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
     }
     dev.synchronize();
-    eprintln!("[big-q4k-bench] 16row: {:.2} ms/launch at m={m} n={n} k={k}",
-              t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    eprintln!(
+        "[big-q4k-bench] 16row: {:.2} ms/launch at m={m} n={n} k={k}",
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
 
-    dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+    dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+        .unwrap();
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
     }
     dev.synchronize();
-    eprintln!("[big-q4k-bench] big64: {:.2} ms/launch at m={m} n={n} k={k}",
-              t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    eprintln!(
+        "[big-q4k-bench] big64: {:.2} ms/launch at m={m} n={n} k={k}",
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
 
     // A/B: 64x128 tile (halves A passes). CORRECTNESS-CHECKED — a variant that
     // skips work wins the timing by not computing (that happened).
     if std::env::var("GRIM_BENCH_64X128").is_ok() {
-        dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
         {
             let got = out.to_cpu_vec_f32().unwrap();
             let ndeq = grim_quant::dequant_q4k(&b_packed, k * n).unwrap();
@@ -127,16 +156,23 @@ fn big_q4k_prefill_bench_vs_16row() {
                 }
             }
             eprintln!("[big-q4k-bench] big64x128 spot max_diff={md:.4}");
-            assert!(md < 1.0, "64x128 variant computes wrong results (max_diff={md})");
+            assert!(
+                md < 1.0,
+                "64x128 variant computes wrong results (max_diff={md})"
+            );
         }
-        dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+            dev.launch_wmma_big64x128_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+                .unwrap();
         }
         dev.synchronize();
-        eprintln!("[big-q4k-bench] big64x128: {:.2} ms/launch at m={m} n={n} k={k}",
-                  t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+        eprintln!(
+            "[big-q4k-bench] big64x128: {:.2} ms/launch at m={m} n={n} k={k}",
+            t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+        );
     }
 }
 
@@ -151,16 +187,25 @@ fn big128_q4k_parity_and_bench() {
     };
     for (m, n, k) in [(128usize, 64, 256), (100, 64, 256), (128, 1024, 4096)] {
         let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
-        let b_host: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0).collect();
+        let b_host: Vec<f32> = (0..k * n)
+            .map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0)
+            .collect();
         let b_packed = grim_quant::quant_q4k(&b_host).unwrap();
-        let a_dev = CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
-        let q_dtype = DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q4K) };
-        let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype).unwrap();
+        let a_dev =
+            CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
+        let q_dtype = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        };
+        let b_dev =
+            MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype)
+                .unwrap();
         let out = CoreTensorOps::zeros(&dev, &Shape::new(vec![m * n]), DType::F32).unwrap();
         let a_r = grim_backend_rocm::as_rocm(a_dev.as_ref()).unwrap();
         let b_r = grim_backend_rocm::as_rocm(b_dev.as_ref()).unwrap();
         let o_r = grim_backend_rocm::as_rocm(out.as_ref()).unwrap();
-        dev.launch_wmma_big128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_big128_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
         let got = out.to_cpu_vec_f32().unwrap();
         let ndeq = grim_quant::dequant_q4k(&b_packed, k * n).unwrap();
         let mut max_diff = 0.0f32;
@@ -203,33 +248,52 @@ fn big128_q4k_parity_and_bench() {
     }
 
     // bench at the production prefill shape
-    let m: usize = std::env::var("GRIM_BENCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(4056);
+    let m: usize = std::env::var("GRIM_BENCH_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4056);
     let (n, k) = (4096usize, 4096usize);
     let a_host: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
-    let b_host: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0).collect();
+    let b_host: Vec<f32> = (0..k * n)
+        .map(|i| 1.0 + (i as f32 * 0.013).cos().abs() * 6.0)
+        .collect();
     let b_packed = grim_quant::quant_q4k(&b_host).unwrap();
-    let a_dev = CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
-    let q_dtype = DType { arith: ArithType::F32, storage: Storage::KQuant(KQuantScheme::Q4K) };
-    let b_dev = MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype).unwrap();
+    let a_dev =
+        CoreTensorOps::from_cpu(&dev, &a_host, &Shape::new(vec![m, k]), DType::F32).unwrap();
+    let q_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::KQuant(KQuantScheme::Q4K),
+    };
+    let b_dev =
+        MemoryOps::from_cpu_bytes(&dev, &b_packed, &Shape::new(vec![b_packed.len()]), q_dtype)
+            .unwrap();
     let out = CoreTensorOps::zeros(&dev, &Shape::new(vec![m * n]), DType::F32).unwrap();
     let a_r = grim_backend_rocm::as_rocm(a_dev.as_ref()).unwrap();
     let b_r = grim_backend_rocm::as_rocm(b_dev.as_ref()).unwrap();
     let o_r = grim_backend_rocm::as_rocm(out.as_ref()).unwrap();
     let iters = 10usize;
-    dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+    dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+        .unwrap();
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_big_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
     }
     dev.synchronize();
-    eprintln!("[big128-bench] big64: {:.2} ms/launch at m={m} n={n} k={k}",
-              t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
-    dev.launch_wmma_big128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+    eprintln!(
+        "[big128-bench] big64: {:.2} ms/launch at m={m} n={n} k={k}",
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
+    dev.launch_wmma_big128_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+        .unwrap();
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        dev.launch_wmma_big128_q4k_for_ab(a_r, b_r, o_r, m, n, k).unwrap();
+        dev.launch_wmma_big128_q4k_for_ab(a_r, b_r, o_r, m, n, k)
+            .unwrap();
     }
     dev.synchronize();
-    eprintln!("[big128-bench] big128: {:.2} ms/launch at m={m} n={n} k={k}",
-              t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    eprintln!(
+        "[big128-bench] big128: {:.2} ms/launch at m={m} n={n} k={k}",
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
 }

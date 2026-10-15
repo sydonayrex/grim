@@ -35,6 +35,11 @@ pub mod gla_kernels;
 pub mod gla_mega_kernel;
 /// GPTQ/EfficientQAT GroupInt fused dequant-GEMM (forward + backward).
 pub mod gptq_gemm;
+/// GreyRaven (WS-E) probe for the sparse FP8 SWMMAC fragment layout. Not yet a
+/// GEMM: the layout is what E6 has to discover first.
+pub mod grey_raven;
+/// GreyRaven production GEMM over HW-order tiled weights (E6 closed).
+pub mod grey_raven_gemm;
 pub mod iq_dequant;
 pub mod iq_gemm;
 pub mod jit_cache;
@@ -59,28 +64,23 @@ pub mod qkv_attention;
 pub mod quant_standalone;
 pub mod quant_tiled_gemm;
 pub mod rmsnorm_quant;
-/// TreePie (WS-A) 5.0 bpw decode + M=1 GEMV over V_DOT2_F32_F16.
-pub mod tree_pie;
-/// ScrubJay (WS-B) 5.5 bpw fused dequant + M=1 GEMV over a frozen codebook.
-pub mod scrub_jay;
-/// GreyRaven (WS-E) probe for the sparse FP8 SWMMAC fragment layout. Not yet a
-/// GEMM: the layout is what E6 has to discover first.
-pub mod grey_raven;
-/// GreyRaven production GEMM over HW-order tiled weights (E6 closed).
-pub mod grey_raven_gemm;
 pub mod rwkv;
 pub mod sage_attention;
+/// ScrubJay (WS-B) 5.5 bpw fused dequant + M=1 GEMV over a frozen codebook.
+pub mod scrub_jay;
 pub mod scythe_persistent;
 pub mod silu_mul_quant;
 pub mod speculative_sampler;
+/// TreePie (WS-A) 5.0 bpw decode + M=1 GEMV over V_DOT2_F32_F16.
+pub mod tree_pie;
 
+pub mod rho_microbench;
 pub mod selective_scan;
 pub mod shared_device_fns;
 pub mod source_asm;
 pub mod tile_picker;
+pub mod wmma_big_gemm;
 pub mod wmma_fp8_gemm;
 pub mod wmma_gemm;
 pub mod wmma_iq_gemm;
-pub mod wmma_big_gemm;
-pub mod rho_microbench;
 pub mod wmma_quantized_gemm;

@@ -161,7 +161,11 @@ fn conv_scan_then_step_chain_matches_step_only() {
     let state_b = f32_tensor(&dev, &state0, &Shape::new(vec![channels * (ks - 1)]));
     let mut b = vec![0.0f32; channels];
     for t in 0..seq {
-        let x_s = f32_tensor(&dev, &x[t * channels..(t + 1) * channels], &Shape::new(vec![channels]));
+        let x_s = f32_tensor(
+            &dev,
+            &x[t * channels..(t + 1) * channels],
+            &Shape::new(vec![channels]),
+        );
         let out_b = f32_tensor(&dev, &vec![0.0f32; channels], &Shape::new(vec![channels]));
         dev.synchronize(); // x_s upload must land before the kernel reads it
         dev.short_conv1d_causal_step_into(
@@ -191,7 +195,13 @@ fn conv_scan_then_step_chain_matches_step_only() {
             let xs = f32_tensor(&dev, &x[..sl * channels], &Shape::new(vec![sl, channels]));
             dev.synchronize(); // uploads must land before the kernel reads them
             let (o_s, _h) = dev
-                .short_conv1d_causal_step(xs.as_ref(), w_s.as_ref(), None, st.as_ref(), &Shape::new(vec![sl, channels]))
+                .short_conv1d_causal_step(
+                    xs.as_ref(),
+                    w_s.as_ref(),
+                    None,
+                    st.as_ref(),
+                    &Shape::new(vec![sl, channels]),
+                )
                 .unwrap();
             dev.synchronize();
             let ov = o_s.to_cpu_vec_f32().unwrap();
@@ -247,10 +257,20 @@ fn conv_scan_then_step_chain_matches_step_only() {
     // Arm A: one 5-token scan (prefill) + 1 step (decode) on a fresh ring.
     let state_a = f32_tensor(&dev, &state0, &Shape::new(vec![channels * (ks - 1)]));
     let x5 = f32_tensor(&dev, &x[..5 * channels], &Shape::new(vec![5, channels]));
-    let _out5 = f32_tensor(&dev, &vec![0.0f32; 5 * channels], &Shape::new(vec![5, channels]));
+    let _out5 = f32_tensor(
+        &dev,
+        &vec![0.0f32; 5 * channels],
+        &Shape::new(vec![5, channels]),
+    );
     dev.synchronize(); // uploads must land before the kernel reads them
     let (o5, _h5) = dev
-        .short_conv1d_causal_step(x5.as_ref(), w_s.as_ref(), None, state_a.as_ref(), &Shape::new(vec![5, channels]))
+        .short_conv1d_causal_step(
+            x5.as_ref(),
+            w_s.as_ref(),
+            None,
+            state_a.as_ref(),
+            &Shape::new(vec![5, channels]),
+        )
         .unwrap();
     dev.synchronize();
     let out5_v = o5.to_cpu_vec_f32().unwrap();
@@ -274,8 +294,10 @@ fn conv_scan_then_step_chain_matches_step_only() {
                         break;
                     }
                 }
-                eprintln!("[conv-chain-forensics] c={c}: scan={got:.5} cpu={:.5} match_shift={:?}",
-                    cpu_out[c], shift);
+                eprintln!(
+                    "[conv-chain-forensics] c={c}: scan={got:.5} cpu={:.5} match_shift={:?}",
+                    cpu_out[c], shift
+                );
             }
         }
         eprintln!("[conv-chain] scan token {t}: worst {worst:.5}");
@@ -294,7 +316,13 @@ fn conv_scan_then_step_chain_matches_step_only() {
     let _out6 = f32_tensor(&dev, &vec![0.0f32; channels], &Shape::new(vec![channels]));
     dev.synchronize(); // x6 upload must land before the kernel reads it
     let (o6, _h6) = dev
-        .short_conv1d_causal_step(x6.as_ref(), w_s.as_ref(), None, state_a.as_ref(), &Shape::new(vec![channels]))
+        .short_conv1d_causal_step(
+            x6.as_ref(),
+            w_s.as_ref(),
+            None,
+            state_a.as_ref(),
+            &Shape::new(vec![channels]),
+        )
         .unwrap();
     dev.synchronize();
     let a = o6.to_cpu_vec_f32().unwrap();

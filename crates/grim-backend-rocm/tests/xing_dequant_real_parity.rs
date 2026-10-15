@@ -57,13 +57,14 @@ fn iq3s_and_q4k_device_dequant_match_cpu_oracle_on_checkpoint_bytes() {
         let (bytes, shape, dtype) = load_tensor_bytes(&path, name);
         assert!(dtype.contains(expect), "{name}: got {dtype}");
         let n = shape.iter().product::<usize>();
-        eprintln!(
-            "[xing-dequant] GIANT {name}: n={n} bytes={}",
-            bytes.len()
-        );
+        eprintln!("[xing-dequant] GIANT {name}: n={n} bytes={}", bytes.len());
         let gpu = match dequant {
-            0 => dev.dequantize_iq3s_host(&bytes, n).expect("device iq3s giant"),
-            _ => dev.dequantize_q4k_host(&bytes, n).expect("device q4k giant"),
+            0 => dev
+                .dequantize_iq3s_host(&bytes, n)
+                .expect("device iq3s giant"),
+            _ => dev
+                .dequantize_q4k_host(&bytes, n)
+                .expect("device q4k giant"),
         };
         let cpu = match dequant {
             0 => grim_quant::dequant_iq3s(&bytes, n).expect("cpu iq3s giant"),
@@ -75,7 +76,10 @@ fn iq3s_and_q4k_device_dequant_match_cpu_oracle_on_checkpoint_bytes() {
             .map(|(g, c)| (g - c).abs())
             .fold(0.0, f32::max);
         eprintln!("[xing-dequant] GIANT {name}: max|gpu-cpu| = {diff:.3e}");
-        assert!(diff < 1e-4, "{name} device dequant diverges: max {diff:.3e}");
+        assert!(
+            diff < 1e-4,
+            "{name} device dequant diverges: max {diff:.3e}"
+        );
     }
 
     // CUMULATION discriminator: serially dequant ~40 varied tensors in this
@@ -105,8 +109,14 @@ fn iq3s_and_q4k_device_dequant_match_cpu_oracle_on_checkpoint_bytes() {
             _ => Ok(n),                                 // F32/F16 - not dispatched here
         };
         match &r {
-            Ok(len) => eprintln!("[xing-cumulate] #{:02} {} {:?} n={} -> ok len={}", i, name, gdtype, n, len),
-            Err(e) => eprintln!("[xing-cumulate] #{:02} {} {:?} n={} -> ERR {}", i, name, gdtype, n, e),
+            Ok(len) => eprintln!(
+                "[xing-cumulate] #{:02} {} {:?} n={} -> ok len={}",
+                i, name, gdtype, n, len
+            ),
+            Err(e) => eprintln!(
+                "[xing-cumulate] #{:02} {} {:?} n={} -> ERR {}",
+                i, name, gdtype, n, e
+            ),
         }
         r.unwrap_or_else(|e| panic!("#{} {} faulted: {}", i, name, e));
     }

@@ -204,7 +204,7 @@ fn route_topk_softmax_matches_host() {
         NUM_EXPERTS,
         TOP_K,
         0,
-    false,
+        false,
     )
     .unwrap();
     dev.synchronize();
@@ -277,7 +277,7 @@ fn route_topk_sqrtsoftplus_matches_host() {
         NUM_EXPERTS,
         TOP_K,
         1,
-    false,
+        false,
     )
     .unwrap();
     dev.synchronize();
@@ -350,7 +350,7 @@ fn route_topk_renorm_matches_host() {
         NUM_EXPERTS,
         TOP_K,
         3,
-    false,
+        false,
     )
     .unwrap();
     dev.synchronize();
@@ -471,7 +471,7 @@ fn device_route_topk_and_dispatch_matches_cpu_oracle() {
         NUM_EXPERTS,
         TOP_K,
         0,
-    false,
+        false,
     )
     .unwrap();
 
@@ -680,7 +680,7 @@ fn device_w8a8_dispatch_matches_exact_dequant_oracle() {
         NUM_EXPERTS,
         TOP_K,
         0,
-    false,
+        false,
     )
     .unwrap();
 
@@ -896,7 +896,7 @@ fn route_on_device(
             num_experts,
             top_k,
             mode,
-        false,
+            false,
         )
         .unwrap();
     }
@@ -1838,8 +1838,7 @@ fn w8a8_head_to_head_vs_dequant_decode_shape() {
         .downcast_ref::<grim_backend_rocm::RocmStorage>()
         .unwrap();
     dev.moe_route_topk_on_device(
-        l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, EXPERTS, TOPK, 0,
-    false,
+        l_rocm, None, tok_rocm, exp_rocm, w_rocm, SEQ, EXPERTS, TOPK, 0, false,
     )
     .unwrap();
 

@@ -83,7 +83,9 @@ impl RocmCachingAllocator {
     }
 
     /// Round a byte size up to the next power of two. Class 0 is treated as 1 to [see: `hipMalloc`]
-    pub fn size_class_of(bytes: usize) -> usize { Self::size_class(bytes) }
+    pub fn size_class_of(bytes: usize) -> usize {
+        Self::size_class(bytes)
+    }
 
     /// Slab sub-allocation bounds (pool-disabled mode, small blocks only).
     const SLAB_SIZE: usize = 128 << 20;
@@ -137,20 +139,22 @@ impl RocmCachingAllocator {
                 let (ptr, fresh_slab) = match bump_from {
                     Some((ptr, _size)) => (ptr, None),
                     None => {
-                        let _guard =
-                            crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                         let mut p: *mut c_void = std::ptr::null_mut();
-                        check_hip(
-                            "hipMalloc(slab)",
-                            unsafe { hipMalloc(&mut p, Self::SLAB_SIZE) },
-                        )?;
+                        check_hip("hipMalloc(slab)", unsafe {
+                            hipMalloc(&mut p, Self::SLAB_SIZE)
+                        })?;
                         drop(_guard);
                         self.malloc_count.fetch_add(1, Ordering::Relaxed);
                         (p as u64, Some(Self::SLAB_SIZE))
                     }
                 };
                 if let Some(size) = fresh_slab {
-                    slabs.push(Slab { base: ptr, size, bump: 0 });
+                    slabs.push(Slab {
+                        base: ptr,
+                        size,
+                        bump: 0,
+                    });
                 }
                 if let Some(s) = slabs.last_mut() {
                     s.bump += need;
@@ -220,19 +224,21 @@ impl RocmCachingAllocator {
                 // did, this path just falls through to the error and the
                 // managed fallback as before.
                 if let Ok(mut slabs) = self.slabs.lock() {
-                    let _guard =
-                        crate::device::util::DeviceGuard::set(self.ordinal as i32);
+                    let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
                     let mut p: *mut c_void = std::ptr::null_mut();
-                    if check_hip(
-                        "hipMalloc(fragmentation slab)",
-                        unsafe { hipMalloc(&mut p, Self::SLAB_SIZE) },
-                    )
+                    if check_hip("hipMalloc(fragmentation slab)", unsafe {
+                        hipMalloc(&mut p, Self::SLAB_SIZE)
+                    })
                     .is_ok()
                     {
                         self.malloc_count.fetch_add(1, Ordering::Relaxed);
                         let base = p as u64;
                         let slot = cls.div_ceil(Self::SLOT_GRAN) * Self::SLOT_GRAN;
-                        slabs.push(Slab { base, size: Self::SLAB_SIZE, bump: slot });
+                        slabs.push(Slab {
+                            base,
+                            size: Self::SLAB_SIZE,
+                            bump: slot,
+                        });
                         self.audit_trace("FSLAB", base, slot);
                         self.audit_insert(base, slot);
                         return Ok(p);
@@ -253,7 +259,9 @@ impl RocmCachingAllocator {
     }
 
     fn audit_trace(&self, what: &str, ptr: u64, cls: usize) {
-        if !self.audit_on() || cls != 16384 { return; }
+        if !self.audit_on() || cls != 16384 {
+            return;
+        }
         eprintln!("[alloc-trace] {} {ptr:#x} c{cls} id{}", what, self.id);
     }
 
@@ -266,13 +274,20 @@ impl RocmCachingAllocator {
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = live.insert(ptr, cls) {
             if self.audit_on() {
-                eprintln!("[alloc-audit] DOUBLE-BOOKING: {ptr:#x} id{} handed out while live (class {old}, now {cls})", self.id);
+                eprintln!(
+                    "[alloc-audit] DOUBLE-BOOKING: {ptr:#x} id{} handed out while live (class {old}, now {cls})",
+                    self.id
+                );
             }
         }
         if self.audit_on() {
             let live_bytes: usize = live.values().sum();
             if live_bytes >= self.next_live_report.load(Ordering::Relaxed) {
-                eprintln!("[alloc-audit] live total: {:.2} GiB across {} blocks", live_bytes as f64 / (1 << 30) as f64, live.len());
+                eprintln!(
+                    "[alloc-audit] live total: {:.2} GiB across {} blocks",
+                    live_bytes as f64 / (1 << 30) as f64,
+                    live.len()
+                );
                 self.next_live_report.fetch_add(1 << 30, Ordering::Relaxed);
             }
         }
@@ -297,7 +312,10 @@ impl RocmCachingAllocator {
             }
             Some(c) if c != cls => {
                 if self.audit_on() {
-                    eprintln!("[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))", self.id);
+                    eprintln!(
+                        "[alloc-audit] CLASS MISMATCH on free: {ptr:#x} live {c}, freed as {cls} (id{}))",
+                        self.id
+                    );
                 }
             }
             _ => {}
@@ -332,8 +350,11 @@ impl RocmCachingAllocator {
                 .lock()
                 .map(|slabs| {
                     let p = ptr as u64;
-                    slabs.iter()
-                        .any(|s| p >= s.base && p + (bytes.div_ceil(Self::SLOT_GRAN) * Self::SLOT_GRAN) as u64 <= s.base + s.size as u64)
+                    slabs.iter().any(|s| {
+                        p >= s.base
+                            && p + (bytes.div_ceil(Self::SLOT_GRAN) * Self::SLOT_GRAN) as u64
+                                <= s.base + s.size as u64
+                    })
                 })
                 .unwrap_or(false)
         {

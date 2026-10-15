@@ -1506,9 +1506,9 @@ impl RocmDevice {
         down_stride: u64,
     ) -> Result<*mut c_void> {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
-        let a_ptr = activations
-            .device_ptr
-            .ok_or_else(|| Error::Backend("whitecrow dispatch: activations has no device ptr".into()))?;
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("whitecrow dispatch: activations has no device ptr".into())
+        })?;
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("whitecrow dispatch: out has no device ptr".into()))?;
@@ -1649,8 +1649,9 @@ impl RocmDevice {
         // faults the GPU; see the WhiteCrow twin of this launcher).
         // DETERMINISM scratch: per-pair down rows, reduced in fixed order.
         use grim_tensor::{ArithType as _AT, Storage as _ST};
-        static PAIR_OUT: std::sync::OnceLock<std::sync::Mutex<Option<(usize, usize, RocmStorage)>>> =
-            std::sync::OnceLock::new();
+        static PAIR_OUT: std::sync::OnceLock<
+            std::sync::Mutex<Option<(usize, usize, RocmStorage)>>,
+        > = std::sync::OnceLock::new();
         let pcell = PAIR_OUT.get_or_init(|| std::sync::Mutex::new(None));
         let mut pguard = pcell.lock().unwrap_or_else(|e| e.into_inner());
         let np_key = num_pairs;
@@ -1658,17 +1659,16 @@ impl RocmDevice {
         {
             let po = RocmStorage::alloc_gpu(
                 &Shape::new(vec![num_pairs * hidden]),
-                DType { arith: _AT::F32, storage: _ST::Native },
+                DType {
+                    arith: _AT::F32,
+                    storage: _ST::Native,
+                },
                 &self.allocator,
                 self.ordinal,
             )?;
             *pguard = Some((self.ordinal, np_key, po));
         }
-        let pair_out_p = pguard
-            .as_ref()
-            .unwrap()
-            .2
-            .device_ptr_checked()? as *mut c_void;
+        let pair_out_p = pguard.as_ref().unwrap().2.device_ptr_checked()? as *mut c_void;
         drop(pguard);
         let mut pair_out_p = pair_out_p;
         let mut det_i: i32 = if batch_i == 1 { 1 } else { 0 };
@@ -1751,8 +1751,9 @@ pub struct MoEBucketBufs {
     pub dt: RocmStorage, // [bucket, hidden]
 }
 
-static MOE_DG_SCRATCH: std::sync::OnceLock<std::sync::Mutex<Option<(usize, MoEDequantGemmScratch)>>> =
-    std::sync::OnceLock::new();
+static MOE_DG_SCRATCH: std::sync::OnceLock<
+    std::sync::Mutex<Option<(usize, MoEDequantGemmScratch)>>,
+> = std::sync::OnceLock::new();
 
 impl RocmDevice {
     /// See the module-level comment. Returns Ok(()) after writing `out`.
@@ -1778,16 +1779,24 @@ impl RocmDevice {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         use grim_tensor::{ArithType, MemoryOps, Storage};
         if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
-            eprintln!("[dg-entry] arm entered: num_pairs={num_pairs} hidden={hidden} inter={inter}");
+            eprintln!(
+                "[dg-entry] arm entered: num_pairs={num_pairs} hidden={hidden} inter={inter}"
+            );
         }
         if num_pairs == 0 {
             return Ok(());
         }
 
         // 1. Routing readback (tiny; prefill is not capture-bound).
-        let tok_host = tokens_rocm.copy_to_host().map_err(|e| Error::Backend(e.to_string()))?;
-        let exp_host = experts_rocm.copy_to_host().map_err(|e| Error::Backend(e.to_string()))?;
-        let w_host = weights_rocm.copy_to_host().map_err(|e| Error::Backend(e.to_string()))?;
+        let tok_host = tokens_rocm
+            .copy_to_host()
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let exp_host = experts_rocm
+            .copy_to_host()
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let w_host = weights_rocm
+            .copy_to_host()
+            .map_err(|e| Error::Backend(e.to_string()))?;
         let u32le = |b: &[u8], i: usize| {
             u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
         };
@@ -1843,14 +1852,19 @@ impl RocmDevice {
             self as &dyn grim_tensor::BackendDevice,
             unsafe { std::slice::from_raw_parts(offs.as_ptr() as *const u8, offs.len() * 4) },
             &Shape::new(vec![offs.len()]),
-            DType { arith: ArithType::U32, storage: Storage::Native },
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e2| Error::Backend(format!("dg offs h2d: {e2}")))?;
-        let offs_p = crate::device::util::as_rocm(offs_st.as_ref())?
-            .device_ptr_checked()? as *mut c_void;
+        let offs_p =
+            crate::device::util::as_rocm(offs_st.as_ref())?.device_ptr_checked()? as *mut c_void;
         let sorted_toks: Vec<i32> = order.iter().map(|&p| u32le(&tok_host, p) as i32).collect();
-        let sorted_wts: Vec<f32> =
-            order.iter().map(|&p| f32le(&w_host, p) * routed_scaling_factor).collect();
+        let sorted_wts: Vec<f32> = order
+            .iter()
+            .map(|&p| f32le(&w_host, p) * routed_scaling_factor)
+            .collect();
 
         // 2. Scratch + stream. The cache guard is held for the whole arm so
         // the storages stay borrowed (RocmStorage is not Clone); the arm is
@@ -1858,9 +1872,11 @@ impl RocmDevice {
         let cell = MOE_DG_SCRATCH.get_or_init(|| std::sync::Mutex::new(None));
         let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
         let need_key = (hidden, inter, num_pairs);
-        if !matches!(guard.as_ref(), Some((ord, s)) if *ord == self.ordinal && s.key == need_key)
-        {
-            let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+        if !matches!(guard.as_ref(), Some((ord, s)) if *ord == self.ordinal && s.key == need_key) {
+            let f32ty = DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            };
             let s = MoEDequantGemmScratch {
                 bg_t: RocmStorage::alloc_gpu(
                     &Shape::new(vec![inter, hidden]),
@@ -1947,12 +1963,12 @@ impl RocmDevice {
                     buckets
                 },
                 dtf: RocmStorage::alloc_gpu(
-                &Shape::new(vec![num_pairs, hidden]),
-                f32ty.clone(),
-                &self.allocator,
-                self.ordinal,
-            )?,
-            key: need_key,
+                    &Shape::new(vec![num_pairs, hidden]),
+                    f32ty.clone(),
+                    &self.allocator,
+                    self.ordinal,
+                )?,
+                key: need_key,
             };
             *guard = Some((self.ordinal, s));
         }
@@ -1990,35 +2006,42 @@ impl RocmDevice {
                 self as &dyn grim_tensor::BackendDevice,
                 unsafe { std::slice::from_raw_parts(toks_slice.as_ptr() as *const u8, count * 4) },
                 &Shape::new(vec![count]),
-                DType { arith: ArithType::U32, storage: Storage::Native },
+                DType {
+                    arith: ArithType::U32,
+                    storage: Storage::Native,
+                },
             )
             .map_err(|e2| Error::Backend(format!("dg toks h2d: {e2}")))?;
             let wts_st = MemoryOps::from_cpu_bytes(
                 self as &dyn grim_tensor::BackendDevice,
                 unsafe { std::slice::from_raw_parts(wts_slice.as_ptr() as *const u8, count * 4) },
                 &Shape::new(vec![count]),
-                DType { arith: ArithType::F32, storage: Storage::Native },
+                DType {
+                    arith: ArithType::F32,
+                    storage: Storage::Native,
+                },
             )
             .map_err(|e2| Error::Backend(format!("dg wts h2d: {e2}")))?;
-            let mut toks_p = crate::device::util::as_rocm(toks_st.as_ref())?
-                .device_ptr_checked()? as *mut c_void;
-            let mut wts_p = crate::device::util::as_rocm(wts_st.as_ref())?
-                .device_ptr_checked()? as *mut c_void;
+            let mut toks_p = crate::device::util::as_rocm(toks_st.as_ref())?.device_ptr_checked()?
+                as *mut c_void;
+            let mut wts_p =
+                crate::device::util::as_rocm(wts_st.as_ref())?.device_ptr_checked()? as *mut c_void;
             let idx_slice: Vec<i32> = order[seg_start..seg_end]
                 .iter()
                 .map(|&orig| rank_of_orig[orig] as i32)
                 .collect();
             let idx_st = MemoryOps::from_cpu_bytes(
                 self as &dyn grim_tensor::BackendDevice,
-                unsafe {
-                    std::slice::from_raw_parts(idx_slice.as_ptr() as *const u8, count * 4)
-                },
+                unsafe { std::slice::from_raw_parts(idx_slice.as_ptr() as *const u8, count * 4) },
                 &Shape::new(vec![count]),
-                DType { arith: ArithType::U32, storage: Storage::Native },
+                DType {
+                    arith: ArithType::U32,
+                    storage: Storage::Native,
+                },
             )
             .map_err(|e2| Error::Backend(format!("dg idx h2d: {e2}")))?;
-            let idx_p = crate::device::util::as_rocm(idx_st.as_ref())?
-                .device_ptr_checked()? as *mut c_void;
+            let idx_p =
+                crate::device::util::as_rocm(idx_st.as_ref())?.device_ptr_checked()? as *mut c_void;
 
             // (a) dequant expert e's banks, transposed, into the scratch.
             t_dq = std::time::Instant::now();
@@ -2064,7 +2087,9 @@ impl RocmDevice {
                 .find(|(b, _)| *b >= count)
                 .map(|(b, bufs)| (*b, bufs))
                 .ok_or_else(|| {
-                    Error::Backend(format!("no bucket for count={count} (num_pairs={num_pairs})"))
+                    Error::Backend(format!(
+                        "no bucket for count={count} (num_pairs={num_pairs})"
+                    ))
                 })?;
             let (bsize, bb) = bucket;
 
@@ -2076,7 +2101,12 @@ impl RocmDevice {
                 "grim_moe_gather_rows",
                 HipDim3::new(count as u32, 1, 1),
                 HipDim3::new(256, 1, 1),
-                &mut [arg(&mut a_x_p), arg(&mut toks_p), arg(&mut xe_p), arg(&mut hidden_i)],
+                &mut [
+                    arg(&mut a_x_p),
+                    arg(&mut toks_p),
+                    arg(&mut xe_p),
+                    arg(&mut hidden_i),
+                ],
             )?;
 
             // (c) gate / up matmuls on the proven path, into preallocated
@@ -2129,7 +2159,12 @@ impl RocmDevice {
                 "grim_silu_mul",
                 HipDim3::new(blocks, 1, 1),
                 HipDim3::new(256, 1, 1),
-                &mut [arg(&mut yg_p), arg(&mut yu_p), arg(&mut yg_p), arg(&mut n_silu)],
+                &mut [
+                    arg(&mut yg_p),
+                    arg(&mut yu_p),
+                    arg(&mut yg_p),
+                    arg(&mut n_silu),
+                ],
             )?;
 
             // (e) down matmul: D[bsize,hidden] = C[bsize,inter] x Bd[inter,hidden]
@@ -2196,7 +2231,12 @@ impl RocmDevice {
                 "grim_moe_token_reduce",
                 HipDim3::new(num_tokens as u32, 1, 1),
                 HipDim3::new(256, 1, 1),
-                &mut [arg(&mut dtf_p), arg(&mut offs_p2), arg(&mut out_p), arg(&mut hidden_i)],
+                &mut [
+                    arg(&mut dtf_p),
+                    arg(&mut offs_p2),
+                    arg(&mut out_p),
+                    arg(&mut hidden_i),
+                ],
             )?;
 
             if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() && seg_start == 0 {

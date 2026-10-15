@@ -142,7 +142,9 @@ fn grey_case(m: usize, n: usize, k: usize, seed: u64, tag: &str) -> TestResult {
 
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
-        &a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect::<Vec<u8>>(),
+        &a.iter()
+            .flat_map(|v| v.to_le_bytes().to_vec())
+            .collect::<Vec<u8>>(),
         &Shape::new(vec![m, k]),
         DType {
             arith: ArithType::F32,

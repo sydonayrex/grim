@@ -218,7 +218,11 @@ fn xing_trace_stage(name: &str, t: &Tensor) {
     }
     if let Ok(v) = t.to_vec_f32() {
         let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-        eprintln!("[xing-mla] {name}: len {} rms {rms:.5e} head {:?}", v.len(), &v[..v.len().min(4)]);
+        eprintln!(
+            "[xing-mla] {name}: len {} rms {rms:.5e} head {:?}",
+            v.len(),
+            &v[..v.len().min(4)]
+        );
     }
 }
 
@@ -562,7 +566,12 @@ impl Xing40HyperConnection {
     /// Sinkhorn iteration count, gate eps, and the comb clamp bounds — the
     /// decode-graph step needs them without reaching into private fields.
     pub fn gate_consts(&self) -> (usize, f32, f32, f32) {
-        (self.sinkhorn_iters, self.eps, self.clamp_min, self.clamp_max)
+        (
+            self.sinkhorn_iters,
+            self.eps,
+            self.clamp_min,
+            self.clamp_max,
+        )
     }
 
     /// Reference gate math: sigmoid gates + clamped Sinkhorn combiner.
@@ -721,33 +730,73 @@ impl Xing40HyperConnection {
         )?;
         let proj_host = proj.to_vec_f32()?;
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
-            let r = (proj_host.iter().map(|x| x * x).sum::<f32>() / proj_host.len().max(1) as f32).sqrt();
-            eprintln!("[xing-trace] hc proj: n {} rms {r:.4e} head {:?}", proj_host.len(), &proj_host[..proj_host.len().min(6)]);
-            eprintln!("[xing-trace] hc pre: {:?}", gates.pre.to_cpu_vec_f32().map(|v| v[..v.len().min(4)].to_vec()));
+            let r = (proj_host.iter().map(|x| x * x).sum::<f32>() / proj_host.len().max(1) as f32)
+                .sqrt();
+            eprintln!(
+                "[xing-trace] hc proj: n {} rms {r:.4e} head {:?}",
+                proj_host.len(),
+                &proj_host[..proj_host.len().min(6)]
+            );
+            eprintln!(
+                "[xing-trace] hc pre: {:?}",
+                gates
+                    .pre
+                    .to_cpu_vec_f32()
+                    .map(|v| v[..v.len().min(4)].to_vec())
+            );
             if let Ok(cv) = gates.comb.to_cpu_vec_f32() {
-                let rs: Vec<f32> = (0..self.hc_mult).map(|h| (0..self.hc_mult).map(|i| cv[h * self.hc_mult + i]).sum()).collect();
+                let rs: Vec<f32> = (0..self.hc_mult)
+                    .map(|h| (0..self.hc_mult).map(|i| cv[h * self.hc_mult + i]).sum())
+                    .collect();
                 eprintln!("[xing-trace] hc comb rowsums {:?}", rs);
-                eprintln!("[xing-trace] hc post {:?}", gates.post.to_cpu_vec_f32().map(|v| v[..v.len().min(4)].to_vec()));
+                eprintln!(
+                    "[xing-trace] hc post {:?}",
+                    gates
+                        .post
+                        .to_cpu_vec_f32()
+                        .map(|v| v[..v.len().min(4)].to_vec())
+                );
             }
-            eprintln!("[xing-trace] hc input_norm weight shape {:?}", self.input_norm.weight.shape());
-            eprintln!("[xing-trace] hc_fn dtype {:?} shape {:?}", self.hc_fn_weight().dtype(), self.hc_fn_weight().shape());
-            eprintln!("[xing-trace] input_norm eps {} dtype {:?}", self.input_norm.eps, self.input_norm.weight.dtype());
+            eprintln!(
+                "[xing-trace] hc input_norm weight shape {:?}",
+                self.input_norm.weight.shape()
+            );
+            eprintln!(
+                "[xing-trace] hc_fn dtype {:?} shape {:?}",
+                self.hc_fn_weight().dtype(),
+                self.hc_fn_weight().shape()
+            );
+            eprintln!(
+                "[xing-trace] input_norm eps {} dtype {:?}",
+                self.input_norm.eps,
+                self.input_norm.weight.dtype()
+            );
             if let Ok(wv) = self.input_norm.weight.to_vec_f32() {
-                eprintln!("[xing-trace] input_norm w[0..4] {:?} rms {:.4e}", &wv[..4.min(wv.len())],
-                    (wv.iter().map(|x| x * x).sum::<f32>() / wv.len().max(1) as f32).sqrt());
+                eprintln!(
+                    "[xing-trace] input_norm w[0..4] {:?} rms {:.4e}",
+                    &wv[..4.min(wv.len())],
+                    (wv.iter().map(|x| x * x).sum::<f32>() / wv.len().max(1) as f32).sqrt()
+                );
             }
             if let Ok(v) = normed.to_vec_f32() {
                 let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                eprintln!("[xing-trace] hc normed: n {} rms {r:.4e} head {:?}", v.len(), &v[..v.len().min(3)]);
+                eprintln!(
+                    "[xing-trace] hc normed: n {} rms {r:.4e} head {:?}",
+                    v.len(),
+                    &v[..v.len().min(3)]
+                );
             }
         }
-        Ok((Xing40HcGatesD2D {
-            pre: gates.pre,
-            post: gates.post,
-            comb: gates.comb,
-            hc,
-            seq,
-        }, proj_host))
+        Ok((
+            Xing40HcGatesD2D {
+                pre: gates.pre,
+                post: gates.post,
+                comb: gates.comb,
+                hc,
+                seq,
+            },
+            proj_host,
+        ))
     }
 
     /// Collapse the `hc_mult` streams into the single block input:
@@ -1130,7 +1179,6 @@ impl Xing40Mla {
         positions: &[u32],
         kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
-
         let seq_len = x.shape().dims()[0];
         if std::env::var_os("GRIM_MOE_PREFILL_GEMM_TRACE").is_some() {
             eprintln!(
@@ -1218,19 +1266,13 @@ impl Xing40Mla {
         let nh = self.num_heads;
 
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
-            let qn = cpu_tensor(
-                q_nope_v.clone(),
-                Shape::new(vec![seq_len, nh * nope]),
-            );
+            let qn = cpu_tensor(q_nope_v.clone(), Shape::new(vec![seq_len, nh * nope]));
             xing_trace_stage("host q_nope", &qn);
         }
         let q_absorbed =
             crate::mla_common::absorb_query_wkc(&q_nope_v, &self.w_kc, seq_len, nh, nope, rank);
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
-            let qa = cpu_tensor(
-                q_absorbed.clone(),
-                Shape::new(vec![seq_len, nh * rank]),
-            );
+            let qa = cpu_tensor(q_absorbed.clone(), Shape::new(vec![seq_len, nh * rank]));
             xing_trace_stage("host q_absorbed", &qa);
         }
 
@@ -1611,7 +1653,12 @@ impl Xing40Mla {
                         format!("{r}:{rms:.3}/{frms:.3}")
                     })
                     .collect();
-                eprintln!("[xing-trace] latent c_kv/full rms rows {} x {}: {}", np, ckv, parts.join(" "));
+                eprintln!(
+                    "[xing-trace] latent c_kv/full rms rows {} x {}: {}",
+                    np,
+                    ckv,
+                    parts.join(" ")
+                );
             }
         }
         if std::env::var_os("GRIM_XING_TRACE").is_some() && seq_len == 1 {
@@ -1623,7 +1670,8 @@ impl Xing40Mla {
                     let last = (np - 1) * row;
                     eprintln!(
                         "[xing-trace] LATENTROW pos {pos} rows {np} rms {:.6e} head {:?}",
-                        (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                        (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32)
+                            .sqrt(),
                         &v[last..last + 4.min(row)]
                     );
                     // A SEEDED row, element-wise. Rows 0..np-1 reach the graph
@@ -1658,7 +1706,8 @@ impl Xing40Mla {
                     let last = (np - 1) * row;
                     eprintln!(
                         "[xing-trace] LATENTROW pos {pos} rows {np} rms {:.6e} head {:?}",
-                        (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32).sqrt(),
+                        (v[last..last + row].iter().map(|x| x * x).sum::<f32>() / row as f32)
+                            .sqrt(),
                         &v[last..last + 4.min(row)]
                     );
                     // A SEEDED row, element-wise. Rows 0..np-1 reach the graph
@@ -1738,8 +1787,8 @@ impl Xing40Mla {
             if std::env::var_os("GRIM_XING_TRACE").is_some() {
                 for (nm, t) in [("QABS", &q_absorbed), ("QROPE", &q_rope)] {
                     if let Ok(v) = t.to_vec_f32() {
-                        let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32)
-                            .sqrt();
+                        let r =
+                            (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
                         eprintln!(
                             "[xing-trace] {nm} pos {} rms {r:.6e} head {:?}",
                             positions.last().copied().unwrap_or(u32::MAX),
@@ -1799,8 +1848,10 @@ impl Xing40Mla {
                                 }
                                 scores[t] = sc * scale;
                             }
-                            let mx =
-                                scores[..slen].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            let mx = scores[..slen]
+                                .iter()
+                                .copied()
+                                .fold(f32::NEG_INFINITY, f32::max);
                             let mut ex = vec![0.0f32; slen];
                             let mut sum = 0.0f32;
                             for t in 0..slen {
@@ -1921,7 +1972,10 @@ impl Xing40Mla {
             // decode paths can be diffed numerically, not by print precision.
             if let Ok(prefix) = std::env::var("GRIM_XING_DUMP") {
                 if positions.last() == Some(&41) {
-                    let li_cap = std::env::var("GRIM_XING_DUMP_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX);
+                    let li_cap = std::env::var("GRIM_XING_DUMP_LAYERS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(usize::MAX);
                     use std::sync::atomic::{AtomicUsize, Ordering};
                     static L: AtomicUsize = AtomicUsize::new(0);
                     let li = L.fetch_add(1, Ordering::Relaxed);
@@ -2047,8 +2101,7 @@ impl Xing40Mla {
                             }
                             scores[t] = sc * scale;
                         }
-                        let mx =
-                            scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mx = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                         let mut ex = vec![0.0f32; slen];
                         let mut sum = 0.0f32;
                         for t in 0..slen {
@@ -2526,7 +2579,7 @@ impl Xing40Moe {
                 shared_expert.as_ref(),
                 self.num_experts_per_tok,
                 self.routed_scaling_factor,
-                2, // route_mode: sigmoid + e_score_correction_bias
+                2,    // route_mode: sigmoid + e_score_correction_bias
                 true, // norm_weights: xing4_0.expert_weights_norm = true
                 &self.charon_cache,
             ) {
@@ -2730,10 +2783,16 @@ impl Xing40Block {
     ) -> Result<Tensor> {
         let trace_nan = std::env::var_os("GRIM_XING_TRACE").is_some();
         let nan_stage = |name: &str, t: &Tensor| {
-            if !trace_nan { return; }
+            if !trace_nan {
+                return;
+            }
             if let Ok(v) = t.to_vec_f32() {
                 let nan = v.iter().filter(|x| x.is_nan()).count();
-                eprintln!("[xing-trace] {name}: len {} nan {nan} head {:?}", v.len(), &v[..v.len().min(4)]);
+                eprintln!(
+                    "[xing-trace] {name}: len {} nan {nan} head {:?}",
+                    v.len(),
+                    &v[..v.len().min(4)]
+                );
             }
         };
         nan_stage("block_in", x);
@@ -2791,9 +2850,7 @@ impl Xing40Block {
             let xin = x.to_vec_f32().ok();
             let pv = attn_gates.post.to_cpu_vec_f32().ok();
             let cv = attn_gates.comb.to_cpu_vec_f32().ok();
-            if let (Some(got), Some(ain), Some(xin), Some(pv), Some(cv)) =
-                (got, ain, xin, pv, cv)
-            {
+            if let (Some(got), Some(ain), Some(xin), Some(pv), Some(cv)) = (got, ain, xin, pv, cv) {
                 let hc = self.attn_hc.hc_mult;
                 // stream width is hc * hidden; hidden is not bound here.
                 let hidden = x.shape().dim(1).unwrap_or(0) / hc.max(1);
@@ -2812,8 +2869,7 @@ impl Xing40Block {
                     }
                 }
                 rr = (rr / (hc * hidden) as f64).sqrt();
-                let rg =
-                    (got.iter().map(|x| x * x).sum::<f32>() / got.len().max(1) as f32).sqrt();
+                let rg = (got.iter().map(|x| x * x).sum::<f32>() / got.len().max(1) as f32).sqrt();
                 eprintln!(
                     "[xing-trace] EAGER ATTNWB pos {} vs HOST: max_abs {md:.4e} rel {:.4e} ref_rms {rr:.4e} got_rms {rg:.4e}",
                     positions.last().copied().unwrap_or(u32::MAX),
@@ -2824,7 +2880,11 @@ impl Xing40Block {
         if std::env::var_os("GRIM_XING_TRACE").is_some() {
             if let Ok(v) = streams.to_vec_f32() {
                 let r = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                eprintln!("[xing-trace] STREAMATTN pos {} rms {r:.6e} head {:?}", positions.last().copied().unwrap_or(u32::MAX), &v[..4]);
+                eprintln!(
+                    "[xing-trace] STREAMATTN pos {} rms {r:.6e} head {:?}",
+                    positions.last().copied().unwrap_or(u32::MAX),
+                    &v[..4]
+                );
             }
         }
         // 4. ffn_hc: collapse for the feed-forward.
@@ -2984,7 +3044,8 @@ pub struct Xing40 {
     pub output: Linear,
     /// Capture-safe per-step scratch for the decode graph; built once at
     /// `get_or_create_decode_graph`, never during capture.
-    pub graph_scratch: std::sync::OnceLock<std::sync::Mutex<crate::decode_graph::Xing40GraphScratch>>,
+    pub graph_scratch:
+        std::sync::OnceLock<std::sync::Mutex<crate::decode_graph::Xing40GraphScratch>>,
 }
 
 impl Xing40 {
@@ -3137,13 +3198,25 @@ impl CausalLm for Xing40 {
                 let nan = v.iter().filter(|x| x.is_nan()).count();
                 let max = v.iter().cloned().fold(0f32, f32::max);
                 let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
-                eprintln!("[xing-trace] x0 embedding: len {} nan {nan} rms {rms:.4e} max {max:.4e} head {:?}", v.len(), &v[..v.len().min(4)]);
+                eprintln!(
+                    "[xing-trace] x0 embedding: len {} nan {nan} rms {rms:.4e} max {max:.4e} head {:?}",
+                    v.len(),
+                    &v[..v.len().min(4)]
+                );
                 let r0: Vec<f32> = v[..v.len().min(3584)].to_vec();
                 let m0 = r0.iter().cloned().fold(0f32, f32::max);
                 let r0r = (r0.iter().map(|x| x * x).sum::<f32>() / r0.len() as f32).sqrt();
-                eprintln!("[xing-trace] x0 token0 row: rms {r0r:.4e} max {m0:.4e} head {:?}", &r0[..4]);
+                eprintln!(
+                    "[xing-trace] x0 token0 row: rms {r0r:.4e} max {m0:.4e} head {:?}",
+                    &r0[..4]
+                );
             }
-            eprintln!("[xing-trace] tok_emb dtype {:?} shape {:?} device {:?}", self.tok_embeddings.weight.dtype(), self.tok_embeddings.weight.shape(), self.tok_embeddings.weight.device());
+            eprintln!(
+                "[xing-trace] tok_emb dtype {:?} shape {:?} device {:?}",
+                self.tok_embeddings.weight.dtype(),
+                self.tok_embeddings.weight.shape(),
+                self.tok_embeddings.weight.device()
+            );
         }
 
         // Seed the hc_mult streams with the embedding (all streams start equal).
@@ -3247,7 +3320,9 @@ mod tests {
         let mut x0 = vec![0f32; seq * hidden];
         let mut s = 0x1234_5678_9abc_def0u64;
         for v in x0.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((s >> 33) as f32 / 8388608.0 - 1.0) * 0.03;
         }
         // In production x0 is device-resident (the embedding gather lands
@@ -3255,7 +3330,9 @@ mod tests {
         let x0_shape = Shape::new(vec![seq, hidden]);
         let dev0 = grim_backend_rocm::RocmDevice::shared(0);
         use grim_tensor::CoreTensorOps;
-        let x0_st = dev0.from_cpu(&x0, &x0_shape, DType::F32).expect("upload x0");
+        let x0_st = dev0
+            .from_cpu(&x0, &x0_shape, DType::F32)
+            .expect("upload x0");
         let x0_t = Tensor::new(
             Arc::from(x0_st),
             x0_shape,
@@ -3297,7 +3374,9 @@ mod tests {
         let mut streams = vec![0f32; seq * hc * hidden];
         let mut s = 0xDEAD_BEEF_1234_5678u64;
         for v in streams.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((s >> 33) as f32 / 8388608.0 - 1.0) * 0.05;
         }
         let plane = Shape::new(vec![seq, hidden]);
@@ -3346,7 +3425,8 @@ mod tests {
         // Two copies: the host reference dequantizes on CPU, the device arm
         // needs a ROCm-resident weight (a CPU weight cannot feed a matmul).
         let ws_cpu = grim_nn::WeightSource::root(&prov, Device::Cpu);
-        let head = Linear::load_shape(&ws_cpu.pp("output"), [3584, 131072]).expect("load lm_head cpu");
+        let head =
+            Linear::load_shape(&ws_cpu.pp("output"), [3584, 131072]).expect("load lm_head cpu");
         let ws_dev = grim_nn::WeightSource::root(&prov, Device::Rocm(0));
         let head_dev =
             Linear::load_shape(&ws_dev.pp("output"), [3584, 131072]).expect("load lm_head dev");
@@ -3354,11 +3434,17 @@ mod tests {
         let mut x = vec![0f32; hidden];
         let mut s = 0x5A17_9E37u64;
         for v in x.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((s >> 33) as f32 / 8388608.0 - 1.0) * 0.5;
         }
         let x_cpu = cpu_tensor(x.clone(), Shape::new(vec![1, hidden]));
-        let want = head.forward(&x_cpu).expect("host lm_head").to_vec_f32().expect("read host");
+        let want = head
+            .forward(&x_cpu)
+            .expect("host lm_head")
+            .to_vec_f32()
+            .expect("read host");
 
         let x_shape = Shape::new(vec![1, hidden]);
         use grim_tensor::{CoreTensorOps, DType, QuantProvenance};
@@ -3370,19 +3456,23 @@ mod tests {
             QuantProvenance::default(),
             Device::Rocm(0),
         );
-        let got = head_dev.forward(&x_dev).expect("device lm_head").to_vec_f32().expect("read dev");
+        let got = head_dev
+            .forward(&x_dev)
+            .expect("device lm_head")
+            .to_vec_f32()
+            .expect("read dev");
         assert_eq!(got.len(), want.len(), "logits length mismatch");
-        let scale = want
-            .iter()
-            .fold(0f32, |m, v| m.max(v.abs()))
-            .max(1e-6);
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
         let mut max_abs = 0f32;
         for (g, w) in got.iter().zip(&want) {
             max_abs = max_abs.max((g - w).abs());
         }
         let rel = max_abs / scale;
         eprintln!("[xing-oracle] lm_head: max_abs {max_abs:.3e} rel {rel:.3e}");
-        assert!(rel < 1e-3, "lm_head device vs host diverges (rel {rel:.3e})");
+        assert!(
+            rel < 1e-3,
+            "lm_head device vs host diverges (rel {rel:.3e})"
+        );
     }
 
     /// The GGUF split-bank reassembly must produce the same matrix the

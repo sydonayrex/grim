@@ -372,4 +372,3 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_mla_absorbed_indexed_decode"));
     }
 }
-

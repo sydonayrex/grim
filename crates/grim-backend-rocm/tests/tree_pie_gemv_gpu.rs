@@ -15,7 +15,7 @@
 //!      cargo test -p grim-backend-rocm --test tree_pie_gemv_gpu -- --ignored
 
 use grim_backend_rocm::RocmDevice;
-use grim_quant::tree_pie::{pack_tree_pie_32, TREE_PIE_WORDS_PER_32};
+use grim_quant::tree_pie::{TREE_PIE_WORDS_PER_32, pack_tree_pie_32};
 use grim_tensor::{ArithType, BackendStorage, DType, MemoryOps, Shape, Storage};
 use std::panic;
 
@@ -33,7 +33,10 @@ fn gpu_device() -> Option<RocmDevice> {
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // Map to [-1, 1) then scale into the range TreePie represents well.
         let unit = ((self.0 >> 40) as f32) / (1u32 << 24) as f32;
         (unit - 0.5) * 2.0 * 6.0
@@ -79,25 +82,37 @@ fn tree_pie_dot2_gpu_matches_cpu() -> TestResult {
         }
 
         // --- upload -------------------------------------------------------
-        let act_f16: Vec<u16> = a.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        let act_f16: Vec<u16> = a
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
         let act_t = MemoryOps::from_cpu_bytes(
             &dev,
             &act_bytes(&act_f16),
             &Shape::new(vec![K]),
-            DType { arith: ArithType::F16, storage: Storage::Native },
+            DType {
+                arith: ArithType::F16,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("act h2d: {e}"))?;
         let b_t = MemoryOps::from_cpu_bytes(
             &dev,
             &as_i32_bytes(&packed),
             &Shape::new(vec![packed.len()]),
-            DType { arith: ArithType::U32, storage: Storage::Native },
+            DType {
+                arith: ArithType::U32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("b h2d: {e}"))?;
         let out_t = MemoryOps::alloc_storage(
             &dev,
             &Shape::new(vec![n]),
-            DType { arith: ArithType::F32, storage: Storage::Native },
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("out alloc: {e}"))?;
 
@@ -127,7 +142,12 @@ fn tree_pie_dot2_gpu_matches_cpu() -> TestResult {
                 let g = kk / 32;
                 let j = kk % 32;
                 let base = (col * groups_per_col + g) * TREE_PIE_WORDS_PER_32;
-                let payload = [packed[base], packed[base + 1], packed[base + 2], packed[base + 3]];
+                let payload = [
+                    packed[base],
+                    packed[base + 1],
+                    packed[base + 2],
+                    packed[base + 3],
+                ];
                 let signs = packed[base + 4] as u32;
                 let nib = ((payload[j >> 3] >> ((j & 7) * 4)) & 0xF) as u8;
                 let code = ((((signs >> j) & 1) as u8) << 4) | nib;
@@ -162,7 +182,9 @@ fn as_i32_bytes(v: &[i32]) -> &[u8] {
 }
 
 fn download_f32(t: &Box<dyn BackendStorage>) -> TestResult<Vec<f32>> {
-    let bytes = grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?;
+    let bytes = grim_backend_rocm::as_rocm(t.as_ref())
+        .map_err(|e| e.to_string())?
+        .copy_to_host()?;
     Ok(bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

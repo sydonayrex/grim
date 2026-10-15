@@ -6,10 +6,10 @@ use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
+use crate::HipDim3;
+use crate::arg;
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::arg;
-use crate::HipDim3;
 
 /// Largest M for which a quantized GEMM takes the u4-lane route instead of the
 /// LDS-tiled kernel.
@@ -574,7 +574,9 @@ impl RocmDevice {
         // DECODE FAST PATH: same lane routing as Q4_K. The scalar q6k fused
         // kernel measures 18.5 ms/launch on the 9B decode (6.0 GB/s) while
         // the u4-lane GEMV runs at 70 us (485 GB/s). GRIM_DECODE_W4A4=0 opts out.
-        if let Some(stream) = self.try_u4_lane_decode(a, b, out, m, n, k, grim_tensor::dtype::KQuantScheme::Q6K)? {
+        if let Some(stream) =
+            self.try_u4_lane_decode(a, b, out, m, n, k, grim_tensor::dtype::KQuantScheme::Q6K)?
+        {
             return Ok(stream);
         }
         self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q6k", a, b, out, m, n, k, 4)
@@ -650,12 +652,22 @@ impl RocmDevice {
         let w4a4_decode = std::env::var("GRIM_DECODE_W4A4")
             .map(|v| v != "0")
             .unwrap_or(true);
-        // Q5K is excluded from the u4-lane GEMV: its converted lanes decode
-        // ~0.2 off against a host reference at M=1 (measured 0.13-0.31 on
-        // Qwen3.8-27B attn_q/qkv/gate/ssm_out and Qwen3.5-9B attn_qkv, warmed
-        // steady state, sleep-invariant), while Q4K/Q6K sit at ~3e-4 through
-        // the same kernel. Q5K M=1 falls through to the exact dot4/WMMA legs.
-        // The M>1 u4-GEMM route is unaffected (verified ~2e-3) and stays.
+        // Q5K is excluded from the u4-lane GEMV at M=1. ROOT CAUSE (measured,
+        // not hypothesized): there is NO functional bug in either stage. The
+        // lane kernel is bit-exact against an activation-quant-aware host
+        // reference (residual 1.8e-7 on blk.3.attn_q; see
+        // `w4a4_gemv_matches_aq_aware_reference`), and the Q5K weight encode
+        // roundtrips at RMSE 1.8e-3 vs Q4K's 1.1e-3 on the same checkpoint
+        // (ratio tracks the ~2x larger Q5K weight magnitudes: amax 0.32 vs
+        // 0.17). The 0.13-0.31 M=1 divergence is inherent W4A4 format noise
+        // at that operating point — activation-quant noise (~0.1 at O(0.5)
+        // activations, identical for a host replica of the quantizer) plus
+        // the requant contribution — amplified past the 8e-2 parity gate by
+        // Q5K's larger weights. Single-hot/constant activations are exact
+        // (7e-9), confirming the kernel, the B-side reads, and the zero
+        // correction are all sound. Q5K M=1 therefore falls through to the
+        // exact dot4/WMMA legs (fidelity over throughput); the M>1 u4-GEMM
+        // route is unaffected and stays.
         let q5k_decode_skip = matches!(scheme, grim_tensor::dtype::KQuantScheme::Q5K);
         if m != 1
             || !w4a4_decode

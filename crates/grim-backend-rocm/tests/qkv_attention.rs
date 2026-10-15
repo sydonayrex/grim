@@ -26,7 +26,7 @@
 use grim_backend_rocm::{
     AttentionOps, BackendStorage, CoreTensorOps, QkvAttentionFusionConfig, RocmDevice,
 };
-use grim_tensor::{DType, Shape};
+use grim_tensor::{DType, MemoryOps, Shape};
 
 /// Pure-Rust reference implementation of causal GQA attention.
 ///
@@ -1499,7 +1499,10 @@ fn int4_append_quantize_parity() {
     }
     eprintln!("[i4-append] rows={n_rows} worst reconstruction error={worst:.4}");
     // 4-bit step is scale/7; max error is scale/14 ~ 0.5/14 ~ 0.036
-    assert!(worst < 0.08, "int4 reconstruction error too high: {worst:.4}");
+    assert!(
+        worst < 0.08,
+        "int4 reconstruction error too high: {worst:.4}"
+    );
 }
 
 /// Phase 3 int4: kv_len=1 must broadcast V rows.
@@ -1592,4 +1595,237 @@ fn int4_attend_single_row_broadcast() {
     }
     eprintln!("[i4-canary] kvlen=1 broadcast worst={worst:.6}");
     assert!(worst < 0.15, "int4 single-row broadcast off by {worst:.6}");
+}
+
+/// Phase-2 sidecar-offset gate: `launch_kv_quantize_rows_i8` must write codes
+/// at `codes_off + row*kv_stride + kh*head_dim` and scales at
+/// `scales_off + row*nkv + kh`, i.e. the two offsets advance in DIFFERENT
+/// units (elements of the codes arena vs rows of the [rows, nkv] sidecar).
+/// The zero-offset test cannot catch a caller that passes one unit for both —
+/// which is exactly the bug this gate exists to pin.
+#[test]
+#[ignore]
+fn i8_append_sidecar_offsets_are_independent_units() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (n_rows, nkv, hd) = (3_usize, 2, 32);
+    let stride = nkv * hd;
+    let codes_off = 5 * stride; // codes arena has room for 8 rows
+    let scales_off = 4; // sidecar has room for 8 rows
+    let src: Vec<f32> = (0..(n_rows * stride))
+        .map(|i| ((i * 3 % 11) as f32) / 11.0 - 0.5)
+        .collect();
+    let src_dev = dev
+        .from_cpu(&src, &Shape::from_slice(&[n_rows, stride]), DType::F32)
+        .unwrap();
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[8 * stride]),
+        u8dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[8 * nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    // Sentinel-fill the sidecar: the caching allocator does NOT zero memory,
+    // so "untouched" can only be asserted against a known value.
+    {
+        let sentinel = dev
+            .from_cpu(
+                &vec![999.0f32; 8 * nkv],
+                &Shape::from_slice(&[8 * nkv]),
+                DType::F32,
+            )
+            .unwrap();
+        let dst = grim_backend_rocm::as_rocm(&scales).unwrap();
+        let src = grim_backend_rocm::as_rocm(sentinel.as_ref()).unwrap();
+        let sp = src.device_ptr_u64().unwrap();
+        let dp = dst.device_ptr_u64().unwrap();
+        let res: grim_backend_rocm::HipErrorT = unsafe {
+            grim_backend_rocm::hipMemcpy(
+                dp as *mut std::ffi::c_void,
+                sp as *const std::ffi::c_void,
+                (8 * nkv * 4) as usize,
+                grim_backend_rocm::HipMemcpyKind::HostToDevice,
+            )
+        };
+        assert_eq!(res, grim_backend_rocm::hipSuccess, "sentinel fill failed");
+        dev.synchronize();
+    }
+    grim_backend_rocm::launch_kv_quantize_rows_i8(
+        &dev,
+        src_dev.as_ref(),
+        0,
+        &codes,
+        codes_off,
+        &scales,
+        scales_off,
+        n_rows,
+        stride,
+        nkv,
+        hd,
+    )
+    .expect("quantize");
+    dev.synchronize();
+    let sc = scales.to_cpu_vec_f32().expect("scales d2h");
+    assert_eq!(sc.len(), 8 * nkv);
+    // Scales BEFORE scales_off must be untouched (allocator zero-fills, and
+    // every written scale is > 0 for this data), and exactly rows
+    // scales_off..scales_off+n_rows*nkv must be written.
+    for i in 0..scales_off {
+        assert_eq!(sc[i], 999.0, "scale row {i} before scales_off was written");
+    }
+    for r in 0..n_rows {
+        for kh in 0..nkv {
+            let idx = scales_off + r * nkv + kh;
+            let got = sc[idx];
+            let want_amax: f32 = src[r * stride + kh * hd..r * stride + (kh + 1) * hd]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                (got - want_amax).abs() < 1e-5,
+                "scale[{idx}] = {got}, expected the row's maxabs {want_amax} \\
+                 (offset unit mismatch: scales_off must count ROWS, not elements)"
+            );
+        }
+    }
+    for i in scales_off + n_rows * nkv..8 * nkv {
+        assert_eq!(sc[i], 999.0, "scale row {i} past the write was clobbered");
+    }
+}
+
+/// Phase-3 eviction ring: `launch_kv_append` must pin the first `sink_rows`
+/// tokens and cycle the newest `cap - sink_rows` through the remaining rows,
+/// so a bounded arena holds a correct KV history. Each token's whole row is the
+/// constant `t + 1`, so the arena layout is readable directly.
+#[test]
+#[ignore]
+fn kv_append_ring_pins_sinks_and_cycles_newest() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    let (cap, sinks, nkv, hd) = (10usize, 3usize, 2usize, 8usize);
+    let stride = nkv * hd;
+    let n_tokens = cap * 2 + 5;
+    let ring = grim_backend_rocm::KvRingPolicy::new(cap, sinks);
+
+    let arena = dev
+        .from_cpu(
+            &vec![-1.0f32; cap * stride],
+            &Shape::from_slice(&[cap, stride]),
+            DType::F32,
+        )
+        .unwrap();
+    for t in 0..n_tokens {
+        let src: Vec<f32> = vec![(t + 1) as f32; stride];
+        let rot = dev
+            .from_cpu(&src, &Shape::from_slice(&[1, stride]), DType::F32)
+            .unwrap();
+        let past = MemoryOps::from_cpu_bytes(
+            &dev,
+            {
+                let bytes = (t as u32).to_le_bytes();
+                // SAFETY: `bytes` lives for the whole call.
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) }
+            },
+            &Shape::from_slice(&[1]),
+            DType::U32,
+        )
+        .unwrap();
+        grim_backend_rocm::launch_kv_append(
+            &dev,
+            arena.as_ref(),
+            rot.as_ref(),
+            past.as_ref(),
+            stride,
+            1,
+            ring,
+        )
+        .expect("append");
+    }
+    dev.synchronize();
+    let got = arena.to_cpu_vec_f32().expect("d2h");
+
+    // Expected layout. Sinks keep tokens 0..sinks. The ring rows hold the newest
+    // token that maps to them — which is NOT "newest first" order: a ring is
+    // written modulo, so after a full wrap row r holds the newest t with
+    // t ≡ r - sinks (mod cap - sinks). Attention reads a SET of rows, so the
+    // cyclic order is irrelevant; what matters is that every live row holds one
+    // of the newest tokens and the sinks were never touched.
+    let row_of = |t: usize| -> usize {
+        if t < cap {
+            t
+        } else if cap - sinks > 0 {
+            sinks + (t - sinks) % (cap - sinks)
+        } else {
+            t % cap
+        }
+    };
+    for r in 0..cap {
+        let want_token = (0..n_tokens)
+            .filter(|t| row_of(*t) == r)
+            .max()
+            .expect("every live row is written");
+        let want = (want_token + 1) as f32;
+        let row = &got[r * stride..(r + 1) * stride];
+        assert!(
+            row.iter().all(|&v| v == want),
+            "arena row {r} should hold token {want_token} (value {want}), got {:?}",
+            &row[..4.min(row.len())]
+        );
+    }
+    // The live set is exactly the newest `sinks` + `cap - sinks` tokens: no
+    // stale row survives, and nothing pre-cap leaks in.
+    let mut live: Vec<usize> = (0..n_tokens).map(row_of).collect();
+    live.sort_unstable();
+    live.dedup();
+    assert_eq!(live.len(), cap, "live rows after wrap");
+    let survivors: std::collections::HashSet<usize> = (0..sinks)
+        .chain(n_tokens - (cap - sinks)..n_tokens)
+        .collect();
+    assert_eq!(
+        survivors.len(),
+        cap,
+        "sink + ring survivors must fill the arena"
+    );
+    for &t in &survivors {
+        let r = row_of(t);
+        let sharing = survivors.iter().filter(|u| row_of(**u) == r).count();
+        assert_eq!(
+            sharing, 1,
+            "survivor token {t} shares row {r} with another survivor"
+        );
+    }
+    let mut covered: std::collections::HashSet<usize> =
+        survivors.iter().map(|t| row_of(*t)).collect();
+    assert_eq!(
+        covered.len(),
+        cap,
+        "survivors must cover every arena row exactly once"
+    );
+    covered.clear();
+    // A token older than the ring window must have been overwritten.
+    for t in sinks..(n_tokens - (cap - sinks)) {
+        let r = row_of(t);
+        let overwritten = survivors.iter().any(|u| *u > t && row_of(*u) == r);
+        assert!(
+            overwritten,
+            "token {t} (row {r}) should have been evicted by a newer token"
+        );
+    }
 }

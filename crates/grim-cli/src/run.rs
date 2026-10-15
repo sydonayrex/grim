@@ -14,8 +14,8 @@ use grim_core::model::CausalLm;
 use grim_core::sampler::{Sampler, SamplingParams};
 use grim_core::session::Inner as SessionInner;
 use grim_engine::{
-    model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
     Engine, EngineConfig,
+    model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
 };
 use grim_format::GgufTokenizer;
 
@@ -31,7 +31,12 @@ fn embedded_mtp_draft_path(model_path: &str) -> Option<String> {
         .ok()?
         .into_iter()
         .find(|a| a.kind == "mtp")?;
-    let sha16: String = att.sha256.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let sha16: String = att
+        .sha256
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let dest = std::env::temp_dir()
         .join("grim-sidecars")
         .join(format!("{sha16}-mtp.gguf"));
@@ -51,7 +56,7 @@ fn embedded_mtp_draft_path(model_path: &str) -> Option<String> {
     }
 }
 use grim_models_transformer::{
-    Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek32, DeepSeek4, Gemma2, Lfm2, Lfm2Config, Llama,
+    Chameleon, DecodeGraphModel, DeepSeek2, DeepSeek4, DeepSeek32, Gemma2, Lfm2, Lfm2Config, Llama,
     LlamaConfig, Mistral3, Qwen35,
 };
 use grim_tensor::{CoreTensorOps, Device};
@@ -544,21 +549,23 @@ fn try_graph_decode_step(
             .and_then(|a| usize::from_str_radix(a.trim_start_matches("0x"), 16).ok())
             .map(|q| vec![("GRIM_PEEK_ADDR".to_string(), q)])
             .unwrap_or_default();
-        if let Some(a) = grim_backend_rocm::device::compute::gemm_launchers::last_captured_head_gemv_a() {
+        if let Some(a) =
+            grim_backend_rocm::device::compute::gemm_launchers::last_captured_head_gemv_a()
+        {
             addrs.push(("head_gemv_A".to_string(), a));
         }
         for (tag, q) in addrs {
             {
-            let mut v = [0f32; 4];
-            let _ = unsafe {
-                grim_backend_rocm::hipMemcpy(
-                    v.as_mut_ptr() as *mut std::ffi::c_void,
-                    q as *mut std::ffi::c_void,
-                    16,
-                    grim_backend_rocm::HipMemcpyKind::DeviceToHost,
-                )
-            };
-            eprintln!("[graph-peek] {tag} {q:#x} head={v:?}");
+                let mut v = [0f32; 4];
+                let _ = unsafe {
+                    grim_backend_rocm::hipMemcpy(
+                        v.as_mut_ptr() as *mut std::ffi::c_void,
+                        q as *mut std::ffi::c_void,
+                        16,
+                        grim_backend_rocm::HipMemcpyKind::DeviceToHost,
+                    )
+                };
+                eprintln!("[graph-peek] {tag} {q:#x} head={v:?}");
             }
         }
         if let Ok(addr) = std::env::var("GRIM_PEEK_ADDR") {
@@ -600,7 +607,10 @@ fn try_graph_decode_step(
                     idx[0]
                 );
             } else {
-                eprintln!("[graph-toplogits] step={step} logits len {} != vocab {vocab}", flat.len());
+                eprintln!(
+                    "[graph-toplogits] step={step} logits len {} != vocab {vocab}",
+                    flat.len()
+                );
             }
         } else {
             eprintln!("[graph-toplogits] step={step} read_logits_f32 failed");

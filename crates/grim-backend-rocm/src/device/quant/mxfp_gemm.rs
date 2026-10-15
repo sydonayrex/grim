@@ -4,12 +4,12 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::error::{Error, Result};
 use grim_tensor::Shape;
+use grim_tensor::error::{Error, Result};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
-use crate::{arg, dtype_f32, HipDim3};
+use crate::{HipDim3, arg, dtype_f32};
 
 impl RocmDevice {
     /// Launch the JIT compiled tiled MXFP4 GEMM kernel.

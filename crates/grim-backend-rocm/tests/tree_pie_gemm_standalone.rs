@@ -56,7 +56,6 @@ __device__ __forceinline__ float grim_fdot2_f32_f16(unsigned a, unsigned b, floa
 #endif
 "#;
 
-
 /// Control: the GEMV, through the *same* standalone harness.
 ///
 /// Without this, a fault from the GEMM says nothing -- it would be equally
@@ -64,14 +63,18 @@ __device__ __forceinline__ float grim_fdot2_f32_f16(unsigned a, unsigned b, floa
 /// aggregate path, so if it also faults here the harness is at fault, not the GEMM.
 #[test]
 fn tree_pie_gemv_standalone_control() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let n = 64usize;
     let k = 128usize;
 
     let mut s = 0x243f_6a88_5a30_1234u64;
     let mut next = move || {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
         ((s >> 40) as f32 / 8_388_608.0) - 1.0
     };
     // O(1) weights: E2M2's smallest nonzero magnitude is 0.25, so sub-0.25
@@ -79,31 +82,56 @@ fn tree_pie_gemv_standalone_control() -> TestResult {
     let w: Vec<f32> = (0..k * n).map(|_| next()).collect();
     let x: Vec<f32> = (0..k).map(|_| next() * 0.5).collect();
 
-    let act_bits: Vec<u8> = x.iter()
+    let act_bits: Vec<u8> = x
+        .iter()
         .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes().to_vec())
         .collect();
-    let act_t = MemoryOps::from_cpu_bytes(dev, &act_bits, &Shape::new(vec![k]),
-        DType { arith: ArithType::F16, storage: Storage::Native })
-        .map_err(|e| format!("act: {e}"))?;
+    let act_t = MemoryOps::from_cpu_bytes(
+        dev,
+        &act_bits,
+        &Shape::new(vec![k]),
+        DType {
+            arith: ArithType::F16,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("act: {e}"))?;
 
     let mut packed = vec![0i32; n * (k / 32) * TREE_PIE_WORDS_PER_32];
     for col in 0..n {
         for g in 0..k / 32 {
             let mut block = [0f32; 32];
-            for j in 0..32 { block[j] = w[(g * 32 + j) * n + col]; }
+            for j in 0..32 {
+                block[j] = w[(g * 32 + j) * n + col];
+            }
             let words = grim_quant::tree_pie::pack_tree_pie_32(&block);
             let base = (col * (k / 32) + g) * TREE_PIE_WORDS_PER_32;
             packed[base..base + TREE_PIE_WORDS_PER_32].copy_from_slice(&words);
         }
     }
-    let b_bytes: Vec<u8> = packed.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
-    let b_t = MemoryOps::from_cpu_bytes(dev, &b_bytes,
+    let b_bytes: Vec<u8> = packed
+        .iter()
+        .flat_map(|v| v.to_le_bytes().to_vec())
+        .collect();
+    let b_t = MemoryOps::from_cpu_bytes(
+        dev,
+        &b_bytes,
         &Shape::new(vec![n * (k / 32) * TREE_PIE_WORDS_PER_32]),
-        DType { arith: ArithType::U32, storage: Storage::Native })
-        .map_err(|e| format!("b: {e}"))?;
-    let out_t = MemoryOps::alloc_storage(dev, &Shape::new(vec![n]),
-        DType { arith: ArithType::F32, storage: Storage::Native })
-        .map_err(|e| format!("out: {e}"))?;
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("b: {e}"))?;
+    let out_t = MemoryOps::alloc_storage(
+        dev,
+        &Shape::new(vec![n]),
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
+    )
+    .map_err(|e| format!("out: {e}"))?;
 
     fn raw(t: &Box<dyn grim_tensor::BackendStorage>) -> &grim_backend_rocm::RocmStorage {
         grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
@@ -127,14 +155,20 @@ fn tree_pie_gemv_standalone_control() -> TestResult {
     //              compiles. If the known-good GEMV flies here, the harness was the
     //              problem; if it faults here too, launch_from_source cannot host
     //              these kernels and this whole route is a dead end.
-    let raw_src = format!("{DOT2_HELPER}\n{}", grim_backend_rocm::kernels::tree_pie::KERNEL_SOURCE);
+    let raw_src = format!(
+        "{DOT2_HELPER}\n{}",
+        grim_backend_rocm::kernels::tree_pie::KERNEL_SOURCE
+    );
     let which = std::env::var("TP_STANDALONE_SRC").unwrap_or_else(|_| "aggregate".to_string());
     let src = if which == "raw" {
         raw_src
     } else {
         grim_backend_rocm::kernels::source_asm::compute_kernel_source()
     };
-    println!("standalone GEMV control via {which} source ({} bytes)", src.len());
+    println!(
+        "standalone GEMV control via {which} source ({} bytes)",
+        src.len()
+    );
     dev.launch_from_source(
         &src,
         "grim_tree_pie_gemv",
@@ -155,18 +189,34 @@ fn tree_pie_gemv_standalone_control() -> TestResult {
     dev.synchronize();
 
     let out = raw(&out_t).copy_to_host().map_err(|e| e.to_string())?;
-    let got: Vec<f64> = out.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).collect();
-    let oracle: f64 = (0..n).map(|col| (0..k).map(|kk| x[kk] as f64 * w[kk * n + col] as f64).sum::<f64>()).sum();
-    println!("GEMV standalone: {}/{} outputs nonzero, mean-oracle {oracle:.4}",
-             got.iter().filter(|v| **v != 0.0).count(), got.len());
-    assert!(got.iter().any(|v| *v != 0.0), "GEMV control produced all zeros");
+    let got: Vec<f64> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+        .collect();
+    let oracle: f64 = (0..n)
+        .map(|col| {
+            (0..k)
+                .map(|kk| x[kk] as f64 * w[kk * n + col] as f64)
+                .sum::<f64>()
+        })
+        .sum();
+    println!(
+        "GEMV standalone: {}/{} outputs nonzero, mean-oracle {oracle:.4}",
+        got.iter().filter(|v| **v != 0.0).count(),
+        got.len()
+    );
+    assert!(
+        got.iter().any(|v| *v != 0.0),
+        "GEMV control produced all zeros"
+    );
     Ok(())
 }
 
 #[test]
 fn tree_pie_gemm_standalone_source() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let m = 2usize;
     let n = 64usize;
@@ -182,19 +232,25 @@ fn tree_pie_gemm_standalone_source() -> TestResult {
     // Deterministic O(1) weights (same construction as the dispatch test):
     // E2M2 swallows sub-0.25 magnitudes to zero, so small-range fixtures read
     // as kernel bugs; uniform data carries ~7.6e-2 of pure quant noise.
-    let w: Vec<f32> = (0..k * n).map(|i| ((i as f32 * 37.0) % 61.0) * 0.03125 - 0.9).collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i as f32 * 37.0) % 61.0) * 0.03125 - 0.9)
+        .collect();
     let x: Vec<f32> = (0..m * k).map(|_| next() * 0.5).collect();
 
     // Activations as f16, so nothing about this test depends on the dispatch's
     // conversion path -- it is bypassed entirely.
-    let act_bits: Vec<u8> = x.iter()
+    let act_bits: Vec<u8> = x
+        .iter()
         .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes().to_vec())
         .collect();
     let act_t = MemoryOps::from_cpu_bytes(
         dev,
         &act_bits,
         &Shape::new(vec![m * k]),
-        DType { arith: ArithType::F16, storage: Storage::Native },
+        DType {
+            arith: ArithType::F16,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("act: {e}"))?;
 
@@ -211,19 +267,28 @@ fn tree_pie_gemm_standalone_source() -> TestResult {
             packed[base..base + TREE_PIE_WORDS_PER_32].copy_from_slice(&words);
         }
     }
-    let b_bytes: Vec<u8> = packed.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect();
+    let b_bytes: Vec<u8> = packed
+        .iter()
+        .flat_map(|v| v.to_le_bytes().to_vec())
+        .collect();
     let b_t = MemoryOps::from_cpu_bytes(
         dev,
         &b_bytes,
         &Shape::new(vec![n * (k / 32) * TREE_PIE_WORDS_PER_32]),
-        DType { arith: ArithType::U32, storage: Storage::Native },
+        DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("b: {e}"))?;
 
     let out_t = MemoryOps::alloc_storage(
         dev,
         &Shape::new(vec![m * n]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("out: {e}"))?;
 
@@ -237,7 +302,10 @@ fn tree_pie_gemm_standalone_source() -> TestResult {
     let (a, b, o) = (ptr(&act_t), ptr(&b_t), ptr(&out_t));
     let (mut a, mut b, mut mm, mut nn, mut kk, mut o) = (a, b, m as i32, n as i32, k as i32, o);
 
-    let src = format!("{DOT2_HELPER}\n{}", grim_backend_rocm::kernels::tree_pie::KERNEL_SOURCE);
+    let src = format!(
+        "{DOT2_HELPER}\n{}",
+        grim_backend_rocm::kernels::tree_pie::KERNEL_SOURCE
+    );
     // NOTE: this test previously launched "grim_tree_pie_gemv" here, so it never
     // exercised the GEMM at all. Entry + grid + order must all be the GEMM's.
     dev.launch_from_source(
@@ -289,6 +357,9 @@ fn tree_pie_gemm_standalone_source() -> TestResult {
     // 0.15: kernel is bit-exact vs the dequant oracle (see the dispatch
     // test's tree_pie_gemm_matches_dequant_oracle_exactly); this bound is
     // E2M2 quant noise only.
-    assert!(worst < 0.15, "standalone GEMM disagrees: worst relative error {worst:.3e}");
+    assert!(
+        worst < 0.15,
+        "standalone GEMM disagrees: worst relative error {worst:.3e}"
+    );
     Ok(())
 }

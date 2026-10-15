@@ -44,7 +44,10 @@ fn gpu_device() -> Option<RocmDevice> {
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let unit = ((self.0 >> 40) as f32) / (1u32 << 24) as f32;
         (unit - 0.5) * 2.0 * 3.0
     }
@@ -72,13 +75,24 @@ fn dot4_q4k_gemv_on_this_arch() -> TestResult {
         let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
 
         // --- A: use the real GPU q8_1 quantizer, as production does --------
-        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
-        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let f32ty = DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        };
+        let u8ty = DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        };
         let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * k]), f32ty)
             .map_err(|e| format!("a h2d: {e}"))?;
         let q81_len = M * (k / 32) * 36;
-        let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone())
-            .map_err(|e| format!("q81 alloc: {e}"))?;
+        let q81_st = MemoryOps::from_cpu_bytes(
+            &dev,
+            &vec![0u8; q81_len],
+            &Shape::new(vec![q81_len]),
+            u8ty.clone(),
+        )
+        .map_err(|e| format!("q81 alloc: {e}"))?;
         dev.launch_quantize_q8_1(
             grim_backend_rocm::as_rocm(a_st.as_ref()).unwrap(),
             grim_backend_rocm::as_rocm(q81_st.as_ref()).unwrap(),
@@ -102,7 +116,10 @@ fn dot4_q4k_gemv_on_this_arch() -> TestResult {
         let out_st = MemoryOps::alloc_storage(
             &dev,
             &Shape::new(vec![M * n]),
-            DType { arith: ArithType::F32, storage: Storage::Native },
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
         )
         .map_err(|e| format!("out alloc: {e}"))?;
 
@@ -245,18 +262,32 @@ fn dot4_kquant_arch_probe() -> TestResult {
             );
 
             // A: real GPU q8_1 quantizer, as production uses.
-            let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
-            let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
-            let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * k]), f32ty)
-                .map_err(|e| format!("a h2d: {e}"))?;
+            let f32ty = DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            };
+            let u8ty = DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            };
+            let a_st =
+                MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * k]), f32ty)
+                    .map_err(|e| format!("a h2d: {e}"))?;
             let q81_len = M * (k / 32) * 36;
-            let q81_st = MemoryOps::from_cpu_bytes(&dev, &vec![0u8; q81_len], &Shape::new(vec![q81_len]), u8ty.clone())
-                .map_err(|e| format!("q81: {e}"))?;
+            let q81_st = MemoryOps::from_cpu_bytes(
+                &dev,
+                &vec![0u8; q81_len],
+                &Shape::new(vec![q81_len]),
+                u8ty.clone(),
+            )
+            .map_err(|e| format!("q81: {e}"))?;
             dev.launch_quantize_q8_1(
                 grim_backend_rocm::as_rocm(a_st.as_ref()).unwrap(),
                 grim_backend_rocm::as_rocm(q81_st.as_ref()).unwrap(),
-                M, k,
-            ).map_err(|e| format!("quantize: {e}"))?;
+                M,
+                k,
+            )
+            .map_err(|e| format!("quantize: {e}"))?;
             dev.synchronize();
             let q81 = bytes_of(&q81_st)?;
             let a_deq = dequant_q81(&q81, M * k);
@@ -264,18 +295,35 @@ fn dot4_kquant_arch_probe() -> TestResult {
             let b_st = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
                 .map_err(|e| format!("b h2d: {e}"))?;
             let out_st = MemoryOps::alloc_storage(
-                &dev, &Shape::new(vec![M * N]),
-                DType { arith: ArithType::F32, storage: Storage::Native },
-            ).map_err(|e| format!("out: {e}"))?;
+                &dev,
+                &Shape::new(vec![M * N]),
+                DType {
+                    arith: ArithType::F32,
+                    storage: Storage::Native,
+                },
+            )
+            .map_err(|e| format!("out: {e}"))?;
 
             fn r(t: &Box<dyn BackendStorage>) -> &grim_backend_rocm::RocmStorage {
                 grim_backend_rocm::as_rocm(t.as_ref()).unwrap()
             }
             let got = match name {
-                "Q2_K" => { dev.launch_dot4_q2k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k).map_err(|e| format!("q2k: {e}"))?; }
-                "Q3_K" => { dev.launch_dot4_q3k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k).map_err(|e| format!("q3k: {e}"))?; }
-                "Q5_K" => { dev.launch_dot4_q5k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k).map_err(|e| format!("q5k: {e}"))?; }
-                _ => { dev.launch_dot4_q6k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k).map_err(|e| format!("q6k: {e}"))?; }
+                "Q2_K" => {
+                    dev.launch_dot4_q2k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k)
+                        .map_err(|e| format!("q2k: {e}"))?;
+                }
+                "Q3_K" => {
+                    dev.launch_dot4_q3k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k)
+                        .map_err(|e| format!("q3k: {e}"))?;
+                }
+                "Q5_K" => {
+                    dev.launch_dot4_q5k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k)
+                        .map_err(|e| format!("q5k: {e}"))?;
+                }
+                _ => {
+                    dev.launch_dot4_q6k_q81_gemv_for_ab(r(&q81_st), r(&b_st), r(&out_st), M, N, k)
+                        .map_err(|e| format!("q6k: {e}"))?;
+                }
             };
             let _ = got;
             dev.synchronize();
@@ -291,7 +339,11 @@ fn dot4_kquant_arch_probe() -> TestResult {
                 worst = worst.max((out[col] - acc).abs() / acc.abs().max(1e-3));
             }
             println!("{name} k={k:<6} worst relative error {worst:.3e}");
-            assert!(worst <= 2e-2, "{name} k={k}: disagrees with the oracle by {worst:.3e} on {}", dev.gpu_target_str());
+            assert!(
+                worst <= 2e-2,
+                "{name} k={k}: disagrees with the oracle by {worst:.3e} on {}",
+                dev.gpu_target_str()
+            );
         }
     }
     Ok(())
@@ -319,7 +371,11 @@ fn synth_superblock(row: &[f32], sb_bytes: usize, seed: u32) -> Vec<u8> {
         st
     };
     let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let d = if amax > 1e-6 { (amax / 31.0).min(60.0) } else { 0.01 };
+    let d = if amax > 1e-6 {
+        (amax / 31.0).min(60.0)
+    } else {
+        0.01
+    };
     let dmin = d * 0.25;
     let mut sb = vec![0u8; sb_bytes];
     for b in sb.iter_mut() {
@@ -328,7 +384,9 @@ fn synth_superblock(row: &[f32], sb_bytes: usize, seed: u32) -> Vec<u8> {
     match sb_bytes {
         // Q2_K: scales[16] + qs[64] + d(2) + dmin(2)
         84 => {
-            for b in sb.iter_mut().take(16) { *b &= 0x0F; }
+            for b in sb.iter_mut().take(16) {
+                *b &= 0x0F;
+            }
             sb[82..84].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
             sb[80..82].copy_from_slice(&half::f16::from_f32(dmin).to_bits().to_le_bytes());
         }
@@ -388,22 +446,28 @@ fn kquant_gate_lift_worth_timing() -> TestResult {
     let a: Vec<f32> = (0..M * K).map(|_| rng.next_f32()).collect();
     let b: Vec<f32> = (0..N * K).map(|_| rng.next_f32()).collect();
 
-    println!("{:>6} {:>11} {:>13} {:>9} {:>9} {:>9} {:>9}",
-        "scheme", "dot4 ms", "scalar ms", "speedup", "dot GB/s", "scl GB/s", "bpw");
+    println!(
+        "{:>6} {:>11} {:>13} {:>9} {:>9} {:>9} {:>9}",
+        "scheme", "dot4 ms", "scalar ms", "speedup", "dot GB/s", "scl GB/s", "bpw"
+    );
     for (name, sb_bytes, kind) in schemes {
         let row_bytes = (K / 256) * sb_bytes;
         let mut bq = vec![0u8; N * row_bytes];
         for col in 0..N {
             let packed = match kind {
-                PackKind::Real(f) => f(&b[col * K..(col + 1) * K]).map_err(|e| format!("{name}: {e}"))?,
+                PackKind::Real(f) => {
+                    f(&b[col * K..(col + 1) * K]).map_err(|e| format!("{name}: {e}"))?
+                }
                 PackKind::Synth(seed) => {
                     let row = &b[col * K..(col + 1) * K];
                     let mut out = Vec::with_capacity(row_bytes);
                     for sb_i in 0..K / 256 {
                         let lo = sb_i * 256;
                         out.extend_from_slice(&synth_superblock(
-                            &row[lo..lo + 256], sb_bytes,
-                            seed ^ (sb_i as u32).wrapping_mul(0x9E37_79B9)));
+                            &row[lo..lo + 256],
+                            sb_bytes,
+                            seed ^ (sb_i as u32).wrapping_mul(0x9E37_79B9),
+                        ));
                     }
                     out
                 }
@@ -414,22 +478,37 @@ fn kquant_gate_lift_worth_timing() -> TestResult {
         let weight_bytes = bq.len() as f64;
         let bpw = weight_bytes * 8.0 / (N * K) as f64;
 
-        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
-        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let f32ty = DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        };
+        let u8ty = DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        };
         let a_t = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * K]), f32ty)
             .map_err(|e| format!("a: {e}"))?;
         let q81 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![(K / 32) * 36]), u8ty.clone())
             .map_err(|e| format!("q81: {e}"))?;
         dev.launch_quantize_q8_1(
             grim_backend_rocm::as_rocm(a_t.as_ref()).unwrap(),
-            grim_backend_rocm::as_rocm(q81.as_ref()).unwrap(), M, K)
-            .map_err(|e| format!("quant: {e}"))?;
+            grim_backend_rocm::as_rocm(q81.as_ref()).unwrap(),
+            M,
+            K,
+        )
+        .map_err(|e| format!("quant: {e}"))?;
         dev.synchronize();
         let b_t = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
             .map_err(|e| format!("b: {e}"))?;
-        let out_t = MemoryOps::alloc_storage(&dev, &Shape::new(vec![M * N]),
-            DType { arith: ArithType::F32, storage: Storage::Native })
-            .map_err(|e| format!("out: {e}"))?;
+        let out_t = MemoryOps::alloc_storage(
+            &dev,
+            &Shape::new(vec![M * N]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+        )
+        .map_err(|e| format!("out: {e}"))?;
 
         let dot4_ms = time_it(&dev, ITERS, || match name {
             "Q2_K" => dev.launch_dot4_q2k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out_t), M, N, K),
@@ -438,16 +517,24 @@ fn kquant_gate_lift_worth_timing() -> TestResult {
             _ => dev.launch_dot4_q6k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out_t), M, N, K),
         })?;
         let scalar_ms = time_it(&dev, ITERS, || match name {
-            "Q2_K" => dev.launch_fused_dequant_gemm_q2k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
-            "Q3_K" => dev.launch_fused_dequant_gemm_q3k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
-            "Q5_K" => dev.launch_fused_dequant_gemm_q5k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
+            "Q2_K" => {
+                dev.launch_fused_dequant_gemm_q2k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K)
+            }
+            "Q3_K" => {
+                dev.launch_fused_dequant_gemm_q3k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K)
+            }
+            "Q5_K" => {
+                dev.launch_fused_dequant_gemm_q5k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K)
+            }
             _ => dev.launch_fused_dequant_gemm_q6k_for_ab(r(&a_t), r(&b_t), r(&out_t), M, N, K),
         })?;
 
         let dgbs = weight_bytes / (dot4_ms * 1e-3) / 1e9;
         let sgbs = weight_bytes / (scalar_ms * 1e-3) / 1e9;
-        println!("{name:>6} {dot4_ms:>11.4} {scalar_ms:>13.4} {:>8.1}x {dgbs:>9.1} {sgbs:>9.1} {bpw:>9.2}",
-            scalar_ms / dot4_ms);
+        println!(
+            "{name:>6} {dot4_ms:>11.4} {scalar_ms:>13.4} {:>8.1}x {dgbs:>9.1} {sgbs:>9.1} {bpw:>9.2}",
+            scalar_ms / dot4_ms
+        );
     }
     Ok(())
 }
@@ -461,10 +548,14 @@ where
     F: FnMut() -> Result<*mut std::ffi::c_void, grim_backend_rocm::Error>,
 {
     use std::time::Instant;
-    for _ in 0..3 { f().map_err(|e| e.to_string())?; }
+    for _ in 0..3 {
+        f().map_err(|e| e.to_string())?;
+    }
     dev.synchronize();
     let t0 = Instant::now();
-    for _ in 0..iters { f().map_err(|e| e.to_string())?; }
+    for _ in 0..iters {
+        f().map_err(|e| e.to_string())?;
+    }
     dev.synchronize();
     Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
 }
@@ -501,7 +592,10 @@ fn dot4_q4k_fast_grid_boundaries() -> TestResult {
     // would report "stock" for an unset variable while the launcher was
     // actually running the fast kernel -- a test that lies about which code
     // path it exercised.
-    let fast = !matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("0" | "false" | "off"));
+    let fast = !matches!(
+        std::env::var("GRIM_DOT4_FAST").as_deref(),
+        Ok("0" | "false" | "off")
+    );
     let variant = if fast { "fast" } else { "stock" };
     println!("target: {}  variant: {variant}", dev.gpu_target_str());
 
@@ -519,13 +613,20 @@ fn dot4_q4k_fast_grid_boundaries() -> TestResult {
                 .map_err(|e| format!("q4k: {e}"))?;
             bq[col * row_bytes..(col + 1) * row_bytes].copy_from_slice(&packed);
         }
-        let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
-        let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+        let f32ty = DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        };
+        let u8ty = DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        };
         let a_t = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * K]), f32ty)
             .map_err(|e| format!("a: {e}"))?;
         let q81 = MemoryOps::alloc_storage(&dev, &Shape::new(vec![(K / 32) * 36]), u8ty.clone())
             .map_err(|e| format!("q81: {e}"))?;
-        dev.launch_quantize_q8_1(r(&a_t), r(&q81), M, K).map_err(|e| format!("quant: {e}"))?;
+        dev.launch_quantize_q8_1(r(&a_t), r(&q81), M, K)
+            .map_err(|e| format!("quant: {e}"))?;
         dev.synchronize();
         let a_deq = dequant_q81(&bytes_of(&q81)?, M * K);
         let b_t = MemoryOps::from_cpu_bytes(&dev, &bq, &Shape::new(vec![bq.len()]), u8ty)
@@ -535,9 +636,15 @@ fn dot4_q4k_fast_grid_boundaries() -> TestResult {
         // rather than looking like a plausible zero.
         let sentinel = vec![-1.0e30f32; M * n];
         let out = MemoryOps::from_cpu_bytes(
-            &dev, &f32_bytes(&sentinel), &Shape::new(vec![M * n]),
-            DType { arith: ArithType::F32, storage: Storage::Native })
-            .map_err(|e| format!("out: {e}"))?;
+            &dev,
+            &f32_bytes(&sentinel),
+            &Shape::new(vec![M * n]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::Native,
+            },
+        )
+        .map_err(|e| format!("out: {e}"))?;
         dev.launch_dot4_q4k_q81_gemv_for_ab(r(&q81), r(&b_t), r(&out), M, n, K)
             .map_err(|e| format!("{variant}: {e}"))?;
         dev.synchronize();
@@ -566,7 +673,10 @@ fn dot4_q4k_fast_grid_boundaries() -> TestResult {
             worst_rel = worst_rel.max(d / want[col].abs().max(1e-3));
         }
         let normed = worst_abs / scale;
-        println!("n={:<4} {variant:<5} normed {normed:.3e}  worst_rel {worst_rel:.3e}", n);
+        println!(
+            "n={:<4} {variant:<5} normed {normed:.3e}  worst_rel {worst_rel:.3e}",
+            n
+        );
         assert!(
             normed <= 2e-2,
             "n={n}: {variant} scale-normalised error {normed:.3e} exceeds 2e-2 (worst_rel {worst_rel:.3e})"

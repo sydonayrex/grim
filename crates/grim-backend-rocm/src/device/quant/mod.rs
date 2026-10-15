@@ -11,10 +11,10 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendStorage, CoreTensorOps, QuantOps, Shape};
 
 use crate::device::roc_device::{
-    RocmDevice, FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS,
+    FUSED_BACKWARD_DISPATCH_STATS, FUSED_FORWARD_DISPATCH_STATS, RocmDevice,
 };
 use crate::memory::storage::RocmStorage;
-use crate::{arg, dtype_f32, RocmHandle};
+use crate::{RocmHandle, arg, dtype_f32};
 
 mod dequant_fp_quants;
 mod dequant_host;
@@ -208,16 +208,16 @@ impl QuantOps for RocmDevice {
                     self.launch_wmma_big64x128_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
-                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
-                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
-                    }) {
+                    if *crate::device::quant::BIG_GEMM_TRACE
+                        .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
+                    {
                         eprintln!("[big-gemm] Q4K m={m} n={n} k={k} -> launch_wmma_big128_q4k");
                     }
                 } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
-                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
-                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
-                    }) {
+                    if *crate::device::quant::BIG_GEMM_TRACE
+                        .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
+                    {
                         eprintln!("[big-gemm] Q4K m={m} n={n} k={k} -> launch_wmma_big_q4k");
                     }
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 256) {
@@ -320,16 +320,16 @@ impl QuantOps for RocmDevice {
                     self.launch_wmma_big64x128_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
-                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
-                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
-                    }) {
+                    if *crate::device::quant::BIG_GEMM_TRACE
+                        .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
+                    {
                         eprintln!("[big-gemm] Q5K m={m} n={n} k={k} -> launch_wmma_big128_q5k");
                     }
                 } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
-                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
-                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
-                    }) {
+                    if *crate::device::quant::BIG_GEMM_TRACE
+                        .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
+                    {
                         eprintln!("[big-gemm] Q5K m={m} n={n} k={k} -> launch_wmma_big_q5k");
                     }
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
@@ -521,16 +521,16 @@ impl QuantOps for RocmDevice {
                     self.launch_wmma_big64x128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
                 } else if is_rdna34 && m >= 128 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big128_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
-                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
-                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
-                    }) {
+                    if *crate::device::quant::BIG_GEMM_TRACE
+                        .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
+                    {
                         eprintln!("[big-gemm] Q6K m={m} n={n} k={k} -> launch_wmma_big128_q6k");
                     }
                 } else if is_rdna34 && m >= 64 && n % 64 == 0 && k % 256 == 0 {
                     self.launch_wmma_big_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
-                    if *crate::device::quant::BIG_GEMM_TRACE.get_or_init(|| {
-                        std::env::var("GRIM_BIG_GEMM_TRACE").is_ok()
-                    }) {
+                    if *crate::device::quant::BIG_GEMM_TRACE
+                        .get_or_init(|| std::env::var("GRIM_BIG_GEMM_TRACE").is_ok())
+                    {
                         eprintln!("[big-gemm] Q6K m={m} n={n} k={k} -> launch_wmma_big_q6k");
                     }
                 } else if is_rdna34 && wmma_quant_path_ok(wave32, m, n, k, 16) {
@@ -1660,15 +1660,9 @@ impl QuantOps for RocmDevice {
                 // correct everywhere and slow per-token, so the kernel is
                 // preferred, never assumed: every condition below names its
                 // reason, and GRIM_DOT_GEMV=0 forces the fallback for A/B.
-                if matches!(
-                    bd,
-                    grim_tensor::dtype::BlockDtype::Int8PerChannel
-                ) {
+                if matches!(bd, grim_tensor::dtype::BlockDtype::Int8PerChannel) {
                     let a_f32 = a_storage.dtype().arith == ArithType::F32
-                        && matches!(
-                            a_storage.dtype().storage,
-                            DTypeStorage::Native
-                        );
+                        && matches!(a_storage.dtype().storage, DTypeStorage::Native);
                     if !a_f32 {
                         return Err(Error::Backend(format!(
                             "ROCm ForestRaven: activations must be F32 native (in-register quant), got {:?}",
@@ -1690,38 +1684,18 @@ impl QuantOps for RocmDevice {
                         && m <= dot4_max_m
                         && m > 0
                     {
-                        self.launch_dot4_forest_gemv(
-                            a_storage,
-                            b_storage,
-                            &out_storage,
-                            m,
-                            n,
-                            k,
-                        )?;
+                        self.launch_dot4_forest_gemv(a_storage, b_storage, &out_storage, m, n, k)?;
                     } else {
-                        return self.forest_fallback_matmul(
-                            a,
-                            b_storage,
-                            out_shape,
-                            m,
-                            n,
-                            k,
-                        );
+                        return self.forest_fallback_matmul(a, b_storage, out_shape, m, n, k);
                     }
-                } else if matches!(
-                    bd,
-                    grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw
-                ) {
+                } else if matches!(bd, grim_tensor::dtype::BlockDtype::Fp8Sparse24Hw) {
                     // GreyRaven-HW tiled: production SWMMAC GEMM (E6 closed).
                     // Kernel on gfx12 (RDNA4/UDNA carry V_SWMMAC; RDNA3 and
                     // older do not); host-dequant + F32 matmul otherwise.
                     // F32 native activations only: the kernel gathers X as
                     // float and encodes E4M3 in-register.
                     let a_f32 = a_storage.dtype().arith == ArithType::F32
-                        && matches!(
-                            a_storage.dtype().storage,
-                            DTypeStorage::Native
-                        );
+                        && matches!(a_storage.dtype().storage, DTypeStorage::Native);
                     if !a_f32 {
                         return Err(Error::Backend(format!(
                             "ROCm GreyRaven-HW: activations must be F32 native, got {:?}",
@@ -1730,8 +1704,7 @@ impl QuantOps for RocmDevice {
                     }
                     let gfx12 = matches!(
                         crate::quantization::gcn_arch(&self.gpu_target),
-                        crate::quantization::GcnArch::RDNA4
-                            | crate::quantization::GcnArch::UDNA
+                        crate::quantization::GcnArch::RDNA4 | crate::quantization::GcnArch::UDNA
                     );
                     if gfx12 && m > 0 && n > 0 && k > 0 {
                         let n_tiles = n.div_ceil(16);
@@ -1741,16 +1714,9 @@ impl QuantOps for RocmDevice {
                         // per (M-tile, window) in cached scratch, then the GEMM
                         // reads plain fragments. Same-stream ordering makes the
                         // reuse safe (WhiteRaven act-prologue discipline).
-                        let b_scratch = self.white_raven_act_scratch(
-                            m_tiles * n_windows * 512,
-                        )?;
+                        let b_scratch = self.white_raven_act_scratch(m_tiles * n_windows * 512)?;
                         self.launch_grey_raven_b_prologue(
-                            a_storage,
-                            &b_scratch,
-                            m,
-                            k,
-                            m_tiles,
-                            n_windows,
+                            a_storage, &b_scratch, m, k, m_tiles, n_windows,
                         )?;
                         self.launch_grey_raven_gemm(
                             b_storage,
@@ -1773,12 +1739,10 @@ impl QuantOps for RocmDevice {
                         let blob = b_storage.copy_to_host().map_err(|e| {
                             Error::Backend(format!("grey fallback: download failed: {e}"))
                         })?;
-                        let w = grim_quant::grey_raven::dequant_grey_raven_hw(
-                            &blob, n, k,
-                        )
-                        .map_err(|e| {
-                            Error::Backend(format!("grey fallback: decode failed: {e}"))
-                        })?;
+                        let w = grim_quant::grey_raven::dequant_grey_raven_hw(&blob, n, k)
+                            .map_err(|e| {
+                                Error::Backend(format!("grey fallback: decode failed: {e}"))
+                            })?;
                         let b_f32 = CoreTensorOps::from_cpu(
                             self,
                             &w,

@@ -81,23 +81,54 @@ pub fn gdl_forward_graph(
         ));
     }
 
-    // 1. Attention norm into the per-layer staging slot (same as softmax path).
-    dev.rms_norm_into(
-        &buffers.layer_input[layer_idx],
-        &**block.attn_norm.weight.storage(),
-        block.attn_norm.eps,
-        &buffers.norm_buf[layer_idx],
-        &buffers.layer_input[layer_idx].shape().clone(),
-    )
-    .map_err(grim_core::error::Error::Tensor)?;
-    let normed: &Storage = &buffers.norm_buf[layer_idx];
-
-    // 2. QKV projections (same Phase-B wiring as the softmax path).
-    let hidden = normed.shape().dims().last().copied().unwrap_or(0);
-    let act = &buffers.act_q81_buf[layer_idx];
+    // 1. Attention norm into the per-layer staging slot — SKIPPED when
+    // the norm-fused QKV path below is taken.
+    let hidden = buffers.layer_input[layer_idx]
+        .shape()
+        .dims()
+        .last()
+        .copied()
+        .unwrap_or(0);
     let n_q = block.num_heads * block.head_dim;
     let n_kv = block.num_kv_heads * block.head_dim;
-    if dot_fused_ok(dev, hidden)
+    let norm_fused_qkv = dot_fused_ok(dev, hidden)
+        && is_q80(&wq.weight)
+        && is_q80(&wk.weight)
+        && is_q80(&wv.weight)
+        && n_q % 4 == 0
+        && n_kv % 4 == 0;
+
+    if !norm_fused_qkv {
+        dev.rms_norm_into(
+            &buffers.layer_input[layer_idx],
+            &**block.attn_norm.weight.storage(),
+            block.attn_norm.eps,
+            &buffers.norm_buf[layer_idx],
+            &buffers.layer_input[layer_idx].shape().clone(),
+        )
+        .map_err(grim_core::error::Error::Tensor)?;
+    }
+    let normed: &Storage = &buffers.norm_buf[layer_idx];
+
+    // 2. QKV projections.
+    let act = &buffers.act_q81_buf[layer_idx];
+    if norm_fused_qkv {
+        dev.fused_qkv_dot4_norm_into(
+            &buffers.layer_input[layer_idx],
+            rocm_storage(&block.attn_norm.weight)?,
+            block.attn_norm.eps,
+            rocm_storage(&wq.weight)?,
+            rocm_storage(&wk.weight)?,
+            rocm_storage(&wv.weight)?,
+            &buffers.q_buf[layer_idx],
+            &buffers.k_buf[layer_idx],
+            &buffers.v_buf[layer_idx],
+            n_q,
+            n_kv,
+            hidden,
+        )
+        .map_err(|e| Error::Backend(format!("gdl norm-fused qkv dot4: {e}")))?;
+    } else if dot_fused_ok(dev, hidden)
         && is_q80(&wq.weight)
         && is_q80(&wk.weight)
         && is_q80(&wv.weight)

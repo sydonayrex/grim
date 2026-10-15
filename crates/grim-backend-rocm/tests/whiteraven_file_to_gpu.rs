@@ -150,9 +150,7 @@ fn w8a8_reference(a: &[f32], wq: &[f32], m: usize, n: usize, k: usize) -> Vec<f3
         .map(|o| {
             let row = o / n;
             let col = o % n;
-            (0..k)
-                .map(|j| aq[row * k + j] * wq[col * k + j])
-                .sum()
+            (0..k).map(|j| aq[row * k + j] * wq[col * k + j]).sum()
         })
         .collect()
 }
@@ -203,12 +201,15 @@ fn a_tag_670_file_reaches_the_blocked_kernel_and_matches_the_host_decode() -> Te
     let scratch = Scratch::new();
     let path = scratch.path("wr.gguf");
     write_white_raven_gguf(&path, n, k, &w);
-    let provider = GgufProvider::open(path.to_str().expect("path")).map_err(|e| format!("open: {e}"))?;
+    let provider =
+        GgufProvider::open(path.to_str().expect("path")).map_err(|e| format!("open: {e}"))?;
 
     // 2. Load it back through the ordinary provider path. Everything the
     //    dispatch needs must come from here -- if the loader has to drop to a
     //    special case later, this is where it shows.
-    let meta = provider.meta("blk.weight").map_err(|e| format!("meta: {e}"))?;
+    let meta = provider
+        .meta("blk.weight")
+        .map_err(|e| format!("meta: {e}"))?;
     assert_eq!(
         meta.dtype.storage,
         Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8Blocked16),
@@ -239,18 +240,18 @@ fn a_tag_670_file_reaches_the_blocked_kernel_and_matches_the_host_decode() -> Te
     // 4. Through the real dispatch, from the file-loaded bytes.
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
-        &a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect::<Vec<u8>>(),
+        &a.iter()
+            .flat_map(|v| v.to_le_bytes().to_vec())
+            .collect::<Vec<u8>>(),
         &Shape::new(vec![m, k]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("act h2d: {e}"))?;
-    let b_t = MemoryOps::from_cpu_bytes(
-        &dev,
-        &raw.bytes,
-        &Shape::new(vec![n, k]),
-        meta.dtype,
-    )
-    .map_err(|e| format!("b h2d: {e}"))?;
+    let b_t = MemoryOps::from_cpu_bytes(&dev, &raw.bytes, &Shape::new(vec![n, k]), meta.dtype)
+        .map_err(|e| format!("b h2d: {e}"))?;
 
     let (c_t, _handle) = dev
         .quantized_matmul(
@@ -296,8 +297,11 @@ fn a_tag_670_file_at_m_equals_1_matches_the_host_decode() -> TestResult {
     let scratch = Scratch::new();
     let path = scratch.path("wr_m1.gguf");
     write_white_raven_gguf(&path, n, k, &w);
-    let provider = GgufProvider::open(path.to_str().expect("path")).map_err(|e| format!("open: {e}"))?;
-    let raw = provider.get("blk.weight").map_err(|e| format!("get: {e}"))?;
+    let provider =
+        GgufProvider::open(path.to_str().expect("path")).map_err(|e| format!("open: {e}"))?;
+    let raw = provider
+        .get("blk.weight")
+        .map_err(|e| format!("get: {e}"))?;
 
     let wq: Vec<f32> = grim_quant::dequant_fp8_blocked16(&raw.bytes, n, k)
         .map_err(|e| format!("host dequant: {e}"))?;
@@ -305,9 +309,14 @@ fn a_tag_670_file_at_m_equals_1_matches_the_host_decode() -> TestResult {
 
     let a_t = MemoryOps::from_cpu_bytes(
         &dev,
-        &a.iter().flat_map(|v| v.to_le_bytes().to_vec()).collect::<Vec<u8>>(),
+        &a.iter()
+            .flat_map(|v| v.to_le_bytes().to_vec())
+            .collect::<Vec<u8>>(),
         &Shape::new(vec![m, k]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("act h2d: {e}"))?;
     let b_t = MemoryOps::from_cpu_bytes(

@@ -190,9 +190,7 @@ mod tests {
         // The untiled `grim_fused_dequant_gemm_iq4nl` is the correct path.
         // See the comment above `GRIM_TILED_QUANT_FWD_BWD(grim_fused_dequant_gemm_iq4xs_tiled`
         // (commit 431e95f5).
-        for fmt in [
-            "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq4xs", "q8_0",
-        ] {
+        for fmt in ["iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq4xs", "q8_0"] {
             assert!(
                 src.contains(&format!("grim_fused_dequant_gemm_{fmt}_tiled")),
                 "missing tiled forward kernel for {fmt}"

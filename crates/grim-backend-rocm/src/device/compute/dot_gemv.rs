@@ -5,8 +5,8 @@ use std::ffi::c_void;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType};
-use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 use grim_tensor::error::{Error, Result};
+use grim_tensor::{BackendStorage, CoreTensorOps, Shape};
 
 use crate::device::roc_device::RocmDevice;
 use crate::memory::storage::RocmStorage;
@@ -353,9 +353,9 @@ impl RocmDevice {
                 b_storage.bytes, want_bytes
             )));
         }
-        let a_ptr = act_f32.device_ptr.ok_or_else(|| {
-            Error::Backend("dot4_forest_gemv: act_f32 has no device ptr".into())
-        })?;
+        let a_ptr = act_f32
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dot4_forest_gemv: act_f32 has no device ptr".into()))?;
         let b_ptr = b_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("dot4_forest_gemv: b has no device ptr".into()))?;
@@ -403,12 +403,11 @@ impl RocmDevice {
         n: usize,
         k: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let blob = b_storage.copy_to_host().map_err(|e| {
-            Error::Backend(format!("forest fallback: blob download failed: {e}"))
-        })?;
-        let w = grim_quant::dequant_forest(&blob, n, k).map_err(|e| {
-            Error::Backend(format!("forest fallback: blob decode failed: {e}"))
-        })?;
+        let blob = b_storage
+            .copy_to_host()
+            .map_err(|e| Error::Backend(format!("forest fallback: blob download failed: {e}")))?;
+        let w = grim_quant::dequant_forest(&blob, n, k)
+            .map_err(|e| Error::Backend(format!("forest fallback: blob decode failed: {e}")))?;
         let b_f32 = CoreTensorOps::from_cpu(
             self,
             &w,
@@ -1467,7 +1466,10 @@ impl RocmDevice {
         // faster (86.4 vs 23.1 GB/s at N=K=4096). GRIM_DOT4_FAST=0 keeps the
         // stock kernel reachable as an escape hatch.
         let fast = *FAST.get_or_init(|| {
-            !matches!(std::env::var("GRIM_DOT4_FAST").as_deref(), Ok("0" | "false" | "off"))
+            !matches!(
+                std::env::var("GRIM_DOT4_FAST").as_deref(),
+                Ok("0" | "false" | "off")
+            )
         });
         let kernel_name = if fast {
             "grim_dot4_q4k_q81_gemv_fast"
@@ -1968,7 +1970,13 @@ impl RocmDevice {
             "grim_tree_pie_gemv",
             grid_dim,
             block_dim,
-            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut nn), arg(&mut kk)],
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 
@@ -1994,19 +2002,22 @@ impl RocmDevice {
             )));
         }
         if m == 0 || n == 0 {
-            return Err(Error::Backend("tree_pie_gemm: m and n must be non-zero".to_string()));
+            return Err(Error::Backend(
+                "tree_pie_gemm: m and n must be non-zero".to_string(),
+            ));
         }
         const TP_M_TILE: usize = 8;
         let b_ptr = b_storage
             .device_ptr_u64()
-            .ok_or_else(|| Error::Backend("tree_pie_gemm: b has no device ptr".into()))? as u64;
+            .ok_or_else(|| Error::Backend("tree_pie_gemm: b has no device ptr".into()))?
+            as u64;
         let b_ptr = b_ptr as *mut c_void;
         let a_ptr = act_f16.device_ptr.ok_or_else(|| {
             Error::Backend("tree_pie_gemm: activations have no device ptr".into())
         })?;
-        let o_ptr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("tree_pie_gemm: out has no device ptr".into())
-        })?;
+        let o_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("tree_pie_gemm: out has no device ptr".into()))?;
 
         let (mut ap, mut bp, mut op) = (a_ptr, b_ptr, o_ptr);
         let (mut mm, mut nn, mut kk) = (m as i32, n as i32, k as i32);
@@ -2020,7 +2031,14 @@ impl RocmDevice {
             "grim_tree_pie_gemm",
             HipDim3::new(n as u32, tiles, 1),
             HipDim3::new(32, 1, 1),
-            &mut [arg(&mut ap), arg(&mut bp), arg(&mut op), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
+            &mut [
+                arg(&mut ap),
+                arg(&mut bp),
+                arg(&mut op),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
         )
     }
 
@@ -2123,23 +2141,25 @@ impl RocmDevice {
             )));
         }
         if m == 0 || n == 0 {
-            return Err(Error::Backend("scrub_jay_gemm_tiled: M and N must be > 0".into()));
+            return Err(Error::Backend(
+                "scrub_jay_gemm_tiled: M and N must be > 0".into(),
+            ));
         }
         let a_ptr = a_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: a has no device ptr".into()))?;
-        let sel_ptr = b_sel
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_sel has no device ptr".into()))?;
-        let idx_ptr = b_idx
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_idx has no device ptr".into()))?;
-        let sgn_ptr = b_sgn
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_sgn has no device ptr".into()))?;
-        let scl_ptr = b_scl
-            .device_ptr
-            .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: b_scl has no device ptr".into()))?;
+        let sel_ptr = b_sel.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_sel has no device ptr".into())
+        })?;
+        let idx_ptr = b_idx.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_idx has no device ptr".into())
+        })?;
+        let sgn_ptr = b_sgn.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_sgn has no device ptr".into())
+        })?;
+        let scl_ptr = b_scl.device_ptr.ok_or_else(|| {
+            Error::Backend("scrub_jay_gemm_tiled: b_scl has no device ptr".into())
+        })?;
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("scrub_jay_gemm_tiled: out has no device ptr".into()))?;

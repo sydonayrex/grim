@@ -165,12 +165,20 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
             let v = all.len() / ctx.len().max(1);
             let last_logits = &all[all.len() - v.max(1)..];
             let target = tokens[start + ppl_window()];
-            let max_l = last_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let max_l = last_logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
             let log_sum_exp = max_l
-                + last_logits.iter().map(|l| (*l - max_l).exp()).sum::<f32>().ln();
-            let target_l = last_logits.get(target as usize).copied().ok_or_else(|| {
-                Error::Config(format!("target token {target} out of vocab"))
-            })?;
+                + last_logits
+                    .iter()
+                    .map(|l| (*l - max_l).exp())
+                    .sum::<f32>()
+                    .ln();
+            let target_l = last_logits
+                .get(target as usize)
+                .copied()
+                .ok_or_else(|| Error::Config(format!("target token {target} out of vocab")))?;
             sum_nll += ((log_sum_exp - target_l) as f64).max(0.0);
             n_tokens += 1;
         } else {
@@ -179,11 +187,11 @@ pub fn compute_ppl(model: &dyn CausalLm, tokens: &[u32]) -> Result<(f32, usize)>
                 let row = &all[i * vocab..(i + 1) * vocab];
                 let target = tokens[start + i + 1];
                 let max_l = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let log_sum_exp =
-                    max_l + row.iter().map(|l| (*l - max_l).exp()).sum::<f32>().ln();
-                let target_l = row.get(target as usize).copied().ok_or_else(|| {
-                    Error::Config(format!("target token {target} out of vocab"))
-                })?;
+                let log_sum_exp = max_l + row.iter().map(|l| (*l - max_l).exp()).sum::<f32>().ln();
+                let target_l = row
+                    .get(target as usize)
+                    .copied()
+                    .ok_or_else(|| Error::Config(format!("target token {target} out of vocab")))?;
                 sum_nll += ((log_sum_exp - target_l) as f64).max(0.0);
                 n_tokens += 1;
             }

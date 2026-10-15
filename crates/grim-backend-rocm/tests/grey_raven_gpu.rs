@@ -47,15 +47,24 @@ const WAVE: usize = 32;
 const FP8_ONE: u8 = 0x38;
 const FP8_ZERO: u8 = 0x00;
 
-fn up(dev: &RocmDevice, bytes: &[u8], dt: DType, what: &str) -> TestResult<Box<dyn BackendStorage>> {
+fn up(
+    dev: &RocmDevice,
+    bytes: &[u8],
+    dt: DType,
+    what: &str,
+) -> TestResult<Box<dyn BackendStorage>> {
     MemoryOps::from_cpu_bytes(dev, bytes, &Shape::new(vec![bytes.len()]), dt)
         .map_err(|e| format!("{what} h2d: {e}").into())
 }
 fn download(t: &Box<dyn BackendStorage>) -> TestResult<Vec<u8>> {
-    Ok(grim_backend_rocm::as_rocm(t.as_ref()).map_err(|e| e.to_string())?.copy_to_host()?)
+    Ok(grim_backend_rocm::as_rocm(t.as_ref())
+        .map_err(|e| e.to_string())?
+        .copy_to_host()?)
 }
 fn as_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Run one MMA and return the 8 floats each of the 32 lanes produced.
@@ -65,8 +74,14 @@ fn run_mma(
     b_bytes: &[u8],
     sidx: u32,
 ) -> TestResult<[[f32; 8]; WAVE]> {
-    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let u8ty = DType {
+        arith: ArithType::U8,
+        storage: Storage::Native,
+    };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
     let a_t = up(dev, a_bytes, u8ty.clone(), "a")?;
     let b_t = up(dev, b_bytes, u8ty, "b")?;
     let c_t = MemoryOps::alloc_storage(dev, &Shape::new(vec![WAVE * 8]), f32ty)
@@ -226,7 +241,10 @@ fn grey_raven_swmmac_layout_probe() -> TestResult {
                 // Every observed run so far: 8 ones, nothing else, and the same
                 // for all four packings. That insensitivity is the informative
                 // part -- see the note below.
-                assert_eq!(others, 0, "C must contain only 0.0 and 1.0, saw {others} others");
+                assert_eq!(
+                    others, 0,
+                    "C must contain only 0.0 and 1.0, saw {others} others"
+                );
                 assert!(
                     ones > 0,
                     "C is entirely zero: the identity probe produced no product at all, \
@@ -318,7 +336,10 @@ fn grey_raven_sparse_index_slot_selection() -> TestResult {
                 }
             }
         }
-        let total: usize = c.iter().map(|l| l.iter().filter(|&&v| v != 0.0).count()).sum();
+        let total: usize = c
+            .iter()
+            .map(|l| l.iter().filter(|&&v| v != 0.0).count())
+            .sum();
         println!(
             "sidx=0x{sidx:08x}  nonzero C elements = {total:<5} lanes with data = {lanes_with_data}",
         );
@@ -331,9 +352,16 @@ fn grey_raven_sparse_index_slot_selection() -> TestResult {
         //
         // (An earlier reading of this data said "lane pair {j, j+4}". It is
         // wrong: the active set is the whole residue class, 8 lanes, not 2.)
-        let pairs: Vec<usize> =
-            c.iter().enumerate().filter(|(_, l)| l.iter().any(|&v| v != 0.0)).map(|(i, _)| i).collect();
-        println!("   active lanes {pairs:?}  (index bits0,1 = {:02b})", sidx & 0b11);
+        let pairs: Vec<usize> = c
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.iter().any(|&v| v != 0.0))
+            .map(|(i, _)| i)
+            .collect();
+        println!(
+            "   active lanes {pairs:?}  (index bits0,1 = {:02b})",
+            sidx & 0b11
+        );
         for (l, lane) in c.iter().enumerate().take(8) {
             let nz: Vec<(usize, f32)> = lane
                 .iter()
@@ -403,7 +431,9 @@ fn grey_raven_sparse_index_slot_selection() -> TestResult {
 /// column mapping directly and the row mapping up to the per-row 2:4 pattern.
 #[test]
 fn grey_raven_b_byte_onehot_sweep() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     let a = vec![FP8_ONE; 256];
@@ -429,8 +459,14 @@ fn grey_raven_b_byte_onehot_sweep() -> TestResult {
         groups.entry(sig).or_default().push(g);
     }
 
-    println!("\n=== B one-hot sweep: 512 offsets -> {} distinct C signatures ===", groups.len());
-    println!("nonzero values seen across the whole sweep: {:?}", values_seen);
+    println!(
+        "\n=== B one-hot sweep: 512 offsets -> {} distinct C signatures ===",
+        groups.len()
+    );
+    println!(
+        "nonzero values seen across the whole sweep: {:?}",
+        values_seen
+    );
 
     for (sig, offs) in &groups {
         let lanes: Vec<usize> = sig.iter().map(|(l, _)| *l).collect();
@@ -444,7 +480,10 @@ fn grey_raven_b_byte_onehot_sweep() -> TestResult {
             v.dedup();
             v
         };
-        println!("\n  signature: {} elems  lanes={lanes:?}  slots={slots:?}", sig.len());
+        println!(
+            "\n  signature: {} elems  lanes={lanes:?}  slots={slots:?}",
+            sig.len()
+        );
         println!("    {} offsets, e.g. {offs:?}", offs.len());
         println!("    distinct byte-in-lane: {uniq_in_lane:?}");
         let distinct_lanes = {
@@ -479,7 +518,9 @@ fn grey_raven_b_byte_onehot_sweep() -> TestResult {
 /// which pins the A byte to a single output row.
 #[test]
 fn grey_raven_a_byte_onehot_sweep() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     let b = identity_32x16();
@@ -504,15 +545,34 @@ fn grey_raven_a_byte_onehot_sweep() -> TestResult {
         groups.entry(sig).or_default().push(g);
     }
 
-    println!("\n=== A one-hot sweep: 256 offsets -> {} distinct C signatures ===", groups.len());
+    println!(
+        "\n=== A one-hot sweep: 256 offsets -> {} distinct C signatures ===",
+        groups.len()
+    );
     println!("nonzero values seen: {values:?}");
     for (sig, offs) in &groups {
-        let lanes: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(l, _)| *l).collect(); v.sort_unstable(); v.dedup(); v };
-        let slots: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(_, s)| *s).collect(); v.sort_unstable(); v.dedup(); v };
-        let in_lane: Vec<usize> = { let mut v: Vec<usize> = offs.iter().map(|o| o % 8).collect(); v.sort_unstable(); v.dedup(); v };
+        let lanes: Vec<usize> = {
+            let mut v: Vec<usize> = sig.iter().map(|(l, _)| *l).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let slots: Vec<usize> = {
+            let mut v: Vec<usize> = sig.iter().map(|(_, s)| *s).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let in_lane: Vec<usize> = {
+            let mut v: Vec<usize> = offs.iter().map(|o| o % 8).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
         println!(
             "  {:>6} elems  lanes={lanes:?} slots={slots:?}  byte-in-lane={in_lane:?}  \
-             {} offs e.g. {offs:?}", sig.len(),
+             {} offs e.g. {offs:?}",
+            sig.len(),
             offs.len()
         );
     }
@@ -637,7 +697,9 @@ fn identity_32x16() -> Vec<u8> {
 ///     retracted A sweep could not report because its B was nearly all zero.
 #[test]
 fn grey_raven_a_fragment_sweep_uniform_b() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     let b = vec![FP8_ONE; 512]; // uniform: removes B's layout from the problem
@@ -662,18 +724,38 @@ fn grey_raven_a_fragment_sweep_uniform_b() -> TestResult {
         groups.entry(sig).or_default().push(g);
     }
 
-    let live: usize = groups.iter().filter(|(s, _)| !s.is_empty()).map(|(_, o)| o.len()).sum();
-    println!("\n=== A sweep, uniform B: 256 offsets -> {} signatures; {live} live ===", groups.len());
+    let live: usize = groups
+        .iter()
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(_, o)| o.len())
+        .sum();
+    println!(
+        "\n=== A sweep, uniform B: 256 offsets -> {} signatures; {live} live ===",
+        groups.len()
+    );
     println!("nonzero values: {values:?}");
     for (sig, offs) in &groups {
         if sig.is_empty() {
             println!("  DEAD: {} offsets", offs.len());
             continue;
         }
-        let lanes: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(l, _)| *l).collect(); v.sort_unstable(); v.dedup(); v };
-        let slots: Vec<usize> = { let mut v: Vec<usize> = sig.iter().map(|(_, s)| *s).collect(); v.sort_unstable(); v.dedup(); v };
-        println!("  {:>3} elems  lanes={lanes:?}  slots={slots:?}  {} offs e.g. {offs:?}",
-                 sig.len(), offs.len());
+        let lanes: Vec<usize> = {
+            let mut v: Vec<usize> = sig.iter().map(|(l, _)| *l).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let slots: Vec<usize> = {
+            let mut v: Vec<usize> = sig.iter().map(|(_, s)| *s).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        println!(
+            "  {:>3} elems  lanes={lanes:?}  slots={slots:?}  {} offs e.g. {offs:?}",
+            sig.len(),
+            offs.len()
+        );
     }
     Ok(())
 }
@@ -729,7 +811,9 @@ fn grey_raven_a_fragment_sweep_uniform_b() -> TestResult {
 /// out entirely.
 #[test]
 fn grey_raven_sparse_index_selects_k() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let b = vec![FP8_ONE; 512];
 
@@ -752,11 +836,21 @@ fn grey_raven_sparse_index_selects_k() -> TestResult {
         while i < live.len() {
             let s = live[i];
             let mut e = s;
-            while e + 1 < live.len() && live[e + 1] == e + 1 { e += 1; }
-            ranges.push(if s == e { format!("{s}") } else { format!("{s}-{e}") });
+            while e + 1 < live.len() && live[e + 1] == e + 1 {
+                e += 1;
+            }
+            ranges.push(if s == e {
+                format!("{s}")
+            } else {
+                format!("{s}-{e}")
+            });
             i = e + 1;
         }
-        println!("sidx={sidx:#04x}  {:>3} live A byte offsets: {}", live.len(), ranges.join(", "));
+        println!(
+            "sidx={sidx:#04x}  {:>3} live A byte offsets: {}",
+            live.len(),
+            ranges.join(", ")
+        );
     }
     Ok(())
 }
@@ -864,7 +958,9 @@ fn grey_raven_sparse_index_selects_k() -> TestResult {
 /// differences between two indices localize exactly which k's changed hands.
 #[test]
 fn grey_raven_index_moves_live_b_set() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
 
@@ -874,10 +970,16 @@ fn grey_raven_index_moves_live_b_set() -> TestResult {
     // them: single-field indices isolate one 2-bit group, and the v-family is
     // extended to v = 0..3 across whole-pattern indices to confirm the linearity.
     for sidx in [
-        0u32, 1, 2, 3,                  // low field only
-        0x5555_5555, 0xaaaa_aaaa, 0xffff_ffff,   // v repeated over all 16 groups
-        0x0000_0004, 0x0000_0008,       // group 1 and 2, value 1
-        0xffff_fffc,                    // only the top group varied
+        0u32,
+        1,
+        2,
+        3, // low field only
+        0x5555_5555,
+        0xaaaa_aaaa,
+        0xffff_ffff, // v repeated over all 16 groups
+        0x0000_0004,
+        0x0000_0008, // group 1 and 2, value 1
+        0xffff_fffc, // only the top group varied
     ] {
         let mut live: Vec<usize> = Vec::new();
         for g in 0..512usize {
@@ -894,8 +996,14 @@ fn grey_raven_index_moves_live_b_set() -> TestResult {
         while i < live.len() {
             let s = live[i];
             let mut e = s;
-            while e + 1 < live.len() && live[e + 1] == e + 1 { e += 1; }
-            ranges.push(if s == e { format!("{s}") } else { format!("{s}-{e}") });
+            while e + 1 < live.len() && live[e + 1] == e + 1 {
+                e += 1;
+            }
+            ranges.push(if s == e {
+                format!("{s}")
+            } else {
+                format!("{s}-{e}")
+            });
             i = e + 1;
         }
         let delta = match &prev {
@@ -906,7 +1014,11 @@ fn grey_raven_index_moves_live_b_set() -> TestResult {
                 format!("  +{} -{}", added.len(), gone.len())
             }
         };
-        println!("sidx={sidx:#010x}  {:>3} live: {}{delta}", live.len(), ranges.join(", "));
+        println!(
+            "sidx={sidx:#010x}  {:>3} live: {}{delta}",
+            live.len(),
+            ranges.join(", ")
+        );
         prev = Some(live);
     }
     Ok(())
@@ -994,7 +1106,9 @@ fn grey_raven_index_moves_live_b_set() -> TestResult {
 /// is positional after all.
 #[test]
 fn grey_raven_index_bit_parity_across_u32() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
 
@@ -1013,12 +1127,17 @@ fn grey_raven_index_bit_parity_across_u32() -> TestResult {
         by_set.entry(live).or_default().push(bit);
     }
 
-    println!("\n=== 32 single-bit indices -> {} distinct live sets ===", by_set.len());
+    println!(
+        "\n=== 32 single-bit indices -> {} distinct live sets ===",
+        by_set.len()
+    );
     let mut classes: Vec<(Vec<usize>, Vec<u32>)> = by_set.into_iter().collect();
     classes.sort_by_key(|(set, _)| set.len());
     for (set, bits) in &classes {
-        let parity: Vec<&str> =
-            bits.iter().map(|b| if b % 2 == 0 { "even" } else { "odd" }).collect();
+        let parity: Vec<&str> = bits
+            .iter()
+            .map(|b| if b % 2 == 0 { "even" } else { "odd" })
+            .collect();
         let head: Vec<usize> = set.iter().take(8).copied().collect();
         println!("  bits {bits:?}  ({:?})", {
             let mut p = parity.clone();
@@ -1080,7 +1199,9 @@ fn grey_raven_index_bit_parity_across_u32() -> TestResult {
 /// no search.
 #[test]
 fn grey_raven_each_selector_k_delta() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
 
@@ -1165,7 +1286,9 @@ fn grey_raven_each_selector_k_delta() -> TestResult {
 /// cheap; the residues are disjoint so restricting loses nothing.
 #[test]
 fn grey_raven_combinations_reach_missing_residues() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
     let sel = [0u32, 1, 4, 5, 8, 9, 12, 13];
@@ -1353,7 +1476,9 @@ fn grey_raven_combinations_reach_missing_residues() -> TestResult {
 /// exactly that B element's position in the tile. No inference required.
 #[test]
 fn grey_raven_b_layout_direct() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
 
@@ -1370,9 +1495,24 @@ fn grey_raven_b_layout_direct() -> TestResult {
             }
         }
         // Summarise: the distinct values, and the lane/slot shape.
-        let vals: Vec<String> = { let mut v: Vec<String> = hits.iter().map(|(_, _, x)| format!("{x}")).collect(); v.sort(); v.dedup(); v };
-        let lanes: Vec<usize> = { let mut v: Vec<usize> = hits.iter().map(|(l, _, _)| *l).collect(); v.sort_unstable(); v.dedup(); v };
-        let slots: Vec<usize> = { let mut v: Vec<usize> = hits.iter().map(|(_, s, _)| *s).collect(); v.sort_unstable(); v.dedup(); v };
+        let vals: Vec<String> = {
+            let mut v: Vec<String> = hits.iter().map(|(_, _, x)| format!("{x}")).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let lanes: Vec<usize> = {
+            let mut v: Vec<usize> = hits.iter().map(|(l, _, _)| *l).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let slots: Vec<usize> = {
+            let mut v: Vec<usize> = hits.iter().map(|(_, s, _)| *s).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
         println!(
             "B[{g:>3}] (lane {}, byte {}): {:>2} hits, values {vals:?}, lanes {lanes:?}, slots {slots:?}",
             g / 16,
@@ -1440,7 +1580,9 @@ fn grey_raven_b_layout_direct() -> TestResult {
 /// Uniform A throughout, so nothing here depends on A's k mapping.
 #[test]
 fn grey_raven_selector_enables_which_byte_positions() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
 
@@ -1459,7 +1601,10 @@ fn grey_raven_selector_enables_which_byte_positions() -> TestResult {
 
     let base = live_positions(0)?;
     let mut all: Vec<usize> = base.clone();
-    println!("\nsidx=0            positions {base:?}  ({} of 16)", base.len());
+    println!(
+        "\nsidx=0            positions {base:?}  ({} of 16)",
+        base.len()
+    );
     for bit in [0u32, 1, 4, 5, 8, 9, 12, 13] {
         let l = live_positions(1u32 << bit)?;
         for p in &l {
@@ -1467,11 +1612,17 @@ fn grey_raven_selector_enables_which_byte_positions() -> TestResult {
                 all.push(*p);
             }
         }
-        println!("selector bit {bit:>2}   positions {l:?}  ({} of 16)", l.len());
+        println!(
+            "selector bit {bit:>2}   positions {l:?}  ({} of 16)",
+            l.len()
+        );
     }
     let mut all = all;
     all.sort_unstable();
-    println!("\nUNION over all 8 selectors: {all:?}  ({} of 16)", all.len());
+    println!(
+        "\nUNION over all 8 selectors: {all:?}  ({} of 16)",
+        all.len()
+    );
     Ok(())
 }
 
@@ -1532,7 +1683,9 @@ fn grey_raven_selector_enables_which_byte_positions() -> TestResult {
 /// doubling is inside the instruction and not in the packing.
 #[test]
 fn grey_raven_a_lane_pair_is_the_doubling() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     // One hot B element at (k = 0, n = 0), the sidx = 0 default column.
@@ -1566,10 +1719,7 @@ fn grey_raven_a_lane_pair_is_the_doubling() -> TestResult {
         let vals: Vec<f32> = c.iter().flatten().copied().filter(|&v| v != 0.0).collect();
         let max = vals.iter().cloned().fold(0.0f32, f32::max);
         let sum: f32 = vals.iter().sum();
-        println!(
-            "{name:<30} -> {} nonzero, max {max}, sum {sum}",
-            vals.len()
-        );
+        println!("{name:<30} -> {} nonzero, max {max}, sum {sum}", vals.len());
     }
     Ok(())
 }
@@ -1621,7 +1771,9 @@ fn grey_raven_a_lane_pair_is_the_doubling() -> TestResult {
 /// which is what the residual 2.0 has been pointing at.
 #[test]
 fn grey_raven_a_byte_position_to_k() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     for j in 0..8usize {
@@ -1635,7 +1787,12 @@ fn grey_raven_a_byte_position_to_k() -> TestResult {
             let c = run_mma(&dev, &a, &b, 0)?;
             if c.iter().any(|l| l.iter().any(|&v| v != 0.0)) {
                 ks.push(k);
-                let v = c.iter().flatten().copied().find(|&v| v != 0.0).unwrap_or(0.0);
+                let v = c
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .find(|&v| v != 0.0)
+                    .unwrap_or(0.0);
                 vals.push(v);
             }
         }
@@ -1713,7 +1870,9 @@ fn grey_raven_a_byte_position_to_k() -> TestResult {
 // at 2.0 no matter what the index does.
 #[test]
 fn grey_raven_index_activates_a_bytes() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
     let mut b = vec![FP8_ZERO; 512];
@@ -1737,7 +1896,10 @@ fn grey_raven_index_activates_a_bytes() -> TestResult {
             v.dedup();
             v
         };
-        println!("{name:<20} -> {} hits, max {max}, distinct {distinct:?}", hits.len());
+        println!(
+            "{name:<20} -> {} hits, max {max}, distinct {distinct:?}",
+            hits.len()
+        );
     }
     Ok(())
 }
@@ -1801,18 +1963,29 @@ fn grey_raven_index_activates_a_bytes() -> TestResult {
 /// why the 2.0 kept reappearing.
 #[test]
 fn grey_raven_a_byte_multiplicity_map() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let mut b = vec![FP8_ZERO; 512];
     b[0] = FP8_ONE; // column 0, k position 0
 
-    for (name, sidx) in [("sidx = 0", 0u32), ("sidx = 0x33", 0x33), ("sidx = 0x11", 0x11)] {
+    for (name, sidx) in [
+        ("sidx = 0", 0u32),
+        ("sidx = 0x33", 0x33),
+        ("sidx = 0x11", 0x11),
+    ] {
         let mut line = format!("{name:<14}");
         for j in 0..8usize {
             let mut a = vec![FP8_ZERO; 256];
             a[j] = FP8_ONE;
             let c = run_mma(&dev, &a, &b, sidx)?;
-            let max = c.iter().flatten().copied().filter(|&v| v != 0.0).fold(0.0f32, f32::max);
+            let max = c
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|&v| v != 0.0)
+                .fold(0.0f32, f32::max);
             line.push_str(&format!(" b{j}={max:?}"));
         }
         println!("{line}");
@@ -1880,7 +2053,9 @@ fn grey_raven_a_byte_multiplicity_map() -> TestResult {
 /// arithmetic above is describing a smaller tile than the name implies.
 #[test]
 fn grey_raven_row_covers_how_many_k() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let a = vec![FP8_ONE; 256];
     let b = vec![FP8_ONE; 512]; // fully uniform: every k, every column
@@ -1964,7 +2139,9 @@ fn grey_raven_row_covers_how_many_k() -> TestResult {
 /// One-hot A byte at row 0, and B one-hot at each of the 32 k positions in turn.
 #[test]
 fn grey_raven_a_byte_covers_which_k() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     for j in [0usize, 1, 2, 3] {
@@ -2037,7 +2214,9 @@ fn grey_raven_a_byte_covers_which_k() -> TestResult {
 /// before: every entry is a yes/no on a single k at a single index.
 #[test]
 fn grey_raven_index_moves_k_coverage() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
     let mut a = vec![FP8_ZERO; 256];
     a[0] = FP8_ONE; // row 0, byte 0
@@ -2126,7 +2305,9 @@ fn grey_raven_index_moves_k_coverage() -> TestResult {
 /// put, offsets are per-group and the format maps through at 2:4.
 #[test]
 fn grey_raven_offset_is_per_group_or_shared() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     let covers = |byte: usize, sidx: u32| -> TestResult<Vec<usize>> {
@@ -2152,7 +2333,11 @@ fn grey_raven_offset_is_per_group_or_shared() -> TestResult {
         ("sidx = 0x1100", 0x1100),
         ("sidx = 0x1010", 0x1010),
     ] {
-        println!("{name}   byte0 {:?}   byte2 {:?}", covers(0, sidx)?, covers(2, sidx)?);
+        println!(
+            "{name}   byte0 {:?}   byte2 {:?}",
+            covers(0, sidx)?,
+            covers(2, sidx)?
+        );
     }
     Ok(())
 }
@@ -2209,7 +2394,9 @@ fn grey_raven_offset_is_per_group_or_shared() -> TestResult {
 /// coverage and multiplicity cannot be confused a second time.
 #[test]
 fn grey_raven_per_byte_reachable_k_union() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     // One index per value of the group-0 field, plus the group-1 field varied, so
@@ -2292,7 +2479,9 @@ fn grey_raven_per_byte_reachable_k_union() -> TestResult {
 /// metadata assumes.
 #[test]
 fn grey_raven_all_group_field_combinations() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     let mut union: Vec<Vec<usize>> = vec![Vec::new(); 8];
@@ -2390,7 +2579,9 @@ fn grey_raven_all_group_field_combinations() -> TestResult {
 // it should not have been asserted from a result line that said FAILED.
 #[test]
 fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
-    let Some(dev) = gpu_device() else { return Ok(()) };
+    let Some(dev) = gpu_device() else {
+        return Ok(());
+    };
     let dev = &dev;
 
     const MR: usize = 16; // rows of A and D
@@ -2425,10 +2616,20 @@ fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
             // understates the reference.
             let (i0u, i1u) = (i0 as usize, i1 as usize);
             a_dense[r * K + 4 * c + 0] = if i0u == 0 { v0 } else { 0.0 };
-            a_dense[r * K + 4 * c + 1] =
-                if i0u == 1 { v0 } else if i1u == 1 { v1 } else { 0.0 };
-            a_dense[r * K + 4 * c + 2] =
-                if i0u == 2 { v0 } else if i1u == 2 { v1 } else { 0.0 };
+            a_dense[r * K + 4 * c + 1] = if i0u == 1 {
+                v0
+            } else if i1u == 1 {
+                v1
+            } else {
+                0.0
+            };
+            a_dense[r * K + 4 * c + 2] = if i0u == 2 {
+                v0
+            } else if i1u == 2 {
+                v1
+            } else {
+                0.0
+            };
             a_dense[r * K + 4 * c + 3] = if i1u == 3 { v1 } else { 0.0 };
         }
     }
@@ -2490,11 +2691,33 @@ fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
     // One launch, with the per-lane index buffer the ISA defines. The scalar-index
     // probe cannot express a real 2:4 pattern: it would apply one lane's index to
     // all 32 lanes and collapse every row onto the same group selection.
-    let u32ty = DType { arith: ArithType::U32, storage: Storage::Native };
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
+    let u32ty = DType {
+        arith: ArithType::U32,
+        storage: Storage::Native,
+    };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
     let idx_bytes: Vec<u8> = sidx.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let a_t = up(dev, &a_frag, DType { arith: ArithType::U8, storage: Storage::Native }, "a")?;
-    let b_t = up(dev, &b_frag, DType { arith: ArithType::U8, storage: Storage::Native }, "b")?;
+    let a_t = up(
+        dev,
+        &a_frag,
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "a",
+    )?;
+    let b_t = up(
+        dev,
+        &b_frag,
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        "b",
+    )?;
     let s_t = up(dev, &idx_bytes, u32ty, "sidx")?;
     let c_t = MemoryOps::alloc_storage(dev, &Shape::new(vec![WAVE * 8]), f32ty)
         .map_err(|e| format!("c: {e}"))?;
@@ -2529,20 +2752,33 @@ fn grey_raven_sparse_gemm_matches_dense_reference() -> TestResult {
             }
         }
     }
-    println!("\ndistinct index words: {}, pairs exercised: {:?}", distinct.len(), PAIRS);
+    println!(
+        "\ndistinct index words: {}, pairs exercised: {:?}",
+        distinct.len(),
+        PAIRS
+    );
     println!("mismatches {bad} of {}", MR * NC);
     if let Some(f) = first {
         println!("first: {f}");
     }
     if bad > 0 {
-        let rows: Vec<usize> = (0..MR).filter(|&r| (0..NC).any(|n| c_acc[r * NC + n] != ref_c[r * NC + n])).collect();
-        let cols: Vec<usize> = (0..NC).filter(|&n| (0..MR).any(|r| c_acc[r * NC + n] != ref_c[r * NC + n])).collect();
-        println!("failing rows {rows:?}
-failing cols {cols:?}");
+        let rows: Vec<usize> = (0..MR)
+            .filter(|&r| (0..NC).any(|n| c_acc[r * NC + n] != ref_c[r * NC + n]))
+            .collect();
+        let cols: Vec<usize> = (0..NC)
+            .filter(|&n| (0..MR).any(|r| c_acc[r * NC + n] != ref_c[r * NC + n]))
+            .collect();
+        println!(
+            "failing rows {rows:?}
+failing cols {cols:?}"
+        );
         println!("r0 got  {:?}", (0..4).map(|n| c_acc[n]).collect::<Vec<_>>());
         println!("r0 want {:?}", (0..4).map(|n| ref_c[n]).collect::<Vec<_>>());
     }
-    assert_eq!(bad, 0, "sparse GEMM disagrees with the ISA-derived reference");
+    assert_eq!(
+        bad, 0,
+        "sparse GEMM disagrees with the ISA-derived reference"
+    );
     Ok(())
 }
 

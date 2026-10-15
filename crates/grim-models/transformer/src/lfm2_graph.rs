@@ -61,11 +61,7 @@ pub(crate) fn linear_into(
 /// Pure host-side predicate: may this layer use the sudot4 fused path?
 /// Mirrors the launchers' own validation (hidden%32, dot4 arch, opt-out flag)
 /// so the branch is decided with zero enqueues — no mid-capture fallback.
-///
-/// Every call site pairs this with `is_q80`, and Q8_0 B codes are SIGNED
-/// (-128..127) while RDNA3/4 `grim_sdot4` lowers to the UNSIGNED dot: the
-/// fused path is therefore exact only where `q80_dot_ok()` holds (RDNA2).
-/// K-quant dot paths are unaffected (codes < 128) and keep their own gates.
+/// `grim_sdot4` sign-extends both operands, making dot4 exact on RDNA2/3/4.
 pub(crate) fn dot_fused_ok(dev: &Dev, hidden: usize) -> bool {
     hidden != 0
         && hidden % 32 == 0
@@ -120,20 +116,14 @@ impl Lfm2 {
                 "decode graph disabled by env".into(),
             ));
         }
-        // LFM2 decode-graph is OPT-IN. The captured attention leg page-faults
-        // deterministically on LFM2.5-230M (Q4_K_M): the first decode replay
-        // dies in `grim_qkv_attention_dev` ("Page not present"), prefill and
-        // step-0 fine, CPU path clean and coherent (" Paris. It is"). The
-        // 350M/VL-3B ran the graph cleanly, but with one known-faulting
-        // configuration in the family and these small models losing little
-        // to eager (~48 ms/token at 350M), default OFF until the
-        // attention_dev replay fault is root-caused. The refusal lands in
-        // the caller's existing capture-failed → eager fallback.
-        if std::env::var("GRIM_LFM2_GRAPH").as_deref() != Ok("1") {
+        // LFM2 decode-graph is enabled by default. To opt-out for diagnostics,
+        // export GRIM_LFM2_GRAPH=0.
+        if matches!(
+            std::env::var("GRIM_LFM2_GRAPH").as_deref(),
+            Ok("0" | "false" | "off")
+        ) {
             return Err(grim_core::error::Error::Backend(
-                "decode graph disabled for Lfm2 by default (230M replay page fault); \
-                 GRIM_LFM2_GRAPH=1 opts in"
-                    .into(),
+                "decode graph disabled for Lfm2 by env (GRIM_LFM2_GRAPH=0)".into(),
             ));
         }
         let dev = dev_for(self)?;
@@ -154,7 +144,9 @@ impl Lfm2 {
         if std::env::var_os("GRIM_FORWARD_TRACE").is_some() {
             eprintln!(
                 "[lfm2-graph] dims hidden={hidden} n_q={n_q} n_k={n_k} inter={inter} vocab={vocab} ctx={ctx} nh={nh} layers={} batch={batch} n_expert={} n_sc_l_cache={}",
-                self.layers.len(), self.cfg.n_expert, self.cfg.n_shortconv_l_cache
+                self.layers.len(),
+                self.cfg.n_expert,
+                self.cfg.n_shortconv_l_cache
             );
         }
         let mut buffers = DecodeGraphBuffers::allocate(
@@ -269,6 +261,10 @@ impl Lfm2 {
                         v_dev: std::ptr::null(),
                         prefill_len: 0,
                         kv_stride: 0,
+                        // No K/V rows travel with a state-only entry.
+                        src_elem_bytes: 4,
+                        k_scales_dev: None,
+                        v_scales_dev: None,
                         gdl_state: state_ptr,
                         _anchor: std::marker::PhantomData,
                     }));
@@ -339,6 +335,13 @@ impl Lfm2 {
                 v_dev: v_ptr,
                 prefill_len: valid_rows,
                 kv_stride,
+                src_elem_bytes: if k_rocm.dtype().arith == grim_tensor::ArithType::F16 {
+                    2
+                } else {
+                    4
+                },
+                k_scales_dev: None,
+                v_scales_dev: None,
                 gdl_state: None,
                 _anchor: std::marker::PhantomData,
             }));
@@ -1090,6 +1093,7 @@ impl Lfm2Block {
                     steps,
                     batch,
                     arena_slot_stride,
+                    grim_backend_rocm::KvRingPolicy::UNLIMITED,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("kv_append k: {e}")))?;
                 grim_backend_rocm::launch_kv_append_batch(
@@ -1101,6 +1105,7 @@ impl Lfm2Block {
                     steps,
                     batch,
                     arena_slot_stride,
+                    grim_backend_rocm::KvRingPolicy::UNLIMITED,
                 )
                 .map_err(|e| grim_core::error::Error::Backend(format!("kv_append v: {e}")))?;
             }
@@ -1132,6 +1137,7 @@ impl Lfm2Block {
             0,
             batch,
             arena_slot_stride,
+            grim_backend_rocm::KvRingPolicy::UNLIMITED,
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention: {e}")))?;
         // Bump LAST so the next replay appends at the new offset (per slot).
@@ -1290,12 +1296,7 @@ impl Lfm2Block {
         // make the kernel and the ring disagree on depth for any checkpoint
         // whose `n_shortconv_l_cache` isn't 3 (finite, plausible-looking
         // output — the failure mode that matters).
-        let l_cache = conv
-            .shape()
-            .dims()
-            .last()
-            .copied()
-            .unwrap_or(3);
+        let l_cache = conv.shape().dims().last().copied().unwrap_or(3);
         dev.short_conv1d_fused_step_into(
             &buffers.sc_proj_buf[layer_idx],
             conv.storage().as_ref(),
@@ -1402,7 +1403,7 @@ impl Lfm2Block {
             batch,
             self.n_expert,
             top_k,
-            0, // softmax routing (matches eager path),
+            0,     // softmax routing (matches eager path),
             false, // softmax mode already normalizes
         )
         .map_err(|e| grim_core::error::Error::Backend(format!("moe route: {e}")))?;

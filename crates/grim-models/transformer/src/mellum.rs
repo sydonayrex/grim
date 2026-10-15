@@ -193,7 +193,7 @@ impl Mellum {
 
             partial_rotary_factor: 1.0,
             yarn: cfg.yarn,
-        ..Default::default()
+            ..Default::default()
         };
 
         // Mellum2 uses a softmax router (no correction bias), no shared expert.

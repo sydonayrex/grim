@@ -28,7 +28,10 @@ fn gpu_device() -> Option<RocmDevice> {
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
     }
 }
@@ -59,7 +62,11 @@ fn dequant_q81(packed: &[u8], len: usize) -> Vec<f32> {
         let s = if h & 0x8000 != 0 { -1.0f32 } else { 1.0f32 };
         let e = ((h >> 10) & 0x1f) as i32;
         let m = (h & 0x3ff) as f32;
-        s * if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
+        s * if e == 0 {
+            m / 1024.0 * 2f32.powi(-14)
+        } else {
+            (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+        }
     };
     let mut out = vec![0f32; len];
     for (bi, chunk) in out.chunks_mut(32).enumerate() {
@@ -96,8 +103,14 @@ fn dot4_kquant_gemv_parity(scheme: &str, k: usize) -> Result<(), String> {
     let a: Vec<f32> = (0..M * k).map(|_| rng.next_f32()).collect();
     let b: Vec<f32> = (0..n * k).map(|_| rng.next_f32()).collect();
 
-    let f32ty = DType { arith: ArithType::F32, storage: Storage::Native };
-    let u8ty = DType { arith: ArithType::U8, storage: Storage::Native };
+    let f32ty = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
+    let u8ty = DType {
+        arith: ArithType::U8,
+        storage: Storage::Native,
+    };
     let a_st = MemoryOps::from_cpu_bytes(&dev, &f32_bytes(&a), &Shape::new(vec![M * k]), f32ty)
         .map_err(|e| format!("a h2d: {e}"))?;
     let q81_len = M * (k / 32) * 36;
@@ -129,7 +142,10 @@ fn dot4_kquant_gemv_parity(scheme: &str, k: usize) -> Result<(), String> {
     let out_st = MemoryOps::alloc_storage(
         &dev,
         &Shape::new(vec![M * n]),
-        DType { arith: ArithType::F32, storage: Storage::Native },
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        },
     )
     .map_err(|e| format!("out alloc: {e}"))?;
 

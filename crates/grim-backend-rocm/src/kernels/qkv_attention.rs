@@ -12,6 +12,70 @@ pub fn kv_f16_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Phase-3 KV-eviction ring policy handed to the graph kernels.
+///
+/// `cap_rows <= 0` means "no cap": the arena grows with the context and every
+/// kernel behaves exactly as before eviction existed. Otherwise the arena
+/// holds `cap_rows` token rows — `sink_rows` pinned attention sinks followed
+/// by the newest `cap_rows - sink_rows` tokens, overwritten in place. See
+/// `grim_kv_ring_row` for the mapping and why the live set stays contiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvRingPolicy {
+    pub cap_rows: i32,
+    pub sink_rows: i32,
+}
+
+impl KvRingPolicy {
+    /// No eviction: the identity for every ring kernel.
+    pub const UNLIMITED: Self = Self {
+        cap_rows: 0,
+        sink_rows: 0,
+    };
+
+    /// Build a policy, clamping sinks into `[0, cap_rows - 1]` so a bad
+    /// `GRIM_KV_SINKS` can never consume the whole arena (which would make the
+    /// ring degenerate to `t % cap_rows` and drop the sinks).
+    pub fn new(cap_rows: usize, sink_rows: usize) -> Self {
+        if cap_rows == 0 {
+            return Self::UNLIMITED;
+        }
+        let cap = i32::try_from(cap_rows).unwrap_or(i32::MAX);
+        let sink = i32::try_from(sink_rows)
+            .unwrap_or(i32::MAX)
+            .min(cap - 1)
+            .max(0);
+        Self {
+            cap_rows: cap,
+            sink_rows: sink,
+        }
+    }
+
+    pub fn is_limited(self) -> bool {
+        self.cap_rows > 0
+    }
+
+    /// Host twin of `grim_kv_ring_row`: the arena row an ABSOLUTE token row
+    /// maps to. `KvRingPolicy::row_matches_device_arithmetic` pins this against
+    /// the inlined device formula, and every host-side caller (the eager
+    /// append, the capture-topology validators) goes through here so there is
+    /// exactly one copy of the mapping in Rust.
+    pub fn row(self, t: usize) -> usize {
+        if self.cap_rows <= 0 {
+            return t;
+        }
+        let t = t as i64;
+        let cap = self.cap_rows as i64;
+        if t < cap {
+            return t as usize;
+        }
+        let span = cap - self.sink_rows as i64;
+        if span <= 0 {
+            return (t % cap) as usize;
+        }
+        (self.sink_rows as i64 + (t - self.sink_rows as i64) % span) as usize
+    }
+}
+
 /// Dense KV-arena representation on ROCm.
 ///
 /// `GRIM_KV_ARENA=f32|f16|int8` wins when set; otherwise the legacy
@@ -1769,6 +1833,26 @@ void grim_qkv_attention_paged_quant(
 }
 
 
+// Phase 3 (KV eviction): map an ABSOLUTE token row to its arena row under a
+// fixed-capacity ring with pinned attention sinks.
+//
+//   rows [0, sink_rows)            -> the first tokens, never evicted
+//   rows [sink_rows, cap_rows)     -> the newest (cap_rows - sink_rows) tokens,
+//                                     overwritten in place
+//
+// The live set is therefore ALWAYS the contiguous range [0, min(t, cap_rows)),
+// which is why the attention kernels only need a capacity clamp and no gather.
+// cap_rows <= 0 means "no cap" (today's grow-with-context behavior).
+//
+// The eager path passes absolute offsets and maps on the host; only the graph
+// kernels need this on-device.
+__device__ inline int grim_kv_ring_row(int t, int cap_rows, int sink_rows) {
+    if (cap_rows <= 0 || t < cap_rows) return t;
+    const int span = cap_rows - sink_rows;
+    if (span <= 0) return t % cap_rows;  // sinks consumed the arena
+    return sink_rows + (t - sink_rows) % span;
+}
+
 // Phase 2 (int8 KV arenas): append-quantize. One block per (slot, step, kv_head)
 // head-vector quantizes `head_dim` f32 values to symmetric int8
 // (q = clamp(round(x/scale), -127, 127), scale = maxabs/127, all-zero row
@@ -1786,7 +1870,9 @@ extern "C" __global__ void grim_kv_append_i8(
     int steps,
     int batch,
     int arena_slot_stride,
-    int scale_slot_stride) {
+    int scale_slot_stride,
+    int cap_rows,
+    int sink_rows) {
     const int vec = blockIdx.x;  // one head-vector per block
     const int tid = threadIdx.x;
     const int vecs_per_slot = steps * nkv_heads;
@@ -1797,7 +1883,10 @@ extern "C" __global__ void grim_kv_append_i8(
     const int step = rem / nkv_heads;
     const int kh = rem - step * nkv_heads;
     const int past = past_dev[slot];
-    const int abs_row = past + step;
+    // Phase 3: codes and scales are indexed by the SAME (ring-mapped) token
+    // row — they must never drift apart, or the reader pairs a row's codes
+    // with another row's scale.
+    const int abs_row = grim_kv_ring_row(past + step, cap_rows, sink_rows);
     const long long src_base = ((long long)slot * steps + step) * kv_stride + (long long)kh * head_dim;
     const long long dst_base = (long long)slot * arena_slot_stride + (long long)abs_row * kv_stride + (long long)kh * head_dim;
     const long long sc_idx = (long long)slot * scale_slot_stride + (long long)abs_row * nkv_heads + kh;
@@ -1862,7 +1951,9 @@ extern "C" __global__ void grim_kv_append(
     int steps,
     int batch,
     int arena_slot_stride,
-    int f16
+    int f16,
+    int cap_rows,
+    int sink_rows
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int per_slot = steps * kv_stride;
@@ -1871,7 +1962,13 @@ extern "C" __global__ void grim_kv_append(
     const int slot = (batch > 1) ? (tid / per_slot) : 0;
     const int local = tid - slot * per_slot;
     const int past = past_dev[slot];
-    long long off = (long long)slot * arena_slot_stride + past * kv_stride + local;
+    // Phase 3: map the token row through the eviction ring. `local` walks the
+    // whole steps x kv_stride span, so the row advances every kv_stride
+    // elements and the in-row column is the remainder.
+    const int row_local = local / kv_stride;
+    const int col = local - row_local * kv_stride;
+    const int dst_tok = grim_kv_ring_row(past + row_local, cap_rows, sink_rows);
+    long long off = (long long)slot * arena_slot_stride + (long long)dst_tok * kv_stride + col;
     if (f16) {
         // GRAVE Phase 1: arena holds f16 (2-byte) elements at the same
         // element offsets; convert on store.
@@ -2098,7 +2195,8 @@ extern "C" __global__ void grim_qkv_attention_dev(
     int has_alibi,
     int batch,
     int arena_slot_stride,
-    int kv_f16
+    int kv_f16,
+    int cap_rows   // Phase 3 ring capacity in token rows; <= 0 means unlimited
 ) {
     // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
     // P3: blockIdx.z is the batch slot — every slot has its own arena region
@@ -2119,7 +2217,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     const int d = lane_id;
     const bool thread_active = d < head_dim;
     if (head_dim > 256) {
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) out[q_offset + d] = nanf("");
         }
@@ -2134,17 +2232,25 @@ extern "C" __global__ void grim_qkv_attention_dev(
     // so the live KV length during this attention is `total_dev[slot] + steps`.
     // `steps` is a graph-safe constant (1 for decode), so replay N times
     // re-derives the right total from the live per-slot total_dev each time.
-    const int kv_seq_len = total_dev[slot] + steps;
-    // Decode: single query at absolute position (kv_seq_len - 1).
+    int live_rows = total_dev[slot] + steps;
+    // Phase 3: under the eviction ring the arena is a fixed capacity and the
+    // live tokens are the contiguous prefix [0, min(live_rows, cap_rows)) —
+    // sinks plus the newest tokens. Clamping here is the whole read-side
+    // change; no gather is needed. cap_rows <= 0 means unlimited.
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    // Decode: single query at the last live row (all live rows are <= it).
     const int abs_i = kv_seq_len - 1;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
-    const int lo = window_lo;
+    // A window lower bound computed from the ABSOLUTE position can exceed the
+    // live range once tokens have been evicted; clamp so the range is never
+    // inverted (hi < lo).
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
     const int range_len = hi - lo;
     const int base = range_len / num_waves;
     const int rem  = range_len % num_waves;
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
-    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
     const unsigned short* k_head16 = (const unsigned short*)k_tensor;
@@ -2154,7 +2260,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     const int kv_stride = num_kv_heads * head_dim;
     float q_reg[8];
     if (thread_active) {
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
         }
@@ -2162,7 +2268,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     for (int j = j_start; j < j_end; ++j) {
         const int kv_idx = lo + j;
         float score = 0.0f;
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             if (idx < head_dim) {
                 float kvv = kv_f16
@@ -2185,7 +2291,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
             float scale_a = expf(running_max - mw);
             float scale_b = expf(score - mw);
             running_sum = running_sum * scale_a + scale_b;
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < 8; ++c) {
                 int idx = d + c * wave_size;
                 if (idx < head_dim) {
                     float vv = kv_f16
@@ -2204,7 +2310,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < 8; ++c) {
         int idx = d + c * wave_size;
         if (idx < head_dim) {
             s_acc[wave_id][idx] = out_acc[c];
@@ -2230,9 +2336,9 @@ extern "C" __global__ void grim_qkv_attention_dev(
     const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
 
     // Each lane reconstructs its strided slice of the normalized attention row.
-    float attn_reg[4];
+    float attn_reg[8];
     #pragma unroll
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < 8; ++c) {
         attn_reg[c] = 0.0f;
         int idx = d + c * wave_size;
         if (idx < head_dim) {
@@ -2247,7 +2353,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
     }
 
     if (fuse_o == 0) {
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
         }
@@ -2258,7 +2364,7 @@ extern "C" __global__ void grim_qkv_attention_dev(
         // (host-zeroed) fused output row. `out` here is [seq_len, o_dim].
         for (int oc = 0; oc < o_dim; ++oc) {
             float partial = 0.0f;
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < 8; ++c) {
                 int idx = d + c * wave_size;
                 if (idx < head_dim) {
                     partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
@@ -2303,7 +2409,8 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     int arena_slot_stride,
     const float* __restrict__ k_scales,
     const float* __restrict__ v_scales,
-    int scale_slot_stride
+    int scale_slot_stride,
+    int cap_rows   // Phase 3 ring capacity in token rows; <= 0 means unlimited
 ) {
     // grid = (seq_len, num_heads, batch); block = (blockDim.x, 1, 1).
     // P3: blockIdx.z is the batch slot — every slot has its own arena region
@@ -2324,7 +2431,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     const int d = lane_id;
     const bool thread_active = d < head_dim;
     if (head_dim > 256) {
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) out[q_offset + d] = nanf("");
         }
@@ -2339,17 +2446,25 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     // so the live KV length during this attention is `total_dev[slot] + steps`.
     // `steps` is a graph-safe constant (1 for decode), so replay N times
     // re-derives the right total from the live per-slot total_dev each time.
-    const int kv_seq_len = total_dev[slot] + steps;
-    // Decode: single query at absolute position (kv_seq_len - 1).
+    int live_rows = total_dev[slot] + steps;
+    // Phase 3: under the eviction ring the arena is a fixed capacity and the
+    // live tokens are the contiguous prefix [0, min(live_rows, cap_rows)) —
+    // sinks plus the newest tokens. Clamping here is the whole read-side
+    // change; no gather is needed. cap_rows <= 0 means unlimited.
+    const int kv_seq_len = (cap_rows > 0 && live_rows > cap_rows) ? cap_rows : live_rows;
+    // Decode: single query at the last live row (all live rows are <= it).
     const int abs_i = kv_seq_len - 1;
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
-    const int lo = window_lo;
+    // A window lower bound computed from the ABSOLUTE position can exceed the
+    // live range once tokens have been evicted; clamp so the range is never
+    // inverted (hi < lo).
+    const int lo = (window_lo < kv_seq_len) ? window_lo : kv_seq_len;
     const int range_len = hi - lo;
     const int base = range_len / num_waves;
     const int rem  = range_len % num_waves;
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
-    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
     // int8-KV variant (Phase 2): codes are biased-u8 (same element layout
@@ -2359,7 +2474,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     const int kv_stride = num_kv_heads * head_dim;
     float q_reg[8];
     if (thread_active) {
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             q_reg[c] = (idx < head_dim) ? q[q_offset + idx] : 0.0f;
         }
@@ -2367,7 +2482,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     for (int j = j_start; j < j_end; ++j) {
         const int kv_idx = lo + j;
         float score = 0.0f;
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             if (idx < head_dim) {
                 float kvv = ((float)((int)k_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_stride + (long long)kv_head * head_dim + idx] - 128) / 127.0f)
@@ -2389,7 +2504,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
             float scale_a = expf(running_max - mw);
             float scale_b = expf(score - mw);
             running_sum = running_sum * scale_a + scale_b;
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < 8; ++c) {
                 int idx = d + c * wave_size;
                 if (idx < head_dim) {
                     float vv = ((float)((int)v_u8[(long long)slot * arena_slot_stride + (long long)kv_idx * kv_stride + (long long)kv_head * head_dim + idx] - 128) / 127.0f)
@@ -2407,7 +2522,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < 8; ++c) {
         int idx = d + c * wave_size;
         if (idx < head_dim) {
             s_acc[wave_id][idx] = out_acc[c];
@@ -2433,9 +2548,9 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
 
     // Each lane reconstructs its strided slice of the normalized attention row.
-    float attn_reg[4];
+    float attn_reg[8];
     #pragma unroll
-    for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < 8; ++c) {
         attn_reg[c] = 0.0f;
         int idx = d + c * wave_size;
         if (idx < head_dim) {
@@ -2450,7 +2565,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
     }
 
     if (fuse_o == 0) {
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 8; ++c) {
             int idx = d + c * wave_size;
             if (idx < head_dim) out[q_offset + idx] = attn_reg[c];
         }
@@ -2461,7 +2576,7 @@ extern "C" __global__ void grim_qkv_attention_dev_i8(
         // (host-zeroed) fused output row. `out` here is [seq_len, o_dim].
         for (int oc = 0; oc < o_dim; ++oc) {
             float partial = 0.0f;
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < 8; ++c) {
                 int idx = d + c * wave_size;
                 if (idx < head_dim) {
                     partial += attn_reg[c] * o_proj_w[(h * head_dim + idx) * o_dim + oc];
@@ -3292,6 +3407,7 @@ pub fn launch_kv_append(
     past_dev: &dyn BackendStorage,
     kv_stride: usize,
     steps: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
     let mut f16_flag = kv_arena_f16(k_arena, "kv_append")? as i32;
     let total = steps * kv_stride;
@@ -3312,6 +3428,9 @@ pub fn launch_kv_append(
         .ok_or_else(|| crate::Error::Backend("kv_append: past_dev has no device ptr".into()))?;
     let mut stride_i = kv_stride as i32;
     let mut steps_i = steps as i32;
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
     let (grid, block) = crate::device::util::linear_launch(total);
     // Legacy single-sequence path: batch=1 (slot always 0 in the kernel).
     dev.launch_compute_kernel(
@@ -3327,6 +3446,8 @@ pub fn launch_kv_append(
             arg(&mut 1i32),
             arg(&mut 0i32),
             arg(&mut f16_flag),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
         ],
     )
 }
@@ -3344,7 +3465,11 @@ pub fn launch_kv_append_batch(
     steps: usize,
     batch: usize,
     arena_slot_stride: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
     let mut f16_flag = kv_arena_f16(k_arena, "kv_append_batch")? as i32;
     let arena_s = k_arena
         .as_any()
@@ -3384,6 +3509,8 @@ pub fn launch_kv_append_batch(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut f16_flag),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
         ],
     )
 }
@@ -3587,7 +3714,11 @@ pub fn launch_kv_append_i8(
     batch: usize,
     arena_slot_stride: usize,
     scale_slot_stride: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
+    let mut sink_rows_i = ring.sink_rows;
     use crate::memory::storage::RocmStorage;
     use grim_tensor::dtype::ArithType;
     let codes_s = codes
@@ -3654,6 +3785,8 @@ pub fn launch_kv_append_i8(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
+            arg(&mut sink_rows_i),
         ],
     )
 }
@@ -3683,6 +3816,7 @@ pub fn launch_qkv_attention_dev(
     fuse_o: u32,
     alibi_slopes: &dyn BackendStorage,
     has_alibi: u32,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
     launch_qkv_attention_dev_batch(
         dev,
@@ -3708,6 +3842,7 @@ pub fn launch_qkv_attention_dev(
         has_alibi,
         1,
         0,
+        ring,
     )
 }
 
@@ -3740,6 +3875,7 @@ pub fn launch_qkv_attention_dev_batch(
     has_alibi: u32,
     batch: usize,
     arena_slot_stride: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
     const KERNEL: &str = "grim_qkv_attention_dev";
     if head_dim > 256 {
@@ -3841,6 +3977,8 @@ pub fn launch_qkv_attention_dev_batch(
     // f16_flag derived from the arenas above (storage truth).
     let grid_dim = crate::HipDim3::new(sl as u32, nh as u32, batch.max(1) as u32);
     let block_dim = crate::HipDim3::new(128, 1, 1);
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
     dev.launch_compute_kernel(
         KERNEL,
         grid_dim,
@@ -3869,6 +4007,7 @@ pub fn launch_qkv_attention_dev_batch(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut f16_flag),
+            arg(&mut cap_rows_i),
         ],
     )
 }
@@ -3904,7 +4043,10 @@ pub fn launch_qkv_attention_dev_batch_i8(
     batch: usize,
     arena_slot_stride: usize,
     scale_slot_stride: usize,
+    ring: KvRingPolicy,
 ) -> Result<*mut std::ffi::c_void, crate::Error> {
+    // Phase 3 ring (cap_rows <= 0 disables eviction).
+    let mut cap_rows_i = ring.cap_rows;
     const KERNEL: &str = "grim_qkv_attention_dev_i8";
     use crate::memory::storage::RocmStorage;
     use grim_tensor::dtype::ArithType;
@@ -4038,6 +4180,7 @@ pub fn launch_qkv_attention_dev_batch_i8(
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
             arg(&mut sc_slot_stride_i),
+            arg(&mut cap_rows_i),
         ],
     )
 }
@@ -4781,6 +4924,7 @@ mod tests {
                 past_dev.as_ref(),
                 kv_stride,
                 steps,
+                KvRingPolicy::UNLIMITED,
             )
             .unwrap();
             dev.synchronize();
@@ -4920,6 +5064,7 @@ mod tests {
                 0,
                 dummy.as_ref(),
                 0,
+                KvRingPolicy::UNLIMITED,
             )
             .unwrap();
             let _ = stream;

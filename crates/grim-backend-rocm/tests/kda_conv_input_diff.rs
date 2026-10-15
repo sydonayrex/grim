@@ -122,13 +122,38 @@ fn conv_kernels_arbitrated_on_production_bytes() {
             .map(|(g, w)| (g - w).abs())
             .fold(0.0f32, f32::max)
     };
-    eprintln!("[arb] arm1 (step kernel) vs d2d production: {:.6}", d(&arm1, &mix_d2d));
-    eprintln!("[arb] arm1 (step kernel) vs host production: {:.6}", d(&arm1, &mix_host));
-    eprintln!("[arb] arm2 (host math)   vs d2d production: {:.6}", d(&arm2, &mix_d2d));
-    eprintln!("[arb] arm2 (host math)   vs host production: {:.6}", d(&arm2, &mix_host));
-    eprintln!("[arb] cpu oracle         vs arm1: {:.6}   vs arm2: {:.6}", d(&cpu, &arm1), d(&cpu, &arm2));
-    eprintln!("[arb] samples c=0..3: cpu={:?} arm1={:?} arm2={:?}", &cpu[..4], &arm1[..4], &arm2[..4]);
-    eprintln!("[arb] production: d2d_mix[0..4]={:?} host_mix[0..4]={:?}", &mix_d2d[..4], &mix_host[..4]);
+    eprintln!(
+        "[arb] arm1 (step kernel) vs d2d production: {:.6}",
+        d(&arm1, &mix_d2d)
+    );
+    eprintln!(
+        "[arb] arm1 (step kernel) vs host production: {:.6}",
+        d(&arm1, &mix_host)
+    );
+    eprintln!(
+        "[arb] arm2 (host math)   vs d2d production: {:.6}",
+        d(&arm2, &mix_d2d)
+    );
+    eprintln!(
+        "[arb] arm2 (host math)   vs host production: {:.6}",
+        d(&arm2, &mix_host)
+    );
+    eprintln!(
+        "[arb] cpu oracle         vs arm1: {:.6}   vs arm2: {:.6}",
+        d(&cpu, &arm1),
+        d(&cpu, &arm2)
+    );
+    eprintln!(
+        "[arb] samples c=0..3: cpu={:?} arm1={:?} arm2={:?}",
+        &cpu[..4],
+        &arm1[..4],
+        &arm2[..4]
+    );
+    eprintln!(
+        "[arb] production: d2d_mix[0..4]={:?} host_mix[0..4]={:?}",
+        &mix_d2d[..4],
+        &mix_host[..4]
+    );
 }
 
 /// Extract the step kernel's ACTUAL coefficient vector per input position:
@@ -236,7 +261,8 @@ fn embedding_gather_arbitration_real_table() {
 
     // Full packed table, device-resident, exactly as production loads it.
     let mut f = std::fs::File::open(path).unwrap();
-    f.seek(std::io::SeekFrom::Start(gg.data_start + t.offset)).unwrap();
+    f.seek(std::io::SeekFrom::Start(gg.data_start + t.offset))
+        .unwrap();
     let mut table = vec![0u8; total_bytes];
     f.read_exact(&mut table).unwrap();
     let table_s = grim_tensor::MemoryOps::from_cpu_bytes(

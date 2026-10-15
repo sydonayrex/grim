@@ -12,9 +12,9 @@
 //!   --test charon_kq_native_grouped_parity
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::dtype::{ArithType, DType, Storage};
 use grim_tensor::MemoryOps;
 use grim_tensor::Shape;
+use grim_tensor::dtype::{ArithType, DType, Storage};
 use std::sync::Arc;
 
 // PRODUCTION geometry (xing4.0 blk.2+): hidden=3584, inter=1024, 64 experts.
@@ -98,9 +98,7 @@ fn host_reference(
         let mut flat = Vec::with_capacity(rows * k);
         for r in 0..rows {
             let row = &blob[r * (k / 256) * 110..(r + 1) * (k / 256) * 110];
-            flat.extend_from_slice(
-                &grim_quant::dequant_iq3s(row, k).expect("host iq3s dequant"),
-            );
+            flat.extend_from_slice(&grim_quant::dequant_iq3s(row, k).expect("host iq3s dequant"));
         }
         let _ = gate_row_bytes.min(down_row_bytes);
         flat
@@ -308,7 +306,9 @@ fn kq_native_grouped_matches_host_iq3s_reference() {
     )
     .expect("out alloc");
 
-    fn as_rocm_s(a: &Arc<dyn grim_tensor::backend::BackendStorage>) -> &grim_backend_rocm::memory::storage::RocmStorage {
+    fn as_rocm_s(
+        a: &Arc<dyn grim_tensor::backend::BackendStorage>,
+    ) -> &grim_backend_rocm::memory::storage::RocmStorage {
         a.as_any()
             .downcast_ref::<grim_backend_rocm::memory::storage::RocmStorage>()
             .unwrap()
@@ -331,7 +331,7 @@ fn kq_native_grouped_matches_host_iq3s_reference() {
         rsf,
         gate_row_bytes,
         down_row_bytes,
-                0,
+        0,
     )
     .expect("kq native dispatch");
     dev.synchronize();
@@ -364,9 +364,7 @@ fn kq_native_grouped_matches_host_iq3s_reference() {
         scale = scale.max(g.abs()).max(wv.abs());
     }
     let rel = max_abs / scale;
-    eprintln!(
-        "[kq-parity] kernel vs host-iq3s: max_abs {max_abs:.3e} rel {rel:.3e}"
-    );
+    eprintln!("[kq-parity] kernel vs host-iq3s: max_abs {max_abs:.3e} rel {rel:.3e}");
     assert!(
         rel < 1e-3,
         "K-quant native grouped kernel diverges from the host IQ3_S reference (rel {rel:.3e})"
@@ -396,10 +394,16 @@ fn kq_native_matches_host_on_real_banks() {
     use grim_format::tprov::GgufProvider;
     use grim_nn::WeightSource;
     let prov = GgufProvider::open(&path).expect("open gguf");
-    let ws = WeightSource::root(&prov, grim_tensor::Device::Cpu).pp("blk").pp("2");
-    let gate_raw = ws.get_raw_packed("ffn_gate_exps.weight").expect("gate bank");
+    let ws = WeightSource::root(&prov, grim_tensor::Device::Cpu)
+        .pp("blk")
+        .pp("2");
+    let gate_raw = ws
+        .get_raw_packed("ffn_gate_exps.weight")
+        .expect("gate bank");
     let up_raw = ws.get_raw_packed("ffn_up_exps.weight").expect("up bank");
-    let down_raw = ws.get_raw_packed("ffn_down_exps.weight").expect("down bank");
+    let down_raw = ws
+        .get_raw_packed("ffn_down_exps.weight")
+        .expect("down bank");
     eprintln!(
         "[kq-real] gate dtype {:?} bytes {} shape {:?}",
         gate_raw.dtype,
@@ -504,7 +508,7 @@ fn kq_native_matches_host_on_real_banks() {
         rsf,
         gate_stride as u64,
         down_stride as u64,
-                0,
+        0,
     )
     .expect("kq native dispatch (real banks)");
     dev.synchronize();
@@ -524,9 +528,7 @@ fn kq_native_matches_host_on_real_banks() {
             let mut flat = Vec::with_capacity(rows * k);
             for r in 0..rows {
                 let row = &blob[r * (k / 256) * 110..(r + 1) * (k / 256) * 110];
-                flat.extend_from_slice(
-                    &grim_quant::dequant_iq3s(row, k).expect("host iq3s"),
-                );
+                flat.extend_from_slice(&grim_quant::dequant_iq3s(row, k).expect("host iq3s"));
             }
             flat
         };
@@ -584,8 +586,8 @@ fn kq_native_over_runtime_bank_storages() {
     let ws = Ws::root(&prov, grim_tensor::Device::Rocm(0))
         .pp("blk")
         .pp("2");
-    let bank = grim_nn::moe::ExpertBank::load(&ws, 64, 3584, 1024, false)
-        .expect("load bank on Rocm");
+    let bank =
+        grim_nn::moe::ExpertBank::load(&ws, 64, 3584, 1024, false).expect("load bank on Rocm");
     let w0 = &bank.gate[0].weight;
     eprintln!(
         "[kq-rt] gate[0] dtype {:?} dims {:?} bytes",
@@ -613,4 +615,3 @@ fn kq_native_over_runtime_bank_storages() {
         .unwrap();
     eprintln!("[kq-rt] down[0] storage bytes {}", sd0.bytes());
 }
-

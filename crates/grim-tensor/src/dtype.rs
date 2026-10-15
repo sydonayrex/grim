@@ -596,7 +596,6 @@ impl TryFrom<&Storage> for QuantFormat {
                 // packed bytes. A loud "no QuantFormat mapping" error is the
                 // better failure, so neither side moves alone.
                 KQuantScheme::GsqRco3p5 => Ok(QuantFormat::GsqRco3p5),
-
             },
             Storage::FloatPack(f) => match f {
                 FloatPackScheme::Fp4 => Ok(QuantFormat::Fp4),

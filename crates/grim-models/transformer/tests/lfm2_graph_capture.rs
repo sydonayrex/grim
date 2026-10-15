@@ -309,11 +309,10 @@ fn tiny_lfm2_q80_down(dev: &RocmDevice, ordinal: usize, n_layers: usize) -> Lfm2
 /// gate. (With the opt-in they exercise the known-faulting path and abort --
 /// that underlying page fault is tracked separately, not here.)
 fn graph_opted_in() -> bool {
-    if std::env::var("GRIM_LFM2_GRAPH").as_deref() == Ok("1") {
-        return true;
-    }
-    eprintln!("skip: LFM2 decode graph is opt-in (GRIM_LFM2_GRAPH=1)");
-    false
+    !matches!(
+        std::env::var("GRIM_LFM2_GRAPH").as_deref(),
+        Ok("0" | "false" | "off")
+    )
 }
 
 #[test]

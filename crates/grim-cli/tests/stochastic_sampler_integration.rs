@@ -30,18 +30,12 @@ fn test_stochastic_sampler_integration() {
         .downcast_ref::<grim_backend_rocm::RocmStorage>()
         .unwrap();
 
-    let tok = sample_logits_on_device_at(
-        &dev,
-        logits_gpu,
-        vocab,
-        0.7f32,
-        50,
-        0.9f32,
-        12345u64,
-        0,
-    )
-    .unwrap()
-    .expect("Sampling should produce a token");
+    let tok = sample_logits_on_device_at(&dev, logits_gpu, vocab, 0.7f32, 50, 0.9f32, 12345u64, 0)
+        .unwrap()
+        .expect("Sampling should produce a token");
 
-    assert_eq!(tok, 42, "Dominant logit token 42 must be selected under low-entropy sampling");
+    assert_eq!(
+        tok, 42,
+        "Dominant logit token 42 must be selected under low-entropy sampling"
+    );
 }

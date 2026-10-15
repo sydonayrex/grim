@@ -2014,6 +2014,14 @@ impl RecurrentOps for CpuDevice {
         let mut out = vec![0.0f32; out_shape.elem_count()];
         for h in 0..hidden {
             let mut sum = 0.0f32;
+            // conv_state is channel-major flat: tap k of channel h lives at
+            // `h * (taps - 1) + k`. This is the layout the GPU kernel
+            // (`grim_short_conv1d_causal_step`: `state_offset + k`), the
+            // graph `sc_state` ring ([channel][tap]), and the `short_conv1d`
+            // host fallback all share — verified by
+            // `cpu_device_impl_agrees_with_fallback`. A tap-major read here
+            // diverges ~0.26 on nonzero state and breaks any multi-call
+            // chain that mixes this impl with the fallback/kernel.
             for k in 0..k_size.saturating_sub(1) {
                 sum += st_data[h * (k_size - 1) + k] * w_data[h * k_size + k];
             }

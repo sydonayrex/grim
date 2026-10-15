@@ -14,13 +14,19 @@ fn packed_blocks(n_blocks: usize, block_bytes: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(n_blocks * block_bytes);
     let mut s = seed | 1;
     let mut next = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (s >> 33) as u8
     };
     for _ in 0..n_blocks {
         for i in 0..block_bytes {
             // scales stay small so dequant never explodes to inf
-            let b = if i < 2 { 0x30 + (next() & 0x0f) } else { next() };
+            let b = if i < 2 {
+                0x30 + (next() & 0x0f)
+            } else {
+                next()
+            };
             out.push(b);
         }
     }
@@ -83,7 +89,11 @@ fn parallel_and_disk_cached_requant_match_the_serial_path_byte_for_byte() {
     // Shapes in the decode range: an FFN matrix and a q/k/o projection. Both
     // must keep k % 256 == 0 (the linear_decode_into contract) and n large
     // enough to chunk.
-    let shapes = [(512usize, 1024usize), (256usize, 2048usize), (128usize, 512usize)];
+    let shapes = [
+        (512usize, 1024usize),
+        (256usize, 2048usize),
+        (128usize, 512usize),
+    ];
     for (scheme, block_bytes) in [(KQuantScheme::Q4K, 144usize), (KQuantScheme::Q6K, 210usize)] {
         for (n, k) in shapes {
             let n_blocks = (n * k) / 256;
@@ -91,9 +101,18 @@ fn parallel_and_disk_cached_requant_match_the_serial_path_byte_for_byte() {
             let (qw, sc, zr) = serial_requant(&packed, n, k, scheme);
             for chunk_rows in [1usize, 7, 64, n] {
                 let (pqw, psc, pzr) = parallel_requant(&packed, n, k, scheme, chunk_rows);
-                assert_eq!(pqw, qw, "qweight differs (scheme {scheme:?} {n}x{k}, chunk {chunk_rows})");
-                assert_eq!(psc, sc, "scales differ (scheme {scheme:?} {n}x{k}, chunk {chunk_rows})");
-                assert_eq!(pzr, zr, "zeros differ (scheme {scheme:?} {n}x{k}, chunk {chunk_rows})");
+                assert_eq!(
+                    pqw, qw,
+                    "qweight differs (scheme {scheme:?} {n}x{k}, chunk {chunk_rows})"
+                );
+                assert_eq!(
+                    psc, sc,
+                    "scales differ (scheme {scheme:?} {n}x{k}, chunk {chunk_rows})"
+                );
+                assert_eq!(
+                    pzr, zr,
+                    "zeros differ (scheme {scheme:?} {n}x{k}, chunk {chunk_rows})"
+                );
             }
         }
     }
@@ -119,9 +138,8 @@ fn disk_cache_round_trip_is_byte_identical() {
     blob.extend_from_slice(&sc);
     blob.extend_from_slice(&zr);
 
-    let rd = |o: usize| {
-        u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]) as usize
-    };
+    let rd =
+        |o: usize| u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]) as usize;
     assert_eq!(rd(0), 0x57_43_00_01);
     assert_eq!(rd(4), grim_quant::OSTQUANT_ENCODER_VERSION as usize);
     assert_eq!(rd(8), n);

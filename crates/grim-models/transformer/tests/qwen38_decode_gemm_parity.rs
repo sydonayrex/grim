@@ -128,28 +128,23 @@ fn qwen38_decode_gemm_parity_m1() {
 
     // Warmed (steady-state) M=1 forwards: run twice, measure the second, so
     // one-time u4 conversions cannot flatter or damn the result.
-    let check = |tag: &str,
-                 gl: &Linear,
-                 cl: &Linear,
-                 xr: &[f32],
-                 in_n: usize,
-                 out_n: usize,
-                 tol: f32| {
-        let x1 = up1(xr, 1, in_n);
-        for _ in 0..1 {
-            let _ = gl.forward(&x1).expect("warmup").to_vec_f32().expect("read");
-        }
-        let got = gl.forward(&x1).expect("fwd").to_vec_f32().expect("read");
-        let (wd, w_in, w_out) = lin_w(cl);
-        assert_eq!((w_in, w_out), (in_n, out_n), "{tag}: geometry");
-        let want = matvec(xr, &wd, in_n, out_n);
-        let w = worst(&got, &want);
-        eprintln!("[m1-parity] {tag}: worst {w:.3e} (tol {tol:.1e})");
-        assert!(
-            w <= tol,
-            "{tag}: M=1 GEMM disagrees with host reference: worst {w:.3e}"
-        );
-    };
+    let check =
+        |tag: &str, gl: &Linear, cl: &Linear, xr: &[f32], in_n: usize, out_n: usize, tol: f32| {
+            let x1 = up1(xr, 1, in_n);
+            for _ in 0..1 {
+                let _ = gl.forward(&x1).expect("warmup").to_vec_f32().expect("read");
+            }
+            let got = gl.forward(&x1).expect("fwd").to_vec_f32().expect("read");
+            let (wd, w_in, w_out) = lin_w(cl);
+            assert_eq!((w_in, w_out), (in_n, out_n), "{tag}: geometry");
+            let want = matvec(xr, &wd, in_n, out_n);
+            let w = worst(&got, &want);
+            eprintln!("[m1-parity] {tag}: worst {w:.3e} (tol {tol:.1e})");
+            assert!(
+                w <= tol,
+                "{tag}: M=1 GEMM disagrees with host reference: worst {w:.3e}"
+            );
+        };
 
     // Full-attention layer 3: Q5K fused-Q (u4-decode skip gate) and IQ4_NL
     // down-projection (WMMA grid-coverage gate).

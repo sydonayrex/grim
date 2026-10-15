@@ -217,10 +217,17 @@ impl DeepSeek32Mla {
             (cfg.index_n_heads, cfg.index_head_dim, cfg.index_topk)
         {
             let idx_ws = ws.scoped("indexer");
-            let wk = Linear::load_shape(&idx_ws.scoped("wk"), [cfg.hidden_size, n_heads * head_dim]).ok();
+            let wk =
+                Linear::load_shape(&idx_ws.scoped("wk"), [cfg.hidden_size, n_heads * head_dim])
+                    .ok();
             let k_norm = RmsNorm::load(&idx_ws.scoped("k_norm"), head_dim, cfg.rms_norm_eps).ok();
-            let wq_b = Linear::load_shape(&idx_ws.scoped("wq_b"), [n_heads * head_dim, cfg.hidden_size]).ok();
-            let weights_proj = Linear::load_shape(&idx_ws.scoped("weights_proj"), [n_heads, cfg.hidden_size]).ok();
+            let wq_b = Linear::load_shape(
+                &idx_ws.scoped("wq_b"),
+                [n_heads * head_dim, cfg.hidden_size],
+            )
+            .ok();
+            let weights_proj =
+                Linear::load_shape(&idx_ws.scoped("weights_proj"), [n_heads, cfg.hidden_size]).ok();
             if let (Some(wq_b), Some(weights_proj)) = (wq_b, weights_proj) {
                 Some(DeepSeek32Indexer {
                     wk,
@@ -454,18 +461,16 @@ impl DeepSeek32Mla {
                             let mut total_s = 0.0f32;
                             for j in 0..h_idx {
                                 let w_val = w_idx_v.get(s * h_idx + j).copied().unwrap_or(1.0);
-                                let q_slice = &q_idx_v[(s * h_idx + j) * d_idx..(s * h_idx + j + 1) * d_idx];
+                                let q_slice =
+                                    &q_idx_v[(s * h_idx + j) * d_idx..(s * h_idx + j + 1) * d_idx];
                                 let k_slice = if t < seq_len && t * d_idx + d_idx <= k_idx_v.len() {
                                     &k_idx_v[t * d_idx..(t + 1) * d_idx]
                                 } else {
                                     // Key fallback from latent slice
                                     &latent_all_v[t * row..t * row + d_idx.min(rank)]
                                 };
-                                let dot: f32 = q_slice
-                                    .iter()
-                                    .zip(k_slice.iter())
-                                    .map(|(a, b)| a * b)
-                                    .sum();
+                                let dot: f32 =
+                                    q_slice.iter().zip(k_slice.iter()).map(|(a, b)| a * b).sum();
                                 let relu_dot = dot.max(0.0f32);
                                 total_s += w_val * relu_dot;
                             }
@@ -1121,4 +1126,3 @@ mod tests {
         }
     }
 }
-

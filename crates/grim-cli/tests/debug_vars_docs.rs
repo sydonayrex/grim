@@ -18,7 +18,9 @@ fn documented_vars(doc: &str) -> BTreeSet<String> {
     while i + 5 < bytes.len() {
         if &bytes[i..i + 5] == b"GRIM_" {
             let mut j = i + 5;
-            while j < bytes.len() && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit() || bytes[j] == b'_') {
+            while j < bytes.len()
+                && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit() || bytes[j] == b'_')
+            {
                 j += 1;
             }
             if j > i + 5 {

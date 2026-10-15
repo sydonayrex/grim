@@ -4243,7 +4243,9 @@ pub fn curdkv_projection_matrix(d: usize, r: usize) -> Vec<f32> {
     // Standard linear congruential / Box-Muller generator for deterministic zero-overhead matrix
     let mut state = 0x123456789abcdef0u64;
     let mut next_u01 = || -> f32 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 33) as f32 + 1.0) / (2147483648.0)
     };
     for _ in 0..(d * r / 2) {

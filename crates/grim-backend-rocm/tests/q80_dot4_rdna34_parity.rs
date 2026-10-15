@@ -4,8 +4,8 @@
 //! `quantized_matmul` derives K from the activation shape, which for a packed
 //! q81 buffer is (k/32)*36, not k — routing a q81 buffer through it reads B out
 //! of bounds. Production callers pass K explicitly.
-use grim_backend_rocm::device::roc_device::RocmDevice;
 use grim_backend_rocm::QuantOps;
+use grim_backend_rocm::device::roc_device::RocmDevice;
 use grim_tensor::dtype::{ArithType, DType, Storage};
 use grim_tensor::{CoreTensorOps, KQuantScheme, MemoryOps, Shape};
 
@@ -104,13 +104,25 @@ fn q80_dot4_q81_parity_on_rdna34() {
                 cpu[row * n + col] = acc;
             }
         }
-        let worst = |v: &[f32]| v.iter().zip(&cpu).fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
+        let worst = |v: &[f32]| {
+            v.iter()
+                .zip(&cpu)
+                .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()))
+        };
         eprintln!(
             "[q80-dot4] m={m} n={n} k={k} f32act={:.6} q81={:.6}",
             worst(&c1),
             worst(&c2)
         );
-        assert!(worst(&c1) < 0.5, "f32act arm diverges m={m} n={n}: {}", worst(&c1));
-        assert!(worst(&c2) < 0.5, "q81 arm diverges m={m} n={n}: {}", worst(&c2));
+        assert!(
+            worst(&c1) < 0.5,
+            "f32act arm diverges m={m} n={n}: {}",
+            worst(&c1)
+        );
+        assert!(
+            worst(&c2) < 0.5,
+            "q81 arm diverges m={m} n={n}: {}",
+            worst(&c2)
+        );
     }
 }

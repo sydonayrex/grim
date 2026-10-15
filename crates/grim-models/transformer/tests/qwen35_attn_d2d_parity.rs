@@ -1045,12 +1045,7 @@ fn qwen35_curdkv_selection_preserves_sinks_and_ranks_tokens() {
     }
 
     let selected = grim_models_transformer::qwen35::KvEvictionPolicy::select_curdkv_indices(
-        &k,
-        &v,
-        n_tokens,
-        d,
-        budget,
-        sinks,
+        &k, &v, n_tokens, d, budget, sinks,
     );
 
     assert_eq!(selected.len(), budget);
@@ -1058,6 +1053,9 @@ fn qwen35_curdkv_selection_preserves_sinks_and_ranks_tokens() {
     assert!(selected.contains(&0), "CurDKV must retain sink 0");
     assert!(selected.contains(&1), "CurDKV must retain sink 1");
     // High-importance token 10 must be retained
-    assert!(selected.contains(&10), "CurDKV must retain high leverage token 10");
+    assert!(
+        selected.contains(&10),
+        "CurDKV must retain high leverage token 10"
+    );
     eprintln!("[curdkv] selected indices: {:?}", selected);
 }

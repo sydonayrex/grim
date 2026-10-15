@@ -39,7 +39,10 @@ fails if any variable documented here stops being read in `crates/`.
 | `GRIM_DISABLE_CALIBRATION` | `set` skips the capability micro-benchmark | calibration on | grim-backend-rocm |
 | `GRIM_DOT_GEMV` | on unless `0` / `false` / `off` | on | grim-backend-rocm, grim-models |
 | `GRIM_DOT_GEMV_LEGACY` | `1` / `true` / `on` enables the legacy path | off | grim-backend-rocm |
-| `GRIM_F16_KV` | any value except `0` / `false` enables (LFM2 arenas only) | off | grim-backend-rocm |
+| `GRIM_F16_KV` | any value except `0` / `false` / `off` enables f16 KV arenas (global alloc hint, default off); Qwen35 dense arenas default to f16 unless explicitly `0`/`false`/`off` (validated eager+graph); launchers derive f16-ness from arena storage, never env | off (Qwen35: on) | grim-backend-rocm, grim-models |
+| `GRIM_KV_ARENA` | `f32` / `f16` / `int8` — dense ROCm KV-arena representation (int8 = u8 codes + f32 per-(row,kv_head) scales, both eager and decode-graph); wins over `GRIM_F16_KV`; launchers read the arena dtype, not this var | per-model (`GRIM_F16_KV`, Qwen35: f16) | grim-backend-rocm, grim-models |
+| `GRIM_KV_ARENA_ROWS` | integer token-row capacity for the KV-eviction ring (Phase 3). Set => arena pinned at that many rows: `GRIM_KV_SINKS` leading tokens pinned as attention sinks, newest `rows - sinks` cycled in place. Decouples KV memory from `GRIM_CONTEXT`. Unset / `0` = no eviction | unset | grim-models (qwen35), grim-backend-rocm |
+| `GRIM_KV_SINKS` | integer token rows pinned as attention sinks under `GRIM_KV_ARENA_ROWS`; clamped to `rows - 1`. Does not enable eviction on its own | `4` | grim-models (qwen35) |
 | `GRIM_F32_GEMV` | on unless `0` / `false` / `off` | on | grim-backend-rocm |
 | `GRIM_FLASH_DECODE_MIN_KV` | integer KV length threshold | `256` (RDNA3/4) / `512` (other) | grim-backend-rocm |
 | `GRIM_FP16_ACT` | `== "1"` enables on-device FP32-to-FP16 pre-quantize path | off | grim-backend-rocm |

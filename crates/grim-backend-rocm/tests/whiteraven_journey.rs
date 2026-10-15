@@ -20,7 +20,7 @@
 //! RUN: GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm \
 //!      --test whiteraven_journey -- --nocapture --test-threads=1
 
-use grim_backend_rocm::{kernel_route_snapshot, RocmDevice};
+use grim_backend_rocm::{RocmDevice, kernel_route_snapshot};
 use grim_nn::Linear;
 use grim_tensor::{
     ArithType, DType, MemoryOps, QuantFormat, QuantProvenance, Shape, Storage, Tensor,
