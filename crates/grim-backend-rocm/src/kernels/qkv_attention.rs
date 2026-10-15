@@ -2,14 +2,55 @@
 
 extern crate alloc;
 
+/// Pure parser for the legacy `GRIM_F16_KV` flag. Split out of
+/// [`kv_f16_enabled`] so the mapping is unit-testable without touching the
+/// process-global environment (which parallel tests share), and so the
+/// Qwen35 resolver can share one definition instead of re-parsing the flag
+/// with different spellings.
+///
+/// `None` (unset) is `false`. Only an explicit `0`/`false`/`off`/`no`
+/// (case-insensitive) disables; any other value — including garbage — reads
+/// as "enabled".
+pub fn parse_f16_kv_env(v: Option<&str>) -> bool {
+    match v {
+        Some(v) => {
+            let v = v.trim();
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        }
+        None => false,
+    }
+}
+
 /// GRAVE Phase 1: store the LFM2-family KV arena in f16 (2 bytes/element)
 /// instead of f32 — halves attention bytes. Read at arena allocation sites
 /// (launchers derive representation from storage instead). LFM2-family
 /// only; other models' arenas are unaffected while the default is off.
 pub fn kv_f16_enabled() -> bool {
-    std::env::var("GRIM_F16_KV")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false)
+    parse_f16_kv_env(std::env::var("GRIM_F16_KV").ok().as_deref())
+}
+
+/// The `GRIM_F16_KV` flag read in the **disabled** sense: `true` only when the
+/// value is an explicit off spelling. Models whose DEFAULT is f16 (they opt
+/// OUT of f16 rather than in) must use this, because
+/// [`parse_f16_kv_env`] treats *unset* as "off" — correct for the f32-default
+/// backend, wrong for a f16-default model.
+///
+/// Invariant (pinned by `f16_kv_flag_senses_are_complements`):
+/// `parse_f16_kv_env(v) == !f16_kv_explicitly_disabled(v)`.
+pub fn f16_kv_explicitly_disabled(v: Option<&str>) -> bool {
+    match v {
+        Some(v) => {
+            let v = v.trim();
+            v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no")
+        }
+        None => false,
+    }
 }
 
 /// Phase-3 KV-eviction ring policy handed to the graph kernels.
@@ -90,39 +131,84 @@ pub enum KvArenaFormat {
     F16,
     Int8,
     Int4,
+    /// Asymmetric 2-bit keys / 4-bit values (WS-3A). The representation is
+    /// declared here so the selector is first-class and cannot be mistaken for
+    /// another format, but its DEVICE KERNELS DO NOT EXIST YET — every arena
+    /// entry point must refuse it rather than fall through (int2v4 and int8 are
+    /// both byte-addressed, so a fallthrough would serve 2-bit codes as 8-bit).
+    Int2V4,
 }
 
 impl KvArenaFormat {
     /// Bytes per stored element, excluding sidecars (scales ride separately).
+    /// `Int2V4` is the average of its two widths: 2-bit K + 4-bit V.
     pub fn bytes_per_elem(self) -> f32 {
         match self {
             KvArenaFormat::F32 => 4.0,
             KvArenaFormat::F16 => 2.0,
             KvArenaFormat::Int8 => 1.0,
             KvArenaFormat::Int4 => 0.5,
+            KvArenaFormat::Int2V4 => 0.375,
+        }
+    }
+
+    /// True for representations whose device kernels are implemented. Every
+    /// declared format is implemented as of WS-3A (`int2v4` gained its 2-bit-K
+    /// quantizer and its mixed-width attention kernel); the query stays so a
+    /// future format can declare itself incomplete and be refused centrally.
+    pub fn has_device_kernels(self) -> bool {
+        match self {
+            KvArenaFormat::F32
+            | KvArenaFormat::F16
+            | KvArenaFormat::Int8
+            | KvArenaFormat::Int4
+            | KvArenaFormat::Int2V4 => true,
         }
     }
 }
 
-/// Resolve the dense-arena representation (see [`KvArenaFormat`]).
-pub fn kv_arena_format() -> KvArenaFormat {
-    match std::env::var("GRIM_KV_ARENA").as_deref() {
-        Ok("f32") => KvArenaFormat::F32,
-        Ok("f16") => KvArenaFormat::F16,
-        Ok("int8" | "i8" | "q8") => KvArenaFormat::Int8,
-        Ok("int4" | "i4" | "q4") => KvArenaFormat::Int4,
-        Ok(other) => {
-            eprintln!("[kv] GRIM_KV_ARENA={other:?} unrecognized (f32|f16|int8|int4); using F32");
+/// Pure parser for an explicit `GRIM_KV_ARENA` value. `None` means "not one
+/// of the known spellings" — the caller decides whether that is a typo
+/// (warn, fall back) or simply unset. This is the SINGLE place the explicit
+/// format spellings live; the Qwen35 model resolver delegates here too, so an
+/// explicit `GRIM_KV_ARENA` can never be read two different ways.
+pub fn parse_kv_arena_env(v: &str) -> Option<KvArenaFormat> {
+    match v {
+        "f32" => Some(KvArenaFormat::F32),
+        "f16" => Some(KvArenaFormat::F16),
+        "int8" | "i8" | "q8" => Some(KvArenaFormat::Int8),
+        "int4" | "i4" | "q4" => Some(KvArenaFormat::Int4),
+        // WS-3A: asymmetric bits. Resolves, then every arena entry point
+        // refuses it (`has_device_kernels` == false) instead of mis-serving.
+        "int2v4" | "i2v4" | "k2v4" => Some(KvArenaFormat::Int2V4),
+        _ => None,
+    }
+}
+
+/// Pure core of [`kv_arena_format`]: resolve from already-read env strings.
+/// Kept pure so the mapping is unit-testable without the process-global
+/// environment.
+pub(crate) fn resolve_kv_arena_format(arena: Option<&str>, f16_kv: Option<&str>) -> KvArenaFormat {
+    match arena {
+        Some(v) => parse_kv_arena_env(v).unwrap_or_else(|| {
+            eprintln!("[kv] GRIM_KV_ARENA={v:?} unrecognized (f32|f16|int8|int4); using F32");
             KvArenaFormat::F32
-        }
-        Err(_) => {
-            if kv_f16_enabled() {
+        }),
+        None => {
+            if parse_f16_kv_env(f16_kv) {
                 KvArenaFormat::F16
             } else {
                 KvArenaFormat::F32
             }
         }
     }
+}
+
+/// Resolve the dense-arena representation (see [`KvArenaFormat`]).
+pub fn kv_arena_format() -> KvArenaFormat {
+    let arena = std::env::var("GRIM_KV_ARENA").ok();
+    let f16 = std::env::var("GRIM_F16_KV").ok();
+    resolve_kv_arena_format(arena.as_deref(), f16.as_deref())
 }
 
 /// HIP source for `grim_qkv_attention`. [see: `COMPUTE_KERNEL_SOURCE`, `lib.rs::RocmDevice::qkv_attention`, `j`, `__shared__`]
@@ -2776,6 +2862,324 @@ extern "C" __global__ void grim_kv_quantize_rows_i4(
         codes[dst_base + (tid >> 1)] = packed;
     }
 }
+
+// ── WS-3A (K2V4): asymmetric 2-bit KEY / 4-bit VALUE dense arena ──────────
+//
+// The int4 kernels hardcode 2 codes/byte and `(code - 7) / 7`. K2V4 needs a
+// different width on each side, so the width is a RUNTIME parameter here and
+// the packing stride follows from it. `k_bits`/`v_bits` are uniform across the
+// launch, so the branches below are not divergence.
+
+// Dequantize one element of a packed signed code row.
+//   bits == 2 -> 4 codes/byte, levels [-1, +1] stored biased +1
+//   bits == 4 -> 2 codes/byte, levels [-7, +7] stored biased +7
+__device__ inline float grim_dequant_iN(
+    const unsigned char* __restrict__ base,
+    long long row_bytes,
+    int d,
+    int bits,
+    float sc) {
+    if (bits == 2) {
+        unsigned char packed = base[row_bytes + (d >> 2)];
+        int code = (packed >> ((d & 3) * 2)) & 0x03;
+        return ((float)(code - 1)) * sc;
+    }
+    unsigned char packed = base[row_bytes + (d >> 1)];
+    int code = (d & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+    return ((float)(code - 7) / 7.0f) * sc;
+}
+
+// Bytes per element for a packed signed code of `bits` width.
+__device__ inline int grim_bytes_per_elem_iN(int bits) { return bits / 8; }
+
+// WS-3A: 2-bit KEY quantizer. Same per-(row, kv_head) amax scheme as the i4
+// quantizer, but 3 used levels (signed [-1, +1], biased +1) packed FOUR codes
+// per byte, lowest 2 bits first. head_dim must be a multiple of 4.
+extern "C" __global__ void grim_kv_quantize_rows_i2(
+    const float* __restrict__ src,
+    int src_off,
+    unsigned char* __restrict__ codes,
+    int codes_off,
+    float* __restrict__ scales,
+    int scales_off,
+    int n_rows,
+    int kv_stride,
+    int nkv_heads,
+    int head_dim) {
+    const int vec = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int vecs = n_rows * nkv_heads;
+    if (vec >= vecs) return;
+    const int row = vec / nkv_heads;
+    const int kh = vec - row * nkv_heads;
+    const long long src_base = (long long)src_off + (long long)row * kv_stride + (long long)kh * head_dim;
+    // 2-bit codes: row stride is kv_stride / 4 bytes, head offset kh * head_dim / 4.
+    const long long dst_base = (long long)codes_off + (long long)row * (kv_stride / 4) + (long long)kh * (head_dim / 4);
+    const long long sc_idx = (long long)scales_off + (long long)row * nkv_heads + kh;
+    const int wave_size = warpSize;
+    const int num_waves = blockDim.x / wave_size;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+
+    float v = (tid < head_dim) ? src[src_base + tid] : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = wave_size >> 1; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffULL, amax, off));
+    __shared__ float s_max2[8];
+    __shared__ float s_scale2;
+    if (lane_id == 0) s_max2[wave_id] = amax;
+    __syncthreads();
+    float mx = (tid < num_waves) ? s_max2[tid] : 0.0f;
+    #pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffffffffffULL, mx, off));
+    float scale = 1.0f;
+    if (tid == 0) {
+        scale = (mx > 1e-30f) ? mx : 1.0f;
+        scales[sc_idx] = scale;
+        s_scale2 = scale;
+    }
+    __syncthreads();
+    scale = s_scale2;
+
+    // Quantize to [-1, +1] -> [0, 2]; stored biased +1 so the reader is a plain
+    // (code - 1) * scale, the 2-bit analogue of the i4 convention.
+    int q = 1;
+    if (tid < head_dim) {
+        float inv = (scale > 1e-30f) ? (1.0f / scale) : 0.0f;
+        int val = (int)__builtin_roundf(v * inv);
+        val = val < -1 ? -1 : (val > 1 ? 1 : val);
+        q = val + 1;
+    }
+
+    // Pack FOUR adjacent lanes into one byte, lowest 2 bits first.
+    const unsigned long long m = 0xffffffffffffffffULL;
+    int q1 = __shfl_xor_sync(m, q, 1);
+    int q2 = __shfl_xor_sync(m, q, 2);
+    int q3 = __shfl_xor_sync(m, q1, 2);
+    if ((tid & 3) == 0 && tid < head_dim) {
+        unsigned char packed = (unsigned char)((q & 0x03) | ((q1 & 0x03) << 2) | ((q2 & 0x03) << 4) | ((q3 & 0x03) << 6));
+        codes[dst_base + (tid >> 2)] = packed;
+    }
+}
+
+// WS-3A: dense-arena attention over a MIXED-WIDTH packed KV row. Same body as
+// `grim_qkv_attention_i4kv` with the K side generalized to `k_bits`; with
+// k_bits == v_bits == 4 it must reproduce that kernel bit for bit, which is
+// what the parity gate pins.
+extern "C" __global__ void grim_qkv_attention_ixkv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_tensor,
+    const unsigned char* __restrict__ v_tensor,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_seq_len,
+    int cache_offset,
+    float inv_sqrt_d,
+    int window_lo,
+    float softcap,
+    const float* __restrict__ o_proj_w,
+    int o_dim,
+    int fuse_o,
+    const float* __restrict__ alibi_slopes,
+    int has_alibi,
+    int k_bits,
+    int v_bits
+) {
+    const int i = blockIdx.x;
+    const int h = blockIdx.y;
+    if (i >= seq_len || h >= num_heads) return;
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = h / q_per_kv;
+    const int q_offset = (i * num_heads + h) * head_dim;
+    const int abs_i = cache_offset + i;
+
+    const int tid = threadIdx.x;
+    const int wave_size = warpSize;
+    const int wave_id = tid / wave_size;
+    const int lane_id = tid % wave_size;
+    const int num_waves = blockDim.x / wave_size;
+
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
+        }
+        return;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][260];
+
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int lo = window_lo;
+    const int range_len = hi - lo;
+
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
+    float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Packed storage: the K and V sides may use DIFFERENT widths, so each side
+    // carries its own row stride and head offset.
+    const int k_elems_per_byte = (k_bits == 2) ? 4 : 2;
+    const int v_elems_per_byte = (v_bits == 2) ? 4 : 2;
+    const int k_stride_bytes = (num_kv_heads * head_dim) / k_elems_per_byte;
+    const int v_stride_bytes = (num_kv_heads * head_dim) / v_elems_per_byte;
+    const int k_head_bytes = (kv_head * head_dim) / k_elems_per_byte;
+    const int v_head_bytes = (kv_head * head_dim) / v_elems_per_byte;
+    const unsigned char* __restrict__ k_bytes = k_tensor + k_head_bytes;
+    const unsigned char* __restrict__ v_bytes = v_tensor + v_head_bytes;
+
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
+
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        float partial = 0.0f;
+        const long long k_row_bytes = (long long)j * k_stride_bytes;
+        const float k_sc = k_scales[(long long)j * num_kv_heads + kv_head];
+        #pragma unroll
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                float k_dq = grim_dequant_iN(k_bytes, k_row_bytes, dd, k_bits, k_sc);
+                partial += q_reg[chunk] * k_dq;
+            }
+        }
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
+        if (softcap > 0.0f) {
+            score = softcap * tanhf(score / softcap);
+        }
+        if (has_alibi) {
+            score += alibi_slopes[h] * (float)(j - abs_i);
+        }
+
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+        const float v_sc = v_scales[(long long)j * num_kv_heads + kv_head];
+        const long long v_row_bytes = (long long)j * v_stride_bytes;
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                float v_dq = grim_dequant_iN(v_bytes, v_row_bytes, d, v_bits, v_sc);
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_dq;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
+    const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+
+    float attn_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        attn_reg[chunk] = 0.0f;
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float acc_final = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w >= num_waves) break;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
+            }
+            attn_reg[chunk] = acc_final * inv_sum;
+        }
+    }
+
+    if (fuse_o == 0) {
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = attn_reg[chunk];
+            }
+        }
+    } else {
+        for (int oc = 0; oc < o_dim; ++oc) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                int d = lane_id + chunk * wave_size;
+                if (d < head_dim) {
+                    partial += attn_reg[chunk] * o_proj_w[(h * head_dim + d) * o_dim + oc];
+                }
+            }
+            #pragma unroll
+            for (int off = wave_size >> 1; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffffffffffffULL, partial, off);
+            }
+            if (lane_id == 0 && partial != 0.0f) {
+                atomicAdd(&out[i * o_dim + oc], partial);
+            }
+        }
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
+    }
+}
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3701,6 +4105,96 @@ pub fn launch_kv_quantize_rows_i4(
     )
 }
 
+/// WS-3A: 2-bit KEY quantizer launcher. Same per-(row, kv_head) amax scheme
+/// as the i4 launcher, packing four codes per byte (`head_dim % 4 == 0`).
+pub fn launch_kv_quantize_rows_i2(
+    dev: &crate::RocmDevice,
+    src: &dyn BackendStorage,
+    src_off: usize,
+    codes: &dyn BackendStorage,
+    codes_off: usize,
+    scales: &dyn BackendStorage,
+    scales_off: usize,
+    n_rows: usize,
+    kv_stride: usize,
+    nkv_heads: usize,
+    head_dim: usize,
+) -> Result<*mut std::ffi::c_void, crate::Error> {
+    use crate::memory::storage::RocmStorage;
+    use grim_tensor::dtype::ArithType;
+    let src_s = src.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: src must be RocmStorage".into())
+    })?;
+    if src_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i2: src must be F32".into(),
+        ));
+    }
+    let codes_s = codes
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i2: codes must be RocmStorage".into())
+        })?;
+    if codes_s.dtype.arith != ArithType::U8 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i2: codes must be U8 (byte storage for packed u2)".into(),
+        ));
+    }
+    let scales_s = scales
+        .as_any()
+        .downcast_ref::<RocmStorage>()
+        .ok_or_else(|| {
+            crate::Error::Backend("kv_quantize_rows_i2: scales must be RocmStorage".into())
+        })?;
+    if scales_s.dtype.arith != ArithType::F32 {
+        return Err(crate::Error::Backend(
+            "kv_quantize_rows_i2: scales must be F32".into(),
+        ));
+    }
+    // 2-bit packing puts FOUR codes per byte, so head_dim must divide by 4.
+    if head_dim == 0 || head_dim > 256 || head_dim % 4 != 0 {
+        return Err(crate::Error::Backend(format!(
+            "kv_quantize_rows_i2: head_dim {head_dim} must be a multiple of 4 and in 1..=256"
+        )));
+    }
+    let mut sptr = src_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: src has no device ptr".into())
+    })?;
+    let mut cptr = codes_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: codes have no device ptr".into())
+    })?;
+    let mut scptr = scales_s.device_ptr.ok_or_else(|| {
+        crate::Error::Backend("kv_quantize_rows_i2: scales have no device ptr".into())
+    })?;
+    let mut src_off_i = src_off as i32;
+    let mut codes_off_i = codes_off as i32;
+    let mut scales_off_i = scales_off as i32;
+    let mut n_rows_i = n_rows as i32;
+    let mut stride_i = kv_stride as i32;
+    let mut nkv_i = nkv_heads as i32;
+    let mut hd_i = head_dim as i32;
+    let grid = crate::HipDim3::new((n_rows * nkv_heads) as u32, 1, 1);
+    let block = crate::HipDim3::new(256, 1, 1);
+    dev.launch_compute_kernel(
+        "grim_kv_quantize_rows_i2",
+        grid,
+        block,
+        &mut [
+            arg(&mut sptr),
+            arg(&mut src_off_i),
+            arg(&mut cptr),
+            arg(&mut codes_off_i),
+            arg(&mut scptr),
+            arg(&mut scales_off_i),
+            arg(&mut n_rows_i),
+            arg(&mut stride_i),
+            arg(&mut nkv_i),
+            arg(&mut hd_i),
+        ],
+    )
+}
+
 pub fn launch_kv_append_i8(
     dev: &crate::RocmDevice,
     k_rot: &dyn BackendStorage,
@@ -4155,11 +4649,14 @@ pub fn launch_qkv_attention_dev_batch_i8(
         grid_dim,
         block_dim,
         &mut [
+            // Argument order MUST match `grim_qkv_attention_dev_i8`'s parameter
+            // list exactly. The i8 kernel takes the code/scale pointers LAST
+            // (after the batch/slot strides), not next to k/v: emitting them
+            // early made the kernel treat `k_scales` as `out`, `num_heads` as a
+            // pointer, and fault at the first dereference.
             arg(&mut q_ptr),
             arg(&mut k_ptr),
             arg(&mut v_ptr),
-            arg(&mut ksc_ptr),
-            arg(&mut vsc_ptr),
             arg(&mut o_ptr),
             arg(&mut om_ptr),
             arg(&mut os_ptr),
@@ -4179,6 +4676,8 @@ pub fn launch_qkv_attention_dev_batch_i8(
             arg(&mut ha),
             arg(&mut batch_i),
             arg(&mut slot_stride_i),
+            arg(&mut ksc_ptr),
+            arg(&mut vsc_ptr),
             arg(&mut sc_slot_stride_i),
             arg(&mut cap_rows_i),
         ],
@@ -4303,6 +4802,99 @@ mod tests {
     use super::*;
     use grim_tensor::dtype::{ArithType, DType, Storage};
     use grim_tensor::{AttentionOps, CoreTensorOps, MemoryOps, Shape};
+
+    /// WS-0: the explicit-format spelling table is the single source of truth.
+    /// Every alias must resolve, and an unknown value must NOT silently become
+    /// a valid format (it is `None`; callers warn and fall back).
+    #[test]
+    fn kv_arena_env_aliases_resolve() {
+        use KvArenaFormat::*;
+        for (s, want) in [
+            ("f32", F32),
+            ("f16", F16),
+            ("int8", Int8),
+            ("i8", Int8),
+            ("q8", Int8),
+            ("int4", Int4),
+            ("i4", Int4),
+            ("q4", Int4),
+        ] {
+            assert_eq!(parse_kv_arena_env(s), Some(want), "GRIM_KV_ARENA={s}");
+        }
+        assert_eq!(parse_kv_arena_env("bogus"), None);
+        // Spellings are case-sensitive; an uppercase value is a typo, not f16.
+        assert_eq!(parse_kv_arena_env("F16"), None);
+        // WS-3A: the asymmetric format resolves as a first-class selector and,
+        // as of the K2V4 kernels landing, reports itself implemented.
+        assert_eq!(parse_kv_arena_env("int2v4"), Some(KvArenaFormat::Int2V4));
+        assert_eq!(parse_kv_arena_env("k2v4"), Some(KvArenaFormat::Int2V4));
+        assert!(KvArenaFormat::Int2V4.has_device_kernels());
+        for f in [
+            KvArenaFormat::F32,
+            KvArenaFormat::F16,
+            KvArenaFormat::Int8,
+            KvArenaFormat::Int4,
+        ] {
+            assert!(f.has_device_kernels(), "{f:?} should have device kernels");
+        }
+        // Density: 2-bit K + 4-bit V averages 0.375 B/elem, half of int4's.
+        assert!((KvArenaFormat::Int2V4.bytes_per_elem() - 0.375).abs() < 1e-6);
+    }
+
+    /// WS-0: the legacy f16 flag and the arena resolver must not drift. The
+    /// backend resolver's only two inputs are these strings, so pinning the
+    /// pure core pins the public `kv_arena_format`/`kv_f16_enabled` pair.
+    #[test]
+    fn kv_arena_resolver_is_consistent_with_f16_flag() {
+        use KvArenaFormat::*;
+        // Unset arena -> driven entirely by the legacy flag.
+        assert_eq!(resolve_kv_arena_format(None, None), F32);
+        assert_eq!(resolve_kv_arena_format(None, Some("1")), F16);
+        assert_eq!(resolve_kv_arena_format(None, Some("off")), F32);
+        // Explicit arena wins over the flag, in every spelling.
+        assert_eq!(resolve_kv_arena_format(Some("f32"), Some("1")), F32);
+        assert_eq!(resolve_kv_arena_format(Some("int8"), Some("1")), Int8);
+        assert_eq!(resolve_kv_arena_format(Some("int4"), Some("0")), Int4);
+        // Unrecognized explicit value falls back to F32 (with a warning).
+        assert_eq!(resolve_kv_arena_format(Some("q7"), None), F32);
+    }
+
+    /// The f16 flag's disabled spellings are ONE set, not two — this is the
+    /// drift that let `GRIM_F16_KV=off` mean f16 to the backend and f32 to the
+    /// model before WS-0.
+    #[test]
+    fn f16_kv_flag_disabled_spellings() {
+        for s in ["0", "false", "FALSE", "off", "no", " off "] {
+            assert!(
+                !parse_f16_kv_env(Some(s)),
+                "GRIM_F16_KV={s:?} should disable"
+            );
+        }
+        for s in ["1", "true", "yes", "on", "garbage"] {
+            assert!(parse_f16_kv_env(Some(s)), "GRIM_F16_KV={s:?} should enable");
+        }
+        assert!(!parse_f16_kv_env(None), "unset must not enable f16");
+    }
+
+    /// WS-0: for an explicit value the two senses of the flag are exact
+    /// complements, so a f16-default model and the f32-default backend can
+    /// never disagree about what a spelling means. UNSET is where the two
+    /// defaults legitimately differ (backend reads it as f32, a f16-default
+    /// model as f16), and there BOTH parsers report false.
+    #[test]
+    fn f16_kv_flag_senses_are_complements() {
+        for v in [
+            "0", "false", "off", "no", "1", "true", "yes", "garbage", " off ",
+        ] {
+            assert_eq!(
+                parse_f16_kv_env(Some(v)),
+                !f16_kv_explicitly_disabled(Some(v)),
+                "GRIM_F16_KV={v:?}"
+            );
+        }
+        assert!(!parse_f16_kv_env(None));
+        assert!(!f16_kv_explicitly_disabled(None));
+    }
 
     #[test]
     fn test_wmma_qkv_attention_source_contains_tensor_core_and_fallback() {

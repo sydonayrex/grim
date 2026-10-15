@@ -879,12 +879,19 @@ impl DecodeGraphModel for Llama {
     }
 
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        // int4 dense KV arenas historically miss a graph-safe i4 kernel pair; refuse
+        // capture (run.rs then uses the eager path, which is correct).
+        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4" | "int8" | "i8" | "q8")) {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph: quantized KV (int8/int4) graph path disabled (eager fallback)".into(),
+            ));
+        }
+        let dev = dev_for_llama(self)?;
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
             ));
         }
-        let dev = dev_for_llama(self)?;
         let stream = dev
             .get_stream_from_pool(0)
             .ok_or_else(|| grim_core::error::Error::Backend("no stream in pool".into()))?;
@@ -2130,6 +2137,45 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
+        // int4 dense KV arenas still have no graph-safe i4 kernel pair; refuse
+        // capture (run.rs then uses the eager path, which is correct).
+        //
+        // int8 IS allowed: `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8`
+        // are the captured pair, and they are gated by
+        // `graph_i8_append_and_attend_match_eager_f32` in
+        // grim-backend-rocm/tests/qkv_attention.rs. That test is what caught the
+        // launcher's argument-order defect (it wrote attention output into the
+        // scale sidecar and faulted) before capture was enabled.
+        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4")) {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph: int4 KV has no dedicated graph kernel pair (eager fallback)".into(),
+            ));
+        }
+        // A per-layer KV budget table (`GRIM_KV_ARENA_ROWS=4096,2048,...`) cannot
+        // be honored by the graph, which captures ONE ring for every layer:
+        // replay would clamp every layer to a single cap. Refuse so the caller
+        // uses the eager path, which applies the table per layer.
+        if let Some(b) = crate::qwen35::KvLayerBudgets::from_env() {
+            if !b.is_uniform() {
+                return Err(grim_core::error::Error::Backend(
+                    "decode graph: per-layer GRIM_KV_ARENA_ROWS is not graph-safe (eager fallback)"
+                        .into(),
+                ));
+            }
+        }
+        // CurDKV survivor selection runs a host compaction pass that rewrites
+        // `current_pos`; the captured graph bakes `total_dev` as a device
+        // scalar it bumps itself, so it cannot observe the reset. Refuse.
+        if crate::qwen35::parse_evict_mode_env(
+            std::env::var("GRIM_KV_EVICT_MODE").ok().as_deref(),
+        ) == crate::qwen35::EvictionMode::Curdkv
+        {
+            return Err(grim_core::error::Error::Backend(
+                "decode graph: GRIM_KV_EVICT_MODE=curdkv needs the host compaction pass (eager \
+                 fallback)"
+                    .into(),
+            ));
+        }
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),

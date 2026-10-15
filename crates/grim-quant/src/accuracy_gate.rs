@@ -184,6 +184,105 @@ impl AccuracyTolerance {
     }
 }
 
+/// Dense-KV-arena representations whose accuracy the gate certifies.
+///
+/// Mirrors the ROCm backend's `KvArenaFormat`, but defined here so grim-quant
+/// keeps no backend dependency (the model/CLI layer maps one to the other).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KvArenaKind {
+    F32,
+    F16,
+    Int8,
+    Int4,
+    /// WS-3A: asymmetric 2-bit keys / 4-bit values.
+    Int2V4,
+}
+
+/// Accuracy budget for a dense KV-arena representation, expressed as the
+/// change measured against the f32 arena on the SAME corpus and window.
+///
+/// Deliberately separate from [`AccuracyTolerance`]: that one is sized for
+/// weight quantization and its `max_delta_ppl` is an absolute delta, whereas a
+/// KV arena is judged on the relative drift of an already-quantized model, and
+/// additionally on step-0 logprob parity (the KV representation is the only
+/// thing that changed, so the first decode step's logprobs isolate it).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct KvArenaTolerance {
+    /// Max `|ppl(mode) - ppl(f32)| / ppl(f32)` on the pinned corpus/window.
+    pub max_relative_ppl_delta: f64,
+    /// Max `|logprob(mode)[i] - logprob(f32)[i]|` at decode step 0.
+    pub max_step0_logprob_abs_delta: f64,
+    /// True while the budget is a provisional bound rather than a measured one.
+    /// A provisional budget still fails loudly; it just has not been tuned by a
+    /// sweep, and says so.
+    pub provisional: bool,
+}
+
+impl KvArenaTolerance {
+    pub fn for_kind(kind: KvArenaKind) -> Self {
+        match kind {
+            // The reference arm: no drift is permitted, and none can occur.
+            KvArenaKind::F32 => Self {
+                max_relative_ppl_delta: 0.0,
+                max_step0_logprob_abs_delta: 0.0,
+                provisional: false,
+            },
+            // f16 is a rounding of the f32 arena: ~3 significant decimal
+            // digits. The PPL bound is that structural floor. The step-0 bound
+            // is MEASURED, not guessed: on LFM2.5-350M-Q8_0 over 768 wikitext
+            // tokens the f16 arena moved PPL by 0.0999% and the top-16 step-0
+            // logprobs by at most 0.115 (argmax unchanged). 0.115 is larger
+            // than f16 storage rounding alone predicts, so this bound is a
+            // recorded measurement with margin — NOT a claim that the f16 arena
+            // is a pure rounding. See `kv_arena_ppl_gate`.
+            KvArenaKind::F16 => Self {
+                max_relative_ppl_delta: 0.001,
+                max_step0_logprob_abs_delta: 0.25,
+                provisional: false,
+            },
+            // int8 per-(row, kv_head): symmetric 8-bit, one scale per
+            // head-vector, dequant `(code-128)/127 * amax`. Provisional until
+            // the long-context sweep sizes it.
+            KvArenaKind::Int8 => Self {
+                max_relative_ppl_delta: 0.02,
+                max_step0_logprob_abs_delta: 0.02,
+                provisional: true,
+            },
+            // int4: coarser (15 levels); the same tier as the Q4K weight budget.
+            KvArenaKind::Int4 => Self {
+                max_relative_ppl_delta: 0.08,
+                max_step0_logprob_abs_delta: 0.20,
+                provisional: true,
+            },
+            // K2V4: the KEY side has only THREE levels, so it is strictly
+            // coarser than int4's 15 and cannot inherit its budget. Unmeasured
+            // against a real model — provisional, and deliberately loose so it
+            // fails loudly only on gross corruption rather than on the 2-bit
+            // coarseness it was designed for.
+            KvArenaKind::Int2V4 => Self {
+                max_relative_ppl_delta: 0.25,
+                max_step0_logprob_abs_delta: 0.60,
+                provisional: true,
+            },
+        }
+    }
+}
+
+/// Result of certifying one dense-KV-arena representation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum KvArenaVerdict {
+    Pass {
+        relative_ppl_delta: f64,
+        step0_logprob_abs_delta: f64,
+    },
+    Fail {
+        reason: String,
+        relative_ppl_delta: f64,
+        step0_logprob_abs_delta: f64,
+        tolerance: KvArenaTolerance,
+    },
+}
+
 /// Compute cosine similarity between reference oracle slice and candidate slice.
 pub fn compute_cosine_similarity(oracle: &[f32], candidate: &[f32]) -> f64 {
     if oracle.len() != candidate.len() || oracle.is_empty() {
@@ -276,6 +375,7 @@ pub enum AccuracyVerdict {
 /// Accuracy Regression Gate runner.
 pub struct AccuracyGate {
     custom_tolerances: HashMap<QuantFormat, AccuracyTolerance>,
+    kv_arena_tolerances: HashMap<KvArenaKind, KvArenaTolerance>,
 }
 
 impl Default for AccuracyGate {
@@ -288,12 +388,98 @@ impl AccuracyGate {
     pub fn new() -> Self {
         Self {
             custom_tolerances: HashMap::new(),
+            kv_arena_tolerances: HashMap::new(),
         }
     }
 
     /// Set a custom tolerance for a given quantization format.
     pub fn set_tolerance(&mut self, format: QuantFormat, tolerance: AccuracyTolerance) {
         self.custom_tolerances.insert(format, tolerance);
+    }
+
+    /// Override the KV-arena budget for one representation (used once a sweep
+    /// has measured a tighter or looser bound than the provisional default).
+    pub fn set_kv_arena_tolerance(&mut self, kind: KvArenaKind, tolerance: KvArenaTolerance) {
+        self.kv_arena_tolerances.insert(kind, tolerance);
+    }
+
+    /// Certify a dense-KV-arena representation against the f32 arena.
+    ///
+    /// `baseline_ppl` is the f32-arm perplexity; `candidate_ppl` the mode under
+    /// test. `step0_logprob_f32` / `step0_logprob_mode` are the decode-step-0
+    /// next-token logprobs for the two arms (same length, same positions).
+    ///
+    /// Both arms must be produced on the same corpus, window and context, so
+    /// the only variable is the arena representation.
+    pub fn verify_kv_arena(
+        &self,
+        kind: KvArenaKind,
+        baseline_ppl: f64,
+        candidate_ppl: f64,
+        step0_logprob_f32: &[f32],
+        step0_logprob_mode: &[f32],
+    ) -> Result<KvArenaVerdict> {
+        if step0_logprob_f32.len() != step0_logprob_mode.len() {
+            return Err(Error::Shape(format!(
+                "kv-arena step-0 logprob length mismatch: {} != {}",
+                step0_logprob_f32.len(),
+                step0_logprob_mode.len()
+            )));
+        }
+        if !(baseline_ppl.is_finite() && baseline_ppl > 0.0) {
+            return Err(Error::Shape(format!(
+                "kv-arena baseline ppl is not a positive finite number: {baseline_ppl}"
+            )));
+        }
+        if !candidate_ppl.is_finite() {
+            return Err(Error::Shape(format!(
+                "kv-arena candidate ppl is not finite: {candidate_ppl}"
+            )));
+        }
+
+        let tol = self
+            .kv_arena_tolerances
+            .get(&kind)
+            .copied()
+            .unwrap_or_else(|| KvArenaTolerance::for_kind(kind));
+
+        let relative_ppl_delta = (candidate_ppl - baseline_ppl).abs() / baseline_ppl;
+        let step0_logprob_abs_delta = step0_logprob_f32
+            .iter()
+            .zip(step0_logprob_mode)
+            .map(|(a, b)| (*a - *b).abs() as f64)
+            .fold(0.0f64, f64::max);
+
+        if relative_ppl_delta > tol.max_relative_ppl_delta {
+            return Ok(KvArenaVerdict::Fail {
+                reason: format!(
+                    "relative PPL delta {:.6} exceeded budget {:.6}{}",
+                    relative_ppl_delta,
+                    tol.max_relative_ppl_delta,
+                    if tol.provisional { " (provisional)" } else { "" }
+                ),
+                relative_ppl_delta,
+                step0_logprob_abs_delta,
+                tolerance: tol,
+            });
+        }
+        if step0_logprob_abs_delta > tol.max_step0_logprob_abs_delta {
+            return Ok(KvArenaVerdict::Fail {
+                reason: format!(
+                    "step-0 logprob max-abs delta {:.6} exceeded budget {:.6}{}",
+                    step0_logprob_abs_delta,
+                    tol.max_step0_logprob_abs_delta,
+                    if tol.provisional { " (provisional)" } else { "" }
+                ),
+                relative_ppl_delta,
+                step0_logprob_abs_delta,
+                tolerance: tol,
+            });
+        }
+        Ok(KvArenaVerdict::Pass {
+            relative_ppl_delta,
+            step0_logprob_abs_delta,
+        })
     }
 
     /// Verify an activation tensor against its reference oracle.
@@ -389,5 +575,92 @@ mod tests {
         let targets = vec![0, 1];
         let ppl = compute_cross_entropy_ppl(&logits, &targets, 4);
         assert!(ppl > 0.0 && ppl < 1.1);
+    }
+
+    #[test]
+    fn kv_arena_tolerance_is_ordered_by_precision() {
+        // A coarser representation may never be given a tighter budget than a
+        // finer one — the ordering is the property that makes the ladder
+        // meaningful.
+        let f32t = KvArenaTolerance::for_kind(KvArenaKind::F32);
+        let f16t = KvArenaTolerance::for_kind(KvArenaKind::F16);
+        let i8t = KvArenaTolerance::for_kind(KvArenaKind::Int8);
+        let i4t = KvArenaTolerance::for_kind(KvArenaKind::Int4);
+        assert!(f32t.max_relative_ppl_delta <= f16t.max_relative_ppl_delta);
+        assert!(f16t.max_relative_ppl_delta <= i8t.max_relative_ppl_delta);
+        assert!(i8t.max_relative_ppl_delta <= i4t.max_relative_ppl_delta);
+        // The reference arm is exact, and f16 is a rounding, not a tunable.
+        assert_eq!(f32t.max_relative_ppl_delta, 0.0);
+        assert!(!f16t.provisional, "f16's bound is structural, not provisional");
+        assert!(i8t.provisional && i4t.provisional);
+    }
+
+    #[test]
+    fn kv_arena_gate_passes_small_drift_and_fails_gross_drift() {
+        let gate = AccuracyGate::new();
+        let base = 20.0f64;
+        let step0_f32 = [1.0f32, -2.0, 0.5];
+
+        // f16: 0.05% ppl drift, step-0 within 2e-3 -> pass.
+        let v = gate
+            .verify_kv_arena(
+                KvArenaKind::F16,
+                base,
+                base * 1.0005,
+                &step0_f32,
+                &[1.0005, -2.0004, 0.5004],
+            )
+            .unwrap();
+        assert!(matches!(v, KvArenaVerdict::Pass { .. }), "got {v:?}");
+
+        // int4 with a 50% ppl blow-up -> fail, and the verdict names the budget.
+        let v = gate
+            .verify_kv_arena(KvArenaKind::Int4, base, base * 1.5, &step0_f32, &step0_f32)
+            .unwrap();
+        match v {
+            KvArenaVerdict::Fail { reason, tolerance, .. } => {
+                assert!(reason.contains("relative PPL delta"), "reason: {reason}");
+                assert!(tolerance.provisional, "int4 budget is provisional");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_arena_gate_flags_step0_desync_even_when_ppl_is_flat() {
+        // A representation can leave aggregate PPL untouched while corrupting
+        // the first step (e.g. a mis-scaled sink row). The step-0 arm is what
+        // catches that; a PPL-only gate would pass it.
+        let gate = AccuracyGate::new();
+        let v = gate
+            .verify_kv_arena(
+                KvArenaKind::F16,
+                20.0,
+                20.0,
+                &[1.0f32, -2.0],
+                &[1.0, -1.0], // 1.0 abs delta, way over 2e-3
+            )
+            .unwrap();
+        match v {
+            KvArenaVerdict::Fail { reason, .. } => {
+                assert!(reason.contains("step-0 logprob"), "reason: {reason}")
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_arena_gate_rejects_bad_inputs() {
+        let gate = AccuracyGate::new();
+        // Length mismatch is a harness bug, not a verdict.
+        assert!(
+            gate.verify_kv_arena(KvArenaKind::F16, 20.0, 20.0, &[1.0], &[1.0, 2.0])
+                .is_err()
+        );
+        // A non-positive baseline would make the relative delta meaningless.
+        assert!(
+            gate.verify_kv_arena(KvArenaKind::F16, 0.0, 20.0, &[], &[])
+                .is_err()
+        );
     }
 }

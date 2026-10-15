@@ -1829,3 +1829,505 @@ fn kv_append_ring_pins_sinks_and_cycles_newest() {
         );
     }
 }
+
+
+/// WS-2b: the DECODE-GRAPH int8 kernels must agree with the eager f32 path.
+///
+/// `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8` are the pair a
+/// captured Qwen35 graph uses when `GRIM_KV_ARENA=int8`. They are reached ONLY
+/// from `decode_graph.rs`, which refused int8 capture, so these two launchers
+/// had NO test at all — the eager i8 tests call `qkv_attention_i8` /
+/// `launch_kv_quantize_rows_i8` instead. This gates the graph pair so the graph
+/// path can be enabled on evidence rather than hope.
+///
+/// Geometry is the graph's own decode shape: batch=1, ONE query step
+/// (`seq_len = steps = 1`, matching `q_head_buf: [batch, n_attn_out]`), one
+/// appended KV row. With a single KV row softmax is exactly 1, so the expected
+/// output is V broadcast by the GQA mapping `kv_head = h * nkv / nh` — an EXACT
+/// oracle, not a tolerance question.
+#[test]
+#[ignore]
+fn graph_i8_append_and_attend_match_eager_f32() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (nh, nkv, hd) = (8_usize, 4, 64);
+    let stride = nkv * hd;
+    let mut seed = 0x28b1u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q_data: Vec<f32> = (0..(nh * hd)).map(|_| rand() * 0.5).collect();
+    let k_data: Vec<f32> = (0..stride).map(|_| rand() * 0.5).collect();
+    let v_data: Vec<f32> = (0..stride).map(|_| rand() * 0.5).collect();
+
+    // Exact oracle: one KV row => out[h] = V[h * nkv / nh].
+    let mut want = vec![0.0f32; nh * hd];
+    for h in 0..nh {
+        let kvh = h * nkv / nh;
+        want[h * hd..(h + 1) * hd].copy_from_slice(&v_data[kvh * hd..(kvh + 1) * hd]);
+    }
+
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[1, stride]),
+        u8dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[1, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let vcodes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[1, stride]),
+        DType {
+            arith: ArithType::U8,
+            storage: grim_tensor::Storage::Native,
+        },
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let vscales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[1, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+
+    // Positions: an F32 buffer the kernel reads as `const int*`; past = 0 has
+    // bit pattern 0.0f32, so a zero-filled f32 buffer is the exact wire value.
+    let pos = dev
+        .from_cpu(&[0.0f32], &Shape::from_slice(&[1]), DType::F32)
+        .unwrap();
+
+    let arena_slot_stride = stride; // max_ctx = 1
+    let scale_slot_stride = nkv;
+    let ring = grim_backend_rocm::KvRingPolicy::UNLIMITED;
+    for (data, c, s) in [(&k_data, &codes, &scales), (&v_data, &vcodes, &vscales)] {
+        let src = dev
+            .from_cpu(data, &Shape::from_slice(&[1, stride]), DType::F32)
+            .unwrap();
+        grim_backend_rocm::launch_kv_append_i8(
+            &dev,
+            src.as_ref(),
+            pos.as_ref(),
+            c,
+            s,
+            stride,
+            nkv,
+            hd,
+            1,
+            1,
+            arena_slot_stride,
+            scale_slot_stride,
+            ring,
+        )
+        .expect("graph kv_append_i8");
+    }
+    dev.synchronize();
+
+    // The quantizer must have produced a usable sidecar (amax, not garbage).
+    let sc = scales.to_cpu_vec_f32().unwrap();
+    assert!(
+        sc.iter().all(|s| s.is_finite() && *s > 0.0),
+        "append_i8 scales must be finite and positive: {sc:?}"
+    );
+
+    let q32 = dev
+        .from_cpu(&q_data, &Shape::from_slice(&[1, nh, hd]), DType::F32)
+        .unwrap();
+    let out = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[1, nh, hd]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let head_buf = |n: usize| {
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n]),
+            DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
+    };
+    let (out_max, out_sum) = (head_buf(nh), head_buf(nh));
+    let dummy = head_buf(1);
+    grim_backend_rocm::launch_qkv_attention_dev_batch_i8(
+        &dev,
+        q32.as_ref(),
+        &codes,
+        &scales,
+        &vcodes,
+        &vscales,
+        &out,
+        &out_max,
+        &out_sum,
+        pos.as_ref(),
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        1, // seq_len: ONE query step, like q_head_buf
+        1, // steps: one KV row appended
+        1.0 / (hd as f32).sqrt(),
+        0, // window_lo
+        0.0,
+        &dummy, // o_proj_w (unused when fuse_o == 0)
+        0,      // o_dim
+        0,      // fuse_o
+        &dummy, // alibi_slopes (unused when has_alibi == 0)
+        0,      // has_alibi
+        1,      // batch
+        arena_slot_stride,
+        scale_slot_stride,
+        ring,
+    )
+    .expect("graph qkv_attention_dev_batch_i8");
+    dev.synchronize();
+
+    let got = out.to_cpu_vec_f32().unwrap();
+    assert!(got.iter().all(|x| x.is_finite()), "graph int8 attend non-finite");
+    let diff = max_abs_diff(&got, &want);
+    let amax = v_data.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+    eprintln!("[graph-i8] max_abs_diff={diff:.6} v_amax={amax:.4}");
+    // int8 rounding is |e| <= scale/2 <= amax/254 per element.
+    assert!(
+        diff <= amax / 200.0 + 1e-6,
+        "graph int8 attend diverges from the exact oracle: {diff:.6} at amax {amax:.4}"
+    );
+}
+
+/// WS-3A: the 2-bit KEY quantizer kernel round-trips within half a step.
+///
+/// Same per-(row, kv_head) amax scheme as the i4 quantizer, but 4 codes/byte
+/// with levels [-1, +1] biased +1, so the bound is `amax/2` per element.
+#[test]
+#[ignore]
+fn k2v4_append_quantize_parity() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (n_rows, nkv, hd) = (5_usize, 4, 64);
+    let stride = nkv * hd;
+    let mut seed = 0x2b1u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let src: Vec<f32> = (0..(n_rows * stride)).map(|_| rand()).collect();
+    let src_dev = dev
+        .from_cpu(&src, &Shape::from_slice(&[n_rows, stride]), DType::F32)
+        .unwrap();
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, stride]),
+        u8dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    grim_backend_rocm::launch_kv_quantize_rows_i2(
+        &dev,
+        src_dev.as_ref(),
+        0,
+        &codes,
+        0,
+        &scales,
+        0,
+        n_rows,
+        stride,
+        nkv,
+        hd,
+    )
+    .expect("quantize i2");
+    dev.synchronize();
+    let cb = codes.to_cpu_vec_u32().expect("codes d2h");
+    let bytes: Vec<u8> = cb.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let sc = scales.to_cpu_vec_f32().expect("scales d2h");
+    assert_eq!(sc.len(), n_rows * nkv);
+
+    // 2-bit packing: 4 codes/byte, row stride stride/4, head offset kh*hd/4.
+    let row_bytes = stride / 4;
+    let head_bytes = hd / 4;
+    let mut worst = 0.0f32;
+    let mut amax = 0.0f32;
+    for r in 0..n_rows {
+        for kh in 0..nkv {
+            let s = sc[r * nkv + kh];
+            assert!(s.is_finite() && s > 0.0, "bad scale r={r} kh={kh}: {s}");
+            for d in 0..hd {
+                let packed = bytes[r * row_bytes + kh * head_bytes + (d >> 2)];
+                let code = ((packed >> ((d & 3) * 2)) & 0x03) as i32;
+                assert!((0..=2).contains(&code), "2-bit code out of the 3 used levels: {code}");
+                let got = (code - 1) as f32 * s;
+                let orig = src[r * stride + kh * hd + d];
+                amax = amax.max(orig.abs());
+                worst = worst.max((got - orig).abs());
+            }
+        }
+    }
+    eprintln!("[k2v4-append] worst={worst:.6} amax={amax:.4}");
+    assert!(
+        worst <= amax / 2.0 + 1e-6,
+        "2-bit key roundtrip off by {worst:.6} at amax {amax:.4}"
+    );
+}
+
+/// WS-3A: the mixed-width (2-bit K / 4-bit V) attention kernel matches an
+/// INDEPENDENT host oracle built from the packed codes.
+///
+/// The oracle dequantizes the codes itself (it does not call the kernel), so a
+/// wrong packing stride, width or level bias on either side shows up as a
+/// divergence rather than being certified by the code under test.
+#[test]
+#[ignore]
+fn k2v4_attend_matches_host_oracle() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (nh, nkv, hd, kv_len) = (8_usize, 4, 64, 6);
+    let stride = nkv * hd;
+    let mut seed = 0x2b2u64;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q_data: Vec<f32> = (0..(kv_len * nh * hd)).map(|_| rand() * 0.5).collect();
+    let k_data: Vec<f32> = (0..(kv_len * stride)).map(|_| rand() * 0.5).collect();
+    let v_data: Vec<f32> = (0..(kv_len * stride)).map(|_| rand() * 0.5).collect();
+
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let alloc_codes = |n: usize| {
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n, stride]),
+            u8dt.clone(),
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
+    };
+    let alloc_scales = |n: usize| {
+        grim_backend_rocm::RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[n, nkv]),
+            DType::F32,
+            &dev.allocator_handle(),
+            0,
+        )
+        .unwrap()
+    };
+    let (kcodes, kscales) = (alloc_codes(kv_len), alloc_scales(kv_len));
+    let (vcodes, vscales) = (alloc_codes(kv_len), alloc_scales(kv_len));
+    let k_src = dev
+        .from_cpu(&k_data, &Shape::from_slice(&[kv_len, stride]), DType::F32)
+        .unwrap();
+    let v_src = dev
+        .from_cpu(&v_data, &Shape::from_slice(&[kv_len, stride]), DType::F32)
+        .unwrap();
+    // K -> 2-bit, V -> 4-bit.
+    grim_backend_rocm::launch_kv_quantize_rows_i2(
+        &dev, k_src.as_ref(), 0, &kcodes, 0, &kscales, 0, kv_len, stride, nkv, hd,
+    )
+    .expect("i2 quantize");
+    grim_backend_rocm::launch_kv_quantize_rows_i4(
+        &dev, v_src.as_ref(), 0, &vcodes, 0, &vscales, 0, kv_len, stride, nkv, hd,
+    )
+    .expect("i4 quantize");
+    dev.synchronize();
+
+    let q32 = dev
+        .from_cpu(&q_data, &Shape::from_slice(&[kv_len, nh, hd]), DType::F32)
+        .unwrap();
+    let out_shape = Shape::from_slice(&[kv_len, nh, hd]);
+    let (out, h) = dev
+        .qkv_attention_i2v4(
+            q32.as_ref(),
+            &kcodes,
+            &kscales,
+            &vcodes,
+            &vscales,
+            nkv,
+            kv_len,
+            0,
+            None,
+            &out_shape,
+        )
+        .expect("qkv_attention_i2v4");
+    h.synchronize().expect("sync");
+    let got = out.to_cpu_vec_f32().unwrap();
+    assert!(got.iter().all(|x| x.is_finite()), "k2v4 attend non-finite");
+
+    // ── independent host oracle ──────────────────────────────────────────
+    let kb: Vec<u8> = kcodes
+        .to_cpu_vec_u32()
+        .unwrap()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let vb: Vec<u8> = vcodes
+        .to_cpu_vec_u32()
+        .unwrap()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let ks = kscales.to_cpu_vec_f32().unwrap();
+    let vs = vscales.to_cpu_vec_f32().unwrap();
+    let deq_k = |row: usize, kh: usize, d: usize| -> f32 {
+        let packed = kb[row * (stride / 4) + kh * (hd / 4) + (d >> 2)];
+        let code = ((packed >> ((d & 3) * 2)) & 0x03) as i32;
+        (code - 1) as f32 * ks[row * nkv + kh]
+    };
+    let deq_v = |row: usize, kh: usize, d: usize| -> f32 {
+        let packed = vb[row * (stride / 2) + kh * (hd / 2) + (d >> 1)];
+        let code = if d & 1 == 1 {
+            ((packed >> 4) & 0x0f) as i32
+        } else {
+            (packed & 0x0f) as i32
+        };
+        (code - 7) as f32 / 7.0 * vs[row * nkv + kh]
+    };
+    let inv_sqrt_d = 1.0 / (hd as f32).sqrt();
+    let mut want = vec![0.0f32; kv_len * nh * hd];
+    for i in 0..kv_len {
+        let hi = (i + 1).min(kv_len);
+        for hh in 0..nh {
+            let kvh = hh * nkv / nh;
+            let mut scores = Vec::with_capacity(hi);
+            for j in 0..hi {
+                let dot: f32 = (0..hd)
+                    .map(|d| q_data[(i * nh + hh) * hd + d] * deq_k(j, kvh, d))
+                    .sum();
+                scores.push(dot * inv_sqrt_d);
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for d in 0..hd {
+                let acc: f32 = (0..hi).map(|j| exps[j] / sum * deq_v(j, kvh, d)).sum();
+                want[(i * nh + hh) * hd + d] = acc;
+            }
+        }
+    }
+
+    let diff = max_abs_diff(&got, &want);
+    let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+    eprintln!(
+        "[k2v4-attend] max_abs_diff={diff:.6} rel={:.6}",
+        diff / scale
+    );
+    assert!(
+        diff / scale < 3e-2,
+        "k2v4 attend diverges from the host oracle: {diff:.6} (rel {:.6})",
+        diff / scale
+    );
+}
+
+/// WS-3A: the 2-bit packing is EXACTLY four codes per byte, lowest bits first.
+///
+/// Hand-computed, so it does not inherit my reading of the kernel: an
+/// alternating `[+a, -a, +a, -a, ...]` head-vector has amax `a`, so every code
+/// is `round(±a/a) + 1` = 2 or 0 and every byte is
+/// `2 | (0<<2) | (2<<4) | (0<<6)` = 0x22.
+#[test]
+#[ignore]
+fn k2v4_packing_is_exactly_four_codes_per_byte() {
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return;
+    }
+    let dev = RocmDevice::try_new(0).expect("try_new");
+    let _lock = grim_backend_rocm::device::util::gpu_test_lock();
+    use grim_tensor::ArithType;
+    let (n_rows, nkv, hd) = (2_usize, 1, 64);
+    let stride = nkv * hd;
+    let a = 0.75f32;
+    let src: Vec<f32> = (0..(n_rows * stride))
+        .map(|i| if i % 2 == 0 { a } else { -a })
+        .collect();
+    let src_dev = dev
+        .from_cpu(&src, &Shape::from_slice(&[n_rows, stride]), DType::F32)
+        .unwrap();
+    let u8dt = DType {
+        arith: ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+    let codes = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, stride]),
+        u8dt,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    let scales = grim_backend_rocm::RocmStorage::alloc_gpu(
+        &Shape::from_slice(&[n_rows, nkv]),
+        DType::F32,
+        &dev.allocator_handle(),
+        0,
+    )
+    .unwrap();
+    grim_backend_rocm::launch_kv_quantize_rows_i2(
+        &dev,
+        src_dev.as_ref(),
+        0,
+        &codes,
+        0,
+        &scales,
+        0,
+        n_rows,
+        stride,
+        nkv,
+        hd,
+    )
+    .expect("quantize i2");
+    dev.synchronize();
+    let cb = codes.to_cpu_vec_u32().expect("codes d2h");
+    let bytes: Vec<u8> = cb.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let sc = scales.to_cpu_vec_f32().expect("scales d2h");
+    for s in &sc {
+        assert!((*s - a).abs() < 1e-6, "scale must be the amax: {s}");
+    }
+    // 4 codes/byte => stride/4 bytes per row.
+    let row_bytes = stride / 4;
+    for r in 0..n_rows {
+        for b in 0..row_bytes {
+            assert_eq!(
+                bytes[r * row_bytes + b],
+                0x22,
+                "row {r} byte {b} is not the hand-computed 0x22 (packing is not 4 codes/byte, \
+                 lowest first)"
+            );
+        }
+    }
+}

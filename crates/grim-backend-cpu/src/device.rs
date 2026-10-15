@@ -3319,6 +3319,59 @@ mod tests {
         assert_eq!(result, vec![22.0, 28.0, 49.0, 64.0]);
     }
 
+    // ── 8. gather_rows_into compacts a non-contiguous row set ───────
+    // WS-4.2: the default `MemoryOps::gather_rows_into` is the reference
+    // oracle for the device gather kernel that value-guided KV eviction
+    // (CurDKV) uses to lay its host-selected survivors down contiguously.
+    #[test]
+    fn gather_rows_into_compacts_selected_rows() {
+        use grim_tensor::{MemoryOps, Shape};
+        let dev = CpuDevice::new();
+        // 5 rows x 2 elems: row r holds [2r, 2r+1].
+        let src_data: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let src = dev
+            .from_cpu(&src_data, &Shape::new(vec![5, 2]), DType::F32)
+            .unwrap();
+        let dst = dev
+            .alloc_storage(&Shape::new(vec![3, 2]), DType::F32)
+            .unwrap();
+        // Keep rows 3, 0, 4 — out of order and non-contiguous.
+        dev.gather_rows_into(dst.as_ref(), 0, src.as_ref(), &[3, 0, 4], 2)
+            .unwrap();
+        assert_eq!(
+            dst.to_cpu_vec_f32().unwrap(),
+            vec![6.0, 7.0, 0.0, 1.0, 8.0, 9.0]
+        );
+    }
+
+    #[test]
+    fn gather_rows_into_rejects_bad_indices_and_overflow() {
+        use grim_tensor::{MemoryOps, Shape};
+        let dev = CpuDevice::new();
+        let src = dev
+            .from_cpu(&vec![0.0f32; 6], &Shape::new(vec![3, 2]), DType::F32)
+            .unwrap();
+        let dst = dev
+            .alloc_storage(&Shape::new(vec![3, 2]), DType::F32)
+            .unwrap();
+        // A source row out of range is an error, never a clamp.
+        assert!(dev
+            .gather_rows_into(dst.as_ref(), 0, src.as_ref(), &[0, 3], 2)
+            .is_err());
+        // More output rows than fit at the offset.
+        assert!(dev
+            .gather_rows_into(dst.as_ref(), 1, src.as_ref(), &[0, 1, 2], 2)
+            .is_err());
+        // An empty selection is a no-op.
+        assert!(dev
+            .gather_rows_into(dst.as_ref(), 0, src.as_ref(), &[], 2)
+            .is_ok());
+        // A zero row width is a bug, not a silent no-op.
+        assert!(dev
+            .gather_rows_into(dst.as_ref(), 0, src.as_ref(), &[0], 0)
+            .is_err());
+    }
+
     // ── 7. Sliding-window attention masks out-of-window keys ───────── Laguna-S-2.1
     // hybrid attention: SWA layers attend only the last `window` positions.
     #[test]
