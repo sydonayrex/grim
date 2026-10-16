@@ -138,6 +138,16 @@ pub struct DecodeGraphBuffers {
     /// and the newest tokens in a ring. Owned here so capture and replay read
     /// the same policy the capture baked into the kernels.
     pub kv_ring: KvRingPolicy,
+    /// Bits per KV code for the packed arenas this pool was built with: `None`
+    /// for f16/f32, `Some(8)`/`Some(4)`/`Some(2)` for int8/int4/int2v4. Set once
+    /// at allocation from the resolved `KvArenaFormat`; the capture dispatch
+    /// reads it to pick the right device-total kernel pair.
+    ///
+    /// Recorded rather than inferred: an 8-bit and a 4-bit arena differ only by
+    /// a factor of two in the innermost shape axis (which is a head's BYTE
+    /// count, not `head_dim`), so no storage-level predicate can tell them apart.
+    /// [`Self::kv_arena_packed_width`] cross-checks it against the arena dtype.
+    pub kv_arena_bits: Option<u32>,
     /// Latent KV cache arena for MLA models (DeepSeek, Kimi): [batch * max_ctx, latent_kv_dim]
     pub latent_kv_arena: Vec<RocmStorage>,
     /// Output projection
@@ -632,6 +642,31 @@ impl DecodeGraphBuffers {
             &dev.allocator,
             dev.ordinal,
         )?;
+        // The device mirror must start at 0 to match `current_pos` (the host
+        // mirror above is 0). `alloc_gpu` does NOT zero: a recycled block
+        // inherits the previous pool's bytes, and `pos_dev` is read as `int*`
+        // by the append/bump kernels but written as f32 by `write_pos_async`
+        // — stale float bits (e.g. 3.0f = 0x40400000) read as ~1.08e9 and the
+        // first append writes at row*~69GB. The int8 pool survived this only
+        // by allocating fresh (driver-zeroed) pages; the int4 pool after it
+        // recycled the int8 pool and faulted the warmup append. Zeroed here,
+        // outside any capture bracket (pool construction is pre-capture).
+        {
+            let _g = crate::device::util::DeviceGuard::set(dev.ordinal as i32);
+            let p = pos_dev
+                .device_ptr
+                .ok_or_else(|| Error::Backend("pos_dev has no device ptr".into()))?;
+            let res: crate::HipErrorT = unsafe {
+                crate::device::handles::hipMemset(
+                    p as *mut std::ffi::c_void,
+                    0,
+                    batch.max(1) * std::mem::size_of::<f32>(),
+                )
+            };
+            if res != crate::hipSuccess {
+                return Err(Error::Backend(format!("zero pos_dev: {res}")));
+            }
+        }
         let token_ids_dev = RocmStorage::alloc_gpu(
             &Shape::new(vec![batch.max(1)]),
             dt.clone(),
@@ -805,6 +840,7 @@ impl DecodeGraphBuffers {
             k_scale_arena,
             v_scale_arena,
             kv_ring: KvRingPolicy::UNLIMITED,
+            kv_arena_bits: None,
             latent_kv_arena,
             head_input,
             head_output,
@@ -836,26 +872,50 @@ impl DecodeGraphBuffers {
         })
     }
 
-    /// True when the KV arenas hold u8 codes (Phase-2 int8 format). Derived
-    /// from STORAGE, never from env — the same storage-truth rule the
-    /// append/attend launchers follow.
-    pub fn kv_arena_is_int8(&self) -> bool {
-        self.k_arena
+    /// Packed KV codes per element width, from STORAGE (never env): `None` when
+    /// the arenas hold f16/f32 K/V directly, `Some(8)` for int8, `Some(4)` for
+    /// int4, `Some(2)` for int2v4.
+    ///
+    /// This replaced `kv_arena_is_int8() -> bool`, which asked `arith == U8` and
+    /// therefore answered "int8" for int4 and int2v4 as well. A bool cannot carry
+    /// three widths, and the dispatch that consumed it could not tell them apart
+    /// — which is how `GRIM_KV_ARENA=int2v4` came to run the 8-bit kernels over
+    /// 4-codes-per-byte keys.
+    ///
+    /// The width is RECORDED at allocation ([`Self::kv_arena_bits`]) rather than
+    /// inferred from the shape: a packed row's innermost axis is a head's BYTE
+    /// count, so the shapes of an 8-bit and a 4-bit arena differ only by a
+    /// factor of two in that axis, and `head_dim` is a model property this
+    /// struct does not hold.
+    pub fn kv_arena_packed_width(&self) -> Option<u32> {
+        // Storage truth: the recorded width and the arena's dtype must agree, so
+        // a mis-set field cannot route a packed arena to the unpacked launcher.
+        let is_u8 = self
+            .k_arena
             .first()
             .map(|a| a.dtype.arith == grim_tensor::dtype::ArithType::U8)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        debug_assert_eq!(
+            is_u8,
+            self.kv_arena_bits.is_some(),
+            "kv_arena_bits ({:?}) disagrees with the arena storage (U8: {is_u8})",
+            self.kv_arena_bits
+        );
+        self.kv_arena_bits
     }
 
-    /// Allocate the per-layer f32 scale sidecars for the int8 KV format, one
-    /// f32 per (row, kv_head) laid out `[batch * max_ctx, nkv_heads]`.
-    /// MUST run outside capture. Idempotent: a second call is a no-op.
-    pub fn allocate_int8_kv_scales(&mut self, dev: &RocmDevice, num_kv_heads: usize) -> Result<()> {
+    /// Allocate the per-layer f32 scale sidecars for a PACKED KV format, one f32
+    /// per (row, kv_head) laid out `[batch * max_ctx, nkv_heads]`. The layout is
+    /// the same for every packed width: int8, int4 and int2v4 each store one
+    /// scale per (row, kv head) per side. MUST run outside capture. Idempotent:
+    /// a second call is a no-op.
+    pub fn allocate_packed_kv_scales(&mut self, dev: &RocmDevice, num_kv_heads: usize) -> Result<()> {
         if !self.k_scale_arena.is_empty() {
             return Ok(());
         }
         if num_kv_heads == 0 {
             return Err(Error::Backend(
-                "allocate_int8_kv_scales: num_kv_heads is zero".into(),
+                "allocate_packed_kv_scales: num_kv_heads is zero".into(),
             ));
         }
         let rows = self.batch.max(1) * self.max_ctx;
@@ -1172,8 +1232,15 @@ impl DecodeGraphBuffers {
                 cap if cap > 0 => src.prefill_len.min(cap as u32),
                 _ => src.prefill_len,
             };
-            let n_elem: usize = (n_rows as usize) * src.kv_stride;
-            // K arena row width must match the eager cache stride.
+            // The arena row extent is the FORMAT's row width, and both the
+            // eager source and the graph arena are built from the same format
+            // resolver — so `src.kv_stride` (the eager arena's trailing-dims
+            // product) already IS that extent: `nkv*hd` for int8/f16/f32 and
+            // the packed `nkv*(hd/2)` for int4. We assert it against the graph
+            // arena's last dim and against the arena's real byte count so a
+            // format/dtype drift fails loud instead of copying half a row.
+            let arena_row_extent: usize = src.kv_stride;
+            let n_elem: usize = (n_rows as usize) * arena_row_extent;
             let arena_k_cols = self.k_arena[layer_idx]
                 .shape
                 .dims()
@@ -1186,9 +1253,9 @@ impl DecodeGraphBuffers {
                 .last()
                 .copied()
                 .unwrap_or(0);
-            if arena_k_cols != src.kv_stride || arena_v_cols != src.kv_stride {
+            if arena_k_cols != arena_row_extent || arena_v_cols != arena_row_extent {
                 return Err(Error::Backend(format!(
-                    "seed_kv_arena: layer {layer_idx} arena width k={arena_k_cols} v={arena_v_cols} != kv_stride {}",
+                    "seed_kv_arena: layer {layer_idx} arena width k={arena_k_cols} v={arena_v_cols} != format row extent {arena_row_extent} (kv_stride {})",
                     src.kv_stride
                 )));
             }
@@ -1221,6 +1288,18 @@ impl DecodeGraphBuffers {
                 }
             };
             let n_bytes = n_elem * arena_elem_bytes;
+            debug_assert_eq!(
+                n_bytes,
+                (n_rows as usize) * arena_row_extent * arena_elem_bytes,
+                "seed_kv_arena: layer {layer_idx} byte count must be rows x format row extent"
+            );
+            debug_assert!(
+                n_bytes <= self.k_arena[layer_idx].bytes
+                    && n_bytes <= self.v_arena[layer_idx].bytes,
+                "seed_kv_arena: layer {layer_idx} seed {n_bytes} B exceeds arena bytes                  (k={}, v={})",
+                self.k_arena[layer_idx].bytes,
+                self.v_arena[layer_idx].bytes
+            );
             let dst_k = self.k_arena[layer_idx]
                 .device_ptr_u64()
                 .ok_or_else(|| Error::Backend("seed: k_arena has no ptr".into()))?
@@ -1340,6 +1419,61 @@ impl DecodeGraphBuffers {
                     return Err(Error::Backend(format!(
                         "seed_kv_arena: hipMemcpyAsync V failed: {res}"
                     )));
+                }
+                // Zero out any remaining tail rows in the arena for layer_idx
+                let total_k_bytes = self.k_arena[layer_idx].bytes;
+                if total_k_bytes > n_bytes {
+                    let tail_bytes = total_k_bytes - n_bytes;
+                    unsafe {
+                        crate::device::handles::hipMemsetAsync(
+                            (dst_k as *mut u8).add(n_bytes) as *mut std::ffi::c_void,
+                            0,
+                            tail_bytes,
+                            stream,
+                        );
+                        crate::device::handles::hipMemsetAsync(
+                            (dst_v as *mut u8).add(n_bytes) as *mut std::ffi::c_void,
+                            0,
+                            tail_bytes,
+                            stream,
+                        );
+                    }
+                }
+                eprintln!(
+                    "[seed-debug] layer {layer_idx}: copied {n_bytes} bytes ({n_rows} rows), tail {} bytes zeroed. total_arena={total_k_bytes}",
+                    total_k_bytes.saturating_sub(n_bytes)
+                );
+                // BYTE-COMPARE CHECK: Verify graph arena matches eager arena bit-for-bit on rows 0..n_rows
+                unsafe {
+                    crate::device::handles::hipStreamSynchronize(stream);
+                    let mut host_eager_k = vec![0u8; n_bytes];
+                    let mut host_graph_k = vec![0u8; n_bytes];
+                    let mut host_eager_v = vec![0u8; n_bytes];
+                    let mut host_graph_v = vec![0u8; n_bytes];
+                    crate::hipMemcpy(host_eager_k.as_mut_ptr() as *mut std::ffi::c_void, src_k, n_bytes, HipMemcpyKind::DeviceToHost);
+                    crate::hipMemcpy(host_graph_k.as_mut_ptr() as *mut std::ffi::c_void, dst_k, n_bytes, HipMemcpyKind::DeviceToHost);
+                    crate::hipMemcpy(host_eager_v.as_mut_ptr() as *mut std::ffi::c_void, src_v, n_bytes, HipMemcpyKind::DeviceToHost);
+                    crate::hipMemcpy(host_graph_v.as_mut_ptr() as *mut std::ffi::c_void, dst_v, n_bytes, HipMemcpyKind::DeviceToHost);
+                    let k_diff = host_eager_k.iter().zip(host_graph_k.iter()).filter(|(a, b)| a != b).count();
+                    let v_diff = host_eager_v.iter().zip(host_graph_v.iter()).filter(|(a, b)| a != b).count();
+                    // Check for NaNs in rows 0..n_rows
+                    let k_u16: &[u16] = std::slice::from_raw_parts(host_graph_k.as_ptr() as *const u16, n_bytes / 2);
+                    let v_u16: &[u16] = std::slice::from_raw_parts(host_graph_v.as_ptr() as *const u16, n_bytes / 2);
+                    let k_nans = k_u16.iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
+                    let v_nans = v_u16.iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
+                    eprintln!(
+                        "[seed-verify] layer {layer_idx}: k_diff_bytes={k_diff}/{n_bytes}, v_diff_bytes={v_diff}/{n_bytes}, k_nans={k_nans}, v_nans={v_nans}"
+                    );
+                    if k_nans > 0 {
+                        for (idx, &val) in k_u16.iter().enumerate() {
+                            if (val & 0x7c00) == 0x7c00 && (val & 0x03ff) != 0 {
+                                let row = idx / 1024;
+                                let col = idx % 1024;
+                                eprintln!("[seed-nan-k] layer {layer_idx}: row={row} col={col} val=0x{val:04x}");
+                                if row > 0 { break; }
+                            }
+                        }
+                    }
                 }
                 continue;
             }

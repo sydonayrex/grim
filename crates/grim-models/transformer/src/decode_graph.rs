@@ -104,6 +104,27 @@ fn dev_for_llama(llama: &Llama) -> Result<Arc<Dev>> {
     }
 }
 
+/// Refuse graph capture when the KV arena's format has no DEVICE-TOTAL
+/// append + attention pair.
+///
+/// Asked of the resolved FORMAT, not of an env spelling list. The list this
+/// replaced had to be extended for every new format, and it answered a
+/// different question from the one that matters: K2V4 has EAGER kernels and no
+/// capturable pair, so `has_device_kernels` is true while `graph_kernel_pair`
+/// is false. Getting that wrong is silent — capture succeeds, and the 8-bit
+/// kernels read 4-codes-per-byte keys as if each byte were one code.
+fn refuse_uncapturable_kv_arena(device: &Device) -> Result<()> {
+    use grim_backend_rocm::KvArenaFormat as F;
+    let fmt = crate::qwen35::kv_arena_format_qwen(device);
+    if fmt.graph_kernel_pair() || matches!(fmt, F::F32 | F::F16) {
+        return Ok(());
+    }
+    Err(grim_core::error::Error::Backend(format!(
+        "decode graph: {fmt:?} has no device-total append/attend kernel pair \
+         (eager fallback)"
+    )))
+}
+
 fn rocm_storage(t: &grim_tensor::Tensor) -> Result<&grim_backend_rocm::RocmStorage> {
     dst_downcast(t.storage().as_ref())
 }
@@ -879,14 +900,13 @@ impl DecodeGraphModel for Llama {
     }
 
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
-        // int4 dense KV arenas historically miss a graph-safe i4 kernel pair; refuse
-        // capture (run.rs then uses the eager path, which is correct).
-        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4" | "int8" | "i8" | "q8")) {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph: quantized KV (int8/int4) graph path disabled (eager fallback)".into(),
-            ));
-        }
         let dev = dev_for_llama(self)?;
+        // Refuse capture for any arena whose DEVICE-TOTAL kernel pair does not
+        // exist. Asked of the resolved FORMAT, not of an env spelling list: a
+        // list has to be extended for every new format and answers a different
+        // question from the one that matters (the eager kernels exist for K2V4;
+        // the capturable pair does not).
+        refuse_uncapturable_kv_arena(&self.device)?;
         if !decode_graph_enabled() {
             return Err(grim_core::error::Error::Backend(
                 "decode graph disabled by env".into(),
@@ -1599,7 +1619,15 @@ impl Qwen35Block {
 
             // 5. KV append to arenas
             let kv_stride = nkv * hd;
-            let arena_slot_stride = buffers.max_ctx * kv_stride;
+            // Packed arenas address codes in BYTES (the i4 kernel packs two
+            // codes per byte, so its row stride is `kv_stride / 2`). int8 is
+            // 1 byte/elem so bytes == elements and the value is unchanged;
+            // int4 must pass the PACKED byte stride or every slot/row lands 2x
+            // too far. f32/f16 keep the element stride for the plain copy.
+            let arena_slot_stride = match buffers.kv_arena_packed_width() {
+                Some(4) => buffers.max_ctx * (nkv * (hd / 2)),
+                _ => buffers.max_ctx * kv_stride,
+            };
             let max_ctx = buffers.max_ctx;
             // Phase 3: bounds-check the RING row, not the absolute pos. With a
             // capped arena `current_pos` outgrows `max_ctx` by design once the
@@ -1620,11 +1648,22 @@ impl Qwen35Block {
             )
             .map_err(|e| grim_core::error::Error::Backend(format!("{e}")))?;
 
-            // Phase-2 int8 arenas take the quantizing append (u8 codes + one
-            // f32 scale per (row, kv_head)); f32/f16 take the plain copy. The
-            // decision comes from STORAGE, so the captured graph always
-            // matches what the arenas actually hold.
-            let arena_i8 = buffers.kv_arena_is_int8();
+            // Packed arenas take the quantizing append (codes + one f32 scale
+            // per (row, kv_head)); f32/f16 take the plain copy. The WIDTH comes
+            // from the arena, so the captured graph always matches what the
+            // arenas actually hold — and a width with no capturable pair is an
+            // error here rather than a silent fallthrough to the 8-bit kernels.
+            let packed_bits = buffers.kv_arena_packed_width();
+            match packed_bits {
+                None | Some(8) | Some(4) => {}
+                Some(bits) => {
+                    return Err(grim_core::error::Error::Backend(format!(
+                        "graph KV append: no device-total kernel pair for {bits}-bit KV codes (eager fallback)"
+                    )));
+                }
+            }
+            let arena_i8 = packed_bits == Some(8);
+            let arena_i4 = packed_bits == Some(4);
             if arena_i8 {
                 let scale_slot_stride = buffers.max_ctx * nkv;
                 for (src, dst, scales, tag) in [
@@ -1664,6 +1703,16 @@ impl Qwen35Block {
                     .map_err(|e| {
                         grim_core::error::Error::Backend(format!("kv_append_i8 {tag}: {e}"))
                     })?;
+                }
+            } else if arena_i4 {
+                let scale_slot_stride = buffers.max_ctx * nkv;
+                for (src, dst, scales, tag) in [
+                    (&buffers.k_buf[layer_idx], &buffers.k_arena[layer_idx], &buffers.k_scale_arena, "k"),
+                    (&buffers.v_buf[layer_idx], &buffers.v_arena[layer_idx], &buffers.v_scale_arena, "v"),
+                ] {
+                    let sc = scales.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph kv_append_i4 {tag}: no scale sidecar for layer {layer_idx}")))?;
+                    grim_backend_rocm::launch_kv_append_i4(dev, src, &buffers.pos_dev, dst, sc, kv_stride, nkv, hd, steps, batch, arena_slot_stride, scale_slot_stride, buffers.kv_ring)
+                        .map_err(|e| grim_core::error::Error::Backend(format!("kv_append_i4 {tag}: {e}")))?;
                 }
             } else {
                 grim_backend_rocm::launch_kv_append_batch(
@@ -1738,6 +1787,26 @@ impl Qwen35Block {
                 .map_err(|e| {
                     grim_core::error::Error::Backend(format!("qkv_attention_dev_i8: {e}"))
                 })?;
+            } else if arena_i4 {
+                let scale_slot_stride = buffers.max_ctx * nkv;
+                let k_scales = buffers.k_scale_arena.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph attention_i4: no k scale sidecar for layer {layer_idx}")))?;
+                let v_scales = buffers.v_scale_arena.get(layer_idx).ok_or_else(|| grim_core::error::Error::Backend(format!("graph attention_i4: no v scale sidecar for layer {layer_idx}")))?;
+                grim_backend_rocm::launch_qkv_attention_dev_batch_i4(
+                    dev,
+                    &buffers.q_head_buf[layer_idx],
+                    &buffers.k_arena[layer_idx],
+                    k_scales,
+                    &buffers.v_arena[layer_idx],
+                    v_scales,
+                    &buffers.attn_out_buf[layer_idx],
+                    &buffers.attn_max_buf[layer_idx],
+                    &buffers.attn_sum_buf[layer_idx],
+                    &buffers.pos_dev,
+                    nh as u32, nkv as u32, hd as u32, steps as u32, steps as u32,
+                    1.0 / (hd as f32).sqrt(), 0, 0.0,
+                    &buffers.attn_dummy, 0, 0, &buffers.attn_dummy, 0,
+                    batch, arena_slot_stride, scale_slot_stride, buffers.kv_ring,
+                ).map_err(|e| grim_core::error::Error::Backend(format!("qkv_attention_dev_i4: {e}")))?;
             } else {
                 grim_backend_rocm::launch_qkv_attention_dev_batch(
                     dev,
@@ -2137,8 +2206,8 @@ impl DecodeGraphModel for Qwen35 {
     }
 
     fn get_or_create_decode_graph(&self, max_ctx: usize, batch: usize) -> Result<DecodeGraph> {
-        // int4 dense KV arenas still have no graph-safe i4 kernel pair; refuse
-        // capture (run.rs then uses the eager path, which is correct).
+        // Refuse capture for any arena whose DEVICE-TOTAL kernel pair does not
+        // exist. Asked of the resolved FORMAT, not of an env spelling list.
         //
         // int8 IS allowed: `launch_kv_append_i8` + `launch_qkv_attention_dev_batch_i8`
         // are the captured pair, and they are gated by
@@ -2146,11 +2215,7 @@ impl DecodeGraphModel for Qwen35 {
         // grim-backend-rocm/tests/qkv_attention.rs. That test is what caught the
         // launcher's argument-order defect (it wrote attention output into the
         // scale sidecar and faulted) before capture was enabled.
-        if matches!(std::env::var("GRIM_KV_ARENA").as_deref(), Ok("int4" | "i4" | "q4")) {
-            return Err(grim_core::error::Error::Backend(
-                "decode graph: int4 KV has no dedicated graph kernel pair (eager fallback)".into(),
-            ));
-        }
+        refuse_uncapturable_kv_arena(&self.device)?;
         // A per-layer KV budget table (`GRIM_KV_ARENA_ROWS=4096,2048,...`) cannot
         // be honored by the graph, which captures ONE ring for every layer:
         // replay would clamp every layer to a single cap. Refuse so the caller
@@ -2293,6 +2358,17 @@ impl DecodeGraphModel for Qwen35 {
         {
             use grim_backend_rocm::RocmStorage;
             let kv_dt = crate::qwen35::kv_arena_dtype(&self.device);
+            let fmt = crate::qwen35::kv_arena_format_qwen(&self.device);
+            // The capture dispatch reads this to pick a device-total kernel
+            // pair. Recorded from the RESOLVED FORMAT: the arena's shape cannot
+            // tell 8-bit codes from 4-bit ones (its innermost axis is a head's
+            // BYTE count), so the width has to be carried, not inferred.
+            buffers.kv_arena_bits = match fmt {
+                grim_backend_rocm::KvArenaFormat::Int8 => Some(8),
+                grim_backend_rocm::KvArenaFormat::Int4 => Some(4),
+                grim_backend_rocm::KvArenaFormat::Int2V4 => Some(2),
+                _ => None,
+            };
             if kv_dt.arith != grim_tensor::ArithType::F32 {
                 for arena in buffers.k_arena.iter_mut().chain(buffers.v_arena.iter_mut()) {
                     let shape = arena.shape().clone();
@@ -2308,14 +2384,18 @@ impl DecodeGraphModel for Qwen35 {
                             kv_dt.arith
                         ))
                     })?;
+                    // ZERO-FILL HYPOTHESIS TEST: clear dirty recycled memory in graph arena
+                    let dev_rocm = grim_backend_rocm::RocmDevice::shared(dev.ordinal());
+                    let _ = dev_rocm.launch_memset_u8(&narrowed, 0, narrowed.bytes());
                     *arena = narrowed;
                 }
             }
-            // int8 codes need their f32 scale sidecars before capture.
+            // Packed codes need their f32 scale sidecars before capture. One f32
+            // per (row, kv head) per side — the same layout at every width.
             if kv_dt.arith == grim_tensor::ArithType::U8 {
                 let n_kv = self.cfg.num_kv_heads;
-                buffers.allocate_int8_kv_scales(&dev, n_kv).map_err(|e| {
-                    grim_core::error::Error::Backend(format!("graph int8 scales: {e}"))
+                buffers.allocate_packed_kv_scales(&dev, n_kv).map_err(|e| {
+                    grim_core::error::Error::Backend(format!("graph packed KV scales: {e}"))
                 })?;
             }
             // Phase 3: publish the ring so the Qwen35 capture sites bake the

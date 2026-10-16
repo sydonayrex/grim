@@ -503,6 +503,9 @@ fn try_graph_decode_step(
         );
         return None;
     }
+    unsafe {
+        let _ = grim_backend_rocm::hipDeviceSynchronize();
+    }
     g.buffers.current_pos = g.buffers.current_pos.wrapping_add(1);
 
     // Diagnostic: dump the replayed graph's own logits — the Sampled path
@@ -1523,7 +1526,10 @@ pub async fn cmd_run(
                 allow_gpu_sample,
                 &history,
                 Some(&session as &dyn grim_core::session::SessionT),
-                tokens.len() as u32,
+                // Fix off-by-one: `tokens` contains the prompt plus the unscheduled token
+                // being decoded in this step. The eager cache only contains tokens forwarded
+                // so far (`tokens.len() - 1`). Passing `tokens.len()` read unwritten tail rows!
+                tokens.len().saturating_sub(1) as u32,
                 &mut ctx_exhausted,
                 &mut graph_just_captured,
             )

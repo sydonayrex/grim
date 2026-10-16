@@ -775,34 +775,57 @@ impl RocmDevice {
         self.launch_wmma_big_fmt_a16(kernel, 64, 128, a16_ptr, b_storage, out_storage, m, n, k, 1)
     }
 
+    /// Scratch f16 copy of a f32 A operand, for the 64x128 big tile's
+    /// `a_f16 = 1` mode.
+    ///
+    /// The fill re-reads A once per column block, so handing it halves instead
+    /// of floats halves that traffic; the copy is therefore redone on EVERY
+    /// call and only the BUFFER is reused.
+    ///
+    /// It used to be memoized on `(device_ptr, bytes, elems, ordinal)` and skip
+    /// the copy on a hit. That key names an allocation, not its contents, and
+    /// the pooled allocator hands one address to one activation after another
+    /// of the same shape — which is the normal case, since a layer's input
+    /// activation is freed as the next layer's is allocated. So the second
+    /// GEMM launch of a forward read the FIRST activation's halves. Measured
+    /// by `tests/big64x128_activation_reuse.rs`: the second launch came back
+    /// 3311.1 from the oracle for the rewritten A and 0.13 from the result for
+    /// the old one. Every 9B prefill with m >= 64 was computed on stale
+    /// activations, which is the whole of the "prefill collapse at 64 tokens".
     fn f32_activation_as_f16_ptr(&self, a: &RocmStorage, elems: usize) -> Result<u64> {
-        static F16_A: OnceLock<
-            std::sync::Mutex<
-                std::collections::HashMap<(u64, usize, usize, usize), Arc<RocmStorage>>,
-            >,
-        > = OnceLock::new();
+        static F16_A: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Arc<RocmStorage>>>> =
+            OnceLock::new();
         if a.dtype.arith != ArithType::F32 {
             return Err(Error::Backend("f32_activation_as_f16: A is not f32".into()));
         }
-        // Keyed by (ptr, bytes, elems, ordinal): the same pooled address can
-        // back a different-length activation on another device — bytes alone
-        // alias across shapes (a prefix reuse), and the ordinal aliases
-        // across GPUs. `elems` (m*k of THIS launch) disambiguates.
-        let key = (a.device_ptr.unwrap_or(0), a.bytes, elems, self.ordinal);
         let map = F16_A.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        if let Some(hit) = map.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            return Ok(hit.device_ptr.unwrap_or(0));
+        // Grown, never reused for its contents: an activation can be longer
+        // than the one that sized the buffer (the same device runs several
+        // shapes), and the ordinal keys the scratch to the card that owns it.
+        // One scratch per ordinal assumes one forward at a time per device,
+        // which is how this backend is driven (a device owns one compute
+        // stream); concurrent forward passes would need a scratch per stream.
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        let need_alloc = match guard.get(&self.ordinal) {
+            Some(s) => s.bytes < elems * 2,
+            None => true,
+        };
+        if need_alloc {
+            let shape = Shape::new(vec![elems]);
+            guard.insert(
+                self.ordinal,
+                Arc::new(RocmStorage::alloc_gpu(
+                    &shape,
+                    DType {
+                        arith: ArithType::F32,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?),
+            );
         }
-        let shape = Shape::new(vec![elems]);
-        let dst = RocmStorage::alloc_gpu(
-            &shape,
-            DType {
-                arith: ArithType::F32,
-                storage: DTypeStorage::Native,
-            },
-            &self.allocator,
-            self.ordinal,
-        )?;
+        let dst = guard.get(&self.ordinal).expect("just inserted");
         let mut sptr = a
             .device_ptr
             .ok_or_else(|| Error::Backend("cvt: src ptr".into()))?;
@@ -817,11 +840,7 @@ impl RocmDevice {
             HipDim3::new(256, 1, 1),
             &mut [arg(&mut sptr), arg(&mut dptr), arg(&mut n_i)],
         )?;
-        let dptr_ret = dst.device_ptr.unwrap_or(0);
-        map.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, Arc::new(dst));
-        Ok(dptr_ret)
+        Ok(dst.device_ptr.unwrap_or(0))
     }
 
     pub(crate) fn launch_wmma_big64x128_q4k(
@@ -858,7 +877,30 @@ impl RocmDevice {
         self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q6k", a, b, out, m, n, k)
     }
 
+    /// TEST ENTRY: the PRODUCTION 64x128 path, `a_f16 = 1` — the memoized
+    /// f32->f16 activation conversion. The `_for_ab` entry below passes six
+    /// arguments to a seven-parameter kernel and leaves `a_f16` undefined, so
+    /// it exercises the fill-converts-A path; a gate that has to see the memo
+    /// must come through here. See `tests/big64x128_activation_reuse.rs`.
+    pub fn launch_wmma_big64x128_q4k_a16_for_ab(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_wmma_big64x128_fmt("grim_wmma_big64x128_q4k", a_storage, b_storage, out_storage, m, n, k)
+    }
+
     /// A/B EXPERIMENT: 64x128 tile, 256 threads (8 waves: 2 row x 4 col quadrants).
+    ///
+    /// `a_f16 = 0`: the fill converts A from f32 itself. This entry used to
+    /// pass SIX arguments to a seven-parameter kernel, leaving `a_f16`
+    /// undefined — it happened to arrive as 0, so the tests built on it stayed
+    /// green while exercising a call production never makes. The parameter is
+    /// now passed explicitly; `..._q4k_a16_for_ab` is the production shape.
     pub fn launch_wmma_big64x128_q4k_for_ab(
         &self,
         a_storage: &RocmStorage,
@@ -885,6 +927,7 @@ impl RocmDevice {
         let mut mm = m as i32;
         let mut nn = n as i32;
         let mut kk = k as i32;
+        let mut af = 0i32;
         self.launch_compute_kernel(
             "grim_wmma_big64x128_q4k",
             grid_dim,
@@ -896,6 +939,7 @@ impl RocmDevice {
                 arg(&mut mm),
                 arg(&mut nn),
                 arg(&mut kk),
+                arg(&mut af),
             ],
         )
     }
@@ -3824,8 +3868,8 @@ impl RocmDevice {
         }
         let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let stream = self.active_stream();
-        crate::check_hip("hipMemsetD8Async", unsafe {
-            crate::device::handles::hipMemsetD8Async(ptr, value, bytes, stream)
+        crate::check_hip("hipMemsetAsync", unsafe {
+            crate::device::handles::hipMemsetAsync(ptr, value as i32, bytes, stream)
         })?;
         Ok(ptr)
     }

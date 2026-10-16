@@ -189,10 +189,12 @@ pub use fusion::{
 
 pub use kernels::qkv_attention::{
     BlockTableEntry, KvArenaFormat, KvCacheQuantFormat, KvRingPolicy, launch_bump_i32,
-    launch_bump_i32_slots, launch_kv_append, launch_kv_append_batch, launch_kv_append_i8,
+    launch_bump_i32_slots, launch_kv_append, launch_kv_append_batch, launch_kv_append_i4,
+    launch_kv_append_i8,
     launch_kv_quantize_rows_i2, launch_kv_quantize_rows_i4, launch_kv_quantize_rows_i8,
     launch_paged_attention,
     launch_paged_attention_quant, launch_qkv_attention_dev, launch_qkv_attention_dev_batch,
+    launch_qkv_attention_dev_batch_i4,
     launch_qkv_attention_dev_batch_i8, launch_qkv_attention_wmma, launch_tree_attention,
     f16_kv_explicitly_disabled, parse_f16_kv_env, parse_kv_arena_env,
 };

@@ -1256,6 +1256,29 @@ impl Qwen35Block {
                         cache.k_scales_device.as_deref(),
                         cache.v_scales_device.as_deref(),
                     )?;
+                    if cache.current_pos == 24 {
+                        use grim_backend_rocm::device::util::as_rocm;
+                        if let Ok(rocm) = as_rocm(k_dev.as_ref()) {
+                            let n_bytes = rocm.bytes();
+                            let mut host_bytes = vec![0u8; n_bytes];
+                            unsafe {
+                                if let Some(p) = rocm.device_ptr_u64() {
+                                    grim_backend_rocm::hipMemcpy(host_bytes.as_mut_ptr() as *mut std::ffi::c_void, p as *const std::ffi::c_void, n_bytes, grim_backend_rocm::HipMemcpyKind::DeviceToHost);
+                                    let k_u16: &[u16] = std::slice::from_raw_parts(host_bytes.as_ptr() as *const u16, n_bytes / 2);
+                                    let r24_start = 24 * 1024;
+                                    let r24_end = (25 * 1024).min(k_u16.len());
+                                    let nans = k_u16[r24_start..r24_end].iter().filter(|&&x| (x & 0x7c00) == 0x7c00 && (x & 0x03ff) != 0).count();
+                                    eprintln!(
+                                        "[eager-scan layer {}] step pos=24: k_ptr=0x{:x} total_rows={} r24_nans={nans}/1024 first_val=0x{:04x}",
+                                        self.layer_idx,
+                                        p,
+                                        k_u16.len() / 1024,
+                                        k_u16.get(r24_start).copied().unwrap_or(0)
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if std::env::var("GRIM_DEBUG_ROPE_ISOLATE").is_ok() {
                         let arena_k = k_dev.to_cpu_vec_f32()?;
                         let stride = self.head_dim;
@@ -1280,7 +1303,14 @@ impl Qwen35Block {
                         .next_power_of_two()
                         .min(evict.cap_rows.unwrap_or(usize::MAX))
                         .max(need_rows);
-                    let full_shape = Shape::new(vec![new_rows, self.num_kv_heads, self.head_dim]);
+                    let fmt = kv_arena_format_qwen(&device);
+                    let full_shape = Shape::new(vec![
+                        new_rows,
+                        self.num_kv_heads,
+                        kv_arena_head_extent(fmt, self.head_dim),
+                    ]);
+                    let row_extent =
+                        kv_arena_row_extent(fmt, self.num_kv_heads, self.head_dim);
                     let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
                     let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
                     if let Some(ref old_k) = cache.k_device {
@@ -1289,7 +1319,7 @@ impl Qwen35Block {
                             0,
                             old_k.as_ref(),
                             0,
-                            cache.current_pos * self.num_kv_heads * self.head_dim,
+                            cache.current_pos * row_extent,
                         )?;
                     }
                     if let Some(ref old_v) = cache.v_device {
@@ -1298,7 +1328,7 @@ impl Qwen35Block {
                             0,
                             old_v.as_ref(),
                             0,
-                            cache.current_pos * self.num_kv_heads * self.head_dim,
+                            cache.current_pos * row_extent,
                         )?;
                     }
                     // Install the grown arena and its int8 sidecars BEFORE the append: the
@@ -3871,8 +3901,16 @@ fn attention_layer_d2d(
             .next_power_of_two()
             .min(evict.cap_rows.unwrap_or(usize::MAX))
             .max(need_rows);
-        let k_idx = blk.num_kv_heads * blk.head_dim;
-        let full_shape = Shape::new(vec![new_rows, blk.num_kv_heads, blk.head_dim]);
+        // The arena is byte-addressed for the packed formats, so a row's extent
+        // is its BYTE count there and `k_idx` (the KV element count) is wrong
+        // for int4 by 2x — as an allocation size AND as the copy length below.
+        let fmt = kv_arena_format_qwen(&device);
+        let full_shape = Shape::new(vec![
+            new_rows,
+            blk.num_kv_heads,
+            kv_arena_head_extent(fmt, blk.head_dim),
+        ]);
+        let row_extent = kv_arena_row_extent(fmt, blk.num_kv_heads, blk.head_dim);
         let k_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
         let v_grown = dev.alloc_storage(&full_shape, kv_arena_dtype(&device))?;
         if let Some(ref old_k) = cache.k_device {
@@ -3881,7 +3919,7 @@ fn attention_layer_d2d(
                 0,
                 old_k.as_ref(),
                 0,
-                cache.current_pos * k_idx,
+                cache.current_pos * row_extent,
             )?;
         }
         if let Some(ref old_v) = cache.v_device {
@@ -3890,7 +3928,7 @@ fn attention_layer_d2d(
                 0,
                 old_v.as_ref(),
                 0,
-                cache.current_pos * k_idx,
+                cache.current_pos * row_extent,
             )?;
         }
         // Install the grown arena and its int8 sidecars BEFORE the append: the
@@ -4783,24 +4821,95 @@ pub(crate) fn kv_arena_format_qwen(device: &Device) -> grim_backend_rocm::KvAren
 /// [`kv_arena_format_qwen`]. ALL dense arena touchpoints key off the format
 /// so the representation can never disagree with itself.
 pub(crate) fn kv_arena_dtype(device: &Device) -> DType {
+    kv_arena_dtype_for(kv_arena_format_qwen(device))
+}
+
+/// [`kv_arena_dtype`] keyed by format, so the size arithmetic below can be
+/// tested without a device.
+pub(crate) fn kv_arena_dtype_for(format: grim_backend_rocm::KvArenaFormat) -> DType {
     use grim_backend_rocm::KvArenaFormat as F;
-    match kv_arena_format_qwen(device) {
+    match format {
         F::F32 => DType::F32,
         F::F16 => DType {
             arith: ArithType::F16,
             storage: Storage::Native,
         },
-        F::Int8 | F::Int4 => DType {
-            arith: ArithType::U8,
-            storage: Storage::Native,
-        },
         // WS-3A: byte-addressed like int8/int4 so the arena allocates, but
         // `ensure_arena_format_supported` refuses it before any use — the
         // 2-bit-K kernels do not exist.
-        F::Int2V4 => DType {
+        F::Int8 | F::Int4 | F::Int2V4 => DType {
             arith: ArithType::U8,
             storage: Storage::Native,
         },
+    }
+}
+
+/// Innermost extent of the dense KV arena's storage shape for ONE KV head, in
+/// elements of [`kv_arena_dtype`] — i.e. the third dim of the arena's
+/// `[rows, nkv, extent]` shape.
+///
+/// The packed formats are byte-addressed — [`kv_arena_dtype`] gives them a U8
+/// element — so for them this number IS a head's byte count, and the shape's
+/// element count is the arena's byte count. int4 packs TWO codes per byte and
+/// int2v4 packs FOUR on the key side, so an extent of `head_dim` (the
+/// f32/f16/int8 layout) allocates twice what the kernels write.
+///
+/// That is how int4 came to occupy exactly as much VRAM as int8 — one byte per
+/// element — while costing 10x int8's perplexity: the format's entire reason to
+/// exist, silently discarded. This function and its two companions are the
+/// ONLY place the arena's size is derived from its representation; the
+/// allocator, the growth copies and the budget planner all call them, because
+/// the previous arrangement had three copies of the same fact and two of them
+/// were wrong.
+///
+/// The MAX over the two sides, because one shape serves both: int2v4's key
+/// codes are half of its value codes and the key side still has to fit.
+pub(crate) fn kv_arena_head_extent(
+    format: grim_backend_rocm::KvArenaFormat,
+    head_dim: usize,
+) -> usize {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match format {
+        F::F32 | F::F16 | F::Int8 => head_dim,
+        F::Int4 => head_dim / 2,
+        F::Int2V4 => head_dim / 2,
+    }
+}
+
+/// Elements one whole token row (every KV head) occupies: `nkv` heads of
+/// [`kv_arena_head_extent`]. This is the unit the growth copies count in.
+pub(crate) fn kv_arena_row_extent(
+    format: grim_backend_rocm::KvArenaFormat,
+    nkv: usize,
+    head_dim: usize,
+) -> usize {
+    nkv * kv_arena_head_extent(format, head_dim)
+}
+
+
+/// Bytes one KV *element* costs in the dense arena, codes only, no scale
+/// sidecar — the unit the arena budget planner reserves in.
+pub(crate) fn kv_arena_bytes_per_kv_elem(format: grim_backend_rocm::KvArenaFormat) -> f64 {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match format {
+        F::F32 => 4.0,
+        F::F16 => 2.0,
+        F::Int8 => 1.0,
+        // Key 0.25, value 0.5; the reservation takes the wider side.
+        F::Int4 | F::Int2V4 => 0.5,
+    }
+}
+
+/// Scale-sidecar BYTES one token row costs: one f32 per (row, kv head) for K
+/// and again for V. Zero for the formats that store K/V directly.
+pub(crate) fn kv_arena_row_scale_bytes(
+    format: grim_backend_rocm::KvArenaFormat,
+    nkv: usize,
+) -> usize {
+    use grim_backend_rocm::KvArenaFormat as F;
+    match format {
+        F::Int8 | F::Int4 | F::Int2V4 => nkv * 4 * 2,
+        F::F32 | F::F16 => 0,
     }
 }
 
@@ -5229,23 +5338,24 @@ fn plan_layer_devices(
         // the reservation vs f32; int8 codes are 1 B/elem plus an f32 scale
         // per row per kv head for K and V); K and V share the representation.
         // Conservative across devices: the max.
+        //
+        // The per-element figure comes from `kv_arena_bytes_per_kv_elem`, NOT
+        // from a table here: the table that used to live at this line said
+        // `_ => (4, 0)`, so int4 reserved as if it were f32 — eight times its
+        // own layout — and admission control could never trade int4's smaller
+        // footprint for a longer context.
         let (bpe, scales_per_row) = devices
             .iter()
-            .map(|d| match kv_arena_format_qwen(d) {
-                grim_backend_rocm::KvArenaFormat::F16 => (2u64, 0u64),
-                grim_backend_rocm::KvArenaFormat::Int8 => {
-                    (1u64, kv_heads as u64 * 4 * 2) // codes + K/V scales
-                }
-                _ => (4u64, 0u64),
+            .map(|d| {
+                let f = kv_arena_format_qwen(d);
+                (
+                    kv_arena_bytes_per_kv_elem(f),
+                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
+                )
             })
-            .max()
-            .unwrap_or((4, 0));
-        (c as u64)
-            .saturating_mul(kv_heads as u64)
-            .saturating_mul(head_dim as u64)
-            .saturating_mul(bpe)
-            .saturating_mul(2) // K and V
-            .saturating_add((c as u64).saturating_mul(scales_per_row))
+            .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
+        (c as f64 * kv_heads as f64 * head_dim as f64 * bpe * 2.0
+            + c as f64 * scales_per_row) as u64
     };
     // Phase 3: a fixed eviction capacity caps the arena BELOW the model's
     // advertised context, so the reservation must budget for the cap — that is
@@ -5259,10 +5369,12 @@ fn plan_layer_devices(
         // for after eviction, not the full advertised context.
         let (bpe_msg, spr_msg) = devices
             .iter()
-            .map(|d| match kv_arena_format_qwen(d) {
-                grim_backend_rocm::KvArenaFormat::F16 => (2.0f64, 0.0f64),
-                grim_backend_rocm::KvArenaFormat::Int8 => (1.0f64, kv_heads as f64 * 4.0 * 2.0),
-                _ => (4.0f64, 0.0f64),
+            .map(|d| {
+                let f = kv_arena_format_qwen(d);
+                (
+                    kv_arena_bytes_per_kv_elem(f),
+                    kv_arena_row_scale_bytes(f, kv_heads) as f64,
+                )
             })
             .fold((0.0f64, 0.0f64), |(a, b), (c, d)| (a.max(c), b.max(d)));
         eprintln!(
@@ -5281,8 +5393,9 @@ fn plan_layer_devices(
         eprintln!(
             "[qwen35] reserving KV arenas: ctx={eff_ctx}, kv_heads={kv_heads}, \
              head_dim={head_dim}, attn_layers={num_attn_layers} \
-             -> {:.1} GB total (budget {:.1} GB)",
+             -> {:.1} GB total ({:.0} MB, budget {:.1} GB)",
             kv_total as f64 / 1e9,
+            kv_total as f64 / 1e6,
             arena_budget as f64 / 1e9
         );
     }
@@ -5712,6 +5825,63 @@ fn bound_kv_arena(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// int4's whole reason to exist is memory, and the arena must be sized as
+    /// what it actually stores.
+    ///
+    /// It was not, in three places at once. `kv_arena_dtype` gives Int4 the same
+    /// U8 element as Int8, so a shape expressed in (row, nkv, head_dim)
+    /// ELEMENTS allocated one byte per element — twice the codes a two-per-byte
+    /// format writes — while the budget planner and its duplicate in the
+    /// BOUNDED message both carried `_ => (4.0, 0.0)`, i.e. f32. Net effect:
+    /// `GRIM_KV_ARENA=int4` occupied exactly as much VRAM as `int8` (67 MB vs
+    /// 67 MB at a 4096 context on this 9B) while costing 10x its perplexity, and
+    /// admission control could not use int4 to reach a longer context than f32.
+    ///
+    /// These functions are now the only place the size comes from. The identity
+    /// at the end is the point: the row extent and the per-element figure are
+    /// two spellings of one fact and must not drift apart again.
+    #[test]
+    fn kv_arena_size_tracks_the_representation() {
+        use grim_backend_rocm::KvArenaFormat as F;
+        let (nkv, hd) = (4usize, 256usize);
+        let row_bytes = |f: F| -> usize {
+            kv_arena_row_extent(f, nkv, hd) * kv_arena_dtype_for(f).expected_bytes(1)
+        };
+        // f32/f16 keep the natural layout; the packed formats pack.
+        assert_eq!(row_bytes(F::F32), nkv * hd * 4);
+        assert_eq!(row_bytes(F::F16), nkv * hd * 2);
+        assert_eq!(row_bytes(F::Int8), nkv * hd);
+        assert_eq!(row_bytes(F::Int4), nkv * hd / 2, "int4 is 2 codes/byte");
+        // K2V4: 4 codes/byte on K, 2 on V — the allocation takes the wider side.
+        assert_eq!(row_bytes(F::Int2V4), nkv * hd / 2);
+
+        // The per-element figure the planner reserves in must equal the bytes
+        // the allocator actually hands out, or the reservation lies.
+        for f in [F::F32, F::F16, F::Int8, F::Int4, F::Int2V4] {
+            let per_elem = kv_arena_bytes_per_kv_elem(f);
+            let from_layout = row_bytes(f) as f64 / (nkv * hd) as f64;
+            assert!(
+                (per_elem - from_layout).abs() < 1e-9,
+                "{f:?}: planner reserves {per_elem} B/elem but the arena layout is \
+                 {from_layout} B/elem"
+            );
+        }
+        // The ladder, stated once: each step halves.
+        assert!(kv_arena_bytes_per_kv_elem(F::Int4) < kv_arena_bytes_per_kv_elem(F::Int8));
+        assert!(kv_arena_bytes_per_kv_elem(F::Int8) < kv_arena_bytes_per_kv_elem(F::F16));
+        // int4 must actually be 8x smaller than the f32 default, not 2x.
+        assert_eq!(
+            kv_arena_bytes_per_kv_elem(F::F32) / kv_arena_bytes_per_kv_elem(F::Int4),
+            8.0
+        );
+
+        // Scale sidecars: one f32 per (row, kv head) per side, only for the
+        // formats that do not store K/V directly.
+        assert_eq!(kv_arena_row_scale_bytes(F::Int4, nkv), nkv * 4 * 2);
+        assert_eq!(kv_arena_row_scale_bytes(F::Int8, nkv), nkv * 4 * 2);
+        assert_eq!(kv_arena_row_scale_bytes(F::F16, nkv), 0);
+    }
 
     /// WS-3A: every declared arena format passes the support guard now that
     /// the K2V4 kernels exist. The guard remains the single place a future

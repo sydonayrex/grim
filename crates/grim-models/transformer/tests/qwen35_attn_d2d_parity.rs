@@ -713,6 +713,67 @@ fn qwen35_i4_kv_decode_matches_f32() {
 ///     codes' row (the off-by-a-factor bug this gate was written for);
 ///   * the dequantized codes must be within HALF a code step of the f32 row,
 ///     i.e. the quantizer round-trips the values it was handed.
+/// int4's whole reason to exist is memory: at a fixed context it must cost
+/// HALF of int8 and a QUARTER of f16.
+///
+/// It did not. `kv_arena_dtype` gives Int4 the same U8 element as Int8, and the
+/// arena shape was expressed in (row, nkv, head_dim) ELEMENTS, so int4
+/// allocated one byte per element — exactly int8's footprint — while writing
+/// only two codes per byte. Choosing int4 therefore saved nothing over int8 and
+/// cost 10x its perplexity. This gate reads the LIVE arena's byte size off the
+/// real layer cache, so it measures the allocation rather than the intention.
+#[test]
+fn qwen35_int4_kv_arena_is_a_quarter_of_f16_and_half_of_int8() {
+    let Some((device, dev)) = gpu_device() else {
+        return;
+    };
+    let c = cfg();
+    let _env = KV_FORMAT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let arena_bytes = |format: &str| -> usize {
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", format);
+        }
+        let blk = build_block(&device, Some(dev.as_ref()));
+        let mut cache = Qwen35LayerCache::new(&c);
+        for step in 0..STEPS {
+            let x_host = w(30 + step, HIDDEN);
+            let _ = blk
+                .forward(
+                    &to_dev(dev.as_ref(), &x_host, Shape::new(vec![1, HIDDEN]), &device),
+                    &[step as u32],
+                    &mut cache,
+                )
+                .expect("forward")
+                .to_vec_f32()
+                .expect("read");
+            cache.current_pos += 1;
+        }
+        unsafe {
+            std::env::set_var("GRIM_KV_ARENA", "f32");
+        }
+        let k = cache.k_device.as_ref().expect("k arena");
+        let v = cache.v_device.as_ref().expect("v arena");
+        let bytes = |s: &dyn grim_tensor::backend::BackendStorage| -> usize {
+            s.shape().elem_count() * s.dtype().expected_bytes(1)
+        };
+        bytes(k.as_ref()) + bytes(v.as_ref())
+    };
+
+    let f16_b = arena_bytes("f16");
+    let i8_b = arena_bytes("int8");
+    let i4_b = arena_bytes("int4");
+    eprintln!("[kv-arena-bytes] f16={f16_b} int8={i8_b} int4={i4_b}");
+    assert!(f16_b > 0 && i8_b > 0 && i4_b > 0, "an arena allocated nothing");
+    assert_eq!(i8_b * 2, f16_b, "int8 must be half of f16 ({i8_b} vs {f16_b})");
+    assert_eq!(
+        i4_b * 2,
+        i8_b,
+        "int4 must be half of int8 ({i4_b} vs {i8_b}) — it is 2 codes per byte, \
+         and while this held it bought nothing over int8"
+    );
+}
+
 #[test]
 fn qwen35_i8_kv_arena_rows_match_f32_within_code_step() {
     let Some((device, dev)) = gpu_device() else {

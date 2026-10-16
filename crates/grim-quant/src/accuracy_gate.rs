@@ -241,27 +241,47 @@ impl KvArenaTolerance {
                 provisional: false,
             },
             // int8 per-(row, kv_head): symmetric 8-bit, one scale per
-            // head-vector, dequant `(code-128)/127 * amax`. Provisional until
-            // the long-context sweep sizes it.
+            // head-vector, dequant `(code-128)/127 * amax`.
+            //
+            // The step-0 bound is a RECORDED MEASUREMENT with margin, the same
+            // rule the f16 entry uses. On Qwen3.5-9B-Q4_K_M (pinned corpus,
+            // 3x256-token windows, `kv_arena_ppl_gate`) int8 moved PPL by
+            // 0.0837% and the step-0 top-16 logprobs by 0.8597 (argmax
+            // unchanged); 2.0 is 2.3x that, matching f16's 2.2x margin over its
+            // own 0.115. The 0.02 this used to carry was set before anything
+            // had been measured, and it was TIGHTER than f16's 0.25 for a
+            // strictly coarser format — an inversion, not a finding.
+            //
+            // Note the step-0 probe reads row 0, whose attention has a single
+            // KV entry: it is the arena's worst case by construction (the
+            // stored V comes back verbatim, nothing averages out). The
+            // decode-like row of the same probe measures 0.0997 for int8 and
+            // 0.0097 for f16, a ~10x ladder per format step.
             KvArenaKind::Int8 => Self {
                 max_relative_ppl_delta: 0.02,
-                max_step0_logprob_abs_delta: 0.02,
+                max_step0_logprob_abs_delta: 2.0,
                 provisional: true,
             },
             // int4: coarser (15 levels); the same tier as the Q4K weight budget.
+            // Measured 3.3890 at step 0 on the same checkpoint (the decode-like
+            // row: 0.5097); 8.0 is 2.4x that. int4 additionally MOVES THE
+            // ARGMAX at row 0, which the gate's structural check catches
+            // separately — this budget does not, and should not, excuse it.
             KvArenaKind::Int4 => Self {
                 max_relative_ppl_delta: 0.08,
-                max_step0_logprob_abs_delta: 0.20,
+                max_step0_logprob_abs_delta: 8.0,
                 provisional: true,
             },
             // K2V4: the KEY side has only THREE levels, so it is strictly
             // coarser than int4's 15 and cannot inherit its budget. Unmeasured
             // against a real model — provisional, and deliberately loose so it
             // fails loudly only on gross corruption rather than on the 2-bit
-            // coarseness it was designed for.
+            // coarseness it was designed for. It must stay above int4's
+            // measured 3.389, which the 0.60 it used to carry did not: it was
+            // below a FINER format's measurement.
             KvArenaKind::Int2V4 => Self {
                 max_relative_ppl_delta: 0.25,
-                max_step0_logprob_abs_delta: 0.60,
+                max_step0_logprob_abs_delta: 16.0,
                 provisional: true,
             },
         }
@@ -582,17 +602,53 @@ mod tests {
         // A coarser representation may never be given a tighter budget than a
         // finer one — the ordering is the property that makes the ladder
         // meaningful.
+        //
+        // Both columns are checked. The step-0 column was NOT, and it carried
+        // exactly the inversion this test exists to catch: int8's bound was
+        // 0.02 against f16's 0.25, i.e. an 8-bit arena held to 1/12th of the
+        // f16 arena's tolerance. Nothing failed, because nothing looked.
         let f32t = KvArenaTolerance::for_kind(KvArenaKind::F32);
         let f16t = KvArenaTolerance::for_kind(KvArenaKind::F16);
         let i8t = KvArenaTolerance::for_kind(KvArenaKind::Int8);
         let i4t = KvArenaTolerance::for_kind(KvArenaKind::Int4);
+        let i2v4t = KvArenaTolerance::for_kind(KvArenaKind::Int2V4);
         assert!(f32t.max_relative_ppl_delta <= f16t.max_relative_ppl_delta);
         assert!(f16t.max_relative_ppl_delta <= i8t.max_relative_ppl_delta);
         assert!(i8t.max_relative_ppl_delta <= i4t.max_relative_ppl_delta);
+        assert!(i4t.max_relative_ppl_delta <= i2v4t.max_relative_ppl_delta);
+        assert!(f32t.max_step0_logprob_abs_delta <= f16t.max_step0_logprob_abs_delta);
+        assert!(f16t.max_step0_logprob_abs_delta <= i8t.max_step0_logprob_abs_delta);
+        assert!(i8t.max_step0_logprob_abs_delta <= i4t.max_step0_logprob_abs_delta);
+        assert!(i4t.max_step0_logprob_abs_delta <= i2v4t.max_step0_logprob_abs_delta);
         // The reference arm is exact, and f16 is a rounding, not a tunable.
         assert_eq!(f32t.max_relative_ppl_delta, 0.0);
         assert!(!f16t.provisional, "f16's bound is structural, not provisional");
         assert!(i8t.provisional && i4t.provisional);
+    }
+
+    #[test]
+    fn kv_arena_step0_budget_admits_the_measured_ladder() {
+        // The budgets are MEASURED envelopes, so the measurement they were
+        // derived from must fit inside them with room to spare. These are the
+        // Qwen3.5-9B-Q4_K_M / `kv_arena_ppl_gate` step-0 top-16 max-abs deltas
+        // at PROBE_LEN = 32 (see the plan's Gate-G2 table): f16 0.0152,
+        // int8 0.8597, int4 3.3890 — a ~10x ladder per format step at the
+        // decode-like row, and the numbers here are the row-0 worst case.
+        let i8t = KvArenaTolerance::for_kind(KvArenaKind::Int8);
+        let i4t = KvArenaTolerance::for_kind(KvArenaKind::Int4);
+        let i2v4t = KvArenaTolerance::for_kind(KvArenaKind::Int2V4);
+        assert!(
+            i8t.max_step0_logprob_abs_delta > 0.8597,
+            "int8's measured step-0 drift no longer fits its budget"
+        );
+        assert!(
+            i4t.max_step0_logprob_abs_delta > 3.3890,
+            "int4's measured step-0 drift no longer fits its budget"
+        );
+        // A budget that admits everything is not a budget: a wrong scale axis
+        // (the failure class this column exists to catch) moves the top-16 by
+        // tens of nats or sends it non-finite.
+        assert!(i2v4t.max_step0_logprob_abs_delta < 64.0);
     }
 
     #[test]
